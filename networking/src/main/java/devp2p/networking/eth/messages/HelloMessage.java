@@ -48,6 +48,11 @@ public final class HelloMessage {
                     cap.writeString("eth");
                     cap.writeInt(68);
                 });
+                // eth/69
+                capWriter.writeList(cap -> {
+                    cap.writeString("eth");
+                    cap.writeInt(69);
+                });
                 // snap/1
                 capWriter.writeList(cap -> {
                     cap.writeString("snap");

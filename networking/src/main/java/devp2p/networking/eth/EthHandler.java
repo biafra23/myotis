@@ -155,7 +155,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             HelloMessage hello = HelloMessage.decode(msg.payload());
             log.info("[eth] Hello from peer: {}", hello);
 
-            // Negotiate highest common eth version (67 or 68)
+            // Negotiate highest common eth version (67, 68, or 69)
             int bestEthVersion = hello.capabilities.stream()
                 .filter(c -> c.name().equals("eth") && c.version() >= StatusMessage.MIN_ETH_VERSION
                         && c.version() <= StatusMessage.MAX_ETH_VERSION)
@@ -185,7 +185,9 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 bytesToHex(msg.payload(), msg.payload().length));
             StatusMessage status;
             try {
-                status = StatusMessage.decode(msg.payload());
+                status = negotiatedEthVersion >= 69
+                    ? StatusMessage.decode69(msg.payload())
+                    : StatusMessage.decode(msg.payload());
             } catch (Exception e) {
                 log.error("[eth] Failed to decode Status from peer: {} | payload[{}]={}", e.getMessage(),
                     msg.payload().length,

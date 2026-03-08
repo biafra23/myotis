@@ -7,50 +7,46 @@ import org.apache.tuweni.rlp.RLP;
 /**
  * eth/Status (message code 0x10, offset 0x10 from p2p base = 0x00).
  *
- * After eth capability is negotiated (offset 0x10 for eth messages):
- *   Status code = 0x10 + 0x00 = 0x10
- *
- * RLP: [protocolVersion, networkId, td, bestHash, genesisHash, forkId([hash, next])]
- *
- * For eth/68, forkId is required.
+ * eth/67-68 RLP: [protocolVersion, networkId, td, bestHash, genesisHash, forkId([hash, next])]
+ * eth/69    RLP: [protocolVersion, networkId, genesis, forkId([hash, next]), earliestBlock, latestBlock, latestBlockHash]
  */
 public final class StatusMessage {
 
-    // eth/68 code within the eth namespace = 0x00 (first message)
-    // Over the wire: 0x10 (base offset for eth capability after p2p hello)
     public static final int CODE = 0x10;
     public static final int MIN_ETH_VERSION = 67;
-    public static final int MAX_ETH_VERSION = 68;
+    public static final int MAX_ETH_VERSION = 69;
 
     // Genesis block difficulty (honest — we haven't synced the chain)
     private static final Bytes DEFAULT_TOTAL_DIFFICULTY = Bytes.fromHexString("0x0400000000");
 
     public final int protocolVersion;
     public final long networkId;
-    public final Bytes totalDifficulty;
-    public final Bytes32 bestHash;
+    public final Bytes totalDifficulty; // null for eth/69
+    public final Bytes32 bestHash;      // latestBlockHash for eth/69
     public final Bytes32 genesisHash;
+    public final long earliestBlock;    // eth/69 only (-1 for eth/67-68)
+    public final long latestBlock;      // eth/69 only (-1 for eth/67-68)
 
     private StatusMessage(int protoVer, long networkId, Bytes td,
-                          Bytes32 best, Bytes32 genesis) {
+                          Bytes32 best, Bytes32 genesis,
+                          long earliestBlock, long latestBlock) {
         this.protocolVersion = protoVer;
         this.networkId = networkId;
         this.totalDifficulty = td;
         this.bestHash = best;
         this.genesisHash = genesis;
+        this.earliestBlock = earliestBlock;
+        this.latestBlock = latestBlock;
     }
 
     /**
-     * Encode a Status message for any network.
-     *
-     * @param networkId    chain network ID
-     * @param genesisHash  genesis block hash
-     * @param bestHash     best known block hash (recent block to avoid being deprioritized)
-     * @param forkIdHash   4-byte EIP-2124 fork ID hash
-     * @param forkNext     next fork timestamp (0 if none known)
+     * Encode an eth/67-68 Status message.
      */
     public static byte[] encode(int ethVersion, long networkId, Bytes32 genesisHash,
                                 Bytes32 bestHash, byte[] forkIdHash, long forkNext) {
+        if (ethVersion >= 69) {
+            return encode69(ethVersion, networkId, genesisHash, bestHash, forkIdHash, forkNext);
+        }
         return RLP.encodeList(writer -> {
             writer.writeInt(ethVersion);
             writer.writeLong(networkId);
@@ -64,6 +60,29 @@ public final class StatusMessage {
         }).toArrayUnsafe();
     }
 
+    /**
+     * Encode an eth/69 Status message.
+     * Format: [version, networkId, genesis, forkId, earliestBlock, latestBlock, latestBlockHash]
+     */
+    private static byte[] encode69(int ethVersion, long networkId, Bytes32 genesisHash,
+                                   Bytes32 latestBlockHash, byte[] forkIdHash, long forkNext) {
+        return RLP.encodeList(writer -> {
+            writer.writeInt(ethVersion);
+            writer.writeLong(networkId);
+            writer.writeValue(genesisHash);
+            writer.writeList(forkWriter -> {
+                forkWriter.writeValue(Bytes.wrap(forkIdHash));
+                forkWriter.writeLong(forkNext);
+            });
+            writer.writeLong(0);  // earliestBlock (we have genesis = block 0)
+            writer.writeLong(0);  // latestBlock (honest — we haven't synced)
+            writer.writeValue(latestBlockHash);
+        }).toArrayUnsafe();
+    }
+
+    /**
+     * Decode an eth/67-68 Status message.
+     */
     public static StatusMessage decode(byte[] rlp) {
         return RLP.decodeList(Bytes.wrap(rlp), reader -> {
             int version = reader.readInt();
@@ -71,11 +90,27 @@ public final class StatusMessage {
             Bytes td = reader.readValue();
             Bytes32 best = Bytes32.wrap(reader.readValue());
             Bytes32 genesis = Bytes32.wrap(reader.readValue());
-            // forkId is an RLP list [hash(4), next(uint64)] — must readList(), not readValue()
             if (!reader.isComplete()) {
-                reader.readList(fr -> null); // consume the forkId list; we only need genesis+networkId
+                reader.readList(fr -> null); // consume forkId
             }
-            return new StatusMessage(version, netId, td, best, genesis);
+            return new StatusMessage(version, netId, td, best, genesis, -1, -1);
+        });
+    }
+
+    /**
+     * Decode an eth/69 Status message.
+     * Format: [version, networkId, genesis, forkId, earliestBlock, latestBlock, latestBlockHash]
+     */
+    public static StatusMessage decode69(byte[] rlp) {
+        return RLP.decodeList(Bytes.wrap(rlp), reader -> {
+            int version = reader.readInt();
+            long netId = reader.readLong();
+            Bytes32 genesis = Bytes32.wrap(reader.readValue());
+            reader.readList(fr -> null); // consume forkId
+            long earliest = reader.readLong();
+            long latest = reader.readLong();
+            Bytes32 latestHash = Bytes32.wrap(reader.readValue());
+            return new StatusMessage(version, netId, null, latestHash, genesis, earliest, latest);
         });
     }
 
@@ -85,6 +120,12 @@ public final class StatusMessage {
 
     @Override
     public String toString() {
+        if (earliestBlock >= 0) {
+            return "Status{version=" + protocolVersion + ", networkId=" + networkId +
+                   ", genesis=" + genesisHash.toShortHexString() +
+                   ", latestBlock=" + latestBlock +
+                   ", latestHash=" + bestHash.toShortHexString() + "}";
+        }
         return "Status{version=" + protocolVersion + ", networkId=" + networkId +
                ", genesis=" + genesisHash.toShortHexString() +
                ", best=" + bestHash.toShortHexString() + "}";
