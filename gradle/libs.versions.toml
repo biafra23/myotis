@@ -1,0 +1,27 @@
+[versions]
+tuweni = "2.7.2"
+netty = "4.2.7.Final"
+bouncycastle = "1.78.1"
+junit = "5.10.0"
+slf4j = "2.0.12"
+logback = "1.5.6"
+
+[libraries]
+tuweni-bytes        = { module = "io.consensys.tuweni:tuweni-bytes",       version.ref = "tuweni" }
+tuweni-rlp          = { module = "io.consensys.tuweni:tuweni-rlp",         version.ref = "tuweni" }
+tuweni-crypto       = { module = "io.consensys.tuweni:tuweni-crypto",      version.ref = "tuweni" }
+tuweni-merkle-trie  = { module = "io.consensys.tuweni:tuweni-merkle-trie", version.ref = "tuweni" }
+tuweni-ssz          = { module = "io.consensys.tuweni:tuweni-ssz",         version.ref = "tuweni" }
+tuweni-units        = { module = "io.consensys.tuweni:tuweni-units",       version.ref = "tuweni" }
+
+netty-transport     = { module = "io.netty:netty-transport",               version.ref = "netty" }
+netty-codec         = { module = "io.netty:netty-codec",                   version.ref = "netty" }
+netty-handler       = { module = "io.netty:netty-handler",                 version.ref = "netty" }
+
+bouncycastle        = { module = "org.bouncycastle:bcprov-jdk18on",        version.ref = "bouncycastle" }
+
+slf4j-api           = { module = "org.slf4j:slf4j-api",                   version.ref = "slf4j" }
+logback-classic     = { module = "ch.qos.logback:logback-classic",         version.ref = "logback" }
+
+junit-bom           = { module = "org.junit:junit-bom",                    version.ref = "junit" }
+junit-jupiter       = { module = "org.junit.jupiter:junit-jupiter" }
