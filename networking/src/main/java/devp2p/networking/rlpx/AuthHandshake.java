@@ -62,6 +62,15 @@ public final class AuthHandshake {
         this.localNonce = randomBytes32();
     }
 
+    /** Package-private constructor for testing with deterministic keys and nonces. */
+    AuthHandshake(NodeKey localKey, SECP256K1.PublicKey remotePubkey,
+                  SECP256K1.KeyPair ephemeralKey, Bytes32 localNonce) {
+        this.localKey = localKey;
+        this.remotePubkey = remotePubkey;
+        this.ephemeralKey = ephemeralKey;
+        this.localNonce = localNonce;
+    }
+
     // -------------------------------------------------------------------------
     // Step 1: Build and encrypt auth message
     // -------------------------------------------------------------------------

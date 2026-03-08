@@ -34,6 +34,10 @@ public final class NodeKey {
         return new NodeKey(SECP256K1.KeyPair.random());
     }
 
+    public static NodeKey fromSecretKey(SECP256K1.SecretKey secret) {
+        return new NodeKey(SECP256K1.KeyPair.fromSecretKey(secret));
+    }
+
     /**
      * Load from a 32-byte hex file, or generate and save a new one.
      */

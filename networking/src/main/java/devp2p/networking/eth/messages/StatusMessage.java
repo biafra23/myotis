@@ -34,16 +34,14 @@ public final class StatusMessage {
     public final Bytes totalDifficulty;
     public final Bytes32 bestHash;
     public final Bytes32 genesisHash;
-    public final Bytes forkId; // raw RLP of [hash(4 bytes), next(uint64)]
 
     private StatusMessage(int protoVer, long networkId, Bytes td,
-                          Bytes32 best, Bytes32 genesis, Bytes forkId) {
+                          Bytes32 best, Bytes32 genesis) {
         this.protocolVersion = protoVer;
         this.networkId = networkId;
         this.totalDifficulty = td;
         this.bestHash = best;
         this.genesisHash = genesis;
-        this.forkId = forkId;
     }
 
     /**
@@ -74,9 +72,11 @@ public final class StatusMessage {
             Bytes td = reader.readValue();
             Bytes32 best = Bytes32.wrap(reader.readValue());
             Bytes32 genesis = Bytes32.wrap(reader.readValue());
-            // forkId is an RLP list [hash(4), next(uint64)]
-            Bytes forkId = reader.isComplete() ? Bytes.EMPTY : reader.readValue();
-            return new StatusMessage(version, netId, td, best, genesis, forkId);
+            // forkId is an RLP list [hash(4), next(uint64)] — must readList(), not readValue()
+            if (!reader.isComplete()) {
+                reader.readList(fr -> null); // consume the forkId list; we only need genesis+networkId
+            }
+            return new StatusMessage(version, netId, td, best, genesis);
         });
     }
 
