@@ -3,6 +3,7 @@ package devp2p.app;
 import devp2p.core.types.BlockHeader;
 import devp2p.networking.discv4.DiscV4Service;
 import devp2p.networking.discv4.KademliaTable;
+import devp2p.networking.eth.messages.BlockBodiesMessage;
 import devp2p.networking.eth.messages.BlockHeadersMessage;
 import devp2p.networking.rlpx.RLPxConnector;
 import org.slf4j.Logger;
@@ -44,6 +45,7 @@ public class CommandHandler {
                 case "status"      -> handleStatus();
                 case "peers"       -> handlePeers();
                 case "get-headers" -> handleGetHeaders(jsonLine);
+                case "get-block"   -> handleGetBlock(jsonLine);
                 case "stop"        -> handleStop();
                 default            -> jsonError("Unknown command: " + cmd);
             };
@@ -138,7 +140,58 @@ public class CommandHandler {
             sb.append("]}");
             return sb.toString();
         } catch (Exception e) {
-            String msg = e.getCause() != null ? e.getCause().getMessage() : e.getMessage();
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
+            return jsonError(msg);
+        }
+    }
+
+    private String handleGetBlock(String jsonLine) {
+        long blockNumber = extractLong(jsonLine, "blockNumber");
+
+        try {
+            // Step 1: fetch the header
+            List<BlockHeadersMessage.VerifiedHeader> headers =
+                    connector.requestBlockHeaders(blockNumber, 1)
+                             .get(30, TimeUnit.SECONDS);
+            if (headers.isEmpty()) {
+                return jsonError("No header returned for block " + blockNumber);
+            }
+            BlockHeadersMessage.VerifiedHeader vh = headers.get(0);
+            BlockHeader h = vh.header();
+
+            // Step 2: fetch the body using the block hash
+            org.apache.tuweni.bytes.Bytes32 blockHash = vh.hash();
+            List<BlockBodiesMessage.BlockBody> bodies =
+                    connector.requestBlockBodies(blockHash)
+                             .get(30, TimeUnit.SECONDS);
+            if (bodies.isEmpty()) {
+                return jsonError("No body returned for block " + blockNumber);
+            }
+            BlockBodiesMessage.BlockBody body = bodies.get(0);
+
+            // Step 3: combine into JSON response
+            StringBuilder sb = new StringBuilder();
+            sb.append("{\"ok\":true,\"block\":{");
+            sb.append("\"number\":").append(h.number);
+            sb.append(",\"hash\":\"0x").append(vh.hash().toHexString()).append("\"");
+            sb.append(",\"parentHash\":\"0x").append(h.parentHash.toHexString()).append("\"");
+            sb.append(",\"stateRoot\":\"0x").append(h.stateRoot.toHexString()).append("\"");
+            sb.append(",\"transactionsRoot\":\"0x").append(h.transactionsRoot.toHexString()).append("\"");
+            sb.append(",\"timestamp\":").append(h.timestamp);
+            sb.append(",\"gasUsed\":").append(h.gasUsed);
+            sb.append(",\"gasLimit\":").append(h.gasLimit);
+            if (h.baseFeePerGas != null) {
+                sb.append(",\"baseFeePerGas\":\"").append(h.baseFeePerGas).append("\"");
+            }
+            sb.append(",\"transactionCount\":").append(body.transactions().size());
+            sb.append(",\"uncleCount\":").append(body.uncleCount());
+            sb.append(",\"withdrawalCount\":").append(body.withdrawalCount());
+            sb.append("}}");
+            return sb.toString();
+        } catch (Exception e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
             return jsonError(msg);
         }
     }

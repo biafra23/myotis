@@ -26,10 +26,13 @@ public final class StatusMessage {
     public final Bytes32 genesisHash;
     public final long earliestBlock;    // eth/69 only (-1 for eth/67-68)
     public final long latestBlock;      // eth/69 only (-1 for eth/67-68)
+    public final Bytes forkIdHash;      // decoded fork ID hash (for debug)
+    public final long forkNext;         // decoded fork next (for debug)
 
     private StatusMessage(int protoVer, long networkId, Bytes td,
                           Bytes32 best, Bytes32 genesis,
-                          long earliestBlock, long latestBlock) {
+                          long earliestBlock, long latestBlock,
+                          Bytes forkIdHash, long forkNext) {
         this.protocolVersion = protoVer;
         this.networkId = networkId;
         this.totalDifficulty = td;
@@ -37,6 +40,8 @@ public final class StatusMessage {
         this.genesisHash = genesis;
         this.earliestBlock = earliestBlock;
         this.latestBlock = latestBlock;
+        this.forkIdHash = forkIdHash;
+        this.forkNext = forkNext;
     }
 
     /**
@@ -90,10 +95,16 @@ public final class StatusMessage {
             Bytes td = reader.readValue();
             Bytes32 best = Bytes32.wrap(reader.readValue());
             Bytes32 genesis = Bytes32.wrap(reader.readValue());
+            Bytes[] forkHash = {null};
+            long[] forkNextArr = {0};
             if (!reader.isComplete()) {
-                reader.readList(fr -> null); // consume forkId
+                reader.readList(fr -> {
+                    forkHash[0] = fr.readValue();
+                    forkNextArr[0] = fr.readLong();
+                    return null;
+                });
             }
-            return new StatusMessage(version, netId, td, best, genesis, -1, -1);
+            return new StatusMessage(version, netId, td, best, genesis, -1, -1, forkHash[0], forkNextArr[0]);
         });
     }
 
@@ -106,11 +117,17 @@ public final class StatusMessage {
             int version = reader.readInt();
             long netId = reader.readLong();
             Bytes32 genesis = Bytes32.wrap(reader.readValue());
-            reader.readList(fr -> null); // consume forkId
+            Bytes[] forkHash = {null};
+            long[] forkNextArr = {0};
+            reader.readList(fr -> {
+                forkHash[0] = fr.readValue();
+                forkNextArr[0] = fr.readLong();
+                return null;
+            });
             long earliest = reader.readLong();
             long latest = reader.readLong();
             Bytes32 latestHash = Bytes32.wrap(reader.readValue());
-            return new StatusMessage(version, netId, null, latestHash, genesis, earliest, latest);
+            return new StatusMessage(version, netId, null, latestHash, genesis, earliest, latest, forkHash[0], forkNextArr[0]);
         });
     }
 
@@ -120,14 +137,19 @@ public final class StatusMessage {
 
     @Override
     public String toString() {
+        String forkStr = forkIdHash != null
+            ? ", forkId=" + forkIdHash.toHexString() + "/" + forkNext
+            : "";
         if (earliestBlock >= 0) {
             return "Status{version=" + protocolVersion + ", networkId=" + networkId +
                    ", genesis=" + genesisHash.toShortHexString() +
                    ", latestBlock=" + latestBlock +
-                   ", latestHash=" + bestHash.toShortHexString() + "}";
+                   ", latestHash=" + bestHash.toShortHexString() +
+                   forkStr + "}";
         }
         return "Status{version=" + protocolVersion + ", networkId=" + networkId +
                ", genesis=" + genesisHash.toShortHexString() +
-               ", best=" + bestHash.toShortHexString() + "}";
+               ", best=" + bestHash.toShortHexString() +
+               forkStr + "}";
     }
 }

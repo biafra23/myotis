@@ -43,12 +43,15 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private static final int ETH_STATUS = 0x10;
     private static final int ETH_GET_BLOCK_HEADERS = 0x13;
     private static final int ETH_BLOCK_HEADERS = 0x14;
+    private static final int ETH_GET_BLOCK_BODIES = 0x15;
+    private static final int ETH_BLOCK_BODIES = 0x16;
 
     public enum State { AWAITING_HELLO, AWAITING_STATUS, READY }
     private volatile State state = State.AWAITING_HELLO;
     private volatile String remoteAddress;
     private volatile String peerBestHash; // what peer claimed in Status
     private volatile String ourBestHash;  // what we claimed in Status
+    private volatile boolean incompatibleNetwork; // confirmed wrong chain
 
     private final NodeKey nodeKey;
     private final int tcpPort;
@@ -58,6 +61,9 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private final AtomicLong requestId = new AtomicLong(1);
     private final ConcurrentMap<Long, CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>>>
             pendingRequests = new ConcurrentHashMap<>();
+    private final ConcurrentMap<Long, CompletableFuture<List<BlockBodiesMessage.BlockBody>>>
+            pendingBodyRequests = new ConcurrentHashMap<>();
+
 
     // Cache received headers so we can serve them back to peers (by block number)
     private final ConcurrentMap<Long, byte[]> headerCache = new ConcurrentHashMap<>();
@@ -129,10 +135,14 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             log.warn("[eth] Peer {} closed before Hello exchange", remoteAddress);
         }
         // Complete all pending request futures exceptionally on disconnect
+        Exception cause = new java.io.IOException("Channel closed: " + remoteAddress);
         if (!pendingRequests.isEmpty()) {
-            Exception cause = new java.io.IOException("Channel closed: " + remoteAddress);
             pendingRequests.values().forEach(f -> f.completeExceptionally(cause));
             pendingRequests.clear();
+        }
+        if (!pendingBodyRequests.isEmpty()) {
+            pendingBodyRequests.values().forEach(f -> f.completeExceptionally(cause));
+            pendingBodyRequests.clear();
         }
         super.channelInactive(ctx);
     }
@@ -150,15 +160,17 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     // -------------------------------------------------------------------------
     // State: AWAITING_HELLO
     // -------------------------------------------------------------------------
+    // Eth versions we advertise in our Hello
+    private static final java.util.Set<Integer> OUR_ETH_VERSIONS = java.util.Set.of(67, 68, 69);
+
     private void handleHello(ChannelHandlerContext ctx, RLPxHandler.RLPxMessage msg) {
         if (msg.code() == P2P_HELLO) {
             HelloMessage hello = HelloMessage.decode(msg.payload());
             log.info("[eth] Hello from peer: {}", hello);
 
-            // Negotiate highest common eth version (67, 68, or 69)
+            // Negotiate highest eth version that BOTH sides support
             int bestEthVersion = hello.capabilities.stream()
-                .filter(c -> c.name().equals("eth") && c.version() >= StatusMessage.MIN_ETH_VERSION
-                        && c.version() <= StatusMessage.MAX_ETH_VERSION)
+                .filter(c -> c.name().equals("eth") && OUR_ETH_VERSIONS.contains(c.version()))
                 .mapToInt(HelloMessage.Capability::version)
                 .max().orElse(-1);
             if (bestEthVersion < 0) {
@@ -200,6 +212,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             if (!status.isCompatible(network.networkId(), network.genesisHash())) {
                 log.warn("[eth] Incompatible network: chainId={}, genesis={}",
                     status.networkId, status.genesisHash);
+                incompatibleNetwork = true;
                 ctx.close();
                 return;
             }
@@ -238,14 +251,13 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     org.apache.tuweni.rlp.RLP.decodeList(payload, reader -> {
                         reqIdHolder[0] = reader.readLong();
                         reader.readList(r -> {
-                            // Start can be a block number (long) or hash (32 bytes)
                             org.apache.tuweni.bytes.Bytes start = r.readValue();
                             if (start.size() <= 8) {
                                 blockNumHolder[0] = start.toLong();
                                 hashHolder[0] = null;
                                 fullHashHolder[0] = null;
                             } else {
-                                blockNumHolder[0] = -1; // hash-based request
+                                blockNumHolder[0] = -1;
                                 hashHolder[0] = start.toShortHexString();
                                 fullHashHolder[0] = start.toHexString();
                             }
@@ -263,11 +275,9 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     // Try to serve from cache — by hash or by number
                     java.util.List<byte[]> cached = new java.util.ArrayList<>();
                     if (fullHash != null) {
-                        // Hash-based request: look up in hashCache
                         byte[] h = hashCache.get(fullHash);
                         if (h != null) cached.add(h);
                     } else if (blockNum >= 0) {
-                        // Number-based request: look up in headerCache
                         for (int i = 0; i < count && cached.size() < count; i++) {
                             byte[] h = headerCache.get(blockNum + i);
                             if (h != null) cached.add(h);
@@ -284,7 +294,6 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                         });
                     }).toArrayUnsafe();
 
-                    // Log what they asked vs what we claimed, with timing
                     String requested = requestedHash != null
                         ? "hash=" + requestedHash
                         : "block=" + blockNum;
@@ -306,7 +315,6 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                         BlockHeadersMessage.decodeWithRequestId(msg.payload());
                     log.info("[eth] Received {} block headers (reqId={})",
                             decoded.headers().size(), decoded.requestId());
-                    // Cache received headers so we can serve them to peers (by number and hash)
                     for (BlockHeadersMessage.VerifiedHeader vh : decoded.headers()) {
                         byte[] raw = vh.rawRlp().toArrayUnsafe();
                         headerCache.put(vh.header().number, raw);
@@ -314,9 +322,9 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                         log.debug("[eth] Cached header for block #{} hash={}",
                                 vh.header().number, vh.hash().toShortHexString());
                     }
-                    // Complete pending future if this was an IPC-originated request
+                    // Complete pending future
                     CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future =
-                            pendingRequests.remove(decoded.requestId());
+                        pendingRequests.remove(decoded.requestId());
                     if (future != null) {
                         future.complete(decoded.headers());
                     }
@@ -325,12 +333,28 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     log.error("[eth] Failed to decode BlockHeaders", e);
                 }
             }
+            case ETH_BLOCK_BODIES -> {
+                try {
+                    BlockBodiesMessage.DecodeResult decoded =
+                        BlockBodiesMessage.decode(msg.payload());
+                    log.info("[eth] Received {} block bodies (reqId={})",
+                            decoded.bodies().size(), decoded.requestId());
+                    CompletableFuture<List<BlockBodiesMessage.BlockBody>> future =
+                        pendingBodyRequests.remove(decoded.requestId());
+                    if (future != null) {
+                        future.complete(decoded.bodies());
+                    }
+                } catch (Exception e) {
+                    log.error("[eth] Failed to decode BlockBodies", e);
+                }
+            }
             case P2P_PING -> sendPong(ctx);
             case P2P_DISCONNECT -> {
                 log.info("[eth] Peer disconnected (reason={})", decodeDisconnectReason(msg.payload()));
                 ctx.close();
             }
-            default -> log.trace("[eth] Unhandled message 0x{}", Integer.toHexString(msg.code()));
+            default -> log.debug("[eth] Unhandled message 0x{} ({} bytes) from {}",
+                Integer.toHexString(msg.code()), msg.payload().length, remoteAddress);
         }
     }
 
@@ -348,7 +372,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         byte[] payload = StatusMessage.encode(
             negotiatedEthVersion, network.networkId(), network.genesisHash(),
             network.bestBlockHash(), network.forkIdHash(), network.forkNext());
-        log.info("[eth] Sending Status ({} bytes): bestHash={}", payload.length, ourBestHash);
+        log.info("[eth] Sending Status ({} bytes, eth/{}): bestHash={} forkIdHash={} forkNext={} hex={}",
+            payload.length, negotiatedEthVersion, ourBestHash,
+            bytesToHex(network.forkIdHash(), network.forkIdHash().length),
+            network.forkNext(), bytesToHex(payload, payload.length));
         rlpxHandler.sendMessage(ctx, ETH_STATUS, payload);
     }
 
@@ -377,13 +404,31 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         ChannelHandlerContext ctx = readyCtx;
         if (ctx == null || state != State.READY) return null;
 
-        long reqId = requestId.getAndIncrement();
         CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future = new CompletableFuture<>();
+        long reqId = requestId.getAndIncrement();
         pendingRequests.put(reqId, future);
-
         log.debug("[eth] GetBlockHeaders (async) block={} count={} reqId={}", blockNumber, count, reqId);
         byte[] payload = GetBlockHeadersMessage.encodeByNumber(reqId, blockNumber, count, 0, false);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
+        return future;
+    }
+
+    /**
+     * Request block bodies and return a future that completes when the response arrives.
+     *
+     * @return a future, or null if this handler is not in READY state
+     */
+    public CompletableFuture<List<BlockBodiesMessage.BlockBody>> requestBlockBodiesAsync(
+            org.apache.tuweni.bytes.Bytes32... hashes) {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) return null;
+
+        CompletableFuture<List<BlockBodiesMessage.BlockBody>> future = new CompletableFuture<>();
+        long reqId = requestId.getAndIncrement();
+        pendingBodyRequests.put(reqId, future);
+        log.debug("[eth] GetBlockBodies (async) hashes={} reqId={}", hashes.length, reqId);
+        byte[] payload = GetBlockBodiesMessage.encode(reqId, hashes);
+        rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_BODIES, payload);
         return future;
     }
 
@@ -393,6 +438,11 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
 
     public String getRemoteAddress() {
         return remoteAddress;
+    }
+
+    /** Returns true if this peer was confirmed on an incompatible network. */
+    public boolean isIncompatibleNetwork() {
+        return incompatibleNetwork;
     }
 
     /** Returns true if this handler has completed the eth handshake. */

@@ -85,6 +85,10 @@ public class DaemonClient {
                 yield "{\"cmd\":\"get-headers\",\"blockNumber\":" + blockNumber
                         + ",\"count\":" + count + "}";
             }
+            case "get-block" -> {
+                long blockNumber = args.length > 1 ? Long.parseLong(args[1]) : 21_000_000L;
+                yield "{\"cmd\":\"get-block\",\"blockNumber\":" + blockNumber + "}";
+            }
             default -> "{\"cmd\":\"" + cmd + "\"}";
         };
     }

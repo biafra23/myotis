@@ -62,7 +62,8 @@ public final class Main {
 
     private static final int UDP_PORT = 30303;
     private static final int TCP_PORT = 30303;
-    private static final long BACKOFF_MS = 5 * 60 * 1000L; // 5 minutes
+    private static final long BACKOFF_INCOMPATIBLE_MS = 10 * 60 * 1000L; // 10 min for wrong-chain peers
+    private static final long BACKOFF_TRANSIENT_MS = 30 * 1000L; // 30s for transient failures (too many peers, etc.)
 
     /** Socket path; override via {@code DEVP2P_SOCKET} env var. Network-specific suffix for non-mainnet. */
     static Path socketPath(String networkName) {
@@ -173,15 +174,13 @@ public final class Main {
                 SECP256K1.PublicKey pubKey = SECP256K1.PublicKey.fromBytes(
                         Bytes.fromHexString(peer.publicKeyHex()));
                 log.info("[main] Connecting to cached peer {}", peer.address());
-                connector.connect(peer.address(), pubKey)
+                connector.connect(peer.address(), pubKey, incompatible -> {
+                            long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
+                            backoff.putIfAbsent(peerKey, System.currentTimeMillis() + backoffMs);
+                            attempted.remove(peerKey);
+                        })
                         .addListener(future -> {
-                            if (future.isSuccess()) {
-                                ((io.netty.channel.ChannelFuture) future).channel().closeFuture()
-                                        .addListener(f -> {
-                                            backoff.putIfAbsent(peerKey, System.currentTimeMillis() + BACKOFF_MS);
-                                            attempted.remove(peerKey);
-                                        });
-                            } else {
+                            if (!future.isSuccess()) {
                                 // Don't blacklist cached peers on first attempt
                                 attempted.remove(peerKey);
                             }
@@ -280,24 +279,22 @@ public final class Main {
                 return;
             }
             SECP256K1.PublicKey peerPubkey = SECP256K1.PublicKey.fromBytes(nodeId);
-            connector.connect(peerTcp, peerPubkey)
+            connector.connect(peerTcp, peerPubkey, incompatible -> {
+                        long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
+                        backoff.putIfAbsent(peerKey, System.currentTimeMillis() + backoffMs);
+                        attempted.remove(peerKey);
+                    })
                     .addListener(future -> {
-                        if (future.isSuccess()) {
-                            ((io.netty.channel.ChannelFuture) future).channel().closeFuture()
-                                    .addListener(f -> {
-                                        backoff.putIfAbsent(peerKey, System.currentTimeMillis() + BACKOFF_MS);
-                                        attempted.remove(peerKey);
-                                    });
-                        } else {
+                        if (!future.isSuccess()) {
                             log.warn("[main] Connection to {} failed: {}",
                                     peerTcp, future.cause().getMessage());
-                            backoff.putIfAbsent(peerKey, System.currentTimeMillis() + BACKOFF_MS);
+                            backoff.putIfAbsent(peerKey, System.currentTimeMillis() + BACKOFF_TRANSIENT_MS);
                             attempted.remove(peerKey);
                         }
                     });
         } catch (Exception e) {
             log.warn("[main] Failed to connect to {}: {}", peerTcp, e.getMessage());
-            backoff.putIfAbsent(peerKey, System.currentTimeMillis() + BACKOFF_MS);
+            backoff.putIfAbsent(peerKey, System.currentTimeMillis() + BACKOFF_TRANSIENT_MS);
             attempted.remove(peerKey);
         }
     }

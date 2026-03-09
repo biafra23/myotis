@@ -188,6 +188,9 @@ public final class RLPxHandler extends ByteToMessageDecoder {
         byte[] frame = frameCodec.encodeFrame(code, payload);
         ByteBuf buf = ctx.alloc().buffer(frame.length);
         buf.writeBytes(frame);
+        log.debug("[rlpx] sendMessage code=0x{} payload={} bytes frame={} bytes to {}",
+            Integer.toHexString(code), payload.length, frame.length,
+            ctx.channel().remoteAddress());
         ctx.writeAndFlush(buf);
     }
 

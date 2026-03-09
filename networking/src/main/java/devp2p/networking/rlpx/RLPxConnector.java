@@ -3,7 +3,9 @@ package devp2p.networking.rlpx;
 import devp2p.core.crypto.NodeKey;
 import devp2p.networking.NetworkConfig;
 import devp2p.networking.eth.EthHandler;
+import devp2p.networking.eth.messages.BlockBodiesMessage;
 import devp2p.networking.eth.messages.BlockHeadersMessage;
+import org.apache.tuweni.bytes.Bytes32;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
@@ -42,6 +44,11 @@ public final class RLPxConnector implements AutoCloseable {
         void onPeerReady(InetSocketAddress address, String publicKeyHex);
     }
 
+    /** Callback when a peer connection closes, with incompatibility info. */
+    public interface PeerCloseCallback {
+        void onPeerClose(boolean incompatibleNetwork);
+    }
+
     private final NodeKey localKey;
     private final int tcpPort;
     private final NetworkConfig network;
@@ -68,6 +75,11 @@ public final class RLPxConnector implements AutoCloseable {
      * @param peerPublicKey peer's secp256k1 public key (64 bytes)
      */
     public ChannelFuture connect(InetSocketAddress peerAddr, SECP256K1.PublicKey peerPublicKey) {
+        return connect(peerAddr, peerPublicKey, null);
+    }
+
+    public ChannelFuture connect(InetSocketAddress peerAddr, SECP256K1.PublicKey peerPublicKey,
+                                  PeerCloseCallback closeCallback) {
         log.info("[rlpx] Connecting to {} ...", peerAddr);
 
         String pubKeyHex = peerPublicKey.bytes().toHexString();
@@ -94,7 +106,12 @@ public final class RLPxConnector implements AutoCloseable {
                     );
                     ch.pipeline().addLast("rlpx", rlpxHandler);
                     ch.pipeline().addLast("eth", ethHandler);
-                    ch.closeFuture().addListener(f -> activeHandlers.remove(ethHandler));
+                    ch.closeFuture().addListener(f -> {
+                        activeHandlers.remove(ethHandler);
+                        if (closeCallback != null) {
+                            closeCallback.onPeerClose(ethHandler.isIncompatibleNetwork());
+                        }
+                    });
                 }
             });
 
@@ -130,6 +147,29 @@ public final class RLPxConnector implements AutoCloseable {
             }
             // Handler reported ready but requestBlockHeadersAsync returned null —
             // channel likely closed between the two checks; remove it.
+            it.remove();
+        }
+        return CompletableFuture.failedFuture(
+                new IllegalStateException("No active peer with completed eth handshake"));
+    }
+
+    /**
+     * Request block bodies from any active READY peer.
+     *
+     * @return a future that completes with the bodies, or a failed future if no peer is available
+     */
+    public CompletableFuture<List<BlockBodiesMessage.BlockBody>> requestBlockBodies(
+            Bytes32... hashes) {
+        Iterator<EthHandler> it = activeHandlers.iterator();
+        while (it.hasNext()) {
+            EthHandler handler = it.next();
+            if (!handler.isReady()) continue;
+            CompletableFuture<List<BlockBodiesMessage.BlockBody>> future =
+                    handler.requestBlockBodiesAsync(hashes);
+            if (future != null) {
+                log.info("[rlpx] Routed GetBlockBodies({} hashes) to active peer", hashes.length);
+                return future;
+            }
             it.remove();
         }
         return CompletableFuture.failedFuture(
