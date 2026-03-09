@@ -7,6 +7,7 @@ dependencies {
     implementation(libs.netty.codec)
     implementation(libs.netty.handler)
     implementation(libs.bouncycastle)
+    implementation(libs.snappy)
     implementation(libs.slf4j.api)
 
     testImplementation(platform(libs.junit.bom))

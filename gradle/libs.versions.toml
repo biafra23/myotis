@@ -5,6 +5,7 @@ bouncycastle = "1.78.1"
 junit = "5.10.0"
 slf4j = "2.0.12"
 logback = "1.5.6"
+snappy = "1.1.10.7"
 
 [libraries]
 tuweni-bytes        = { module = "io.consensys.tuweni:tuweni-bytes",       version.ref = "tuweni" }
@@ -22,6 +23,8 @@ bouncycastle        = { module = "org.bouncycastle:bcprov-jdk18on",        versi
 
 slf4j-api           = { module = "org.slf4j:slf4j-api",                   version.ref = "slf4j" }
 logback-classic     = { module = "ch.qos.logback:logback-classic",         version.ref = "logback" }
+
+snappy              = { module = "org.xerial.snappy:snappy-java",           version.ref = "snappy" }
 
 junit-bom           = { module = "org.junit:junit-bom",                    version.ref = "junit" }
 junit-jupiter       = { module = "org.junit.jupiter:junit-jupiter" }

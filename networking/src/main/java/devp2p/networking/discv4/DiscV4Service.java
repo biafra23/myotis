@@ -30,15 +30,8 @@ public final class DiscV4Service implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(DiscV4Service.class);
 
-    // Ethereum Mainnet bootnodes (from go-ethereum)
-    private static final List<InetSocketAddress> MAINNET_BOOTNODES = List.of(
-        new InetSocketAddress("18.138.108.67", 30303),
-        new InetSocketAddress("3.209.45.79", 30303),
-        new InetSocketAddress("18.188.214.86", 30303),
-        new InetSocketAddress("3.219.208.172", 30303)
-    );
-
     private final NodeKey nodeKey;
+    private final List<InetSocketAddress> bootnodes;
     private final KademliaTable table;
     private final NioEventLoopGroup group;
     private Channel channel;
@@ -46,8 +39,10 @@ public final class DiscV4Service implements AutoCloseable {
     private ScheduledExecutorService scheduler;
     private final Consumer<KademliaTable.Entry> onPeerDiscovered;
 
-    public DiscV4Service(NodeKey nodeKey, Consumer<KademliaTable.Entry> onPeerDiscovered) {
+    public DiscV4Service(NodeKey nodeKey, List<InetSocketAddress> bootnodes,
+                         Consumer<KademliaTable.Entry> onPeerDiscovered) {
         this.nodeKey = nodeKey;
+        this.bootnodes = bootnodes;
         this.table = new KademliaTable(nodeKey.nodeId());
         this.group = new NioEventLoopGroup(1);
         this.onPeerDiscovered = onPeerDiscovered;
@@ -71,7 +66,7 @@ public final class DiscV4Service implements AutoCloseable {
 
         // Bootstrap: ping all bootnodes
         InetSocketAddress localAddr = new InetSocketAddress("0.0.0.0", udpPort);
-        for (InetSocketAddress bootnode : MAINNET_BOOTNODES) {
+        for (InetSocketAddress bootnode : bootnodes) {
             sendPing(localAddr, bootnode);
         }
 
@@ -119,21 +114,26 @@ public final class DiscV4Service implements AutoCloseable {
         InetSocketAddress localAddr = (InetSocketAddress) channel.localAddress();
         if (peers.isEmpty()) {
             // Re-ping bootnodes if table is empty
-            for (InetSocketAddress bootnode : MAINNET_BOOTNODES) {
+            for (InetSocketAddress bootnode : bootnodes) {
                 sendPing(localAddr, bootnode);
             }
             return;
         }
         // Send FindNode to bootnodes (they have our bond cached from previous runs).
-        // Also send FindNode to random peers discovered in the table.
-        for (InetSocketAddress bootnode : MAINNET_BOOTNODES) {
+        for (InetSocketAddress bootnode : bootnodes) {
             findNode(bootnode, nodeKey.publicKeyBytes());
         }
+        // Send FindNode to random discovered peers to traverse deeper into the network.
+        // We ping first (to establish bond), then send FindNode.
         List<KademliaTable.Entry> sample = new ArrayList<>(peers);
         Collections.shuffle(sample);
-        int count = Math.min(5, sample.size());
+        int count = Math.min(10, sample.size());
+        // Use a random target to discover diverse peers across the keyspace
+        Bytes randomTarget = Bytes.random(64);
         for (int i = 0; i < count; i++) {
-            sendPing(localAddr, sample.get(i).udpAddr());
+            InetSocketAddress peerAddr = sample.get(i).udpAddr();
+            sendPing(localAddr, peerAddr);
+            findNode(peerAddr, randomTarget);
         }
     }
 

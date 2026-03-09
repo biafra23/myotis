@@ -8,6 +8,9 @@ import org.bouncycastle.crypto.modes.SICBlockCipher;
 import org.bouncycastle.crypto.params.KeyParameter;
 import org.bouncycastle.crypto.params.ParametersWithIV;
 
+import org.xerial.snappy.Snappy;
+
+import java.io.IOException;
 import java.util.Arrays;
 
 /**
@@ -75,17 +78,27 @@ public final class FrameCodec {
     // Encode a message into a frame
     // -------------------------------------------------------------------------
     public byte[] encodeFrame(int messageCode, byte[] body) {
+        // Snappy-compress payload for all messages except Hello (0x00)
+        byte[] payload = body;
+        if (messageCode != 0x00) {
+            try {
+                payload = Snappy.compress(body);
+            } catch (IOException e) {
+                throw new IllegalStateException("Snappy compress failed", e);
+            }
+        }
+
         // RLP message code prefix
         byte[] codedBody;
         if (messageCode < 0x80) {
-            codedBody = new byte[body.length + 1];
+            codedBody = new byte[payload.length + 1];
             codedBody[0] = (byte) messageCode;
-            System.arraycopy(body, 0, codedBody, 1, body.length);
+            System.arraycopy(payload, 0, codedBody, 1, payload.length);
         } else {
             byte[] rlpCode = org.apache.tuweni.rlp.RLP.encodeInt(messageCode).toArrayUnsafe();
-            codedBody = new byte[rlpCode.length + body.length];
+            codedBody = new byte[rlpCode.length + payload.length];
             System.arraycopy(rlpCode, 0, codedBody, 0, rlpCode.length);
-            System.arraycopy(body, 0, codedBody, rlpCode.length, body.length);
+            System.arraycopy(payload, 0, codedBody, rlpCode.length, payload.length);
         }
 
         int bodyLen = codedBody.length;
@@ -164,11 +177,15 @@ public final class FrameCodec {
             offset = 1 + lenOfLen;
         }
         byte[] payload = Arrays.copyOfRange(body, offset, bodyLen);
-        // Debug: log raw body bytes for Status messages (code=0x10)
-        if (code == 0x10) {
-            StringBuilder sb = new StringBuilder("[raw body] bodyLen=" + bodyLen + " offset=" + offset + " body[0]=" + String.format("%02x", body[0] & 0xFF) + " payload=");
-            for (int i = 0; i < Math.min(16, payload.length); i++) sb.append(String.format("%02x", payload[i] & 0xFF));
-            org.slf4j.LoggerFactory.getLogger(FrameCodec.class).info(sb.toString());
+        // Snappy-decompress payload for all messages except Hello (0x00).
+        // Some peers send p2p control messages (Disconnect, Ping, Pong) without
+        // Snappy compression, so fall back to raw payload if decompression fails.
+        if (code != 0x00 && payload.length > 0) {
+            try {
+                payload = Snappy.uncompress(payload);
+            } catch (IOException e) {
+                // Not Snappy-compressed; use raw payload (common for Disconnect/Ping/Pong)
+            }
         }
         return new DecodeResult(code, payload);
     }

@@ -38,10 +38,20 @@ public final class HelloMessage {
             writer.writeInt(PROTOCOL_VERSION);
             writer.writeString("devp2p-playground/0.1.0");
             writer.writeList(capWriter -> {
+                // eth/67
+                capWriter.writeList(cap -> {
+                    cap.writeString("eth");
+                    cap.writeInt(67);
+                });
                 // eth/68
                 capWriter.writeList(cap -> {
                     cap.writeString("eth");
                     cap.writeInt(68);
+                });
+                // eth/69
+                capWriter.writeList(cap -> {
+                    cap.writeString("eth");
+                    cap.writeInt(69);
                 });
                 // snap/1
                 capWriter.writeList(cap -> {

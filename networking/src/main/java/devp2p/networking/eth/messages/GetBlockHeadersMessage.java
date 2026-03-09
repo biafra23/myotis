@@ -45,4 +45,26 @@ public final class GetBlockHeadersMessage {
             });
         }).toArrayUnsafe();
     }
+
+    /** eth/69: Request headers by block number (no requestId). */
+    public static byte[] encodeByNumber69(long blockNumber, int maxHeaders,
+                                           int skip, boolean reverse) {
+        return RLP.encodeList(writer -> {
+            writer.writeLong(blockNumber);
+            writer.writeInt(maxHeaders);
+            writer.writeInt(skip);
+            writer.writeInt(reverse ? 1 : 0);
+        }).toArrayUnsafe();
+    }
+
+    /** eth/69: Request headers by block hash (no requestId). */
+    public static byte[] encodeByHash69(Bytes32 blockHash, int maxHeaders,
+                                         int skip, boolean reverse) {
+        return RLP.encodeList(writer -> {
+            writer.writeValue(blockHash);
+            writer.writeInt(maxHeaders);
+            writer.writeInt(skip);
+            writer.writeInt(reverse ? 1 : 0);
+        }).toArrayUnsafe();
+    }
 }
