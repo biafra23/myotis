@@ -57,29 +57,46 @@ public final class BlockBodiesMessage {
         while (!bodiesReader.isComplete()) {
             // each body: [transactions[], uncles[], withdrawals[]?]
             bodiesReader.readList(bodyReader -> {
-                // transactions list
+                // transactions list — legacy txs are RLP lists, typed txs (EIP-2718) are values
                 List<Bytes> txs = new ArrayList<>();
                 bodyReader.readList(txReader -> {
                     while (!txReader.isComplete()) {
-                        txs.add(txReader.readValue());
+                        if (txReader.nextIsList()) {
+                            // Legacy transaction: RLP list — read and discard inner structure
+                            txReader.readList(legacyReader -> {
+                                legacyReader.readRemaining();
+                                return null;
+                            });
+                            txs.add(Bytes.EMPTY); // placeholder — we only need the count
+                        } else {
+                            txs.add(txReader.readValue());
+                        }
                     }
                     return null;
                 });
-                // uncles list
+                // uncles list — each uncle is an RLP-encoded block header (a list)
                 int[] uncleCount = {0};
                 bodyReader.readList(uncleReader -> {
                     while (!uncleReader.isComplete()) {
-                        uncleReader.readValue();
+                        if (uncleReader.nextIsList()) {
+                            uncleReader.readList(u -> { u.readRemaining(); return null; });
+                        } else {
+                            uncleReader.readValue();
+                        }
                         uncleCount[0]++;
                     }
                     return null;
                 });
-                // optional withdrawals list (post-Shanghai)
+                // optional withdrawals list (post-Shanghai) — each withdrawal is a list
                 int[] withdrawalCount = {0};
                 if (!bodyReader.isComplete()) {
                     bodyReader.readList(wReader -> {
                         while (!wReader.isComplete()) {
-                            wReader.readValue();
+                            if (wReader.nextIsList()) {
+                                wReader.readList(w -> { w.readRemaining(); return null; });
+                            } else {
+                                wReader.readValue();
+                            }
                             withdrawalCount[0]++;
                         }
                         return null;
