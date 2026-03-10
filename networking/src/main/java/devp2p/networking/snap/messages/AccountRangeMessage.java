@@ -45,7 +45,7 @@ public final class AccountRangeMessage {
         Bytes32 codeHash
     ) {}
 
-    public record DecodeResult(long requestId, List<AccountData> accounts) {}
+    public record DecodeResult(long requestId, List<AccountData> accounts, List<Bytes> proof) {}
 
     /**
      * Extract just the request ID from the raw RLP without fully decoding.
@@ -55,8 +55,21 @@ public final class AccountRangeMessage {
         return RLP.decodeList(Bytes.wrap(rlp), reader -> reader.readLong());
     }
 
+    /**
+     * Encode an empty AccountRange response (no accounts, no proof).
+     * This is the proper way to decline serving snap data.
+     */
+    public static byte[] encodeEmpty(long requestId) {
+        return RLP.encodeList(w -> {
+            w.writeLong(requestId);
+            w.writeList(accounts -> {});  // empty accounts list
+            w.writeList(proof -> {});      // empty proof list
+        }).toArrayUnsafe();
+    }
+
     public static DecodeResult decode(byte[] rlp) {
         List<AccountData> accounts = new ArrayList<>();
+        List<Bytes> proof = new ArrayList<>();
         long[] reqIdHolder = {0L};
 
         RLP.decodeList(Bytes.wrap(rlp), outerReader -> {
@@ -79,18 +92,23 @@ public final class AccountRangeMessage {
                 outerReader.readValue();
             }
 
-            // Skip proof list (may be a list or a value for empty proofs)
+            // Proof list: Merkle-Patricia trie nodes proving inclusion in the state trie
             if (!outerReader.isComplete()) {
                 if (outerReader.nextIsList()) {
-                    outerReader.readList(p -> { p.readRemaining(); return null; });
+                    outerReader.readList(proofReader -> {
+                        while (!proofReader.isComplete()) {
+                            proof.add(proofReader.readValue());
+                        }
+                        return null;
+                    });
                 } else {
-                    outerReader.readValue();
+                    outerReader.readValue(); // empty proof encoded as value
                 }
             }
             return null;
         });
 
-        return new DecodeResult(reqIdHolder[0], accounts);
+        return new DecodeResult(reqIdHolder[0], accounts, proof);
     }
 
     /**

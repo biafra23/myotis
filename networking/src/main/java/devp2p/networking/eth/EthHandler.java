@@ -49,14 +49,17 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private static final int ETH_GET_BLOCK_BODIES = 0x15;
     private static final int ETH_BLOCK_BODIES = 0x16;
 
-    // snap/1 absolute message codes: snap base = 0x10 (p2p len) + 17 (eth len) = 0x21
-    private static final int SNAP_GET_ACCOUNT_RANGE = 0x21;
-    private static final int SNAP_ACCOUNT_RANGE     = 0x22;
+    // snap/1 message codes depend on negotiated eth version:
+    //   eth/67-68: protocol length 17, snap base = 0x10 + 17 = 0x21
+    //   eth/69:    protocol length 18 (adds BlockRangeUpdate at 0x11), snap base = 0x10 + 18 = 0x22
+    private int snapGetAccountRange = 0x21; // updated after Hello negotiation
+    private int snapAccountRange    = 0x22;
 
     public enum State { AWAITING_HELLO, AWAITING_STATUS, READY }
     private volatile State state = State.AWAITING_HELLO;
     private volatile String remoteAddress;
-    private volatile String peerBestHash; // what peer claimed in Status
+    private volatile String peerBestHash; // what peer claimed in Status (short hex for logging)
+    private volatile org.apache.tuweni.bytes.Bytes32 peerBestBlockHash; // full hash for queries
     private volatile String ourBestHash;  // what we claimed in Status
     private volatile boolean incompatibleNetwork; // confirmed wrong chain
     private volatile boolean snapNegotiated = false;
@@ -88,7 +91,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private RLPxHandler rlpxHandler; // reference to the RLPx layer for sending
     private volatile ChannelHandlerContext readyCtx; // stored when state reaches READY
     private volatile long readyTimestamp; // when we entered READY state
-    private int negotiatedEthVersion = StatusMessage.MAX_ETH_VERSION;
+    private int negotiatedEthVersion = 68; // default, updated during Hello negotiation
 
     public EthHandler(NodeKey nodeKey, int tcpPort, NetworkConfig network,
                       ChainHead chainHead,
@@ -147,7 +150,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         if (state == State.AWAITING_STATUS) {
-            log.warn("[eth] Peer {} closed without responding to Status", remoteAddress);
+            log.warn("[eth] Peer {} ({}) closed without responding to Status (we sent eth/{})",
+                remoteAddress, clientId != null ? clientId : "unknown", negotiatedEthVersion);
         } else if (state == State.AWAITING_HELLO) {
             log.warn("[eth] Peer {} closed before Hello exchange", remoteAddress);
         }
@@ -202,13 +206,22 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             }
             negotiatedEthVersion = bestEthVersion;
             log.info("[eth] Negotiated eth/{}", negotiatedEthVersion);
+            // eth/69 adds BlockRangeUpdate (0x11), making protocol length 18 instead of 17
+            int ethProtocolLength = negotiatedEthVersion >= 69 ? 18 : 17;
+            int snapBase = 0x10 + ethProtocolLength; // p2p base (16) + eth length
+            snapGetAccountRange = snapBase;
+            snapAccountRange = snapBase + 1;
+            log.info("[eth] snap base offset: 0x{} (eth length={})",
+                Integer.toHexString(snapBase), ethProtocolLength);
             snapNegotiated = hello.capabilities.stream()
                 .anyMatch(c -> c.name().equals("snap") && c.version() == 1);
             log.info("[eth] snap/1 {}", snapNegotiated ? "negotiated" : "NOT supported by peer");
             state = State.AWAITING_STATUS;
             sendStatus(ctx);
         } else if (msg.code() == P2P_DISCONNECT) {
-            log.info("[eth] Peer disconnected during Hello (reason={})", decodeDisconnectReason(msg.payload()));
+            int reason = decodeDisconnectReason(msg.payload());
+            log.info("[eth] Peer {} disconnected during Hello (reason={}/{})",
+                remoteAddress, reason, disconnectReasonName(reason));
             ctx.close();
         }
     }
@@ -233,7 +246,15 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 return;
             }
             peerBestHash = status.bestHash.toShortHexString();
+            peerBestBlockHash = status.bestHash;
             log.info("[eth] Status from peer: {} (bestHash={})", status, peerBestHash);
+            // Update chain head from peer's Status (especially eth/69 which reports latestBlock)
+            // This ensures subsequent Status messages to other peers use a realistic block number
+            if (status.latestBlock > 0) {
+                chainHead.update(status.latestBlock, status.bestHash);
+                log.info("[eth] Updated chain head from peer Status: block={} hash={}",
+                    status.latestBlock, peerBestHash);
+            }
             if (!status.isCompatible(network.networkId(), network.genesisHash())) {
                 log.warn("[eth] Incompatible network: chainId={}, genesis={}",
                     status.networkId, status.genesisHash);
@@ -252,7 +273,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         } else if (msg.code() == P2P_PING) {
             sendPong(ctx);
         } else if (msg.code() == P2P_DISCONNECT) {
-            log.info("[eth] Peer disconnected during Status exchange (reason={})", decodeDisconnectReason(msg.payload()));
+            int reason = decodeDisconnectReason(msg.payload());
+            log.info("[eth] Peer {} ({}) disconnected during Status exchange (reason={}/{}, eth/{})",
+                remoteAddress, clientId != null ? clientId : "unknown",
+                reason, disconnectReasonName(reason), negotiatedEthVersion);
             ctx.close();
         } else {
             log.info("[eth] Unexpected msg during Status: code=0x{}", Integer.toHexString(msg.code()));
@@ -378,38 +402,61 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     log.error("[eth] Failed to decode BlockBodies", e);
                 }
             }
-            case SNAP_ACCOUNT_RANGE -> {
-                // Extract request ID first so we can complete the future even if full decode fails
-                long snapReqId = -1;
-                try {
-                    snapReqId = AccountRangeMessage.extractRequestId(msg.payload());
-                } catch (Exception ignored) {}
-                try {
-                    AccountRangeMessage.DecodeResult decoded = AccountRangeMessage.decode(msg.payload());
-                    log.info("[snap] AccountRange: {} accounts (reqId={})",
-                        decoded.accounts().size(), decoded.requestId());
-                    CompletableFuture<AccountRangeMessage.DecodeResult> f =
-                        pendingSnapRequests.remove(decoded.requestId());
-                    if (f != null) f.complete(decoded);
-                } catch (Exception e) {
-                    log.error("[snap] Failed to decode AccountRange (reqId={}): {}",
-                        snapReqId, e.getMessage());
-                    if (snapReqId >= 0) {
-                        CompletableFuture<AccountRangeMessage.DecodeResult> f =
-                            pendingSnapRequests.remove(snapReqId);
-                        if (f != null) f.completeExceptionally(e);
-                    }
-                }
-            }
-            case SNAP_GET_ACCOUNT_RANGE ->
-                log.debug("[snap] Ignoring inbound GetAccountRange (we don't serve snap data)");
             case P2P_PING -> sendPong(ctx);
             case P2P_DISCONNECT -> {
-                log.info("[eth] Peer disconnected (reason={})", decodeDisconnectReason(msg.payload()));
+                int reason = decodeDisconnectReason(msg.payload());
+                log.info("[eth] Peer {} ({}) disconnected in READY (reason={}/{})",
+                    remoteAddress, clientId != null ? clientId : "unknown",
+                    reason, disconnectReasonName(reason));
                 ctx.close();
             }
-            default -> log.debug("[eth] Unhandled message 0x{} ({} bytes) from {}",
-                Integer.toHexString(msg.code()), msg.payload().length, remoteAddress);
+            default -> {
+                if (msg.code() == snapAccountRange) {
+                    handleSnapAccountRange(msg);
+                } else if (msg.code() == snapGetAccountRange) {
+                    handleSnapGetAccountRange(ctx, msg);
+                } else {
+                    log.debug("[eth] Unhandled message 0x{} ({} bytes) from {}",
+                        Integer.toHexString(msg.code()), msg.payload().length, remoteAddress);
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Snap message handlers
+    // -------------------------------------------------------------------------
+    private void handleSnapAccountRange(RLPxHandler.RLPxMessage msg) {
+        long snapReqId = -1;
+        try {
+            snapReqId = AccountRangeMessage.extractRequestId(msg.payload());
+        } catch (Exception ignored) {}
+        try {
+            AccountRangeMessage.DecodeResult decoded = AccountRangeMessage.decode(msg.payload());
+            log.info("[snap] AccountRange: {} accounts (reqId={})",
+                decoded.accounts().size(), decoded.requestId());
+            CompletableFuture<AccountRangeMessage.DecodeResult> f =
+                pendingSnapRequests.remove(decoded.requestId());
+            if (f != null) f.complete(decoded);
+        } catch (Exception e) {
+            log.error("[snap] Failed to decode AccountRange (reqId={}): {}",
+                snapReqId, e.getMessage());
+            if (snapReqId >= 0) {
+                CompletableFuture<AccountRangeMessage.DecodeResult> f =
+                    pendingSnapRequests.remove(snapReqId);
+                if (f != null) f.completeExceptionally(e);
+            }
+        }
+    }
+
+    private void handleSnapGetAccountRange(ChannelHandlerContext ctx, RLPxHandler.RLPxMessage msg) {
+        try {
+            long snapReqId = AccountRangeMessage.extractRequestId(msg.payload());
+            byte[] emptyResponse = AccountRangeMessage.encodeEmpty(snapReqId);
+            rlpxHandler.sendMessage(ctx, snapAccountRange, emptyResponse);
+            log.debug("[snap] Responded with empty AccountRange (reqId={})", snapReqId);
+        } catch (Exception e) {
+            log.debug("[snap] Failed to respond to GetAccountRange: {}", e.getMessage());
         }
     }
 
@@ -423,18 +470,23 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     }
 
     private void sendStatus(ChannelHandlerContext ctx) {
+        // Always use chain-head mode with current forkId (post-merge standard)
         ChainHead.Head head = chainHead.get();
-        org.apache.tuweni.bytes.Bytes32 bestHash = head.blockNumber() > 0
-            ? head.blockHash() : network.bestBlockHash();
+        byte[] forkIdHash = network.forkIdHash();
+        long forkNext = network.forkNext();
+        org.apache.tuweni.bytes.Bytes32 bestHash = head.blockNumber() > 0 ? head.blockHash() : network.bestBlockHash();
+        long blockNumber = head.blockNumber();
+        String modeLabel = "CHAINHEAD";
+
         ourBestHash = bestHash.toShortHexString();
         byte[] payload = StatusMessage.encode(
             negotiatedEthVersion, network.networkId(), network.genesisHash(),
-            bestHash, network.forkIdHash(), network.forkNext(),
-            head.blockNumber());
-        log.info("[eth] Sending Status ({} bytes, eth/{}): bestHash={} forkIdHash={} forkNext={} hex={}",
-            payload.length, negotiatedEthVersion, ourBestHash,
-            bytesToHex(network.forkIdHash(), network.forkIdHash().length),
-            network.forkNext(), bytesToHex(payload, payload.length));
+            bestHash, forkIdHash, forkNext, blockNumber);
+        log.info("[eth] Sending Status [{}] ({} bytes, eth/{}): bestHash={} block={} forkIdHash={} forkNext={} peer={} hex={}",
+            modeLabel, payload.length, negotiatedEthVersion, ourBestHash, blockNumber,
+            bytesToHex(forkIdHash, forkIdHash.length), forkNext,
+            clientId != null ? clientId : remoteAddress,
+            bytesToHex(payload, payload.length));
         rlpxHandler.sendMessage(ctx, ETH_STATUS, payload);
     }
 
@@ -494,8 +546,9 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     /**
      * Fetch a single account from the snap/1 state trie.
      *
-     * Computes keccak256(address) as the account hash and sends a GetAccountRange request.
-     * If no state root is cached yet (no block headers received), one is fetched first.
+     * Always fetches a fresh block header from this peer (using their best block hash)
+     * to get a recent state root that the peer is guaranteed to have available.
+     * Stale state roots get silently dropped by peers (Geth prunes beyond 128 blocks).
      *
      * @param address 20-byte Ethereum address
      * @return future completing with the AccountRange decode result, or null if not READY
@@ -510,28 +563,41 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         org.apache.tuweni.bytes.Bytes32 accountHash =
             org.apache.tuweni.crypto.Hash.keccak256(address);
 
-        if (latestStateRoot != null) {
-            return sendGetAccountRange(ctx, accountHash, latestStateRoot);
-        }
-
-        // Lazy fallback: request a header to obtain a state root, then send snap query
+        // Always fetch a fresh header from this peer to get a non-pruned state root
         CompletableFuture<AccountRangeMessage.DecodeResult> result = new CompletableFuture<>();
         long reqId = requestId.getAndIncrement();
         CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> headerFut = new CompletableFuture<>();
         pendingRequests.put(reqId, headerFut);
-        rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS,
-            GetBlockHeadersMessage.encodeByNumber(reqId, 21_000_000L, 1, 0, false));
-        headerFut.thenAccept(headers -> {
+        org.apache.tuweni.bytes.Bytes32 hash = peerBestBlockHash;
+        if (hash == null) {
+            return CompletableFuture.failedFuture(
+                new IllegalStateException("No best block hash from peer"));
+        }
+        byte[] headerPayload = GetBlockHeadersMessage.encodeByHash(reqId, hash, 1, 0, false);
+        log.info("[snap] Fetching fresh header (hash={}) from peer {} before snap query",
+            hash.toShortHexString(), remoteAddress);
+        rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, headerPayload);
+        // 5-second timeout: if this peer doesn't respond, fail fast so RLPxConnector tries the next
+        headerFut.orTimeout(5, TimeUnit.SECONDS).thenAccept(headers -> {
             if (headers.isEmpty()) {
                 result.completeExceptionally(new RuntimeException("No header returned for state root"));
                 return;
             }
-            sendGetAccountRange(ctx, accountHash, latestStateRoot)
+            org.apache.tuweni.bytes.Bytes32 freshStateRoot = headers.get(0).header().stateRoot;
+            log.info("[snap] Using fresh stateRoot={} from block #{}", freshStateRoot.toShortHexString(),
+                headers.get(0).header().number);
+            sendGetAccountRange(ctx, accountHash, freshStateRoot)
+                .orTimeout(10, TimeUnit.SECONDS)
                 .whenComplete((r, ex) -> {
                     if (ex != null) result.completeExceptionally(ex);
                     else result.complete(r);
                 });
-        }).exceptionally(ex -> { result.completeExceptionally(ex); return null; });
+        }).exceptionally(ex -> {
+            log.warn("[snap] Header fetch from {} failed: {}", remoteAddress, ex.getMessage());
+            pendingRequests.remove(reqId); // clean up
+            result.completeExceptionally(ex);
+            return null;
+        });
         return result;
     }
 
@@ -545,9 +611,9 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         org.apache.tuweni.bytes.Bytes32 limitHash = org.apache.tuweni.bytes.Bytes32.fromHexString(
             "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         byte[] payload = GetAccountRangeMessage.encode(reqId, stateRoot, accountHash, limitHash, 128 * 1024L);
-        rlpxHandler.sendMessage(ctx, SNAP_GET_ACCOUNT_RANGE, payload);
         log.info("[snap] GetAccountRange reqId={} accountHash={} stateRoot={}",
             reqId, accountHash.toShortHexString(), stateRoot.toShortHexString());
+        rlpxHandler.sendMessage(ctx, snapGetAccountRange, payload);
         return future;
     }
 
@@ -590,14 +656,34 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     /**
      * Decode disconnect reason from RLP payload.
      * Disconnect payload: RLP([reason]) = [0xC1, reason_byte] or [0xC0] (empty)
+     * RLP encoding of 0 is 0x80 (empty byte string), not 0x00.
      */
     private static int decodeDisconnectReason(byte[] payload) {
         if (payload.length == 0) return -1;
         int first = payload[0] & 0xFF;
         if (first < 0x80) return first;          // raw byte (non-standard)
-        if (first == 0xC0) return 0;             // empty list
-        if (first >= 0xC1 && payload.length >= 2) return payload[1] & 0xFF; // list[reason]
+        if (first == 0x80) return 0;             // RLP integer 0
+        if (first == 0xC0) return 0;             // empty list = reason 0
+        if (first >= 0xC1 && payload.length >= 2) {
+            int reason = payload[1] & 0xFF;
+            if (reason == 0x80) return 0;        // RLP integer 0 inside list
+            if (reason < 0x80) return reason;    // single-byte integer
+            return reason;                       // fallback
+        }
         return -1;
+    }
+
+    private static final String[] DISCONNECT_REASONS = {
+        "DiscRequested", "DiscNetworkError", "DiscProtocolError", "DiscUselessPeer",
+        "DiscTooManyPeers", "DiscAlreadyConnected", "DiscIncompatibleVersion",
+        "DiscInvalidIdentity", "DiscQuittingPeer", "DiscUnexpectedIdentity",
+        "DiscSelf", "DiscReadTimeout", "DiscSubprotocolError"
+    };
+
+    private static String disconnectReasonName(int reason) {
+        if (reason >= 0 && reason < DISCONNECT_REASONS.length) return DISCONNECT_REASONS[reason];
+        if (reason == 16) return "DiscSubprotocolError";
+        return "Unknown(" + reason + ")";
     }
 
     @Override

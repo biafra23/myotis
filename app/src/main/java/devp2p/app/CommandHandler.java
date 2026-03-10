@@ -15,6 +15,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -31,14 +32,17 @@ public class CommandHandler {
     private final long startTimeMs;
     private final CountDownLatch stopLatch;
     private final Map<String, Long> backoff;
+    private final Set<String> blacklistedNodeIds;
 
     public CommandHandler(DiscV4Service discV4, RLPxConnector connector,
-                          CountDownLatch stopLatch, Map<String, Long> backoff) {
+                          CountDownLatch stopLatch, Map<String, Long> backoff,
+                          Set<String> blacklistedNodeIds) {
         this.discV4 = discV4;
         this.connector = connector;
         this.startTimeMs = System.currentTimeMillis();
         this.stopLatch = stopLatch;
         this.backoff = backoff;
+        this.blacklistedNodeIds = blacklistedNodeIds;
     }
 
     /** Parse and dispatch one JSON-Lines request; returns a JSON-Lines response. */
@@ -51,6 +55,7 @@ public class CommandHandler {
                 case "get-headers" -> handleGetHeaders(jsonLine);
                 case "get-block"   -> handleGetBlock(jsonLine);
                 case "get-account" -> handleGetAccount(jsonLine);
+                case "dial"        -> handleDial(jsonLine);
                 case "stop"        -> handleStop();
                 default            -> jsonError("Unknown command: " + cmd);
             };
@@ -77,12 +82,14 @@ public class CommandHandler {
                 .count();
         long now = System.currentTimeMillis();
         backoff.values().removeIf(exp -> now >= exp);
-        long blacklistedPeers = backoff.size();
+        long backedOffPeers = backoff.size();
+        long blacklistedPeers = blacklistedNodeIds.size();
         return "{\"ok\":true,\"state\":\"RUNNING\",\"uptimeSeconds\":" + uptimeSec
                 + ",\"discoveredPeers\":" + discovered
                 + ",\"connectedPeers\":" + connectedPeers
                 + ",\"readyPeers\":" + readyPeers
                 + ",\"snapPeers\":" + snapPeers
+                + ",\"backedOffPeers\":" + backedOffPeers
                 + ",\"blacklistedPeers\":" + blacklistedPeers + "}";
     }
 
@@ -223,10 +230,20 @@ public class CommandHandler {
             AccountRangeMessage.AccountData found = result.accounts().stream()
                 .filter(a -> a.accountHash().equals(accountHash))
                 .findFirst().orElse(null);
+            // Build proof array
+            StringBuilder proofSb = new StringBuilder("[");
+            for (int i = 0; i < result.proof().size(); i++) {
+                if (i > 0) proofSb.append(",");
+                proofSb.append("\"0x").append(result.proof().get(i).toHexString()).append("\"");
+            }
+            proofSb.append("]");
+            String proofJson = proofSb.toString();
+
             if (found == null) {
                 return "{\"ok\":true,\"exists\":false"
                     + ",\"address\":\"" + addr + "\""
-                    + ",\"accountHash\":\"0x" + accountHash.toHexString() + "\"}";
+                    + ",\"accountHash\":\"0x" + accountHash.toHexString() + "\""
+                    + ",\"proof\":" + proofJson + "}";
             }
             return "{\"ok\":true,\"exists\":true"
                 + ",\"address\":\"" + addr + "\""
@@ -234,11 +251,42 @@ public class CommandHandler {
                 + ",\"nonce\":" + found.nonce()
                 + ",\"balance\":\"" + found.balance() + "\""
                 + ",\"storageRoot\":\"0x" + found.storageRoot().toHexString() + "\""
-                + ",\"codeHash\":\"0x" + found.codeHash().toHexString() + "\"}";
+                + ",\"codeHash\":\"0x" + found.codeHash().toHexString() + "\""
+                + ",\"proof\":" + proofJson + "}";
         } catch (Exception e) {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
             return jsonError(msg);
+        }
+    }
+
+    private String handleDial(String jsonLine) {
+        // Parse enode URL: enode://<pubkey>@<host>:<port>
+        String enode = extractString(jsonLine, "enode");
+        try {
+            if (!enode.startsWith("enode://")) {
+                return jsonError("enode must start with enode://");
+            }
+            String rest = enode.substring("enode://".length());
+            int atIdx = rest.indexOf('@');
+            if (atIdx < 0) return jsonError("Invalid enode format: missing @");
+            String pubKeyHex = rest.substring(0, atIdx);
+            String hostPort = rest.split("\\?")[0].substring(atIdx + 1); // strip query params
+            hostPort = rest.substring(atIdx + 1).split("\\?")[0];
+            int colonIdx = hostPort.lastIndexOf(':');
+            if (colonIdx < 0) return jsonError("Invalid enode format: missing port");
+            String host = hostPort.substring(0, colonIdx);
+            int port = Integer.parseInt(hostPort.substring(colonIdx + 1));
+
+            org.apache.tuweni.crypto.SECP256K1.PublicKey pubKey =
+                org.apache.tuweni.crypto.SECP256K1.PublicKey.fromBytes(
+                    org.apache.tuweni.bytes.Bytes.fromHexString(pubKeyHex));
+            java.net.InetSocketAddress addr = new java.net.InetSocketAddress(host, port);
+            log.info("[ipc] Dialing enode {} at {}", pubKeyHex.substring(0, 16) + "...", addr);
+            connector.connect(addr, pubKey);
+            return "{\"ok\":true,\"message\":\"Dialing " + host + ":" + port + "\"}";
+        } catch (Exception e) {
+            return jsonError("Failed to dial: " + e.getMessage());
         }
     }
 

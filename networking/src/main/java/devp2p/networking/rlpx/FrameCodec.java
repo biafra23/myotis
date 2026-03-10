@@ -88,18 +88,19 @@ public final class FrameCodec {
             }
         }
 
-        // RLP message code prefix
-        byte[] codedBody;
-        if (messageCode < 0x80) {
-            codedBody = new byte[payload.length + 1];
-            codedBody[0] = (byte) messageCode;
-            System.arraycopy(payload, 0, codedBody, 1, payload.length);
+        // RLP message code prefix (msg-id is an RLP-encoded integer per devp2p spec)
+        // RLP integer encoding: 0 → 0x80 (empty string), 1-127 → single byte, 128+ → 0x81+ prefix
+        byte[] rlpCode;
+        if (messageCode == 0) {
+            rlpCode = new byte[]{(byte) 0x80}; // canonical RLP encoding of integer 0
+        } else if (messageCode < 0x80) {
+            rlpCode = new byte[]{(byte) messageCode};
         } else {
-            byte[] rlpCode = org.apache.tuweni.rlp.RLP.encodeInt(messageCode).toArrayUnsafe();
-            codedBody = new byte[rlpCode.length + payload.length];
-            System.arraycopy(rlpCode, 0, codedBody, 0, rlpCode.length);
-            System.arraycopy(payload, 0, codedBody, rlpCode.length, payload.length);
+            rlpCode = org.apache.tuweni.rlp.RLP.encodeInt(messageCode).toArrayUnsafe();
         }
+        byte[] codedBody = new byte[rlpCode.length + payload.length];
+        System.arraycopy(rlpCode, 0, codedBody, 0, rlpCode.length);
+        System.arraycopy(payload, 0, codedBody, rlpCode.length, payload.length);
 
         int bodyLen = codedBody.length;
         int paddedBodyLen = (bodyLen + 15) & ~15;

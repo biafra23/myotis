@@ -46,9 +46,9 @@ public final class RLPxConnector implements AutoCloseable {
         void onPeerReady(InetSocketAddress address, String publicKeyHex);
     }
 
-    /** Callback when a peer connection closes, with incompatibility info. */
+    /** Callback when a peer connection closes, with incompatibility info and node identity. */
     public interface PeerCloseCallback {
-        void onPeerClose(boolean incompatibleNetwork);
+        void onPeerClose(boolean incompatibleNetwork, String nodeIdHex);
     }
 
     private final NodeKey localKey;
@@ -113,7 +113,7 @@ public final class RLPxConnector implements AutoCloseable {
                     ch.closeFuture().addListener(f -> {
                         activeHandlers.remove(ethHandler);
                         if (closeCallback != null) {
-                            closeCallback.onPeerClose(ethHandler.isIncompatibleNetwork());
+                            closeCallback.onPeerClose(ethHandler.isIncompatibleNetwork(), pubKeyHex);
                         }
                     });
                 }
@@ -218,7 +218,7 @@ public final class RLPxConnector implements AutoCloseable {
         return future.exceptionallyCompose(ex -> {
             log.warn("[rlpx] Snap request failed on peer {}: {}, trying next peer",
                 handler.getRemoteAddress(), ex.getMessage());
-            handler.markSnapServingFailed();
+            // Don't permanently mark as failed — disconnects and timeouts are usually transient
             return trySnapPeer(address, peers, index + 1);
         });
     }

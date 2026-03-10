@@ -65,6 +65,12 @@ public record NetworkConfig(
             )
     );
 
+    // Frontier (genesis) fork IDs — CRC32(genesis_hash), forkNext = first fork block
+    // Used when announcing block height 0 so forkId is consistent with head
+    public static final byte[] MAINNET_GENESIS_FORK_HASH =
+            new byte[]{(byte) 0xfc, (byte) 0x64, (byte) 0xec, (byte) 0x04};
+    public static final long MAINNET_GENESIS_FORK_NEXT = 1_150_000L; // Homestead
+
     /** Look up a network by name (case-insensitive). */
     public static NetworkConfig byName(String name) {
         return switch (name.toLowerCase()) {

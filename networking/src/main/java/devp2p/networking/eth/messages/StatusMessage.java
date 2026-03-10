@@ -16,8 +16,8 @@ public final class StatusMessage {
     public static final int MIN_ETH_VERSION = 67;
     public static final int MAX_ETH_VERSION = 69;
 
-    // Genesis block difficulty (honest — we haven't synced the chain)
-    private static final Bytes DEFAULT_TOTAL_DIFFICULTY = Bytes.fromHexString("0x0400000000");
+    // Post-merge: TD is irrelevant, send 0 (matches Geth v1.17+ behavior)
+    private static final Bytes DEFAULT_TOTAL_DIFFICULTY = Bytes.EMPTY;
 
     public final int protocolVersion;
     public final long networkId;

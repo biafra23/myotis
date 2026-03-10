@@ -182,9 +182,21 @@ public final class RLPxHandler extends ByteToMessageDecoder {
         }
     }
 
-    /** Send an RLPx framed message. */
+    /**
+     * Send an RLPx framed message.
+     * Frame encoding (AES-CTR cipher + Keccak MAC) is stateful and not thread-safe,
+     * so we must ensure it always runs on the channel's event loop thread.
+     */
     public void sendMessage(ChannelHandlerContext ctx, int code, byte[] payload) {
         if (frameCodec == null) throw new IllegalStateException("Handshake not complete");
+        if (ctx.executor().inEventLoop()) {
+            doSendMessage(ctx, code, payload);
+        } else {
+            ctx.executor().execute(() -> doSendMessage(ctx, code, payload));
+        }
+    }
+
+    private void doSendMessage(ChannelHandlerContext ctx, int code, byte[] payload) {
         byte[] frame = frameCodec.encodeFrame(code, payload);
         ByteBuf buf = ctx.alloc().buffer(frame.length);
         buf.writeBytes(frame);

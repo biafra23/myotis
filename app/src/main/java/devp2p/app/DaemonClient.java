@@ -93,6 +93,10 @@ public class DaemonClient {
                 if (args.length < 2) throw new IllegalArgumentException("Usage: get-account <0xAddress>");
                 yield "{\"cmd\":\"get-account\",\"address\":\"" + args[1] + "\"}";
             }
+            case "dial" -> {
+                if (args.length < 2) throw new IllegalArgumentException("Usage: dial <enode://pubkey@host:port>");
+                yield "{\"cmd\":\"dial\",\"enode\":\"" + args[1] + "\"}";
+            }
             default -> "{\"cmd\":\"" + cmd + "\"}";
         };
     }

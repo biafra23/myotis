@@ -169,6 +169,7 @@ public final class Main {
         // 4. RLPx connector
         Set<String> attempted = ConcurrentHashMap.newKeySet();
         Map<String, Long> backoff = new ConcurrentHashMap<>();
+        Set<String> blacklistedNodeIds = ConcurrentHashMap.newKeySet();
         RLPxConnector connector = new RLPxConnector(nodeKey, TCP_PORT, network, headers -> {
             if (!headers.isEmpty()) {
                 log.info("\n=== BLOCK HEADERS RECEIVED ===");
@@ -196,7 +197,11 @@ public final class Main {
                 SECP256K1.PublicKey pubKey = SECP256K1.PublicKey.fromBytes(
                         Bytes.fromHexString(peer.publicKeyHex()));
                 log.info("[main] Connecting to cached peer {}", peer.address());
-                connector.connect(peer.address(), pubKey, incompatible -> {
+                connector.connect(peer.address(), pubKey, (incompatible, nodeIdHex) -> {
+                            if (incompatible) {
+                                blacklistedNodeIds.add(nodeIdHex);
+                                log.info("[main] Blacklisted node {} (incompatible network, cached peer)", nodeIdHex.substring(0, 16) + "...");
+                            }
                             long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
                             backoff.putIfAbsent(peerKey, System.currentTimeMillis() + backoffMs);
                             attempted.remove(peerKey);
@@ -217,6 +222,11 @@ public final class Main {
         // 6. discv4 discovery
         DiscV4Service discV4 = new DiscV4Service(nodeKey, network.bootnodes(), entry -> {
             if (entry.tcpPort() > 0 && attempted.size() < 2000) {
+                String nodeIdHex = entry.nodeId().toHexString();
+                if (blacklistedNodeIds.contains(nodeIdHex)) {
+                    log.debug("[main] Skipping blacklisted node {}", nodeIdHex.substring(0, 16) + "...");
+                    return;
+                }
                 String peerKey = entry.udpAddr().getAddress().getHostAddress()
                         + ":" + entry.tcpPort();
                 Long expiry = backoff.get(peerKey);
@@ -228,7 +238,7 @@ public final class Main {
                     InetSocketAddress peerTcp = new InetSocketAddress(
                             entry.udpAddr().getAddress(), entry.tcpPort());
                     log.info("[main] Attempting RLPx connection to {}", peerTcp);
-                    tryConnectWithKnownKey(connector, entry, peerTcp, nodeKey, attempted, peerKey, backoff);
+                    tryConnectWithKnownKey(connector, entry, peerTcp, nodeKey, attempted, peerKey, backoff, blacklistedNodeIds);
                 }
             }
         });
@@ -251,7 +261,7 @@ public final class Main {
         log.info("[daemon] discv4 started on UDP port {}. Waiting for peers...", UDP_PORT);
 
         // 7. IPC server
-        CommandHandler commandHandler = new CommandHandler(discV4, connector, stopLatch, backoff);
+        CommandHandler commandHandler = new CommandHandler(discV4, connector, stopLatch, backoff, blacklistedNodeIds);
         DaemonServer server = new DaemonServer(socketPath, commandHandler);
         try {
             server.start();
@@ -347,7 +357,7 @@ public final class Main {
             RLPxConnector connector, KademliaTable.Entry entry,
             InetSocketAddress peerTcp, NodeKey localKey,
             Set<String> attempted, String peerKey,
-            Map<String, Long> backoff) {
+            Map<String, Long> backoff, Set<String> blacklistedNodeIds) {
         try {
             Bytes nodeId = entry.nodeId();
             if (nodeId.size() != 64) {
@@ -356,7 +366,11 @@ public final class Main {
                 return;
             }
             SECP256K1.PublicKey peerPubkey = SECP256K1.PublicKey.fromBytes(nodeId);
-            connector.connect(peerTcp, peerPubkey, incompatible -> {
+            connector.connect(peerTcp, peerPubkey, (incompatible, nodeIdHex) -> {
+                        if (incompatible) {
+                            blacklistedNodeIds.add(nodeIdHex);
+                            log.info("[main] Blacklisted node {} (incompatible network)", nodeIdHex.substring(0, 16) + "...");
+                        }
                         long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
                         backoff.putIfAbsent(peerKey, System.currentTimeMillis() + backoffMs);
                         attempted.remove(peerKey);
