@@ -62,6 +62,12 @@ public class BeaconP2PService implements AutoCloseable {
     /** One binding per protocol, registered once at startup. */
     private final Map<String, QueuedReqRespBinding> bindings = new ConcurrentHashMap<>();
 
+    /** Cached Identify protocol lists per peer ID (populated lazily). */
+    private final Map<String, List<String>> peerProtocols = new ConcurrentHashMap<>();
+
+    /** Cached agent version (client ID) per peer ID. */
+    private final Map<String, String> peerAgentVersions = new ConcurrentHashMap<>();
+
     public BeaconP2PService() {}
 
     /**
@@ -78,12 +84,33 @@ public class BeaconP2PService implements AutoCloseable {
                 .builderModifier(b -> b.getIdentity().random(KeyType.SECP256K1))
                 .build();
 
-        // Log connection events for debugging handshake issues
+        // Log connection events and auto-query Identify for protocol support
         host.addConnectionHandler(conn -> {
+            String pid = conn.secureSession().getRemoteId().toString();
             log.info("[beacon-p2p] Connection established to peer={} remote={} local={}",
-                    conn.secureSession().getRemoteId(),
-                    conn.remoteAddress(),
-                    conn.localAddress());
+                    pid, conn.remoteAddress(), conn.localAddress());
+            // Automatically query Identify to cache supported protocols
+            try {
+                StreamPromise<IdentifyController> sp =
+                        conn.muxerSession().createStream(identifyBinding);
+                sp.getController().thenCompose(ctrl -> ctrl.id()).thenAccept(idMsg -> {
+                    List<String> protos = idMsg.getProtocolsList().stream()
+                            .map(Object::toString).toList();
+                    peerProtocols.put(pid, protos);
+                    String agent = idMsg.getAgentVersion();
+                    if (agent != null && !agent.isEmpty()) {
+                        peerAgentVersions.put(pid, agent);
+                    }
+                    long lcCount = protos.stream().filter(p -> p.contains("light_client")).count();
+                    log.debug("[beacon-p2p] Identify auto-query for {}: agent={}, {} protocols ({} light_client)",
+                            pid, agent, protos.size(), lcCount);
+                }).exceptionally(ex -> {
+                    log.debug("[beacon-p2p] Identify auto-query failed for {}: {}", pid, ex.getMessage());
+                    return null;
+                });
+            } catch (Exception e) {
+                log.debug("[beacon-p2p] Failed to start Identify for {}: {}", pid, e.getMessage());
+            }
         });
 
         // Register identify protocol to query remote peer capabilities
@@ -114,6 +141,35 @@ public class BeaconP2PService implements AutoCloseable {
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
+
+    /** Info about a connected CL peer. */
+    public record PeerInfo(String peerId, String remoteAddress, List<String> protocols, String agentVersion) {
+        /** Whether this peer advertises any light_client protocol. */
+        public boolean supportsLightClient() {
+            return protocols != null && protocols.stream()
+                    .anyMatch(p -> p.contains("light_client"));
+        }
+    }
+
+    /**
+     * Return info about all currently connected CL peers.
+     * For each peer, attempts to retrieve cached Identify protocol lists.
+     */
+    public List<PeerInfo> getConnectedPeers() {
+        Host h = host;
+        if (h == null) return List.of();
+        List<PeerInfo> result = new ArrayList<>();
+        for (io.libp2p.core.Connection conn : h.getNetwork().getConnections()) {
+            String peerId = conn.secureSession().getRemoteId().toString();
+            String remote = conn.remoteAddress().toString();
+            List<String> protocols = peerProtocols.get(peerId);
+            String agent = peerAgentVersions.get(peerId);
+            result.add(new PeerInfo(peerId, remote,
+                    protocols != null ? protocols : List.of(),
+                    agent));
+        }
+        return result;
+    }
 
     /**
      * Disconnect all existing connections to a peer, forcing fresh connections
@@ -157,16 +213,28 @@ public class BeaconP2PService implements AutoCloseable {
                 return streamPromise.getController().thenCompose(ctrl -> ctrl.id());
             }).thenAccept(idMsg -> {
                 List<?> protocols = idMsg.getProtocolsList();
-                log.info("[beacon-p2p] Identify response from {}: {} protocols", peerMultiaddr, protocols.size());
-                for (Object proto : protocols) {
-                    String protoStr = proto.toString();
+                List<String> protoStrings = protocols.stream()
+                        .map(Object::toString).toList();
+                // Cache protocol list and agent version keyed by peer ID
+                try {
+                    PeerId pid = new Multiaddr(peerMultiaddr).getPeerId();
+                    if (pid != null) {
+                        peerProtocols.put(pid.toString(), protoStrings);
+                        String agent = idMsg.getAgentVersion();
+                        if (agent != null && !agent.isEmpty()) {
+                            peerAgentVersions.put(pid.toString(), agent);
+                        }
+                    }
+                } catch (Exception ignored) {}
+                log.info("[beacon-p2p] Identify response from {}: {} protocols", peerMultiaddr, protoStrings.size());
+                for (String protoStr : protoStrings) {
                     if (protoStr.contains("light_client") || protoStr.contains("eth2")) {
                         log.info("[beacon-p2p]   MATCH: {}", protoStr);
                     }
                 }
                 // Log all protocols at debug level
-                for (Object proto : protocols) {
-                    log.debug("[beacon-p2p]   proto: {}", proto);
+                for (String protoStr : protoStrings) {
+                    log.debug("[beacon-p2p]   proto: {}", protoStr);
                 }
             }).exceptionally(ex -> {
                 log.warn("[beacon-p2p] Identify failed for {}: {}", peerMultiaddr, ex.getMessage());
@@ -256,9 +324,19 @@ public class BeaconP2PService implements AutoCloseable {
         try {
             ReqRespCodec.DecodeResult result = ReqRespCodec.decodeResponse(raw);
             return result.sszPayload();
-        } catch (IOException e) {
-            throw new RuntimeException("Failed to decode response", e);
+        } catch (Exception e) {
+            log.warn("[beacon-p2p] Failed to decode response ({} bytes): {} — first 20 bytes: {}",
+                    raw.length, e.getMessage(), bytesToHex(raw, 20));
+            throw new RuntimeException("Failed to decode response: " + e.getMessage(), e);
         }
+    }
+
+    private static String bytesToHex(byte[] bytes, int limit) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < Math.min(bytes.length, limit); i++) {
+            sb.append(String.format("%02x", bytes[i]));
+        }
+        return sb.toString();
     }
 
     /**
@@ -305,11 +383,14 @@ public class BeaconP2PService implements AutoCloseable {
                 }
 
                 // Step 2: Enqueue request state, then open a stream on the muxer
+                log.debug("[beacon-p2p] Connection ready for {}, enqueueing and creating stream for {}",
+                        peerMultiaddr, protocolId);
                 binding.enqueue(requestBytes, responseFuture);
 
                 try {
                     StreamPromise<?> streamPromise =
                             conn.muxerSession().createStream(binding);
+                    log.debug("[beacon-p2p] createStream() returned for {} to {}", protocolId, peerMultiaddr);
 
                     streamPromise.getStream().whenComplete((stream, ex) -> {
                         if (ex != null && !responseFuture.isDone()) {
@@ -380,7 +461,9 @@ public class BeaconP2PService implements AutoCloseable {
 
     /**
      * Decode a multi-chunk eth2 req/resp response (used by both updates_by_range
-     * and blocks_by_range). Each chunk: 1B result + 4B fork_digest + varint len + snappy data.
+     * and blocks_by_range). Each chunk: 1B result + 4B fork_digest + varint(uncompressed_len) + snappy data.
+     * The varint is the uncompressed SSZ length, NOT the compressed length.
+     * We scan snappy frames to find chunk boundaries.
      */
     private static List<byte[]> decodeMultiChunkResponse(byte[] raw, long expectedCount)
             throws IOException {
@@ -397,15 +480,42 @@ public class BeaconP2PService implements AutoCloseable {
             pos += 4; // skip fork digest
             ReqRespCodec.VarintResult varint = ReqRespCodec.readVarint(raw, pos);
             pos = varint.nextPos();
-            int compressedLength = varint.value();
-            if (compressedLength == 0) { items.add(new byte[0]); continue; }
-            if (pos + compressedLength > raw.length) break;
+            int uncompressedLength = varint.value();
+            if (uncompressedLength == 0) { items.add(new byte[0]); continue; }
+
+            // Scan snappy frames to find the end of this chunk's compressed data
+            int snappyStart = pos;
+            pos = skipSnappyFrames(raw, pos);
+            int compressedLength = pos - snappyStart;
+            if (compressedLength <= 0) break;
             byte[] compressed = new byte[compressedLength];
-            System.arraycopy(raw, pos, compressed, 0, compressedLength);
-            pos += compressedLength;
+            System.arraycopy(raw, snappyStart, compressed, 0, compressedLength);
             items.add(ReqRespCodec.snappyDecompress(compressed));
         }
         return items;
+    }
+
+    /**
+     * Skip past one complete snappy framed stream. Snappy frames:
+     * - Stream identifier: 0xff + 3-byte LE length (always 6) + "sNaPpY"
+     * - Compressed: 0x00 + 3-byte LE length + data
+     * - Uncompressed: 0x01 + 3-byte LE length + data
+     * Returns position after the last frame.
+     */
+    private static int skipSnappyFrames(byte[] data, int pos) {
+        while (pos < data.length) {
+            int chunkType = data[pos] & 0xFF;
+            if (chunkType != 0xFF && chunkType != 0x00 && chunkType != 0x01) {
+                // Not a snappy frame — this is the start of the next chunk's result code
+                break;
+            }
+            if (pos + 4 > data.length) break;
+            int frameLen = (data[pos + 1] & 0xFF)
+                    | ((data[pos + 2] & 0xFF) << 8)
+                    | ((data[pos + 3] & 0xFF) << 16);
+            pos += 4 + frameLen;
+        }
+        return pos;
     }
 
     // =========================================================================
@@ -438,10 +548,17 @@ public class BeaconP2PService implements AutoCloseable {
 
         @Override
         public CompletableFuture<ReqRespController> initChannel(P2PChannel channel, String negotiatedProtocol) {
-            PendingRequest pending = pendingRequests.poll();
-            if (pending == null) {
-                return CompletableFuture.failedFuture(
-                        new IllegalStateException("No pending request for " + protocolId));
+            // Drain stale (already-timed-out) requests from the queue
+            PendingRequest pending = null;
+            while (true) {
+                pending = pendingRequests.poll();
+                if (pending == null) {
+                    log.warn("[beacon-p2p] No pending request for {} — queue was empty!", protocolId);
+                    return CompletableFuture.failedFuture(
+                            new IllegalStateException("No pending request for " + protocolId));
+                }
+                if (!pending.responseFuture.isDone()) break;
+                log.debug("[beacon-p2p] Skipping stale request for {}", protocolId);
             }
 
             // Cast to Stream to access closeWrite() for half-close
@@ -465,6 +582,8 @@ public class BeaconP2PService implements AutoCloseable {
         private final ByteArrayOutputStream responseBuffer = new ByteArrayOutputStream();
         private final io.libp2p.core.Stream stream;
         private volatile boolean writeClosedOnly;
+        private volatile boolean dataReceived;
+        private volatile java.util.concurrent.ScheduledFuture<?> completionTimer;
 
         ReqRespController(byte[] requestBytes, CompletableFuture<byte[]> responseFuture,
                           io.libp2p.core.Stream stream) {
@@ -503,20 +622,41 @@ public class BeaconP2PService implements AutoCloseable {
                 @Override
                 protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) {
                     int readable = msg.readableBytes();
-                    log.debug("[beacon-p2p] channelRead0: {} bytes received", readable);
+                    log.debug("[beacon-p2p] channelRead0: {} bytes received, total={}",
+                            readable, responseBuffer.size() + readable);
+                    dataReceived = true;
                     byte[] bytes = new byte[readable];
                     msg.readBytes(bytes);
                     responseBuffer.write(bytes, 0, bytes.length);
+
+                    // Reset the completion timer on each chunk — complete 200ms after
+                    // the last chunk arrives (we can't predict compressed size).
+                    var prev = completionTimer;
+                    if (prev != null) prev.cancel(false);
+                    completionTimer = ctx.executor().schedule(() -> {
+                        if (!responseFuture.isDone() && responseBuffer.size() > 0) {
+                            log.debug("[beacon-p2p] Completing response: {} bytes", responseBuffer.size());
+                            responseFuture.complete(responseBuffer.toByteArray());
+                        }
+                    }, 200, java.util.concurrent.TimeUnit.MILLISECONDS);
                 }
 
                 @Override
                 public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-                    log.debug("[beacon-p2p] channelInactive fired, buffer size={}, writeClosedOnly={}",
-                            responseBuffer.size(), writeClosedOnly);
+                    log.debug("[beacon-p2p] channelInactive fired, buffer size={}, dataReceived={}, writeClosedOnly={}",
+                            responseBuffer.size(), dataReceived, writeClosedOnly);
                     if (writeClosedOnly) {
                         // This channelInactive is from our closeWrite(), not a full close.
                         // Ignore it — data may still arrive on the read side.
                         writeClosedOnly = false;
+                        super.channelInactive(ctx);
+                        return;
+                    }
+                    if (!dataReceived && responseBuffer.size() == 0) {
+                        // Spurious channelInactive before any data arrived (common with
+                        // empty-request protocols like finality_update). Don't complete
+                        // the future — let the caller's timeout handle real failures.
+                        log.debug("[beacon-p2p] Ignoring channelInactive with no data yet");
                         super.channelInactive(ctx);
                         return;
                     }

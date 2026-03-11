@@ -91,7 +91,8 @@ public final class Main {
 
     static Path clCacheFile(String networkName) {
         String suffix = "mainnet".equals(networkName) ? "" : "-" + networkName;
-        return Path.of("cl-peers" + suffix + ".cache");
+        // Place alongside the EL peer cache in the same directory
+        return cacheFile(networkName).resolveSibling("cl-peers" + suffix + ".cache");
     }
 
     public static void main(String[] args) throws Exception {
@@ -291,7 +292,7 @@ public final class Main {
                 clPeers.size(), clPeers.size() - network.clPeerMultiaddrs().size());
 
         // 8. IPC server
-        CommandHandler commandHandler = new CommandHandler(discV4, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState);
+        CommandHandler commandHandler = new CommandHandler(discV4, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState, beaconLightClient);
         DaemonServer server = new DaemonServer(socketPath, commandHandler);
         try {
             server.start();

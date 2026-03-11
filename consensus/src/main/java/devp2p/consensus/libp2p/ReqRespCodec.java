@@ -96,23 +96,23 @@ public final class ReqRespCodec {
         System.arraycopy(rawBytes, pos, forkDigest, 0, 4);
         pos += 4;
 
-        // Next: varint(length of compressed payload)
+        // Next: varint(uncompressed SSZ payload length) per eth2 req/resp spec
         VarintResult varint = readVarint(rawBytes, pos);
         pos = varint.nextPos;
-        int compressedLength = varint.value;
+        int uncompressedLength = varint.value;
 
-        if (compressedLength == 0) {
+        if (uncompressedLength == 0) {
             // Empty payload
             return new DecodeResult(resultCode, forkDigest, new byte[0]);
         }
 
-        if (pos + compressedLength > rawBytes.length) {
+        // All remaining bytes are the snappy-framed compressed payload
+        int compressedLength = rawBytes.length - pos;
+        if (compressedLength <= 0) {
             throw new IllegalArgumentException(
-                    "Response truncated: compressed length=" + compressedLength +
-                    " but only " + (rawBytes.length - pos) + " bytes remain");
+                    "Response truncated: no compressed data after header");
         }
 
-        // Decompress the snappy-framed payload
         byte[] compressedData = new byte[compressedLength];
         System.arraycopy(rawBytes, pos, compressedData, 0, compressedLength);
         byte[] sszPayload = snappyDecompress(compressedData);

@@ -76,7 +76,9 @@ public final class ExecutionPayloadHeader {
     private final byte[] consolidationRequestsRoot;  // 32 bytes
 
     // Minimum fixed part size (with one 4B offset for extraData)
-    public static final int FIXED_SIZE = 680;
+    public static final int ELECTRA_FIXED_SIZE = 680;
+    public static final int DENEB_FIXED_SIZE = 584; // no request roots
+    public static final int FIXED_SIZE = DENEB_FIXED_SIZE; // minimum required
 
     public ExecutionPayloadHeader(
             byte[] parentHash,
@@ -174,21 +176,32 @@ public final class ExecutionPayloadHeader {
         long blobGasUsed = buf.getLong();                       // offset 568
         long excessBlobGas = buf.getLong();                     // offset 576
 
-        byte[] depositRequestsRoot = new byte[32];
-        buf.get(depositRequestsRoot);                           // offset 584
+        // Detect Deneb vs Electra: extraDataOffset tells us the fixed part size.
+        // Deneb: extraDataOffset == 584 (no request roots)
+        // Electra: extraDataOffset == 680 (3 request roots after offset 584)
+        boolean isElectra = extraDataOffset >= ELECTRA_FIXED_SIZE;
 
-        byte[] withdrawalRequestsRoot = new byte[32];
-        buf.get(withdrawalRequestsRoot);                        // offset 616
+        byte[] depositRequestsRoot = null;
+        byte[] withdrawalRequestsRoot = null;
+        byte[] consolidationRequestsRoot = null;
 
-        byte[] consolidationRequestsRoot = new byte[32];
-        buf.get(consolidationRequestsRoot);                     // offset 648
-        // buf.position() == 680 now
+        if (isElectra) {
+            depositRequestsRoot = new byte[32];
+            buf.get(depositRequestsRoot);                       // offset 584
+
+            withdrawalRequestsRoot = new byte[32];
+            buf.get(withdrawalRequestsRoot);                    // offset 616
+
+            consolidationRequestsRoot = new byte[32];
+            buf.get(consolidationRequestsRoot);                 // offset 648
+            // buf.position() == 680 now
+        }
+
+        int fixedSize = isElectra ? ELECTRA_FIXED_SIZE : DENEB_FIXED_SIZE;
 
         // Read variable-length extraData
         byte[] extraData;
-        if (extraDataOffset >= FIXED_SIZE && extraDataOffset <= ssz.length) {
-            // extraData ends at the next variable field's offset, or end of bytes
-            // Since extraData is the only variable field, it runs to end of ssz
+        if (extraDataOffset >= fixedSize && extraDataOffset <= ssz.length) {
             int extraDataLength = ssz.length - extraDataOffset;
             extraData = new byte[extraDataLength];
             System.arraycopy(ssz, extraDataOffset, extraData, 0, extraDataLength);

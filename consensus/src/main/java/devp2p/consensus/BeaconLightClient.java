@@ -474,9 +474,9 @@ public class BeaconLightClient implements AutoCloseable {
                         if (attestedRoot != null && attestedRoot.length == 32) {
                             syncState.recordStateRoot(update.attestedHeader().beacon().slot(), attestedRoot, false);
                         }
+                        notifyPeerSuccess(peer);
                         if (slot > syncState.getFinalizedSlot()) {
                             syncState.update(slot, sr, update.signatureSlot());
-                            notifyPeerSuccess(peer);
                             log.debug("[beacon] Finality update refreshed from {}, finalizedSlot={}", peer, slot);
                         }
                         return;
@@ -660,5 +660,10 @@ public class BeaconLightClient implements AutoCloseable {
     /** Returns true if the sync loop is running. */
     public boolean isRunning() {
         return running;
+    }
+
+    /** Returns info about connected CL peers including their protocol support. */
+    public List<BeaconP2PService.PeerInfo> getConnectedPeers() {
+        return p2pService.getConnectedPeers();
     }
 }

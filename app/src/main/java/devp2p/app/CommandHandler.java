@@ -1,6 +1,8 @@
 package devp2p.app;
 
+import devp2p.consensus.BeaconLightClient;
 import devp2p.consensus.BeaconSyncState;
+import devp2p.consensus.libp2p.BeaconP2PService;
 import devp2p.consensus.proof.MerklePatriciaVerifier;
 import devp2p.core.types.BlockHeader;
 import devp2p.networking.discv4.DiscV4Service;
@@ -36,10 +38,18 @@ public class CommandHandler {
     private final Map<String, Long> backoff;
     private final Set<String> blacklistedNodeIds;
     private final BeaconSyncState beaconSyncState;
+    private final BeaconLightClient beaconLightClient; // nullable
 
     public CommandHandler(DiscV4Service discV4, RLPxConnector connector,
                           CountDownLatch stopLatch, Map<String, Long> backoff,
                           Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState) {
+        this(discV4, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState, null);
+    }
+
+    public CommandHandler(DiscV4Service discV4, RLPxConnector connector,
+                          CountDownLatch stopLatch, Map<String, Long> backoff,
+                          Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState,
+                          BeaconLightClient beaconLightClient) {
         this.discV4 = discV4;
         this.connector = connector;
         this.startTimeMs = System.currentTimeMillis();
@@ -47,6 +57,7 @@ public class CommandHandler {
         this.backoff = backoff;
         this.blacklistedNodeIds = blacklistedNodeIds;
         this.beaconSyncState = beaconSyncState;
+        this.beaconLightClient = beaconLightClient;
     }
 
     /** Parse and dispatch one JSON-Lines request; returns a JSON-Lines response. */
@@ -278,9 +289,11 @@ public class CommandHandler {
     }
 
     private String handleBeaconStatus() {
+        String peersJson = buildBeaconPeersJson();
         if (!beaconSyncState.isSynced()) {
             return "{\"ok\":true,\"state\":\"SYNCING\",\"finalizedSlot\":0,\"optimisticSlot\":0"
-                    + ",\"executionStateRoot\":null}";
+                    + ",\"executionStateRoot\":null"
+                    + ",\"peers\":" + peersJson + "}";
         }
         byte[] stateRoot = beaconSyncState.getVerifiedExecutionStateRoot();
         String stateRootHex = stateRoot != null ? "\"0x" + bytesToHex(stateRoot) + "\"" : "null";
@@ -292,7 +305,34 @@ public class CommandHandler {
                 + ",\"optimisticSlot\":" + optimisticSlot
                 + ",\"syncCommitteePeriod\":" + period
                 + ",\"executionStateRoot\":" + stateRootHex
-                + ",\"knownStateRoots\":" + beaconSyncState.getKnownStateRootCount() + "}";
+                + ",\"knownStateRoots\":" + beaconSyncState.getKnownStateRootCount()
+                + ",\"peers\":" + peersJson + "}";
+    }
+
+    private String buildBeaconPeersJson() {
+        if (beaconLightClient == null) return "[]";
+        List<BeaconP2PService.PeerInfo> peers = beaconLightClient.getConnectedPeers();
+        StringBuilder sb = new StringBuilder("[");
+        boolean first = true;
+        for (BeaconP2PService.PeerInfo p : peers) {
+            if (!first) sb.append(",");
+            first = false;
+            sb.append("{\"peerId\":\"").append(escapeJson(truncatePeerId(p.peerId()))).append("\"");
+            sb.append(",\"remoteAddress\":\"").append(escapeJson(p.remoteAddress())).append("\"");
+            if (p.agentVersion() != null) {
+                sb.append(",\"clientId\":\"").append(escapeJson(p.agentVersion())).append("\"");
+            }
+            sb.append(",\"lightClient\":").append(p.supportsLightClient());
+            sb.append(",\"protocols\":").append(p.protocols().size());
+            sb.append("}");
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    private static String truncatePeerId(String peerId) {
+        return peerId != null && peerId.length() > 16
+                ? peerId.substring(0, 16) + "..." : peerId;
     }
 
     private String handleDial(String jsonLine) {
