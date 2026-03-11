@@ -5,6 +5,7 @@ import devp2p.consensus.lightclient.BeaconChainSpec;
 import devp2p.consensus.lightclient.LightClientProcessor;
 import devp2p.consensus.lightclient.LightClientStore;
 import devp2p.consensus.ssz.SszUtil;
+import devp2p.consensus.types.BeaconBlockParser;
 import devp2p.consensus.types.LightClientBootstrap;
 import devp2p.consensus.types.LightClientFinalityUpdate;
 import devp2p.consensus.types.LightClientHeader;
@@ -291,6 +292,12 @@ public class BeaconLightClient implements AutoCloseable {
 
                 // Seed the sync state directly (trusted peer, no BLS verification)
                 syncState.update(finalizedSlot, executionStateRoot, update.signatureSlot());
+                syncState.recordStateRoot(finalizedSlot, executionStateRoot, false);
+                // Also record the attested header's execution state root
+                byte[] attestedRoot = update.attestedHeader().execution().stateRoot();
+                if (attestedRoot != null && attestedRoot.length == 32) {
+                    syncState.recordStateRoot(update.attestedHeader().beacon().slot(), attestedRoot, false);
+                }
                 log.info("[beacon] Seeded from finality update via {}, finalizedSlot={}", peer, finalizedSlot);
                 return;
 
@@ -357,6 +364,25 @@ public class BeaconLightClient implements AutoCloseable {
             long signatureSlot = sigSlotMatcher.find() ? Long.parseLong(sigSlotMatcher.group(1)) : finalizedSlot + 1;
 
             syncState.update(finalizedSlot, executionStateRoot, signatureSlot);
+            syncState.recordStateRoot(finalizedSlot, executionStateRoot, false);
+
+            // Also extract attested_header execution state root if present
+            Pattern attestedSrPattern = Pattern.compile(
+                    "\"attested_header\"\\s*:\\s*\\{.*?\"execution\"\\s*:\\s*\\{.*?\"state_root\"\\s*:\\s*\"(0x[0-9a-fA-F]{64})\"",
+                    Pattern.DOTALL);
+            Matcher attestedSrMatcher = attestedSrPattern.matcher(body);
+            if (attestedSrMatcher.find()) {
+                byte[] attestedRoot = hexToBytes(attestedSrMatcher.group(1));
+                Pattern attestedSlotPattern = Pattern.compile(
+                        "\"attested_header\"\\s*:\\s*\\{\\s*\"beacon\"\\s*:\\s*\\{.*?\"slot\"\\s*:\\s*\"(\\d+)\"",
+                        Pattern.DOTALL);
+                Matcher attestedSlotMatcher = attestedSlotPattern.matcher(body);
+                if (attestedSlotMatcher.find()) {
+                    long attestedSlot = Long.parseLong(attestedSlotMatcher.group(1));
+                    syncState.recordStateRoot(attestedSlot, attestedRoot, false);
+                }
+            }
+
             log.info("[beacon] Seeded from beacon HTTP API, finalizedSlot={}, stateRoot={}",
                     finalizedSlot, stateRootHex);
 
@@ -403,6 +429,7 @@ public class BeaconLightClient implements AutoCloseable {
 
                 if (store.isInitialized() && processor.processFinalityUpdate(update)) {
                     updateSyncState();
+                    fillChainStateRoots(peer, true);
                     log.debug("[beacon] Finality update applied from {}, finalizedSlot={}",
                             peer, store.getFinalizedSlot());
                     return;
@@ -414,6 +441,12 @@ public class BeaconLightClient implements AutoCloseable {
                     byte[] sr = fh.execution().stateRoot();
                     if (sr != null && sr.length == 32) {
                         long slot = fh.beacon().slot();
+                        syncState.recordStateRoot(slot, sr, false);
+                        // Also record the attested header's execution state root
+                        byte[] attestedRoot = update.attestedHeader().execution().stateRoot();
+                        if (attestedRoot != null && attestedRoot.length == 32) {
+                            syncState.recordStateRoot(update.attestedHeader().beacon().slot(), attestedRoot, false);
+                        }
                         if (slot > syncState.getFinalizedSlot()) {
                             syncState.update(slot, sr, update.signatureSlot());
                             log.debug("[beacon] Finality update refreshed from {}, finalizedSlot={}", peer, slot);
@@ -435,13 +468,117 @@ public class BeaconLightClient implements AutoCloseable {
     /**
      * Push the current store state into the shared {@link BeaconSyncState}.
      * Only called after a successful bootstrap or finality update.
+     *
+     * <p>Records both the finalized and optimistic execution state roots
+     * into the rolling window so that peer state roots from recent blocks
+     * can be verified against beacon-attested headers.
      */
     private void updateSyncState() {
-        LightClientHeader header = store.getFinalizedHeader();
-        if (header != null) {
-            byte[] stateRoot = header.execution().stateRoot();
+        LightClientHeader finalizedHeader = store.getFinalizedHeader();
+        if (finalizedHeader != null) {
+            byte[] stateRoot = finalizedHeader.execution().stateRoot();
             syncState.update(store.getFinalizedSlot(), stateRoot, store.getOptimisticSlot());
+            syncState.recordStateRoot(store.getFinalizedSlot(), stateRoot, true);
         }
+        LightClientHeader optimisticHeader = store.getOptimisticHeader();
+        if (optimisticHeader != null) {
+            byte[] optRoot = optimisticHeader.execution().stateRoot();
+            syncState.recordStateRoot(store.getOptimisticSlot(), optRoot, true);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Chain fill: fetch intermediate blocks and verify hash chain
+    // -------------------------------------------------------------------------
+
+    /**
+     * After a successful finality update, fetch all beacon blocks between the
+     * finalized slot and the attested slot via {@code beacon_blocks_by_range},
+     * verify the parent hash chain back to the attested header, and record each
+     * block's execution state root as BLS-verified.
+     *
+     * <p>This fills the gap between the finalized root (~13 min old) and the
+     * attested header (1-2 slots old), giving full coverage of recent state roots.
+     *
+     * @param peer           the CL peer multiaddr to fetch blocks from
+     * @param blsVerified    true if the finality update was BLS-verified
+     */
+    private void fillChainStateRoots(String peer, boolean blsVerified) {
+        long finalizedSlot = store.getFinalizedSlot();
+        long optimisticSlot = store.getOptimisticSlot();
+        if (optimisticSlot <= finalizedSlot + 1) return; // nothing to fill
+
+        long startSlot = finalizedSlot + 1;
+        long count = optimisticSlot - finalizedSlot; // includes the attested slot
+
+        try {
+            List<byte[]> blockSszList = p2pService
+                    .requestBlocksByRange(peer, startSlot, count)
+                    .get(30, TimeUnit.SECONDS);
+
+            if (blockSszList.isEmpty()) {
+                log.debug("[beacon] Chain fill: no blocks returned for slots {}-{}",
+                        startSlot, optimisticSlot);
+                return;
+            }
+
+            // Parse all blocks
+            List<BeaconBlockParser.ParsedBlock> blocks = new java.util.ArrayList<>();
+            for (byte[] ssz : blockSszList) {
+                if (ssz.length == 0) continue;
+                try {
+                    blocks.add(BeaconBlockParser.parse(ssz));
+                } catch (Exception e) {
+                    log.debug("[beacon] Chain fill: failed to parse block: {}", e.getMessage());
+                }
+            }
+
+            if (blocks.isEmpty()) return;
+
+            // Verify hash chain: walk from newest to oldest.
+            // The attested header's blockHeaderRoot should match the last block,
+            // and each block's parentRoot should match the previous block's headerRoot.
+            LightClientHeader attestedHeader = store.getOptimisticHeader();
+            byte[] expectedHash = attestedHeader != null
+                    ? attestedHeader.beacon().hashTreeRoot() : null;
+
+            int verified = 0;
+            // Process blocks in reverse (newest first) to verify chain from attested header
+            for (int i = blocks.size() - 1; i >= 0; i--) {
+                BeaconBlockParser.ParsedBlock block = blocks.get(i);
+
+                if (expectedHash != null) {
+                    if (!java.util.Arrays.equals(block.blockHeaderRoot(), expectedHash)) {
+                        log.debug("[beacon] Chain fill: hash mismatch at slot {} (expected {}, got {})",
+                                block.slot(),
+                                bytesToHex(expectedHash),
+                                bytesToHex(block.blockHeaderRoot()));
+                        break; // stop verifying at first mismatch
+                    }
+                }
+
+                // This block is verified — record its execution state root
+                if (block.executionStateRoot() != null && block.executionStateRoot().length == 32) {
+                    syncState.recordStateRoot(block.slot(), block.executionStateRoot(), blsVerified);
+                    verified++;
+                }
+
+                // Next iteration should match this block's parentRoot
+                expectedHash = block.parentRoot();
+            }
+
+            log.info("[beacon] Chain fill: recorded {} verified state roots for slots {}-{} from {}",
+                    verified, startSlot, blocks.get(blocks.size() - 1).slot(), peer);
+
+        } catch (Exception e) {
+            log.debug("[beacon] Chain fill failed from {}: {}", peer, e.getMessage());
+        }
+    }
+
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) sb.append(String.format("%02x", b));
+        return sb.toString();
     }
 
     // -------------------------------------------------------------------------

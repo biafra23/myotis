@@ -291,7 +291,8 @@ public class CommandHandler {
                 + ",\"finalizedSlot\":" + finalizedSlot
                 + ",\"optimisticSlot\":" + optimisticSlot
                 + ",\"syncCommitteePeriod\":" + period
-                + ",\"executionStateRoot\":" + stateRootHex + "}";
+                + ",\"executionStateRoot\":" + stateRootHex
+                + ",\"knownStateRoots\":" + beaconSyncState.getKnownStateRootCount() + "}";
     }
 
     private String handleDial(String jsonLine) {
@@ -348,7 +349,7 @@ public class CommandHandler {
             peerStateRootHex = peerStateRoot.toHexString();
         }
 
-        // Verify against the beacon-verified state root
+        // Verify against the beacon-verified finalized state root
         byte[] trustedStateRoot = beaconSyncState.getVerifiedExecutionStateRoot();
         boolean beaconProofValid = false;
         String beaconStateRootHex = null;
@@ -357,6 +358,25 @@ public class CommandHandler {
             beaconProofValid = MerklePatriciaVerifier.verify(
                     trustedStateRoot, address, proofBytes, nonce, balance);
             beaconStateRootHex = "0x" + bytesToHex(trustedStateRoot);
+        }
+
+        // Check if the peer's state root matches any beacon-attested block.
+        // This bridges the gap between the finalized root (which is ~13 min old
+        // and usually too stale to match the peer's current state) and the peer's
+        // fresh state root — by checking it against the rolling window of
+        // execution state roots seen in recent beacon headers (both finalized
+        // and attested/optimistic).
+        boolean beaconChainVerified = false;
+        boolean blsVerified = false;
+        long matchedSlot = -1;
+        if (peerStateRoot != null) {
+            BeaconSyncState.SlottedStateRoot match =
+                    beaconSyncState.findStateRoot(peerStateRoot.toArrayUnsafe());
+            if (match != null) {
+                beaconChainVerified = true;
+                matchedSlot = match.slot();
+                blsVerified = match.blsVerified();
+            }
         }
 
         StringBuilder sb = new StringBuilder("{");
@@ -370,6 +390,11 @@ public class CommandHandler {
         }
         sb.append(",\"beaconSynced\":").append(trustedStateRoot != null);
         sb.append(",\"beaconSlot\":").append(beaconSlot);
+        sb.append(",\"beaconChainVerified\":").append(beaconChainVerified);
+        if (beaconChainVerified) {
+            sb.append(",\"matchedBeaconSlot\":").append(matchedSlot);
+            sb.append(",\"blsVerified\":").append(blsVerified);
+        }
         sb.append("}");
         return sb.toString();
     }

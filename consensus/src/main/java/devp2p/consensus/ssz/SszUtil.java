@@ -169,6 +169,47 @@ public final class SszUtil {
     }
 
     /**
+     * Merkleize with a large limit efficiently using recursive zero-hash pruning.
+     * For a tree with limit=1M but only 100 actual chunks, this does ~2000 hashes
+     * instead of 1M by short-circuiting all-zero subtrees.
+     */
+    public static byte[] merkleizeSparse(byte[][] chunks, int limit) {
+        if (limit <= 0) return ZERO_HASHES[0];
+        int depth = 0;
+        int n = nextPowerOfTwo(limit);
+        while ((1 << depth) < n) depth++;
+        return merkleizeSparseRec(chunks, 0, depth);
+    }
+
+    private static byte[] merkleizeSparseRec(byte[][] chunks, int offset, int depth) {
+        if (depth == 0) {
+            return offset < chunks.length ? chunks[offset] : ZERO_HASHES[0];
+        }
+        byte[] left = merkleizeSparseRec(chunks, offset, depth - 1);
+        int rightOffset = offset + (1 << (depth - 1));
+        byte[] right = rightOffset >= chunks.length
+                ? ZERO_HASHES[depth - 1]
+                : merkleizeSparseRec(chunks, rightOffset, depth - 1);
+        return sha256(left, right);
+    }
+
+    /**
+     * hash_tree_root of a fixed-length byte vector of any size.
+     * Splits into 32-byte chunks (last chunk zero-padded) and merkleizes.
+     */
+    public static byte[] hashTreeRootByteVector(byte[] data) {
+        int numChunks = (data.length + 31) / 32;
+        byte[][] chunks = new byte[numChunks][];
+        for (int i = 0; i < numChunks; i++) {
+            chunks[i] = new byte[32];
+            int start = i * 32;
+            int len = Math.min(32, data.length - start);
+            System.arraycopy(data, start, chunks[i], 0, len);
+        }
+        return merkleize(chunks);
+    }
+
+    /**
      * hash_tree_root of a uint256 stored as 32 bytes LE (already a chunk).
      */
     public static byte[] hashTreeRootUint256(byte[] bytes32Le) {

@@ -53,6 +53,8 @@ public class BeaconP2PService implements AutoCloseable {
             "/eth2/beacon_chain/req/light_client_finality_update/1/ssz_snappy";
     static final String OPTIMISTIC =
             "/eth2/beacon_chain/req/light_client_optimistic_update/1/ssz_snappy";
+    static final String BLOCKS_BY_RANGE =
+            "/eth2/beacon_chain/req/beacon_blocks_by_range/2/ssz_snappy";
 
     private volatile Host host;
     private Identify identifyBinding;
@@ -89,7 +91,7 @@ public class BeaconP2PService implements AutoCloseable {
         host.addProtocolHandler(identifyBinding);
 
         // Register protocol bindings before starting
-        for (String proto : List.of(BOOTSTRAP, UPDATES, FINALITY, OPTIMISTIC)) {
+        for (String proto : List.of(BOOTSTRAP, UPDATES, FINALITY, OPTIMISTIC, BLOCKS_BY_RANGE)) {
             QueuedReqRespBinding binding = new QueuedReqRespBinding(proto);
             bindings.put(proto, binding);
             host.addProtocolHandler(binding);
@@ -221,6 +223,31 @@ public class BeaconP2PService implements AutoCloseable {
                 });
     }
 
+    /**
+     * Request beacon blocks by slot range from a CL peer.
+     * Returns a list of SSZ-decoded SignedBeaconBlock payloads.
+     */
+    public CompletableFuture<List<byte[]>> requestBlocksByRange(
+            String peerMultiaddr, long startSlot, long count) {
+        ByteBuffer buf = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
+        buf.putLong(startSlot);
+        buf.putLong(count);
+        byte[] requestPayload;
+        try {
+            requestPayload = ReqRespCodec.encodeRequest(buf.array());
+        } catch (IOException e) {
+            return CompletableFuture.failedFuture(e);
+        }
+        return doReqResp(peerMultiaddr, BLOCKS_BY_RANGE, requestPayload)
+                .thenApply(raw -> {
+                    try {
+                        return decodeMultiChunkResponse(raw, count);
+                    } catch (IOException e) {
+                        throw new RuntimeException("Failed to decode blocks_by_range response", e);
+                    }
+                });
+    }
+
     // -------------------------------------------------------------------------
     // Internal
     // -------------------------------------------------------------------------
@@ -348,12 +375,21 @@ public class BeaconP2PService implements AutoCloseable {
 
     private static List<byte[]> decodeUpdatesByRangeResponse(byte[] raw, int expectedCount)
             throws IOException {
-        List<byte[]> updates = new ArrayList<>();
+        return decodeMultiChunkResponse(raw, expectedCount);
+    }
+
+    /**
+     * Decode a multi-chunk eth2 req/resp response (used by both updates_by_range
+     * and blocks_by_range). Each chunk: 1B result + 4B fork_digest + varint len + snappy data.
+     */
+    private static List<byte[]> decodeMultiChunkResponse(byte[] raw, long expectedCount)
+            throws IOException {
+        List<byte[]> items = new ArrayList<>();
         int pos = 0;
-        while (pos < raw.length && updates.size() < expectedCount) {
+        while (pos < raw.length && items.size() < expectedCount) {
             byte resultCode = raw[pos];
             if (resultCode != 0) {
-                log.warn("[beacon-p2p] updates_by_range chunk {} error code {}", updates.size(), resultCode);
+                log.warn("[beacon-p2p] Multi-chunk response item {} error code {}", items.size(), resultCode);
                 break;
             }
             pos++;
@@ -362,14 +398,14 @@ public class BeaconP2PService implements AutoCloseable {
             ReqRespCodec.VarintResult varint = ReqRespCodec.readVarint(raw, pos);
             pos = varint.nextPos();
             int compressedLength = varint.value();
-            if (compressedLength == 0) { updates.add(new byte[0]); continue; }
+            if (compressedLength == 0) { items.add(new byte[0]); continue; }
             if (pos + compressedLength > raw.length) break;
             byte[] compressed = new byte[compressedLength];
             System.arraycopy(raw, pos, compressed, 0, compressedLength);
             pos += compressedLength;
-            updates.add(ReqRespCodec.snappyDecompress(compressed));
+            items.add(ReqRespCodec.snappyDecompress(compressed));
         }
-        return updates;
+        return items;
     }
 
     // =========================================================================
