@@ -6,6 +6,8 @@ junit = "5.10.0"
 slf4j = "2.0.12"
 logback = "1.5.6"
 snappy = "1.1.10.7"
+jblst = "0.3.15"
+jvm-libp2p = "1.2.2-RELEASE"
 
 [libraries]
 tuweni-bytes        = { module = "io.consensys.tuweni:tuweni-bytes",       version.ref = "tuweni" }
@@ -28,3 +30,6 @@ snappy              = { module = "org.xerial.snappy:snappy-java",           vers
 
 junit-bom           = { module = "org.junit:junit-bom",                    version.ref = "junit" }
 junit-jupiter       = { module = "org.junit.jupiter:junit-jupiter" }
+
+jblst               = { module = "tech.pegasys:jblst",                      version.ref = "jblst" }
+jvm-libp2p          = { module = "io.libp2p:jvm-libp2p",                   version.ref = "jvm-libp2p" }

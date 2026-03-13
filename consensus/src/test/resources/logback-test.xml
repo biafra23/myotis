@@ -1,0 +1,19 @@
+<configuration>
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{50} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <logger name="io.libp2p.security.noise" level="TRACE"/>
+    <logger name="io.libp2p.core" level="DEBUG"/>
+    <logger name="io.libp2p.transport" level="DEBUG"/>
+    <logger name="io.libp2p.multistream" level="DEBUG"/>
+    <logger name="io.libp2p.mux" level="DEBUG"/>
+    <logger name="com.jaeckel.ethp2p" level="DEBUG"/>
+    <logger name="io.netty" level="WARN"/>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>

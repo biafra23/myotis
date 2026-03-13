@@ -1,6 +1,7 @@
 dependencies {
     implementation(project(":core"))
     implementation(project(":networking"))
+    implementation(project(":consensus"))
     implementation(libs.tuweni.bytes)
     implementation(libs.tuweni.crypto)
     implementation(libs.slf4j.api)
@@ -9,9 +10,9 @@ dependencies {
 
 tasks.register<JavaExec>("run") {
     group = "application"
-    description = "Run the devp2p daemon (no args) or send a command to a running daemon (-Pargs=<cmd>)"
+    description = "Run the ethp2p daemon (no args) or send a command to a running daemon (-Pargs=<cmd>)"
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass = "devp2p.app.Main"
+    mainClass = "com.jaeckel.ethp2p.app.Main"
     // Use Java 21 toolchain JVM (matches compile target)
     javaLauncher = javaToolchains.launcherFor {
         languageVersion = JavaLanguageVersion.of(21)
@@ -23,6 +24,11 @@ tasks.register<JavaExec>("run") {
     if (networkArg != null) {
         appArgs.add("--network")
         appArgs.add(networkArg)
+    }
+    val portArg = project.findProperty("port") as String?
+    if (portArg != null) {
+        appArgs.add("--port")
+        appArgs.add(portArg)
     }
     val cmdArgs = (project.findProperty("args") as String?)
         ?.split("\\s+".toRegex())
