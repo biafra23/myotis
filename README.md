@@ -22,7 +22,7 @@ A from-scratch Ethereum devp2p implementation in Java 21. Connects to the Ethere
 
 ## Run
 
-The application operates in two modes: **daemon** and **client**. The daemon discovers peers, maintains connections, and listens for commands on a Unix domain socket (`/tmp/devp2p.sock`). The client sends a single command to the running daemon and exits.
+The application operates in two modes: **daemon** and **client**. The daemon discovers peers, maintains connections, and listens for commands on a Unix domain socket (`/tmp/ethp2p.sock`). The client sends a single command to the running daemon and exits.
 
 ### Start the daemon
 
@@ -56,7 +56,18 @@ All commands are sent to the running daemon via IPC. Responses are JSON.
 ./gradlew :app:run -Pargs=status
 ```
 
-Returns uptime, discovered/connected/ready peer counts, snap peer count, and backoff/blacklist stats.
+Returns daemon operational metrics.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `state` | string | Always `"RUNNING"` for an active daemon |
+| `uptimeSeconds` | long | Daemon uptime in seconds |
+| `discoveredPeers` | int | Total peers in the Kademlia DHT |
+| `connectedPeers` | int | Total active TCP (RLPx) connections |
+| `readyPeers` | long | Peers that completed the eth handshake |
+| `snapPeers` | long | Ready peers that also support snap/1 |
+| `backedOffPeers` | long | Peers in temporary exponential backoff |
+| `blacklistedPeers` | long | Peers permanently blacklisted (incompatible network) |
 
 ### Peers
 
@@ -72,7 +83,28 @@ Returns discovered peers (from the Kademlia table) and connected peers with thei
 ./gradlew :app:run -Pargs=beacon-status
 ```
 
-Returns beacon light client sync state: finalized slot, optimistic slot, execution state root, execution block number, known state root count, connected CL peers, and sync status.
+Returns beacon chain light client sync state.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `state` | string | `"SYNCING"` or `"SYNCED"` |
+| `finalizedSlot` | long | Latest finalized beacon slot (0 if not synced) |
+| `optimisticSlot` | long | Latest optimistic (attested but not finalized) slot |
+| `syncCommitteePeriod` | long | Current sync committee period (finalizedSlot / 8192, only when `SYNCED`) |
+| `executionStateRoot` | string/null | Verified execution state root (null if not synced) |
+| `executionBlockNumber` | long | Finalized execution block number (only when `SYNCED`) |
+| `knownStateRoots` | int | State roots in the rolling window cache (only when `SYNCED`) |
+| `peers` | array | Connected beacon peers (see below) |
+
+**Peer fields** (in the `peers` array):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `peerId` | string | Truncated libp2p peer ID |
+| `remoteAddress` | string | Peer's network address |
+| `clientId` | string | Client identification string (if available) |
+| `lightClient` | boolean | Whether peer supports the light client protocol |
+| `protocols` | int | Number of advertised protocols |
 
 ### Get block headers
 
@@ -93,15 +125,37 @@ Returns beacon light client sync state: finalized slot, optimistic slot, executi
 ./gradlew :app:run -Pargs="get-account 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 ```
 
-Returns account data (nonce, balance, storage root, code hash) with a Merkle-Patricia proof and cryptographic verification. The response includes a `verification` object with:
+Returns account data with a Merkle-Patricia proof and cryptographic verification.
 
-- `peerProofValid` -- the Merkle proof verifies against the peer's state root
-- `beaconChainVerified` -- the peer's state root has been verified against the beacon chain
-- `verifyMethod` -- how verification was achieved:
-  - `stateRootMatch` -- the peer's state root exactly matches a beacon-attested execution state root
-  - `headerChain` -- a verified chain of block headers links the beacon-finalized block to the peer's block (used when the peer is ahead of the finalized block)
-- `matchedBeaconSlot` -- the beacon slot used as the trust anchor
-- `blsVerified` -- whether the trust anchor was validated via BLS sync committee signatures
+**Account fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `exists` | boolean | Whether the account was found in the state trie |
+| `address` | string | The queried address (0x-prefixed) |
+| `accountHash` | string | keccak256 of the address |
+| `nonce` | long | Account transaction count (only if `exists=true`) |
+| `balance` | string | Account balance in wei (only if `exists=true`) |
+| `storageRoot` | string | Storage trie root hash (only if `exists=true`) |
+| `codeHash` | string | Contract code hash (only if `exists=true`) |
+| `proof` | array | Merkle-Patricia trie proof nodes (RLP-encoded, hex) |
+
+**Verification fields** (in the `verification` object):
+
+| Field | Type | Values | Description |
+|-------|------|--------|-------------|
+| `peerProofValid` | boolean | `true` / `false` | Whether the Merkle proof is cryptographically valid against the peer's state root. Proves the data is authentic relative to the peer's claimed state, but does not prove the state root itself is canonical. |
+| `peerStateRoot` | string | 0x-prefixed hex | The state root the peer provided, against which the proof was verified. |
+| `beaconSynced` | boolean | `true` / `false` | Whether the beacon chain light client has synced (has a finalized state root). |
+| `beaconChainVerified` | boolean | `true` / `false` | Whether the peer's state root is verified against the beacon chain. This is the critical trust anchor: `true` means the data is cryptographically backed by sync committee signatures. |
+| `verifyMethod` | string | `"stateRootMatch"` / `"headerChain"` | How the beacon chain verification was achieved (only present when `beaconChainVerified=true`). See below. |
+| `matchedBeaconSlot` | long | slot number | The beacon slot used as the trust anchor (only present when `beaconChainVerified=true`). Beacon slots increment every 12 seconds. |
+| `blsVerified` | boolean | `true` / `false` | Whether the trust anchor slot was validated via BLS sync committee signatures (only present when `beaconChainVerified=true`). `true` means at least 2/3 of the sync committee signed off on the data. |
+
+**`verifyMethod` values:**
+
+- **`stateRootMatch`** -- The peer's state root exactly matches a state root from a recent beacon block header stored in the rolling window cache. This is the most direct verification path.
+- **`headerChain`** -- The peer's block is ahead of the finalized beacon block, so a chain of consecutive block headers was fetched and verified from the beacon-finalized block to the peer's block. Verification checks: (1) the first header's state root matches the beacon-attested root, (2) each header's parent hash matches the previous header's hash, (3) the last header's state root matches the peer's root.
 
 ### Get storage
 
@@ -113,12 +167,34 @@ Returns account data (nonce, balance, storage root, code hash) with a Merkle-Pat
 ./gradlew :app:run -Pargs="get-storage 0x<token> <slot> 0x<holder>"
 ```
 
-Returns storage slot data for a contract with Merkle-Patricia proof verification. For ERC-20 tokens, pass the mapping slot number and holder address to compute `keccak256(abi.encode(holder, slot))`. The response includes:
+Returns storage slot data for a contract with Merkle-Patricia proof verification. For ERC-20 tokens, pass the mapping slot number and holder address to compute `keccak256(abi.encode(holder, slot))`.
 
-- `value` / `valueDecimal` -- the storage slot value (hex and decimal)
-- `storageRoot` -- the account's storage trie root
-- `storageProofValid` -- the storage proof verifies against the account's storage root
-- `beaconChainVerified` -- same header chain verification as `get-account`
+**Storage fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `address` | string | Contract address queried |
+| `slot` | long | Slot number |
+| `holder` | string | Holder address (only for ERC-20 mapping lookups) |
+| `storageKey` | string | Computed storage key (0x-prefixed hex) |
+| `storageKeyHash` | string | keccak256 of the storage key |
+| `exists` | boolean | Whether the slot has a value |
+| `value` | string | Storage value in hex (only if `exists=true`) |
+| `valueDecimal` | string | Storage value as decimal (only if `exists=true`) |
+| `slotsReturned` | int | Number of slots returned by peer (only if `exists=false`) |
+| `storageRoot` | string | Account's storage trie root |
+| `proof` | array | Merkle-Patricia proof nodes (RLP-encoded, hex) |
+
+**Verification fields** (in the `verification` object):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `storageProofValid` | boolean | Whether the storage proof is valid against the account's storage root |
+| `beaconSynced` | boolean | Whether the beacon light client has synced |
+| `beaconChainVerified` | boolean | Whether the state is verified against the beacon chain (same logic as `get-account`) |
+| `verifyMethod` | string | `"stateRootMatch"` or `"headerChain"` (same as `get-account`, only present when `beaconChainVerified=true`) |
+| `matchedBeaconSlot` | long | Beacon slot trust anchor (only present when `beaconChainVerified=true`) |
+| `blsVerified` | boolean | Whether the trust anchor has BLS verification (only present when `beaconChainVerified=true`) |
 
 ### Dial a specific peer
 

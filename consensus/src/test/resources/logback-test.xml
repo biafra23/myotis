@@ -10,7 +10,7 @@
     <logger name="io.libp2p.transport" level="DEBUG"/>
     <logger name="io.libp2p.multistream" level="DEBUG"/>
     <logger name="io.libp2p.mux" level="DEBUG"/>
-    <logger name="devp2p" level="DEBUG"/>
+    <logger name="com.jaeckel.ethp2p" level="DEBUG"/>
     <logger name="io.netty" level="WARN"/>
 
     <root level="INFO">

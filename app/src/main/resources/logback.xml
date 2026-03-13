@@ -5,7 +5,7 @@
         </encoder>
     </appender>
 
-    <logger name="devp2p" level="DEBUG"/>
+    <logger name="com.jaeckel.ethp2p" level="DEBUG"/>
     <logger name="io.netty" level="WARN"/>
     <logger name="org.apache.tuweni" level="WARN"/>
     <logger name="io.libp2p" level="WARN"/>

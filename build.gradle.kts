@@ -3,7 +3,7 @@ plugins {
 }
 
 allprojects {
-    group = "io.devp2p"
+    group = "com.jaeckel.ethp2p"
     version = "0.1.0-SNAPSHOT"
 }
 

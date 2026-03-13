@@ -1,4 +1,4 @@
-rootProject.name = "devp2p-playground"
+rootProject.name = "ethp2p"
 
 pluginManagement {
     repositories {

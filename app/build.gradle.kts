@@ -10,9 +10,9 @@ dependencies {
 
 tasks.register<JavaExec>("run") {
     group = "application"
-    description = "Run the devp2p daemon (no args) or send a command to a running daemon (-Pargs=<cmd>)"
+    description = "Run the ethp2p daemon (no args) or send a command to a running daemon (-Pargs=<cmd>)"
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass = "devp2p.app.Main"
+    mainClass = "com.jaeckel.ethp2p.app.Main"
     // Use Java 21 toolchain JVM (matches compile target)
     javaLauncher = javaToolchains.launcherFor {
         languageVersion = JavaLanguageVersion.of(21)
