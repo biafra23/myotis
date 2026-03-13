@@ -63,7 +63,7 @@ Three Gradle modules (Java 21):
 
 ## Trust
 
-- Peer trusted is never an option everything has to be cryptographycally verified
+- Peer trusted is never an option everything has to be cryptographically verified
 - The only trust anchors are sync committee signatures and  the embedded pre-Merge historical hashes accumulator and the Bellatrix-era historical roots accumulator
 
 ## Data sources
