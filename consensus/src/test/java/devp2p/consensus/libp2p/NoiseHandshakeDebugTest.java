@@ -23,6 +23,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,6 +36,7 @@ import java.util.concurrent.TimeUnit;
  * Debug test: attempt a Noise XX handshake to a local Lighthouse node.
  * Run with: ./gradlew :consensus:test --tests "devp2p.consensus.libp2p.NoiseHandshakeDebugTest"
  */
+@Disabled("Manual/debug harness requiring a local Lighthouse node — not for CI")
 class NoiseHandshakeDebugTest {
 
     private static final Logger log = LoggerFactory.getLogger(NoiseHandshakeDebugTest.class);
