@@ -606,6 +606,9 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     public CompletableFuture<AccountRangeMessage.DecodeResult> requestAccountAsync(
             org.apache.tuweni.bytes.Bytes address,
             org.apache.tuweni.bytes.Bytes32 explicitStateRoot) {
+        if (explicitStateRoot == null) {
+            return requestAccountAsync(address);
+        }
         ChannelHandlerContext ctx = readyCtx;
         if (ctx == null || state != State.READY) return null;
         if (!snapNegotiated) return CompletableFuture.failedFuture(
@@ -767,6 +770,9 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             org.apache.tuweni.bytes.Bytes contractAddress,
             org.apache.tuweni.bytes.Bytes32 storageKeyHash,
             org.apache.tuweni.bytes.Bytes32 explicitStateRoot) {
+        if (explicitStateRoot == null) {
+            return requestStorageAsync(contractAddress, storageKeyHash);
+        }
         ChannelHandlerContext ctx = readyCtx;
         if (ctx == null || state != State.READY) return null;
         if (!snapNegotiated) return CompletableFuture.failedFuture(
