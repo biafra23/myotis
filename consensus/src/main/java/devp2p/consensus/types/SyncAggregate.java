@@ -1,5 +1,7 @@
 package devp2p.consensus.types;
 
+import devp2p.consensus.ssz.SszUtil;
+
 import java.util.Arrays;
 
 /**
@@ -27,6 +29,33 @@ public record SyncAggregate(
         byte[] bits = Arrays.copyOfRange(ssz, 0, 64);
         byte[] sig = Arrays.copyOfRange(ssz, 64, 160);
         return new SyncAggregate(bits, sig);
+    }
+
+    /**
+     * hash_tree_root of this SyncAggregate container.
+     * Fields: syncCommitteeBits (Bitvector[512] = 64B → 2 chunks), syncCommitteeSignature (Bytes96)
+     */
+    public byte[] hashTreeRoot() {
+        byte[][] bitChunks = {
+                Arrays.copyOfRange(syncCommitteeBits, 0, 32),
+                Arrays.copyOfRange(syncCommitteeBits, 32, 64)
+        };
+        byte[] bitsRoot = SszUtil.merkleize(bitChunks);
+        byte[] sigRoot = SszUtil.hashTreeRootByteVector(syncCommitteeSignature);
+        return SszUtil.hashTreeRootContainer(bitsRoot, sigRoot);
+    }
+
+    /**
+     * hash_tree_root computed from raw body bytes at a given offset (avoids object allocation).
+     */
+    public static byte[] hashTreeRootAt(byte[] data, int off) {
+        byte[][] bitChunks = {
+                Arrays.copyOfRange(data, off, off + 32),
+                Arrays.copyOfRange(data, off + 32, off + 64)
+        };
+        byte[] bitsRoot = SszUtil.merkleize(bitChunks);
+        byte[] sigRoot = SszUtil.hashTreeRootByteVector(Arrays.copyOfRange(data, off + 64, off + 160));
+        return SszUtil.hashTreeRootContainer(bitsRoot, sigRoot);
     }
 
     /**

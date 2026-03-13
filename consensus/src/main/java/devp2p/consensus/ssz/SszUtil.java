@@ -1,5 +1,7 @@
 package devp2p.consensus.ssz;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
@@ -272,5 +274,155 @@ public final class SszUtil {
         }
         byte[] root = merkleize(chunks, chunkLimit);
         return mixInLength(root, data.length);
+    }
+
+    // =========================================================================
+    // SSZ little-endian readers
+    // =========================================================================
+
+    /** Read a little-endian uint32 from a byte array at the given offset. */
+    public static int readUint32(byte[] data, int offset) {
+        return (data[offset] & 0xFF)
+                | ((data[offset + 1] & 0xFF) << 8)
+                | ((data[offset + 2] & 0xFF) << 16)
+                | ((data[offset + 3] & 0xFF) << 24);
+    }
+
+    /** Read a little-endian uint64 from a byte array at the given offset. */
+    public static long readUint64(byte[] data, int offset) {
+        return ByteBuffer.wrap(data, offset, 8).order(ByteOrder.LITTLE_ENDIAN).getLong();
+    }
+
+    // =========================================================================
+    // SSZ list hashing helpers
+    // =========================================================================
+
+    /**
+     * Zero-hash root for an empty list with the given limit.
+     * Returns ZERO_HASHES[depth] where depth = ceil(log2(limit)).
+     */
+    public static byte[] emptyListRoot(int limit) {
+        if (limit <= 0) return ZERO_HASHES[0];
+        int depth = 0;
+        int n = 1;
+        while (n < limit) { n <<= 1; depth++; }
+        return ZERO_HASHES[depth];
+    }
+
+    /**
+     * hash_tree_root of a Bitlist[maxBits]: remove delimiter bit, pack into chunks,
+     * merkleize with chunk limit, mix in bit length.
+     */
+    public static byte[] hashBitlist(byte[] serialized, int maxBits) {
+        if (serialized.length == 0) {
+            int chunkLimit = (maxBits + 255) / 256;
+            return mixInLength(emptyListRoot(chunkLimit), 0);
+        }
+        // Find delimiter bit (highest set bit in last byte)
+        byte lastByte = serialized[serialized.length - 1];
+        int delimPos = 7;
+        while (delimPos >= 0 && ((lastByte >> delimPos) & 1) == 0) delimPos--;
+        int bitLength = (serialized.length - 1) * 8 + delimPos;
+
+        // Copy bytes and clear delimiter bit
+        byte[] bits = Arrays.copyOf(serialized, serialized.length);
+        bits[bits.length - 1] = (byte) (bits[bits.length - 1] & ~(1 << delimPos));
+        int neededBytes = (bitLength + 7) / 8;
+
+        // Pack into 32-byte chunks
+        int numChunks = Math.max(1, (neededBytes + 31) / 32);
+        byte[][] chunks = new byte[numChunks][];
+        for (int i = 0; i < numChunks; i++) {
+            chunks[i] = new byte[32];
+            int copyStart = i * 32;
+            int copyLen = Math.min(32, Math.min(bits.length - copyStart, neededBytes - copyStart));
+            if (copyLen > 0) System.arraycopy(bits, copyStart, chunks[i], 0, copyLen);
+        }
+
+        int chunkLimit = (maxBits + 255) / 256;
+        byte[] root = chunkLimit > 256
+                ? merkleizeSparse(chunks, chunkLimit)
+                : merkleize(chunks, chunkLimit);
+        return mixInLength(root, bitLength);
+    }
+
+    /**
+     * hash_tree_root of a List[uint64, limit]: pack uint64s into 32-byte chunks (4 per chunk).
+     */
+    public static byte[] hashUint64List(byte[] data, int limit) {
+        int count = data.length / 8;
+        int numChunks = (count + 3) / 4;
+        byte[][] chunks = new byte[numChunks][];
+        for (int i = 0; i < numChunks; i++) {
+            chunks[i] = new byte[32];
+            int base = i * 4;
+            for (int j = 0; j < 4 && base + j < count; j++) {
+                System.arraycopy(data, (base + j) * 8, chunks[i], j * 8, 8);
+            }
+        }
+        int chunkLimit = (limit + 3) / 4;
+        byte[] root = chunkLimit > 256
+                ? merkleizeSparse(chunks, chunkLimit)
+                : merkleize(chunks, chunkLimit);
+        return mixInLength(root, count);
+    }
+
+    @FunctionalInterface
+    public interface FixedElementHasher {
+        byte[] hash(byte[] data, int offset);
+    }
+
+    @FunctionalInterface
+    public interface VariableElementHasher {
+        byte[] hash(byte[] data, int offset, int end);
+    }
+
+    /**
+     * Hash a list of fixed-size composite elements.
+     * hash_tree_root(List[T, limit]) = mixInLength(merkleize(element_roots, limit), count)
+     */
+    public static byte[] hashFixedElementList(byte[] data, int start, int end,
+                                               int elementSize, int limit,
+                                               FixedElementHasher hasher) {
+        int len = end - start;
+        int count = elementSize > 0 ? len / elementSize : 0;
+        byte[][] roots = new byte[count][];
+        for (int i = 0; i < count; i++) {
+            roots[i] = hasher.hash(data, start + i * elementSize);
+        }
+        byte[] root = limit > 256
+                ? merkleizeSparse(roots, limit)
+                : merkleize(roots, limit);
+        return mixInLength(root, count);
+    }
+
+    /**
+     * Hash a list of variable-size composite elements (uses SSZ offsets).
+     */
+    public static byte[] hashVariableElementList(byte[] data, int start, int end,
+                                                  int limit, VariableElementHasher hasher) {
+        int len = end - start;
+        if (len == 0) return mixInLength(emptyListRoot(limit), 0);
+
+        int firstOffset = readUint32(data, start);
+        int count = firstOffset / 4;
+        if (count == 0) return mixInLength(emptyListRoot(limit), 0);
+
+        int[] offsets = new int[count];
+        for (int i = 0; i < count; i++) {
+            offsets[i] = readUint32(data, start + i * 4);
+        }
+
+        byte[][] roots = new byte[count][];
+        for (int i = 0; i < count; i++) {
+            int elemStart = start + offsets[i];
+            int elemEnd = (i + 1 < count) ? start + offsets[i + 1] : end;
+            roots[i] = hasher.hash(data, elemStart, elemEnd);
+        }
+
+        byte[] root = limit > 256
+                ? merkleizeSparse(roots, limit)
+                : merkleize(roots, limit);
+        return mixInLength(root, count);
     }
 }
