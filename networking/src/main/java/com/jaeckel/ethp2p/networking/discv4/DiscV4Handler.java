@@ -97,7 +97,7 @@ public final class DiscV4Handler extends SimpleChannelInboundHandler<DatagramPac
             onPeerDiscovered.accept(entry);
             // NOTE: Do NOT send FindNode here. go-ethereum requires "LastPongReceived"
             // from us before answering FindNode. We must first respond to the bootnode's
-            // return Ping (handlePing sends FindNode after the Pong response).
+            // return Ping before initiating any FindNode requests.
         } else {
             log.debug("[discv4] Unsolicited/mismatched pong from {}", sender);
         }
