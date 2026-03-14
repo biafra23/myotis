@@ -153,7 +153,7 @@ public final class FrameCodec {
         decryptCipher.processBytes(encHeader, 0, 16, header, 0);
         int bodyLen = ((header[0] & 0xFF) << 16) | ((header[1] & 0xFF) << 8) | (header[2] & 0xFF);
         if (bodyLen > MAX_FRAME_BODY_SIZE) {
-            throw new IllegalStateException("Frame body size " + bodyLen + " exceeds maximum " + MAX_FRAME_BODY_SIZE);
+            throw new IllegalArgumentException("Frame body size " + bodyLen + " exceeds maximum " + MAX_FRAME_BODY_SIZE);
         }
         return bodyLen;
     }
