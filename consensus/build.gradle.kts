@@ -12,3 +12,7 @@ dependencies {
     testImplementation(libs.junit.jupiter)
     testRuntimeOnly(libs.logback.classic)
 }
+
+tasks.test {
+    useJUnitPlatform()
+}

@@ -1,6 +1,7 @@
 [versions]
 tuweni = "2.7.2"
-netty = "4.2.7.Final"
+netty-kotlin = "main-SNAPSHOT"
+#netty = "4.2.7.Final"
 bouncycastle = "1.78.1"
 junit = "5.10.0"
 slf4j = "2.0.12"
@@ -17,9 +18,9 @@ tuweni-merkle-trie  = { module = "io.consensys.tuweni:tuweni-merkle-trie", versi
 tuweni-ssz          = { module = "io.consensys.tuweni:tuweni-ssz",         version.ref = "tuweni" }
 tuweni-units        = { module = "io.consensys.tuweni:tuweni-units",       version.ref = "tuweni" }
 
-netty-transport     = { module = "io.netty:netty-transport",               version.ref = "netty" }
-netty-codec         = { module = "io.netty:netty-codec",                   version.ref = "netty" }
-netty-handler       = { module = "io.netty:netty-handler",                 version.ref = "netty" }
+netty-transport     = { module = "com.github.biafra23:netty-transport",               version.ref = "netty-kotlin" }
+netty-codec         = { module = "com.github.biafra23:inetty-codec",                   version.ref = "netty-kotlin" }
+netty-handler       = { module = "com.github.biafra23:netty-handler",                 version.ref = "netty-kotlin" }
 
 bouncycastle        = { module = "org.bouncycastle:bcprov-jdk18on",        version.ref = "bouncycastle" }
 
