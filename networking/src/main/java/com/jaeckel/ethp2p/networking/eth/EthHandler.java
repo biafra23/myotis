@@ -336,7 +336,9 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                                 hashHolder[0] = start.toShortHexString();
                                 fullHashHolder[0] = start.toHexString();
                             }
-                            countHolder[0] = Math.min(r.readInt(), 1024);
+                            int requestedCount = r.readInt();
+                            requestedCount = Math.max(0, Math.min(requestedCount, 1024));
+                            countHolder[0] = requestedCount;
                             return null;
                         });
                         return null;
