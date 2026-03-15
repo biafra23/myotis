@@ -305,21 +305,19 @@ Block verification (`get-block`) currently has the following limitations:
 - **Pre-merge blocks (before block 15,537,394)** cannot be verified. The beacon chain only exists post-Merge, so there is no sync committee anchor for proof-of-work era blocks.
 - **Post-merge blocks more than 8,192 blocks from the finalized block** cannot be verified via header chain. This covers roughly 27 hours of blocks at 12-second slots.
 - **Account and storage queries** (`get-account`, `get-storage`) share the 8,192-block header chain limit but are less affected in practice because they query the peer's current state (usually close to head).
+- **Single-peer beacon bootstrap**: The light client currently bootstraps from the first responsive beacon peer. A malicious peer could serve a crafted bootstrap response to establish a false trust anchor. In the future, bootstrap should cross-check against multiple peers or use a checkpoint root embedded at build time.
 
-**Roadmap — historical block verification:**
+**Roadmap:**
 
+- **Multi-peer / embedded bootstrap**: Cross-validate bootstrap responses from multiple beacon peers, or embed a known-good checkpoint root in the release binary so the initial trust anchor does not depend on any single peer.
 - **Pre-merge blocks**: Implement the [pre-merge historical hashes accumulator](https://github.com/ethereum/portal-network-specs/blob/master/history/history-network.md#the-header-accumulator) (EIP-2935). This is a Merkle tree over all ~15.5M pre-merge block hashes, with the root embedded as a static trust anchor. Any pre-merge block hash can be verified with an inclusion proof against this accumulator.
 - **Post-merge historical blocks**: Implement the [Bellatrix-era historical roots accumulator](https://github.com/ethereum/annotated-spec/blob/master/phase0/beacon-chain.md#historical-roots). The beacon chain stores `historical_roots` (batches of 8,192 slots) and `historical_summaries` (post-Capella) that cover all post-merge execution payloads. By walking the beacon state's historical records, any post-merge block hash can be verified without an 8,192-block proximity constraint.
 
 ### Sync modes
 
-The light client can sync from:
-- **Beacon chain P2P network** (libp2p) -- fully decentralized, uses BLS-verified bootstrap and finality updates
-- **Beacon node HTTP API** (seeded mode) -- seeds initial state from a local beacon node (e.g. Lighthouse on `http://localhost:5052`), then continues via P2P
+The light client syncs from the **beacon chain P2P network** (libp2p) -- fully decentralized, using BLS-verified bootstrap and finality updates.
 
-Helper scripts for running a local beacon node are in `scripts/`:
-- `scripts/lighthouse.sh` -- starts Lighthouse via Docker with checkpoint sync
-- `scripts/lodestar.sh` -- starts Lodestar via Docker with checkpoint sync
+> **Debug only (not for production):** During development, the light client can also seed initial state from a local beacon node's HTTP API (e.g. Lighthouse on `http://localhost:5052`). This is a convenience fallback for debugging and will not be part of a future release. Helper scripts: `scripts/lighthouse.sh`, `scripts/lodestar.sh`.
 
 ## Architecture
 
