@@ -463,7 +463,9 @@ public class BeaconP2PService implements AutoCloseable {
      * Decode a multi-chunk eth2 req/resp response (used by both updates_by_range
      * and blocks_by_range). Each chunk: 1B result + 4B fork_digest + varint(uncompressed_len) + snappy data.
      * The varint is the uncompressed SSZ length, NOT the compressed length.
-     * We scan snappy frames to find chunk boundaries.
+     * We scan snappy frames to find chunk boundaries, using the expected uncompressed
+     * length to resolve ambiguity between snappy compressed frames (type 0x00) and
+     * the next chunk's result code (also 0x00).
      */
     private static List<byte[]> decodeMultiChunkResponse(byte[] raw, long expectedCount)
             throws IOException {
@@ -485,7 +487,7 @@ public class BeaconP2PService implements AutoCloseable {
 
             // Scan snappy frames to find the end of this chunk's compressed data
             int snappyStart = pos;
-            pos = skipSnappyFrames(raw, pos);
+            pos = skipSnappyFrames(raw, pos, uncompressedLength);
             int compressedLength = pos - snappyStart;
             if (compressedLength <= 0) break;
             byte[] compressed = new byte[compressedLength];
@@ -500,9 +502,18 @@ public class BeaconP2PService implements AutoCloseable {
      * - Stream identifier: 0xff + 3-byte LE length (always 6) + "sNaPpY"
      * - Compressed: 0x00 + 3-byte LE length + data
      * - Uncompressed: 0x01 + 3-byte LE length + data
-     * Returns position after the last frame.
+     *
+     * Tracks decompressed output to stop when the expected uncompressed length
+     * is reached, preventing ambiguity between snappy compressed frames (0x00)
+     * and the next response chunk's result code (also 0x00).
+     *
+     * @param data              raw response bytes
+     * @param pos               start position of the snappy stream
+     * @param uncompressedLength expected total decompressed output for this chunk
+     * @return position after the last frame belonging to this chunk
      */
-    private static int skipSnappyFrames(byte[] data, int pos) {
+    private static int skipSnappyFrames(byte[] data, int pos, int uncompressedLength) {
+        int decompressedSoFar = 0;
         while (pos < data.length) {
             int chunkType = data[pos] & 0xFF;
             if (chunkType != 0xFF && chunkType != 0x00 && chunkType != 0x01) {
@@ -513,7 +524,38 @@ public class BeaconP2PService implements AutoCloseable {
             int frameLen = (data[pos + 1] & 0xFF)
                     | ((data[pos + 2] & 0xFF) << 8)
                     | ((data[pos + 3] & 0xFF) << 16);
+            // Bounds check: frame must fit within the data
+            if (pos + 4 + frameLen > data.length) {
+                // Truncated frame — consume remaining data
+                pos = data.length;
+                break;
+            }
+
+            // Track decompressed output to know when this chunk is complete
+            if (chunkType == 0x01 && frameLen > 4) {
+                // Uncompressed frame: 4 bytes CRC32C + raw data
+                decompressedSoFar += frameLen - 4;
+            } else if (chunkType == 0x00 && frameLen > 4) {
+                // Compressed frame: 4 bytes CRC32C + snappy block
+                // Snappy block starts with a varint for uncompressed block length
+                try {
+                    int snappyBlockStart = pos + 4 + 4; // frame header (4) + CRC32C (4)
+                    ReqRespCodec.VarintResult blockSize =
+                            ReqRespCodec.readVarint(data, snappyBlockStart);
+                    decompressedSoFar += blockSize.value();
+                } catch (Exception e) {
+                    // Can't read varint — likely not a real snappy frame
+                    break;
+                }
+            }
+            // 0xFF is stream identifier — contributes 0 decompressed bytes
+
             pos += 4 + frameLen;
+
+            // Stop when we've accounted for all expected decompressed bytes
+            if (decompressedSoFar >= uncompressedLength && uncompressedLength > 0) {
+                break;
+            }
         }
         return pos;
     }

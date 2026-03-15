@@ -47,7 +47,7 @@ class FrameCodecTest {
         byte[] headerMac = Arrays.copyOfRange(encodedFrame, 16, 32);
 
         // decodeHeader must throw because bodyLen (MAX_FRAME_BODY_SIZE + 1) exceeds the limit
-        IllegalStateException ex = assertThrows(IllegalStateException.class,
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
             () -> responderCodec.decodeHeader(encHeader, headerMac));
         assertTrue(ex.getMessage().contains("exceeds maximum"),
             "Exception message should mention the size limit, got: " + ex.getMessage());

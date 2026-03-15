@@ -5,6 +5,13 @@
         </encoder>
     </appender>
 
+    <appender name="FILE" class="ch.qos.logback.core.FileAppender">
+        <file>${user.dir}/devp2p.log</file>
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
     <logger name="com.jaeckel.ethp2p" level="DEBUG"/>
     <logger name="io.netty" level="WARN"/>
     <logger name="org.apache.tuweni" level="WARN"/>
@@ -15,5 +22,6 @@
 
     <root level="INFO">
         <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="FILE"/>
     </root>
 </configuration>

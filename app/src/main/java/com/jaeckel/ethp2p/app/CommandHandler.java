@@ -686,8 +686,8 @@ public class CommandHandler {
                                               byte[] beaconStateRoot, byte[] peerStateRoot)
             throws Exception {
         int total = (int) (peerBlock - finalizedBlock + 1);
-        if (total < 2 || total > 16384) {
-            log.info("[verify] Header chain gap {} blocks — out of range [2, 16384]", total);
+        if (total < 2 || total > 32768) {
+            log.info("[verify] Header chain gap {} blocks — out of range [2, 32768]", total);
             return false;
         }
 
