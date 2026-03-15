@@ -23,8 +23,10 @@ public class LightClientProcessor {
 
     public LightClientProcessor(LightClientStore store, byte[] forkVersion, byte[] genesisValidatorsRoot) {
         this.store = store;
-        this.forkVersion = forkVersion;
-        this.genesisValidatorsRoot = genesisValidatorsRoot;
+        this.forkVersion = forkVersion.clone();
+        this.genesisValidatorsRoot = genesisValidatorsRoot.clone();
+        log.info("[lc-processor] Initialized with forkVersion={}, fv[0]={}, id={}",
+                bytesToHex(this.forkVersion), this.forkVersion[0], System.identityHashCode(this.forkVersion));
     }
 
     /**
@@ -63,8 +65,9 @@ public class LightClientProcessor {
                 forkVersion,
                 genesisValidatorsRoot)) {
             log.debug("[lc-processor] Finality update rejected: BLS verification failed " +
-                    "(attestedSlot={}, forkVersion={}, participation={})",
-                    attestedSlot, bytesToHex(forkVersion), participation);
+                    "(attestedSlot={}, forkVersion={}, fv[0]={}, id={}, participation={})",
+                    attestedSlot, bytesToHex(forkVersion), forkVersion[0],
+                    System.identityHashCode(forkVersion), participation);
             return false;
         }
 
@@ -139,7 +142,8 @@ public class LightClientProcessor {
             return false;
         }
 
-        // Verify and store next sync committee if present
+        // Verify and store next sync committee if present.
+        // Always verify and store when the store has no next committee (e.g. after rotation).
         SyncCommittee nextSyncCommittee = update.nextSyncCommittee();
         if (nextSyncCommittee != null && store.getNextSyncCommittee() == null) {
             // Verify the next sync committee branch against the attested state

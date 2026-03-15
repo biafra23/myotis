@@ -75,10 +75,15 @@ public final class LightClientFinalityUpdate {
         // fixedSize = 4 + 4 + (branchNodes * 32) + 160 + 8
         // branchBytes = fixedSize - 176
         int branchBytes = attestedHeaderOffset - 4 - 4 - 160 - 8;
+        if (branchBytes % 32 != 0) {
+            throw new IllegalArgumentException(
+                    "Finality branch region is not a multiple of 32 bytes: " + branchBytes);
+        }
         int branchNodeCount = branchBytes / 32;
-        if (branchNodeCount < 6 || branchNodeCount > 7 || branchBytes % 32 != 0) {
-            // Fall back to pre-Electra if we can't determine
-            branchNodeCount = 6;
+        if (branchNodeCount != 6 && branchNodeCount != 7) {
+            throw new IllegalArgumentException(
+                    "Unexpected finality branch node count: " + branchNodeCount
+                            + " (expected 6 for pre-Electra or 7 for post-Electra)");
         }
 
         byte[][] finalityBranch = new byte[branchNodeCount][32];

@@ -121,7 +121,7 @@ public class BeaconLightClient implements AutoCloseable {
         this.onPeerSuccess = onPeerSuccess;
 
         this.store = new LightClientStore();
-        this.processor = new LightClientProcessor(store, forkVersion, genesisValidatorsRoot);
+        this.processor = new LightClientProcessor(store, this.forkVersion, genesisValidatorsRoot);
         this.p2pService = new BeaconP2PService();
     }
 
@@ -134,6 +134,7 @@ public class BeaconLightClient implements AutoCloseable {
         if (running) {
             throw new IllegalStateException("BeaconLightClient is already running");
         }
+        log.info("[beacon] Starting with forkVersion={}", bytesToHex(forkVersion));
         p2pService.start();
         running = true;
         syncThread = Thread.ofVirtual()
@@ -485,6 +486,14 @@ public class BeaconLightClient implements AutoCloseable {
                         if (processor.processUpdate(update)) {
                             applied++;
                             updateSyncState();
+                            // Rotate sync committee between updates: finality lags attestation,
+                            // so the finalized slot in the update may not cross the period
+                            // boundary even though the next update is signed by the new committee.
+                            // Force-rotate based on wall clock so the next update can be verified.
+                            store.forceRotateIfPastPeriod(currentSlotEstimate);
+                            log.debug("[beacon] Catch-up: applied update slot={}, store period now={}",
+                                    update.finalizedHeader().beacon().slot(),
+                                    BeaconChainSpec.computeSyncCommitteePeriod(store.getFinalizedSlot()));
                         } else {
                             log.debug("[beacon] Catch-up update not applied (slot={})",
                                     update.finalizedHeader().beacon().slot());
@@ -495,11 +504,6 @@ public class BeaconLightClient implements AutoCloseable {
                 }
 
                 if (applied > 0) {
-                    // Force-rotate if wall clock says we're past the period boundary.
-                    // Catch-up updates store nextSyncCommittee but their finalized slots
-                    // may not cross the boundary (finality lags attestation).
-                    store.forceRotateIfPastPeriod(currentSlotEstimate);
-
                     long newPeriod = BeaconChainSpec.computeSyncCommitteePeriod(store.getFinalizedSlot());
                     notifyPeerSuccess(peer);
                     log.info("[beacon] Sync committee catch-up: applied {} update(s), now at period {} (slot {})",

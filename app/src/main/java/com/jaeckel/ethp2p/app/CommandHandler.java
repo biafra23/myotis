@@ -686,15 +686,15 @@ public class CommandHandler {
                                               byte[] beaconStateRoot, byte[] peerStateRoot)
             throws Exception {
         int total = (int) (peerBlock - finalizedBlock + 1);
-        if (total < 2 || total > 32768) {
-            log.info("[verify] Header chain gap {} blocks — out of range [2, 32768]", total);
+        if (total < 2 || total > 8192) {
+            log.info("[verify] Header chain gap {} blocks — out of range [2, 8192]", total);
             return false;
         }
 
         log.info("[verify] Fetching {} headers from block #{} to #{}", total, finalizedBlock, peerBlock);
         List<BlockHeadersMessage.VerifiedHeader> allHeaders =
                 connector.requestBlockHeadersBatched(finalizedBlock, total)
-                        .get(120, TimeUnit.SECONDS);
+                        .get(60, TimeUnit.SECONDS);
 
         boolean valid = verifyHeaderChain(allHeaders, beaconStateRoot, peerStateRoot);
         log.info("[verify] Full header chain ({} blocks) valid: {}", total, valid);
