@@ -3,6 +3,9 @@
 build/
 !gradle/wrapper/gradle-wrapper.jar
 
+# Compiled class files
+*.class
+
 # IntelliJ IDEA
 .idea/
 *.iml
@@ -23,3 +26,5 @@ out/
 nodekey.hex
 app/peers.cache
 *.cache
+app/devp2p.log
+app/devlibp2p.log
