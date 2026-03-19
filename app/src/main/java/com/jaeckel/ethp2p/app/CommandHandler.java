@@ -15,6 +15,7 @@ import com.jaeckel.ethp2p.networking.snap.messages.StorageRangesMessage;
 import org.apache.tuweni.bytes.Bytes;
 import org.apache.tuweni.bytes.Bytes32;
 import org.apache.tuweni.crypto.Hash;
+import org.apache.tuweni.rlp.RLP;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import com.jaeckel.trueblocks.AppearanceRecord;
@@ -227,11 +228,17 @@ public class CommandHandler {
                                     continue;
                                 }
                                 Bytes rawTx = txList.get(txIndex);
+                                String parsedFields = parseTxToJson(rawTx);
 
-                                writer.write("{\"ok\":true,\"blockNumber\":" + blockNumber
-                                        + ",\"transactionIndex\":" + txIndex
-                                        + ",\"rawTx\":\"0x" + rawTx.toUnprefixedHexString() + "\""
-                                        + ",\"verified\":false}");
+                                StringBuilder txJson = new StringBuilder();
+                                txJson.append("{\"ok\":true,\"blockNumber\":").append(blockNumber);
+                                txJson.append(",\"transactionIndex\":").append(txIndex);
+                                if (!parsedFields.isEmpty()) {
+                                    txJson.append(",").append(parsedFields);
+                                }
+                                txJson.append(",\"rawTx\":\"0x").append(rawTx.toUnprefixedHexString()).append("\"");
+                                txJson.append(",\"verified\":false}");
+                                writer.write(txJson.toString());
                                 writer.newLine();
                                 writer.flush();
                                 successCount++;
@@ -1074,6 +1081,168 @@ public class CommandHandler {
         StringBuilder sb = new StringBuilder(bytes.length * 2);
         for (byte b : bytes) sb.append(String.format("%02x", b));
         return sb.toString();
+    }
+
+    // -------------------------------------------------------------------------
+    // Transaction parsing
+    // -------------------------------------------------------------------------
+
+    /**
+     * Parse raw transaction bytes into JSON fields.
+     * Supports legacy, EIP-2930 (type 1), EIP-1559 (type 2), and EIP-4844 (type 3).
+     */
+    private static String parseTxToJson(Bytes rawTx) {
+        if (rawTx == null || rawTx.isEmpty()) return "";
+        try {
+            int firstByte = rawTx.get(0) & 0xFF;
+            if (firstByte >= 0xc0) {
+                // Legacy transaction (RLP list)
+                return parseLegacyTx(rawTx);
+            } else if (firstByte <= 0x03) {
+                // Typed transaction (EIP-2718): type byte + RLP payload
+                int type = firstByte;
+                Bytes payload = rawTx.slice(1);
+                return switch (type) {
+                    case 1 -> parseEip2930Tx(payload);
+                    case 2 -> parseEip1559Tx(payload);
+                    case 3 -> parseEip4844Tx(payload);
+                    default -> "\"type\":" + type;
+                };
+            }
+            return "";
+        } catch (Exception e) {
+            return "\"parseError\":\"" + escapeJson(e.getMessage()) + "\"";
+        }
+    }
+
+    /** Legacy tx: [nonce, gasPrice, gasLimit, to, value, data, v, r, s] */
+    private static String parseLegacyTx(Bytes rlp) {
+        StringBuilder sb = new StringBuilder();
+        RLP.decodeList(rlp, reader -> {
+            Bytes nonce = reader.readValue();
+            Bytes gasPrice = reader.readValue();
+            Bytes gasLimit = reader.readValue();
+            Bytes to = reader.readValue();
+            Bytes value = reader.readValue();
+            Bytes data = reader.readValue();
+            sb.append("\"type\":0");
+            sb.append(",\"nonce\":").append(toLong(nonce));
+            sb.append(",\"gasPrice\":\"0x").append(toMinHex(gasPrice)).append("\"");
+            sb.append(",\"gasLimit\":").append(toLong(gasLimit));
+            if (!to.isEmpty()) {
+                sb.append(",\"to\":\"0x").append(to.toUnprefixedHexString()).append("\"");
+            }
+            sb.append(",\"value\":\"0x").append(toMinHex(value)).append("\"");
+            if (!data.isEmpty()) {
+                sb.append(",\"data\":\"0x").append(data.toUnprefixedHexString()).append("\"");
+            }
+            return null;
+        });
+        return sb.toString();
+    }
+
+    /** EIP-2930 tx: [chainId, nonce, gasPrice, gasLimit, to, value, data, accessList, yParity, r, s] */
+    private static String parseEip2930Tx(Bytes rlp) {
+        StringBuilder sb = new StringBuilder();
+        RLP.decodeList(rlp, reader -> {
+            Bytes chainId = reader.readValue();
+            Bytes nonce = reader.readValue();
+            Bytes gasPrice = reader.readValue();
+            Bytes gasLimit = reader.readValue();
+            Bytes to = reader.readValue();
+            Bytes value = reader.readValue();
+            Bytes data = reader.readValue();
+            sb.append("\"type\":1");
+            sb.append(",\"chainId\":").append(toLong(chainId));
+            sb.append(",\"nonce\":").append(toLong(nonce));
+            sb.append(",\"gasPrice\":\"0x").append(toMinHex(gasPrice)).append("\"");
+            sb.append(",\"gasLimit\":").append(toLong(gasLimit));
+            if (!to.isEmpty()) {
+                sb.append(",\"to\":\"0x").append(to.toUnprefixedHexString()).append("\"");
+            }
+            sb.append(",\"value\":\"0x").append(toMinHex(value)).append("\"");
+            if (!data.isEmpty()) {
+                sb.append(",\"data\":\"0x").append(data.toUnprefixedHexString()).append("\"");
+            }
+            return null;
+        });
+        return sb.toString();
+    }
+
+    /** EIP-1559 tx: [chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList, yParity, r, s] */
+    private static String parseEip1559Tx(Bytes rlp) {
+        StringBuilder sb = new StringBuilder();
+        RLP.decodeList(rlp, reader -> {
+            Bytes chainId = reader.readValue();
+            Bytes nonce = reader.readValue();
+            Bytes maxPriorityFee = reader.readValue();
+            Bytes maxFee = reader.readValue();
+            Bytes gasLimit = reader.readValue();
+            Bytes to = reader.readValue();
+            Bytes value = reader.readValue();
+            Bytes data = reader.readValue();
+            sb.append("\"type\":2");
+            sb.append(",\"chainId\":").append(toLong(chainId));
+            sb.append(",\"nonce\":").append(toLong(nonce));
+            sb.append(",\"maxPriorityFeePerGas\":\"0x").append(toMinHex(maxPriorityFee)).append("\"");
+            sb.append(",\"maxFeePerGas\":\"0x").append(toMinHex(maxFee)).append("\"");
+            sb.append(",\"gasLimit\":").append(toLong(gasLimit));
+            if (!to.isEmpty()) {
+                sb.append(",\"to\":\"0x").append(to.toUnprefixedHexString()).append("\"");
+            }
+            sb.append(",\"value\":\"0x").append(toMinHex(value)).append("\"");
+            if (!data.isEmpty()) {
+                sb.append(",\"data\":\"0x").append(data.toUnprefixedHexString()).append("\"");
+            }
+            return null;
+        });
+        return sb.toString();
+    }
+
+    /** EIP-4844 tx: [chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList, maxFeePerBlobGas, blobVersionedHashes, yParity, r, s] */
+    private static String parseEip4844Tx(Bytes rlp) {
+        StringBuilder sb = new StringBuilder();
+        RLP.decodeList(rlp, reader -> {
+            Bytes chainId = reader.readValue();
+            Bytes nonce = reader.readValue();
+            Bytes maxPriorityFee = reader.readValue();
+            Bytes maxFee = reader.readValue();
+            Bytes gasLimit = reader.readValue();
+            Bytes to = reader.readValue();
+            Bytes value = reader.readValue();
+            Bytes data = reader.readValue();
+            reader.readList(r -> { r.readRemaining(); return null; }); // accessList
+            Bytes maxFeePerBlobGas = reader.readValue();
+            sb.append("\"type\":3");
+            sb.append(",\"chainId\":").append(toLong(chainId));
+            sb.append(",\"nonce\":").append(toLong(nonce));
+            sb.append(",\"maxPriorityFeePerGas\":\"0x").append(toMinHex(maxPriorityFee)).append("\"");
+            sb.append(",\"maxFeePerGas\":\"0x").append(toMinHex(maxFee)).append("\"");
+            sb.append(",\"gasLimit\":").append(toLong(gasLimit));
+            if (!to.isEmpty()) {
+                sb.append(",\"to\":\"0x").append(to.toUnprefixedHexString()).append("\"");
+            }
+            sb.append(",\"value\":\"0x").append(toMinHex(value)).append("\"");
+            sb.append(",\"maxFeePerBlobGas\":\"0x").append(toMinHex(maxFeePerBlobGas)).append("\"");
+            if (!data.isEmpty()) {
+                sb.append(",\"data\":\"0x").append(data.toUnprefixedHexString()).append("\"");
+            }
+            return null;
+        });
+        return sb.toString();
+    }
+
+    /** Convert RLP-encoded integer bytes to long. Empty bytes = 0. */
+    private static long toLong(Bytes b) {
+        if (b.isEmpty()) return 0;
+        return b.toLong();
+    }
+
+    /** Minimal hex representation (no leading zeros), or "0" for empty/zero. */
+    private static String toMinHex(Bytes b) {
+        if (b.isEmpty()) return "0";
+        String hex = b.toUnprefixedHexString().replaceFirst("^0+", "");
+        return hex.isEmpty() ? "0" : hex;
     }
 
     // -------------------------------------------------------------------------

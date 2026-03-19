@@ -3,6 +3,7 @@ dependencies {
     implementation(project(":networking"))
     implementation(project(":consensus"))
     implementation(libs.tuweni.bytes)
+    implementation(libs.tuweni.rlp)
     implementation(libs.tuweni.crypto)
     implementation(libs.trueblocks.kotlin)
     implementation(libs.slf4j.api)
