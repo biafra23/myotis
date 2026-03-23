@@ -259,7 +259,7 @@ Returns all transactions for an address by looking them up in the [TrueBlocks Un
 
 **How it works:**
 
-1. Fetches the TrueBlocks manifest from IPFS (hardcoded CID: `QmUBS83qjRmXmSgEvZADVv2ch47137jkgNbqfVVxQep5Y1`)
+1. Fetches the TrueBlocks manifest from IPFS (hardcoded CID: "[QmUBS83qjRmXmSgEvZADVv2ch47137jkgNbqfVVxQep5Y1](https://ipfs.unchainedindex.io/ipfs/QmUBS83qjRmXmSgEvZADVv2ch47137jkgNbqfVVxQep5Y1)")
 2. For each chunk in the manifest (scanned from newest to oldest blocks):
    - Downloads the Bloom filter and checks if the address appears
    - On a Bloom hit, downloads the index chunk and extracts appearance records (block number + transaction index)
