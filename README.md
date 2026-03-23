@@ -1,6 +1,6 @@
 # devp2p Playground
 
-An Ethereum devp2p implementation in Java 21 based on tuweni libraries. Connects to the Ethereum mainnet (or testnets) using the devp2p protocol stack: discv4 peer discovery, RLPx encrypted transport, and eth/67-69 sub-protocol. Includes a beacon chain light client for consensus-layer state root verification and snap/1 support for account and storage lookups with Merkle proofs and cryptographic verification back to beacon chain finality.
+An Ethereum devp2p implementation in Java 21 based on tuweni libraries meant to run on Android devices eventually. Connects to the Ethereum mainnet (or testnets) using the devp2p protocol stack: discv4 peer discovery, RLPx encrypted transport, and eth/67-69 sub-protocol. Includes a beacon chain light client for consensus-layer state root verification and snap/1 support for account and storage lookups with Merkle proofs and cryptographic verification back to beacon chain finality.
 
 ## Documentation
 
@@ -248,6 +248,52 @@ Returns storage slot data for a contract with Merkle-Patricia proof verification
 | `verifyMethod` | string | `"stateRootMatch"` or `"headerChain"` (same as `get-account`, only present when `beaconChainVerified=true`) |
 | `matchedBeaconSlot` | long | Beacon slot trust anchor (only present when `beaconChainVerified=true`) |
 | `blsVerified` | boolean | Whether the trust anchor has BLS verification (only present when `beaconChainVerified=true`) |
+
+### Get transactions
+
+```bash
+./gradlew :app:run -Pargs="get-transactions 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+```
+
+Returns all transactions for an address by looking them up in the [TrueBlocks Unchained Index](https://trueblocks.io/). Results are streamed as JSON-Lines (one JSON object per transaction), followed by a summary object.
+
+**How it works:**
+
+1. Fetches the TrueBlocks manifest from IPFS (hardcoded CID: `QmUBS83qjRmXmSgEvZADVv2ch47137jkgNbqfVVxQep5Y1`)
+2. For each chunk in the manifest (scanned from newest to oldest blocks):
+   - Downloads the Bloom filter and checks if the address appears
+   - On a Bloom hit, downloads the index chunk and extracts appearance records (block number + transaction index)
+3. For each appearance, fetches the block header and body from devp2p peers and extracts the raw transaction
+4. Parses the transaction RLP into human-readable fields (supports legacy, EIP-2930, EIP-1559, and EIP-4844 transaction types)
+
+**Transaction fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `blockNumber` | long | Block containing the transaction |
+| `transactionIndex` | int | Position within the block |
+| `type` | int | Transaction type (0=legacy, 1=EIP-2930, 2=EIP-1559, 3=EIP-4844) |
+| `nonce` | long | Sender's transaction count |
+| `to` | string | Recipient address (absent for contract creation) |
+| `value` | string | Value transferred in wei (hex) |
+| `gasLimit` | long | Gas limit |
+| `gasPrice` | string | Gas price in wei (type 0-1, hex) |
+| `maxPriorityFeePerGas` | string | Priority fee (type 2-3, hex) |
+| `maxFeePerGas` | string | Max fee (type 2-3, hex) |
+| `maxFeePerBlobGas` | string | Max blob fee (type 3, hex) |
+| `chainId` | long | Chain ID (type 1-3) |
+| `data` | string | Input data (hex, absent if empty) |
+| `rawTx` | string | Full raw transaction bytes (hex) |
+| `verified` | boolean | Always `false` (see limitations below) |
+
+The stream ends with `{"ok":true,"done":true,"totalTransactions":N}`.
+
+**Limitations:**
+
+- **Blocks are not verified.** Individual transactions are not yet verified against the block's `transactionsRoot`. The `verified` field is always `false`. This means a malicious peer could serve tampered transaction data. Verification against the transactions trie is planned but not implemented.
+- **The Unchained Index is stale.** The manifest CID is hardcoded and points to a snapshot of the TrueBlocks index that is not kept up to date. Transactions in recent blocks will not be found. There is currently no mechanism to dynamically update the manifest CID.
+- **Completeness is not guaranteed.** IPFS content-addressing guarantees the index data has not been tampered with, but it does not guarantee all appearances for an address are present. If the TrueBlocks index has missing entries (due to indexing gaps or incomplete coverage), transactions will be silently missed. A future mitigation is balance reconciliation -- computing the expected balance from fetched transactions and comparing it against the on-chain balance via snap proofs.
+- **Signature and access list data not returned.** The parsed JSON omits signature fields (v, r, s), access list details (type 1-2), and blob versioned hashes (type 3).
 
 ### Dial a specific peer
 
