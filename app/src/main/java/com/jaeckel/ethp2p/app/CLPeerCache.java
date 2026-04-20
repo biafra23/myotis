@@ -42,12 +42,14 @@ public final class CLPeerCache {
      * Record a successful interaction with a peer: add it to the cache if new and
      * reset its failure counter.
      */
-    public void add(String multiaddr) {
+    public synchronized void add(String multiaddr) {
         if (multiaddr == null || multiaddr.isEmpty()) return;
         failures.remove(multiaddr);
         if (!seen.add(multiaddr)) return;
 
         try {
+            // Shares the monitor with rewriteFile() so an append can't interleave
+            // with a truncate+rewrite from a concurrent eviction.
             Files.writeString(cacheFile, multiaddr + "\n",
                     StandardOpenOption.CREATE, StandardOpenOption.APPEND);
             log.info("[cl-cache] Saved responsive CL peer: {}", multiaddr);
