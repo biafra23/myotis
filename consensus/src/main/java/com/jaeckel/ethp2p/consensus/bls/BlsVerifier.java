@@ -223,7 +223,7 @@ public final class BlsVerifier {
 
         int cmpImag = BIG.comp(yImag, halfP);
         if (cmpImag > 0) return true;
-        if (cmpImag < 0 || !yImag.iszilch()) return false;
+        if (!yImag.iszilch()) return false;
         // imaginary part is zero, compare real part
         return BIG.comp(yReal, halfP) > 0;
     }
