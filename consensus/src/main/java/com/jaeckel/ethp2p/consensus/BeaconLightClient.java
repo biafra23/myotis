@@ -469,10 +469,10 @@ public class BeaconLightClient implements AutoCloseable {
      * nextSyncCommittee for each intermediate period and rotate until we reach the
      * current period.
      */
-    private void catchUpSyncCommittee() {
-        long bootstrapSlot = store.getFinalizedSlot();
-        long bootstrapPeriod = BeaconChainSpec.computeSyncCommitteePeriod(bootstrapSlot);
+    /** Max 128-period batches per catch-up call. Bounds wall-clock on very old checkpoints. */
+    private static final int MAX_CATCHUP_BATCHES = 8;
 
+    private void catchUpSyncCommittee() {
         // Estimate current period from wall clock:
         // Genesis time for mainnet = 1606824023
         // Each slot = 12s, each period = 8192 slots
@@ -481,28 +481,48 @@ public class BeaconLightClient implements AutoCloseable {
         long currentSlotEstimate = (now - genesisTime) / 12;
         long currentPeriod = BeaconChainSpec.computeSyncCommitteePeriod(currentSlotEstimate);
 
-        if (currentPeriod <= bootstrapPeriod) {
-            log.info("[beacon] Sync committee is current (period {}), no catch-up needed", bootstrapPeriod);
-            return;
+        for (int batch = 0; batch < MAX_CATCHUP_BATCHES && running; batch++) {
+            long bootstrapPeriod = BeaconChainSpec.computeSyncCommitteePeriod(store.getFinalizedSlot());
+            if (currentPeriod <= bootstrapPeriod) {
+                if (batch == 0) {
+                    log.info("[beacon] Sync committee is current (period {}), no catch-up needed", bootstrapPeriod);
+                }
+                return;
+            }
+
+            long periodsToFetch = currentPeriod - bootstrapPeriod;
+            log.info("[beacon] Sync committee catch-up batch {}: bootstrap period={}, current period={}, fetching {} update(s)",
+                    batch, bootstrapPeriod, currentPeriod, periodsToFetch);
+
+            if (!attemptCatchUpBatch(bootstrapPeriod, periodsToFetch, currentSlotEstimate)) {
+                log.warn("[beacon] Catch-up batch {} made no progress — will retry on next sync cycle", batch);
+                return;
+            }
         }
 
-        long periodsToFetch = currentPeriod - bootstrapPeriod;
-        log.info("[beacon] Sync committee catch-up: bootstrap period={}, current period={}, fetching {} update(s)",
-                bootstrapPeriod, currentPeriod, periodsToFetch);
+        long finalPeriod = BeaconChainSpec.computeSyncCommitteePeriod(store.getFinalizedSlot());
+        if (finalPeriod < currentPeriod) {
+            log.warn("[beacon] Catch-up hit batch cap ({}) at period {} (target {}); further progress on next cycle",
+                    MAX_CATCHUP_BATCHES, finalPeriod, currentPeriod);
+        }
+    }
 
+    /**
+     * Run one parallel 128-period fetch across all peers; return true if the store advanced.
+     */
+    private boolean attemptCatchUpBatch(long bootstrapPeriod, long periodsToFetch, long slotEstimate) {
         // Fire requests to all peers in parallel — first peer to deliver a response that
         // actually advances the store wins. Serial iteration with 30s timeouts meant ~9
         // minutes worst case with a list full of dead peers.
         List<String> peers = peersPrioritized(lastBootstrapPeer);
         int count = (int) Math.min(periodsToFetch, 128);
-        long slotEstimate = currentSlotEstimate;
 
         CompletableFuture<Boolean> winner = new CompletableFuture<>();
         java.util.concurrent.atomic.AtomicInteger remaining =
                 new java.util.concurrent.atomic.AtomicInteger(peers.size());
 
         for (String peer : peers) {
-            if (!running) return;
+            if (!running) return false;
             p2pService.requestUpdatesByRange(peer, bootstrapPeriod, count)
                     .whenComplete((responses, ex) -> {
                         if (ex != null) {
@@ -545,11 +565,10 @@ public class BeaconLightClient implements AutoCloseable {
         }
 
         try {
-            if (!winner.get(60, TimeUnit.SECONDS)) {
-                log.warn("[beacon] Could not catch up sync committee from any peer");
-            }
+            return winner.get(60, TimeUnit.SECONDS);
         } catch (Exception e) {
             log.warn("[beacon] Catch-up wait aborted: {}", e.getMessage());
+            return false;
         }
     }
 
