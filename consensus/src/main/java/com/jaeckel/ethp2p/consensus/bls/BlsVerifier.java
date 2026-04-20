@@ -28,6 +28,19 @@ public final class BlsVerifier {
     /** BLS12-381 prime-order subgroup generator scalar, used for subgroup membership checks. */
     private static final BIG CURVE_ORDER = new BIG(ROM.CURVE_Order);
 
+    /**
+     * (p-1)/2, used as the midpoint when encoding the y-coordinate sort flag for
+     * compressed BLS12-381 points. Cached because every serialize/deserialize call
+     * would otherwise rebuild it.
+     */
+    private static final BIG HALF_P = buildHalfP();
+
+    private static BIG buildHalfP() {
+        BIG halfP = new BIG(new BIG(ROM.Modulus));
+        halfP.shr(1);
+        return halfP;
+    }
+
     private BlsVerifier() {}
 
     /**
@@ -118,10 +131,7 @@ public final class BlsVerifier {
 
         // Choose correct y based on sort flag
         BIG y = point.getY();
-        BIG pMod = new BIG(ROM.Modulus);
-        BIG halfP = new BIG(pMod);
-        halfP.shr(1);
-        boolean yLarger = BIG.comp(y, halfP) > 0;
+        boolean yLarger = BIG.comp(y, HALF_P) > 0;
         if (yLarger != sortFlag) {
             point.neg();
         }
@@ -187,9 +197,7 @@ public final class BlsVerifier {
         result[0] |= (byte) 0x80; // compressed flag
 
         BIG y = point.getY();
-        BIG halfP = new BIG(new BIG(ROM.Modulus));
-        halfP.shr(1);
-        if (BIG.comp(y, halfP) > 0) {
+        if (BIG.comp(y, HALF_P) > 0) {
             result[0] |= (byte) 0x20; // sort flag
         }
         return result;
@@ -251,13 +259,11 @@ public final class BlsVerifier {
         y.reduce();
         BIG yImag = y.getB();
         BIG yReal = y.getA();
-        BIG halfP = new BIG(new BIG(ROM.Modulus));
-        halfP.shr(1);
 
-        int cmpImag = BIG.comp(yImag, halfP);
+        int cmpImag = BIG.comp(yImag, HALF_P);
         if (cmpImag > 0) return true;
         if (!yImag.iszilch()) return false;
         // imaginary part is zero, compare real part
-        return BIG.comp(yReal, halfP) > 0;
+        return BIG.comp(yReal, HALF_P) > 0;
     }
 }
