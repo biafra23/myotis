@@ -231,6 +231,26 @@ class BlsFixtureTest {
                 "G2 must reject infinity encoding with sort flag set");
     }
 
+    @Test
+    void fastAggregateVerify_rejectsInfinitySignature() {
+        byte[] pk = hex(fixtures.get("single.0.pk"));
+        byte[] msg = hex(fixtures.get("single.0.msg"));
+        byte[] infSig = new byte[96];
+        infSig[0] = (byte) 0xC0; // canonical compressed infinity
+        assertFalse(BlsVerifier.fastAggregateVerify(List.of(pk), msg, infSig),
+                "must reject identity-encoded signature");
+    }
+
+    @Test
+    void fastAggregateVerify_rejectsInfinityPubkey() {
+        byte[] infPk = new byte[48];
+        infPk[0] = (byte) 0xC0;
+        byte[] msg = hex(fixtures.get("single.0.msg"));
+        byte[] sig = hex(fixtures.get("single.0.sig"));
+        assertFalse(BlsVerifier.fastAggregateVerify(List.of(infPk), msg, sig),
+                "must reject identity-encoded pubkey");
+    }
+
     private static byte[] hex(String s) {
         int len = s.length();
         byte[] out = new byte[len / 2];

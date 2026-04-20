@@ -25,6 +25,9 @@ public final class BlsVerifier {
     private static final String DST_STRING = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
     private static final byte[] DST_BYTES = DST_STRING.getBytes();
 
+    /** BLS12-381 prime-order subgroup generator scalar, used for subgroup membership checks. */
+    private static final BIG CURVE_ORDER = new BIG(ROM.CURVE_Order);
+
     private BlsVerifier() {}
 
     /**
@@ -48,20 +51,22 @@ public final class BlsVerifier {
             return false;
         }
         try {
-            // Decompress and aggregate pubkeys
+            // Decompress and aggregate pubkeys. Per the BLS spec, KeyValidate
+            // rejects the identity pubkey (allows trivial forgeries).
             ECP aggregated = deserializeG1(pubkeyBytes.get(0));
-            if (aggregated == null) return false;
+            if (aggregated == null || aggregated.is_infinity()) return false;
 
             for (int i = 1; i < pubkeyBytes.size(); i++) {
                 ECP pk = deserializeG1(pubkeyBytes.get(i));
-                if (pk == null) return false;
+                if (pk == null || pk.is_infinity()) return false;
                 aggregated.add(pk);
             }
             aggregated.affine();
 
-            // Decompress signature
+            // Decompress signature. Identity signatures would pair trivially to 1
+            // against any identity pubkey, so reject them explicitly as well.
             ECP2 sig = deserializeG2(signatureBytes);
-            if (sig == null) return false;
+            if (sig == null || sig.is_infinity()) return false;
 
             // Hash message to G2
             ECP2 hm = HashToCurve.hashToG2(message, DST_BYTES);
@@ -120,6 +125,7 @@ public final class BlsVerifier {
         if (yLarger != sortFlag) {
             point.neg();
         }
+        if (!isInG1Subgroup(point)) return null;
         return point;
     }
 
@@ -161,6 +167,7 @@ public final class BlsVerifier {
         if (isLargerY(point) != sortFlag) {
             point.neg();
         }
+        if (!isInG2Subgroup(point)) return null;
         return point;
     }
 
@@ -216,6 +223,23 @@ public final class BlsVerifier {
             result[0] |= (byte) 0x20; // sort flag
         }
         return result;
+    }
+
+    /**
+     * Subgroup membership check for G1. Rejects points on the curve that are not in
+     * the prime-order subgroup (needed to prevent small-subgroup attacks during pairing).
+     * Uses the straightforward r*P == O test; callers multiplying large batches may want
+     * to cache validated points.
+     */
+    private static boolean isInG1Subgroup(ECP point) {
+        return point.mul(CURVE_ORDER).is_infinity();
+    }
+
+    /**
+     * Subgroup membership check for G2. See {@link #isInG1Subgroup}.
+     */
+    private static boolean isInG2Subgroup(ECP2 point) {
+        return point.mul(CURVE_ORDER).is_infinity();
     }
 
     /**
