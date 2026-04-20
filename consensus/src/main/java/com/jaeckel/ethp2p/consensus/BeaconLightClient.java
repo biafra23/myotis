@@ -59,6 +59,7 @@ public class BeaconLightClient implements AutoCloseable {
     private final byte[] checkpointRoot;      // 32-byte trusted checkpoint block root
     private final byte[] forkVersion;         // 4-byte fork version
     private final byte[] genesisValidatorsRoot; // 32-byte genesis validators root
+    private final long clGenesisTime;         // beacon chain genesis time (seconds since epoch)
     private final java.util.function.Consumer<String> onPeerSuccess; // nullable; called with multiaddr on success
     private final java.util.function.Consumer<String> onPeerFailure; // nullable; called with multiaddr on failure
 
@@ -84,7 +85,7 @@ public class BeaconLightClient implements AutoCloseable {
                               BeaconSyncState syncState,
                               String beaconApiUrl) {
         this(clPeerMultiaddrs, checkpointRoot, forkVersion, genesisValidatorsRoot,
-                syncState, beaconApiUrl, null);
+                syncState, beaconApiUrl, null, null, BeaconChainSpec.MAINNET_GENESIS_TIME);
     }
 
     /**
@@ -106,7 +107,7 @@ public class BeaconLightClient implements AutoCloseable {
                               String beaconApiUrl,
                               java.util.function.Consumer<String> onPeerSuccess) {
         this(clPeerMultiaddrs, checkpointRoot, forkVersion, genesisValidatorsRoot,
-                syncState, beaconApiUrl, onPeerSuccess, null);
+                syncState, beaconApiUrl, onPeerSuccess, null, BeaconChainSpec.MAINNET_GENESIS_TIME);
     }
 
     /**
@@ -124,6 +125,28 @@ public class BeaconLightClient implements AutoCloseable {
                               String beaconApiUrl,
                               java.util.function.Consumer<String> onPeerSuccess,
                               java.util.function.Consumer<String> onPeerFailure) {
+        this(clPeerMultiaddrs, checkpointRoot, forkVersion, genesisValidatorsRoot,
+                syncState, beaconApiUrl, onPeerSuccess, onPeerFailure,
+                BeaconChainSpec.MAINNET_GENESIS_TIME);
+    }
+
+    /**
+     * Construct a BeaconLightClient with network-specific beacon chain genesis time.
+     *
+     * @param clGenesisTime beacon chain genesis time in seconds since epoch. Used to
+     *                      estimate the current wall-clock sync-committee period for
+     *                      catch-up targeting; must match the network the checkpointRoot
+     *                      was taken from.
+     */
+    public BeaconLightClient(List<String> clPeerMultiaddrs,
+                              byte[] checkpointRoot,
+                              byte[] forkVersion,
+                              byte[] genesisValidatorsRoot,
+                              BeaconSyncState syncState,
+                              String beaconApiUrl,
+                              java.util.function.Consumer<String> onPeerSuccess,
+                              java.util.function.Consumer<String> onPeerFailure,
+                              long clGenesisTime) {
         if (checkpointRoot == null || checkpointRoot.length != 32) {
             throw new IllegalArgumentException("checkpointRoot must be 32 bytes");
         }
@@ -139,6 +162,7 @@ public class BeaconLightClient implements AutoCloseable {
         this.checkpointRoot = checkpointRoot.clone();
         this.forkVersion = forkVersion.clone();
         this.genesisValidatorsRoot = genesisValidatorsRoot.clone();
+        this.clGenesisTime = clGenesisTime;
         this.syncState = syncState;
         this.onPeerSuccess = onPeerSuccess;
         this.onPeerFailure = onPeerFailure;
@@ -473,12 +497,9 @@ public class BeaconLightClient implements AutoCloseable {
     private static final int MAX_CATCHUP_BATCHES = 8;
 
     private void catchUpSyncCommittee() {
-        // Estimate current period from wall clock:
-        // Genesis time for mainnet = 1606824023
-        // Each slot = 12s, each period = 8192 slots
+        // Estimate current period from wall clock, using the network's CL genesis time.
         long now = System.currentTimeMillis() / 1000;
-        long genesisTime = 1606824023L;
-        long currentSlotEstimate = (now - genesisTime) / 12;
+        long currentSlotEstimate = (now - clGenesisTime) / 12;
         long currentPeriod = BeaconChainSpec.computeSyncCommitteePeriod(currentSlotEstimate);
 
         for (int batch = 0; batch < MAX_CATCHUP_BATCHES && running; batch++) {

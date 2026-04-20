@@ -54,17 +54,27 @@ public class CommandHandler {
     private final Set<String> blacklistedNodeIds;
     private final BeaconSyncState beaconSyncState;
     private final BeaconLightClient beaconLightClient; // nullable
+    private final long clGenesisTime; // beacon chain genesis time (seconds since epoch)
 
     public CommandHandler(DiscV4Service discV4, RLPxConnector connector,
                           CountDownLatch stopLatch, Map<String, Long> backoff,
                           Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState) {
-        this(discV4, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState, null);
+        this(discV4, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState,
+                null, BeaconChainSpec.MAINNET_GENESIS_TIME);
     }
 
     public CommandHandler(DiscV4Service discV4, RLPxConnector connector,
                           CountDownLatch stopLatch, Map<String, Long> backoff,
                           Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState,
                           BeaconLightClient beaconLightClient) {
+        this(discV4, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState,
+                beaconLightClient, BeaconChainSpec.MAINNET_GENESIS_TIME);
+    }
+
+    public CommandHandler(DiscV4Service discV4, RLPxConnector connector,
+                          CountDownLatch stopLatch, Map<String, Long> backoff,
+                          Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState,
+                          BeaconLightClient beaconLightClient, long clGenesisTime) {
         this.discV4 = discV4;
         this.connector = connector;
         this.startTimeMs = System.currentTimeMillis();
@@ -73,6 +83,7 @@ public class CommandHandler {
         this.blacklistedNodeIds = blacklistedNodeIds;
         this.beaconSyncState = beaconSyncState;
         this.beaconLightClient = beaconLightClient;
+        this.clGenesisTime = clGenesisTime;
     }
 
     /** Parse and dispatch one JSON-Lines request; returns a JSON-Lines response. */
@@ -974,7 +985,7 @@ public class CommandHandler {
         long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
         byte[] beaconRoot = beaconSyncState.getVerifiedExecutionStateRoot();
         long finalizedPeriod = beaconSyncState.getFinalizedPeriod();
-        long wallClockPeriod = BeaconChainSpec.currentMainnetPeriod();
+        long wallClockPeriod = BeaconChainSpec.currentPeriod(clGenesisTime);
         long periodLag = wallClockPeriod - finalizedPeriod;
 
         if (!beaconChainVerified) {

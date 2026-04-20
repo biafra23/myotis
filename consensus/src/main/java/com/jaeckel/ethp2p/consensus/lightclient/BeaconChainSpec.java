@@ -68,10 +68,23 @@ public final class BeaconChainSpec {
 
     /**
      * Estimate the current wall-clock sync committee period for mainnet.
+     *
+     * @deprecated prefer {@link #currentPeriod(long)} with the network-specific CL
+     * genesis time, so the estimate is correct on testnets too.
      */
+    @Deprecated
     public static long currentMainnetPeriod() {
+        return currentPeriod(MAINNET_GENESIS_TIME);
+    }
+
+    /**
+     * Estimate the current wall-clock sync committee period from a beacon chain
+     * genesis time (seconds since epoch). Callers should pass the genesis time of
+     * the network they're actually on (mainnet/sepolia/holesky differ).
+     */
+    public static long currentPeriod(long genesisTimeSec) {
         long nowSec = System.currentTimeMillis() / 1000;
-        long slot = (nowSec - MAINNET_GENESIS_TIME) / SECONDS_PER_SLOT;
+        long slot = (nowSec - genesisTimeSec) / SECONDS_PER_SLOT;
         return computeSyncCommitteePeriod(slot);
     }
 }

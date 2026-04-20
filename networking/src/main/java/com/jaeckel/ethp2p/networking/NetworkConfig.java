@@ -26,7 +26,8 @@ public record NetworkConfig(
         byte[] checkpointRoot,          // 32 bytes: trusted checkpoint block root for bootstrap
         byte[] currentForkVersion,      // 4 bytes: current fork version for signing domain
         List<String> clPeerMultiaddrs,  // libp2p multiaddrs of known CL peers
-        String beaconApiUrl             // HTTP API URL for local beacon node (e.g. http://172.17.0.1:5052)
+        String beaconApiUrl,            // HTTP API URL for local beacon node (e.g. http://172.17.0.1:5052)
+        long clGenesisTime              // beacon chain genesis time (seconds since epoch) for wall-clock period estimation
 ) {
 
     // -------------------------------------------------------------------------
@@ -99,7 +100,8 @@ public record NetworkConfig(
                     "/ip4/54.201.148.177/tcp/9000/p2p/16Uiu2HAmNwEsdBC2phX7qU7camNe9Gs21WyrpV5AZDYyjZBMYjWZ",
                     "/ip4/16.63.94.117/tcp/9000/p2p/16Uiu2HAmSd7qzG5joNgvEYYcgVvg1y9MiYjpMHMvzRzaWYqXxkCM"
             ),
-            "http://localhost:5052"
+            "http://localhost:5052",
+            1606824023L // mainnet beacon genesis: 2020-12-01 12:00:23 UTC
     );
 
     public static final NetworkConfig SEPOLIA = new NetworkConfig(
@@ -126,7 +128,8 @@ public record NetworkConfig(
             List.of(
                     "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS"
             ),
-            null
+            null,
+            1655733600L // sepolia beacon genesis: 2022-06-20 14:00:00 UTC
     );
 
     public static final NetworkConfig HOLESKY = new NetworkConfig(
@@ -150,7 +153,8 @@ public record NetworkConfig(
             List.of(
                     "/ip4/159.69.35.70/tcp/9000/p2p/16Uiu2HAmFMfXsymWEK6BFPQNPW3nPz57uB3TKpVNFDmeoW7WXNUA"
             ),
-            null
+            null,
+            1695902400L // holesky beacon genesis: 2023-09-28 12:00:00 UTC
     );
 
     // Frontier (genesis) fork IDs — CRC32(genesis_hash), forkNext = first fork block
