@@ -5,7 +5,7 @@ dependencies {
     implementation(libs.tuweni.crypto)
     implementation(libs.snappy)
     implementation(libs.slf4j.api)
-    implementation(libs.jblst)
+    implementation(libs.milagro)
     implementation(libs.jvm.libp2p)
 
     testImplementation(platform(libs.junit.bom))

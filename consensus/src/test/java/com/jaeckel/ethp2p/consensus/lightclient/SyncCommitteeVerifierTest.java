@@ -6,9 +6,11 @@ import com.jaeckel.ethp2p.consensus.types.BeaconBlockHeader;
 import com.jaeckel.ethp2p.consensus.types.ForkData;
 import com.jaeckel.ethp2p.consensus.types.SyncAggregate;
 import com.jaeckel.ethp2p.consensus.types.SyncCommittee;
+import com.jaeckel.ethp2p.consensus.bls.BlsVerifier;
+import org.apache.milagro.amcl.BLS381.BIG;
+import org.apache.milagro.amcl.BLS381.ECP;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
-import supranational.blst.SecretKey;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -25,12 +27,12 @@ class SyncCommitteeVerifierTest {
     private static final byte[] GVR = new byte[32]; // all-zero genesis validators root
 
     // Pre-generated keys for BLS tests (512 keys)
-    private static SecretKey[] secretKeys;
+    private static BIG[] secretKeys;
     private static byte[][] pubkeys;
 
     @BeforeAll
     static void generateKeys() {
-        secretKeys = new SecretKey[512];
+        secretKeys = new BIG[512];
         pubkeys = new byte[512][];
         for (int i = 0; i < 512; i++) {
             secretKeys[i] = TestUtil.generateSecretKey(5000 + i);
@@ -191,11 +193,12 @@ class SyncCommitteeVerifierTest {
 
     private SyncCommittee buildSyncCommittee() {
         // Compute aggregate pubkey from all 512 keys
-        supranational.blst.P1 agg = new supranational.blst.P1(new supranational.blst.P1_Affine(pubkeys[0]));
+        ECP agg = BlsVerifier.deserializeG1(pubkeys[0]);
         for (int i = 1; i < 512; i++) {
-            agg.aggregate(new supranational.blst.P1_Affine(pubkeys[i]));
+            agg.add(BlsVerifier.deserializeG1(pubkeys[i]));
         }
-        return new SyncCommittee(pubkeys, agg.compress());
+        agg.affine();
+        return new SyncCommittee(pubkeys, BlsVerifier.serializeG1(agg));
     }
 
     /**

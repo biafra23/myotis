@@ -1,8 +1,8 @@
 package com.jaeckel.ethp2p.consensus.bls;
 
 import com.jaeckel.ethp2p.consensus.TestUtil;
+import org.apache.milagro.amcl.BLS381.BIG;
 import org.junit.jupiter.api.Test;
-import supranational.blst.SecretKey;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -56,11 +56,11 @@ class BlsVerifierTest {
         assertFalse(BlsVerifier.fastAggregateVerify(List.of(pubkey), msg, wrongSig));
     }
 
-    // === New positive tests ===
+    // === Positive tests ===
 
     @Test
     void validSingleSignatureVerifies() {
-        SecretKey sk = TestUtil.generateSecretKey(1);
+        BIG sk = TestUtil.generateSecretKey(1);
         byte[] pk = TestUtil.getPublicKey(sk);
         byte[] msg = new byte[32];
         msg[0] = 0x42;
@@ -78,7 +78,7 @@ class BlsVerifierTest {
         List<byte[]> pubkeys = new ArrayList<>();
         List<byte[]> sigs = new ArrayList<>();
         for (int i = 0; i < count; i++) {
-            SecretKey sk = TestUtil.generateSecretKey(100 + i);
+            BIG sk = TestUtil.generateSecretKey(100 + i);
             pubkeys.add(TestUtil.getPublicKey(sk));
             sigs.add(TestUtil.blsSign(sk, msg));
         }
@@ -87,11 +87,11 @@ class BlsVerifierTest {
         assertTrue(BlsVerifier.fastAggregateVerify(pubkeys, msg, aggSig));
     }
 
-    // === New negative tests ===
+    // === Negative tests ===
 
     @Test
     void rejectsWrongMessage() {
-        SecretKey sk = TestUtil.generateSecretKey(2);
+        BIG sk = TestUtil.generateSecretKey(2);
         byte[] pk = TestUtil.getPublicKey(sk);
         byte[] msg = new byte[32];
         msg[0] = 0x01;
@@ -104,7 +104,7 @@ class BlsVerifierTest {
 
     @Test
     void rejectsWrongSignature() {
-        SecretKey sk = TestUtil.generateSecretKey(3);
+        BIG sk = TestUtil.generateSecretKey(3);
         byte[] pk = TestUtil.getPublicKey(sk);
         byte[] msg = new byte[32];
         byte[] sig = TestUtil.blsSign(sk, msg);
@@ -117,8 +117,8 @@ class BlsVerifierTest {
 
     @Test
     void rejectsWrongPubkey() {
-        SecretKey sk1 = TestUtil.generateSecretKey(4);
-        SecretKey sk2 = TestUtil.generateSecretKey(5);
+        BIG sk1 = TestUtil.generateSecretKey(4);
+        BIG sk2 = TestUtil.generateSecretKey(5);
         byte[] pk2 = TestUtil.getPublicKey(sk2);
         byte[] msg = new byte[32];
         byte[] sig = TestUtil.blsSign(sk1, msg);
@@ -135,7 +135,7 @@ class BlsVerifierTest {
         List<byte[]> allPks = new ArrayList<>();
         List<byte[]> sigs = new ArrayList<>();
         for (int i = 0; i < 3; i++) {
-            SecretKey sk = TestUtil.generateSecretKey(200 + i);
+            BIG sk = TestUtil.generateSecretKey(200 + i);
             allPks.add(TestUtil.getPublicKey(sk));
             sigs.add(TestUtil.blsSign(sk, msg));
         }
@@ -154,7 +154,7 @@ class BlsVerifierTest {
         List<byte[]> signerPks = new ArrayList<>();
         List<byte[]> sigs = new ArrayList<>();
         for (int i = 0; i < 2; i++) {
-            SecretKey sk = TestUtil.generateSecretKey(300 + i);
+            BIG sk = TestUtil.generateSecretKey(300 + i);
             signerPks.add(TestUtil.getPublicKey(sk));
             sigs.add(TestUtil.blsSign(sk, msg));
         }
