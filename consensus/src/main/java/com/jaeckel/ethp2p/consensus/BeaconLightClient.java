@@ -60,6 +60,9 @@ public class BeaconLightClient implements AutoCloseable {
     private final byte[] forkVersion;         // 4-byte fork version
     private final byte[] genesisValidatorsRoot; // 32-byte genesis validators root
     private final java.util.function.Consumer<String> onPeerSuccess; // nullable; called with multiaddr on success
+    private final java.util.function.Consumer<String> onPeerFailure; // nullable; called with multiaddr on failure
+
+    private volatile String lastBootstrapPeer; // multiaddr of the peer that last served a bootstrap; prioritized by catch-up
 
     private volatile Thread syncThread;
     private volatile boolean running;
@@ -102,6 +105,25 @@ public class BeaconLightClient implements AutoCloseable {
                               BeaconSyncState syncState,
                               String beaconApiUrl,
                               java.util.function.Consumer<String> onPeerSuccess) {
+        this(clPeerMultiaddrs, checkpointRoot, forkVersion, genesisValidatorsRoot,
+                syncState, beaconApiUrl, onPeerSuccess, null);
+    }
+
+    /**
+     * Construct a BeaconLightClient with peer success + failure callbacks.
+     *
+     * @param onPeerFailure nullable callback invoked with peer multiaddr on protocol failure
+     *                      (timeout, reset, InvalidRemotePubKey, etc.). Used to evict dead
+     *                      peers from the cache.
+     */
+    public BeaconLightClient(List<String> clPeerMultiaddrs,
+                              byte[] checkpointRoot,
+                              byte[] forkVersion,
+                              byte[] genesisValidatorsRoot,
+                              BeaconSyncState syncState,
+                              String beaconApiUrl,
+                              java.util.function.Consumer<String> onPeerSuccess,
+                              java.util.function.Consumer<String> onPeerFailure) {
         if (checkpointRoot == null || checkpointRoot.length != 32) {
             throw new IllegalArgumentException("checkpointRoot must be 32 bytes");
         }
@@ -119,6 +141,7 @@ public class BeaconLightClient implements AutoCloseable {
         this.genesisValidatorsRoot = genesisValidatorsRoot.clone();
         this.syncState = syncState;
         this.onPeerSuccess = onPeerSuccess;
+        this.onPeerFailure = onPeerFailure;
 
         this.store = new LightClientStore();
         this.processor = new LightClientProcessor(store, this.forkVersion, genesisValidatorsRoot);
@@ -374,6 +397,7 @@ public class BeaconLightClient implements AutoCloseable {
                                     : root.getClass().getSimpleName();
                             log.debug("[beacon] Bootstrap failed from {}: {} ({})",
                                     peer, msg, root.getClass().getSimpleName());
+                            notifyPeerFailure(peer);
                             if (remaining.decrementAndGet() == 0 && !winnerFuture.isDone()) {
                                 winnerFuture.completeExceptionally(
                                         new RuntimeException("All peers failed bootstrap"));
@@ -411,6 +435,7 @@ public class BeaconLightClient implements AutoCloseable {
                                     updateSyncState();
                                     winnerFuture.complete(response);
                                     successPeer = peer;
+                                    lastBootstrapPeer = peer;
                                     log.info("[beacon] Bootstrap complete from {}, slot={}",
                                             peer, bootstrap.header().beacon().slot());
                                 }
@@ -465,58 +490,97 @@ public class BeaconLightClient implements AutoCloseable {
         log.info("[beacon] Sync committee catch-up: bootstrap period={}, current period={}, fetching {} update(s)",
                 bootstrapPeriod, currentPeriod, periodsToFetch);
 
-        List<String> peers = copyPeers();
+        // Fire requests to all peers in parallel — first peer to deliver a response that
+        // actually advances the store wins. Serial iteration with 30s timeouts meant ~9
+        // minutes worst case with a list full of dead peers.
+        List<String> peers = peersPrioritized(lastBootstrapPeer);
+        int count = (int) Math.min(periodsToFetch, 128);
+        long slotEstimate = currentSlotEstimate;
+
+        CompletableFuture<Boolean> winner = new CompletableFuture<>();
+        java.util.concurrent.atomic.AtomicInteger remaining =
+                new java.util.concurrent.atomic.AtomicInteger(peers.size());
+
         for (String peer : peers) {
             if (!running) return;
-            try {
-                List<byte[]> responses = p2pService
-                        .requestUpdatesByRange(peer, bootstrapPeriod, (int) Math.min(periodsToFetch, 128))
-                        .get(30, TimeUnit.SECONDS);
-
-                if (responses.isEmpty()) {
-                    log.debug("[beacon] No updates returned from {} for period range {}-{}",
-                            peer, bootstrapPeriod, bootstrapPeriod + periodsToFetch - 1);
-                    continue;
-                }
-
-                int applied = 0;
-                for (byte[] responseSsz : responses) {
-                    try {
-                        LightClientUpdate update = LightClientUpdate.decode(responseSsz);
-                        if (processor.processUpdate(update)) {
-                            applied++;
-                            updateSyncState();
-                            // Rotate sync committee between updates: finality lags attestation,
-                            // so the finalized slot in the update may not cross the period
-                            // boundary even though the next update is signed by the new committee.
-                            // Force-rotate based on wall clock so the next update can be verified.
-                            store.forceRotateIfPastPeriod(currentSlotEstimate);
-                            log.debug("[beacon] Catch-up: applied update slot={}, store period now={}",
-                                    update.finalizedHeader().beacon().slot(),
-                                    BeaconChainSpec.computeSyncCommitteePeriod(store.getFinalizedSlot()));
-                        } else {
-                            log.debug("[beacon] Catch-up update not applied (slot={})",
-                                    update.finalizedHeader().beacon().slot());
+            p2pService.requestUpdatesByRange(peer, bootstrapPeriod, count)
+                    .whenComplete((responses, ex) -> {
+                        if (ex != null) {
+                            Throwable root = ex;
+                            while (root.getCause() != null) root = root.getCause();
+                            log.debug("[beacon] Catch-up updates_by_range failed from {}: {}",
+                                    peer, root.getMessage());
+                            notifyPeerFailure(peer);
+                            if (remaining.decrementAndGet() == 0 && !winner.isDone()) {
+                                winner.complete(false);
+                            }
+                            return;
                         }
-                    } catch (Exception e) {
-                        log.debug("[beacon] Failed to decode/process catch-up update: {}", e.getMessage());
-                    }
-                }
+                        // Serialize state mutation; first apply-success wins.
+                        synchronized (store) {
+                            if (winner.isDone()) return;
+                            if (responses == null || responses.isEmpty()) {
+                                log.debug("[beacon] No updates returned from {}", peer);
+                                if (remaining.decrementAndGet() == 0 && !winner.isDone()) {
+                                    winner.complete(false);
+                                }
+                                return;
+                            }
+                            int applied = applyCatchUpResponses(responses, slotEstimate);
+                            if (applied > 0) {
+                                long newPeriod = BeaconChainSpec.computeSyncCommitteePeriod(store.getFinalizedSlot());
+                                notifyPeerSuccess(peer);
+                                log.info("[beacon] Sync committee catch-up: applied {} update(s) from {}, now at period {} (slot {})",
+                                        applied, peer, newPeriod, store.getFinalizedSlot());
+                                winner.complete(true);
+                            } else {
+                                log.debug("[beacon] Catch-up: peer {} returned {} update(s), none applied",
+                                        peer, responses.size());
+                                if (remaining.decrementAndGet() == 0 && !winner.isDone()) {
+                                    winner.complete(false);
+                                }
+                            }
+                        }
+                    });
+        }
 
-                if (applied > 0) {
-                    long newPeriod = BeaconChainSpec.computeSyncCommitteePeriod(store.getFinalizedSlot());
-                    notifyPeerSuccess(peer);
-                    log.info("[beacon] Sync committee catch-up: applied {} update(s), now at period {} (slot {})",
-                            applied, newPeriod, store.getFinalizedSlot());
-                    return;
+        try {
+            if (!winner.get(60, TimeUnit.SECONDS)) {
+                log.warn("[beacon] Could not catch up sync committee from any peer");
+            }
+        } catch (Exception e) {
+            log.warn("[beacon] Catch-up wait aborted: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Decode and process a list of catch-up response SSZ blobs, returning the number applied.
+     * Must be called while holding the {@code store} monitor.
+     */
+    private int applyCatchUpResponses(List<byte[]> responses, long currentSlotEstimate) {
+        int applied = 0;
+        for (byte[] responseSsz : responses) {
+            try {
+                LightClientUpdate update = LightClientUpdate.decode(responseSsz);
+                if (processor.processUpdate(update)) {
+                    applied++;
+                    updateSyncState();
+                    // Rotate sync committee between updates: finality lags attestation,
+                    // so the finalized slot in the update may not cross the period
+                    // boundary even though the next update is signed by the new committee.
+                    store.forceRotateIfPastPeriod(currentSlotEstimate);
+                    log.debug("[beacon] Catch-up: applied update slot={}, store period now={}",
+                            update.finalizedHeader().beacon().slot(),
+                            BeaconChainSpec.computeSyncCommitteePeriod(store.getFinalizedSlot()));
+                } else {
+                    log.debug("[beacon] Catch-up update not applied (slot={})",
+                            update.finalizedHeader().beacon().slot());
                 }
             } catch (Exception e) {
-                Throwable root = e;
-                while (root.getCause() != null) root = root.getCause();
-                log.debug("[beacon] Catch-up updates_by_range failed from {}: {}", peer, root.getMessage());
+                log.debug("[beacon] Failed to decode/process catch-up update: {}", e.getMessage());
             }
         }
-        log.warn("[beacon] Could not catch up sync committee from any peer");
+        return applied;
     }
 
     /**
@@ -582,6 +646,7 @@ public class BeaconLightClient implements AutoCloseable {
                         : e.getClass().getSimpleName()
                           + (e.getCause() != null ? ": " + e.getCause().getMessage() : "");
                 log.warn("[beacon] Finality update seed failed from {}: {}", peer, msg);
+                notifyPeerFailure(peer);
             }
         }
         log.warn("[beacon] Could not seed from any peer — will retry on next sync cycle");
@@ -716,6 +781,11 @@ public class BeaconLightClient implements AutoCloseable {
                 // and retry bootstrap on the next cycle
                 log.debug("[beacon] Bootstrap pending, continuing with seeded mode");
             } else {
+                // Bootstrap just succeeded via retry. Mirror the syncLoop phase-1b work
+                // so the sync committee is caught up to wall-clock before we start
+                // verifying finality updates against a stale committee.
+                catchUpSyncCommittee();
+                fillChainStateRootsFromAnyPeer(true);
                 return;
             }
         }
@@ -773,6 +843,7 @@ public class BeaconLightClient implements AutoCloseable {
                         : e.getClass().getSimpleName()
                           + (e.getCause() != null ? ": " + e.getCause().getMessage() : "");
                 log.debug("[beacon] Finality update failed from {}: {}", peer, msg);
+                notifyPeerFailure(peer);
             }
         }
     }
@@ -928,6 +999,32 @@ public class BeaconLightClient implements AutoCloseable {
     private List<String> copyPeers() {
         synchronized (clPeerMultiaddrs) {
             return List.copyOf(clPeerMultiaddrs);
+        }
+    }
+
+    /**
+     * Return peers with {@code preferred} moved to the front if it is in the list.
+     * Used by catch-up and finality-update polling to try the last bootstrap-success
+     * peer first — it just proved it is reachable and serves light-client protocols.
+     */
+    private List<String> peersPrioritized(String preferred) {
+        List<String> peers = copyPeers();
+        if (preferred == null || !peers.contains(preferred)) return peers;
+        List<String> reordered = new java.util.ArrayList<>(peers.size());
+        reordered.add(preferred);
+        for (String p : peers) {
+            if (!p.equals(preferred)) reordered.add(p);
+        }
+        return reordered;
+    }
+
+    private void notifyPeerFailure(String peer) {
+        if (onPeerFailure != null && peer != null) {
+            try {
+                onPeerFailure.accept(peer);
+            } catch (Exception e) {
+                log.debug("[beacon] Peer failure callback failed: {}", e.getMessage());
+            }
         }
     }
 

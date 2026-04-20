@@ -286,7 +286,8 @@ public final class Main {
                 network.genesisValidatorsRoot(),
                 beaconSyncState,
                 network.beaconApiUrl(),
-                clPeerCache::add);
+                clPeerCache::add,
+                clPeerCache::markFailure);
         beaconLightClient.start();
         log.info("[daemon] Beacon light client started with {} CL peer(s) ({} cached)",
                 clPeers.size(), clPeers.size() - network.clPeerMultiaddrs().size());

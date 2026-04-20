@@ -9,6 +9,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -17,21 +18,33 @@ import java.util.concurrent.ConcurrentHashMap;
  * so they can be reconnected on restart without discovery.
  *
  * <p>File format: one multiaddr per line (e.g. {@code /ip4/1.2.3.4/tcp/9000/p2p/16Uiu2...}).
+ *
+ * <p>Peers are evicted after {@link #FAILURE_THRESHOLD} consecutive failures so the
+ * cache does not accumulate dead peers across restarts. Any success resets a peer's
+ * counter.
  */
 public final class CLPeerCache {
 
     private static final Logger log = LoggerFactory.getLogger(CLPeerCache.class);
 
+    /** Consecutive failures before a peer is evicted from the cache. */
+    public static final int FAILURE_THRESHOLD = 3;
+
     private final Path cacheFile;
     private final Set<String> seen = ConcurrentHashMap.newKeySet();
+    private final Map<String, Integer> failures = new ConcurrentHashMap<>();
 
     public CLPeerCache(Path cacheFile) {
         this.cacheFile = cacheFile;
     }
 
-    /** Add a peer multiaddr to the cache. Thread-safe, deduplicates. */
+    /**
+     * Record a successful interaction with a peer: add it to the cache if new and
+     * reset its failure counter.
+     */
     public void add(String multiaddr) {
         if (multiaddr == null || multiaddr.isEmpty()) return;
+        failures.remove(multiaddr);
         if (!seen.add(multiaddr)) return;
 
         try {
@@ -40,6 +53,23 @@ public final class CLPeerCache {
             log.info("[cl-cache] Saved responsive CL peer: {}", multiaddr);
         } catch (IOException e) {
             log.warn("[cl-cache] Failed to write CL peer cache: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Record a failed interaction. After {@link #FAILURE_THRESHOLD} consecutive
+     * failures, the peer is removed from the cache file.
+     */
+    public void markFailure(String multiaddr) {
+        if (multiaddr == null || multiaddr.isEmpty()) return;
+        if (!seen.contains(multiaddr)) return; // not a cached peer; ignore
+        int count = failures.merge(multiaddr, 1, Integer::sum);
+        if (count >= FAILURE_THRESHOLD) {
+            if (seen.remove(multiaddr)) {
+                failures.remove(multiaddr);
+                rewriteFile();
+                log.info("[cl-cache] Evicted peer after {} consecutive failures: {}", count, multiaddr);
+            }
         }
     }
 
@@ -74,6 +104,17 @@ public final class CLPeerCache {
             }
         } catch (IOException e) {
             System.err.println("Failed to purge CL cache: " + e.getMessage());
+        }
+    }
+
+    private synchronized void rewriteFile() {
+        try {
+            // Stable order: sorted lines, idempotent across rewrites
+            List<String> lines = new ArrayList<>(seen);
+            java.util.Collections.sort(lines);
+            Files.writeString(cacheFile, String.join("\n", lines) + (lines.isEmpty() ? "" : "\n"));
+        } catch (IOException e) {
+            log.warn("[cl-cache] Failed to rewrite cache after eviction: {}", e.getMessage());
         }
     }
 }
