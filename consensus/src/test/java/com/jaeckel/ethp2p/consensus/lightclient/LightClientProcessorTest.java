@@ -3,12 +3,12 @@ package com.jaeckel.ethp2p.consensus.lightclient;
 import com.jaeckel.ethp2p.consensus.TestUtil;
 import com.jaeckel.ethp2p.consensus.ssz.SszUtil;
 import com.jaeckel.ethp2p.consensus.types.*;
+import com.jaeckel.ethp2p.consensus.bls.BlsVerifier;
+import org.apache.milagro.amcl.BLS381.BIG;
+import org.apache.milagro.amcl.BLS381.ECP;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import supranational.blst.P1;
-import supranational.blst.P1_Affine;
-import supranational.blst.SecretKey;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -24,7 +24,7 @@ class LightClientProcessorTest {
     private static final byte[] FORK_VERSION = {0x05, 0x00, 0x00, 0x00};
     private static final byte[] GVR = new byte[32];
 
-    private static SecretKey[] secretKeys;
+    private static BIG[] secretKeys;
     private static byte[][] pubkeys;
     private static SyncCommittee syncCommittee;
 
@@ -33,17 +33,13 @@ class LightClientProcessorTest {
 
     @BeforeAll
     static void generateKeys() {
-        secretKeys = new SecretKey[512];
+        secretKeys = new BIG[512];
         pubkeys = new byte[512][];
         for (int i = 0; i < 512; i++) {
             secretKeys[i] = TestUtil.generateSecretKey(8000 + i);
             pubkeys[i] = TestUtil.getPublicKey(secretKeys[i]);
         }
-        P1 agg = new P1(new P1_Affine(pubkeys[0]));
-        for (int i = 1; i < 512; i++) {
-            agg.aggregate(new P1_Affine(pubkeys[i]));
-        }
-        syncCommittee = new SyncCommittee(pubkeys, agg.compress());
+        syncCommittee = new SyncCommittee(pubkeys, aggregatePubkeys(pubkeys));
     }
 
     @BeforeEach
@@ -175,17 +171,13 @@ class LightClientProcessorTest {
     @Test
     void syncCommitteeRotatesOnPeriodBoundary() {
         // Build a next sync committee with different keys
-        SecretKey[] nextKeys = new SecretKey[512];
+        BIG[] nextKeys = new BIG[512];
         byte[][] nextPubkeys = new byte[512][];
         for (int i = 0; i < 512; i++) {
             nextKeys[i] = TestUtil.generateSecretKey(9000 + i);
             nextPubkeys[i] = TestUtil.getPublicKey(nextKeys[i]);
         }
-        P1 nextAgg = new P1(new P1_Affine(nextPubkeys[0]));
-        for (int i = 1; i < 512; i++) {
-            nextAgg.aggregate(new P1_Affine(nextPubkeys[i]));
-        }
-        SyncCommittee nextCommittee = new SyncCommittee(nextPubkeys, nextAgg.compress());
+        SyncCommittee nextCommittee = new SyncCommittee(nextPubkeys, aggregatePubkeys(nextPubkeys));
 
         // Store the next committee
         store.updateNextSyncCommittee(nextCommittee);
@@ -263,5 +255,14 @@ class LightClientProcessorTest {
             bits[i / 8] |= (1 << (i % 8));
         }
         return new SyncAggregate(bits, aggSig);
+    }
+
+    private static byte[] aggregatePubkeys(byte[][] pks) {
+        ECP agg = BlsVerifier.deserializeG1(pks[0]);
+        for (int i = 1; i < pks.length; i++) {
+            agg.add(BlsVerifier.deserializeG1(pks[i]));
+        }
+        agg.affine();
+        return BlsVerifier.serializeG1(agg);
     }
 }

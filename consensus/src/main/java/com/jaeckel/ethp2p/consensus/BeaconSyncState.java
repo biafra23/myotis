@@ -1,5 +1,7 @@
 package com.jaeckel.ethp2p.consensus;
 
+import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
+
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicReference;
@@ -96,9 +98,19 @@ public class BeaconSyncState {
 
     /**
      * Returns true if the beacon sync state has been populated with at least one update.
+     * <p>Note: this is true as soon as bootstrap completes. It does <em>not</em> imply the
+     * sync committee is current; use {@link #getFinalizedPeriod()} and compare against
+     * {@link BeaconChainSpec#currentMainnetPeriod()} to detect stale catch-up.
      */
     public boolean isSynced() {
         return state.get().executionStateRoot() != null;
+    }
+
+    /**
+     * Returns the sync committee period of the latest finalized slot, or 0 if not synced.
+     */
+    public long getFinalizedPeriod() {
+        return BeaconChainSpec.computeSyncCommitteePeriod(getFinalizedSlot());
     }
 
     /**

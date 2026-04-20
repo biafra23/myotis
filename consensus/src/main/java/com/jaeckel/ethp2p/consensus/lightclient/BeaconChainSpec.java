@@ -12,6 +12,8 @@ public final class BeaconChainSpec {
     public static final int SYNC_COMMITTEE_SIZE = 512;
     public static final int MIN_SYNC_COMMITTEE_PARTICIPANTS = 1;
     public static final int UPDATE_TIMEOUT = SLOTS_PER_SYNC_COMMITTEE_PERIOD;
+    public static final int SECONDS_PER_SLOT = 12;
+    public static final long MAINNET_GENESIS_TIME = 1606824023L;
 
     // Domain types (4 bytes each)
     public static final byte[] DOMAIN_SYNC_COMMITTEE = {0x07, 0x00, 0x00, 0x00};
@@ -62,5 +64,27 @@ public final class BeaconChainSpec {
      */
     public static long computeSyncCommitteePeriod(long slot) {
         return slot / SLOTS_PER_SYNC_COMMITTEE_PERIOD;
+    }
+
+    /**
+     * Estimate the current wall-clock sync committee period for mainnet.
+     *
+     * @deprecated prefer {@link #currentPeriod(long)} with the network-specific CL
+     * genesis time, so the estimate is correct on testnets too.
+     */
+    @Deprecated
+    public static long currentMainnetPeriod() {
+        return currentPeriod(MAINNET_GENESIS_TIME);
+    }
+
+    /**
+     * Estimate the current wall-clock sync committee period from a beacon chain
+     * genesis time (seconds since epoch). Callers should pass the genesis time of
+     * the network they're actually on (mainnet/sepolia/holesky differ).
+     */
+    public static long currentPeriod(long genesisTimeSec) {
+        long nowSec = System.currentTimeMillis() / 1000;
+        long slot = (nowSec - genesisTimeSec) / SECONDS_PER_SLOT;
+        return computeSyncCommitteePeriod(slot);
     }
 }

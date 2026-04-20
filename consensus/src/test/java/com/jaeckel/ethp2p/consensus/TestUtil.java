@@ -1,12 +1,12 @@
 package com.jaeckel.ethp2p.consensus;
 
+import com.jaeckel.ethp2p.consensus.bls.BlsVerifier;
+import com.jaeckel.ethp2p.consensus.bls.HashToCurve;
 import com.jaeckel.ethp2p.consensus.ssz.SszUtil;
 import com.jaeckel.ethp2p.consensus.types.BeaconBlockHeader;
 import com.jaeckel.ethp2p.consensus.types.ExecutionPayloadHeader;
 import com.jaeckel.ethp2p.consensus.types.LightClientHeader;
-import supranational.blst.P1;
-import supranational.blst.P2;
-import supranational.blst.SecretKey;
+import org.apache.milagro.amcl.BLS381.*;
 
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -19,14 +19,15 @@ import java.util.List;
 public final class TestUtil {
 
     private static final String DST = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
+    private static final byte[] DST_BYTES = DST.getBytes();
 
     private TestUtil() {}
 
     /**
      * Generate a deterministic BLS secret key from a seed.
-     * Uses SHA-256 of the seed to produce a 32-byte scalar, then loads via from_bendian.
+     * Uses SHA-256 of the seed to produce a 32-byte scalar.
      */
-    public static SecretKey generateSecretKey(int seed) {
+    public static BIG generateSecretKey(int seed) {
         byte[] seedBytes = new byte[32];
         seedBytes[0] = (byte) (seed);
         seedBytes[1] = (byte) (seed >>> 8);
@@ -38,9 +39,10 @@ public final class TestUtil {
             hash[0] &= 0x7F;
             // Ensure non-zero
             if (isAllZero(hash)) hash[31] = 0x01;
-            SecretKey sk = new SecretKey();
-            sk.from_bendian(hash);
-            return sk;
+            // Pad to MODBYTES (48 bytes)
+            byte[] padded = new byte[BIG.MODBYTES];
+            System.arraycopy(hash, 0, padded, BIG.MODBYTES - hash.length, hash.length);
+            return BIG.fromBytes(padded);
         } catch (NoSuchAlgorithmException e) {
             throw new RuntimeException(e);
         }
@@ -48,28 +50,37 @@ public final class TestUtil {
 
     /**
      * Get the compressed public key (48 bytes) for a secret key.
+     * Public key = [sk] * G1 generator.
      */
-    public static byte[] getPublicKey(SecretKey sk) {
-        return new P1(sk).compress();
+    public static byte[] getPublicKey(BIG sk) {
+        ECP g1 = ECP.generator();
+        ECP pk = PAIR.G1mul(g1, sk);
+        return BlsVerifier.serializeG1(pk);
     }
 
     /**
      * Sign a message with a secret key using the Ethereum 2.0 DST.
      * Returns 96-byte compressed G2 signature.
+     *
+     * sig = [sk] * H(msg)
      */
-    public static byte[] blsSign(SecretKey sk, byte[] message) {
-        return new P2().hash_to(message, DST).sign_with(sk).compress();
+    public static byte[] blsSign(BIG sk, byte[] message) {
+        ECP2 hm = HashToCurve.hashToG2(message, DST_BYTES);
+        ECP2 sig = PAIR.G2mul(hm, sk);
+        return BlsVerifier.serializeG2(sig);
     }
 
     /**
      * Aggregate multiple compressed G2 signatures into one.
      */
     public static byte[] aggregateSignatures(List<byte[]> compressedSigs) {
-        P2 agg = new P2(new supranational.blst.P2_Affine(compressedSigs.get(0)));
+        ECP2 agg = BlsVerifier.deserializeG2(compressedSigs.get(0));
         for (int i = 1; i < compressedSigs.size(); i++) {
-            agg.aggregate(new supranational.blst.P2_Affine(compressedSigs.get(i)));
+            ECP2 s = BlsVerifier.deserializeG2(compressedSigs.get(i));
+            agg.add(s);
         }
-        return agg.compress();
+        agg.affine();
+        return BlsVerifier.serializeG2(agg);
     }
 
     /**

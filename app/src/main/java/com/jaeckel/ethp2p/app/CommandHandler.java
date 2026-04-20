@@ -3,6 +3,7 @@ package com.jaeckel.ethp2p.app;
 import com.jaeckel.ethp2p.consensus.BeaconLightClient;
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
 import com.jaeckel.ethp2p.consensus.libp2p.BeaconP2PService;
+import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
 import com.jaeckel.ethp2p.consensus.proof.MerklePatriciaVerifier;
 import com.jaeckel.ethp2p.core.types.BlockHeader;
 import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
@@ -53,17 +54,27 @@ public class CommandHandler {
     private final Set<String> blacklistedNodeIds;
     private final BeaconSyncState beaconSyncState;
     private final BeaconLightClient beaconLightClient; // nullable
+    private final long clGenesisTime; // beacon chain genesis time (seconds since epoch)
 
     public CommandHandler(DiscV4Service discV4, RLPxConnector connector,
                           CountDownLatch stopLatch, Map<String, Long> backoff,
                           Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState) {
-        this(discV4, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState, null);
+        this(discV4, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState,
+                null, BeaconChainSpec.MAINNET_GENESIS_TIME);
     }
 
     public CommandHandler(DiscV4Service discV4, RLPxConnector connector,
                           CountDownLatch stopLatch, Map<String, Long> backoff,
                           Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState,
                           BeaconLightClient beaconLightClient) {
+        this(discV4, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState,
+                beaconLightClient, BeaconChainSpec.MAINNET_GENESIS_TIME);
+    }
+
+    public CommandHandler(DiscV4Service discV4, RLPxConnector connector,
+                          CountDownLatch stopLatch, Map<String, Long> backoff,
+                          Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState,
+                          BeaconLightClient beaconLightClient, long clGenesisTime) {
         this.discV4 = discV4;
         this.connector = connector;
         this.startTimeMs = System.currentTimeMillis();
@@ -72,6 +83,7 @@ public class CommandHandler {
         this.blacklistedNodeIds = blacklistedNodeIds;
         this.beaconSyncState = beaconSyncState;
         this.beaconLightClient = beaconLightClient;
+        this.clGenesisTime = clGenesisTime;
     }
 
     /** Parse and dispatch one JSON-Lines request; returns a JSON-Lines response. */
@@ -957,6 +969,8 @@ public class CommandHandler {
         boolean blsVerified = false;
         long matchedSlot = -1;
         String verifyMethod = null;
+        String failReason = null;
+
         if (peerStateRoot != null) {
             BeaconSyncState.SlottedStateRoot match =
                     beaconSyncState.findStateRoot(peerStateRoot.toArrayUnsafe());
@@ -968,16 +982,35 @@ public class CommandHandler {
             }
         }
 
-        // Header chain verification fallback: request block headers from the
-        // beacon-finalized block to the peer's block and verify the hash chain.
-        if (!beaconChainVerified && peerProofValid && beaconSyncState.isSynced()
-                && peerBlockNumber > 0) {
-            long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
-            byte[] beaconRoot = beaconSyncState.getVerifiedExecutionStateRoot();
-            log.info("[verify] headerChain: peerBlock={}, finalizedBlock={}, gap={}",
-                    peerBlockNumber, finalizedBlockNum,
-                    peerBlockNumber > finalizedBlockNum ? peerBlockNumber - finalizedBlockNum : "N/A");
-            if (finalizedBlockNum > 0 && beaconRoot != null && peerBlockNumber > finalizedBlockNum) {
+        long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
+        byte[] beaconRoot = beaconSyncState.getVerifiedExecutionStateRoot();
+        long finalizedPeriod = beaconSyncState.getFinalizedPeriod();
+        long wallClockPeriod = BeaconChainSpec.currentPeriod(clGenesisTime);
+        long periodLag = wallClockPeriod - finalizedPeriod;
+
+        if (!beaconChainVerified) {
+            if (peerStateRoot == null) {
+                failReason = "noPeerStateRoot";
+            } else if (!peerProofValid) {
+                failReason = "peerProofInvalid";
+            } else if (!beaconSyncState.isSynced()) {
+                failReason = "beaconNotSynced";
+            } else if (periodLag > 1) {
+                // Catch-up never reached the current period: committee is stale,
+                // finality updates can't verify, state roots stop being recorded.
+                failReason = "beaconStale";
+            } else if (peerBlockNumber <= 0) {
+                failReason = "noPeerBlockNumber";
+            } else if (finalizedBlockNum <= 0 || beaconRoot == null) {
+                failReason = "beaconBlockUnavailable";
+            } else if (peerBlockNumber <= finalizedBlockNum) {
+                failReason = "peerBlockBehindFinalized";
+            } else if (peerBlockNumber - finalizedBlockNum > MAX_HEADER_CHAIN_GAP) {
+                failReason = "headerChainGapTooLarge";
+            } else {
+                // Attempt header chain verification
+                log.info("[verify] headerChain: peerBlock={}, finalizedBlock={}, gap={}",
+                        peerBlockNumber, finalizedBlockNum, peerBlockNumber - finalizedBlockNum);
                 try {
                     boolean chainValid = verifyHeaderChainBatched(
                             finalizedBlockNum, peerBlockNumber, beaconRoot,
@@ -987,9 +1020,12 @@ public class CommandHandler {
                         matchedSlot = beaconSyncState.getFinalizedSlot();
                         blsVerified = true;
                         verifyMethod = "headerChain";
+                    } else {
+                        failReason = "headerChainInvalid";
                     }
                 } catch (Exception e) {
                     log.info("[verify] Header chain verification failed: {}", e.getMessage());
+                    failReason = "headerChainError";
                 }
             }
         }
@@ -1006,6 +1042,19 @@ public class CommandHandler {
             sb.append(",\"blsVerified\":").append(blsVerified);
             if (verifyMethod != null) {
                 sb.append(",\"verifyMethod\":\"").append(verifyMethod).append("\"");
+            }
+        } else {
+            if (failReason != null) {
+                sb.append(",\"failReason\":\"").append(failReason).append("\"");
+            }
+            sb.append(",\"finalizedPeriod\":").append(finalizedPeriod);
+            sb.append(",\"wallClockPeriod\":").append(wallClockPeriod);
+            sb.append(",\"periodLag\":").append(periodLag);
+            if (peerBlockNumber > 0) {
+                sb.append(",\"peerBlockNumber\":").append(peerBlockNumber);
+            }
+            if (finalizedBlockNum > 0) {
+                sb.append(",\"finalizedBlockNumber\":").append(finalizedBlockNum);
             }
         }
         sb.append("}");

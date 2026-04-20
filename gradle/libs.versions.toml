@@ -8,7 +8,7 @@ junit = "5.10.0"
 slf4j = "2.0.12"
 logback = "1.5.6"
 snappy = "1.1.10.7"
-jblst = "0.3.15"
+milagro = "0.4.0"
 jvm-libp2p = "1.2.2-RELEASE"
 trueblocks-kotlin = "main-SNAPSHOT"
 
@@ -34,6 +34,6 @@ snappy              = { module = "org.xerial.snappy:snappy-java",           vers
 junit-bom           = { module = "org.junit:junit-bom",                    version.ref = "junit" }
 junit-jupiter       = { module = "org.junit.jupiter:junit-jupiter" }
 
-jblst               = { module = "tech.pegasys:jblst",                      version.ref = "jblst" }
+milagro             = { module = "org.miracl.milagro.amcl:milagro-crypto-java", version.ref = "milagro" }
 jvm-libp2p          = { module = "io.libp2p:jvm-libp2p",                   version.ref = "jvm-libp2p" }
 trueblocks-kotlin   = { module = "com.github.biafra23:trueblocks-kotlin", version.ref = "trueblocks-kotlin" }
