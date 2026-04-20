@@ -195,6 +195,42 @@ class BlsFixtureTest {
         assertArrayEquals(expected, actual, "aggregate G1 pubkey mismatch");
     }
 
+    // ---- non-canonical encoding rejection ----
+
+    @Test
+    void deserializeG1_rejectsUncompressed() {
+        byte[] pk = hex(fixtures.get("sk2pk.0.pk"));
+        byte[] bad = pk.clone();
+        bad[0] &= 0x7F; // clear compression bit
+        assertNull(BlsVerifier.deserializeG1(bad),
+                "G1 must reject encoding without compression flag");
+    }
+
+    @Test
+    void deserializeG2_rejectsUncompressed() {
+        byte[] sig = hex(fixtures.get("single.0.sig"));
+        byte[] bad = sig.clone();
+        bad[0] &= 0x7F;
+        assertNull(BlsVerifier.deserializeG2(bad),
+                "G2 must reject encoding without compression flag");
+    }
+
+    @Test
+    void deserializeG1_rejectsInfinityWithSortFlag() {
+        byte[] bad = new byte[48];
+        bad[0] = (byte) 0xE0; // compressed + infinity + sort — non-canonical
+        assertNull(BlsVerifier.deserializeG1(bad),
+                "G1 must reject infinity encoding with sort flag set");
+    }
+
+    @Test
+    void deserializeG2_rejectsInfinityWithSortFlag() {
+        byte[] bad = new byte[96];
+        bad[0] = (byte) 0xE0;
+        assertNull(BlsVerifier.deserializeG2(bad),
+                "G2 must reject infinity encoding with sort flag set");
+    }
+
     private static byte[] hex(String s) {
         int len = s.length();
         byte[] out = new byte[len / 2];

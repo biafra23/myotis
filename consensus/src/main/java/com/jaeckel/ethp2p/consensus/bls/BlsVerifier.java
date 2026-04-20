@@ -90,8 +90,12 @@ public final class BlsVerifier {
         boolean infinity = (data[0] & 0x40) != 0;
         boolean sortFlag = (data[0] & 0x20) != 0;
 
+        // Ethereum BLS wire format for 48-byte G1 is always compressed.
+        if (!compressed) return null;
+
         if (infinity) {
-            // Check remaining bytes are zero
+            // Canonical infinity: sort flag must be clear and remaining bytes zero.
+            if (sortFlag) return null;
             byte[] rest = data.clone();
             rest[0] &= 0x1F;
             for (byte b : rest) if (b != 0) return null;
@@ -125,10 +129,15 @@ public final class BlsVerifier {
     public static ECP2 deserializeG2(byte[] data) {
         if (data == null || data.length != 96) return null;
 
+        boolean compressed = (data[0] & 0x80) != 0;
         boolean infinity = (data[0] & 0x40) != 0;
         boolean sortFlag = (data[0] & 0x20) != 0;
 
+        // Ethereum BLS wire format for 96-byte G2 is always compressed.
+        if (!compressed) return null;
+
         if (infinity) {
+            if (sortFlag) return null;
             byte[] rest = data.clone();
             rest[0] &= 0x1F;
             for (byte b : rest) if (b != 0) return null;
