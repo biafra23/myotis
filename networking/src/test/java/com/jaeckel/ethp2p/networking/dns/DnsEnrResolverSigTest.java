@@ -8,6 +8,7 @@ import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
 import java.security.Security;
 import java.util.Base64;
 
@@ -32,7 +33,7 @@ class DnsEnrResolverSigTest {
 
     private static String buildSignedRoot(SECP256K1.KeyPair keyPair, String eHash, String lHash, long seq) {
         String signed = "enrtree-root:v1 e=" + eHash + " l=" + lHash + " seq=" + seq;
-        Bytes32 hash = Hash.keccak256(Bytes.wrap(signed.getBytes()));
+        Bytes32 hash = Hash.keccak256(Bytes.wrap(signed.getBytes(StandardCharsets.UTF_8)));
         SECP256K1.Signature sig = SECP256K1.signHashed(hash, keyPair);
         byte[] r = padTo32(sig.r().toByteArray());
         byte[] s = padTo32(sig.s().toByteArray());

@@ -8,6 +8,7 @@ import java.security.Security;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class EnrTreeUrlTest {
 
@@ -60,5 +61,30 @@ class EnrTreeUrlTest {
         // RFC 4648 test vector: "foobar" → "MZXW6YTBOI======" (16 chars unpadded)
         byte[] decoded = EnrTreeUrl.base32Decode("MZXW6YTBOI");
         assertEquals("foobar", new String(decoded));
+    }
+
+    @Test
+    void base32DecodesFullRfc4648Vectors() {
+        // Cover the full RFC 4648 §10 test vector set to catch overflow in the 5-bit
+        // accumulator when inputs exceed what fits in an int without masking.
+        assertEquals("",        new String(EnrTreeUrl.base32Decode("")));
+        assertEquals("f",       new String(EnrTreeUrl.base32Decode("MY")));
+        assertEquals("fo",      new String(EnrTreeUrl.base32Decode("MZXQ")));
+        assertEquals("foo",     new String(EnrTreeUrl.base32Decode("MZXW6")));
+        assertEquals("foob",    new String(EnrTreeUrl.base32Decode("MZXW6YQ")));
+        assertEquals("fooba",   new String(EnrTreeUrl.base32Decode("MZXW6YTB")));
+        assertEquals("foobar",  new String(EnrTreeUrl.base32Decode("MZXW6YTBOI")));
+    }
+
+    @Test
+    void base32DecodesLongInput() {
+        // 53-char input (the canonical mainnet tree pubkey) must decode to 33 bytes.
+        // This would fail quietly if the 5-bit accumulator was not masked on emit.
+        byte[] decoded = EnrTreeUrl.base32Decode("AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE");
+        assertEquals(33, decoded.length);
+        // Compressed secp256k1 points start with 0x02 or 0x03.
+        assertTrue((decoded[0] & 0xFF) == 0x02 || (decoded[0] & 0xFF) == 0x03,
+                "first byte of decoded pubkey should be 0x02 or 0x03; got 0x"
+                        + Integer.toHexString(decoded[0] & 0xFF));
     }
 }

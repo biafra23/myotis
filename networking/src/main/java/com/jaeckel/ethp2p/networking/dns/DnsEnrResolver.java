@@ -13,6 +13,7 @@ import org.xbill.DNS.TXTRecord;
 import org.xbill.DNS.Type;
 
 import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -206,7 +207,7 @@ public final class DnsEnrResolver {
         if (sigBytes.length != 65) {
             throw new IllegalArgumentException("expected 65-byte signature, got " + sigBytes.length);
         }
-        Bytes32 hash = Hash.keccak256(Bytes.wrap(signed.getBytes()));
+        Bytes32 hash = Hash.keccak256(Bytes.wrap(signed.getBytes(StandardCharsets.UTF_8)));
         BigInteger r = new BigInteger(1, java.util.Arrays.copyOfRange(sigBytes, 0, 32));
         BigInteger s = new BigInteger(1, java.util.Arrays.copyOfRange(sigBytes, 32, 64));
         byte v = sigBytes[64];
@@ -234,15 +235,23 @@ public final class DnsEnrResolver {
             throw new IllegalStateException(
                     "TXT lookup failed for " + name + ": " + lookup.getErrorString());
         }
-        // Each TXTRecord may contain multiple string segments; EIP-1459 records may
-        // also be split across multiple TXT RRs for the same name when they exceed
-        // 255 chars. Concatenate all segments of all matching records.
-        StringBuilder sb = new StringBuilder();
+        // EIP-1459 §3: a single record may be split into multiple 255-char segments
+        // that MUST be concatenated in wire order. Multiple TXT RRs at the same name
+        // are not contemplated by the spec in practice, but resolvers can return
+        // them in non-deterministic order — sort by RR content so the output is
+        // stable regardless of DNS packet ordering. Segment order within each RR
+        // is preserved.
+        List<String> perRecord = new ArrayList<>();
         for (Record r : records) {
             if (!(r instanceof TXTRecord txt)) continue;
+            StringBuilder sb = new StringBuilder();
             for (Object seg : txt.getStrings()) sb.append(seg);
+            perRecord.add(sb.toString());
         }
-        return sb.toString();
+        if (perRecord.size() > 1) {
+            java.util.Collections.sort(perRecord);
+        }
+        return String.join("", perRecord);
     }
 
     // ---- small utilities ----

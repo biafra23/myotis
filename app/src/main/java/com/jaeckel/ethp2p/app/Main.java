@@ -31,6 +31,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 
@@ -182,14 +183,18 @@ public final class Main {
 
         // 3a. EIP-1459 DNS-based peer discovery. Best-effort: on any failure (timeout,
         // missing TXT, bad signature) the resolver returns an empty list and we fall
-        // through to the hardcoded + cached peers. Resolved separately per layer so
-        // EL-tree entries only feed discv4 bootnodes and CL-tree entries only feed
-        // the libp2p peer list.
+        // through to the hardcoded + cached peers. Run EL and CL resolution concurrently
+        // on virtual threads so total startup cost is max(elTimeout, clTimeout), not
+        // sum. Layers stay separated so EL-tree entries only feed discv4 bootnodes and
+        // CL-tree entries only feed the libp2p peer list.
         DnsEnrResolver dnsResolver = new DnsEnrResolver();
-        List<Enr> dnsElEnrs = dnsResolver.resolveAllFromStrings(
-                network.elEnrTreeUrls(), Duration.ofSeconds(10));
-        List<Enr> dnsClEnrs = dnsResolver.resolveAllFromStrings(
-                network.clEnrTreeUrls(), Duration.ofSeconds(10));
+        Duration dnsDeadline = Duration.ofSeconds(10);
+        CompletableFuture<List<Enr>> elFuture = CompletableFuture.supplyAsync(
+                () -> dnsResolver.resolveAllFromStrings(network.elEnrTreeUrls(), dnsDeadline));
+        CompletableFuture<List<Enr>> clFuture = CompletableFuture.supplyAsync(
+                () -> dnsResolver.resolveAllFromStrings(network.clEnrTreeUrls(), dnsDeadline));
+        List<Enr> dnsElEnrs = elFuture.join();
+        List<Enr> dnsClEnrs = clFuture.join();
 
         List<InetSocketAddress> mergedBootnodes = new ArrayList<>(network.bootnodes());
         for (Enr enr : dnsElEnrs) {

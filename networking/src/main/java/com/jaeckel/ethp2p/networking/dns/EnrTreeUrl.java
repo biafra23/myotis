@@ -84,6 +84,9 @@ public final class EnrTreeUrl {
             if (bits >= 8) {
                 bits -= 8;
                 out.write((buffer >> bits) & 0xFF);
+                // Mask off the bits we just emitted; keeps `buffer` from overflowing
+                // a 32-bit int on long inputs.
+                buffer &= (1 << bits) - 1;
             }
         }
         return out.toByteArray();
