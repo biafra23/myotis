@@ -2,6 +2,14 @@ plugins {
     alias(libs.plugins.android.application)
 }
 
+// The JitPack netty-kotlin fork republishes netty-common/buffer/etc. with the
+// same fully-qualified classes; the JVM tolerates the shadowing but the dexer
+// doesn't. vertx-core (transitive via tuweni-crypto) drags upstream netty in,
+// so strip it project-wide and rely on the fork.
+configurations.all {
+    exclude(group = "io.netty")
+}
+
 android {
     namespace = "com.jaeckel.ethp2p.android"
     compileSdk = 34
@@ -38,6 +46,12 @@ android {
                 "META-INF/LGPL2.1",
                 "META-INF/INDEX.LIST",
                 "META-INF/io.netty.versions.properties",
+                "META-INF/com.jaeckel.versions.properties",
+            )
+            // The jitpack netty-kotlin fork ships the same native-image hint
+            // file as upstream netty-common; just take the first one.
+            pickFirsts += setOf(
+                "META-INF/native-image/io.netty/netty-common/native-image.properties",
             )
         }
     }
@@ -48,6 +62,12 @@ dependencies {
 
     implementation(project(":core"))
     implementation(project(":networking"))
+
+    // core/networking expose tuweni and netty only as `implementation`, so
+    // add what the service code references directly.
+    implementation(libs.tuweni.bytes)
+    implementation(libs.tuweni.crypto)
+    implementation(libs.netty.transport)
 
     implementation(libs.bouncycastle)
     implementation(libs.slf4j.api)

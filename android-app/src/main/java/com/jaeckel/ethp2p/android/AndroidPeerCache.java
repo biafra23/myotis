@@ -2,11 +2,13 @@ package com.jaeckel.ethp2p.android;
 
 import android.util.Log;
 
+import java.io.BufferedReader;
+import java.io.FileOutputStream;
+import java.io.FileReader;
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.nio.file.Files;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -33,9 +35,8 @@ public final class AndroidPeerCache {
     public void add(InetSocketAddress address, String publicKeyHex) {
         String key = address.getAddress().getHostAddress() + ":" + address.getPort();
         if (!seen.add(key)) return;
-        try {
-            Files.writeString(cacheFile, key + ":" + publicKeyHex + "\n",
-                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        try (FileOutputStream out = new FileOutputStream(cacheFile.toFile(), true)) {
+            out.write((key + ":" + publicKeyHex + "\n").getBytes(StandardCharsets.UTF_8));
         } catch (IOException e) {
             Log.w(TAG, "write failed: " + e.getMessage());
         }
@@ -43,9 +44,10 @@ public final class AndroidPeerCache {
 
     public List<CachedPeer> load() {
         List<CachedPeer> result = new ArrayList<>();
-        if (!Files.exists(cacheFile)) return result;
-        try {
-            for (String line : Files.readAllLines(cacheFile)) {
+        if (!cacheFile.toFile().exists()) return result;
+        try (BufferedReader r = new BufferedReader(new FileReader(cacheFile.toFile()))) {
+            String line;
+            while ((line = r.readLine()) != null) {
                 line = line.strip();
                 if (line.isEmpty()) continue;
                 int firstColon = line.indexOf(':');
