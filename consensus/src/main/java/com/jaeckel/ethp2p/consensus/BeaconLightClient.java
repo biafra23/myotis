@@ -19,6 +19,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -363,6 +364,17 @@ public class BeaconLightClient implements AutoCloseable {
 
             LightClientBootstrap bootstrap = LightClientBootstrap.decode(ssz);
 
+            // Enforce the trust anchor: the header we're about to pin our sync-committee
+            // belief on must hash to the committed checkpointRoot. Without this, an
+            // adversary-controlled endpoint could serve an internally-consistent bootstrap
+            // for a different block they control.
+            byte[] headerRoot = bootstrap.header().beacon().hashTreeRoot();
+            if (!Arrays.equals(headerRoot, checkpointRoot)) {
+                log.warn("[beacon] HTTP bootstrap header root {} does not match checkpointRoot {}",
+                        bytesToHex(headerRoot), bytesToHex(checkpointRoot));
+                return false;
+            }
+
             int branchDepth = bootstrap.currentSyncCommitteeBranch().length;
             int gindex = BeaconChainSpec.syncCommitteeGindex(branchDepth);
             boolean branchValid = SszUtil.verifyMerkleBranch(
@@ -431,6 +443,19 @@ public class BeaconLightClient implements AutoCloseable {
                         log.info("[beacon] Bootstrap response: {} bytes from {}", response.length, peer);
                         try {
                             LightClientBootstrap bootstrap = LightClientBootstrap.decode(response);
+
+                            // Enforce the trust anchor — see HTTP-path comment above.
+                            byte[] headerRoot = bootstrap.header().beacon().hashTreeRoot();
+                            if (!Arrays.equals(headerRoot, checkpointRoot)) {
+                                log.warn("[beacon] Bootstrap header root {} does not match checkpointRoot {} from {}",
+                                        bytesToHex(headerRoot), bytesToHex(checkpointRoot), peer);
+                                notifyPeerFailure(peer);
+                                if (remaining.decrementAndGet() == 0 && !winnerFuture.isDone()) {
+                                    winnerFuture.completeExceptionally(
+                                            new RuntimeException("All peers failed bootstrap"));
+                                }
+                                return;
+                            }
 
                             int bDepth = bootstrap.currentSyncCommitteeBranch().length;
                             int bGindex = BeaconChainSpec.syncCommitteeGindex(bDepth);
