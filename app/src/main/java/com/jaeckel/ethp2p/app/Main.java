@@ -197,13 +197,23 @@ public final class Main {
         List<Enr> dnsClEnrs = clFuture.join();
 
         List<InetSocketAddress> mergedBootnodes = new ArrayList<>(network.bootnodes());
+        // Dedupe by (host, port) so trees that overlap with the hardcoded list
+        // (or contain internal duplicates) don't produce repeated dial attempts.
+        Set<String> seenHostPort = new java.util.HashSet<>();
+        for (InetSocketAddress sa : mergedBootnodes) {
+            seenHostPort.add(sa.getAddress().getHostAddress() + ":" + sa.getPort());
+        }
+        int bootnodesBeforeDns = mergedBootnodes.size();
         for (Enr enr : dnsElEnrs) {
             // discv4 speaks UDP; fall back to the TCP endpoint only if UDP is missing.
-            enr.udpAddress().or(enr::tcpAddress).ifPresent(mergedBootnodes::add);
+            enr.udpAddress().or(enr::tcpAddress).ifPresent(sa -> {
+                String key = sa.getAddress().getHostAddress() + ":" + sa.getPort();
+                if (seenHostPort.add(key)) mergedBootnodes.add(sa);
+            });
         }
-        if (!dnsElEnrs.isEmpty()) {
+        if (mergedBootnodes.size() > bootnodesBeforeDns) {
             log.info("[main] DNS discovery added {} EL bootnode(s) (total: {})",
-                    mergedBootnodes.size() - network.bootnodes().size(), mergedBootnodes.size());
+                    mergedBootnodes.size() - bootnodesBeforeDns, mergedBootnodes.size());
         }
 
         // 4. RLPx connector

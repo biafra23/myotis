@@ -22,12 +22,9 @@ import java.util.Collections;
 import java.util.Deque;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
 
 /**
  * EIP-1459 DNS ENR tree resolver.
@@ -228,30 +225,38 @@ public final class DnsEnrResolver {
         String lookup(String name) throws Exception;
     }
 
+    /** Per-DNS-query timeout. Caps blocking on a single unresponsive nameserver so
+     *  the overall deadline in {@link #resolveAll} can actually fire. */
+    private static final Duration LOOKUP_TIMEOUT = Duration.ofSeconds(3);
+
     private static String defaultTxtLookup(String name) throws Exception {
         Lookup lookup = new Lookup(name, Type.TXT);
+        org.xbill.DNS.SimpleResolver resolver = new org.xbill.DNS.SimpleResolver();
+        resolver.setTimeout(LOOKUP_TIMEOUT);
+        lookup.setResolver(resolver);
         Record[] records = lookup.run();
         if (lookup.getResult() != Lookup.SUCCESSFUL || records == null || records.length == 0) {
             throw new IllegalStateException(
                     "TXT lookup failed for " + name + ": " + lookup.getErrorString());
         }
-        // EIP-1459 §3: a single record may be split into multiple 255-char segments
-        // that MUST be concatenated in wire order. Multiple TXT RRs at the same name
-        // are not contemplated by the spec in practice, but resolvers can return
-        // them in non-deterministic order — sort by RR content so the output is
-        // stable regardless of DNS packet ordering. Segment order within each RR
-        // is preserved.
-        List<String> perRecord = new ArrayList<>();
+        // EIP-1459 treats a single TXT RR (possibly split into multiple 255-char
+        // segments) as the authoritative record. Multiple TXT RRs at the same name
+        // would represent distinct values, and concatenating across them would
+        // corrupt the record and break signature verification. If the resolver
+        // returns more than one, log and use the first.
+        List<TXTRecord> txts = new ArrayList<>();
         for (Record r : records) {
-            if (!(r instanceof TXTRecord txt)) continue;
-            StringBuilder sb = new StringBuilder();
-            for (Object seg : txt.getStrings()) sb.append(seg);
-            perRecord.add(sb.toString());
+            if (r instanceof TXTRecord txt) txts.add(txt);
         }
-        if (perRecord.size() > 1) {
-            java.util.Collections.sort(perRecord);
+        if (txts.isEmpty()) {
+            throw new IllegalStateException("no TXT records for " + name);
         }
-        return String.join("", perRecord);
+        if (txts.size() > 1) {
+            log.warn("[dns] {} returned {} TXT records; using the first", name, txts.size());
+        }
+        StringBuilder sb = new StringBuilder();
+        for (Object seg : txts.get(0).getStrings()) sb.append(seg);
+        return sb.toString();
     }
 
     // ---- small utilities ----
