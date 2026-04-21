@@ -5,6 +5,7 @@ import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
 import com.jaeckel.ethp2p.consensus.lightclient.LightClientProcessor;
 import com.jaeckel.ethp2p.consensus.lightclient.LightClientStore;
 import com.jaeckel.ethp2p.consensus.ssz.SszUtil;
+import com.jaeckel.ethp2p.consensus.types.BeaconBlockHeader;
 import com.jaeckel.ethp2p.consensus.types.BeaconBlockParser;
 import com.jaeckel.ethp2p.consensus.types.LightClientBootstrap;
 import com.jaeckel.ethp2p.consensus.types.LightClientFinalityUpdate;
@@ -364,14 +365,10 @@ public class BeaconLightClient implements AutoCloseable {
 
             LightClientBootstrap bootstrap = LightClientBootstrap.decode(ssz);
 
-            // Enforce the trust anchor: the header we're about to pin our sync-committee
-            // belief on must hash to the committed checkpointRoot. Without this, an
-            // adversary-controlled endpoint could serve an internally-consistent bootstrap
-            // for a different block they control.
-            byte[] headerRoot = bootstrap.header().beacon().hashTreeRoot();
-            if (!Arrays.equals(headerRoot, checkpointRoot)) {
-                log.warn("[beacon] HTTP bootstrap header root {} does not match checkpointRoot {}",
-                        bytesToHex(headerRoot), bytesToHex(checkpointRoot));
+            try {
+                verifyCheckpointPin(bootstrap.header().beacon(), checkpointRoot);
+            } catch (IllegalStateException e) {
+                log.warn("[beacon] HTTP bootstrap rejected: {}", e.getMessage());
                 return false;
             }
 
@@ -444,11 +441,10 @@ public class BeaconLightClient implements AutoCloseable {
                         try {
                             LightClientBootstrap bootstrap = LightClientBootstrap.decode(response);
 
-                            // Enforce the trust anchor — see HTTP-path comment above.
-                            byte[] headerRoot = bootstrap.header().beacon().hashTreeRoot();
-                            if (!Arrays.equals(headerRoot, checkpointRoot)) {
-                                log.warn("[beacon] Bootstrap header root {} does not match checkpointRoot {} from {}",
-                                        bytesToHex(headerRoot), bytesToHex(checkpointRoot), peer);
+                            try {
+                                verifyCheckpointPin(bootstrap.header().beacon(), checkpointRoot);
+                            } catch (IllegalStateException e) {
+                                log.warn("[beacon] Bootstrap from {} rejected: {}", peer, e.getMessage());
                                 notifyPeerFailure(peer);
                                 if (remaining.decrementAndGet() == 0 && !winnerFuture.isDone()) {
                                     winnerFuture.completeExceptionally(
@@ -1107,6 +1103,27 @@ public class BeaconLightClient implements AutoCloseable {
         StringBuilder sb = new StringBuilder(bytes.length * 2);
         for (byte b : bytes) sb.append(String.format("%02x", b));
         return sb.toString();
+    }
+
+    /**
+     * Enforce the trust anchor: the bootstrap header we're about to pin our
+     * sync-committee belief on must hash to the committed checkpointRoot.
+     *
+     * <p>Without this, an adversary-controlled endpoint (or a peer ignoring
+     * our request argument) could serve an internally-consistent bootstrap
+     * for a different block they control, and every subsequent merkle/BLS
+     * verification would be anchored to that forged header. Compare against
+     * {@code hash_tree_root(header)} before any other processing.
+     *
+     * @throws IllegalStateException if the header root does not match
+     */
+    static void verifyCheckpointPin(BeaconBlockHeader header, byte[] checkpointRoot) {
+        byte[] headerRoot = header.hashTreeRoot();
+        if (!Arrays.equals(headerRoot, checkpointRoot)) {
+            throw new IllegalStateException(
+                    "bootstrap header root 0x" + bytesToHex(headerRoot)
+                            + " does not match checkpointRoot 0x" + bytesToHex(checkpointRoot));
+        }
     }
 
     // -------------------------------------------------------------------------
