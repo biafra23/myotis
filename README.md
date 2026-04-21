@@ -406,9 +406,20 @@ DiscV4Service (UDP)
           --> block headers, account/storage queries available
 ```
 
+### Peer seeding
+
+Both discv4 (EL) and libp2p (CL) get their initial peer lists from three sources, merged at startup:
+
+1. **Hardcoded fallback** in `NetworkConfig` — a handful of IPv4 bootnodes and CL multiaddrs that ship with the binary.
+2. **On-disk cache** (`PeerCache`, `CLPeerCache`) — peers that responded successfully on a prior run, loaded from `~/.ethp2p/*-peers.cache`.
+3. **EIP-1459 DNS-based ENR trees** — each network can list `enrtree://<base32-pubkey>@<domain>` URLs in `NetworkConfig.elEnrTreeUrls` / `clEnrTreeUrls`. At startup the daemon walks each tree over DNS TXT records, verifies the root record's secp256k1 signature against the embedded pubkey, and decodes the leaf ENRs. Results are merged into the EL bootnode list and the CL peer list. Mainnet currently pins the Ethereum Foundation canonical tree (`all.mainnet.ethdisco.net`); the resolver is implemented in `networking/dns/DnsEnrResolver`.
+
+DNS resolution is best-effort: on timeout, missing TXT records, or signature mismatch the daemon logs a warning and starts up with whatever the hardcoded + cached sources provide. Per-tree deadline defaults to 10 s.
+
 ### Key dependencies
 
 - **Tuweni 2.7.2** -- RLP encoding, SECP256K1, byte utilities
 - **Netty 4.2.x (modified)** -- NIO transport. Uses a modified Netty archive based on 4.2 that has been rewritten in Kotlin. This is a proof-of-concept for migrating the Java codebase to Kotlin to enable use in a Compose Multiplatform project
 - **BouncyCastle** -- SECP256K1 crypto provider
 - **jvm-libp2p** -- beacon chain P2P networking (consensus module)
+- **dnsjava 3.6** -- TXT-record resolution for EIP-1459 ENR tree walks
