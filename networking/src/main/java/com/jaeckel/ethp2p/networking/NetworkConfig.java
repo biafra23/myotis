@@ -71,8 +71,10 @@ public record NetworkConfig(
             ),
             // genesis_validators_root (mainnet)
             Bytes.fromHexString("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95").toArrayUnsafe(),
-            // trusted checkpoint: recent finalized mainnet block root (slot 13897696, 2026-03-15, period 1696)
-            Bytes.fromHexString("b0d9a1cda62d2ae134c829f6cd504b93771640bdca3770a1b46bf4c2e0fa5216").toArrayUnsafe(),
+            // @checkpoint:mainnet:begin — managed by `./gradlew refreshMainnetCheckpoint`
+            // trusted checkpoint: recent finalized mainnet block root (slot 14158720, 2026-04-20, period 1728)
+            Bytes.fromHexString("611c852c9c52812d1a8701d06c230617159b69d33b344704fb524558ee79ff5d").toArrayUnsafe(),
+            // @checkpoint:mainnet:end
             // current fork version: Fulu (0x06000000) — activated at slot 13164544 (2025-12-03)
             new byte[]{0x06, 0x00, 0x00, 0x00},
             // CL peer multiaddrs: known light-client-serving peers (nimbus, lodestar, lighthouse)

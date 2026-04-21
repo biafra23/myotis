@@ -5,6 +5,7 @@ import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
 import com.jaeckel.ethp2p.consensus.lightclient.LightClientProcessor;
 import com.jaeckel.ethp2p.consensus.lightclient.LightClientStore;
 import com.jaeckel.ethp2p.consensus.ssz.SszUtil;
+import com.jaeckel.ethp2p.consensus.types.BeaconBlockHeader;
 import com.jaeckel.ethp2p.consensus.types.BeaconBlockParser;
 import com.jaeckel.ethp2p.consensus.types.LightClientBootstrap;
 import com.jaeckel.ethp2p.consensus.types.LightClientFinalityUpdate;
@@ -19,6 +20,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -363,6 +365,13 @@ public class BeaconLightClient implements AutoCloseable {
 
             LightClientBootstrap bootstrap = LightClientBootstrap.decode(ssz);
 
+            try {
+                verifyCheckpointPin(bootstrap.header().beacon(), checkpointRoot);
+            } catch (IllegalStateException e) {
+                log.warn("[beacon] HTTP bootstrap rejected: {}", e.getMessage());
+                return false;
+            }
+
             int branchDepth = bootstrap.currentSyncCommitteeBranch().length;
             int gindex = BeaconChainSpec.syncCommitteeGindex(branchDepth);
             boolean branchValid = SszUtil.verifyMerkleBranch(
@@ -431,6 +440,18 @@ public class BeaconLightClient implements AutoCloseable {
                         log.info("[beacon] Bootstrap response: {} bytes from {}", response.length, peer);
                         try {
                             LightClientBootstrap bootstrap = LightClientBootstrap.decode(response);
+
+                            try {
+                                verifyCheckpointPin(bootstrap.header().beacon(), checkpointRoot);
+                            } catch (IllegalStateException e) {
+                                log.warn("[beacon] Bootstrap from {} rejected: {}", peer, e.getMessage());
+                                notifyPeerFailure(peer);
+                                if (remaining.decrementAndGet() == 0 && !winnerFuture.isDone()) {
+                                    winnerFuture.completeExceptionally(
+                                            new RuntimeException("All peers failed bootstrap"));
+                                }
+                                return;
+                            }
 
                             int bDepth = bootstrap.currentSyncCommitteeBranch().length;
                             int bGindex = BeaconChainSpec.syncCommitteeGindex(bDepth);
@@ -1082,6 +1103,27 @@ public class BeaconLightClient implements AutoCloseable {
         StringBuilder sb = new StringBuilder(bytes.length * 2);
         for (byte b : bytes) sb.append(String.format("%02x", b));
         return sb.toString();
+    }
+
+    /**
+     * Enforce the trust anchor: the bootstrap header we're about to pin our
+     * sync-committee belief on must hash to the committed checkpointRoot.
+     *
+     * <p>Without this, an adversary-controlled endpoint (or a peer ignoring
+     * our request argument) could serve an internally-consistent bootstrap
+     * for a different block they control, and every subsequent merkle/BLS
+     * verification would be anchored to that forged header. Compare against
+     * {@code hash_tree_root(header)} before any other processing.
+     *
+     * @throws IllegalStateException if the header root does not match
+     */
+    static void verifyCheckpointPin(BeaconBlockHeader header, byte[] checkpointRoot) {
+        byte[] headerRoot = header.hashTreeRoot();
+        if (!Arrays.equals(headerRoot, checkpointRoot)) {
+            throw new IllegalStateException(
+                    "bootstrap header root 0x" + bytesToHex(headerRoot)
+                            + " does not match checkpointRoot 0x" + bytesToHex(checkpointRoot));
+        }
     }
 
     // -------------------------------------------------------------------------

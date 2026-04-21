@@ -342,6 +342,20 @@ The daemon includes a consensus-layer light client that tracks finalized state r
 
 The only trust anchors are **sync committee BLS signatures** and the embedded historical hash accumulators. All data from devp2p and libp2p peers is cryptographically verified -- no trusted third-party RPCs or HTTP APIs are used in production.
 
+The bootstrap trust anchor is a 32-byte mainnet block root hardcoded in `NetworkConfig.MAINNET.checkpointRoot`. Every `LightClientBootstrap` response is rejected unless `hash_tree_root(response.header)` equals this committed value, so the pin is cryptographic: no peer (libp2p or HTTP checkpoint endpoint) can substitute a different anchor, even an internally-consistent one, without finding a SHA-256 preimage.
+
+Ethereum's weak-subjectivity window is only ~28 hours of stake-weighted safety, so the committed root needs to be refreshed periodically or binaries eventually age past the safety envelope. The repo ships with a Gradle task that fetches a current finalized root, cross-validates it against multiple independent providers, and rewrites the `@checkpoint:mainnet` region of `NetworkConfig.java`:
+
+```bash
+# Preview the diff without writing
+./gradlew refreshMainnetCheckpoint -Pdry
+
+# Fetch + write (commit the resulting NetworkConfig.java diff)
+./gradlew refreshMainnetCheckpoint
+```
+
+The task queries `/eth/v2/beacon/blocks/finalized` on three independent mainnet checkpoint providers (beaconstate.info, sync-mainnet.beaconcha.in, mainnet-checkpoint-sync.attestant.io), normalizes to the oldest observed finalized slot, re-queries each provider for the canonical block root at that slot, and requires byte-for-byte agreement before writing. Any disagreement aborts without modifying the source.
+
 ### Verification flow
 
 1. The beacon light client obtains a finalized execution state root (BLS-verified via sync committee signatures)
@@ -357,11 +371,8 @@ Block verification (`get-block`) currently has the following limitations:
 - **Pre-merge blocks (before block 15,537,394)** cannot be verified. The beacon chain only exists post-Merge, so there is no sync committee anchor for proof-of-work era blocks.
 - **Post-merge blocks more than 8,192 blocks from the finalized block** cannot be verified via header chain. This covers roughly 27 hours of blocks at 12-second slots.
 - **Account and storage queries** (`get-account`, `get-storage`) share the 8,192-block header chain limit but are less affected in practice because they query the peer's current state (usually close to head).
-- **Single-peer beacon bootstrap**: The light client currently bootstraps from the first responsive beacon peer. A malicious peer could serve a crafted bootstrap response to establish a false trust anchor. In the future, bootstrap should cross-check against multiple peers or use a checkpoint root embedded at build time.
-
 **Roadmap:**
 
-- **Multi-peer / embedded bootstrap**: Cross-validate bootstrap responses from multiple beacon peers, or embed a known-good checkpoint root in the release binary so the initial trust anchor does not depend on any single peer.
 - **Pre-merge blocks**: Implement the [pre-merge historical hashes accumulator](https://github.com/ethereum/portal-network-specs/blob/master/history/history-network.md#the-header-accumulator) (EIP-2935). This is a Merkle tree over all ~15.5M pre-merge block hashes, with the root embedded as a static trust anchor. Any pre-merge block hash can be verified with an inclusion proof against this accumulator.
 - **Post-merge historical blocks**: Implement the [Bellatrix-era historical roots accumulator](https://github.com/ethereum/annotated-spec/blob/master/phase0/beacon-chain.md#historical-roots). The beacon chain stores `historical_roots` (batches of 8,192 slots) and `historical_summaries` (post-Capella) that cover all post-merge execution payloads. By walking the beacon state's historical records, any post-merge block hash can be verified without an 8,192-block proximity constraint.
 
