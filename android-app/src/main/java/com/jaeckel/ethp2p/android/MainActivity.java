@@ -11,7 +11,6 @@ import android.widget.TextView;
 
 public final class MainActivity extends Activity {
 
-    private boolean running = false;
     private Button toggleButton;
 
     @Override
@@ -25,16 +24,27 @@ public final class MainActivity extends Activity {
 
         toggleButton.setOnClickListener(v -> {
             Intent svc = new Intent(this, NodeService.class);
-            if (running) {
+            if (NodeService.isRunning()) {
                 stopService(svc);
-                toggleButton.setText(R.string.start);
             } else {
                 ensureNotificationPermission();
                 startForegroundService(svc);
-                toggleButton.setText(R.string.stop);
             }
-            running = !running;
+            // Let onResume reconcile the label once the service state has flipped.
+            refreshButtonLabel();
         });
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // Activity is recreated on configuration changes (rotation, theme); the
+        // service process survives, so read truth from its static flag.
+        refreshButtonLabel();
+    }
+
+    private void refreshButtonLabel() {
+        toggleButton.setText(NodeService.isRunning() ? R.string.stop : R.string.start);
     }
 
     private void ensureNotificationPermission() {

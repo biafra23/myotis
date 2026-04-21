@@ -3,6 +3,9 @@
 build/
 !gradle/wrapper/gradle-wrapper.jar
 
+# Android — local SDK path, per-dev only
+local.properties
+
 # Compiled class files
 *.class
 

@@ -21,6 +21,7 @@ import java.nio.file.Path;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Foreground service that runs the ethp2p node — a stripped-down port of
@@ -36,6 +37,15 @@ public final class NodeService extends Service {
     private static final long BACKOFF_INCOMPATIBLE_MS = 10 * 60 * 1000L;
     private static final long BACKOFF_TRANSIENT_MS = 30 * 1000L;
 
+    // Static so MainActivity can reflect the correct button state after a
+    // configuration change — the activity instance is recreated, but the
+    // service process (and this flag) outlive it.
+    private static final AtomicBoolean RUNNING = new AtomicBoolean(false);
+
+    public static boolean isRunning() {
+        return RUNNING.get();
+    }
+
     private DiscV4Service discV4;
     private RLPxConnector connector;
 
@@ -46,6 +56,13 @@ public final class NodeService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // The system may redeliver onStartCommand (e.g. repeated taps, or a
+        // restart race with stopService). Guard so we don't boot two copies
+        // of the node racing for the same UDP/TCP ports.
+        if (!RUNNING.compareAndSet(false, true)) {
+            Log.i(TAG, "start requested but node is already running");
+            return START_NOT_STICKY;
+        }
         startForeground(NOTIFICATION_ID, buildNotification());
 
         // Netty boot is blocking-ish; punt off the main thread.
@@ -113,7 +130,8 @@ public final class NodeService extends Service {
                         attempted.remove(peerKey);
                         return;
                     }
-                    // Reconstruct the uncompressed SECP256K1 public key (0x04 prefix + 64 bytes).
+                    // discv4 node IDs are the 64-byte uncompressed SECP256K1
+                    // public key bytes without the 0x04 prefix.
                     SECP256K1.PublicKey pubKey = SECP256K1.PublicKey.fromBytes(nodeId);
                     InetSocketAddress peerTcp = new InetSocketAddress(
                             entry.udpAddr().getAddress(), entry.tcpPort());
@@ -141,6 +159,7 @@ public final class NodeService extends Service {
         Log.i(TAG, "Stopping node");
         if (connector != null) try { connector.close(); } catch (Exception ignored) {}
         if (discV4 != null) try { discV4.close(); } catch (Exception ignored) {}
+        RUNNING.set(false);
         super.onDestroy();
     }
 
