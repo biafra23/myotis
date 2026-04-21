@@ -53,11 +53,17 @@ public final class Enr {
             reader.skipNext(); // signature
             // Second element: sequence number
             seqHolder[0] = reader.readLong();
-            // Remaining: key-value pairs
+            // Remaining: key-value pairs. Most pairs are (string, bytes) — e.g. ip, tcp,
+            // secp256k1 — but modern ENRs carry list-valued pairs too (eth2, attnets,
+            // syncnets, …). Preserve simple bytes values for the fields we consume and
+            // skip list values we don't model.
             while (!reader.isComplete()) {
                 String key = reader.readString();
-                Bytes value = reader.readValue();
-                pairs.put(key, value);
+                if (reader.nextIsList()) {
+                    reader.skipNext();
+                } else {
+                    pairs.put(key, reader.readValue());
+                }
             }
             return null;
         });

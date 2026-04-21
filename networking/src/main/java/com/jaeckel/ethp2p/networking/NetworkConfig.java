@@ -27,7 +27,9 @@ public record NetworkConfig(
         byte[] currentForkVersion,      // 4 bytes: current fork version for signing domain
         List<String> clPeerMultiaddrs,  // libp2p multiaddrs of known CL peers
         String beaconApiUrl,            // HTTP API URL for local beacon node (e.g. http://172.17.0.1:5052)
-        long clGenesisTime              // beacon chain genesis time (seconds since epoch) for wall-clock period estimation
+        long clGenesisTime,             // beacon chain genesis time (seconds since epoch) for wall-clock period estimation
+        List<String> elEnrTreeUrls,     // EIP-1459 enrtree:// URLs for execution-layer discv4 peers
+        List<String> clEnrTreeUrls      // EIP-1459 enrtree:// URLs for consensus-layer libp2p peers
 ) {
 
     // -------------------------------------------------------------------------
@@ -103,7 +105,13 @@ public record NetworkConfig(
                     "/ip4/16.63.94.117/tcp/9000/p2p/16Uiu2HAmSd7qzG5joNgvEYYcgVvg1y9MiYjpMHMvzRzaWYqXxkCM"
             ),
             "http://localhost:5052",
-            1606824023L // mainnet beacon genesis: 2020-12-01 12:00:23 UTC
+            1606824023L, // mainnet beacon genesis: 2020-12-01 12:00:23 UTC
+            // EIP-1459 ENR tree URLs — DNS-seeded discv4 bootnodes (EL) and libp2p peers (CL).
+            // EL: Ethereum Foundation canonical tree used by all EL clients.
+            List.of("enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.mainnet.ethdisco.net"),
+            // CL: no canonical single tree; each CL client team (Lighthouse, Lodestar, Nimbus, Teku)
+            // publishes their own. Empty for now — add entries once a tree URL is pinned and verified.
+            List.of()
     );
 
     public static final NetworkConfig SEPOLIA = new NetworkConfig(
@@ -131,7 +139,9 @@ public record NetworkConfig(
                     "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS"
             ),
             null,
-            1655733600L // sepolia beacon genesis: 2022-06-20 14:00:00 UTC
+            1655733600L, // sepolia beacon genesis: 2022-06-20 14:00:00 UTC
+            List.of(), // EL ENR trees — not pinned
+            List.of()  // CL ENR trees — not pinned
     );
 
     public static final NetworkConfig HOLESKY = new NetworkConfig(
@@ -156,7 +166,9 @@ public record NetworkConfig(
                     "/ip4/159.69.35.70/tcp/9000/p2p/16Uiu2HAmFMfXsymWEK6BFPQNPW3nPz57uB3TKpVNFDmeoW7WXNUA"
             ),
             null,
-            1695902400L // holesky beacon genesis: 2023-09-28 12:00:00 UTC
+            1695902400L, // holesky beacon genesis: 2023-09-28 12:00:00 UTC
+            List.of(), // EL ENR trees — not pinned
+            List.of()  // CL ENR trees — not pinned
     );
 
     // Frontier (genesis) fork IDs — CRC32(genesis_hash), forkNext = first fork block
