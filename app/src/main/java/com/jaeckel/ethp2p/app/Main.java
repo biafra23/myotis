@@ -3,10 +3,12 @@ package com.jaeckel.ethp2p.app;
 import com.jaeckel.ethp2p.consensus.BeaconLightClient;
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
 import com.jaeckel.ethp2p.core.crypto.NodeKey;
+import com.jaeckel.ethp2p.core.enr.Enr;
 import com.jaeckel.ethp2p.core.types.BlockHeader;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
 import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
 import com.jaeckel.ethp2p.networking.discv4.KademliaTable;
+import com.jaeckel.ethp2p.networking.dns.DnsEnrResolver;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
 import org.apache.tuweni.bytes.Bytes;
@@ -24,10 +26,12 @@ import java.nio.channels.SocketChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 
@@ -177,6 +181,41 @@ public final class Main {
         // 3. Peer cache
         PeerCache peerCache = new PeerCache(cacheFile(network.name()));
 
+        // 3a. EIP-1459 DNS-based peer discovery. Best-effort: on any failure (timeout,
+        // missing TXT, bad signature) the resolver returns an empty list and we fall
+        // through to the hardcoded + cached peers. Run EL and CL resolution concurrently
+        // on virtual threads so total startup cost is max(elTimeout, clTimeout), not
+        // sum. Layers stay separated so EL-tree entries only feed discv4 bootnodes and
+        // CL-tree entries only feed the libp2p peer list.
+        DnsEnrResolver dnsResolver = new DnsEnrResolver();
+        Duration dnsDeadline = Duration.ofSeconds(10);
+        CompletableFuture<List<Enr>> elFuture = CompletableFuture.supplyAsync(
+                () -> dnsResolver.resolveAllFromStrings(network.elEnrTreeUrls(), dnsDeadline));
+        CompletableFuture<List<Enr>> clFuture = CompletableFuture.supplyAsync(
+                () -> dnsResolver.resolveAllFromStrings(network.clEnrTreeUrls(), dnsDeadline));
+        List<Enr> dnsElEnrs = elFuture.join();
+        List<Enr> dnsClEnrs = clFuture.join();
+
+        List<InetSocketAddress> mergedBootnodes = new ArrayList<>(network.bootnodes());
+        // Dedupe by (host, port) so trees that overlap with the hardcoded list
+        // (or contain internal duplicates) don't produce repeated dial attempts.
+        Set<String> seenHostPort = new java.util.HashSet<>();
+        for (InetSocketAddress sa : mergedBootnodes) {
+            seenHostPort.add(sa.getAddress().getHostAddress() + ":" + sa.getPort());
+        }
+        int bootnodesBeforeDns = mergedBootnodes.size();
+        for (Enr enr : dnsElEnrs) {
+            // discv4 speaks UDP; fall back to the TCP endpoint only if UDP is missing.
+            enr.udpAddress().or(enr::tcpAddress).ifPresent(sa -> {
+                String key = sa.getAddress().getHostAddress() + ":" + sa.getPort();
+                if (seenHostPort.add(key)) mergedBootnodes.add(sa);
+            });
+        }
+        if (mergedBootnodes.size() > bootnodesBeforeDns) {
+            log.info("[main] DNS discovery added {} EL bootnode(s) (total: {})",
+                    mergedBootnodes.size() - bootnodesBeforeDns, mergedBootnodes.size());
+        }
+
         // 4. RLPx connector
         Set<String> attempted = ConcurrentHashMap.newKeySet();
         Map<String, Long> backoff = new ConcurrentHashMap<>();
@@ -231,7 +270,7 @@ public final class Main {
         }
 
         // 6. discv4 discovery
-        DiscV4Service discV4 = new DiscV4Service(nodeKey, network.bootnodes(), entry -> {
+        DiscV4Service discV4 = new DiscV4Service(nodeKey, mergedBootnodes, entry -> {
             if (entry.tcpPort() > 0 && attempted.size() < 2000) {
                 String nodeIdHex = entry.nodeId().toHexString();
                 if (blacklistedNodeIds.contains(nodeIdHex)) {
@@ -278,6 +317,18 @@ public final class Main {
         // Append configured peers after cached ones (cached peers are tried first)
         for (String peer : network.clPeerMultiaddrs()) {
             if (!clPeers.contains(peer)) clPeers.add(peer);
+        }
+        // Append DNS-discovered CL peers (from enrtree:// resolution above). Deduped
+        // against cached + configured entries.
+        int clPeersBeforeDns = clPeers.size();
+        for (Enr enr : dnsClEnrs) {
+            enr.toLibp2pMultiaddr().ifPresent(ma -> {
+                if (!clPeers.contains(ma)) clPeers.add(ma);
+            });
+        }
+        if (clPeers.size() > clPeersBeforeDns) {
+            log.info("[main] DNS discovery added {} CL peer(s) (total: {})",
+                    clPeers.size() - clPeersBeforeDns, clPeers.size());
         }
         BeaconLightClient beaconLightClient = new BeaconLightClient(
                 clPeers,

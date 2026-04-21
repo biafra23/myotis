@@ -11,6 +11,7 @@ snappy = "1.1.10.7"
 milagro = "0.4.0"
 jvm-libp2p = "1.2.2-RELEASE"
 trueblocks-kotlin = "main-SNAPSHOT"
+dnsjava = "3.6.2"
 
 [libraries]
 tuweni-bytes        = { module = "io.consensys.tuweni:tuweni-bytes",       version.ref = "tuweni" }
@@ -37,3 +38,4 @@ junit-jupiter       = { module = "org.junit.jupiter:junit-jupiter" }
 milagro             = { module = "org.miracl.milagro.amcl:milagro-crypto-java", version.ref = "milagro" }
 jvm-libp2p          = { module = "io.libp2p:jvm-libp2p",                   version.ref = "jvm-libp2p" }
 trueblocks-kotlin   = { module = "com.github.biafra23:trueblocks-kotlin", version.ref = "trueblocks-kotlin" }
+dnsjava             = { module = "dnsjava:dnsjava",                       version.ref = "dnsjava" }

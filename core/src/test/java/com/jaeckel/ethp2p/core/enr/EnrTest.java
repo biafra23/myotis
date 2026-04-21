@@ -60,6 +60,40 @@ class EnrTest {
     }
 
     @Test
+    void tolerateListValuedPairs() {
+        // Build a synthetic ENR with an "eth2"-style list-valued pair. A naive decoder
+        // that only handles byte values would throw on the list; ours should skip the
+        // list value and still recover the flat fields (ip, tcp, secp256k1).
+        org.apache.tuweni.bytes.Bytes ip = org.apache.tuweni.bytes.Bytes.fromHexString("03932500"); // 3.147.37.0
+        org.apache.tuweni.bytes.Bytes tcp = org.apache.tuweni.bytes.Bytes.fromHexString("2328");     // 9000
+        org.apache.tuweni.bytes.Bytes key = org.apache.tuweni.bytes.Bytes.fromHexString(
+                "02197590fab436299291f568e5b82253c306463855c3a61c60f69c4acad1429180");                    // 33B compressed
+
+        org.apache.tuweni.bytes.Bytes rlp = org.apache.tuweni.rlp.RLP.encodeList(w -> {
+            w.writeValue(org.apache.tuweni.bytes.Bytes.wrap(new byte[0])); // empty signature
+            w.writeLong(0);                                                // seq
+            // eth2 value as a nested list — what would've blown up the old decoder
+            w.writeString("eth2");
+            w.writeList(inner -> {
+                inner.writeValue(org.apache.tuweni.bytes.Bytes.fromHexString("deadbeef"));
+                inner.writeLong(42);
+            });
+            w.writeString("ip");
+            w.writeValue(ip);
+            w.writeString("secp256k1");
+            w.writeValue(key);
+            w.writeString("tcp");
+            w.writeValue(tcp);
+        });
+
+        Enr enr = Enr.decode(rlp);
+        assertTrue(enr.tcpAddress().isPresent());
+        assertEquals(9000, enr.tcpAddress().get().getPort());
+        assertEquals("3.147.37.0", enr.tcpAddress().get().getAddress().getHostAddress());
+        assertTrue(enr.compressedSecp256k1().isPresent());
+    }
+
+    @Test
     void enrWithoutTcpReturnsEmptyMultiaddr() {
         // ENR that only has UDP (no "tcp" key) should return empty
         // Use an ENR string where tcp is missing — we simulate by checking the last ENR
