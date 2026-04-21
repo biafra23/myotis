@@ -29,6 +29,20 @@ android {
         isCoreLibraryDesugaringEnabled = true
     }
 
+    // Pin the debug signing identity to a keystore checked into the repo so
+    // every developer (and CI) signs debug APKs with the same key. This is a
+    // widely used convention — the Android Studio-generated debug keystore
+    // uses these exact defaults (password `android`, alias `androiddebugkey`,
+    // key password `android`). Do not reuse these credentials for release.
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
