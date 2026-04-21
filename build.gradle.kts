@@ -82,7 +82,10 @@ tasks.register("refreshMainnetCheckpoint") {
         // matching `parent_root`/`state_root`/`body_root` inside a header. Some endpoints
         // omit the `0x` prefix, so accept either form.
         val rootRe = Regex(""""data"\s*:\s*\{\s*"root"\s*:\s*"(0x)?([0-9a-fA-F]+)"""")
-        val slotRe = Regex(""""slot"\s*:\s*"?(\d+)"?""")
+        // Anchor the slot search inside the "data" object. A full beacon block response
+        // contains nested attestations that each carry a "slot" field — without the
+        // anchor the regex would otherwise match those.
+        val slotRe = Regex(""""data"\s*:\s*\{.*?"slot"\s*:\s*"?(\d+)"?""", RegexOption.DOT_MATCHES_ALL)
 
         fun normRoot(m: MatchResult): String = m.groupValues[2].lowercase()
 
@@ -126,11 +129,13 @@ tasks.register("refreshMainnetCheckpoint") {
 
         val finalRoot = distinct.single().removePrefix("0x")
         val period = minSlot / 8192
-        val genesis = 1606824023L
+        // Shared with BeaconChainSpec.MAINNET_GENESIS_TIME via gradle.properties
+        val genesis = (project.property("ethp2p.mainnet.genesisTime") as String).toLong()
         val ts = Instant.ofEpochSecond(genesis + minSlot * 12)
         val date = DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(ZoneOffset.UTC).format(ts)
 
-        val file = rootDir.resolve("networking/src/main/java/com/jaeckel/ethp2p/networking/NetworkConfig.java")
+        val file = project(":networking").projectDir.resolve(
+            "src/main/java/com/jaeckel/ethp2p/networking/NetworkConfig.java")
         val original = file.readText()
         val beginMarker = "// @checkpoint:mainnet:begin"
         val endMarker = "// @checkpoint:mainnet:end"
@@ -139,17 +144,22 @@ tasks.register("refreshMainnetCheckpoint") {
         if (beginIdx < 0 || endIdx < 0 || endIdx < beginIdx) {
             throw GradleException("Could not find @checkpoint:mainnet:begin/end markers in NetworkConfig.java")
         }
+        // Preserve whatever line ending the source file uses so we don't mix CRLF/LF
+        // when running on Windows.
+        val eol = if (original.contains("\r\n")) "\r\n" else "\n"
         val beginLineStart = original.lastIndexOf('\n', beginIdx) + 1
-        val endLineEnd = original.indexOf('\n', endIdx).let { if (it < 0) original.length else it }
+        // Stop the replaced region at the end of the end-marker text itself (not at the
+        // following newline), so the original line terminator is preserved verbatim.
+        val endMarkerEnd = endIdx + endMarker.length
         val indent = original.substring(beginLineStart, beginIdx)
 
         val replacement = buildString {
-            append(indent).append("// @checkpoint:mainnet:begin — managed by `./gradlew refreshMainnetCheckpoint`\n")
-            append(indent).append("// trusted checkpoint: recent finalized mainnet block root (slot $minSlot, $date, period $period)\n")
-            append(indent).append("Bytes.fromHexString(\"$finalRoot\").toArrayUnsafe(),\n")
+            append(indent).append("// @checkpoint:mainnet:begin — managed by `./gradlew refreshMainnetCheckpoint`").append(eol)
+            append(indent).append("// trusted checkpoint: recent finalized mainnet block root (slot $minSlot, $date, period $period)").append(eol)
+            append(indent).append("Bytes.fromHexString(\"$finalRoot\").toArrayUnsafe(),").append(eol)
             append(indent).append("// @checkpoint:mainnet:end")
         }
-        val updated = original.substring(0, beginLineStart) + replacement + original.substring(endLineEnd)
+        val updated = original.substring(0, beginLineStart) + replacement + original.substring(endMarkerEnd)
 
         if (original == updated) {
             logger.lifecycle("[refresh] NetworkConfig.java already up to date (slot $minSlot, root 0x$finalRoot). No change.")
@@ -159,7 +169,7 @@ tasks.register("refreshMainnetCheckpoint") {
         val matchedHosts = probed.map { URI(it.base).host }
         if (dryRun) {
             logger.lifecycle("[refresh] -Pdry set; preview only (no write):")
-            original.substring(beginLineStart, endLineEnd).lines().forEach { logger.lifecycle("- $it") }
+            original.substring(beginLineStart, endMarkerEnd).lines().forEach { logger.lifecycle("- $it") }
             replacement.lines().forEach { logger.lifecycle("+ $it") }
             logger.lifecycle("[refresh] consensus: slot=$minSlot date=$date period=$period")
             logger.lifecycle("[refresh] matched ${probed.size}/${endpoints.size} endpoints: $matchedHosts")
