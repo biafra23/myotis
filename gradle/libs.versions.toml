@@ -12,6 +12,10 @@ milagro = "0.4.0"
 jvm-libp2p = "1.2.2-RELEASE"
 trueblocks-kotlin = "main-SNAPSHOT"
 dnsjava = "3.6.2"
+agp = "8.7.3"
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
 
 [libraries]
 tuweni-bytes        = { module = "io.consensys.tuweni:tuweni-bytes",       version.ref = "tuweni" }

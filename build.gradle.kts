@@ -19,6 +19,16 @@ allprojects {
 }
 
 subprojects {
+    // android-app uses the Android Gradle Plugin, not the java plugin
+    if (name == "android-app") {
+        configurations.all {
+            exclude(group = "io.netty", module = "netty-transport-native-epoll")
+            exclude(group = "io.netty", module = "netty-transport-native-kqueue")
+            exclude(group = "io.netty", module = "netty-transport-native-unix-common")
+        }
+        return@subprojects
+    }
+
     apply(plugin = "java")
 
     java {

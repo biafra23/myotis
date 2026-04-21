@@ -186,9 +186,9 @@ public class BeaconLightClient implements AutoCloseable {
         log.info("[beacon] Starting with forkVersion={}", bytesToHex(forkVersion));
         p2pService.start();
         running = true;
-        syncThread = Thread.ofVirtual()
-                .name("beacon-sync")
-                .start(this::syncLoop);
+        syncThread = new Thread(this::syncLoop, "beacon-sync");
+        syncThread.setDaemon(true);
+        syncThread.start();
         log.info("[beacon] Light client started with {} peer(s)", clPeerMultiaddrs.size());
     }
 
