@@ -1,7 +1,7 @@
 package com.jaeckel.ethp2p.consensus.libp2p;
 
-import org.xerial.snappy.SnappyFramedInputStream;
-import org.xerial.snappy.SnappyFramedOutputStream;
+import org.iq80.snappy.SnappyFramedInputStream;
+import org.iq80.snappy.SnappyFramedOutputStream;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -200,7 +200,7 @@ public final class ReqRespCodec {
      */
     static byte[] snappyDecompress(byte[] input) throws IOException {
         try (SnappyFramedInputStream snappyIn = new SnappyFramedInputStream(
-                new ByteArrayInputStream(input))) {
+                new ByteArrayInputStream(input), true)) {
             return snappyIn.readAllBytes();
         }
     }
