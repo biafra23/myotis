@@ -10,8 +10,9 @@
 
     <application
         android:name=".EthP2PApplication"
-        android:label="@string/app_name"
-        android:allowBackup="false">
+        android:label="ethp2p"
+        android:allowBackup="false"
+        android:theme="@android:style/Theme.DeviceDefault.DayNight">
 
         <activity
             android:name=".MainActivity"

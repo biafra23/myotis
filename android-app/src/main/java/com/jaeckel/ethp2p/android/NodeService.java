@@ -5,6 +5,7 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
+import android.os.Binder;
 import android.os.IBinder;
 import android.util.Log;
 
@@ -18,6 +19,9 @@ import org.apache.tuweni.crypto.SECP256K1;
 
 import java.net.InetSocketAddress;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -46,12 +50,37 @@ public final class NodeService extends Service {
         return RUNNING.get();
     }
 
+    // Promoted from startNode() locals so snapshot() can read them while the
+    // Netty threads mutate them concurrently. All three are thread-safe.
+    private final Set<String> attempted = ConcurrentHashMap.newKeySet();
+    private final Map<String, Long> backoff = new ConcurrentHashMap<>();
+    private final Set<String> blacklistedNodeIds = ConcurrentHashMap.newKeySet();
+
     private DiscV4Service discV4;
     private RLPxConnector connector;
+    private volatile int cachedPeerCount;
+
+    private final IBinder binder = new LocalBinder();
+
+    public final class LocalBinder extends Binder {
+        public NodeService service() { return NodeService.this; }
+    }
+
+    public record Snapshot(
+            boolean running,
+            int discoveredPeers,
+            int connectedPeers,
+            int readyPeers,
+            int snapPeers,
+            int cachedPeers,
+            int attemptedPeers,
+            int backedOffPeers,
+            int blacklistedPeers,
+            List<RLPxConnector.PeerInfo> readyPeerList) {}
 
     @Override
     public IBinder onBind(Intent intent) {
-        return null;
+        return binder;
     }
 
     @Override
@@ -79,10 +108,8 @@ public final class NodeService extends Service {
 
             Path cacheFile = new java.io.File(getFilesDir(), "peers.cache").toPath();
             AndroidPeerCache peerCache = new AndroidPeerCache(cacheFile);
-
-            Set<String> attempted = ConcurrentHashMap.newKeySet();
-            Map<String, Long> backoff = new ConcurrentHashMap<>();
-            Set<String> blacklistedNodeIds = ConcurrentHashMap.newKeySet();
+            List<AndroidPeerCache.CachedPeer> cached = peerCache.load();
+            cachedPeerCount = cached.size();
 
             connector = new RLPxConnector(nodeKey, DEFAULT_PORT, network,
                     headers -> {
@@ -93,7 +120,7 @@ public final class NodeService extends Service {
                     peerCache::add);
 
             // Reconnect cached peers first
-            for (AndroidPeerCache.CachedPeer peer : peerCache.load()) {
+            for (AndroidPeerCache.CachedPeer peer : cached) {
                 String peerKey = peer.address().getAddress().getHostAddress()
                         + ":" + peer.address().getPort();
                 attempted.add(peerKey);
@@ -154,6 +181,39 @@ public final class NodeService extends Service {
         }
     }
 
+    public Snapshot snapshot() {
+        boolean running = RUNNING.get();
+        if (!running || connector == null) {
+            return new Snapshot(running, 0, 0, 0, 0,
+                    cachedPeerCount, attempted.size(), countActiveBackoff(),
+                    blacklistedNodeIds.size(), List.of());
+        }
+        List<RLPxConnector.PeerInfo> active = connector.getActivePeers();
+        List<RLPxConnector.PeerInfo> ready = new ArrayList<>();
+        int snapCount = 0;
+        for (RLPxConnector.PeerInfo p : active) {
+            if ("READY".equals(p.state())) {
+                ready.add(p);
+                if (p.snapSupported()) snapCount++;
+            }
+        }
+        // snap peers first, then by clientId. Mirrors peers.sh.
+        ready.sort(Comparator
+                .comparing(RLPxConnector.PeerInfo::snapSupported).reversed()
+                .thenComparing(p -> p.clientId() == null ? "" : p.clientId()));
+        int tableSize = discV4 != null ? discV4.table().size() : 0;
+        return new Snapshot(true, tableSize, active.size(), ready.size(), snapCount,
+                cachedPeerCount, attempted.size(), countActiveBackoff(),
+                blacklistedNodeIds.size(), ready);
+    }
+
+    private int countActiveBackoff() {
+        long now = System.currentTimeMillis();
+        int n = 0;
+        for (Long expiry : backoff.values()) if (expiry > now) n++;
+        return n;
+    }
+
     @Override
     public void onDestroy() {
         Log.i(TAG, "Stopping node");
@@ -166,11 +226,11 @@ public final class NodeService extends Service {
     private Notification buildNotification() {
         NotificationManager nm = getSystemService(NotificationManager.class);
         NotificationChannel channel = new NotificationChannel(
-                CHANNEL_ID, getString(R.string.notification_channel),
+                CHANNEL_ID, "ethp2p node",
                 NotificationManager.IMPORTANCE_LOW);
         nm.createNotificationChannel(channel);
         return new Notification.Builder(this, CHANNEL_ID)
-                .setContentTitle(getString(R.string.notification_title))
+                .setContentTitle("ethp2p node running")
                 .setSmallIcon(android.R.drawable.stat_sys_download)
                 .setOngoing(true)
                 .build();

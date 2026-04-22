@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <string name="app_name">ethp2p</string>
-    <string name="start">Start node</string>
-    <string name="stop">Stop node</string>
-    <string name="notification_channel">ethp2p node</string>
-    <string name="notification_title">ethp2p node running</string>
-</resources>

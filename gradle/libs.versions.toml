@@ -7,15 +7,20 @@ bouncycastle = "1.78.1"
 junit = "5.10.0"
 slf4j = "2.0.12"
 logback = "1.5.6"
-snappy = "1.1.10.7"
+snappy = "0.4"
 milagro = "0.4.0"
 jvm-libp2p = "1.2.2-RELEASE"
 trueblocks-kotlin = "main-SNAPSHOT"
 dnsjava = "3.6.2"
 agp = "8.7.3"
+kotlin = "2.0.21"
+compose-bom = "2024.11.00"
+activity-compose = "1.9.3"
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android      = { id = "org.jetbrains.kotlin.android",         version.ref = "kotlin" }
+compose-compiler    = { id = "org.jetbrains.kotlin.plugin.compose",  version.ref = "kotlin" }
 
 [libraries]
 tuweni-bytes        = { module = "io.consensys.tuweni:tuweni-bytes",       version.ref = "tuweni" }
@@ -34,7 +39,7 @@ bouncycastle        = { module = "org.bouncycastle:bcprov-jdk18on",        versi
 slf4j-api           = { module = "org.slf4j:slf4j-api",                   version.ref = "slf4j" }
 logback-classic     = { module = "ch.qos.logback:logback-classic",         version.ref = "logback" }
 
-snappy              = { module = "org.xerial.snappy:snappy-java",           version.ref = "snappy" }
+snappy              = { module = "org.iq80.snappy:snappy",                  version.ref = "snappy" }
 
 junit-bom           = { module = "org.junit:junit-bom",                    version.ref = "junit" }
 junit-jupiter       = { module = "org.junit.jupiter:junit-jupiter" }
@@ -43,3 +48,11 @@ milagro             = { module = "org.miracl.milagro.amcl:milagro-crypto-java", 
 jvm-libp2p          = { module = "io.libp2p:jvm-libp2p",                   version.ref = "jvm-libp2p" }
 trueblocks-kotlin   = { module = "com.github.biafra23:trueblocks-kotlin", version.ref = "trueblocks-kotlin" }
 dnsjava             = { module = "dnsjava:dnsjava",                       version.ref = "dnsjava" }
+
+androidx-compose-bom              = { module = "androidx.compose:compose-bom", version.ref = "compose-bom" }
+androidx-activity-compose         = { module = "androidx.activity:activity-compose", version.ref = "activity-compose" }
+androidx-compose-ui               = { module = "androidx.compose.ui:ui" }
+androidx-compose-ui-graphics      = { module = "androidx.compose.ui:ui-graphics" }
+androidx-compose-ui-tooling       = { module = "androidx.compose.ui:ui-tooling" }
+androidx-compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
+androidx-compose-material3        = { module = "androidx.compose.material3:material3" }

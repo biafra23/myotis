@@ -1,5 +1,7 @@
 plugins {
     alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.compose.compiler)
 }
 
 // The JitPack netty-kotlin fork republishes netty-common/buffer/etc. with the
@@ -27,6 +29,14 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
         // Sugar for java.time, java.nio.file etc. on minSdk 28
         isCoreLibraryDesugaringEnabled = true
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    buildFeatures {
+        compose = true
     }
 
     // Pin the debug signing identity to a keystore checked into the repo so
@@ -87,4 +97,13 @@ dependencies {
     implementation(libs.slf4j.api)
     // slf4j-android binding would be nicer, but slf4j-simple keeps the POC self-contained
     runtimeOnly("org.slf4j:slf4j-simple:2.0.12")
+
+    // Jetpack Compose UI (BOM pins all compose-* versions together)
+    implementation(platform(libs.androidx.compose.bom))
+    implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.compose.ui)
+    implementation(libs.androidx.compose.ui.graphics)
+    implementation(libs.androidx.compose.material3)
+    implementation(libs.androidx.compose.ui.tooling.preview)
+    debugImplementation(libs.androidx.compose.ui.tooling)
 }
