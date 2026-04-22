@@ -53,10 +53,19 @@ public final class DiscV5Service implements AutoCloseable {
 
     /**
      * Bind UDP {@code udpPort} and start advertising / discovering.
-     * CL convention is to run discv5 on the libp2p port (9000), so the caller
-     * typically passes that rather than the EL 30303.
+     *
+     * <p>Non-blocking: the library's bootstrap (UDP bind + Netty boot + initial
+     * bootnode pings) runs asynchronously. If the caller blocks this method
+     * daemon boot stalls the whole downstream chain (IPC server, etc.) waiting
+     * for a network-dependent handshake, and a {@code status} query in that
+     * window sees the daemon's file lock but no socket yet. We kick the library
+     * off, schedule our poll task to fire only after it's ready, and let the
+     * daemon continue booting immediately.
+     *
+     * <p>CL convention is to run discv5 on the libp2p port (9000), so the
+     * caller typically passes that rather than the EL 30303.
      */
-    public void start(int udpPort) throws Exception {
+    public void start(int udpPort) {
         DefaultSigner signer = new DefaultSigner(nodeKey.secretKey());
 
         NodeRecord localRecord = new NodeRecordBuilder()
@@ -72,19 +81,26 @@ public final class DiscV5Service implements AutoCloseable {
                 .bootnodes(bootnodeEnrs.toArray(new String[0]))
                 .build();
 
-        // start() returns a CompletableFuture that completes when the UDP bind
-        // + Netty boot is done. Block briefly; matches DiscV4Service.start().
-        system.start().get(30, TimeUnit.SECONDS);
-        log.info("[discv5] Listening on UDP port {} with {} bootnode(s)", udpPort, bootnodeEnrs.size());
-
         scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "discv5-poll");
             t.setDaemon(true);
             return t;
         });
-        // First poll at 5s to pick up fast bootnode responses; then every 15s
-        // (same cadence as discv4-refresh) to surface newly-discovered peers.
-        scheduler.scheduleAtFixedRate(this::pollAndNotify, 5, 15, TimeUnit.SECONDS);
+
+        // Kick the library's bootstrap off; arm the poll task from the
+        // completion callback so it doesn't fire before the UDP bind is done.
+        system.start().whenComplete((v, ex) -> {
+            if (ex != null) {
+                log.warn("[discv5] start failed on UDP {}: {}", udpPort, ex.toString());
+                scheduler.shutdownNow();
+                return;
+            }
+            log.info("[discv5] Listening on UDP port {} with {} bootnode(s)",
+                    udpPort, bootnodeEnrs.size());
+            // First poll at 5s to pick up fast bootnode responses; then every
+            // 15s (same cadence as discv4-refresh) to surface new peers.
+            scheduler.scheduleAtFixedRate(this::pollAndNotify, 5, 15, TimeUnit.SECONDS);
+        });
     }
 
     /**
