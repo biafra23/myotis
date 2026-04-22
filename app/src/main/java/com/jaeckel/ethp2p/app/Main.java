@@ -326,10 +326,26 @@ public final class Main {
         // Runtime integration with the running BLC is a follow-up: BLC freezes its
         // peer list at construction. The feedback loop is one daemon restart today.
         byte[] currentForkDigest = network.currentForkDigest();
+        log.info("[discv5] expecting fork_digest=0x{} for network {}",
+                java.util.HexFormat.of().formatHex(currentForkDigest), network.name());
+        // Log the first few mismatches so we can tell whether the filter is
+        // rejecting every peer (wrong expected digest?) vs. no peers arriving.
+        java.util.concurrent.atomic.AtomicInteger mismatchesLogged =
+                new java.util.concurrent.atomic.AtomicInteger();
         DiscV5Service discV5 = new DiscV5Service(nodeKey, network.clDiscv5Bootnodes(), enr -> {
             var eth2 = enr.eth2();
             if (eth2.isEmpty()) return;
-            if (!java.util.Arrays.equals(eth2.get().forkDigest(), currentForkDigest)) return;
+            byte[] peerDigest = eth2.get().forkDigest();
+            if (!java.util.Arrays.equals(peerDigest, currentForkDigest)) {
+                int n = mismatchesLogged.incrementAndGet();
+                if (n <= 5) {
+                    log.info("[discv5] eth2 peer fork_digest=0x{} (expected 0x{}) — rejected{}",
+                            java.util.HexFormat.of().formatHex(peerDigest),
+                            java.util.HexFormat.of().formatHex(currentForkDigest),
+                            n == 5 ? " [further mismatch logs suppressed]" : "");
+                }
+                return;
+            }
             enr.toLibp2pMultiaddr().ifPresent(ma -> {
                 log.info("[discv5] CL peer {} (fork_digest match)", ma);
                 clPeerCache.add(ma);

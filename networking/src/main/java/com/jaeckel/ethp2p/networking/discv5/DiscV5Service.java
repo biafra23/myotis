@@ -117,11 +117,16 @@ public final class DiscV5Service implements AutoCloseable {
 
     private void pollAndNotify() {
         try {
+            int[] newThisTick = {0};
+            int[] withEth2 = {0};
             system.streamLiveNodes().forEach(nr -> {
                 String enrStr = nr.asEnr();
                 if (seenEnrs.add(enrStr)) {
+                    newThisTick[0]++;
                     try {
-                        onPeerDiscovered.accept(Enr.fromEnrString(enrStr));
+                        Enr parsed = Enr.fromEnrString(enrStr);
+                        if (parsed.eth2().isPresent()) withEth2[0]++;
+                        onPeerDiscovered.accept(parsed);
                     } catch (Exception e) {
                         log.warn("[discv5] failed to parse library ENR: {}", e.getMessage());
                     }
@@ -130,6 +135,13 @@ public final class DiscV5Service implements AutoCloseable {
             // Kick a background search so the table keeps expanding between
             // polls rather than stalling at whatever the bootnodes returned.
             system.searchForNewPeers();
+            // One INFO line per 15s poll so the daemon log makes it obvious
+            // whether the library is making progress. The library itself logs
+            // through log4j which our logback pipeline doesn't route — this is
+            // the only visibility we have at the slf4j layer.
+            log.info("[discv5] poll: live={} seen-total={} new-this-tick={} with-eth2-this-tick={}",
+                    (int) system.streamLiveNodes().count(), seenEnrs.size(),
+                    newThisTick[0], withEth2[0]);
         } catch (Exception e) {
             log.warn("[discv5] poll failed: {}", e.getMessage());
         }
