@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="myotis_logo_light.svg">
+    <img src="myotis_logo.svg" alt="Myotis logo" width="200">
+  </picture>
+</p>
+
 # devp2p Playground
 
 An Ethereum devp2p implementation in Java 21 based on tuweni libraries meant to run on Android devices eventually. Connects to the Ethereum mainnet (or testnets) using the devp2p protocol stack: discv4 peer discovery, RLPx encrypted transport, and eth/67-69 sub-protocol. Includes a beacon chain light client for consensus-layer state root verification and snap/1 support for account and storage lookups with Merkle proofs and cryptographic verification back to beacon chain finality.
