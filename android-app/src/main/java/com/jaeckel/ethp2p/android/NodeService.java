@@ -319,10 +319,19 @@ public final class NodeService extends Service {
     }
 
     private int countActiveBackoff() {
+        // Piggyback a prune on every count: the discv4 callback only clears a
+        // backoff entry if the same peer is discovered again, so peers we
+        // never see again would leak slots forever. snapshot() polls this
+        // every ~2s while the UI is visible, which is plenty of cleanup cadence.
         long now = System.currentTimeMillis();
-        int n = 0;
-        for (Long expiry : backoff.values()) if (expiry > now) n++;
-        return n;
+        int active = 0;
+        java.util.Iterator<Map.Entry<String, Long>> it = backoff.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<String, Long> e = it.next();
+            if (e.getValue() <= now) it.remove();
+            else active++;
+        }
+        return active;
     }
 
     @Override
