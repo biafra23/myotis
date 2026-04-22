@@ -202,16 +202,23 @@ public final class NodeService extends Service {
             });
 
             // discv5 — CL peer discovery. Runs on a separate UDP port from discv4.
-            // Callback filters ENRs by eth2 fork digest; matches are counted for
+            // Callback filters ENRs by eth2 fork digest (current OR prior — same
+            // dual-accept behaviour the JVM daemon uses so a mis-pinned current
+            // fork doesn't silently discard every peer). Matches are counted for
             // display. No BeaconLightClient consumer on Android yet, so discovered
             // peers aren't connected — the counter only verifies discv5 is reaching
             // the CL DHT. When BeaconService lands, this callback feeds it.
-            byte[] forkDigest = network.currentForkDigest();
+            List<byte[]> acceptedForkDigests = network.acceptedForkDigests();
             localDiscV5 = new DiscV5Service(nodeKey, network.clDiscv5Bootnodes(), enr -> {
                 var eth2 = enr.eth2();
                 if (eth2.isEmpty()) return;
-                if (!java.util.Arrays.equals(eth2.get().forkDigest(), forkDigest)) return;
-                clPeersDiscovered.incrementAndGet();
+                byte[] peerDigest = eth2.get().forkDigest();
+                for (byte[] accepted : acceptedForkDigests) {
+                    if (java.util.Arrays.equals(peerDigest, accepted)) {
+                        clPeersDiscovered.incrementAndGet();
+                        return;
+                    }
+                }
             });
 
             // Publish atomically vs. shutdown() — if shutdown won the race

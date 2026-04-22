@@ -325,9 +325,12 @@ public final class Main {
         //
         // Runtime integration with the running BLC is a follow-up: BLC freezes its
         // peer list at construction. The feedback loop is one daemon restart today.
-        byte[] currentForkDigest = network.currentForkDigest();
-        log.info("[discv5] expecting fork_digest=0x{} for network {}",
-                java.util.HexFormat.of().formatHex(currentForkDigest), network.name());
+        List<byte[]> acceptedForkDigests = network.acceptedForkDigests();
+        log.info("[discv5] accepted fork_digests for network {}: {}",
+                network.name(),
+                acceptedForkDigests.stream()
+                        .map(d -> "0x" + java.util.HexFormat.of().formatHex(d))
+                        .toList());
         // Log the first few mismatches so we can tell whether the filter is
         // rejecting every peer (wrong expected digest?) vs. no peers arriving.
         java.util.concurrent.atomic.AtomicInteger mismatchesLogged =
@@ -336,18 +339,26 @@ public final class Main {
             var eth2 = enr.eth2();
             if (eth2.isEmpty()) return;
             byte[] peerDigest = eth2.get().forkDigest();
-            if (!java.util.Arrays.equals(peerDigest, currentForkDigest)) {
+            int matchIdx = -1;
+            for (int i = 0; i < acceptedForkDigests.size(); i++) {
+                if (java.util.Arrays.equals(peerDigest, acceptedForkDigests.get(i))) {
+                    matchIdx = i;
+                    break;
+                }
+            }
+            if (matchIdx < 0) {
                 int n = mismatchesLogged.incrementAndGet();
                 if (n <= 5) {
-                    log.info("[discv5] eth2 peer fork_digest=0x{} (expected 0x{}) — rejected{}",
+                    log.info("[discv5] eth2 peer fork_digest=0x{} not in accepted set — rejected{}",
                             java.util.HexFormat.of().formatHex(peerDigest),
-                            java.util.HexFormat.of().formatHex(currentForkDigest),
                             n == 5 ? " [further mismatch logs suppressed]" : "");
                 }
                 return;
             }
+            final int mi = matchIdx;
             enr.toLibp2pMultiaddr().ifPresent(ma -> {
-                log.info("[discv5] CL peer {} (fork_digest match)", ma);
+                String tier = mi == 0 ? "current" : "prior";
+                log.info("[discv5] CL peer {} (fork_digest {} match)", ma, tier);
                 clPeerCache.add(ma);
             });
         });

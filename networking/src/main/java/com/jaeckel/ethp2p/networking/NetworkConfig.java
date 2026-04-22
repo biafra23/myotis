@@ -25,6 +25,10 @@ public record NetworkConfig(
         byte[] genesisValidatorsRoot,   // 32 bytes: genesis_validators_root for BLS domain computation
         byte[] checkpointRoot,          // 32 bytes: trusted checkpoint block root for bootstrap
         byte[] currentForkVersion,      // 4 bytes: current fork version for signing domain
+        byte[] priorForkVersion,        // 4 bytes: immediately preceding fork (nullable). Accepted as
+                                        // a discv5 fork_digest fallback so a configured "current" fork
+                                        // that hasn't yet activated on the network doesn't filter every
+                                        // peer out. Null skips the fallback (testnets, genesis fork).
         List<String> clPeerMultiaddrs,  // libp2p multiaddrs of known CL peers
         String beaconApiUrl,            // HTTP API URL for local beacon node (e.g. http://172.17.0.1:5052)
         long clGenesisTime,             // beacon chain genesis time (seconds since epoch) for wall-clock period estimation
@@ -80,6 +84,9 @@ public record NetworkConfig(
             // @checkpoint:mainnet:end
             // current fork version: Fulu (0x06000000) — activated at slot 13164544 (2025-12-03)
             new byte[]{0x06, 0x00, 0x00, 0x00},
+            // prior fork: Electra (0x05000000). Accepted as a discv5 fork_digest
+            // fallback so peers still on the previous fork survive our filter.
+            new byte[]{0x05, 0x00, 0x00, 0x00},
             // CL peer multiaddrs: known light-client-serving peers (nimbus, lodestar, lighthouse)
             // discovered via Lighthouse peer API 2026-03-11
             List.of(
@@ -165,6 +172,7 @@ public record NetworkConfig(
             Bytes.fromHexString("1f7c15e7e1a7be27b4e7e9b7bdb0e5e9b2aa5aebd33498ec04b58ef2adb5e9ce").toArrayUnsafe(),
             // current fork version: Electra on sepolia (0x90000073)
             new byte[]{(byte) 0x90, 0x00, 0x00, 0x73},
+            null, // prior fork version not pinned for sepolia
             // CL peer multiaddrs for sepolia
             List.of(
                     "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS"
@@ -193,6 +201,7 @@ public record NetworkConfig(
             Bytes.fromHexString("e4571b4f4a3bffdc9b87e75de28b86e5d9e8e1ab2b27d8a66e3e4e9f9ebe7f4c").toArrayUnsafe(),
             // current fork version: Electra on holesky (0x06017000)
             new byte[]{0x06, 0x01, 0x70, 0x00},
+            null, // prior fork version not pinned for holesky
             // CL peer multiaddrs for holesky
             List.of(
                     "/ip4/159.69.35.70/tcp/9000/p2p/16Uiu2HAmFMfXsymWEK6BFPQNPW3nPz57uB3TKpVNFDmeoW7WXNUA"
@@ -211,25 +220,24 @@ public record NetworkConfig(
     public static final long MAINNET_GENESIS_FORK_NEXT = 1_150_000L; // Homestead
 
     /**
-     * Compute {@code fork_digest} per the CL spec:
-     * {@code fork_digest = SHA256( (current_version || 28 zero bytes) || genesis_validators_root )[:4]}.
+     * Compute {@code fork_digest} per the CL spec for an arbitrary fork version:
+     * {@code fork_digest = SHA256( (fork_version || 28 zero bytes) || genesis_validators_root )[:4]}.
      *
      * <p>Used to filter discv5-advertised ENRs down to peers on the same fork
      * as us. The padding to 32 bytes is the SSZ chunk size; the whole thing
-     * is really {@code hash_tree_root(ForkData(current_version, genesis_validators_root))}
+     * is really {@code hash_tree_root(ForkData(fork_version, genesis_validators_root))}
      * but for a 2-field container with leaf sizes &le; 32 bytes that collapses
      * to a single SHA-256 over the concatenated, chunked leaves.
      */
-    public byte[] currentForkDigest() {
-        byte[] currentForkVersion = currentForkVersion();
+    public byte[] forkDigestFor(byte[] forkVersion) {
         byte[] genesisValidatorsRoot = genesisValidatorsRoot();
-        if (currentForkVersion == null || currentForkVersion.length != 4)
-            throw new IllegalArgumentException("currentForkVersion must be 4 bytes");
+        if (forkVersion == null || forkVersion.length != 4)
+            throw new IllegalArgumentException("forkVersion must be 4 bytes");
         if (genesisValidatorsRoot == null || genesisValidatorsRoot.length != 32)
             throw new IllegalArgumentException("genesisValidatorsRoot must be 32 bytes");
         try {
             byte[] buf = new byte[64];
-            System.arraycopy(currentForkVersion, 0, buf, 0, 4);
+            System.arraycopy(forkVersion, 0, buf, 0, 4);
             // bytes 4..32 are zeros (SSZ padding for Bytes4 leaf)
             System.arraycopy(genesisValidatorsRoot, 0, buf, 32, 32);
             byte[] hash = java.security.MessageDigest.getInstance("SHA-256").digest(buf);
@@ -239,6 +247,27 @@ public record NetworkConfig(
         } catch (java.security.NoSuchAlgorithmException e) {
             throw new AssertionError("SHA-256 missing", e);
         }
+    }
+
+    /** Shorthand for {@code forkDigestFor(currentForkVersion())}. */
+    public byte[] currentForkDigest() {
+        return forkDigestFor(currentForkVersion());
+    }
+
+    /**
+     * Fork digests to accept when filtering discv5 ENRs — current first, then
+     * the prior fork if configured. Matching the prior digest keeps discv5
+     * useful during the period around a fork activation (our {@code
+     * currentForkVersion} may be ahead of — or behind — the network's actual
+     * state without a config bump) instead of rejecting every peer.
+     */
+    public List<byte[]> acceptedForkDigests() {
+        List<byte[]> digests = new ArrayList<>(2);
+        digests.add(currentForkDigest());
+        if (priorForkVersion != null) {
+            digests.add(forkDigestFor(priorForkVersion));
+        }
+        return List.copyOf(digests);
     }
 
     /** Look up a network by name (case-insensitive). */
