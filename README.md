@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="myotis_logo_dark.svg">
-    <img src="myotis_logo.svg" alt="Myotis logo" width="200">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/myotis_logo_dark.svg">
+    <img src="assets/myotis_logo.svg" alt="Myotis logo" width="200">
   </picture>
 </p>
 

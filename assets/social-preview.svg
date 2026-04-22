@@ -15,5 +15,5 @@
   <text x="640" y="590" text-anchor="middle"
         font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
         font-size="22" font-weight="400" fill="#5A5A70"
-        letter-spacing="1">a trustless Ethereum light client in Java</text>
+        letter-spacing="1">A trustless Ethereum light client for Android</text>
 </svg>
