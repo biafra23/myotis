@@ -176,6 +176,24 @@ public class BeaconLightClient implements AutoCloseable {
     }
 
     /**
+     * Add a newly-discovered CL peer to the live pool so the next sync cycle
+     * sees it. Dedup'd via {@link #knownPeerAddrs}. Safe to call from any
+     * thread (discv5 callback, beacon API polling, etc.).
+     *
+     * <p>Inserted near the front of the pool so freshly-discovered peers are
+     * tried before possibly-rotten hardcoded seed entries.
+     *
+     * @return true if the peer was new (added to the pool); false if it was
+     *         already known
+     */
+    public boolean addPeer(String multiaddr) {
+        if (multiaddr == null || multiaddr.isEmpty()) return false;
+        if (!knownPeerAddrs.add(multiaddr)) return false;
+        clPeerMultiaddrs.add(Math.min(1, clPeerMultiaddrs.size()), multiaddr);
+        return true;
+    }
+
+    /**
      * Start the libp2p host and launch the background sync loop on a virtual thread.
      *
      * @throws IllegalStateException if already started

@@ -335,6 +335,11 @@ public final class Main {
         // rejecting every peer (wrong expected digest?) vs. no peers arriving.
         java.util.concurrent.atomic.AtomicInteger mismatchesLogged =
                 new java.util.concurrent.atomic.AtomicInteger();
+        // Discovered peers land here; BLC is constructed a few lines below and
+        // has this reference set once it's up so the discv5 callback can feed
+        // fresh peers directly into its live pool, not just the on-disk cache.
+        java.util.concurrent.atomic.AtomicReference<BeaconLightClient> blcRef =
+                new java.util.concurrent.atomic.AtomicReference<>();
         DiscV5Service discV5 = new DiscV5Service(nodeKey, network.clDiscv5Bootnodes(), enr -> {
             var eth2 = enr.eth2();
             if (eth2.isEmpty()) return;
@@ -358,8 +363,11 @@ public final class Main {
             final int mi = matchIdx;
             enr.toLibp2pMultiaddr().ifPresent(ma -> {
                 String tier = mi == 0 ? "current" : "prior";
-                log.info("[discv5] CL peer {} (fork_digest {} match)", ma, tier);
                 clPeerCache.add(ma);
+                BeaconLightClient blc = blcRef.get();
+                boolean liveAdded = blc != null && blc.addPeer(ma);
+                log.info("[discv5] CL peer {} (fork_digest {} match){}", ma, tier,
+                        liveAdded ? " → live pool" : "");
             });
         });
         try {
@@ -402,6 +410,9 @@ public final class Main {
                 clPeerCache::add,
                 clPeerCache::markFailure,
                 network.clGenesisTime());
+        // Publish to discv5 callback; any eth2-matching ENRs seen from here on
+        // out get added to BLC's live peer pool (not just the on-disk cache).
+        blcRef.set(beaconLightClient);
         beaconLightClient.start();
         log.info("[daemon] Beacon light client started with {} CL peer(s) ({} cached)",
                 clPeers.size(), clPeers.size() - network.clPeerMultiaddrs().size());
