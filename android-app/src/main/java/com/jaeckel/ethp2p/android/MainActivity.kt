@@ -27,6 +27,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -68,6 +69,7 @@ class MainActivity : ComponentActivity() {
                         serviceProvider = { boundServiceState.value },
                         onToggle = ::toggleService,
                         onOpenNetworkSettings = ::openWifiSettings,
+                        onClearCaches = ::clearPeerCaches,
                     )
                 }
             }
@@ -109,6 +111,10 @@ class MainActivity : ComponentActivity() {
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
 
+    private fun clearPeerCaches() {
+        boundServiceState.value?.clearCaches()
+    }
+
     private fun ensureNotificationPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
@@ -123,9 +129,11 @@ private fun NodeScreen(
     serviceProvider: () -> NodeService?,
     onToggle: () -> Unit,
     onOpenNetworkSettings: () -> Unit,
+    onClearCaches: () -> Unit,
 ) {
     var snapshot by remember { mutableStateOf<NodeService.Snapshot?>(null) }
     var running by remember { mutableStateOf(NodeService.isRunning()) }
+    var now by remember { mutableStateOf(System.currentTimeMillis()) }
     val online = rememberIsOnline()
 
     LaunchedEffect(Unit) {
@@ -133,6 +141,13 @@ private fun NodeScreen(
             running = NodeService.isRunning()
             snapshot = serviceProvider()?.snapshot()
             delay(2000)
+        }
+    }
+    // Tick once a second so the uptime readout doesn't jump in 2-second steps.
+    LaunchedEffect(Unit) {
+        while (isActive) {
+            now = System.currentTimeMillis()
+            delay(1000)
         }
     }
 
@@ -154,6 +169,14 @@ private fun NodeScreen(
             Text(if (running) "Stop node" else "Start node")
         }
 
+        OutlinedButton(
+            onClick = onClearCaches,
+            enabled = serviceProvider() != null,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Clear peer caches")
+        }
+
         val s = snapshot
         if (s == null || !s.running) {
             Text(
@@ -161,11 +184,24 @@ private fun NodeScreen(
                 else "Connect to the internet before starting the node."
             )
         } else {
+            StatusRow("uptime", formatUptime(now - s.startTimeMs))
             StatusSummary(s)
             HorizontalDivider()
             Text("READY peers (${s.readyPeerList.size})", style = MaterialTheme.typography.titleSmall)
             PeerList(s.readyPeerList)
         }
+    }
+}
+
+private fun formatUptime(ms: Long): String {
+    val seconds = (ms / 1000).coerceAtLeast(0)
+    val h = seconds / 3600
+    val m = (seconds % 3600) / 60
+    val s = seconds % 60
+    return when {
+        h > 0 -> "%dh %02dm %02ds".format(h, m, s)
+        m > 0 -> "%dm %02ds".format(m, s)
+        else -> "%ds".format(s)
     }
 }
 

@@ -58,7 +58,9 @@ public final class NodeService extends Service {
 
     private DiscV4Service discV4;
     private RLPxConnector connector;
+    private AndroidPeerCache peerCache;
     private volatile int cachedPeerCount;
+    private volatile long startTimeMs;
 
     private final IBinder binder = new LocalBinder();
 
@@ -68,6 +70,7 @@ public final class NodeService extends Service {
 
     public record Snapshot(
             boolean running,
+            long startTimeMs,
             int discoveredPeers,
             int connectedPeers,
             int readyPeers,
@@ -92,6 +95,7 @@ public final class NodeService extends Service {
             Log.i(TAG, "start requested but node is already running");
             return START_NOT_STICKY;
         }
+        startTimeMs = System.currentTimeMillis();
         startForeground(NOTIFICATION_ID, buildNotification());
 
         // Netty boot is blocking-ish; punt off the main thread.
@@ -107,7 +111,7 @@ public final class NodeService extends Service {
             Log.i(TAG, "Node ID: " + nodeKey.nodeId().toHexString());
 
             Path cacheFile = new java.io.File(getFilesDir(), "peers.cache").toPath();
-            AndroidPeerCache peerCache = new AndroidPeerCache(cacheFile);
+            peerCache = new AndroidPeerCache(cacheFile);
             List<AndroidPeerCache.CachedPeer> cached = peerCache.load();
             cachedPeerCount = cached.size();
 
@@ -201,19 +205,47 @@ public final class NodeService extends Service {
             try { discV4.close(); } catch (Exception ignored) {}
             discV4 = null;
         }
+        peerCache = null;
         attempted.clear();
         backoff.clear();
         blacklistedNodeIds.clear();
         cachedPeerCount = 0;
+        startTimeMs = 0L;
         RUNNING.set(false);
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
     }
 
+    /**
+     * Wipe the in-memory backoff + blacklist sets and delete the on-disk peer
+     * cache. Safe to call while the node is running; the next discv4 hit will
+     * refill backoff/blacklist from scratch, and {@link AndroidPeerCache} will
+     * recreate the file on the next successful RLPx handshake.
+     *
+     * <p>Does not touch {@code attempted} — those are live in-flight dials, not
+     * a cache, and clearing them would race with the per-peer close callback.
+     */
+    public void clearCaches() {
+        Log.i(TAG, "clearing peer caches from UI");
+        backoff.clear();
+        blacklistedNodeIds.clear();
+        cachedPeerCount = 0;
+        if (peerCache != null) {
+            peerCache.clear();
+        } else {
+            // Node is stopped: no live AndroidPeerCache instance exists, so
+            // delete the on-disk file directly.
+            java.io.File cacheFile = new java.io.File(getFilesDir(), "peers.cache");
+            if (cacheFile.exists() && !cacheFile.delete()) {
+                Log.w(TAG, "failed to delete " + cacheFile);
+            }
+        }
+    }
+
     public Snapshot snapshot() {
         boolean running = RUNNING.get();
         if (!running || connector == null) {
-            return new Snapshot(running, 0, 0, 0, 0,
+            return new Snapshot(running, startTimeMs, 0, 0, 0, 0,
                     cachedPeerCount, attempted.size(), countActiveBackoff(),
                     blacklistedNodeIds.size(), List.of());
         }
@@ -231,7 +263,7 @@ public final class NodeService extends Service {
                 .comparing(RLPxConnector.PeerInfo::snapSupported).reversed()
                 .thenComparing(p -> p.clientId() == null ? "" : p.clientId()));
         int tableSize = discV4 != null ? discV4.table().size() : 0;
-        return new Snapshot(true, tableSize, active.size(), ready.size(), snapCount,
+        return new Snapshot(true, startTimeMs, tableSize, active.size(), ready.size(), snapCount,
                 cachedPeerCount, attempted.size(), countActiveBackoff(),
                 blacklistedNodeIds.size(), ready);
     }

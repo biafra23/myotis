@@ -53,6 +53,17 @@ public final class AndroidPeerCache {
         }
     }
 
+    /**
+     * Delete the cache file and forget every peer we've written. Next call
+     * to {@link #add} will recreate the file.
+     */
+    public synchronized void clear() {
+        seen.clear();
+        if (!cacheFile.toFile().delete() && cacheFile.toFile().exists()) {
+            Log.w(TAG, "failed to delete cache file " + cacheFile);
+        }
+    }
+
     public List<CachedPeer> load() {
         List<CachedPeer> result = new ArrayList<>();
         if (!cacheFile.toFile().exists()) return result;
