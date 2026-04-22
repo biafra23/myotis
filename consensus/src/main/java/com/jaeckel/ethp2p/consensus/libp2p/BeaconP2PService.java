@@ -92,8 +92,18 @@ public class BeaconP2PService implements AutoCloseable {
         // Log connection events and auto-query Identify for protocol support
         host.addConnectionHandler(conn -> {
             String pid = conn.secureSession().getRemoteId().toString();
+            String remote = conn.remoteAddress().toString();
             log.info("[beacon-p2p] Connection established to peer={} remote={} local={}",
-                    pid, conn.remoteAddress(), conn.localAddress());
+                    pid, remote, conn.localAddress());
+            // Log when the connection dies so we can tell if LC-capable peers
+            // are dropping us (the prime symptom of a botched Status exchange).
+            conn.closeFuture().thenRun(() -> {
+                String agent = peerAgentVersions.get(pid);
+                List<String> protos = peerProtocols.get(pid);
+                boolean wasLc = protos != null && protos.stream().anyMatch(p -> p.contains("light_client"));
+                log.info("[beacon-p2p] Connection closed remote={} agent={} lightClient={}",
+                        remote, agent != null ? agent : "?", wasLc);
+            });
             // Automatically query Identify to cache supported protocols
             try {
                 StreamPromise<IdentifyController> sp =
@@ -154,6 +164,23 @@ public class BeaconP2PService implements AutoCloseable {
             return protocols != null && protocols.stream()
                     .anyMatch(p -> p.contains("light_client"));
         }
+    }
+
+    /**
+     * Return the cached agent string for a peer if Identify has completed.
+     * Accepts either a libp2p multiaddr (we'll extract the {@code /p2p/<peerId>})
+     * or a raw peerId string. Returns {@code null} if unknown.
+     */
+    public String cachedAgent(String multiaddrOrPeerId) {
+        if (multiaddrOrPeerId == null) return null;
+        String peerId = multiaddrOrPeerId;
+        int idx = multiaddrOrPeerId.indexOf("/p2p/");
+        if (idx >= 0) {
+            peerId = multiaddrOrPeerId.substring(idx + "/p2p/".length());
+            int slash = peerId.indexOf('/');
+            if (slash >= 0) peerId = peerId.substring(0, slash);
+        }
+        return peerAgentVersions.get(peerId);
     }
 
     /**

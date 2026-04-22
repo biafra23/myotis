@@ -243,8 +243,12 @@ public class BeaconLightClient implements AutoCloseable {
 
         // Phase 2: steady-state poll loop — one slot = 12 seconds.
         // If not yet synced, each cycle disconnects stale connections and retries.
+        int cycleCount = 0;
         while (running) {
             try {
+                // Every 5 cycles (~60s), log pool stats so it's easy to see
+                // whether LC-capable peers are accumulating or bleeding off.
+                if (++cycleCount % 5 == 0) logPeerPoolStats();
                 pollFinalityUpdate();
                 Thread.sleep(12_000);
             } catch (InterruptedException e) {
@@ -490,20 +494,9 @@ public class BeaconLightClient implements AutoCloseable {
         }
     }
 
-    /** Fork versions to try for Status, in priority order. */
+    /** Fork versions to try for Status. Currently just the one we're configured for. */
     private java.util.List<byte[]> acceptedForkVersions() {
-        java.util.List<byte[]> versions = new java.util.ArrayList<>(2);
-        versions.add(forkVersion);
-        // Heuristic: derive the immediately prior fork by decrementing the
-        // first byte, so e.g. Fulu (0x06) falls back to Electra (0x05). This
-        // is brittle but covers our current mainnet situation; once we plumb
-        // priorForkVersion through the BLC constructor we'll use that.
-        if ((forkVersion[0] & 0xFF) > 0) {
-            byte[] prior = forkVersion.clone();
-            prior[0] = (byte) ((forkVersion[0] & 0xFF) - 1);
-            versions.add(prior);
-        }
-        return versions;
+        return java.util.List.of(forkVersion);
     }
 
     /**
@@ -1229,12 +1222,63 @@ public class BeaconLightClient implements AutoCloseable {
         }
     }
 
+    /**
+     * One-line snapshot of the peer pool to the log. Intended for periodic
+     * calls while debugging why SYNCED isn't being reached — surfaces how many
+     * peers are in the pool total, how many libp2p has a live connection to,
+     * how many of those connected are LC-capable, and how many are Lodestar
+     * (currently excluded from use for debugging purposes).
+     */
+    private void logPeerPoolStats() {
+        int poolTotal;
+        int excludedPool = 0;
+        synchronized (clPeerMultiaddrs) {
+            poolTotal = clPeerMultiaddrs.size();
+            if (EXCLUDED_AGENT_SUBSTRING != null) {
+                for (String p : clPeerMultiaddrs) {
+                    String a = p2pService.cachedAgent(p);
+                    if (a != null && a.toLowerCase().contains(EXCLUDED_AGENT_SUBSTRING)) excludedPool++;
+                }
+            }
+        }
+        List<BeaconP2PService.PeerInfo> connected = p2pService.getConnectedPeers();
+        long lcConnected = connected.stream().filter(BeaconP2PService.PeerInfo::supportsLightClient).count();
+        long lodestarConnected = connected.stream()
+                .filter(p -> p.agentVersion() != null
+                        && p.agentVersion().toLowerCase().contains("lodestar"))
+                .count();
+        log.info("[beacon] peer-pool: total={} excluded={} connected={} connected-lc={} connected-lodestar={}",
+                poolTotal, excludedPool, connected.size(), lcConnected, lodestarConnected);
+    }
+
     /** Thread-safe snapshot of the peer list. */
     private List<String> copyPeers() {
         synchronized (clPeerMultiaddrs) {
-            return List.copyOf(clPeerMultiaddrs);
+            List<String> all = List.copyOf(clPeerMultiaddrs);
+            if (EXCLUDED_AGENT_SUBSTRING == null) return all;
+            // Drop peers whose Identify agent matches the exclusion substring.
+            // Useful for isolating debugging: pretending Lodestar doesn't exist
+            // forces us to actually get Lighthouse/Teku/Nimbus/Prysm working.
+            List<String> filtered = new ArrayList<>(all.size());
+            for (String p : all) {
+                String agent = p2pService.cachedAgent(p);
+                if (agent != null && agent.toLowerCase().contains(EXCLUDED_AGENT_SUBSTRING)) {
+                    continue;
+                }
+                filtered.add(p);
+            }
+            return filtered;
         }
     }
+
+    /**
+     * Case-insensitive substring that excludes a peer from the usable pool if
+     * its Identify agent string contains it. Set to {@code null} to disable.
+     * Temporarily set to {@code "lodestar"} to force catch-up / finality to go
+     * through Lighthouse/Teku peers instead — the one Lodestar in the
+     * hardcoded seed list was masking failures on the other clients.
+     */
+    private static final String EXCLUDED_AGENT_SUBSTRING = "lodestar";
 
     /**
      * Return peers with {@code preferred} moved to the front if it is in the list.

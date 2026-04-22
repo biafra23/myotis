@@ -84,9 +84,10 @@ public record NetworkConfig(
             // @checkpoint:mainnet:end
             // current fork version: Fulu (0x06000000) — activated at slot 13164544 (2025-12-03)
             new byte[]{0x06, 0x00, 0x00, 0x00},
-            // prior fork: Electra (0x05000000). Accepted as a discv5 fork_digest
-            // fallback so peers still on the previous fork survive our filter.
-            new byte[]{0x05, 0x00, 0x00, 0x00},
+            // No prior-fork fallback: mainnet is on Fulu; peers still advertising
+            // an older digest are either stale ENRs or unupgraded nodes — matching
+            // them wouldn't help us sync to the current head anyway.
+            null,
             // CL peer multiaddrs: known light-client-serving peers (nimbus, lodestar, lighthouse)
             // discovered via Lighthouse peer API 2026-03-11
             List.of(
