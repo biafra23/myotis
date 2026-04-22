@@ -29,7 +29,8 @@ public record NetworkConfig(
         String beaconApiUrl,            // HTTP API URL for local beacon node (e.g. http://172.17.0.1:5052)
         long clGenesisTime,             // beacon chain genesis time (seconds since epoch) for wall-clock period estimation
         List<String> elEnrTreeUrls,     // EIP-1459 enrtree:// URLs for execution-layer discv4 peers
-        List<String> clEnrTreeUrls      // EIP-1459 enrtree:// URLs for consensus-layer libp2p peers
+        List<String> clEnrTreeUrls,     // EIP-1459 enrtree:// URLs for consensus-layer libp2p peers
+        List<String> clDiscv5Bootnodes  // ENR strings of CL discv5 bootnodes (seed for DHT discovery)
 ) {
 
     // -------------------------------------------------------------------------
@@ -111,7 +112,37 @@ public record NetworkConfig(
             List.of("enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.mainnet.ethdisco.net"),
             // CL: no canonical single tree; each CL client team (Lighthouse, Lodestar, Nimbus, Teku)
             // publishes their own. Empty for now — add entries once a tree URL is pinned and verified.
-            List.of()
+            List.of(),
+            // CL discv5 bootnodes — the canonical seed set for the consensus-layer DHT.
+            // Mirrors sigp/lighthouse .../mainnet/bootstrap_nodes.yaml (Teku, Prylabs, Sigma
+            // Prime, EF, Nimbus, Lodestar). These are hardened, long-running ENRs; discv5
+            // uses them only to seed the routing table, then the Kademlia lookup loop
+            // expands beyond them.
+            List.of(
+                    // Teku
+                    "enr:-Iu4QLm7bZGdAt9NSeJG0cEnJohWcQTQaI9wFLu3Q7eHIDfrI4cwtzvEW3F3VbG9XdFXlrHyFGeXPn9snTCQJ9bnMRABgmlkgnY0gmlwhAOTJQCJc2VjcDI1NmsxoQIZdZD6tDYpkpEfVo5bgiU8MGRjhcOmHGD2nErK0UKRrIN0Y3CCIyiDdWRwgiMo",
+                    "enr:-Iu4QEDJ4Wa_UQNbK8Ay1hFEkXvd8psolVK6OhfTL9irqz3nbXxxWyKwEplPfkju4zduVQj6mMhUCm9R2Lc4YM5jPcIBgmlkgnY0gmlwhANrfESJc2VjcDI1NmsxoQJCYz2-nsqFpeEj6eov9HSi9QssIVIVNr0I89J1vXM9foN0Y3CCIyiDdWRwgiMo",
+                    // Prylabs
+                    "enr:-Ku4QImhMc1z8yCiNJ1TyUxdcfNucje3BGwEHzodEZUan8PherEo4sF7pPHPSIB1NNuSg5fZy7qFsjmUKs2ea1Whi0EBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpD1pf1CAAAAAP__________gmlkgnY0gmlwhBLf22SJc2VjcDI1NmsxoQOVphkDqal4QzPMksc5wnpuC3gvSC8AfbFOnZY_On34wIN1ZHCCIyg",
+                    "enr:-Ku4QP2xDnEtUXIjzJ_DhlCRN9SN99RYQPJL92TMlSv7U5C1YnYLjwOQHgZIUXw6c-BvRg2Yc2QsZxxoS_pPRVe0yK8Bh2F0dG5ldHOIAAAAAAAAAACEZXRoMpD1pf1CAAAAAP__________gmlkgnY0gmlwhBLf22SJc2VjcDI1NmsxoQMeFF5GrS7UZpAH2Ly84aLK-TyvH-dRo0JM1i8yygH50YN1ZHCCJxA",
+                    "enr:-Ku4QPp9z1W4tAO8Ber_NQierYaOStqhDqQdOPY3bB3jDgkjcbk6YrEnVYIiCBbTxuar3CzS528d2iE7TdJsrL-dEKoBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpD1pf1CAAAAAP__________gmlkgnY0gmlwhBLf22SJc2VjcDI1NmsxoQMw5fqqkw2hHC4F5HZZDPsNmPdB1Gi8JPQK7pRc9XHh-oN1ZHCCKvg",
+                    // Sigma Prime (Lighthouse)
+                    "enr:-Le4QPUXJS2BTORXxyx2Ia-9ae4YqA_JWX3ssj4E_J-3z1A-HmFGrU8BpvpqhNabayXeOZ2Nq_sbeDgtzMJpLLnXFgAChGV0aDKQtTA_KgEAAAAAIgEAAAAAAIJpZIJ2NIJpcISsaa0Zg2lwNpAkAIkHAAAAAPA8kv_-awoTiXNlY3AyNTZrMaEDHAD2JKYevx89W0CcFJFiskdcEzkH_Wdv9iW42qLK79ODdWRwgiMohHVkcDaCI4I",
+                    "enr:-Le4QLHZDSvkLfqgEo8IWGG96h6mxwe_PsggC20CL3neLBjfXLGAQFOPSltZ7oP6ol54OvaNqO02Rnvb8YmDR274uq8ChGV0aDKQtTA_KgEAAAAAIgEAAAAAAIJpZIJ2NIJpcISLosQxg2lwNpAqAX4AAAAAAPA8kv_-ax65iXNlY3AyNTZrMaEDBJj7_dLFACaxBfaI8KZTh_SSJUjhyAyfshimvSqo22WDdWRwgiMohHVkcDaCI4I",
+                    "enr:-Le4QH6LQrusDbAHPjU_HcKOuMeXfdEB5NJyXgHWFadfHgiySqeDyusQMvfphdYWOzuSZO9Uq2AMRJR5O4ip7OvVma8BhGV0aDKQtTA_KgEAAAAAIgEAAAAAAIJpZIJ2NIJpcISLY9ncg2lwNpAkAh8AgQIBAAAAAAAAAAmXiXNlY3AyNTZrMaECDYCZTZEksF-kmgPholqgVt8IXr-8L7Nu7YrZ7HUpgxmDdWRwgiMohHVkcDaCI4I",
+                    "enr:-Le4QIqLuWybHNONr933Lk0dcMmAB5WgvGKRyDihy1wHDIVlNuuztX62W51voT4I8qD34GcTEOTmag1bcdZ_8aaT4NUBhGV0aDKQtTA_KgEAAAAAIgEAAAAAAIJpZIJ2NIJpcISLY04ng2lwNpAkAh8AgAIBAAAAAAAAAA-fiXNlY3AyNTZrMaEDscnRV6n1m-D9ID5UsURk0jsoKNXt1TIrj8uKOGW6iluDdWRwgiMohHVkcDaCI4I",
+                    // Ethereum Foundation
+                    "enr:-Ku4QHqVeJ8PPICcWk1vSn_XcSkjOkNiTg6Fmii5j6vUQgvzMc9L1goFnLKgXqBJspJjIsB91LTOleFmyWWrFVATGngBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpC1MD8qAAAAAP__________gmlkgnY0gmlwhAMRHkWJc2VjcDI1NmsxoQKLVXFOhp2uX6jeT0DvvDpPcU8FWMjQdR4wMuORMhpX24N1ZHCCIyg",
+                    "enr:-Ku4QG-2_Md3sZIAUebGYT6g0SMskIml77l6yR-M_JXc-UdNHCmHQeOiMLbylPejyJsdAPsTHJyjJB2sYGDLe0dn8uYBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpC1MD8qAAAAAP__________gmlkgnY0gmlwhBLY-NyJc2VjcDI1NmsxoQORcM6e19T1T9gi7jxEZjk_sjVLGFscUNqAY9obgZaxbIN1ZHCCIyg",
+                    "enr:-Ku4QPn5eVhcoF1opaFEvg1b6JNFD2rqVkHQ8HApOKK61OIcIXD127bKWgAtbwI7pnxx6cDyk_nI88TrZKQaGMZj0q0Bh2F0dG5ldHOIAAAAAAAAAACEZXRoMpC1MD8qAAAAAP__________gmlkgnY0gmlwhDayLMaJc2VjcDI1NmsxoQK2sBOLGcUb4AwuYzFuAVCaNHA-dy24UuEKkeFNgCVCsIN1ZHCCIyg",
+                    "enr:-Ku4QEWzdnVtXc2Q0ZVigfCGggOVB2Vc1ZCPEc6j21NIFLODSJbvNaef1g4PxhPwl_3kax86YPheFUSLXPRs98vvYsoBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpC1MD8qAAAAAP__________gmlkgnY0gmlwhDZBrP2Jc2VjcDI1NmsxoQM6jr8Rb1ktLEsVcKAPa08wCsKUmvoQ8khiOl_SLozf9IN1ZHCCIyg",
+                    // Nimbus
+                    "enr:-LK4QA8FfhaAjlb_BXsXxSfiysR7R52Nhi9JBt4F8SPssu8hdE1BXQQEtVDC3qStCW60LSO7hEsVHv5zm8_6Vnjhcn0Bh2F0dG5ldHOIAAAAAAAAAACEZXRoMpC1MD8qAAAAAP__________gmlkgnY0gmlwhAN4aBKJc2VjcDI1NmsxoQJerDhsJ-KxZ8sHySMOCmTO6sHM3iCFQ6VMvLTe948MyYN0Y3CCI4yDdWRwgiOM",
+                    "enr:-LK4QKWrXTpV9T78hNG6s8AM6IO4XH9kFT91uZtFg1GcsJ6dKovDOr1jtAAFPnS2lvNltkOGA9k29BUN7lFh_sjuc9QBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpC1MD8qAAAAAP__________gmlkgnY0gmlwhANAdd-Jc2VjcDI1NmsxoQLQa6ai7y9PMN5hpLe5HmiJSlYzMuzP7ZhwRiwHvqNXdoN0Y3CCI4yDdWRwgiOM",
+                    // Lodestar
+                    "enr:-IS4QPi-onjNsT5xAIAenhCGTDl4z-4UOR25Uq-3TmG4V3kwB9ljLTb_Kp1wdjHNj-H8VVLRBSSWVZo3GUe3z6k0E-IBgmlkgnY0gmlwhKB3_qGJc2VjcDI1NmsxoQMvAfgB4cJXvvXeM6WbCG86CstbSxbQBSGx31FAwVtOTYN1ZHCCIyg",
+                    "enr:-KG4QPUf8-g_jU-KrwzG42AGt0wWM1BTnQxgZXlvCEIfTQ5hSmptkmgmMbRkpOqv6kzb33SlhPHJp7x4rLWWiVq5lSECgmlkgnY0gmlwhFPlR9KDaXA2kCoGxcAJAAAVAAAAAAAAABCJc2VjcDI1NmsxoQLdUv9Eo9sxCt0tc_CheLOWnX59yHJtkBSOL7kpxdJ6GYN1ZHCCIyiEdWRwNoIjKA"
+            )
     );
 
     public static final NetworkConfig SEPOLIA = new NetworkConfig(
@@ -141,7 +172,8 @@ public record NetworkConfig(
             null,
             1655733600L, // sepolia beacon genesis: 2022-06-20 14:00:00 UTC
             List.of(), // EL ENR trees — not pinned
-            List.of()  // CL ENR trees — not pinned
+            List.of(), // CL ENR trees — not pinned
+            List.of()  // CL discv5 bootnodes — not pinned for sepolia this PR
     );
 
     public static final NetworkConfig HOLESKY = new NetworkConfig(
@@ -168,7 +200,8 @@ public record NetworkConfig(
             null,
             1695902400L, // holesky beacon genesis: 2023-09-28 12:00:00 UTC
             List.of(), // EL ENR trees — not pinned
-            List.of()  // CL ENR trees — not pinned
+            List.of(), // CL ENR trees — not pinned
+            List.of()  // CL discv5 bootnodes — not pinned for holesky this PR
     );
 
     // Frontier (genesis) fork IDs — CRC32(genesis_hash), forkNext = first fork block
@@ -176,6 +209,37 @@ public record NetworkConfig(
     public static final byte[] MAINNET_GENESIS_FORK_HASH =
             new byte[]{(byte) 0xfc, (byte) 0x64, (byte) 0xec, (byte) 0x04};
     public static final long MAINNET_GENESIS_FORK_NEXT = 1_150_000L; // Homestead
+
+    /**
+     * Compute {@code fork_digest} per the CL spec:
+     * {@code fork_digest = SHA256( (current_version || 28 zero bytes) || genesis_validators_root )[:4]}.
+     *
+     * <p>Used to filter discv5-advertised ENRs down to peers on the same fork
+     * as us. The padding to 32 bytes is the SSZ chunk size; the whole thing
+     * is really {@code hash_tree_root(ForkData(current_version, genesis_validators_root))}
+     * but for a 2-field container with leaf sizes &le; 32 bytes that collapses
+     * to a single SHA-256 over the concatenated, chunked leaves.
+     */
+    public byte[] currentForkDigest() {
+        byte[] currentForkVersion = currentForkVersion();
+        byte[] genesisValidatorsRoot = genesisValidatorsRoot();
+        if (currentForkVersion == null || currentForkVersion.length != 4)
+            throw new IllegalArgumentException("currentForkVersion must be 4 bytes");
+        if (genesisValidatorsRoot == null || genesisValidatorsRoot.length != 32)
+            throw new IllegalArgumentException("genesisValidatorsRoot must be 32 bytes");
+        try {
+            byte[] buf = new byte[64];
+            System.arraycopy(currentForkVersion, 0, buf, 0, 4);
+            // bytes 4..32 are zeros (SSZ padding for Bytes4 leaf)
+            System.arraycopy(genesisValidatorsRoot, 0, buf, 32, 32);
+            byte[] hash = java.security.MessageDigest.getInstance("SHA-256").digest(buf);
+            byte[] digest = new byte[4];
+            System.arraycopy(hash, 0, digest, 0, 4);
+            return digest;
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new AssertionError("SHA-256 missing", e);
+        }
+    }
 
     /** Look up a network by name (case-insensitive). */
     public static NetworkConfig byName(String name) {

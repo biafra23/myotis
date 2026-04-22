@@ -1,5 +1,6 @@
 [versions]
 tuweni = "2.7.2"
+discovery = "26.4.0"
 #netty-kotlin = "c5a8303903"
 netty-kotlin = "main-SNAPSHOT"
 #netty = "4.2.7.Final"
@@ -48,6 +49,7 @@ milagro             = { module = "org.miracl.milagro.amcl:milagro-crypto-java", 
 jvm-libp2p          = { module = "io.libp2p:jvm-libp2p",                   version.ref = "jvm-libp2p" }
 trueblocks-kotlin   = { module = "com.github.biafra23:trueblocks-kotlin", version.ref = "trueblocks-kotlin" }
 dnsjava             = { module = "dnsjava:dnsjava",                       version.ref = "dnsjava" }
+discovery           = { module = "io.consensys.protocols:discovery",      version.ref = "discovery" }
 
 androidx-compose-bom              = { module = "androidx.compose:compose-bom", version.ref = "compose-bom" }
 androidx-activity-compose         = { module = "androidx.activity:activity-compose", version.ref = "activity-compose" }
