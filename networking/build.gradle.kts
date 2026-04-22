@@ -24,16 +24,18 @@ dependencies {
     implementation(libs.slf4j.api)
     implementation(libs.dnsjava)
     // ConsenSys discv5 library — republished successor of tech.pegasys.discovery.
-    // Excludes:
-    //  - upstream io.netty: the JitPack netty-kotlin fork republishes the same
-    //    classes under different coordinates; D8 rejects the duplicates on Android.
-    //    android-app already strips io.netty group-wide; mirror that here so the
-    //    JVM daemon also resolves to the fork.
-    //  - log4j: the rest of the project uses slf4j-api + logback; we don't want
-    //    log4j on the classpath just for this library's internal logs.
+    // Excludes upstream io.netty: the JitPack netty-kotlin fork republishes the
+    // same classes under different coordinates; D8 rejects the duplicates on
+    // Android. android-app already strips io.netty group-wide; mirror that here
+    // so the JVM daemon also resolves to the fork.
+    //
+    // log4j is NOT excluded: several of the library's internal classes
+    // (IdentitySchemaV4Interpreter etc.) reference org.apache.logging.log4j.LogManager
+    // in their <clinit>, so stripping it NoClassDefFoundErrors the whole library
+    // at first use. Our own code stays on slf4j + logback; log4j-api just
+    // satisfies the library's static init.
     implementation(libs.discovery) {
         exclude(group = "io.netty")
-        exclude(group = "org.apache.logging.log4j")
     }
 
     testImplementation(platform(libs.junit.bom))

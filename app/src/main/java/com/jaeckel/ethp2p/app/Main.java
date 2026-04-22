@@ -337,9 +337,14 @@ public final class Main {
         });
         try {
             discV5.start(9000);
-        } catch (Exception e) {
-            // Non-fatal: EL side still works and CL falls back to cached + hardcoded peers.
-            log.warn("[discv5] failed to start, continuing without CL discovery: {}", e.getMessage());
+        } catch (Throwable t) {
+            // Catch Throwable, not Exception: earlier we hit a NoClassDefFoundError
+            // (library static-init) which slipped past an Exception handler and
+            // killed the main thread while the Netty event loop kept the JVM alive
+            // — the daemon lock stayed held but the IPC socket never got created.
+            // discv5 is non-essential; EL keeps working and CL falls back to the
+            // cache + hardcoded seed list.
+            log.warn("[discv5] failed to start, continuing without CL discovery: {}", t.toString());
         }
 
         // 7. Beacon light client (consensus layer, runs on virtual thread)
