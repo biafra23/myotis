@@ -1,0 +1,43 @@
+name: Android APK
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    name: Build debug APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      # The ubuntu-latest runner ships an Android SDK via $ANDROID_HOME, which
+      # AGP picks up automatically when local.properties is absent. No extra
+      # sdkmanager calls needed for compileSdk 34.
+
+      - name: Build debug APK
+        run: ./gradlew :android-app:assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-app-debug-${{ github.sha }}
+          path: android-app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30

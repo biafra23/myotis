@@ -8,9 +8,8 @@ import org.bouncycastle.crypto.modes.SICBlockCipher;
 import org.bouncycastle.crypto.params.KeyParameter;
 import org.bouncycastle.crypto.params.ParametersWithIV;
 
-import org.xerial.snappy.Snappy;
+import org.iq80.snappy.Snappy;
 
-import java.io.IOException;
 import java.util.Arrays;
 
 /**
@@ -83,11 +82,7 @@ public final class FrameCodec {
         // Snappy-compress payload for all messages except Hello (0x00)
         byte[] payload = body;
         if (messageCode != 0x00) {
-            try {
-                payload = Snappy.compress(body);
-            } catch (IOException e) {
-                throw new IllegalStateException("Snappy compress failed", e);
-            }
+            payload = Snappy.compress(body);
         }
 
         // RLP message code prefix (msg-id is an RLP-encoded integer per devp2p spec)
@@ -189,9 +184,10 @@ public final class FrameCodec {
         // Snappy compression, so fall back to raw payload if decompression fails.
         if (code != 0x00 && payload.length > 0) {
             try {
-                payload = Snappy.uncompress(payload);
-            } catch (IOException e) {
-                // Not Snappy-compressed; use raw payload (common for Disconnect/Ping/Pong)
+                payload = Snappy.uncompress(payload, 0, payload.length);
+            } catch (RuntimeException e) {
+                // Not Snappy-compressed; use raw payload (common for Disconnect/Ping/Pong).
+                // iq80 snappy throws CorruptionException (RuntimeException) on malformed input.
             }
         }
         return new DecodeResult(code, payload);
