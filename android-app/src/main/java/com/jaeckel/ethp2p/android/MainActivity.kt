@@ -6,6 +6,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
@@ -20,17 +23,21 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -60,6 +67,7 @@ class MainActivity : ComponentActivity() {
                     NodeScreen(
                         serviceProvider = { boundServiceState.value },
                         onToggle = ::toggleService,
+                        onOpenNetworkSettings = ::openWifiSettings,
                     )
                 }
             }
@@ -85,11 +93,20 @@ class MainActivity : ComponentActivity() {
     private fun toggleService() {
         val svc = Intent(this, NodeService::class.java)
         if (NodeService.isRunning()) {
-            stopService(svc)
+            // We're bound with BIND_AUTO_CREATE from onStart, which keeps the
+            // service alive even after stopService. Ask the service to tear
+            // down networking explicitly; it will also call stopSelf so the
+            // foreground notification clears immediately.
+            boundServiceState.value?.shutdown() ?: stopService(svc)
         } else {
             ensureNotificationPermission()
             startForegroundService(svc)
         }
+    }
+
+    private fun openWifiSettings() {
+        startActivity(Intent(android.provider.Settings.ACTION_WIFI_SETTINGS)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
 
     private fun ensureNotificationPermission() {
@@ -105,9 +122,11 @@ class MainActivity : ComponentActivity() {
 private fun NodeScreen(
     serviceProvider: () -> NodeService?,
     onToggle: () -> Unit,
+    onOpenNetworkSettings: () -> Unit,
 ) {
     var snapshot by remember { mutableStateOf<NodeService.Snapshot?>(null) }
     var running by remember { mutableStateOf(NodeService.isRunning()) }
+    val online = rememberIsOnline()
 
     LaunchedEffect(Unit) {
         while (isActive) {
@@ -123,13 +142,24 @@ private fun NodeScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Button(onClick = onToggle, modifier = Modifier.fillMaxWidth()) {
+        if (!online) {
+            OfflineBanner(onOpenNetworkSettings)
+        }
+
+        Button(
+            onClick = onToggle,
+            enabled = running || online,
+            modifier = Modifier.fillMaxWidth()
+        ) {
             Text(if (running) "Stop node" else "Start node")
         }
 
         val s = snapshot
         if (s == null || !s.running) {
-            Text("Tap Start to launch the node.")
+            Text(
+                if (online) "Tap Start to launch the node."
+                else "Connect to the internet before starting the node."
+            )
         } else {
             StatusSummary(s)
             HorizontalDivider()
@@ -137,6 +167,66 @@ private fun NodeScreen(
             PeerList(s.readyPeerList)
         }
     }
+}
+
+@Composable
+private fun OfflineBanner(onOpenNetworkSettings: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer,
+            contentColor = MaterialTheme.colorScheme.onErrorContainer,
+        )
+    ) {
+        Column(
+            Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text("No internet connection", style = MaterialTheme.typography.titleSmall)
+            Text(
+                "The node needs internet access to discover and connect to peers. " +
+                    "Enable Wi-Fi or mobile data to continue.",
+                fontSize = 13.sp
+            )
+            Button(onClick = onOpenNetworkSettings, modifier = Modifier.fillMaxWidth()) {
+                Text("Open network settings")
+            }
+        }
+    }
+}
+
+@Composable
+private fun rememberIsOnline(): Boolean {
+    val context = LocalContext.current
+    var online by remember { mutableStateOf(currentlyOnline(context)) }
+    DisposableEffect(context) {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                online = currentlyOnline(context)
+            }
+
+            override fun onLost(network: Network) {
+                online = currentlyOnline(context)
+            }
+
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                online = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+            }
+        }
+        cm.registerDefaultNetworkCallback(callback)
+        onDispose { cm.unregisterNetworkCallback(callback) }
+    }
+    return online
+}
+
+private fun currentlyOnline(context: Context): Boolean {
+    val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    val network = cm.activeNetwork ?: return false
+    val caps = cm.getNetworkCapabilities(network) ?: return false
+    return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
 }
 
 @Composable

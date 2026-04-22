@@ -181,6 +181,35 @@ public final class NodeService extends Service {
         }
     }
 
+    /**
+     * Tear down the node from the UI.
+     * <p>
+     * {@code stopService()} alone does not shut us down, because MainActivity
+     * holds a binding with {@code BIND_AUTO_CREATE}: Android keeps the service
+     * alive as long as such a binding exists, even after stopService. So we
+     * close networking here and drop the foreground notification immediately;
+     * the service instance may linger until the activity unbinds, but the node
+     * is no longer running.
+     */
+    public void shutdown() {
+        Log.i(TAG, "shutdown requested from UI");
+        if (connector != null) {
+            try { connector.close(); } catch (Exception ignored) {}
+            connector = null;
+        }
+        if (discV4 != null) {
+            try { discV4.close(); } catch (Exception ignored) {}
+            discV4 = null;
+        }
+        attempted.clear();
+        backoff.clear();
+        blacklistedNodeIds.clear();
+        cachedPeerCount = 0;
+        RUNNING.set(false);
+        stopForeground(STOP_FOREGROUND_REMOVE);
+        stopSelf();
+    }
+
     public Snapshot snapshot() {
         boolean running = RUNNING.get();
         if (!running || connector == null) {
