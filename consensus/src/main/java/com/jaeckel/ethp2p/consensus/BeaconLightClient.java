@@ -307,8 +307,9 @@ public class BeaconLightClient implements AutoCloseable {
         List<String> peers = copyPeers();
         if (peers.isEmpty()) return;
 
-        log.info("[beacon] Pre-connecting to {} peer(s) for Identify + Status...", peers.size());
-        StatusMessage local = buildLocalStatus();
+        List<byte[]> forkVersions = acceptedForkVersions();
+        log.info("[beacon] Pre-connecting to {} peer(s) for Identify + Status (will try {} fork versions)...",
+                peers.size(), forkVersions.size());
         List<CompletableFuture<Void>> futures = new ArrayList<>();
         java.util.concurrent.atomic.AtomicInteger statusOk = new java.util.concurrent.atomic.AtomicInteger();
         java.util.concurrent.atomic.AtomicInteger statusFail = new java.util.concurrent.atomic.AtomicInteger();
@@ -317,16 +318,18 @@ public class BeaconLightClient implements AutoCloseable {
             // Identify first (libp2p-level, no eth2 handshake needed), then Status.
             // Modern CL clients disconnect peers that don't Status within a few
             // seconds, so this must fire before any light_client_* request.
+            // Try each candidate fork version in sequence so a "wrong fork"
+            // goodbye on the first attempt doesn't doom us for this peer.
             CompletableFuture<Void> combined = p2pService.queryIdentify(peer)
-                    .thenCompose(v -> p2pService.exchangeStatus(peer, local)
+                    .thenCompose(v -> tryStatusWithFallback(peer, forkVersions, 0)
                             .handle((peerStatus, ex) -> {
-                                if (ex == null) {
+                                if (ex == null && peerStatus != null) {
                                     statusOk.incrementAndGet();
                                     log.debug("[beacon] Status OK with {}: {}", peer, peerStatus);
                                 } else {
                                     statusFail.incrementAndGet();
-                                    log.debug("[beacon] Status failed with {}: {}",
-                                            peer, ex.getMessage());
+                                    String msg = ex != null ? ex.getMessage() : "null peer Status";
+                                    log.debug("[beacon] Status failed with {}: {}", peer, msg);
                                 }
                                 return null;
                             }));
@@ -366,8 +369,12 @@ public class BeaconLightClient implements AutoCloseable {
      * {@code fork_digest} match that actually gates the connection.
      */
     private StatusMessage buildLocalStatus() {
+        return buildLocalStatusFor(forkVersion);
+    }
+
+    private StatusMessage buildLocalStatusFor(byte[] fv) {
         return new StatusMessage(
-                computeForkDigest(),
+                computeForkDigest(fv),
                 checkpointRoot.clone(),
                 0L,                  // finalized_epoch — unknown, peers tolerate 0 from light clients
                 new byte[32],        // head_root — light client has no verified head yet
@@ -380,10 +387,10 @@ public class BeaconLightClient implements AutoCloseable {
      * Matches {@code NetworkConfig.currentForkDigest()} but computed locally
      * to avoid a networking-module dep inside consensus.
      */
-    private byte[] computeForkDigest() {
+    private byte[] computeForkDigest(byte[] fv) {
         try {
             byte[] buf = new byte[64];
-            System.arraycopy(forkVersion, 0, buf, 0, 4);
+            System.arraycopy(fv, 0, buf, 0, 4);
             System.arraycopy(genesisValidatorsRoot, 0, buf, 32, 32);
             byte[] hash = java.security.MessageDigest.getInstance("SHA-256").digest(buf);
             byte[] digest = new byte[4];
@@ -392,6 +399,93 @@ public class BeaconLightClient implements AutoCloseable {
         } catch (java.security.NoSuchAlgorithmException e) {
             throw new AssertionError("SHA-256 missing", e);
         }
+    }
+
+    /**
+     * Send Status to a peer, trying {@code /status/2} first and falling back
+     * to {@code /status/1} if the peer doesn't support v2. Each protocol is
+     * additionally tried with each candidate fork version in sequence.
+     *
+     * <p>The mainnet CL network has a split: some peers (current Lodestar)
+     * advertise only v2, others (current Nimbus) advertise only v1. Trying
+     * both catches both populations.
+     */
+    private CompletableFuture<StatusMessage> tryStatusWithFallback(
+            String peer, List<byte[]> forkVersions, int idx) {
+        byte[] fv = forkVersions.get(idx);
+        CompletableFuture<StatusMessage> outer = new CompletableFuture<>();
+        // Try /status/2 first, then /status/1.
+        p2pService.exchangeStatus(peer, buildLocalStatusFor(fv))
+                .whenComplete((status, ex) -> {
+                    if (ex == null && status != null) {
+                        outer.complete(status);
+                        return;
+                    }
+                    String msg = ex != null ? ex.getMessage() : "empty response";
+                    boolean protoUnsupported = msg != null && (
+                            msg.contains("Protocol negotiation failed")
+                            || msg.contains("ProtocolNegotiation"));
+                    if (protoUnsupported) {
+                        // Peer only speaks /status/1 — retry on that protocol,
+                        // still with the same fork version.
+                        p2pService.exchangeStatusV1(peer, buildLocalStatusFor(fv))
+                                .whenComplete((s1, e1) -> {
+                                    if (e1 == null && s1 != null) {
+                                        outer.complete(s1);
+                                    } else {
+                                        retryOrFail(peer, forkVersions, idx, e1 != null ? e1 : ex,
+                                                e1 != null ? e1.getMessage() : msg, outer);
+                                    }
+                                });
+                    } else {
+                        retryOrFail(peer, forkVersions, idx, ex, msg, outer);
+                    }
+                });
+        return outer;
+    }
+
+    /**
+     * After an exchange attempt fails, decide whether to retry the next fork
+     * version or propagate the error. Extracted so both v2 and v1 paths share it.
+     */
+    private void retryOrFail(String peer, List<byte[]> forkVersions, int idx,
+                             Throwable ex, String msg,
+                             CompletableFuture<StatusMessage> outer) {
+        boolean forkDigestIsh = msg != null && (
+                msg.contains("requires 92 bytes")
+                || msg.contains("requires 84 bytes")
+                || msg.contains("Channel closed")
+                || msg.contains("Connection reset")
+                || msg.contains("closed"));
+        if (forkDigestIsh && idx + 1 < forkVersions.size()) {
+            log.debug("[beacon] Status attempt {} (fork=0x{}) for {}: {}; retry next fv",
+                    idx, bytesToHex(forkVersions.get(idx)), peer, msg);
+            tryStatusWithFallback(peer, forkVersions, idx + 1)
+                    .whenComplete((s2, e2) -> {
+                        if (e2 == null) outer.complete(s2);
+                        else outer.completeExceptionally(e2);
+                    });
+        } else if (ex != null) {
+            outer.completeExceptionally(ex);
+        } else {
+            outer.complete(null);
+        }
+    }
+
+    /** Fork versions to try for Status, in priority order. */
+    private java.util.List<byte[]> acceptedForkVersions() {
+        java.util.List<byte[]> versions = new java.util.ArrayList<>(2);
+        versions.add(forkVersion);
+        // Heuristic: derive the immediately prior fork by decrementing the
+        // first byte, so e.g. Fulu (0x06) falls back to Electra (0x05). This
+        // is brittle but covers our current mainnet situation; once we plumb
+        // priorForkVersion through the BLC constructor we'll use that.
+        if ((forkVersion[0] & 0xFF) > 0) {
+            byte[] prior = forkVersion.clone();
+            prior[0] = (byte) ((forkVersion[0] & 0xFF) - 1);
+            versions.add(prior);
+        }
+        return versions;
     }
 
     /**

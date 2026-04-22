@@ -76,6 +76,35 @@ public record StatusMessage(
         return buf.array();
     }
 
+    /** SSZ encoding for {@code /req/status/1/ssz_snappy} — 84 bytes, no earliest_available_slot. */
+    public byte[] encodeV1() {
+        ByteBuffer buf = ByteBuffer.allocate(84).order(ByteOrder.LITTLE_ENDIAN);
+        buf.put(forkDigest);
+        buf.put(finalizedRoot);
+        buf.putLong(finalizedEpoch);
+        buf.put(headRoot);
+        buf.putLong(headSlot);
+        return buf.array();
+    }
+
+    /** SSZ decoding for {@code /req/status/1/ssz_snappy} — 84 bytes, earliest_available_slot defaulted to 0. */
+    public static StatusMessage decodeV1(byte[] ssz) {
+        if (ssz.length < 84) {
+            throw new IllegalArgumentException(
+                    "Status v1 requires 84 bytes, got " + ssz.length);
+        }
+        ByteBuffer buf = ByteBuffer.wrap(ssz).order(ByteOrder.LITTLE_ENDIAN);
+        byte[] forkDigest = new byte[4];
+        byte[] finalizedRoot = new byte[32];
+        byte[] headRoot = new byte[32];
+        buf.get(forkDigest);
+        buf.get(finalizedRoot);
+        long finalizedEpoch = buf.getLong();
+        buf.get(headRoot);
+        long headSlot = buf.getLong();
+        return new StatusMessage(forkDigest, finalizedRoot, finalizedEpoch, headRoot, headSlot, 0L);
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;

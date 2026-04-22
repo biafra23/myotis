@@ -48,6 +48,8 @@ public class BeaconP2PService implements AutoCloseable {
 
     static final String STATUS =
             "/eth2/beacon_chain/req/status/2/ssz_snappy";
+    static final String STATUS_V1 =
+            "/eth2/beacon_chain/req/status/1/ssz_snappy";
     static final String BOOTSTRAP =
             "/eth2/beacon_chain/req/light_client_bootstrap/1/ssz_snappy";
     static final String UPDATES =
@@ -121,7 +123,7 @@ public class BeaconP2PService implements AutoCloseable {
         host.addProtocolHandler(identifyBinding);
 
         // Register protocol bindings before starting
-        for (String proto : List.of(STATUS, BOOTSTRAP, UPDATES, FINALITY, OPTIMISTIC, BLOCKS_BY_RANGE)) {
+        for (String proto : List.of(STATUS, STATUS_V1, BOOTSTRAP, UPDATES, FINALITY, OPTIMISTIC, BLOCKS_BY_RANGE)) {
             QueuedReqRespBinding binding = new QueuedReqRespBinding(proto);
             bindings.put(proto, binding);
             host.addProtocolHandler(binding);
@@ -273,6 +275,19 @@ public class BeaconP2PService implements AutoCloseable {
         return doReqResp(peerMultiaddr, STATUS, requestPayload)
                 .thenApply(BeaconP2PService::decodeSingleResponse)
                 .thenApply(StatusMessage::decode);
+    }
+
+    /** Legacy {@code /status/1} variant (84-byte payload, no earliest_available_slot). */
+    public CompletableFuture<StatusMessage> exchangeStatusV1(String peerMultiaddr, StatusMessage local) {
+        byte[] requestPayload;
+        try {
+            requestPayload = ReqRespCodec.encodeRequest(local.encodeV1());
+        } catch (IOException e) {
+            return CompletableFuture.failedFuture(e);
+        }
+        return doReqResp(peerMultiaddr, STATUS_V1, requestPayload)
+                .thenApply(BeaconP2PService::decodeSingleResponse)
+                .thenApply(StatusMessage::decodeV1);
     }
 
     public CompletableFuture<byte[]> requestBootstrap(String peerMultiaddr, byte[] blockRoot32) {
@@ -620,12 +635,30 @@ public class BeaconP2PService implements AutoCloseable {
 
         @Override
         public CompletableFuture<ReqRespController> initChannel(P2PChannel channel, String negotiatedProtocol) {
-            // Drain stale (already-timed-out) requests from the queue
+            io.libp2p.core.Stream stream = (io.libp2p.core.Stream) channel;
+
+            // Peer-initiated streams (symmetric CL protocols like /req/status/2
+            // are opened by either side) must NOT drain the outgoing pending-request
+            // queue — that queue belongs to streams WE opened. Draining it here
+            // steals the PendingRequest intended for a concurrent outgoing stream
+            // and that stream then fails with "No pending request" masquerading
+            // as "Protocol negotiation failed". We don't yet serve responder
+            // roles for any of our registered protocols, so close the incoming
+            // stream cleanly and leave the queue alone.
+            if (!stream.isInitiator()) {
+                log.debug("[beacon-p2p] Peer-initiated {} stream — no responder, closing",
+                        protocolId);
+                try { stream.close(); } catch (Exception ignored) {}
+                return CompletableFuture.failedFuture(
+                        new IllegalStateException("Responder role not implemented for " + protocolId));
+            }
+
+            // Outgoing stream: drain stale (already-timed-out) requests from the queue.
             PendingRequest pending = null;
             while (true) {
                 pending = pendingRequests.poll();
                 if (pending == null) {
-                    log.warn("[beacon-p2p] No pending request for {} — queue was empty!", protocolId);
+                    log.warn("[beacon-p2p] No pending request for outgoing {} — queue was empty!", protocolId);
                     return CompletableFuture.failedFuture(
                             new IllegalStateException("No pending request for " + protocolId));
                 }
@@ -633,8 +666,6 @@ public class BeaconP2PService implements AutoCloseable {
                 log.debug("[beacon-p2p] Skipping stale request for {}", protocolId);
             }
 
-            // Cast to Stream to access closeWrite() for half-close
-            io.libp2p.core.Stream stream = (io.libp2p.core.Stream) channel;
             ReqRespController controller = new ReqRespController(
                     pending.requestBytes, pending.responseFuture, stream);
             channel.pushHandler(controller.nettyHandler());
