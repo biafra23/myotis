@@ -18,7 +18,7 @@ android {
 
     defaultConfig {
         applicationId = "com.jaeckel.ethp2p.android"
-        minSdk = 28
+        minSdk = 29
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"
@@ -27,7 +27,7 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-        // Sugar for java.time, java.nio.file etc. on minSdk 28
+        // Sugar for java.time, java.nio.file etc. missing from Android's stdlib
         isCoreLibraryDesugaringEnabled = true
     }
 
