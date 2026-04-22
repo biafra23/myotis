@@ -396,7 +396,7 @@ public final class Main {
                 clPeers.size(), clPeers.size() - network.clPeerMultiaddrs().size());
 
         // 8. IPC server
-        CommandHandler commandHandler = new CommandHandler(discV4, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState, beaconLightClient, network.clGenesisTime());
+        CommandHandler commandHandler = new CommandHandler(discV4, discV5, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState, beaconLightClient, network.clGenesisTime());
         DaemonServer server = new DaemonServer(socketPath, commandHandler);
         try {
             server.start();

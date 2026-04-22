@@ -8,6 +8,7 @@ import com.jaeckel.ethp2p.consensus.proof.MerklePatriciaVerifier;
 import com.jaeckel.ethp2p.core.types.BlockHeader;
 import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
 import com.jaeckel.ethp2p.networking.discv4.KademliaTable;
+import com.jaeckel.ethp2p.networking.discv5.DiscV5Service;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockBodiesMessage;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
@@ -47,6 +48,7 @@ public class CommandHandler {
     private static final Logger log = LoggerFactory.getLogger(CommandHandler.class);
 
     private final DiscV4Service discV4;
+    private final DiscV5Service discV5; // nullable
     private final RLPxConnector connector;
     private final long startTimeMs;
     private final CountDownLatch stopLatch;
@@ -59,7 +61,7 @@ public class CommandHandler {
     public CommandHandler(DiscV4Service discV4, RLPxConnector connector,
                           CountDownLatch stopLatch, Map<String, Long> backoff,
                           Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState) {
-        this(discV4, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState,
+        this(discV4, null, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState,
                 null, BeaconChainSpec.MAINNET_GENESIS_TIME);
     }
 
@@ -67,7 +69,7 @@ public class CommandHandler {
                           CountDownLatch stopLatch, Map<String, Long> backoff,
                           Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState,
                           BeaconLightClient beaconLightClient) {
-        this(discV4, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState,
+        this(discV4, null, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState,
                 beaconLightClient, BeaconChainSpec.MAINNET_GENESIS_TIME);
     }
 
@@ -75,7 +77,17 @@ public class CommandHandler {
                           CountDownLatch stopLatch, Map<String, Long> backoff,
                           Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState,
                           BeaconLightClient beaconLightClient, long clGenesisTime) {
+        this(discV4, null, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState,
+                beaconLightClient, clGenesisTime);
+    }
+
+    public CommandHandler(DiscV4Service discV4, DiscV5Service discV5,
+                          RLPxConnector connector,
+                          CountDownLatch stopLatch, Map<String, Long> backoff,
+                          Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState,
+                          BeaconLightClient beaconLightClient, long clGenesisTime) {
         this.discV4 = discV4;
+        this.discV5 = discV5;
         this.connector = connector;
         this.startTimeMs = System.currentTimeMillis();
         this.stopLatch = stopLatch;
@@ -864,9 +876,27 @@ public class CommandHandler {
     }
 
     private String handleBeaconStatus() {
+        // Peer / discovery counters — same shape as `status` for the EL side so
+        // the two outputs compare apples-to-apples.
+        long uptimeSec = (System.currentTimeMillis() - startTimeMs) / 1000;
+        int discv5Live = discV5 != null ? discV5.liveNodeCount() : 0;
+        List<BeaconP2PService.PeerInfo> peers = beaconLightClient != null
+                ? beaconLightClient.getConnectedPeers()
+                : List.of();
+        int connectedPeers = peers.size();
+        long lightClientPeers = peers.stream()
+                .filter(BeaconP2PService.PeerInfo::supportsLightClient)
+                .count();
+        String peerStats = "\"uptimeSeconds\":" + uptimeSec
+                + ",\"discoveredPeers\":" + discv5Live
+                + ",\"connectedPeers\":" + connectedPeers
+                + ",\"lightClientPeers\":" + lightClientPeers;
+
         String peersJson = buildBeaconPeersJson();
         if (!beaconSyncState.isSynced()) {
-            return "{\"ok\":true,\"state\":\"SYNCING\",\"finalizedSlot\":0,\"optimisticSlot\":0"
+            return "{\"ok\":true,\"state\":\"SYNCING\","
+                    + peerStats
+                    + ",\"finalizedSlot\":0,\"optimisticSlot\":0"
                     + ",\"executionStateRoot\":null"
                     + ",\"peers\":" + peersJson + "}";
         }
@@ -875,7 +905,8 @@ public class CommandHandler {
         long finalizedSlot = beaconSyncState.getFinalizedSlot();
         long optimisticSlot = beaconSyncState.getOptimisticSlot();
         long period = finalizedSlot / (32 * 256); // SLOTS_PER_EPOCH * EPOCHS_PER_SYNC_COMMITTEE_PERIOD
-        return "{\"ok\":true,\"state\":\"SYNCED\""
+        return "{\"ok\":true,\"state\":\"SYNCED\","
+                + peerStats
                 + ",\"finalizedSlot\":" + finalizedSlot
                 + ",\"optimisticSlot\":" + optimisticSlot
                 + ",\"syncCommitteePeriod\":" + period
