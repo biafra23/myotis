@@ -43,7 +43,11 @@ public final class AndroidPeerCache {
      * without it two simultaneous writes can interleave and corrupt a line.
      */
     public synchronized void add(InetSocketAddress address, String publicKeyHex) {
-        String key = address.getAddress().getHostAddress() + SEP + address.getPort();
+        // getHostString() over getAddress().getHostAddress() — the latter NPEs
+        // if the address is unresolved. RLPxConnector hands us resolved
+        // addresses, but getHostString() returns the literal ip string
+        // directly and skips the defensive branch.
+        String key = address.getHostString() + SEP + address.getPort();
         if (!seen.add(key)) return;
         String line = key + SEP + publicKeyHex + "\n";
         try (FileOutputStream out = new FileOutputStream(cacheFile.toFile(), true)) {

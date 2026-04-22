@@ -5,6 +5,7 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
+import android.content.pm.ServiceInfo;
 import android.os.Binder;
 import android.os.IBinder;
 import android.util.Log;
@@ -40,6 +41,10 @@ public final class NodeService extends Service {
     private static final int DEFAULT_PORT = 30303;
     private static final long BACKOFF_INCOMPATIBLE_MS = 10 * 60 * 1000L;
     private static final long BACKOFF_TRANSIENT_MS = 30 * 1000L;
+    // Dial cap: the JVM daemon allows 2000, which is fine on a workstation but
+    // abusive on a phone (battery, data, NAT table, file descriptors). attempted
+    // is removed only when a peer drops, so this bounds in-flight dial churn.
+    private static final int MAX_ATTEMPTED = 200;
 
     // Static so MainActivity can reflect the correct button state after a
     // configuration change — the activity instance is recreated, but the
@@ -96,7 +101,11 @@ public final class NodeService extends Service {
             return START_NOT_STICKY;
         }
         startTimeMs = System.currentTimeMillis();
-        startForeground(NOTIFICATION_ID, buildNotification());
+        // API 34+ requires the foregroundServiceType to be passed here and
+        // to match the manifest's <service android:foregroundServiceType="...">
+        // declaration. API 29-33 ignore the third arg. minSdk is 29.
+        startForeground(NOTIFICATION_ID, buildNotification(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
 
         // Netty boot is blocking-ish; punt off the main thread.
         new Thread(this::startNode, "ethp2p-boot").start();
@@ -104,6 +113,10 @@ public final class NodeService extends Service {
     }
 
     private void startNode() {
+        AndroidPeerCache localCache = null;
+        RLPxConnector localConnector = null;
+        DiscV4Service localDisc = null;
+        int localCachedCount = 0;
         try {
             NetworkConfig network = NetworkConfig.byName("mainnet");
             Path keyFile = new java.io.File(getFilesDir(), "nodekey.hex").toPath();
@@ -111,27 +124,28 @@ public final class NodeService extends Service {
             Log.i(TAG, "Node ID: " + nodeKey.nodeId().toHexString());
 
             Path cacheFile = new java.io.File(getFilesDir(), "peers.cache").toPath();
-            peerCache = new AndroidPeerCache(cacheFile);
-            List<AndroidPeerCache.CachedPeer> cached = peerCache.load();
-            cachedPeerCount = cached.size();
+            localCache = new AndroidPeerCache(cacheFile);
+            List<AndroidPeerCache.CachedPeer> cached = localCache.load();
+            localCachedCount = cached.size();
 
-            connector = new RLPxConnector(nodeKey, DEFAULT_PORT, network,
+            final AndroidPeerCache cacheRef = localCache;
+            localConnector = new RLPxConnector(nodeKey, DEFAULT_PORT, network,
                     headers -> {
                         if (!headers.isEmpty()) {
                             Log.i(TAG, "Received " + headers.size() + " block header(s)");
                         }
                     },
-                    peerCache::add);
+                    cacheRef::add);
+            final RLPxConnector connectorRef = localConnector;
 
-            // Reconnect cached peers first
+            // Reconnect cached peers first.
             for (AndroidPeerCache.CachedPeer peer : cached) {
-                String peerKey = peer.address().getAddress().getHostAddress()
-                        + ":" + peer.address().getPort();
+                String peerKey = peer.address().getHostString() + ":" + peer.address().getPort();
                 attempted.add(peerKey);
                 try {
                     SECP256K1.PublicKey pubKey = SECP256K1.PublicKey.fromBytes(
                             Bytes.fromHexString(peer.publicKeyHex()));
-                    connector.connect(peer.address(), pubKey, (incompatible, nodeIdHex) -> {
+                    connectorRef.connect(peer.address(), pubKey, (incompatible, nodeIdHex) -> {
                         if (incompatible) blacklistedNodeIds.add(nodeIdHex);
                         long ms = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
                         backoff.putIfAbsent(peerKey, System.currentTimeMillis() + ms);
@@ -143,12 +157,11 @@ public final class NodeService extends Service {
                 }
             }
 
-            discV4 = new DiscV4Service(nodeKey, network.bootnodes(), entry -> {
-                if (entry.tcpPort() <= 0 || attempted.size() >= 2000) return;
+            localDisc = new DiscV4Service(nodeKey, network.bootnodes(), entry -> {
+                if (entry.tcpPort() <= 0 || attempted.size() >= MAX_ATTEMPTED) return;
                 String nodeIdHex = entry.nodeId().toHexString();
                 if (blacklistedNodeIds.contains(nodeIdHex)) return;
-                String peerKey = entry.udpAddr().getAddress().getHostAddress()
-                        + ":" + entry.tcpPort();
+                String peerKey = entry.udpAddr().getHostString() + ":" + entry.tcpPort();
                 Long expiry = backoff.get(peerKey);
                 if (expiry != null) {
                     if (System.currentTimeMillis() < expiry) return;
@@ -166,7 +179,7 @@ public final class NodeService extends Service {
                     SECP256K1.PublicKey pubKey = SECP256K1.PublicKey.fromBytes(nodeId);
                     InetSocketAddress peerTcp = new InetSocketAddress(
                             entry.udpAddr().getAddress(), entry.tcpPort());
-                    connector.connect(peerTcp, pubKey, (incompatible, idHex) -> {
+                    connectorRef.connect(peerTcp, pubKey, (incompatible, idHex) -> {
                         if (incompatible) blacklistedNodeIds.add(idHex);
                         long ms = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
                         backoff.putIfAbsent(peerKey, System.currentTimeMillis() + ms);
@@ -177,12 +190,53 @@ public final class NodeService extends Service {
                     attempted.remove(peerKey);
                 }
             });
-            discV4.start(DEFAULT_PORT);
+
+            // Publish atomically vs. shutdown() — if shutdown won the race
+            // while we were constructing, we own every resource above, so we
+            // have to close them ourselves instead of letting shutdown do it.
+            // disc.start() runs inside the same synchronized block so shutdown
+            // cannot close the service between publish and start.
+            if (!startAndPublish(localCache, localConnector, localDisc, localCachedCount)) {
+                Log.i(TAG, "shutdown raced boot; tearing down constructed resources");
+                closeQuietly(localDisc);
+                closeQuietly(localConnector);
+                return;
+            }
             Log.i(TAG, "discv4 started on UDP " + DEFAULT_PORT);
         } catch (Exception e) {
             Log.e(TAG, "node boot failed", e);
+            closeQuietly(localDisc);
+            closeQuietly(localConnector);
+            // Reset state so the button flips back to Start and the user can
+            // retry; otherwise RUNNING stays true and the bound Service shell
+            // keeps the stale foreground notification visible.
+            attempted.clear();
+            backoff.clear();
+            blacklistedNodeIds.clear();
+            cachedPeerCount = 0;
+            startTimeMs = 0L;
+            RUNNING.set(false);
+            stopForeground(STOP_FOREGROUND_REMOVE);
             stopSelf();
         }
+    }
+
+    private synchronized boolean startAndPublish(AndroidPeerCache cache,
+                                                 RLPxConnector conn,
+                                                 DiscV4Service disc,
+                                                 int cachedCount) throws Exception {
+        if (!RUNNING.get()) return false;
+        disc.start(DEFAULT_PORT);
+        this.peerCache = cache;
+        this.connector = conn;
+        this.discV4 = disc;
+        this.cachedPeerCount = cachedCount;
+        return true;
+    }
+
+    private static void closeQuietly(AutoCloseable c) {
+        if (c == null) return;
+        try { c.close(); } catch (Exception ignored) {}
     }
 
     /**
@@ -195,23 +249,19 @@ public final class NodeService extends Service {
      * the service instance may linger until the activity unbinds, but the node
      * is no longer running.
      */
-    public void shutdown() {
+    public synchronized void shutdown() {
         Log.i(TAG, "shutdown requested from UI");
-        if (connector != null) {
-            try { connector.close(); } catch (Exception ignored) {}
-            connector = null;
-        }
-        if (discV4 != null) {
-            try { discV4.close(); } catch (Exception ignored) {}
-            discV4 = null;
-        }
+        RUNNING.set(false);
+        closeQuietly(connector);
+        connector = null;
+        closeQuietly(discV4);
+        discV4 = null;
         peerCache = null;
         attempted.clear();
         backoff.clear();
         blacklistedNodeIds.clear();
         cachedPeerCount = 0;
         startTimeMs = 0L;
-        RUNNING.set(false);
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
     }
@@ -276,10 +326,10 @@ public final class NodeService extends Service {
     }
 
     @Override
-    public void onDestroy() {
+    public synchronized void onDestroy() {
         Log.i(TAG, "Stopping node");
-        if (connector != null) try { connector.close(); } catch (Exception ignored) {}
-        if (discV4 != null) try { discV4.close(); } catch (Exception ignored) {}
+        closeQuietly(connector);
+        closeQuietly(discV4);
         RUNNING.set(false);
         super.onDestroy();
     }

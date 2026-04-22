@@ -14,6 +14,7 @@ import android.os.Bundle
 import android.os.IBinder
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -49,6 +50,14 @@ class MainActivity : ComponentActivity() {
 
     // Exposed to Compose via a state holder so recomposition sees bind/unbind.
     private val boundServiceState = mutableStateOf<NodeService?>(null)
+
+    // Registered eagerly so the permission dialog can fire once we hit the
+    // Start button. The result fires whether the user grants or denies;
+    // either way we start the service — denial just means the foreground
+    // notification is invisible on Android 13+, not that the service fails.
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { _ -> startNodeService() }
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -100,10 +109,21 @@ class MainActivity : ComponentActivity() {
             // down networking explicitly; it will also call stopSelf so the
             // foreground notification clears immediately.
             boundServiceState.value?.shutdown() ?: stopService(svc)
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            // Defer startForegroundService until the permission dialog
+            // resolves — otherwise we'd post the notification before the
+            // user has decided and the callback would have to start the
+            // service a second time.
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         } else {
-            ensureNotificationPermission()
-            startForegroundService(svc)
+            startNodeService()
         }
+    }
+
+    private fun startNodeService() {
+        startForegroundService(Intent(this, NodeService::class.java))
     }
 
     private fun openWifiSettings() {
@@ -113,14 +133,6 @@ class MainActivity : ComponentActivity() {
 
     private fun clearPeerCaches() {
         boundServiceState.value?.clearCaches()
-    }
-
-    private fun ensureNotificationPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
-        }
     }
 }
 
