@@ -8,6 +8,7 @@ import com.jaeckel.ethp2p.core.types.BlockHeader;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
 import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
 import com.jaeckel.ethp2p.networking.discv4.KademliaTable;
+import com.jaeckel.ethp2p.networking.discv5.DiscV5Service;
 import com.jaeckel.ethp2p.networking.dns.DnsEnrResolver;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
@@ -98,6 +99,7 @@ public final class Main {
         // Place alongside the EL peer cache in the same directory
         return cacheFile(networkName).resolveSibling("cl-peers" + suffix + ".cache");
     }
+
 
     public static void main(String[] args) throws Exception {
         // Parse --network and --port flags from anywhere in args
@@ -310,9 +312,37 @@ public final class Main {
         }
         log.info("[daemon] discv4 started on UDP port {}. Waiting for peers...", port);
 
-        // 7. Beacon light client (consensus layer, runs on virtual thread)
+        // Beacon light client scaffolding (moved ahead of discv5 so its callback can
+        // write to CLPeerCache as peers are discovered).
         BeaconSyncState beaconSyncState = new BeaconSyncState();
         CLPeerCache clPeerCache = new CLPeerCache(clCacheFile(network.name()));
+
+        // 6b. discv5 — the canonical CL peer discovery mechanism. Runs on a separate
+        // UDP port from discv4 (default 9000, matching CL libp2p convention). The
+        // callback filters to ENRs carrying the eth2 field with a matching fork digest,
+        // converts to a libp2p multiaddr, and writes to CLPeerCache so the next
+        // daemon start seeds BeaconLightClient with a refreshed list.
+        //
+        // Runtime integration with the running BLC is a follow-up: BLC freezes its
+        // peer list at construction. The feedback loop is one daemon restart today.
+        byte[] currentForkDigest = network.currentForkDigest();
+        DiscV5Service discV5 = new DiscV5Service(nodeKey, network.clDiscv5Bootnodes(), enr -> {
+            var eth2 = enr.eth2();
+            if (eth2.isEmpty()) return;
+            if (!java.util.Arrays.equals(eth2.get().forkDigest(), currentForkDigest)) return;
+            enr.toLibp2pMultiaddr().ifPresent(ma -> {
+                log.info("[discv5] CL peer {} (fork_digest match)", ma);
+                clPeerCache.add(ma);
+            });
+        });
+        try {
+            discV5.start(9000);
+        } catch (Exception e) {
+            // Non-fatal: EL side still works and CL falls back to cached + hardcoded peers.
+            log.warn("[discv5] failed to start, continuing without CL discovery: {}", e.getMessage());
+        }
+
+        // 7. Beacon light client (consensus layer, runs on virtual thread)
         List<String> clPeers = new java.util.ArrayList<>(clPeerCache.load());
         // Append configured peers after cached ones (cached peers are tried first)
         for (String peer : network.clPeerMultiaddrs()) {
@@ -352,6 +382,7 @@ public final class Main {
         } catch (BindException e) {
             System.err.println("Cannot bind IPC socket " + socketPath + ": " + e.getMessage());
             System.err.println("Is another instance already running?");
+            discV5.close();
             discV4.close();
             fileLock.release();
             lockChannel.close();
@@ -359,6 +390,7 @@ public final class Main {
             return;
         } catch (Exception e) {
             System.err.println("Failed to start IPC server: " + e.getMessage());
+            discV5.close();
             discV4.close();
             fileLock.release();
             lockChannel.close();
@@ -373,6 +405,7 @@ public final class Main {
             beaconLightClient.close();
             server.close();
             connector.close();
+            discV5.close();
             discV4.close();
             try { fileLock.release(); lockChannel.close(); } catch (Exception ignored) {}
             stopLatch.countDown();
@@ -386,6 +419,7 @@ public final class Main {
         beaconLightClient.close();
         server.close();
         connector.close();
+        discV5.close();
         discV4.close();
         try { fileLock.release(); lockChannel.close(); } catch (Exception ignored) {}
         log.info("[daemon] Done.");

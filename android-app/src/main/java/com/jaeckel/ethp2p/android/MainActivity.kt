@@ -288,6 +288,8 @@ private fun StatusSummary(s: NodeService.Snapshot) {
         StatusRow("dialing", s.attemptedPeers.toString())
         StatusRow("in backoff", s.backedOffPeers.toString())
         StatusRow("blacklisted", s.blacklistedPeers.toString())
+        StatusRow("discv5 peers", s.discv5Peers.toString())
+        StatusRow("CL peers (eth2)", s.clPeersDiscovered.toString())
     }
 }
 
