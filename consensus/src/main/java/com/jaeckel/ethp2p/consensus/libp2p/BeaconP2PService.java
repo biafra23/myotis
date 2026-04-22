@@ -1,5 +1,6 @@
 package com.jaeckel.ethp2p.consensus.libp2p;
 
+import com.jaeckel.ethp2p.consensus.types.StatusMessage;
 import io.libp2p.core.Host;
 import io.libp2p.core.P2PChannel;
 import io.libp2p.core.PeerId;
@@ -45,6 +46,8 @@ public class BeaconP2PService implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(BeaconP2PService.class);
 
+    static final String STATUS =
+            "/eth2/beacon_chain/req/status/2/ssz_snappy";
     static final String BOOTSTRAP =
             "/eth2/beacon_chain/req/light_client_bootstrap/1/ssz_snappy";
     static final String UPDATES =
@@ -118,7 +121,7 @@ public class BeaconP2PService implements AutoCloseable {
         host.addProtocolHandler(identifyBinding);
 
         // Register protocol bindings before starting
-        for (String proto : List.of(BOOTSTRAP, UPDATES, FINALITY, OPTIMISTIC, BLOCKS_BY_RANGE)) {
+        for (String proto : List.of(STATUS, BOOTSTRAP, UPDATES, FINALITY, OPTIMISTIC, BLOCKS_BY_RANGE)) {
             QueuedReqRespBinding binding = new QueuedReqRespBinding(proto);
             bindings.put(proto, binding);
             host.addProtocolHandler(binding);
@@ -243,6 +246,33 @@ public class BeaconP2PService implements AutoCloseable {
         } catch (Exception e) {
             return CompletableFuture.failedFuture(e);
         }
+    }
+
+    /**
+     * Send the CL Status handshake and return the peer's Status response.
+     *
+     * <p>Modern CL clients (Lighthouse v8+, recent Teku / Prysm) enforce the
+     * {@code /req/status/1} handshake: a peer that doesn't send Status within
+     * a few seconds is disconnected. Calling this immediately after Identify
+     * keeps bootstrap-capable peers from RST'ing our stream before we can
+     * ask for {@code light_client_bootstrap}.
+     *
+     * <p>The resulting Status from the peer is mostly informative for a light
+     * client — we don't yet build a view of the chain head from it — but
+     * completing the exchange is what the peer actually requires.
+     *
+     * @return the decoded peer Status, or a failed future if the exchange fails
+     */
+    public CompletableFuture<StatusMessage> exchangeStatus(String peerMultiaddr, StatusMessage local) {
+        byte[] requestPayload;
+        try {
+            requestPayload = ReqRespCodec.encodeRequest(local.encode());
+        } catch (IOException e) {
+            return CompletableFuture.failedFuture(e);
+        }
+        return doReqResp(peerMultiaddr, STATUS, requestPayload)
+                .thenApply(BeaconP2PService::decodeSingleResponse)
+                .thenApply(StatusMessage::decode);
     }
 
     public CompletableFuture<byte[]> requestBootstrap(String peerMultiaddr, byte[] blockRoot32) {

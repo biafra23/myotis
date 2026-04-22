@@ -11,6 +11,7 @@ import com.jaeckel.ethp2p.consensus.types.LightClientBootstrap;
 import com.jaeckel.ethp2p.consensus.types.LightClientFinalityUpdate;
 import com.jaeckel.ethp2p.consensus.types.LightClientHeader;
 import com.jaeckel.ethp2p.consensus.types.LightClientUpdate;
+import com.jaeckel.ethp2p.consensus.types.StatusMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -306,30 +307,90 @@ public class BeaconLightClient implements AutoCloseable {
         List<String> peers = copyPeers();
         if (peers.isEmpty()) return;
 
-        log.info("[beacon] Pre-connecting to {} peer(s) for Identify...", peers.size());
+        log.info("[beacon] Pre-connecting to {} peer(s) for Identify + Status...", peers.size());
+        StatusMessage local = buildLocalStatus();
         List<CompletableFuture<Void>> futures = new ArrayList<>();
+        java.util.concurrent.atomic.AtomicInteger statusOk = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger statusFail = new java.util.concurrent.atomic.AtomicInteger();
         for (String peer : peers) {
             if (!running) return;
-            futures.add(p2pService.queryIdentify(peer));
+            // Identify first (libp2p-level, no eth2 handshake needed), then Status.
+            // Modern CL clients disconnect peers that don't Status within a few
+            // seconds, so this must fire before any light_client_* request.
+            CompletableFuture<Void> combined = p2pService.queryIdentify(peer)
+                    .thenCompose(v -> p2pService.exchangeStatus(peer, local)
+                            .handle((peerStatus, ex) -> {
+                                if (ex == null) {
+                                    statusOk.incrementAndGet();
+                                    log.debug("[beacon] Status OK with {}: {}", peer, peerStatus);
+                                } else {
+                                    statusFail.incrementAndGet();
+                                    log.debug("[beacon] Status failed with {}: {}",
+                                            peer, ex.getMessage());
+                                }
+                                return null;
+                            }));
+            futures.add(combined);
         }
 
-        // Wait for all to complete (or timeout)
+        // Wait for all to complete (or timeout). 10s covers Identify (~200ms)
+        // + Status (~300ms) × ~18 peers in parallel with generous headroom.
         try {
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-                    .get(8, TimeUnit.SECONDS);
+                    .get(10, TimeUnit.SECONDS);
         } catch (Exception e) {
             // Some peers may have timed out — that's fine
         }
 
-        // Log summary of light client support
+        // Log summary of light client support and Status exchange success
         List<BeaconP2PService.PeerInfo> connected = p2pService.getConnectedPeers();
         long lcCount = connected.stream().filter(BeaconP2PService.PeerInfo::supportsLightClient).count();
-        log.info("[beacon] Identify complete: {}/{} connected peers support light_client",
-                lcCount, connected.size());
+        log.info("[beacon] Identify complete: {}/{} connected peers support light_client; Status OK={}, fail={}",
+                lcCount, connected.size(), statusOk.get(), statusFail.get());
         for (BeaconP2PService.PeerInfo pi : connected) {
             if (pi.supportsLightClient()) {
                 log.info("[beacon]   LC peer: {} agent={}", pi.peerId(), pi.agentVersion());
             }
+        }
+    }
+
+    /**
+     * Build the local Status we send on each connection.
+     *
+     * <p>Light-client semantics: we do not yet have a verified view of the
+     * chain head, so {@code head_root} / {@code head_slot} are zero. We pin
+     * {@code finalized_root} to our trusted checkpoint so the peer can see
+     * we're on the same fork as them; {@code finalized_epoch} is zero (we
+     * don't store the checkpoint's epoch in NetworkConfig). Peers accept
+     * inconsistent-looking Status from light clients — it's the
+     * {@code fork_digest} match that actually gates the connection.
+     */
+    private StatusMessage buildLocalStatus() {
+        return new StatusMessage(
+                computeForkDigest(),
+                checkpointRoot.clone(),
+                0L,                  // finalized_epoch — unknown, peers tolerate 0 from light clients
+                new byte[32],        // head_root — light client has no verified head yet
+                0L,                  // head_slot
+                0L);                 // earliest_available_slot — we serve nothing
+    }
+
+    /**
+     * {@code fork_digest = SHA256( (fork_version || 28 zero bytes) || genesis_validators_root )[:4]}.
+     * Matches {@code NetworkConfig.currentForkDigest()} but computed locally
+     * to avoid a networking-module dep inside consensus.
+     */
+    private byte[] computeForkDigest() {
+        try {
+            byte[] buf = new byte[64];
+            System.arraycopy(forkVersion, 0, buf, 0, 4);
+            System.arraycopy(genesisValidatorsRoot, 0, buf, 32, 32);
+            byte[] hash = java.security.MessageDigest.getInstance("SHA-256").digest(buf);
+            byte[] digest = new byte[4];
+            System.arraycopy(hash, 0, digest, 0, 4);
+            return digest;
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new AssertionError("SHA-256 missing", e);
         }
     }
 
