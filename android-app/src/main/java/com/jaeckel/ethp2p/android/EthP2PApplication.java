@@ -11,10 +11,9 @@ public final class EthP2PApplication extends Application {
     @Override
     public void onCreate() {
         super.onCreate();
-        // BouncyCastle ships its own SECP256K1 implementation; the platform provider
-        // on Android may be missing curves we need.
-        if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
-            Security.insertProviderAt(new BouncyCastleProvider(), 1);
-        }
+        // Android ships a stripped-down provider also named "BC" that lacks ECDSA.
+        // Replace it with the full BouncyCastle we bundle so Tuweni's SECP256K1 works.
+        Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME);
+        Security.insertProviderAt(new BouncyCastleProvider(), 1);
     }
 }
