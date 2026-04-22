@@ -122,6 +122,33 @@ public final class Enr {
     }
 
     /**
+     * CL ENR "eth2" field: SSZ-encoded {@code ForkID} per the consensus-layer p2p spec.
+     * Layout is {@code fork_digest(4) || next_fork_version(4) || next_fork_epoch(uint64 LE)}
+     * — 16 bytes total.
+     *
+     * <p>Callers filter "is this peer on the same CL fork as me" by comparing
+     * {@link Eth2Field#forkDigest()} to their own current digest. Peers without
+     * this field are plain discv5 participants (EL discv4 nodes advertising v4
+     * ENRs, bootnodes, experiments) and should be filtered out when seeding the
+     * CL peer pipeline.
+     */
+    public Optional<Eth2Field> eth2() {
+        Bytes raw = pairs.get("eth2");
+        if (raw == null || raw.size() < 16) return Optional.empty();
+        byte[] forkDigest = raw.slice(0, 4).toArrayUnsafe();
+        byte[] nextForkVersion = raw.slice(4, 4).toArrayUnsafe();
+        // uint64 little-endian per SSZ.
+        long nextForkEpoch = 0L;
+        for (int i = 0; i < 8; i++) {
+            nextForkEpoch |= (raw.get(8 + i) & 0xFFL) << (i * 8);
+        }
+        return Optional.of(new Eth2Field(forkDigest, nextForkVersion, nextForkEpoch));
+    }
+
+    /** Decoded CL "eth2" ENR field. */
+    public record Eth2Field(byte[] forkDigest, byte[] nextForkVersion, long nextForkEpoch) {}
+
+    /**
      * Derive a libp2p multiaddr string from this ENR.
      * Format: {@code /ip4/<ip>/tcp/<port>/p2p/<peer-id>}
      *

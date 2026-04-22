@@ -94,6 +94,31 @@ class EnrTest {
     }
 
     @Test
+    void eth2FieldDecodesForkIdFromRealBootnode() {
+        // Prylabs mainnet CL bootnode — carries an "eth2" SSZ blob with the
+        // CL fork digest. Lifted verbatim from sigp/lighthouse .../mainnet/bootstrap_nodes.yaml.
+        String prylabsEnr = "enr:-Ku4QImhMc1z8yCiNJ1TyUxdcfNucje3BGwEHzodEZUan8PherEo4sF7pPHPSIB1NNuSg5fZy7qFsjmUKs2ea1Whi0EBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpD1pf1CAAAAAP__________gmlkgnY0gmlwhBLf22SJc2VjcDI1NmsxoQOVphkDqal4QzPMksc5wnpuC3gvSC8AfbFOnZY_On34wIN1ZHCCIyg";
+        Enr enr = Enr.fromEnrString(prylabsEnr);
+        var eth2 = enr.eth2();
+        assertTrue(eth2.isPresent(), "Prylabs bootnode must carry eth2 field");
+        // The Prylabs bootnode advertises a fork_digest of 0xf5a5fd42 (a pre-Merge
+        // phase0 digest; these ENRs predate recent hard forks and the next_fork_*
+        // fields advertise the original "all future forks" sentinel). That's fine
+        // for our purposes — we only need the field to be parseable.
+        assertEquals(4, eth2.get().forkDigest().length);
+        assertEquals(4, eth2.get().nextForkVersion().length);
+        assertEquals((byte) 0xf5, eth2.get().forkDigest()[0]);
+    }
+
+    @Test
+    void eth2FieldAbsentWhenNotPresent() {
+        // The Teku bootnode we have on hand carries no "eth2" key — confirm empty Optional.
+        String tekuEnr = "enr:-Iu4QLm7bZGdAt9NSeJG0cEnJohWcQTQaI9wFLu3Q7eHIDfrI4cwtzvEW3F3VbG9XdFXlrHyFGeXPn9snTCQJ9bnMRABgmlkgnY0gmlwhAOTJQCJc2VjcDI1NmsxoQIZdZD6tDYpkpEfVo5bgiU8MGRjhcOmHGD2nErK0UKRrIN0Y3CCIyiDdWRwgiMo";
+        Enr enr = Enr.fromEnrString(tekuEnr);
+        assertTrue(enr.eth2().isEmpty());
+    }
+
+    @Test
     void enrWithoutTcpReturnsEmptyMultiaddr() {
         // ENR that only has UDP (no "tcp" key) should return empty
         // Use an ENR string where tcp is missing — we simulate by checking the last ENR
