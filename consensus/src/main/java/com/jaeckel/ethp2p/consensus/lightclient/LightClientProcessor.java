@@ -155,10 +155,14 @@ public class LightClientProcessor {
         // Always verify and store when the store has no next committee (e.g. after rotation).
         SyncCommittee nextSyncCommittee = update.nextSyncCommittee();
         if (nextSyncCommittee != null && store.getNextSyncCommittee() == null) {
-            // Verify the next sync committee branch against the attested state
-            // Branch depth is fork-dependent (5 pre-Electra, 6 post-Electra)
+            // Verify the next sync committee branch against the attested state.
+            // Branch depth is fork-dependent (5 pre-Electra, 6 post-Electra).
+            // NEXT sync committee lives at field index 23, not 22 — using the
+            // CURRENT gindex here (as we did before) silently rejected every
+            // valid update because the Merkle proof path from field 23 doesn't
+            // reconcile when verified as if it came from field 22.
             int scDepth = update.nextSyncCommitteeBranch().length;
-            int scGindex = BeaconChainSpec.syncCommitteeGindex(scDepth);
+            int scGindex = BeaconChainSpec.nextSyncCommitteeGindex(scDepth);
             if (!SszUtil.verifyMerkleBranch(
                     nextSyncCommittee.hashTreeRoot(),
                     update.nextSyncCommitteeBranch(),

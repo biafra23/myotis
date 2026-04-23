@@ -22,7 +22,14 @@ public final class BlsVerifier {
     /**
      * Domain separation tag for Ethereum 2.0 BLS signatures.
      */
-    private static final String DST_STRING = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
+    // Ethereum consensus uses the BLS Proof-of-Possession (POP) scheme per the
+    // eth2 spec, not the basic (NUL) scheme. The hash-to-curve DST differs
+    // between schemes: BLS_SIG_..._POP_ vs BLS_SIG_..._NUL_. Using NUL here
+    // silently made every sync-aggregate verify fail — the hash_to_G2 output
+    // didn't match what validators actually signed against. Regression from
+    // the jblst → Milagro AMCL swap in 8acd8f1 (jblst hardcoded POP).
+    // See draft-irtf-cfrg-bls-signature-05 §4.2.3 and consensus-specs.
+    private static final String DST_STRING = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
     private static final byte[] DST_BYTES = DST_STRING.getBytes();
 
     /** BLS12-381 prime-order subgroup generator scalar, used for subgroup membership checks. */
@@ -60,12 +67,23 @@ public final class BlsVerifier {
      * @return true if the signature is valid, false otherwise
      */
     public static boolean fastAggregateVerify(List<byte[]> pubkeyBytes, byte[] message, byte[] signatureBytes) {
+        return fastAggregateVerify(pubkeyBytes, message, signatureBytes, DST_BYTES);
+    }
+
+    /**
+     * Same as {@link #fastAggregateVerify(List, byte[], byte[])} but with an
+     * explicit hash-to-curve DST. Production callers should use the no-DST
+     * overload, which defaults to Ethereum's POP ciphersuite; the DST
+     * parameter exists to let tests verify fixtures generated under a
+     * different ciphersuite (e.g., the basic "NUL" scheme that our jblst
+     * reference fixtures used).
+     */
+    public static boolean fastAggregateVerify(List<byte[]> pubkeyBytes, byte[] message,
+                                               byte[] signatureBytes, byte[] dst) {
         if (pubkeyBytes == null || pubkeyBytes.isEmpty()) {
             return false;
         }
         try {
-            // Decompress and aggregate pubkeys. Per the BLS spec, KeyValidate
-            // rejects the identity pubkey (allows trivial forgeries).
             ECP aggregated = deserializeG1(pubkeyBytes.get(0));
             if (aggregated == null || aggregated.is_infinity()) return false;
 
@@ -76,15 +94,11 @@ public final class BlsVerifier {
             }
             aggregated.affine();
 
-            // Decompress signature. Identity signatures would pair trivially to 1
-            // against any identity pubkey, so reject them explicitly as well.
             ECP2 sig = deserializeG2(signatureBytes);
             if (sig == null || sig.is_infinity()) return false;
 
-            // Hash message to G2
-            ECP2 hm = HashToCurve.hashToG2(message, DST_BYTES);
+            ECP2 hm = HashToCurve.hashToG2(message, dst);
 
-            // Pairing check: e(H(m), pk) * e(sig, -G1) == 1
             ECP g1neg = ECP.generator();
             g1neg.neg();
 

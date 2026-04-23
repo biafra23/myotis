@@ -18,7 +18,14 @@ import java.util.List;
  */
 public final class TestUtil {
 
-    private static final String DST = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
+    // Ethereum consensus-layer ciphersuite (POP scheme per BLS IETF draft 04
+    // and consensus-specs/specs/phase0/beacon-chain.md). Previously this was
+    // "_NUL_", which matched neither the spec nor what validators actually
+    // sign with on mainnet. Tests that sign via this DST and verify via
+    // BlsVerifier's production path were passing circularly (both wrong)
+    // while production verification of real mainnet signatures failed
+    // silently. Fixed in tandem with BlsVerifier's default DST.
+    private static final String DST = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
     private static final byte[] DST_BYTES = DST.getBytes();
 
     private TestUtil() {}
