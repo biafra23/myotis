@@ -6,6 +6,8 @@ import com.jaeckel.ethp2p.consensus.types.BeaconBlockHeader;
 import com.jaeckel.ethp2p.consensus.types.ForkData;
 import com.jaeckel.ethp2p.consensus.types.SyncAggregate;
 import com.jaeckel.ethp2p.consensus.types.SyncCommittee;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -14,6 +16,8 @@ import java.util.List;
  * Verifies sync committee BLS signatures over beacon block headers.
  */
 public final class SyncCommitteeVerifier {
+
+    private static final Logger log = LoggerFactory.getLogger(SyncCommitteeVerifier.class);
 
     private SyncCommitteeVerifier() {}
 
@@ -43,6 +47,9 @@ public final class SyncCommitteeVerifier {
         // 1. Check participation: must be >= 2/3 of SYNC_COMMITTEE_SIZE
         int participants = syncAggregate.countParticipants();
         if (participants * 3 < BeaconChainSpec.SYNC_COMMITTEE_SIZE * 2) {
+            log.info("[sync-verify] Insufficient participation: {}/{} (< 2/3 of {})",
+                    participants, BeaconChainSpec.SYNC_COMMITTEE_SIZE,
+                    BeaconChainSpec.SYNC_COMMITTEE_SIZE);
             return false;
         }
 
@@ -60,7 +67,17 @@ public final class SyncCommitteeVerifier {
         byte[] signingRoot = computeSigningRoot(attestedHeader.hashTreeRoot(), domain);
 
         // 4. BLS fast-aggregate verify
-        return BlsVerifier.fastAggregateVerify(pubkeys, signingRoot, syncAggregate.syncCommitteeSignature());
+        boolean ok = BlsVerifier.fastAggregateVerify(pubkeys, signingRoot, syncAggregate.syncCommitteeSignature());
+        if (!ok) {
+            StringBuilder fvHex = new StringBuilder();
+            for (byte b : forkVersion) fvHex.append(String.format("%02x", b));
+            StringBuilder dHex = new StringBuilder();
+            for (int i = 0; i < Math.min(8, domain.length); i++) dHex.append(String.format("%02x", domain[i]));
+            log.info("[sync-verify] BLS fast_aggregate_verify FAILED: participants={}, fork_version=0x{}, "
+                            + "domain[0..8]=0x{}, attestedSlot={}",
+                    participants, fvHex, dHex, attestedHeader.slot());
+        }
+        return ok;
     }
 
     /**

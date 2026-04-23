@@ -115,8 +115,13 @@ public class LightClientProcessor {
      * @return true if the update was successfully applied
      */
     public boolean processUpdate(LightClientUpdate update) {
+        long attestedSlot = update.attestedHeader().beacon().slot();
+        long finalizedSlot = update.finalizedHeader().beacon().slot();
+
         SyncCommittee committee = store.getCurrentSyncCommittee();
         if (committee == null) {
+            log.info("[lc-processor] Update rejected (attestedSlot={}): no current sync committee",
+                    attestedSlot);
             return false;
         }
 
@@ -127,6 +132,8 @@ public class LightClientProcessor {
                 update.attestedHeader().beacon(),
                 forkVersion,
                 genesisValidatorsRoot)) {
+            log.info("[lc-processor] Update rejected (attestedSlot={}, finalizedSlot={}): BLS sync-aggregate verify failed",
+                    attestedSlot, finalizedSlot);
             return false;
         }
 
@@ -139,6 +146,8 @@ public class LightClientProcessor {
                 finalityDepth,
                 finalityGindex,
                 update.attestedHeader().beacon().stateRoot())) {
+            log.info("[lc-processor] Update rejected (attestedSlot={}): finality branch Merkle proof failed (depth={}, gindex={})",
+                    attestedSlot, finalityDepth, finalityGindex);
             return false;
         }
 
@@ -156,13 +165,14 @@ public class LightClientProcessor {
                     scDepth,
                     scGindex,
                     update.attestedHeader().beacon().stateRoot())) {
+                log.info("[lc-processor] Update rejected (attestedSlot={}): nextSyncCommittee branch Merkle proof failed (depth={}, gindex={})",
+                        attestedSlot, scDepth, scGindex);
                 return false;
             }
             store.updateNextSyncCommittee(nextSyncCommittee);
         }
 
         long oldFinalizedSlot = store.getFinalizedSlot();
-        long finalizedSlot = update.finalizedHeader().beacon().slot();
         store.updateFinalized(update.finalizedHeader(), finalizedSlot);
         store.updateOptimistic(update.attestedHeader(), update.signatureSlot());
 
