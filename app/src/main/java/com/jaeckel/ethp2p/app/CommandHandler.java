@@ -886,8 +886,21 @@ public class CommandHandler {
                 if (verifyMethod != null) {
                     sb.append(",\"verifyMethod\":\"").append(verifyMethod).append("\"");
                 }
-            } else if (failReason != null) {
-                sb.append(",\"failReason\":\"").append(failReason).append("\"");
+            } else {
+                if (failReason != null) {
+                    sb.append(",\"failReason\":\"").append(failReason).append("\"");
+                }
+                // Always surface the numbers so the operator can see *how far*
+                // off we are, not just that we're off.
+                long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
+                long finalizedSlot = beaconSyncState.getFinalizedSlot();
+                sb.append(",\"peerBlockNumber\":").append(peerBlockNumber);
+                sb.append(",\"finalizedBlockNumber\":").append(finalizedBlockNum);
+                if (peerBlockNumber > 0 && finalizedBlockNum > 0) {
+                    sb.append(",\"blockGap\":").append(peerBlockNumber - finalizedBlockNum);
+                    sb.append(",\"maxHeaderChainGap\":").append(MAX_HEADER_CHAIN_GAP);
+                }
+                sb.append(",\"finalizedSlot\":").append(finalizedSlot);
             }
             sb.append("}}");
             return sb.toString();
