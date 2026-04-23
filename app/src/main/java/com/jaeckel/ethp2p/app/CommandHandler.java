@@ -793,6 +793,7 @@ public class CommandHandler {
             boolean blsVerified = false;
             long matchedSlot = -1;
             String verifyMethod = null;
+            String failReason = null;
             Bytes32 usedStateRoot = accountResult.stateRoot();
             if (usedStateRoot != null) {
                 BeaconSyncState.SlottedStateRoot match =
@@ -805,14 +806,31 @@ public class CommandHandler {
                 }
             }
 
-            // Header chain verification fallback
+            // Header chain verification fallback. Mirror get-account's
+            // buildVerificationJson flow so that a "beaconChainVerified:false"
+            // response always comes with a named failReason — silent nopes
+            // used to turn into a 3-boolean blob that was impossible to debug.
             long peerBlockNumber = accountResult.blockNumber();
-            if (!beaconChainVerified && storageProofValid && beaconSyncState.isSynced()
-                    && peerBlockNumber > 0 && usedStateRoot != null) {
+            if (!beaconChainVerified) {
                 long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
                 byte[] beaconRoot = beaconSyncState.getVerifiedExecutionStateRoot();
-                if (finalizedBlockNum > 0 && beaconRoot != null
-                        && peerBlockNumber > finalizedBlockNum) {
+                if (usedStateRoot == null) {
+                    failReason = "noPeerStateRoot";
+                } else if (!storageProofValid) {
+                    failReason = "peerProofInvalid";
+                } else if (!beaconSyncState.isSynced()) {
+                    failReason = "beaconNotSynced";
+                } else if (peerBlockNumber <= 0) {
+                    failReason = "noPeerBlockNumber";
+                } else if (finalizedBlockNum <= 0 || beaconRoot == null) {
+                    failReason = "beaconBlockUnavailable";
+                } else if (peerBlockNumber <= finalizedBlockNum) {
+                    failReason = "peerBlockBehindFinalized";
+                } else if (peerBlockNumber - finalizedBlockNum > MAX_HEADER_CHAIN_GAP) {
+                    failReason = "headerChainGapTooLarge";
+                } else {
+                    log.info("[verify] headerChain: peerBlock={}, finalizedBlock={}, gap={}",
+                            peerBlockNumber, finalizedBlockNum, peerBlockNumber - finalizedBlockNum);
                     try {
                         boolean chainValid = verifyHeaderChainBatched(
                                 finalizedBlockNum, peerBlockNumber, beaconRoot,
@@ -822,9 +840,12 @@ public class CommandHandler {
                             matchedSlot = beaconSyncState.getFinalizedSlot();
                             blsVerified = true;
                             verifyMethod = "headerChain";
+                        } else {
+                            failReason = "headerChainInvalid";
                         }
                     } catch (Exception e) {
-                        log.debug("[verify] Header chain verification failed: {}", e.getMessage());
+                        log.info("[verify] Header chain verification failed: {}", e.getMessage());
+                        failReason = "headerChainError";
                     }
                 }
             }
@@ -865,6 +886,8 @@ public class CommandHandler {
                 if (verifyMethod != null) {
                     sb.append(",\"verifyMethod\":\"").append(verifyMethod).append("\"");
                 }
+            } else if (failReason != null) {
+                sb.append(",\"failReason\":\"").append(failReason).append("\"");
             }
             sb.append("}}");
             return sb.toString();
