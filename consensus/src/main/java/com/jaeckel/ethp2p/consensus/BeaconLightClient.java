@@ -1404,11 +1404,13 @@ public class BeaconLightClient implements AutoCloseable {
     /**
      * Case-insensitive substring that excludes a peer from the usable pool if
      * its Identify agent string contains it. Set to {@code null} to disable.
-     * Temporarily set to {@code "lodestar"} to force catch-up / finality to go
-     * through Lighthouse/Teku peers instead — the one Lodestar in the
-     * hardcoded seed list was masking failures on the other clients.
+     * Was temporarily set to {@code "lodestar"} to force catch-up / finality
+     * through Lighthouse/Teku/Prysm/Nimbus while debugging why non-Lodestar
+     * peers wouldn't talk to us — root cause turned out to be the EIP-7892
+     * fork_digest mismatch (fixed via NetworkConfig.currentForkDigestOverride).
+     * Filter is now off; all clients are usable.
      */
-    private static final String EXCLUDED_AGENT_SUBSTRING = "lodestar";
+    private static final String EXCLUDED_AGENT_SUBSTRING = null;
 
     /**
      * Return peers with {@code preferred} moved to the front if it is in the list.
