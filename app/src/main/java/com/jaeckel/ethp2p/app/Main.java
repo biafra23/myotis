@@ -421,11 +421,12 @@ public final class Main {
                 clPeerCache::add,
                 clPeerCache::markFailure,
                 network.clGenesisTime());
-        // EIP-7892 BPO-fork workaround: if the network config pins a
-        // fork_digest value, use it instead of computing from fork_version.
-        if (network.currentForkDigestOverride() != null) {
-            beaconLightClient.setForkDigestOverride(network.currentForkDigestOverride());
-        }
+        // EIP-7892: apply active BPO blob-parameters so compute_fork_digest
+        // folds them in per the Fulu spec (XOR of base fork_data_root[0..4]
+        // with sha256(u64_le(epoch)||u64_le(max_blobs))[0..4]).
+        beaconLightClient.setBlobParameters(
+                network.activeBlobParamsEpoch(),
+                network.activeBlobParamsMaxBlobs());
         // Off by default (short-session clients churn the mesh). Enable
         // with `-Pgossipsub=true` via gradle or `--gossipsub` on the CLI.
         beaconLightClient.setGossipsubEnabled(gossipsubEnabled);

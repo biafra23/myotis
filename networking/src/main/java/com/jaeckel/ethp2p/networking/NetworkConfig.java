@@ -28,10 +28,11 @@ public record NetworkConfig(
                                         // Status.finalized_epoch before bootstrap so Lighthouse
                                         // doesn't goodbye us with IrrelevantNetwork(code=2).
         byte[] currentForkVersion,      // 4 bytes: current fork version for signing domain
-        byte[] currentForkDigestOverride, // 4 bytes or null. Bypasses the standard
-                                        // SHA-256(pad(fork_version) || gvr)[:4] calculation so we
-                                        // can follow EIP-7892 BPO-fork digest changes on mainnet
-                                        // without implementing ExtendedForkData. Null = compute.
+        long activeBlobParamsEpoch,     // EIP-7892: epoch of the currently-active BPO fork, or 0 if none.
+                                        // Folded into compute_fork_digest via the XOR formula so our digest
+                                        // tracks the network's post-Fulu BPO activations.
+        long activeBlobParamsMaxBlobs,  // EIP-7892: MAX_BLOBS_PER_BLOCK for the active BPO entry (paired
+                                        // with activeBlobParamsEpoch). Ignored when activeBlobParamsEpoch == 0.
         byte[] priorForkVersion,        // 4 bytes: immediately preceding fork (nullable). Accepted as
                                         // a discv5 fork_digest fallback so a configured "current" fork
                                         // that hasn't yet activated on the network doesn't filter every
@@ -92,12 +93,11 @@ public record NetworkConfig(
             // @checkpoint:mainnet:end
             // current fork version: Fulu (0x06000000) — activated at slot 13164544 (2025-12-03)
             new byte[]{0x06, 0x00, 0x00, 0x00},
-            // Observed fork_digest that peers actually use post-BPO2 (Fusaka):
-            // 0x8c9f62fe. The textbook SHA-256(pad(0x06000000)||gvr)[:4] returns
-            // 0x82fae541, which peers reject as IrrelevantNetwork. EIP-7892
-            // changes compute_fork_digest to include blob_parameters_epoch,
-            // and we're not implementing that yet — override explicitly.
-            new byte[]{(byte) 0x8c, (byte) 0x9f, 0x62, (byte) 0xfe},
+            // EIP-7892 BLOB_SCHEDULE — latest active entry on mainnet.
+            // BPO2 (Fusaka) at epoch 419072, MAX_BLOBS_PER_BLOCK=21, 2026-01-07.
+            // Feeds into compute_fork_digest (XOR of base_digest with sha256 of
+            // (epoch_le || max_blobs_le)).
+            419072L, 21L,
             // No prior-fork fallback: mainnet is on Fulu; peers still advertising
             // an older digest are either stale ENRs or unupgraded nodes — matching
             // them wouldn't help us sync to the current head anyway.
@@ -188,7 +188,7 @@ public record NetworkConfig(
             0L, // checkpoint slot — unknown for sepolia, use 0 (spec-default). refresh job should fill this.
             // current fork version: Electra on sepolia (0x90000073)
             new byte[]{(byte) 0x90, 0x00, 0x00, 0x73},
-            null, // fork_digest override — testnets compute per spec
+            0L, 0L, // no BPO active on sepolia
             null, // prior fork version not pinned for sepolia
             // CL peer multiaddrs for sepolia
             List.of(
@@ -219,7 +219,7 @@ public record NetworkConfig(
             0L, // checkpoint slot — unknown for holesky, use 0 (spec-default). refresh job should fill this.
             // current fork version: Electra on holesky (0x06017000)
             new byte[]{0x06, 0x01, 0x70, 0x00},
-            null, // fork_digest override — testnets compute per spec
+            0L, 0L, // no BPO active on holesky
             null, // prior fork version not pinned for holesky
             // CL peer multiaddrs for holesky
             List.of(
@@ -269,19 +269,53 @@ public record NetworkConfig(
     }
 
     /**
-     * Shorthand for {@code forkDigestFor(currentForkVersion())}, or the
-     * {@link #currentForkDigestOverride} if one was configured (needed post-
-     * EIP-7892 BPO forks where the spec's {@code compute_fork_digest}
-     * function no longer matches {@code sha256(pad(version)||gvr)[:4]}).
+     * Compute the current 4-byte fork digest per the Fulu / EIP-7892 spec:
+     * <pre>
+     *   base_digest = compute_fork_data_root(fork_version, gvr)  // 32 bytes
+     *   bp_hash     = sha256(u64_le(epoch) || u64_le(max_blobs)) // 32 bytes
+     *   fork_digest = (base_digest XOR bp_hash)[0..4]
+     * </pre>
+     * When no BPO is active ({@code activeBlobParamsEpoch == 0}), falls back
+     * to the pre-EIP-7892 formula {@code base_digest[0..4]} that testnets
+     * still use. See consensus-specs/specs/fulu/beacon-chain.md.
      */
     public byte[] currentForkDigest() {
-        if (currentForkDigestOverride != null) {
-            if (currentForkDigestOverride.length != 4) {
-                throw new IllegalStateException("currentForkDigestOverride must be 4 bytes");
-            }
-            return currentForkDigestOverride.clone();
+        byte[] base = forkDigestFor32(currentForkVersion());
+        if (activeBlobParamsEpoch == 0) {
+            byte[] out = new byte[4];
+            System.arraycopy(base, 0, out, 0, 4);
+            return out;
         }
-        return forkDigestFor(currentForkVersion());
+        byte[] bpInput = new byte[16];
+        // SSZ uint64 is little-endian
+        longToLeBytes(activeBlobParamsEpoch, bpInput, 0);
+        longToLeBytes(activeBlobParamsMaxBlobs, bpInput, 8);
+        byte[] bpHash;
+        try {
+            bpHash = java.security.MessageDigest.getInstance("SHA-256").digest(bpInput);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new AssertionError(e);
+        }
+        byte[] out = new byte[4];
+        for (int i = 0; i < 4; i++) out[i] = (byte) (base[i] ^ bpHash[i]);
+        return out;
+    }
+
+    /** Same as {@link #forkDigestFor} but returns the full 32-byte fork_data_root. */
+    private byte[] forkDigestFor32(byte[] forkVersion) {
+        byte[] genesisValidatorsRoot = genesisValidatorsRoot();
+        try {
+            byte[] buf = new byte[64];
+            System.arraycopy(forkVersion, 0, buf, 0, 4);
+            System.arraycopy(genesisValidatorsRoot, 0, buf, 32, 32);
+            return java.security.MessageDigest.getInstance("SHA-256").digest(buf);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private static void longToLeBytes(long v, byte[] out, int offset) {
+        for (int i = 0; i < 8; i++) out[offset + i] = (byte) (v >>> (8 * i));
     }
 
     /**

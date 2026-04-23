@@ -63,13 +63,13 @@ public class BeaconLightClient implements AutoCloseable {
     private final long checkpointSlot;        // slot of trusted checkpoint (for pre-bootstrap Status)
     private final byte[] forkVersion;         // 4-byte fork version
     /**
-     * Optional 4-byte override that bypasses the standard fork_digest
-     * computation (see {@link #computeForkDigest(byte[])}). Needed post
-     * EIP-7892 BPO forks, which change the digest function in a way we
-     * haven't implemented yet. Null = compute per legacy formula. Must be
-     * set via {@link #setForkDigestOverride(byte[])} before {@link #start()}.
+     * Active BPO parameters per EIP-7892: {@code (epoch, max_blobs_per_block)}.
+     * Folded into {@link #computeForkDigest(byte[])} via the XOR-mix-in
+     * formula from the Fulu spec. {@code epoch == 0} means no BPO is active
+     * and the legacy {@code base_digest[:4]} formula is used (testnets).
      */
-    private volatile byte[] forkDigestOverride;
+    private volatile long activeBlobParamsEpoch;
+    private volatile long activeBlobParamsMaxBlobs;
     private final byte[] genesisValidatorsRoot; // 32-byte genesis validators root
     private final long clGenesisTime;         // beacon chain genesis time (seconds since epoch)
     private final java.util.function.Consumer<String> onPeerSuccess; // nullable; called with multiaddr on success
@@ -470,41 +470,61 @@ public class BeaconLightClient implements AutoCloseable {
     }
 
     /**
-     * {@code fork_digest = SHA256( (fork_version || 28 zero bytes) || genesis_validators_root )[:4]}.
-     * Matches {@code NetworkConfig.currentForkDigest()} but computed locally
-     * to avoid a networking-module dep inside consensus.
-     *
-     * <p>If {@link #forkDigestOverride} has been set, returns that instead —
-     * needed on mainnet post-EIP-7892 (BPO forks) where the spec's
-     * {@code compute_fork_digest} function no longer matches this formula.
+     * EIP-7892 {@code compute_fork_digest}:
+     * <pre>
+     *   base_digest = sha256(pad(fork_version, 32) || gvr)  // fork_data_root
+     *   bp_hash     = sha256(u64_le(epoch) || u64_le(max_blobs))
+     *   fork_digest = (base_digest XOR bp_hash)[0..4]
+     * </pre>
+     * When no BPO is active ({@link #activeBlobParamsEpoch} == 0) we return
+     * {@code base_digest[0..4]} — the pre-Fulu formula. See
+     * consensus-specs/specs/fulu/beacon-chain.md.
      */
     private byte[] computeForkDigest(byte[] fv) {
-        if (forkDigestOverride != null) {
-            return forkDigestOverride.clone();
+        byte[] base = computeForkDataRoot(fv);
+        if (activeBlobParamsEpoch == 0) {
+            byte[] out = new byte[4];
+            System.arraycopy(base, 0, out, 0, 4);
+            return out;
         }
+        byte[] bpInput = new byte[16];
+        longToLeBytes(activeBlobParamsEpoch, bpInput, 0);
+        longToLeBytes(activeBlobParamsMaxBlobs, bpInput, 8);
+        byte[] bpHash;
+        try {
+            bpHash = java.security.MessageDigest.getInstance("SHA-256").digest(bpInput);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new AssertionError(e);
+        }
+        byte[] out = new byte[4];
+        for (int i = 0; i < 4; i++) out[i] = (byte) (base[i] ^ bpHash[i]);
+        return out;
+    }
+
+    /** Legacy (pre-Fulu) fork_data_root: sha256(pad(fork_version) || gvr). */
+    private byte[] computeForkDataRoot(byte[] fv) {
         try {
             byte[] buf = new byte[64];
             System.arraycopy(fv, 0, buf, 0, 4);
             System.arraycopy(genesisValidatorsRoot, 0, buf, 32, 32);
-            byte[] hash = java.security.MessageDigest.getInstance("SHA-256").digest(buf);
-            byte[] digest = new byte[4];
-            System.arraycopy(hash, 0, digest, 0, 4);
-            return digest;
+            return java.security.MessageDigest.getInstance("SHA-256").digest(buf);
         } catch (java.security.NoSuchAlgorithmException e) {
             throw new AssertionError("SHA-256 missing", e);
         }
     }
 
+    private static void longToLeBytes(long v, byte[] out, int offset) {
+        for (int i = 0; i < 8; i++) out[offset + i] = (byte) (v >>> (8 * i));
+    }
+
     /**
-     * Set a hardcoded fork_digest to use instead of computing it from
-     * {@code fork_version + gvr}. Must be called before {@link #start()}.
-     * Pass {@code null} to restore the default computation.
+     * Set the active EIP-7892 BPO parameters. Must be called before
+     * {@link #start()}. Pass {@code epoch = 0} to disable (use legacy
+     * fork_digest formula).
      */
-    public void setForkDigestOverride(byte[] digest) {
-        if (digest != null && digest.length != 4) {
-            throw new IllegalArgumentException("forkDigestOverride must be 4 bytes");
-        }
-        this.forkDigestOverride = digest == null ? null : digest.clone();
+    public void setBlobParameters(long epoch, long maxBlobsPerBlock) {
+        this.activeBlobParamsEpoch = epoch;
+        this.activeBlobParamsMaxBlobs = maxBlobsPerBlock;
     }
 
     /**
