@@ -403,6 +403,7 @@ public final class Main {
         BeaconLightClient beaconLightClient = new BeaconLightClient(
                 clPeers,
                 network.checkpointRoot(),
+                network.checkpointSlot(),
                 network.currentForkVersion(),
                 network.genesisValidatorsRoot(),
                 beaconSyncState,
@@ -410,6 +411,11 @@ public final class Main {
                 clPeerCache::add,
                 clPeerCache::markFailure,
                 network.clGenesisTime());
+        // EIP-7892 BPO-fork workaround: if the network config pins a
+        // fork_digest value, use it instead of computing from fork_version.
+        if (network.currentForkDigestOverride() != null) {
+            beaconLightClient.setForkDigestOverride(network.currentForkDigestOverride());
+        }
         // Publish to discv5 callback; any eth2-matching ENRs seen from here on
         // out get added to BLC's live peer pool (not just the on-disk cache).
         blcRef.set(beaconLightClient);

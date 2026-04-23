@@ -53,12 +53,34 @@ public final class ReqRespCodec {
     /**
      * Decodes an Ethereum 2 req/resp response frame.
      *
+     * <p>Backwards-compatible overload: assumes the response includes the 4-byte
+     * context bytes (fork_digest) after the result code, which is true for
+     * fork-dependent protocols like {@code /req/light_client_*},
+     * {@code /req/beacon_blocks_by_*}, and {@code /req/blob_sidecars_by_*}.
+     * For protocols whose SSZ type is fixed ({@code /req/status/*},
+     * {@code /req/ping/*}, {@code /req/metadata/*}, {@code /req/goodbye/*})
+     * use {@link #decodeResponse(byte[], boolean)} with {@code false}.
+     */
+    public static DecodeResult decodeResponse(byte[] rawBytes) throws IOException {
+        return decodeResponse(rawBytes, true);
+    }
+
+    /**
+     * Decodes an Ethereum 2 req/resp response frame.
+     *
      * @param rawBytes raw bytes read from the stream
-     * @return DecodeResult with resultCode, forkDigest (4 bytes), and decompressed SSZ payload
+     * @param hasContextBytes whether the wire format includes 4 bytes of
+     *                        context (fork_digest) between the result byte and
+     *                        the varint length. True for fork-dependent SSZ
+     *                        types (light_client_*, beacon_blocks_by_*,
+     *                        blob_sidecars_by_*); false for fixed types
+     *                        (status, ping, metadata, goodbye).
+     * @return DecodeResult with resultCode, forkDigest (4 bytes if present,
+     *         zero bytes otherwise), and decompressed SSZ payload
      * @throws IllegalArgumentException if resultCode != 0 (error response from peer)
      * @throws IOException if the snappy decompression or reading fails
      */
-    public static DecodeResult decodeResponse(byte[] rawBytes) throws IOException {
+    public static DecodeResult decodeResponse(byte[] rawBytes, boolean hasContextBytes) throws IOException {
         if (rawBytes == null || rawBytes.length < 1) {
             throw new IllegalArgumentException("Response too short: no result byte");
         }
@@ -88,14 +110,20 @@ public final class ReqRespCodec {
                     (errorMsg.isEmpty() ? "" : " — " + errorMsg));
         }
 
-        // Bytes 1..4: fork digest (4 bytes context)
-        if (rawBytes.length < pos + 4) {
-            throw new IllegalArgumentException("Response too short: missing fork digest (need 4 bytes after result, have " +
-                    (rawBytes.length - pos) + ")");
+        // Bytes 1..4: fork digest (4 bytes context) — only present for
+        // fork-dependent SSZ types. Status/Ping/Metadata/Goodbye skip this.
+        byte[] forkDigest;
+        if (hasContextBytes) {
+            if (rawBytes.length < pos + 4) {
+                throw new IllegalArgumentException("Response too short: missing fork digest (need 4 bytes after result, have " +
+                        (rawBytes.length - pos) + ")");
+            }
+            forkDigest = new byte[4];
+            System.arraycopy(rawBytes, pos, forkDigest, 0, 4);
+            pos += 4;
+        } else {
+            forkDigest = new byte[0];
         }
-        byte[] forkDigest = new byte[4];
-        System.arraycopy(rawBytes, pos, forkDigest, 0, 4);
-        pos += 4;
 
         // Next: varint(uncompressed SSZ payload length) per eth2 req/resp spec
         VarintResult varint = readVarint(rawBytes, pos);

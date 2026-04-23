@@ -24,7 +24,14 @@ public record NetworkConfig(
         // Beacon chain / consensus layer fields
         byte[] genesisValidatorsRoot,   // 32 bytes: genesis_validators_root for BLS domain computation
         byte[] checkpointRoot,          // 32 bytes: trusted checkpoint block root for bootstrap
+        long checkpointSlot,            // slot of the trusted checkpoint. Used to populate
+                                        // Status.finalized_epoch before bootstrap so Lighthouse
+                                        // doesn't goodbye us with IrrelevantNetwork(code=2).
         byte[] currentForkVersion,      // 4 bytes: current fork version for signing domain
+        byte[] currentForkDigestOverride, // 4 bytes or null. Bypasses the standard
+                                        // SHA-256(pad(fork_version) || gvr)[:4] calculation so we
+                                        // can follow EIP-7892 BPO-fork digest changes on mainnet
+                                        // without implementing ExtendedForkData. Null = compute.
         byte[] priorForkVersion,        // 4 bytes: immediately preceding fork (nullable). Accepted as
                                         // a discv5 fork_digest fallback so a configured "current" fork
                                         // that hasn't yet activated on the network doesn't filter every
@@ -81,9 +88,16 @@ public record NetworkConfig(
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshMainnetCheckpoint`
             // trusted checkpoint: recent finalized mainnet block root (slot 14158720, 2026-04-20, period 1728)
             Bytes.fromHexString("611c852c9c52812d1a8701d06c230617159b69d33b344704fb524558ee79ff5d").toArrayUnsafe(),
+            14158720L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:mainnet:end
             // current fork version: Fulu (0x06000000) — activated at slot 13164544 (2025-12-03)
             new byte[]{0x06, 0x00, 0x00, 0x00},
+            // Observed fork_digest that peers actually use post-BPO2 (Fusaka):
+            // 0x8c9f62fe. The textbook SHA-256(pad(0x06000000)||gvr)[:4] returns
+            // 0x82fae541, which peers reject as IrrelevantNetwork. EIP-7892
+            // changes compute_fork_digest to include blob_parameters_epoch,
+            // and we're not implementing that yet — override explicitly.
+            new byte[]{(byte) 0x8c, (byte) 0x9f, 0x62, (byte) 0xfe},
             // No prior-fork fallback: mainnet is on Fulu; peers still advertising
             // an older digest are either stale ENRs or unupgraded nodes — matching
             // them wouldn't help us sync to the current head anyway.
@@ -171,8 +185,10 @@ public record NetworkConfig(
             Bytes.fromHexString("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078").toArrayUnsafe(),
             // trusted checkpoint: a recent finalized sepolia block root
             Bytes.fromHexString("1f7c15e7e1a7be27b4e7e9b7bdb0e5e9b2aa5aebd33498ec04b58ef2adb5e9ce").toArrayUnsafe(),
+            0L, // checkpoint slot — unknown for sepolia, use 0 (spec-default). refresh job should fill this.
             // current fork version: Electra on sepolia (0x90000073)
             new byte[]{(byte) 0x90, 0x00, 0x00, 0x73},
+            null, // fork_digest override — testnets compute per spec
             null, // prior fork version not pinned for sepolia
             // CL peer multiaddrs for sepolia
             List.of(
@@ -200,8 +216,10 @@ public record NetworkConfig(
             Bytes.fromHexString("9143aa7c615a7f7115e2b6aac319c03529df8242ae705fba9df39b79c59fa8b1").toArrayUnsafe(),
             // trusted checkpoint: a recent finalized holesky block root
             Bytes.fromHexString("e4571b4f4a3bffdc9b87e75de28b86e5d9e8e1ab2b27d8a66e3e4e9f9ebe7f4c").toArrayUnsafe(),
+            0L, // checkpoint slot — unknown for holesky, use 0 (spec-default). refresh job should fill this.
             // current fork version: Electra on holesky (0x06017000)
             new byte[]{0x06, 0x01, 0x70, 0x00},
+            null, // fork_digest override — testnets compute per spec
             null, // prior fork version not pinned for holesky
             // CL peer multiaddrs for holesky
             List.of(
@@ -250,8 +268,19 @@ public record NetworkConfig(
         }
     }
 
-    /** Shorthand for {@code forkDigestFor(currentForkVersion())}. */
+    /**
+     * Shorthand for {@code forkDigestFor(currentForkVersion())}, or the
+     * {@link #currentForkDigestOverride} if one was configured (needed post-
+     * EIP-7892 BPO forks where the spec's {@code compute_fork_digest}
+     * function no longer matches {@code sha256(pad(version)||gvr)[:4]}).
+     */
     public byte[] currentForkDigest() {
+        if (currentForkDigestOverride != null) {
+            if (currentForkDigestOverride.length != 4) {
+                throw new IllegalStateException("currentForkDigestOverride must be 4 bytes");
+            }
+            return currentForkDigestOverride.clone();
+        }
         return forkDigestFor(currentForkVersion());
     }
 
