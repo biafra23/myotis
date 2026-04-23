@@ -153,13 +153,26 @@ public class BeaconP2PService implements AutoCloseable {
     private static final long PING_INTERVAL_SECS = 15;
 
     /**
-     * Gossipsub instance. Installed into the host mainly so we advertise
-     * {@code /meshsub/1.2.0} in our Identify response — that is what
-     * Lighthouse/Teku/Prysm appear to require before they'll talk to us
-     * without an {@code IrrelevantNetwork} Goodbye. Observation-only:
-     * handler logs incoming messages and always returns {@code Ignore}.
+     * Gossipsub instance. Observation-only: handler logs incoming messages
+     * and always returns {@code Ignore}. Only created when
+     * {@link #gossipsubEnabled} is true, which defaults to {@code false}
+     * because the primary target (short-lived Android sessions) doesn't
+     * benefit from mesh participation — mesh-join latency is longer than a
+     * whole session, and churning the mesh every 24 h is worse citizenship
+     * than not joining.
      */
     private io.libp2p.pubsub.gossip.Gossip gossip;
+
+    /** Off by default; call {@link #setGossipsubEnabled(boolean)} before {@link #start()}. */
+    private boolean gossipsubEnabled = false;
+
+    /** Toggle gossipsub subscription. Must be called before {@link #start()}. */
+    public void setGossipsubEnabled(boolean enabled) {
+        if (host != null) {
+            throw new IllegalStateException("gossipsub flag cannot change after start()");
+        }
+        this.gossipsubEnabled = enabled;
+    }
 
     public BeaconP2PService() {
         this(null);
@@ -213,18 +226,22 @@ public class BeaconP2PService implements AutoCloseable {
         // capable peer in Identify, subscribe to light-client topics and
         // log messages without propagating them. PR 1 of the gossipsub
         // rollout plan (see plan-gossipsub-subscription.md).
-        gossip = new io.libp2p.pubsub.gossip.Gossip();
-
-        host = new HostBuilder()
+        //
+        // Gated off by default — mesh participation is net-negative for
+        // short-session clients (see commit message / gossipsub plan).
+        HostBuilder hostBuilder = new HostBuilder()
                 .transport(TcpTransport::new)
                 .secureChannel((key, muxers) -> new NoiseXXSecureChannel(key, muxers))
                 .muxer(StreamMuxerProtocol::getYamux)
                 .muxer(StreamMuxerProtocol::getMplex)
-                .protocol(gossip)
                 .listen("/ip4/0.0.0.0/tcp/0") // ephemeral port; some peers reject dial-only hosts
                 // Ethereum CL spec requires secp256k1 identity keys
-                .builderModifier(b -> b.getIdentity().random(KeyType.SECP256K1))
-                .build();
+                .builderModifier(b -> b.getIdentity().random(KeyType.SECP256K1));
+        if (gossipsubEnabled) {
+            gossip = new io.libp2p.pubsub.gossip.Gossip();
+            hostBuilder.protocol(gossip);
+        }
+        host = hostBuilder.build();
 
         // Log connection events and auto-query Identify for protocol support
         host.addConnectionHandler(conn -> {
@@ -316,7 +333,9 @@ public class BeaconP2PService implements AutoCloseable {
         keepaliveExecutor.scheduleAtFixedRate(this::pingAllConnections,
                 PING_INTERVAL_SECS, PING_INTERVAL_SECS, java.util.concurrent.TimeUnit.SECONDS);
 
-        subscribeLightClientGossipTopics();
+        if (gossipsubEnabled) {
+            subscribeLightClientGossipTopics();
+        }
     }
 
     /**

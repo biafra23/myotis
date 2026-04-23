@@ -508,6 +508,17 @@ public class BeaconLightClient implements AutoCloseable {
     }
 
     /**
+     * Enable gossipsub subscription to the light-client topics. Off by
+     * default because short-session clients (Android app that runs ~2 min
+     * once per day) don't benefit from mesh participation and churn the
+     * mesh by joining-then-disappearing. Must be called before
+     * {@link #start()}.
+     */
+    public void setGossipsubEnabled(boolean enabled) {
+        p2pService.setGossipsubEnabled(enabled);
+    }
+
+    /**
      * Send Status to a peer, trying {@code /status/2} first and falling back
      * to {@code /status/1} if the peer doesn't support v2. Each protocol is
      * additionally tried with each candidate fork version in sequence.

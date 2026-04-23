@@ -105,15 +105,24 @@ public final class Main {
         // Parse --network and --port flags from anywhere in args
         String networkName = "mainnet";
         int port = DEFAULT_PORT;
+        boolean gossipsubEnabled = false;
         List<String> remaining = new ArrayList<>();
         for (int i = 0; i < args.length; i++) {
             if ("--network".equals(args[i]) && i + 1 < args.length) {
                 networkName = args[++i];
             } else if ("--port".equals(args[i]) && i + 1 < args.length) {
                 port = Integer.parseInt(args[++i]);
+            } else if ("--gossipsub".equals(args[i])) {
+                gossipsubEnabled = true;
             } else {
                 remaining.add(args[i]);
             }
+        }
+        // System property fallback so Android / other embedders can opt in
+        // without touching CLI args.
+        if (!gossipsubEnabled
+                && Boolean.parseBoolean(System.getProperty("beacon.gossipsub", "false"))) {
+            gossipsubEnabled = true;
         }
         String[] cmdArgs = remaining.toArray(new String[0]);
 
@@ -149,7 +158,7 @@ public final class Main {
         } else {
             // ── Daemon mode ──────────────────────────────────────────────────
             NetworkConfig network = NetworkConfig.byName(networkName);
-            runDaemon(socketPath, lockPath, network, port);
+            runDaemon(socketPath, lockPath, network, port, gossipsubEnabled);
         }
     }
 
@@ -157,7 +166,8 @@ public final class Main {
     // Daemon
     // -------------------------------------------------------------------------
 
-    private static void runDaemon(Path socketPath, Path lockPath, NetworkConfig network, int port) throws Exception {
+    private static void runDaemon(Path socketPath, Path lockPath, NetworkConfig network, int port,
+                                  boolean gossipsubEnabled) throws Exception {
         log.info("=== ethp2p Daemon ({}) ===", network.name());
         log.info("IPC socket: {}", socketPath);
 
@@ -415,6 +425,12 @@ public final class Main {
         // fork_digest value, use it instead of computing from fork_version.
         if (network.currentForkDigestOverride() != null) {
             beaconLightClient.setForkDigestOverride(network.currentForkDigestOverride());
+        }
+        // Off by default (short-session clients churn the mesh). Enable
+        // with `-Pgossipsub=true` via gradle or `--gossipsub` on the CLI.
+        beaconLightClient.setGossipsubEnabled(gossipsubEnabled);
+        if (gossipsubEnabled) {
+            log.info("[main] Gossipsub subscription ENABLED (observation-only)");
         }
         // Publish to discv5 callback; any eth2-matching ENRs seen from here on
         // out get added to BLC's live peer pool (not just the on-disk cache).
