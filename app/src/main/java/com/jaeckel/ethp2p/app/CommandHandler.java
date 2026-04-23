@@ -1026,10 +1026,6 @@ public class CommandHandler {
                 failReason = "peerProofInvalid";
             } else if (!beaconSyncState.isSynced()) {
                 failReason = "beaconNotSynced";
-            } else if (periodLag > 1) {
-                // Catch-up never reached the current period: committee is stale,
-                // finality updates can't verify, state roots stop being recorded.
-                failReason = "beaconStale";
             } else if (peerBlockNumber <= 0) {
                 failReason = "noPeerBlockNumber";
             } else if (finalizedBlockNum <= 0 || beaconRoot == null) {
