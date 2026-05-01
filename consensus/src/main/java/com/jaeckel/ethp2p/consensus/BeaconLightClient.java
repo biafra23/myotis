@@ -808,25 +808,29 @@ public class BeaconLightClient implements AutoCloseable {
         long currentPeriod = BeaconChainSpec.computeSyncCommitteePeriod(currentSlotEstimate);
 
         for (int batch = 0; batch < MAX_CATCHUP_BATCHES && running; batch++) {
-            long bootstrapPeriod = BeaconChainSpec.computeSyncCommitteePeriod(store.getFinalizedSlot());
-            if (currentPeriod <= bootstrapPeriod) {
+            // Use the committee's own period, not the finalized slot's. After
+            // forceRotate the two diverge by one period and starting from
+            // finalizedPeriod re-requests a period whose signing committee we
+            // no longer hold — every response then fails BLS verify.
+            long committeePeriod = store.getCurrentSyncCommitteePeriod();
+            if (currentPeriod <= committeePeriod) {
                 if (batch == 0) {
-                    log.info("[beacon] Sync committee is current (period {}), no catch-up needed", bootstrapPeriod);
+                    log.info("[beacon] Sync committee is current (period {}), no catch-up needed", committeePeriod);
                 }
                 return;
             }
 
-            long periodsToFetch = currentPeriod - bootstrapPeriod;
-            log.info("[beacon] Sync committee catch-up batch {}: bootstrap period={}, current period={}, fetching {} update(s)",
-                    batch, bootstrapPeriod, currentPeriod, periodsToFetch);
+            long periodsToFetch = currentPeriod - committeePeriod;
+            log.info("[beacon] Sync committee catch-up batch {}: committee period={}, current period={}, fetching {} update(s)",
+                    batch, committeePeriod, currentPeriod, periodsToFetch);
 
-            if (!attemptCatchUpBatch(bootstrapPeriod, periodsToFetch, currentSlotEstimate)) {
+            if (!attemptCatchUpBatch(committeePeriod, periodsToFetch, currentSlotEstimate)) {
                 log.warn("[beacon] Catch-up batch {} made no progress — will retry on next sync cycle", batch);
                 return;
             }
         }
 
-        long finalPeriod = BeaconChainSpec.computeSyncCommitteePeriod(store.getFinalizedSlot());
+        long finalPeriod = store.getCurrentSyncCommitteePeriod();
         if (finalPeriod < currentPeriod) {
             log.warn("[beacon] Catch-up hit batch cap ({}) at period {} (target {}); further progress on next cycle",
                     MAX_CATCHUP_BATCHES, finalPeriod, currentPeriod);
@@ -930,14 +934,14 @@ public class BeaconLightClient implements AutoCloseable {
                 LightClientUpdate update = LightClientUpdate.decode(responseSsz);
                 if (processor.processUpdate(update)) {
                     applied++;
-                    updateSyncState();
-                    // Rotate sync committee between updates: finality lags attestation,
-                    // so the finalized slot in the update may not cross the period
-                    // boundary even though the next update is signed by the new committee.
+                    // Rotate BEFORE updateSyncState so the committee-period pushed to
+                    // BeaconSyncState reflects the post-rotation value — otherwise
+                    // beacon-status' SYNCED gate flips late by one update cycle.
                     store.forceRotateIfPastPeriod(currentSlotEstimate);
-                    log.debug("[beacon] Catch-up: applied update slot={}, store period now={}",
+                    updateSyncState();
+                    log.debug("[beacon] Catch-up: applied update slot={}, committee period now={}",
                             update.finalizedHeader().beacon().slot(),
-                            BeaconChainSpec.computeSyncCommitteePeriod(store.getFinalizedSlot()));
+                            store.getCurrentSyncCommitteePeriod());
                 } else {
                     log.debug("[beacon] Catch-up update not applied (slot={})",
                             update.finalizedHeader().beacon().slot());
@@ -1154,6 +1158,18 @@ public class BeaconLightClient implements AutoCloseable {
                 fillChainStateRootsFromAnyPeer(true);
                 return;
             }
+        } else {
+            // Steady-state: the initial catchUpSyncCommittee() runs once at startup,
+            // but light_client_finality_update does NOT carry nextSyncCommittee —
+            // only LightClientUpdate (from updates_by_range) does. So once wall-clock
+            // crosses the next period boundary, finality updates are signed by a
+            // committee we don't have and BLS verify fails indefinitely. We must
+            // re-fetch a LightClientUpdate to rotate. This is a cheap no-op when
+            // the committee is current.
+            long wallPeriod = BeaconChainSpec.currentPeriod(clGenesisTime);
+            if (wallPeriod > store.getCurrentSyncCommitteePeriod()) {
+                catchUpSyncCommittee();
+            }
         }
 
         // Honor the Lodestar exclusion — finality polling is part of the
@@ -1241,7 +1257,15 @@ public class BeaconLightClient implements AutoCloseable {
         if (optimisticHeader != null) {
             byte[] optRoot = optimisticHeader.execution().stateRoot();
             syncState.recordStateRoot(store.getOptimisticSlot(), optRoot, true);
+            syncState.updateOptimisticExecution(
+                    optimisticHeader.execution().blockNumber(),
+                    optimisticHeader.execution().blockHash(),
+                    optRoot);
         }
+        // Mirror the store's committee period into the observable sync state so
+        // beacon-status' SYNCED gate and verification callers don't need a store
+        // reference to detect "wall-clock crossed into a period we don't hold."
+        syncState.setCurrentSyncCommitteePeriod(store.getCurrentSyncCommitteePeriod());
     }
 
     // -------------------------------------------------------------------------

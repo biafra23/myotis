@@ -891,16 +891,25 @@ public class CommandHandler {
                     sb.append(",\"failReason\":\"").append(failReason).append("\"");
                 }
                 // Always surface the numbers so the operator can see *how far*
-                // off we are, not just that we're off.
+                // off we are, not just that we're off. Emit both finalized and
+                // optimistic anchors — headerChainGapTooLarge is meaningful only
+                // after you see which anchor was considered.
                 long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
                 long finalizedSlot = beaconSyncState.getFinalizedSlot();
+                long optBlockNum = beaconSyncState.getOptimisticBlockNumber();
+                long optSlot = beaconSyncState.getOptimisticSlot();
                 sb.append(",\"peerBlockNumber\":").append(peerBlockNumber);
                 sb.append(",\"finalizedBlockNumber\":").append(finalizedBlockNum);
+                sb.append(",\"optimisticBlockNumber\":").append(optBlockNum);
                 if (peerBlockNumber > 0 && finalizedBlockNum > 0) {
                     sb.append(",\"blockGap\":").append(peerBlockNumber - finalizedBlockNum);
-                    sb.append(",\"maxHeaderChainGap\":").append(MAX_HEADER_CHAIN_GAP);
                 }
+                if (peerBlockNumber > 0 && optBlockNum > 0) {
+                    sb.append(",\"optimisticBlockGap\":").append(peerBlockNumber - optBlockNum);
+                }
+                sb.append(",\"maxHeaderChainGap\":").append(MAX_HEADER_CHAIN_GAP);
                 sb.append(",\"finalizedSlot\":").append(finalizedSlot);
+                sb.append(",\"optimisticSlot\":").append(optSlot);
             }
             sb.append("}}");
             return sb.toString();
@@ -929,26 +938,33 @@ public class CommandHandler {
                 + ",\"lightClientPeers\":" + lightClientPeers;
 
         String peersJson = buildBeaconPeersJson();
-        if (!beaconSyncState.isSynced()) {
+        BeaconSyncState.State state = beaconSyncState.getSyncState(clGenesisTime);
+        if (state == BeaconSyncState.State.SYNCING) {
             return "{\"ok\":true,\"state\":\"SYNCING\","
                     + peerStats
                     + ",\"finalizedSlot\":0,\"optimisticSlot\":0"
                     + ",\"executionStateRoot\":null"
+                    + ",\"knownStateRoots\":" + beaconSyncState.getKnownStateRootCount()
                     + ",\"peers\":" + peersJson + "}";
         }
         byte[] stateRoot = beaconSyncState.getVerifiedExecutionStateRoot();
         String stateRootHex = stateRoot != null ? "\"0x" + bytesToHex(stateRoot) + "\"" : "null";
         long finalizedSlot = beaconSyncState.getFinalizedSlot();
         long optimisticSlot = beaconSyncState.getOptimisticSlot();
-        long period = finalizedSlot / (32 * 256); // SLOTS_PER_EPOCH * EPOCHS_PER_SYNC_COMMITTEE_PERIOD
-        return "{\"ok\":true,\"state\":\"SYNCED\","
+        long finalizedPeriod = finalizedSlot / (32 * 256); // SLOTS_PER_EPOCH * EPOCHS_PER_SYNC_COMMITTEE_PERIOD
+        long committeePeriod = beaconSyncState.getCurrentSyncCommitteePeriod();
+        long wallPeriod = BeaconChainSpec.currentPeriod(clGenesisTime);
+        return "{\"ok\":true,\"state\":\"" + state.name() + "\","
                 + peerStats
                 + ",\"finalizedSlot\":" + finalizedSlot
                 + ",\"optimisticSlot\":" + optimisticSlot
-                + ",\"syncCommitteePeriod\":" + period
+                + ",\"finalizedPeriod\":" + finalizedPeriod
+                + ",\"syncCommitteePeriod\":" + committeePeriod
+                + ",\"wallClockPeriod\":" + wallPeriod
                 + ",\"executionStateRoot\":" + stateRootHex
                 + ",\"executionBlockNumber\":" + beaconSyncState.getExecutionBlockNumber()
                 + ",\"knownStateRoots\":" + beaconSyncState.getKnownStateRootCount()
+                + ",\"fillThreshold\":" + BeaconSyncState.FILL_THRESHOLD
                 + ",\"peers\":" + peersJson + "}";
     }
 
@@ -1071,7 +1087,6 @@ public class CommandHandler {
             } else if (peerBlockNumber - finalizedBlockNum > MAX_HEADER_CHAIN_GAP) {
                 failReason = "headerChainGapTooLarge";
             } else {
-                // Attempt header chain verification
                 log.info("[verify] headerChain: peerBlock={}, finalizedBlock={}, gap={}",
                         peerBlockNumber, finalizedBlockNum, peerBlockNumber - finalizedBlockNum);
                 try {
@@ -1118,6 +1133,10 @@ public class CommandHandler {
             }
             if (finalizedBlockNum > 0) {
                 sb.append(",\"finalizedBlockNumber\":").append(finalizedBlockNum);
+            }
+            long optBlockNum = beaconSyncState.getOptimisticBlockNumber();
+            if (optBlockNum > 0) {
+                sb.append(",\"optimisticBlockNumber\":").append(optBlockNum);
             }
         }
         sb.append("}");

@@ -1153,7 +1153,24 @@ public class BeaconP2PService implements AutoCloseable {
         while (pos < raw.length && items.size() < expectedCount) {
             byte resultCode = raw[pos];
             if (resultCode != 0) {
-                log.warn("[beacon-p2p] Multi-chunk response item {} error code {}", items.size(), resultCode);
+                // Per eth2 req/resp, error responses are <result><error_msg> with
+                // NO fork_digest. Log the (UTF-8) error so we can tell why the
+                // peer refused.
+                String errBody = "";
+                try {
+                    // Skip 1-3B varint length prefix if present, then decode rest as UTF-8
+                    int errStart = Math.min(pos + 1, raw.length);
+                    if (errStart < raw.length) {
+                        ReqRespCodec.VarintResult vr = ReqRespCodec.readVarint(raw, errStart);
+                        int msgStart = vr.nextPos();
+                        if (msgStart < raw.length) {
+                            errBody = new String(raw, msgStart, raw.length - msgStart,
+                                    java.nio.charset.StandardCharsets.UTF_8).trim();
+                        }
+                    }
+                } catch (Exception ignored) {}
+                log.info("[beacon-p2p] Multi-chunk response item {} error code {} (raw {} bytes): {}",
+                        items.size(), resultCode, raw.length, errBody);
                 break;
             }
             pos++;
@@ -1162,16 +1179,39 @@ public class BeaconP2PService implements AutoCloseable {
             ReqRespCodec.VarintResult varint = ReqRespCodec.readVarint(raw, pos);
             pos = varint.nextPos();
             int uncompressedLength = varint.value();
-            if (uncompressedLength == 0) { items.add(new byte[0]); continue; }
+            if (uncompressedLength == 0) {
+                log.info("[beacon-p2p] Multi-chunk chunk {} has uncompressedLength=0 (raw {} bytes, first 32: {})",
+                        items.size(), raw.length, bytesToHex(raw, Math.min(32, raw.length)));
+                items.add(new byte[0]);
+                continue;
+            }
 
             // Scan snappy frames to find the end of this chunk's compressed data
             int snappyStart = pos;
             pos = skipSnappyFrames(raw, pos, uncompressedLength);
             int compressedLength = pos - snappyStart;
-            if (compressedLength <= 0) break;
+            if (compressedLength <= 0) {
+                log.info("[beacon-p2p] Multi-chunk chunk {} skipSnappyFrames returned empty span (raw {} bytes, first 48: {})",
+                        items.size(), raw.length, bytesToHex(raw, Math.min(48, raw.length)));
+                break;
+            }
             byte[] compressed = new byte[compressedLength];
             System.arraycopy(raw, snappyStart, compressed, 0, compressedLength);
-            items.add(ReqRespCodec.snappyDecompress(compressed));
+            byte[] decompressed = ReqRespCodec.snappyDecompress(compressed);
+            if (decompressed.length == 0) {
+                // Snappy returned an empty stream — usually because only the
+                // framing header (`FF 06 00 00 sNaPpY`) was present with no
+                // data frames. Log enough context to pin down the peer's wire
+                // format and move on — don't poison {@code items} with an
+                // empty SSZ blob that {@code LightClientUpdate.decode} will
+                // just throw on downstream.
+                log.info("[beacon-p2p] Multi-chunk chunk {} snappyDecompress returned 0 bytes "
+                                + "(varintLen={}, compressedLen={}, raw {} bytes, first 48: {})",
+                        items.size(), uncompressedLength, compressedLength, raw.length,
+                        bytesToHex(raw, Math.min(48, raw.length)));
+                break;
+            }
+            items.add(decompressed);
         }
         return items;
     }
@@ -1496,13 +1536,33 @@ public class BeaconP2PService implements AutoCloseable {
                         return;
                     }
                     if (!responseFuture.isDone()) {
-                        byte[] response = responseBuffer.toByteArray();
-                        if (response.length == 0) {
-                            responseFuture.completeExceptionally(
-                                    new RuntimeException("Empty response (stream closed without data)"));
-                        } else {
-                            responseFuture.complete(response);
-                        }
+                        // Don't complete immediately — Netty can still deliver
+                        // buffered inbound reads AFTER channelInactive. We
+                        // observed this on mainnet: peer sends 18B chunk header
+                        // (result + fork_digest + varint + snappy stream id) in
+                        // one TCP segment, then the snappy data frames ~40ms
+                        // later; channelInactive fires between the two, so
+                        // completing now truncates the response and the snappy
+                        // stream decompresses to 0 bytes.
+                        //
+                        // Cancel any safety timer from channelReadComplete and
+                        // schedule a short drain window. Further channelRead0
+                        // calls will append to the buffer; the timer completes
+                        // with whatever's there when it fires.
+                        var prev = completionTimer;
+                        if (prev != null) prev.cancel(false);
+                        completionTimer = ctx.executor().schedule(() -> {
+                            if (responseFuture.isDone()) return;
+                            byte[] response = responseBuffer.toByteArray();
+                            if (response.length == 0) {
+                                responseFuture.completeExceptionally(
+                                        new RuntimeException("Empty response (stream closed without data)"));
+                            } else {
+                                log.debug("[beacon-p2p] Completing response (inactive drain): {} bytes",
+                                        response.length);
+                                responseFuture.complete(response);
+                            }
+                        }, 250, java.util.concurrent.TimeUnit.MILLISECONDS);
                     }
                     super.channelInactive(ctx);
                 }
