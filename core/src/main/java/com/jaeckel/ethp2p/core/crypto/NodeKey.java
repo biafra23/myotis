@@ -7,6 +7,7 @@ import org.apache.tuweni.crypto.SECP256K1;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.Security;
@@ -43,14 +44,18 @@ public final class NodeKey {
      */
     public static NodeKey loadOrGenerate(Path file) throws IOException {
         if (Files.exists(file)) {
-            String hex = Files.readString(file).strip();
+            // Files.readString / writeString are in JDK 11 but not in the
+            // Android core-library-desugaring minimal NIO subset, so use the
+            // byte-oriented Files APIs (always available via desugar) and
+            // decode/encode as UTF-8 ourselves.
+            String hex = new String(Files.readAllBytes(file), StandardCharsets.UTF_8).strip();
             Bytes32 privBytes = Bytes32.fromHexString(hex);
             SECP256K1.SecretKey secret = SECP256K1.SecretKey.fromBytes(privBytes);
             SECP256K1.KeyPair kp = SECP256K1.KeyPair.fromSecretKey(secret);
             return new NodeKey(kp);
         }
         NodeKey key = generate();
-        Files.writeString(file, key.privateKeyHex());
+        Files.write(file, key.privateKeyHex().getBytes(StandardCharsets.UTF_8));
         return key;
     }
 
