@@ -590,7 +590,7 @@ public class BeaconP2PService implements AutoCloseable {
                 log.debug("[beacon-p2p] ping ok with {} ({} bytes)", pid, raw == null ? 0 : raw.length);
             }
         });
-        binding.enqueue(requestPayload, responseFuture);
+        binding.enqueue(pid, requestPayload, responseFuture);
         try {
             StreamPromise<?> sp = conn.muxerSession().createStream(binding);
             sp.getStream().whenComplete((s, e) -> {
@@ -669,7 +669,7 @@ public class BeaconP2PService implements AutoCloseable {
             return CompletableFuture.failedFuture(e);
         }
         CompletableFuture<byte[]> responseFuture = new CompletableFuture<>();
-        binding.enqueue(requestPayload, responseFuture);
+        binding.enqueue(pid, requestPayload, responseFuture);
         try {
             StreamPromise<?> sp = conn.muxerSession().createStream(binding);
             sp.getStream().whenComplete((s, e) -> {
@@ -1087,7 +1087,7 @@ public class BeaconP2PService implements AutoCloseable {
                 // Step 2: Enqueue request state, then open a stream on the muxer
                 log.debug("[beacon-p2p] Connection ready for {}, enqueueing and creating stream for {}",
                         peerMultiaddr, protocolId);
-                binding.enqueue(requestBytes, responseFuture);
+                binding.enqueue(peerId.toString(), requestBytes, responseFuture);
 
                 try {
                     StreamPromise<?> streamPromise =
@@ -1358,7 +1358,15 @@ public class BeaconP2PService implements AutoCloseable {
     static class QueuedReqRespBinding implements ProtocolBinding<ReqRespController> {
 
         private final String protocolId;
-        private final ConcurrentLinkedQueue<PendingRequest> pendingRequests = new ConcurrentLinkedQueue<>();
+        // Per-peer FIFO of outgoing requests. A single global queue would race
+        // across peers: streams on different muxers run their initChannel on
+        // different libp2p threads, so the order of poll() between two
+        // concurrent createStream() calls (e.g. parallel finality polling
+        // across peers) is not the same as the order of enqueue(). With a
+        // global queue, a request enqueued for peer A could be polled by
+        // peer B's stream and vice versa, mismatching response futures.
+        private final java.util.concurrent.ConcurrentMap<String, ConcurrentLinkedQueue<PendingRequest>>
+                pendingByPeer = new java.util.concurrent.ConcurrentHashMap<>();
         private final Map<String, String> peerAgentsRef;
         /** When non-null, the binding serves peer-initiated streams with this handler. */
         private final ReqRespHandler responderHandler;
@@ -1391,8 +1399,9 @@ public class BeaconP2PService implements AutoCloseable {
             this.forkDigestSupplier = forkDigestSupplier;
         }
 
-        void enqueue(byte[] requestBytes, CompletableFuture<byte[]> responseFuture) {
-            pendingRequests.add(new PendingRequest(requestBytes, responseFuture));
+        void enqueue(String peerId, byte[] requestBytes, CompletableFuture<byte[]> responseFuture) {
+            pendingByPeer.computeIfAbsent(peerId, k -> new ConcurrentLinkedQueue<>())
+                    .add(new PendingRequest(requestBytes, responseFuture));
         }
 
         @Override
@@ -1437,17 +1446,31 @@ public class BeaconP2PService implements AutoCloseable {
                         new IllegalStateException("Responder role not implemented for " + protocolId));
             }
 
-            // Outgoing stream: drain stale (already-timed-out) requests from the queue.
+            // Outgoing stream: drain THIS peer's queue. Per-peer queues
+            // prevent the cross-peer mismatch that a global queue allowed
+            // when two muxers' initChannel callbacks raced (see field doc).
+            String outgoingPeerId;
+            try {
+                outgoingPeerId = stream.getConnection().secureSession().getRemoteId().toString();
+            } catch (Exception e) {
+                return CompletableFuture.failedFuture(
+                        new IllegalStateException("Cannot resolve peer ID for outgoing " + protocolId, e));
+            }
+            ConcurrentLinkedQueue<PendingRequest> queue = pendingByPeer.get(outgoingPeerId);
             PendingRequest pending = null;
-            while (true) {
-                pending = pendingRequests.poll();
-                if (pending == null) {
-                    log.warn("[beacon-p2p] No pending request for outgoing {} — queue was empty!", protocolId);
-                    return CompletableFuture.failedFuture(
-                            new IllegalStateException("No pending request for " + protocolId));
-                }
+            while (queue != null) {
+                pending = queue.poll();
+                if (pending == null) break;
                 if (!pending.responseFuture.isDone()) break;
-                log.debug("[beacon-p2p] Skipping stale request for {}", protocolId);
+                log.debug("[beacon-p2p] Skipping stale request for {} to {}", protocolId, outgoingPeerId);
+                pending = null;
+            }
+            if (pending == null) {
+                log.warn("[beacon-p2p] No pending request for outgoing {} to {} — queue was empty!",
+                        protocolId, outgoingPeerId);
+                return CompletableFuture.failedFuture(
+                        new IllegalStateException("No pending request for " + protocolId
+                                + " to " + outgoingPeerId));
             }
 
             ReqRespController controller = new ReqRespController(
@@ -1773,9 +1796,15 @@ public class BeaconP2PService implements AutoCloseable {
             try {
                 ReqRespCodec.VarintResult v = ReqRespCodec.readVarint(raw, 0);
                 if (v.value() != expectedRequestSize) return false;
-                // Need at least the snappy stream-identifier frame (10 B) + a
-                // compressed chunk header (4 B) before we can decompress.
-                return raw.length - v.nextPos() >= 14;
+                // The raw "≥14 bytes after the varint" check let us fire as
+                // soon as the snappy stream-identifier + first chunk header
+                // had arrived, but a fragmented request would then fail
+                // inside parseRequestSsz and we'd send InvalidRequest on
+                // perfectly-good-but-not-yet-complete data. Verify the
+                // snappy frame actually decompresses to the expected
+                // uncompressed length before declaring the request decodable.
+                byte[] decoded = parseRequestSsz(raw);
+                return decoded != null && decoded.length == expectedRequestSize;
             } catch (Exception e) {
                 return false;
             }
