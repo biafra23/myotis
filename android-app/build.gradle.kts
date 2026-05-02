@@ -8,8 +8,16 @@ plugins {
 // same fully-qualified classes; the JVM tolerates the shadowing but the dexer
 // doesn't. vertx-core (transitive via tuweni-crypto) drags upstream netty in,
 // so strip it project-wide and rely on the fork.
+//
+// log4j-api is excluded because its `LogManager.getLogger()` no-args overload
+// uses StackWalker to name the logger after the caller class, and Android's
+// StackWalker returns null `getDeclaringClass()` for some frames — every
+// discovery class with `static final Logger LOG = LogManager.getLogger()`
+// blows up at <clinit>. Replaced with a tiny shim under
+// src/main/java/org/apache/logging/log4j that routes to slf4j.
 configurations.all {
     exclude(group = "io.netty")
+    exclude(group = "org.apache.logging.log4j")
 }
 
 android {
@@ -76,6 +84,10 @@ android {
             // file as upstream netty-common; just take the first one.
             pickFirsts += setOf(
                 "META-INF/native-image/io.netty/netty-common/native-image.properties",
+                // jvm-libp2p drags in four bouncycastle jars (bcprov, bcpkix,
+                // bctls, bcutil) that all ship the same OSGI manifest under
+                // META-INF/versions/9; the file is metadata-only.
+                "META-INF/versions/9/OSGI-INF/MANIFEST.MF",
             )
         }
     }
@@ -86,12 +98,18 @@ dependencies {
 
     implementation(project(":core"))
     implementation(project(":networking"))
+    implementation(project(":consensus"))
 
     // core/networking expose tuweni and netty only as `implementation`, so
     // add what the service code references directly.
     implementation(libs.tuweni.bytes)
     implementation(libs.tuweni.crypto)
     implementation(libs.netty.transport)
+
+    // consensus stack — BeaconLightClient, libp2p, BLS, snappy.
+    implementation(libs.jvm.libp2p)
+    implementation(libs.milagro)
+    implementation(libs.snappy)
 
     implementation(libs.bouncycastle)
     implementation(libs.slf4j.api)
