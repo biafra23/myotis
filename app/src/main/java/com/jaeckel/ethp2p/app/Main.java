@@ -8,6 +8,7 @@ import com.jaeckel.ethp2p.core.types.BlockHeader;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
 import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
 import com.jaeckel.ethp2p.networking.discv4.KademliaTable;
+import com.jaeckel.ethp2p.networking.discv5.DiscV5Service;
 import com.jaeckel.ethp2p.networking.dns.DnsEnrResolver;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
@@ -99,19 +100,29 @@ public final class Main {
         return cacheFile(networkName).resolveSibling("cl-peers" + suffix + ".cache");
     }
 
+
     public static void main(String[] args) throws Exception {
         // Parse --network and --port flags from anywhere in args
         String networkName = "mainnet";
         int port = DEFAULT_PORT;
+        boolean gossipsubEnabled = false;
         List<String> remaining = new ArrayList<>();
         for (int i = 0; i < args.length; i++) {
             if ("--network".equals(args[i]) && i + 1 < args.length) {
                 networkName = args[++i];
             } else if ("--port".equals(args[i]) && i + 1 < args.length) {
                 port = Integer.parseInt(args[++i]);
+            } else if ("--gossipsub".equals(args[i])) {
+                gossipsubEnabled = true;
             } else {
                 remaining.add(args[i]);
             }
+        }
+        // System property fallback so Android / other embedders can opt in
+        // without touching CLI args.
+        if (!gossipsubEnabled
+                && Boolean.parseBoolean(System.getProperty("beacon.gossipsub", "false"))) {
+            gossipsubEnabled = true;
         }
         String[] cmdArgs = remaining.toArray(new String[0]);
 
@@ -147,7 +158,7 @@ public final class Main {
         } else {
             // ── Daemon mode ──────────────────────────────────────────────────
             NetworkConfig network = NetworkConfig.byName(networkName);
-            runDaemon(socketPath, lockPath, network, port);
+            runDaemon(socketPath, lockPath, network, port, gossipsubEnabled);
         }
     }
 
@@ -155,7 +166,8 @@ public final class Main {
     // Daemon
     // -------------------------------------------------------------------------
 
-    private static void runDaemon(Path socketPath, Path lockPath, NetworkConfig network, int port) throws Exception {
+    private static void runDaemon(Path socketPath, Path lockPath, NetworkConfig network, int port,
+                                  boolean gossipsubEnabled) throws Exception {
         log.info("=== ethp2p Daemon ({}) ===", network.name());
         log.info("IPC socket: {}", socketPath);
 
@@ -310,9 +322,77 @@ public final class Main {
         }
         log.info("[daemon] discv4 started on UDP port {}. Waiting for peers...", port);
 
-        // 7. Beacon light client (consensus layer, runs on virtual thread)
+        // Beacon light client scaffolding (moved ahead of discv5 so its callback can
+        // write to CLPeerCache as peers are discovered).
         BeaconSyncState beaconSyncState = new BeaconSyncState();
         CLPeerCache clPeerCache = new CLPeerCache(clCacheFile(network.name()));
+
+        // 6b. discv5 — the canonical CL peer discovery mechanism. Runs on a separate
+        // UDP port from discv4 (default 9000, matching CL libp2p convention). The
+        // callback filters to ENRs carrying the eth2 field with a matching fork digest,
+        // converts to a libp2p multiaddr, and writes to CLPeerCache so the next
+        // daemon start seeds BeaconLightClient with a refreshed list.
+        //
+        // Runtime integration with the running BLC is a follow-up: BLC freezes its
+        // peer list at construction. The feedback loop is one daemon restart today.
+        List<byte[]> acceptedForkDigests = network.acceptedForkDigests();
+        log.info("[discv5] accepted fork_digests for network {}: {}",
+                network.name(),
+                acceptedForkDigests.stream()
+                        .map(d -> "0x" + java.util.HexFormat.of().formatHex(d))
+                        .toList());
+        // Log the first few mismatches so we can tell whether the filter is
+        // rejecting every peer (wrong expected digest?) vs. no peers arriving.
+        java.util.concurrent.atomic.AtomicInteger mismatchesLogged =
+                new java.util.concurrent.atomic.AtomicInteger();
+        // Discovered peers land here; BLC is constructed a few lines below and
+        // has this reference set once it's up so the discv5 callback can feed
+        // fresh peers directly into its live pool, not just the on-disk cache.
+        java.util.concurrent.atomic.AtomicReference<BeaconLightClient> blcRef =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        DiscV5Service discV5 = new DiscV5Service(nodeKey, network.clDiscv5Bootnodes(), enr -> {
+            var eth2 = enr.eth2();
+            if (eth2.isEmpty()) return;
+            byte[] peerDigest = eth2.get().forkDigest();
+            int matchIdx = -1;
+            for (int i = 0; i < acceptedForkDigests.size(); i++) {
+                if (java.util.Arrays.equals(peerDigest, acceptedForkDigests.get(i))) {
+                    matchIdx = i;
+                    break;
+                }
+            }
+            if (matchIdx < 0) {
+                int n = mismatchesLogged.incrementAndGet();
+                if (n <= 5) {
+                    log.info("[discv5] eth2 peer fork_digest=0x{} not in accepted set — rejected{}",
+                            java.util.HexFormat.of().formatHex(peerDigest),
+                            n == 5 ? " [further mismatch logs suppressed]" : "");
+                }
+                return;
+            }
+            final int mi = matchIdx;
+            enr.toLibp2pMultiaddr().ifPresent(ma -> {
+                String tier = mi == 0 ? "current" : "prior";
+                clPeerCache.add(ma);
+                BeaconLightClient blc = blcRef.get();
+                boolean liveAdded = blc != null && blc.addPeer(ma);
+                log.info("[discv5] CL peer {} (fork_digest {} match){}", ma, tier,
+                        liveAdded ? " → live pool" : "");
+            });
+        });
+        try {
+            discV5.start(9000);
+        } catch (Throwable t) {
+            // Catch Throwable, not Exception: earlier we hit a NoClassDefFoundError
+            // (library static-init) which slipped past an Exception handler and
+            // killed the main thread while the Netty event loop kept the JVM alive
+            // — the daemon lock stayed held but the IPC socket never got created.
+            // discv5 is non-essential; EL keeps working and CL falls back to the
+            // cache + hardcoded seed list.
+            log.warn("[discv5] failed to start, continuing without CL discovery: {}", t.toString());
+        }
+
+        // 7. Beacon light client (consensus layer, runs on virtual thread)
         List<String> clPeers = new java.util.ArrayList<>(clPeerCache.load());
         // Append configured peers after cached ones (cached peers are tried first)
         for (String peer : network.clPeerMultiaddrs()) {
@@ -333,6 +413,7 @@ public final class Main {
         BeaconLightClient beaconLightClient = new BeaconLightClient(
                 clPeers,
                 network.checkpointRoot(),
+                network.checkpointSlot(),
                 network.currentForkVersion(),
                 network.genesisValidatorsRoot(),
                 beaconSyncState,
@@ -340,18 +421,34 @@ public final class Main {
                 clPeerCache::add,
                 clPeerCache::markFailure,
                 network.clGenesisTime());
+        // EIP-7892: apply active BPO blob-parameters so compute_fork_digest
+        // folds them in per the Fulu spec (XOR of base fork_data_root[0..4]
+        // with sha256(u64_le(epoch)||u64_le(max_blobs))[0..4]).
+        beaconLightClient.setBlobParameters(
+                network.activeBlobParamsEpoch(),
+                network.activeBlobParamsMaxBlobs());
+        // Off by default (short-session clients churn the mesh). Enable
+        // with `-Pgossipsub=true` via gradle or `--gossipsub` on the CLI.
+        beaconLightClient.setGossipsubEnabled(gossipsubEnabled);
+        if (gossipsubEnabled) {
+            log.info("[main] Gossipsub subscription ENABLED (observation-only)");
+        }
+        // Publish to discv5 callback; any eth2-matching ENRs seen from here on
+        // out get added to BLC's live peer pool (not just the on-disk cache).
+        blcRef.set(beaconLightClient);
         beaconLightClient.start();
         log.info("[daemon] Beacon light client started with {} CL peer(s) ({} cached)",
                 clPeers.size(), clPeers.size() - network.clPeerMultiaddrs().size());
 
         // 8. IPC server
-        CommandHandler commandHandler = new CommandHandler(discV4, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState, beaconLightClient, network.clGenesisTime());
+        CommandHandler commandHandler = new CommandHandler(discV4, discV5, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState, beaconLightClient, network.clGenesisTime());
         DaemonServer server = new DaemonServer(socketPath, commandHandler);
         try {
             server.start();
         } catch (BindException e) {
             System.err.println("Cannot bind IPC socket " + socketPath + ": " + e.getMessage());
             System.err.println("Is another instance already running?");
+            discV5.close();
             discV4.close();
             fileLock.release();
             lockChannel.close();
@@ -359,6 +456,7 @@ public final class Main {
             return;
         } catch (Exception e) {
             System.err.println("Failed to start IPC server: " + e.getMessage());
+            discV5.close();
             discV4.close();
             fileLock.release();
             lockChannel.close();
@@ -373,6 +471,7 @@ public final class Main {
             beaconLightClient.close();
             server.close();
             connector.close();
+            discV5.close();
             discV4.close();
             try { fileLock.release(); lockChannel.close(); } catch (Exception ignored) {}
             stopLatch.countDown();
@@ -386,6 +485,7 @@ public final class Main {
         beaconLightClient.close();
         server.close();
         connector.close();
+        discV5.close();
         discV4.close();
         try { fileLock.release(); lockChannel.close(); } catch (Exception ignored) {}
         log.info("[daemon] Done.");

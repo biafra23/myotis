@@ -120,7 +120,11 @@ class BlsFixtureTest {
             byte[] pk = hex(fixtures.get("single." + i + ".pk"));
             byte[] sig = hex(fixtures.get("single." + i + ".sig"));
 
-            assertTrue(BlsVerifier.fastAggregateVerify(List.of(pk), msg, sig),
+            // Fixtures were generated under the NUL ciphersuite; production
+            // uses POP (Ethereum's scheme). Explicit DST lets us regression-
+            // test Milagro's hash_to_G2/pairing math without reshaping the
+            // fixture corpus.
+            assertTrue(BlsVerifier.fastAggregateVerify(List.of(pk), msg, sig, DST_BYTES),
                     "verify must pass for fixture single." + i);
         }
     }
@@ -172,7 +176,8 @@ class BlsFixtureTest {
             for (int i = 0; i < n; i++) {
                 pks.add(hex(fixtures.get("agg." + n + ".pk." + i)));
             }
-            assertTrue(BlsVerifier.fastAggregateVerify(pks, msg, sig),
+            // NUL-ciphersuite fixtures (see verifySingle_jblstFixtures).
+            assertTrue(BlsVerifier.fastAggregateVerify(pks, msg, sig, DST_BYTES),
                     "aggregate verify must pass for n=" + n);
         }
     }

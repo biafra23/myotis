@@ -115,8 +115,13 @@ public class LightClientProcessor {
      * @return true if the update was successfully applied
      */
     public boolean processUpdate(LightClientUpdate update) {
+        long attestedSlot = update.attestedHeader().beacon().slot();
+        long finalizedSlot = update.finalizedHeader().beacon().slot();
+
         SyncCommittee committee = store.getCurrentSyncCommittee();
         if (committee == null) {
+            log.info("[lc-processor] Update rejected (attestedSlot={}): no current sync committee",
+                    attestedSlot);
             return false;
         }
 
@@ -127,6 +132,8 @@ public class LightClientProcessor {
                 update.attestedHeader().beacon(),
                 forkVersion,
                 genesisValidatorsRoot)) {
+            log.info("[lc-processor] Update rejected (attestedSlot={}, finalizedSlot={}): BLS sync-aggregate verify failed",
+                    attestedSlot, finalizedSlot);
             return false;
         }
 
@@ -139,6 +146,8 @@ public class LightClientProcessor {
                 finalityDepth,
                 finalityGindex,
                 update.attestedHeader().beacon().stateRoot())) {
+            log.info("[lc-processor] Update rejected (attestedSlot={}): finality branch Merkle proof failed (depth={}, gindex={})",
+                    attestedSlot, finalityDepth, finalityGindex);
             return false;
         }
 
@@ -146,23 +155,28 @@ public class LightClientProcessor {
         // Always verify and store when the store has no next committee (e.g. after rotation).
         SyncCommittee nextSyncCommittee = update.nextSyncCommittee();
         if (nextSyncCommittee != null && store.getNextSyncCommittee() == null) {
-            // Verify the next sync committee branch against the attested state
-            // Branch depth is fork-dependent (5 pre-Electra, 6 post-Electra)
+            // Verify the next sync committee branch against the attested state.
+            // Branch depth is fork-dependent (5 pre-Electra, 6 post-Electra).
+            // NEXT sync committee lives at field index 23, not 22 — using the
+            // CURRENT gindex here (as we did before) silently rejected every
+            // valid update because the Merkle proof path from field 23 doesn't
+            // reconcile when verified as if it came from field 22.
             int scDepth = update.nextSyncCommitteeBranch().length;
-            int scGindex = BeaconChainSpec.syncCommitteeGindex(scDepth);
+            int scGindex = BeaconChainSpec.nextSyncCommitteeGindex(scDepth);
             if (!SszUtil.verifyMerkleBranch(
                     nextSyncCommittee.hashTreeRoot(),
                     update.nextSyncCommitteeBranch(),
                     scDepth,
                     scGindex,
                     update.attestedHeader().beacon().stateRoot())) {
+                log.info("[lc-processor] Update rejected (attestedSlot={}): nextSyncCommittee branch Merkle proof failed (depth={}, gindex={})",
+                        attestedSlot, scDepth, scGindex);
                 return false;
             }
             store.updateNextSyncCommittee(nextSyncCommittee);
         }
 
         long oldFinalizedSlot = store.getFinalizedSlot();
-        long finalizedSlot = update.finalizedHeader().beacon().slot();
         store.updateFinalized(update.finalizedHeader(), finalizedSlot);
         store.updateOptimistic(update.attestedHeader(), update.signatureSlot());
 

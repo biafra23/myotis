@@ -32,6 +32,12 @@ tasks.register<JavaExec>("run") {
         appArgs.add("--port")
         appArgs.add(portArg)
     }
+    // -Pgossipsub=true enables the (observation-only) light-client gossipsub
+    // subscription. Off by default because short-session clients churn the mesh.
+    val gossipsubArg = project.findProperty("gossipsub") as String?
+    if (gossipsubArg != null && gossipsubArg.equals("true", ignoreCase = true)) {
+        appArgs.add("--gossipsub")
+    }
     val cmdArgs = (project.findProperty("args") as String?)
         ?.split("\\s+".toRegex())
         ?.filter { it.isNotEmpty() }

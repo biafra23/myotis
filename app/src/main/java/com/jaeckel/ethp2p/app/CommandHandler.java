@@ -8,6 +8,7 @@ import com.jaeckel.ethp2p.consensus.proof.MerklePatriciaVerifier;
 import com.jaeckel.ethp2p.core.types.BlockHeader;
 import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
 import com.jaeckel.ethp2p.networking.discv4.KademliaTable;
+import com.jaeckel.ethp2p.networking.discv5.DiscV5Service;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockBodiesMessage;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
@@ -47,6 +48,7 @@ public class CommandHandler {
     private static final Logger log = LoggerFactory.getLogger(CommandHandler.class);
 
     private final DiscV4Service discV4;
+    private final DiscV5Service discV5; // nullable
     private final RLPxConnector connector;
     private final long startTimeMs;
     private final CountDownLatch stopLatch;
@@ -59,7 +61,7 @@ public class CommandHandler {
     public CommandHandler(DiscV4Service discV4, RLPxConnector connector,
                           CountDownLatch stopLatch, Map<String, Long> backoff,
                           Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState) {
-        this(discV4, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState,
+        this(discV4, null, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState,
                 null, BeaconChainSpec.MAINNET_GENESIS_TIME);
     }
 
@@ -67,7 +69,7 @@ public class CommandHandler {
                           CountDownLatch stopLatch, Map<String, Long> backoff,
                           Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState,
                           BeaconLightClient beaconLightClient) {
-        this(discV4, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState,
+        this(discV4, null, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState,
                 beaconLightClient, BeaconChainSpec.MAINNET_GENESIS_TIME);
     }
 
@@ -75,7 +77,17 @@ public class CommandHandler {
                           CountDownLatch stopLatch, Map<String, Long> backoff,
                           Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState,
                           BeaconLightClient beaconLightClient, long clGenesisTime) {
+        this(discV4, null, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState,
+                beaconLightClient, clGenesisTime);
+    }
+
+    public CommandHandler(DiscV4Service discV4, DiscV5Service discV5,
+                          RLPxConnector connector,
+                          CountDownLatch stopLatch, Map<String, Long> backoff,
+                          Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState,
+                          BeaconLightClient beaconLightClient, long clGenesisTime) {
         this.discV4 = discV4;
+        this.discV5 = discV5;
         this.connector = connector;
         this.startTimeMs = System.currentTimeMillis();
         this.stopLatch = stopLatch;
@@ -781,6 +793,7 @@ public class CommandHandler {
             boolean blsVerified = false;
             long matchedSlot = -1;
             String verifyMethod = null;
+            String failReason = null;
             Bytes32 usedStateRoot = accountResult.stateRoot();
             if (usedStateRoot != null) {
                 BeaconSyncState.SlottedStateRoot match =
@@ -793,14 +806,31 @@ public class CommandHandler {
                 }
             }
 
-            // Header chain verification fallback
+            // Header chain verification fallback. Mirror get-account's
+            // buildVerificationJson flow so that a "beaconChainVerified:false"
+            // response always comes with a named failReason — silent nopes
+            // used to turn into a 3-boolean blob that was impossible to debug.
             long peerBlockNumber = accountResult.blockNumber();
-            if (!beaconChainVerified && storageProofValid && beaconSyncState.isSynced()
-                    && peerBlockNumber > 0 && usedStateRoot != null) {
+            if (!beaconChainVerified) {
                 long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
                 byte[] beaconRoot = beaconSyncState.getVerifiedExecutionStateRoot();
-                if (finalizedBlockNum > 0 && beaconRoot != null
-                        && peerBlockNumber > finalizedBlockNum) {
+                if (usedStateRoot == null) {
+                    failReason = "noPeerStateRoot";
+                } else if (!storageProofValid) {
+                    failReason = "peerProofInvalid";
+                } else if (!beaconSyncState.isSynced()) {
+                    failReason = "beaconNotSynced";
+                } else if (peerBlockNumber <= 0) {
+                    failReason = "noPeerBlockNumber";
+                } else if (finalizedBlockNum <= 0 || beaconRoot == null) {
+                    failReason = "beaconBlockUnavailable";
+                } else if (peerBlockNumber <= finalizedBlockNum) {
+                    failReason = "peerBlockBehindFinalized";
+                } else if (peerBlockNumber - finalizedBlockNum > MAX_HEADER_CHAIN_GAP) {
+                    failReason = "headerChainGapTooLarge";
+                } else {
+                    log.info("[verify] headerChain: peerBlock={}, finalizedBlock={}, gap={}",
+                            peerBlockNumber, finalizedBlockNum, peerBlockNumber - finalizedBlockNum);
                     try {
                         boolean chainValid = verifyHeaderChainBatched(
                                 finalizedBlockNum, peerBlockNumber, beaconRoot,
@@ -810,9 +840,12 @@ public class CommandHandler {
                             matchedSlot = beaconSyncState.getFinalizedSlot();
                             blsVerified = true;
                             verifyMethod = "headerChain";
+                        } else {
+                            failReason = "headerChainInvalid";
                         }
                     } catch (Exception e) {
-                        log.debug("[verify] Header chain verification failed: {}", e.getMessage());
+                        log.info("[verify] Header chain verification failed: {}", e.getMessage());
+                        failReason = "headerChainError";
                     }
                 }
             }
@@ -853,6 +886,30 @@ public class CommandHandler {
                 if (verifyMethod != null) {
                     sb.append(",\"verifyMethod\":\"").append(verifyMethod).append("\"");
                 }
+            } else {
+                if (failReason != null) {
+                    sb.append(",\"failReason\":\"").append(failReason).append("\"");
+                }
+                // Always surface the numbers so the operator can see *how far*
+                // off we are, not just that we're off. Emit both finalized and
+                // optimistic anchors — headerChainGapTooLarge is meaningful only
+                // after you see which anchor was considered.
+                long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
+                long finalizedSlot = beaconSyncState.getFinalizedSlot();
+                long optBlockNum = beaconSyncState.getOptimisticBlockNumber();
+                long optSlot = beaconSyncState.getOptimisticSlot();
+                sb.append(",\"peerBlockNumber\":").append(peerBlockNumber);
+                sb.append(",\"finalizedBlockNumber\":").append(finalizedBlockNum);
+                sb.append(",\"optimisticBlockNumber\":").append(optBlockNum);
+                if (peerBlockNumber > 0 && finalizedBlockNum > 0) {
+                    sb.append(",\"blockGap\":").append(peerBlockNumber - finalizedBlockNum);
+                }
+                if (peerBlockNumber > 0 && optBlockNum > 0) {
+                    sb.append(",\"optimisticBlockGap\":").append(peerBlockNumber - optBlockNum);
+                }
+                sb.append(",\"maxHeaderChainGap\":").append(MAX_HEADER_CHAIN_GAP);
+                sb.append(",\"finalizedSlot\":").append(finalizedSlot);
+                sb.append(",\"optimisticSlot\":").append(optSlot);
             }
             sb.append("}}");
             return sb.toString();
@@ -864,24 +921,50 @@ public class CommandHandler {
     }
 
     private String handleBeaconStatus() {
+        // Peer / discovery counters — same shape as `status` for the EL side so
+        // the two outputs compare apples-to-apples.
+        long uptimeSec = (System.currentTimeMillis() - startTimeMs) / 1000;
+        int discv5Live = discV5 != null ? discV5.liveNodeCount() : 0;
+        List<BeaconP2PService.PeerInfo> peers = beaconLightClient != null
+                ? beaconLightClient.getConnectedPeers()
+                : List.of();
+        int connectedPeers = peers.size();
+        long lightClientPeers = peers.stream()
+                .filter(BeaconP2PService.PeerInfo::supportsLightClient)
+                .count();
+        String peerStats = "\"uptimeSeconds\":" + uptimeSec
+                + ",\"discoveredPeers\":" + discv5Live
+                + ",\"connectedPeers\":" + connectedPeers
+                + ",\"lightClientPeers\":" + lightClientPeers;
+
         String peersJson = buildBeaconPeersJson();
-        if (!beaconSyncState.isSynced()) {
-            return "{\"ok\":true,\"state\":\"SYNCING\",\"finalizedSlot\":0,\"optimisticSlot\":0"
+        BeaconSyncState.State state = beaconSyncState.getSyncState(clGenesisTime);
+        if (state == BeaconSyncState.State.SYNCING) {
+            return "{\"ok\":true,\"state\":\"SYNCING\","
+                    + peerStats
+                    + ",\"finalizedSlot\":0,\"optimisticSlot\":0"
                     + ",\"executionStateRoot\":null"
+                    + ",\"knownStateRoots\":" + beaconSyncState.getKnownStateRootCount()
                     + ",\"peers\":" + peersJson + "}";
         }
         byte[] stateRoot = beaconSyncState.getVerifiedExecutionStateRoot();
         String stateRootHex = stateRoot != null ? "\"0x" + bytesToHex(stateRoot) + "\"" : "null";
         long finalizedSlot = beaconSyncState.getFinalizedSlot();
         long optimisticSlot = beaconSyncState.getOptimisticSlot();
-        long period = finalizedSlot / (32 * 256); // SLOTS_PER_EPOCH * EPOCHS_PER_SYNC_COMMITTEE_PERIOD
-        return "{\"ok\":true,\"state\":\"SYNCED\""
+        long finalizedPeriod = finalizedSlot / (32 * 256); // SLOTS_PER_EPOCH * EPOCHS_PER_SYNC_COMMITTEE_PERIOD
+        long committeePeriod = beaconSyncState.getCurrentSyncCommitteePeriod();
+        long wallPeriod = BeaconChainSpec.currentPeriod(clGenesisTime);
+        return "{\"ok\":true,\"state\":\"" + state.name() + "\","
+                + peerStats
                 + ",\"finalizedSlot\":" + finalizedSlot
                 + ",\"optimisticSlot\":" + optimisticSlot
-                + ",\"syncCommitteePeriod\":" + period
+                + ",\"finalizedPeriod\":" + finalizedPeriod
+                + ",\"syncCommitteePeriod\":" + committeePeriod
+                + ",\"wallClockPeriod\":" + wallPeriod
                 + ",\"executionStateRoot\":" + stateRootHex
                 + ",\"executionBlockNumber\":" + beaconSyncState.getExecutionBlockNumber()
                 + ",\"knownStateRoots\":" + beaconSyncState.getKnownStateRootCount()
+                + ",\"fillThreshold\":" + BeaconSyncState.FILL_THRESHOLD
                 + ",\"peers\":" + peersJson + "}";
     }
 
@@ -995,10 +1078,6 @@ public class CommandHandler {
                 failReason = "peerProofInvalid";
             } else if (!beaconSyncState.isSynced()) {
                 failReason = "beaconNotSynced";
-            } else if (periodLag > 1) {
-                // Catch-up never reached the current period: committee is stale,
-                // finality updates can't verify, state roots stop being recorded.
-                failReason = "beaconStale";
             } else if (peerBlockNumber <= 0) {
                 failReason = "noPeerBlockNumber";
             } else if (finalizedBlockNum <= 0 || beaconRoot == null) {
@@ -1008,7 +1087,6 @@ public class CommandHandler {
             } else if (peerBlockNumber - finalizedBlockNum > MAX_HEADER_CHAIN_GAP) {
                 failReason = "headerChainGapTooLarge";
             } else {
-                // Attempt header chain verification
                 log.info("[verify] headerChain: peerBlock={}, finalizedBlock={}, gap={}",
                         peerBlockNumber, finalizedBlockNum, peerBlockNumber - finalizedBlockNum);
                 try {
@@ -1055,6 +1133,10 @@ public class CommandHandler {
             }
             if (finalizedBlockNum > 0) {
                 sb.append(",\"finalizedBlockNumber\":").append(finalizedBlockNum);
+            }
+            long optBlockNum = beaconSyncState.getOptimisticBlockNumber();
+            if (optBlockNum > 0) {
+                sb.append(",\"optimisticBlockNumber\":").append(optBlockNum);
             }
         }
         sb.append("}");

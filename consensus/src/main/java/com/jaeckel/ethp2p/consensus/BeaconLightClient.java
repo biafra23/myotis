@@ -11,6 +11,7 @@ import com.jaeckel.ethp2p.consensus.types.LightClientBootstrap;
 import com.jaeckel.ethp2p.consensus.types.LightClientFinalityUpdate;
 import com.jaeckel.ethp2p.consensus.types.LightClientHeader;
 import com.jaeckel.ethp2p.consensus.types.LightClientUpdate;
+import com.jaeckel.ethp2p.consensus.types.StatusMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -59,7 +60,16 @@ public class BeaconLightClient implements AutoCloseable {
     private final Set<String> knownPeerAddrs;     // dedup set for discovered peers
     private final String beaconApiUrl;            // nullable; HTTP API for peer discovery
     private final byte[] checkpointRoot;      // 32-byte trusted checkpoint block root
+    private final long checkpointSlot;        // slot of trusted checkpoint (for pre-bootstrap Status)
     private final byte[] forkVersion;         // 4-byte fork version
+    /**
+     * Active BPO parameters per EIP-7892: {@code (epoch, max_blobs_per_block)}.
+     * Folded into {@link #computeForkDigest(byte[])} via the XOR-mix-in
+     * formula from the Fulu spec. {@code epoch == 0} means no BPO is active
+     * and the legacy {@code base_digest[:4]} formula is used (testnets).
+     */
+    private volatile long activeBlobParamsEpoch;
+    private volatile long activeBlobParamsMaxBlobs;
     private final byte[] genesisValidatorsRoot; // 32-byte genesis validators root
     private final long clGenesisTime;         // beacon chain genesis time (seconds since epoch)
     private final java.util.function.Consumer<String> onPeerSuccess; // nullable; called with multiaddr on success
@@ -149,6 +159,29 @@ public class BeaconLightClient implements AutoCloseable {
                               java.util.function.Consumer<String> onPeerSuccess,
                               java.util.function.Consumer<String> onPeerFailure,
                               long clGenesisTime) {
+        this(clPeerMultiaddrs, checkpointRoot, 0L, forkVersion, genesisValidatorsRoot,
+                syncState, beaconApiUrl, onPeerSuccess, onPeerFailure, clGenesisTime);
+    }
+
+    /**
+     * Full constructor including the trusted-checkpoint slot, which is used
+     * to populate Status.finalized_epoch before bootstrap completes.
+     * Sending Status with {@code finalized_epoch=0} + {@code finalized_root=0}
+     * causes Lighthouse (and other clients that replicate its check) to
+     * reply with Goodbye(IrrelevantNetwork=2) and disconnect, because their
+     * block_root_at_epoch(0) = mainnet genesis root ≠ zero. Claiming the
+     * known checkpoint {epoch, root} lets us pass that check.
+     */
+    public BeaconLightClient(List<String> clPeerMultiaddrs,
+                              byte[] checkpointRoot,
+                              long checkpointSlot,
+                              byte[] forkVersion,
+                              byte[] genesisValidatorsRoot,
+                              BeaconSyncState syncState,
+                              String beaconApiUrl,
+                              java.util.function.Consumer<String> onPeerSuccess,
+                              java.util.function.Consumer<String> onPeerFailure,
+                              long clGenesisTime) {
         if (checkpointRoot == null || checkpointRoot.length != 32) {
             throw new IllegalArgumentException("checkpointRoot must be 32 bytes");
         }
@@ -162,6 +195,7 @@ public class BeaconLightClient implements AutoCloseable {
         this.knownPeerAddrs = Collections.synchronizedSet(new LinkedHashSet<>(clPeerMultiaddrs));
         this.beaconApiUrl = beaconApiUrl;
         this.checkpointRoot = checkpointRoot.clone();
+        this.checkpointSlot = checkpointSlot;
         this.forkVersion = forkVersion.clone();
         this.genesisValidatorsRoot = genesisValidatorsRoot.clone();
         this.clGenesisTime = clGenesisTime;
@@ -171,7 +205,28 @@ public class BeaconLightClient implements AutoCloseable {
 
         this.store = new LightClientStore();
         this.processor = new LightClientProcessor(store, this.forkVersion, genesisValidatorsRoot);
-        this.p2pService = new BeaconP2PService();
+        // Supply the local Status on demand so BeaconP2PService can serve
+        // inbound /status/{1,2} streams opened by peers — modern CL clients
+        // drop us if we don't respond within RESP_TIMEOUT (~5 s).
+        this.p2pService = new BeaconP2PService(this::buildLocalStatus);
+    }
+
+    /**
+     * Add a newly-discovered CL peer to the live pool so the next sync cycle
+     * sees it. Dedup'd via {@link #knownPeerAddrs}. Safe to call from any
+     * thread (discv5 callback, beacon API polling, etc.).
+     *
+     * <p>Inserted near the front of the pool so freshly-discovered peers are
+     * tried before possibly-rotten hardcoded seed entries.
+     *
+     * @return true if the peer was new (added to the pool); false if it was
+     *         already known
+     */
+    public boolean addPeer(String multiaddr) {
+        if (multiaddr == null || multiaddr.isEmpty()) return false;
+        if (!knownPeerAddrs.add(multiaddr)) return false;
+        clPeerMultiaddrs.add(Math.min(1, clPeerMultiaddrs.size()), multiaddr);
+        return true;
     }
 
     /**
@@ -224,8 +279,12 @@ public class BeaconLightClient implements AutoCloseable {
 
         // Phase 2: steady-state poll loop — one slot = 12 seconds.
         // If not yet synced, each cycle disconnects stale connections and retries.
+        int cycleCount = 0;
         while (running) {
             try {
+                // Every 5 cycles (~60s), log pool stats so it's easy to see
+                // whether LC-capable peers are accumulating or bleeding off.
+                if (++cycleCount % 5 == 0) logPeerPoolStats();
                 pollFinalityUpdate();
                 Thread.sleep(12_000);
             } catch (InterruptedException e) {
@@ -310,18 +369,21 @@ public class BeaconLightClient implements AutoCloseable {
         List<CompletableFuture<Void>> futures = new ArrayList<>();
         for (String peer : peers) {
             if (!running) return;
-            futures.add(p2pService.queryIdentify(peer));
+            // Only run Identify here. The CL-spec-required Status exchange is
+            // fired automatically by {@link BeaconP2PService#autoStatus} on
+            // every outbound connection; duplicating it here would create two
+            // concurrent /status/2 streams that race and cause one side to
+            // fail with "Stream closed by peer".
+            futures.add(p2pService.queryIdentify(peer).handle((v, ex) -> null));
         }
 
-        // Wait for all to complete (or timeout)
         try {
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-                    .get(8, TimeUnit.SECONDS);
+                    .get(10, TimeUnit.SECONDS);
         } catch (Exception e) {
             // Some peers may have timed out — that's fine
         }
 
-        // Log summary of light client support
         List<BeaconP2PService.PeerInfo> connected = p2pService.getConnectedPeers();
         long lcCount = connected.stream().filter(BeaconP2PService.PeerInfo::supportsLightClient).count();
         log.info("[beacon] Identify complete: {}/{} connected peers support light_client",
@@ -331,6 +393,225 @@ public class BeaconLightClient implements AutoCloseable {
                 log.info("[beacon]   LC peer: {} agent={}", pi.peerId(), pi.agentVersion());
             }
         }
+    }
+
+    /**
+     * Build the local Status we send on each connection.
+     *
+     * <p>Light-client semantics: we do not yet have a verified view of the
+     * chain head. Per the eth2 p2p-interface spec, a client that has not
+     * finalized any block MUST send {@code finalized_root = 0x00..00} and
+     * {@code finalized_epoch = 0}; an inconsistent pairing
+     * (non-zero root with epoch 0) is treated as malformed by Lighthouse
+     * v8+, which silently disconnects and blacklists us. The only thing
+     * that actually gates peer acceptance is a matching
+     * {@code fork_digest}.
+     */
+    private StatusMessage buildLocalStatus() {
+        return buildLocalStatusFor(forkVersion);
+    }
+
+    /**
+     * Build a Status the peer will accept (see {@link #BeaconLightClient(List,
+     * byte[], long, byte[], byte[], BeaconSyncState, String, java.util.function.Consumer,
+     * java.util.function.Consumer, long)}).
+     *
+     * <p>Lighthouse's relevance check maps out as:
+     * <pre>
+     *   if remote.finalized_epoch &lt;= local.finalized_epoch:
+     *     local_root_at_remote_epoch = chain.root_at_epoch(remote.finalized_epoch)
+     *     if local_root_at_remote_epoch != remote.finalized_root:
+     *       goodbye IrrelevantNetwork
+     * </pre>
+     * So sending {@code epoch=0, root=0} fails: they look up their own
+     * {@code root_at_epoch(0)} = genesis block root, which is not zero.
+     *
+     * <p>We send the trusted checkpoint once we know its epoch, and the
+     * bootstrap-verified finalized header afterwards. Both values are valid
+     * block roots on the real chain, so the peer's ancestry check passes.
+     */
+    private StatusMessage buildLocalStatusFor(byte[] fv) {
+        byte[] finalizedRoot;
+        long finalizedEpoch;
+        byte[] headRoot;
+        long headSlot;
+        if (store != null && store.isInitialized()) {
+            // Use the bootstrap-verified finalized header — the most
+            // trustworthy values we have and what peers actually run
+            // ancestor-match against.
+            var fh = store.getFinalizedHeader();
+            headSlot = fh.beacon().slot();
+            headRoot = fh.beacon().hashTreeRoot();
+            finalizedEpoch = headSlot / 32;
+            finalizedRoot = headRoot;
+        } else if (checkpointSlot > 0) {
+            // Pre-bootstrap: claim the trusted weak-subjectivity checkpoint.
+            // We haven't BLS-verified it yet, but it's a real mainnet block
+            // root at a known slot, so peers' root_at_epoch check succeeds.
+            finalizedEpoch = checkpointSlot / 32;
+            finalizedRoot = checkpointRoot.clone();
+            headSlot = checkpointSlot;
+            headRoot = checkpointRoot.clone();
+        } else {
+            // Fallback: spec-default genesis. Some peers (Lighthouse) will
+            // goodbye us; others (Lodestar, Nimbus) tolerate this.
+            finalizedRoot = new byte[32];
+            finalizedEpoch = 0L;
+            headRoot = new byte[32];
+            headSlot = 0L;
+        }
+        return new StatusMessage(
+                computeForkDigest(fv),
+                finalizedRoot,
+                finalizedEpoch,
+                headRoot,
+                headSlot,
+                0L); // earliest_available_slot — we serve nothing historical
+    }
+
+    /**
+     * EIP-7892 {@code compute_fork_digest}:
+     * <pre>
+     *   base_digest = sha256(pad(fork_version, 32) || gvr)  // fork_data_root
+     *   bp_hash     = sha256(u64_le(epoch) || u64_le(max_blobs))
+     *   fork_digest = (base_digest XOR bp_hash)[0..4]
+     * </pre>
+     * When no BPO is active ({@link #activeBlobParamsEpoch} == 0) we return
+     * {@code base_digest[0..4]} — the pre-Fulu formula. See
+     * consensus-specs/specs/fulu/beacon-chain.md.
+     */
+    private byte[] computeForkDigest(byte[] fv) {
+        byte[] base = computeForkDataRoot(fv);
+        if (activeBlobParamsEpoch == 0) {
+            byte[] out = new byte[4];
+            System.arraycopy(base, 0, out, 0, 4);
+            return out;
+        }
+        byte[] bpInput = new byte[16];
+        longToLeBytes(activeBlobParamsEpoch, bpInput, 0);
+        longToLeBytes(activeBlobParamsMaxBlobs, bpInput, 8);
+        byte[] bpHash;
+        try {
+            bpHash = java.security.MessageDigest.getInstance("SHA-256").digest(bpInput);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new AssertionError(e);
+        }
+        byte[] out = new byte[4];
+        for (int i = 0; i < 4; i++) out[i] = (byte) (base[i] ^ bpHash[i]);
+        return out;
+    }
+
+    /** Legacy (pre-Fulu) fork_data_root: sha256(pad(fork_version) || gvr). */
+    private byte[] computeForkDataRoot(byte[] fv) {
+        try {
+            byte[] buf = new byte[64];
+            System.arraycopy(fv, 0, buf, 0, 4);
+            System.arraycopy(genesisValidatorsRoot, 0, buf, 32, 32);
+            return java.security.MessageDigest.getInstance("SHA-256").digest(buf);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new AssertionError("SHA-256 missing", e);
+        }
+    }
+
+    private static void longToLeBytes(long v, byte[] out, int offset) {
+        for (int i = 0; i < 8; i++) out[offset + i] = (byte) (v >>> (8 * i));
+    }
+
+    /**
+     * Set the active EIP-7892 BPO parameters. Must be called before
+     * {@link #start()}. Pass {@code epoch = 0} to disable (use legacy
+     * fork_digest formula).
+     */
+    public void setBlobParameters(long epoch, long maxBlobsPerBlock) {
+        this.activeBlobParamsEpoch = epoch;
+        this.activeBlobParamsMaxBlobs = maxBlobsPerBlock;
+    }
+
+    /**
+     * Enable gossipsub subscription to the light-client topics. Off by
+     * default because short-session clients (Android app that runs ~2 min
+     * once per day) don't benefit from mesh participation and churn the
+     * mesh by joining-then-disappearing. Must be called before
+     * {@link #start()}.
+     */
+    public void setGossipsubEnabled(boolean enabled) {
+        p2pService.setGossipsubEnabled(enabled);
+    }
+
+    /**
+     * Send Status to a peer, trying {@code /status/2} first and falling back
+     * to {@code /status/1} if the peer doesn't support v2. Each protocol is
+     * additionally tried with each candidate fork version in sequence.
+     *
+     * <p>The mainnet CL network has a split: some peers (current Lodestar)
+     * advertise only v2, others (current Nimbus) advertise only v1. Trying
+     * both catches both populations.
+     */
+    private CompletableFuture<StatusMessage> tryStatusWithFallback(
+            String peer, List<byte[]> forkVersions, int idx) {
+        byte[] fv = forkVersions.get(idx);
+        CompletableFuture<StatusMessage> outer = new CompletableFuture<>();
+        // Try /status/2 first, then /status/1.
+        p2pService.exchangeStatus(peer, buildLocalStatusFor(fv))
+                .whenComplete((status, ex) -> {
+                    if (ex == null && status != null) {
+                        outer.complete(status);
+                        return;
+                    }
+                    String msg = ex != null ? ex.getMessage() : "empty response";
+                    boolean protoUnsupported = msg != null && (
+                            msg.contains("Protocol negotiation failed")
+                            || msg.contains("ProtocolNegotiation"));
+                    if (protoUnsupported) {
+                        // Peer only speaks /status/1 — retry on that protocol,
+                        // still with the same fork version.
+                        p2pService.exchangeStatusV1(peer, buildLocalStatusFor(fv))
+                                .whenComplete((s1, e1) -> {
+                                    if (e1 == null && s1 != null) {
+                                        outer.complete(s1);
+                                    } else {
+                                        retryOrFail(peer, forkVersions, idx, e1 != null ? e1 : ex,
+                                                e1 != null ? e1.getMessage() : msg, outer);
+                                    }
+                                });
+                    } else {
+                        retryOrFail(peer, forkVersions, idx, ex, msg, outer);
+                    }
+                });
+        return outer;
+    }
+
+    /**
+     * After an exchange attempt fails, decide whether to retry the next fork
+     * version or propagate the error. Extracted so both v2 and v1 paths share it.
+     */
+    private void retryOrFail(String peer, List<byte[]> forkVersions, int idx,
+                             Throwable ex, String msg,
+                             CompletableFuture<StatusMessage> outer) {
+        boolean forkDigestIsh = msg != null && (
+                msg.contains("requires 92 bytes")
+                || msg.contains("requires 84 bytes")
+                || msg.contains("Channel closed")
+                || msg.contains("Connection reset")
+                || msg.contains("closed"));
+        if (forkDigestIsh && idx + 1 < forkVersions.size()) {
+            log.debug("[beacon] Status attempt {} (fork=0x{}) for {}: {}; retry next fv",
+                    idx, bytesToHex(forkVersions.get(idx)), peer, msg);
+            tryStatusWithFallback(peer, forkVersions, idx + 1)
+                    .whenComplete((s2, e2) -> {
+                        if (e2 == null) outer.complete(s2);
+                        else outer.completeExceptionally(e2);
+                    });
+        } else if (ex != null) {
+            outer.completeExceptionally(ex);
+        } else {
+            outer.complete(null);
+        }
+    }
+
+    /** Fork versions to try for Status. Currently just the one we're configured for. */
+    private java.util.List<byte[]> acceptedForkVersions() {
+        return java.util.List.of(forkVersion);
     }
 
     /**
@@ -481,6 +762,9 @@ public class BeaconLightClient implements AutoCloseable {
                                     winnerFuture.complete(response);
                                     successPeer = peer;
                                     lastBootstrapPeer = peer;
+                                    // Cache the bootstrap so we can relay it to any peer
+                                    // that asks us for the same block root.
+                                    p2pService.cacheBootstrap(checkpointRoot, response);
                                     log.info("[beacon] Bootstrap complete from {}, slot={}",
                                             peer, bootstrap.header().beacon().slot());
                                 }
@@ -524,25 +808,29 @@ public class BeaconLightClient implements AutoCloseable {
         long currentPeriod = BeaconChainSpec.computeSyncCommitteePeriod(currentSlotEstimate);
 
         for (int batch = 0; batch < MAX_CATCHUP_BATCHES && running; batch++) {
-            long bootstrapPeriod = BeaconChainSpec.computeSyncCommitteePeriod(store.getFinalizedSlot());
-            if (currentPeriod <= bootstrapPeriod) {
+            // Use the committee's own period, not the finalized slot's. After
+            // forceRotate the two diverge by one period and starting from
+            // finalizedPeriod re-requests a period whose signing committee we
+            // no longer hold — every response then fails BLS verify.
+            long committeePeriod = store.getCurrentSyncCommitteePeriod();
+            if (currentPeriod <= committeePeriod) {
                 if (batch == 0) {
-                    log.info("[beacon] Sync committee is current (period {}), no catch-up needed", bootstrapPeriod);
+                    log.info("[beacon] Sync committee is current (period {}), no catch-up needed", committeePeriod);
                 }
                 return;
             }
 
-            long periodsToFetch = currentPeriod - bootstrapPeriod;
-            log.info("[beacon] Sync committee catch-up batch {}: bootstrap period={}, current period={}, fetching {} update(s)",
-                    batch, bootstrapPeriod, currentPeriod, periodsToFetch);
+            long periodsToFetch = currentPeriod - committeePeriod;
+            log.info("[beacon] Sync committee catch-up batch {}: committee period={}, current period={}, fetching {} update(s)",
+                    batch, committeePeriod, currentPeriod, periodsToFetch);
 
-            if (!attemptCatchUpBatch(bootstrapPeriod, periodsToFetch, currentSlotEstimate)) {
+            if (!attemptCatchUpBatch(committeePeriod, periodsToFetch, currentSlotEstimate)) {
                 log.warn("[beacon] Catch-up batch {} made no progress — will retry on next sync cycle", batch);
                 return;
             }
         }
 
-        long finalPeriod = BeaconChainSpec.computeSyncCommitteePeriod(store.getFinalizedSlot());
+        long finalPeriod = store.getCurrentSyncCommitteePeriod();
         if (finalPeriod < currentPeriod) {
             log.warn("[beacon] Catch-up hit batch cap ({}) at period {} (target {}); further progress on next cycle",
                     MAX_CATCHUP_BATCHES, finalPeriod, currentPeriod);
@@ -556,12 +844,24 @@ public class BeaconLightClient implements AutoCloseable {
         // Fire requests to all peers in parallel — first peer to deliver a response that
         // actually advances the store wins. Serial iteration with 30s timeouts meant ~9
         // minutes worst case with a list full of dead peers.
+        //
+        // Honor the agent-exclusion filter: we're still debugging whether
+        // Lighthouse/Teku/Prysm peers serve updates_by_range reliably, and
+        // bypassing the Lodestar exclusion here masks those failures.
         List<String> peers = peersPrioritized(lastBootstrapPeer);
         int count = (int) Math.min(periodsToFetch, 128);
+        // {@link BeaconP2PService#doReqResp} detects a dying connection and
+        // retries with a fresh one, so we no longer pre-emptively disconnect
+        // every peer here — that was costing us Lighthouse/Teku connections
+        // that would otherwise have stayed alive and kept our peer score up.
+        log.info("[beacon] Catch-up: requesting {} update(s) from period {} across {} usable peer(s)",
+                count, bootstrapPeriod, peers.size());
 
         CompletableFuture<Boolean> winner = new CompletableFuture<>();
         java.util.concurrent.atomic.AtomicInteger remaining =
                 new java.util.concurrent.atomic.AtomicInteger(peers.size());
+        java.util.concurrent.atomic.AtomicInteger failCount = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger emptyCount = new java.util.concurrent.atomic.AtomicInteger();
 
         for (String peer : peers) {
             if (!running) return false;
@@ -570,6 +870,7 @@ public class BeaconLightClient implements AutoCloseable {
                         if (ex != null) {
                             Throwable root = ex;
                             while (root.getCause() != null) root = root.getCause();
+                            failCount.incrementAndGet();
                             log.debug("[beacon] Catch-up updates_by_range failed from {}: {}",
                                     peer, root.getMessage());
                             notifyPeerFailure(peer);
@@ -582,6 +883,7 @@ public class BeaconLightClient implements AutoCloseable {
                         synchronized (store) {
                             if (winner.isDone()) return;
                             if (responses == null || responses.isEmpty()) {
+                                emptyCount.incrementAndGet();
                                 log.debug("[beacon] No updates returned from {}", peer);
                                 if (remaining.decrementAndGet() == 0 && !winner.isDone()) {
                                     winner.complete(false);
@@ -596,6 +898,7 @@ public class BeaconLightClient implements AutoCloseable {
                                         applied, peer, newPeriod, store.getFinalizedSlot());
                                 winner.complete(true);
                             } else {
+                                emptyCount.incrementAndGet();
                                 log.debug("[beacon] Catch-up: peer {} returned {} update(s), none applied",
                                         peer, responses.size());
                                 if (remaining.decrementAndGet() == 0 && !winner.isDone()) {
@@ -607,9 +910,15 @@ public class BeaconLightClient implements AutoCloseable {
         }
 
         try {
-            return winner.get(60, TimeUnit.SECONDS);
+            boolean result = winner.get(60, TimeUnit.SECONDS);
+            if (!result) {
+                log.warn("[beacon] Catch-up batch: no peer advanced store (tried {}, {} failed, {} returned empty/unusable)",
+                        peers.size(), failCount.get(), emptyCount.get());
+            }
+            return result;
         } catch (Exception e) {
-            log.warn("[beacon] Catch-up wait aborted: {}", e.getMessage());
+            log.warn("[beacon] Catch-up wait aborted: {} (tried {}, {} failed, {} empty)",
+                    e.getMessage(), peers.size(), failCount.get(), emptyCount.get());
             return false;
         }
     }
@@ -625,14 +934,14 @@ public class BeaconLightClient implements AutoCloseable {
                 LightClientUpdate update = LightClientUpdate.decode(responseSsz);
                 if (processor.processUpdate(update)) {
                     applied++;
-                    updateSyncState();
-                    // Rotate sync committee between updates: finality lags attestation,
-                    // so the finalized slot in the update may not cross the period
-                    // boundary even though the next update is signed by the new committee.
+                    // Rotate BEFORE updateSyncState so the committee-period pushed to
+                    // BeaconSyncState reflects the post-rotation value — otherwise
+                    // beacon-status' SYNCED gate flips late by one update cycle.
                     store.forceRotateIfPastPeriod(currentSlotEstimate);
-                    log.debug("[beacon] Catch-up: applied update slot={}, store period now={}",
+                    updateSyncState();
+                    log.debug("[beacon] Catch-up: applied update slot={}, committee period now={}",
                             update.finalizedHeader().beacon().slot(),
-                            BeaconChainSpec.computeSyncCommitteePeriod(store.getFinalizedSlot()));
+                            store.getCurrentSyncCommitteePeriod());
                 } else {
                     log.debug("[beacon] Catch-up update not applied (slot={})",
                             update.finalizedHeader().beacon().slot());
@@ -650,6 +959,8 @@ public class BeaconLightClient implements AutoCloseable {
      * This trusts the local beacon node but allows the state root to be used immediately.
      */
     private void seedFromFinalityUpdate() {
+        // Honor the Lodestar exclusion here too so we're forced to
+        // verify that non-Lodestar peers actually serve finality updates.
         List<String> peers = copyPeers();
         log.info("[beacon] Attempting to seed from finality update ({} peer(s))", peers.size());
 
@@ -670,6 +981,7 @@ public class BeaconLightClient implements AutoCloseable {
                 byte[] response = p2pService
                         .requestFinalityUpdate(peer)
                         .get(5, TimeUnit.SECONDS);
+                p2pService.cacheFinalityUpdate(response);
 
                 LightClientFinalityUpdate update = LightClientFinalityUpdate.decode(response);
                 LightClientHeader finalizedHeader = update.finalizedHeader();
@@ -822,14 +1134,11 @@ public class BeaconLightClient implements AutoCloseable {
      */
     private void pollFinalityUpdate() {
         if (!store.isInitialized()) {
-            // Not bootstrapped yet — try bootstrap, then fall back to seeding
+            // Not bootstrapped yet — try bootstrap, then fall back to seeding.
+            // We used to disconnect all peers here to force fresh connections,
+            // but doReqResp now handles stale connections automatically and
+            // staying connected lets us keep our peer score up.
             discoverPeersFromBeaconApi();
-            if (!syncState.isSynced()) {
-                // First time: disconnect stale peers to force fresh connections
-                for (String peer : copyPeers()) {
-                    p2pService.disconnectPeer(peer);
-                }
-            }
             bootstrap();
             if (!store.isInitialized() && !syncState.isSynced()) {
                 seedFromBeaconApi();
@@ -849,14 +1158,32 @@ public class BeaconLightClient implements AutoCloseable {
                 fillChainStateRootsFromAnyPeer(true);
                 return;
             }
+        } else {
+            // Steady-state: the initial catchUpSyncCommittee() runs once at startup,
+            // but light_client_finality_update does NOT carry nextSyncCommittee —
+            // only LightClientUpdate (from updates_by_range) does. So once wall-clock
+            // crosses the next period boundary, finality updates are signed by a
+            // committee we don't have and BLS verify fails indefinitely. We must
+            // re-fetch a LightClientUpdate to rotate. This is a cheap no-op when
+            // the committee is current.
+            long wallPeriod = BeaconChainSpec.currentPeriod(clGenesisTime);
+            if (wallPeriod > store.getCurrentSyncCommitteePeriod()) {
+                catchUpSyncCommittee();
+            }
         }
 
+        // Honor the Lodestar exclusion — finality polling is part of the
+        // debug surface for Lighthouse/Teku/Prysm reliability.
         for (String peer : copyPeers()) {
             if (!running) return;
             try {
                 byte[] response = p2pService
                         .requestFinalityUpdate(peer)
                         .get(10, TimeUnit.SECONDS);
+                // Relay-cache the raw SSZ so peers who query us get the
+                // latest finality update we just received, without having to
+                // re-ask upstream.
+                p2pService.cacheFinalityUpdate(response);
 
                 LightClientFinalityUpdate update = LightClientFinalityUpdate.decode(response);
 
@@ -930,7 +1257,15 @@ public class BeaconLightClient implements AutoCloseable {
         if (optimisticHeader != null) {
             byte[] optRoot = optimisticHeader.execution().stateRoot();
             syncState.recordStateRoot(store.getOptimisticSlot(), optRoot, true);
+            syncState.updateOptimisticExecution(
+                    optimisticHeader.execution().blockNumber(),
+                    optimisticHeader.execution().blockHash(),
+                    optRoot);
         }
+        // Mirror the store's committee period into the observable sync state so
+        // beacon-status' SYNCED gate and verification callers don't need a store
+        // reference to detect "wall-clock crossed into a period we don't hold."
+        syncState.setCurrentSyncCommitteePeriod(store.getCurrentSyncCommitteePeriod());
     }
 
     // -------------------------------------------------------------------------
@@ -944,6 +1279,8 @@ public class BeaconLightClient implements AutoCloseable {
      * @param blsVerified true if the bootstrap was BLS-verified
      */
     private void fillChainStateRootsFromAnyPeer(boolean blsVerified) {
+        // Honor the Lodestar exclusion — chain-fill uses blocks_by_range,
+        // and we want to prove the non-Lodestar peers can serve it.
         for (String peer : copyPeers()) {
             if (!running) return;
             try {
@@ -1056,12 +1393,79 @@ public class BeaconLightClient implements AutoCloseable {
         }
     }
 
-    /** Thread-safe snapshot of the peer list. */
-    private List<String> copyPeers() {
+    /**
+     * One-line snapshot of the peer pool to the log. Intended for periodic
+     * calls while debugging why SYNCED isn't being reached — surfaces how many
+     * peers are in the pool total, how many libp2p has a live connection to,
+     * how many of those connected are LC-capable, and how many are Lodestar
+     * (currently excluded from use for debugging purposes).
+     */
+    private void logPeerPoolStats() {
+        int poolTotal;
+        int excludedPool = 0;
         synchronized (clPeerMultiaddrs) {
-            return List.copyOf(clPeerMultiaddrs);
+            poolTotal = clPeerMultiaddrs.size();
+            if (EXCLUDED_AGENT_SUBSTRING != null) {
+                for (String p : clPeerMultiaddrs) {
+                    String a = p2pService.cachedAgent(p);
+                    if (a != null && a.toLowerCase().contains(EXCLUDED_AGENT_SUBSTRING)) excludedPool++;
+                }
+            }
+        }
+        List<BeaconP2PService.PeerInfo> connected = p2pService.getConnectedPeers();
+        long lcConnected = connected.stream().filter(BeaconP2PService.PeerInfo::supportsLightClient).count();
+        long lodestarConnected = connected.stream()
+                .filter(p -> p.agentVersion() != null
+                        && p.agentVersion().toLowerCase().contains("lodestar"))
+                .count();
+        log.info("[beacon] peer-pool: total={} excluded={} connected={} connected-lc={} connected-lodestar={}",
+                poolTotal, excludedPool, connected.size(), lcConnected, lodestarConnected);
+    }
+
+    /** Thread-safe snapshot of the peer list, with the agent-exclusion filter applied. */
+    private List<String> copyPeers() {
+        return copyPeers(true);
+    }
+
+    /**
+     * Thread-safe snapshot of the peer list.
+     *
+     * @param applyAgentFilter when false, the {@link #EXCLUDED_AGENT_SUBSTRING}
+     *     agent filter is bypassed. Used by catch-up / finality polling so
+     *     that the one Lodestar peer we keep as a reliable fallback can
+     *     actually serve us after the Lighthouse/Teku handshake debug is
+     *     done — excluding it there just causes beaconStale on a stale
+     *     hardcoded seed list.
+     */
+    private List<String> copyPeers(boolean applyAgentFilter) {
+        synchronized (clPeerMultiaddrs) {
+            List<String> all = List.copyOf(clPeerMultiaddrs);
+            if (!applyAgentFilter || EXCLUDED_AGENT_SUBSTRING == null) return all;
+            // Drop peers whose Identify agent matches the exclusion substring.
+            // Useful for isolating debugging: pretending Lodestar doesn't exist
+            // forces us to actually get Lighthouse/Teku/Nimbus/Prysm working.
+            List<String> filtered = new ArrayList<>(all.size());
+            for (String p : all) {
+                String agent = p2pService.cachedAgent(p);
+                if (agent != null && agent.toLowerCase().contains(EXCLUDED_AGENT_SUBSTRING)) {
+                    continue;
+                }
+                filtered.add(p);
+            }
+            return filtered;
         }
     }
+
+    /**
+     * Case-insensitive substring that excludes a peer from the usable pool if
+     * its Identify agent string contains it. Set to {@code null} to disable.
+     * Was temporarily set to {@code "lodestar"} to force catch-up / finality
+     * through Lighthouse/Teku/Prysm/Nimbus while debugging why non-Lodestar
+     * peers wouldn't talk to us — root cause turned out to be the EIP-7892
+     * fork_digest mismatch (fixed via NetworkConfig.currentForkDigestOverride).
+     * Filter is now off; all clients are usable.
+     */
+    private static final String EXCLUDED_AGENT_SUBSTRING = null;
 
     /**
      * Return peers with {@code preferred} moved to the front if it is in the list.
@@ -1069,7 +1473,11 @@ public class BeaconLightClient implements AutoCloseable {
      * peer first — it just proved it is reachable and serves light-client protocols.
      */
     private List<String> peersPrioritized(String preferred) {
-        List<String> peers = copyPeers();
+        return peersPrioritized(preferred, true);
+    }
+
+    private List<String> peersPrioritized(String preferred, boolean applyAgentFilter) {
+        List<String> peers = copyPeers(applyAgentFilter);
         if (preferred == null || !peers.contains(preferred)) return peers;
         List<String> reordered = new java.util.ArrayList<>(peers.size());
         reordered.add(preferred);

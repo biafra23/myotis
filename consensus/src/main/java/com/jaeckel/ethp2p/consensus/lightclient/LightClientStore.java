@@ -17,6 +17,15 @@ public class LightClientStore {
     private SyncCommittee nextSyncCommittee; // may be null
     private long finalizedSlot;
     private long optimisticSlot;
+    /**
+     * Period of the committee currently in {@code currentSyncCommittee}. Tracked explicitly
+     * because it can run ahead of {@code finalizedSlot}'s period after {@code forceRotate}:
+     * finality lags the attested chain by ~2 epochs, so when wall-clock crosses a period
+     * boundary we need to rotate the committee before finalizedSlot catches up. Using
+     * {@code computeSyncCommitteePeriod(finalizedSlot)} as the committee period in that
+     * window would make catch-up re-fetch an update whose signer we no longer hold.
+     */
+    private long currentSyncCommitteePeriod;
 
     /**
      * Initialize the store from a bootstrap.
@@ -31,6 +40,7 @@ public class LightClientStore {
         this.nextSyncCommittee = null;
         this.finalizedSlot = header.beacon().slot();
         this.optimisticSlot = header.beacon().slot();
+        this.currentSyncCommitteePeriod = BeaconChainSpec.computeSyncCommitteePeriod(this.finalizedSlot);
     }
 
     /**
@@ -87,6 +97,7 @@ public class LightClientStore {
         if (newPeriod > oldPeriod) {
             currentSyncCommittee = nextSyncCommittee;
             nextSyncCommittee = null;
+            currentSyncCommitteePeriod++;
         }
     }
 
@@ -101,11 +112,11 @@ public class LightClientStore {
         if (nextSyncCommittee == null) {
             return;
         }
-        long storePeriod = BeaconChainSpec.computeSyncCommitteePeriod(finalizedSlot);
         long wallPeriod = BeaconChainSpec.computeSyncCommitteePeriod(currentSlotEstimate);
-        if (wallPeriod > storePeriod) {
+        if (wallPeriod > currentSyncCommitteePeriod) {
             currentSyncCommittee = nextSyncCommittee;
             nextSyncCommittee = null;
+            currentSyncCommitteePeriod++;
         }
     }
 
@@ -131,6 +142,16 @@ public class LightClientStore {
 
     public synchronized long getOptimisticSlot() {
         return optimisticSlot;
+    }
+
+    /**
+     * Returns the sync committee period of {@code currentSyncCommittee}. This is the
+     * authoritative "how far forward are we" signal for catch-up — finalizedSlot's period
+     * lags because finality lags attestation by ~2 epochs, so deriving the committee
+     * period from finalizedSlot races with forceRotate.
+     */
+    public synchronized long getCurrentSyncCommitteePeriod() {
+        return currentSyncCommitteePeriod;
     }
 
     public synchronized boolean isInitialized() {

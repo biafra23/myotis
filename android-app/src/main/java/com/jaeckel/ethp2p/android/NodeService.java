@@ -13,6 +13,7 @@ import android.util.Log;
 import com.jaeckel.ethp2p.core.crypto.NodeKey;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
 import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
+import com.jaeckel.ethp2p.networking.discv5.DiscV5Service;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
 
 import org.apache.tuweni.bytes.Bytes;
@@ -62,10 +63,16 @@ public final class NodeService extends Service {
     private final Set<String> blacklistedNodeIds = ConcurrentHashMap.newKeySet();
 
     private DiscV4Service discV4;
+    private DiscV5Service discV5;
     private RLPxConnector connector;
     private AndroidPeerCache peerCache;
     private volatile int cachedPeerCount;
     private volatile long startTimeMs;
+    // Eth2-fork-digest-matching peers seen via discv5 since start. A counter
+    // rather than a collection because the UI only displays the number; when
+    // we integrate BeaconLightClient on Android this can feed a real peer sink.
+    private final java.util.concurrent.atomic.AtomicInteger clPeersDiscovered =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     private final IBinder binder = new LocalBinder();
 
@@ -84,6 +91,8 @@ public final class NodeService extends Service {
             int attemptedPeers,
             int backedOffPeers,
             int blacklistedPeers,
+            int discv5Peers,          // total live nodes in the discv5 routing table
+            int clPeersDiscovered,    // discv5 peers whose eth2 field matches our fork digest
             List<RLPxConnector.PeerInfo> readyPeerList) {}
 
     @Override
@@ -116,6 +125,7 @@ public final class NodeService extends Service {
         AndroidPeerCache localCache = null;
         RLPxConnector localConnector = null;
         DiscV4Service localDisc = null;
+        DiscV5Service localDiscV5 = null;
         int localCachedCount = 0;
         try {
             NetworkConfig network = NetworkConfig.byName("mainnet");
@@ -191,20 +201,43 @@ public final class NodeService extends Service {
                 }
             });
 
+            // discv5 — CL peer discovery. Runs on a separate UDP port from discv4.
+            // Callback filters ENRs by eth2 fork digest (current OR prior — same
+            // dual-accept behaviour the JVM daemon uses so a mis-pinned current
+            // fork doesn't silently discard every peer). Matches are counted for
+            // display. No BeaconLightClient consumer on Android yet, so discovered
+            // peers aren't connected — the counter only verifies discv5 is reaching
+            // the CL DHT. When BeaconService lands, this callback feeds it.
+            List<byte[]> acceptedForkDigests = network.acceptedForkDigests();
+            localDiscV5 = new DiscV5Service(nodeKey, network.clDiscv5Bootnodes(), enr -> {
+                var eth2 = enr.eth2();
+                if (eth2.isEmpty()) return;
+                byte[] peerDigest = eth2.get().forkDigest();
+                for (byte[] accepted : acceptedForkDigests) {
+                    if (java.util.Arrays.equals(peerDigest, accepted)) {
+                        clPeersDiscovered.incrementAndGet();
+                        return;
+                    }
+                }
+            });
+
             // Publish atomically vs. shutdown() — if shutdown won the race
             // while we were constructing, we own every resource above, so we
             // have to close them ourselves instead of letting shutdown do it.
             // disc.start() runs inside the same synchronized block so shutdown
             // cannot close the service between publish and start.
-            if (!startAndPublish(localCache, localConnector, localDisc, localCachedCount)) {
+            if (!startAndPublish(localCache, localConnector, localDisc, localDiscV5, localCachedCount)) {
                 Log.i(TAG, "shutdown raced boot; tearing down constructed resources");
+                closeQuietly(localDiscV5);
                 closeQuietly(localDisc);
                 closeQuietly(localConnector);
                 return;
             }
-            Log.i(TAG, "discv4 started on UDP " + DEFAULT_PORT);
+            Log.i(TAG, "discv4 started on UDP " + DEFAULT_PORT
+                    + (this.discV5 != null ? ", discv5 on UDP 9000" : " (discv5 unavailable)"));
         } catch (Exception e) {
             Log.e(TAG, "node boot failed", e);
+            closeQuietly(localDiscV5);
             closeQuietly(localDisc);
             closeQuietly(localConnector);
             // Reset state so the button flips back to Start and the user can
@@ -224,12 +257,25 @@ public final class NodeService extends Service {
     private synchronized boolean startAndPublish(AndroidPeerCache cache,
                                                  RLPxConnector conn,
                                                  DiscV4Service disc,
+                                                 DiscV5Service disc5,
                                                  int cachedCount) throws Exception {
         if (!RUNNING.get()) return false;
         disc.start(DEFAULT_PORT);
+        // discv5 is diagnostic-only on Android (no BLC consumer yet), so a
+        // start failure (UDP 9000 busy, permission denied, …) must not take
+        // down EL: log and keep going with discV5=null.
+        DiscV5Service startedDiscV5 = disc5;
+        try {
+            disc5.start(9000);
+        } catch (Throwable t) {
+            Log.w(TAG, "discv5 start failed, continuing without CL discovery: " + t.getMessage());
+            closeQuietly(disc5);
+            startedDiscV5 = null;
+        }
         this.peerCache = cache;
         this.connector = conn;
         this.discV4 = disc;
+        this.discV5 = startedDiscV5;
         this.cachedPeerCount = cachedCount;
         return true;
     }
@@ -254,6 +300,8 @@ public final class NodeService extends Service {
         RUNNING.set(false);
         closeQuietly(connector);
         connector = null;
+        closeQuietly(discV5);
+        discV5 = null;
         closeQuietly(discV4);
         discV4 = null;
         peerCache = null;
@@ -262,6 +310,7 @@ public final class NodeService extends Service {
         blacklistedNodeIds.clear();
         cachedPeerCount = 0;
         startTimeMs = 0L;
+        clPeersDiscovered.set(0);
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
     }
@@ -294,10 +343,12 @@ public final class NodeService extends Service {
 
     public Snapshot snapshot() {
         boolean running = RUNNING.get();
+        int discv5Live = discV5 != null ? discV5.liveNodeCount() : 0;
         if (!running || connector == null) {
             return new Snapshot(running, startTimeMs, 0, 0, 0, 0,
                     cachedPeerCount, attempted.size(), countActiveBackoff(),
-                    blacklistedNodeIds.size(), List.of());
+                    blacklistedNodeIds.size(), discv5Live, clPeersDiscovered.get(),
+                    List.of());
         }
         List<RLPxConnector.PeerInfo> active = connector.getActivePeers();
         List<RLPxConnector.PeerInfo> ready = new ArrayList<>();
@@ -315,7 +366,8 @@ public final class NodeService extends Service {
         int tableSize = discV4 != null ? discV4.table().size() : 0;
         return new Snapshot(true, startTimeMs, tableSize, active.size(), ready.size(), snapCount,
                 cachedPeerCount, attempted.size(), countActiveBackoff(),
-                blacklistedNodeIds.size(), ready);
+                blacklistedNodeIds.size(), discv5Live, clPeersDiscovered.get(),
+                ready);
     }
 
     private int countActiveBackoff() {
@@ -338,6 +390,7 @@ public final class NodeService extends Service {
     public synchronized void onDestroy() {
         Log.i(TAG, "Stopping node");
         closeQuietly(connector);
+        closeQuietly(discV5);
         closeQuietly(discV4);
         RUNNING.set(false);
         super.onDestroy();

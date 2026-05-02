@@ -31,6 +31,12 @@ public final class BeaconChainSpec {
     public static final int CURRENT_SYNC_COMMITTEE_DEPTH = 5;
     public static final int CURRENT_SYNC_COMMITTEE_FIELD_INDEX = 22;
 
+    // Generalized index for next sync committee in BeaconState.
+    // Field index 23 (one past current_sync_committee).
+    // Pre-Electra: depth 5, gindex = 32 + 23 = 55
+    // Post-Electra: depth 6, gindex = 64 + 23 = 87
+    public static final int NEXT_SYNC_COMMITTEE_FIELD_INDEX = 23;
+
     // Generalized index for finalized checkpoint root in BeaconState.
     // finalized_checkpoint is field 20; root is the 2nd child (index 1) within Checkpoint.
     // Pre-Electra: depth 6, gindex = (32+20)*2+1 = 105
@@ -45,6 +51,14 @@ public final class BeaconChainSpec {
      */
     public static int syncCommitteeGindex(int branchDepth) {
         return (1 << branchDepth) + CURRENT_SYNC_COMMITTEE_FIELD_INDEX;
+    }
+
+    /**
+     * Compute the generalized index for next_sync_committee given the branch depth.
+     * One field past current_sync_committee in the BeaconState SSZ container.
+     */
+    public static int nextSyncCommitteeGindex(int branchDepth) {
+        return (1 << branchDepth) + NEXT_SYNC_COMMITTEE_FIELD_INDEX;
     }
 
     /**
