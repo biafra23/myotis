@@ -613,40 +613,92 @@ public class BeaconP2PService implements AutoCloseable {
      * arrives before Status has completed. Calling this from the connection
      * handler makes every outbound connection spec-compliant without
      * requiring the caller to remember to exchange Status first.
+     *
+     * <p>Tries {@code /status/2} first; on a libp2p protocol-negotiation
+     * failure (peer only advertises v1 — current Nimbus is in this bucket)
+     * falls back to {@code /status/1}. Without the fallback, v1-only peers
+     * never complete the spec-required first Status, so every later
+     * light-client request gets reset.
      */
     private void autoStatus(io.libp2p.core.Connection conn, String pid) {
         if (localStatusSupplier == null) return;
-        QueuedReqRespBinding statusBinding = bindings.get(STATUS);
-        if (statusBinding == null) return;
         try {
             StatusMessage local = localStatusSupplier.get();
-            byte[] requestPayload = ReqRespCodec.encodeRequest(local.encode());
-            CompletableFuture<byte[]> responseFuture = new CompletableFuture<>();
-            responseFuture.whenComplete((raw, ex) -> {
-                if (ex != null) {
-                    log.debug("[beacon-p2p] auto-Status failed with {}: {}", pid, ex.getMessage());
-                } else {
-                    try {
-                        ReqRespCodec.DecodeResult decoded = ReqRespCodec.decodeResponse(raw, false);
-                        StatusMessage peer = StatusMessage.decode(decoded.sszPayload());
-                        log.info("[beacon-p2p] auto-Status with {} (agent={}): peer={}",
-                                pid, peerAgentVersions.getOrDefault(pid, "?"), peer);
-                    } catch (Exception e) {
-                        log.debug("[beacon-p2p] auto-Status decode failed with {}: {} ({} bytes)",
-                                pid, e.getMessage(), raw != null ? raw.length : -1);
-                    }
+            sendAutoStatus(conn, pid, /*v2*/ true, local).whenComplete((unused, v2Ex) -> {
+                if (v2Ex == null) return;
+                String msg = v2Ex.getMessage() == null ? "" : v2Ex.getMessage();
+                boolean protoUnsupported =
+                        msg.contains("Protocol negotiation failed")
+                                || msg.contains("ProtocolNegotiation");
+                if (!protoUnsupported) {
+                    log.debug("[beacon-p2p] auto-Status v2 failed with {}: {}", pid, msg);
+                    return;
                 }
+                sendAutoStatus(conn, pid, /*v2*/ false, local).whenComplete((u2, v1Ex) -> {
+                    if (v1Ex != null) {
+                        log.debug("[beacon-p2p] auto-Status v1 fallback failed with {}: {}",
+                                pid, v1Ex.getMessage());
+                    }
+                });
             });
-            statusBinding.enqueue(requestPayload, responseFuture);
-            StreamPromise<?> sp = conn.muxerSession().createStream(statusBinding);
+        } catch (Exception e) {
+            log.debug("[beacon-p2p] auto-Status init failed for {}: {}", pid, e.getMessage());
+        }
+    }
+
+    /**
+     * One leg of the autoStatus exchange — opens a stream on either
+     * {@link #STATUS} (v2) or {@link #STATUS_V1} and decodes the response
+     * for logging. The returned future completes successfully on a decoded
+     * peer Status, or exceptionally on stream/decode failure (so the caller
+     * can detect ProtocolNegotiation and fall back).
+     */
+    private CompletableFuture<Void> sendAutoStatus(
+            io.libp2p.core.Connection conn, String pid, boolean v2, StatusMessage local) {
+        String protoId = v2 ? STATUS : STATUS_V1;
+        QueuedReqRespBinding binding = bindings.get(protoId);
+        if (binding == null) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("no binding for " + protoId));
+        }
+        byte[] requestPayload;
+        try {
+            byte[] ssz = v2 ? local.encode() : local.encodeV1();
+            requestPayload = ReqRespCodec.encodeRequest(ssz);
+        } catch (IOException e) {
+            return CompletableFuture.failedFuture(e);
+        }
+        CompletableFuture<byte[]> responseFuture = new CompletableFuture<>();
+        binding.enqueue(requestPayload, responseFuture);
+        try {
+            StreamPromise<?> sp = conn.muxerSession().createStream(binding);
             sp.getStream().whenComplete((s, e) -> {
                 if (e != null && !responseFuture.isDone()) {
                     responseFuture.completeExceptionally(e);
                 }
             });
         } catch (Exception e) {
-            log.debug("[beacon-p2p] auto-Status init failed for {}: {}", pid, e.getMessage());
+            if (!responseFuture.isDone()) responseFuture.completeExceptionally(e);
         }
+        return responseFuture.handle((raw, ex) -> {
+            if (ex != null) {
+                throw ex instanceof RuntimeException re ? re : new RuntimeException(ex);
+            }
+            try {
+                ReqRespCodec.DecodeResult decoded = ReqRespCodec.decodeResponse(raw, false);
+                StatusMessage peer = v2
+                        ? StatusMessage.decode(decoded.sszPayload())
+                        : StatusMessage.decodeV1(decoded.sszPayload());
+                log.info("[beacon-p2p] auto-Status({}) with {} (agent={}): peer={}",
+                        v2 ? "v2" : "v1", pid,
+                        peerAgentVersions.getOrDefault(pid, "?"), peer);
+            } catch (Exception e) {
+                log.debug("[beacon-p2p] auto-Status({}) decode failed with {}: {} ({} bytes)",
+                        v2 ? "v2" : "v1", pid, e.getMessage(),
+                        raw != null ? raw.length : -1);
+            }
+            return null;
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -1153,22 +1205,38 @@ public class BeaconP2PService implements AutoCloseable {
         while (pos < raw.length && items.size() < expectedCount) {
             byte resultCode = raw[pos];
             if (resultCode != 0) {
-                // Per eth2 req/resp, error responses are <result><error_msg> with
-                // NO fork_digest. Log the (UTF-8) error so we can tell why the
-                // peer refused.
+                // Per eth2 req/resp, error responses are <result><error_msg>
+                // with NO fork_digest. <error_msg> is snappy-framed
+                // List[byte, 256] prefixed by a varint(uncompressed_len).
                 String errBody = "";
                 try {
-                    // Skip 1-3B varint length prefix if present, then decode rest as UTF-8
-                    int errStart = Math.min(pos + 1, raw.length);
+                    int errStart = pos + 1;
                     if (errStart < raw.length) {
                         ReqRespCodec.VarintResult vr = ReqRespCodec.readVarint(raw, errStart);
                         int msgStart = vr.nextPos();
                         if (msgStart < raw.length) {
-                            errBody = new String(raw, msgStart, raw.length - msgStart,
+                            byte[] compressed = new byte[raw.length - msgStart];
+                            System.arraycopy(raw, msgStart, compressed, 0, compressed.length);
+                            byte[] decompressed = ReqRespCodec.snappyDecompress(compressed);
+                            errBody = new String(decompressed,
                                     java.nio.charset.StandardCharsets.UTF_8).trim();
                         }
                     }
-                } catch (Exception ignored) {}
+                } catch (Exception e) {
+                    // Snappy frame missing/corrupt — fall back to raw UTF-8 so
+                    // we still get something readable when the peer is buggy.
+                    int errStart = pos + 1;
+                    if (errStart < raw.length) {
+                        try {
+                            ReqRespCodec.VarintResult vr = ReqRespCodec.readVarint(raw, errStart);
+                            int msgStart = vr.nextPos();
+                            if (msgStart < raw.length) {
+                                errBody = "[raw] " + new String(raw, msgStart, raw.length - msgStart,
+                                        java.nio.charset.StandardCharsets.UTF_8).trim();
+                            }
+                        } catch (Exception ignored) {}
+                    }
+                }
                 log.info("[beacon-p2p] Multi-chunk response item {} error code {} (raw {} bytes): {}",
                         items.size(), resultCode, raw.length, errBody);
                 break;

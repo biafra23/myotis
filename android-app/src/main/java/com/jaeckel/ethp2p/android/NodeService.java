@@ -233,7 +233,8 @@ public final class NodeService extends Service {
                 closeQuietly(localConnector);
                 return;
             }
-            Log.i(TAG, "discv4 started on UDP " + DEFAULT_PORT + ", discv5 on UDP 9000");
+            Log.i(TAG, "discv4 started on UDP " + DEFAULT_PORT
+                    + (this.discV5 != null ? ", discv5 on UDP 9000" : " (discv5 unavailable)"));
         } catch (Exception e) {
             Log.e(TAG, "node boot failed", e);
             closeQuietly(localDiscV5);
@@ -260,14 +261,21 @@ public final class NodeService extends Service {
                                                  int cachedCount) throws Exception {
         if (!RUNNING.get()) return false;
         disc.start(DEFAULT_PORT);
-        // discv5 listens on the CL libp2p convention port (9000). A throw here
-        // (already-bound, permission-denied, …) propagates up to startNode()'s
-        // catch block so we don't leave discv4 orphaned — startNode closes both.
-        disc5.start(9000);
+        // discv5 is diagnostic-only on Android (no BLC consumer yet), so a
+        // start failure (UDP 9000 busy, permission denied, …) must not take
+        // down EL: log and keep going with discV5=null.
+        DiscV5Service startedDiscV5 = disc5;
+        try {
+            disc5.start(9000);
+        } catch (Throwable t) {
+            Log.w(TAG, "discv5 start failed, continuing without CL discovery: " + t.getMessage());
+            closeQuietly(disc5);
+            startedDiscV5 = null;
+        }
         this.peerCache = cache;
         this.connector = conn;
         this.discV4 = disc;
-        this.discV5 = disc5;
+        this.discV5 = startedDiscV5;
         this.cachedPeerCount = cachedCount;
         return true;
     }
