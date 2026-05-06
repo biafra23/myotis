@@ -8,7 +8,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * snap/1 GetByteCodes request (absolute message code 0x24).
+ * snap/1 GetByteCodes request (snap message id 0x04; absolute code 0x25
+ * under eth/68's protocol length 17).
  *
  * <p>Wire format: {@code [reqId, [hash, ...], responseBytes]}
  *

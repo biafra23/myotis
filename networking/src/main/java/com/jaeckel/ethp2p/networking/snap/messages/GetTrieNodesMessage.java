@@ -8,7 +8,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * snap/1 GetTrieNodes request (absolute message code 0x26).
+ * snap/1 GetTrieNodes request (snap message id 0x06; absolute code 0x27
+ * under eth/68's protocol length 17).
  *
  * <p>Wire format:
  * {@code [reqId, stateRoot, [[accountPath, storagePath, storagePath, ...], ...], responseBytes]}

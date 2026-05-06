@@ -70,19 +70,40 @@ and missing-node detection. Hand-built tries (programmatic RLP + keccak256)
 rather than external fixtures so the tests are reproducible and the
 correctness pattern is visible in the test source.
 
-### 3 — SNAP protocol client
+### 3 — SNAP protocol client (done)
 
-The Phase 0 `:networking` work has the eth/67-68 sub-protocol but no `snap/1`
-client wiring beyond message types. Tasks:
+`:networking` already negotiated `snap/1` in HELLO and had request/response
+plumbing for `GetAccountRange` / `GetStorageRanges` (range-style sync).
+Phase 1 commit 3 extends `EthHandler` with the lower-bandwidth pair:
 
-- Announce `snap/1` capability in the eth handshake.
-- `SnapHandler` (NioInboundHandler) that routes incoming `TrieNodes` /
-  `ByteCodes` responses to pending request futures keyed by request id.
-- Outbound API: `client.getTrieNodes(stateRoot, paths) -> CompletableFuture<List<Bytes>>`
-  and `client.getByteCodes(hashes) -> CompletableFuture<List<Bytes>>`.
-- Per-peer rate limiting and timeout handling.
-- Peer disconnection on protocol violation (proof verification failure
-  surfaces as a peer score decrement; not the wire layer's concern).
+- `requestByteCodesAsync(hashes)` — issues `GetByteCodes`, returns a
+  `CompletableFuture<ByteCodesMessage.DecodeResult>` keyed by request id;
+  10-second timeout.
+- `requestTrieNodesAsync(stateRoot, paths)` — issues `GetTrieNodes`,
+  returns a `CompletableFuture<TrieNodesMessage.DecodeResult>`; 10-second
+  timeout.
+- Inbound dispatch in `channelRead` routes the four new message codes
+  (0x25 GetByteCodes / 0x26 ByteCodes / 0x27 GetTrieNodes / 0x28 TrieNodes
+  under eth/68's offset; auto-shifted for eth/69) to handlers that either
+  complete the matching pending future or respond with empty when serving.
+- Wallet-side serving is intentionally empty — we ship `encodeEmpty(reqId)`
+  responses to incoming `GetByteCodes` / `GetTrieNodes` so peers don't time
+  out, mirroring the existing `GetAccountRange` / `GetStorageRanges`
+  policy.
+
+A dedicated `SnapHandler` class is intentionally not extracted: snap/1
+shares the same RLPx connection and `ChannelHandlerContext` as eth/68, and
+splitting them now would require a parallel multiplexer with no immediate
+benefit. A future commit may extract it once the surface is large enough
+to justify the restructure.
+
+Out of scope for commit 3 (deferred to integration testing in commit 5):
+- Per-peer rate limiting (the existing eth/snap path doesn't have it
+  either; defer until we observe a peer that needs it).
+- Proof-verification-failure handling. The verifier lives in `:core`
+  (commit 2); the oracle in `:myotis-evm` (commit 4) is what owns the
+  peer-score-decrement / retry logic since that's an EVM-execution
+  concern, not a wire concern.
 
 ### 4 — `SnapBackedStateOracle`
 
@@ -134,8 +155,12 @@ so CI can skip them when no peer is available.
 ## What this branch has shipped so far
 
 - Commit 1 (`be8331f`): four SNAP wire types + roundtrip tests.
-- Commit 2 (this one): MPT proof verifier in `:core` + hex-prefix codec
+- Commit 2 (`5e430d2`): MPT proof verifier in `:core` + hex-prefix codec
   + RLP-item splitter, all unit-tested.
+- Commit 3 (this one): `EthHandler` outbound + inbound wiring for the four
+  new snap/1 message codes. 37/37 `:networking` tests still pass.
 
-Next: commit 3 wires `snap/1` capability into the eth handshake and adds
-the `SnapHandler` request multiplexer.
+Next: commit 4 wires `SnapBackedStateOracle` in `:myotis-evm` — combines
+the wire client (commit 1+3), the verifier (commit 2), and the oracle
+contract from Phase 0. After that, commit 5 adds the mainnet integration
+tests.
