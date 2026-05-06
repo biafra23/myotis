@@ -34,14 +34,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
-Three Gradle modules (Java 21):
+Five Gradle modules:
 
 - **core** — Cryptographic identity (`NodeKey`), data types (`BlockHeader`), ENR decoding
 - **networking** — Three protocol layers, all Netty-based:
   - `discv4` — UDP peer discovery using Kademlia DHT (ping/pong/findnode/neighbors)
   - `rlpx` — TCP transport: EIP-8 ECIES handshake → AES-256-CTR framed channel
   - `eth` — eth/67-68 sub-protocol on top of RLPx (hello → status → ready)
+- **consensus** — Sync-committee light client (libp2p, BLS, SSZ)
 - **app** — Daemon/CLI entry point, Unix domain socket IPC server, peer caching
+- **myotis-evm** — Local EVM execution (Besu) against SNAP-verified state for view calls and gas estimation
 
 **Protocol flow**: `DiscV4Service` discovers peers → `Main` dials them via `RLPxConnector.connect()` → `RLPxHandler` performs ECIES handshake (state machine: HANDSHAKE_WRITE → HANDSHAKE_READ → FRAMED) → fires `RLPX_READY` event → `EthHandler` runs eth handshake (AWAITING_HELLO → AWAITING_STATUS → READY) → block header requests available.
 
@@ -60,6 +62,33 @@ Three Gradle modules (Java 21):
 - Concurrent collections (`ConcurrentHashMap.newKeySet()`) for shared mutable state
 - IPC uses JSON-Lines over Unix domain sockets with Java 21 virtual threads
 - Network configs (genesis hash, fork ID, bootnodes) live in `NetworkConfig`
+
+## Platform & language direction
+
+- **Android compatibility is a first-class concern.** This is ultimately a wallet
+  library that has to run inside an Android app (`:android-app`, minSdk 29).
+  Every change needs to keep the consumer working: avoid JVM-only APIs that
+  the Android runtime / `coreLibraryDesugaring` can't cover, mind APK / DEX
+  size, and prefer libraries with known Android support. `java.net.http` is
+  not desugared and is not available below API 33 — do not use it.
+- **JVM 17 is the default source/target.** New modules should compile to
+  Java 17 class files (`sourceCompatibility = JavaVersion.VERSION_17`,
+  `targetCompatibility = JavaVersion.VERSION_17`) so they're consumable from
+  the Android module. The toolchain may run on Java 21, and existing modules
+  ship 21 class files only for transitive reasons (`:networking` because of
+  ConsenSys discv5 26.4.0; `:myotis-evm` because of Besu's `evm` module both
+  publishing Gradle module metadata declaring a JVM-21 floor). Only diverge
+  when a transitive forces it, and document the reason in the module's
+  build file.
+- **Long-term direction is Kotlin + Compose Multiplatform.** New code can
+  still land in Java where it lowers risk, but expect a migration to Kotlin
+  to enable Compose Multiplatform consumers (Android + desktop + iOS). Public
+  APIs should not depend on Java-only types that block Kotlin/Native or JS
+  targets later. Avoid leaking `CompletableFuture` into shared APIs designed
+  for multiplatform; expose suspending or library-neutral shapes instead.
+- **HTTP client: Ktor.** When a feature needs HTTP (e.g. CCIP-Read gateways
+  in `myotis-evm`), use Ktor — not OkHttp, not `java.net.http`. Ktor has
+  Multiplatform-ready engines and runs on Android.
 
 ## Trust
 

@@ -26,7 +26,14 @@ dependencyResolutionManagement {
             name = "JitPack"
             url = uri("https://jitpack.io")
         }
+        // Hyperledger Besu publishes release artifacts (incl. the standalone
+        // `evm` module) here. Maven Central mirrors are inconsistent across
+        // versions, so we pin the source.
+        maven {
+            name = "Hyperledger"
+            url = uri("https://hyperledger.jfrog.io/artifactory/besu-maven")
+        }
     }
 }
 
-include("core", "networking", "consensus", "app", "android-app")
+include("core", "networking", "consensus", "app", "android-app", "myotis-evm")
