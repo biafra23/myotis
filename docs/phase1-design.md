@@ -40,20 +40,35 @@ needs. For per-account lookups Phase 1 needs the lower-bandwidth pair:
 
 Encoders / decoders + RLP roundtrip tests. No protocol wiring yet.
 
-### 2 — Proof verifier
+### 2 — Proof verifier (done)
 
 Goal: given a `stateRoot`, a key (account hash or storage slot hash), an
 expected value, and a Merkle-Patricia-Trie proof, decide whether the proof
 verifies.
 
-Decision (open): use Tuweni's `tuweni-merkle-trie` (already in the version
-catalog) or roll our own. A small spike will tell us whether Tuweni's API
-covers the path of "verify a proof for a given root + key" cleanly. If yes,
-this is a thin wrapper. If not, we hand-roll — the algorithm is
-well-specified and not large.
+Decision: **hand-rolled** in `:core` at
+`com.jaeckel.ethp2p.core.trie.MerklePatriciaProofVerifier`. The catalog
+entry for `io.consensys.tuweni:tuweni-merkle-trie:2.7.2` was aspirational
+— that artifact does not exist in any version of ConsenSys Tuweni we can
+resolve, and the alternative would be downgrading to Apache Tuweni 2.4.x
+(unmaintained) or pulling in a heavier MPT library. The verifier is ~150
+lines of straightforward Yellow-Paper-Appendix-D code.
 
-The verifier is the Phase 1 trust anchor. Test vectors come from a hand-
-crafted trie + Geth-generated proofs.
+Components:
+- `HexPrefix.java` — compact path codec (4-flag header + nibble pack).
+- `RlpItems.java` — splits an RLP list into raw child item bytes (Tuweni's
+  `RLPReader` is callback-based and doesn't expose embedded children as
+  raw RLP, which we need for in-line trie nodes).
+- `MerklePatriciaProofVerifier.java` — descend from a trusted root through
+  branch / extension / leaf nodes, supporting both 32-byte hashed and
+  embedded children, returning `Found(value)` / `Absent` / `Invalid(reason)`.
+
+Tests cover single-leaf inclusion, exclusion via different key, empty trie,
+extension+branch+two-leaf inclusion, exclusion at the branch level, exclusion
+above the extension, embedded sub-32-byte children, tampered-node detection,
+and missing-node detection. Hand-built tries (programmatic RLP + keccak256)
+rather than external fixtures so the tests are reproducible and the
+correctness pattern is visible in the test source.
 
 ### 3 — SNAP protocol client
 
@@ -102,23 +117,25 @@ so CI can skip them when no peer is available.
 
 ## Open decisions
 
-- **Proof verifier source.** Tuweni vs. hand-rolled — settle in commit 2.
+- **Proof verifier source.** ~~Tuweni vs. hand-rolled — settle in commit 2.~~
+  Settled: hand-rolled in `:core`. See section 2 above.
+- **Where the verifier lives.** ~~`:core` vs `:networking` vs `:myotis-evm`.~~
+  Settled: `:core`. Generic utility shared across modules.
 - **`GetTrieNodes` vs `GetAccountRange` for single-account fetches.** The
   plan specifies `GetTrieNodes` because it returns just the proof path, not
   a 128 KB range. We may discover that mainnet peers serve `GetTrieNodes`
   inconsistently and need to fall back to `GetAccountRange` with a tight
-  hash window.
-- **Where the verifier lives.** `:core` adds it as a generic utility;
-  `:networking` keeps it next to the wire types; `:myotis-evm` owns it as a
-  private dependency. `:core` is the most natural home (the consensus
-  module also benefits from MPT verification).
+  hash window. Decide when commit 3 hits real peers.
 - **Threading model.** Phase 0 uses `Runnable::run` in the no-arg ctor and
   documents that production callers must pass a worker pool. Phase 1's
   oracle blocks on real network IO; the executor must run on a non-UI
   thread. Concrete recommendation lands in commit 4.
 
-## What this commit ships
+## What this branch has shipped so far
 
-Just step 1 — the four new SNAP wire types and their roundtrip tests.
-Nothing changes for callers of Phase 0; the new types are not wired
-anywhere yet.
+- Commit 1 (`be8331f`): four SNAP wire types + roundtrip tests.
+- Commit 2 (this one): MPT proof verifier in `:core` + hex-prefix codec
+  + RLP-item splitter, all unit-tested.
+
+Next: commit 3 wires `snap/1` capability into the eth handshake and adds
+the `SnapHandler` request multiplexer.
