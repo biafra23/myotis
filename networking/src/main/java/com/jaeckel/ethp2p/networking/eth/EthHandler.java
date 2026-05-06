@@ -935,7 +935,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     public CompletableFuture<ByteCodesMessage.DecodeResult> requestByteCodesAsync(
             java.util.List<org.apache.tuweni.bytes.Bytes32> hashes) {
         ChannelHandlerContext ctx = readyCtx;
-        if (ctx == null || state != State.READY) return null;
+        if (ctx == null || state != State.READY) return CompletableFuture.failedFuture(
+            new IllegalStateException("EthHandler not READY"));
         if (!snapNegotiated) return CompletableFuture.failedFuture(
             new UnsupportedOperationException("snap/1 not negotiated with this peer"));
 
@@ -965,7 +966,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             org.apache.tuweni.bytes.Bytes32 stateRoot,
             java.util.List<GetTrieNodesMessage.PathSet> paths) {
         ChannelHandlerContext ctx = readyCtx;
-        if (ctx == null || state != State.READY) return null;
+        if (ctx == null || state != State.READY) return CompletableFuture.failedFuture(
+            new IllegalStateException("EthHandler not READY"));
         if (!snapNegotiated) return CompletableFuture.failedFuture(
             new UnsupportedOperationException("snap/1 not negotiated with this peer"));
 

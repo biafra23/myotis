@@ -38,7 +38,6 @@ public final class HexPrefix {
         boolean odd = (flag & 0x01) != 0;
 
         int totalNibbles = encoded.length * 2 - (odd ? 1 : 2);
-        if (totalNibbles < 0) totalNibbles = 0;
         byte[] nibbles = new byte[totalNibbles];
         int n = 0;
         // Odd: first nibble is encoded[0] & 0x0f. Even: skip the padding nibble.

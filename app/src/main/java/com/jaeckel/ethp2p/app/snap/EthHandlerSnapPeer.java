@@ -41,23 +41,13 @@ public final class EthHandlerSnapPeer implements SnapPeer {
         for (PathSet p : paths) {
             wirePaths.add(new GetTrieNodesMessage.PathSet(p.accountPath(), p.storagePaths()));
         }
-        CompletableFuture<TrieNodesMessage.DecodeResult> fut =
-                handler.requestTrieNodesAsync(stateRoot, wirePaths);
-        if (fut == null) {
-            return CompletableFuture.failedFuture(
-                    new IllegalStateException("peer not READY"));
-        }
-        return fut.thenApply(TrieNodesMessage.DecodeResult::nodes);
+        return handler.requestTrieNodesAsync(stateRoot, wirePaths)
+                .thenApply(TrieNodesMessage.DecodeResult::nodes);
     }
 
     @Override
     public CompletableFuture<List<Bytes>> getByteCodes(List<Bytes32> hashes) {
-        CompletableFuture<ByteCodesMessage.DecodeResult> fut =
-                handler.requestByteCodesAsync(hashes);
-        if (fut == null) {
-            return CompletableFuture.failedFuture(
-                    new IllegalStateException("peer not READY"));
-        }
-        return fut.thenApply(ByteCodesMessage.DecodeResult::codes);
+        return handler.requestByteCodesAsync(hashes)
+                .thenApply(ByteCodesMessage.DecodeResult::codes);
     }
 }
