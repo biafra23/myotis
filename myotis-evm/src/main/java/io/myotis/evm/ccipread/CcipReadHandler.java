@@ -24,6 +24,15 @@ import java.util.regex.Pattern;
  * wiring into {@link io.myotis.evm.DefaultEvmExecutor#callView} happens in
  * Phase 4 once the recursion and re-entry semantics are settled.
  *
+ * <p><strong>HTTP client TODO (Android compat).</strong> This class currently
+ * uses {@code java.net.http.HttpClient} for the JVM Phase-4 prototype. That
+ * package is API 33+ on Android and is <em>not</em> in the
+ * {@code coreLibraryDesugaring} set, so it would crash at runtime on
+ * {@code minSdk = 29} devices. Per {@code CLAUDE.md}'s "Platform & language
+ * direction" section, the production HTTP client must be Ktor (works on
+ * Android and is Compose-Multiplatform-ready). Swap before Phase 4 lands or
+ * before this module is wired into {@code :android-app}.
+ *
  * <p>Execution path per spec:
  * <ol>
  *   <li>EVM reverts with {@link OffchainLookupRevert#SELECTOR}.

@@ -46,8 +46,21 @@ public record OffchainLookupRevert(
         return Optional.of(parseBody(body));
     }
 
+    /** Minimum bytes for the static portion of the args (5 head slots). */
+    static final int MIN_BODY_SIZE = 5 * 32;
+
+    /** Cap on the number of URLs in a single revert; defends against length-bomb payloads. */
+    static final int MAX_URLS = 32;
+
     /** Parse the args region (after the 4-byte selector). */
     static OffchainLookupRevert parseBody(byte[] body) {
+        // Truncated payloads from a hostile or malformed revert would otherwise
+        // AIOOBE / NumberFormatException out of the AbiDecoder. Reject early
+        // with a clean error type the executor can map to Reverted.
+        if (body.length < MIN_BODY_SIZE) {
+            throw new IllegalArgumentException(
+                    "OffchainLookup body too short: " + body.length + " < " + MIN_BODY_SIZE);
+        }
         // Head layout: sender (static, slot 0), urls (offset, slot 1),
         // callData (offset, slot 2), callbackFunction (static, slot 3),
         // extraData (offset, slot 4).
@@ -61,14 +74,26 @@ public record OffchainLookupRevert(
         //   length || head[0..n-1] (each is an offset relative to the start of
         //   the array body's head section) || tail (each entry is a length-prefixed
         //   utf-8 payload, padded to a 32-byte boundary).
-        int urlsOffset = AbiDecoder.uint256(body, 32).intValueExact();
-        int n = AbiDecoder.uint256(body, urlsOffset).intValueExact();
+        int urlsOffset = AbiDecoder.toIntStrict(
+                AbiDecoder.uint256(body, 32), "urls offset");
+        int n = AbiDecoder.toIntStrict(
+                AbiDecoder.uint256(body, urlsOffset), "urls length");
+        if (n > MAX_URLS) {
+            throw new IllegalArgumentException(
+                    "OffchainLookup urls length " + n + " exceeds cap " + MAX_URLS);
+        }
         int urlsHeadStart = urlsOffset + 32;
         List<String> urls = new ArrayList<>(n);
         for (int i = 0; i < n; i++) {
-            int relOffset = AbiDecoder.uint256(body, urlsHeadStart + i * 32).intValueExact();
+            int relOffset = AbiDecoder.toIntStrict(
+                    AbiDecoder.uint256(body, urlsHeadStart + i * 32), "url[" + i + "] offset");
             int strStart = urlsHeadStart + relOffset;
-            int strLen = AbiDecoder.uint256(body, strStart).intValueExact();
+            int strLen = AbiDecoder.toIntStrict(
+                    AbiDecoder.uint256(body, strStart), "url[" + i + "] length");
+            if (strStart > body.length - 32 || strLen > body.length - strStart - 32) {
+                throw new IllegalArgumentException(
+                        "url[" + i + "] runs past buffer (start=" + strStart + " len=" + strLen + ")");
+            }
             urls.add(new String(
                     Arrays.copyOfRange(body, strStart + 32, strStart + 32 + strLen),
                     java.nio.charset.StandardCharsets.UTF_8));

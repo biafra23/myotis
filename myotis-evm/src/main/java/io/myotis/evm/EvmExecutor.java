@@ -20,10 +20,17 @@ public interface EvmExecutor {
     /**
      * Execute a view-style call: invoke {@code target} with {@code calldata}
      * against the state at {@code blockContext.stateRoot()} and return the raw
-     * return bytes. Handles ERC-3668 CCIP-Read transparently.
+     * return bytes.
      *
      * <p>State writes performed during execution are journalled in memory and
      * discarded once the call completes; this method never mutates the chain.
+     *
+     * <p>ERC-3668 CCIP-Read handling is a Phase 4 deliverable. Until that
+     * lands, a target that reverts with {@code OffchainLookup} surfaces as
+     * {@link EvmExecutionError.Reverted} and the caller cannot resolve it
+     * without an explicit gateway round trip. The Phase 4 commit will catch
+     * the revert in this implementation and re-enter the EVM with the
+     * gateway response transparently.
      */
     CompletableFuture<byte[]> callView(Address target, byte[] calldata, BlockContext blockContext);
 

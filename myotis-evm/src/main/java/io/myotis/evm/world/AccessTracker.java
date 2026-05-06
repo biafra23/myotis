@@ -9,12 +9,15 @@ import java.util.HashSet;
 import java.util.Set;
 
 /**
- * Tracks (address, slot) and codeHash misses observed during a single EVM run.
+ * Records (address, slot) and codeHash <em>accesses</em> observed during a
+ * single EVM run.
  *
- * <p>Phase 2 deliverable. The first execution pass uses sentinel values for
- * every miss and produces a (likely incorrect) result, but a complete access
- * list. The prefetch loop then batches the misses, populates the cache, and
- * re-runs.
+ * <p>Phase 0/1: records every read; the executor uses the snapshot only as
+ * an audit trail. Phase 2 will distinguish hits vs misses (likely by adding
+ * a separate {@code recordMiss(...)} entry point so the prefetch loop can
+ * iterate on the miss set without re-walking everything). The current API
+ * intentionally reports every access so that switching the policy in Phase 2
+ * is purely additive.
  *
  * <p>Thread-safe in the limited sense that all updates are recorded via
  * {@code synchronized} and snapshots return immutable copies.

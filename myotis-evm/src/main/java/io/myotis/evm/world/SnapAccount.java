@@ -79,6 +79,14 @@ final class SnapAccount implements MutableAccount {
         a.balance = src.getBalance();
         a.codeHash = src.getCodeHash().toArrayUnsafe();
         a.loadedCode = src.getCode();
+        // Inherit storage journals from the parent so writes performed
+        // earlier in the same transaction are visible inside nested calls.
+        // Without this, a child frame's SLOAD would re-read from the oracle
+        // and miss the in-flight SSTORE's effect.
+        if (src instanceof SnapAccount s) {
+            a.originalStorage.putAll(s.originalStorage);
+            a.updatedStorage.putAll(s.updatedStorage);
+        }
         return a;
     }
 
@@ -122,13 +130,13 @@ final class SnapAccount implements MutableAccount {
 
     @Override
     public boolean isStorageEmpty() {
-        // Conservative: if any updates are journalled, storage is non-empty.
-        // Otherwise we can't know without scanning the trie, which we cannot
-        // do under SNAP without enumerating the entire account. The EVM uses
-        // this only as a fast-path for SELFDESTRUCT cleanup; saying "false"
-        // is always safe.
-        return updatedStorage.isEmpty() && originalStorage.isEmpty()
-                && codeHashIsEmpty() && nonce == 0 && balance.isZero();
+        // We cannot prove emptiness under SNAP without enumerating the entire
+        // storage trie of the account. Returning false is always safe — at
+        // worst the EVM does a redundant SLOAD for a slot that turns out to
+        // be zero. Returning true incorrectly is *not* safe: SELFDESTRUCT and
+        // EIP-161 empty-account cleanup would skip work that is required for
+        // correct gas accounting.
+        return false;
     }
 
     @Override

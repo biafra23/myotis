@@ -9,7 +9,6 @@ import org.apache.tuweni.crypto.Hash;
 
 import java.math.BigInteger;
 import java.util.HashMap;
-import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 

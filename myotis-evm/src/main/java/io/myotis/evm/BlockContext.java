@@ -10,6 +10,12 @@ import java.util.Objects;
  * locally — using the local clock for {@code timestamp} would, for instance,
  * desynchronise EVM execution from consensus.
  *
+ * <p>{@code stateRoot} and {@code prevRandao} are byte arrays; the canonical
+ * constructor and accessors clone them defensively so post-construction
+ * mutation by a caller cannot silently change the EVM's view of the trusted
+ * head. A future Kotlin migration will replace these with an immutable
+ * value class.
+ *
  * @param stateRoot      32-byte state root the call must verify against
  * @param blockNumber    block number; selects the EVM hard fork rules
  * @param timestamp      Unix seconds; selects fork rules where ranges are timestamp-keyed
@@ -40,5 +46,17 @@ public record BlockContext(
             throw new IllegalArgumentException("prevRandao must be 32 bytes");
         }
         Objects.requireNonNull(chainId, "chainId");
+        stateRoot = stateRoot.clone();
+        prevRandao = prevRandao.clone();
+    }
+
+    @Override
+    public byte[] stateRoot() {
+        return stateRoot.clone();
+    }
+
+    @Override
+    public byte[] prevRandao() {
+        return prevRandao.clone();
     }
 }

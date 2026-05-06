@@ -12,10 +12,12 @@ import org.hyperledger.besu.datatypes.Hash;
 import org.hyperledger.besu.datatypes.Wei;
 import org.hyperledger.besu.evm.Code;
 import org.hyperledger.besu.evm.EVM;
+import org.hyperledger.besu.evm.frame.ExceptionalHaltReason;
 import org.hyperledger.besu.evm.frame.MessageFrame;
 import org.hyperledger.besu.evm.processor.MessageCallProcessor;
 import org.hyperledger.besu.evm.tracing.OperationTracer;
 
+import java.util.Deque;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 
@@ -46,6 +48,16 @@ public final class DefaultEvmExecutor implements EvmExecutor {
         this.executor = executor;
     }
 
+    /**
+     * Convenience constructor for tests and Phase 0 integration. <strong>Uses
+     * an inline executor</strong> ({@code Runnable::run}), so the returned
+     * future is effectively synchronous and any blocking inside execution
+     * (Phase 1+ {@code SyncStateView.join()} on real SNAP fetches) blocks the
+     * calling thread. Production callers must use the three-arg constructor
+     * with a worker thread pool — typically the same pool used by the rest of
+     * the wallet — to avoid stalling the UI / coroutine context. Documented
+     * at the boundary because the wallet integration owns the lifecycle.
+     */
     public DefaultEvmExecutor(SnapStateOracle oracle) {
         this(oracle, BytecodeCache.inMemory(), Runnable::run);
     }
@@ -99,35 +111,52 @@ public final class DefaultEvmExecutor implements EvmExecutor {
                 .blockValues(new BlockContextValues(blockContext))
                 .completer(f -> {})
                 .miningBeneficiary(besuCoinbase)
-                .blockHashLookup(n -> Hash.ZERO)
+                // BLOCKHASH is not supported in Phase 0. Returning Hash.ZERO
+                // would silently diverge from mainnet for any contract that
+                // touches BLOCKHASH (or derived libraries — Compound v2 used
+                // it as a "weak randomness" source). Fail fast instead; the
+                // EVM will surface this as PRECOMPILE_ERROR / opaque halt and
+                // we relabel it via the halt-reason mapping below.
+                .blockHashLookup(n -> {
+                    throw new UnsupportedOperationException(
+                            "BLOCKHASH not implemented; needs a verified block-hash provider");
+                })
                 .isStatic(true)
                 .build();
 
-        // Drive the frame to a terminal state. AbstractMessageProcessor.process()
-        // walks the state machine: NOT_STARTED → CODE_EXECUTING (via start()) →
-        // runToHalt → CODE_SUCCESS/REVERT/EXCEPTIONAL_HALT → COMPLETED_*.
-        // Calling start() directly only initialises and is not enough.
-        // Child frames (CALL/CREATE) are kept on the EVM's own stack; we
-        // re-process the parent until it reaches a COMPLETED_* state.
         MessageCallProcessor processor = new MessageCallProcessor(evm, bundle.precompiles());
-        while (frame.getState() != MessageFrame.State.COMPLETED_SUCCESS
-                && frame.getState() != MessageFrame.State.COMPLETED_FAILED) {
-            processor.process(frame, OperationTracer.NO_TRACING);
+
+        // Drive the entire frame stack to completion. When a call performs
+        // CALL/STATICCALL/DELEGATECALL, Besu pushes a child frame onto
+        // frame.getMessageFrameStack() and suspends the parent at
+        // CODE_SUSPENDED. The processor only acts on the frame at the top of
+        // the stack, so we always re-fetch the top.
+        Deque<MessageFrame> stack = frame.getMessageFrameStack();
+        while (!stack.isEmpty()) {
+            processor.process(stack.peek(), OperationTracer.NO_TRACING);
         }
 
-        MessageFrame.State state = frame.getState();
-        if (state == MessageFrame.State.COMPLETED_SUCCESS) {
+        // process() auto-transitions REVERT/EXCEPTIONAL_HALT to a COMPLETED_*
+        // terminal state before returning, so MessageFrame.State.REVERT is
+        // unobservable here. Derive the outcome from the surviving signals
+        // (revertReason / exceptionalHaltReason / output) on the original
+        // outer frame, not on whatever popped last.
+        if (frame.getState() == MessageFrame.State.COMPLETED_SUCCESS) {
             return frame.getOutputData().toArrayUnsafe();
         }
-        if (state == MessageFrame.State.REVERT) {
-            byte[] data = frame.getRevertReason().map(Bytes::toArrayUnsafe).orElse(new byte[0]);
-            throw new EvmExecutionException(new EvmExecutionError.Reverted(data));
+        if (frame.getRevertReason().isPresent()) {
+            throw new EvmExecutionException(
+                    new EvmExecutionError.Reverted(frame.getRevertReason().get().toArrayUnsafe()));
         }
-        // EXCEPTIONAL_HALT, COMPLETED_FAILED, etc. Surface the halt reason so
-        // this isn't an opaque "execution failed" — investigations against
-        // unfamiliar bytecode rely on it.
-        String detail = state + frame.getExceptionalHaltReason()
-                .map(r -> "/" + r.name()).orElse("");
+        // Halt without an explicit revert payload: map the halt reason to
+        // OutOfGas where applicable, otherwise surface a Reverted with a
+        // human-readable detail so the failure isn't opaque.
+        var halt = frame.getExceptionalHaltReason();
+        if (halt.isPresent() && halt.get() == ExceptionalHaltReason.INSUFFICIENT_GAS) {
+            throw new EvmExecutionException(new EvmExecutionError.OutOfGas());
+        }
+        String detail = "halt=" + halt.map(ExceptionalHaltReason::name).orElse("UNKNOWN")
+                + " state=" + frame.getState();
         throw new EvmExecutionException(
                 new EvmExecutionError.Reverted(detail.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
     }
