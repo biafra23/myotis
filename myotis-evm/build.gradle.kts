@@ -30,6 +30,7 @@ dependencies {
     implementation(libs.tuweni.bytes)
     implementation(libs.tuweni.units)
     implementation(libs.tuweni.crypto)
+    implementation(libs.tuweni.rlp)
 
     // BouncyCastle: Tuweni's Hash.keccak256 dispatches through JCA, which
     // requires BouncyCastle to be registered as a security provider.

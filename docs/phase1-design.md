@@ -105,21 +105,52 @@ Out of scope for commit 3 (deferred to integration testing in commit 5):
   peer-score-decrement / retry logic since that's an EVM-execution
   concern, not a wire concern.
 
-### 4 — `SnapBackedStateOracle`
+### 4 — `SnapBackedStateOracle` (done)
 
-Implements `io.myotis.evm.world.SnapStateOracle`. For each call:
+Implements `io.myotis.evm.world.SnapStateOracle` against a `SnapPeer`
+abstraction defined in the same package. The peer interface is intentionally
+minimal — `getTrieNodes(stateRoot, paths)` and `getByteCodes(hashes)`,
+returning raw bytes — so `:myotis-evm` can stay decoupled from
+`:networking`. The wallet integration plugs in an `EthHandler`-backed
+implementation when constructing the oracle.
 
-1. Issue the SNAP request via the client.
-2. Verify the proof against the trusted `stateRoot` (or the `codeHash` for
-   bytecode).
-3. On verification failure: deprioritise the peer, retry with another peer
-   (cap retries; fail with `EvmExecutionError.InvalidProof` after).
-4. Cache `(stateRoot, address, slot) → value` in-memory for the duration
-   of the call.
+For each call:
 
-This lives in `:myotis-evm/world/SnapBackedStateOracle.java` (alongside
-`FixtureSnapStateOracle`). The `DefaultEvmExecutor` doesn't change — only
-the oracle the wallet hands it does.
+1. `fetchAccount` — keccak256(address) → account-only path set →
+   `getTrieNodes` → MPT verifier against the world stateRoot → decode
+   `[nonce, balance, storageRoot, codeHash]` from the leaf value. The
+   internal helper also captures `storageRoot` for downstream storage
+   fetches.
+2. `fetchStorage` — chain on `fetchAccountWithRoot` to pick up the
+   storageRoot, then issue a path set carrying the account hash + slot
+   hash, verify against the storageRoot, decode the RLP integer.
+   Empty storage root short-circuits to zero without a network round trip.
+3. `fetchBytecode` — bytecode cache check first; on miss, `getByteCodes`,
+   keccak256 the response, match against the requested codeHash; surface
+   `EvmExecutionError.InvalidProof` on mismatch.
+
+Retry policy: a `Supplier<SnapPeer>` is consulted at the start of every
+attempt. On any failure (proof invalid, IO timeout, hash mismatch) we
+rotate to the next peer, up to `maxAttempts` (default 3). The supplier is
+free to track peer scores externally — the oracle doesn't dictate that.
+
+Tests build hand-crafted single-leaf tries, encode the proofs by hand,
+register them with an in-memory `FixturePeer`, then run the oracle through
+its three entry points. Eight tests cover: account hit, account absent,
+account retry-on-bad-proof + retry budget exhaustion, storage hit, storage
+on empty trie, bytecode hit + cache hit, bytecode hash mismatch, empty-code
+short-circuit. 29/29 `:myotis-evm` tests now pass (Phase 0's 21 + the new 8).
+
+`DefaultEvmExecutor` and `SyncStateView` from Phase 0 already consume
+`SnapStateOracle`, so the executor needs no changes — wallet integration
+is "construct `SnapBackedStateOracle` instead of `FixtureSnapStateOracle`."
+
+What's still missing for the public-API "wallet integration" piece: an
+`EthHandler`-backed `SnapPeer`. That's a thin adapter (translate
+`SnapPeer.PathSet` to `GetTrieNodesMessage.PathSet`, call
+`requestTrieNodesAsync`, project the response). It belongs in `:app` (or
+wherever the daemon wires things up) since `:myotis-evm` doesn't depend on
+`:networking`. Adapter + mainnet integration tests come together in commit 5.
 
 ### 5 — Mainnet integration tests
 
@@ -157,10 +188,12 @@ so CI can skip them when no peer is available.
 - Commit 1 (`be8331f`): four SNAP wire types + roundtrip tests.
 - Commit 2 (`5e430d2`): MPT proof verifier in `:core` + hex-prefix codec
   + RLP-item splitter, all unit-tested.
-- Commit 3 (this one): `EthHandler` outbound + inbound wiring for the four
-  new snap/1 message codes. 37/37 `:networking` tests still pass.
+- Commit 3 (`0a21c47`): `EthHandler` outbound + inbound wiring for the
+  four new snap/1 message codes.
+- Commit 4 (this one): `SnapBackedStateOracle` in `:myotis-evm` — combines
+  the verifier + the SnapPeer abstraction with proof-verification + retry
+  semantics. 8 new tests; 29/29 `:myotis-evm` tests pass.
 
-Next: commit 4 wires `SnapBackedStateOracle` in `:myotis-evm` — combines
-the wire client (commit 1+3), the verifier (commit 2), and the oracle
-contract from Phase 0. After that, commit 5 adds the mainnet integration
-tests.
+Next: commit 5 adds (a) an `EthHandler`-backed `SnapPeer` adapter in `:app`
+and (b) the mainnet integration tests (USDC / DAI / ENS) that close out
+Phase 1's acceptance criteria.
