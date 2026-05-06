@@ -152,20 +152,48 @@ What's still missing for the public-API "wallet integration" piece: an
 wherever the daemon wires things up) since `:myotis-evm` doesn't depend on
 `:networking`. Adapter + mainnet integration tests come together in commit 5.
 
-### 5 — Mainnet integration tests
+### 5 — Mainnet integration tests (scaffolding done; bootstrap pending)
 
-Separate Gradle source set (`src/integrationTest/java`) so they don't run
-on every `:test` invocation. Each test:
+Two pieces shipped in commit 5:
 
-1. Connects to a real SNAP peer (or runs against a local Geth/Besu).
-2. Picks a recent finalised `stateRoot` (could be sourced via `:consensus`
-   light client or hard-coded with the corresponding block number for the
-   test).
-3. Runs `callView` for the three target contracts.
-4. Compares the result with `eth_call` from a public RPC at the same block.
+**EthHandlerSnapPeer adapter (`:app/snap`).** Translates between
+`io.myotis.evm.world.SnapPeer.PathSet` and
+`com.jaeckel.ethp2p.networking.snap.messages.GetTrieNodesMessage.PathSet`,
+and wraps `EthHandler.requestTrieNodesAsync` /
+`EthHandler.requestByteCodesAsync` for the `:myotis-evm` consumer. Lives
+in `:app` rather than `:myotis-evm` because the latter is intentionally
+decoupled from `:networking`. The adapter is mechanical type translation —
+its real coverage comes from the integration test below.
 
-Acceptable for these tests to be `@EnabledIfEnvironmentVariable(MAINNET=1)`
-so CI can skip them when no peer is available.
+**Integration test source set (`:myotis-evm/src/integrationTest`).** A
+separate Gradle source set + task (`./gradlew :myotis-evm:integrationTest`)
+that's not bound to `check`. Tests are gated with
+`@EnabledIfEnvironmentVariable(MYOTIS_MAINNET=1)` so the unit suite stays
+offline. `MainnetCallViewIT` defines three tests covering the original
+Phase 1 acceptance corpus:
+
+- USDC `balanceOf(vitalik.eth)` (ERC-20 storage proof end-to-end)
+- DAI `balanceOf(vitalik.eth)` (different storage layout, validates the
+  oracle isn't accidentally USDC-shaped)
+- ENS Public Resolver `addr(namehash("vitalik.eth"))` (multi-call walk:
+  read account → read storage slot → return address)
+
+Each test reads `MYOTIS_INTEGRATION_*` env vars (peer enode, state root,
+block number/timestamp, base fee), constructs `DefaultEvmExecutor` against
+`SnapBackedStateOracle`, calls `callView`, and decodes the result. For
+USDC the test optionally cross-checks the value against an externally-
+provided `eth_call` result via `MYOTIS_INTEGRATION_VITALIK_USDC_BALANCE`.
+
+**What's not done in this commit:** the `connectToMainnetPeer()` helper
+inside the test currently throws `UnsupportedOperationException`. Standing
+up an `EthHandler` from inside a JUnit fixture means reproducing
+`:app:Main`'s bootstrap (NodeKey, NetworkConfig, RLPxConnector,
+ChainHead). The simpler path is to extract that wiring into a reusable
+`MainnetSnapClient` helper in `:app` — that's a non-trivial refactor of
+the daemon code and is intentionally out of scope here. The test compiles,
+the gating works (`./gradlew :myotis-evm:integrationTest` without
+`MYOTIS_MAINNET=1` reports 3 ignored / 0 failures), and the acceptance
+criterion is reachable as soon as the bootstrap helper exists.
 
 ## Open decisions
 
@@ -190,10 +218,16 @@ so CI can skip them when no peer is available.
   + RLP-item splitter, all unit-tested.
 - Commit 3 (`0a21c47`): `EthHandler` outbound + inbound wiring for the
   four new snap/1 message codes.
-- Commit 4 (this one): `SnapBackedStateOracle` in `:myotis-evm` — combines
+- Commit 4 (`2adb2dd`): `SnapBackedStateOracle` in `:myotis-evm` — combines
   the verifier + the SnapPeer abstraction with proof-verification + retry
-  semantics. 8 new tests; 29/29 `:myotis-evm` tests pass.
+  semantics.
+- Commit 5 (this one): `EthHandlerSnapPeer` adapter in `:app/snap` +
+  `MainnetCallViewIT` integration-test scaffolding (env-gated, three target
+  contracts). Final piece pending: a reusable `EthHandler` bootstrap
+  helper so the `connectToMainnetPeer()` stub becomes runnable.
 
-Next: commit 5 adds (a) an `EthHandler`-backed `SnapPeer` adapter in `:app`
-and (b) the mainnet integration tests (USDC / DAI / ENS) that close out
-Phase 1's acceptance criteria.
+Phase 1 status: structurally complete (every component compiles, every
+unit test passes, every layer has the integration shape it needs). The
+`connectToMainnetPeer` bootstrap is the last gate before the acceptance
+criterion ("integration tests pass against a real SNAP peer") can be
+declared met.
