@@ -922,6 +922,27 @@ public class CommandHandler {
     }
 
     /**
+     * Shared single-thread pool that drives the EVM for the {@code resolve-ens}
+     * command (and any future EVM-backed commands). Created lazily on first
+     * use; survives for the daemon's lifetime. Daemon thread, so it doesn't
+     * keep the JVM alive on shutdown.
+     *
+     * <p>Reusing one pool across requests avoids the per-request
+     * {@code Executors.newSingleThreadExecutor} / {@code shutdown} churn
+     * that an earlier draft of {@code handleResolveEns} did. The thread is
+     * single because Besu's EVM is sequential per-call; concurrent
+     * resolutions would either need separate pools or a bounded
+     * {@code newFixedThreadPool}, but the daemon serializes commands
+     * anyway.
+     */
+    private static final java.util.concurrent.ExecutorService EVM_POOL =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "myotis-evm-cmd");
+                t.setDaemon(true);
+                return t;
+            });
+
+    /**
      * Resolve {@code name → address} via ENSIP-1 + ENSIP-10 (Universal Resolver),
      * with ERC-3668 CCIP-Read transparently handled for off-chain names
      * (Coinbase IDs, Uniswap names, Base subdomains, …).
@@ -953,12 +974,12 @@ public class CommandHandler {
     private String handleResolveEns(String jsonLine) {
         String name = extractString(jsonLine, "name");
         try {
-            // 1. Pick a snap-capable peer.
-            List<com.jaeckel.ethp2p.networking.eth.EthHandler> snapPeers = connector.activeSnapHandlers();
-            if (snapPeers.isEmpty()) {
+            // 1. Confirm at least one snap-capable peer exists. The oracle's
+            //    rotating supplier (below) re-polls for each retry, so we
+            //    don't pin a single handler here.
+            if (connector.activeSnapHandlers().isEmpty()) {
                 return jsonError("No active peer with snap/1 support");
             }
-            com.jaeckel.ethp2p.networking.eth.EthHandler peer = snapPeers.get(0);
 
             // 2. Fetch a fresh header (the peer's chain head) so we have a
             // recent, peer-servable state root for snap requests.
@@ -984,45 +1005,46 @@ public class CommandHandler {
                 java.math.BigInteger.valueOf(connector.getNetwork().networkId()),
                 header.gasLimit);
 
-            // 4. Build the executor stack on top of this peer.
-            com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer snapPeer =
-                new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(peer);
+            // 4. Build the executor stack. The supplier re-polls the
+            //    connector each invocation and round-robins through whatever
+            //    snap-capable peers are currently active, so the oracle's
+            //    retry-on-InvalidProof / IO-failure logic actually engages a
+            //    different peer on each attempt — capturing one handler at
+            //    construction time would defeat that.
+            java.util.concurrent.atomic.AtomicInteger peerIndex =
+                new java.util.concurrent.atomic.AtomicInteger();
             io.myotis.evm.world.SnapBackedStateOracle oracle =
                 new io.myotis.evm.world.SnapBackedStateOracle(
-                    () -> snapPeer, io.myotis.evm.world.BytecodeCache.inMemory());
-            java.util.concurrent.ExecutorService evmPool =
-                java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
-                    Thread t = new Thread(r, "myotis-evm-resolve-ens");
-                    t.setDaemon(true);
-                    return t;
-                });
-            try {
-                io.myotis.evm.DefaultEvmExecutor base = new io.myotis.evm.DefaultEvmExecutor(
-                    oracle, io.myotis.evm.world.BytecodeCache.inMemory(), evmPool);
-                io.myotis.evm.PrefetchingEvmExecutor prefetching =
-                    new io.myotis.evm.PrefetchingEvmExecutor(base);
-                io.myotis.evm.ccipread.CcipReadHandler ccipHandler =
-                    new io.myotis.evm.ccipread.CcipReadHandler(new JavaHttpCcipGateway());
-                io.myotis.evm.CcipReadEvmExecutor executor =
-                    new io.myotis.evm.CcipReadEvmExecutor(prefetching, ccipHandler);
+                    () -> {
+                        List<com.jaeckel.ethp2p.networking.eth.EthHandler> live =
+                            connector.activeSnapHandlers();
+                        if (live.isEmpty()) return null;
+                        int idx = Math.floorMod(peerIndex.getAndIncrement(), live.size());
+                        return new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(live.get(idx));
+                    }, io.myotis.evm.world.BytecodeCache.inMemory());
+            io.myotis.evm.DefaultEvmExecutor base = new io.myotis.evm.DefaultEvmExecutor(
+                oracle, io.myotis.evm.world.BytecodeCache.inMemory(), EVM_POOL);
+            io.myotis.evm.PrefetchingEvmExecutor prefetching =
+                new io.myotis.evm.PrefetchingEvmExecutor(base);
+            io.myotis.evm.ccipread.CcipReadHandler ccipHandler =
+                new io.myotis.evm.ccipread.CcipReadHandler(new JavaHttpCcipGateway());
+            io.myotis.evm.CcipReadEvmExecutor executor =
+                new io.myotis.evm.CcipReadEvmExecutor(prefetching, ccipHandler);
 
-                // 5. Resolve.
-                io.myotis.ens.EnsResolver resolver = new io.myotis.ens.EnsResolver(executor);
-                java.util.Optional<io.myotis.evm.Address> resolved =
-                    resolver.resolveAddress(name, blockCtx).get(60, TimeUnit.SECONDS);
+            // 5. Resolve.
+            io.myotis.ens.EnsResolver resolver = new io.myotis.ens.EnsResolver(executor);
+            java.util.Optional<io.myotis.evm.Address> resolved =
+                resolver.resolveAddress(name, blockCtx).get(60, TimeUnit.SECONDS);
 
-                if (resolved.isEmpty()) {
-                    return "{\"ok\":true,\"resolved\":false"
-                        + ",\"name\":\"" + escapeJson(name) + "\""
-                        + ",\"blockNumber\":" + header.number + "}";
-                }
-                return "{\"ok\":true,\"resolved\":true"
+            if (resolved.isEmpty()) {
+                return "{\"ok\":true,\"resolved\":false"
                     + ",\"name\":\"" + escapeJson(name) + "\""
-                    + ",\"address\":\"" + resolved.get().toHex() + "\""
                     + ",\"blockNumber\":" + header.number + "}";
-            } finally {
-                evmPool.shutdown();
             }
+            return "{\"ok\":true,\"resolved\":true"
+                + ",\"name\":\"" + escapeJson(name) + "\""
+                + ",\"address\":\"" + resolved.get().toHex() + "\""
+                + ",\"blockNumber\":" + header.number + "}";
         } catch (Exception e) {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
@@ -1036,6 +1058,13 @@ public class CommandHandler {
      * guaranteed. Android consumers must supply a Ktor-backed gateway per
      * {@code CLAUDE.md} (java.net.http isn't covered by Android core library
      * desugaring below API 33).
+     *
+     * <p>Per ERC-3668 §6.1, any non-2xx HTTP status code must be treated as
+     * an error so {@link io.myotis.evm.ccipread.CcipReadHandler} can fall
+     * through to the next URL in the gateway list. We surface non-2xx as a
+     * failed future carrying an {@link java.io.IOException} with the status
+     * code and URL, which the handler's {@code exceptionallyCompose} catches
+     * and folds into the per-URL diagnostic list.
      */
     private static final class JavaHttpCcipGateway implements io.myotis.evm.ccipread.CcipGateway {
         private static final java.net.http.HttpClient CLIENT = java.net.http.HttpClient.newBuilder()
@@ -1056,7 +1085,14 @@ public class CommandHandler {
             }
             return CLIENT.sendAsync(rb.build(),
                     java.net.http.HttpResponse.BodyHandlers.ofString())
-                    .thenApply(java.net.http.HttpResponse::body);
+                    .thenCompose(resp -> {
+                        int status = resp.statusCode();
+                        if (status >= 200 && status < 300) {
+                            return java.util.concurrent.CompletableFuture.completedFuture(resp.body());
+                        }
+                        return java.util.concurrent.CompletableFuture.failedFuture(
+                                new java.io.IOException("HTTP " + status + " from " + url));
+                    });
         }
     }
 
