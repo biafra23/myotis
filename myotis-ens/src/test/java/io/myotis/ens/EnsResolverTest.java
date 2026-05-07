@@ -169,6 +169,63 @@ class EnsResolverTest {
         assertEquals(1, mock.callCount());
     }
 
+    /**
+     * The Registry address in an offline / misconfigured wallet might point
+     * at an EOA (no code). The EVM returns empty bytes for a successful
+     * call against a code-less account. The resolver must surface this as
+     * {@code Optional.empty()} rather than throwing in the ABI decoder.
+     */
+    @Test
+    void emptyResponseFromRegistryReturnsEmpty() throws Exception {
+        var mock = new MockExecutor();
+        mock.respond(REGISTRY,
+                callRegistryResolver("anything.eth"),
+                new byte[0]);
+
+        var resolver = new EnsResolver(mock, REGISTRY);
+        Optional<Address> result = resolver.resolveAddress("anything.eth", ctx()).get();
+        assertTrue(result.isEmpty());
+    }
+
+    /**
+     * A non-conforming resolver might return short or malformed data instead
+     * of a 32-byte address. The resolver must treat this as "no answer"
+     * rather than crash the call.
+     */
+    @Test
+    void shortResponseFromResolverReturnsEmpty() throws Exception {
+        var mock = new MockExecutor();
+        mock.respond(REGISTRY,
+                callRegistryResolver("weird.eth"),
+                encodeAddress(PUBLIC_RESOLVER));
+        // Resolver returns 16 bytes — not a valid uint256/address encoding.
+        mock.respond(PUBLIC_RESOLVER,
+                callResolverAddr("weird.eth"),
+                new byte[]{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16});
+
+        var resolver = new EnsResolver(mock, REGISTRY);
+        Optional<Address> result = resolver.resolveAddress("weird.eth", ctx()).get();
+        assertTrue(result.isEmpty());
+    }
+
+    /** Symmetric short/empty handling for the reverse-name decoder. */
+    @Test
+    void emptyResponseFromReverseResolverReturnsEmpty() throws Exception {
+        var mock = new MockExecutor();
+        String reverseName = ReverseLookup.nameFor(VITALIK);
+        mock.respond(REGISTRY,
+                callRegistryResolver(reverseName),
+                encodeAddress(PUBLIC_RESOLVER));
+        // Resolver returns nothing for the name(bytes32) call.
+        mock.respond(PUBLIC_RESOLVER,
+                callResolverName(reverseName),
+                new byte[0]);
+
+        var resolver = new EnsResolver(mock, REGISTRY);
+        Optional<String> result = resolver.resolveName(VITALIK, ctx()).get();
+        assertTrue(result.isEmpty());
+    }
+
     // ---- Calldata builders mirroring what EnsResolver should issue --------
 
     private static byte[] callRegistryResolver(String name) {

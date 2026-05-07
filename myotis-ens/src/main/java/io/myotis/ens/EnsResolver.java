@@ -102,30 +102,58 @@ public final class EnsResolver {
     private CompletableFuture<Optional<Address>> getResolver(byte[] node, BlockContext ctx) {
         byte[] calldata = AbiEncoder.encodeCall(RESOLVER, AbiEncoder.bytes32(node));
         return executor.callView(registry, calldata, ctx)
-                .thenApply(result -> {
-                    Address resolver = AbiDecoder.address(result, 0);
-                    return resolver.equals(Address.ZERO) ? Optional.<Address>empty() : Optional.of(resolver);
-                });
+                .thenApply(EnsResolver::decodeAddressOrEmpty);
     }
 
     /** Resolver call: {@code addr(bytes32) → address}. */
     private CompletableFuture<Optional<Address>> getAddress(Address resolver, byte[] node, BlockContext ctx) {
         byte[] calldata = AbiEncoder.encodeCall(ADDR, AbiEncoder.bytes32(node));
         return executor.callView(resolver, calldata, ctx)
-                .thenApply(result -> {
-                    Address addr = AbiDecoder.address(result, 0);
-                    return addr.equals(Address.ZERO) ? Optional.<Address>empty() : Optional.of(addr);
-                });
+                .thenApply(EnsResolver::decodeAddressOrEmpty);
     }
 
     /** Resolver call: {@code name(bytes32) → string}. */
     private CompletableFuture<Optional<String>> getName(Address resolver, byte[] node, BlockContext ctx) {
         byte[] calldata = AbiEncoder.encodeCall(NAME, AbiEncoder.bytes32(node));
         return executor.callView(resolver, calldata, ctx)
-                .thenApply(result -> {
-                    String s = AbiDecoder.string(result, 0);
-                    return s.isEmpty() ? Optional.<String>empty() : Optional.of(s);
-                });
+                .thenApply(EnsResolver::decodeStringOrEmpty);
+    }
+
+    /**
+     * Decode a single address from a {@code callView} return, returning
+     * {@link Optional#empty()} for any of:
+     * <ul>
+     *   <li>An empty result. The EVM returns zero bytes when a CALL targets
+     *       an EOA (address with no code) or a contract that doesn't
+     *       implement the queried function — both are "no answer" for ENS.
+     *   <li>A short result (&lt; 32 bytes). Indicates a non-conforming
+     *       contract; treat as "no answer" rather than crash the call.
+     *   <li>The zero address.
+     * </ul>
+     */
+    private static Optional<Address> decodeAddressOrEmpty(byte[] result) {
+        if (result == null || result.length < 32) return Optional.empty();
+        Address addr = AbiDecoder.address(result, 0);
+        return addr.equals(Address.ZERO) ? Optional.<Address>empty() : Optional.of(addr);
+    }
+
+    /**
+     * Decode a single dynamic string from a {@code callView} return, with
+     * the same robustness contract as {@link #decodeAddressOrEmpty}: empty,
+     * short, or malformed responses surface as {@link Optional#empty()}
+     * rather than throwing.
+     */
+    private static Optional<String> decodeStringOrEmpty(byte[] result) {
+        if (result == null || result.length < 64) return Optional.empty();
+        try {
+            String s = AbiDecoder.string(result, 0);
+            return s.isEmpty() ? Optional.<String>empty() : Optional.of(s);
+        } catch (RuntimeException e) {
+            // Malformed dynamic encoding (offset/length out of range) —
+            // a non-conforming resolver. Treat as "no name" rather than
+            // propagate the decode failure to the wallet.
+            return Optional.empty();
+        }
     }
 
     /**
