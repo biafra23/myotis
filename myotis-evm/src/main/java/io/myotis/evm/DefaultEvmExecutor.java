@@ -68,12 +68,26 @@ public final class DefaultEvmExecutor implements EvmExecutor {
     }
 
     private byte[] runOnce(Address target, byte[] calldata, BlockContext blockContext) {
+        AccessTracker tracker = new AccessTracker();
+        SyncStateView view = new SyncStateView(oracle, blockContext.stateRoot(), bytecodeCache, tracker);
+        return runOnTracedView(target, calldata, blockContext, view, OperationTracer.NO_TRACING);
+    }
+
+    /**
+     * Drive a single EVM run against a caller-supplied {@link SyncStateView} and
+     * {@link OperationTracer}. Used by {@code PrefetchingEvmExecutor} to share a
+     * cache + tracer across the convergence loop's iterations; the public
+     * {@link #callView} path still constructs a fresh per-call view.
+     *
+     * <p>Package-private: it's the seam the prefetch layer plugs into, but it's
+     * not part of the public {@link EvmExecutor} contract.
+     */
+    byte[] runOnTracedView(Address target, byte[] calldata, BlockContext blockContext,
+                           SyncStateView view, OperationTracer tracer) {
         CryptoProviders.ensureRegistered();
         EvmFactory.EvmAndPrecompiles bundle = EvmFactory.buildForBlock(blockContext);
         EVM evm = bundle.evm();
 
-        AccessTracker tracker = new AccessTracker();
-        SyncStateView view = new SyncStateView(oracle, blockContext.stateRoot(), bytecodeCache, tracker);
         SnapWorldUpdater root = new SnapWorldUpdater(view);
         // Besu's EVM runs against a child updater so commit/revert of the
         // outer call doesn't pollute the read-through cache.
@@ -133,7 +147,7 @@ public final class DefaultEvmExecutor implements EvmExecutor {
         // the stack, so we always re-fetch the top.
         Deque<MessageFrame> stack = frame.getMessageFrameStack();
         while (!stack.isEmpty()) {
-            processor.process(stack.peek(), OperationTracer.NO_TRACING);
+            processor.process(stack.peek(), tracer);
         }
 
         // process() auto-transitions REVERT/EXCEPTIONAL_HALT to a COMPLETED_*
@@ -160,4 +174,9 @@ public final class DefaultEvmExecutor implements EvmExecutor {
         throw new EvmExecutionException(
                 new EvmExecutionError.Reverted(detail.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
     }
+
+    /** Accessors used by {@code PrefetchingEvmExecutor} to share configuration. */
+    SnapStateOracle oracle() { return oracle; }
+    BytecodeCache bytecodeCache() { return bytecodeCache; }
+    Executor executor() { return executor; }
 }

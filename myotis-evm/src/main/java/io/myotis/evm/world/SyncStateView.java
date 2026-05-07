@@ -5,6 +5,9 @@ import io.myotis.evm.EvmExecutionException;
 import org.apache.tuweni.units.bigints.UInt256;
 
 import java.math.BigInteger;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CompletionException;
 
 /**
@@ -19,13 +22,17 @@ import java.util.concurrent.CompletionException;
  *       {@code join()} is effectively free.
  *   <li>Phase 1: a single synchronous round trip per miss is acceptable but
  *       slow. {@code join()} blocks the calling thread for the duration of the
- *       fetch. The executor must run the EVM on a worker thread so this does
- *       not block the caller's coroutine context.
- *   <li>Phase 2: the prefetch loop populates a per-call cache before the EVM
+ *       fetch.
+ *   <li>Phase 2: the prefetch loop populates the in-view cache before the EVM
  *       reaches each miss, making the {@code join()} a no-op in the common
- *       case. Misses fall through and either trigger another iteration of the
- *       loop or return a sentinel (TBD per the open question in the plan).
+ *       case.
  * </ul>
+ *
+ * <p>The view caches {@code (address) → AccountState} and
+ * {@code (address, slot) → UInt256} so that repeated reads — both within a
+ * single EVM run and across iterations of the Phase 2 prefetch loop — hit
+ * memory rather than the oracle. Bytecode caching is delegated to the
+ * supplied {@link BytecodeCache}.
  */
 public final class SyncStateView {
 
@@ -33,6 +40,9 @@ public final class SyncStateView {
     private final byte[] stateRoot;
     private final BytecodeCache bytecodeCache;
     private final AccessTracker accessTracker;
+
+    private final Map<Address, AccountState> accountCache = new ConcurrentHashMap<>();
+    private final Map<SlotKey, UInt256> storageCache = new ConcurrentHashMap<>();
 
     public SyncStateView(
             SnapStateOracle oracle,
@@ -47,8 +57,12 @@ public final class SyncStateView {
 
     public AccountState account(Address address) {
         if (accessTracker != null) accessTracker.recordAccount(address);
+        AccountState cached = accountCache.get(address);
+        if (cached != null) return cached;
         try {
-            return oracle.fetchAccount(stateRoot, address).join();
+            AccountState fetched = oracle.fetchAccount(stateRoot, address).join();
+            accountCache.put(address, fetched);
+            return fetched;
         } catch (CompletionException ce) {
             unwrap(ce);
             throw ce;
@@ -57,9 +71,14 @@ public final class SyncStateView {
 
     public UInt256 storage(Address address, UInt256 slot) {
         if (accessTracker != null) accessTracker.recordStorage(address, slot.toUnsignedBigInteger());
+        SlotKey key = new SlotKey(address, slot);
+        UInt256 cached = storageCache.get(key);
+        if (cached != null) return cached;
         try {
             BigInteger v = oracle.fetchStorage(stateRoot, address, slot.toUnsignedBigInteger()).join();
-            return UInt256.valueOf(v);
+            UInt256 value = UInt256.valueOf(v);
+            storageCache.put(key, value);
+            return value;
         } catch (CompletionException ce) {
             unwrap(ce);
             throw ce;
@@ -80,8 +99,33 @@ public final class SyncStateView {
         });
     }
 
+    /** Phase 2 helpers — let the prefetch loop pre-populate values from a parallel batch fetch. */
+
+    public boolean hasAccount(Address address) {
+        return accountCache.containsKey(address);
+    }
+
+    public boolean hasStorage(Address address, UInt256 slot) {
+        return storageCache.containsKey(new SlotKey(address, slot));
+    }
+
+    public void putAccount(Address address, AccountState value) {
+        accountCache.put(address, value);
+    }
+
+    public void putStorage(Address address, UInt256 slot, UInt256 value) {
+        storageCache.put(new SlotKey(address, slot), value);
+    }
+
     private static void unwrap(CompletionException ce) {
         if (ce.getCause() instanceof EvmExecutionException eee) throw eee;
         if (ce.getCause() instanceof RuntimeException re) throw re;
+    }
+
+    private record SlotKey(Address address, UInt256 slot) {
+        SlotKey {
+            Objects.requireNonNull(address);
+            Objects.requireNonNull(slot);
+        }
     }
 }
