@@ -24,35 +24,53 @@ The benchmark corpus (per the plan):
 - ENS Public Resolver `addr()`
 - ENS Public Resolver `resolve()` (multi-record path)
 
-## Approach (decision)
+## Approach (decision — revised in commit 3)
 
 The Phase 0 plan flagged two options: sentinel-return and trace-based
-access tracking. `docs/decisions.md` already recorded the Phase 2
-recommendation as **trace-based** — that decision stands.
+access tracking. The branch shipped trace-based first (commits 1–2) and
+then switched to **sentinel-return** in commit 3, after Copilot's review
+on PR #14 surfaced that trace-based's "parallel prefetch wave" was
+largely a no-op against a synchronously-caching `SyncStateView`.
 
-Rationale, re-stated:
+The two approaches:
 
-- Sentinel-return runs the EVM with a placeholder value for every miss
-  and collects the access list. Data-dependent branches can take a
-  *different* path with the placeholder, so the access list captures
-  slots the real run would never touch — and misses ones it does. The
-  loop converges, but slowly and with wasted bandwidth.
-- Trace-based uses Besu's `OperationTracer.tracePreExecution` hook to
-  observe SLOAD's stack arguments (account from `getRecipientAddress()`,
-  slot from `getStackItem(0)`) and EXTCODECOPY / EXTCODEHASH / EXTCODESIZE
-  for the target accounts whose bytecode the EVM may need — without
-  changing what the EVM reads. (`getRecipientAddress()` returns the
-  storage-owning account in Besu's frame model: the called contract for
-  CALL, the caller for DELEGATECALL.)
-  Access list is exact for the path the EVM would have taken. No false
-  positives or negatives.
+- **Trace-based** (commits 1–2 of this branch): use Besu's
+  `OperationTracer.tracePreExecution` to observe SLOAD's stack arguments
+  (account from `getRecipientAddress()`, slot from `getStackItem(0)`) and
+  EXTCODECOPY / EXTCODEHASH / EXTCODESIZE for target accounts. Access
+  list is exact for the EVM's real execution path. Iteration 0 blocks on
+  every miss serially.
+- **Sentinel-return** (commit 3, current): run the EVM with sentinel
+  zeros for cache misses. The tracer still records the access list, but
+  no oracle calls are made during iteration 0. Result is bogus and
+  discarded. Parallel-fetch the recorded misses, then re-run with sentinel
+  mode off to get a real result.
 
-Trade-off: the trace-based approach still observes behaviour from a *first*
-EVM run that necessarily misses on every fetch (since the cache is empty).
-That first run is slow — every miss is a blocking SyncStateView fetch.
-Subsequent runs use the populated cache and fly. The convergence loop
-exists because data-dependent branches in the real path may issue new
-fetches once earlier values are populated; we re-run to catch those.
+The fundamental advantage of sentinel-return: iteration 0 produces a full
+access list at memory speed (0 wire RTTs), so the parallel batch fetch
+that follows it actually saves round trips. Trace-based's iteration 0
+already paid for those RTTs serially.
+
+The fundamental cost: iteration 0's wrong values can cause the EVM to
+take a different path than the real run would. This means:
+- The recorded access list may include slots the real path doesn't read
+  (over-fetching — wasteful but harmless).
+- The recorded access list may miss slots the real path does read (the
+  real iteration 1 then blocks serially on them).
+
+In practice both happen rarely for view-style calls. ERC-20 `balanceOf`
+and ENS `addr` both produce identical access lists under sentinel and
+real runs because the access pattern is purely a function of the inputs.
+Where divergence does happen, the convergence loop catches it: iteration
+1 records the real-path access set, the loop checks for new misses, and
+re-runs iteration 2 if needed.
+
+Special case for the *target contract*: sentinel mode for the target's
+account record means its codeHash comes back as `keccak256("")` and the
+EVM finds no bytecode to execute, defeating the iteration. The executor
+synchronously pre-populates the target's account and bytecode before
+iteration 0 starts. Two RTTs upfront, but they would have been paid
+during iteration 0 in any other design.
 
 ## Wire-up
 
@@ -92,60 +110,69 @@ access list; subsequent runs use the parallel-batched cache."
   reaches into the same package; that coupling is the cost of running the
   same EVM-driving code twice with shared state.
 
-## Honesty about latency
+## Latency profile
 
-The trace-based design's win was always nuanced. Worth being explicit so
-future readers don't over-promise:
+After commit 3 (sentinel-return), the convergence loop's structure is:
 
-- **Iteration 0 is fully serial.** Every cache miss blocks on a synchronous
-  `SyncStateView.account()` / `storage()` call, which `join()`s the
-  oracle's per-call retry path. There is no parallelism in iteration 0.
-- **The "parallel prefetch wave" between iterations is largely a no-op
-  for data-independent contracts.** By the time the wave runs, iteration
-  N's synchronous reads have already populated the SyncStateView cache
-  for every successfully-executed access. The wave's `view.hasAccount(a)
-  ? skip : fetch` predicate skips almost everything.
-- **Where the wave actually helps:** iterations N+1 onwards that take a
-  *different* data-dependent path than iteration N — the cache is shared
-  but the access set changed. Rare in practice for the Phase 2 corpus
-  (ERC-20 balances, ENS resolver lookups), more common in contracts with
-  branching on storage values.
-- **The convergence loop's primary value is correctness, not speed.**
-  Iteration 1 verifies the access set is stable, which is the trust
-  property — without it we wouldn't know if data-dependent branches
-  matter. The latency saved relative to `DefaultEvmExecutor` alone is
-  whatever round trips iteration N+1's parallel fetches saved over the
-  serial reads they replace, which is `0` when N+1's accesses are a
-  subset of N's.
+| Step | Mode | Network round trips |
+|------|------|---------------------|
+| Pre-prime target | Block | 2 RTT (target account + bytecode) |
+| Iteration 0 | Sentinel | 0 RTT (records access list at memory speed) |
+| Parallel batch fetch | — | 1 RTT (covers all of iter 0's recorded misses) |
+| Iteration 1 | Block-on-miss | 0 RTT in the common case (everything is cached) |
+| If unstable: iter 2+ | Block-on-miss | 1 RTT per truly data-dependent miss |
 
-A genuine end-to-end latency win requires a different design — sentinel-
-return for iteration 0 (run with placeholders, get the access list
-without blocking on each miss, then parallel-fetch and run for real).
-That's deferred to a future phase. The current code ships the structural
-prerequisites: tracer hooks, convergence-loop scaffolding, per-call cache.
-A sentinel-return mode is additive on top.
+For the canonical ERC-20 `balanceOf` (storage at `keccak(holder . slot)`):
+~3 RTTs total — 2 for target prime, 1 for the parallel batch covering the
+balance slot. Roughly half of the trace-based predecessor's ~5 RTTs.
 
-The Phase 2 acceptance criteria (`≤3 iterations, p95 < 2s`) are still
-achievable with the current design — they're statements about iteration
-counts and total latency, not about parallel-fetch ratios. Whether the
-current design hits the p95 target is something we'll only know once
-the benchmark runs against mainnet.
+For a multi-balance call (e.g., reading several token balances of the
+same holder via one contract): the saving scales linearly. N independent
+SLOADs go from `N · RTT` to `1 · RTT` after the prime.
+
+For chained data-dependent reads (proxy slot → impl bytecode → balance
+slot): sentinel-return doesn't help much because each chain link blocks
+on its own RTT in iteration 1. The win in proxy patterns comes mostly
+from the parallel batch covering the impl slot + same-account storage
+slots together.
+
+## Trade-offs we accepted
+
+- **Sentinel iteration 0's result is wrong by construction.** The
+  convergence loop guarantees it never leaks — the caller only sees the
+  iteration-1+ result that ran with real values. There's a unit test for
+  this exact scenario (`sentinelIteration0RevertDoesNotSurface`).
+- **Sentinel iteration 0 may revert.** Bytecode that does
+  `require(balance > 0)` will revert with a sentinel zero. The executor
+  catches the revert during sentinel iteration only and continues with
+  whatever access list was recorded up to that point. Iteration 1 with
+  real values either succeeds or surfaces the genuine revert.
+- **Two extra RTTs upfront** for the target's account + bytecode. Same
+  cost the trace-based design paid in iteration 0; just paid earlier.
+- **Doesn't help fully chained access patterns.** A proxy that calls into
+  another contract that calls into another contract still needs N RTTs
+  in iteration 1. Sentinel-return saves on parallel-discoverable
+  accesses, not on dependency-chained ones. Documented because future
+  contributors might over-attribute latency wins.
 
 ## What this branch ships
 
-- Commit 1 (`bf09dcd`): design doc + `PrefetchingTracer` + `PrefetchingEvmExecutor`.
-  Tracer observes SLOAD / EXTCODE* on every opcode; executor drives the
-  convergence loop; fixture-oracle unit tests prove the loop converges in
-  2 iterations on simple cases and respects the iteration cap.
-- Commit 2 (this one): benchmark scaffolding —
+- Commit 1 (`bf09dcd`): tracer + executor convergence loop scaffolding +
+  unit tests. Originally trace-based.
+- Commit 2 (`3bea3fd`): benchmark scaffolding —
   `MainnetPrefetchBenchmarkIT` measures latency and iteration counts for
   the corpus, `docs/prefetch-benchmarks.md` is the artifact callers paste
   numbers into. Same env-gating as Phase 1's `MainnetCallViewIT`; both
-  ITs share the missing `connectToMainnetPeer()` helper. Originally
-  drafted as "wire-level batching in `SnapBackedStateOracle`", but tracing
-  through the existing prefetcher logic showed the parallel-fetch path
-  is already in place — the next real win comes from measuring against
-  mainnet, not from condensing N parallel wire requests into 1.
+  ITs share the missing `connectToMainnetPeer()` helper.
+- Commit 3 (current): switched to sentinel-return after PR #14 review
+  identified that the trace-based parallel-fetch wave was largely a
+  no-op against `SyncStateView`'s synchronous cache. `SyncStateView` got
+  a `setSentinelOnMiss(boolean)` mode; `PrefetchingEvmExecutor` toggles
+  it on for iteration 0 and off thereafter, with a synchronous prime
+  step for the target contract beforehand. Three new unit tests pin
+  down the new semantics: multi-SLOAD parallel batch, sentinel-revert
+  recovery, and direct-vs-prefetched correctness parity across several
+  bytecode shapes.
 
 ## Deliberately not in this commit
 
@@ -156,15 +183,14 @@ the benchmark runs against mainnet.
   trips, which probably doesn't move p95 latency much (the peer
   pipelines well), but it does reduce peer load. Defer until benchmark
   numbers say it matters.
-- **Bytecode prefetching as a separate wave.** Tried it in an earlier
-  draft of commit 2 and reverted: `SyncStateView.bytecode()` already
-  populates the shared `BytecodeCache` synchronously during the run that
-  records the access. A separate "fetch new accounts' bytecode" wave
-  between iterations finds everything already cached. No latency win.
-- **Sentinel-return mode.** The plan flagged it as an alternative; the
-  trace-based design we shipped in commit 1 is the choice. Revisiting
-  would require pulling apart the convergence-loop assumptions and isn't
-  motivated until the benchmark numbers say trace-based isn't fast enough.
+- **Bytecode prefetching as a separate wave.** Tried it earlier and
+  reverted: bytecode is fetched synchronously during the run that
+  records its access, so a separate wave finds everything already
+  cached. (Bytecode for *non-target* accounts under sentinel mode
+  does miss in iter 0; iter 1 fetches it serially. Could be batched
+  with the iter-0-discovered accounts in a future refinement.)
+- **Sentinel mode for the target contract.** Pre-priming is intentional;
+  see "Special case for the target contract" in the Approach section.
 
 ## Out of scope
 

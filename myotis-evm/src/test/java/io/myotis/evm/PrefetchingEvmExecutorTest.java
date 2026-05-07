@@ -162,6 +162,124 @@ class PrefetchingEvmExecutorTest {
         }
     }
 
+    // ---- Sentinel-mode-specific tests --------------------------------------
+
+    /**
+     * Three independent SLOADs whose slot values are all non-zero. With
+     * trace-based execution this used to require N=3 serial network round
+     * trips in iteration 0; with sentinel-return iteration 0 records all
+     * three at memory speed, the parallel batch fetch covers them in one
+     * round trip, and iteration 1 returns the real value of slot 0.
+     *
+     * <p>The fixture oracle is synchronous, so we can't time the win — but we
+     * can verify that the convergence count is still 2 (not more, despite
+     * the multi-slot access set) and that the returned value is correct.
+     */
+    @Test
+    void multipleSloadsConvergeInTwoIterationsWithSentinelMode() throws Exception {
+        // PUSH1 0; SLOAD; PUSH1 1; SLOAD; PUSH1 2; SLOAD; POP; POP;
+        // PUSH1 0; MSTORE; PUSH1 32; PUSH1 0; RETURN
+        byte[] bytecode = HexFormat.of().parseHex(
+                "60005460015460025450506000526020600 0f3".replace(" ", ""));
+        var oracle = FixtureSnapStateOracle.builder()
+                .account(new AccountState(CONTRACT, 0L, BigInteger.ZERO,
+                        FixtureSnapStateOracle.codeHashOf(bytecode)))
+                .bytecode(bytecode)
+                .storage(CONTRACT, BigInteger.ZERO, BigInteger.TEN)
+                .storage(CONTRACT, BigInteger.ONE, BigInteger.valueOf(20))
+                .storage(CONTRACT, BigInteger.TWO, BigInteger.valueOf(30))
+                .build();
+        var tracker = new ConvergenceTracker();
+        var executor = new PrefetchingEvmExecutor(new DefaultEvmExecutor(oracle),
+                PrefetchingEvmExecutor.DEFAULT_ITERATION_CAP, tracker);
+
+        byte[] result = executor.callView(CONTRACT, balanceOfCalldata(), ctx()).get();
+        assertEquals(BigInteger.TEN, AbiDecoder.uint256(result, 0));
+        assertEquals(2, tracker.snapshot().get(0),
+                "three independent SLOADs should still converge in 2 iterations");
+    }
+
+    /**
+     * Sentinel mode causes iteration 0 to see {@code SLOAD(0) == 0}, which
+     * trips an explicit {@code REVERT} in the bytecode. The convergence loop
+     * must absorb that exception and run iteration 1 with real values
+     * (slot 0 = 42), producing a successful return.
+     *
+     * <p>This is the test that proves "iteration 0's wrong values don't leak
+     * to the caller" — without the catch in {@link PrefetchingEvmExecutor},
+     * the first iteration's revert would propagate as the call's failure.
+     */
+    @Test
+    void sentinelIteration0RevertDoesNotSurface() throws Exception {
+        // Pseudocode:
+        //   v = sload(0)
+        //   if (v == 0) revert
+        //   else return v
+        //
+        // 60 00 SLOAD DUP1 ISZERO PUSH1 0x10 JUMPI
+        // PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+        // JUMPDEST PUSH1 0 PUSH1 0 REVERT
+        byte[] bytecode = HexFormat.of().parseHex(
+                "6000" + "54" + "80" + "15" + "6010" + "57" +
+                "6000" + "52" + "6020" + "6000" + "f3" +
+                "5b" + "6000" + "6000" + "fd");
+        BigInteger realBalance = BigInteger.valueOf(42);
+        var oracle = FixtureSnapStateOracle.builder()
+                .account(new AccountState(CONTRACT, 0L, BigInteger.ZERO,
+                        FixtureSnapStateOracle.codeHashOf(bytecode)))
+                .bytecode(bytecode)
+                .storage(CONTRACT, BigInteger.ZERO, realBalance)
+                .build();
+        var tracker = new ConvergenceTracker();
+        var executor = new PrefetchingEvmExecutor(new DefaultEvmExecutor(oracle),
+                PrefetchingEvmExecutor.DEFAULT_ITERATION_CAP, tracker);
+
+        byte[] result = executor.callView(CONTRACT, balanceOfCalldata(), ctx()).get();
+        // Without sentinel-revert recovery the call would fail with Reverted.
+        assertEquals(realBalance, AbiDecoder.uint256(result, 0));
+        assertEquals(2, tracker.snapshot().get(0));
+    }
+
+    /**
+     * Last line of defense: regardless of execution path through the prefetch
+     * loop, the result of {@code PrefetchingEvmExecutor.callView} must be
+     * byte-for-byte identical to {@code DefaultEvmExecutor.callView}. The
+     * sentinel run produces wrong intermediate state, but the convergence
+     * loop must always end up returning the real-iteration result.
+     */
+    @Test
+    void prefetchedAndDirectAgreeAcrossManyCallShapes() throws Exception {
+        record Case(byte[] bytecode, java.util.List<long[]> storage) {}
+        var cases = java.util.List.of(
+                new Case(SLOAD_SLOT_0, java.util.List.of(new long[]{0, 100})),
+                new Case(SLOAD_TWO_SLOTS, java.util.List.of(
+                        new long[]{0, 7}, new long[]{1, 13})),
+                new Case(HexFormat.of().parseHex(
+                        "60005460015460025450506000526020600 0f3".replace(" ", "")),
+                        java.util.List.of(
+                                new long[]{0, 42}, new long[]{1, 99}, new long[]{2, 256})));
+
+        for (Case c : cases) {
+            var b = FixtureSnapStateOracle.builder()
+                    .account(new AccountState(CONTRACT, 0L, BigInteger.ZERO,
+                            FixtureSnapStateOracle.codeHashOf(c.bytecode())))
+                    .bytecode(c.bytecode());
+            for (long[] s : c.storage()) {
+                b.storage(CONTRACT, BigInteger.valueOf(s[0]), BigInteger.valueOf(s[1]));
+            }
+            var oracle = b.build();
+
+            byte[] direct = new DefaultEvmExecutor(oracle)
+                    .callView(CONTRACT, balanceOfCalldata(), ctx()).get();
+            byte[] prefetched = new PrefetchingEvmExecutor(new DefaultEvmExecutor(oracle))
+                    .callView(CONTRACT, balanceOfCalldata(), ctx()).get();
+            assertEquals(
+                    HexFormat.of().formatHex(direct),
+                    HexFormat.of().formatHex(prefetched),
+                    "mismatch for bytecode " + HexFormat.of().formatHex(c.bytecode()));
+        }
+    }
+
     // ---- Helpers -----------------------------------------------------------
 
     private static FixtureSnapStateOracle.Builder fixtureOracle(byte[] bytecode) {

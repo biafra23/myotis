@@ -1,7 +1,10 @@
 package io.myotis.evm.world;
 
 import io.myotis.evm.Address;
+import io.myotis.evm.CryptoProviders;
 import io.myotis.evm.EvmExecutionException;
+import org.apache.tuweni.bytes.Bytes;
+import org.apache.tuweni.crypto.Hash;
 import org.apache.tuweni.units.bigints.UInt256;
 
 import java.math.BigInteger;
@@ -16,16 +19,20 @@ import java.util.concurrent.CompletionException;
  * <p>Besu's EVM is synchronous: the {@code runToHalt} loop calls
  * {@code WorldUpdater#get} and {@code Account#getStorageValue} expecting
  * values returned directly. Our oracle is async by nature (a SNAP fetch is a
- * network round trip). The bridge is one of two strategies:
+ * network round trip). The bridge has three modes:
  * <ul>
- *   <li>Phase 0: the fixture oracle returns already-completed futures, so
- *       {@code join()} is effectively free.
- *   <li>Phase 1: a single synchronous round trip per miss is acceptable but
- *       slow. {@code join()} blocks the calling thread for the duration of the
- *       fetch.
- *   <li>Phase 2: the prefetch loop populates the in-view cache before the EVM
- *       reaches each miss, making the {@code join()} a no-op in the common
- *       case.
+ *   <li><strong>Cache-only:</strong> read from the in-view cache. Misses
+ *       fall through to one of the two paths below.
+ *   <li><strong>Block-on-miss</strong> (default): on a cache miss, call the
+ *       oracle and {@code join()} the future. Slow but correct. This is
+ *       what {@link io.myotis.evm.DefaultEvmExecutor} uses.
+ *   <li><strong>Sentinel-on-miss</strong> (Phase 2 prefetch loop, iter 0):
+ *       on a cache miss, return a sentinel value (zero / empty) without
+ *       blocking. The miss is recorded in the {@link AccessTracker} and the
+ *       sentinel is <em>not</em> cached — so a subsequent run with the flag
+ *       cleared will hit the oracle. The convergence loop runs the EVM with
+ *       this flag set, collects the access list, parallel-fetches the misses,
+ *       and re-runs with the flag cleared to get a real result.
  * </ul>
  *
  * <p>The view caches {@code (address) → AccountState} and
@@ -36,6 +43,12 @@ import java.util.concurrent.CompletionException;
  */
 public final class SyncStateView {
 
+    private static final byte[] EMPTY_CODE_HASH;
+    static {
+        CryptoProviders.ensureRegistered();
+        EMPTY_CODE_HASH = Hash.keccak256(Bytes.EMPTY).toArrayUnsafe();
+    }
+
     private final SnapStateOracle oracle;
     private final byte[] stateRoot;
     private final BytecodeCache bytecodeCache;
@@ -43,6 +56,13 @@ public final class SyncStateView {
 
     private final Map<Address, AccountState> accountCache = new ConcurrentHashMap<>();
     private final Map<SlotKey, UInt256> storageCache = new ConcurrentHashMap<>();
+
+    /**
+     * When true, cache misses return zero-shaped sentinel values without
+     * calling the oracle. The miss is recorded in {@code accessTracker};
+     * the sentinel is not cached. See class Javadoc.
+     */
+    private volatile boolean sentinelOnMiss = false;
 
     public SyncStateView(
             SnapStateOracle oracle,
@@ -55,10 +75,24 @@ public final class SyncStateView {
         this.accessTracker = accessTracker;
     }
 
+    /** Toggle sentinel-on-miss mode for the next run. See class Javadoc. */
+    public void setSentinelOnMiss(boolean v) {
+        this.sentinelOnMiss = v;
+    }
+
+    public boolean isSentinelOnMiss() {
+        return sentinelOnMiss;
+    }
+
     public AccountState account(Address address) {
         if (accessTracker != null) accessTracker.recordAccount(address);
         AccountState cached = accountCache.get(address);
         if (cached != null) return cached;
+        if (sentinelOnMiss) {
+            // Empty default; intentionally NOT cached so a subsequent run
+            // with the flag cleared will fetch the real value.
+            return new AccountState(address, 0L, BigInteger.ZERO, EMPTY_CODE_HASH);
+        }
         try {
             AccountState fetched = oracle.fetchAccount(stateRoot, address).join();
             accountCache.put(address, fetched);
@@ -74,6 +108,13 @@ public final class SyncStateView {
         SlotKey key = new SlotKey(address, slot);
         UInt256 cached = storageCache.get(key);
         if (cached != null) return cached;
+        if (sentinelOnMiss) {
+            // Zero is a valid storage value, so this is indistinguishable
+            // from a real zero — but the access is recorded in the tracker
+            // either way, and the convergence loop will re-run with the
+            // flag cleared to confirm.
+            return UInt256.ZERO;
+        }
         try {
             BigInteger v = oracle.fetchStorage(stateRoot, address, slot.toUnsignedBigInteger()).join();
             UInt256 value = UInt256.valueOf(v);
@@ -87,16 +128,26 @@ public final class SyncStateView {
 
     public byte[] bytecode(byte[] codeHash) {
         if (accessTracker != null) accessTracker.recordBytecode(codeHash);
-        return bytecodeCache.get(codeHash).orElseGet(() -> {
-            try {
-                byte[] code = oracle.fetchBytecode(codeHash).join();
-                bytecodeCache.put(codeHash, code);
-                return code;
-            } catch (CompletionException ce) {
-                unwrap(ce);
-                throw ce;
-            }
-        });
+        var cached = bytecodeCache.get(codeHash);
+        if (cached.isPresent()) return cached.get();
+        if (sentinelOnMiss) {
+            // Empty bytecode means "no code" to the EVM — a CALL to such an
+            // account returns immediately with no execution, so the iter-0
+            // sentinel run will short-circuit any nested calls. That's
+            // expected: the access list is still recorded, and iter 1
+            // re-enters with real bytecode populated. The PrefetchingEvmExecutor
+            // pre-populates the *target* contract's bytecode synchronously so
+            // iter 0's run reaches actual bytecode at the top level.
+            return new byte[0];
+        }
+        try {
+            byte[] code = oracle.fetchBytecode(codeHash).join();
+            bytecodeCache.put(codeHash, code);
+            return code;
+        } catch (CompletionException ce) {
+            unwrap(ce);
+            throw ce;
+        }
     }
 
     /** Phase 2 helpers — let the prefetch loop pre-populate values from a parallel batch fetch. */
