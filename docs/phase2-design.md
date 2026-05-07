@@ -38,9 +38,12 @@ Rationale, re-stated:
   slots the real run would never touch — and misses ones it does. The
   loop converges, but slowly and with wasted bandwidth.
 - Trace-based uses Besu's `OperationTracer.tracePreExecution` hook to
-  observe SLOAD's stack arguments (account from `getContractAddress()`,
-  slot from `getStackItem(0)`) and CODECOPY/EXTCODECOPY/EXTCODEHASH/
-  EXTCODESIZE for bytecode access — without changing what the EVM reads.
+  observe SLOAD's stack arguments (account from `getRecipientAddress()`,
+  slot from `getStackItem(0)`) and EXTCODECOPY / EXTCODEHASH / EXTCODESIZE
+  for the target accounts whose bytecode the EVM may need — without
+  changing what the EVM reads. (`getRecipientAddress()` returns the
+  storage-owning account in Besu's frame model: the called contract for
+  CALL, the caller for DELEGATECALL.)
   Access list is exact for the path the EVM would have taken. No false
   positives or negatives.
 
@@ -78,12 +81,55 @@ access list; subsequent runs use the parallel-batched cache."
 
 ## Open question (settled in commit 1)
 
-- `PrefetchingEvmExecutor` lives in `:myotis-evm` alongside
-  `DefaultEvmExecutor` (not as a Decorator wrapping a `DefaultEvmExecutor`
-  instance). Reasoning: the prefetch loop must drive the EVM directly to
-  reuse the same world updater across iterations and inspect the populated
-  state cache between runs. A wrapping decorator would have to expose the
-  internal cache state to coordinate, which leaks the abstraction.
+- `PrefetchingEvmExecutor` is a thin wrapper around a `DefaultEvmExecutor`
+  delegate (constructor: `new PrefetchingEvmExecutor(DefaultEvmExecutor)`),
+  not a sibling executor. The wrapper relies on `DefaultEvmExecutor`'s
+  package-private `runOnTracedView(...)` seam to share a single
+  `SyncStateView` cache across iterations, and on its package-private
+  config accessors (`oracle()`, `bytecodeCache()`, `executor()`) to inherit
+  the delegate's wiring. A pure decorator that only delegated `callView`
+  wouldn't have access to those internals, so the wrapper deliberately
+  reaches into the same package; that coupling is the cost of running the
+  same EVM-driving code twice with shared state.
+
+## Honesty about latency
+
+The trace-based design's win was always nuanced. Worth being explicit so
+future readers don't over-promise:
+
+- **Iteration 0 is fully serial.** Every cache miss blocks on a synchronous
+  `SyncStateView.account()` / `storage()` call, which `join()`s the
+  oracle's per-call retry path. There is no parallelism in iteration 0.
+- **The "parallel prefetch wave" between iterations is largely a no-op
+  for data-independent contracts.** By the time the wave runs, iteration
+  N's synchronous reads have already populated the SyncStateView cache
+  for every successfully-executed access. The wave's `view.hasAccount(a)
+  ? skip : fetch` predicate skips almost everything.
+- **Where the wave actually helps:** iterations N+1 onwards that take a
+  *different* data-dependent path than iteration N — the cache is shared
+  but the access set changed. Rare in practice for the Phase 2 corpus
+  (ERC-20 balances, ENS resolver lookups), more common in contracts with
+  branching on storage values.
+- **The convergence loop's primary value is correctness, not speed.**
+  Iteration 1 verifies the access set is stable, which is the trust
+  property — without it we wouldn't know if data-dependent branches
+  matter. The latency saved relative to `DefaultEvmExecutor` alone is
+  whatever round trips iteration N+1's parallel fetches saved over the
+  serial reads they replace, which is `0` when N+1's accesses are a
+  subset of N's.
+
+A genuine end-to-end latency win requires a different design — sentinel-
+return for iteration 0 (run with placeholders, get the access list
+without blocking on each miss, then parallel-fetch and run for real).
+That's deferred to a future phase. The current code ships the structural
+prerequisites: tracer hooks, convergence-loop scaffolding, per-call cache.
+A sentinel-return mode is additive on top.
+
+The Phase 2 acceptance criteria (`≤3 iterations, p95 < 2s`) are still
+achievable with the current design — they're statements about iteration
+counts and total latency, not about parallel-fetch ratios. Whether the
+current design hits the p95 target is something we'll only know once
+the benchmark runs against mainnet.
 
 ## What this branch ships
 

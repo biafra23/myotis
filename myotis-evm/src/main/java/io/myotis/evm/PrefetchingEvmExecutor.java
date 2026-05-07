@@ -25,8 +25,8 @@ import java.util.concurrent.Executor;
  *
  * <p>The loop runs the EVM repeatedly against a shared per-call
  * {@link SyncStateView} cache. Each iteration uses {@link PrefetchingTracer}
- * to record (account, slot) and codeHash accesses without changing what the
- * EVM reads. After the iteration:
+ * to record (account, slot) accesses without changing what the EVM reads.
+ * After the iteration:
  *
  * <ol>
  *   <li>Compute the set of accesses that <em>missed</em> the cache (the
@@ -46,14 +46,30 @@ import java.util.concurrent.Executor;
  * typically converge in 2–3 iterations because the access pattern is
  * data-independent past the first SLOAD.
  *
+ * <p><strong>Honesty about latency.</strong> Because {@link SyncStateView}
+ * caches synchronously during the run that records each access, the
+ * "parallel prefetch wave" that runs between iterations is largely a no-op
+ * for data-independent contracts: by the time it executes, the previous
+ * run already populated everything in the cache. The wave only earns its
+ * keep when iteration N+1 takes a different data-dependent path than N
+ * (the cache is shared but the access set changed). The convergence loop's
+ * primary value is therefore <em>verifying</em> stability, not reducing
+ * round-trips. A genuine latency win would require sentinel-return mode for
+ * iteration 0 — running the EVM with placeholder values to extract an
+ * access list without blocking on each miss — and is deferred to a future
+ * phase. See {@code docs/phase2-design.md} for the full discussion.
+ *
  * <p>Limitations:
  * <ul>
  *   <li>The loop currently re-runs the EVM from scratch each iteration
  *       (cheap because state is in memory). A future refinement could use
  *       Besu's frame-pause hooks to resume mid-execution.
  *   <li>Bytecode is fetched lazily by the existing {@code BytecodeCache}
- *       path; trace-recorded codeHashes that aren't yet cached are batched
- *       just like account/storage misses.
+ *       path; bytecode is shared with whatever {@link DefaultEvmExecutor}
+ *       does — there's no separate prefetch wave for it (an earlier draft
+ *       had one and it was reverted: the SyncStateView cache populates
+ *       bytecode synchronously during the same run that observes the
+ *       access, so a separate wave finds everything already cached).
  * </ul>
  */
 public final class PrefetchingEvmExecutor implements EvmExecutor {
@@ -192,6 +208,15 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
                     .get(30, java.util.concurrent.TimeUnit.SECONDS);
         } catch (Exception e) {
             log.debug("[prefetch] batch fetch timed out / failed: {}", e.getMessage());
+            // Cancel outstanding futures so background SNAP requests don't
+            // continue racing the next iteration's serial reads. We can't
+            // interrupt the underlying network IO (cancel(true) doesn't help
+            // most JDK / SnapPeer impls), but cancel(false) at least marks
+            // the future complete-exceptionally so any thenApply chains
+            // short-circuit and don't pollute the cache asynchronously.
+            for (CompletableFuture<?> f : futures) {
+                if (!f.isDone()) f.cancel(false);
+            }
         }
     }
 

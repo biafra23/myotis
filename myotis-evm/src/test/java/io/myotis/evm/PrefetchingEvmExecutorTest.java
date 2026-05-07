@@ -134,11 +134,11 @@ class PrefetchingEvmExecutorTest {
         var direct = new DefaultEvmExecutor(oracle);
         var prefetched = new PrefetchingEvmExecutor(new DefaultEvmExecutor(oracle));
 
-        byte[] direct_result = direct.callView(CONTRACT, balanceOfCalldata(), ctx()).get();
-        byte[] prefetched_result = prefetched.callView(CONTRACT, balanceOfCalldata(), ctx()).get();
+        byte[] directResult = direct.callView(CONTRACT, balanceOfCalldata(), ctx()).get();
+        byte[] prefetchedResult = prefetched.callView(CONTRACT, balanceOfCalldata(), ctx()).get();
         assertEquals(
-                HexFormat.of().formatHex(direct_result),
-                HexFormat.of().formatHex(prefetched_result));
+                HexFormat.of().formatHex(directResult),
+                HexFormat.of().formatHex(prefetchedResult));
     }
 
     @Test

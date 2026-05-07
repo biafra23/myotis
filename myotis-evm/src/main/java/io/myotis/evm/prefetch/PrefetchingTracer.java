@@ -12,10 +12,18 @@ import org.hyperledger.besu.evm.tracing.OperationTracer;
  *
  * <p>Used by {@link io.myotis.evm.PrefetchingEvmExecutor} to drive the
  * convergence loop: run the EVM once with this tracer attached, collect the
- * (account, slot) and codeHash misses, batch-fetch them in parallel, then
- * re-run. The plan calls this the "trace-based" approach, chosen over
- * sentinel-return because it observes the real path the EVM would take
- * rather than a placeholder-shaped one.
+ * (account, slot) misses, batch-fetch them in parallel, then re-run. The
+ * plan calls this the "trace-based" approach, chosen over sentinel-return
+ * because it observes the real path the EVM would take rather than a
+ * placeholder-shaped one.
+ *
+ * <p>Bytecode access is intentionally <em>not</em> recorded here: the
+ * {@code SyncStateView}'s {@link io.myotis.evm.world.BytecodeCache} hits the
+ * same code path whether the bytecode is needed during this iteration's
+ * synchronous run or pre-fetched between iterations, and the prefetch
+ * doesn't avoid any round trips. {@link io.myotis.evm.world.AccessTracker}
+ * still exposes a {@code recordBytecode}/{@code codeHashes} surface so a
+ * future phase can opt in if a sentinel-return iteration-0 mode lands.
  *
  * <p>Hook points (Yellow Paper opcode numbers):
  * <ul>

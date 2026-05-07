@@ -180,6 +180,10 @@ class MainnetPrefetchBenchmarkIT {
 
     private static byte[] parseHex32(String hex) {
         String s = hex.startsWith("0x") || hex.startsWith("0X") ? hex.substring(2) : hex;
+        if (s.length() != 64) {
+            throw new IllegalArgumentException(
+                    "expected 32-byte hex (64 chars), got " + s.length() + ": " + hex);
+        }
         return HexFormat.of().parseHex(s);
     }
 
