@@ -3,8 +3,11 @@ package io.myotis.ens.integration;
 import io.myotis.ens.EnsResolver;
 import io.myotis.evm.Address;
 import io.myotis.evm.BlockContext;
+import io.myotis.evm.CcipReadEvmExecutor;
 import io.myotis.evm.DefaultEvmExecutor;
 import io.myotis.evm.PrefetchingEvmExecutor;
+import io.myotis.evm.ccipread.CcipGateway;
+import io.myotis.evm.ccipread.CcipReadHandler;
 import io.myotis.evm.world.BytecodeCache;
 import io.myotis.evm.world.SnapBackedStateOracle;
 import io.myotis.evm.world.SnapPeer;
@@ -12,9 +15,17 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
 import java.math.BigInteger;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -84,6 +95,41 @@ class MainnetEnsResolutionIT {
         assertEquals("vitalik.eth", name.get());
     }
 
+    /**
+     * CCIP-Read corpus: names whose resolvers delegate to off-chain
+     * gateways via ERC-3668. These work only when the executor is
+     * wrapped in {@link CcipReadEvmExecutor} and a working
+     * {@link CcipGateway} is plumbed in.
+     *
+     * <p>Specific addresses aren't pinned because gateway-served records
+     * can change without an on-chain transaction. The smoke test just
+     * verifies the names resolve to <em>some</em> non-empty address
+     * within the timeout.
+     */
+    private static final List<String> CCIP_READ_CORPUS = List.of(
+            // Coinbase IDs (resolver delegates to a Coinbase gateway).
+            "ens.cb.id",
+            // Uniswap names (resolver uses Uniswap's CCIP-Read gateway).
+            "ens.uni.eth",
+            // Base subnames (resolver uses Base's gateway).
+            "ens.base.eth");
+
+    @Test
+    void ccipReadNamesResolve() throws Exception {
+        EnsResolver resolver = mainnetResolver();
+        BlockContext ctx = mainnetBlockContext();
+
+        for (String name : CCIP_READ_CORPUS) {
+            Optional<Address> resolved = resolver.resolveAddress(name, ctx)
+                    .get(120, TimeUnit.SECONDS);
+            assertTrue(resolved.isPresent(),
+                    "CCIP-Read resolution returned empty for " + name
+                            + " — gateway may have rotated, name unregistered, "
+                            + "or CCIP-Read flow is broken");
+            System.out.printf("[ens-it] %-24s -> %s%n", name, resolved.get().toHex());
+        }
+    }
+
     @Test
     void absentNameReturnsEmpty() throws Exception {
         EnsResolver resolver = mainnetResolver();
@@ -109,9 +155,47 @@ class MainnetEnsResolutionIT {
                     t.setDaemon(true);
                     return t;
                 }));
-        // Use the prefetcher — Phase 3 is a Phase-2 consumer.
-        var executor = new PrefetchingEvmExecutor(inner);
-        return new EnsResolver(executor);
+        // Stack: prefetch on the inside, CCIP-Read on the outside. Order
+        // matters — CCIP-Read needs to observe OffchainLookup reverts at
+        // the call boundary, which only the outer wrapper sees.
+        var prefetched = new PrefetchingEvmExecutor(inner);
+        var ccipReady = new CcipReadEvmExecutor(prefetched,
+                new CcipReadHandler(new JavaHttpCcipGateway()));
+        return new EnsResolver(ccipReady);
+    }
+
+    /**
+     * IT-only {@link CcipGateway} backed by {@code java.net.http.HttpClient}.
+     * The wallet's Android-side implementation will use Ktor per
+     * {@code CLAUDE.md}'s platform direction; this one is fine for the
+     * JVM integration test which only runs on developer/CI machines, not
+     * on Android.
+     */
+    private static final class JavaHttpCcipGateway implements CcipGateway {
+        private final HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .build();
+
+        @Override
+        public CompletableFuture<String> request(Method method, String url, String body) {
+            HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(url))
+                    .timeout(Duration.ofSeconds(15))
+                    .header("Accept", "application/json");
+            HttpRequest request = (method == Method.POST)
+                    ? builder.header("Content-Type", "application/json")
+                            .POST(HttpRequest.BodyPublishers.ofString(
+                                    body == null ? "" : body, StandardCharsets.UTF_8))
+                            .build()
+                    : builder.GET().build();
+            return client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                    .thenApply(response -> {
+                        if (response.statusCode() / 100 != 2) {
+                            throw new RuntimeException("gateway " + url
+                                    + " returned status " + response.statusCode());
+                        }
+                        return response.body();
+                    });
+        }
     }
 
     private static SnapPeer connectToMainnetPeer() {
