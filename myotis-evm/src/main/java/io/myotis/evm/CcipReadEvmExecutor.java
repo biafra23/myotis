@@ -35,6 +35,11 @@ import java.util.concurrent.CompletionException;
  *
  * <p>If a non-CCIP-Read revert escapes the wrapped executor, this class
  * passes it through unchanged.
+ *
+ * <p><strong>Async-by-contract.</strong> The handler chain is composed via
+ * {@link CompletableFuture#thenCompose} all the way down — no
+ * {@code join()}, no blocking on the EVM executor's thread pool. The
+ * gateway transport is free to use whatever async HTTP client it likes.
  */
 public final class CcipReadEvmExecutor implements EvmExecutor {
 
@@ -77,19 +82,15 @@ public final class CcipReadEvmExecutor implements EvmExecutor {
                                     + " exceeds cap " + CcipReadHandler.MAX_RECURSION_DEPTH))));
         }
 
-        byte[] gatewayResponse;
-        try {
-            gatewayResponse = handler.handle(lookup.get());
-        } catch (EvmExecutionException eee) {
-            return CompletableFuture.failedFuture(eee);
-        } catch (Exception e) {
-            return CompletableFuture.failedFuture(e);
-        }
-
-        byte[] callbackCalldata = encodeCallback(lookup.get(), gatewayResponse);
-        log.debug("[ccip] re-entering EVM (sender={}, depth={})",
-                lookup.get().sender(), depth + 1);
-        return tryWithCcipRead(lookup.get().sender(), callbackCalldata, ctx, depth + 1);
+        log.debug("[ccip] caught OffchainLookup; fetching from {} gateway(s)",
+                lookup.get().urls().size());
+        return handler.handle(lookup.get())
+                .thenCompose(gatewayResponse -> {
+                    byte[] callbackCalldata = encodeCallback(lookup.get(), gatewayResponse);
+                    log.debug("[ccip] re-entering EVM (sender={}, depth={})",
+                            lookup.get().sender(), depth + 1);
+                    return tryWithCcipRead(lookup.get().sender(), callbackCalldata, ctx, depth + 1);
+                });
     }
 
     /**

@@ -8,6 +8,7 @@ import io.myotis.evm.EvmExecutor;
 import io.myotis.evm.abi.AbiDecoder;
 import io.myotis.evm.abi.AbiEncoder;
 import io.myotis.evm.abi.FunctionSignature;
+import io.myotis.evm.ccipread.OffchainLookupRevert;
 import io.myotis.evm.ens.Namehash;
 
 import java.util.Optional;
@@ -32,8 +33,11 @@ import java.util.concurrent.CompletionException;
  * <p>For modern ENS surfaces (Coinbase IDs, Uniswap names, Base
  * subdomains, etc.) to work, callers must wrap the executor in
  * {@code io.myotis.evm.CcipReadEvmExecutor}. Without that, those names
- * surface as {@code Reverted} errors when the wildcard resolver issues
- * its OffchainLookup revert.
+ * surface as {@code Reverted} errors carrying the {@code OffchainLookup}
+ * selector — distinct from "name not found", so callers can tell whether
+ * they forgot to wrap vs. whether the name is genuinely unregistered.
+ * Generic UR reverts (ResolverNotFound and friends) still map to
+ * {@link Optional#empty()}.
  */
 public final class EnsResolver {
 
@@ -102,20 +106,27 @@ public final class EnsResolver {
         return executor.callView(universalResolver, resolveCalldata, blockContext)
                 .handle((result, error) -> {
                     if (error != null) {
-                        // The UR may revert with custom errors for unregistered
-                        // names. Treat all reverts the same for the wallet: no
-                        // answer. CCIP-Read reverts are caught upstream by the
-                        // CcipReadEvmExecutor decorator before they reach here,
-                        // so anything that escapes is a genuine "not resolvable."
                         Throwable cause = unwrap(error);
+                        // OffchainLookup reverts are rethrown so the caller's
+                        // CcipReadEvmExecutor wrapper can handle them. If the
+                        // caller forgot to wrap, the OffchainLookup surfaces
+                        // as a Reverted error rather than being silently
+                        // swallowed as "name not found."
+                        if (cause instanceof EvmExecutionException eee
+                                && eee.error() instanceof EvmExecutionError.Reverted r
+                                && OffchainLookupRevert.tryParse(r.data()).isPresent()) {
+                            throw new CompletionException(cause);
+                        }
+                        // Other reverts (UR's ResolverNotFound and friends) =
+                        // "no result." The wallet's intent is "look up this
+                        // name" and the reasonable answer for an unregistered
+                        // name is empty.
                         if (cause instanceof EvmExecutionException eee
                                 && eee.error() instanceof EvmExecutionError.Reverted) {
                             return Optional.<Address>empty();
                         }
-                        // Not a revert: bubble the real failure (oracle issue,
-                        // network problem, etc.). Wrap in a CompletionException
-                        // so the caller sees the original cause.
-                        if (cause instanceof RuntimeException re) throw re;
+                        // Not a revert at all: bubble the real failure
+                        // (oracle issue, network problem, etc.).
                         throw new CompletionException(cause);
                     }
                     return decodeUrAddrResult(result);

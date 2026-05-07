@@ -59,4 +59,28 @@ class DnsEncoderTest {
         assertThrows(IllegalArgumentException.class,
                 () -> DnsEncoder.encode(tooLong + ".eth"));
     }
+
+    @Test
+    void encodeAcceptsTrailingDotAsFqdnForm() {
+        // FQDN form ("vitalik.eth.") is equivalent to the bare form;
+        // the encoder strips the trailing dot before splitting.
+        assertEquals(
+                HexFormat.of().formatHex(DnsEncoder.encode("vitalik.eth")),
+                HexFormat.of().formatHex(DnsEncoder.encode("vitalik.eth.")));
+    }
+
+    @Test
+    void encodeRejectsEmptyMiddleLabel() {
+        // "a..b" would otherwise produce 01 61 00 01 62 00 — invalid because
+        // only the final root label may be zero-length.
+        assertThrows(IllegalArgumentException.class,
+                () -> DnsEncoder.encode("a..b"));
+    }
+
+    @Test
+    void encodeRejectsEmptyLeadingLabel() {
+        // ".eth" leads with an empty label, also invalid.
+        assertThrows(IllegalArgumentException.class,
+                () -> DnsEncoder.encode(".eth"));
+    }
 }

@@ -26,10 +26,11 @@ public interface CcipGateway {
      * Send a request to {@code url} and return the raw response body as a
      * UTF-8 string.
      *
-     * @param method  GET or POST. ERC-3668 says GET when the URL template
-     *                contains both {@code {sender}} and {@code {data}}
-     *                placeholders (so the request can fit in the URL),
-     *                POST otherwise.
+     * @param method  GET or POST. ERC-3668 §6.1: the wallet uses GET when
+     *                the URL template contains a {@code {data}} placeholder
+     *                (so the entire request fits in the URL), POST otherwise.
+     *                The {@code {sender}} placeholder is independent of the
+     *                routing decision — it can appear in either method's URL.
      * @param url     URL with {@code {sender}}/{@code {data}} placeholders
      *                already substituted.
      * @param body    For POST requests: the JSON body

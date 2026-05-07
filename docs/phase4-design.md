@@ -52,20 +52,43 @@ This mirrors the `SnapPeer` decoupling pattern in `:myotis-evm`:
 `:myotis-evm` doesn't depend on `:networking`; the wallet integration
 provides the bridge.
 
-### Wiring into `DefaultEvmExecutor.callView`
+### Wiring into the EVM call path
+
+CCIP-Read is wired in via a decorator, **not** baked into
+`DefaultEvmExecutor`. `CcipReadEvmExecutor` wraps any `EvmExecutor`
+(Default, Prefetching, etc.) and intercepts `OffchainLookup` reverts at
+the call boundary. Wallet stack:
+
+```java
+new CcipReadEvmExecutor(
+    new PrefetchingEvmExecutor(
+        new DefaultEvmExecutor(oracle)),
+    new CcipReadHandler(gateway))
+```
+
+The handler chain is fully async — no `.join()` anywhere — so the
+gateway transport's network IO never blocks the EVM executor's thread
+pool.
 
 ```
-DefaultEvmExecutor.callView(target, calldata, ctx)
-  result = runOnTracedView(...)         // existing path
-  catch EvmExecutionException(Reverted(data)):
-    parsed = OffchainLookupRevert.tryParse(data)
-    if parsed.isEmpty(): rethrow         // not CCIP-Read; bubble up
-    if depth >= MAX_RECURSION_DEPTH: rethrow CcipGatewayFailed
-    response = ccipGateway.request(...)  // (parsed.urls, parsed.callData, parsed.sender)
-    callback = parsed.callbackSelector || abi.encode(response, parsed.extraData)
-    // Re-enter against the original sender, depth+1
-    return callView(parsed.sender, callback, ctx, depth+1)
+CcipReadEvmExecutor.tryWithCcipRead(target, calldata, ctx, depth):
+  delegate.callView(target, calldata, ctx)
+    .exceptionallyCompose(error ->
+      lookup = OffchainLookupRevert.tryParse(reverteddata(error))
+      if lookup absent:    return failedFuture(error)        // not CCIP-Read
+      if depth >= MAX_RECURSION_DEPTH:
+                           return failedFuture(CcipGatewayFailed(...))
+      handler.handle(lookup)                                  // async
+        .thenCompose(response ->
+          callback = lookup.callbackSelector
+                  || abi.encode(response, lookup.extraData)
+          tryWithCcipRead(lookup.sender, callback, ctx, depth+1)))
 ```
+
+URLs are tried serially inside `handler.handle` (composed via
+`thenCompose` recursion), not in parallel — ERC-3668 wants the first
+listed URL to win when it can, and parallel fan-out would mask
+diagnostic information about specific gateway problems.
 
 The depth cap is plan-mandated at 1 — the spec allows nested
 OffchainLookup reverts, but no real resolver does it, and capping is a

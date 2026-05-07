@@ -31,7 +31,13 @@ public final class DnsEncoder {
      * Encode {@code name} into DNS wire format. Returns a single null byte
      * for the empty string (the root domain).
      *
-     * @throws IllegalArgumentException if any label exceeds 63 bytes.
+     * <p>Rejects names with empty labels — {@code "a..b"}, {@code "..eth"},
+     * etc. The trailing-dot form {@code "vitalik.eth."} (FQDN-style) is
+     * accepted by stripping the trailing dot, since it's a common convention
+     * and unambiguously equivalent to the bare form.
+     *
+     * @throws IllegalArgumentException if any label is empty (other than the
+     *         implicit root) or exceeds 63 bytes.
      */
     public static byte[] encode(String name) {
         if (name == null || name.isEmpty()) {
@@ -40,6 +46,16 @@ public final class DnsEncoder {
         // Lower-case for consistency with Namehash; ENSIP-1 normalisation
         // is a separate concern (UTS-46 / IDNA) tracked elsewhere.
         String lower = name.toLowerCase(java.util.Locale.ROOT);
+        // FQDN form ("vitalik.eth.") is accepted by stripping the trailing
+        // dot — semantically equivalent to the bare form, but the split
+        // would otherwise produce a spurious empty label and an invalid
+        // double-zero terminator on the wire.
+        if (lower.endsWith(".")) {
+            lower = lower.substring(0, lower.length() - 1);
+        }
+        if (lower.isEmpty()) {
+            return new byte[]{0x00};
+        }
         String[] labels = lower.split("\\.", -1);
 
         // Compute total size: each label is 1 byte length + N bytes of UTF-8,
@@ -47,10 +63,18 @@ public final class DnsEncoder {
         int total = 1; // terminator
         byte[][] encodedLabels = new byte[labels.length][];
         for (int i = 0; i < labels.length; i++) {
-            byte[] labelBytes = labels[i].getBytes(StandardCharsets.UTF_8);
+            String label = labels[i];
+            if (label.isEmpty()) {
+                // Per RFC 1035, only the final root label may be zero-length.
+                // Empty labels in the middle / start come from inputs like
+                // "a..b" or ".eth"; both are not valid DNS names.
+                throw new IllegalArgumentException(
+                        "DNS name contains an empty label: " + name);
+            }
+            byte[] labelBytes = label.getBytes(StandardCharsets.UTF_8);
             if (labelBytes.length > MAX_LABEL_LENGTH) {
                 throw new IllegalArgumentException(
-                        "DNS label exceeds " + MAX_LABEL_LENGTH + " bytes: " + labels[i]);
+                        "DNS label exceeds " + MAX_LABEL_LENGTH + " bytes: " + label);
             }
             encodedLabels[i] = labelBytes;
             total += 1 + labelBytes.length;

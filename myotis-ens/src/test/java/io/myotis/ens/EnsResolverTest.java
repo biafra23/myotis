@@ -88,6 +88,49 @@ class EnsResolverTest {
     }
 
     @Test
+    void resolveAddressOffchainLookupRevertIsRethrown() {
+        // The Universal Resolver's wildcard resolver may revert with an
+        // ERC-3668 OffchainLookup. When the caller hasn't wrapped the
+        // executor in CcipReadEvmExecutor, that revert must surface as a
+        // distinct error — not be swallowed as "name not found." This
+        // distinguishes "you forgot CCIP-Read wiring" from "the name
+        // genuinely doesn't resolve."
+        var mock = new MockExecutor();
+        // Build a minimal, valid OffchainLookup payload so
+        // OffchainLookupRevert.tryParse() recognises it.
+        byte[] offchainLookupPayload = io.myotis.evm.ccipread.OffchainLookupRevert.SELECTOR;
+        // The selector alone isn't a valid full payload, but we need a
+        // representative payload that the parser recognises. Build one via
+        // AbiEncoder so it round-trips:
+        byte[] body = AbiEncoder.encodeRaw(
+                AbiEncoder.address(io.myotis.evm.Address.ZERO),                  // sender
+                AbiEncoder.stringArray(java.util.List.of("test://gateway")),     // urls
+                AbiEncoder.bytes(new byte[0]),                                   // callData
+                new io.myotis.evm.abi.AbiValue(false, new byte[32]),             // callbackFunction
+                AbiEncoder.bytes(new byte[0]));                                  // extraData
+        byte[] full = new byte[4 + body.length];
+        System.arraycopy(offchainLookupPayload, 0, full, 0, 4);
+        System.arraycopy(body, 0, full, 4, body.length);
+
+        mock.revertOn(UR, callUrResolveAddr("ccip-read.eth"), full);
+
+        var resolver = new EnsResolver(mock, REGISTRY, UR);
+        try {
+            resolver.resolveAddress("ccip-read.eth", ctx()).get();
+            org.junit.jupiter.api.Assertions.fail(
+                    "OffchainLookup reverts must propagate so the caller learns "
+                            + "they need CcipReadEvmExecutor — not be swallowed as empty");
+        } catch (Exception e) {
+            Throwable cause = e instanceof java.util.concurrent.ExecutionException
+                    ? e.getCause() : e;
+            var eee = org.junit.jupiter.api.Assertions.assertInstanceOf(
+                    EvmExecutionException.class, cause);
+            org.junit.jupiter.api.Assertions.assertInstanceOf(
+                    EvmExecutionError.Reverted.class, eee.error());
+        }
+    }
+
+    @Test
     void resolveAddressShortResponseReturnsEmpty() throws Exception {
         // UR returned non-conforming bytes (less than the 64 head bytes
         // a (bytes, address) tuple needs). Treat as no answer.
