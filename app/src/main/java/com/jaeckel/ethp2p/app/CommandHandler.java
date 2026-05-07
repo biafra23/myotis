@@ -109,6 +109,7 @@ public class CommandHandler {
                 case "get-block"     -> handleGetBlock(jsonLine);
                 case "get-account"   -> handleGetAccount(jsonLine);
                 case "get-storage"   -> handleGetStorage(jsonLine);
+                case "resolve-ens"   -> handleResolveEns(jsonLine);
                 case "dial"          -> handleDial(jsonLine);
                 case "stop"          -> handleStop();
                 case "beacon-status" -> handleBeaconStatus();
@@ -917,6 +918,145 @@ public class CommandHandler {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
             return jsonError(msg);
+        }
+    }
+
+    /**
+     * Resolve {@code name → address} via ENSIP-1 + ENSIP-10 (Universal Resolver),
+     * with ERC-3668 CCIP-Read transparently handled for off-chain names
+     * (Coinbase IDs, Uniswap names, Base subdomains, …).
+     *
+     * <p>Builds the full executor stack on demand:
+     * <pre>
+     *   CcipReadEvmExecutor
+     *     └─ PrefetchingEvmExecutor
+     *         └─ DefaultEvmExecutor
+     *             └─ SnapBackedStateOracle
+     *                 └─ EthHandlerSnapPeer (over a snap-capable peer)
+     * </pre>
+     *
+     * <p>{@link BlockContext} fields come from a freshly-fetched header — the
+     * peer's chain head — rather than the beacon-finalized header. Peers prune
+     * state beyond ~128 blocks, so a 6-minute-old finalized root is usually
+     * stale; the chain-head root is recent enough to serve. Acceptable here
+     * because resolver contracts inspect block.timestamp / block.number for
+     * deadline-style guards, not for trust decisions, and the headers we read
+     * came from peers we already trust to serve snap data.
+     *
+     * <p>The CCIP-Read gateway transport is a tiny inline {@link CcipGateway}
+     * impl over {@code java.net.http.HttpClient}. That's JVM-only and so not
+     * suitable for the Android wallet — but {@code :app} is the daemon, not
+     * the Android consumer, and the daemon already runs on JVM 21. The
+     * Android module supplies a Ktor-backed {@link CcipGateway} per the
+     * {@code CLAUDE.md} platform direction.
+     */
+    private String handleResolveEns(String jsonLine) {
+        String name = extractString(jsonLine, "name");
+        try {
+            // 1. Pick a snap-capable peer.
+            List<com.jaeckel.ethp2p.networking.eth.EthHandler> snapPeers = connector.activeSnapHandlers();
+            if (snapPeers.isEmpty()) {
+                return jsonError("No active peer with snap/1 support");
+            }
+            com.jaeckel.ethp2p.networking.eth.EthHandler peer = snapPeers.get(0);
+
+            // 2. Fetch a fresh header (the peer's chain head) so we have a
+            // recent, peer-servable state root for snap requests.
+            long headBlock = connector.getChainHead().blockNumber();
+            if (headBlock <= 0) {
+                return jsonError("Chain head not yet known; wait for the eth handshake to complete");
+            }
+            List<BlockHeadersMessage.VerifiedHeader> headers =
+                connector.requestBlockHeaders(headBlock, 1).get(15, TimeUnit.SECONDS);
+            if (headers.isEmpty()) {
+                return jsonError("Peer returned no header for block " + headBlock);
+            }
+            BlockHeader header = headers.get(0).header();
+
+            // 3. Build the BlockContext from that header.
+            io.myotis.evm.BlockContext blockCtx = new io.myotis.evm.BlockContext(
+                header.stateRoot.toArrayUnsafe(),
+                header.number,
+                header.timestamp,
+                header.baseFeePerGas,
+                io.myotis.evm.Address.of(header.beneficiary.toArrayUnsafe()),
+                header.mixHashOrPrevRandao.toArrayUnsafe(),
+                java.math.BigInteger.valueOf(connector.getNetwork().networkId()),
+                header.gasLimit);
+
+            // 4. Build the executor stack on top of this peer.
+            com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer snapPeer =
+                new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(peer);
+            io.myotis.evm.world.SnapBackedStateOracle oracle =
+                new io.myotis.evm.world.SnapBackedStateOracle(
+                    () -> snapPeer, io.myotis.evm.world.BytecodeCache.inMemory());
+            java.util.concurrent.ExecutorService evmPool =
+                java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                    Thread t = new Thread(r, "myotis-evm-resolve-ens");
+                    t.setDaemon(true);
+                    return t;
+                });
+            try {
+                io.myotis.evm.DefaultEvmExecutor base = new io.myotis.evm.DefaultEvmExecutor(
+                    oracle, io.myotis.evm.world.BytecodeCache.inMemory(), evmPool);
+                io.myotis.evm.PrefetchingEvmExecutor prefetching =
+                    new io.myotis.evm.PrefetchingEvmExecutor(base);
+                io.myotis.evm.ccipread.CcipReadHandler ccipHandler =
+                    new io.myotis.evm.ccipread.CcipReadHandler(new JavaHttpCcipGateway());
+                io.myotis.evm.CcipReadEvmExecutor executor =
+                    new io.myotis.evm.CcipReadEvmExecutor(prefetching, ccipHandler);
+
+                // 5. Resolve.
+                io.myotis.ens.EnsResolver resolver = new io.myotis.ens.EnsResolver(executor);
+                java.util.Optional<io.myotis.evm.Address> resolved =
+                    resolver.resolveAddress(name, blockCtx).get(60, TimeUnit.SECONDS);
+
+                if (resolved.isEmpty()) {
+                    return "{\"ok\":true,\"resolved\":false"
+                        + ",\"name\":\"" + escapeJson(name) + "\""
+                        + ",\"blockNumber\":" + header.number + "}";
+                }
+                return "{\"ok\":true,\"resolved\":true"
+                    + ",\"name\":\"" + escapeJson(name) + "\""
+                    + ",\"address\":\"" + resolved.get().toHex() + "\""
+                    + ",\"blockNumber\":" + header.number + "}";
+            } finally {
+                evmPool.shutdown();
+            }
+        } catch (Exception e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
+            return jsonError(msg);
+        }
+    }
+
+    /**
+     * JVM-only {@link io.myotis.evm.ccipread.CcipGateway} backed by
+     * {@code java.net.http.HttpClient}. Used by the daemon, where JVM 21 is
+     * guaranteed. Android consumers must supply a Ktor-backed gateway per
+     * {@code CLAUDE.md} (java.net.http isn't covered by Android core library
+     * desugaring below API 33).
+     */
+    private static final class JavaHttpCcipGateway implements io.myotis.evm.ccipread.CcipGateway {
+        private static final java.net.http.HttpClient CLIENT = java.net.http.HttpClient.newBuilder()
+                .connectTimeout(java.time.Duration.ofSeconds(10))
+                .build();
+
+        @Override
+        public java.util.concurrent.CompletableFuture<String> request(Method method, String url, String body) {
+            java.net.http.HttpRequest.Builder rb = java.net.http.HttpRequest.newBuilder()
+                    .uri(java.net.URI.create(url))
+                    .timeout(java.time.Duration.ofSeconds(15));
+            if (method == Method.POST) {
+                rb.header("Content-Type", "application/json");
+                rb.POST(java.net.http.HttpRequest.BodyPublishers.ofString(
+                        body == null ? "" : body));
+            } else {
+                rb.GET();
+            }
+            return CLIENT.sendAsync(rb.build(),
+                    java.net.http.HttpResponse.BodyHandlers.ofString())
+                    .thenApply(java.net.http.HttpResponse::body);
         }
     }
 

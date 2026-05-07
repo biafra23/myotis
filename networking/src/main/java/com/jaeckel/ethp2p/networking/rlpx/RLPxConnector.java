@@ -360,6 +360,39 @@ public final class RLPxConnector implements AutoCloseable {
         return result;
     }
 
+    /** Best chain head we've heard about across all peers. Used by callers that
+     *  need a recent block number for header fetches (e.g. {@code resolve-ens}
+     *  reads the latest header to populate {@code BlockContext}). */
+    public ChainHead.Head getChainHead() {
+        return chainHead.get();
+    }
+
+    /** Network configuration (chain id, genesis hash, fork id, …) the connector
+     *  was constructed with. Exposed so command handlers don't need a separate
+     *  reference passed through every constructor. */
+    public NetworkConfig getNetwork() {
+        return network;
+    }
+
+    /**
+     * Snapshot of currently-active READY peers that have negotiated snap/1
+     * and are not flagged as snap-serving-failed. Used by callers that need
+     * to drive snap-protocol traffic directly through an {@link EthHandler}
+     * (e.g. {@code :app}'s {@code resolve-ens} command, which builds the
+     * EVM executor stack on top of one of these handlers). The returned
+     * list is a snapshot — handlers may disconnect afterwards, callers
+     * should be prepared to fall through to the next entry on failure.
+     */
+    public List<EthHandler> activeSnapHandlers() {
+        List<EthHandler> result = new ArrayList<>();
+        for (EthHandler handler : activeHandlers) {
+            if (handler.isReady() && handler.isSnapNegotiated() && !handler.isSnapServingFailed()) {
+                result.add(handler);
+            }
+        }
+        return result;
+    }
+
     @Override
     public void close() {
         group.shutdownGracefully();

@@ -3,6 +3,7 @@ dependencies {
     implementation(project(":networking"))
     implementation(project(":consensus"))
     implementation(project(":myotis-evm"))
+    implementation(project(":myotis-ens"))
     implementation(libs.tuweni.bytes)
     implementation(libs.tuweni.rlp)
     implementation(libs.tuweni.crypto)
