@@ -128,6 +128,12 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
 
             // Pre-populate the view's cache with parallel batch fetches of the
             // new accesses. After this, the next iteration's reads hit memory.
+            //
+            // Note: bytecode prefetching isn't a separate wave here because
+            // SyncStateView.bytecode() already populates the shared
+            // BytecodeCache synchronously during the run that just finished;
+            // any EXTCODE* target's code is in the cache by the time the
+            // tracer reports the access. A separate wave would be redundant.
             prefetchInParallel(view, blockContext.stateRoot(), newAccounts, newSlots);
             seenAccounts.addAll(newAccounts);
             seenSlots.addAll(newSlots);
@@ -188,4 +194,5 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
             log.debug("[prefetch] batch fetch timed out / failed: {}", e.getMessage());
         }
     }
+
 }

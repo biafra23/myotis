@@ -85,17 +85,40 @@ access list; subsequent runs use the parallel-batched cache."
   state cache between runs. A wrapping decorator would have to expose the
   internal cache state to coordinate, which leaks the abstraction.
 
-## What this branch will ship
+## What this branch ships
 
-- Commit 1 (this design doc + tracer + executor): `PrefetchingTracer`
-  observes SLOAD on every opcode, `PrefetchingEvmExecutor` drives the
-  convergence loop, fixture-oracle unit tests prove the loop converges
-  and respects the iteration cap.
-- Commit 2: integrate with `SnapBackedStateOracle` parallel batch fetches
-  (currently the oracle's `tryWithRetries` is per-key serial).
-- Commit 3: benchmark harness + `docs/prefetch-benchmarks.md` recording
-  iteration counts and latency for the Phase 2 corpus. Acceptance
-  criterion lands here.
+- Commit 1 (`bf09dcd`): design doc + `PrefetchingTracer` + `PrefetchingEvmExecutor`.
+  Tracer observes SLOAD / EXTCODE* on every opcode; executor drives the
+  convergence loop; fixture-oracle unit tests prove the loop converges in
+  2 iterations on simple cases and respects the iteration cap.
+- Commit 2 (this one): benchmark scaffolding —
+  `MainnetPrefetchBenchmarkIT` measures latency and iteration counts for
+  the corpus, `docs/prefetch-benchmarks.md` is the artifact callers paste
+  numbers into. Same env-gating as Phase 1's `MainnetCallViewIT`; both
+  ITs share the missing `connectToMainnetPeer()` helper. Originally
+  drafted as "wire-level batching in `SnapBackedStateOracle`", but tracing
+  through the existing prefetcher logic showed the parallel-fetch path
+  is already in place — the next real win comes from measuring against
+  mainnet, not from condensing N parallel wire requests into 1.
+
+## Deliberately not in this commit
+
+- **Wire-level batching in `SnapBackedStateOracle`.** The current loop
+  fires N parallel `oracle.fetchAccount` / `fetchStorage` calls; each
+  goes through the per-key retry loop independently. Folding them into
+  one `peer.getTrieNodes` request with N path-sets saves wire round
+  trips, which probably doesn't move p95 latency much (the peer
+  pipelines well), but it does reduce peer load. Defer until benchmark
+  numbers say it matters.
+- **Bytecode prefetching as a separate wave.** Tried it in an earlier
+  draft of commit 2 and reverted: `SyncStateView.bytecode()` already
+  populates the shared `BytecodeCache` synchronously during the run that
+  records the access. A separate "fetch new accounts' bytecode" wave
+  between iterations finds everything already cached. No latency win.
+- **Sentinel-return mode.** The plan flagged it as an alternative; the
+  trace-based design we shipped in commit 1 is the choice. Revisiting
+  would require pulling apart the convergence-loop assumptions and isn't
+  motivated until the benchmark numbers say trace-based isn't fast enough.
 
 ## Out of scope
 
