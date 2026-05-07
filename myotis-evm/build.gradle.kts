@@ -30,6 +30,7 @@ dependencies {
     implementation(libs.tuweni.bytes)
     implementation(libs.tuweni.units)
     implementation(libs.tuweni.crypto)
+    implementation(libs.tuweni.rlp)
 
     // BouncyCastle: Tuweni's Hash.keccak256 dispatches through JCA, which
     // requires BouncyCastle to be registered as a security provider.
@@ -44,4 +45,50 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+}
+
+// ----------------------------------------------------------------------------
+// Mainnet integration tests
+//
+// Closes Phase 1's acceptance criterion: USDC / DAI / ENS public-resolver
+// balanceOf/addr against a real SNAP peer at a verified state root, results
+// compared with eth_call from a public RPC at the same block.
+//
+// Gated by env var MYOTIS_MAINNET=1 so `./gradlew :myotis-evm:test` (the unit
+// suite) stays offline. Run explicitly via `./gradlew :myotis-evm:integrationTest`
+// after providing a peer + state root via env vars (see the test class for
+// the contract).
+// ----------------------------------------------------------------------------
+sourceSets {
+    create("integrationTest") {
+        java.srcDir("src/integrationTest/java")
+        resources.srcDir("src/integrationTest/resources")
+        compileClasspath += sourceSets["main"].output
+        runtimeClasspath += sourceSets["main"].output
+    }
+}
+
+configurations {
+    "integrationTestImplementation" {
+        extendsFrom(configurations["testImplementation"])
+    }
+    "integrationTestRuntimeOnly" {
+        extendsFrom(configurations["testRuntimeOnly"])
+    }
+}
+
+dependencies {
+    "integrationTestImplementation"(project(":app"))
+    "integrationTestImplementation"(project(":networking"))
+    "integrationTestImplementation"(libs.tuweni.bytes)
+}
+
+tasks.register<Test>("integrationTest") {
+    description = "Phase 1 mainnet integration tests (env-gated, requires MYOTIS_MAINNET=1)."
+    group = "verification"
+    testClassesDirs = sourceSets["integrationTest"].output.classesDirs
+    classpath = sourceSets["integrationTest"].runtimeClasspath
+    useJUnitPlatform()
+    // Don't bind to `./gradlew check` — operators run this on demand.
+    shouldRunAfter("test")
 }

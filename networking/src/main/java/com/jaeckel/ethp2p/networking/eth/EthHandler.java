@@ -6,9 +6,13 @@ import com.jaeckel.ethp2p.networking.NetworkConfig;
 import com.jaeckel.ethp2p.networking.eth.messages.*;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxHandler;
 import com.jaeckel.ethp2p.networking.snap.messages.AccountRangeMessage;
+import com.jaeckel.ethp2p.networking.snap.messages.ByteCodesMessage;
 import com.jaeckel.ethp2p.networking.snap.messages.GetAccountRangeMessage;
+import com.jaeckel.ethp2p.networking.snap.messages.GetByteCodesMessage;
 import com.jaeckel.ethp2p.networking.snap.messages.GetStorageRangesMessage;
+import com.jaeckel.ethp2p.networking.snap.messages.GetTrieNodesMessage;
 import com.jaeckel.ethp2p.networking.snap.messages.StorageRangesMessage;
+import com.jaeckel.ethp2p.networking.snap.messages.TrieNodesMessage;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import org.slf4j.Logger;
@@ -57,10 +61,20 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     // snap/1 message codes depend on negotiated eth version:
     //   eth/67-68: protocol length 17, snap base = 0x10 + 17 = 0x21
     //   eth/69:    protocol length 18 (adds BlockRangeUpdate at 0x11), snap base = 0x10 + 18 = 0x22
+    //
+    // Snap message ids (offsets from snapBase) per the snap/1 wire spec:
+    //   0x00 GetAccountRange / 0x01 AccountRange
+    //   0x02 GetStorageRanges / 0x03 StorageRanges
+    //   0x04 GetByteCodes    / 0x05 ByteCodes
+    //   0x06 GetTrieNodes    / 0x07 TrieNodes
     private int snapGetAccountRange  = 0x21; // updated after Hello negotiation
     private int snapAccountRange     = 0x22;
     private int snapGetStorageRanges = 0x23;
     private int snapStorageRanges    = 0x24;
+    private int snapGetByteCodes     = 0x25;
+    private int snapByteCodes        = 0x26;
+    private int snapGetTrieNodes     = 0x27;
+    private int snapTrieNodes        = 0x28;
 
     public enum State { AWAITING_HELLO, AWAITING_STATUS, READY }
     private volatile State state = State.AWAITING_HELLO;
@@ -90,6 +104,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             pendingSnapRequests = new ConcurrentHashMap<>();
     private final ConcurrentMap<Long, CompletableFuture<StorageRangesMessage.DecodeResult>>
             pendingStorageRequests = new ConcurrentHashMap<>();
+    private final ConcurrentMap<Long, CompletableFuture<ByteCodesMessage.DecodeResult>>
+            pendingByteCodeRequests = new ConcurrentHashMap<>();
+    private final ConcurrentMap<Long, CompletableFuture<TrieNodesMessage.DecodeResult>>
+            pendingTrieNodeRequests = new ConcurrentHashMap<>();
 
 
     // Cache received headers so we can serve them back to peers (by block number)
@@ -237,6 +255,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             snapAccountRange     = snapBase + 1;
             snapGetStorageRanges = snapBase + 2;
             snapStorageRanges    = snapBase + 3;
+            snapGetByteCodes     = snapBase + 4;
+            snapByteCodes        = snapBase + 5;
+            snapGetTrieNodes     = snapBase + 6;
+            snapTrieNodes        = snapBase + 7;
             log.info("[eth] snap base offset: 0x{} (eth length={})",
                 Integer.toHexString(snapBase), ethProtocolLength);
             snapNegotiated = hello.capabilities.stream()
@@ -447,6 +469,14 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     handleSnapStorageRanges(msg);
                 } else if (msg.code() == snapGetStorageRanges) {
                     handleSnapGetStorageRanges(ctx, msg);
+                } else if (msg.code() == snapByteCodes) {
+                    handleSnapByteCodes(msg);
+                } else if (msg.code() == snapGetByteCodes) {
+                    handleSnapGetByteCodes(ctx, msg);
+                } else if (msg.code() == snapTrieNodes) {
+                    handleSnapTrieNodes(msg);
+                } else if (msg.code() == snapGetTrieNodes) {
+                    handleSnapGetTrieNodes(ctx, msg);
                 } else {
                     log.debug("[eth] Unhandled message 0x{} ({} bytes) from {}",
                         Integer.toHexString(msg.code()), msg.payload().length, remoteAddress);
@@ -523,6 +553,78 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             log.debug("[snap] Responded with empty StorageRanges (reqId={})", snapReqId);
         } catch (Exception e) {
             log.debug("[snap] Failed to respond to GetStorageRanges: {}", e.getMessage());
+        }
+    }
+
+    private void handleSnapByteCodes(RLPxHandler.RLPxMessage msg) {
+        long snapReqId = -1;
+        try {
+            snapReqId = ByteCodesMessage.extractRequestId(msg.payload());
+        } catch (Exception ignored) {}
+        try {
+            ByteCodesMessage.DecodeResult decoded = ByteCodesMessage.decode(msg.payload());
+            log.info("[snap] ByteCodes: {} entries (reqId={})",
+                decoded.codes().size(), decoded.requestId());
+            CompletableFuture<ByteCodesMessage.DecodeResult> f =
+                pendingByteCodeRequests.remove(decoded.requestId());
+            if (f != null) f.complete(decoded);
+        } catch (Exception e) {
+            log.error("[snap] Failed to decode ByteCodes (reqId={}): {}",
+                snapReqId, e.getMessage());
+            if (snapReqId >= 0) {
+                CompletableFuture<ByteCodesMessage.DecodeResult> f =
+                    pendingByteCodeRequests.remove(snapReqId);
+                if (f != null) f.completeExceptionally(e);
+            }
+        }
+    }
+
+    private void handleSnapGetByteCodes(ChannelHandlerContext ctx, RLPxHandler.RLPxMessage msg) {
+        // We never serve bytecode — answer with an empty list so the peer
+        // doesn't time out and disconnect us.
+        try {
+            long snapReqId = GetByteCodesMessage.decode(msg.payload()).requestId();
+            byte[] emptyResponse = ByteCodesMessage.encodeEmpty(snapReqId);
+            rlpxHandler.sendMessage(ctx, snapByteCodes, emptyResponse);
+            log.debug("[snap] Responded with empty ByteCodes (reqId={})", snapReqId);
+        } catch (Exception e) {
+            log.debug("[snap] Failed to respond to GetByteCodes: {}", e.getMessage());
+        }
+    }
+
+    private void handleSnapTrieNodes(RLPxHandler.RLPxMessage msg) {
+        long snapReqId = -1;
+        try {
+            snapReqId = TrieNodesMessage.extractRequestId(msg.payload());
+        } catch (Exception ignored) {}
+        try {
+            TrieNodesMessage.DecodeResult decoded = TrieNodesMessage.decode(msg.payload());
+            log.info("[snap] TrieNodes: {} nodes (reqId={})",
+                decoded.nodes().size(), decoded.requestId());
+            CompletableFuture<TrieNodesMessage.DecodeResult> f =
+                pendingTrieNodeRequests.remove(decoded.requestId());
+            if (f != null) f.complete(decoded);
+        } catch (Exception e) {
+            log.error("[snap] Failed to decode TrieNodes (reqId={}): {}",
+                snapReqId, e.getMessage());
+            if (snapReqId >= 0) {
+                CompletableFuture<TrieNodesMessage.DecodeResult> f =
+                    pendingTrieNodeRequests.remove(snapReqId);
+                if (f != null) f.completeExceptionally(e);
+            }
+        }
+    }
+
+    private void handleSnapGetTrieNodes(ChannelHandlerContext ctx, RLPxHandler.RLPxMessage msg) {
+        // Same policy as GetByteCodes: empty response so the peer doesn't
+        // time out. We're a wallet, not a serving full node.
+        try {
+            long snapReqId = GetTrieNodesMessage.decode(msg.payload()).requestId();
+            byte[] emptyResponse = TrieNodesMessage.encodeEmpty(snapReqId);
+            rlpxHandler.sendMessage(ctx, snapTrieNodes, emptyResponse);
+            log.debug("[snap] Responded with empty TrieNodes (reqId={})", snapReqId);
+        } catch (Exception e) {
+            log.debug("[snap] Failed to respond to GetTrieNodes: {}", e.getMessage());
         }
     }
 
@@ -818,6 +920,65 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             stateRoot.toShortHexString());
         rlpxHandler.sendMessage(ctx, snapGetStorageRanges, payload);
         return future;
+    }
+
+    /**
+     * Fetch bytecode by code hash via snap/1 GetByteCodes.
+     *
+     * <p>Bytecode is immutable, so this request does not need a state root —
+     * the caller must verify the response by hashing each returned blob and
+     * matching against the originally-requested hash.
+     *
+     * @param hashes 32-byte keccak256 hashes of the bytecodes to fetch
+     * @return future completing with the ByteCodes decode result, or null if not READY
+     */
+    public CompletableFuture<ByteCodesMessage.DecodeResult> requestByteCodesAsync(
+            java.util.List<org.apache.tuweni.bytes.Bytes32> hashes) {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) return CompletableFuture.failedFuture(
+            new IllegalStateException("EthHandler not READY"));
+        if (!snapNegotiated) return CompletableFuture.failedFuture(
+            new UnsupportedOperationException("snap/1 not negotiated with this peer"));
+
+        long reqId = requestId.getAndIncrement();
+        CompletableFuture<ByteCodesMessage.DecodeResult> future = new CompletableFuture<>();
+        pendingByteCodeRequests.put(reqId, future);
+        byte[] payload = GetByteCodesMessage.encode(reqId, hashes, 128 * 1024L);
+        log.info("[snap] GetByteCodes reqId={} hashes={}", reqId, hashes.size());
+        rlpxHandler.sendMessage(ctx, snapGetByteCodes, payload);
+        return future.orTimeout(10, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Fetch trie nodes via snap/1 GetTrieNodes for the given path sets.
+     *
+     * <p>Each {@link GetTrieNodesMessage.PathSet} addresses one account in
+     * the world state trie; subsequent storage paths within the set are
+     * looked up in that account's storage trie. The caller is responsible
+     * for verifying every returned node against {@code stateRoot} via the
+     * MPT proof verifier in {@code :core}.
+     *
+     * @param stateRoot the trusted state root to query against
+     * @param paths     path sets the peer should resolve
+     * @return future completing with the TrieNodes decode result, or null if not READY
+     */
+    public CompletableFuture<TrieNodesMessage.DecodeResult> requestTrieNodesAsync(
+            org.apache.tuweni.bytes.Bytes32 stateRoot,
+            java.util.List<GetTrieNodesMessage.PathSet> paths) {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) return CompletableFuture.failedFuture(
+            new IllegalStateException("EthHandler not READY"));
+        if (!snapNegotiated) return CompletableFuture.failedFuture(
+            new UnsupportedOperationException("snap/1 not negotiated with this peer"));
+
+        long reqId = requestId.getAndIncrement();
+        CompletableFuture<TrieNodesMessage.DecodeResult> future = new CompletableFuture<>();
+        pendingTrieNodeRequests.put(reqId, future);
+        byte[] payload = GetTrieNodesMessage.encode(reqId, stateRoot, paths, 128 * 1024L);
+        log.info("[snap] GetTrieNodes reqId={} root={} paths={}",
+            reqId, stateRoot.toShortHexString(), paths.size());
+        rlpxHandler.sendMessage(ctx, snapGetTrieNodes, payload);
+        return future.orTimeout(10, TimeUnit.SECONDS);
     }
 
     public String getClientId() { return clientId; }

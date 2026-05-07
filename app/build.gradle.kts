@@ -2,12 +2,20 @@ dependencies {
     implementation(project(":core"))
     implementation(project(":networking"))
     implementation(project(":consensus"))
+    implementation(project(":myotis-evm"))
     implementation(libs.tuweni.bytes)
     implementation(libs.tuweni.rlp)
     implementation(libs.tuweni.crypto)
     implementation(libs.trueblocks.kotlin)
     implementation(libs.slf4j.api)
     runtimeOnly(libs.logback.classic)
+
+    testImplementation(platform(libs.junit.bom))
+    testImplementation(libs.junit.jupiter)
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
 
 tasks.register<JavaExec>("run") {
