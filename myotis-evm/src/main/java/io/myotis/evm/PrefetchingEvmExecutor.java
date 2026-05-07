@@ -188,7 +188,7 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
         // will hit the (still-uncached) miss and either succeed via the
         // oracle's serial path or surface a clean error from there.
         try {
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+            CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new))
                     .get(30, java.util.concurrent.TimeUnit.SECONDS);
         } catch (Exception e) {
             log.debug("[prefetch] batch fetch timed out / failed: {}", e.getMessage());
