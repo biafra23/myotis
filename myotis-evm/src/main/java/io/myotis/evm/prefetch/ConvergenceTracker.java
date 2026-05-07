@@ -30,4 +30,14 @@ public final class ConvergenceTracker {
             return iterations.stream().mapToInt(Integer::intValue).max().orElse(0);
         }
     }
+
+    /**
+     * Discard all recorded iteration counts. Used by the benchmark IT after
+     * warm-up runs so the reported stats reflect only the timed measurements.
+     */
+    public void clear() {
+        synchronized (iterations) {
+            iterations.clear();
+        }
+    }
 }

@@ -52,7 +52,15 @@ public final class SyncStateView {
     private final SnapStateOracle oracle;
     private final byte[] stateRoot;
     private final BytecodeCache bytecodeCache;
-    private final AccessTracker accessTracker;
+
+    /**
+     * Tracker that receives every account/storage/bytecode access. Mutable
+     * so the Phase 2 prefetch loop can swap a fresh tracker in per
+     * iteration (the per-iteration access set drives the parallel batch
+     * fetch wave between iterations). May be null if no recording is
+     * needed.
+     */
+    private volatile AccessTracker accessTracker;
 
     private final Map<Address, AccountState> accountCache = new ConcurrentHashMap<>();
     private final Map<SlotKey, UInt256> storageCache = new ConcurrentHashMap<>();
@@ -82,6 +90,15 @@ public final class SyncStateView {
 
     public boolean isSentinelOnMiss() {
         return sentinelOnMiss;
+    }
+
+    /**
+     * Swap the access tracker. Used by the Phase 2 prefetch loop to install
+     * a fresh per-iteration tracker without rebuilding the whole view (and
+     * losing the cache).
+     */
+    public void setAccessTracker(AccessTracker accessTracker) {
+        this.accessTracker = accessTracker;
     }
 
     public AccountState account(Address address) {

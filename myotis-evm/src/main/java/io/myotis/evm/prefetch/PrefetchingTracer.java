@@ -7,23 +7,28 @@ import org.hyperledger.besu.evm.frame.MessageFrame;
 import org.hyperledger.besu.evm.tracing.OperationTracer;
 
 /**
- * Besu {@link OperationTracer} that records every storage and code access
- * the EVM would issue during execution, without changing what gets executed.
+ * Besu {@link OperationTracer} that observes opcode-level state accesses
+ * during the Phase 2 sentinel-return convergence loop.
  *
- * <p>Used by {@link io.myotis.evm.PrefetchingEvmExecutor} to drive the
- * convergence loop: run the EVM once with this tracer attached, collect the
- * (account, slot) misses, batch-fetch them in parallel, then re-run. The
- * plan calls this the "trace-based" approach, chosen over sentinel-return
- * because it observes the real path the EVM would take rather than a
- * placeholder-shaped one.
+ * <p>The {@link io.myotis.evm.PrefetchingEvmExecutor} runs the EVM with
+ * this tracer attached and {@code SyncStateView.setSentinelOnMiss(true)};
+ * cache misses return zero-shaped placeholders, the tracer (and the view
+ * itself, via the same {@link AccessTracker}) records every access, and
+ * the prefetch loop batch-fetches the recorded misses in parallel before
+ * re-running for real. See {@code io.myotis.evm.PrefetchingEvmExecutor}'s
+ * Javadoc for the full convergence-loop description.
  *
- * <p>Bytecode access is intentionally <em>not</em> recorded here: the
- * {@code SyncStateView}'s {@link io.myotis.evm.world.BytecodeCache} hits the
- * same code path whether the bytecode is needed during this iteration's
- * synchronous run or pre-fetched between iterations, and the prefetch
- * doesn't avoid any round trips. {@link io.myotis.evm.world.AccessTracker}
- * still exposes a {@code recordBytecode}/{@code codeHashes} surface so a
- * future phase can opt in if a sentinel-return iteration-0 mode lands.
+ * <p>The tracer is one of two recording sources — the other is
+ * {@code SyncStateView}, which records every access the world updater
+ * makes (including the implicit account/bytecode lookups Besu performs
+ * when entering a CALL/STATICCALL/DELEGATECALL child frame). The two
+ * overlap by design and {@link AccessTracker} de-dupes via {@code HashSet}.
+ *
+ * <p>Bytecode access is intentionally <em>not</em> recorded by this tracer:
+ * {@code SyncStateView.bytecode()} already records via the access tracker
+ * when the view is wired with one, so the EXTCODE* opcodes' targets get
+ * captured downstream. {@link io.myotis.evm.world.AccessTracker} retains
+ * the {@code recordBytecode}/{@code codeHashes} surface for future use.
  *
  * <p>Hook points (Yellow Paper opcode numbers):
  * <ul>

@@ -102,7 +102,11 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
         SnapStateOracle oracle = delegate.oracle();
         BytecodeCache bytecodeCache = delegate.bytecodeCache();
 
-        // One view across all iterations so cache hits accumulate.
+        // One view across all iterations so cache hits accumulate. The
+        // accessTracker is null during prime — pre-populating the target
+        // shouldn't show up as an "iteration 0 access" because primeTarget
+        // pulls real values, not sentinels, and we don't want it to inflate
+        // the per-iteration access set we use to drive parallel batches.
         SyncStateView view = new SyncStateView(
                 oracle, blockContext.stateRoot(), bytecodeCache, /* tracker */ null);
 
@@ -121,7 +125,15 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
             boolean sentinelMode = iter == 0;
             view.setSentinelOnMiss(sentinelMode);
 
+            // Per-iteration tracker, wired into both the tracer (records SLOAD
+            // / EXTCODE* stack args before opcode dispatch) AND the view
+            // (records every account/storage/bytecode lookup the world
+            // updater performs — including the implicit lookups Besu does
+            // when entering a child frame for CALL / STATICCALL / DELEGATECALL,
+            // which the tracer alone wouldn't capture). The two sources
+            // overlap by design; HashSet de-dupes.
             AccessTracker iterationTracker = new AccessTracker();
+            view.setAccessTracker(iterationTracker);
             PrefetchingTracer tracer = new PrefetchingTracer(iterationTracker);
 
             byte[] result;

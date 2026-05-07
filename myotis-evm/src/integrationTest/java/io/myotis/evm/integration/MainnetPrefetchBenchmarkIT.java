@@ -110,10 +110,16 @@ class MainnetPrefetchBenchmarkIT {
         var prefetched = new PrefetchingEvmExecutor(inner,
                 PrefetchingEvmExecutor.DEFAULT_ITERATION_CAP, convergenceTracker);
 
-        // Warm-up runs (untimed)
+        // Warm-up runs (untimed). The convergence tracker is shared with
+        // the executor we'll later time, so any iteration counts the
+        // warm-ups produced would otherwise pollute the reported min/max
+        // and the `convergenceTracker.max() <= 3` acceptance assertion.
+        // Reset the tracker after warm-ups so stats reflect only the
+        // timed runs.
         for (int i = 0; i < WARMUP_ITERATIONS; i++) {
             prefetched.callView(target, calldata, ctx).get(60, TimeUnit.SECONDS);
         }
+        convergenceTracker.clear();
 
         // Baseline: DefaultEvmExecutor (no prefetch)
         long[] baselineNs = timeRuns(inner, target, calldata, ctx);

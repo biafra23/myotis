@@ -57,22 +57,35 @@ whether the additional tokens reveal something new.
 ## What we expect to see
 
 Calibration ahead of measurement, so the numbers can be cross-checked when
-they arrive:
+they arrive. Phase 2 ships the **sentinel-return** convergence loop —
+iteration 0 makes no oracle calls aside from priming the target contract;
+iteration 1 runs against a cache pre-populated by a parallel batch fetch.
 
-- **Iterations**: Trace-based prefetching converges in 2 iterations for any
-  contract whose access path is data-independent. ERC-20 `balanceOf` is
-  trivially data-independent (the slot is `keccak256(addr || mappingSlot)`,
-  computed entirely from inputs). ENS `addr` involves one mapping lookup
-  in the Public Resolver — also data-independent. Expected: 2 iterations
-  for all three. If we see 3, that's worth investigating; if we see > 3,
-  the cap is hit and the call fails.
-- **Baseline latency**: ~1 round trip per SLOAD plus 1 for the account.
-  USDC's proxy slot + impl mapping = 2 SLOADs + account = ~3 RTT. With
-  100 ms RTT to a typical peer, that's ~300 ms baseline p50.
-- **Prefetch latency**: 1 RTT for iteration 0's serial fetches +
-  1 RTT for the parallel batch + ~0 ms for iteration 1's all-cache run =
-  ~200 ms prefetch p50. About 30% faster than baseline at 100 ms RTT;
-  the win is bigger at higher RTTs.
+- **Iterations**: Sentinel-return converges in 2 iterations for any contract
+  whose access path is data-independent. ERC-20 `balanceOf` is trivially
+  data-independent (the slot is `keccak256(addr || mappingSlot)`, computed
+  entirely from inputs). ENS `addr` involves one mapping lookup in the
+  Public Resolver — also data-independent. Expected: 2 iterations for all
+  three. If we see 3, the iter-0 sentinel run took a different path than
+  iter 1 (a data-dependent branch); if we see > 3, the cap is hit and the
+  call fails.
+- **Baseline latency** (`DefaultEvmExecutor`): ~1 round trip per SLOAD
+  plus 1 for the account fetch and 1 for the bytecode. USDC's proxy slot
+  + impl + balance mapping = ~5 serial RTTs. At 100 ms RTT to a typical
+  peer, that's ~500 ms baseline p50.
+- **Prefetch latency** (sentinel-return): 2 RTTs for the synchronous
+  target prime (account + bytecode), then 0 RTTs in iteration 0 (sentinel
+  values), then 1 RTT for the parallel batch covering all the recorded
+  storage misses plus any non-target accounts the iter-0 path visited,
+  then ~0 ms for iteration 1's all-cache run. Total: ~3 RTTs ≈ 300 ms
+  prefetch p50. About 40% faster than baseline at 100 ms RTT; the win
+  scales linearly with RTT and with the number of independent storage
+  reads on the contract.
+- **Where prefetching does NOT help**: chained-dependency calls where
+  each step's input depends on the previous step's output (deep proxy
+  chains, contracts that resolve a slot's value as the slot index of
+  another read). Iteration 1 has to block serially on those, so the
+  total latency is roughly the same as the baseline.
 - **p95 vs p50**: depends entirely on peer tail latency. The convergence
   loop doesn't add tail-latency surface relative to the baseline.
 

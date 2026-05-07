@@ -76,26 +76,42 @@ during iteration 0 in any other design.
 
 The Phase 0/1 architecture has `DefaultEvmExecutor` driving Besu's EVM
 through `MessageCallProcessor.process()` against a `SnapWorldUpdater`.
-The tracer hook is the natural insertion point — pass a non-`NO_TRACING`
-tracer that observes (but doesn't mutate) execution.
+Phase 2 adds two seams: a `PrefetchingTracer` plugged into Besu's
+`OperationTracer` slot, and a `setSentinelOnMiss(boolean)` toggle on
+`SyncStateView` that switches cache-miss behaviour between
+"block-on-oracle" and "return placeholder zero".
 
 ```
 PrefetchingEvmExecutor.callView(target, calldata, ctx)
+  primeTarget(view, target)                          // 2 RTTs, blocking
   loop iteration ≤ iterationCap:
-    tracer = new PrefetchingTracer()
-    DefaultEvmExecutor.runOnceWithTracer(target, calldata, ctx, tracer)
-        ↳ Besu EVM executes normally; tracer records SLOAD/CODE* ops
-    new misses = tracer.observed - already-cached
+    iterationTracker = new AccessTracker()
+    view.setAccessTracker(iterationTracker)          // record via view too
+    view.setSentinelOnMiss(iter == 0)
+    tracer = new PrefetchingTracer(iterationTracker)
+    DefaultEvmExecutor.runOnTracedView(target, calldata, ctx, view, tracer)
+        ↳ iter 0: sentinel returns on miss, no oracle calls
+        ↳ iter 1+: real values from cache or blocking oracle fetch
+    if iter == 0:
+      // Discard the (bogus) result; keep the access list.
+      parallel-batch fetch tracker.snapshot() into the view's cache
+      continue
+    if tracker.snapshot() ⊆ seenAccesses: return result   // converged
+    new misses = tracker.snapshot() - already-cached
     if new misses is empty: return result        // converged
     batch fetch new misses through SnapPeer in parallel
     populate per-call cache (BytecodeCache + an in-call storage cache)
   after loop: throw IterationLimitExceeded
 ```
 
-The first iteration's run is SLOW — each miss is a serial blocking fetch.
-Subsequent iterations are fast because the cache satisfies the hits. That
-matches the plan's expectation: "first run is slow but produces a complete
-access list; subsequent runs use the parallel-batched cache."
+Iteration 0 makes no oracle calls (other than the synchronous prime of
+the target contract). Every miss returns a placeholder; the tracer and
+view together record the access. The result is discarded. The parallel
+batch fetch wave then covers all the recorded misses in one round-trip
+window. Iteration 1 runs against the populated cache and produces the
+real result; any data-dependent accesses iteration 0's wrong path didn't
+reach are blocking-fetched serially in iteration 1, which adds them to
+the cache for iteration 2 to verify stability if needed.
 
 ## Open question (settled in commit 1)
 
