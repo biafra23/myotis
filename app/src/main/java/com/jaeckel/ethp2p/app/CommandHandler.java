@@ -1019,8 +1019,14 @@ public class CommandHandler {
                 CompletableFuture.allOf(safeProbes.toArray(new CompletableFuture<?>[0]))
                     .get(10, TimeUnit.SECONDS);
             } catch (TimeoutException | ExecutionException ignore) {
-                // Some peers may still be in-flight; we'll treat unfinished
-                // probes as failures below. Fall through.
+                // Some peers may still be in-flight; cancel them so they
+                // don't keep using the channel after we've already fallen
+                // through to "no usable peer". Already-completed probes are
+                // unaffected by cancel(). Then treat any !isDone probe as a
+                // failure below.
+                for (CompletableFuture<BlockHeader> p : probes) {
+                    if (!p.isDone()) p.cancel(true);
+                }
             }
             com.jaeckel.ethp2p.networking.eth.EthHandler pinnedPeer = null;
             BlockHeader header = null;

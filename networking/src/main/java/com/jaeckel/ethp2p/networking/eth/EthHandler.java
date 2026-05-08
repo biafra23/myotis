@@ -728,12 +728,14 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         log.debug("[eth] GetBlockHeaders (fresh head, hash={}) reqId={}",
             hash.toShortHexString(), reqId);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
-        return headerFut.orTimeout(5, TimeUnit.SECONDS).thenApply(headers -> {
-            if (headers.isEmpty()) {
-                throw new RuntimeException("Peer returned no header for its own best hash");
-            }
-            return headers.get(0).header();
-        });
+        return headerFut.orTimeout(5, TimeUnit.SECONDS)
+            .whenComplete((r, ex) -> pendingRequests.remove(reqId))
+            .thenApply(headers -> {
+                if (headers.isEmpty()) {
+                    throw new RuntimeException("Peer returned no header for its own best hash");
+                }
+                return headers.get(0).header();
+            });
     }
 
     /**
@@ -780,8 +782,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             org.apache.tuweni.crypto.Hash.keccak256(address);
 
         log.info("[snap] Using explicit stateRoot={} for account query", explicitStateRoot.toShortHexString());
-        return sendGetAccountRange(ctx, accountHash, explicitStateRoot)
-            .orTimeout(10, TimeUnit.SECONDS);
+        // Timeout + pendingSnapRequests cleanup are applied inside sendGetAccountRange.
+        return sendGetAccountRange(ctx, accountHash, explicitStateRoot);
     }
 
     public CompletableFuture<AccountRangeMessage.DecodeResult> requestAccountAsync(
@@ -856,7 +858,12 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         log.info("[snap] GetAccountRange reqId={} accountHash={} stateRoot={}",
             reqId, accountHash.toShortHexString(), stateRoot.toShortHexString());
         rlpxHandler.sendMessage(ctx, snapGetAccountRange, payload);
-        return future;
+        // Apply the timeout here (where the reqId is in scope) and clear the
+        // pendingSnapRequests entry on any terminal outcome — completion,
+        // exception, or timeout. Without this, an orTimeout firing while the
+        // peer stays connected would leak the entry until channelInactive.
+        return future.orTimeout(10, TimeUnit.SECONDS)
+            .whenComplete((r, ex) -> pendingSnapRequests.remove(reqId));
     }
 
     /**
@@ -943,8 +950,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         org.apache.tuweni.bytes.Bytes32 accountHash =
             org.apache.tuweni.crypto.Hash.keccak256(contractAddress);
 
-        return sendGetStorageRanges(ctx, accountHash, storageKeyHash, explicitStateRoot)
-            .orTimeout(10, TimeUnit.SECONDS);
+        // Timeout + pendingStorageRequests cleanup are applied inside sendGetStorageRanges.
+        return sendGetStorageRanges(ctx, accountHash, storageKeyHash, explicitStateRoot);
     }
 
     private CompletableFuture<StorageRangesMessage.DecodeResult> sendGetStorageRanges(
@@ -963,7 +970,11 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             reqId, accountHash.toShortHexString(), storageKeyHash.toShortHexString(),
             stateRoot.toShortHexString());
         rlpxHandler.sendMessage(ctx, snapGetStorageRanges, payload);
-        return future;
+        // Same pattern as sendGetAccountRange: timeout + cleanup keyed on the
+        // reqId we just allocated, so timeouts don't leak pendingStorageRequests
+        // entries on a still-connected peer.
+        return future.orTimeout(10, TimeUnit.SECONDS)
+            .whenComplete((r, ex) -> pendingStorageRequests.remove(reqId));
     }
 
     /**
@@ -990,22 +1001,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         byte[] payload = GetByteCodesMessage.encode(reqId, hashes, 128 * 1024L);
         log.info("[snap] GetByteCodes reqId={} hashes={}", reqId, hashes.size());
         rlpxHandler.sendMessage(ctx, snapGetByteCodes, payload);
-        return future.orTimeout(10, TimeUnit.SECONDS);
+        return future.orTimeout(10, TimeUnit.SECONDS)
+            .whenComplete((r, ex) -> pendingByteCodeRequests.remove(reqId));
     }
 
-    /**
-     * Fetch trie nodes via snap/1 GetTrieNodes for the given path sets.
-     *
-     * <p>Each {@link GetTrieNodesMessage.PathSet} addresses one account in
-     * the world state trie; subsequent storage paths within the set are
-     * looked up in that account's storage trie. The caller is responsible
-     * for verifying every returned node against {@code stateRoot} via the
-     * MPT proof verifier in {@code :core}.
-     *
-     * @param stateRoot the trusted state root to query against
-     * @param paths     path sets the peer should resolve
-     * @return future completing with the TrieNodes decode result, or null if not READY
-     */
     /**
      * Direct {@link GetAccountRangeMessage} send keyed by account-hash, no
      * fresh-header probe. The caller already has a stateRoot and just wants
@@ -1026,8 +1025,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             new IllegalStateException("EthHandler not READY"));
         if (!snapNegotiated) return CompletableFuture.failedFuture(
             new UnsupportedOperationException("snap/1 not negotiated with this peer"));
-        return sendGetAccountRange(ctx, accountHash, stateRoot)
-            .orTimeout(10, TimeUnit.SECONDS);
+        return sendGetAccountRange(ctx, accountHash, stateRoot);
     }
 
     /**
@@ -1048,10 +1046,28 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             new IllegalStateException("EthHandler not READY"));
         if (!snapNegotiated) return CompletableFuture.failedFuture(
             new UnsupportedOperationException("snap/1 not negotiated with this peer"));
-        return sendGetStorageRanges(ctx, accountHash, slotHash, stateRoot)
-            .orTimeout(10, TimeUnit.SECONDS);
+        return sendGetStorageRanges(ctx, accountHash, slotHash, stateRoot);
     }
 
+    /**
+     * Fetch trie nodes via snap/1 GetTrieNodes for the given path sets.
+     *
+     * <p>Each {@link GetTrieNodesMessage.PathSet} addresses one account in
+     * the world state trie; subsequent storage paths within the set are
+     * looked up in that account's storage trie. The caller is responsible
+     * for verifying every returned node against {@code stateRoot} via the
+     * MPT proof verifier in {@code :core}.
+     *
+     * <p>Note: geth's GetTrieNodes handler returns only the node at the
+     * requested path, not the root-to-leaf proof. For account/storage leaf
+     * lookups that need to verify against {@code stateRoot}, prefer
+     * {@link #requestAccountByHashAsync} / {@link #requestStorageByHashAsync},
+     * which return proofs.
+     *
+     * @param stateRoot the trusted state root to query against
+     * @param paths     path sets the peer should resolve
+     * @return future completing with the TrieNodes decode result
+     */
     public CompletableFuture<TrieNodesMessage.DecodeResult> requestTrieNodesAsync(
             org.apache.tuweni.bytes.Bytes32 stateRoot,
             java.util.List<GetTrieNodesMessage.PathSet> paths) {
@@ -1068,7 +1084,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         log.info("[snap] GetTrieNodes reqId={} root={} paths={}",
             reqId, stateRoot.toShortHexString(), paths.size());
         rlpxHandler.sendMessage(ctx, snapGetTrieNodes, payload);
-        return future.orTimeout(10, TimeUnit.SECONDS);
+        return future.orTimeout(10, TimeUnit.SECONDS)
+            .whenComplete((r, ex) -> pendingTrieNodeRequests.remove(reqId));
     }
 
     public String getClientId() { return clientId; }
