@@ -103,17 +103,24 @@ public class CommandHandler {
         try {
             String cmd = extractString(jsonLine, "cmd");
             return switch (cmd) {
-                case "status"        -> handleStatus();
-                case "peers"         -> handlePeers();
-                case "get-headers"   -> handleGetHeaders(jsonLine);
-                case "get-block"     -> handleGetBlock(jsonLine);
-                case "get-account"   -> handleGetAccount(jsonLine);
-                case "get-storage"   -> handleGetStorage(jsonLine);
-                case "resolve-ens"   -> handleResolveEns(jsonLine);
-                case "dial"          -> handleDial(jsonLine);
-                case "stop"          -> handleStop();
-                case "beacon-status" -> handleBeaconStatus();
-                default              -> jsonError("Unknown command: " + cmd);
+                case "status"                  -> handleStatus();
+                case "peers"                   -> handlePeers();
+                case "get-headers"             -> handleGetHeaders(jsonLine);
+                case "get-block"               -> handleGetBlock(jsonLine);
+                case "get-account"             -> handleGetAccount(jsonLine);
+                case "get-storage"             -> handleGetStorage(jsonLine);
+                case "resolve-ens"             -> handleResolveEns(jsonLine);
+                case "resolve-ens-text"        -> handleResolveEnsText(jsonLine);
+                case "resolve-ens-contenthash" -> handleResolveEnsContenthash(jsonLine);
+                case "resolve-ens-addr-coin"   -> handleResolveEnsAddrCoin(jsonLine);
+                case "resolve-ens-pubkey"      -> handleResolveEnsPubkey(jsonLine);
+                case "resolve-ens-abi"         -> handleResolveEnsAbi(jsonLine);
+                case "resolve-ens-dns"         -> handleResolveEnsDns(jsonLine);
+                case "resolve-ens-interface"   -> handleResolveEnsInterface(jsonLine);
+                case "dial"                    -> handleDial(jsonLine);
+                case "stop"                    -> handleStop();
+                case "beacon-status"           -> handleBeaconStatus();
+                default                        -> jsonError("Unknown command: " + cmd);
             };
         } catch (Exception e) {
             log.warn("[ipc] Error handling command '{}': {}", jsonLine, e.getMessage());
@@ -974,81 +981,276 @@ public class CommandHandler {
     private String handleResolveEns(String jsonLine) {
         String name = extractString(jsonLine, "name");
         try {
-            // 1. Confirm at least one snap-capable peer exists. The oracle's
-            //    rotating supplier (below) re-polls for each retry, so we
-            //    don't pin a single handler here.
-            if (connector.activeSnapHandlers().isEmpty()) {
-                return jsonError("No active peer with snap/1 support");
-            }
-
-            // 2. Fetch a fresh header (the peer's chain head) so we have a
-            // recent, peer-servable state root for snap requests.
-            long headBlock = connector.getChainHead().blockNumber();
-            if (headBlock <= 0) {
-                return jsonError("Chain head not yet known; wait for the eth handshake to complete");
-            }
-            List<BlockHeadersMessage.VerifiedHeader> headers =
-                connector.requestBlockHeaders(headBlock, 1).get(15, TimeUnit.SECONDS);
-            if (headers.isEmpty()) {
-                return jsonError("Peer returned no header for block " + headBlock);
-            }
-            BlockHeader header = headers.get(0).header();
-
-            // 3. Build the BlockContext from that header.
-            io.myotis.evm.BlockContext blockCtx = new io.myotis.evm.BlockContext(
-                header.stateRoot.toArrayUnsafe(),
-                header.number,
-                header.timestamp,
-                header.baseFeePerGas,
-                io.myotis.evm.Address.of(header.beneficiary.toArrayUnsafe()),
-                header.mixHashOrPrevRandao.toArrayUnsafe(),
-                java.math.BigInteger.valueOf(connector.getNetwork().networkId()),
-                header.gasLimit);
-
-            // 4. Build the executor stack. The supplier re-polls the
-            //    connector each invocation and round-robins through whatever
-            //    snap-capable peers are currently active, so the oracle's
-            //    retry-on-InvalidProof / IO-failure logic actually engages a
-            //    different peer on each attempt — capturing one handler at
-            //    construction time would defeat that.
-            java.util.concurrent.atomic.AtomicInteger peerIndex =
-                new java.util.concurrent.atomic.AtomicInteger();
-            io.myotis.evm.world.SnapBackedStateOracle oracle =
-                new io.myotis.evm.world.SnapBackedStateOracle(
-                    () -> {
-                        List<com.jaeckel.ethp2p.networking.eth.EthHandler> live =
-                            connector.activeSnapHandlers();
-                        if (live.isEmpty()) return null;
-                        int idx = Math.floorMod(peerIndex.getAndIncrement(), live.size());
-                        return new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(live.get(idx));
-                    }, io.myotis.evm.world.BytecodeCache.inMemory());
-            io.myotis.evm.DefaultEvmExecutor base = new io.myotis.evm.DefaultEvmExecutor(
-                oracle, io.myotis.evm.world.BytecodeCache.inMemory(), EVM_POOL);
-            io.myotis.evm.PrefetchingEvmExecutor prefetching =
-                new io.myotis.evm.PrefetchingEvmExecutor(base);
-            io.myotis.evm.ccipread.CcipReadHandler ccipHandler =
-                new io.myotis.evm.ccipread.CcipReadHandler(new JavaHttpCcipGateway());
-            io.myotis.evm.CcipReadEvmExecutor executor =
-                new io.myotis.evm.CcipReadEvmExecutor(prefetching, ccipHandler);
-
-            // 5. Resolve.
-            io.myotis.ens.EnsResolver resolver = new io.myotis.ens.EnsResolver(executor);
+            EnsCallContext ctx = prepareEnsCall();
             java.util.Optional<io.myotis.evm.Address> resolved =
-                resolver.resolveAddress(name, blockCtx).get(60, TimeUnit.SECONDS);
-
+                ctx.resolver.resolveAddress(name, ctx.blockCtx).get(60, TimeUnit.SECONDS);
             if (resolved.isEmpty()) {
                 return "{\"ok\":true,\"resolved\":false"
                     + ",\"name\":\"" + escapeJson(name) + "\""
-                    + ",\"blockNumber\":" + header.number + "}";
+                    + ",\"blockNumber\":" + ctx.header.number + "}";
             }
             return "{\"ok\":true,\"resolved\":true"
                 + ",\"name\":\"" + escapeJson(name) + "\""
                 + ",\"address\":\"" + resolved.get().toHex() + "\""
-                + ",\"blockNumber\":" + header.number + "}";
+                + ",\"blockNumber\":" + ctx.header.number + "}";
         } catch (Exception e) {
-            Throwable cause = e.getCause() != null ? e.getCause() : e;
-            String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
-            return jsonError(msg);
+            return jsonError(unwrapMessage(e));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ENS shared call setup
+    // -----------------------------------------------------------------------
+
+    /**
+     * Aggregate of the per-call EVM context every ENS handler needs:
+     * the peer-servable header (for the response's blockNumber), the
+     * BlockContext built from it, and a network-aware
+     * {@link io.myotis.ens.EnsResolver}. Constructed via
+     * {@link #prepareEnsCall()} so the snap-peer probe + EVM stack
+     * boilerplate isn't duplicated across the eight ENS commands.
+     */
+    private record EnsCallContext(
+            BlockHeader header,
+            io.myotis.evm.BlockContext blockCtx,
+            io.myotis.ens.EnsResolver resolver) {}
+
+    /**
+     * Run the snap-peer-availability check, fetch a fresh header for a
+     * peer-servable state root, build the EVM executor stack
+     * (SnapBackedStateOracle → DefaultEvmExecutor → PrefetchingEvmExecutor
+     * → CcipReadEvmExecutor), and pick the canonical ENS contract pair
+     * for the running daemon's network.
+     *
+     * <p>Throws on any failure; callers fold the throw into a
+     * {@code jsonError} response.
+     */
+    private EnsCallContext prepareEnsCall() throws Exception {
+        if (connector.activeSnapHandlers().isEmpty()) {
+            throw new IllegalStateException("No active peer with snap/1 support");
+        }
+        long headBlock = connector.getChainHead().blockNumber();
+        if (headBlock <= 0) {
+            throw new IllegalStateException(
+                "Chain head not yet known; wait for the eth handshake to complete");
+        }
+        List<BlockHeadersMessage.VerifiedHeader> headers =
+            connector.requestBlockHeaders(headBlock, 1).get(15, TimeUnit.SECONDS);
+        if (headers.isEmpty()) {
+            throw new IllegalStateException("Peer returned no header for block " + headBlock);
+        }
+        BlockHeader header = headers.get(0).header();
+
+        io.myotis.evm.BlockContext blockCtx = new io.myotis.evm.BlockContext(
+            header.stateRoot.toArrayUnsafe(),
+            header.number,
+            header.timestamp,
+            header.baseFeePerGas,
+            io.myotis.evm.Address.of(header.beneficiary.toArrayUnsafe()),
+            header.mixHashOrPrevRandao.toArrayUnsafe(),
+            java.math.BigInteger.valueOf(connector.getNetwork().networkId()),
+            header.gasLimit);
+
+        java.util.concurrent.atomic.AtomicInteger peerIndex =
+            new java.util.concurrent.atomic.AtomicInteger();
+        io.myotis.evm.world.SnapBackedStateOracle oracle =
+            new io.myotis.evm.world.SnapBackedStateOracle(
+                () -> {
+                    List<com.jaeckel.ethp2p.networking.eth.EthHandler> live =
+                        connector.activeSnapHandlers();
+                    if (live.isEmpty()) return null;
+                    int idx = Math.floorMod(peerIndex.getAndIncrement(), live.size());
+                    return new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(live.get(idx));
+                }, io.myotis.evm.world.BytecodeCache.inMemory());
+        io.myotis.evm.DefaultEvmExecutor base = new io.myotis.evm.DefaultEvmExecutor(
+            oracle, io.myotis.evm.world.BytecodeCache.inMemory(), EVM_POOL);
+        io.myotis.evm.PrefetchingEvmExecutor prefetching =
+            new io.myotis.evm.PrefetchingEvmExecutor(base);
+        io.myotis.evm.ccipread.CcipReadHandler ccipHandler =
+            new io.myotis.evm.ccipread.CcipReadHandler(new JavaHttpCcipGateway());
+        io.myotis.evm.CcipReadEvmExecutor executor =
+            new io.myotis.evm.CcipReadEvmExecutor(prefetching, ccipHandler);
+
+        io.myotis.ens.EnsResolver resolver = io.myotis.ens.EnsResolver
+            .forChainId(executor, connector.getNetwork().networkId());
+        return new EnsCallContext(header, blockCtx, resolver);
+    }
+
+    private static String unwrapMessage(Exception e) {
+        Throwable cause = e.getCause() != null ? e.getCause() : e;
+        return cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
+    }
+
+    // -----------------------------------------------------------------------
+    // Extended ENS record-type IPC handlers
+    // -----------------------------------------------------------------------
+
+    private String handleResolveEnsText(String jsonLine) {
+        String name = extractString(jsonLine, "name");
+        String key  = extractString(jsonLine, "key");
+        try {
+            EnsCallContext ctx = prepareEnsCall();
+            java.util.Optional<String> value =
+                ctx.resolver.resolveText(name, key, ctx.blockCtx).get(60, TimeUnit.SECONDS);
+            String head = "{\"ok\":true"
+                + ",\"name\":\"" + escapeJson(name) + "\""
+                + ",\"key\":\"" + escapeJson(key) + "\""
+                + ",\"blockNumber\":" + ctx.header.number;
+            if (value.isEmpty()) {
+                return head + ",\"resolved\":false}";
+            }
+            return head + ",\"resolved\":true,\"value\":\"" + escapeJson(value.get()) + "\"}";
+        } catch (Exception e) {
+            return jsonError(unwrapMessage(e));
+        }
+    }
+
+    private String handleResolveEnsContenthash(String jsonLine) {
+        String name = extractString(jsonLine, "name");
+        try {
+            EnsCallContext ctx = prepareEnsCall();
+            java.util.Optional<byte[]> value =
+                ctx.resolver.resolveContenthash(name, ctx.blockCtx).get(60, TimeUnit.SECONDS);
+            String head = "{\"ok\":true"
+                + ",\"name\":\"" + escapeJson(name) + "\""
+                + ",\"blockNumber\":" + ctx.header.number;
+            if (value.isEmpty()) {
+                return head + ",\"resolved\":false}";
+            }
+            return head + ",\"resolved\":true,\"contenthash\":\""
+                + Bytes.wrap(value.get()).toHexString() + "\"}";
+        } catch (Exception e) {
+            return jsonError(unwrapMessage(e));
+        }
+    }
+
+    private String handleResolveEnsAddrCoin(String jsonLine) {
+        String name = extractString(jsonLine, "name");
+        long coinType = extractLong(jsonLine, "coinType");
+        try {
+            EnsCallContext ctx = prepareEnsCall();
+            java.util.Optional<byte[]> value =
+                ctx.resolver.resolveMultiCoinAddress(name, coinType, ctx.blockCtx)
+                    .get(60, TimeUnit.SECONDS);
+            String head = "{\"ok\":true"
+                + ",\"name\":\"" + escapeJson(name) + "\""
+                + ",\"coinType\":" + coinType
+                + ",\"blockNumber\":" + ctx.header.number;
+            if (value.isEmpty()) {
+                return head + ",\"resolved\":false}";
+            }
+            return head + ",\"resolved\":true,\"address\":\""
+                + Bytes.wrap(value.get()).toHexString() + "\"}";
+        } catch (Exception e) {
+            return jsonError(unwrapMessage(e));
+        }
+    }
+
+    private String handleResolveEnsPubkey(String jsonLine) {
+        String name = extractString(jsonLine, "name");
+        try {
+            EnsCallContext ctx = prepareEnsCall();
+            java.util.Optional<io.myotis.ens.EnsResolver.Pubkey> value =
+                ctx.resolver.resolvePubkey(name, ctx.blockCtx).get(60, TimeUnit.SECONDS);
+            String head = "{\"ok\":true"
+                + ",\"name\":\"" + escapeJson(name) + "\""
+                + ",\"blockNumber\":" + ctx.header.number;
+            if (value.isEmpty()) {
+                return head + ",\"resolved\":false}";
+            }
+            io.myotis.ens.EnsResolver.Pubkey pk = value.get();
+            return head + ",\"resolved\":true"
+                + ",\"pubkeyX\":\"" + Bytes.wrap(pk.x()).toHexString() + "\""
+                + ",\"pubkeyY\":\"" + Bytes.wrap(pk.y()).toHexString() + "\"}";
+        } catch (Exception e) {
+            return jsonError(unwrapMessage(e));
+        }
+    }
+
+    private String handleResolveEnsAbi(String jsonLine) {
+        String name = extractString(jsonLine, "name");
+        long contentTypes;
+        try {
+            contentTypes = extractLong(jsonLine, "contentTypes");
+        } catch (Exception ignored) {
+            // Default: ask for any encoding the resolver supports
+            // (1 | 2 | 4 | 8 = 0xF). Resolvers return the highest
+            // matching bit they have data for.
+            contentTypes = 0xFL;
+        }
+        try {
+            EnsCallContext ctx = prepareEnsCall();
+            java.util.Optional<io.myotis.ens.EnsResolver.AbiRecord> value =
+                ctx.resolver.resolveAbi(name, contentTypes, ctx.blockCtx)
+                    .get(60, TimeUnit.SECONDS);
+            String head = "{\"ok\":true"
+                + ",\"name\":\"" + escapeJson(name) + "\""
+                + ",\"contentTypes\":" + contentTypes
+                + ",\"blockNumber\":" + ctx.header.number;
+            if (value.isEmpty()) {
+                return head + ",\"resolved\":false}";
+            }
+            io.myotis.ens.EnsResolver.AbiRecord r = value.get();
+            return head + ",\"resolved\":true"
+                + ",\"contentType\":" + r.contentType()
+                + ",\"data\":\"" + Bytes.wrap(r.data()).toHexString() + "\"}";
+        } catch (Exception e) {
+            return jsonError(unwrapMessage(e));
+        }
+    }
+
+    private String handleResolveEnsDns(String jsonLine) {
+        String name = extractString(jsonLine, "name");
+        String dnsName = extractString(jsonLine, "dnsName");
+        long resource = extractLong(jsonLine, "resource");
+        if (resource < 0 || resource > 0xFFFFL) {
+            return jsonError("resource must fit in uint16");
+        }
+        try {
+            EnsCallContext ctx = prepareEnsCall();
+            byte[] dnsNameWire = io.myotis.ens.DnsEncoder.encode(dnsName);
+            java.util.Optional<byte[]> value =
+                ctx.resolver.resolveDnsRecord(name, dnsNameWire, (int) resource, ctx.blockCtx)
+                    .get(60, TimeUnit.SECONDS);
+            String head = "{\"ok\":true"
+                + ",\"name\":\"" + escapeJson(name) + "\""
+                + ",\"dnsName\":\"" + escapeJson(dnsName) + "\""
+                + ",\"resource\":" + resource
+                + ",\"blockNumber\":" + ctx.header.number;
+            if (value.isEmpty()) {
+                return head + ",\"resolved\":false}";
+            }
+            return head + ",\"resolved\":true,\"data\":\""
+                + Bytes.wrap(value.get()).toHexString() + "\"}";
+        } catch (Exception e) {
+            return jsonError(unwrapMessage(e));
+        }
+    }
+
+    private String handleResolveEnsInterface(String jsonLine) {
+        String name = extractString(jsonLine, "name");
+        String interfaceIdStr = extractString(jsonLine, "interfaceId");
+        String hex = (interfaceIdStr.startsWith("0x") || interfaceIdStr.startsWith("0X"))
+            ? interfaceIdStr.substring(2) : interfaceIdStr;
+        if (hex.length() != 8) {
+            return jsonError("interfaceId must be a 4-byte hex string (8 hex chars)");
+        }
+        byte[] interfaceId = Bytes.fromHexString(hex).toArrayUnsafe();
+        try {
+            EnsCallContext ctx = prepareEnsCall();
+            java.util.Optional<io.myotis.evm.Address> value =
+                ctx.resolver.resolveInterfaceImplementer(name, interfaceId, ctx.blockCtx)
+                    .get(60, TimeUnit.SECONDS);
+            String head = "{\"ok\":true"
+                + ",\"name\":\"" + escapeJson(name) + "\""
+                + ",\"interfaceId\":\"0x" + hex.toLowerCase() + "\""
+                + ",\"blockNumber\":" + ctx.header.number;
+            if (value.isEmpty()) {
+                return head + ",\"resolved\":false}";
+            }
+            return head + ",\"resolved\":true,\"implementer\":\"" + value.get().toHex() + "\"}";
+        } catch (Exception e) {
+            return jsonError(unwrapMessage(e));
         }
     }
 

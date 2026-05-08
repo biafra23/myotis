@@ -257,6 +257,126 @@ Returns storage slot data for a contract with Merkle-Patricia proof verification
 | `matchedBeaconSlot` | long | Beacon slot trust anchor (only present when `beaconChainVerified=true`) |
 | `blsVerified` | boolean | Whether the trust anchor has BLS verification (only present when `beaconChainVerified=true`) |
 
+### Resolve ENS name
+
+```bash
+./gradlew :app:run -Pargs="resolve-ens vitalik.eth"
+```
+
+Resolves an ENS name to an Ethereum address by running the ENS contracts in a local EVM with state served from SNAP proofs. Supports vanilla `*.eth` names, ENSIP-10 wildcard resolution, and ERC-3668 off-chain (CCIP-Read) lookups.
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ok` | boolean | `true` if the resolution attempt completed without protocol errors |
+| `resolved` | boolean | `true` if a non-zero address was returned, `false` if the name has no record set |
+| `name` | string | The queried name |
+| `address` | string | Resolved address (0x-prefixed, only if `resolved=true`) |
+| `blockNumber` | long | Execution block at which the resolution was performed |
+
+**How it works:**
+
+1. The daemon picks a snap-capable peer and fetches a fresh chain head — the `stateRoot` and the proofs that descend from it stay consistent for the whole call.
+2. A local EVM (Hyperledger Besu's standalone EVM module) executes a single `resolve(bytes name, bytes data)` call to the ENS Universal Resolver. Every account field, storage slot, and contract bytecode the EVM reads is fetched on demand via snap/1 and verified by Merkle-Patricia proof against the peer's `stateRoot`.
+3. If the call reverts with `OffchainLookup` (ERC-3668), the daemon fetches the gateway response over HTTPS and re-enters the EVM with the resolver's callback. The callback validates the gateway's response on-chain — typically by checking a signer's signature against a list of trusted signers embedded in the resolver — so a malicious gateway cannot inject a wrong answer.
+4. The Universal Resolver's return value is decoded as the resolved address.
+
+**Trust model:** every state read is backed by a Merkle proof against the verified `stateRoot`; bytecode is verified by `keccak256(code) == codeHash`; CCIP-Read gateways are trusted only for *availability* — the resolver's callback validates the response cryptographically. The same trust model applies to every other `resolve-ens-*` command.
+
+**Networks:** mainnet, sepolia, and holesky have canonical Registry + Universal Resolver addresses pinned. Other networks fail with `ENS not pinned for chain id …`.
+
+### Resolve ENS text record
+
+```bash
+./gradlew :app:run -Pargs="resolve-ens-text vitalik.eth avatar"
+./gradlew :app:run -Pargs="resolve-ens-text vitalik.eth com.twitter"
+```
+
+Reads a text record (ENSIP-5) for a name. Common keys: `avatar`, `url`, `description`, `email`, `notice`, `keywords`, `com.twitter`, `com.github`, `org.telegram`.
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | The queried name |
+| `key` | string | The text-record key |
+| `resolved` | boolean | `true` if a non-empty value was returned |
+| `value` | string | The record value (only if `resolved=true`) |
+| `blockNumber` | long | Execution block at which the resolution was performed |
+
+### Resolve ENS contenthash
+
+```bash
+./gradlew :app:run -Pargs="resolve-ens-contenthash vitalik.eth"
+```
+
+Reads the contenthash (ENSIP-7) — a multicodec-encoded pointer to IPFS, Swarm, IPNS, or Arweave content. Used to attach a decentralized website to an ENS name.
+
+**Response fields:** `name`, `resolved`, `contenthash` (0x-prefixed multicodec bytes; decoder is the caller's responsibility), `blockNumber`.
+
+### Resolve ENS multi-coin address
+
+```bash
+# Bitcoin (SLIP-44 coinType 0)
+./gradlew :app:run -Pargs="resolve-ens-addr-coin some-name.eth 0"
+
+# Litecoin (SLIP-44 coinType 2)
+./gradlew :app:run -Pargs="resolve-ens-addr-coin some-name.eth 2"
+
+# Solana (SLIP-44 coinType 501)
+./gradlew :app:run -Pargs="resolve-ens-addr-coin some-name.eth 501"
+```
+
+Reads an `addr(node, coinType)` record (ENSIP-9 / SLIP-44). The default `addr` command returns the ETH-mainnet address (`coinType=60`); this two-arg form returns the chain-specific address bytes for any coinType the resolver has set.
+
+**Response fields:** `name`, `coinType`, `resolved`, `address` (0x-prefixed raw chain-specific bytes — for Bitcoin this is the script payload, not a base58 address; the caller is responsible for decoding for that chain), `blockNumber`.
+
+### Resolve ENS pubkey
+
+```bash
+./gradlew :app:run -Pargs="resolve-ens-pubkey some-name.eth"
+```
+
+Reads the secp256k1 public-key record (EIP-619). Niche — used for end-to-end-encrypted DM flows.
+
+**Response fields:** `name`, `resolved`, `pubkeyX`, `pubkeyY` (each 0x-prefixed 32-byte hex), `blockNumber`. Returns `resolved:false` when both coordinates are zero.
+
+### Resolve ENS ABI record
+
+```bash
+./gradlew :app:run -Pargs="resolve-ens-abi some-name.eth"
+./gradlew :app:run -Pargs='{"cmd":"resolve-ens-abi","name":"some-name.eth","contentTypes":1}'
+```
+
+Reads an ABI record (EIP-205) — ABI metadata for a contract owned by the name. `contentTypes` is a bitmask: `1` = Solidity ABI JSON, `2` = zlib-compressed JSON, `4` = CBOR, `8` = URI. Default is `0xF` (all).
+
+**Response fields:** `name`, `contentTypes`, `resolved`, `contentType` (which encoding the resolver chose), `data` (0x-prefixed bytes in that encoding), `blockNumber`.
+
+### Resolve ENS DNS record
+
+Reads a DNS record (ENSIP-8) stored under the name. The DNS record returned can include DNSSEC RRSIG bytes; the caller is responsible for parsing and (if desired) DNSSEC-verifying the bytes.
+
+This command takes a JSON arg rather than positional args because it has three parameters:
+
+```bash
+./gradlew :app:run -Pargs='{"cmd":"resolve-ens-dns","name":"some-name.eth","dnsName":"www.example.com","resource":1}'
+```
+
+`resource` is a DNS resource type (1 = A, 28 = AAAA, 16 = TXT, 33 = SRV, …).
+
+**Response fields:** `name`, `dnsName`, `resource`, `resolved`, `data` (raw RDATA bytes), `blockNumber`.
+
+### Resolve ENS interface implementer
+
+```bash
+./gradlew :app:run -Pargs='{"cmd":"resolve-ens-interface","name":"some-name.eth","interfaceId":"0x5b5e139f"}'
+```
+
+Reads `interfaceImplementer(node, interfaceId)` (EIP-1820 over ENS) — the address of a contract implementing the given EIP-165 interface for this name's owner.
+
+**Response fields:** `name`, `interfaceId`, `resolved`, `implementer` (0x-prefixed 20-byte address), `blockNumber`.
+
 ### Get transactions
 
 ```bash

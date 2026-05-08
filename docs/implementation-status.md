@@ -66,10 +66,31 @@ CL peers are seeded from four sources (in priority order): the persistent `CLPee
 - NFT ownership queries (same mechanism but not exposed via IPC)
 - Vyper storage slot layout support
 
-## 6. ENS Resolution — Via SNAP Storage Proofs
-**Not implemented**
+## 6. ENS Resolution — Via Local EVM over SNAP-Verified State
+**POC: Implemented (full record-type coverage)**
 
-The primitives exist (storage proofs work), but there is no ENS-specific command or logic to do the multi-step registry -> resolver lookup.
+Resolution runs the ENS contracts in a local EVM (`myotis-evm`) with state served from SNAP proofs. Every record type goes through the Universal Resolver's `resolve(bytes,bytes)` so wildcard (ENSIP-10) and CCIP-Read (ERC-3668) work transparently for all of them.
+
+| Record | Spec | IPC command |
+|---|---|---|
+| Forward address | ENSIP-1 | `resolve-ens` |
+| Multi-coin address | ENSIP-9 / SLIP-44 | `resolve-ens-addr-coin` |
+| Text records | ENSIP-5 | `resolve-ens-text` |
+| Content hash | ENSIP-7 | `resolve-ens-contenthash` |
+| Public key | EIP-619 | `resolve-ens-pubkey` |
+| ABI metadata | EIP-205 | `resolve-ens-abi` |
+| DNS records | ENSIP-8 | `resolve-ens-dns` |
+| Interface implementer | EIP-1820 over ENS | `resolve-ens-interface` |
+
+Reverse resolution (`address → name`) is implemented in the resolver with mandatory ENSIP-3 forward-verification round-trip — no IPC command surfaces it yet.
+
+CCIP-Read end-to-end: `OffchainLookup` reverts caught by `CcipReadEvmExecutor`, gateway HTTP fetch via injectable `CcipGateway` (daemon supplies a `java.net.http`-backed impl; Android consumer supplies a Ktor-backed one), callback re-entry into the EVM. Validated against the EIP-3668 demo gateway and Coinbase IDs (`*.cb.id`).
+
+Network coverage: mainnet, sepolia, holesky have canonical Registry + Universal Resolver addresses pinned (sourced from `ensdomains/ens-contracts` deployment manifests). `EnsResolver.forChainId(chainId)` picks the right pair.
+
+**Not implemented:**
+- IPC command for reverse lookup (the resolver method exists, just no surface)
+- L2 / cross-chain name handling beyond the Universal Resolver path
 
 ## 7. Submitting Signed Transactions — devp2p Transaction Gossip
 **Not implemented**
@@ -79,19 +100,36 @@ No `Transactions`, `NewPooledTransactionHashes`, or `GetPooledTransactions` mess
 ## 8. Gas Estimation
 **Not implemented**
 
-`baseFeePerGas` is available in `BlockHeader` and returned in `get-block`, but there is no dedicated gas estimation command or priority fee calculation logic.
+`baseFeePerGas` is available in `BlockHeader` and returned in `get-block`, but there is no dedicated gas estimation command or priority fee calculation logic. The local EVM gives us the simulation path natively — wiring it through to a `gas-estimate` IPC command is straightforward.
+
+## 9. Local EVM Execution
+**POC: Implemented**
+
+`myotis-evm` embeds Hyperledger Besu's standalone `org.hyperledger.besu:evm` artifact and runs it against a SNAP-backed `StateOracle`.
+
+- `DefaultEvmExecutor` runs a transaction-shaped call against state served from snap/1; every read verified by Merkle-Patricia proof against a verified `stateRoot`.
+- `PrefetchingEvmExecutor` does a speculative dry-run to record accessed paths, then warm-loads them before the real run — eliminates the round-trip-per-SLOAD latency that would otherwise dominate.
+- `CcipReadEvmExecutor` handles ERC-3668 off-chain lookups (see Section 6).
+- Bytecode verified via `keccak256(code) == codeHash` against the proof-verified account. Block context (`block.number`, `coinbase`, `prevRandao`, `baseFeePerGas`, `gasLimit`, `chainId`) supplied from a verified header.
+- Currently used for ENS resolution; `:myotis-evm:test` covers the executor stack with deterministic fixtures.
+
+**Not implemented:**
+- `eth_call`-equivalent IPC command for arbitrary view calls (ERC-20 metadata, NFT `tokenURI`, multicall)
+- Gas-estimate IPC command (the executor already returns gas used; just needs an IPC surface)
+- Pre-flight transaction simulation (catch reverts before broadcast)
 
 ## Summary
 
 | Architecture Section                 | Status          | Key Gap                                        |
 |--------------------------------------|-----------------|------------------------------------------------|
-| 1. Sync Committees (CL light client) | **Implemented** | No discv5, hardcoded CL peers                  |
+| 1. Sync Committees (CL light client) | **Implemented** | —                                              |
 | 2. Historical Block Verification     | **Partial**     | No accumulator snapshots, 8192-block limit     |
 | 3. TrueBlocks Transaction History    | **Implemented** | No tx verification against `transactionsRoot`  |
 | 4. Block Data via devp2p             | **Implemented** | No `GetReceipts`, no EIP-4444                  |
 | 5. State Data via SNAP               | **Implemented** | No `GetTrieNodes`, no NFT/Vyper support        |
-| 6. ENS Resolution                    | **Not started** | Primitives exist, no ENS logic                 |
+| 6. ENS Resolution                    | **Implemented** | Reverse lookup has no IPC command surface yet  |
 | 7. Transaction Submission            | **Not started** | No tx gossip messages                          |
-| 8. Gas Estimation                    | **Not started** | `baseFeePerGas` available but no command       |
+| 8. Gas Estimation                    | **Not started** | EVM is wired, just needs an IPC command        |
+| 9. Local EVM Execution               | **Implemented** | No generic view-call / gas-estimate IPC yet    |
 
-The core verification pipeline (sync committees -> state root -> Merkle proofs) is fully functional end-to-end. The biggest gaps are on the "wallet action" side: submitting transactions, ENS, and gas estimation.
+The core verification pipeline (sync committees → state root → Merkle proofs → local EVM) is functional end-to-end. ENS resolution covers all eight record types with identical verification, including CCIP-Read on mainnet. The biggest remaining gaps are on the "wallet action" side: submitting transactions and exposing the EVM as a generic view-call / gas-estimate surface.
