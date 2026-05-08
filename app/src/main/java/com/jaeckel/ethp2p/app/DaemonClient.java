@@ -117,6 +117,51 @@ public class DaemonClient {
                 if (args.length < 2) throw new IllegalArgumentException("Usage: resolve-ens <name.eth>");
                 yield "{\"cmd\":\"resolve-ens\",\"name\":\"" + args[1] + "\"}";
             }
+            case "resolve-ens-text" -> {
+                if (args.length < 3) throw new IllegalArgumentException(
+                    "Usage: resolve-ens-text <name.eth> <key>");
+                yield "{\"cmd\":\"resolve-ens-text\",\"name\":\"" + args[1]
+                    + "\",\"key\":\"" + args[2] + "\"}";
+            }
+            case "resolve-ens-contenthash" -> {
+                if (args.length < 2) throw new IllegalArgumentException(
+                    "Usage: resolve-ens-contenthash <name.eth>");
+                yield "{\"cmd\":\"resolve-ens-contenthash\",\"name\":\"" + args[1] + "\"}";
+            }
+            case "resolve-ens-addr-coin" -> {
+                if (args.length < 3) throw new IllegalArgumentException(
+                    "Usage: resolve-ens-addr-coin <name.eth> <coinType>");
+                yield "{\"cmd\":\"resolve-ens-addr-coin\",\"name\":\"" + args[1]
+                    + "\",\"coinType\":" + Long.parseLong(args[2]) + "}";
+            }
+            case "resolve-ens-pubkey" -> {
+                if (args.length < 2) throw new IllegalArgumentException(
+                    "Usage: resolve-ens-pubkey <name.eth>");
+                yield "{\"cmd\":\"resolve-ens-pubkey\",\"name\":\"" + args[1] + "\"}";
+            }
+            case "resolve-ens-abi" -> {
+                if (args.length < 2) throw new IllegalArgumentException(
+                    "Usage: resolve-ens-abi <name.eth> [contentTypes]");
+                String json = "{\"cmd\":\"resolve-ens-abi\",\"name\":\"" + args[1] + "\"";
+                if (args.length > 2) {
+                    json += ",\"contentTypes\":" + Long.parseLong(args[2]);
+                }
+                json += "}";
+                yield json;
+            }
+            case "resolve-ens-dns" -> {
+                if (args.length < 4) throw new IllegalArgumentException(
+                    "Usage: resolve-ens-dns <name.eth> <dnsName> <resource>");
+                yield "{\"cmd\":\"resolve-ens-dns\",\"name\":\"" + args[1]
+                    + "\",\"dnsName\":\"" + args[2]
+                    + "\",\"resource\":" + Long.parseLong(args[3]) + "}";
+            }
+            case "resolve-ens-interface" -> {
+                if (args.length < 3) throw new IllegalArgumentException(
+                    "Usage: resolve-ens-interface <name.eth> <0xInterfaceId>");
+                yield "{\"cmd\":\"resolve-ens-interface\",\"name\":\"" + args[1]
+                    + "\",\"interfaceId\":\"" + args[2] + "\"}";
+            }
             default -> "{\"cmd\":\"" + cmd + "\"}";
         };
     }

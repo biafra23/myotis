@@ -345,11 +345,14 @@ Reads the secp256k1 public-key record (EIP-619). Niche — used for end-to-end-e
 ### Resolve ENS ABI record
 
 ```bash
+# Default contentTypes mask = 0xF (any encoding)
 ./gradlew :app:run -Pargs="resolve-ens-abi some-name.eth"
-./gradlew :app:run -Pargs='{"cmd":"resolve-ens-abi","name":"some-name.eth","contentTypes":1}'
+
+# Explicit mask: 1 = Solidity ABI JSON only
+./gradlew :app:run -Pargs="resolve-ens-abi some-name.eth 1"
 ```
 
-Reads an ABI record (EIP-205) — ABI metadata for a contract owned by the name. `contentTypes` is a bitmask: `1` = Solidity ABI JSON, `2` = zlib-compressed JSON, `4` = CBOR, `8` = URI. Default is `0xF` (all).
+Reads an ABI record (EIP-205) — ABI metadata for a contract owned by the name. `contentTypes` is a bitmask: `1` = Solidity ABI JSON, `2` = zlib-compressed JSON, `4` = CBOR, `8` = URI. Default is `15` (all).
 
 **Response fields:** `name`, `contentTypes`, `resolved`, `contentType` (which encoding the resolver chose), `data` (0x-prefixed bytes in that encoding), `blockNumber`.
 
@@ -357,23 +360,22 @@ Reads an ABI record (EIP-205) — ABI metadata for a contract owned by the name.
 
 Reads a DNS record (ENSIP-8) stored under the name. The DNS record returned can include DNSSEC RRSIG bytes; the caller is responsible for parsing and (if desired) DNSSEC-verifying the bytes.
 
-This command takes a JSON arg rather than positional args because it has three parameters:
-
 ```bash
-./gradlew :app:run -Pargs='{"cmd":"resolve-ens-dns","name":"some-name.eth","dnsName":"www.example.com","resource":1}'
+./gradlew :app:run -Pargs="resolve-ens-dns some-name.eth www.example.com 1"
 ```
 
-`resource` is a DNS resource type (1 = A, 28 = AAAA, 16 = TXT, 33 = SRV, …).
+Positional args are `<name.eth> <dnsName> <resource>`. `resource` is a DNS resource type (1 = A, 28 = AAAA, 16 = TXT, 33 = SRV, …).
 
 **Response fields:** `name`, `dnsName`, `resource`, `resolved`, `data` (raw RDATA bytes), `blockNumber`.
 
 ### Resolve ENS interface implementer
 
 ```bash
-./gradlew :app:run -Pargs='{"cmd":"resolve-ens-interface","name":"some-name.eth","interfaceId":"0x5b5e139f"}'
+# 0x5b5e139f is the EIP-165 selector for ERC-721 Metadata
+./gradlew :app:run -Pargs="resolve-ens-interface some-name.eth 0x5b5e139f"
 ```
 
-Reads `interfaceImplementer(node, interfaceId)` (EIP-1820 over ENS) — the address of a contract implementing the given EIP-165 interface for this name's owner.
+Reads `interfaceImplementer(node, interfaceId)` (EIP-1820 over ENS) — the address of a contract implementing the given EIP-165 interface for this name's owner. Positional args are `<name.eth> <0xInterfaceId>`.
 
 **Response fields:** `name`, `interfaceId`, `resolved`, `implementer` (0x-prefixed 20-byte address), `blockNumber`.
 
