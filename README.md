@@ -40,12 +40,8 @@ The application operates in two modes: **daemon** and **client**. The daemon dis
 ### Start the daemon
 
 ```bash
-# Mainnet (default)
+# Mainnet
 ./gradlew :app:run
-
-# Testnet
-./gradlew :app:run -Pnetwork=sepolia
-./gradlew :app:run -Pnetwork=holesky
 
 # Custom port (default: 30303)
 ./gradlew :app:run -Pport=30304
