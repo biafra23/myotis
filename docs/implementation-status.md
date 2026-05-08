@@ -66,10 +66,21 @@ CL peers are seeded from four sources (in priority order): the persistent `CLPee
 - NFT ownership queries (same mechanism but not exposed via IPC)
 - Vyper storage slot layout support
 
-## 6. ENS Resolution — Via SNAP Storage Proofs
-**Not implemented**
+## 6. ENS Resolution — Via Local EVM over SNAP-Verified State
+**POC: Implemented**
 
-The primitives exist (storage proofs work), but there is no ENS-specific command or logic to do the multi-step registry -> resolver lookup.
+Resolution runs the ENS contracts in a local EVM (`myotis-evm`, see Section 9) with state served from SNAP proofs.
+
+- Forward resolution via the **Universal Resolver** (`resolve(bytes,bytes)`) — handles wildcard names (ENSIP-10) and surfaces ERC-3668 reverts. Implementation in `myotis-ens/EnsResolver`.
+- **CCIP-Read (ERC-3668)** end-to-end: `OffchainLookup` reverts caught by `CcipReadEvmExecutor`, gateway HTTP fetch via injectable `CcipGateway` (daemon supplies a `java.net.http`-backed impl; Android consumer supplies a Ktor-backed one), callback re-entry into the EVM. Validated against the EIP-3668 demo gateway and Coinbase IDs (`*.cb.id`).
+- **Reverse resolution** (`address → name`) with mandatory ENSIP-3 forward-verification round-trip — the resolver's claim is rejected if a forward lookup of the claimed name doesn't return the original address.
+- IPC command: `resolve-ens <name>` returns `{"resolved":bool, "address":"0x...", "blockNumber":N}`.
+
+Validated against mainnet: `vitalik.eth`, `1.offchainexample.eth` (CCIP-Read demo), `jesse.cb.id` (Coinbase gateway).
+
+**Not implemented:**
+- Forward resolution of L2 / cross-chain names that depend on resolver behaviour beyond the Universal Resolver path
+- Profile fields beyond `addr(bytes32)` (text records, content hash, multi-coin addresses)
 
 ## 7. Submitting Signed Transactions — devp2p Transaction Gossip
 **Not implemented**
@@ -79,19 +90,36 @@ No `Transactions`, `NewPooledTransactionHashes`, or `GetPooledTransactions` mess
 ## 8. Gas Estimation
 **Not implemented**
 
-`baseFeePerGas` is available in `BlockHeader` and returned in `get-block`, but there is no dedicated gas estimation command or priority fee calculation logic.
+`baseFeePerGas` is available in `BlockHeader` and returned in `get-block`, but there is no dedicated gas estimation command or priority fee calculation logic. The local EVM (Section 9) gives us the simulation path natively — wiring it through to a `gas-estimate` IPC command is straightforward, just not done yet.
+
+## 9. Local EVM Execution
+**POC: Implemented**
+
+`myotis-evm` embeds Hyperledger Besu's standalone `org.hyperledger.besu:evm` artifact and runs it against a SNAP-backed `StateOracle`.
+
+- `DefaultEvmExecutor` runs a transaction-shaped call against state served from snap/1; every read verified by Merkle-Patricia proof against a verified `stateRoot`.
+- `PrefetchingEvmExecutor` does a speculative dry-run to record accessed paths, then warm-loads them before the real run — eliminates the round-trip-per-SLOAD latency that would otherwise dominate.
+- `CcipReadEvmExecutor` handles ERC-3668 off-chain lookups (see Section 6).
+- Bytecode verified via `keccak256(code) == codeHash` against the proof-verified account. Block context (`block.number`, `coinbase`, `prevRandao`, `baseFeePerGas`, `gasLimit`, `chainId`) supplied from a verified header.
+- Currently used for ENS resolution; `:myotis-evm:test` covers the executor stack with deterministic fixtures.
+
+**Not implemented:**
+- `eth_call`-equivalent IPC command for arbitrary view calls (ERC-20 metadata, NFT `tokenURI`, multicall)
+- Gas estimation IPC command (the executor already returns gas used; just needs an IPC surface)
+- Pre-flight transaction simulation (catch reverts before broadcast)
 
 ## Summary
 
 | Architecture Section                 | Status          | Key Gap                                        |
 |--------------------------------------|-----------------|------------------------------------------------|
-| 1. Sync Committees (CL light client) | **Implemented** | No discv5, hardcoded CL peers                  |
+| 1. Sync Committees (CL light client) | **Implemented** | —                                              |
 | 2. Historical Block Verification     | **Partial**     | No accumulator snapshots, 8192-block limit     |
 | 3. TrueBlocks Transaction History    | **Implemented** | No tx verification against `transactionsRoot`  |
 | 4. Block Data via devp2p             | **Implemented** | No `GetReceipts`, no EIP-4444                  |
 | 5. State Data via SNAP               | **Implemented** | No `GetTrieNodes`, no NFT/Vyper support        |
-| 6. ENS Resolution                    | **Not started** | Primitives exist, no ENS logic                 |
+| 6. ENS Resolution                    | **Implemented** | No text records / multi-coin addrs             |
 | 7. Transaction Submission            | **Not started** | No tx gossip messages                          |
-| 8. Gas Estimation                    | **Not started** | `baseFeePerGas` available but no command       |
+| 8. Gas Estimation                    | **Not started** | EVM is wired, just needs an IPC command        |
+| 9. Local EVM Execution               | **Implemented** | No generic view-call / gas-estimate IPC yet    |
 
-The core verification pipeline (sync committees -> state root -> Merkle proofs) is fully functional end-to-end. The biggest gaps are on the "wallet action" side: submitting transactions, ENS, and gas estimation.
+The core verification pipeline (sync committees → state root → Merkle proofs → local EVM) is functional end-to-end. ENS resolution including CCIP-Read is validated on mainnet. The biggest remaining gaps are on the "wallet action" side: submitting transactions and exposing the EVM as a generic view-call / gas-estimate surface.
