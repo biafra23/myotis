@@ -113,6 +113,10 @@ public class DaemonClient {
                 if (args.length < 2) throw new IllegalArgumentException("Usage: get-transactions <0xAddress>");
                 yield "{\"cmd\":\"get-transactions\",\"address\":\"" + args[1] + "\"}";
             }
+            case "resolve-ens" -> {
+                if (args.length < 2) throw new IllegalArgumentException("Usage: resolve-ens <name.eth>");
+                yield "{\"cmd\":\"resolve-ens\",\"name\":\"" + args[1] + "\"}";
+            }
             default -> "{\"cmd\":\"" + cmd + "\"}";
         };
     }
