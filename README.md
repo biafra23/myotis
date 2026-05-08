@@ -63,6 +63,38 @@ The daemon runs in the foreground. It discovers peers via discv4 (Kademlia DHT),
 
 All commands are sent to the running daemon via IPC. Responses are JSON.
 
+### When is the daemon ready to answer?
+
+Most commands depend on different parts of the stack being up. After
+starting the daemon, wait for the sub-system you need before issuing
+queries:
+
+| Command | Requires |
+|---------|----------|
+| `status`, `peers`, `dial` | daemon running |
+| `beacon-status` | daemon running (returns `SYNCING` until ready) |
+| `get-headers`, `get-block`, `get-transactions` | at least one peer in `READY` state (check with `peers`) |
+| `get-account`, `get-storage` | at least one peer with `snap=true` in `READY` state |
+| `get-account`, `get-storage`, `get-block` (full beacon verification — `verifyMethod` populated, `beaconChainVerified=true`) | `beacon-status` returns `"state":"SYNCED"` |
+| `resolve-ens` | at least one peer with `snap=true` in `READY` state |
+
+Account and storage queries return data with a Merkle proof against
+the peer's `stateRoot` even before the beacon light client reaches
+`SYNCED` — but the response will report `beaconChainVerified=false`
+with `failReason: "beaconNotSynced"`. Wait for `SYNCED` if you need
+the full beacon-anchored trust chain.
+
+The beacon light client typically reaches `SYNCED` within ~30–60
+seconds of daemon startup, depending on how quickly libp2p peers are
+discovered and how recent the embedded checkpoint is. Watch progress
+with:
+
+```bash
+./beacon-status.sh
+# or
+watch -n 2 ./beacon-status.sh
+```
+
 ### Status
 
 ```bash
