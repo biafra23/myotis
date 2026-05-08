@@ -1187,8 +1187,25 @@ public class BeaconLightClient implements AutoCloseable {
 
         // Honor the Lodestar exclusion — finality polling is part of the
         // debug surface for Lighthouse/Teku/Prysm reliability.
+        //
+        // Cap the per-cycle iteration. Without this, when every peer's
+        // finality update fails (typical when the committee is stale and
+        // can't be advanced because peers pruned the LC updates we'd
+        // need), we'd serially iterate ~1000 peers at up to 10s each =
+        // burning hours per cycle. That starves the syncLoop's
+        // wall-clock catchUpSyncCommittee retry at the top of the next
+        // call and locks the daemon in CATCHING_UP indefinitely. 16 is
+        // enough to find a working peer when one exists; the syncLoop
+        // re-fires every 12s so we cycle through fresh selections fast.
+        final int POLL_FINALITY_PEER_LIMIT = 16;
+        int tried = 0;
         for (String peer : copyPeers()) {
             if (!running) return;
+            if (tried++ >= POLL_FINALITY_PEER_LIMIT) {
+                log.debug("[beacon] pollFinalityUpdate: tried {} peers, no advance — will retry next cycle",
+                        POLL_FINALITY_PEER_LIMIT);
+                return;
+            }
             try {
                 byte[] response = p2pService
                         .requestFinalityUpdate(peer)
