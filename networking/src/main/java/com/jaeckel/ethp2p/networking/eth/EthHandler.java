@@ -296,19 +296,22 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             peerBestHash = status.bestHash.toShortHexString();
             peerBestBlockHash = status.bestHash;
             log.info("[eth] Status from peer: {} (bestHash={})", status, peerBestHash);
-            // Update chain head from peer's Status (especially eth/69 which reports latestBlock)
-            // This ensures subsequent Status messages to other peers use a realistic block number
-            if (status.latestBlock > 0) {
-                chainHead.update(status.latestBlock, status.bestHash);
-                log.info("[eth] Updated chain head from peer Status: block={} hash={}",
-                    status.latestBlock, peerBestHash);
-            }
             if (!status.isCompatible(network.networkId(), network.genesisHash())) {
                 log.warn("[eth] Incompatible network: chainId={}, genesis={}",
                     status.networkId, status.genesisHash);
                 incompatibleNetwork = true;
                 ctx.close();
                 return;
+            }
+            // Update chain head only after confirming the peer is on our network.
+            // Peers on foreign networks (e.g. BOB Network networkId=60808 with its
+            // own genesis) can otherwise poison ChainHead with block numbers from
+            // an unrelated chain, which then causes header requests routed to real
+            // peers to come back empty.
+            if (status.latestBlock > 0) {
+                chainHead.update(status.latestBlock, status.bestHash);
+                log.info("[eth] Updated chain head from peer Status: block={} hash={}",
+                    status.latestBlock, peerBestHash);
             }
             state = State.READY;
             readyCtx = ctx;
@@ -693,6 +696,47 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     }
 
     /**
+     * Probe THIS peer for the header at its own current best-block hash.
+     *
+     * <p>This is the right primitive to use before any snap/1 query: peers
+     * prune state outside a ~128-block window, so the only stateRoot a peer
+     * is reliably willing to serve is the one anchored at its own current
+     * head. Callers should pair the returned header's {@code stateRoot} with
+     * the peer it came from — a stateRoot from peer A is not safe to use
+     * against peer B, which is exactly the bug that triggers
+     * {@code InvalidProof[... missing node ... (path idx=0)]} when the
+     * verifier descends from a root the responding peer doesn't have.
+     *
+     * <p>Returns failed future if the peer is not READY or hasn't reported a
+     * best-block hash yet (i.e., hasn't completed the eth handshake).
+     */
+    public CompletableFuture<com.jaeckel.ethp2p.core.types.BlockHeader> requestFreshHeadHeaderAsync() {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) {
+            return CompletableFuture.failedFuture(
+                new IllegalStateException("EthHandler not READY"));
+        }
+        org.apache.tuweni.bytes.Bytes32 hash = peerBestBlockHash;
+        if (hash == null) {
+            return CompletableFuture.failedFuture(
+                new IllegalStateException("No best block hash from peer"));
+        }
+        long reqId = requestId.getAndIncrement();
+        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> headerFut = new CompletableFuture<>();
+        pendingRequests.put(reqId, headerFut);
+        byte[] payload = GetBlockHeadersMessage.encodeByHash(reqId, hash, 1, 0, false);
+        log.debug("[eth] GetBlockHeaders (fresh head, hash={}) reqId={}",
+            hash.toShortHexString(), reqId);
+        rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
+        return headerFut.orTimeout(5, TimeUnit.SECONDS).thenApply(headers -> {
+            if (headers.isEmpty()) {
+                throw new RuntimeException("Peer returned no header for its own best hash");
+            }
+            return headers.get(0).header();
+        });
+    }
+
+    /**
      * Request block bodies and return a future that completes when the response arrives.
      *
      * @return a future, or null if this handler is not in READY state
@@ -962,6 +1006,52 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
      * @param paths     path sets the peer should resolve
      * @return future completing with the TrieNodes decode result, or null if not READY
      */
+    /**
+     * Direct {@link GetAccountRangeMessage} send keyed by account-hash, no
+     * fresh-header probe. The caller already has a stateRoot and just wants
+     * the proof that lets it verify the account leaf at {@code accountHash}
+     * — that's exactly what {@link SnapBackedStateOracle} needs.
+     *
+     * <p>Use this instead of {@link #requestTrieNodesAsync} when the goal is
+     * a verifiable account record. {@code GetTrieNodes} returns only the
+     * node at the requested path (per geth's snap handler), not the
+     * root-to-leaf proof — so the MPT verifier can never descend from the
+     * stateRoot. {@code GetAccountRange} returns the proof.
+     */
+    public CompletableFuture<AccountRangeMessage.DecodeResult> requestAccountByHashAsync(
+            org.apache.tuweni.bytes.Bytes32 accountHash,
+            org.apache.tuweni.bytes.Bytes32 stateRoot) {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) return CompletableFuture.failedFuture(
+            new IllegalStateException("EthHandler not READY"));
+        if (!snapNegotiated) return CompletableFuture.failedFuture(
+            new UnsupportedOperationException("snap/1 not negotiated with this peer"));
+        return sendGetAccountRange(ctx, accountHash, stateRoot)
+            .orTimeout(10, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Direct {@link GetStorageRangesMessage} send keyed by account-hash and
+     * slot-hash. Same rationale as {@link #requestAccountByHashAsync} —
+     * returns the storage proof rooted at the account's storageRoot.
+     *
+     * <p>{@code stateRoot} is the world state root the request anchors at;
+     * the peer uses it to look up the account by hash and then serves the
+     * storage proof from that account's storageRoot.
+     */
+    public CompletableFuture<StorageRangesMessage.DecodeResult> requestStorageByHashAsync(
+            org.apache.tuweni.bytes.Bytes32 accountHash,
+            org.apache.tuweni.bytes.Bytes32 slotHash,
+            org.apache.tuweni.bytes.Bytes32 stateRoot) {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) return CompletableFuture.failedFuture(
+            new IllegalStateException("EthHandler not READY"));
+        if (!snapNegotiated) return CompletableFuture.failedFuture(
+            new UnsupportedOperationException("snap/1 not negotiated with this peer"));
+        return sendGetStorageRanges(ctx, accountHash, slotHash, stateRoot)
+            .orTimeout(10, TimeUnit.SECONDS);
+    }
+
     public CompletableFuture<TrieNodesMessage.DecodeResult> requestTrieNodesAsync(
             org.apache.tuweni.bytes.Bytes32 stateRoot,
             java.util.List<GetTrieNodesMessage.PathSet> paths) {
