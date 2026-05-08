@@ -865,7 +865,14 @@ public class BeaconLightClient implements AutoCloseable {
 
         for (String peer : peers) {
             if (!running) return false;
+            // Per-attempt timeout: libp2p reqresp has no inherent deadline, so a
+            // peer that accepts the stream but never responds leaves the future
+            // hanging forever. That keeps `remaining` non-zero and forces the
+            // outer winner.get(60s) wall to fire on every batch where any peer
+            // is a silent hanger — the dominant cost in the catch-up timeline.
+            // 15s is generous for a real LC peer to deliver a 15-update batch.
             p2pService.requestUpdatesByRange(peer, bootstrapPeriod, count)
+                    .orTimeout(15, TimeUnit.SECONDS)
                     .whenComplete((responses, ex) -> {
                         if (ex != null) {
                             Throwable root = ex;
@@ -910,7 +917,13 @@ public class BeaconLightClient implements AutoCloseable {
         }
 
         try {
-            boolean result = winner.get(60, TimeUnit.SECONDS);
+            // 20s outer wall = per-attempt 15s timeout + ~5s slack for the
+            // last future's whenComplete to settle and complete `winner`.
+            // Pre-fix this was 60s, but with hung futures now bounded at 15s
+            // the longer wall just kept a doomed batch alive — the catch-up
+            // loop retries with a fresh batch immediately, which usually
+            // finds a fast peer in the next attempt.
+            boolean result = winner.get(20, TimeUnit.SECONDS);
             if (!result) {
                 log.warn("[beacon] Catch-up batch: no peer advanced store (tried {}, {} failed, {} returned empty/unusable)",
                         peers.size(), failCount.get(), emptyCount.get());
