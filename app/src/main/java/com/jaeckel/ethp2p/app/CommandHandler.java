@@ -36,8 +36,11 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Handles JSON-Lines IPC commands dispatched by DaemonServer.
@@ -974,27 +977,99 @@ public class CommandHandler {
     private String handleResolveEns(String jsonLine) {
         String name = extractString(jsonLine, "name");
         try {
-            // 1. Confirm at least one snap-capable peer exists. The oracle's
-            //    rotating supplier (below) re-polls for each retry, so we
-            //    don't pin a single handler here.
-            if (connector.activeSnapHandlers().isEmpty()) {
+            // 1. Find a snap-capable peer that responds with a fresh head we
+            //    can use. We MUST take the stateRoot from the same peer that
+            //    will serve the SNAP requests: peers prune trie state outside
+            //    a ~128-block window, and the snapshot is anchored at the
+            //    peer's own current head. A stateRoot from peer A used
+            //    against peer B reliably surfaces as
+            //    InvalidProof[... missing node ... (path idx=0)] — peer B has
+            //    no node hashing to A's root.
+            //
+            //    Earlier versions of this command pulled the head block
+            //    number from the cluster-wide ChainHead, fetched a header
+            //    from one peer, and then routed SNAP requests to a rotating
+            //    set of *other* peers via the oracle. That worked only when
+            //    every peer happened to share the same head — unreliable in
+            //    practice and the source of the path-idx=0 errors.
+            List<com.jaeckel.ethp2p.networking.eth.EthHandler> snapPeers =
+                connector.activeSnapHandlers();
+            if (snapPeers.isEmpty()) {
                 return jsonError("No active peer with snap/1 support");
             }
-
-            // 2. Fetch a fresh header (the peer's chain head) so we have a
-            // recent, peer-servable state root for snap requests.
-            long headBlock = connector.getChainHead().blockNumber();
-            if (headBlock <= 0) {
-                return jsonError("Chain head not yet known; wait for the eth handshake to complete");
+            // Probe all snap peers in parallel rather than serially — with a
+            // 10s per-peer timeout a serial loop would block the whole
+            // command for up to 10s × N on an unresponsive cluster. allOf
+            // bounded by a single 10s wait gives us at-most-10s total, then
+            // we pick the first peer (in iteration order, deterministic)
+            // whose probe completed with a sensible head.
+            //
+            // The per-probe wrap with handle((v,ex)->null) is so allOf
+            // doesn't short-circuit when one peer throws — we want to give
+            // every peer the full window to respond.
+            long minSensibleHead = connector.getNetwork().minSensibleHeadBlock();
+            List<CompletableFuture<BlockHeader>> probes = new ArrayList<>(snapPeers.size());
+            List<CompletableFuture<Void>> safeProbes = new ArrayList<>(snapPeers.size());
+            for (com.jaeckel.ethp2p.networking.eth.EthHandler peer : snapPeers) {
+                CompletableFuture<BlockHeader> f = peer.requestFreshHeadHeaderAsync();
+                probes.add(f);
+                safeProbes.add(f.handle((v, ex) -> null));
             }
-            List<BlockHeadersMessage.VerifiedHeader> headers =
-                connector.requestBlockHeaders(headBlock, 1).get(15, TimeUnit.SECONDS);
-            if (headers.isEmpty()) {
-                return jsonError("Peer returned no header for block " + headBlock);
+            try {
+                CompletableFuture.allOf(safeProbes.toArray(new CompletableFuture<?>[0]))
+                    .get(10, TimeUnit.SECONDS);
+            } catch (TimeoutException | ExecutionException ignore) {
+                // Some peers may still be in-flight; cancel them so they
+                // don't keep using the channel after we've already fallen
+                // through to "no usable peer". Already-completed probes are
+                // unaffected by cancel(). Then treat any !isDone probe as a
+                // failure below.
+                for (CompletableFuture<BlockHeader> p : probes) {
+                    if (!p.isDone()) p.cancel(true);
+                }
             }
-            BlockHeader header = headers.get(0).header();
+            com.jaeckel.ethp2p.networking.eth.EthHandler pinnedPeer = null;
+            BlockHeader header = null;
+            String lastError = null;
+            for (int i = 0; i < snapPeers.size(); i++) {
+                com.jaeckel.ethp2p.networking.eth.EthHandler peer = snapPeers.get(i);
+                CompletableFuture<BlockHeader> probe = probes.get(i);
+                if (!probe.isDone()) {
+                    lastError = "peer " + peer.getRemoteAddress() + " probe timed out";
+                    continue;
+                }
+                if (probe.isCompletedExceptionally()) {
+                    try {
+                        probe.getNow(null);
+                    } catch (Exception e) {
+                        Throwable c = e.getCause() != null ? e.getCause() : e;
+                        lastError = "peer " + peer.getRemoteAddress()
+                            + " probe failed: "
+                            + (c.getMessage() != null ? c.getMessage() : c.getClass().getSimpleName());
+                    }
+                    continue;
+                }
+                BlockHeader fresh = probe.join();
+                // Sanity floor on the block number — guards against a peer
+                // claiming an absurd best-hash (the chain-head poisoning fix
+                // covers eth-handshake-time corruption, but not this).
+                // Floor is per-network; 0 disables the check on unknown
+                // networks. See NetworkConfig#minSensibleHeadBlock.
+                if (fresh.number < minSensibleHead) {
+                    lastError = "peer " + peer.getRemoteAddress()
+                        + " returned stale head #" + fresh.number;
+                    continue;
+                }
+                pinnedPeer = peer;
+                header = fresh;
+                break;
+            }
+            if (pinnedPeer == null || header == null) {
+                return jsonError("No snap peer returned a usable fresh head"
+                    + (lastError != null ? " (" + lastError + ")" : ""));
+            }
 
-            // 3. Build the BlockContext from that header.
+            // 2. Build the BlockContext from that header.
             io.myotis.evm.BlockContext blockCtx = new io.myotis.evm.BlockContext(
                 header.stateRoot.toArrayUnsafe(),
                 header.number,
@@ -1005,23 +1080,20 @@ public class CommandHandler {
                 java.math.BigInteger.valueOf(connector.getNetwork().networkId()),
                 header.gasLimit);
 
-            // 4. Build the executor stack. The supplier re-polls the
-            //    connector each invocation and round-robins through whatever
-            //    snap-capable peers are currently active, so the oracle's
-            //    retry-on-InvalidProof / IO-failure logic actually engages a
-            //    different peer on each attempt — capturing one handler at
-            //    construction time would defeat that.
-            java.util.concurrent.atomic.AtomicInteger peerIndex =
-                new java.util.concurrent.atomic.AtomicInteger();
+            // 3. Pin every SNAP request to the same peer the stateRoot came
+            //    from. The oracle's retry budget still engages on transient
+            //    failures (timeouts, channel close), but every retry targets
+            //    the one peer that is guaranteed to have this exact root in
+            //    its snapshot. If that peer goes away mid-resolve, the user
+            //    can retry — better a clean failure than three rotating
+            //    attempts that each fail with "missing node".
+            final com.jaeckel.ethp2p.networking.eth.EthHandler finalPeer = pinnedPeer;
             io.myotis.evm.world.SnapBackedStateOracle oracle =
                 new io.myotis.evm.world.SnapBackedStateOracle(
-                    () -> {
-                        List<com.jaeckel.ethp2p.networking.eth.EthHandler> live =
-                            connector.activeSnapHandlers();
-                        if (live.isEmpty()) return null;
-                        int idx = Math.floorMod(peerIndex.getAndIncrement(), live.size());
-                        return new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(live.get(idx));
-                    }, io.myotis.evm.world.BytecodeCache.inMemory());
+                    () -> finalPeer.isReady() && !finalPeer.isSnapServingFailed()
+                        ? new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(finalPeer)
+                        : null,
+                    io.myotis.evm.world.BytecodeCache.inMemory());
             io.myotis.evm.DefaultEvmExecutor base = new io.myotis.evm.DefaultEvmExecutor(
                 oracle, io.myotis.evm.world.BytecodeCache.inMemory(), EVM_POOL);
             io.myotis.evm.PrefetchingEvmExecutor prefetching =

@@ -296,19 +296,22 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             peerBestHash = status.bestHash.toShortHexString();
             peerBestBlockHash = status.bestHash;
             log.info("[eth] Status from peer: {} (bestHash={})", status, peerBestHash);
-            // Update chain head from peer's Status (especially eth/69 which reports latestBlock)
-            // This ensures subsequent Status messages to other peers use a realistic block number
-            if (status.latestBlock > 0) {
-                chainHead.update(status.latestBlock, status.bestHash);
-                log.info("[eth] Updated chain head from peer Status: block={} hash={}",
-                    status.latestBlock, peerBestHash);
-            }
             if (!status.isCompatible(network.networkId(), network.genesisHash())) {
                 log.warn("[eth] Incompatible network: chainId={}, genesis={}",
                     status.networkId, status.genesisHash);
                 incompatibleNetwork = true;
                 ctx.close();
                 return;
+            }
+            // Update chain head only after confirming the peer is on our network.
+            // Peers on foreign networks (e.g. BOB Network networkId=60808 with its
+            // own genesis) can otherwise poison ChainHead with block numbers from
+            // an unrelated chain, which then causes header requests routed to real
+            // peers to come back empty.
+            if (status.latestBlock > 0) {
+                chainHead.update(status.latestBlock, status.bestHash);
+                log.info("[eth] Updated chain head from peer Status: block={} hash={}",
+                    status.latestBlock, peerBestHash);
             }
             state = State.READY;
             readyCtx = ctx;
@@ -693,6 +696,49 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     }
 
     /**
+     * Probe THIS peer for the header at its own current best-block hash.
+     *
+     * <p>This is the right primitive to use before any snap/1 query: peers
+     * prune state outside a ~128-block window, so the only stateRoot a peer
+     * is reliably willing to serve is the one anchored at its own current
+     * head. Callers should pair the returned header's {@code stateRoot} with
+     * the peer it came from — a stateRoot from peer A is not safe to use
+     * against peer B, which is exactly the bug that triggers
+     * {@code InvalidProof[... missing node ... (path idx=0)]} when the
+     * verifier descends from a root the responding peer doesn't have.
+     *
+     * <p>Returns failed future if the peer is not READY or hasn't reported a
+     * best-block hash yet (i.e., hasn't completed the eth handshake).
+     */
+    public CompletableFuture<com.jaeckel.ethp2p.core.types.BlockHeader> requestFreshHeadHeaderAsync() {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) {
+            return CompletableFuture.failedFuture(
+                new IllegalStateException("EthHandler not READY"));
+        }
+        org.apache.tuweni.bytes.Bytes32 hash = peerBestBlockHash;
+        if (hash == null) {
+            return CompletableFuture.failedFuture(
+                new IllegalStateException("No best block hash from peer"));
+        }
+        long reqId = requestId.getAndIncrement();
+        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> headerFut = new CompletableFuture<>();
+        pendingRequests.put(reqId, headerFut);
+        byte[] payload = GetBlockHeadersMessage.encodeByHash(reqId, hash, 1, 0, false);
+        log.debug("[eth] GetBlockHeaders (fresh head, hash={}) reqId={}",
+            hash.toShortHexString(), reqId);
+        rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
+        return headerFut.orTimeout(5, TimeUnit.SECONDS)
+            .whenComplete((r, ex) -> pendingRequests.remove(reqId))
+            .thenApply(headers -> {
+                if (headers.isEmpty()) {
+                    throw new RuntimeException("Peer returned no header for its own best hash");
+                }
+                return headers.get(0).header();
+            });
+    }
+
+    /**
      * Request block bodies and return a future that completes when the response arrives.
      *
      * @return a future, or null if this handler is not in READY state
@@ -736,8 +782,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             org.apache.tuweni.crypto.Hash.keccak256(address);
 
         log.info("[snap] Using explicit stateRoot={} for account query", explicitStateRoot.toShortHexString());
-        return sendGetAccountRange(ctx, accountHash, explicitStateRoot)
-            .orTimeout(10, TimeUnit.SECONDS);
+        // Timeout + pendingSnapRequests cleanup are applied inside sendGetAccountRange.
+        return sendGetAccountRange(ctx, accountHash, explicitStateRoot);
     }
 
     public CompletableFuture<AccountRangeMessage.DecodeResult> requestAccountAsync(
@@ -812,7 +858,12 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         log.info("[snap] GetAccountRange reqId={} accountHash={} stateRoot={}",
             reqId, accountHash.toShortHexString(), stateRoot.toShortHexString());
         rlpxHandler.sendMessage(ctx, snapGetAccountRange, payload);
-        return future;
+        // Apply the timeout here (where the reqId is in scope) and clear the
+        // pendingSnapRequests entry on any terminal outcome — completion,
+        // exception, or timeout. Without this, an orTimeout firing while the
+        // peer stays connected would leak the entry until channelInactive.
+        return future.orTimeout(10, TimeUnit.SECONDS)
+            .whenComplete((r, ex) -> pendingSnapRequests.remove(reqId));
     }
 
     /**
@@ -899,8 +950,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         org.apache.tuweni.bytes.Bytes32 accountHash =
             org.apache.tuweni.crypto.Hash.keccak256(contractAddress);
 
-        return sendGetStorageRanges(ctx, accountHash, storageKeyHash, explicitStateRoot)
-            .orTimeout(10, TimeUnit.SECONDS);
+        // Timeout + pendingStorageRequests cleanup are applied inside sendGetStorageRanges.
+        return sendGetStorageRanges(ctx, accountHash, storageKeyHash, explicitStateRoot);
     }
 
     private CompletableFuture<StorageRangesMessage.DecodeResult> sendGetStorageRanges(
@@ -919,7 +970,11 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             reqId, accountHash.toShortHexString(), storageKeyHash.toShortHexString(),
             stateRoot.toShortHexString());
         rlpxHandler.sendMessage(ctx, snapGetStorageRanges, payload);
-        return future;
+        // Same pattern as sendGetAccountRange: timeout + cleanup keyed on the
+        // reqId we just allocated, so timeouts don't leak pendingStorageRequests
+        // entries on a still-connected peer.
+        return future.orTimeout(10, TimeUnit.SECONDS)
+            .whenComplete((r, ex) -> pendingStorageRequests.remove(reqId));
     }
 
     /**
@@ -946,7 +1001,52 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         byte[] payload = GetByteCodesMessage.encode(reqId, hashes, 128 * 1024L);
         log.info("[snap] GetByteCodes reqId={} hashes={}", reqId, hashes.size());
         rlpxHandler.sendMessage(ctx, snapGetByteCodes, payload);
-        return future.orTimeout(10, TimeUnit.SECONDS);
+        return future.orTimeout(10, TimeUnit.SECONDS)
+            .whenComplete((r, ex) -> pendingByteCodeRequests.remove(reqId));
+    }
+
+    /**
+     * Direct {@link GetAccountRangeMessage} send keyed by account-hash, no
+     * fresh-header probe. The caller already has a stateRoot and just wants
+     * the proof that lets it verify the account leaf at {@code accountHash}
+     * — that's exactly what {@link SnapBackedStateOracle} needs.
+     *
+     * <p>Use this instead of {@link #requestTrieNodesAsync} when the goal is
+     * a verifiable account record. {@code GetTrieNodes} returns only the
+     * node at the requested path (per geth's snap handler), not the
+     * root-to-leaf proof — so the MPT verifier can never descend from the
+     * stateRoot. {@code GetAccountRange} returns the proof.
+     */
+    public CompletableFuture<AccountRangeMessage.DecodeResult> requestAccountByHashAsync(
+            org.apache.tuweni.bytes.Bytes32 accountHash,
+            org.apache.tuweni.bytes.Bytes32 stateRoot) {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) return CompletableFuture.failedFuture(
+            new IllegalStateException("EthHandler not READY"));
+        if (!snapNegotiated) return CompletableFuture.failedFuture(
+            new UnsupportedOperationException("snap/1 not negotiated with this peer"));
+        return sendGetAccountRange(ctx, accountHash, stateRoot);
+    }
+
+    /**
+     * Direct {@link GetStorageRangesMessage} send keyed by account-hash and
+     * slot-hash. Same rationale as {@link #requestAccountByHashAsync} —
+     * returns the storage proof rooted at the account's storageRoot.
+     *
+     * <p>{@code stateRoot} is the world state root the request anchors at;
+     * the peer uses it to look up the account by hash and then serves the
+     * storage proof from that account's storageRoot.
+     */
+    public CompletableFuture<StorageRangesMessage.DecodeResult> requestStorageByHashAsync(
+            org.apache.tuweni.bytes.Bytes32 accountHash,
+            org.apache.tuweni.bytes.Bytes32 slotHash,
+            org.apache.tuweni.bytes.Bytes32 stateRoot) {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) return CompletableFuture.failedFuture(
+            new IllegalStateException("EthHandler not READY"));
+        if (!snapNegotiated) return CompletableFuture.failedFuture(
+            new UnsupportedOperationException("snap/1 not negotiated with this peer"));
+        return sendGetStorageRanges(ctx, accountHash, slotHash, stateRoot);
     }
 
     /**
@@ -958,9 +1058,15 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
      * for verifying every returned node against {@code stateRoot} via the
      * MPT proof verifier in {@code :core}.
      *
+     * <p>Note: geth's GetTrieNodes handler returns only the node at the
+     * requested path, not the root-to-leaf proof. For account/storage leaf
+     * lookups that need to verify against {@code stateRoot}, prefer
+     * {@link #requestAccountByHashAsync} / {@link #requestStorageByHashAsync},
+     * which return proofs.
+     *
      * @param stateRoot the trusted state root to query against
      * @param paths     path sets the peer should resolve
-     * @return future completing with the TrieNodes decode result, or null if not READY
+     * @return future completing with the TrieNodes decode result
      */
     public CompletableFuture<TrieNodesMessage.DecodeResult> requestTrieNodesAsync(
             org.apache.tuweni.bytes.Bytes32 stateRoot,
@@ -978,7 +1084,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         log.info("[snap] GetTrieNodes reqId={} root={} paths={}",
             reqId, stateRoot.toShortHexString(), paths.size());
         rlpxHandler.sendMessage(ctx, snapGetTrieNodes, payload);
-        return future.orTimeout(10, TimeUnit.SECONDS);
+        return future.orTimeout(10, TimeUnit.SECONDS)
+            .whenComplete((r, ex) -> pendingTrieNodeRequests.remove(reqId));
     }
 
     public String getClientId() { return clientId; }
