@@ -13,7 +13,7 @@ At 200 ms per round trip that's 1–2 s of unnecessary serial latency.
 - All benchmark cases converge in ≤ 3 iterations.
 - p95 latency under 2 s on simulated good network conditions.
 - Convergence histogram per contract type recorded in
-  `docs/prefetch-benchmarks.md`.
+  `docs/evm/prefetch-benchmarks.md`.
 
 The benchmark corpus (per the plan):
 
@@ -177,7 +177,7 @@ slots together.
   unit tests. Originally trace-based.
 - Commit 2 (`3bea3fd`): benchmark scaffolding —
   `MainnetPrefetchBenchmarkIT` measures latency and iteration counts for
-  the corpus, `docs/prefetch-benchmarks.md` is the artifact callers paste
+  the corpus, `docs/evm/prefetch-benchmarks.md` is the artifact callers paste
   numbers into. Same env-gating as Phase 1's `MainnetCallViewIT`; both
   ITs share the missing `connectToMainnetPeer()` helper.
 - Commit 3 (current): switched to sentinel-return after PR #14 review

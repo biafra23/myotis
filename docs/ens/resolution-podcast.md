@@ -869,7 +869,7 @@ locally with espeak:
 
 ```bash
 awk '/^\[ALICE\]/{voice="en+f3";sub(/^\[ALICE\] /,"")} /^\[BOB\]/{voice="en+m3";sub(/^\[BOB\] /,"")} /^\[/{print voice"|"$0}' \
-  docs/ens-resolution-podcast.md \
+  docs/ens/resolution-podcast.md \
   | while IFS='|' read voice line; do espeak -v "$voice" "$line"; done
 ```
 
