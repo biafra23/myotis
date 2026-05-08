@@ -52,7 +52,11 @@ public final class EthHandlerSnapPeer implements SnapPeer {
         // that path set. Account-only sets go through GetAccountRange; sets
         // with one or more storage paths fan out to one GetStorageRanges
         // per slot (the oracle currently never asks for more than one slot
-        // per set, but the chain still works if it does).
+        // per set, but the chain still works if it does). Storage requests
+        // within a set run concurrently — EthHandler keys pending requests
+        // by reqId so concurrent sends on the same handler are safe, and
+        // the verifier looks proof nodes up by hash so merge order doesn't
+        // matter.
         List<CompletableFuture<List<Bytes>>> perSet = new ArrayList<>(paths.size());
         for (PathSet p : paths) {
             Bytes32 accountHash = Bytes32.wrap(p.accountPath());
@@ -60,19 +64,23 @@ public final class EthHandlerSnapPeer implements SnapPeer {
                 perSet.add(handler.requestAccountByHashAsync(accountHash, stateRoot)
                     .thenApply(AccountRangeMessage.DecodeResult::proof));
             } else {
-                CompletableFuture<List<Bytes>> chained =
-                    CompletableFuture.completedFuture(new ArrayList<>());
+                List<CompletableFuture<List<Bytes>>> storageFuts =
+                    new ArrayList<>(p.storagePaths().size());
                 for (Bytes sp : p.storagePaths()) {
                     Bytes32 slotHash = Bytes32.wrap(sp);
-                    chained = chained.thenCompose(acc -> handler
+                    storageFuts.add(handler
                         .requestStorageByHashAsync(accountHash, slotHash, stateRoot)
-                        .thenApply(r -> {
-                            List<Bytes> merged = new ArrayList<>(acc);
-                            merged.addAll(r.proof());
-                            return merged;
-                        }));
+                        .thenApply(StorageRangesMessage.DecodeResult::proof));
                 }
-                perSet.add(chained);
+                perSet.add(CompletableFuture
+                    .allOf(storageFuts.toArray(new CompletableFuture<?>[0]))
+                    .thenApply(v -> {
+                        List<Bytes> merged = new ArrayList<>();
+                        for (CompletableFuture<List<Bytes>> f : storageFuts) {
+                            merged.addAll(f.join());
+                        }
+                        return merged;
+                    }));
             }
         }
         return CompletableFuture.allOf(perSet.toArray(new CompletableFuture<?>[0]))

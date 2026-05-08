@@ -36,8 +36,11 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Handles JSON-Lines IPC commands dispatched by DaemonServer.
@@ -994,32 +997,66 @@ public class CommandHandler {
             if (snapPeers.isEmpty()) {
                 return jsonError("No active peer with snap/1 support");
             }
+            // Probe all snap peers in parallel rather than serially — with a
+            // 10s per-peer timeout a serial loop would block the whole
+            // command for up to 10s × N on an unresponsive cluster. allOf
+            // bounded by a single 10s wait gives us at-most-10s total, then
+            // we pick the first peer (in iteration order, deterministic)
+            // whose probe completed with a sensible head.
+            //
+            // The per-probe wrap with handle((v,ex)->null) is so allOf
+            // doesn't short-circuit when one peer throws — we want to give
+            // every peer the full window to respond.
+            long minSensibleHead = connector.getNetwork().minSensibleHeadBlock();
+            List<CompletableFuture<BlockHeader>> probes = new ArrayList<>(snapPeers.size());
+            List<CompletableFuture<Void>> safeProbes = new ArrayList<>(snapPeers.size());
+            for (com.jaeckel.ethp2p.networking.eth.EthHandler peer : snapPeers) {
+                CompletableFuture<BlockHeader> f = peer.requestFreshHeadHeaderAsync();
+                probes.add(f);
+                safeProbes.add(f.handle((v, ex) -> null));
+            }
+            try {
+                CompletableFuture.allOf(safeProbes.toArray(new CompletableFuture<?>[0]))
+                    .get(10, TimeUnit.SECONDS);
+            } catch (TimeoutException | ExecutionException ignore) {
+                // Some peers may still be in-flight; we'll treat unfinished
+                // probes as failures below. Fall through.
+            }
             com.jaeckel.ethp2p.networking.eth.EthHandler pinnedPeer = null;
             BlockHeader header = null;
             String lastError = null;
-            for (com.jaeckel.ethp2p.networking.eth.EthHandler peer : snapPeers) {
-                try {
-                    BlockHeader fresh = peer.requestFreshHeadHeaderAsync()
-                        .get(10, TimeUnit.SECONDS);
-                    // Sanity floor on the block number — guards against any
-                    // peer reporting nonsense (the chain-head poisoning fix
-                    // covers eth-handshake-time corruption, but a peer can
-                    // still claim an absurd best-hash). 20M leaves margin
-                    // against current mainnet (~25M).
-                    if (fresh.number < 20_000_000) {
-                        lastError = "peer " + peer.getRemoteAddress()
-                            + " returned stale head #" + fresh.number;
-                        continue;
-                    }
-                    pinnedPeer = peer;
-                    header = fresh;
-                    break;
-                } catch (Exception e) {
-                    Throwable c = e.getCause() != null ? e.getCause() : e;
-                    lastError = "peer " + peer.getRemoteAddress()
-                        + " probe failed: "
-                        + (c.getMessage() != null ? c.getMessage() : c.getClass().getSimpleName());
+            for (int i = 0; i < snapPeers.size(); i++) {
+                com.jaeckel.ethp2p.networking.eth.EthHandler peer = snapPeers.get(i);
+                CompletableFuture<BlockHeader> probe = probes.get(i);
+                if (!probe.isDone()) {
+                    lastError = "peer " + peer.getRemoteAddress() + " probe timed out";
+                    continue;
                 }
+                if (probe.isCompletedExceptionally()) {
+                    try {
+                        probe.getNow(null);
+                    } catch (Exception e) {
+                        Throwable c = e.getCause() != null ? e.getCause() : e;
+                        lastError = "peer " + peer.getRemoteAddress()
+                            + " probe failed: "
+                            + (c.getMessage() != null ? c.getMessage() : c.getClass().getSimpleName());
+                    }
+                    continue;
+                }
+                BlockHeader fresh = probe.join();
+                // Sanity floor on the block number — guards against a peer
+                // claiming an absurd best-hash (the chain-head poisoning fix
+                // covers eth-handshake-time corruption, but not this).
+                // Floor is per-network; 0 disables the check on unknown
+                // networks. See NetworkConfig#minSensibleHeadBlock.
+                if (fresh.number < minSensibleHead) {
+                    lastError = "peer " + peer.getRemoteAddress()
+                        + " returned stale head #" + fresh.number;
+                    continue;
+                }
+                pinnedPeer = peer;
+                header = fresh;
+                break;
             }
             if (pinnedPeer == null || header == null) {
                 return jsonError("No snap peer returned a usable fresh head"
