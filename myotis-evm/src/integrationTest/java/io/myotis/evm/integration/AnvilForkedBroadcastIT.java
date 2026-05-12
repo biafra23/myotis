@@ -91,6 +91,20 @@ class AnvilForkedBroadcastIT {
     private static volatile MainnetPeerBootstrap.Session session;
     private static final Object SESSION_LOCK = new Object();
 
+    /**
+     * One executor shared across the test methods in this class, shut
+     * down in {@link #closePeerSession()}. Previously this was a fresh
+     * {@code newSingleThreadExecutor} per {@code mainnetExecutor()} call
+     * — daemon threads kept the JVM exit-clean, but each call still
+     * leaked an {@code ExecutorService} (worker thread + queue).
+     */
+    private static final java.util.concurrent.ExecutorService EVM_POOL =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "myotis-evm-anvil-it");
+                t.setDaemon(true);
+                return t;
+            });
+
     private static final Address VITALIK = Address.fromHex(
             "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
     private static final Address USDC = Address.fromHex(
@@ -160,11 +174,7 @@ class AnvilForkedBroadcastIT {
         return new DefaultEvmExecutor(
                 new SnapBackedStateOracle(() -> peer, BytecodeCache.inMemory()),
                 BytecodeCache.inMemory(),
-                java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
-                    Thread t = new Thread(r, "myotis-evm-anvil-it");
-                    t.setDaemon(true);
-                    return t;
-                }));
+                EVM_POOL);
     }
 
     private static SnapPeer connectToMainnetPeer() {
@@ -195,6 +205,7 @@ class AnvilForkedBroadcastIT {
                 session = null;
             }
         }
+        EVM_POOL.shutdownNow();
     }
 
     private static BlockContext mainnetBlockContext() {

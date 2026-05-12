@@ -12,8 +12,6 @@ import org.apache.tuweni.crypto.SECP256K1;
 import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 /**

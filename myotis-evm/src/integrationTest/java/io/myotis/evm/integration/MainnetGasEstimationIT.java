@@ -54,6 +54,20 @@ class MainnetGasEstimationIT {
     private static volatile MainnetPeerBootstrap.Session session;
     private static final Object SESSION_LOCK = new Object();
 
+    /**
+     * One executor shared across the test methods in this class, shut
+     * down in {@link #closePeerSession()}. Previously this was a fresh
+     * {@code newSingleThreadExecutor} per {@code mainnetExecutor()} call
+     * — daemon threads kept the JVM exit-clean, but each call still
+     * leaked an {@code ExecutorService} (worker thread + queue).
+     */
+    private static final java.util.concurrent.ExecutorService EVM_POOL =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "myotis-evm-gas-it");
+                t.setDaemon(true);
+                return t;
+            });
+
     private static final Address VITALIK = Address.fromHex(
             "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
     private static final Address USDC = Address.fromHex(
@@ -246,10 +260,14 @@ class MainnetGasEstimationIT {
         // than fail, matching the class Javadoc's "test still runs but
         // optional cross-check is skipped" contract.
         String overrideCalldata = System.getenv("MYOTIS_INTEGRATION_UNISWAP_CALLDATA");
-        assumeTrue(overrideCalldata != null,
+        // Treat blank/whitespace as unset — otherwise an empty value
+        // would slip through assumeTrue and crash later in parseHex
+        // rather than skipping cleanly. Matches the envOrDefault /
+        // envAddressOrDefault helpers below.
+        assumeTrue(overrideCalldata != null && !overrideCalldata.isBlank(),
                 "MYOTIS_INTEGRATION_UNISWAP_CALLDATA not set — skipping Uniswap swap"
                         + " estimation; supply realistic calldata to exercise this path");
-        byte[] calldata = HexFormat.of().parseHex(stripHexPrefix(overrideCalldata));
+        byte[] calldata = HexFormat.of().parseHex(stripHexPrefix(overrideCalldata.trim()));
 
         var tx = new UnsignedTransaction(
                 VITALIK, UNISWAP_V3_ROUTER, BigInteger.ZERO, calldata, null);
@@ -269,11 +287,7 @@ class MainnetGasEstimationIT {
         return new DefaultEvmExecutor(
                 new SnapBackedStateOracle(() -> peer, BytecodeCache.inMemory()),
                 BytecodeCache.inMemory(),
-                java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
-                    Thread t = new Thread(r, "myotis-evm-gas-it");
-                    t.setDaemon(true);
-                    return t;
-                }));
+                EVM_POOL);
     }
 
     private static SnapPeer connectToMainnetPeer() {
@@ -304,6 +318,7 @@ class MainnetGasEstimationIT {
                 session = null;
             }
         }
+        EVM_POOL.shutdownNow();
     }
 
     private static BlockContext mainnetBlockContext() {
