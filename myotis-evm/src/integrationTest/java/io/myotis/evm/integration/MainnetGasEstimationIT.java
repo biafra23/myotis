@@ -62,6 +62,17 @@ class MainnetGasEstimationIT {
             "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
     private static final Address UNISWAP_V3_ROUTER = Address.fromHex(
             "0xE592427A0AEce92De3Edee1F18E0157C05861564");
+    /** ENS BaseRegistrar (ERC-721 wrapping the .eth name registry). */
+    private static final Address ENS_BASE_REGISTRAR = Address.fromHex(
+            "0x57f1887a8BF19b14fC0dF6Fd9B2acc9Af147eA85");
+    /**
+     * Default ERC-721 corpus case: VITALIK transfers vitalik.eth. The
+     * tokenId for an ENS .eth name on the BaseRegistrar is the labelhash
+     * of the label (NOT the namehash) — for {@code vitalik} that's
+     * keccak256("vitalik").
+     */
+    private static final String VITALIK_ETH_TOKEN_ID =
+            "0xee6c4522aab0003e8d14cd40a6af439055fd2577951148c14b6cea9a53475835";
 
     /**
      * Plain ETH transfer to an EOA. Reference: ~21000 gas (intrinsic only),
@@ -86,6 +97,41 @@ class MainnetGasEstimationIT {
         // accounting differs by 100 gas).
         assertTrue(estimate >= 23_000 && estimate <= 26_000,
                 "ETH-to-EOA estimate out of expected range; got " + estimate);
+    }
+
+    /**
+     * ETH transfer to a contract with a payable fallback. Reference: ~50k
+     * gas — intrinsic 21k plus the EVM cost of running WETH9's
+     * {@code receive() → deposit()} (one SSTORE on the sender's balance
+     * slot, one LOG2 for the {@code Deposit} event).
+     *
+     * <p>This is the design doc's "ETH transfer to contract" corpus case;
+     * adding it closes the gap between the original plan and the previous
+     * IT coverage (which only had ETH→EOA).
+     */
+    @Test
+    void ethTransferToContractWrapsWeth() throws Exception {
+        EvmExecutor executor = mainnetExecutor();
+        BlockContext ctx = mainnetBlockContext();
+
+        // No calldata: WETH9's fallback routes to deposit(), which credits
+        // the sender's balance. We use VITALIK as the sender because
+        // VITALIK has ETH on mainnet at every recent state root — the
+        // estimation runs as if he were paying.
+        var tx = new UnsignedTransaction(
+                VITALIK, WETH,
+                new BigInteger("100000000000000000"),  // 0.1 ETH
+                new byte[0],
+                null);
+
+        long estimate = executor.estimateGas(tx, ctx).get(60, TimeUnit.SECONDS);
+        System.out.printf("[gas-it] eth-transfer-to-contract-weth: %d%n", estimate);
+        crossCheckIfReferenceProvided(
+                estimate, "MYOTIS_INTEGRATION_WETH_DEPOSIT_REFERENCE_GAS");
+        // First-time deposit (cold balance slot) is ~45k; warm is ~28k.
+        // The +15% buffer pushes both inside [27_000, 60_000].
+        assertTrue(estimate >= 27_000 && estimate <= 60_000,
+                "WETH deposit (ETH→contract) estimate out of expected range; got " + estimate);
     }
 
     /**
@@ -117,6 +163,62 @@ class MainnetGasEstimationIT {
         // cost-elision; 200k ceiling catches a runaway loop.
         assertTrue(estimate >= 30_000 && estimate <= 200_000,
                 "USDC.transfer estimate out of expected range; got " + estimate);
+    }
+
+    /**
+     * ERC-721 transfer corpus case: closes the design doc's "ERC-721
+     * transfer" acceptance bullet that the previous IT explicitly
+     * deferred.
+     *
+     * <p>Defaults to {@code transferFrom(VITALIK, recipient, tokenId(vitalik.eth))}
+     * on the ENS BaseRegistrar — VITALIK has owned vitalik.eth since
+     * registration. If at some future block he transfers it, the test
+     * reverts (and estimateGas correctly refuses to return a number);
+     * operators override via env vars:
+     *
+     * <ul>
+     *   <li>{@code MYOTIS_INTEGRATION_NFT_CONTRACT} — ERC-721 contract
+     *   <li>{@code MYOTIS_INTEGRATION_NFT_HOLDER} — address that owns the token at the test block
+     *   <li>{@code MYOTIS_INTEGRATION_NFT_TOKEN_ID} — uint256 hex (with or without 0x)
+     * </ul>
+     *
+     * <p>Reference: ~30–60k gas. The exact number depends on whether the
+     * recipient already has a balance entry (warm vs. cold storage slot).
+     */
+    @Test
+    void erc721TransferIsAroundFiftyKilogas() throws Exception {
+        EvmExecutor executor = mainnetExecutor();
+        BlockContext ctx = mainnetBlockContext();
+
+        Address nftContract = envAddressOrDefault(
+                "MYOTIS_INTEGRATION_NFT_CONTRACT", ENS_BASE_REGISTRAR);
+        Address holder = envAddressOrDefault(
+                "MYOTIS_INTEGRATION_NFT_HOLDER", VITALIK);
+        BigInteger tokenId = new BigInteger(
+                stripHexPrefix(envOrDefault(
+                        "MYOTIS_INTEGRATION_NFT_TOKEN_ID", VITALIK_ETH_TOKEN_ID)),
+                16);
+
+        FunctionSignature transferFrom =
+                FunctionSignature.of("transferFrom(address,address,uint256)");
+        Address recipient = Address.fromHex("0x1111111111111111111111111111111111111111");
+        byte[] calldata = AbiEncoder.encodeCall(transferFrom,
+                AbiEncoder.address(holder),
+                AbiEncoder.address(recipient),
+                AbiEncoder.uint256(tokenId));
+
+        var tx = new UnsignedTransaction(holder, nftContract, BigInteger.ZERO, calldata, null);
+
+        long estimate = executor.estimateGas(tx, ctx).get(60, TimeUnit.SECONDS);
+        System.out.printf("[gas-it] erc721-transfer: %d%n", estimate);
+        crossCheckIfReferenceProvided(
+                estimate, "MYOTIS_INTEGRATION_NFT_TRANSFER_REFERENCE_GAS");
+        // Cold recipient slot ~55k, warm ~28k. +15% buffer pushes both
+        // into [27000, 90000]. If the estimate falls outside, the token's
+        // owner likely changed — supply MYOTIS_INTEGRATION_NFT_HOLDER /
+        // _TOKEN_ID / _CONTRACT and retry.
+        assertTrue(estimate >= 27_000 && estimate <= 90_000,
+                "ERC-721 transferFrom estimate out of expected range; got " + estimate);
     }
 
     /**
@@ -237,6 +339,16 @@ class MainnetGasEstimationIT {
         String v = System.getenv(name);
         assertNotNull(v, name + " must be set; see class Javadoc");
         return v;
+    }
+
+    private static String envOrDefault(String name, String fallback) {
+        String v = System.getenv(name);
+        return (v == null || v.isBlank()) ? fallback : v.trim();
+    }
+
+    private static Address envAddressOrDefault(String name, Address fallback) {
+        String v = System.getenv(name);
+        return (v == null || v.isBlank()) ? fallback : Address.fromHex(v.trim());
     }
 
     private static byte[] parseHex32(String hex) {
