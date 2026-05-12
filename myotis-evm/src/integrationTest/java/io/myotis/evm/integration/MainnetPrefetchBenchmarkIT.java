@@ -28,7 +28,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Phase 2 benchmark — measures convergence iterations and end-to-end latency
  * for the corpus listed in the original plan, with results going into
- * {@code docs/prefetch-benchmarks.md} for review.
+ * {@code docs/evm/prefetch-benchmarks.md} for review.
  *
  * <p>Acceptance criteria the benchmark validates:
  * <ul>
@@ -57,7 +57,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>Two execution modes are compared per call to make the prefetch win
  * visible: {@code DefaultEvmExecutor} alone (Phase 1 baseline) and
  * {@code PrefetchingEvmExecutor} (Phase 2). Numbers go in the markdown
- * table in {@code docs/prefetch-benchmarks.md}.
+ * table in {@code docs/evm/prefetch-benchmarks.md}.
  */
 @EnabledIfEnvironmentVariable(named = "MYOTIS_MAINNET", matches = "1")
 class MainnetPrefetchBenchmarkIT {

@@ -69,7 +69,7 @@ CL peers are seeded from four sources (in priority order): the persistent `CLPee
 ## 6. ENS Resolution — Via Local EVM over SNAP-Verified State
 **POC: Implemented (full record-type coverage)**
 
-Resolution runs the ENS contracts in a local EVM (`myotis-evm`) with state served from SNAP proofs. Every record type goes through the Universal Resolver's `resolve(bytes,bytes)` so wildcard (ENSIP-10) and CCIP-Read (ERC-3668) work transparently for all of them.
+Resolution runs the ENS contracts in a local EVM (`myotis-evm`, see Section 9) with state served from SNAP proofs. Every record type goes through the Universal Resolver's `resolve(bytes,bytes)` so wildcard (ENSIP-10) and CCIP-Read (ERC-3668) work transparently for all of them.
 
 | Record | Spec | IPC command |
 |---|---|---|
@@ -100,7 +100,7 @@ No `Transactions`, `NewPooledTransactionHashes`, or `GetPooledTransactions` mess
 ## 8. Gas Estimation
 **Not implemented**
 
-`baseFeePerGas` is available in `BlockHeader` and returned in `get-block`, but there is no dedicated gas estimation command or priority fee calculation logic. The local EVM gives us the simulation path natively — wiring it through to a `gas-estimate` IPC command is straightforward.
+`baseFeePerGas` is available in `BlockHeader` and returned in `get-block`, but there is no dedicated gas estimation command or priority fee calculation logic. The local EVM (Section 9) gives us the simulation path natively — wiring it through to a `gas-estimate` IPC command is straightforward, just not done yet.
 
 ## 9. Local EVM Execution
 **POC: Implemented**
@@ -115,7 +115,7 @@ No `Transactions`, `NewPooledTransactionHashes`, or `GetPooledTransactions` mess
 
 **Not implemented:**
 - `eth_call`-equivalent IPC command for arbitrary view calls (ERC-20 metadata, NFT `tokenURI`, multicall)
-- Gas-estimate IPC command (the executor already returns gas used; just needs an IPC surface)
+- Gas estimation IPC command (the executor already returns gas used; just needs an IPC surface)
 - Pre-flight transaction simulation (catch reverts before broadcast)
 
 ## Summary

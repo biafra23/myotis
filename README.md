@@ -40,12 +40,8 @@ The application operates in two modes: **daemon** and **client**. The daemon dis
 ### Start the daemon
 
 ```bash
-# Mainnet (default)
+# Mainnet
 ./gradlew :app:run
-
-# Testnet
-./gradlew :app:run -Pnetwork=sepolia
-./gradlew :app:run -Pnetwork=holesky
 
 # Custom port (default: 30303)
 ./gradlew :app:run -Pport=30304
@@ -62,6 +58,38 @@ The daemon runs in the foreground. It discovers peers via discv4 (Kademlia DHT),
 ## Query commands
 
 All commands are sent to the running daemon via IPC. Responses are JSON.
+
+### When is the daemon ready to answer?
+
+Most commands depend on different parts of the stack being up. After
+starting the daemon, wait for the sub-system you need before issuing
+queries:
+
+| Command | Requires |
+|---------|----------|
+| `status`, `peers`, `dial` | daemon running |
+| `beacon-status` | daemon running (returns `SYNCING` until ready) |
+| `get-headers`, `get-block`, `get-transactions` | at least one peer in `READY` state (check with `peers`) |
+| `get-account`, `get-storage` | at least one peer with `snap=true` in `READY` state |
+| `get-account`, `get-storage`, `get-block` (full beacon verification — `verifyMethod` populated, `beaconChainVerified=true`) | `beacon-status` returns `"state":"SYNCED"` |
+| `resolve-ens` | at least one peer with `snap=true` in `READY` state |
+
+Account and storage queries return data with a Merkle proof against
+the peer's `stateRoot` even before the beacon light client reaches
+`SYNCED` — but the response will report `beaconChainVerified=false`
+with `failReason: "beaconNotSynced"`. Wait for `SYNCED` if you need
+the full beacon-anchored trust chain.
+
+The beacon light client typically reaches `SYNCED` within ~30–60
+seconds of daemon startup, depending on how quickly libp2p peers are
+discovered and how recent the embedded checkpoint is. Watch progress
+with:
+
+```bash
+./beacon-status.sh
+# or
+watch -n 2 ./beacon-status.sh
+```
 
 ### Status
 
@@ -282,9 +310,32 @@ Resolves an ENS name to an Ethereum address by running the ENS contracts in a lo
 3. If the call reverts with `OffchainLookup` (ERC-3668), the daemon fetches the gateway response over HTTPS and re-enters the EVM with the resolver's callback. The callback validates the gateway's response on-chain — typically by checking a signer's signature against a list of trusted signers embedded in the resolver — so a malicious gateway cannot inject a wrong answer.
 4. The Universal Resolver's return value is decoded as the resolved address.
 
-**Trust model:** every state read is backed by a Merkle proof against the verified `stateRoot`; bytecode is verified by `keccak256(code) == codeHash`; CCIP-Read gateways are trusted only for *availability* — the resolver's callback validates the response cryptographically. The same trust model applies to every other `resolve-ens-*` command.
+**Trust model:**
+
+- **State**: every read backed by a Merkle proof against the verified `stateRoot`.
+- **Bytecode**: verified by `keccak256(code) == codeHash` from the proof-verified account.
+- **CCIP-Read gateways**: trusted only for *availability* — the resolver's callback validates the response cryptographically. A lying gateway causes the call to revert, surfacing as a clean failure.
+- The `blockNumber` field is the peer's recent head, not necessarily a beacon-finalized block. The data is always cryptographically backed by a real on-chain `stateRoot`, but unlike `get-account` / `get-storage` there is no separate beacon-chain anchor field returned with the resolution. (The same beacon-anchoring that backs SNAP queries applies; it is just not surfaced per-call.)
+
+The same trust model applies to every other `resolve-ens-*` command.
 
 **Networks:** mainnet, sepolia, and holesky have canonical Registry + Universal Resolver addresses pinned. Other networks fail with `ENS not pinned for chain id …`.
+
+**Validated names** (mainnet):
+
+```bash
+# Vanilla ENS (Public Resolver)
+./gradlew :app:run -Pargs="resolve-ens vitalik.eth"
+# → 0xd8da6bf26964af9d7eed9e03e53415d37aa96045
+
+# CCIP-Read demo (EIP-3668 reference gateway)
+./gradlew :app:run -Pargs="resolve-ens 1.offchainexample.eth"
+# → 0x41563129cdbbd0c5d3e1c86cf9563926b243834d
+
+# Coinbase ID (CCIP-Read via Coinbase's gateway)
+./gradlew :app:run -Pargs="resolve-ens jesse.cb.id"
+# → 0x849151d7d0bf1f34b70d5cad5149d28cc2308bf1
+```
 
 ### Resolve ENS text record
 
@@ -513,15 +564,18 @@ The light client syncs from the **beacon chain P2P network** (libp2p) -- fully d
 
 ## Architecture
 
-Three Gradle modules:
+Six Gradle modules:
 
 - **core** -- cryptographic identity (`NodeKey`), data types (`BlockHeader`), ENR decoding
 - **networking** -- protocol layers, all Netty-based:
   - `discv4` -- UDP peer discovery (ping/pong/findnode/neighbors)
+  - `discv5` -- UDP CL peer discovery (wraps ConsenSys' `io.consensys.protocols:discovery`)
   - `rlpx` -- TCP transport with EIP-8 ECIES handshake and AES-256-CTR framed channel
   - `eth` -- eth/67-69 sub-protocol (hello, status, block headers/bodies)
-  - `snap` -- snap/1 sub-protocol (account range, storage range queries with Merkle proofs)
+  - `snap` -- snap/1 sub-protocol (account range, storage range, bytecode, with Merkle proofs)
 - **consensus** -- beacon chain light client (sync committee BLS verification), Merkle-Patricia proof verification
+- **myotis-evm** -- Hyperledger Besu EVM running against a SNAP-backed `StateOracle`. Used today for ENS resolution; the foundation for view calls and gas estimation. Includes `CcipReadEvmExecutor` for ERC-3668 off-chain lookups and `PrefetchingEvmExecutor` to amortize SNAP round-trips.
+- **myotis-ens** -- ENS resolver (`EnsResolver`, `ReverseLookup`) using the Universal Resolver via the local EVM. Forward and reverse resolution, ENSIP-10 wildcards, ERC-3668 off-chain records.
 - **app** -- daemon/CLI entry point, Unix domain socket IPC server, peer caching
 
 ### Protocol flow

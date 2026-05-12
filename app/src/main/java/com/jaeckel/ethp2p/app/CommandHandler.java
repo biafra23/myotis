@@ -36,8 +36,11 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Handles JSON-Lines IPC commands dispatched by DaemonServer.
@@ -58,13 +61,10 @@ public class CommandHandler {
     private final BeaconLightClient beaconLightClient; // nullable
     private final long clGenesisTime; // beacon chain genesis time (seconds since epoch)
 
-    // Shared across every ENS resolution: keeps round-robin progress between
-    // requests (so a slow-but-responsive first peer doesn't get picked every
-    // time) and lets a single bytecode cache amortize Registry / Universal
-    // Resolver fetches across requests and across the oracle + executor in
-    // the same request.
-    private final java.util.concurrent.atomic.AtomicInteger ensPeerIndex =
-            new java.util.concurrent.atomic.AtomicInteger();
+    // Shared across every ENS resolution: a single bytecode cache amortizes
+    // Registry + Universal Resolver fetches across requests and between the
+    // oracle and executor in the same request. (Peer selection is done
+    // per-call by prepareEnsCall, which pins one peer for the whole call.)
     private final io.myotis.evm.world.BytecodeCache ensBytecodeCache =
             io.myotis.evm.world.BytecodeCache.inMemory();
 
@@ -1026,30 +1026,86 @@ public class CommandHandler {
             io.myotis.ens.EnsResolver resolver) {}
 
     /**
-     * Run the snap-peer-availability check, fetch a fresh header for a
-     * peer-servable state root, build the EVM executor stack
-     * (SnapBackedStateOracle → DefaultEvmExecutor → PrefetchingEvmExecutor
-     * → CcipReadEvmExecutor), and pick the canonical ENS contract pair
-     * for the running daemon's network.
+     * Probe every active snap peer in parallel for a fresh head, pick the
+     * first one with a sensible block number, and pin <em>that</em> peer
+     * for every state read of the resolution. We MUST take the stateRoot
+     * from the same peer that will serve the SNAP requests: peers prune
+     * trie state outside a ~128-block window and the snapshot is anchored
+     * at the peer's own current head. A stateRoot from peer A used against
+     * peer B reliably surfaces as
+     * {@code InvalidProof[... missing node ... (path idx=0)]} — peer B has
+     * no node hashing to A's root.
      *
-     * <p>Throws on any failure; callers fold the throw into a
-     * {@code jsonError} response.
+     * <p>Wraps the result in {@link EnsCallContext} so every ENS handler
+     * shares the same peer-probe + EVM-stack boilerplate. Throws on any
+     * failure; callers fold the throw into a {@code jsonError} response.
      */
     private EnsCallContext prepareEnsCall() throws Exception {
-        if (connector.activeSnapHandlers().isEmpty()) {
+        List<com.jaeckel.ethp2p.networking.eth.EthHandler> snapPeers =
+            connector.activeSnapHandlers();
+        if (snapPeers.isEmpty()) {
             throw new IllegalStateException("No active peer with snap/1 support");
         }
-        long headBlock = connector.getChainHead().blockNumber();
-        if (headBlock <= 0) {
-            throw new IllegalStateException(
-                "Chain head not yet known; wait for the eth handshake to complete");
+
+        // Probe all snap peers in parallel rather than serially — with a
+        // 10s per-peer timeout a serial loop would block the whole command
+        // for up to 10s × N on an unresponsive cluster. allOf bounded by a
+        // single 10s wait gives at-most-10s total; then we pick the first
+        // peer (in iteration order, deterministic) whose probe completed
+        // with a sensible head. The handle((v,ex)->null) wrap keeps allOf
+        // from short-circuiting when one peer throws.
+        long minSensibleHead = connector.getNetwork().minSensibleHeadBlock();
+        List<CompletableFuture<BlockHeader>> probes = new ArrayList<>(snapPeers.size());
+        List<CompletableFuture<Void>> safeProbes = new ArrayList<>(snapPeers.size());
+        for (com.jaeckel.ethp2p.networking.eth.EthHandler peer : snapPeers) {
+            CompletableFuture<BlockHeader> f = peer.requestFreshHeadHeaderAsync();
+            probes.add(f);
+            safeProbes.add(f.handle((v, ex) -> null));
         }
-        List<BlockHeadersMessage.VerifiedHeader> headers =
-            connector.requestBlockHeaders(headBlock, 1).get(15, TimeUnit.SECONDS);
-        if (headers.isEmpty()) {
-            throw new IllegalStateException("Peer returned no header for block " + headBlock);
+        try {
+            CompletableFuture.allOf(safeProbes.toArray(new CompletableFuture<?>[0]))
+                .get(10, TimeUnit.SECONDS);
+        } catch (TimeoutException | ExecutionException ignore) {
+            for (CompletableFuture<BlockHeader> p : probes) {
+                if (!p.isDone()) p.cancel(true);
+            }
         }
-        BlockHeader header = headers.get(0).header();
+
+        com.jaeckel.ethp2p.networking.eth.EthHandler pinnedPeer = null;
+        BlockHeader header = null;
+        String lastError = null;
+        for (int i = 0; i < snapPeers.size(); i++) {
+            com.jaeckel.ethp2p.networking.eth.EthHandler peer = snapPeers.get(i);
+            CompletableFuture<BlockHeader> probe = probes.get(i);
+            if (!probe.isDone()) {
+                lastError = "peer " + peer.getRemoteAddress() + " probe timed out";
+                continue;
+            }
+            if (probe.isCompletedExceptionally()) {
+                try {
+                    probe.getNow(null);
+                } catch (Exception e) {
+                    Throwable c = e.getCause() != null ? e.getCause() : e;
+                    lastError = "peer " + peer.getRemoteAddress()
+                        + " probe failed: "
+                        + (c.getMessage() != null ? c.getMessage() : c.getClass().getSimpleName());
+                }
+                continue;
+            }
+            BlockHeader fresh = probe.join();
+            if (fresh.number < minSensibleHead) {
+                lastError = "peer " + peer.getRemoteAddress()
+                    + " returned stale head #" + fresh.number;
+                continue;
+            }
+            pinnedPeer = peer;
+            header = fresh;
+            break;
+        }
+        if (pinnedPeer == null || header == null) {
+            throw new IllegalStateException("No snap peer returned a usable fresh head"
+                + (lastError != null ? " (" + lastError + ")" : ""));
+        }
 
         io.myotis.evm.BlockContext blockCtx = new io.myotis.evm.BlockContext(
             header.stateRoot.toArrayUnsafe(),
@@ -1061,15 +1117,17 @@ public class CommandHandler {
             java.math.BigInteger.valueOf(connector.getNetwork().networkId()),
             header.gasLimit);
 
+        // Pin every SNAP request to the same peer the stateRoot came from.
+        // Retries inside the oracle still engage on transient failures
+        // (timeouts, channel close), but every retry targets the one peer
+        // that is guaranteed to have this exact root in its snapshot.
+        final com.jaeckel.ethp2p.networking.eth.EthHandler finalPeer = pinnedPeer;
         io.myotis.evm.world.SnapBackedStateOracle oracle =
             new io.myotis.evm.world.SnapBackedStateOracle(
-                () -> {
-                    List<com.jaeckel.ethp2p.networking.eth.EthHandler> live =
-                        connector.activeSnapHandlers();
-                    if (live.isEmpty()) return null;
-                    int idx = Math.floorMod(ensPeerIndex.getAndIncrement(), live.size());
-                    return new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(live.get(idx));
-                }, ensBytecodeCache);
+                () -> finalPeer.isReady() && !finalPeer.isSnapServingFailed()
+                    ? new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(finalPeer)
+                    : null,
+                ensBytecodeCache);
         io.myotis.evm.DefaultEvmExecutor base = new io.myotis.evm.DefaultEvmExecutor(
             oracle, ensBytecodeCache, EVM_POOL);
         io.myotis.evm.PrefetchingEvmExecutor prefetching =

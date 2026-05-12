@@ -334,6 +334,27 @@ public record NetworkConfig(
         return List.copyOf(digests);
     }
 
+    /**
+     * Lower bound for what counts as a sensible peer-reported chain head on
+     * this network. Used as a sanity floor when probing peers for a fresh
+     * head: a peer claiming a head far below current is either far behind or
+     * lying, and routing SNAP requests at its stateRoot will surface as
+     * proof-verification failures rather than clean errors.
+     *
+     * <p>Values are chosen with comfortable margin under the actual current
+     * head so the floor doesn't need to chase the chain — only catch egregious
+     * outliers. {@code 0} for unknown networks disables the floor (better to
+     * try than to refuse).
+     */
+    public long minSensibleHeadBlock() {
+        return switch ((int) networkId) {
+            case 1 -> 20_000_000L;        // mainnet (current ~25M, 2026-05)
+            case 11155111 -> 5_000_000L;  // sepolia
+            case 17000 -> 1_000_000L;     // holesky
+            default -> 0L;
+        };
+    }
+
     /** Look up a network by name (case-insensitive). */
     public static NetworkConfig byName(String name) {
         return switch (name.toLowerCase()) {

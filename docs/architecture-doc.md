@@ -319,10 +319,45 @@ The wallet can estimate priority fees by examining recent blocks it has already 
 
 - **Simple ETH transfers to EOAs**: Fixed at 21,000 gas. However, the wallet must first verify that the destination is an Externally Owned Account (EOA) by checking its `codeHash` via a SNAP proof. Sending ETH to a contract address can trigger fallback or receive functions that consume significantly more gas. If the destination is a contract, a conservative higher gas limit should be used.
 - **ERC-20 transfers**: Typically 45,000–65,000 gas. A conservative fixed limit (e.g., 100,000) can be used, or a small set of known gas costs for standard contract interaction patterns can be maintained.
-- **Complex contract interactions**: This is the one area where fully RPC-free operation is difficult. Accurate gas estimation for arbitrary contract calls requires EVM simulation with the relevant state. Possible approaches:
-  - Use conservative fixed limits for known interaction patterns
-  - Embed a lightweight EVM interpreter and fetch the necessary state via SNAP for simulation
-  - Accept a minimal RPC concession: use `eth_estimateGas` from an untrusted source, treating it as a hint (overestimating gas wastes a small amount of ETH but doesn't compromise security)
+- **Complex contract interactions**: Accurate gas estimation for arbitrary contract calls requires EVM simulation with the relevant state. The wallet's local EVM (Section 9) gives us this path natively: we run the call against SNAP-verified state and read the gas consumed from the execution result, no RPC concession needed. Until that path is wired through to a `gas-estimate` IPC command, conservative fixed limits for known interaction patterns are used.
+
+---
+
+## 9. Local EVM Execution — View Calls and Gas Estimation
+
+### The Problem
+
+Some wallet operations cannot be answered by simple state lookups. ENS resolution (Section 6) needs to run resolver bytecode. Gas estimation for arbitrary contract interactions needs to actually execute the call to count consumed gas. ERC-20 metadata reads (`name()`, `symbol()`, `decimals()`) are view calls. Without a local EVM these are all forced through an RPC provider.
+
+### How It Works
+
+The wallet embeds a stripped-down EVM (`myotis-evm`) built around Hyperledger Besu's standalone `org.hyperledger.besu:evm` module. The EVM runs against a `StateOracle` that fetches account fields, storage slots, and contract bytecode on demand from snap/1 peers, verifying every response with a Merkle-Patricia proof against a verified `stateRoot`.
+
+Execution is structured as a stack of decorators around a base `EvmExecutor`:
+
+1. **`DefaultEvmExecutor`** — runs a transaction-shaped call against the SNAP-backed state and returns the execution result (return data, gas used, revert reason, accessed storage paths).
+2. **`PrefetchingEvmExecutor`** — wraps the base executor to do a speculative dry-run that records every account/storage access, then warm-loads those into the cache before the real run. Eliminates the round-trip-per-SLOAD latency that would otherwise dominate.
+3. **`CcipReadEvmExecutor`** — catches ERC-3668 `OffchainLookup` reverts, fetches the gateway response over HTTPS, and re-enters the EVM with the resolver's callback (Section 6).
+
+### Trust Model
+
+Identical to the SNAP / state-data trust model:
+
+- **State**: every read backed by a Merkle proof against a verified `stateRoot`.
+- **Bytecode**: verified by `keccak256(code) == codeHash` against the (proof-verified) account.
+- **Block context** (`block.number`, `block.timestamp`, `coinbase`, `prevRandao`, `baseFeePerGas`, `gasLimit`, `chainId`): supplied from a verified block header.
+- **No peer trust**: a peer cannot influence execution outcomes by lying about state — they can only refuse to serve, which surfaces as a clean failure rather than a wrong answer.
+
+### Current Use Cases
+
+- **ENS resolution** (`resolve-ens`): full forward resolution, including ENSIP-10 wildcard names and ERC-3668 off-chain records.
+- **Reverse ENS lookup**: address → name with mandatory forward-verification round-trip.
+
+### Future Use Cases
+
+- **`eth_call`-equivalent view calls**: arbitrary contract reads (ERC-20 metadata, NFT `tokenURI`, multicall aggregations) without an RPC concession.
+- **Gas estimation**: simulate a candidate transaction to count actual gas usage instead of relying on conservative fixed limits.
+- **Pre-flight checks**: run a transaction locally before broadcasting to detect reverts (insufficient balance, stale approvals, slippage) and surface a useful error message rather than a confirmed-but-failed on-chain transaction.
 
 ---
 
@@ -348,7 +383,12 @@ The wallet can estimate priority fees by examining recent blocks it has already 
    └─→ ERC-20 balances (storage proofs)
        └─→ Verified against stateRoot
 
-6. TRANSACTION SUBMISSION (devp2p eth protocol)
+6. LOCAL EVM (Besu evm + SNAP-backed StateOracle)
+   └─→ ENS resolution (Universal Resolver + CCIP-Read)
+   └─→ View calls / gas estimation (future)
+       └─→ All reads verified against stateRoot
+
+7. TRANSACTION SUBMISSION (devp2p eth protocol)
    └─→ Broadcast signed transactions via gossip
 ```
 
@@ -358,7 +398,8 @@ The wallet can estimate priority fees by examining recent blocks it has already 
 |-----------|----------|---------------------------------------------|
 | libp2p    | CL light client sync | Sync committees, beacon block headers |
 | devp2p    | eth      | Block headers/bodies, tx gossip, receipts   |
-| devp2p    | snap     | Account state, storage proofs               |
+| devp2p    | snap     | Account state, storage proofs, bytecode     |
+| HTTPS     | CCIP-Read gateway | Off-chain ENS records (ERC-3668)   |
 | IPFS      | bitswap  | TrueBlocks index chunks                     |
 | discv5    | UDP DHT  | Consensus layer peer discovery              |
 | discv4    | UDP DHT  | Execution layer peer discovery              |
@@ -374,6 +415,8 @@ The wallet can estimate priority fees by examining recent blocks it has already 
 | TrueBlocks / IPFS   | Integrity verified via CID — but completeness is unverifiable; mitigated by balance reconciliation |
 | Accumulator snapshot | One-time trust at build/distribution time                        |
 | Transaction gossip   | Availability only — need multiple peers to mitigate censorship   |
+| Local EVM           | Same as SNAP peers — every state read backed by Merkle proof; bytecode verified by `codeHash`     |
+| CCIP-Read gateways  | Availability only — responses validated on-chain by the resolver's callback                       |
 
 ---
 
