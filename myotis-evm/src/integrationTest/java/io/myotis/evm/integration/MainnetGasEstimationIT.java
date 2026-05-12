@@ -19,6 +19,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * Phase 5 acceptance test: locally-estimated gas for the corpus the
@@ -128,37 +129,29 @@ class MainnetGasEstimationIT {
 
         // exactInputSingle(ExactInputSingleParams calldata params) where
         // params packs (tokenIn, tokenOut, fee, recipient, deadline,
-        // amountIn, amountOutMinimum, sqrtPriceLimitX96). For estimation
-        // purposes we don't need the actual values to be realistic — the
-        // EVM just needs the calldata to be parseable by the router.
-        // Constructing the tuple by hand is verbose; using a placeholder
-        // that the router will probably revert on is acceptable for
-        // estimation IF estimation surfaces the revert (it does, per
-        // unit tests). For a true acceptance run, the operator should
-        // override this with realistic params via env var.
+        // amountIn, amountOutMinimum, sqrtPriceLimitX96). Constructing
+        // a realistic tuple at runtime needs current pool state, so
+        // operators supply ready-made calldata via env var. Without it
+        // there's no valid input that exercises the swap path — a bare
+        // 4-byte selector reverts in the router's ABI decode, which
+        // estimateGas (correctly) refuses to estimate over. Skip rather
+        // than fail, matching the class Javadoc's "test still runs but
+        // optional cross-check is skipped" contract.
         String overrideCalldata = System.getenv("MYOTIS_INTEGRATION_UNISWAP_CALLDATA");
-        byte[] calldata = overrideCalldata != null
-                ? HexFormat.of().parseHex(stripHexPrefix(overrideCalldata))
-                : buildSimpleSwapCalldata();
+        assumeTrue(overrideCalldata != null,
+                "MYOTIS_INTEGRATION_UNISWAP_CALLDATA not set — skipping Uniswap swap"
+                        + " estimation; supply realistic calldata to exercise this path");
+        byte[] calldata = HexFormat.of().parseHex(stripHexPrefix(overrideCalldata));
 
         var tx = new UnsignedTransaction(
                 VITALIK, UNISWAP_V3_ROUTER, BigInteger.ZERO, calldata, null);
 
-        try {
-            long estimate = executor.estimateGas(tx, ctx).get(60, TimeUnit.SECONDS);
-            System.out.printf("[gas-it] uniswap-v3-swap: %d%n", estimate);
-            crossCheckIfReferenceProvided(
-                    estimate, "MYOTIS_INTEGRATION_UNISWAP_REFERENCE_GAS");
-            assertTrue(estimate >= 100_000 && estimate <= 500_000,
-                    "Uniswap V3 swap estimate out of expected range; got " + estimate);
-        } catch (java.util.concurrent.ExecutionException ee) {
-            // If the placeholder calldata reverts, Phase 5 correctly refuses
-            // to return an estimate — surface the revert so the operator
-            // knows to provide realistic calldata via env var.
-            System.out.println("[gas-it] uniswap-v3-swap reverted; supply realistic"
-                    + " MYOTIS_INTEGRATION_UNISWAP_CALLDATA to exercise the swap path");
-            throw ee;
-        }
+        long estimate = executor.estimateGas(tx, ctx).get(60, TimeUnit.SECONDS);
+        System.out.printf("[gas-it] uniswap-v3-swap: %d%n", estimate);
+        crossCheckIfReferenceProvided(
+                estimate, "MYOTIS_INTEGRATION_UNISWAP_REFERENCE_GAS");
+        assertTrue(estimate >= 100_000 && estimate <= 500_000,
+                "Uniswap V3 swap estimate out of expected range; got " + estimate);
     }
 
     // ---- Wiring ------------------------------------------------------------
@@ -213,18 +206,6 @@ class MainnetGasEstimationIT {
         assertTrue(localEstimate >= lowerBound && localEstimate <= upperBound,
                 "local estimate " + localEstimate + " is more than 5% off the reference "
                         + referenceGas + " (acceptable: [" + lowerBound + ", " + upperBound + "])");
-    }
-
-    /**
-     * A minimal placeholder for Uniswap V3 calldata. The router will
-     * almost certainly revert on this, exercising the revert path; the
-     * operator supplies realistic calldata via {@code MYOTIS_INTEGRATION_UNISWAP_CALLDATA}
-     * for an actual gas-number assertion.
-     */
-    private static byte[] buildSimpleSwapCalldata() {
-        // exactInputSingle selector with empty struct args. Will revert in
-        // the router but we want to verify the codepath is reachable.
-        return HexFormat.of().parseHex("414bf389");
     }
 
     private static String env(String name) {
