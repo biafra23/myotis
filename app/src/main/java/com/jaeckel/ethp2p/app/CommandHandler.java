@@ -58,6 +58,16 @@ public class CommandHandler {
     private final BeaconLightClient beaconLightClient; // nullable
     private final long clGenesisTime; // beacon chain genesis time (seconds since epoch)
 
+    // Shared across every ENS resolution: keeps round-robin progress between
+    // requests (so a slow-but-responsive first peer doesn't get picked every
+    // time) and lets a single bytecode cache amortize Registry / Universal
+    // Resolver fetches across requests and across the oracle + executor in
+    // the same request.
+    private final java.util.concurrent.atomic.AtomicInteger ensPeerIndex =
+            new java.util.concurrent.atomic.AtomicInteger();
+    private final io.myotis.evm.world.BytecodeCache ensBytecodeCache =
+            io.myotis.evm.world.BytecodeCache.inMemory();
+
     public CommandHandler(DiscV4Service discV4, RLPxConnector connector,
                           CountDownLatch stopLatch, Map<String, Long> backoff,
                           Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState) {
@@ -1051,19 +1061,17 @@ public class CommandHandler {
             java.math.BigInteger.valueOf(connector.getNetwork().networkId()),
             header.gasLimit);
 
-        java.util.concurrent.atomic.AtomicInteger peerIndex =
-            new java.util.concurrent.atomic.AtomicInteger();
         io.myotis.evm.world.SnapBackedStateOracle oracle =
             new io.myotis.evm.world.SnapBackedStateOracle(
                 () -> {
                     List<com.jaeckel.ethp2p.networking.eth.EthHandler> live =
                         connector.activeSnapHandlers();
                     if (live.isEmpty()) return null;
-                    int idx = Math.floorMod(peerIndex.getAndIncrement(), live.size());
+                    int idx = Math.floorMod(ensPeerIndex.getAndIncrement(), live.size());
                     return new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(live.get(idx));
-                }, io.myotis.evm.world.BytecodeCache.inMemory());
+                }, ensBytecodeCache);
         io.myotis.evm.DefaultEvmExecutor base = new io.myotis.evm.DefaultEvmExecutor(
-            oracle, io.myotis.evm.world.BytecodeCache.inMemory(), EVM_POOL);
+            oracle, ensBytecodeCache, EVM_POOL);
         io.myotis.evm.PrefetchingEvmExecutor prefetching =
             new io.myotis.evm.PrefetchingEvmExecutor(base);
         io.myotis.evm.ccipread.CcipReadHandler ccipHandler =
@@ -1170,12 +1178,17 @@ public class CommandHandler {
     private String handleResolveEnsAbi(String jsonLine) {
         String name = extractString(jsonLine, "name");
         long contentTypes;
-        try {
-            contentTypes = extractLong(jsonLine, "contentTypes");
-        } catch (Exception ignored) {
-            // Default: ask for any encoding the resolver supports
-            // (1 | 2 | 4 | 8 = 0xF). Resolvers return the highest
-            // matching bit they have data for.
+        // Default to "any encoding the resolver supports" (1|2|4|8 = 0xF) only
+        // when the field is absent. If it's present but malformed, let the
+        // parse error surface — silently defaulting on bad input would hide
+        // user typos like {"contentTypes": "two"}.
+        if (jsonLine.contains("\"contentTypes\"")) {
+            try {
+                contentTypes = extractLong(jsonLine, "contentTypes");
+            } catch (Exception e) {
+                return jsonError("contentTypes: " + (e.getMessage() != null ? e.getMessage() : "malformed"));
+            }
+        } else {
             contentTypes = 0xFL;
         }
         try {

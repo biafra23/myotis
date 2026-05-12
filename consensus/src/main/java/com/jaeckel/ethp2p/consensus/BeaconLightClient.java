@@ -871,8 +871,10 @@ public class BeaconLightClient implements AutoCloseable {
             // outer winner.get(60s) wall to fire on every batch where any peer
             // is a silent hanger — the dominant cost in the catch-up timeline.
             // 15s is generous for a real LC peer to deliver a 15-update batch.
-            p2pService.requestUpdatesByRange(peer, bootstrapPeriod, count)
-                    .orTimeout(15, TimeUnit.SECONDS)
+            // Pass the deadline into the req/resp layer (not orTimeout out here)
+            // so it can actually close the underlying libp2p stream when it
+            // fires — otherwise channelRead0 would keep buffering bytes.
+            p2pService.requestUpdatesByRange(peer, bootstrapPeriod, count, 15_000L)
                     .whenComplete((responses, ex) -> {
                         if (ex != null) {
                             Throwable root = ex;

@@ -113,16 +113,23 @@ public final class EnsResolver {
      *                17000 = holesky
      */
     public static EnsResolver forChainId(EvmExecutor executor, long chainId) {
-        return switch ((int) chainId) {
-            case 1 -> new EnsResolver(executor,
+        // Java's switch statement only accepts int-promotable types, so a
+        // `switch ((int) chainId)` would truncate large chain ids — a
+        // mainnet-shaped id like 4_294_967_297L would wrap to 1 and
+        // silently pick the mainnet contracts. Compare on the long.
+        if (chainId == 1L) {
+            return new EnsResolver(executor,
                     EnsAddresses.MAINNET_REGISTRY, EnsAddresses.MAINNET_UNIVERSAL_RESOLVER);
-            case 11155111 -> new EnsResolver(executor,
+        }
+        if (chainId == 11155111L) {
+            return new EnsResolver(executor,
                     EnsAddresses.SEPOLIA_REGISTRY, EnsAddresses.SEPOLIA_UNIVERSAL_RESOLVER);
-            case 17000 -> new EnsResolver(executor,
+        }
+        if (chainId == 17000L) {
+            return new EnsResolver(executor,
                     EnsAddresses.HOLESKY_REGISTRY, EnsAddresses.HOLESKY_UNIVERSAL_RESOLVER);
-            default -> throw new IllegalArgumentException(
-                    "ENS not pinned for chain id " + chainId);
-        };
+        }
+        throw new IllegalArgumentException("ENS not pinned for chain id " + chainId);
     }
 
     // ---- Forward record-type calls ----------------------------------------

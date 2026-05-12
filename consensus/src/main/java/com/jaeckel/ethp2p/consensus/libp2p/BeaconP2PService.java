@@ -940,6 +940,18 @@ public class BeaconP2PService implements AutoCloseable {
 
     public CompletableFuture<List<byte[]>> requestUpdatesByRange(
             String peerMultiaddr, long startPeriod, int count) {
+        return requestUpdatesByRange(peerMultiaddr, startPeriod, count, 0L);
+    }
+
+    /**
+     * Variant with a per-attempt deadline. {@code timeoutMs <= 0} means no
+     * deadline. When the deadline fires the underlying libp2p stream is
+     * closed, so the controller stops buffering bytes from a silent peer;
+     * applying {@code orTimeout} to the future returned here would only
+     * complete the wrapper future and leave the stream accumulating.
+     */
+    public CompletableFuture<List<byte[]>> requestUpdatesByRange(
+            String peerMultiaddr, long startPeriod, int count, long timeoutMs) {
         byte[] sszRequest = encodeUpdatesByRangeRequest(startPeriod, count);
         byte[] requestPayload;
         try {
@@ -947,7 +959,7 @@ public class BeaconP2PService implements AutoCloseable {
         } catch (IOException e) {
             return CompletableFuture.failedFuture(e);
         }
-        return doReqResp(peerMultiaddr, UPDATES, requestPayload)
+        return doReqResp(peerMultiaddr, UPDATES, requestPayload, timeoutMs)
                 .thenApply(raw -> {
                     try {
                         return decodeUpdatesByRangeResponse(raw, count);
@@ -1027,11 +1039,17 @@ public class BeaconP2PService implements AutoCloseable {
      */
     private CompletableFuture<byte[]> doReqResp(
             String peerMultiaddr, String protocolId, byte[] requestBytes) {
-        return doReqRespAttempt(peerMultiaddr, protocolId, requestBytes, true);
+        return doReqRespAttempt(peerMultiaddr, protocolId, requestBytes, true, 0L);
+    }
+
+    private CompletableFuture<byte[]> doReqResp(
+            String peerMultiaddr, String protocolId, byte[] requestBytes, long timeoutMs) {
+        return doReqRespAttempt(peerMultiaddr, protocolId, requestBytes, true, timeoutMs);
     }
 
     private CompletableFuture<byte[]> doReqRespAttempt(
-            String peerMultiaddr, String protocolId, byte[] requestBytes, boolean allowRetry) {
+            String peerMultiaddr, String protocolId, byte[] requestBytes, boolean allowRetry,
+            long timeoutMs) {
 
         Host h = host;
         if (h == null) {
@@ -1040,6 +1058,15 @@ public class BeaconP2PService implements AutoCloseable {
         }
 
         CompletableFuture<byte[]> responseFuture = new CompletableFuture<>();
+        if (timeoutMs > 0L) {
+            // Start the deadline now so it matches the caller's intent (X ms total),
+            // not "X ms from when the muxer happened to open a stream". When the
+            // timer fires it completes responseFuture exceptionally, which triggers
+            // the stream-close whenComplete registered after the stream opens
+            // (see below) — without that, channelRead0 would keep buffering bytes
+            // from a silent peer.
+            responseFuture.orTimeout(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
 
         QueuedReqRespBinding binding = bindings.get(protocolId);
         if (binding == null) {
@@ -1109,7 +1136,7 @@ public class BeaconP2PService implements AutoCloseable {
                                 log.debug("[beacon-p2p] Stale connection to {} — retrying with fresh dial",
                                         peerMultiaddr);
                                 disconnectPeer(peerMultiaddr);
-                                doReqRespAttempt(peerMultiaddr, protocolId, requestBytes, false)
+                                doReqRespAttempt(peerMultiaddr, protocolId, requestBytes, false, timeoutMs)
                                         .whenComplete((r, e) -> {
                                             if (e != null) responseFuture.completeExceptionally(e);
                                             else responseFuture.complete(r);
@@ -1118,6 +1145,17 @@ public class BeaconP2PService implements AutoCloseable {
                                 responseFuture.completeExceptionally(
                                         new RuntimeException("Failed to open stream to " + peerMultiaddr, ex));
                             }
+                            return;
+                        }
+                        if (stream != null) {
+                            // Tie the stream's lifetime to the response future. The ReqRespController
+                            // already cleans up on normal close, but if the future completes via
+                            // orTimeout (set at the top of this method) the underlying libp2p stream
+                            // would otherwise stay open and channelRead0 would keep buffering bytes
+                            // from a silent peer.
+                            responseFuture.whenComplete((r, e) -> {
+                                try { stream.close(); } catch (Exception ignored) {}
+                            });
                         }
                     });
 
