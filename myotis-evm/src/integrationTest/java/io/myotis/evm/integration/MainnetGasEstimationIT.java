@@ -10,10 +10,13 @@ import io.myotis.evm.abi.FunctionSignature;
 import io.myotis.evm.world.BytecodeCache;
 import io.myotis.evm.world.SnapBackedStateOracle;
 import io.myotis.evm.world.SnapPeer;
+import com.jaeckel.ethp2p.app.testing.MainnetPeerBootstrap;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
 import java.math.BigInteger;
+import java.time.Duration;
 import java.util.HexFormat;
 import java.util.concurrent.TimeUnit;
 
@@ -42,11 +45,14 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * the plan's acceptance criterion. When unset, the test still runs
  * (proves the estimation succeeded) but skips the cross-check.
  *
- * <p>The {@code connectToMainnetPeer()} stub is shared with Phases 1–4 ITs;
- * all light up when the {@code :app:Main} bootstrap helper lands.
+ * <p>The shared {@link MainnetPeerBootstrap} dials the peer once per
+ * test class and closes the RLPx connector in {@code @AfterAll}.
  */
 @EnabledIfEnvironmentVariable(named = "MYOTIS_MAINNET", matches = "1")
 class MainnetGasEstimationIT {
+
+    private static volatile MainnetPeerBootstrap.Session session;
+    private static final Object SESSION_LOCK = new Object();
 
     private static final Address VITALIK = Address.fromHex(
             "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
@@ -169,14 +175,33 @@ class MainnetGasEstimationIT {
     }
 
     private static SnapPeer connectToMainnetPeer() {
-        String enode = System.getenv("MYOTIS_INTEGRATION_PEER_ENODE");
-        assertNotNull(enode,
-                "MYOTIS_INTEGRATION_PEER_ENODE must be set; "
-                        + "see MainnetCallViewIT Javadoc for the contract");
-        // TODO(phase1.commit5+): same bootstrap helper as the other mainnet ITs.
-        throw new UnsupportedOperationException(
-                "EthHandler bootstrap from a test is not yet implemented; "
-                        + "see TODO in MainnetCallViewIT.connectToMainnetPeer.");
+        if (session == null) {
+            synchronized (SESSION_LOCK) {
+                if (session == null) {
+                    String enode = System.getenv("MYOTIS_INTEGRATION_PEER_ENODE");
+                    assertNotNull(enode,
+                            "MYOTIS_INTEGRATION_PEER_ENODE must be set; "
+                                    + "see MainnetCallViewIT Javadoc for the contract");
+                    try {
+                        session = MainnetPeerBootstrap.dial(enode, Duration.ofSeconds(30));
+                    } catch (Exception e) {
+                        throw new RuntimeException(
+                                "Failed to bootstrap mainnet peer: " + e.getMessage(), e);
+                    }
+                }
+            }
+        }
+        return session.peer();
+    }
+
+    @AfterAll
+    static void closePeerSession() {
+        synchronized (SESSION_LOCK) {
+            if (session != null) {
+                session.close();
+                session = null;
+            }
+        }
     }
 
     private static BlockContext mainnetBlockContext() {

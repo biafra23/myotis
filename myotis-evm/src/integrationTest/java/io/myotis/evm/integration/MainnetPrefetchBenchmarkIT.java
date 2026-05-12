@@ -12,10 +12,13 @@ import io.myotis.evm.prefetch.ConvergenceTracker;
 import io.myotis.evm.world.BytecodeCache;
 import io.myotis.evm.world.SnapBackedStateOracle;
 import io.myotis.evm.world.SnapPeer;
+import com.jaeckel.ethp2p.app.testing.MainnetPeerBootstrap;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
 import java.math.BigInteger;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HexFormat;
@@ -61,6 +64,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 @EnabledIfEnvironmentVariable(named = "MYOTIS_MAINNET", matches = "1")
 class MainnetPrefetchBenchmarkIT {
+
+    private static volatile MainnetPeerBootstrap.Session session;
+    private static final Object SESSION_LOCK = new Object();
 
     private static final int TIMED_ITERATIONS = 10;
     private static final int WARMUP_ITERATIONS = 1;
@@ -159,14 +165,32 @@ class MainnetPrefetchBenchmarkIT {
     }
 
     private static SnapPeer connectToMainnetPeer() {
-        String enode = System.getenv("MYOTIS_INTEGRATION_PEER_ENODE");
-        assertNotNull(enode,
-                "MYOTIS_INTEGRATION_PEER_ENODE must be set; see MainnetCallViewIT Javadoc");
-        // TODO(phase1.commit5+): same bootstrap helper as MainnetCallViewIT.
-        // Both ITs share the gap; both light up at once when the helper lands.
-        throw new UnsupportedOperationException(
-                "EthHandler bootstrap from a test is not yet implemented; "
-                        + "see TODO in MainnetCallViewIT.connectToMainnetPeer.");
+        if (session == null) {
+            synchronized (SESSION_LOCK) {
+                if (session == null) {
+                    String enode = System.getenv("MYOTIS_INTEGRATION_PEER_ENODE");
+                    assertNotNull(enode,
+                            "MYOTIS_INTEGRATION_PEER_ENODE must be set; see MainnetCallViewIT Javadoc");
+                    try {
+                        session = MainnetPeerBootstrap.dial(enode, Duration.ofSeconds(30));
+                    } catch (Exception e) {
+                        throw new RuntimeException(
+                                "Failed to bootstrap mainnet peer: " + e.getMessage(), e);
+                    }
+                }
+            }
+        }
+        return session.peer();
+    }
+
+    @AfterAll
+    static void closePeerSession() {
+        synchronized (SESSION_LOCK) {
+            if (session != null) {
+                session.close();
+                session = null;
+            }
+        }
     }
 
     private static BlockContext mainnetBlockContext() {
