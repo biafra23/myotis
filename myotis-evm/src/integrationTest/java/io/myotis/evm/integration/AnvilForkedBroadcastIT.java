@@ -25,6 +25,8 @@ import java.time.Duration;
 import java.util.HexFormat;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -234,6 +236,18 @@ class AnvilForkedBroadcastIT {
      * stable so an extracted regex per field is fine here.
      */
     private static final class AnvilRpcClient {
+        /**
+         * JSON-RPC error responses always shape as {@code "error":{code,message,...}}.
+         * Match the start of that object — discriminates between a real error and
+         * a literal {@code "error"} substring that could in principle appear
+         * inside a result payload. {@code \\s*} tolerates pretty-printed responses.
+         */
+        private static final Pattern ERROR_OBJECT =
+                Pattern.compile("\"error\"\\s*:\\s*\\{");
+        /** Whitespace-tolerant {@code "result":null}. */
+        private static final Pattern NULL_RESULT =
+                Pattern.compile("\"result\"\\s*:\\s*null");
+
         private final URI endpoint;
         private final HttpClient http = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(5))
@@ -260,8 +274,7 @@ class AnvilForkedBroadcastIT {
                         + ": " + resp.body());
             }
             String s = resp.body();
-            int errIdx = s.indexOf("\"error\"");
-            if (errIdx >= 0) {
+            if (ERROR_OBJECT.matcher(s).find()) {
                 throw new IOException("Anvil RPC " + method + " error: " + s);
             }
             return s;
@@ -295,7 +308,7 @@ class AnvilForkedBroadcastIT {
             long deadlineNanos = System.nanoTime() + timeout.toNanos();
             while (System.nanoTime() < deadlineNanos) {
                 String resp = call("eth_getTransactionReceipt", "[\"" + txHash + "\"]");
-                if (!resp.contains("\"result\":null")) {
+                if (!NULL_RESULT.matcher(resp).find()) {
                     long status = parseHexLong(extractJsonString(resp, "status"));
                     long gasUsed = parseHexLong(extractJsonString(resp, "gasUsed"));
                     return new Receipt(status, gasUsed);
@@ -306,15 +319,22 @@ class AnvilForkedBroadcastIT {
             throw new AssertionError("unreachable");
         }
 
+        /**
+         * Extract a string-typed JSON field value. Whitespace-tolerant
+         * (pretty-printed responses) and handles standard JSON string
+         * escapes inside the value via {@code [^"\\\\]|\\\\.} —
+         * indispensable if the field's value happens to contain a
+         * quoted character.
+         */
         private static String extractJsonString(String json, String field) {
-            String needle = "\"" + field + "\":\"";
-            int start = json.indexOf(needle);
-            if (start < 0) {
-                throw new IllegalStateException("field '" + field + "' not in JSON: " + json);
+            Pattern p = Pattern.compile(
+                    "\"" + Pattern.quote(field) + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+            Matcher m = p.matcher(json);
+            if (!m.find()) {
+                throw new IllegalStateException(
+                        "field '" + field + "' not in JSON (or not a string): " + json);
             }
-            start += needle.length();
-            int end = json.indexOf('"', start);
-            return json.substring(start, end);
+            return m.group(1);
         }
 
         private static long parseHexLong(String hex) {
