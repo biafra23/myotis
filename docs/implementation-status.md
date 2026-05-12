@@ -88,9 +88,15 @@ Validated against mainnet: `vitalik.eth`, `1.offchainexample.eth` (CCIP-Read dem
 No `Transactions`, `NewPooledTransactionHashes`, or `GetPooledTransactions` message handling. The eth handler only covers handshake + block header/body + snap queries.
 
 ## 8. Gas Estimation
-**Not implemented**
+**POC: Implemented**
 
-`baseFeePerGas` is available in `BlockHeader` and returned in `get-block`, but there is no dedicated gas estimation command or priority fee calculation logic. The local EVM (Section 9) gives us the simulation path natively — wiring it through to a `gas-estimate` IPC command is straightforward, just not done yet.
+`DefaultEvmExecutor.estimateGas(UnsignedTransaction, BlockContext)` returns a Yellow-Paper-correct intrinsic + Besu-EVM-metered + 15%-buffer estimate. Revert and OOG halts throw rather than return a number (callers must not broadcast a doomed transaction). Out of scope for v1: contract creation, EIP-2930 access lists, EIP-3860 init-code, binary-search refinement.
+
+Acceptance corpus (`MainnetGasEstimationIT`, env-gated): ETH→EOA, ETH→contract (WETH deposit), ERC-20 transfer (USDC), ERC-721 transfer (ENS BaseRegistrar), Uniswap V3 exact-input swap. Each cross-checks against `eth_estimateGas` from a reference RPC within 5% when the operator supplies `MYOTIS_INTEGRATION_<NAME>_REFERENCE_GAS`.
+
+The headline end-to-end acceptance (`AnvilForkedBroadcastIT`) builds a transaction with the locally-estimated gas, broadcasts it to an Anvil fork of mainnet (via `anvil_impersonateAccount`), and asserts the receipt succeeds without OOG and `gasUsed <= localEstimate`. This proves the 15% safety buffer is actually sufficient on the wire — a property the 5%-of-reference cross-check alone can't guarantee.
+
+`baseFeePerGas` is exposed via `get-block`. The plan's wallet integration (switching the tx-builder from fixed limits to `estimateGas`) is deferred to whenever `myotis-tx-builder` lands; the API is ready. The local EVM (Section 9) gives us the simulation path natively — wiring it through to a `gas-estimate` IPC command is straightforward, just not done yet.
 
 ## 9. Local EVM Execution
 **POC: Implemented**
@@ -105,7 +111,7 @@ No `Transactions`, `NewPooledTransactionHashes`, or `GetPooledTransactions` mess
 
 **Not implemented:**
 - `eth_call`-equivalent IPC command for arbitrary view calls (ERC-20 metadata, NFT `tokenURI`, multicall)
-- Gas estimation IPC command (the executor already returns gas used; just needs an IPC surface)
+- Gas-estimate IPC command (the executor's `estimateGas` works; Section 8 covers the implementation, just no daemon surface yet)
 - Pre-flight transaction simulation (catch reverts before broadcast)
 
 ## Summary
@@ -119,7 +125,7 @@ No `Transactions`, `NewPooledTransactionHashes`, or `GetPooledTransactions` mess
 | 5. State Data via SNAP               | **Implemented** | No `GetTrieNodes`, no NFT/Vyper support        |
 | 6. ENS Resolution                    | **Implemented** | No text records / multi-coin addrs             |
 | 7. Transaction Submission            | **Not started** | No tx gossip messages                          |
-| 8. Gas Estimation                    | **Not started** | EVM is wired, just needs an IPC command        |
+| 8. Gas Estimation                    | **Implemented** | No IPC surface yet (executor API ready)        |
 | 9. Local EVM Execution               | **Implemented** | No generic view-call / gas-estimate IPC yet    |
 
 The core verification pipeline (sync committees → state root → Merkle proofs → local EVM) is functional end-to-end. ENS resolution including CCIP-Read is validated on mainnet. The biggest remaining gaps are on the "wallet action" side: submitting transactions and exposing the EVM as a generic view-call / gas-estimate surface.
