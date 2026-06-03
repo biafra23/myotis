@@ -305,7 +305,7 @@ Resolves an ENS name to an Ethereum address by running the ENS contracts in a lo
 
 **How it works:**
 
-1. The daemon picks a snap-capable peer and probes it for a fresh chain head — pinning every subsequent state read to that one peer ensures the `stateRoot` and the proofs that descend from it are consistent.
+1. The daemon picks a snap-capable peer and fetches a fresh chain head — the `stateRoot` and the proofs that descend from it stay consistent for the whole call.
 2. A local EVM (Hyperledger Besu's standalone EVM module) executes a single `resolve(bytes name, bytes data)` call to the ENS Universal Resolver. Every account field, storage slot, and contract bytecode the EVM reads is fetched on demand via snap/1 and verified by Merkle-Patricia proof against the peer's `stateRoot`.
 3. If the call reverts with `OffchainLookup` (ERC-3668), the daemon fetches the gateway response over HTTPS and re-enters the EVM with the resolver's callback. The callback validates the gateway's response on-chain — typically by checking a signer's signature against a list of trusted signers embedded in the resolver — so a malicious gateway cannot inject a wrong answer.
 4. The Universal Resolver's return value is decoded as the resolved address.
@@ -316,6 +316,10 @@ Resolves an ENS name to an Ethereum address by running the ENS contracts in a lo
 - **Bytecode**: verified by `keccak256(code) == codeHash` from the proof-verified account.
 - **CCIP-Read gateways**: trusted only for *availability* — the resolver's callback validates the response cryptographically. A lying gateway causes the call to revert, surfacing as a clean failure.
 - The `blockNumber` field is the peer's recent head, not necessarily a beacon-finalized block. The data is always cryptographically backed by a real on-chain `stateRoot`, but unlike `get-account` / `get-storage` there is no separate beacon-chain anchor field returned with the resolution. (The same beacon-anchoring that backs SNAP queries applies; it is just not surfaced per-call.)
+
+The same trust model applies to every other `resolve-ens-*` command.
+
+**Networks:** mainnet, sepolia, and holesky have canonical Registry + Universal Resolver addresses pinned. Other networks fail with `ENS not pinned for chain id …`.
 
 **Validated names** (mainnet):
 
@@ -332,6 +336,99 @@ Resolves an ENS name to an Ethereum address by running the ENS contracts in a lo
 ./gradlew :app:run -Pargs="resolve-ens jesse.cb.id"
 # → 0x849151d7d0bf1f34b70d5cad5149d28cc2308bf1
 ```
+
+### Resolve ENS text record
+
+```bash
+./gradlew :app:run -Pargs="resolve-ens-text vitalik.eth avatar"
+./gradlew :app:run -Pargs="resolve-ens-text vitalik.eth com.twitter"
+```
+
+Reads a text record (ENSIP-5) for a name. Common keys: `avatar`, `url`, `description`, `email`, `notice`, `keywords`, `com.twitter`, `com.github`, `org.telegram`.
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | The queried name |
+| `key` | string | The text-record key |
+| `resolved` | boolean | `true` if a non-empty value was returned |
+| `value` | string | The record value (only if `resolved=true`) |
+| `blockNumber` | long | Execution block at which the resolution was performed |
+
+### Resolve ENS contenthash
+
+```bash
+./gradlew :app:run -Pargs="resolve-ens-contenthash vitalik.eth"
+```
+
+Reads the contenthash (ENSIP-7) — a multicodec-encoded pointer to IPFS, Swarm, IPNS, or Arweave content. Used to attach a decentralized website to an ENS name.
+
+**Response fields:** `name`, `resolved`, `contenthash` (0x-prefixed multicodec bytes; decoder is the caller's responsibility), `blockNumber`.
+
+### Resolve ENS multi-coin address
+
+```bash
+# Bitcoin (SLIP-44 coinType 0)
+./gradlew :app:run -Pargs="resolve-ens-addr-coin some-name.eth 0"
+
+# Litecoin (SLIP-44 coinType 2)
+./gradlew :app:run -Pargs="resolve-ens-addr-coin some-name.eth 2"
+
+# Solana (SLIP-44 coinType 501)
+./gradlew :app:run -Pargs="resolve-ens-addr-coin some-name.eth 501"
+```
+
+Reads an `addr(node, coinType)` record (ENSIP-9 / SLIP-44). The default `addr` command returns the ETH-mainnet address (`coinType=60`); this two-arg form returns the chain-specific address bytes for any coinType the resolver has set.
+
+**Response fields:** `name`, `coinType`, `resolved`, `address` (0x-prefixed raw chain-specific bytes — for Bitcoin this is the script payload, not a base58 address; the caller is responsible for decoding for that chain), `blockNumber`.
+
+### Resolve ENS pubkey
+
+```bash
+./gradlew :app:run -Pargs="resolve-ens-pubkey some-name.eth"
+```
+
+Reads the secp256k1 public-key record (EIP-619). Niche — used for end-to-end-encrypted DM flows.
+
+**Response fields:** `name`, `resolved`, `pubkeyX`, `pubkeyY` (each 0x-prefixed 32-byte hex), `blockNumber`. Returns `resolved:false` when both coordinates are zero.
+
+### Resolve ENS ABI record
+
+```bash
+# Default contentTypes mask = 0xF (any encoding)
+./gradlew :app:run -Pargs="resolve-ens-abi some-name.eth"
+
+# Explicit mask: 1 = Solidity ABI JSON only
+./gradlew :app:run -Pargs="resolve-ens-abi some-name.eth 1"
+```
+
+Reads an ABI record (EIP-205) — ABI metadata for a contract owned by the name. `contentTypes` is a bitmask: `1` = Solidity ABI JSON, `2` = zlib-compressed JSON, `4` = CBOR, `8` = URI. Default is `15` (all).
+
+**Response fields:** `name`, `contentTypes`, `resolved`, `contentType` (which encoding the resolver chose), `data` (0x-prefixed bytes in that encoding), `blockNumber`.
+
+### Resolve ENS DNS record
+
+Reads a DNS record (ENSIP-8) stored under the name. The DNS record returned can include DNSSEC RRSIG bytes; the caller is responsible for parsing and (if desired) DNSSEC-verifying the bytes.
+
+```bash
+./gradlew :app:run -Pargs="resolve-ens-dns some-name.eth www.example.com 1"
+```
+
+Positional args are `<name.eth> <dnsName> <resource>`. `resource` is a DNS resource type (1 = A, 28 = AAAA, 16 = TXT, 33 = SRV, …).
+
+**Response fields:** `name`, `dnsName`, `resource`, `resolved`, `data` (raw RDATA bytes), `blockNumber`.
+
+### Resolve ENS interface implementer
+
+```bash
+# 0x5b5e139f is the EIP-165 selector for ERC-721 Metadata
+./gradlew :app:run -Pargs="resolve-ens-interface some-name.eth 0x5b5e139f"
+```
+
+Reads `interfaceImplementer(node, interfaceId)` (EIP-1820 over ENS) — the address of a contract implementing the given EIP-165 interface for this name's owner. Positional args are `<name.eth> <0xInterfaceId>`.
+
+**Response fields:** `name`, `interfaceId`, `resolved`, `implementer` (0x-prefixed 20-byte address), `blockNumber`.
 
 ### Get transactions
 

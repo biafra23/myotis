@@ -11,19 +11,33 @@ import io.myotis.evm.abi.FunctionSignature;
 import io.myotis.evm.ccipread.OffchainLookupRevert;
 import io.myotis.evm.ens.Namehash;
 
+import java.math.BigInteger;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.function.Function;
 
 /**
- * Forward + reverse resolver for ENS names.
+ * Forward + reverse + record-type resolver for ENS names.
  *
- * <p>Forward resolution ({@code name → address}) goes through the
- * Universal Resolver: a single {@code resolve(bytes name, bytes data)}
- * call that walks the registry/resolver chain, handles wildcard names
- * (ENSIP-10), and surfaces ERC-3668 OffchainLookup reverts at the call
- * boundary so a {@code CcipReadEvmExecutor} wrapping the supplied
- * executor can fetch the off-chain response transparently.
+ * <p>All forward record-type calls go through the Universal Resolver:
+ * a single {@code resolve(bytes name, bytes data)} that walks the
+ * registry/resolver chain, handles wildcard names (ENSIP-10), and
+ * surfaces ERC-3668 OffchainLookup reverts at the call boundary so a
+ * {@code CcipReadEvmExecutor} wrapping the supplied executor can fetch
+ * the off-chain response transparently.
+ *
+ * <p>Supported records:
+ * <ul>
+ *   <li>{@code addr(bytes32)} — {@link #resolveAddress}
+ *   <li>{@code addr(bytes32, uint256)} — {@link #resolveMultiCoinAddress} (ENSIP-9, SLIP-44)
+ *   <li>{@code text(bytes32, string)} — {@link #resolveText} (ENSIP-5)
+ *   <li>{@code contenthash(bytes32)} — {@link #resolveContenthash} (ENSIP-7)
+ *   <li>{@code pubkey(bytes32)} — {@link #resolvePubkey} (EIP-619)
+ *   <li>{@code ABI(bytes32, uint256)} — {@link #resolveAbi} (EIP-205)
+ *   <li>{@code dnsRecord(bytes32, bytes, uint16)} — {@link #resolveDnsRecord} (ENSIP-8)
+ *   <li>{@code interfaceImplementer(bytes32, bytes4)} — {@link #resolveInterfaceImplementer} (EIP-1820 over ENS)
+ * </ul>
  *
  * <p>Reverse resolution ({@code address → name}) uses the step-by-step
  * Registry → reverse-resolver path with a mandatory ENSIP-3 forward
@@ -45,6 +59,20 @@ public final class EnsResolver {
             FunctionSignature.of("resolve(bytes,bytes)");
     private static final FunctionSignature ADDR =
             FunctionSignature.of("addr(bytes32)");
+    private static final FunctionSignature ADDR_COIN =
+            FunctionSignature.of("addr(bytes32,uint256)");
+    private static final FunctionSignature TEXT =
+            FunctionSignature.of("text(bytes32,string)");
+    private static final FunctionSignature CONTENTHASH =
+            FunctionSignature.of("contenthash(bytes32)");
+    private static final FunctionSignature PUBKEY =
+            FunctionSignature.of("pubkey(bytes32)");
+    private static final FunctionSignature ABI =
+            FunctionSignature.of("ABI(bytes32,uint256)");
+    private static final FunctionSignature DNS_RECORD =
+            FunctionSignature.of("dnsRecord(bytes32,bytes,uint16)");
+    private static final FunctionSignature INTERFACE_IMPLEMENTER =
+            FunctionSignature.of("interfaceImplementer(bytes32,bytes4)");
     private static final FunctionSignature RESOLVER =
             FunctionSignature.of("resolver(bytes32)");
     private static final FunctionSignature NAME =
@@ -70,67 +98,174 @@ public final class EnsResolver {
     }
 
     /**
+     * Network-aware factory keyed on the EVM chain ID: picks the
+     * canonical Registry + Universal Resolver pair for the given
+     * network. Throws {@link IllegalArgumentException} for networks
+     * where ENS is not pinned (callers that need to override can use
+     * the three-arg constructor directly).
+     *
+     * <p>Keeping this on chain-id (not on a {@code NetworkConfig}) keeps
+     * {@code :myotis-ens} from depending on {@code :networking} — the
+     * ENS module needs to remain Android-friendly and the networking
+     * module pulls in Netty + discv5 transitively.
+     *
+     * @param chainId EVM chain id: 1 = mainnet, 11155111 = sepolia,
+     *                17000 = holesky
+     */
+    public static EnsResolver forChainId(EvmExecutor executor, long chainId) {
+        // Java's switch statement only accepts int-promotable types, so a
+        // `switch ((int) chainId)` would truncate large chain ids — a
+        // mainnet-shaped id like 4_294_967_297L would wrap to 1 and
+        // silently pick the mainnet contracts. Compare on the long.
+        if (chainId == 1L) {
+            return new EnsResolver(executor,
+                    EnsAddresses.MAINNET_REGISTRY, EnsAddresses.MAINNET_UNIVERSAL_RESOLVER);
+        }
+        if (chainId == 11155111L) {
+            return new EnsResolver(executor,
+                    EnsAddresses.SEPOLIA_REGISTRY, EnsAddresses.SEPOLIA_UNIVERSAL_RESOLVER);
+        }
+        if (chainId == 17000L) {
+            return new EnsResolver(executor,
+                    EnsAddresses.HOLESKY_REGISTRY, EnsAddresses.HOLESKY_UNIVERSAL_RESOLVER);
+        }
+        throw new IllegalArgumentException("ENS not pinned for chain id " + chainId);
+    }
+
+    // ---- Forward record-type calls ----------------------------------------
+
+    /**
      * Forward resolution: {@code name → address}.
      *
-     * <p>Returns {@link Optional#empty()} when:
-     * <ul>
-     *   <li>The Universal Resolver returns empty / zero bytes for the
-     *       inner call (no record set).
-     *   <li>The UR reverts with a known "not found" condition. Most UR
-     *       implementations revert with {@code ResolverNotFound} or
-     *       similar custom errors when the name has no resolver; we
-     *       map any revert from the UR to {@code Optional.empty()}
-     *       rather than propagate it as a call failure, since the
-     *       wallet's intent is "look up this name" and the reasonable
-     *       answer for an unregistered name is "no result."
-     * </ul>
-     *
-     * <p>OffchainLookup reverts from the UR's nested resolver call are
-     * <em>not</em> surfaced here — they're caught one layer up by the
-     * {@code CcipReadEvmExecutor} wrapping {@code executor}. If the
-     * caller hasn't wrapped, those reverts propagate as
-     * {@code Reverted} errors.
+     * <p>Returns {@link Optional#empty()} when the UR returns empty/zero
+     * bytes for the inner call (no record set) or when the UR reverts
+     * with a known "not found" condition. {@code OffchainLookup} reverts
+     * are rethrown for the {@code CcipReadEvmExecutor} wrapper to catch.
      */
     public CompletableFuture<Optional<Address>> resolveAddress(String name, BlockContext blockContext) {
-        byte[] dnsName = DnsEncoder.encode(name);
         byte[] node = Namehash.of(name);
-        // Inner call: addr(bytes32) with the namehash. The UR will dispatch
-        // this against the right resolver internally.
         byte[] innerCall = AbiEncoder.encodeCall(ADDR, AbiEncoder.bytes32(node));
-        // Outer call: resolve(bytes name, bytes data) on the UR.
-        byte[] resolveCalldata = AbiEncoder.encodeCall(
-                RESOLVE,
-                AbiEncoder.bytes(dnsName),
-                AbiEncoder.bytes(innerCall));
+        return dispatchUR(name, innerCall, blockContext, EnsResolver::decodeAddrResult);
+    }
 
-        return executor.callView(universalResolver, resolveCalldata, blockContext)
-                .handle((result, error) -> {
-                    if (error != null) {
-                        Throwable cause = unwrap(error);
-                        // OffchainLookup reverts are rethrown so the caller's
-                        // CcipReadEvmExecutor wrapper can handle them. If the
-                        // caller forgot to wrap, the OffchainLookup surfaces
-                        // as a Reverted error rather than being silently
-                        // swallowed as "name not found."
-                        if (cause instanceof EvmExecutionException eee
-                                && eee.error() instanceof EvmExecutionError.Reverted r
-                                && OffchainLookupRevert.tryParse(r.data()).isPresent()) {
-                            throw new CompletionException(cause);
-                        }
-                        // Other reverts (UR's ResolverNotFound and friends) =
-                        // "no result." The wallet's intent is "look up this
-                        // name" and the reasonable answer for an unregistered
-                        // name is empty.
-                        if (cause instanceof EvmExecutionException eee
-                                && eee.error() instanceof EvmExecutionError.Reverted) {
-                            return Optional.<Address>empty();
-                        }
-                        // Not a revert at all: bubble the real failure
-                        // (oracle issue, network problem, etc.).
-                        throw new CompletionException(cause);
-                    }
-                    return decodeUrAddrResult(result);
-                });
+    /**
+     * Multi-coin address (ENSIP-9 / SLIP-44):
+     * {@code addr(node, coinType) → bytes}.
+     *
+     * <p>{@code coinType} is the SLIP-44 coin type for the chain whose
+     * address we want (e.g. {@code 0} for Bitcoin, {@code 60} for ETH).
+     * The return is the chain-specific address bytes; for Bitcoin that
+     * is the script payload, for EVM chains it is the 20-byte address.
+     * Decoding the bytes for a given chain is the caller's responsibility.
+     */
+    public CompletableFuture<Optional<byte[]>> resolveMultiCoinAddress(
+            String name, long coinType, BlockContext blockContext) {
+        byte[] node = Namehash.of(name);
+        byte[] innerCall = AbiEncoder.encodeCall(
+                ADDR_COIN, AbiEncoder.bytes32(node), AbiEncoder.uint256(coinType));
+        return dispatchUR(name, innerCall, blockContext, EnsResolver::decodeNonEmptyBytes);
+    }
+
+    /**
+     * Text record (ENSIP-5):
+     * {@code text(node, key) → string}. Common keys: {@code "avatar"},
+     * {@code "url"}, {@code "description"}, {@code "email"},
+     * {@code "com.twitter"}, {@code "com.github"}, {@code "org.telegram"}.
+     */
+    public CompletableFuture<Optional<String>> resolveText(
+            String name, String key, BlockContext blockContext) {
+        byte[] node = Namehash.of(name);
+        byte[] innerCall = AbiEncoder.encodeCall(
+                TEXT, AbiEncoder.bytes32(node), AbiEncoder.string(key));
+        return dispatchUR(name, innerCall, blockContext, EnsResolver::decodeStringResult);
+    }
+
+    /**
+     * Content hash (ENSIP-7):
+     * {@code contenthash(node) → bytes}. The return is a multicodec-
+     * encoded pointer (IPFS / Swarm / IPNS / Arweave); see
+     * <a href="https://github.com/multiformats/multicodec">multicodec</a>.
+     * Decoding the multicodec is the caller's responsibility.
+     */
+    public CompletableFuture<Optional<byte[]>> resolveContenthash(
+            String name, BlockContext blockContext) {
+        byte[] node = Namehash.of(name);
+        byte[] innerCall = AbiEncoder.encodeCall(CONTENTHASH, AbiEncoder.bytes32(node));
+        return dispatchUR(name, innerCall, blockContext, EnsResolver::decodeNonEmptyBytes);
+    }
+
+    /**
+     * Public key record (EIP-619):
+     * {@code pubkey(node) → (bytes32 x, bytes32 y)} — secp256k1 public-
+     * key coordinates. Returns {@link Optional#empty()} when both
+     * coordinates are zero (no record set).
+     */
+    public CompletableFuture<Optional<Pubkey>> resolvePubkey(
+            String name, BlockContext blockContext) {
+        byte[] node = Namehash.of(name);
+        byte[] innerCall = AbiEncoder.encodeCall(PUBKEY, AbiEncoder.bytes32(node));
+        return dispatchUR(name, innerCall, blockContext, EnsResolver::decodePubkeyResult);
+    }
+
+    /**
+     * ABI record (EIP-205):
+     * {@code ABI(node, contentTypes) → (uint256 contentType, bytes data)}.
+     * {@code contentTypes} is a bitmask of supported encodings: 1 =
+     * Solidity ABI JSON, 2 = zlib-compressed JSON, 4 = CBOR, 8 = URI
+     * (resolver may return any of those it has, with the chosen
+     * {@code contentType} echoed back).
+     */
+    public CompletableFuture<Optional<AbiRecord>> resolveAbi(
+            String name, long contentTypes, BlockContext blockContext) {
+        byte[] node = Namehash.of(name);
+        byte[] innerCall = AbiEncoder.encodeCall(
+                ABI, AbiEncoder.bytes32(node), AbiEncoder.uint256(contentTypes));
+        return dispatchUR(name, innerCall, blockContext, EnsResolver::decodeAbiResult);
+    }
+
+    /**
+     * DNS record (ENSIP-8):
+     * {@code dnsRecord(node, dnsName, resource) → bytes}. The return is
+     * the raw DNS RDATA the resolver has stored for that
+     * (name, resource-type) pair, including any DNSSEC signing. The
+     * caller is responsible for parsing and (if desired) DNSSEC-
+     * verifying the bytes.
+     *
+     * @param dnsName  DNS-wire-encoded name (use {@link DnsEncoder#encode})
+     * @param resource DNS resource type (e.g. 1 = A, 28 = AAAA, 16 = TXT)
+     */
+    public CompletableFuture<Optional<byte[]>> resolveDnsRecord(
+            String name, byte[] dnsName, int resource, BlockContext blockContext) {
+        byte[] node = Namehash.of(name);
+        byte[] innerCall = AbiEncoder.encodeCall(
+                DNS_RECORD,
+                AbiEncoder.bytes32(node),
+                AbiEncoder.bytes(dnsName),
+                AbiEncoder.uint256(resource & 0xFFFFL));
+        return dispatchUR(name, innerCall, blockContext, EnsResolver::decodeNonEmptyBytes);
+    }
+
+    /**
+     * Interface implementer (EIP-1820 over ENS):
+     * {@code interfaceImplementer(node, interfaceId) → address}. Returns
+     * the address of a contract that implements the given EIP-165
+     * interface for this name's owner.
+     *
+     * @param interfaceId 4-byte EIP-165 interface selector
+     */
+    public CompletableFuture<Optional<Address>> resolveInterfaceImplementer(
+            String name, byte[] interfaceId, BlockContext blockContext) {
+        if (interfaceId == null || interfaceId.length != 4) {
+            throw new IllegalArgumentException("interfaceId must be 4 bytes");
+        }
+        byte[] padded = new byte[32];
+        System.arraycopy(interfaceId, 0, padded, 0, 4);
+        byte[] node = Namehash.of(name);
+        byte[] innerCall = AbiEncoder.encodeCall(
+                INTERFACE_IMPLEMENTER,
+                AbiEncoder.bytes32(node),
+                AbiEncoder.bytes32(padded));
+        return dispatchUR(name, innerCall, blockContext, EnsResolver::decodeAddrResult);
     }
 
     /**
@@ -157,6 +292,73 @@ public final class EnsResolver {
                 });
     }
 
+    // ---- Universal-Resolver dispatch helper -------------------------------
+
+    /**
+     * Wrap {@code innerCall} in a UR {@code resolve(bytes,bytes)} call,
+     * route through {@link EvmExecutor#callView}, handle the standard
+     * revert taxonomy, and feed the inner-call return bytes into
+     * {@code innerResultDecoder}.
+     *
+     * <p>Revert taxonomy:
+     * <ul>
+     *   <li>{@code OffchainLookup} (ERC-3668) — rethrown so the
+     *       {@code CcipReadEvmExecutor} wrapper can fetch the gateway
+     *       response and re-enter the EVM with the resolver's callback.
+     *   <li>Any other revert — mapped to {@link Optional#empty()}. The
+     *       caller's intent is "look up this record" and the reasonable
+     *       answer for an unregistered name or missing record is "no
+     *       result," not a propagated failure.
+     *   <li>Non-revert failure (oracle issue, network problem) —
+     *       propagated as a failed future.
+     * </ul>
+     *
+     * <p>Decoding:
+     * <ul>
+     *   <li>UR return is {@code (bytes innerResult, address resolver)}.
+     *       We pull {@code innerResult} via
+     *       {@code AbiDecoder.dynamicBytes(urReturn, 0)}.
+     *   <li>The decoder receives {@code innerResult} and returns
+     *       {@link Optional#empty()} for any "missing record" condition
+     *       (zero address, empty bytes, etc.) and the value otherwise.
+     *   <li>A {@link RuntimeException} from the decoder (malformed
+     *       buffer) is also folded to {@link Optional#empty()} — same
+     *       reasoning as a generic UR revert.
+     * </ul>
+     */
+    private <T> CompletableFuture<Optional<T>> dispatchUR(
+            String name, byte[] innerCall, BlockContext blockContext,
+            Function<byte[], Optional<T>> innerResultDecoder) {
+        byte[] dnsName = DnsEncoder.encode(name);
+        byte[] resolveCalldata = AbiEncoder.encodeCall(
+                RESOLVE,
+                AbiEncoder.bytes(dnsName),
+                AbiEncoder.bytes(innerCall));
+        return executor.callView(universalResolver, resolveCalldata, blockContext)
+                .handle((result, error) -> {
+                    if (error != null) {
+                        Throwable cause = unwrap(error);
+                        if (cause instanceof EvmExecutionException eee
+                                && eee.error() instanceof EvmExecutionError.Reverted r
+                                && OffchainLookupRevert.tryParse(r.data()).isPresent()) {
+                            throw new CompletionException(cause);
+                        }
+                        if (cause instanceof EvmExecutionException eee
+                                && eee.error() instanceof EvmExecutionError.Reverted) {
+                            return Optional.<T>empty();
+                        }
+                        throw new CompletionException(cause);
+                    }
+                    if (result == null || result.length < 64) return Optional.<T>empty();
+                    try {
+                        byte[] inner = AbiDecoder.dynamicBytes(result, 0);
+                        return innerResultDecoder.apply(inner);
+                    } catch (RuntimeException ex) {
+                        return Optional.<T>empty();
+                    }
+                });
+    }
+
     // ---- Reverse-path step-by-step calls ----------------------------------
 
     /** Registry call: {@code resolver(bytes32) → address}. Used only for the reverse path. */
@@ -176,22 +378,61 @@ public final class EnsResolver {
     // ---- Decoders ---------------------------------------------------------
 
     /**
-     * Decode the Universal Resolver's {@code resolve(...)} return.
-     *
-     * <p>Wire shape: {@code (bytes result, address resolver)}. For an
-     * {@code addr(bytes32)} inner call, {@code result} is the 32-byte
-     * ABI-encoded address (or empty if no record).
+     * Inner-call return for {@code addr(bytes32)} and
+     * {@code interfaceImplementer(bytes32, bytes4)}: a single 32-byte
+     * slot holding an address. Zero address → empty.
      */
-    private static Optional<Address> decodeUrAddrResult(byte[] urReturn) {
-        if (urReturn == null || urReturn.length < 64) return Optional.empty();
-        try {
-            byte[] resultBytes = AbiDecoder.dynamicBytes(urReturn, 0);
-            if (resultBytes.length < 32) return Optional.empty();
-            Address addr = AbiDecoder.address(resultBytes, 0);
-            return addr.equals(Address.ZERO) ? Optional.<Address>empty() : Optional.of(addr);
-        } catch (RuntimeException e) {
-            return Optional.empty();
-        }
+    private static Optional<Address> decodeAddrResult(byte[] inner) {
+        if (inner.length < 32) return Optional.empty();
+        Address addr = AbiDecoder.address(inner, 0);
+        return addr.equals(Address.ZERO) ? Optional.<Address>empty() : Optional.of(addr);
+    }
+
+    /**
+     * Inner-call return for {@code text(bytes32, string)}: dynamic
+     * UTF-8 string. Empty string → empty.
+     */
+    private static Optional<String> decodeStringResult(byte[] inner) {
+        if (inner.length < 64) return Optional.empty();
+        String s = AbiDecoder.string(inner, 0);
+        return s.isEmpty() ? Optional.<String>empty() : Optional.of(s);
+    }
+
+    /**
+     * Inner-call return for {@code addr(bytes32, uint256)},
+     * {@code contenthash(bytes32)}, and
+     * {@code dnsRecord(bytes32, bytes, uint16)}: dynamic bytes. Empty
+     * bytes → empty.
+     */
+    private static Optional<byte[]> decodeNonEmptyBytes(byte[] inner) {
+        if (inner.length < 32) return Optional.empty();
+        byte[] payload = AbiDecoder.dynamicBytes(inner, 0);
+        return payload.length == 0 ? Optional.<byte[]>empty() : Optional.of(payload);
+    }
+
+    /**
+     * Inner-call return for {@code pubkey(bytes32)}: fixed
+     * {@code (bytes32 x, bytes32 y)} tuple. Both-zero → empty.
+     */
+    private static Optional<Pubkey> decodePubkeyResult(byte[] inner) {
+        if (inner.length < 64) return Optional.empty();
+        byte[] x = AbiDecoder.bytes32(inner, 0);
+        byte[] y = AbiDecoder.bytes32(inner, 32);
+        if (isAllZero(x) && isAllZero(y)) return Optional.empty();
+        return Optional.of(new Pubkey(x, y));
+    }
+
+    /**
+     * Inner-call return for {@code ABI(bytes32, uint256)}:
+     * {@code (uint256 contentType, bytes data)}. Empty data → empty.
+     */
+    private static Optional<AbiRecord> decodeAbiResult(byte[] inner) {
+        if (inner.length < 64) return Optional.empty();
+        BigInteger contentType = AbiDecoder.uint256(inner, 0);
+        byte[] data = AbiDecoder.dynamicBytes(inner, 32);
+        if (data.length == 0) return Optional.empty();
+        // contentType is a small bitmask in practice (1, 2, 4, 8) — long is plenty.
+        return Optional.of(new AbiRecord(contentType.longValueExact(), data));
     }
 
     /** Decode a single 32-byte address with empty/short fallback. */
@@ -223,10 +464,32 @@ public final class EnsResolver {
                 forward.filter(a -> a.equals(address)).map(a -> claimed.get()));
     }
 
+    private static boolean isAllZero(byte[] b) {
+        for (byte x : b) if (x != 0) return false;
+        return true;
+    }
+
     private static Throwable unwrap(Throwable t) {
         while (t instanceof CompletionException && t.getCause() != null) {
             t = t.getCause();
         }
         return t;
+    }
+
+    // ---- Value records ----------------------------------------------------
+
+    /** {@code (bytes32 x, bytes32 y)} — secp256k1 public-key coordinates per EIP-619. */
+    public record Pubkey(byte[] x, byte[] y) {
+        public Pubkey {
+            if (x == null || x.length != 32) throw new IllegalArgumentException("x must be 32 bytes");
+            if (y == null || y.length != 32) throw new IllegalArgumentException("y must be 32 bytes");
+        }
+    }
+
+    /** {@code (uint256 contentType, bytes data)} — ABI record per EIP-205. */
+    public record AbiRecord(long contentType, byte[] data) {
+        public AbiRecord {
+            if (data == null) throw new IllegalArgumentException("data must not be null");
+        }
     }
 }

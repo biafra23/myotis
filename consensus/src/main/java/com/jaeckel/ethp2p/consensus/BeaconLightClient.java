@@ -436,14 +436,25 @@ public class BeaconLightClient implements AutoCloseable {
         byte[] headRoot;
         long headSlot;
         if (store != null && store.isInitialized()) {
-            // Use the bootstrap-verified finalized header — the most
-            // trustworthy values we have and what peers actually run
-            // ancestor-match against.
+            // finalized_* come from the bootstrap-verified finalized header —
+            // the trust anchor peers run their ancestor/relevance check against.
             var fh = store.getFinalizedHeader();
-            headSlot = fh.beacon().slot();
-            headRoot = fh.beacon().hashTreeRoot();
-            finalizedEpoch = headSlot / 32;
-            finalizedRoot = headRoot;
+            finalizedEpoch = fh.beacon().slot() / 32;
+            finalizedRoot = fh.beacon().hashTreeRoot();
+            // head_* must reflect our latest known block, not finalized: the
+            // optimistic (attested) header trails wall-clock by ~1-2 slots vs
+            // ~2 epochs for finalized. Reporting finalized as head made us look
+            // 64+ slots stale and depressed peer scoring. The attested header
+            // shares the same sync-committee trust anchor. Fall back to
+            // finalized if optimistic is somehow behind (shouldn't happen).
+            var oh = store.getOptimisticHeader();
+            if (oh != null && oh.beacon().slot() >= fh.beacon().slot()) {
+                headSlot = oh.beacon().slot();
+                headRoot = oh.beacon().hashTreeRoot();
+            } else {
+                headSlot = fh.beacon().slot();
+                headRoot = fh.beacon().hashTreeRoot();
+            }
         } else if (checkpointSlot > 0) {
             // Pre-bootstrap: claim the trusted weak-subjectivity checkpoint.
             // We haven't BLS-verified it yet, but it's a real mainnet block
@@ -865,7 +876,16 @@ public class BeaconLightClient implements AutoCloseable {
 
         for (String peer : peers) {
             if (!running) return false;
-            p2pService.requestUpdatesByRange(peer, bootstrapPeriod, count)
+            // Per-attempt timeout: libp2p reqresp has no inherent deadline, so a
+            // peer that accepts the stream but never responds leaves the future
+            // hanging forever. That keeps `remaining` non-zero and forces the
+            // outer winner.get(60s) wall to fire on every batch where any peer
+            // is a silent hanger — the dominant cost in the catch-up timeline.
+            // 15s is generous for a real LC peer to deliver a 15-update batch.
+            // Pass the deadline into the req/resp layer (not orTimeout out here)
+            // so it can actually close the underlying libp2p stream when it
+            // fires — otherwise channelRead0 would keep buffering bytes.
+            p2pService.requestUpdatesByRange(peer, bootstrapPeriod, count, 15_000L)
                     .whenComplete((responses, ex) -> {
                         if (ex != null) {
                             Throwable root = ex;
@@ -910,7 +930,13 @@ public class BeaconLightClient implements AutoCloseable {
         }
 
         try {
-            boolean result = winner.get(60, TimeUnit.SECONDS);
+            // 20s outer wall = per-attempt 15s timeout + ~5s slack for the
+            // last future's whenComplete to settle and complete `winner`.
+            // Pre-fix this was 60s, but with hung futures now bounded at 15s
+            // the longer wall just kept a doomed batch alive — the catch-up
+            // loop retries with a fresh batch immediately, which usually
+            // finds a fast peer in the next attempt.
+            boolean result = winner.get(20, TimeUnit.SECONDS);
             if (!result) {
                 log.warn("[beacon] Catch-up batch: no peer advanced store (tried {}, {} failed, {} returned empty/unusable)",
                         peers.size(), failCount.get(), emptyCount.get());
@@ -1174,8 +1200,25 @@ public class BeaconLightClient implements AutoCloseable {
 
         // Honor the Lodestar exclusion — finality polling is part of the
         // debug surface for Lighthouse/Teku/Prysm reliability.
+        //
+        // Cap the per-cycle iteration. Without this, when every peer's
+        // finality update fails (typical when the committee is stale and
+        // can't be advanced because peers pruned the LC updates we'd
+        // need), we'd serially iterate ~1000 peers at up to 10s each =
+        // burning hours per cycle. That starves the syncLoop's
+        // wall-clock catchUpSyncCommittee retry at the top of the next
+        // call and locks the daemon in CATCHING_UP indefinitely. 16 is
+        // enough to find a working peer when one exists; the syncLoop
+        // re-fires every 12s so we cycle through fresh selections fast.
+        final int POLL_FINALITY_PEER_LIMIT = 16;
+        int tried = 0;
         for (String peer : copyPeers()) {
             if (!running) return;
+            if (tried++ >= POLL_FINALITY_PEER_LIMIT) {
+                log.debug("[beacon] pollFinalityUpdate: tried {} peers, no advance — will retry next cycle",
+                        POLL_FINALITY_PEER_LIMIT);
+                return;
+            }
             try {
                 byte[] response = p2pService
                         .requestFinalityUpdate(peer)
