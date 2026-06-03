@@ -97,6 +97,14 @@ Five Gradle modules:
 
 ## Data sources
 - the only sources for data are devp2p and libp2p calling a local client via http may only be used for debugging purposes it is not an option for production
+- **Portal Network is dead.** The EF officially discontinued Portal Network and
+  nobody has picked up its development. Do NOT treat Portal as available
+  infrastructure — anything Portal would have solved (deep historical state/blocks,
+  a distributed state network as a SNAP fallback, etc.) must be solved another way.
+  If you ever come across credible evidence that Portal has been revived or that
+  someone is actively continuing it, FLAG IT TO THE USER IMMEDIATELY and
+  prominently — the user wants to know right away because it would cover a lot of
+  wallet needs.
 
 ## Integration-Test
 - When './gradlew :app:run -Pargs=beacon-status' returns "state":"SYNCED" then './gradlew :app:run -Pargs="get-storage 0x1A5F9352Af8aF974bFC03399e3767DF6370d82e4 1 0x308686553a1EAC2fE721Ac8B814De638975a276e"'  and './gradlew  :app:run -Pargs="get-account 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"' should return "verifyMethod":"headerChain"
