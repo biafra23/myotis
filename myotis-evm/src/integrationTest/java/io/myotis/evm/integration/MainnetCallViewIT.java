@@ -10,10 +10,13 @@ import io.myotis.evm.ens.Namehash;
 import io.myotis.evm.world.BytecodeCache;
 import io.myotis.evm.world.SnapBackedStateOracle;
 import io.myotis.evm.world.SnapPeer;
+import com.jaeckel.ethp2p.app.testing.MainnetPeerBootstrap;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
 import java.math.BigInteger;
+import java.time.Duration;
 import java.util.HexFormat;
 import java.util.concurrent.TimeUnit;
 
@@ -54,6 +57,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 @EnabledIfEnvironmentVariable(named = "MYOTIS_MAINNET", matches = "1")
 class MainnetCallViewIT {
+
+    /**
+     * Shared peer session across the test methods in this class. Lazy-init
+     * because @{@code EnabledIfEnvironmentVariable} skips the class entirely
+     * when the kill switch is unset and we don't want to dial just to discover
+     * we're going to skip.
+     */
+    private static volatile MainnetPeerBootstrap.Session session;
+    private static final Object SESSION_LOCK = new Object();
 
     private static final Address USDC = Address.fromHex("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     private static final Address DAI  = Address.fromHex("0x6B175474E89094C44Da98b954EedeAC495271d0F");
@@ -126,19 +138,10 @@ class MainnetCallViewIT {
 
     /**
      * Build a {@link DefaultEvmExecutor} backed by a real SNAP peer.
-     *
-     * <p>This stub is deliberately incomplete: standing up a discv4-discovered,
-     * eth/68- and snap/1-handshaked {@code EthHandler} from inside a test is a
-     * non-trivial reproduction of {@code :app}'s {@code Main}. The simplest
-     * path for an operator is to run the daemon via
-     * {@code ./gradlew :app:run} until it has at least one snap-capable peer,
-     * then expose that peer's {@code EthHandler} (or an enode-addressable
-     * connection helper) here.
-     *
-     * <p>For now this method throws {@code UnsupportedOperationException} so
-     * the test fails fast with a clear pointer to what's missing — and so the
-     * compile path is exercised on every build, catching API drift in the
-     * adapter / oracle / executor before it lands.
+     * The peer connection is established once per test class and shared
+     * across methods via {@link #connectToMainnetPeer()}; each method
+     * still gets its own executor + oracle so any per-call state stays
+     * isolated.
      */
     private static DefaultEvmExecutor mainnetExecutor() {
         SnapPeer peer = connectToMainnetPeer();
@@ -153,16 +156,32 @@ class MainnetCallViewIT {
     }
 
     private static SnapPeer connectToMainnetPeer() {
-        String enode = System.getenv("MYOTIS_INTEGRATION_PEER_ENODE");
-        assertNotNull(enode,
-                "MYOTIS_INTEGRATION_PEER_ENODE must be set; see class Javadoc");
-        // TODO(phase1.commit5+): stand up an EthHandler against the configured
-        // enode and wrap it with com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer.
-        // Reuse :app's RLPxConnector / ChainHead glue once it's factored out
-        // of Main into a reusable test fixture.
-        throw new UnsupportedOperationException(
-                "EthHandler bootstrap from a test is not yet implemented; "
-                        + "see TODO in MainnetCallViewIT.connectToMainnetPeer.");
+        if (session == null) {
+            synchronized (SESSION_LOCK) {
+                if (session == null) {
+                    String enode = System.getenv("MYOTIS_INTEGRATION_PEER_ENODE");
+                    assertNotNull(enode,
+                            "MYOTIS_INTEGRATION_PEER_ENODE must be set; see class Javadoc");
+                    try {
+                        session = MainnetPeerBootstrap.dial(enode, Duration.ofSeconds(30));
+                    } catch (Exception e) {
+                        throw new RuntimeException(
+                                "Failed to bootstrap mainnet peer: " + e.getMessage(), e);
+                    }
+                }
+            }
+        }
+        return session.peer();
+    }
+
+    @AfterAll
+    static void closePeerSession() {
+        synchronized (SESSION_LOCK) {
+            if (session != null) {
+                session.close();
+                session = null;
+            }
+        }
     }
 
     private static BlockContext mainnetBlockContext() {

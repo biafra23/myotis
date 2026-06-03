@@ -29,8 +29,12 @@ class EstimateGasTest {
             "0x1111111111111111111111111111111111111111");
     private static final Address EOA_RECIPIENT = Address.fromHex(
             "0x2222222222222222222222222222222222222222");
+    // Dummy address — the fixture installs an arbitrary SLOAD-and-return
+    // bytecode here, unrelated to whatever lives at this slot on mainnet.
+    // Using a placeholder avoids confusing test output that names a real
+    // mainnet contract whose bytecode we're not actually executing.
     private static final Address CONTRACT = Address.fromHex(
-            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+            "0x3333333333333333333333333333333333333333");
 
     @Test
     void intrinsicGasMatchesYellowPaper() {

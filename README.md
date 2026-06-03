@@ -574,7 +574,7 @@ Six Gradle modules:
   - `eth` -- eth/67-69 sub-protocol (hello, status, block headers/bodies)
   - `snap` -- snap/1 sub-protocol (account range, storage range, bytecode, with Merkle proofs)
 - **consensus** -- beacon chain light client (sync committee BLS verification), Merkle-Patricia proof verification
-- **myotis-evm** -- Hyperledger Besu EVM running against a SNAP-backed `StateOracle`. Used today for ENS resolution; the foundation for view calls and gas estimation. Includes `CcipReadEvmExecutor` for ERC-3668 off-chain lookups and `PrefetchingEvmExecutor` to amortize SNAP round-trips.
+- **myotis-evm** -- Hyperledger Besu EVM running against a SNAP-backed `StateOracle`. Powers ENS resolution and local gas estimation (`DefaultEvmExecutor.estimateGas` — intrinsic + EVM-metered + 15% safety buffer). Includes `CcipReadEvmExecutor` for ERC-3668 off-chain lookups and `PrefetchingEvmExecutor` to amortize SNAP round-trips.
 - **myotis-ens** -- ENS resolver (`EnsResolver`, `ReverseLookup`) using the Universal Resolver via the local EVM. Forward and reverse resolution, ENSIP-10 wildcards, ERC-3668 off-chain records.
 - **app** -- daemon/CLI entry point, Unix domain socket IPC server, peer caching
 

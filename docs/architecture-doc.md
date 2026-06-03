@@ -319,7 +319,7 @@ The wallet can estimate priority fees by examining recent blocks it has already 
 
 - **Simple ETH transfers to EOAs**: Fixed at 21,000 gas. However, the wallet must first verify that the destination is an Externally Owned Account (EOA) by checking its `codeHash` via a SNAP proof. Sending ETH to a contract address can trigger fallback or receive functions that consume significantly more gas. If the destination is a contract, a conservative higher gas limit should be used.
 - **ERC-20 transfers**: Typically 45,000–65,000 gas. A conservative fixed limit (e.g., 100,000) can be used, or a small set of known gas costs for standard contract interaction patterns can be maintained.
-- **Complex contract interactions**: Accurate gas estimation for arbitrary contract calls requires EVM simulation with the relevant state. The wallet's local EVM (Section 9) gives us this path natively: we run the call against SNAP-verified state and read the gas consumed from the execution result, no RPC concession needed. Until that path is wired through to a `gas-estimate` IPC command, conservative fixed limits for known interaction patterns are used.
+- **Complex contract interactions**: Accurate gas estimation for arbitrary contract calls requires EVM simulation with the relevant state. The wallet's local EVM (Section 9) gives us this path natively: `DefaultEvmExecutor.estimateGas` runs the call against SNAP-verified state and returns the Yellow-Paper-correct intrinsic-plus-EVM-metered gas with a 15% safety buffer; revert / OOG halts throw instead of returning a number (callers must not broadcast a doomed transaction). Validated end-to-end against an Anvil fork — the broadcast acceptance test confirms `gasUsed <= localEstimate`. No daemon IPC surface for it yet; the `myotis-tx-builder` wallet integration is the next consumer.
 
 ---
 
@@ -350,13 +350,13 @@ Identical to the SNAP / state-data trust model:
 
 ### Current Use Cases
 
-- **ENS resolution** (`resolve-ens`): full forward resolution, including ENSIP-10 wildcard names and ERC-3668 off-chain records.
+- **ENS resolution** (`resolve-ens` and the seven `resolve-ens-*` variants): full forward resolution, including ENSIP-10 wildcard names and ERC-3668 off-chain records.
 - **Reverse ENS lookup**: address → name with mandatory forward-verification round-trip.
+- **Gas estimation** (`DefaultEvmExecutor.estimateGas`): Yellow-Paper-correct intrinsic + Besu-EVM-metered + 15% safety buffer. Acceptance corpus (ETH→EOA / ETH→contract / ERC-20 / ERC-721 / Uniswap V3) cross-checks against `eth_estimateGas` within 5%; an Anvil-fork broadcast test additionally confirms the estimate is sufficient on the wire (`gasUsed <= localEstimate`). No IPC surface yet — the API is ready for `myotis-tx-builder`.
 
 ### Future Use Cases
 
 - **`eth_call`-equivalent view calls**: arbitrary contract reads (ERC-20 metadata, NFT `tokenURI`, multicall aggregations) without an RPC concession.
-- **Gas estimation**: simulate a candidate transaction to count actual gas usage instead of relying on conservative fixed limits.
 - **Pre-flight checks**: run a transaction locally before broadcasting to detect reverts (insufficient balance, stale approvals, slippage) and surface a useful error message rather than a confirmed-but-failed on-chain transaction.
 
 ---
@@ -385,7 +385,8 @@ Identical to the SNAP / state-data trust model:
 
 6. LOCAL EVM (Besu evm + SNAP-backed StateOracle)
    └─→ ENS resolution (Universal Resolver + CCIP-Read)
-   └─→ View calls / gas estimation (future)
+   └─→ Gas estimation (DefaultEvmExecutor.estimateGas)
+   └─→ View calls (future)
        └─→ All reads verified against stateRoot
 
 7. TRANSACTION SUBMISSION (devp2p eth protocol)

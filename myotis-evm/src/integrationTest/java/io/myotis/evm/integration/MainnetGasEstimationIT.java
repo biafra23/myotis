@@ -10,15 +10,19 @@ import io.myotis.evm.abi.FunctionSignature;
 import io.myotis.evm.world.BytecodeCache;
 import io.myotis.evm.world.SnapBackedStateOracle;
 import io.myotis.evm.world.SnapPeer;
+import com.jaeckel.ethp2p.app.testing.MainnetPeerBootstrap;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
 import java.math.BigInteger;
+import java.time.Duration;
 import java.util.HexFormat;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * Phase 5 acceptance test: locally-estimated gas for the corpus the
@@ -41,11 +45,28 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * the plan's acceptance criterion. When unset, the test still runs
  * (proves the estimation succeeded) but skips the cross-check.
  *
- * <p>The {@code connectToMainnetPeer()} stub is shared with Phases 1–4 ITs;
- * all light up when the {@code :app:Main} bootstrap helper lands.
+ * <p>The shared {@link MainnetPeerBootstrap} dials the peer once per
+ * test class and closes the RLPx connector in {@code @AfterAll}.
  */
 @EnabledIfEnvironmentVariable(named = "MYOTIS_MAINNET", matches = "1")
 class MainnetGasEstimationIT {
+
+    private static volatile MainnetPeerBootstrap.Session session;
+    private static final Object SESSION_LOCK = new Object();
+
+    /**
+     * One executor shared across the test methods in this class, shut
+     * down in {@link #closePeerSession()}. Previously this was a fresh
+     * {@code newSingleThreadExecutor} per {@code mainnetExecutor()} call
+     * — daemon threads kept the JVM exit-clean, but each call still
+     * leaked an {@code ExecutorService} (worker thread + queue).
+     */
+    private static final java.util.concurrent.ExecutorService EVM_POOL =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "myotis-evm-gas-it");
+                t.setDaemon(true);
+                return t;
+            });
 
     private static final Address VITALIK = Address.fromHex(
             "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
@@ -55,6 +76,17 @@ class MainnetGasEstimationIT {
             "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
     private static final Address UNISWAP_V3_ROUTER = Address.fromHex(
             "0xE592427A0AEce92De3Edee1F18E0157C05861564");
+    /** ENS BaseRegistrar (ERC-721 wrapping the .eth name registry). */
+    private static final Address ENS_BASE_REGISTRAR = Address.fromHex(
+            "0x57f1887a8BF19b14fC0dF6Fd9B2acc9Af147eA85");
+    /**
+     * Default ERC-721 corpus case: VITALIK transfers vitalik.eth. The
+     * tokenId for an ENS .eth name on the BaseRegistrar is the labelhash
+     * of the label (NOT the namehash) — for {@code vitalik} that's
+     * keccak256("vitalik").
+     */
+    private static final String VITALIK_ETH_TOKEN_ID =
+            "0xee6c4522aab0003e8d14cd40a6af439055fd2577951148c14b6cea9a53475835";
 
     /**
      * Plain ETH transfer to an EOA. Reference: ~21000 gas (intrinsic only),
@@ -79,6 +111,41 @@ class MainnetGasEstimationIT {
         // accounting differs by 100 gas).
         assertTrue(estimate >= 23_000 && estimate <= 26_000,
                 "ETH-to-EOA estimate out of expected range; got " + estimate);
+    }
+
+    /**
+     * ETH transfer to a contract with a payable fallback. Reference: ~50k
+     * gas — intrinsic 21k plus the EVM cost of running WETH9's
+     * {@code receive() → deposit()} (one SSTORE on the sender's balance
+     * slot, one LOG2 for the {@code Deposit} event).
+     *
+     * <p>This is the design doc's "ETH transfer to contract" corpus case;
+     * adding it closes the gap between the original plan and the previous
+     * IT coverage (which only had ETH→EOA).
+     */
+    @Test
+    void ethTransferToContractWrapsWeth() throws Exception {
+        EvmExecutor executor = mainnetExecutor();
+        BlockContext ctx = mainnetBlockContext();
+
+        // No calldata: WETH9's fallback routes to deposit(), which credits
+        // the sender's balance. We use VITALIK as the sender because
+        // VITALIK has ETH on mainnet at every recent state root — the
+        // estimation runs as if he were paying.
+        var tx = new UnsignedTransaction(
+                VITALIK, WETH,
+                new BigInteger("100000000000000000"),  // 0.1 ETH
+                new byte[0],
+                null);
+
+        long estimate = executor.estimateGas(tx, ctx).get(60, TimeUnit.SECONDS);
+        System.out.printf("[gas-it] eth-transfer-to-contract-weth: %d%n", estimate);
+        crossCheckIfReferenceProvided(
+                estimate, "MYOTIS_INTEGRATION_WETH_DEPOSIT_REFERENCE_GAS");
+        // First-time deposit (cold balance slot) is ~45k; warm is ~28k.
+        // The +15% buffer pushes both inside [27_000, 60_000].
+        assertTrue(estimate >= 27_000 && estimate <= 60_000,
+                "WETH deposit (ETH→contract) estimate out of expected range; got " + estimate);
     }
 
     /**
@@ -113,6 +180,62 @@ class MainnetGasEstimationIT {
     }
 
     /**
+     * ERC-721 transfer corpus case: closes the design doc's "ERC-721
+     * transfer" acceptance bullet that the previous IT explicitly
+     * deferred.
+     *
+     * <p>Defaults to {@code transferFrom(VITALIK, recipient, tokenId(vitalik.eth))}
+     * on the ENS BaseRegistrar — VITALIK has owned vitalik.eth since
+     * registration. If at some future block he transfers it, the test
+     * reverts (and estimateGas correctly refuses to return a number);
+     * operators override via env vars:
+     *
+     * <ul>
+     *   <li>{@code MYOTIS_INTEGRATION_NFT_CONTRACT} — ERC-721 contract
+     *   <li>{@code MYOTIS_INTEGRATION_NFT_HOLDER} — address that owns the token at the test block
+     *   <li>{@code MYOTIS_INTEGRATION_NFT_TOKEN_ID} — uint256 hex (with or without 0x)
+     * </ul>
+     *
+     * <p>Reference: ~30–60k gas. The exact number depends on whether the
+     * recipient already has a balance entry (warm vs. cold storage slot).
+     */
+    @Test
+    void erc721TransferIsAroundFiftyKilogas() throws Exception {
+        EvmExecutor executor = mainnetExecutor();
+        BlockContext ctx = mainnetBlockContext();
+
+        Address nftContract = envAddressOrDefault(
+                "MYOTIS_INTEGRATION_NFT_CONTRACT", ENS_BASE_REGISTRAR);
+        Address holder = envAddressOrDefault(
+                "MYOTIS_INTEGRATION_NFT_HOLDER", VITALIK);
+        BigInteger tokenId = new BigInteger(
+                stripHexPrefix(envOrDefault(
+                        "MYOTIS_INTEGRATION_NFT_TOKEN_ID", VITALIK_ETH_TOKEN_ID)),
+                16);
+
+        FunctionSignature transferFrom =
+                FunctionSignature.of("transferFrom(address,address,uint256)");
+        Address recipient = Address.fromHex("0x1111111111111111111111111111111111111111");
+        byte[] calldata = AbiEncoder.encodeCall(transferFrom,
+                AbiEncoder.address(holder),
+                AbiEncoder.address(recipient),
+                AbiEncoder.uint256(tokenId));
+
+        var tx = new UnsignedTransaction(holder, nftContract, BigInteger.ZERO, calldata, null);
+
+        long estimate = executor.estimateGas(tx, ctx).get(60, TimeUnit.SECONDS);
+        System.out.printf("[gas-it] erc721-transfer: %d%n", estimate);
+        crossCheckIfReferenceProvided(
+                estimate, "MYOTIS_INTEGRATION_NFT_TRANSFER_REFERENCE_GAS");
+        // Cold recipient slot ~55k, warm ~28k. +15% buffer pushes both
+        // into [27000, 90000]. If the estimate falls outside, the token's
+        // owner likely changed — supply MYOTIS_INTEGRATION_NFT_HOLDER /
+        // _TOKEN_ID / _CONTRACT and retry.
+        assertTrue(estimate >= 27_000 && estimate <= 90_000,
+                "ERC-721 transferFrom estimate out of expected range; got " + estimate);
+    }
+
+    /**
      * Uniswap V3 exact-input swap. Reference: ~150–250k gas depending on
      * pool state (if the tick-bitmap traversal hits cold ticks, gas climbs).
      *
@@ -128,37 +251,33 @@ class MainnetGasEstimationIT {
 
         // exactInputSingle(ExactInputSingleParams calldata params) where
         // params packs (tokenIn, tokenOut, fee, recipient, deadline,
-        // amountIn, amountOutMinimum, sqrtPriceLimitX96). For estimation
-        // purposes we don't need the actual values to be realistic — the
-        // EVM just needs the calldata to be parseable by the router.
-        // Constructing the tuple by hand is verbose; using a placeholder
-        // that the router will probably revert on is acceptable for
-        // estimation IF estimation surfaces the revert (it does, per
-        // unit tests). For a true acceptance run, the operator should
-        // override this with realistic params via env var.
+        // amountIn, amountOutMinimum, sqrtPriceLimitX96). Constructing
+        // a realistic tuple at runtime needs current pool state, so
+        // operators supply ready-made calldata via env var. Without it
+        // there's no valid input that exercises the swap path — a bare
+        // 4-byte selector reverts in the router's ABI decode, which
+        // estimateGas (correctly) refuses to estimate over. Skip rather
+        // than fail, matching the class Javadoc's "test still runs but
+        // optional cross-check is skipped" contract.
         String overrideCalldata = System.getenv("MYOTIS_INTEGRATION_UNISWAP_CALLDATA");
-        byte[] calldata = overrideCalldata != null
-                ? HexFormat.of().parseHex(stripHexPrefix(overrideCalldata))
-                : buildSimpleSwapCalldata();
+        // Treat blank/whitespace as unset — otherwise an empty value
+        // would slip through assumeTrue and crash later in parseHex
+        // rather than skipping cleanly. Matches the envOrDefault /
+        // envAddressOrDefault helpers below.
+        assumeTrue(overrideCalldata != null && !overrideCalldata.isBlank(),
+                "MYOTIS_INTEGRATION_UNISWAP_CALLDATA not set — skipping Uniswap swap"
+                        + " estimation; supply realistic calldata to exercise this path");
+        byte[] calldata = HexFormat.of().parseHex(stripHexPrefix(overrideCalldata.trim()));
 
         var tx = new UnsignedTransaction(
                 VITALIK, UNISWAP_V3_ROUTER, BigInteger.ZERO, calldata, null);
 
-        try {
-            long estimate = executor.estimateGas(tx, ctx).get(60, TimeUnit.SECONDS);
-            System.out.printf("[gas-it] uniswap-v3-swap: %d%n", estimate);
-            crossCheckIfReferenceProvided(
-                    estimate, "MYOTIS_INTEGRATION_UNISWAP_REFERENCE_GAS");
-            assertTrue(estimate >= 100_000 && estimate <= 500_000,
-                    "Uniswap V3 swap estimate out of expected range; got " + estimate);
-        } catch (java.util.concurrent.ExecutionException ee) {
-            // If the placeholder calldata reverts, Phase 5 correctly refuses
-            // to return an estimate — surface the revert so the operator
-            // knows to provide realistic calldata via env var.
-            System.out.println("[gas-it] uniswap-v3-swap reverted; supply realistic"
-                    + " MYOTIS_INTEGRATION_UNISWAP_CALLDATA to exercise the swap path");
-            throw ee;
-        }
+        long estimate = executor.estimateGas(tx, ctx).get(60, TimeUnit.SECONDS);
+        System.out.printf("[gas-it] uniswap-v3-swap: %d%n", estimate);
+        crossCheckIfReferenceProvided(
+                estimate, "MYOTIS_INTEGRATION_UNISWAP_REFERENCE_GAS");
+        assertTrue(estimate >= 100_000 && estimate <= 500_000,
+                "Uniswap V3 swap estimate out of expected range; got " + estimate);
     }
 
     // ---- Wiring ------------------------------------------------------------
@@ -168,22 +287,38 @@ class MainnetGasEstimationIT {
         return new DefaultEvmExecutor(
                 new SnapBackedStateOracle(() -> peer, BytecodeCache.inMemory()),
                 BytecodeCache.inMemory(),
-                java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
-                    Thread t = new Thread(r, "myotis-evm-gas-it");
-                    t.setDaemon(true);
-                    return t;
-                }));
+                EVM_POOL);
     }
 
     private static SnapPeer connectToMainnetPeer() {
-        String enode = System.getenv("MYOTIS_INTEGRATION_PEER_ENODE");
-        assertNotNull(enode,
-                "MYOTIS_INTEGRATION_PEER_ENODE must be set; "
-                        + "see MainnetCallViewIT Javadoc for the contract");
-        // TODO(phase1.commit5+): same bootstrap helper as the other mainnet ITs.
-        throw new UnsupportedOperationException(
-                "EthHandler bootstrap from a test is not yet implemented; "
-                        + "see TODO in MainnetCallViewIT.connectToMainnetPeer.");
+        if (session == null) {
+            synchronized (SESSION_LOCK) {
+                if (session == null) {
+                    String enode = System.getenv("MYOTIS_INTEGRATION_PEER_ENODE");
+                    assertNotNull(enode,
+                            "MYOTIS_INTEGRATION_PEER_ENODE must be set; "
+                                    + "see MainnetCallViewIT Javadoc for the contract");
+                    try {
+                        session = MainnetPeerBootstrap.dial(enode, Duration.ofSeconds(30));
+                    } catch (Exception e) {
+                        throw new RuntimeException(
+                                "Failed to bootstrap mainnet peer: " + e.getMessage(), e);
+                    }
+                }
+            }
+        }
+        return session.peer();
+    }
+
+    @AfterAll
+    static void closePeerSession() {
+        synchronized (SESSION_LOCK) {
+            if (session != null) {
+                session.close();
+                session = null;
+            }
+        }
+        EVM_POOL.shutdownNow();
     }
 
     private static BlockContext mainnetBlockContext() {
@@ -215,22 +350,20 @@ class MainnetGasEstimationIT {
                         + referenceGas + " (acceptable: [" + lowerBound + ", " + upperBound + "])");
     }
 
-    /**
-     * A minimal placeholder for Uniswap V3 calldata. The router will
-     * almost certainly revert on this, exercising the revert path; the
-     * operator supplies realistic calldata via {@code MYOTIS_INTEGRATION_UNISWAP_CALLDATA}
-     * for an actual gas-number assertion.
-     */
-    private static byte[] buildSimpleSwapCalldata() {
-        // exactInputSingle selector with empty struct args. Will revert in
-        // the router but we want to verify the codepath is reachable.
-        return HexFormat.of().parseHex("414bf389");
-    }
-
     private static String env(String name) {
         String v = System.getenv(name);
         assertNotNull(v, name + " must be set; see class Javadoc");
         return v;
+    }
+
+    private static String envOrDefault(String name, String fallback) {
+        String v = System.getenv(name);
+        return (v == null || v.isBlank()) ? fallback : v.trim();
+    }
+
+    private static Address envAddressOrDefault(String name, Address fallback) {
+        String v = System.getenv(name);
+        return (v == null || v.isBlank()) ? fallback : Address.fromHex(v.trim());
     }
 
     private static byte[] parseHex32(String hex) {

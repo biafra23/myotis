@@ -81,17 +81,22 @@ public final class DefaultEvmExecutor implements EvmExecutor {
         long intrinsicGas = computeIntrinsicGas(tx.data());
         long ceiling = tx.gasLimit() != null ? tx.gasLimit() : DEFAULT_GAS_LIMIT;
         long evmBudget = ceiling - intrinsicGas;
-        if (evmBudget <= 0) {
+        if (evmBudget < 0) {
             // The intrinsic cost alone exceeds the ceiling — caller's
             // gasLimit is too low even before the EVM gets a chance to run.
+            // Note: a budget of exactly 0 is legal — a plain ETH transfer
+            // to an existing EOA at gasLimit=21000 has no EVM execution
+            // and runForEstimation correctly returns evmUsed=0.
             throw new EvmExecutionException(new EvmExecutionError.OutOfGas());
         }
         long evmUsed = runForEstimation(tx, blockContext, evmBudget);
         long total = intrinsicGas + evmUsed;
         // 15% safety buffer per the plan. A slightly-too-high estimate just
         // costs the user some priority fee; a slightly-too-low one OOG's
-        // the broadcast transaction.
-        return Math.round(total * 1.15);
+        // the broadcast transaction — so round *up* strictly. Math.round
+        // can round down (e.g. for totals where total * 1.15 lands just
+        // below x.5), defeating the safety property.
+        return (long) Math.ceil(total * 1.15);
     }
 
     /**
@@ -117,12 +122,9 @@ public final class DefaultEvmExecutor implements EvmExecutor {
         org.hyperledger.besu.datatypes.Address besuCoinbase =
                 org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(blockContext.coinbase().toByteArray()));
 
-        Bytes contractCode = scope.get(besuTarget) == null
-                ? Bytes.EMPTY
-                : scope.get(besuTarget).getCode();
-        Hash contractCodeHash = scope.get(besuTarget) == null
-                ? Hash.EMPTY
-                : scope.get(besuTarget).getCodeHash();
+        var targetAccount = scope.get(besuTarget);
+        Bytes contractCode = targetAccount == null ? Bytes.EMPTY : targetAccount.getCode();
+        Hash contractCodeHash = targetAccount == null ? Hash.EMPTY : targetAccount.getCodeHash();
         Code code = evm.getCode(contractCodeHash, contractCode);
 
         Wei value = Wei.of(tx.value());
@@ -226,12 +228,9 @@ public final class DefaultEvmExecutor implements EvmExecutor {
         org.hyperledger.besu.datatypes.Address besuCoinbase =
                 org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(blockContext.coinbase().toByteArray()));
 
-        Bytes contractCode = scope.get(besuTarget) == null
-                ? Bytes.EMPTY
-                : scope.get(besuTarget).getCode();
-        Hash contractCodeHash = scope.get(besuTarget) == null
-                ? Hash.EMPTY
-                : scope.get(besuTarget).getCodeHash();
+        var targetAccount = scope.get(besuTarget);
+        Bytes contractCode = targetAccount == null ? Bytes.EMPTY : targetAccount.getCode();
+        Hash contractCodeHash = targetAccount == null ? Hash.EMPTY : targetAccount.getCodeHash();
         Code code = evm.getCode(contractCodeHash, contractCode);
 
         MessageFrame frame = MessageFrame.builder()

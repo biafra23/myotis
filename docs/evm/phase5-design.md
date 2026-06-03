@@ -11,17 +11,25 @@ fixed limits the wallet would otherwise have to use.
 
 ## Acceptance criteria (from the original plan)
 
-- `EvmExecutor.estimateGas` works for the benchmark corpus.
-- Estimates within 5% of `eth_estimateGas` for the benchmark transactions:
+- ✅ `EvmExecutor.estimateGas` works for the benchmark corpus.
+- ✅ Estimates within 5% of `eth_estimateGas` for the benchmark transactions
+  (`MainnetGasEstimationIT`, env-gated; cross-check on per-test
+  `MYOTIS_INTEGRATION_<NAME>_REFERENCE_GAS`):
   - ETH transfer to EOA
-  - ETH transfer to contract
-  - ERC-20 transfer
-  - Uniswap V3 exact-input swap
-  - ERC-721 transfer
-- An end-to-end IT demonstrates that an Uniswap-swap transaction built
-  with a locally-estimated gas limit executes successfully without
-  out-of-gas when broadcast (against a forked-mainnet Anvil; deferred
-  pending the Phase 1 bootstrap helper).
+  - ETH transfer to contract (WETH deposit)
+  - ERC-20 transfer (USDC)
+  - ERC-721 transfer (ENS BaseRegistrar)
+  - Uniswap V3 exact-input swap (requires operator-supplied calldata)
+- ✅ End-to-end IT (`AnvilForkedBroadcastIT`) that builds a USDC.transfer
+  with a locally-estimated gas limit, broadcasts it against a forked-
+  mainnet Anvil (via `anvil_impersonateAccount`), and asserts the
+  receipt succeeded without OOG and `gasUsed <= localEstimate`. This is
+  the unique signal that the 15% safety buffer is actually sufficient
+  on the wire — the 5%-of-reference cross-check alone can't prove it.
+
+All four are env-gated; `./gradlew check` stays offline. The bootstrap
+helper (`app/testing/MainnetPeerBootstrap`) that this phase introduced
+unblocks every mainnet IT across Phases 1–5, not just Phase 5's.
 
 ## Design
 
@@ -110,14 +118,29 @@ daemon CLI but not a transaction builder. The integration point is
 deferred to whenever the wallet team adds the tx-builder module; this
 phase ships the `estimateGas` API ready for it.
 
-## What this branch will ship
+## What shipped
 
-- Commit 1 (this design + impl + unit tests): `DefaultEvmExecutor.estimateGas`
-  with intrinsic-gas accounting, EVM run with caller-supplied ceiling,
-  15% buffer, revert/OOG mapping. Unit tests cover ETH transfer to EOA,
-  call into a contract, revert path, OOG path.
-- Commit 2: env-gated mainnet IT comparing against `eth_estimateGas`
-  for the corpus. Same bootstrap-helper gating as Phases 1–4.
+PR #17 (initial Phase 5):
+- `DefaultEvmExecutor.estimateGas` with intrinsic-gas accounting, EVM
+  run with caller-supplied ceiling, 15% buffer, revert/OOG mapping.
+  Unit tests for ETH→EOA, call-into-contract, revert path, OOG path.
+- `MainnetGasEstimationIT` scaffold covering ETH→EOA, ERC-20, Uniswap V3.
+
+Phase 5 completion (this branch):
+- Review-comment fixes orphaned by the merge of PR #17: `evmBudget < 0`
+  (was `<= 0`), `Math.ceil` safety buffer (was `Math.round`),
+  `scope.get(besuTarget)` caching, dummy CONTRACT address in
+  EstimateGasTest, `assumeTrue` skip for the Uniswap IT when realistic
+  calldata isn't supplied.
+- `MainnetPeerBootstrap` test fixture (`:app.testing`) — unblocks every
+  Phase 1–5 mainnet IT by standing up a single RLPx connection from
+  inside a test. Drops the four `connectToMainnetPeer()` stubs.
+- Missing corpus cases: ETH→contract (WETH deposit) and ERC-721 transfer
+  (ENS BaseRegistrar default).
+- `AnvilForkedBroadcastIT` — the headline acceptance test. Builds a
+  USDC.transfer with the local estimate, broadcasts to a forked Anvil
+  via `anvil_impersonateAccount`, asserts receipt success and
+  `gasUsed <= estimate`.
 
 ## Out of scope
 
