@@ -226,13 +226,28 @@ For a wallet with a handful of addresses, the total SNAP traffic per session is 
 
 ### The Problem
 
-When a user wants to send to a human-readable name like `vitalik.eth` instead of a raw address, the wallet needs to resolve that name to an Ethereum address. Normally this is done via `eth_call` to the ENS contracts through an RPC provider. We resolve ENS names locally by **executing the ENS contracts in our own EVM**, with all state reads served from SNAP proofs verified against the trusted `stateRoot`.
+When a user wants to send to a human-readable name like `vitalik.eth` instead of a raw address, the wallet needs to resolve that name. Beyond plain forward resolution, modern wallet UIs also need text records (`avatar`, `description`, `com.twitter`, …), content hashes (for ENS-pointed websites), multi-coin addresses (BTC/LTC/SOL alongside ETH), and several niche record types (pubkey, ABI, DNS, interface implementer). Every modern resolver also relies on ENSIP-10 wildcard dispatch and ERC-3668 (CCIP-Read) off-chain lookups.
+
+Direct storage reads against the registry and resolver contracts work for vanilla `*.eth` names but break on wildcard names, custom resolvers with non-standard storage layouts, and off-chain records — those would need either contract execution or a minimal RPC concession. We avoid that concession by **executing the resolver contracts in our own local EVM**, with all state reads served from SNAP proofs.
 
 ### How It Works
 
-The wallet's `EnsResolver` issues a single call to the **Universal Resolver** — `resolve(bytes name, bytes data)` — which is the canonical entry point for forward resolution. The Universal Resolver internally walks the registry/resolver chain, handles wildcard names (ENSIP-10), and surfaces ERC-3668 `OffchainLookup` reverts at the call boundary so a higher-level decorator can fetch the off-chain response transparently.
+The wallet's `EnsResolver` issues a single call to the **Universal Resolver** — `resolve(bytes name, bytes data)` — for every record type. The Universal Resolver internally walks the registry/resolver chain, handles wildcard names (ENSIP-10), and surfaces ERC-3668 `OffchainLookup` reverts at the call boundary so a higher-level decorator can fetch the off-chain response transparently.
 
 The call runs entirely inside the local EVM. State reads (account fields, storage slots, contract bytecode) are served by a `StateOracle` that fetches them on demand via the snap/1 protocol and verifies every response with a Merkle-Patricia proof against the `stateRoot` from a verified block header.
+
+Supported record types — every one goes through the same Universal Resolver dispatch path, so wildcard + CCIP-Read work identically for all of them:
+
+| Record | Spec | Selector |
+|---|---|---|
+| Forward address | ENSIP-1 | `addr(bytes32)` |
+| Multi-coin address | ENSIP-9 / SLIP-44 | `addr(bytes32, uint256 coinType)` |
+| Text records | ENSIP-5 | `text(bytes32, string key)` |
+| Content hash | ENSIP-7 | `contenthash(bytes32)` |
+| Public key | EIP-619 | `pubkey(bytes32)` |
+| ABI metadata | EIP-205 | `ABI(bytes32, uint256 contentTypes)` |
+| DNS records | ENSIP-8 | `dnsRecord(bytes32, bytes name, uint16 resource)` |
+| Interface implementer | EIP-1820 over ENS | `interfaceImplementer(bytes32, bytes4 interfaceId)` |
 
 Reverse resolution (`address → name`) uses the step-by-step Registry → reverse-resolver path, with a mandatory ENSIP-3 forward-verification round-trip — the resolver's claim is only accepted if a forward lookup of the claimed name returns the original address.
 
@@ -243,26 +258,24 @@ Modern ENS surfaces — Coinbase IDs (`*.cb.id`), Uniswap names, Base subdomains
 1. The Universal Resolver call reverts with `OffchainLookup(sender, urls, callData, callbackFunction, extraData)`.
 2. The wallet POSTs `callData` to one of the gateway `urls` (HTTPS), receiving a signed off-chain response.
 3. The wallet re-enters the EVM via `callbackFunction(response, extraData)`, which validates the response on-chain (typically by verifying a signer's signature against a list of trusted gateways the resolver embeds).
-4. The callback's return value is the resolved record.
+4. The callback's return value is the resolved record — and because the callback runs in the same proof-verified EVM, the signature check itself is anchored to the `stateRoot`.
 
 The CCIP-Read flow is implemented as an executor decorator (`CcipReadEvmExecutor`) that wraps the base EVM executor: it catches `OffchainLookup` reverts, performs the gateway HTTP fetch, and re-enters the EVM with the callback. The HTTP transport is an injectable interface (`CcipGateway`) — the daemon supplies a `java.net.http.HttpClient`-backed implementation; the Android consumer supplies a Ktor-backed one.
 
-### Why Local EVM Instead of Direct Storage Reads
+### Trust Model — Identical Across Record Types
 
-An earlier iteration read the ENS registry and resolver storage slots directly via SNAP proofs. That works for vanilla `*.eth` names backed by the Public Resolver, but it cannot handle:
+Verifiability is a property of the dispatch path (Universal Resolver call via local EVM over SNAP-verified state, with CCIP-Read callbacks re-entering the same proof-verified EVM), not of the record's selector or return type. Every record type listed above gets the same chain:
 
-- **Wildcard resolution (ENSIP-10)**: A resolver may compute the answer from the queried name's labels rather than store it in a fixed slot.
-- **Custom resolvers**: Many name surfaces use bespoke resolver contracts whose storage layout we cannot assume.
-- **Off-chain records (CCIP-Read)**: The "answer" lives at a gateway URL, not on-chain.
+- **State reads**: every account field and storage slot accessed during execution is verified by a Merkle-Patricia proof against the `stateRoot` of a verified block header. A peer cannot lie about state without producing a forged proof.
+- **Contract bytecode**: bytecode fetched via `GetByteCodes` is verified by checking that its keccak256 matches the `codeHash` field of the (proof-verified) account record.
+- **CCIP-Read gateways**: trusted only for *availability*. The resolver's callback validates the gateway's response on-chain — typically by checking a signer's signature against trusted-signers stored on-chain. If the gateway lies, the callback reverts and resolution fails cleanly.
+- **Block header**: as elsewhere, anchored to the beacon chain via sync committee BLS signatures and the historical accumulator.
 
-By running the resolver's actual bytecode in a local EVM, we delegate slot-layout knowledge to the contracts themselves. The trust property is preserved: every storage read the EVM performs is backed by a SNAP proof against the verified `stateRoot`, so the contract sees the real on-chain state and produces the same answer a full node would.
+The "interpretation" of returned bytes is a separate concern from verification: we verify that a `contenthash` value is the exact bytes the resolver returned, not that the IPFS hash inside resolves to live content; we verify a multi-coin BTC address is what the resolver stored, not that the bytes form a valid Bitcoin script. Sanity-decoding the value is the caller's responsibility.
 
-### Trust Model
+### Network Coverage
 
-- **State reads**: Every account field and storage slot accessed during execution is verified by a Merkle-Patricia proof against the `stateRoot` of a verified block header. A peer cannot lie about state without producing a forged proof.
-- **Contract bytecode**: Bytecode fetched via `GetByteCodes` is verified by checking that its keccak256 matches the `codeHash` field of the (proof-verified) account record.
-- **CCIP-Read gateways**: Trusted only for *availability*. The resolver's callback validates the gateway's response on-chain — typically by checking a signer's signature against a list of trusted signers embedded in the resolver. If the gateway lies, the callback reverts and resolution fails cleanly.
-- **Block header**: As elsewhere, anchored to the beacon chain via sync committee BLS signatures and the historical accumulator.
+Canonical Registry + Universal Resolver addresses are pinned for mainnet, sepolia, and holesky (sourced from the `ensdomains/ens-contracts` deployment manifests). `EnsResolver.forChainId(chainId)` picks the right pair; other networks fail fast with a clear error.
 
 ---
 

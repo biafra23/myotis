@@ -67,20 +67,30 @@ CL peers are seeded from four sources (in priority order): the persistent `CLPee
 - Vyper storage slot layout support
 
 ## 6. ENS Resolution — Via Local EVM over SNAP-Verified State
-**POC: Implemented**
+**POC: Implemented (full record-type coverage)**
 
-Resolution runs the ENS contracts in a local EVM (`myotis-evm`, see Section 9) with state served from SNAP proofs.
+Resolution runs the ENS contracts in a local EVM (`myotis-evm`, see Section 9) with state served from SNAP proofs. Every record type goes through the Universal Resolver's `resolve(bytes,bytes)` so wildcard (ENSIP-10) and CCIP-Read (ERC-3668) work transparently for all of them.
 
-- Forward resolution via the **Universal Resolver** (`resolve(bytes,bytes)`) — handles wildcard names (ENSIP-10) and surfaces ERC-3668 reverts. Implementation in `myotis-ens/EnsResolver`.
-- **CCIP-Read (ERC-3668)** end-to-end: `OffchainLookup` reverts caught by `CcipReadEvmExecutor`, gateway HTTP fetch via injectable `CcipGateway` (daemon supplies a `java.net.http`-backed impl; Android consumer supplies a Ktor-backed one), callback re-entry into the EVM. Validated against the EIP-3668 demo gateway and Coinbase IDs (`*.cb.id`).
-- **Reverse resolution** (`address → name`) with mandatory ENSIP-3 forward-verification round-trip — the resolver's claim is rejected if a forward lookup of the claimed name doesn't return the original address.
-- IPC command: `resolve-ens <name>` returns `{"resolved":bool, "address":"0x...", "blockNumber":N}`.
+| Record | Spec | IPC command |
+|---|---|---|
+| Forward address | ENSIP-1 | `resolve-ens` |
+| Multi-coin address | ENSIP-9 / SLIP-44 | `resolve-ens-addr-coin` |
+| Text records | ENSIP-5 | `resolve-ens-text` |
+| Content hash | ENSIP-7 | `resolve-ens-contenthash` |
+| Public key | EIP-619 | `resolve-ens-pubkey` |
+| ABI metadata | EIP-205 | `resolve-ens-abi` |
+| DNS records | ENSIP-8 | `resolve-ens-dns` |
+| Interface implementer | EIP-1820 over ENS | `resolve-ens-interface` |
 
-Validated against mainnet: `vitalik.eth`, `1.offchainexample.eth` (CCIP-Read demo), `jesse.cb.id` (Coinbase gateway).
+Reverse resolution (`address → name`) is implemented in the resolver with mandatory ENSIP-3 forward-verification round-trip — no IPC command surfaces it yet.
+
+CCIP-Read end-to-end: `OffchainLookup` reverts caught by `CcipReadEvmExecutor`, gateway HTTP fetch via injectable `CcipGateway` (daemon supplies a `java.net.http`-backed impl; Android consumer supplies a Ktor-backed one), callback re-entry into the EVM. Validated against the EIP-3668 demo gateway and Coinbase IDs (`*.cb.id`).
+
+Network coverage: mainnet, sepolia, holesky have canonical Registry + Universal Resolver addresses pinned (sourced from `ensdomains/ens-contracts` deployment manifests). `EnsResolver.forChainId(chainId)` picks the right pair.
 
 **Not implemented:**
-- Forward resolution of L2 / cross-chain names that depend on resolver behaviour beyond the Universal Resolver path
-- Profile fields beyond `addr(bytes32)` (text records, content hash, multi-coin addresses)
+- IPC command for reverse lookup (the resolver method exists, just no surface)
+- L2 / cross-chain name handling beyond the Universal Resolver path
 
 ## 7. Submitting Signed Transactions — devp2p Transaction Gossip
 **Not implemented**
@@ -123,9 +133,9 @@ The headline end-to-end acceptance (`AnvilForkedBroadcastIT`) builds a transacti
 | 3. TrueBlocks Transaction History    | **Implemented** | No tx verification against `transactionsRoot`  |
 | 4. Block Data via devp2p             | **Implemented** | No `GetReceipts`, no EIP-4444                  |
 | 5. State Data via SNAP               | **Implemented** | No `GetTrieNodes`, no NFT/Vyper support        |
-| 6. ENS Resolution                    | **Implemented** | No text records / multi-coin addrs             |
+| 6. ENS Resolution                    | **Implemented** | Reverse lookup has no IPC command surface yet  |
 | 7. Transaction Submission            | **Not started** | No tx gossip messages                          |
 | 8. Gas Estimation                    | **Implemented** | No IPC surface yet (executor API ready)        |
 | 9. Local EVM Execution               | **Implemented** | No generic view-call / gas-estimate IPC yet    |
 
-The core verification pipeline (sync committees → state root → Merkle proofs → local EVM) is functional end-to-end. ENS resolution including CCIP-Read is validated on mainnet. The biggest remaining gaps are on the "wallet action" side: submitting transactions and exposing the EVM as a generic view-call / gas-estimate surface.
+The core verification pipeline (sync committees → state root → Merkle proofs → local EVM) is functional end-to-end. ENS resolution covers all eight record types with identical verification, including CCIP-Read on mainnet. The biggest remaining gaps are on the "wallet action" side: submitting transactions and exposing the EVM as a generic view-call / gas-estimate surface.

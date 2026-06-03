@@ -33,3 +33,7 @@ app/devp2p.log
 app/devlibp2p.log
 .gradle-home/
 app/cacheDir/
+
+# Kotlin incremental-compile scratch + ad-hoc daemon logs
+.kotlin/
+*.log

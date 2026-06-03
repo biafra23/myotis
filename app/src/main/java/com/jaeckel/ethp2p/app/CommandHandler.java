@@ -61,6 +61,13 @@ public class CommandHandler {
     private final BeaconLightClient beaconLightClient; // nullable
     private final long clGenesisTime; // beacon chain genesis time (seconds since epoch)
 
+    // Shared across every ENS resolution: a single bytecode cache amortizes
+    // Registry + Universal Resolver fetches across requests and between the
+    // oracle and executor in the same request. (Peer selection is done
+    // per-call by prepareEnsCall, which pins one peer for the whole call.)
+    private final io.myotis.evm.world.BytecodeCache ensBytecodeCache =
+            io.myotis.evm.world.BytecodeCache.inMemory();
+
     public CommandHandler(DiscV4Service discV4, RLPxConnector connector,
                           CountDownLatch stopLatch, Map<String, Long> backoff,
                           Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState) {
@@ -106,17 +113,24 @@ public class CommandHandler {
         try {
             String cmd = extractString(jsonLine, "cmd");
             return switch (cmd) {
-                case "status"        -> handleStatus();
-                case "peers"         -> handlePeers();
-                case "get-headers"   -> handleGetHeaders(jsonLine);
-                case "get-block"     -> handleGetBlock(jsonLine);
-                case "get-account"   -> handleGetAccount(jsonLine);
-                case "get-storage"   -> handleGetStorage(jsonLine);
-                case "resolve-ens"   -> handleResolveEns(jsonLine);
-                case "dial"          -> handleDial(jsonLine);
-                case "stop"          -> handleStop();
-                case "beacon-status" -> handleBeaconStatus();
-                default              -> jsonError("Unknown command: " + cmd);
+                case "status"                  -> handleStatus();
+                case "peers"                   -> handlePeers();
+                case "get-headers"             -> handleGetHeaders(jsonLine);
+                case "get-block"               -> handleGetBlock(jsonLine);
+                case "get-account"             -> handleGetAccount(jsonLine);
+                case "get-storage"             -> handleGetStorage(jsonLine);
+                case "resolve-ens"             -> handleResolveEns(jsonLine);
+                case "resolve-ens-text"        -> handleResolveEnsText(jsonLine);
+                case "resolve-ens-contenthash" -> handleResolveEnsContenthash(jsonLine);
+                case "resolve-ens-addr-coin"   -> handleResolveEnsAddrCoin(jsonLine);
+                case "resolve-ens-pubkey"      -> handleResolveEnsPubkey(jsonLine);
+                case "resolve-ens-abi"         -> handleResolveEnsAbi(jsonLine);
+                case "resolve-ens-dns"         -> handleResolveEnsDns(jsonLine);
+                case "resolve-ens-interface"   -> handleResolveEnsInterface(jsonLine);
+                case "dial"                    -> handleDial(jsonLine);
+                case "stop"                    -> handleStop();
+                case "beacon-status"           -> handleBeaconStatus();
+                default                        -> jsonError("Unknown command: " + cmd);
             };
         } catch (Exception e) {
             log.warn("[ipc] Error handling command '{}': {}", jsonLine, e.getMessage());
@@ -816,8 +830,12 @@ public class CommandHandler {
             // used to turn into a 3-boolean blob that was impossible to debug.
             long peerBlockNumber = accountResult.blockNumber();
             if (!beaconChainVerified) {
-                long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
-                byte[] beaconRoot = beaconSyncState.getVerifiedExecutionStateRoot();
+                // Atomic snapshot: block number + state root must come from the same
+                // finalized payload, since the header chain is anchored at the block
+                // number and required to terminate at the state root.
+                BeaconSyncState.FinalizedExecution fin = beaconSyncState.getFinalizedExecution();
+                long finalizedBlockNum = fin.blockNumber();
+                byte[] beaconRoot = fin.stateRoot();
                 if (usedStateRoot == null) {
                     failReason = "noPeerStateRoot";
                 } else if (!storageProofValid) {
@@ -977,150 +995,337 @@ public class CommandHandler {
     private String handleResolveEns(String jsonLine) {
         String name = extractString(jsonLine, "name");
         try {
-            // 1. Find a snap-capable peer that responds with a fresh head we
-            //    can use. We MUST take the stateRoot from the same peer that
-            //    will serve the SNAP requests: peers prune trie state outside
-            //    a ~128-block window, and the snapshot is anchored at the
-            //    peer's own current head. A stateRoot from peer A used
-            //    against peer B reliably surfaces as
-            //    InvalidProof[... missing node ... (path idx=0)] — peer B has
-            //    no node hashing to A's root.
-            //
-            //    Earlier versions of this command pulled the head block
-            //    number from the cluster-wide ChainHead, fetched a header
-            //    from one peer, and then routed SNAP requests to a rotating
-            //    set of *other* peers via the oracle. That worked only when
-            //    every peer happened to share the same head — unreliable in
-            //    practice and the source of the path-idx=0 errors.
-            List<com.jaeckel.ethp2p.networking.eth.EthHandler> snapPeers =
-                connector.activeSnapHandlers();
-            if (snapPeers.isEmpty()) {
-                return jsonError("No active peer with snap/1 support");
-            }
-            // Probe all snap peers in parallel rather than serially — with a
-            // 10s per-peer timeout a serial loop would block the whole
-            // command for up to 10s × N on an unresponsive cluster. allOf
-            // bounded by a single 10s wait gives us at-most-10s total, then
-            // we pick the first peer (in iteration order, deterministic)
-            // whose probe completed with a sensible head.
-            //
-            // The per-probe wrap with handle((v,ex)->null) is so allOf
-            // doesn't short-circuit when one peer throws — we want to give
-            // every peer the full window to respond.
-            long minSensibleHead = connector.getNetwork().minSensibleHeadBlock();
-            List<CompletableFuture<BlockHeader>> probes = new ArrayList<>(snapPeers.size());
-            List<CompletableFuture<Void>> safeProbes = new ArrayList<>(snapPeers.size());
-            for (com.jaeckel.ethp2p.networking.eth.EthHandler peer : snapPeers) {
-                CompletableFuture<BlockHeader> f = peer.requestFreshHeadHeaderAsync();
-                probes.add(f);
-                safeProbes.add(f.handle((v, ex) -> null));
-            }
-            try {
-                CompletableFuture.allOf(safeProbes.toArray(new CompletableFuture<?>[0]))
-                    .get(10, TimeUnit.SECONDS);
-            } catch (TimeoutException | ExecutionException ignore) {
-                // Some peers may still be in-flight; cancel them so they
-                // don't keep using the channel after we've already fallen
-                // through to "no usable peer". Already-completed probes are
-                // unaffected by cancel(). Then treat any !isDone probe as a
-                // failure below.
-                for (CompletableFuture<BlockHeader> p : probes) {
-                    if (!p.isDone()) p.cancel(true);
-                }
-            }
-            com.jaeckel.ethp2p.networking.eth.EthHandler pinnedPeer = null;
-            BlockHeader header = null;
-            String lastError = null;
-            for (int i = 0; i < snapPeers.size(); i++) {
-                com.jaeckel.ethp2p.networking.eth.EthHandler peer = snapPeers.get(i);
-                CompletableFuture<BlockHeader> probe = probes.get(i);
-                if (!probe.isDone()) {
-                    lastError = "peer " + peer.getRemoteAddress() + " probe timed out";
-                    continue;
-                }
-                if (probe.isCompletedExceptionally()) {
-                    try {
-                        probe.getNow(null);
-                    } catch (Exception e) {
-                        Throwable c = e.getCause() != null ? e.getCause() : e;
-                        lastError = "peer " + peer.getRemoteAddress()
-                            + " probe failed: "
-                            + (c.getMessage() != null ? c.getMessage() : c.getClass().getSimpleName());
-                    }
-                    continue;
-                }
-                BlockHeader fresh = probe.join();
-                // Sanity floor on the block number — guards against a peer
-                // claiming an absurd best-hash (the chain-head poisoning fix
-                // covers eth-handshake-time corruption, but not this).
-                // Floor is per-network; 0 disables the check on unknown
-                // networks. See NetworkConfig#minSensibleHeadBlock.
-                if (fresh.number < minSensibleHead) {
-                    lastError = "peer " + peer.getRemoteAddress()
-                        + " returned stale head #" + fresh.number;
-                    continue;
-                }
-                pinnedPeer = peer;
-                header = fresh;
-                break;
-            }
-            if (pinnedPeer == null || header == null) {
-                return jsonError("No snap peer returned a usable fresh head"
-                    + (lastError != null ? " (" + lastError + ")" : ""));
-            }
-
-            // 2. Build the BlockContext from that header.
-            io.myotis.evm.BlockContext blockCtx = new io.myotis.evm.BlockContext(
-                header.stateRoot.toArrayUnsafe(),
-                header.number,
-                header.timestamp,
-                header.baseFeePerGas,
-                io.myotis.evm.Address.of(header.beneficiary.toArrayUnsafe()),
-                header.mixHashOrPrevRandao.toArrayUnsafe(),
-                java.math.BigInteger.valueOf(connector.getNetwork().networkId()),
-                header.gasLimit);
-
-            // 3. Pin every SNAP request to the same peer the stateRoot came
-            //    from. The oracle's retry budget still engages on transient
-            //    failures (timeouts, channel close), but every retry targets
-            //    the one peer that is guaranteed to have this exact root in
-            //    its snapshot. If that peer goes away mid-resolve, the user
-            //    can retry — better a clean failure than three rotating
-            //    attempts that each fail with "missing node".
-            final com.jaeckel.ethp2p.networking.eth.EthHandler finalPeer = pinnedPeer;
-            io.myotis.evm.world.SnapBackedStateOracle oracle =
-                new io.myotis.evm.world.SnapBackedStateOracle(
-                    () -> finalPeer.isReady() && !finalPeer.isSnapServingFailed()
-                        ? new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(finalPeer)
-                        : null,
-                    io.myotis.evm.world.BytecodeCache.inMemory());
-            io.myotis.evm.DefaultEvmExecutor base = new io.myotis.evm.DefaultEvmExecutor(
-                oracle, io.myotis.evm.world.BytecodeCache.inMemory(), EVM_POOL);
-            io.myotis.evm.PrefetchingEvmExecutor prefetching =
-                new io.myotis.evm.PrefetchingEvmExecutor(base);
-            io.myotis.evm.ccipread.CcipReadHandler ccipHandler =
-                new io.myotis.evm.ccipread.CcipReadHandler(new JavaHttpCcipGateway());
-            io.myotis.evm.CcipReadEvmExecutor executor =
-                new io.myotis.evm.CcipReadEvmExecutor(prefetching, ccipHandler);
-
-            // 5. Resolve.
-            io.myotis.ens.EnsResolver resolver = new io.myotis.ens.EnsResolver(executor);
+            EnsCallContext ctx = prepareEnsCall();
             java.util.Optional<io.myotis.evm.Address> resolved =
-                resolver.resolveAddress(name, blockCtx).get(60, TimeUnit.SECONDS);
-
+                ctx.resolver.resolveAddress(name, ctx.blockCtx).get(60, TimeUnit.SECONDS);
             if (resolved.isEmpty()) {
                 return "{\"ok\":true,\"resolved\":false"
                     + ",\"name\":\"" + escapeJson(name) + "\""
-                    + ",\"blockNumber\":" + header.number + "}";
+                    + ",\"blockNumber\":" + ctx.header.number + "}";
             }
             return "{\"ok\":true,\"resolved\":true"
                 + ",\"name\":\"" + escapeJson(name) + "\""
                 + ",\"address\":\"" + resolved.get().toHex() + "\""
-                + ",\"blockNumber\":" + header.number + "}";
+                + ",\"blockNumber\":" + ctx.header.number + "}";
         } catch (Exception e) {
-            Throwable cause = e.getCause() != null ? e.getCause() : e;
-            String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
-            return jsonError(msg);
+            return jsonError(unwrapMessage(e));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ENS shared call setup
+    // -----------------------------------------------------------------------
+
+    /**
+     * Aggregate of the per-call EVM context every ENS handler needs:
+     * the peer-servable header (for the response's blockNumber), the
+     * BlockContext built from it, and a network-aware
+     * {@link io.myotis.ens.EnsResolver}. Constructed via
+     * {@link #prepareEnsCall()} so the snap-peer probe + EVM stack
+     * boilerplate isn't duplicated across the eight ENS commands.
+     */
+    private record EnsCallContext(
+            BlockHeader header,
+            io.myotis.evm.BlockContext blockCtx,
+            io.myotis.ens.EnsResolver resolver) {}
+
+    /**
+     * Probe every active snap peer in parallel for a fresh head, pick the
+     * first one with a sensible block number, and pin <em>that</em> peer
+     * for every state read of the resolution. We MUST take the stateRoot
+     * from the same peer that will serve the SNAP requests: peers prune
+     * trie state outside a ~128-block window and the snapshot is anchored
+     * at the peer's own current head. A stateRoot from peer A used against
+     * peer B reliably surfaces as
+     * {@code InvalidProof[... missing node ... (path idx=0)]} — peer B has
+     * no node hashing to A's root.
+     *
+     * <p>Wraps the result in {@link EnsCallContext} so every ENS handler
+     * shares the same peer-probe + EVM-stack boilerplate. Throws on any
+     * failure; callers fold the throw into a {@code jsonError} response.
+     */
+    private EnsCallContext prepareEnsCall() throws Exception {
+        List<com.jaeckel.ethp2p.networking.eth.EthHandler> snapPeers =
+            connector.activeSnapHandlers();
+        if (snapPeers.isEmpty()) {
+            throw new IllegalStateException("No active peer with snap/1 support");
+        }
+
+        // Probe all snap peers in parallel rather than serially — with a
+        // 10s per-peer timeout a serial loop would block the whole command
+        // for up to 10s × N on an unresponsive cluster. allOf bounded by a
+        // single 10s wait gives at-most-10s total; then we pick the first
+        // peer (in iteration order, deterministic) whose probe completed
+        // with a sensible head. The handle((v,ex)->null) wrap keeps allOf
+        // from short-circuiting when one peer throws.
+        long minSensibleHead = connector.getNetwork().minSensibleHeadBlock();
+        List<CompletableFuture<BlockHeader>> probes = new ArrayList<>(snapPeers.size());
+        List<CompletableFuture<Void>> safeProbes = new ArrayList<>(snapPeers.size());
+        for (com.jaeckel.ethp2p.networking.eth.EthHandler peer : snapPeers) {
+            CompletableFuture<BlockHeader> f = peer.requestFreshHeadHeaderAsync();
+            probes.add(f);
+            safeProbes.add(f.handle((v, ex) -> null));
+        }
+        try {
+            CompletableFuture.allOf(safeProbes.toArray(new CompletableFuture<?>[0]))
+                .get(10, TimeUnit.SECONDS);
+        } catch (TimeoutException | ExecutionException ignore) {
+            for (CompletableFuture<BlockHeader> p : probes) {
+                if (!p.isDone()) p.cancel(true);
+            }
+        }
+
+        com.jaeckel.ethp2p.networking.eth.EthHandler pinnedPeer = null;
+        BlockHeader header = null;
+        String lastError = null;
+        for (int i = 0; i < snapPeers.size(); i++) {
+            com.jaeckel.ethp2p.networking.eth.EthHandler peer = snapPeers.get(i);
+            CompletableFuture<BlockHeader> probe = probes.get(i);
+            if (!probe.isDone()) {
+                lastError = "peer " + peer.getRemoteAddress() + " probe timed out";
+                continue;
+            }
+            if (probe.isCompletedExceptionally()) {
+                try {
+                    probe.getNow(null);
+                } catch (Exception e) {
+                    Throwable c = e.getCause() != null ? e.getCause() : e;
+                    lastError = "peer " + peer.getRemoteAddress()
+                        + " probe failed: "
+                        + (c.getMessage() != null ? c.getMessage() : c.getClass().getSimpleName());
+                }
+                continue;
+            }
+            BlockHeader fresh = probe.join();
+            if (fresh.number < minSensibleHead) {
+                lastError = "peer " + peer.getRemoteAddress()
+                    + " returned stale head #" + fresh.number;
+                continue;
+            }
+            pinnedPeer = peer;
+            header = fresh;
+            break;
+        }
+        if (pinnedPeer == null || header == null) {
+            throw new IllegalStateException("No snap peer returned a usable fresh head"
+                + (lastError != null ? " (" + lastError + ")" : ""));
+        }
+
+        io.myotis.evm.BlockContext blockCtx = new io.myotis.evm.BlockContext(
+            header.stateRoot.toArrayUnsafe(),
+            header.number,
+            header.timestamp,
+            header.baseFeePerGas,
+            io.myotis.evm.Address.of(header.beneficiary.toArrayUnsafe()),
+            header.mixHashOrPrevRandao.toArrayUnsafe(),
+            java.math.BigInteger.valueOf(connector.getNetwork().networkId()),
+            header.gasLimit);
+
+        // Pin every SNAP request to the same peer the stateRoot came from.
+        // Retries inside the oracle still engage on transient failures
+        // (timeouts, channel close), but every retry targets the one peer
+        // that is guaranteed to have this exact root in its snapshot.
+        final com.jaeckel.ethp2p.networking.eth.EthHandler finalPeer = pinnedPeer;
+        io.myotis.evm.world.SnapBackedStateOracle oracle =
+            new io.myotis.evm.world.SnapBackedStateOracle(
+                () -> finalPeer.isReady() && !finalPeer.isSnapServingFailed()
+                    ? new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(finalPeer)
+                    : null,
+                ensBytecodeCache);
+        io.myotis.evm.DefaultEvmExecutor base = new io.myotis.evm.DefaultEvmExecutor(
+            oracle, ensBytecodeCache, EVM_POOL);
+        io.myotis.evm.PrefetchingEvmExecutor prefetching =
+            new io.myotis.evm.PrefetchingEvmExecutor(base);
+        io.myotis.evm.ccipread.CcipReadHandler ccipHandler =
+            new io.myotis.evm.ccipread.CcipReadHandler(new JavaHttpCcipGateway());
+        io.myotis.evm.CcipReadEvmExecutor executor =
+            new io.myotis.evm.CcipReadEvmExecutor(prefetching, ccipHandler);
+
+        io.myotis.ens.EnsResolver resolver = io.myotis.ens.EnsResolver
+            .forChainId(executor, connector.getNetwork().networkId());
+        return new EnsCallContext(header, blockCtx, resolver);
+    }
+
+    private static String unwrapMessage(Exception e) {
+        Throwable cause = e.getCause() != null ? e.getCause() : e;
+        return cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
+    }
+
+    // -----------------------------------------------------------------------
+    // Extended ENS record-type IPC handlers
+    // -----------------------------------------------------------------------
+
+    private String handleResolveEnsText(String jsonLine) {
+        String name = extractString(jsonLine, "name");
+        String key  = extractString(jsonLine, "key");
+        try {
+            EnsCallContext ctx = prepareEnsCall();
+            java.util.Optional<String> value =
+                ctx.resolver.resolveText(name, key, ctx.blockCtx).get(60, TimeUnit.SECONDS);
+            String head = "{\"ok\":true"
+                + ",\"name\":\"" + escapeJson(name) + "\""
+                + ",\"key\":\"" + escapeJson(key) + "\""
+                + ",\"blockNumber\":" + ctx.header.number;
+            if (value.isEmpty()) {
+                return head + ",\"resolved\":false}";
+            }
+            return head + ",\"resolved\":true,\"value\":\"" + escapeJson(value.get()) + "\"}";
+        } catch (Exception e) {
+            return jsonError(unwrapMessage(e));
+        }
+    }
+
+    private String handleResolveEnsContenthash(String jsonLine) {
+        String name = extractString(jsonLine, "name");
+        try {
+            EnsCallContext ctx = prepareEnsCall();
+            java.util.Optional<byte[]> value =
+                ctx.resolver.resolveContenthash(name, ctx.blockCtx).get(60, TimeUnit.SECONDS);
+            String head = "{\"ok\":true"
+                + ",\"name\":\"" + escapeJson(name) + "\""
+                + ",\"blockNumber\":" + ctx.header.number;
+            if (value.isEmpty()) {
+                return head + ",\"resolved\":false}";
+            }
+            return head + ",\"resolved\":true,\"contenthash\":\""
+                + Bytes.wrap(value.get()).toHexString() + "\"}";
+        } catch (Exception e) {
+            return jsonError(unwrapMessage(e));
+        }
+    }
+
+    private String handleResolveEnsAddrCoin(String jsonLine) {
+        String name = extractString(jsonLine, "name");
+        long coinType = extractLong(jsonLine, "coinType");
+        try {
+            EnsCallContext ctx = prepareEnsCall();
+            java.util.Optional<byte[]> value =
+                ctx.resolver.resolveMultiCoinAddress(name, coinType, ctx.blockCtx)
+                    .get(60, TimeUnit.SECONDS);
+            String head = "{\"ok\":true"
+                + ",\"name\":\"" + escapeJson(name) + "\""
+                + ",\"coinType\":" + coinType
+                + ",\"blockNumber\":" + ctx.header.number;
+            if (value.isEmpty()) {
+                return head + ",\"resolved\":false}";
+            }
+            return head + ",\"resolved\":true,\"address\":\""
+                + Bytes.wrap(value.get()).toHexString() + "\"}";
+        } catch (Exception e) {
+            return jsonError(unwrapMessage(e));
+        }
+    }
+
+    private String handleResolveEnsPubkey(String jsonLine) {
+        String name = extractString(jsonLine, "name");
+        try {
+            EnsCallContext ctx = prepareEnsCall();
+            java.util.Optional<io.myotis.ens.EnsResolver.Pubkey> value =
+                ctx.resolver.resolvePubkey(name, ctx.blockCtx).get(60, TimeUnit.SECONDS);
+            String head = "{\"ok\":true"
+                + ",\"name\":\"" + escapeJson(name) + "\""
+                + ",\"blockNumber\":" + ctx.header.number;
+            if (value.isEmpty()) {
+                return head + ",\"resolved\":false}";
+            }
+            io.myotis.ens.EnsResolver.Pubkey pk = value.get();
+            return head + ",\"resolved\":true"
+                + ",\"pubkeyX\":\"" + Bytes.wrap(pk.x()).toHexString() + "\""
+                + ",\"pubkeyY\":\"" + Bytes.wrap(pk.y()).toHexString() + "\"}";
+        } catch (Exception e) {
+            return jsonError(unwrapMessage(e));
+        }
+    }
+
+    private String handleResolveEnsAbi(String jsonLine) {
+        String name = extractString(jsonLine, "name");
+        long contentTypes;
+        // Default to "any encoding the resolver supports" (1|2|4|8 = 0xF) only
+        // when the field is absent. If it's present but malformed, let the
+        // parse error surface — silently defaulting on bad input would hide
+        // user typos like {"contentTypes": "two"}.
+        if (jsonLine.contains("\"contentTypes\"")) {
+            try {
+                contentTypes = extractLong(jsonLine, "contentTypes");
+            } catch (Exception e) {
+                return jsonError("contentTypes: " + (e.getMessage() != null ? e.getMessage() : "malformed"));
+            }
+        } else {
+            contentTypes = 0xFL;
+        }
+        try {
+            EnsCallContext ctx = prepareEnsCall();
+            java.util.Optional<io.myotis.ens.EnsResolver.AbiRecord> value =
+                ctx.resolver.resolveAbi(name, contentTypes, ctx.blockCtx)
+                    .get(60, TimeUnit.SECONDS);
+            String head = "{\"ok\":true"
+                + ",\"name\":\"" + escapeJson(name) + "\""
+                + ",\"contentTypes\":" + contentTypes
+                + ",\"blockNumber\":" + ctx.header.number;
+            if (value.isEmpty()) {
+                return head + ",\"resolved\":false}";
+            }
+            io.myotis.ens.EnsResolver.AbiRecord r = value.get();
+            return head + ",\"resolved\":true"
+                + ",\"contentType\":" + r.contentType()
+                + ",\"data\":\"" + Bytes.wrap(r.data()).toHexString() + "\"}";
+        } catch (Exception e) {
+            return jsonError(unwrapMessage(e));
+        }
+    }
+
+    private String handleResolveEnsDns(String jsonLine) {
+        String name = extractString(jsonLine, "name");
+        String dnsName = extractString(jsonLine, "dnsName");
+        long resource = extractLong(jsonLine, "resource");
+        if (resource < 0 || resource > 0xFFFFL) {
+            return jsonError("resource must fit in uint16");
+        }
+        try {
+            EnsCallContext ctx = prepareEnsCall();
+            byte[] dnsNameWire = io.myotis.ens.DnsEncoder.encode(dnsName);
+            java.util.Optional<byte[]> value =
+                ctx.resolver.resolveDnsRecord(name, dnsNameWire, (int) resource, ctx.blockCtx)
+                    .get(60, TimeUnit.SECONDS);
+            String head = "{\"ok\":true"
+                + ",\"name\":\"" + escapeJson(name) + "\""
+                + ",\"dnsName\":\"" + escapeJson(dnsName) + "\""
+                + ",\"resource\":" + resource
+                + ",\"blockNumber\":" + ctx.header.number;
+            if (value.isEmpty()) {
+                return head + ",\"resolved\":false}";
+            }
+            return head + ",\"resolved\":true,\"data\":\""
+                + Bytes.wrap(value.get()).toHexString() + "\"}";
+        } catch (Exception e) {
+            return jsonError(unwrapMessage(e));
+        }
+    }
+
+    private String handleResolveEnsInterface(String jsonLine) {
+        String name = extractString(jsonLine, "name");
+        String interfaceIdStr = extractString(jsonLine, "interfaceId");
+        String hex = (interfaceIdStr.startsWith("0x") || interfaceIdStr.startsWith("0X"))
+            ? interfaceIdStr.substring(2) : interfaceIdStr;
+        if (hex.length() != 8) {
+            return jsonError("interfaceId must be a 4-byte hex string (8 hex chars)");
+        }
+        byte[] interfaceId = Bytes.fromHexString(hex).toArrayUnsafe();
+        try {
+            EnsCallContext ctx = prepareEnsCall();
+            java.util.Optional<io.myotis.evm.Address> value =
+                ctx.resolver.resolveInterfaceImplementer(name, interfaceId, ctx.blockCtx)
+                    .get(60, TimeUnit.SECONDS);
+            String head = "{\"ok\":true"
+                + ",\"name\":\"" + escapeJson(name) + "\""
+                + ",\"interfaceId\":\"0x" + hex.toLowerCase() + "\""
+                + ",\"blockNumber\":" + ctx.header.number;
+            if (value.isEmpty()) {
+                return head + ",\"resolved\":false}";
+            }
+            return head + ",\"resolved\":true,\"implementer\":\"" + value.get().toHex() + "\"}";
+        } catch (Exception e) {
+            return jsonError(unwrapMessage(e));
         }
     }
 
@@ -1313,8 +1518,11 @@ public class CommandHandler {
             }
         }
 
-        long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
-        byte[] beaconRoot = beaconSyncState.getVerifiedExecutionStateRoot();
+        // Atomic snapshot — see note at the get-storage verification path. Block number
+        // and state root must describe the same finalized payload.
+        BeaconSyncState.FinalizedExecution fin = beaconSyncState.getFinalizedExecution();
+        long finalizedBlockNum = fin.blockNumber();
+        byte[] beaconRoot = fin.stateRoot();
         long finalizedPeriod = beaconSyncState.getFinalizedPeriod();
         long wallClockPeriod = BeaconChainSpec.currentPeriod(clGenesisTime);
         long periodLag = wallClockPeriod - finalizedPeriod;

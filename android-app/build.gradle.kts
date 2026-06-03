@@ -8,8 +8,16 @@ plugins {
 // same fully-qualified classes; the JVM tolerates the shadowing but the dexer
 // doesn't. vertx-core (transitive via tuweni-crypto) drags upstream netty in,
 // so strip it project-wide and rely on the fork.
+//
+// log4j-api is excluded because its `LogManager.getLogger()` no-args overload
+// uses StackWalker to name the logger after the caller class, and Android's
+// StackWalker returns null `getDeclaringClass()` for some frames — every
+// discovery class with `static final Logger LOG = LogManager.getLogger()`
+// blows up at <clinit>. Replaced with a tiny shim under
+// src/main/java/org/apache/logging/log4j that routes to slf4j.
 configurations.all {
     exclude(group = "io.netty")
+    exclude(group = "org.apache.logging.log4j")
 }
 
 android {
@@ -76,9 +84,29 @@ android {
             // file as upstream netty-common; just take the first one.
             pickFirsts += setOf(
                 "META-INF/native-image/io.netty/netty-common/native-image.properties",
+                // jvm-libp2p drags in four bouncycastle jars (bcprov, bcpkix,
+                // bctls, bcutil) that all ship the same OSGI manifest under
+                // META-INF/versions/9; the file is metadata-only.
+                "META-INF/versions/9/OSGI-INF/MANIFEST.MF",
             )
         }
     }
+}
+
+// Two-layer setup so AGP can compile against class-file-65 dependencies
+// (ConsenSys discovery 26.4.0 and its transitive Vert.x, plus our own
+// :networking module pinned to JVM 21 for discovery) while still emitting
+// Java 17 bytecode for our own sources:
+//
+//   1. jvmToolchain(21) — Gradle uses a Java 21 toolchain to *run* javac.
+//      JDK 17's javac cannot parse class file 65, so without this we'd get
+//      "class file has wrong version 65.0, should be 61.0" at parse time.
+//
+//   2. compileOptions stays at JavaVersion.VERSION_17 — javac targets
+//      Java 17 bytecode, our output is class file 61 (D8/ART-friendly),
+//      and we don't admit Java 18+ language features.
+kotlin {
+    jvmToolchain(21)
 }
 
 dependencies {
@@ -86,6 +114,7 @@ dependencies {
 
     implementation(project(":core"))
     implementation(project(":networking"))
+    implementation(project(":consensus"))
 
     // core/networking expose tuweni and netty only as `implementation`, so
     // add what the service code references directly.
@@ -93,10 +122,18 @@ dependencies {
     implementation(libs.tuweni.crypto)
     implementation(libs.netty.transport)
 
+    // consensus stack — BeaconLightClient, libp2p, BLS, snappy.
+    implementation(libs.jvm.libp2p)
+    implementation(libs.milagro)
+    implementation(libs.snappy)
+
     implementation(libs.bouncycastle)
     implementation(libs.slf4j.api)
-    // slf4j-android binding would be nicer, but slf4j-simple keeps the POC self-contained
-    runtimeOnly("org.slf4j:slf4j-simple:2.0.12")
+    // The SLF4J service provider is in-tree (com.jaeckel.ethp2p.android.log
+    // .AppSlf4jProvider) and registered via META-INF/services. It tees every
+    // SLF4J call to logcat *and* the in-app LogBuffer so the Logs tab can
+    // render output from consensus / networking / libp2p alongside our own
+    // android.util.Log calls. No third-party binding needed.
 
     // Jetpack Compose UI (BOM pins all compose-* versions together)
     implementation(platform(libs.androidx.compose.bom))
