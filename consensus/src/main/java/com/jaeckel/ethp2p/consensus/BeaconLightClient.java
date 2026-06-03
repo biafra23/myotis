@@ -436,14 +436,25 @@ public class BeaconLightClient implements AutoCloseable {
         byte[] headRoot;
         long headSlot;
         if (store != null && store.isInitialized()) {
-            // Use the bootstrap-verified finalized header — the most
-            // trustworthy values we have and what peers actually run
-            // ancestor-match against.
+            // finalized_* come from the bootstrap-verified finalized header —
+            // the trust anchor peers run their ancestor/relevance check against.
             var fh = store.getFinalizedHeader();
-            headSlot = fh.beacon().slot();
-            headRoot = fh.beacon().hashTreeRoot();
-            finalizedEpoch = headSlot / 32;
-            finalizedRoot = headRoot;
+            finalizedEpoch = fh.beacon().slot() / 32;
+            finalizedRoot = fh.beacon().hashTreeRoot();
+            // head_* must reflect our latest known block, not finalized: the
+            // optimistic (attested) header trails wall-clock by ~1-2 slots vs
+            // ~2 epochs for finalized. Reporting finalized as head made us look
+            // 64+ slots stale and depressed peer scoring. The attested header
+            // shares the same sync-committee trust anchor. Fall back to
+            // finalized if optimistic is somehow behind (shouldn't happen).
+            var oh = store.getOptimisticHeader();
+            if (oh != null && oh.beacon().slot() >= fh.beacon().slot()) {
+                headSlot = oh.beacon().slot();
+                headRoot = oh.beacon().hashTreeRoot();
+            } else {
+                headSlot = fh.beacon().slot();
+                headRoot = fh.beacon().hashTreeRoot();
+            }
         } else if (checkpointSlot > 0) {
             // Pre-bootstrap: claim the trusted weak-subjectivity checkpoint.
             // We haven't BLS-verified it yet, but it's a real mainnet block
