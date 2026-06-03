@@ -285,8 +285,12 @@ public final class NodeService extends Service {
             v.failReason = "beaconNotSynced";
         } else {
             long peerBlockNumber = result.blockNumber();
-            long finalizedBlock = bss.getExecutionBlockNumber();
-            byte[] beaconRoot = bss.getVerifiedExecutionStateRoot();
+            // Read block number + state root from one atomic snapshot — reading them via
+            // two separate getters can pair a block number with a state root from a
+            // different finalized payload if an update lands between the calls.
+            BeaconSyncState.FinalizedExecution fin = bss.getFinalizedExecution();
+            long finalizedBlock = fin.blockNumber();
+            byte[] beaconRoot = fin.stateRoot();
 
             if (peerBlockNumber <= 0) {
                 v.failReason = "noPeerBlockNumber";
@@ -814,8 +818,16 @@ public final class NodeService extends Service {
     private BeaconStats beaconStatsSnapshot() {
         BeaconLightClient blc = beaconLightClient;
         BeaconSyncState bss = beaconSyncState;
+        // clGenesisTime is set last in startAndPublish (after blc/bss are visible), so a
+        // snapshot can race in with blc/bss non-null but genesis time still 0. Passing 0 to
+        // getSyncState computes the period from epoch 0 → a wildly wrong (huge) wall period
+        // → misclassified sync state. Treat genesis-not-ready as still STARTING.
+        long genesis = clGenesisTime;
         if (blc == null || bss == null) {
             return new BeaconStats("STOPPED", false, 0, 0, 0L, 0L, null);
+        }
+        if (genesis <= 0L) {
+            return new BeaconStats("STARTING", false, 0, 0, 0L, 0L, null);
         }
         List<BeaconP2PService.PeerInfo> peers = blc.getConnectedPeers();
         int lc = 0;
@@ -826,7 +838,7 @@ public final class NodeService extends Service {
         String execHashHex = execHash == null ? null
                 : org.apache.tuweni.bytes.Bytes.wrap(execHash).toHexString();
         return new BeaconStats(
-                bss.getSyncState(clGenesisTime).name(),
+                bss.getSyncState(genesis).name(),
                 blc.isBootstrapped(),
                 peers.size(),
                 lc,

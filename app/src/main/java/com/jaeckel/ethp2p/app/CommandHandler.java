@@ -812,8 +812,12 @@ public class CommandHandler {
             // used to turn into a 3-boolean blob that was impossible to debug.
             long peerBlockNumber = accountResult.blockNumber();
             if (!beaconChainVerified) {
-                long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
-                byte[] beaconRoot = beaconSyncState.getVerifiedExecutionStateRoot();
+                // Atomic snapshot: block number + state root must come from the same
+                // finalized payload, since the header chain is anchored at the block
+                // number and required to terminate at the state root.
+                BeaconSyncState.FinalizedExecution fin = beaconSyncState.getFinalizedExecution();
+                long finalizedBlockNum = fin.blockNumber();
+                byte[] beaconRoot = fin.stateRoot();
                 if (usedStateRoot == null) {
                     failReason = "noPeerStateRoot";
                 } else if (!storageProofValid) {
@@ -1065,8 +1069,11 @@ public class CommandHandler {
             }
         }
 
-        long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
-        byte[] beaconRoot = beaconSyncState.getVerifiedExecutionStateRoot();
+        // Atomic snapshot — see note at the get-storage verification path. Block number
+        // and state root must describe the same finalized payload.
+        BeaconSyncState.FinalizedExecution fin = beaconSyncState.getFinalizedExecution();
+        long finalizedBlockNum = fin.blockNumber();
+        byte[] beaconRoot = fin.stateRoot();
         long finalizedPeriod = beaconSyncState.getFinalizedPeriod();
         long wallClockPeriod = BeaconChainSpec.currentPeriod(clGenesisTime);
         long periodLag = wallClockPeriod - finalizedPeriod;

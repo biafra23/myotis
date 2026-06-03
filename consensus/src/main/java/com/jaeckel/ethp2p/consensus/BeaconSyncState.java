@@ -127,6 +127,25 @@ public class BeaconSyncState {
     }
 
     /**
+     * The finalized execution payload's (block number, state root) read from a single
+     * atomic snapshot. {@code stateRoot} is null if not yet synced.
+     */
+    public record FinalizedExecution(long blockNumber, byte[] stateRoot) {}
+
+    /**
+     * Returns the finalized execution block number and state root from one atomic read.
+     * <p>Callers that need both (e.g. header-chain verification anchors the chain at
+     * {@code blockNumber} and requires its state root to equal {@code stateRoot}) MUST use
+     * this rather than {@link #getExecutionBlockNumber()} + {@link #getVerifiedExecutionStateRoot()}
+     * separately: the underlying {@code InnerState} can be replaced between two reads, pairing a
+     * block number with a state root from a different payload.
+     */
+    public FinalizedExecution getFinalizedExecution() {
+        InnerState s = state.get();
+        return new FinalizedExecution(s.executionBlockNumber(), s.executionStateRoot());
+    }
+
+    /**
      * Returns the latest finalized beacon slot, or 0 if not yet synced.
      */
     public long getFinalizedSlot() {
