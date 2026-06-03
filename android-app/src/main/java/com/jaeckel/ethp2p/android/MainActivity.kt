@@ -16,6 +16,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -25,6 +26,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -40,18 +43,27 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.jaeckel.ethp2p.android.log.LogBuffer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -59,6 +71,9 @@ import kotlinx.coroutines.withContext
 import java.math.BigDecimal
 import java.math.BigInteger
 import java.math.RoundingMode
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
 
@@ -168,8 +183,14 @@ private fun NodeScreen(
 
     LaunchedEffect(Unit) {
         while (isActive) {
+            // snapshot() walks the connector's active handler list, sorts
+            // ready peers, and prunes the backoff map. Cheap on a phone but
+            // not free — keep it off the main thread so a pause inside the
+            // sort or a brief lock contention with Netty's READY transitions
+            // can't blow the frame budget.
+            val s = withContext(Dispatchers.Default) { serviceProvider()?.snapshot() }
             running = NodeService.isRunning()
-            snapshot = serviceProvider()?.snapshot()
+            snapshot = s
             delay(2000)
         }
     }
@@ -192,6 +213,11 @@ private fun NodeScreen(
                 onClick = { selectedTab = 1 },
                 text = { Text("Query") }
             )
+            Tab(
+                selected = selectedTab == 2,
+                onClick = { selectedTab = 2 },
+                text = { Text("Logs") }
+            )
         }
         when (selectedTab) {
             0 -> StatusTab(
@@ -204,11 +230,12 @@ private fun NodeScreen(
                 onOpenNetworkSettings = onOpenNetworkSettings,
                 onClearCaches = onClearCaches,
             )
-            else -> QueryTab(
+            1 -> QueryTab(
                 snapshot = snapshot,
                 running = running,
                 serviceProvider = serviceProvider,
             )
+            else -> LogsTab()
         }
     }
 }
@@ -224,59 +251,66 @@ private fun StatusTab(
     onOpenNetworkSettings: () -> Unit,
     onClearCaches: () -> Unit,
 ) {
-    // Single LazyColumn for the whole tab so EL stats + beacon stats + peer
-    // list scroll together — a nested LazyColumn inside a non-scrolling
-    // Column would only scroll the peers.
-    LazyColumn(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        if (!online) {
-            item { OfflineBanner(onOpenNetworkSettings) }
-        }
-
-        item {
-            Button(
-                onClick = onToggle,
-                enabled = running || online,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text(if (running) "Stop node" else "Start node")
+    // SelectionContainer wraps the whole tab so long-pressing any text
+    // (peer rows, stats, hashes) lets the user copy from the standard
+    // Android selection toolbar. Buttons stay tappable — selection only
+    // engages on Text composables.
+    //
+    // Single LazyColumn so EL stats + beacon stats + peer list scroll
+    // together — a nested LazyColumn inside a non-scrolling Column
+    // would only scroll the peers.
+    SelectionContainer {
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            if (!online) {
+                item { OfflineBanner(onOpenNetworkSettings) }
             }
-        }
 
-        item {
-            OutlinedButton(
-                onClick = onClearCaches,
-                enabled = serviceProvider() != null,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("Clear peer caches")
-            }
-        }
-
-        val s = snapshot
-        if (s == null || !s.running) {
             item {
-                Text(
-                    if (online) "Tap Start to launch the node."
-                    else "Connect to the internet before starting the node."
-                )
+                Button(
+                    onClick = onToggle,
+                    enabled = running || online,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(if (running) "Stop node" else "Start node")
+                }
             }
-        } else {
-            item { StatusRow("uptime", formatUptime(now - s.startTimeMs)) }
-            item { StatusSummary(s) }
-            item { HorizontalDivider() }
-            item { Text("Beacon (consensus)", style = MaterialTheme.typography.titleSmall) }
-            item { BeaconSummary(s) }
-            item { HorizontalDivider() }
+
             item {
-                Text("READY peers (${s.readyPeerList.size})",
-                    style = MaterialTheme.typography.titleSmall)
+                OutlinedButton(
+                    onClick = onClearCaches,
+                    enabled = serviceProvider() != null,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Clear peer caches")
+                }
             }
-            items(s.readyPeerList) { p -> PeerRow(p) }
+
+            val s = snapshot
+            if (s == null || !s.running) {
+                item {
+                    Text(
+                        if (online) "Tap Start to launch the node."
+                        else "Connect to the internet before starting the node."
+                    )
+                }
+            } else {
+                item { StatusRow("uptime", formatUptime(now - s.startTimeMs)) }
+                item { StatusSummary(s) }
+                item { HorizontalDivider() }
+                item { Text("Beacon (consensus)", style = MaterialTheme.typography.titleSmall) }
+                item { BeaconSummary(s) }
+                item { HorizontalDivider() }
+                item {
+                    Text("READY peers (${s.readyPeerList.size})",
+                        style = MaterialTheme.typography.titleSmall)
+                }
+                items(s.readyPeerList) { p -> PeerRow(p) }
+            }
         }
     }
 }
@@ -387,6 +421,168 @@ private fun QueryTab(
     }
 }
 
+/**
+ * Live log viewer fed by [LogBuffer]. Auto-follows the tail when the user
+ * is parked at the bottom and pauses follow as soon as they scroll up;
+ * a "Jump to latest" button reappears so they can resume.
+ *
+ * <p>Selection is enabled (long-press → standard Android selection toolbar
+ * with Copy / Share). The toolbar above also exposes "Copy all" — useful
+ * when the buffer has thousands of lines and dragging selection handles
+ * across them is impractical.
+ */
+@Composable
+private fun LogsTab() {
+    // Poll the LogBuffer's monotonic version counter rather than the buffer
+    // itself — re-snapshotting only on change keeps the recomposition cost
+    // bounded even when the consensus stack is logging dozens of lines/sec.
+    var entries by remember { mutableStateOf<List<LogBuffer.Entry>>(emptyList()) }
+    var lastVersion by remember { mutableLongStateOf(-1L) }
+    LaunchedEffect(Unit) {
+        while (isActive) {
+            val v = LogBuffer.version()
+            if (v != lastVersion) {
+                entries = LogBuffer.snapshot()
+                lastVersion = v
+            }
+            // 250ms ≈ 4 Hz refresh — fast enough to feel live, slow enough
+            // not to thrash the LazyColumn during log bursts.
+            delay(250)
+        }
+    }
+
+    val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboardManager.current
+
+    // Auto-follow: ON when the bottom is visible, OFF the moment the user
+    // scrolls away. derivedStateOf keeps recomposition off the hot path —
+    // we only re-evaluate when the LazyColumn's layout info actually
+    // changes.
+    val atBottom by remember {
+        derivedStateOf {
+            val info = listState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull()
+            last == null || last.index >= info.totalItemsCount - 1
+        }
+    }
+    var autoFollow by remember { mutableStateOf(true) }
+    LaunchedEffect(listState) {
+        snapshotFlow { atBottom }
+            .distinctUntilChanged()
+            .collect { autoFollow = it }
+    }
+
+    // Pin to the latest item whenever a new line arrives AND we're following.
+    // Using scrollToItem (instant) rather than animateScrollToItem keeps
+    // pace with rapid log streams without queuing animations.
+    LaunchedEffect(entries.size, autoFollow) {
+        if (autoFollow && entries.isNotEmpty()) {
+            listState.scrollToItem(entries.size - 1)
+        }
+    }
+
+    Box(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize()) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "${entries.size} line${if (entries.size == 1) "" else "s"}" +
+                        if (autoFollow) " · live" else " · paused",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+                OutlinedButton(
+                    onClick = {
+                        clipboard.setText(AnnotatedString(formatLogs(entries)))
+                    },
+                    enabled = entries.isNotEmpty(),
+                ) { Text("Copy all") }
+                OutlinedButton(
+                    onClick = { LogBuffer.clear() },
+                    enabled = entries.isNotEmpty(),
+                ) { Text("Clear") }
+            }
+            HorizontalDivider()
+            // SelectionContainer here gives a long-press → Copy gesture on
+            // any visible line. It's compatible with LazyColumn — selection
+            // tracks across items as you drag the handle.
+            SelectionContainer(Modifier.fillMaxSize()) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 8.dp),
+                ) {
+                    // Keying by sequence keeps the user's scroll position
+                    // anchored to a specific log line as older entries fall
+                    // off the front of the ring buffer.
+                    items(entries, key = { it.sequence }) { entry ->
+                        LogLineRow(entry)
+                    }
+                }
+            }
+        }
+        // "Jump to latest" floats over the list when the user has scrolled
+        // up to read older lines. Clicking it scrolls to the end and (via
+        // the auto-follow LaunchedEffect above, since atBottom flips back
+        // to true) resumes live tailing.
+        if (!autoFollow) {
+            Button(
+                onClick = {
+                    scope.launch {
+                        if (entries.isNotEmpty()) listState.scrollToItem(entries.size - 1)
+                    }
+                },
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(16.dp),
+            ) { Text("Jump to latest ↓") }
+        }
+    }
+}
+
+private val LOG_TIME_FORMAT = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+
+@Composable
+private fun LogLineRow(entry: LogBuffer.Entry) {
+    // Color by level so warnings / errors visually pop against a wall of INFO.
+    val levelColor = when (entry.level) {
+        'E' -> MaterialTheme.colorScheme.error
+        'W' -> Color(0xFFB58900) // dim amber — readable on both light/dark
+        'D' -> MaterialTheme.colorScheme.onSurfaceVariant
+        'V' -> MaterialTheme.colorScheme.onSurfaceVariant
+        else -> MaterialTheme.colorScheme.onSurface  // 'I' and unknown
+    }
+    val ts = LOG_TIME_FORMAT.format(Date(entry.timestampMillis))
+    // Logger names like "com.jaeckel.ethp2p.consensus.BeaconLightClient" are
+    // long; strip the package for display while keeping the full name in the
+    // copy-all output so debugging context isn't lost.
+    val shortTag = entry.tag.substringAfterLast('.')
+    Text(
+        text = "$ts ${entry.level} $shortTag: ${entry.message}",
+        fontSize = 11.sp,
+        fontFamily = FontFamily.Monospace,
+        color = levelColor,
+    )
+}
+
+/** Render the buffer in `adb logcat -v threadtime`-ish format for clipboard. */
+private fun formatLogs(entries: List<LogBuffer.Entry>): String = buildString {
+    for (e in entries) {
+        append(LOG_TIME_FORMAT.format(Date(e.timestampMillis)))
+        append(' ').append(e.level)
+        append(' ').append(e.tag).append(": ").append(e.message)
+        append('\n')
+    }
+}
+
 @Composable
 private fun LoadingRow() {
     Row(
@@ -440,30 +636,71 @@ private fun ErrorPanel(message: String) {
 
 @Composable
 private fun AccountResultPanel(r: NodeService.AccountQueryResult) {
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text("Result", style = MaterialTheme.typography.titleSmall)
-        StatusRow("address", shortenHash(r.address))
-        StatusRow("exists", r.exists.toString())
-        if (r.exists) {
-            StatusRow("balance (ETH)", formatEth(r.balanceWei))
-            StatusRow("balance (wei)", r.balanceWei ?: "—")
-            StatusRow("nonce", r.nonce.toString())
-            r.storageRootHex?.let { StatusRow("storageRoot", shortenHash(it)) }
-            r.codeHashHex?.let { StatusRow("codeHash", shortenHash(it)) }
+    val clipboard = LocalClipboardManager.current
+    SelectionContainer {
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Result", style = MaterialTheme.typography.titleSmall)
+                // DisableSelection is implicit on Buttons; the explicit
+                // copy is a one-tap convenience that pastes the *full*
+                // hex (not the shortened form) for every field.
+                OutlinedButton(
+                    onClick = { clipboard.setText(AnnotatedString(formatAccountResult(r))) },
+                ) { Text("Copy") }
+            }
+            // Show full hex — selection range copy needs the full string,
+            // and shortenHash() makes that impossible. Long lines wrap.
+            StatusRow("address", r.address)
+            StatusRow("exists", r.exists.toString())
+            if (r.exists) {
+                StatusRow("balance (ETH)", formatEth(r.balanceWei))
+                StatusRow("balance (wei)", r.balanceWei ?: "—")
+                StatusRow("nonce", r.nonce.toString())
+                r.storageRootHex?.let { StatusRow("storageRoot", it) }
+                r.codeHashHex?.let { StatusRow("codeHash", it) }
+            }
+            StatusRow("block #", r.blockNumber.toString())
+            r.peerStateRootHex?.let { StatusRow("peer stateRoot", it) }
+            HorizontalDivider()
+            Text("Verification", style = MaterialTheme.typography.titleSmall)
+            StatusRow("peer proof valid", r.peerProofValid.toString())
+            StatusRow("beacon-verified", r.beaconChainVerified.toString())
+            if (r.beaconChainVerified) {
+                r.verifyMethod?.let { StatusRow("method", it) }
+                StatusRow("matched slot", r.matchedBeaconSlot.toString())
+                StatusRow("BLS verified", r.blsVerified.toString())
+            } else {
+                r.failReason?.let { StatusRow("fail reason", it) }
+            }
         }
-        StatusRow("block #", r.blockNumber.toString())
-        r.peerStateRootHex?.let { StatusRow("peer stateRoot", shortenHash(it)) }
-        HorizontalDivider()
-        Text("Verification", style = MaterialTheme.typography.titleSmall)
-        StatusRow("peer proof valid", r.peerProofValid.toString())
-        StatusRow("beacon-verified", r.beaconChainVerified.toString())
-        if (r.beaconChainVerified) {
-            r.verifyMethod?.let { StatusRow("method", it) }
-            StatusRow("matched slot", r.matchedBeaconSlot.toString())
-            StatusRow("BLS verified", r.blsVerified.toString())
-        } else {
-            r.failReason?.let { StatusRow("fail reason", it) }
-        }
+    }
+}
+
+/** Format an AccountQueryResult as a plain-text JSON-ish blob for clipboard. */
+private fun formatAccountResult(r: NodeService.AccountQueryResult): String = buildString {
+    appendLine("address=${r.address}")
+    appendLine("exists=${r.exists}")
+    if (r.exists) {
+        appendLine("balanceWei=${r.balanceWei}")
+        appendLine("balanceETH=${formatEth(r.balanceWei)}")
+        appendLine("nonce=${r.nonce}")
+        r.storageRootHex?.let { appendLine("storageRoot=$it") }
+        r.codeHashHex?.let { appendLine("codeHash=$it") }
+    }
+    appendLine("blockNumber=${r.blockNumber}")
+    r.peerStateRootHex?.let { appendLine("peerStateRoot=$it") }
+    appendLine("peerProofValid=${r.peerProofValid}")
+    appendLine("beaconChainVerified=${r.beaconChainVerified}")
+    if (r.beaconChainVerified) {
+        r.verifyMethod?.let { appendLine("verifyMethod=$it") }
+        appendLine("matchedBeaconSlot=${r.matchedBeaconSlot}")
+        appendLine("blsVerified=${r.blsVerified}")
+    } else {
+        r.failReason?.let { appendLine("failReason=$it") }
     }
 }
 

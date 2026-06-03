@@ -1,6 +1,6 @@
 package com.jaeckel.ethp2p.android;
 
-import android.util.Log;
+import com.jaeckel.ethp2p.android.log.LogBuffer;
 
 import java.io.BufferedReader;
 import java.io.FileInputStream;
@@ -53,7 +53,7 @@ public final class AndroidPeerCache {
         try (FileOutputStream out = new FileOutputStream(cacheFile.toFile(), true)) {
             out.write(line.getBytes(StandardCharsets.UTF_8));
         } catch (IOException e) {
-            Log.w(TAG, "write failed: " + e.getMessage());
+            LogBuffer.w(TAG, "write failed: " + e.getMessage());
         }
     }
 
@@ -64,7 +64,7 @@ public final class AndroidPeerCache {
     public synchronized void clear() {
         seen.clear();
         if (!cacheFile.toFile().delete() && cacheFile.toFile().exists()) {
-            Log.w(TAG, "failed to delete cache file " + cacheFile);
+            LogBuffer.w(TAG, "failed to delete cache file " + cacheFile);
         }
     }
 
@@ -81,7 +81,7 @@ public final class AndroidPeerCache {
                     int firstSep = line.indexOf(SEP);
                     int secondSep = line.indexOf(SEP, firstSep + 1);
                     if (firstSep < 0 || secondSep < 0) {
-                        Log.w(TAG, "skipping malformed peer line");
+                        LogBuffer.w(TAG, "skipping malformed peer line");
                         continue;
                     }
                     String ip = line.substring(0, firstSep);
@@ -90,11 +90,11 @@ public final class AndroidPeerCache {
                     result.add(new CachedPeer(new InetSocketAddress(ip, port), pubKeyHex));
                     seen.add(ip + SEP + port);
                 } catch (Exception e) {
-                    Log.w(TAG, "skipping malformed peer line: " + e.getMessage());
+                    LogBuffer.w(TAG, "skipping malformed peer line: " + e.getMessage());
                 }
             }
         } catch (IOException e) {
-            Log.w(TAG, "read failed: " + e.getMessage());
+            LogBuffer.w(TAG, "read failed: " + e.getMessage());
         }
         return result;
     }

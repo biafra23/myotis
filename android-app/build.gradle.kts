@@ -93,6 +93,22 @@ android {
     }
 }
 
+// Two-layer setup so AGP can compile against class-file-65 dependencies
+// (ConsenSys discovery 26.4.0 and its transitive Vert.x, plus our own
+// :networking module pinned to JVM 21 for discovery) while still emitting
+// Java 17 bytecode for our own sources:
+//
+//   1. jvmToolchain(21) — Gradle uses a Java 21 toolchain to *run* javac.
+//      JDK 17's javac cannot parse class file 65, so without this we'd get
+//      "class file has wrong version 65.0, should be 61.0" at parse time.
+//
+//   2. compileOptions stays at JavaVersion.VERSION_17 — javac targets
+//      Java 17 bytecode, our output is class file 61 (D8/ART-friendly),
+//      and we don't admit Java 18+ language features.
+kotlin {
+    jvmToolchain(21)
+}
+
 dependencies {
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.3")
 
@@ -113,8 +129,11 @@ dependencies {
 
     implementation(libs.bouncycastle)
     implementation(libs.slf4j.api)
-    // slf4j-android binding would be nicer, but slf4j-simple keeps the POC self-contained
-    runtimeOnly("org.slf4j:slf4j-simple:2.0.12")
+    // The SLF4J service provider is in-tree (com.jaeckel.ethp2p.android.log
+    // .AppSlf4jProvider) and registered via META-INF/services. It tees every
+    // SLF4J call to logcat *and* the in-app LogBuffer so the Logs tab can
+    // render output from consensus / networking / libp2p alongside our own
+    // android.util.Log calls. No third-party binding needed.
 
     // Jetpack Compose UI (BOM pins all compose-* versions together)
     implementation(platform(libs.androidx.compose.bom))

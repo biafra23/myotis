@@ -1,6 +1,6 @@
 package com.jaeckel.ethp2p.android;
 
-import android.util.Log;
+import com.jaeckel.ethp2p.android.log.LogBuffer;
 
 import java.io.BufferedReader;
 import java.io.FileInputStream;
@@ -48,7 +48,7 @@ public final class AndroidCLPeerCache {
         try (FileOutputStream out = new FileOutputStream(cacheFile.toFile(), true)) {
             out.write((multiaddr + "\n").getBytes(StandardCharsets.UTF_8));
         } catch (IOException e) {
-            Log.w(TAG, "write failed: " + e.getMessage());
+            LogBuffer.w(TAG, "write failed: " + e.getMessage());
         }
     }
 
@@ -60,7 +60,7 @@ public final class AndroidCLPeerCache {
             if (seen.remove(multiaddr)) {
                 failures.remove(multiaddr);
                 rewriteFile();
-                Log.i(TAG, "evicted peer after " + count + " failures: " + multiaddr);
+                LogBuffer.i(TAG, "evicted peer after " + count + " failures: " + multiaddr);
             }
         }
     }
@@ -78,10 +78,10 @@ public final class AndroidCLPeerCache {
                 seen.add(line);
             }
             if (!result.isEmpty()) {
-                Log.i(TAG, "loaded " + result.size() + " cached CL peer(s)");
+                LogBuffer.i(TAG, "loaded " + result.size() + " cached CL peer(s)");
             }
         } catch (IOException e) {
-            Log.w(TAG, "read failed: " + e.getMessage());
+            LogBuffer.w(TAG, "read failed: " + e.getMessage());
         }
         return result;
     }
@@ -90,7 +90,7 @@ public final class AndroidCLPeerCache {
         seen.clear();
         failures.clear();
         if (!cacheFile.toFile().delete() && cacheFile.toFile().exists()) {
-            Log.w(TAG, "failed to delete cache file " + cacheFile);
+            LogBuffer.w(TAG, "failed to delete cache file " + cacheFile);
         }
     }
 
@@ -104,7 +104,7 @@ public final class AndroidCLPeerCache {
                 w.write('\n');
             }
         } catch (IOException e) {
-            Log.w(TAG, "rewrite failed: " + e.getMessage());
+            LogBuffer.w(TAG, "rewrite failed: " + e.getMessage());
         }
     }
 }
