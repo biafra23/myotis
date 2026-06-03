@@ -99,6 +99,33 @@ public final class NodeService extends Service {
     private final java.util.concurrent.atomic.AtomicInteger clPeersDiscovered =
             new java.util.concurrent.atomic.AtomicInteger();
 
+    // --- ENS resolution (local Besu EVM over SNAP-verified state) ---------
+    // Mirrors the JVM daemon's CommandHandler.prepareEnsCall stack. Bytecode
+    // cache + EVM pool are service-lifecycle (not node-lifecycle) so they
+    // survive Stop/Start; shut down in onDestroy.
+    private final io.myotis.evm.world.BytecodeCache ensBytecodeCache =
+            io.myotis.evm.world.BytecodeCache.inMemory();
+    // Single thread: Besu EVM execution is CPU-bound and the oracle is pinned
+    // to one peer, so serializing avoids contention. Daemon thread so it never
+    // blocks process exit.
+    private final java.util.concurrent.ExecutorService evmPool =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "android-evm");
+                t.setDaemon(true);
+                return t;
+            });
+    // CCIP-Read gateway HTTP is blocking; keep it off the single EVM thread.
+    private final java.util.concurrent.ExecutorService ccipPool =
+            java.util.concurrent.Executors.newCachedThreadPool(r -> {
+                Thread t = new Thread(r, "android-ccip");
+                t.setDaemon(true);
+                return t;
+            });
+
+    // Query-tab history. Lazily created from getFilesDir() so it works even
+    // when the node is stopped (the UI can browse/re-run past queries anytime).
+    private AndroidQueryHistory queryHistory;
+
     private final IBinder binder = new LocalBinder();
 
     public final class LocalBinder extends Binder {
@@ -416,6 +443,166 @@ public final class NodeService extends Service {
             }
         }
         return true;
+    }
+
+    // ---------------------------------------------------------------------
+    // ENS resolution + query history
+    // ---------------------------------------------------------------------
+
+    private static final long ENS_TIMEOUT_SEC = 60;
+
+    /** Lazily-created, file-backed history of Query-tab inputs. */
+    public synchronized AndroidQueryHistory queryHistory() {
+        if (queryHistory == null) {
+            queryHistory = new AndroidQueryHistory(
+                    new java.io.File(getFilesDir(), "query-history.tsv").toPath());
+        }
+        return queryHistory;
+    }
+
+    /**
+     * Heuristic: is {@code input} an ENS name (vs a hex address)? A 40-hex
+     * string (with or without {@code 0x}) is an address; anything else is an
+     * ENS name. Addresses never contain a dot; ENS names do.
+     */
+    public static boolean looksLikeEnsName(String input) {
+        if (input == null) return false;
+        String s = input.trim();
+        if (s.startsWith("0x") || s.startsWith("0X")) s = s.substring(2);
+        if (s.length() != 40) return true;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            boolean hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex) return true;
+        }
+        return false;
+    }
+
+    /** Outcome of an ENS forward resolution. {@code addressHex} null if unresolved. */
+    public record EnsResolution(String name, String addressHex, long blockNumber, String error) {}
+
+    /**
+     * Resolve an ENS name to an address by running the ENS contracts in a local
+     * Besu EVM over SNAP-verified state — the same stack as the JVM daemon's
+     * {@code resolve-ens}. Never throws; failures come back in
+     * {@link EnsResolution#error}.
+     */
+    @SuppressLint("NewApi") // CompletableFuture.orTimeout — see requestAccount
+    public CompletableFuture<EnsResolution> resolveEns(String name) {
+        final String trimmed = name == null ? "" : name.trim();
+        if (!RUNNING.get() || connector == null) {
+            return CompletableFuture.completedFuture(
+                    new EnsResolution(trimmed, null, -1, "node not running"));
+        }
+        if (trimmed.isEmpty()) {
+            return CompletableFuture.completedFuture(
+                    new EnsResolution(trimmed, null, -1, "empty name"));
+        }
+        final EnsCall call;
+        try {
+            call = prepareEnsCall();
+        } catch (Exception e) {
+            return CompletableFuture.completedFuture(
+                    new EnsResolution(trimmed, null, -1, unwrap(e)));
+        }
+        return call.resolver().resolveAddress(trimmed, call.blockCtx())
+                .orTimeout(ENS_TIMEOUT_SEC, TimeUnit.SECONDS)
+                .handle((opt, ex) -> {
+                    if (ex != null) {
+                        return new EnsResolution(trimmed, null, call.blockNumber(), unwrap(ex));
+                    }
+                    if (opt == null || opt.isEmpty()) {
+                        return new EnsResolution(trimmed, null, call.blockNumber(),
+                                "name does not resolve");
+                    }
+                    return new EnsResolution(trimmed, opt.get().toHex(), call.blockNumber(), null);
+                });
+    }
+
+    private record EnsCall(io.myotis.ens.EnsResolver resolver,
+                           io.myotis.evm.BlockContext blockCtx,
+                           long blockNumber) {}
+
+    /**
+     * Build the EVM/ENS stack pinned to one fresh snap peer. Mirrors
+     * {@code CommandHandler.prepareEnsCall}. Blocking (probes peer heads with a
+     * 10s budget) — call off the UI thread.
+     */
+    private EnsCall prepareEnsCall() throws Exception {
+        RLPxConnector conn = connector;
+        if (conn == null) throw new IllegalStateException("node not running");
+        List<com.jaeckel.ethp2p.networking.eth.EthHandler> snapPeers = conn.activeSnapHandlers();
+        if (snapPeers.isEmpty()) {
+            throw new IllegalStateException("No active peer with snap/1 support");
+        }
+        long minSensibleHead = conn.getNetwork().minSensibleHeadBlock();
+        List<CompletableFuture<com.jaeckel.ethp2p.core.types.BlockHeader>> probes =
+                new ArrayList<>(snapPeers.size());
+        List<CompletableFuture<Void>> safe = new ArrayList<>(snapPeers.size());
+        for (com.jaeckel.ethp2p.networking.eth.EthHandler peer : snapPeers) {
+            CompletableFuture<com.jaeckel.ethp2p.core.types.BlockHeader> f =
+                    peer.requestFreshHeadHeaderAsync();
+            probes.add(f);
+            safe.add(f.handle((v, ex) -> null));
+        }
+        try {
+            CompletableFuture.allOf(safe.toArray(new CompletableFuture<?>[0]))
+                    .get(10, TimeUnit.SECONDS);
+        } catch (Exception ignore) {
+            for (CompletableFuture<com.jaeckel.ethp2p.core.types.BlockHeader> p : probes) {
+                if (!p.isDone()) p.cancel(true);
+            }
+        }
+        com.jaeckel.ethp2p.networking.eth.EthHandler pinned = null;
+        com.jaeckel.ethp2p.core.types.BlockHeader header = null;
+        for (int i = 0; i < snapPeers.size(); i++) {
+            CompletableFuture<com.jaeckel.ethp2p.core.types.BlockHeader> p = probes.get(i);
+            if (!p.isDone() || p.isCompletedExceptionally()) continue;
+            com.jaeckel.ethp2p.core.types.BlockHeader fresh = p.join();
+            if (fresh.number < minSensibleHead) continue;
+            pinned = snapPeers.get(i);
+            header = fresh;
+            break;
+        }
+        if (pinned == null || header == null) {
+            throw new IllegalStateException("No snap peer returned a usable fresh head");
+        }
+
+        io.myotis.evm.BlockContext blockCtx = new io.myotis.evm.BlockContext(
+                header.stateRoot.toArrayUnsafe(),
+                header.number,
+                header.timestamp,
+                header.baseFeePerGas,
+                io.myotis.evm.Address.of(header.beneficiary.toArrayUnsafe()),
+                header.mixHashOrPrevRandao.toArrayUnsafe(),
+                java.math.BigInteger.valueOf(conn.getNetwork().networkId()),
+                header.gasLimit);
+
+        // Pin every SNAP request to the peer that served this stateRoot.
+        final com.jaeckel.ethp2p.networking.eth.EthHandler finalPeer = pinned;
+        io.myotis.evm.world.SnapBackedStateOracle oracle =
+                new io.myotis.evm.world.SnapBackedStateOracle(
+                        () -> finalPeer.isReady() && !finalPeer.isSnapServingFailed()
+                                ? new com.jaeckel.ethp2p.android.snap.EthHandlerSnapPeer(finalPeer)
+                                : null,
+                        ensBytecodeCache);
+        io.myotis.evm.DefaultEvmExecutor base =
+                new io.myotis.evm.DefaultEvmExecutor(oracle, ensBytecodeCache, evmPool);
+        io.myotis.evm.PrefetchingEvmExecutor prefetching =
+                new io.myotis.evm.PrefetchingEvmExecutor(base);
+        io.myotis.evm.ccipread.CcipReadHandler ccip =
+                new io.myotis.evm.ccipread.CcipReadHandler(
+                        new com.jaeckel.ethp2p.android.ens.AndroidCcipGateway(ccipPool));
+        io.myotis.evm.CcipReadEvmExecutor executor =
+                new io.myotis.evm.CcipReadEvmExecutor(prefetching, ccip);
+        io.myotis.ens.EnsResolver resolver =
+                io.myotis.ens.EnsResolver.forChainId(executor, conn.getNetwork().networkId());
+        return new EnsCall(resolver, blockCtx, header.number);
+    }
+
+    private static String unwrap(Throwable t) {
+        Throwable c = t.getCause() != null ? t.getCause() : t;
+        return c.getMessage() != null ? c.getMessage() : c.getClass().getSimpleName();
     }
 
     @Override
@@ -872,6 +1059,8 @@ public final class NodeService extends Service {
         // worker holds the same lock as startAndPublish, so a subsequent
         // service start can't race with a half-finished close.
         RUNNING.set(false);
+        evmPool.shutdownNow();
+        ccipPool.shutdownNow();
         new Thread(this::doShutdown, "ethp2p-shutdown").start();
         super.onDestroy();
     }

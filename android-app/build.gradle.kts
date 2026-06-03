@@ -18,6 +18,21 @@ plugins {
 configurations.all {
     exclude(group = "io.netty")
     exclude(group = "org.apache.logging.log4j")
+    // Besu pulls Guava's -jre flavor. On Android, D8 mis-dexes the -jre
+    // Suppliers.NonSerializableMemoizingSupplier so it loses its
+    // java.util.function.Supplier supertype, and Besu's crypto.Hash blows up
+    // at runtime with an IncompatibleClassChangeError. Force the -android
+    // flavor, which is dex-clean and API-compatible for what Besu uses.
+    resolutionStrategy {
+        force("com.google.guava:guava:33.3.1-android")
+    }
+    // Besu (via :myotis-evm) pulls the pre-rename tuweni coordinates
+    // io.tmio:tuweni-* 2.4.2, whose org.apache.tuweni.* classes collide with
+    // our JitPack fork (com.github.biafra23.tuweni-kotlin 2.7.2-jvm17.1) —
+    // D8 rejects the duplicates. Strip io.tmio and route Besu's tuweni to the
+    // fork (same package, newer version; API-compatible for the units/bytes
+    // Besu uses).
+    exclude(group = "io.tmio")
 }
 
 android {
@@ -115,6 +130,13 @@ dependencies {
     implementation(project(":core"))
     implementation(project(":networking"))
     implementation(project(":consensus"))
+    // ENS resolution runs the ENS contracts in a local Besu EVM over
+    // SNAP-verified state. :myotis-evm is needed directly (not just
+    // transitively) because the SnapPeer/CcipGateway/BlockContext/Address
+    // types are referenced from our adapter + NodeService, and Gradle hides
+    // a transitive `implementation` dep from the consumer's compile classpath.
+    implementation(project(":myotis-ens"))
+    implementation(project(":myotis-evm"))
 
     // core/networking expose tuweni and netty only as `implementation`, so
     // add what the service code references directly.

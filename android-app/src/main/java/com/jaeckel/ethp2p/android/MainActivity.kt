@@ -15,6 +15,7 @@ import android.os.IBinder
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -318,7 +319,11 @@ private fun StatusTab(
 private sealed interface QueryState {
     data object Idle : QueryState
     data object Loading : QueryState
-    data class Success(val result: NodeService.AccountQueryResult) : QueryState
+    data class Success(
+        val result: NodeService.AccountQueryResult,
+        // Non-null when the input was an ENS name we resolved first.
+        val resolution: NodeService.EnsResolution?,
+    ) : QueryState
     data class Failure(val message: String) : QueryState
 }
 
@@ -328,9 +333,62 @@ private fun QueryTab(
     running: Boolean,
     serviceProvider: () -> NodeService?,
 ) {
-    var address by remember { mutableStateOf("") }
+    var input by remember { mutableStateOf("") }
     var state by remember { mutableStateOf<QueryState>(QueryState.Idle) }
+    var history by remember {
+        mutableStateOf<List<AndroidQueryHistory.Entry>>(emptyList())
+    }
     val scope = rememberCoroutineScope()
+
+    // Load persisted history once the service is bound.
+    LaunchedEffect(running) {
+        val svc = serviceProvider() ?: return@LaunchedEffect
+        history = withContext(Dispatchers.IO) { svc.queryHistory().list() }
+    }
+
+    // Shared by the button and by tapping a history entry. One text input
+    // handles both addresses and ENS names: if it doesn't look like a 40-hex
+    // address we resolve it via ENS first, then look up the resolved address.
+    fun runQuery(raw: String) {
+        val svc = serviceProvider()
+        if (svc == null) {
+            state = QueryState.Failure("Service not bound")
+            return
+        }
+        val q = raw.trim()
+        if (q.isEmpty()) return
+        input = q
+        state = QueryState.Loading
+        scope.launch {
+            // Bounce off the IO dispatcher: resolveEns/requestAccount block on
+            // snap-peer + EVM futures internally (sub-second happy path, up to
+            // ~60s on retry); keep the main dispatcher free.
+            val outcome: QueryState = try {
+                withContext(Dispatchers.IO) {
+                    if (NodeService.looksLikeEnsName(q)) {
+                        val res = svc.resolveEns(q).await()
+                        if (res.error != null || res.addressHex == null) {
+                            QueryState.Failure("ENS: ${res.error ?: "name does not resolve"}")
+                        } else {
+                            QueryState.Success(svc.requestAccount(res.addressHex).await(), res)
+                        }
+                    } else {
+                        QueryState.Success(svc.requestAccount(q).await(), null)
+                    }
+                }
+            } catch (t: Throwable) {
+                QueryState.Failure(t.cause?.message ?: t.message ?: t::class.java.simpleName)
+            }
+            state = outcome
+            if (outcome is QueryState.Success) {
+                val label = outcome.resolution?.addressHex ?: ""
+                history = withContext(Dispatchers.IO) {
+                    svc.queryHistory().add(q, label)
+                    svc.queryHistory().list()
+                }
+            }
+        }
+    }
 
     LazyColumn(
         modifier = Modifier
@@ -367,10 +425,10 @@ private fun QueryTab(
 
         item {
             OutlinedTextField(
-                value = address,
-                onValueChange = { address = it.trim() },
-                label = { Text("Account address") },
-                placeholder = { Text("0x…") },
+                value = input,
+                onValueChange = { input = it },
+                label = { Text("Address or ENS name") },
+                placeholder = { Text("0x… or vitalik.eth") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
                 enabled = state !is QueryState.Loading,
@@ -379,45 +437,87 @@ private fun QueryTab(
 
         item {
             Button(
-                onClick = {
-                    val svc = serviceProvider()
-                    if (svc == null) {
-                        state = QueryState.Failure("Service not bound")
-                        return@Button
-                    }
-                    state = QueryState.Loading
-                    scope.launch {
-                        state = try {
-                            // Bounce off the IO dispatcher because requestAccount
-                            // will block the calling thread on the snap peer
-                            // future internally; we don't want to occupy the
-                            // main dispatcher while peers respond (~hundreds of
-                            // ms in the happy path, 30s timeout on retry).
-                            val result = withContext(Dispatchers.IO) {
-                                svc.requestAccount(address).await()
-                            }
-                            QueryState.Success(result)
-                        } catch (t: Throwable) {
-                            QueryState.Failure(
-                                t.cause?.message ?: t.message
-                                    ?: t::class.java.simpleName
-                            )
-                        }
-                    }
-                },
-                enabled = running && address.isNotEmpty() && state !is QueryState.Loading,
+                onClick = { runQuery(input) },
+                enabled = running && input.isNotBlank() && state !is QueryState.Loading,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text("Get account")
+                Text("Look up")
             }
         }
 
         when (val st = state) {
             is QueryState.Idle -> { /* nothing */ }
             is QueryState.Loading -> item { LoadingRow() }
-            is QueryState.Success -> item { AccountResultPanel(st.result) }
+            is QueryState.Success -> {
+                st.resolution?.let { item { EnsResolutionPanel(it) } }
+                item { AccountResultPanel(st.result) }
+            }
             is QueryState.Failure -> item { ErrorPanel(st.message) }
         }
+
+        if (history.isNotEmpty()) {
+            item {
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("Recent", style = MaterialTheme.typography.titleSmall)
+                    OutlinedButton(onClick = {
+                        val svc = serviceProvider() ?: return@OutlinedButton
+                        scope.launch {
+                            history = withContext(Dispatchers.IO) {
+                                svc.queryHistory().clear()
+                                svc.queryHistory().list()
+                            }
+                        }
+                    }) { Text("Clear") }
+                }
+            }
+            items(history) { entry ->
+                HistoryRow(
+                    entry = entry,
+                    enabled = running && state !is QueryState.Loading,
+                    onClick = { runQuery(entry.input) },
+                )
+            }
+        }
+    }
+}
+
+/** One tappable past-query row: tap to re-run with that input. */
+@Composable
+private fun HistoryRow(
+    entry: AndroidQueryHistory.Entry,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = enabled, onClick = onClick),
+    ) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(entry.input, style = MaterialTheme.typography.bodyMedium)
+            if (entry.label.isNotEmpty()) {
+                Text(
+                    "→ ${shortenHash(entry.label)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+/** Shows what an ENS name resolved to, above the account result. */
+@Composable
+private fun EnsResolutionPanel(res: NodeService.EnsResolution) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text("ENS", style = MaterialTheme.typography.titleSmall)
+        StatusRow("name", res.name)
+        StatusRow("resolved", res.addressHex ?: "—")
+        HorizontalDivider()
     }
 }
 
