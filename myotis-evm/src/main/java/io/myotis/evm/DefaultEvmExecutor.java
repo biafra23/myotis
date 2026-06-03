@@ -67,6 +67,132 @@ public final class DefaultEvmExecutor implements EvmExecutor {
         return CompletableFuture.supplyAsync(() -> runOnce(target, calldata, blockContext), executor);
     }
 
+    @Override
+    public CompletableFuture<Long> estimateGas(UnsignedTransaction tx, BlockContext blockContext) {
+        if (tx.to() == null) {
+            return CompletableFuture.failedFuture(new UnsupportedOperationException(
+                    "Phase 5 does not yet handle contract creation (to=null)"));
+        }
+        return CompletableFuture.supplyAsync(() -> estimateGasOnce(tx, blockContext), executor);
+    }
+
+    private long estimateGasOnce(UnsignedTransaction tx, BlockContext blockContext) {
+        CryptoProviders.ensureRegistered();
+        long intrinsicGas = computeIntrinsicGas(tx.data());
+        long ceiling = tx.gasLimit() != null ? tx.gasLimit() : DEFAULT_GAS_LIMIT;
+        long evmBudget = ceiling - intrinsicGas;
+        if (evmBudget <= 0) {
+            // The intrinsic cost alone exceeds the ceiling — caller's
+            // gasLimit is too low even before the EVM gets a chance to run.
+            throw new EvmExecutionException(new EvmExecutionError.OutOfGas());
+        }
+        long evmUsed = runForEstimation(tx, blockContext, evmBudget);
+        long total = intrinsicGas + evmUsed;
+        // 15% safety buffer per the plan. A slightly-too-high estimate just
+        // costs the user some priority fee; a slightly-too-low one OOG's
+        // the broadcast transaction.
+        return Math.round(total * 1.15);
+    }
+
+    /**
+     * Run the EVM with transaction-shaped frame parameters and return the
+     * EVM-side gas consumed. Throws {@link EvmExecutionException} on
+     * revert / exceptional halt — the plan mandates that estimation does
+     * NOT return a number for a reverting transaction (the caller must
+     * not broadcast it).
+     */
+    private long runForEstimation(UnsignedTransaction tx, BlockContext blockContext, long evmBudget) {
+        EvmFactory.EvmAndPrecompiles bundle = EvmFactory.buildForBlock(blockContext);
+        EVM evm = bundle.evm();
+
+        AccessTracker tracker = new AccessTracker();
+        SyncStateView view = new SyncStateView(oracle, blockContext.stateRoot(), bytecodeCache, tracker);
+        SnapWorldUpdater root = new SnapWorldUpdater(view);
+        org.hyperledger.besu.evm.worldstate.WorldUpdater scope = root.updater();
+
+        org.hyperledger.besu.datatypes.Address besuTarget =
+                org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(tx.to().toByteArray()));
+        org.hyperledger.besu.datatypes.Address besuSender =
+                org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(tx.from().toByteArray()));
+        org.hyperledger.besu.datatypes.Address besuCoinbase =
+                org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(blockContext.coinbase().toByteArray()));
+
+        Bytes contractCode = scope.get(besuTarget) == null
+                ? Bytes.EMPTY
+                : scope.get(besuTarget).getCode();
+        Hash contractCodeHash = scope.get(besuTarget) == null
+                ? Hash.EMPTY
+                : scope.get(besuTarget).getCodeHash();
+        Code code = evm.getCode(contractCodeHash, contractCode);
+
+        Wei value = Wei.of(tx.value());
+
+        MessageFrame frame = MessageFrame.builder()
+                .type(MessageFrame.Type.MESSAGE_CALL)
+                .worldUpdater(scope)
+                .initialGas(evmBudget)
+                .address(besuTarget)
+                .originator(besuSender)
+                .contract(besuTarget)
+                .gasPrice(Wei.ZERO)
+                .blobGasPrice(Wei.ZERO)
+                .inputData(Bytes.wrap(tx.data()))
+                .sender(besuSender)
+                .value(value)
+                .apparentValue(value)
+                .code(code)
+                .blockValues(new BlockContextValues(blockContext))
+                .completer(f -> {})
+                .miningBeneficiary(besuCoinbase)
+                .blockHashLookup(n -> {
+                    throw new UnsupportedOperationException(
+                            "BLOCKHASH not implemented; needs a verified block-hash provider");
+                })
+                // Estimation runs as a real (non-static) call so SSTOREs
+                // inside the target's bytecode can be metered correctly,
+                // including refund accounting. The per-call journal is
+                // discarded after we read getRemainingGas; nothing
+                // mutates the chain.
+                .isStatic(false)
+                .build();
+
+        MessageCallProcessor processor = new MessageCallProcessor(evm, bundle.precompiles());
+        Deque<MessageFrame> stack = frame.getMessageFrameStack();
+        while (!stack.isEmpty()) {
+            processor.process(stack.peek(), OperationTracer.NO_TRACING);
+        }
+
+        if (frame.getState() == MessageFrame.State.COMPLETED_SUCCESS) {
+            return evmBudget - frame.getRemainingGas();
+        }
+        if (frame.getRevertReason().isPresent()) {
+            throw new EvmExecutionException(
+                    new EvmExecutionError.Reverted(frame.getRevertReason().get().toArrayUnsafe()));
+        }
+        var halt = frame.getExceptionalHaltReason();
+        if (halt.isPresent() && halt.get() == ExceptionalHaltReason.INSUFFICIENT_GAS) {
+            throw new EvmExecutionException(new EvmExecutionError.OutOfGas());
+        }
+        String detail = "halt=" + halt.map(ExceptionalHaltReason::name).orElse("UNKNOWN")
+                + " state=" + frame.getState();
+        throw new EvmExecutionException(
+                new EvmExecutionError.Reverted(detail.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+    }
+
+    /**
+     * Yellow-Paper-Appendix-G intrinsic gas cost for a transaction:
+     * 21000 base, 4 per zero byte of calldata, 16 per non-zero byte
+     * (post-Istanbul, EIP-2028). EIP-2930 access lists and EIP-3860
+     * init-code costs are not modelled in v1 — see {@code phase5-design.md}.
+     */
+    static long computeIntrinsicGas(byte[] calldata) {
+        long gas = 21_000L;
+        for (byte b : calldata) {
+            gas += (b == 0) ? 4L : 16L;
+        }
+        return gas;
+    }
+
     private byte[] runOnce(Address target, byte[] calldata, BlockContext blockContext) {
         AccessTracker tracker = new AccessTracker();
         SyncStateView view = new SyncStateView(oracle, blockContext.stateRoot(), bytecodeCache, tracker);

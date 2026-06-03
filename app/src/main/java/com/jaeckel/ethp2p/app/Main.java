@@ -448,6 +448,8 @@ public final class Main {
         } catch (BindException e) {
             System.err.println("Cannot bind IPC socket " + socketPath + ": " + e.getMessage());
             System.err.println("Is another instance already running?");
+            beaconLightClient.close();
+            connector.close();
             discV5.close();
             discV4.close();
             fileLock.release();
@@ -456,6 +458,8 @@ public final class Main {
             return;
         } catch (Exception e) {
             System.err.println("Failed to start IPC server: " + e.getMessage());
+            beaconLightClient.close();
+            connector.close();
             discV5.close();
             discV4.close();
             fileLock.release();

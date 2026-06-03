@@ -5,8 +5,7 @@ java {
     // Java 21 class files as input and rewrites them for the Android runtime,
     // so this keeps working on android-app (minSdk 29) provided the library
     // doesn't use Java 21 runtime APIs (SequencedCollection, scoped values,
-    // structured concurrency). Verified at integration time; fall back to an
-    // in-tree discv5 port if assembleDebug rejects it.
+    // structured concurrency).
     sourceCompatibility = JavaVersion.VERSION_21
     targetCompatibility = JavaVersion.VERSION_21
 }
@@ -29,6 +28,14 @@ dependencies {
     // Android. android-app already strips io.netty group-wide; mirror that here
     // so the JVM daemon also resolves to the fork.
     //
+    // Same story for io.consensys.tuweni: discovery transitively pulls upstream
+    // tuweni 2.7.0, but we resolve tuweni via the JitPack fork
+    // (com.github.biafra23.tuweni-kotlin, recompiled to Java 17 bytecode). The
+    // fork kept the original org.apache.tuweni.* package names, so both jars
+    // ship identical FQCNs under different coordinates — Gradle can't dedupe
+    // them and D8's checkDebugDuplicateClasses fails. The fork is a >=2.7.0
+    // recompile of the same classes, so it satisfies everything discovery needs.
+    //
     // log4j is NOT excluded: several of the library's internal classes
     // (IdentitySchemaV4Interpreter etc.) reference org.apache.logging.log4j.LogManager
     // in their <clinit>, so stripping it NoClassDefFoundErrors the whole library
@@ -36,6 +43,7 @@ dependencies {
     // satisfies the library's static init.
     implementation(libs.discovery) {
         exclude(group = "io.netty")
+        exclude(group = "io.consensys.tuweni")
     }
 
     testImplementation(platform(libs.junit.bom))
