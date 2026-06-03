@@ -18,14 +18,6 @@ plugins {
 configurations.all {
     exclude(group = "io.netty")
     exclude(group = "org.apache.logging.log4j")
-    // Besu pulls Guava's -jre flavor. On Android, D8 mis-dexes the -jre
-    // Suppliers.NonSerializableMemoizingSupplier so it loses its
-    // java.util.function.Supplier supertype, and Besu's crypto.Hash blows up
-    // at runtime with an IncompatibleClassChangeError. Force the -android
-    // flavor, which is dex-clean and API-compatible for what Besu uses.
-    resolutionStrategy {
-        force("com.google.guava:guava:33.3.1-android")
-    }
     // Besu (via :myotis-evm) pulls the pre-rename tuweni coordinates
     // io.tmio:tuweni-* 2.4.2, whose org.apache.tuweni.* classes collide with
     // our JitPack fork (com.github.biafra23.tuweni-kotlin 2.7.2-jvm17.1) —
@@ -33,6 +25,22 @@ configurations.all {
     // fork (same package, newer version; API-compatible for the units/bytes
     // Besu uses).
     exclude(group = "io.tmio")
+    // Requesting the STANDARD_JVM Guava variant (below) clashes with the
+    // `android` variant that Besu pulls transitively — both provide the guava
+    // capability. Resolve the conflict toward the JRE variant, which is the one
+    // whose com.google.common.base.Supplier extends java.util.function.Supplier
+    // (what Besu's crypto.Hash needs).
+    // Guava declares two capabilities (its own, plus the legacy
+    // com.google.collections:google-collections); both see the variant clash.
+    listOf("com.google.guava:guava", "com.google.collections:google-collections").forEach { cap ->
+        resolutionStrategy.capabilitiesResolution.withCapability(cap) {
+            val jre = candidates.firstOrNull { it.variantName.contains("jre", ignoreCase = true) }
+            if (jre != null) {
+                select(jre)
+                because("Besu needs the JRE variant of Guava on Android")
+            }
+        }
+    }
 }
 
 android {
@@ -137,6 +145,27 @@ dependencies {
     // a transitive `implementation` dep from the consumer's compile classpath.
     implementation(project(":myotis-ens"))
     implementation(project(":myotis-evm"))
+
+    // Force the JRE *variant* of Guava. Guava publishes jre and android
+    // variants under one module; on an Android project Gradle's
+    // org.gradle.jvm.environment=android attribute selects the `android`
+    // variant, whose com.google.common.base.Supplier does NOT extend
+    // java.util.function.Supplier. Besu's crypto.Hash memoizes a Supplier and
+    // invokes it as java.util.function.Supplier, so the android variant throws
+    // IncompatibleClassChangeError at runtime. The JRE variant's Supplier does
+    // extend it (native at minSdk 29). A version force can't fix this — it's
+    // variant selection — so request STANDARD_JVM explicitly for guava.
+    implementation("com.google.guava:guava") {
+        attributes {
+            attribute(
+                org.gradle.api.attributes.java.TargetJvmEnvironment.TARGET_JVM_ENVIRONMENT_ATTRIBUTE,
+                objects.named(
+                    org.gradle.api.attributes.java.TargetJvmEnvironment::class.java,
+                    org.gradle.api.attributes.java.TargetJvmEnvironment.STANDARD_JVM
+                )
+            )
+        }
+    }
 
     // core/networking expose tuweni and netty only as `implementation`, so
     // add what the service code references directly.
