@@ -1,5 +1,5 @@
 [versions]
-tuweni = "2.7.2"
+tuweni = "2.7.2-jvm17.1"
 discovery = "26.4.0"
 #netty-kotlin = "c5a8303903"
 netty-kotlin = "main-SNAPSHOT"
@@ -28,12 +28,12 @@ kotlin-android      = { id = "org.jetbrains.kotlin.android",         version.ref
 compose-compiler    = { id = "org.jetbrains.kotlin.plugin.compose",  version.ref = "kotlin" }
 
 [libraries]
-tuweni-bytes        = { module = "io.consensys.tuweni:tuweni-bytes",       version.ref = "tuweni" }
-tuweni-rlp          = { module = "io.consensys.tuweni:tuweni-rlp",         version.ref = "tuweni" }
-tuweni-crypto       = { module = "io.consensys.tuweni:tuweni-crypto",      version.ref = "tuweni" }
-tuweni-merkle-trie  = { module = "io.consensys.tuweni:tuweni-merkle-trie", version.ref = "tuweni" }
-tuweni-ssz          = { module = "io.consensys.tuweni:tuweni-ssz",         version.ref = "tuweni" }
-tuweni-units        = { module = "io.consensys.tuweni:tuweni-units",       version.ref = "tuweni" }
+tuweni-bytes        = { module = "com.github.biafra23.tuweni-kotlin:tuweni-bytes",       version.ref = "tuweni" }
+tuweni-rlp          = { module = "com.github.biafra23.tuweni-kotlin:tuweni-rlp",         version.ref = "tuweni" }
+tuweni-crypto       = { module = "com.github.biafra23.tuweni-kotlin:tuweni-crypto",      version.ref = "tuweni" }
+tuweni-merkle-trie  = { module = "com.github.biafra23.tuweni-kotlin:tuweni-merkle-trie", version.ref = "tuweni" }
+tuweni-ssz          = { module = "com.github.biafra23.tuweni-kotlin:tuweni-ssz",         version.ref = "tuweni" }
+tuweni-units        = { module = "com.github.biafra23.tuweni-kotlin:tuweni-units",       version.ref = "tuweni" }
 
 netty-transport     = { module = "com.github.biafra23.netty-kotlin:netty-transport",               version.ref = "netty-kotlin" }
 netty-codec         = { module = "com.github.biafra23.netty-kotlin:netty-codec",                   version.ref = "netty-kotlin" }
@@ -53,7 +53,7 @@ milagro             = { module = "org.miracl.milagro.amcl:milagro-crypto-java", 
 jvm-libp2p          = { module = "io.libp2p:jvm-libp2p",                   version.ref = "jvm-libp2p" }
 trueblocks-kotlin   = { module = "com.github.biafra23:trueblocks-kotlin", version.ref = "trueblocks-kotlin" }
 dnsjava             = { module = "dnsjava:dnsjava",                       version.ref = "dnsjava" }
-discovery           = { module = "io.consensys.protocols:discovery",      version.ref = "discovery" }
+discovery           = { module = "io.consensys.protocols:discovery",       version.ref = "discovery" }
 
 # Besu EVM module. The standalone `evm` artifact is the heart of the Phase 0
 # spike — a hand-rolled WorldUpdater plugs into it. `besu-datatypes` carries

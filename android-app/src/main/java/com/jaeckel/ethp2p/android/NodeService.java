@@ -1,5 +1,6 @@
 package com.jaeckel.ethp2p.android;
 
+import android.annotation.SuppressLint;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -8,13 +9,22 @@ import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.os.Binder;
 import android.os.IBinder;
-import android.util.Log;
+import com.jaeckel.ethp2p.android.log.LogBuffer;
 
+import com.jaeckel.ethp2p.consensus.BeaconLightClient;
+import com.jaeckel.ethp2p.consensus.BeaconSyncState;
+import com.jaeckel.ethp2p.consensus.libp2p.BeaconP2PService;
+import com.jaeckel.ethp2p.consensus.proof.MerklePatriciaVerifier;
 import com.jaeckel.ethp2p.core.crypto.NodeKey;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
 import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
 import com.jaeckel.ethp2p.networking.discv5.DiscV5Service;
+import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
+import com.jaeckel.ethp2p.networking.snap.messages.AccountRangeMessage;
+
+import org.apache.tuweni.bytes.Bytes32;
+import org.apache.tuweni.crypto.Hash;
 
 import org.apache.tuweni.bytes.Bytes;
 import org.apache.tuweni.crypto.SECP256K1;
@@ -26,7 +36,9 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -46,6 +58,14 @@ public final class NodeService extends Service {
     // abusive on a phone (battery, data, NAT table, file descriptors). attempted
     // is removed only when a peer drops, so this bounds in-flight dial churn.
     private static final int MAX_ATTEMPTED = 200;
+    // Same bound the JVM daemon uses (CommandHandler.MAX_HEADER_CHAIN_GAP).
+    // Caps how many headers we'll fetch to bridge from the beacon-finalized
+    // block to the peer's head — i.e. the maximum gap the headerChain
+    // verification path will tolerate. In normal operation the gap is small
+    // (snap peers track head, BLC finality lags by ~12.8 minutes ≈ 64 blocks),
+    // but the bound has to cover catch-up after the phone wakes from doze.
+    private static final int MAX_HEADER_CHAIN_GAP = 8192;
+    private static final long HEADER_CHAIN_TIMEOUT_SEC = 60;
 
     // Static so MainActivity can reflect the correct button state after a
     // configuration change — the activity instance is recreated, but the
@@ -66,11 +86,16 @@ public final class NodeService extends Service {
     private DiscV5Service discV5;
     private RLPxConnector connector;
     private AndroidPeerCache peerCache;
+    private AndroidCLPeerCache clPeerCache;
+    private BeaconLightClient beaconLightClient;
+    private BeaconSyncState beaconSyncState;
+    private long clGenesisTime;
     private volatile int cachedPeerCount;
+    private volatile int cachedClPeerCount;
     private volatile long startTimeMs;
-    // Eth2-fork-digest-matching peers seen via discv5 since start. A counter
-    // rather than a collection because the UI only displays the number; when
-    // we integrate BeaconLightClient on Android this can feed a real peer sink.
+    // Eth2-fork-digest-matching peers seen via discv5 since start. Bumped on
+    // each ENR match so we can show fork-digest filter progress in the UI even
+    // before BLC has connected to anything.
     private final java.util.concurrent.atomic.AtomicInteger clPeersDiscovered =
             new java.util.concurrent.atomic.AtomicInteger();
 
@@ -93,11 +118,304 @@ public final class NodeService extends Service {
             int blacklistedPeers,
             int discv5Peers,          // total live nodes in the discv5 routing table
             int clPeersDiscovered,    // discv5 peers whose eth2 field matches our fork digest
+            // Beacon light client status (filled in only when BLC is wired up)
+            String beaconState,       // "STOPPED", "SYNCING", "CATCHING_UP", "SYNCED"
+            boolean beaconBootstrapped,
+            int clPeersConnected,
+            int clPeersLightClient,
+            int clPeersCached,
+            long finalizedSlot,
+            long executionBlockNumber,
+            String executionBlockHashHex, // null until first finality update
             List<RLPxConnector.PeerInfo> readyPeerList) {}
+
+    /** Result of a get-account query. Mirrors the JVM daemon's JSON response shape. */
+    public record AccountQueryResult(
+            String address,                  // 0x-prefixed checksum-form input
+            boolean exists,                  // false when the account isn't in the trie
+            long nonce,                      // -1 when !exists
+            String balanceWei,               // decimal string (BigInteger.toString); null when !exists
+            String storageRootHex,           // null when !exists
+            String codeHashHex,              // null when !exists
+            long blockNumber,                // peer-reported block number the proof is anchored to
+            String peerStateRootHex,         // 0x… root the proof was built against
+            boolean peerProofValid,          // proof verifies against peerStateRoot
+            boolean beaconChainVerified,     // peerStateRoot matches a beacon-attested root
+            boolean blsVerified,             // beacon match was BLS-signed (vs. unverified header)
+            long matchedBeaconSlot,          // -1 when not matched
+            String verifyMethod,             // "stateRootMatch" or null
+            String failReason                // null when verified
+    ) {}
 
     @Override
     public IBinder onBind(Intent intent) {
         return binder;
+    }
+
+    /**
+     * Run a get-account query against any active READY+snap peer and verify
+     * the returned proof against the beacon-attested state root.
+     *
+     * <p>Two verification methods, mirroring the JVM daemon
+     * ({@code CommandHandler#buildVerificationJson} for {@code get-account}):
+     * <ul>
+     *   <li><b>headerChain</b> (load-bearing path) — fetch the contiguous
+     *       header range {@code [finalizedBlock .. peerBlock]} via eth/68
+     *       from the same peer that served the proof, verify the
+     *       parent-hash chain, and require the first header's stateRoot
+     *       to equal the BLC-finalized execution stateRoot and the last
+     *       header's stateRoot to equal the peer-reported stateRoot. This
+     *       is what succeeds in normal operation, because snap peers serve
+     *       proofs at their head while the BLC's attested-root window
+     *       trails finalized + a few recent optimistic slots.</li>
+     *   <li><b>stateRootMatch</b> (fast-path shortcut) — if the peer's
+     *       reported stateRoot happens to be one the BLC has already
+     *       attested ({@link BeaconSyncState#findStateRoot}), skip the
+     *       header fetch entirely. Rare in practice: only fires when the
+     *       peer's head briefly aligns with a slot the BLC has just seen.</li>
+     * </ul>
+     * The shortcut is checked first so that when it does fire we save a
+     * round-trip; otherwise we fall through to the headerChain path.
+     */
+    // CompletableFuture.failedFuture (Java 9, hidden behind Android API 31)
+    // and orTimeout (also gated to API 31) are backported to minSdk 29 via
+    // desugar_jdk_libs 2.1.3 — see android-app/build.gradle.kts. Lint flags
+    // them anyway because its API database doesn't track desugar coverage
+    // for every CF method. Suppress at the method level rather than file —
+    // a future use of a *genuinely* unbackported API should still trip.
+    @SuppressLint("NewApi")
+    public CompletableFuture<AccountQueryResult> requestAccount(String hexAddress) {
+        if (!RUNNING.get() || connector == null) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("Node is not running"));
+        }
+        if (hexAddress == null) {
+            return CompletableFuture.failedFuture(
+                    new IllegalArgumentException("Address is required"));
+        }
+        String hex = hexAddress.strip();
+        if (hex.startsWith("0x") || hex.startsWith("0X")) hex = hex.substring(2);
+        if (hex.length() != 40) {
+            return CompletableFuture.failedFuture(
+                    new IllegalArgumentException("Address must be 20 bytes (40 hex chars)"));
+        }
+        final String hexAddrFinal = hex;
+        Bytes address;
+        try {
+            address = Bytes.fromHexString(hex);
+        } catch (Exception e) {
+            return CompletableFuture.failedFuture(
+                    new IllegalArgumentException("Invalid hex address: " + e.getMessage()));
+        }
+        Bytes32 accountHash = Hash.keccak256(address);
+        BeaconSyncState bss = beaconSyncState;
+        RLPxConnector conn = connector;
+        return connector.requestAccount(address).thenCompose(result ->
+                buildAccountResult("0x" + hexAddrFinal, address, accountHash, result, bss, conn));
+    }
+
+    /**
+     * Mutable verification scratchpad. Keeps the two verification methods
+     * (headerChain + stateRootMatch) from threading 5 separate parameters
+     * through the async chain.
+     */
+    private static final class Verification {
+        boolean beaconChainVerified;
+        boolean blsVerified;
+        long matchedSlot = -1;
+        String verifyMethod;
+        String failReason;
+    }
+
+    private static CompletableFuture<AccountQueryResult> buildAccountResult(
+            String addr,
+            Bytes address,
+            Bytes32 accountHash,
+            AccountRangeMessage.DecodeResult result,
+            BeaconSyncState bss,
+            RLPxConnector connector) {
+        AccountRangeMessage.AccountData found = null;
+        for (AccountRangeMessage.AccountData a : result.accounts()) {
+            if (a.accountHash().equals(accountHash)) {
+                found = a;
+                break;
+            }
+        }
+        final AccountRangeMessage.AccountData foundFinal = found;
+        long nonce = found != null ? found.nonce() : -1;
+        String balance = found != null ? found.balance().toString() : null;
+
+        boolean peerProofValid = false;
+        if (result.stateRoot() != null && !result.proof().isEmpty()) {
+            List<byte[]> proofBytes = new ArrayList<>(result.proof().size());
+            for (Bytes b : result.proof()) proofBytes.add(b.toArrayUnsafe());
+            peerProofValid = MerklePatriciaVerifier.verify(
+                    result.stateRoot().toArrayUnsafe(),
+                    address.toArrayUnsafe(),
+                    proofBytes, nonce, balance);
+        }
+        final boolean peerProofValidFinal = peerProofValid;
+
+        Verification v = new Verification();
+
+        // Fast-path shortcut: if the BLC has already attested the peer's
+        // exact stateRoot, we're done — no header fetch needed. Rare, but
+        // free to check.
+        if (bss != null && result.stateRoot() != null) {
+            BeaconSyncState.SlottedStateRoot match =
+                    bss.findStateRoot(result.stateRoot().toArrayUnsafe());
+            if (match != null) {
+                v.beaconChainVerified = true;
+                v.matchedSlot = match.slot();
+                v.blsVerified = match.blsVerified();
+                v.verifyMethod = "stateRootMatch";
+                return CompletableFuture.completedFuture(
+                        finalizeResult(addr, foundFinal, result, peerProofValidFinal, v));
+            }
+        }
+
+        // Main verification path: headerChain. Walk the failure ladder
+        // (mirrors CommandHandler.buildVerificationJson) — only run the
+        // fetch + chain verification if every prerequisite holds.
+        if (result.stateRoot() == null) {
+            v.failReason = "noPeerStateRoot";
+        } else if (!peerProofValid) {
+            v.failReason = "peerProofInvalid";
+        } else if (bss == null || !bss.isSynced()) {
+            v.failReason = "beaconNotSynced";
+        } else {
+            long peerBlockNumber = result.blockNumber();
+            // Read block number + state root from one atomic snapshot — reading them via
+            // two separate getters can pair a block number with a state root from a
+            // different finalized payload if an update lands between the calls.
+            BeaconSyncState.FinalizedExecution fin = bss.getFinalizedExecution();
+            long finalizedBlock = fin.blockNumber();
+            byte[] beaconRoot = fin.stateRoot();
+
+            if (peerBlockNumber <= 0) {
+                v.failReason = "noPeerBlockNumber";
+            } else if (finalizedBlock <= 0 || beaconRoot == null) {
+                v.failReason = "beaconBlockUnavailable";
+            } else if (peerBlockNumber <= finalizedBlock) {
+                v.failReason = "peerBlockBehindFinalized";
+            } else if (peerBlockNumber - finalizedBlock > MAX_HEADER_CHAIN_GAP) {
+                v.failReason = "headerChainGapTooLarge";
+            } else {
+                // headerChain: fetch [finalized .. peerBlock] inclusive
+                // from a single peer and verify the chain end-to-end.
+                final long finalizedSlot = bss.getFinalizedSlot();
+                LogBuffer.i(TAG, "[verify] headerChain: peerBlock=" + peerBlockNumber
+                        + ", finalizedBlock=" + finalizedBlock
+                        + ", gap=" + (peerBlockNumber - finalizedBlock));
+                return verifyHeaderChainBatched(
+                                connector, finalizedBlock, peerBlockNumber,
+                                beaconRoot, result.stateRoot().toArrayUnsafe())
+                        .handle((chainValid, ex) -> {
+                            if (ex != null) {
+                                LogBuffer.i(TAG, "[verify] headerChain error: " + ex.getMessage());
+                                v.failReason = "headerChainError";
+                            } else if (Boolean.TRUE.equals(chainValid)) {
+                                v.beaconChainVerified = true;
+                                v.matchedSlot = finalizedSlot;
+                                v.blsVerified = true;
+                                v.verifyMethod = "headerChain";
+                                v.failReason = null;
+                            } else {
+                                v.failReason = "headerChainInvalid";
+                            }
+                            return finalizeResult(addr, foundFinal, result, peerProofValidFinal, v);
+                        });
+            }
+        }
+
+        return CompletableFuture.completedFuture(
+                finalizeResult(addr, foundFinal, result, peerProofValidFinal, v));
+    }
+
+    private static AccountQueryResult finalizeResult(String addr,
+                                                      AccountRangeMessage.AccountData found,
+                                                      AccountRangeMessage.DecodeResult result,
+                                                      boolean peerProofValid,
+                                                      Verification v) {
+        long nonce = found != null ? found.nonce() : -1;
+        String balance = found != null ? found.balance().toString() : null;
+        return new AccountQueryResult(
+                addr,
+                found != null,
+                nonce,
+                balance,
+                found != null ? found.storageRoot().toHexString() : null,
+                found != null ? found.codeHash().toHexString() : null,
+                result.blockNumber(),
+                result.stateRoot() != null ? result.stateRoot().toHexString() : null,
+                peerProofValid,
+                v.beaconChainVerified,
+                v.blsVerified,
+                v.matchedSlot,
+                v.verifyMethod,
+                v.failReason);
+    }
+
+    /**
+     * Fetch headers in a single batch and verify the chain end-to-end.
+     * Returns a future that completes with {@code true} iff:
+     * <ul>
+     *   <li>the first header's stateRoot equals the beacon-finalized root,</li>
+     *   <li>the last header's stateRoot equals the peer's reported root,</li>
+     *   <li>and every header's hash equals the next header's parentHash.</li>
+     * </ul>
+     */
+    @SuppressLint("NewApi") // CompletableFuture.orTimeout — see requestAccount
+    private static CompletableFuture<Boolean> verifyHeaderChainBatched(
+            RLPxConnector connector, long finalizedBlock, long peerBlock,
+            byte[] beaconStateRoot, byte[] peerStateRoot) {
+        long totalLong = peerBlock - finalizedBlock + 1;
+        if (totalLong < 2 || totalLong > MAX_HEADER_CHAIN_GAP) {
+            LogBuffer.i(TAG, "[verify] headerChain gap " + totalLong
+                    + " out of range [2, " + MAX_HEADER_CHAIN_GAP + "]");
+            return CompletableFuture.completedFuture(false);
+        }
+        int total = (int) totalLong;
+        LogBuffer.i(TAG, "[verify] Fetching " + total + " headers from #"
+                + finalizedBlock + " to #" + peerBlock);
+        return connector.requestBlockHeadersBatched(finalizedBlock, total)
+                .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
+                .thenApply(headers -> {
+                    boolean valid = verifyHeaderChain(headers, beaconStateRoot, peerStateRoot);
+                    LogBuffer.i(TAG, "[verify] Full header chain (" + headers.size()
+                            + " blocks) valid: " + valid);
+                    return valid;
+                });
+    }
+
+    /**
+     * Pure verification of a contiguous header range. Identical algorithm to
+     * {@code CommandHandler#verifyHeaderChain} in the JVM daemon.
+     */
+    private static boolean verifyHeaderChain(List<BlockHeadersMessage.VerifiedHeader> headers,
+                                              byte[] expectedFirstStateRoot,
+                                              byte[] expectedLastStateRoot) {
+        if (headers.isEmpty()) return false;
+
+        byte[] firstStateRoot = headers.get(0).header().stateRoot.toArrayUnsafe();
+        if (!java.util.Arrays.equals(firstStateRoot, expectedFirstStateRoot)) return false;
+
+        byte[] lastStateRoot = headers.get(headers.size() - 1).header().stateRoot.toArrayUnsafe();
+        if (!java.util.Arrays.equals(lastStateRoot, expectedLastStateRoot)) return false;
+
+        for (int i = 0; i < headers.size() - 1; i++) {
+            Bytes32 currentHash = headers.get(i).hash();
+            Bytes32 nextParent = headers.get(i + 1).header().parentHash;
+            if (!currentHash.equals(nextParent)) {
+                LogBuffer.i(TAG, "[verify] hash chain break at index " + i
+                        + ": block #" + headers.get(i).header().number
+                        + " hash=" + currentHash.toShortHexString()
+                        + " != block #" + headers.get(i + 1).header().number
+                        + " parentHash=" + nextParent.toShortHexString());
+                return false;
+            }
+        }
+        return true;
     }
 
     @Override
@@ -106,7 +424,7 @@ public final class NodeService extends Service {
         // restart race with stopService). Guard so we don't boot two copies
         // of the node racing for the same UDP/TCP ports.
         if (!RUNNING.compareAndSet(false, true)) {
-            Log.i(TAG, "start requested but node is already running");
+            LogBuffer.i(TAG, "start requested but node is already running");
             return START_NOT_STICKY;
         }
         startTimeMs = System.currentTimeMillis();
@@ -123,15 +441,21 @@ public final class NodeService extends Service {
 
     private void startNode() {
         AndroidPeerCache localCache = null;
+        AndroidCLPeerCache localClCache = null;
         RLPxConnector localConnector = null;
         DiscV4Service localDisc = null;
         DiscV5Service localDiscV5 = null;
+        BeaconLightClient localBlc = null;
+        BeaconSyncState localBeaconState = null;
         int localCachedCount = 0;
+        int localCachedClCount = 0;
+        long localGenesisTime = 0L;
         try {
             NetworkConfig network = NetworkConfig.byName("mainnet");
+            localGenesisTime = network.clGenesisTime();
             Path keyFile = new java.io.File(getFilesDir(), "nodekey.hex").toPath();
             NodeKey nodeKey = NodeKey.loadOrGenerate(keyFile);
-            Log.i(TAG, "Node ID: " + nodeKey.nodeId().toHexString());
+            LogBuffer.i(TAG, "Node ID: " + nodeKey.nodeId().toHexString());
 
             Path cacheFile = new java.io.File(getFilesDir(), "peers.cache").toPath();
             localCache = new AndroidPeerCache(cacheFile);
@@ -142,7 +466,7 @@ public final class NodeService extends Service {
             localConnector = new RLPxConnector(nodeKey, DEFAULT_PORT, network,
                     headers -> {
                         if (!headers.isEmpty()) {
-                            Log.i(TAG, "Received " + headers.size() + " block header(s)");
+                            LogBuffer.i(TAG, "Received " + headers.size() + " block header(s)");
                         }
                     },
                     cacheRef::add);
@@ -162,7 +486,7 @@ public final class NodeService extends Service {
                         attempted.remove(peerKey);
                     });
                 } catch (Exception e) {
-                    Log.w(TAG, "cached peer connect failed: " + e.getMessage());
+                    LogBuffer.w(TAG, "cached peer connect failed: " + e.getMessage());
                     attempted.remove(peerKey);
                 }
             }
@@ -196,7 +520,7 @@ public final class NodeService extends Service {
                         attempted.remove(peerKey);
                     });
                 } catch (Exception e) {
-                    Log.w(TAG, "discovered peer connect failed: " + e.getMessage());
+                    LogBuffer.w(TAG, "discovered peer connect failed: " + e.getMessage());
                     attempted.remove(peerKey);
                 }
             });
@@ -204,39 +528,88 @@ public final class NodeService extends Service {
             // discv5 — CL peer discovery. Runs on a separate UDP port from discv4.
             // Callback filters ENRs by eth2 fork digest (current OR prior — same
             // dual-accept behaviour the JVM daemon uses so a mis-pinned current
-            // fork doesn't silently discard every peer). Matches are counted for
-            // display. No BeaconLightClient consumer on Android yet, so discovered
-            // peers aren't connected — the counter only verifies discv5 is reaching
-            // the CL DHT. When BeaconService lands, this callback feeds it.
+            // fork doesn't silently discard every peer). Matches are counted,
+            // saved to the on-disk CL peer cache, and (once BLC is up) added to
+            // its live peer pool via blcRef.
             List<byte[]> acceptedForkDigests = network.acceptedForkDigests();
+            // Seed CL peer cache before BLC is constructed so cached peers are
+            // available at startup. Cache file lives next to nodekey/peers.cache
+            // in the app's filesDir; same eviction-on-failure semantics as JVM.
+            Path clCacheFile = new java.io.File(getFilesDir(), "cl-peers.cache").toPath();
+            localClCache = new AndroidCLPeerCache(clCacheFile);
+            List<String> clCached = localClCache.load();
+            localCachedClCount = clCached.size();
+
+            final AndroidCLPeerCache clCacheRef = localClCache;
+            final java.util.concurrent.atomic.AtomicReference<BeaconLightClient> blcRef =
+                    new java.util.concurrent.atomic.AtomicReference<>();
             localDiscV5 = new DiscV5Service(nodeKey, network.clDiscv5Bootnodes(), enr -> {
                 var eth2 = enr.eth2();
                 if (eth2.isEmpty()) return;
                 byte[] peerDigest = eth2.get().forkDigest();
+                boolean match = false;
                 for (byte[] accepted : acceptedForkDigests) {
                     if (java.util.Arrays.equals(peerDigest, accepted)) {
-                        clPeersDiscovered.incrementAndGet();
-                        return;
+                        match = true;
+                        break;
                     }
                 }
+                if (!match) return;
+                clPeersDiscovered.incrementAndGet();
+                enr.toLibp2pMultiaddr().ifPresent(ma -> {
+                    clCacheRef.add(ma);
+                    BeaconLightClient blc = blcRef.get();
+                    if (blc != null) blc.addPeer(ma);
+                });
             });
+
+            // Beacon light client. Same construction shape as Main.runDaemon:
+            // seed with cached peers + network's configured CL multiaddrs,
+            // attach the cache as success/failure callbacks so live updates
+            // reach disk, apply EIP-7892 BPO parameters. Gossipsub stays off
+            // (battery cost is steeper on a phone).
+            localBeaconState = new BeaconSyncState();
+            List<String> clPeers = new ArrayList<>(clCached);
+            for (String peer : network.clPeerMultiaddrs()) {
+                if (!clPeers.contains(peer)) clPeers.add(peer);
+            }
+            localBlc = new BeaconLightClient(
+                    clPeers,
+                    network.checkpointRoot(),
+                    network.checkpointSlot(),
+                    network.currentForkVersion(),
+                    network.genesisValidatorsRoot(),
+                    localBeaconState,
+                    null,                     // beaconApiUrl: no local beacon node on a phone
+                    clCacheRef::add,          // onPeerSuccess
+                    clCacheRef::markFailure,  // onPeerFailure
+                    network.clGenesisTime());
+            localBlc.setBlobParameters(
+                    network.activeBlobParamsEpoch(),
+                    network.activeBlobParamsMaxBlobs());
+            blcRef.set(localBlc);
 
             // Publish atomically vs. shutdown() — if shutdown won the race
             // while we were constructing, we own every resource above, so we
             // have to close them ourselves instead of letting shutdown do it.
-            // disc.start() runs inside the same synchronized block so shutdown
-            // cannot close the service between publish and start.
-            if (!startAndPublish(localCache, localConnector, localDisc, localDiscV5, localCachedCount)) {
-                Log.i(TAG, "shutdown raced boot; tearing down constructed resources");
+            // disc.start() / blc.start() run inside the same synchronized block
+            // so shutdown cannot close the service between publish and start.
+            if (!startAndPublish(localCache, localClCache, localConnector, localDisc, localDiscV5,
+                    localBlc, localBeaconState, localGenesisTime,
+                    localCachedCount, localCachedClCount)) {
+                LogBuffer.i(TAG, "shutdown raced boot; tearing down constructed resources");
+                closeQuietly(localBlc);
                 closeQuietly(localDiscV5);
                 closeQuietly(localDisc);
                 closeQuietly(localConnector);
                 return;
             }
-            Log.i(TAG, "discv4 started on UDP " + DEFAULT_PORT
-                    + (this.discV5 != null ? ", discv5 on UDP 9000" : " (discv5 unavailable)"));
+            LogBuffer.i(TAG, "discv4 started on UDP " + DEFAULT_PORT
+                    + (this.discV5 != null ? ", discv5 on UDP 9000" : " (discv5 unavailable)")
+                    + ", beacon LC seeded with " + clPeers.size() + " CL peer(s)");
         } catch (Exception e) {
-            Log.e(TAG, "node boot failed", e);
+            LogBuffer.e(TAG, "node boot failed", e);
+            closeQuietly(localBlc);
             closeQuietly(localDiscV5);
             closeQuietly(localDisc);
             closeQuietly(localConnector);
@@ -247,6 +620,8 @@ public final class NodeService extends Service {
             backoff.clear();
             blacklistedNodeIds.clear();
             cachedPeerCount = 0;
+            cachedClPeerCount = 0;
+            clGenesisTime = 0L;
             startTimeMs = 0L;
             RUNNING.set(false);
             stopForeground(STOP_FOREGROUND_REMOVE);
@@ -255,28 +630,45 @@ public final class NodeService extends Service {
     }
 
     private synchronized boolean startAndPublish(AndroidPeerCache cache,
+                                                 AndroidCLPeerCache clCache,
                                                  RLPxConnector conn,
                                                  DiscV4Service disc,
                                                  DiscV5Service disc5,
-                                                 int cachedCount) throws Exception {
+                                                 BeaconLightClient blc,
+                                                 BeaconSyncState beaconState,
+                                                 long genesisTime,
+                                                 int cachedCount,
+                                                 int cachedClCount) throws Exception {
         if (!RUNNING.get()) return false;
         disc.start(DEFAULT_PORT);
-        // discv5 is diagnostic-only on Android (no BLC consumer yet), so a
-        // start failure (UDP 9000 busy, permission denied, …) must not take
-        // down EL: log and keep going with discV5=null.
+        // discv5 only feeds the CL peer cache on Android (BLC also reads from
+        // hardcoded multiaddrs and the cached pool), so a start failure
+        // (UDP 9000 busy, permission denied, …) must not take down EL or BLC:
+        // log and keep going with discV5=null.
         DiscV5Service startedDiscV5 = disc5;
         try {
             disc5.start(9000);
         } catch (Throwable t) {
-            Log.w(TAG, "discv5 start failed, continuing without CL discovery: " + t.getMessage());
+            LogBuffer.w(TAG, "discv5 start failed, continuing without CL discovery: " + t.getMessage());
             closeQuietly(disc5);
             startedDiscV5 = null;
         }
+        // blc.start() spins up the libp2p host (TCP) and a sync thread that
+        // bootstraps from the first responsive peer, then polls finality every
+        // 12s. Throws IllegalStateException if already running, which can't
+        // happen here (we just constructed it) — but propagate any startup
+        // failure so the caller can tear down cleanly.
+        blc.start();
         this.peerCache = cache;
+        this.clPeerCache = clCache;
         this.connector = conn;
         this.discV4 = disc;
         this.discV5 = startedDiscV5;
+        this.beaconLightClient = blc;
+        this.beaconSyncState = beaconState;
+        this.clGenesisTime = genesisTime;
         this.cachedPeerCount = cachedCount;
+        this.cachedClPeerCount = cachedClCount;
         return true;
     }
 
@@ -295,9 +687,32 @@ public final class NodeService extends Service {
      * the service instance may linger until the activity unbinds, but the node
      * is no longer running.
      */
-    public synchronized void shutdown() {
-        Log.i(TAG, "shutdown requested from UI");
+    public void shutdown() {
+        LogBuffer.i(TAG, "shutdown requested from UI");
+        // Flip RUNNING + clear the foreground notification synchronously so
+        // the UI button flips and the notification disappears immediately.
+        // The expensive close chain (libp2p host.stop().join(), Netty
+        // shutdownGracefully, syncThread.join) runs on a worker — doing it
+        // on the UI thread blocks main for seconds and ANRs.
         RUNNING.set(false);
+        stopForeground(STOP_FOREGROUND_REMOVE);
+        stopSelf();
+        new Thread(this::doShutdown, "ethp2p-shutdown").start();
+    }
+
+    /**
+     * Worker-thread close chain. Synchronized so it serializes against
+     * {@link #startAndPublish}: a fast Stop → Start sequence will block
+     * boot at {@code startAndPublish} until UDP 30303 / 9000 are released,
+     * instead of failing with bind-in-use.
+     */
+    private synchronized void doShutdown() {
+        // Close BLC first: its libp2p host's outbound dials hold references
+        // through to the discv5 callback's blcRef, and the sync thread can
+        // be in the middle of an addPeer call when shutdown fires.
+        closeQuietly(beaconLightClient);
+        beaconLightClient = null;
+        beaconSyncState = null;
         closeQuietly(connector);
         connector = null;
         closeQuietly(discV5);
@@ -305,14 +720,16 @@ public final class NodeService extends Service {
         closeQuietly(discV4);
         discV4 = null;
         peerCache = null;
+        clPeerCache = null;
         attempted.clear();
         backoff.clear();
         blacklistedNodeIds.clear();
         cachedPeerCount = 0;
+        cachedClPeerCount = 0;
+        clGenesisTime = 0L;
         startTimeMs = 0L;
         clPeersDiscovered.set(0);
-        stopForeground(STOP_FOREGROUND_REMOVE);
-        stopSelf();
+        LogBuffer.i(TAG, "node shutdown complete");
     }
 
     /**
@@ -325,18 +742,37 @@ public final class NodeService extends Service {
      * a cache, and clearing them would race with the per-peer close callback.
      */
     public void clearCaches() {
-        Log.i(TAG, "clearing peer caches from UI");
+        LogBuffer.i(TAG, "clearing peer caches from UI");
+        // File deletes are fast in the happy case but still IO; keep the UI
+        // thread off them so a slow flash + cache-file fsync can't ANR.
+        new Thread(this::doClearCaches, "ethp2p-clear-caches").start();
+    }
+
+    private void doClearCaches() {
         backoff.clear();
         blacklistedNodeIds.clear();
         cachedPeerCount = 0;
-        if (peerCache != null) {
-            peerCache.clear();
+        cachedClPeerCount = 0;
+        // Capture references — doShutdown can null these out concurrently
+        // if the user taps Clear and Stop in quick succession.
+        AndroidPeerCache pc = peerCache;
+        if (pc != null) {
+            pc.clear();
         } else {
             // Node is stopped: no live AndroidPeerCache instance exists, so
             // delete the on-disk file directly.
             java.io.File cacheFile = new java.io.File(getFilesDir(), "peers.cache");
             if (cacheFile.exists() && !cacheFile.delete()) {
-                Log.w(TAG, "failed to delete " + cacheFile);
+                LogBuffer.w(TAG, "failed to delete " + cacheFile);
+            }
+        }
+        AndroidCLPeerCache clpc = clPeerCache;
+        if (clpc != null) {
+            clpc.clear();
+        } else {
+            java.io.File clCacheFile = new java.io.File(getFilesDir(), "cl-peers.cache");
+            if (clCacheFile.exists() && !clCacheFile.delete()) {
+                LogBuffer.w(TAG, "failed to delete " + clCacheFile);
             }
         }
     }
@@ -344,10 +780,13 @@ public final class NodeService extends Service {
     public Snapshot snapshot() {
         boolean running = RUNNING.get();
         int discv5Live = discV5 != null ? discV5.liveNodeCount() : 0;
+        BeaconStats bs = beaconStatsSnapshot();
         if (!running || connector == null) {
             return new Snapshot(running, startTimeMs, 0, 0, 0, 0,
                     cachedPeerCount, attempted.size(), countActiveBackoff(),
                     blacklistedNodeIds.size(), discv5Live, clPeersDiscovered.get(),
+                    bs.state, bs.bootstrapped, bs.connected, bs.lc,
+                    cachedClPeerCount, bs.finalizedSlot, bs.execBlockNum, bs.execBlockHashHex,
                     List.of());
         }
         List<RLPxConnector.PeerInfo> active = connector.getActivePeers();
@@ -367,7 +806,45 @@ public final class NodeService extends Service {
         return new Snapshot(true, startTimeMs, tableSize, active.size(), ready.size(), snapCount,
                 cachedPeerCount, attempted.size(), countActiveBackoff(),
                 blacklistedNodeIds.size(), discv5Live, clPeersDiscovered.get(),
+                bs.state, bs.bootstrapped, bs.connected, bs.lc,
+                cachedClPeerCount, bs.finalizedSlot, bs.execBlockNum, bs.execBlockHashHex,
                 ready);
+    }
+
+    /** Per-snapshot beacon view, computed once so the record fields stay consistent. */
+    private record BeaconStats(String state, boolean bootstrapped, int connected, int lc,
+                               long finalizedSlot, long execBlockNum, String execBlockHashHex) {}
+
+    private BeaconStats beaconStatsSnapshot() {
+        BeaconLightClient blc = beaconLightClient;
+        BeaconSyncState bss = beaconSyncState;
+        // clGenesisTime is set last in startAndPublish (after blc/bss are visible), so a
+        // snapshot can race in with blc/bss non-null but genesis time still 0. Passing 0 to
+        // getSyncState computes the period from epoch 0 → a wildly wrong (huge) wall period
+        // → misclassified sync state. Treat genesis-not-ready as still STARTING.
+        long genesis = clGenesisTime;
+        if (blc == null || bss == null) {
+            return new BeaconStats("STOPPED", false, 0, 0, 0L, 0L, null);
+        }
+        if (genesis <= 0L) {
+            return new BeaconStats("STARTING", false, 0, 0, 0L, 0L, null);
+        }
+        List<BeaconP2PService.PeerInfo> peers = blc.getConnectedPeers();
+        int lc = 0;
+        for (BeaconP2PService.PeerInfo p : peers) {
+            if (p.supportsLightClient()) lc++;
+        }
+        byte[] execHash = bss.getExecutionBlockHash();
+        String execHashHex = execHash == null ? null
+                : org.apache.tuweni.bytes.Bytes.wrap(execHash).toHexString();
+        return new BeaconStats(
+                bss.getSyncState(genesis).name(),
+                blc.isBootstrapped(),
+                peers.size(),
+                lc,
+                bss.getFinalizedSlot(),
+                bss.getExecutionBlockNumber(),
+                execHashHex);
     }
 
     private int countActiveBackoff() {
@@ -387,12 +864,15 @@ public final class NodeService extends Service {
     }
 
     @Override
-    public synchronized void onDestroy() {
-        Log.i(TAG, "Stopping node");
-        closeQuietly(connector);
-        closeQuietly(discV5);
-        closeQuietly(discV4);
+    public void onDestroy() {
+        LogBuffer.i(TAG, "Stopping node (onDestroy)");
+        // Same fire-and-forget pattern as shutdown(): the system gives us a
+        // brief window to return from onDestroy and we don't want to spend
+        // it blocking on libp2p host shutdown / Netty graceful drain. The
+        // worker holds the same lock as startAndPublish, so a subsequent
+        // service start can't race with a half-finished close.
         RUNNING.set(false);
+        new Thread(this::doShutdown, "ethp2p-shutdown").start();
         super.onDestroy();
     }
 
