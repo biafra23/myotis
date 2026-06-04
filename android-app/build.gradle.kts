@@ -1,7 +1,63 @@
+import org.gradle.api.artifacts.transform.InputArtifact
+import org.gradle.api.artifacts.transform.TransformAction
+import org.gradle.api.artifacts.transform.TransformOutputs
+import org.gradle.api.artifacts.transform.TransformParameters
+import org.gradle.api.artifacts.type.ArtifactTypeDefinition
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.compose.compiler)
+}
+
+// === Besu BesuProvider strip (Android runtime compatibility) ===========
+// Besu's org.hyperledger.besu.crypto.BesuProvider calls the JDK-9
+// Provider(String,String,String) constructor, which is in the Android compile
+// stubs but ABSENT from the ART runtime even on API 35/36 — so any Besu hash
+// (keccak via MessageDigestFactory) throws NoSuchMethodError at runtime. We
+// ship an Android-safe replacement at
+// android-app/src/main/java/org/hyperledger/besu/crypto/BesuProvider.java that
+// uses the API-1 Provider(String,double,String) constructor instead.
+//
+// To stop our class from colliding with the jar's at dex time, this artifact
+// transform deletes the single BesuProvider.class entry from the algorithms
+// jar before dexing. It is a zip-entry removal, NOT a bytecode rewrite: every
+// other class (including Blake2bfMessageDigest, which our replacement
+// references) is copied through byte-for-byte. Jars without that entry pass
+// through untouched.
+val besuProviderStripped = Attribute.of("besuProviderStripped", Boolean::class.javaObjectType)
+
+abstract class StripBesuProvider : TransformAction<TransformParameters.None> {
+    @get:InputArtifact
+    abstract val inputArtifact: Provider<FileSystemLocation>
+
+    override fun transform(outputs: TransformOutputs) {
+        val input = inputArtifact.get().asFile
+        val target = "org/hyperledger/besu/crypto/BesuProvider.class"
+        val hasTarget = ZipFile(input).use { it.getEntry(target) != null }
+        if (!hasTarget) {
+            outputs.file(input) // pass through unchanged
+            return
+        }
+        val out = outputs.file(input.name.removeSuffix(".jar") + "-noBesuProvider.jar")
+        ZipInputStream(input.inputStream().buffered()).use { zin ->
+            ZipOutputStream(out.outputStream().buffered()).use { zout ->
+                var e: ZipEntry? = zin.nextEntry
+                while (e != null) {
+                    if (e.name != target) {
+                        zout.putNextEntry(ZipEntry(e.name))
+                        zin.copyTo(zout)
+                        zout.closeEntry()
+                    }
+                    e = zin.nextEntry
+                }
+            }
+        }
+    }
 }
 
 // The JitPack netty-kotlin fork republishes netty-common/buffer/etc. with the
@@ -41,6 +97,14 @@ configurations.all {
             }
         }
     }
+    // Caffeine 3.x (pulled transitively by Besu) logs through java.lang.System
+    // .getLogger / System.Logger (JDK 9 platform logging), which is absent from
+    // the Android runtime — every cache class (BoundedLocalCache, LocalLoading-
+    // Cache, …) trips NoSuchMethodError the moment Besu touches a cache. Caffeine
+    // 2.9.3 is the last 2.x release: it logs via java.util.logging instead and
+    // keeps the same com.github.benmanes.caffeine.cache API Besu uses. (Caffeine
+    // 3 dropped Android support outright; 2.9.x is the documented Android pin.)
+    resolutionStrategy.force("com.github.ben-manes.caffeine:caffeine:2.9.3")
 }
 
 android {
@@ -130,6 +194,29 @@ android {
 //      and we don't admit Java 18+ language features.
 kotlin {
     jvmToolchain(21)
+}
+
+// Register the BesuProvider-strip transform (jar → jar) and route compile/
+// runtime classpaths through it. Scoped to *Classpath configurations so AGP's
+// internal/special configurations are left alone.
+dependencies {
+    attributesSchema { attribute(besuProviderStripped) }
+    artifactTypes.getByName(ArtifactTypeDefinition.JAR_TYPE) {
+        attributes.attribute(besuProviderStripped, false)
+    }
+    registerTransform(StripBesuProvider::class) {
+        from.attribute(besuProviderStripped, false)
+            .attribute(ArtifactTypeDefinition.ARTIFACT_TYPE_ATTRIBUTE, ArtifactTypeDefinition.JAR_TYPE)
+        to.attribute(besuProviderStripped, true)
+            .attribute(ArtifactTypeDefinition.ARTIFACT_TYPE_ATTRIBUTE, ArtifactTypeDefinition.JAR_TYPE)
+    }
+}
+configurations.configureEach {
+    if (isCanBeResolved &&
+        (name.endsWith("RuntimeClasspath") || name.endsWith("CompileClasspath"))
+    ) {
+        attributes.attribute(besuProviderStripped, true)
+    }
 }
 
 dependencies {
