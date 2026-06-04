@@ -30,6 +30,13 @@ public final class AndroidCcipGateway implements CcipGateway {
 
     private static final int CONNECT_TIMEOUT_MS = 10_000;
     private static final int READ_TIMEOUT_MS = 15_000;
+    /**
+     * Hard cap on the response body. ERC-3668 gateway responses are JSON
+     * wrapping a small ABI blob (well under 1 MB); without a cap, a malicious or
+     * misconfigured gateway could stream unbounded data into memory and OOM the
+     * app. Read defensively and abort past the limit.
+     */
+    private static final int MAX_RESPONSE_BYTES = 1_048_576; // 1 MiB
 
     private final Executor executor;
 
@@ -40,7 +47,20 @@ public final class AndroidCcipGateway implements CcipGateway {
     @Override
     public CompletableFuture<String> request(Method method, String url, String body) {
         CompletableFuture<String> result = new CompletableFuture<>();
-        executor.execute(() -> {
+        // executor.execute can throw RejectedExecutionException synchronously if
+        // the pool was shut down (service onDestroy). Complete the future
+        // exceptionally rather than letting it propagate and leave the caller's
+        // future hanging until the ENS timeout.
+        try {
+            executor.execute(() -> requestBlocking(method, url, body, result));
+        } catch (RuntimeException e) {
+            result.completeExceptionally(e);
+        }
+        return result;
+    }
+
+    private static void requestBlocking(
+            Method method, String url, String body, CompletableFuture<String> result) {
             HttpURLConnection conn = null;
             try {
                 conn = (HttpURLConnection) new URL(url).openConnection();
@@ -69,8 +89,6 @@ public final class AndroidCcipGateway implements CcipGateway {
             } finally {
                 if (conn != null) conn.disconnect();
             }
-        });
-        return result;
     }
 
     private static String readAll(InputStream in) throws IOException {
@@ -79,6 +97,10 @@ public final class AndroidCcipGateway implements CcipGateway {
         int n;
         while ((n = in.read(chunk)) != -1) {
             buf.write(chunk, 0, n);
+            if (buf.size() > MAX_RESPONSE_BYTES) {
+                throw new IOException("CCIP gateway response exceeds "
+                        + MAX_RESPONSE_BYTES + " bytes");
+            }
         }
         return buf.toString(StandardCharsets.UTF_8.name());
     }

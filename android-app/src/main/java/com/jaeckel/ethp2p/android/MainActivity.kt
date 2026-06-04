@@ -517,6 +517,18 @@ private fun EnsResolutionPanel(res: NodeService.EnsResolution) {
         Text("ENS", style = MaterialTheme.typography.titleSmall)
         StatusRow("name", res.name)
         StatusRow("resolved", res.addressHex ?: "—")
+        if (res.blockNumber >= 0) StatusRow("at block #", res.blockNumber.toString())
+        // ENS resolution runs the ENS contracts in a local EVM over a snap
+        // peer's *head* state, which is proof-checked against that peer's
+        // claimed stateRoot but NOT anchored to a beacon-attested root. So the
+        // resolved address is peer-claimed, unlike the account result below
+        // (which reports its own beacon-verification). Flag that so the two
+        // aren't mistaken for the same trust level.
+        Text(
+            "Peer-claimed — the name→address mapping is not beacon-verified.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error,
+        )
         HorizontalDivider()
     }
 }
