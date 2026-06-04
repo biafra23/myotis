@@ -3,16 +3,17 @@
 Hyperledger Besu's `evm` module (and its `algorithms` crypto module) assume
 JDK/runtime features that Android's ART runtime lacks. Running the EVM on
 Android (for on-device ENS resolution / view calls in `:android-app`) needs
-**two source patches**. They're currently applied *in-repo* via in-tree class
-replacements + a `stripBesuProvider` Gradle artifact transform
-(`android-app/build.gradle.kts`); this directory is the handoff for moving them
-into a proper Besu fork so the in-repo hacks can be deleted.
+**two source patches**. This directory documents them.
 
-**Status: verified.** With exactly these two patches, `vitalik.eth` resolves
-end-to-end on an API-35 emulator (→ `0xd8dA…96045`, account read over SNAP).
-No other Besu/dependency Android-runtime gap remains on the EVM path.
+**Status: DONE — fork published and consumed.** The patches live in
+**[biafra23/besu](https://github.com/biafra23/besu)** (branch `24.12.2-android`,
+tag **`24.12.2-android.2`**), published via JitPack, and `:android-app` consumes
+them. `vitalik.eth` resolves end-to-end on an API-35 emulator against the fork
+artifacts (→ `0xd8dA…96045`, 5.68 ETH, account read over SNAP). The earlier
+in-tree class-replacement + strip-transform mechanism has been removed.
 
-Besu version pinned: **24.12.2** (`gradle/libs.versions.toml` → `besu`).
+Besu base version: **24.12.2**. The fork is built with `version=24.12.2`
+(gradle.properties) so its non-patched sibling refs resolve from Maven Central.
 
 ---
 
@@ -50,65 +51,62 @@ may be deleted** (or left — it's harmless if never loaded).
 
 ---
 
-## Building & publishing the fork
+## How the fork was built & published (as done)
 
-1. In the fork (**https://github.com/biafra23/besu**), branch off tag `24.12.2`
-   (e.g. `24.12.2-android`). Prepend `FORK-README-PREAMBLE.md` to the fork's
-   `README.md`.
-2. Apply the patches:
-   ```
-   git apply /path/to/besu-android-fork/patches/0001-besuprovider.patch
-   git apply /path/to/besu-android-fork/patches/0002-codecache.patch
-   # (or copy the full reference files over the originals)
-   ```
-3. Publish. Two options:
-
-   **a) JitPack** (matches the netty-kotlin / tuweni-kotlin / discovery fork pattern).
-   Add `jitpack.yml` at the fork root pinning JDK 21 (Besu requires it):
+1. Branched `biafra23/besu` off tag `24.12.2` → `24.12.2-android`; prepended
+   `FORK-README-PREAMBLE.md` to its README; applied both patches
+   (`patches/0001-besuprovider.patch`, `patches/0002-codecache.patch`).
+2. Set **`version=24.12.2`** in `gradle.properties` — Besu's git-versioning
+   otherwise stamps a `26.6-develop-<hash>` version into the published POMs'
+   sibling refs, which isn't on Maven Central. Pinning to the released base
+   makes the non-patched siblings (besu-datatypes, internal:rlp) resolve from
+   Central, and avoids duplicate `org.hyperledger.besu.datatypes.*` classes
+   downstream (we do NOT republish those modules).
+3. Added `jitpack.yml` (JDK 21) publishing the two patched modules **plus
+   `:platform`** (the `bom` they import via `<scope>import</scope>`, which Besu
+   never publishes to Central — so the fork must provide a resolvable one):
    ```yaml
    jdk:
      - openjdk21
    install:
-     - ./gradlew :evm:publishToMavenLocal :crypto:algorithms:publishToMavenLocal -x test -x spotlessCheck
+     - ./gradlew :evm:publishToMavenLocal :crypto:algorithms:publishToMavenLocal :platform:publishToMavenLocal -x test -x spotlessCheck -x spotlessApply -x checkLicense -x javadoc --no-daemon --stacktrace
    ```
-   Tag and push; JitPack builds `com.github.biafra23.besu:evm:<tag>` and
-   `com.github.biafra23.besu:algorithms:<tag>`.
-   ⚠️ Besu is a large, build-heavy repo — JitPack's time/memory limits and
-   Besu's full build (errorprone, spotless, integration setup) can make this
-   flaky. Skipping tests/spotless (above) helps. If JitPack can't build it:
-
-   **b) Local/private Maven** — `./gradlew :evm:publish :crypto:algorithms:publish`
-   to a Maven repo the project can reach (or `publishToMavenLocal` + add
-   `mavenLocal()` on the android-app branch only, as an interim).
+4. Tagged **`24.12.2-android.2`** and pushed → JitPack built it (~50s) and
+   published `com.github.biafra23.besu:{evm,algorithms,platform/bom}:24.12.2-android.2`.
+   (JitPack's full Besu build is feasible thanks to building only this subset +
+   skipping tests/spotless/docs.)
 
 ---
 
-## Wiring the consumer (when the fork is published)
+## How the consumer is wired (in `android-app/build.gradle.kts`)
 
-The **JVM daemon** must stay on upstream Besu (the patches are Android-only;
-on a desktop JVM the 3-String ctor and Caffeine both work). So scope the swap
-to `:android-app` via dependency substitution — do **not** change
-`gradle/libs.versions.toml` globally.
+The JVM daemon stays on upstream Besu (the patches are Android-only); the swap
+is scoped to `:android-app` and does **not** touch `gradle/libs.versions.toml`.
+Substitute the two patched modules + redirect the `bom` import (note
+`platform(...)` on both sides — the bom is a Gradle java-platform, so a plain
+module substitution mismatches variants):
 
-In `android-app/build.gradle.kts`, replace the in-tree mechanism with:
 ```kotlin
-configurations.configureEach {
+val besuForkVersion = "24.12.2-android.2"
+configurations.all {                       // eager, so AGP classpaths see it
     resolutionStrategy.dependencySubstitution {
         substitute(module("org.hyperledger.besu:evm"))
-            .using(module("com.github.biafra23.besu:evm:<tag>"))
+            .using(module("com.github.biafra23.besu:evm:$besuForkVersion"))
         substitute(module("org.hyperledger.besu.internal:algorithms"))
-            .using(module("com.github.biafra23.besu:algorithms:<tag>"))
+            .using(module("com.github.biafra23.besu:algorithms:$besuForkVersion"))
+        substitute(platform(module("org.hyperledger.besu:bom")))
+            .using(platform(module("com.github.biafra23.besu:bom:$besuForkVersion")))
     }
 }
 ```
-(plus the JitPack repo in `settings.gradle.kts`, already present).
+(JitPack repo is already in `settings.gradle.kts`.) The in-repo workarounds
+(in-tree `BesuProvider`/`CodeCache`, the strip transform + its `compileOnly`
+besu deps, the Caffeine pin) have been **removed**. Kept (independent of Besu
+source): the `io.tmio` exclude and the Guava **jre-variant** capability
+resolution.
 
-Then **delete the in-repo workarounds** (no longer needed):
-- `android-app/src/main/java/org/hyperledger/besu/crypto/BesuProvider.java`
-- `android-app/src/main/java/org/hyperledger/besu/evm/internal/CodeCache.java`
-- the `StripBesuProvider` transform + its registration in `build.gradle.kts`
-- the `compileOnly(libs.besu.evm/datatypes)` lines added for those patches
-- the `resolutionStrategy.force("…caffeine:2.9.3")` (moot once CodeCache is patched)
+To bump the fork later: push a new tag (e.g. `24.12.2-android.3`) and update
+`besuForkVersion`.
 
 Keep (these are independent of Besu source): the `io.tmio` exclude, the Guava
 **jre-variant** capability resolution, and the Android CCIP gateway / SnapPeer

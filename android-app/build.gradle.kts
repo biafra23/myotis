@@ -1,72 +1,18 @@
-import org.gradle.api.artifacts.transform.InputArtifact
-import org.gradle.api.artifacts.transform.TransformAction
-import org.gradle.api.artifacts.transform.TransformOutputs
-import org.gradle.api.artifacts.transform.TransformParameters
-import org.gradle.api.artifacts.type.ArtifactTypeDefinition
-import java.util.zip.ZipEntry
-import java.util.zip.ZipFile
-import java.util.zip.ZipInputStream
-import java.util.zip.ZipOutputStream
-
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.compose.compiler)
 }
 
-// === Besu Android-runtime source patches ===============================
-// Two Besu classes assume JDK/runtime features Android's ART lacks, and we
-// replace them with Android-safe copies under src/main/java/org/hyperledger/...:
-//
-//  1. crypto/BesuProvider — calls the JDK-9 Provider(String,String,String)
-//     ctor, present in Android compile stubs but ABSENT from the ART runtime
-//     even on API 35/36, so any Besu keccak (MessageDigestFactory) throws
-//     NoSuchMethodError. Our copy uses the API-1 Provider(String,double,String).
-//  2. evm/internal/CodeCache — backs the EVM bytecode cache with Caffeine,
-//     whose StripedBuffer.<clinit> reflects into Thread.threadLocalRandomProbe
-//     (a JDK-internal field missing on Android) and throws on every EVM build.
-//     Our copy uses a plain LinkedHashMap LRU, so the EVM never loads Caffeine.
-//
-// To stop our classes colliding with the jars' at dex time, this artifact
-// transform deletes exactly those .class entries from whichever jar contains
-// them, before dexing. It is a zip-entry removal, NOT a bytecode rewrite: every
-// other class is copied through byte-for-byte. Jars with none of the targets
-// pass through untouched. (These patches move into a Besu fork later; the
-// transform is the in-repo mechanism until then.)
-val besuProviderStripped = Attribute.of("besuProviderStripped", Boolean::class.javaObjectType)
-
-abstract class StripBesuProvider : TransformAction<TransformParameters.None> {
-    @get:InputArtifact
-    abstract val inputArtifact: Provider<FileSystemLocation>
-
-    private val targets = setOf(
-        "org/hyperledger/besu/crypto/BesuProvider.class",
-        "org/hyperledger/besu/evm/internal/CodeCache.class",
-    )
-
-    override fun transform(outputs: TransformOutputs) {
-        val input = inputArtifact.get().asFile
-        val hasAny = ZipFile(input).use { zf -> targets.any { zf.getEntry(it) != null } }
-        if (!hasAny) {
-            outputs.file(input) // pass through unchanged
-            return
-        }
-        val out = outputs.file(input.name.removeSuffix(".jar") + "-besuPatched.jar")
-        ZipInputStream(input.inputStream().buffered()).use { zin ->
-            ZipOutputStream(out.outputStream().buffered()).use { zout ->
-                var e: ZipEntry? = zin.nextEntry
-                while (e != null) {
-                    if (e.name !in targets) {
-                        zout.putNextEntry(ZipEntry(e.name))
-                        zin.copyTo(zout)
-                        zout.closeEntry()
-                    }
-                    e = zin.nextEntry
-                }
-            }
-        }
-    }
-}
+// === Android-compatible Besu (biafra23/besu fork) ======================
+// Besu's evm + algorithms modules assume JDK/runtime APIs Android's ART lacks
+// (the JDK-9 Provider(String,String,String) ctor; Caffeine's StripedBuffer
+// reflecting into Thread.threadLocalRandomProbe). The biafra23/besu fork
+// patches both (BesuProvider → API-1 ctor; CodeCache → LinkedHashMap LRU, no
+// Caffeine) and publishes them via JitPack. See besu-android-fork/README.md.
+// We swap only these two modules to the fork — scoped to :android-app so the
+// JVM daemon stays on upstream Besu, where those APIs work.
+val besuForkVersion = "24.12.2-android.2"
 
 // The JitPack netty-kotlin fork republishes netty-common/buffer/etc. with the
 // same fully-qualified classes; the JVM tolerates the shadowing but the dexer
@@ -82,6 +28,23 @@ abstract class StripBesuProvider : TransformAction<TransformParameters.None> {
 configurations.all {
     exclude(group = "io.netty")
     exclude(group = "org.apache.logging.log4j")
+    // Swap Besu's evm + algorithms to the Android-patched fork (biafra23/besu via
+    // JitPack); everything else stays upstream. Eager `all` so AGP's classpaths
+    // pick up the resolutionStrategy before they resolve.
+    resolutionStrategy.dependencySubstitution {
+        substitute(module("org.hyperledger.besu:evm"))
+            .using(module("com.github.biafra23.besu:evm:$besuForkVersion"))
+        substitute(module("org.hyperledger.besu.internal:algorithms"))
+            .using(module("com.github.biafra23.besu:algorithms:$besuForkVersion"))
+        // The fork's POMs import org.hyperledger.besu:bom:24.12.2, which Besu
+        // never publishes to Maven Central; redirect it to the fork-published
+        // bom. The fork is pinned to version 24.12.2, so its other sibling refs
+        // (besu-datatypes, internal:rlp) are the real released 24.12.2 on
+        // Central and need no redirect — keeping them un-forked also avoids
+        // duplicate org.hyperledger.besu.datatypes.* classes at dex time.
+        substitute(platform(module("org.hyperledger.besu:bom")))
+            .using(platform(module("com.github.biafra23.besu:bom:$besuForkVersion")))
+    }
     // Besu (via :myotis-evm) pulls the pre-rename tuweni coordinates
     // io.tmio:tuweni-* 2.4.2, whose org.apache.tuweni.* classes collide with
     // our JitPack fork (com.github.biafra23.tuweni-kotlin 2.7.2-jvm17.1) —
@@ -105,14 +68,9 @@ configurations.all {
             }
         }
     }
-    // Caffeine 3.x (pulled transitively by Besu) logs through java.lang.System
-    // .getLogger / System.Logger (JDK 9 platform logging), which is absent from
-    // the Android runtime — every cache class (BoundedLocalCache, LocalLoading-
-    // Cache, …) trips NoSuchMethodError the moment Besu touches a cache. Caffeine
-    // 2.9.3 is the last 2.x release: it logs via java.util.logging instead and
-    // keeps the same com.github.benmanes.caffeine.cache API Besu uses. (Caffeine
-    // 3 dropped Android support outright; 2.9.x is the documented Android pin.)
-    resolutionStrategy.force("com.github.ben-manes.caffeine:caffeine:2.9.3")
+    // (No Caffeine pin needed: the fork's CodeCache drops Caffeine, so nothing
+    // on the EVM path loads a Caffeine class — its StripedBuffer/System.Logger
+    // Android incompatibilities never trigger.)
 }
 
 android {
@@ -204,29 +162,6 @@ kotlin {
     jvmToolchain(21)
 }
 
-// Register the BesuProvider-strip transform (jar → jar) and route compile/
-// runtime classpaths through it. Scoped to *Classpath configurations so AGP's
-// internal/special configurations are left alone.
-dependencies {
-    attributesSchema { attribute(besuProviderStripped) }
-    artifactTypes.getByName(ArtifactTypeDefinition.JAR_TYPE) {
-        attributes.attribute(besuProviderStripped, false)
-    }
-    registerTransform(StripBesuProvider::class) {
-        from.attribute(besuProviderStripped, false)
-            .attribute(ArtifactTypeDefinition.ARTIFACT_TYPE_ATTRIBUTE, ArtifactTypeDefinition.JAR_TYPE)
-        to.attribute(besuProviderStripped, true)
-            .attribute(ArtifactTypeDefinition.ARTIFACT_TYPE_ATTRIBUTE, ArtifactTypeDefinition.JAR_TYPE)
-    }
-}
-configurations.configureEach {
-    if (isCanBeResolved &&
-        (name.endsWith("RuntimeClasspath") || name.endsWith("CompileClasspath"))
-    ) {
-        attributes.attribute(besuProviderStripped, true)
-    }
-}
-
 dependencies {
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.3")
 
@@ -240,14 +175,6 @@ dependencies {
     // a transitive `implementation` dep from the consumer's compile classpath.
     implementation(project(":myotis-ens"))
     implementation(project(":myotis-evm"))
-
-    // On the compile classpath only so our in-tree Besu patches (BesuProvider,
-    // CodeCache under src/main/java/org/hyperledger/besu/...) can reference Besu
-    // types (EvmConfiguration, Code, Hash). At runtime these come transitively
-    // via Besu anyway; the strip transform removes the upstream copies of the
-    // two classes we replace.
-    compileOnly(libs.besu.evm)
-    compileOnly(libs.besu.datatypes)
 
     // Force the JRE *variant* of Guava. Guava publishes jre and android
     // variants under one module; on an Android project Gradle's
