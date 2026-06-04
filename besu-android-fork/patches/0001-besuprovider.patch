@@ -1,0 +1,11 @@
+--- a/crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/BesuProvider.java
++++ b/crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/BesuProvider.java
+@@ -29,7 +29,7 @@
+   /** Instantiates a new Besu provider. */
+   @SuppressWarnings({"unchecked", "removal"})
+   public BesuProvider() {
+-    super(PROVIDER_NAME, "1.0", info);
++    super(PROVIDER_NAME, 1.0, info); // ANDROID: 3-String Provider ctor missing from ART runtime; use API-1 (String,double,String)
+     AccessController.doPrivileged(
+         (PrivilegedAction)
+             () -> {
