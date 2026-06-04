@@ -14,41 +14,49 @@ plugins {
     alias(libs.plugins.compose.compiler)
 }
 
-// === Besu BesuProvider strip (Android runtime compatibility) ===========
-// Besu's org.hyperledger.besu.crypto.BesuProvider calls the JDK-9
-// Provider(String,String,String) constructor, which is in the Android compile
-// stubs but ABSENT from the ART runtime even on API 35/36 — so any Besu hash
-// (keccak via MessageDigestFactory) throws NoSuchMethodError at runtime. We
-// ship an Android-safe replacement at
-// android-app/src/main/java/org/hyperledger/besu/crypto/BesuProvider.java that
-// uses the API-1 Provider(String,double,String) constructor instead.
+// === Besu Android-runtime source patches ===============================
+// Two Besu classes assume JDK/runtime features Android's ART lacks, and we
+// replace them with Android-safe copies under src/main/java/org/hyperledger/...:
 //
-// To stop our class from colliding with the jar's at dex time, this artifact
-// transform deletes the single BesuProvider.class entry from the algorithms
-// jar before dexing. It is a zip-entry removal, NOT a bytecode rewrite: every
-// other class (including Blake2bfMessageDigest, which our replacement
-// references) is copied through byte-for-byte. Jars without that entry pass
-// through untouched.
+//  1. crypto/BesuProvider — calls the JDK-9 Provider(String,String,String)
+//     ctor, present in Android compile stubs but ABSENT from the ART runtime
+//     even on API 35/36, so any Besu keccak (MessageDigestFactory) throws
+//     NoSuchMethodError. Our copy uses the API-1 Provider(String,double,String).
+//  2. evm/internal/CodeCache — backs the EVM bytecode cache with Caffeine,
+//     whose StripedBuffer.<clinit> reflects into Thread.threadLocalRandomProbe
+//     (a JDK-internal field missing on Android) and throws on every EVM build.
+//     Our copy uses a plain LinkedHashMap LRU, so the EVM never loads Caffeine.
+//
+// To stop our classes colliding with the jars' at dex time, this artifact
+// transform deletes exactly those .class entries from whichever jar contains
+// them, before dexing. It is a zip-entry removal, NOT a bytecode rewrite: every
+// other class is copied through byte-for-byte. Jars with none of the targets
+// pass through untouched. (These patches move into a Besu fork later; the
+// transform is the in-repo mechanism until then.)
 val besuProviderStripped = Attribute.of("besuProviderStripped", Boolean::class.javaObjectType)
 
 abstract class StripBesuProvider : TransformAction<TransformParameters.None> {
     @get:InputArtifact
     abstract val inputArtifact: Provider<FileSystemLocation>
 
+    private val targets = setOf(
+        "org/hyperledger/besu/crypto/BesuProvider.class",
+        "org/hyperledger/besu/evm/internal/CodeCache.class",
+    )
+
     override fun transform(outputs: TransformOutputs) {
         val input = inputArtifact.get().asFile
-        val target = "org/hyperledger/besu/crypto/BesuProvider.class"
-        val hasTarget = ZipFile(input).use { it.getEntry(target) != null }
-        if (!hasTarget) {
+        val hasAny = ZipFile(input).use { zf -> targets.any { zf.getEntry(it) != null } }
+        if (!hasAny) {
             outputs.file(input) // pass through unchanged
             return
         }
-        val out = outputs.file(input.name.removeSuffix(".jar") + "-noBesuProvider.jar")
+        val out = outputs.file(input.name.removeSuffix(".jar") + "-besuPatched.jar")
         ZipInputStream(input.inputStream().buffered()).use { zin ->
             ZipOutputStream(out.outputStream().buffered()).use { zout ->
                 var e: ZipEntry? = zin.nextEntry
                 while (e != null) {
-                    if (e.name != target) {
+                    if (e.name !in targets) {
                         zout.putNextEntry(ZipEntry(e.name))
                         zin.copyTo(zout)
                         zout.closeEntry()
@@ -232,6 +240,14 @@ dependencies {
     // a transitive `implementation` dep from the consumer's compile classpath.
     implementation(project(":myotis-ens"))
     implementation(project(":myotis-evm"))
+
+    // On the compile classpath only so our in-tree Besu patches (BesuProvider,
+    // CodeCache under src/main/java/org/hyperledger/besu/...) can reference Besu
+    // types (EvmConfiguration, Code, Hash). At runtime these come transitively
+    // via Besu anyway; the strip transform removes the upstream copies of the
+    // two classes we replace.
+    compileOnly(libs.besu.evm)
+    compileOnly(libs.besu.datatypes)
 
     // Force the JRE *variant* of Guava. Guava publishes jre and android
     // variants under one module; on an Android project Gradle's

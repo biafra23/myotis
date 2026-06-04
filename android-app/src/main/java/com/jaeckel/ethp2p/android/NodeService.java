@@ -509,6 +509,10 @@ public final class NodeService extends Service {
                 .orTimeout(ENS_TIMEOUT_SEC, TimeUnit.SECONDS)
                 .handle((opt, ex) -> {
                     if (ex != null) {
+                        // Log the full stack: library wrappers (e.g. Caffeine's
+                        // IllegalStateException(className)) mask the real
+                        // Android-incompat cause, which unwrap() now chains.
+                        LogBuffer.e(TAG, "[ens] resolveAddress failed for " + trimmed, ex);
                         return new EnsResolution(trimmed, null, call.blockNumber(), unwrap(ex));
                     }
                     if (opt == null || opt.isEmpty()) {
@@ -600,9 +604,22 @@ public final class NodeService extends Service {
         return new EnsCall(resolver, blockCtx, header.number);
     }
 
+    /**
+     * Render the whole cause chain, deepest cause included. Library wrappers
+     * (e.g. Caffeine throwing {@code IllegalStateException(className)} around a
+     * reflective failure) otherwise mask the real Android-incompatibility under
+     * a misleading top-level message.
+     */
     private static String unwrap(Throwable t) {
-        Throwable c = t.getCause() != null ? t.getCause() : t;
-        return c.getMessage() != null ? c.getMessage() : c.getClass().getSimpleName();
+        StringBuilder sb = new StringBuilder();
+        java.util.Set<Throwable> seen =
+                java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        for (Throwable c = t; c != null && seen.add(c); c = c.getCause()) {
+            if (sb.length() > 0) sb.append(" <- ");
+            sb.append(c.getClass().getSimpleName());
+            if (c.getMessage() != null) sb.append(": ").append(c.getMessage());
+        }
+        return sb.toString();
     }
 
     @Override
