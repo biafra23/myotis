@@ -154,6 +154,11 @@ public final class NodeService extends Service {
             long finalizedSlot,
             long executionBlockNumber,
             String executionBlockHashHex, // null until first finality update
+            // Sync-committee-period catch-up progress; all -1 until known. UI draws a
+            // determinate progress bar from (current - start) / (target - start).
+            long syncStartPeriod,
+            long syncCurrentPeriod,
+            long syncTargetPeriod,
             List<RLPxConnector.PeerInfo> readyPeerList) {}
 
     /** Result of a get-account query. Mirrors the JVM daemon's JSON response shape. */
@@ -991,6 +996,7 @@ public final class NodeService extends Service {
                     blacklistedNodeIds.size(), discv5Live, clPeersDiscovered.get(),
                     bs.state, bs.bootstrapped, bs.connected, bs.lc,
                     cachedClPeerCount, bs.finalizedSlot, bs.execBlockNum, bs.execBlockHashHex,
+                    bs.syncStartPeriod, bs.syncCurrentPeriod, bs.syncTargetPeriod,
                     List.of());
         }
         List<RLPxConnector.PeerInfo> active = connector.getActivePeers();
@@ -1012,12 +1018,18 @@ public final class NodeService extends Service {
                 blacklistedNodeIds.size(), discv5Live, clPeersDiscovered.get(),
                 bs.state, bs.bootstrapped, bs.connected, bs.lc,
                 cachedClPeerCount, bs.finalizedSlot, bs.execBlockNum, bs.execBlockHashHex,
+                bs.syncStartPeriod, bs.syncCurrentPeriod, bs.syncTargetPeriod,
                 ready);
     }
 
     /** Per-snapshot beacon view, computed once so the record fields stay consistent. */
     private record BeaconStats(String state, boolean bootstrapped, int connected, int lc,
-                               long finalizedSlot, long execBlockNum, String execBlockHashHex) {}
+                               long finalizedSlot, long execBlockNum, String execBlockHashHex,
+                               // Sync-committee-period catch-up progress (all -1 until known):
+                               // start = period catch-up began from, current = period the store
+                               // holds now, target = wall-clock period. Lets the UI draw a
+                               // determinate progress bar during CATCHING_UP.
+                               long syncStartPeriod, long syncCurrentPeriod, long syncTargetPeriod) {}
 
     private BeaconStats beaconStatsSnapshot() {
         BeaconLightClient blc = beaconLightClient;
@@ -1028,10 +1040,10 @@ public final class NodeService extends Service {
         // → misclassified sync state. Treat genesis-not-ready as still STARTING.
         long genesis = clGenesisTime;
         if (blc == null || bss == null) {
-            return new BeaconStats("STOPPED", false, 0, 0, 0L, 0L, null);
+            return new BeaconStats("STOPPED", false, 0, 0, 0L, 0L, null, -1, -1, -1);
         }
         if (genesis <= 0L) {
-            return new BeaconStats("STARTING", false, 0, 0, 0L, 0L, null);
+            return new BeaconStats("STARTING", false, 0, 0, 0L, 0L, null, -1, -1, -1);
         }
         List<BeaconP2PService.PeerInfo> peers = blc.getConnectedPeers();
         int lc = 0;
@@ -1048,7 +1060,10 @@ public final class NodeService extends Service {
                 lc,
                 bss.getFinalizedSlot(),
                 bss.getExecutionBlockNumber(),
-                execHashHex);
+                execHashHex,
+                bss.getCatchUpStartPeriod(),
+                bss.getCurrentSyncCommitteePeriod(),
+                com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec.currentPeriod(genesis));
     }
 
     private int countActiveBackoff() {

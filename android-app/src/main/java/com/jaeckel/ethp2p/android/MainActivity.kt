@@ -34,6 +34,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -203,6 +204,10 @@ private fun NodeScreen(
     }
 
     Column(Modifier.fillMaxSize()) {
+        // App-wide sync banner above the tabs: indeterminate while bootstrapping,
+        // determinate as the light client catches up sync-committee periods, gone
+        // once SYNCED.
+        SyncProgressBar(snapshot)
         TabRow(selectedTabIndex = selectedTab) {
             Tab(
                 selected = selectedTab == 0,
@@ -237,6 +242,48 @@ private fun NodeScreen(
                 serviceProvider = serviceProvider,
             )
             else -> LogsTab()
+        }
+    }
+}
+
+/**
+ * App-wide beacon sync banner, drawn above the tab bar. Hidden when the node is
+ * stopped or SYNCED. While catching up sync-committee periods it's a determinate
+ * bar `(current - start) / (target - start)`; while bootstrapping (no anchor yet)
+ * or during the brief post-catch-up state-root fill it's indeterminate.
+ */
+@Composable
+private fun SyncProgressBar(snapshot: NodeService.Snapshot?) {
+    val s = snapshot ?: return
+    if (!s.running || s.beaconState == "SYNCED" || s.beaconState == "STOPPED") return
+
+    val start = s.syncStartPeriod
+    val current = s.syncCurrentPeriod
+    val target = s.syncTargetPeriod
+    val determinate = s.beaconState == "CATCHING_UP" && start >= 0 && target > start
+
+    Column(Modifier.fillMaxWidth()) {
+        val label = when {
+            !determinate -> "Bootstrapping light client…"
+            current >= target -> "Finishing sync…"
+            else -> "Catching up sync committees — period $current / $target"
+        }
+        Text(
+            label,
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 4.dp),
+        )
+        if (determinate) {
+            val fraction = ((current - start).coerceAtLeast(0).toFloat() /
+                (target - start).toFloat()).coerceIn(0f, 1f)
+            LinearProgressIndicator(
+                progress = { fraction },
+                modifier = Modifier.fillMaxWidth(),
+            )
+        } else {
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
         }
     }
 }

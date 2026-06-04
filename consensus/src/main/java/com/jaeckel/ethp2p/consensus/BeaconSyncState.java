@@ -65,6 +65,12 @@ public class BeaconSyncState {
      *  path) and isn't transactional with the other execution-payload fields. */
     private volatile long currentSyncCommitteePeriod = 0L;
 
+    /** The first committee period observed once bootstrap completes — i.e. where catch-up
+     *  begins. Captured on the first {@link #setCurrentSyncCommitteePeriod} call and never
+     *  moved, so {@code (current - start) / (target - start)} is a stable progress fraction.
+     *  -1 until the first rotation is recorded. */
+    private volatile long catchUpStartPeriod = -1L;
+
     /** Rolling window of recently seen execution state roots from beacon headers. */
     private final ConcurrentLinkedDeque<SlottedStateRoot> knownStateRoots = new ConcurrentLinkedDeque<>();
 
@@ -214,7 +220,23 @@ public class BeaconSyncState {
      * {@code forceRotateIfPastPeriod}).
      */
     public void setCurrentSyncCommitteePeriod(long period) {
+        // Record where catch-up started the first time we learn a period (bootstrap
+        // completes), so a progress bar can compute a stable fraction. Use the lower of
+        // the two if called out of order, so the start can only move backwards.
+        if (catchUpStartPeriod < 0 || period < catchUpStartPeriod) {
+            catchUpStartPeriod = period;
+        }
         this.currentSyncCommitteePeriod = period;
+    }
+
+    /**
+     * The committee period catch-up started from (first observed period), or -1 if
+     * bootstrap hasn't recorded a period yet. With {@link #getCurrentSyncCommitteePeriod()}
+     * and {@link BeaconChainSpec#currentPeriod(long)} this gives a catch-up progress
+     * fraction: {@code (current - start) / (target - start)}.
+     */
+    public long getCatchUpStartPeriod() {
+        return catchUpStartPeriod;
     }
 
     /**
