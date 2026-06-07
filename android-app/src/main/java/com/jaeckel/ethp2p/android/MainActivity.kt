@@ -368,6 +368,7 @@ private fun StatusTab(
                 }
             } else {
                 item { StatusRow("uptime", formatUptime(now - s.startTimeMs)) }
+                item { Text("Execution layer (devp2p)", style = MaterialTheme.typography.titleSmall) }
                 item { StatusSummary(s) }
                 item { HorizontalDivider() }
                 item { Text("Beacon (consensus)", style = MaterialTheme.typography.titleSmall) }
@@ -978,8 +979,6 @@ private fun StatusSummary(s: NodeService.Snapshot) {
         StatusRow("dialing", s.attemptedPeers.toString())
         StatusRow("in backoff", s.backedOffPeers.toString())
         StatusRow("blacklisted", s.blacklistedPeers.toString())
-        StatusRow("discv5 peers", s.discv5Peers.toString())
-        StatusRow("CL peers (eth2)", s.clPeersDiscovered.toString())
     }
 }
 
@@ -988,6 +987,9 @@ private fun BeaconSummary(s: NodeService.Snapshot) {
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         StatusRow("state", s.beaconState)
         StatusRow("bootstrapped", s.beaconBootstrapped.toString())
+        // discv5 is the CL (eth2) discovery layer — belongs with the beacon stats.
+        StatusRow("discv5 peers", s.discv5Peers.toString())
+        StatusRow("CL peers (eth2)", s.clPeersDiscovered.toString())
         StatusRow("CL peers connected", s.clPeersConnected.toString())
         StatusRow("CL peers (light_client)", s.clPeersLightClient.toString())
         StatusRow("CL peers cached", s.clPeersCached.toString())
