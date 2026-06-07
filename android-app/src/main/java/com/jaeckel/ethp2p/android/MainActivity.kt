@@ -623,23 +623,25 @@ private fun EnsResolutionPanel(res: NodeService.EnsResolution) {
         StatusRow("name", res.name)
         StatusRow("resolved", res.addressHex ?: "—")
         if (res.blockNumber >= 0) StatusRow("at block #", res.blockNumber.toString())
-        // ENS resolution runs the ENS contracts in a local EVM over a snap
-        // peer's *head* state, which is proof-checked against that peer's
-        // claimed stateRoot but NOT anchored to a beacon-attested root. So the
-        // resolved address is peer-claimed, unlike the account result below
-        // (which reports its own beacon-verification). Flag that so the two
-        // aren't mistaken for the same trust level.
-        // Scope the caveat explicitly: it's the NAME→ADDRESS mapping that's
-        // peer-claimed, not the account state below — which carries its own
-        // "beacon-verified" line. Without this contrast the two read as a
-        // contradiction. Muted (onSurfaceVariant), not error red — it's a known
-        // limitation of the resolution step, not a failure.
-        Text(
-            "The name→address mapping is peer-claimed (not beacon-verified). "
-                + "The account state below is independently beacon-verified.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        // The trust level of the mapping depends on which state it resolved
+        // against (NodeService.ensResolutionRoot). AUTO (default) tries the
+        // beacon-verified finalized state first and only falls back to a peer's
+        // head when finalized yields no answer; resolving over finalized anchors
+        // the name→address mapping cryptographically (beaconVerified=true), while
+        // the head fallback is proof-checked against the peer's *claimed* root but
+        // not beacon-attested (peer-claimed). res.beaconVerified reports which
+        // path produced this result; show the matching line so it's never
+        // confused with the account state's own verification below.
+        if (res.beaconVerified) {
+            StatusRow("mapping", "beacon-verified")
+        } else {
+            Text(
+                "The name→address mapping is peer-claimed (not beacon-verified). "
+                    + "The account state below is independently beacon-verified.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         HorizontalDivider()
     }
 }

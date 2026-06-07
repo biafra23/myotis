@@ -301,23 +301,31 @@ Resolves an ENS name to an Ethereum address by running the ENS contracts in a lo
 | `resolved` | boolean | `true` if a non-zero address was returned, `false` if the name has no record set |
 | `name` | string | The queried name |
 | `address` | string | Resolved address (0x-prefixed, only if `resolved=true`) |
+| `beaconVerified` | boolean | `true` when resolution ran against the beacon-verified finalized state (the default), so the name→address mapping is anchored to a beacon-attested root |
 | `blockNumber` | long | Execution block at which the resolution was performed |
 
 **How it works:**
 
-1. The daemon picks a snap-capable peer and fetches a fresh chain head — the `stateRoot` and the proofs that descend from it stay consistent for the whole call.
-2. A local EVM (Hyperledger Besu's standalone EVM module) executes a single `resolve(bytes name, bytes data)` call to the ENS Universal Resolver. Every account field, storage slot, and contract bytecode the EVM reads is fetched on demand via snap/1 and verified by Merkle-Patricia proof against the peer's `stateRoot`.
+1. By default (AUTO) the daemon resolves against the light client's **beacon-verified finalized** execution state root first — no peer-head probe. Only if that yields no address (the record didn't exist at the finalized block) or can't be served does it fall back to a peer's head. (See *Resolution root* below.) A snap-capable peer serves the state; the proofs descend from the chosen `stateRoot`.
+2. A local EVM (Hyperledger Besu's standalone EVM module) executes a single `resolve(bytes name, bytes data)` call to the ENS Universal Resolver. Every account field, storage slot, and contract bytecode the EVM reads is fetched on demand via snap/1 and verified by Merkle-Patricia proof against that `stateRoot`.
 3. If the call reverts with `OffchainLookup` (ERC-3668), the daemon fetches the gateway response over HTTPS and re-enters the EVM with the resolver's callback. The callback validates the gateway's response on-chain — typically by checking a signer's signature against a list of trusted signers embedded in the resolver — so a malicious gateway cannot inject a wrong answer.
 4. The Universal Resolver's return value is decoded as the resolved address.
 
+**Resolution root (trust vs freshness):**
+
+The state ENS executes against is configurable via `io.myotis.ens.EnsResolutionRoot`:
+
+- **`AUTO` (default)** — resolve against the beacon-verified finalized state first; if that yields no address (the record didn't exist at the finalized block — e.g. a name registered or an `addr()` first set in the last ~12 min) or errors (a snap peer doesn't retain that block's state), fall back to the peer head. You get a beacon-verified mapping (`beaconVerified=true`) whenever one exists, and brand-new names still resolve (`beaconVerified=false`, peer-claimed). A record that *changed* in the last ~12 min resolves to its verified-but-stale finalized value (staleness, not a failure) — AUTO only falls back when finalized returns *no* address.
+- **`FINALIZED`** — finalized state only; no fallback. Always `beaconVerified=true`, but brand-new names return "does not resolve."
+- **`PEER_HEAD`** — resolve against a snap peer's latest head state. Freshest possible data, but the head root is the peer's *claim*, not beacon-attested, so the mapping is peer-claimed (`beaconVerified=false`). Choose this when you need the very latest ENS state and accept the weaker trust. (On Android, set via `NodeService.setEnsResolutionRoot(...)`.)
+
 **Trust model:**
 
-- **State**: every read backed by a Merkle proof against the verified `stateRoot`.
+- **State**: every read backed by a Merkle proof against the `stateRoot` — beacon-verified in `FINALIZED` mode.
 - **Bytecode**: verified by `keccak256(code) == codeHash` from the proof-verified account.
 - **CCIP-Read gateways**: trusted only for *availability* — the resolver's callback validates the response cryptographically. A lying gateway causes the call to revert, surfacing as a clean failure.
-- The `blockNumber` field is the peer's recent head, not necessarily a beacon-finalized block. The data is always cryptographically backed by a real on-chain `stateRoot`, but unlike `get-account` / `get-storage` there is no separate beacon-chain anchor field returned with the resolution. (The same beacon-anchoring that backs SNAP queries applies; it is just not surfaced per-call.)
 
-The same trust model applies to every other `resolve-ens-*` command.
+The same trust model and resolution root apply to every other `resolve-ens-*` command.
 
 **Networks:** mainnet, sepolia, and holesky have canonical Registry + Universal Resolver addresses pinned. Other networks fail with `ENS not pinned for chain id …`.
 

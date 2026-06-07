@@ -485,33 +485,85 @@ public final class NodeService extends Service {
         return false;
     }
 
-    /** Outcome of an ENS forward resolution. {@code addressHex} null if unresolved. */
-    public record EnsResolution(String name, String addressHex, long blockNumber, String error) {}
+    /**
+     * Outcome of an ENS forward resolution. {@code addressHex} null if unresolved.
+     * {@code beaconVerified} is true when the resolution ran against the
+     * beacon-verified finalized state (default), so the name→address mapping is
+     * cryptographically anchored; false in PEER_HEAD mode (peer-claimed mapping).
+     */
+    public record EnsResolution(String name, String addressHex, long blockNumber,
+                                boolean beaconVerified, String error) {}
+
+    /**
+     * Which state ENS resolution runs against. Defaults to the beacon-verified
+     * finalized root so resolved mappings are verified end-to-end; switch to
+     * {@link io.myotis.ens.EnsResolutionRoot#PEER_HEAD} for freshest (unverified)
+     * data. Library consumers can override via {@link #setEnsResolutionRoot}.
+     */
+    private volatile io.myotis.ens.EnsResolutionRoot ensResolutionRoot =
+            io.myotis.ens.EnsResolutionRoot.AUTO;
+
+    public void setEnsResolutionRoot(io.myotis.ens.EnsResolutionRoot root) {
+        if (root != null) this.ensResolutionRoot = root;
+    }
+
+    public io.myotis.ens.EnsResolutionRoot getEnsResolutionRoot() {
+        return ensResolutionRoot;
+    }
 
     /**
      * Resolve an ENS name to an address by running the ENS contracts in a local
      * Besu EVM over SNAP-verified state — the same stack as the JVM daemon's
      * {@code resolve-ens}. Never throws; failures come back in
      * {@link EnsResolution#error}.
+     *
+     * <p>In {@link io.myotis.ens.EnsResolutionRoot#AUTO} (default) we resolve
+     * against the beacon-verified finalized state first; only if that yields no
+     * address (record not yet in finalized state) or errors do we fall back to
+     * the peer head (returned marked unverified). See {@link EnsResolutionRoot}.
      */
     @SuppressLint("NewApi") // CompletableFuture.orTimeout — see requestAccount
     public CompletableFuture<EnsResolution> resolveEns(String name) {
         final String trimmed = name == null ? "" : name.trim();
         if (!RUNNING.get() || connector == null) {
             return CompletableFuture.completedFuture(
-                    new EnsResolution(trimmed, null, -1, "node not running"));
+                    new EnsResolution(trimmed, null, -1, false, "node not running"));
         }
         if (trimmed.isEmpty()) {
             return CompletableFuture.completedFuture(
-                    new EnsResolution(trimmed, null, -1, "empty name"));
+                    new EnsResolution(trimmed, null, -1, false, "empty name"));
         }
+        io.myotis.ens.EnsResolutionRoot mode = ensResolutionRoot;
+        if (mode == io.myotis.ens.EnsResolutionRoot.AUTO) {
+            return attemptResolve(trimmed, io.myotis.ens.EnsResolutionRoot.FINALIZED)
+                    .thenCompose(fin -> {
+                        // Verified hit → done. Otherwise (no record at the
+                        // finalized block, or finalized couldn't be served) fall
+                        // back to the peer head for a fresher, peer-claimed answer.
+                        if (fin.addressHex() != null) {
+                            return CompletableFuture.completedFuture(fin);
+                        }
+                        return attemptResolve(trimmed, io.myotis.ens.EnsResolutionRoot.PEER_HEAD);
+                    });
+        }
+        return attemptResolve(trimmed, mode);
+    }
+
+    /** One resolution attempt against a specific root. Never throws. */
+    @SuppressLint("NewApi")
+    private CompletableFuture<EnsResolution> attemptResolve(String trimmed,
+                                                            io.myotis.ens.EnsResolutionRoot root) {
         final EnsCall call;
         try {
-            call = prepareEnsCall();
+            call = prepareEnsCall(root);
         } catch (Exception e) {
+            // FINALIZED can throw (no finalized header yet, snap peer can't serve
+            // the block). Return a null-address result so AUTO can fall back.
             return CompletableFuture.completedFuture(
-                    new EnsResolution(trimmed, null, -1, unwrap(e)));
+                    new EnsResolution(trimmed, null, -1,
+                            root == io.myotis.ens.EnsResolutionRoot.FINALIZED, unwrap(e)));
         }
+        final boolean verified = call.beaconVerified();
         return call.resolver().resolveAddress(trimmed, call.blockCtx())
                 .orTimeout(ENS_TIMEOUT_SEC, TimeUnit.SECONDS)
                 .handle((opt, ex) -> {
@@ -520,76 +572,125 @@ public final class NodeService extends Service {
                         // IllegalStateException(className)) mask the real
                         // Android-incompat cause, which unwrap() now chains.
                         LogBuffer.e(TAG, "[ens] resolveAddress failed for " + trimmed, ex);
-                        return new EnsResolution(trimmed, null, call.blockNumber(), unwrap(ex));
+                        return new EnsResolution(trimmed, null, call.blockNumber(), verified, unwrap(ex));
                     }
                     if (opt == null || opt.isEmpty()) {
-                        return new EnsResolution(trimmed, null, call.blockNumber(),
+                        return new EnsResolution(trimmed, null, call.blockNumber(), verified,
                                 "name does not resolve");
                     }
-                    return new EnsResolution(trimmed, opt.get().toHex(), call.blockNumber(), null);
+                    return new EnsResolution(trimmed, opt.get().toHex(), call.blockNumber(), verified, null);
                 });
     }
 
     private record EnsCall(io.myotis.ens.EnsResolver resolver,
                            io.myotis.evm.BlockContext blockCtx,
-                           long blockNumber) {}
+                           long blockNumber,
+                           boolean beaconVerified) {}
 
     /**
-     * Build the EVM/ENS stack pinned to one fresh snap peer. Mirrors
-     * {@code CommandHandler.prepareEnsCall}. Blocking (probes peer heads with a
-     * 10s budget) — call off the UI thread.
+     * Build the EVM/ENS stack. The {@code root} selects which state the ENS
+     * contracts run against — see {@link io.myotis.ens.EnsResolutionRoot}:
+     * FINALIZED (default) anchors resolution to the light client's
+     * beacon-verified finalized state (verified mapping, no head probe);
+     * PEER_HEAD uses a snap peer's latest head (freshest, but peer-claimed).
+     * Mirrors {@code CommandHandler.prepareEnsCall}. Blocking — call off the UI thread.
      */
-    private EnsCall prepareEnsCall() throws Exception {
+    private EnsCall prepareEnsCall(io.myotis.ens.EnsResolutionRoot root) throws Exception {
         RLPxConnector conn = connector;
         if (conn == null) throw new IllegalStateException("node not running");
         List<com.jaeckel.ethp2p.networking.eth.EthHandler> snapPeers = conn.activeSnapHandlers();
         if (snapPeers.isEmpty()) {
             throw new IllegalStateException("No active peer with snap/1 support");
         }
-        long minSensibleHead = conn.getNetwork().minSensibleHeadBlock();
-        List<CompletableFuture<com.jaeckel.ethp2p.core.types.BlockHeader>> probes =
-                new ArrayList<>(snapPeers.size());
-        List<CompletableFuture<Void>> safe = new ArrayList<>(snapPeers.size());
-        for (com.jaeckel.ethp2p.networking.eth.EthHandler peer : snapPeers) {
-            CompletableFuture<com.jaeckel.ethp2p.core.types.BlockHeader> f =
-                    peer.requestFreshHeadHeaderAsync();
-            probes.add(f);
-            safe.add(f.handle((v, ex) -> null));
-        }
-        try {
-            CompletableFuture.allOf(safe.toArray(new CompletableFuture<?>[0]))
-                    .get(10, TimeUnit.SECONDS);
-        } catch (Exception ignore) {
-            for (CompletableFuture<com.jaeckel.ethp2p.core.types.BlockHeader> p : probes) {
-                if (!p.isDone()) p.cancel(true);
+
+        io.myotis.evm.BlockContext blockCtx;
+        long blockNumber;
+        boolean verified;
+        com.jaeckel.ethp2p.networking.eth.EthHandler pinned;
+
+        if (root == io.myotis.ens.EnsResolutionRoot.FINALIZED) {
+            // Resolve against the beacon-verified finalized execution header — the
+            // resulting name→address mapping is anchored to a beacon-attested root
+            // (snap proofs verify against it). ~12 min stale (finality lag). A snap
+            // peer must still retain that block's state, which they often DON'T
+            // (Geth prunes trie state beyond ~128 blocks and serves snap from a
+            // flat layer lagging the head). So we don't blindly pin a peer — we
+            // probe each one for the finalized root and pin the first that actually
+            // serves it. If none do, we throw and AUTO falls back to the head.
+            com.jaeckel.ethp2p.consensus.BeaconLightClient blc = beaconLightClient;
+            if (blc == null) throw new IllegalStateException("beacon light client not running");
+            com.jaeckel.ethp2p.consensus.types.LightClientHeader fin = blc.getStore().getFinalizedHeader();
+            if (fin == null) throw new IllegalStateException("no beacon-verified finalized header yet");
+            com.jaeckel.ethp2p.consensus.types.ExecutionPayloadHeader exec = fin.execution();
+            org.apache.tuweni.bytes.Bytes32 finRoot =
+                    org.apache.tuweni.bytes.Bytes32.wrap(exec.stateRoot());
+            pinned = firstPeerServing(snapPeers, finRoot);
+            if (pinned == null) {
+                throw new IllegalStateException(
+                        "no snap peer retains the beacon-finalized state (block #"
+                        + exec.blockNumber() + ")");
             }
-        }
-        com.jaeckel.ethp2p.networking.eth.EthHandler pinned = null;
-        com.jaeckel.ethp2p.core.types.BlockHeader header = null;
-        for (int i = 0; i < snapPeers.size(); i++) {
-            CompletableFuture<com.jaeckel.ethp2p.core.types.BlockHeader> p = probes.get(i);
-            if (!p.isDone() || p.isCompletedExceptionally()) continue;
-            com.jaeckel.ethp2p.core.types.BlockHeader fresh = p.join();
-            if (fresh.number < minSensibleHead) continue;
-            pinned = snapPeers.get(i);
-            header = fresh;
-            break;
-        }
-        if (pinned == null || header == null) {
-            throw new IllegalStateException("No snap peer returned a usable fresh head");
+            blockCtx = new io.myotis.evm.BlockContext(
+                    exec.stateRoot(),
+                    exec.blockNumber(),
+                    exec.timestamp(),
+                    leUint256ToBigInteger(exec.baseFeePerGas()),
+                    io.myotis.evm.Address.of(exec.feeRecipient()),
+                    exec.prevRandao(),
+                    java.math.BigInteger.valueOf(conn.getNetwork().networkId()),
+                    exec.gasLimit());
+            blockNumber = exec.blockNumber();
+            verified = true;
+        } else {
+            // PEER_HEAD: each peer's bleeding-edge head root is frequently NOT yet
+            // snap-servable (the flat state lags the head). Walk every peer: fetch
+            // its fresh head, then PROBE that the peer actually serves a snap
+            // account at that root before pinning it — the same resilience
+            // get-account gets by retrying across peers. The first peer that passes
+            // both is pinned for the whole resolution (one consistent root).
+            long minSensibleHead = conn.getNetwork().minSensibleHeadBlock();
+            com.jaeckel.ethp2p.networking.eth.EthHandler headPeer = null;
+            com.jaeckel.ethp2p.core.types.BlockHeader header = null;
+            String lastError = null;
+            for (com.jaeckel.ethp2p.networking.eth.EthHandler peer : snapPeers) {
+                if (!peer.isReady() || peer.isSnapServingFailed()) continue;
+                try {
+                    com.jaeckel.ethp2p.core.types.BlockHeader fresh =
+                            peer.requestFreshHeadHeaderAsync().get(6, TimeUnit.SECONDS);
+                    if (fresh.number < minSensibleHead) {
+                        lastError = "stale head #" + fresh.number;
+                        continue;
+                    }
+                    if (!servesRoot(peer, fresh.stateRoot)) {
+                        lastError = "peer does not snap-serve head root (block #" + fresh.number + ")";
+                        continue;
+                    }
+                    headPeer = peer;
+                    header = fresh;
+                    break;
+                } catch (Exception e) {
+                    lastError = unwrap(e);
+                }
+            }
+            if (headPeer == null || header == null) {
+                throw new IllegalStateException("No snap peer served a fresh head root for ENS"
+                        + (lastError != null ? " (" + lastError + ")" : ""));
+            }
+            blockCtx = new io.myotis.evm.BlockContext(
+                    header.stateRoot.toArrayUnsafe(),
+                    header.number,
+                    header.timestamp,
+                    header.baseFeePerGas,
+                    io.myotis.evm.Address.of(header.beneficiary.toArrayUnsafe()),
+                    header.mixHashOrPrevRandao.toArrayUnsafe(),
+                    java.math.BigInteger.valueOf(conn.getNetwork().networkId()),
+                    header.gasLimit);
+            blockNumber = header.number;
+            verified = false;
+            pinned = headPeer;
         }
 
-        io.myotis.evm.BlockContext blockCtx = new io.myotis.evm.BlockContext(
-                header.stateRoot.toArrayUnsafe(),
-                header.number,
-                header.timestamp,
-                header.baseFeePerGas,
-                io.myotis.evm.Address.of(header.beneficiary.toArrayUnsafe()),
-                header.mixHashOrPrevRandao.toArrayUnsafe(),
-                java.math.BigInteger.valueOf(conn.getNetwork().networkId()),
-                header.gasLimit);
-
-        // Pin every SNAP request to the peer that served this stateRoot.
+        // Pin every SNAP request to the chosen peer (serves blockCtx's stateRoot).
         final com.jaeckel.ethp2p.networking.eth.EthHandler finalPeer = pinned;
         io.myotis.evm.world.SnapBackedStateOracle oracle =
                 new io.myotis.evm.world.SnapBackedStateOracle(
@@ -608,7 +709,48 @@ public final class NodeService extends Service {
                 new io.myotis.evm.CcipReadEvmExecutor(prefetching, ccip);
         io.myotis.ens.EnsResolver resolver =
                 io.myotis.ens.EnsResolver.forChainId(executor, conn.getNetwork().networkId());
-        return new EnsCall(resolver, blockCtx, header.number);
+        return new EnsCall(resolver, blockCtx, blockNumber, verified);
+    }
+
+    /**
+     * Probe account used only to confirm a peer can actually serve snap state at a
+     * given root before we pin it for a whole ENS resolution. The beacon deposit
+     * contract is present in every post-Merge state, so a non-empty proof for it
+     * means the peer retains that root's trie.
+     */
+    private static final org.apache.tuweni.bytes.Bytes32 SNAP_PROBE_ACCOUNT_HASH =
+            org.apache.tuweni.crypto.Hash.keccak256(
+                    org.apache.tuweni.bytes.Bytes.fromHexString("0x00000000219ab540356cBB839Cbe05303d7705Fa"));
+
+    /** First ready snap peer that returns a non-empty account proof at {@code root}, or null. */
+    private com.jaeckel.ethp2p.networking.eth.EthHandler firstPeerServing(
+            List<com.jaeckel.ethp2p.networking.eth.EthHandler> peers,
+            org.apache.tuweni.bytes.Bytes32 root) {
+        for (com.jaeckel.ethp2p.networking.eth.EthHandler peer : peers) {
+            if (peer.isReady() && !peer.isSnapServingFailed() && servesRoot(peer, root)) {
+                return peer;
+            }
+        }
+        return null;
+    }
+
+    /** True if this peer returns a non-empty account proof for the probe account at {@code root}. */
+    private boolean servesRoot(com.jaeckel.ethp2p.networking.eth.EthHandler peer,
+                               org.apache.tuweni.bytes.Bytes32 root) {
+        try {
+            com.jaeckel.ethp2p.networking.snap.messages.AccountRangeMessage.DecodeResult r =
+                    peer.requestAccountByHashAsync(SNAP_PROBE_ACCOUNT_HASH, root).get(10, TimeUnit.SECONDS);
+            return r.proof() != null && !r.proof().isEmpty();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Convert an SSZ uint256 (32-byte little-endian) to a non-negative BigInteger. */
+    private static java.math.BigInteger leUint256ToBigInteger(byte[] le) {
+        byte[] be = new byte[le.length];
+        for (int i = 0; i < le.length; i++) be[i] = le[le.length - 1 - i];
+        return new java.math.BigInteger(1, be);
     }
 
     /**
