@@ -51,6 +51,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -189,6 +190,85 @@ private fun NodeScreen(
     var selectedTab by remember { mutableStateOf(0) }
     val online = rememberIsOnline()
 
+    // Query-tab state is hoisted here, NOT inside QueryTab, so it survives
+    // switching tabs. QueryTab leaves the composition whenever another tab is
+    // selected, which would otherwise discard the result and cancel the
+    // in-flight query (its rememberCoroutineScope dies with it). NodeScreen
+    // stays composed across tab switches, so both the state and the coroutine
+    // launched from queryScope outlive navigating away and back.
+    var queryInput by rememberSaveable { mutableStateOf("") }
+    var queryState by remember { mutableStateOf<QueryState>(QueryState.Idle) }
+    var queryHistory by remember { mutableStateOf<List<AndroidQueryHistory.Entry>>(emptyList()) }
+    val queryScope = rememberCoroutineScope()
+
+    // Load persisted query history once the service is bound / running flips.
+    LaunchedEffect(running) {
+        val svc = serviceProvider() ?: return@LaunchedEffect
+        queryHistory = withContext(Dispatchers.IO) { svc.queryHistory().list() }
+    }
+
+    // Shared by the button and by tapping a history entry. One text input
+    // handles both addresses and ENS names: if it doesn't look like a 40-hex
+    // address we resolve it via ENS first, then look up the resolved address.
+    // Runs on queryScope (NodeScreen-scoped) so leaving the Query tab mid-query
+    // doesn't cancel it.
+    fun runQuery(raw: String) {
+        val svc = serviceProvider()
+        if (svc == null) {
+            queryState = QueryState.Failure("Service not bound")
+            return
+        }
+        val q = raw.trim()
+        if (q.isEmpty()) return
+        queryInput = q
+        queryState = QueryState.Loading
+        queryScope.launch {
+            // Bounce blocking work off to IO (snap-peer + EVM futures, sub-second
+            // happy path, up to ~60s on retry); keep the main dispatcher free.
+            // For ENS we update state between the two phases so the resolved
+            // address shows immediately, then the verified account fills in.
+            val outcome: QueryState = try {
+                if (NodeService.looksLikeEnsName(q)) {
+                    val res = withContext(Dispatchers.IO) { svc.resolveEns(q).await() }
+                    if (res.error != null || res.addressHex == null) {
+                        QueryState.Failure("ENS: ${res.error ?: "name does not resolve"}")
+                    } else {
+                        // Show the address now; verify the account next. If the
+                        // account phase fails, keep the resolved address visible.
+                        queryState = QueryState.ResolvedPendingAccount(res)
+                        try {
+                            QueryState.Success(
+                                withContext(Dispatchers.IO) { svc.requestAccount(res.addressHex).await() }, res)
+                        } catch (t: Throwable) {
+                            QueryState.ResolvedAccountFailed(
+                                res, t.cause?.message ?: t.message ?: t::class.java.simpleName)
+                        }
+                    }
+                } else {
+                    QueryState.Success(
+                        withContext(Dispatchers.IO) { svc.requestAccount(q).await() }, null)
+                }
+            } catch (t: Throwable) {
+                QueryState.Failure(t.cause?.message ?: t.message ?: t::class.java.simpleName)
+            }
+            queryState = outcome
+            // Record history when the query produced a usable result — a verified
+            // account, or at least a resolved address (even if the account lookup
+            // then failed). The resolution is the expensive part worth remembering.
+            val histLabel: String? = when (outcome) {
+                is QueryState.Success -> outcome.resolution?.addressHex ?: ""
+                is QueryState.ResolvedAccountFailed -> outcome.resolution.addressHex ?: ""
+                else -> null
+            }
+            if (histLabel != null) {
+                queryHistory = withContext(Dispatchers.IO) {
+                    svc.queryHistory().add(q, histLabel)
+                    svc.queryHistory().list()
+                }
+            }
+        }
+    }
+
     LaunchedEffect(Unit) {
         while (isActive) {
             // snapshot() walks the connector's active handler list, sorts
@@ -246,7 +326,20 @@ private fun NodeScreen(
             1 -> QueryTab(
                 snapshot = snapshot,
                 running = running,
-                serviceProvider = serviceProvider,
+                input = queryInput,
+                onInputChange = { queryInput = it },
+                state = queryState,
+                history = queryHistory,
+                onRunQuery = { runQuery(it) },
+                onClearHistory = {
+                    val svc = serviceProvider()
+                    if (svc != null) queryScope.launch {
+                        queryHistory = withContext(Dispatchers.IO) {
+                            svc.queryHistory().clear()
+                            svc.queryHistory().list()
+                        }
+                    }
+                },
             )
             else -> LogsTab()
         }
@@ -412,81 +505,13 @@ private sealed interface QueryState {
 private fun QueryTab(
     snapshot: NodeService.Snapshot?,
     running: Boolean,
-    serviceProvider: () -> NodeService?,
+    input: String,
+    onInputChange: (String) -> Unit,
+    state: QueryState,
+    history: List<AndroidQueryHistory.Entry>,
+    onRunQuery: (String) -> Unit,
+    onClearHistory: () -> Unit,
 ) {
-    var input by remember { mutableStateOf("") }
-    var state by remember { mutableStateOf<QueryState>(QueryState.Idle) }
-    var history by remember {
-        mutableStateOf<List<AndroidQueryHistory.Entry>>(emptyList())
-    }
-    val scope = rememberCoroutineScope()
-
-    // Load persisted history once the service is bound.
-    LaunchedEffect(running) {
-        val svc = serviceProvider() ?: return@LaunchedEffect
-        history = withContext(Dispatchers.IO) { svc.queryHistory().list() }
-    }
-
-    // Shared by the button and by tapping a history entry. One text input
-    // handles both addresses and ENS names: if it doesn't look like a 40-hex
-    // address we resolve it via ENS first, then look up the resolved address.
-    fun runQuery(raw: String) {
-        val svc = serviceProvider()
-        if (svc == null) {
-            state = QueryState.Failure("Service not bound")
-            return
-        }
-        val q = raw.trim()
-        if (q.isEmpty()) return
-        input = q
-        state = QueryState.Loading
-        scope.launch {
-            // Bounce blocking work off to IO (snap-peer + EVM futures, sub-second
-            // happy path, up to ~60s on retry); keep the main dispatcher free.
-            // For ENS we update `state` between the two phases so the resolved
-            // address shows immediately, then the verified account fills in.
-            val outcome: QueryState = try {
-                if (NodeService.looksLikeEnsName(q)) {
-                    val res = withContext(Dispatchers.IO) { svc.resolveEns(q).await() }
-                    if (res.error != null || res.addressHex == null) {
-                        QueryState.Failure("ENS: ${res.error ?: "name does not resolve"}")
-                    } else {
-                        // Show the address now; verify the account next. If the
-                        // account phase fails, keep the resolved address visible.
-                        state = QueryState.ResolvedPendingAccount(res)
-                        try {
-                            QueryState.Success(
-                                withContext(Dispatchers.IO) { svc.requestAccount(res.addressHex).await() }, res)
-                        } catch (t: Throwable) {
-                            QueryState.ResolvedAccountFailed(
-                                res, t.cause?.message ?: t.message ?: t::class.java.simpleName)
-                        }
-                    }
-                } else {
-                    QueryState.Success(
-                        withContext(Dispatchers.IO) { svc.requestAccount(q).await() }, null)
-                }
-            } catch (t: Throwable) {
-                QueryState.Failure(t.cause?.message ?: t.message ?: t::class.java.simpleName)
-            }
-            state = outcome
-            // Record history when the query produced a usable result — a verified
-            // account, or at least a resolved address (even if the account lookup
-            // then failed). The resolution is the expensive part worth remembering.
-            val histLabel: String? = when (outcome) {
-                is QueryState.Success -> outcome.resolution?.addressHex ?: ""
-                is QueryState.ResolvedAccountFailed -> outcome.resolution.addressHex ?: ""
-                else -> null
-            }
-            if (histLabel != null) {
-                history = withContext(Dispatchers.IO) {
-                    svc.queryHistory().add(q, histLabel)
-                    svc.queryHistory().list()
-                }
-            }
-        }
-    }
-
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -523,7 +548,7 @@ private fun QueryTab(
         item {
             OutlinedTextField(
                 value = input,
-                onValueChange = { input = it },
+                onValueChange = onInputChange,
                 label = { Text("Address or ENS name") },
                 placeholder = { Text("0x… or vitalik.eth") },
                 singleLine = true,
@@ -534,7 +559,7 @@ private fun QueryTab(
 
         item {
             Button(
-                onClick = { runQuery(input) },
+                onClick = { onRunQuery(input) },
                 enabled = running && input.isNotBlank() && state !is QueryState.Loading,
                 modifier = Modifier.fillMaxWidth()
             ) {
@@ -568,22 +593,14 @@ private fun QueryTab(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text("Recent", style = MaterialTheme.typography.titleSmall)
-                    OutlinedButton(onClick = {
-                        val svc = serviceProvider() ?: return@OutlinedButton
-                        scope.launch {
-                            history = withContext(Dispatchers.IO) {
-                                svc.queryHistory().clear()
-                                svc.queryHistory().list()
-                            }
-                        }
-                    }) { Text("Clear") }
+                    OutlinedButton(onClick = onClearHistory) { Text("Clear") }
                 }
             }
             items(history) { entry ->
                 HistoryRow(
                     entry = entry,
                     enabled = running && state !is QueryState.Loading,
-                    onClick = { runQuery(entry.input) },
+                    onClick = { onRunQuery(entry.input) },
                 )
             }
         }
