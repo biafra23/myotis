@@ -387,10 +387,23 @@ private fun StatusTab(
 private sealed interface QueryState {
     data object Idle : QueryState
     data object Loading : QueryState
+    // ENS resolved → show the address right away while the (separate, fast)
+    // account lookup + beacon verification runs. Resolution is the slow part of
+    // an ENS query; the account verify is a cheap state-root match, so surfacing
+    // the address first makes the query feel responsive.
+    data class ResolvedPendingAccount(
+        val resolution: NodeService.EnsResolution,
+    ) : QueryState
     data class Success(
         val result: NodeService.AccountQueryResult,
         // Non-null when the input was an ENS name we resolved first.
         val resolution: NodeService.EnsResolution?,
+    ) : QueryState
+    // Resolution succeeded but the account lookup/verification failed — keep the
+    // resolved address on screen (it's still useful) rather than discarding it.
+    data class ResolvedAccountFailed(
+        val resolution: NodeService.EnsResolution,
+        val message: String,
     ) : QueryState
     data class Failure(val message: String) : QueryState
 }
@@ -428,30 +441,46 @@ private fun QueryTab(
         input = q
         state = QueryState.Loading
         scope.launch {
-            // Bounce off the IO dispatcher: resolveEns/requestAccount block on
-            // snap-peer + EVM futures internally (sub-second happy path, up to
-            // ~60s on retry); keep the main dispatcher free.
+            // Bounce blocking work off to IO (snap-peer + EVM futures, sub-second
+            // happy path, up to ~60s on retry); keep the main dispatcher free.
+            // For ENS we update `state` between the two phases so the resolved
+            // address shows immediately, then the verified account fills in.
             val outcome: QueryState = try {
-                withContext(Dispatchers.IO) {
-                    if (NodeService.looksLikeEnsName(q)) {
-                        val res = svc.resolveEns(q).await()
-                        if (res.error != null || res.addressHex == null) {
-                            QueryState.Failure("ENS: ${res.error ?: "name does not resolve"}")
-                        } else {
-                            QueryState.Success(svc.requestAccount(res.addressHex).await(), res)
-                        }
+                if (NodeService.looksLikeEnsName(q)) {
+                    val res = withContext(Dispatchers.IO) { svc.resolveEns(q).await() }
+                    if (res.error != null || res.addressHex == null) {
+                        QueryState.Failure("ENS: ${res.error ?: "name does not resolve"}")
                     } else {
-                        QueryState.Success(svc.requestAccount(q).await(), null)
+                        // Show the address now; verify the account next. If the
+                        // account phase fails, keep the resolved address visible.
+                        state = QueryState.ResolvedPendingAccount(res)
+                        try {
+                            QueryState.Success(
+                                withContext(Dispatchers.IO) { svc.requestAccount(res.addressHex).await() }, res)
+                        } catch (t: Throwable) {
+                            QueryState.ResolvedAccountFailed(
+                                res, t.cause?.message ?: t.message ?: t::class.java.simpleName)
+                        }
                     }
+                } else {
+                    QueryState.Success(
+                        withContext(Dispatchers.IO) { svc.requestAccount(q).await() }, null)
                 }
             } catch (t: Throwable) {
                 QueryState.Failure(t.cause?.message ?: t.message ?: t::class.java.simpleName)
             }
             state = outcome
-            if (outcome is QueryState.Success) {
-                val label = outcome.resolution?.addressHex ?: ""
+            // Record history when the query produced a usable result — a verified
+            // account, or at least a resolved address (even if the account lookup
+            // then failed). The resolution is the expensive part worth remembering.
+            val histLabel: String? = when (outcome) {
+                is QueryState.Success -> outcome.resolution?.addressHex ?: ""
+                is QueryState.ResolvedAccountFailed -> outcome.resolution.addressHex ?: ""
+                else -> null
+            }
+            if (histLabel != null) {
                 history = withContext(Dispatchers.IO) {
-                    svc.queryHistory().add(q, label)
+                    svc.queryHistory().add(q, histLabel)
                     svc.queryHistory().list()
                 }
             }
@@ -515,10 +544,18 @@ private fun QueryTab(
 
         when (val st = state) {
             is QueryState.Idle -> { /* nothing */ }
-            is QueryState.Loading -> item { LoadingRow() }
+            is QueryState.Loading -> item { LoadingRow("Resolving…") }
+            is QueryState.ResolvedPendingAccount -> {
+                item { EnsResolutionPanel(st.resolution) }
+                item { LoadingRow("Verifying account…") }
+            }
             is QueryState.Success -> {
                 st.resolution?.let { item { EnsResolutionPanel(it) } }
                 item { AccountResultPanel(st.result) }
+            }
+            is QueryState.ResolvedAccountFailed -> {
+                item { EnsResolutionPanel(st.resolution) }
+                item { ErrorPanel("Account lookup failed: ${st.message}") }
             }
             is QueryState.Failure -> item { ErrorPanel(st.message) }
         }
@@ -592,10 +629,16 @@ private fun EnsResolutionPanel(res: NodeService.EnsResolution) {
         // resolved address is peer-claimed, unlike the account result below
         // (which reports its own beacon-verification). Flag that so the two
         // aren't mistaken for the same trust level.
+        // Scope the caveat explicitly: it's the NAME→ADDRESS mapping that's
+        // peer-claimed, not the account state below — which carries its own
+        // "beacon-verified" line. Without this contrast the two read as a
+        // contradiction. Muted (onSurfaceVariant), not error red — it's a known
+        // limitation of the resolution step, not a failure.
         Text(
-            "Peer-claimed — the name→address mapping is not beacon-verified.",
+            "The name→address mapping is peer-claimed (not beacon-verified). "
+                + "The account state below is independently beacon-verified.",
             style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.error,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         HorizontalDivider()
     }
@@ -764,7 +807,7 @@ private fun formatLogs(entries: List<LogBuffer.Entry>): String = buildString {
 }
 
 @Composable
-private fun LoadingRow() {
+private fun LoadingRow(message: String = "Querying snap peer…") {
     Row(
         Modifier.fillMaxWidth(),
         verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
@@ -772,7 +815,7 @@ private fun LoadingRow() {
     ) {
         CircularProgressIndicator(modifier = Modifier.height(20.dp))
         Spacer(Modifier.height(4.dp))
-        Text("Querying snap peer…", fontSize = 13.sp)
+        Text(message, fontSize = 13.sp)
     }
 }
 
