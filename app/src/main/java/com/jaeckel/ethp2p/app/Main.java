@@ -298,6 +298,10 @@ public final class Main {
 
         // 6. discv4 discovery
         DiscV4Service discV4 = new DiscV4Service(nodeKey, mergedBootnodes, entry -> {
+            // Pause acquiring NEW peers while an ENS resolution is running: its
+            // snap round-trips share the event loop with outbound dials, and a
+            // dial burst inflates resolution latency. Existing peers stay.
+            if (connector.isSnapHeavy()) return;
             if (entry.tcpPort() > 0 && attempted.size() < 2000) {
                 String nodeIdHex = entry.nodeId().toHexString();
                 if (blacklistedNodeIds.contains(nodeIdHex)) {

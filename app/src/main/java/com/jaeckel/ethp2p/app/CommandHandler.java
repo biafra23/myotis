@@ -994,11 +994,17 @@ public class CommandHandler {
      */
     private String handleResolveEns(String jsonLine) {
         String name = extractString(jsonLine, "name");
+        // Pause acquiring new peers for the duration of the resolution so its
+        // snap round-trips aren't starved by outbound-dial bursts on the shared
+        // event loop. See RLPxConnector.isSnapHeavy().
+        connector.enterSnapHeavy();
+        try {
         // AUTO: resolve against the beacon-verified finalized state first; only if
         // it yields no address (record not yet finalized) or can't be served do we
         // fall back to the peer head (returned with beaconVerified=false).
+        EnsCallContext fin = null;
         try {
-            EnsCallContext fin = prepareEnsCall(io.myotis.ens.EnsResolutionRoot.FINALIZED);
+            fin = prepareEnsCall(io.myotis.ens.EnsResolutionRoot.FINALIZED);
             java.util.Optional<io.myotis.evm.Address> resolved =
                 fin.resolver.resolveAddress(name, fin.blockCtx).get(60, TimeUnit.SECONDS);
             if (resolved.isPresent()) {
@@ -1008,6 +1014,19 @@ public class CommandHandler {
         } catch (Exception finErr) {
             log.debug("[ens] finalized resolution failed for {} ({}); falling back to head",
                 name, unwrapMessage(finErr));
+        }
+        // If the finalized attempt already consumed an ERC-3668 offchain (CCIP)
+        // answer, the result is determined by the gateway, not by which EL state
+        // root we ran against — re-resolving at the peer head would just repeat
+        // the same (slow, multi-round-trip) gateway calls for the same answer.
+        // Skip the fallback and report unresolved. (If finalized had produced an
+        // address we'd have returned above.)
+        if (fin != null && fin.offchainExecutor().usedOffchain()) {
+            log.debug("[ens] {} used an offchain gateway at finalized; skipping head fallback", name);
+            return "{\"ok\":true,\"resolved\":false"
+                + ",\"name\":\"" + escapeJson(name) + "\""
+                + ",\"beaconVerified\":false"
+                + ",\"blockNumber\":" + fin.blockNumber + "}";
         }
         try {
             EnsCallContext head = prepareEnsCall(io.myotis.ens.EnsResolutionRoot.PEER_HEAD);
@@ -1022,6 +1041,9 @@ public class CommandHandler {
             return resolveEnsJson(name, resolved.get().toHex(), false, head.blockNumber);
         } catch (Exception e) {
             return jsonError(unwrapMessage(e));
+        }
+        } finally {
+            connector.exitSnapHeavy();
         }
     }
 
@@ -1049,7 +1071,8 @@ public class CommandHandler {
             long blockNumber,
             boolean beaconVerified,
             io.myotis.evm.BlockContext blockCtx,
-            io.myotis.ens.EnsResolver resolver) {}
+            io.myotis.ens.EnsResolver resolver,
+            io.myotis.evm.CcipReadEvmExecutor offchainExecutor) {}
 
     /**
      * Probe every active snap peer in parallel for a fresh head, pick the
@@ -1113,7 +1136,9 @@ public class CommandHandler {
                 exec.prevRandao(),
                 java.math.BigInteger.valueOf(connector.getNetwork().networkId()),
                 exec.gasLimit());
-            return new EnsCallContext(exec.blockNumber(), true, finCtx, buildEnsResolver(finPeer, finCtx));
+            io.myotis.evm.CcipReadEvmExecutor finExec = buildEnsResolver(finPeer, finCtx);
+            return new EnsCallContext(exec.blockNumber(), true, finCtx,
+                io.myotis.ens.EnsResolver.forChainId(finExec, connector.getNetwork().networkId()), finExec);
         }
 
         // PEER_HEAD: each snap peer has its own chain head, and the bleeding-edge
@@ -1152,7 +1177,9 @@ public class CommandHandler {
                     head.mixHashOrPrevRandao.toArrayUnsafe(),
                     java.math.BigInteger.valueOf(connector.getNetwork().networkId()),
                     head.gasLimit);
-                return new EnsCallContext(head.number, false, blockCtx, buildEnsResolver(peer, blockCtx));
+                io.myotis.evm.CcipReadEvmExecutor headExec = buildEnsResolver(peer, blockCtx);
+                return new EnsCallContext(head.number, false, blockCtx,
+                    io.myotis.ens.EnsResolver.forChainId(headExec, connector.getNetwork().networkId()), headExec);
             } catch (Exception e) {
                 lastError = "peer " + peer.getRemoteAddress() + " probe failed: " + unwrapMessage(e);
             }
@@ -1203,7 +1230,7 @@ public class CommandHandler {
      * channel close), but every retry targets this one peer — the one expected to
      * have {@code blockCtx}'s stateRoot in its snapshot.
      */
-    private io.myotis.ens.EnsResolver buildEnsResolver(
+    private io.myotis.evm.CcipReadEvmExecutor buildEnsResolver(
             com.jaeckel.ethp2p.networking.eth.EthHandler pinnedPeer,
             io.myotis.evm.BlockContext blockCtx) {
         final com.jaeckel.ethp2p.networking.eth.EthHandler finalPeer = pinnedPeer;
@@ -1219,9 +1246,9 @@ public class CommandHandler {
             new io.myotis.evm.PrefetchingEvmExecutor(base);
         io.myotis.evm.ccipread.CcipReadHandler ccipHandler =
             new io.myotis.evm.ccipread.CcipReadHandler(new JavaHttpCcipGateway());
-        io.myotis.evm.CcipReadEvmExecutor executor =
-            new io.myotis.evm.CcipReadEvmExecutor(prefetching, ccipHandler);
-        return io.myotis.ens.EnsResolver.forChainId(executor, connector.getNetwork().networkId());
+        // Returned (not just wrapped) so the caller can later read usedOffchain()
+        // to decide whether an AUTO head-fallback is worthwhile.
+        return new io.myotis.evm.CcipReadEvmExecutor(prefetching, ccipHandler);
     }
 
     /** Convert an SSZ uint256 (32-byte little-endian) to a non-negative BigInteger. */

@@ -48,9 +48,26 @@ public final class CcipReadEvmExecutor implements EvmExecutor {
     private final EvmExecutor delegate;
     private final CcipReadHandler handler;
 
+    /**
+     * Set once this executor observes (and starts handling) an OffchainLookup
+     * revert. A wallet that builds one executor per resolution can read this
+     * afterwards to learn whether the answer came from an ERC-3668 gateway.
+     * That matters for fallback policy: an offchain answer is determined by the
+     * gateway, not by which execution-layer state root we ran against, so there
+     * is no point re-resolving the same name against a different (e.g. head)
+     * root when an offchain lookup already produced the (non-)answer.
+     */
+    private final java.util.concurrent.atomic.AtomicBoolean usedOffchain =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
     public CcipReadEvmExecutor(EvmExecutor delegate, CcipReadHandler handler) {
         this.delegate = delegate;
         this.handler = handler;
+    }
+
+    /** Whether this executor handled at least one ERC-3668 OffchainLookup. */
+    public boolean usedOffchain() {
+        return usedOffchain.get();
     }
 
     @Override
@@ -82,6 +99,7 @@ public final class CcipReadEvmExecutor implements EvmExecutor {
                                     + " exceeds cap " + CcipReadHandler.MAX_RECURSION_DEPTH))));
         }
 
+        usedOffchain.set(true);
         log.debug("[ccip] caught OffchainLookup; fetching from {} gateway(s)",
                 lookup.get().urls().size());
         return handler.handle(lookup.get())

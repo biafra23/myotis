@@ -534,58 +534,84 @@ public final class NodeService extends Service {
                     new EnsResolution(trimmed, null, -1, false, "empty name"));
         }
         io.myotis.ens.EnsResolutionRoot mode = ensResolutionRoot;
+        // Pause acquiring new peers for the duration of the resolution so its snap
+        // round-trips aren't starved by outbound-dial bursts on the shared event
+        // loop. Released when the (async) resolution completes. See isSnapHeavy().
+        final RLPxConnector conn = connector;
+        conn.enterSnapHeavy();
+        final CompletableFuture<EnsResolution> result;
         if (mode == io.myotis.ens.EnsResolutionRoot.AUTO) {
-            return attemptResolve(trimmed, io.myotis.ens.EnsResolutionRoot.FINALIZED)
+            result = attemptResolve(trimmed, io.myotis.ens.EnsResolutionRoot.FINALIZED)
                     .thenCompose(fin -> {
-                        // Verified hit → done. Otherwise (no record at the
-                        // finalized block, or finalized couldn't be served) fall
-                        // back to the peer head for a fresher, peer-claimed answer.
-                        if (fin.addressHex() != null) {
-                            return CompletableFuture.completedFuture(fin);
+                        // Verified hit → done.
+                        if (fin.resolution().addressHex() != null) {
+                            return CompletableFuture.completedFuture(fin.resolution());
                         }
-                        return attemptResolve(trimmed, io.myotis.ens.EnsResolutionRoot.PEER_HEAD);
+                        // If finalized already consumed an ERC-3668 offchain (CCIP)
+                        // answer, the result is determined by the gateway, not by
+                        // which EL state root we ran against — re-resolving at the
+                        // peer head would just repeat the same slow, multi-round-trip
+                        // gateway calls for the same (non-)answer. Don't fall back.
+                        if (fin.usedOffchain()) {
+                            return CompletableFuture.completedFuture(fin.resolution());
+                        }
+                        // Otherwise (no record at the finalized block, or finalized
+                        // couldn't be served) fall back to the peer head for a
+                        // fresher, peer-claimed answer.
+                        return attemptResolve(trimmed, io.myotis.ens.EnsResolutionRoot.PEER_HEAD)
+                                .thenApply(Attempt::resolution);
                     });
+        } else {
+            result = attemptResolve(trimmed, mode).thenApply(Attempt::resolution);
         }
-        return attemptResolve(trimmed, mode);
+        return result.whenComplete((r, ex) -> conn.exitSnapHeavy());
     }
 
     /** One resolution attempt against a specific root. Never throws. */
     @SuppressLint("NewApi")
-    private CompletableFuture<EnsResolution> attemptResolve(String trimmed,
-                                                            io.myotis.ens.EnsResolutionRoot root) {
+    private CompletableFuture<Attempt> attemptResolve(String trimmed,
+                                                      io.myotis.ens.EnsResolutionRoot root) {
         final EnsCall call;
         try {
             call = prepareEnsCall(root);
         } catch (Exception e) {
             // FINALIZED can throw (no finalized header yet, snap peer can't serve
             // the block). Return a null-address result so AUTO can fall back.
-            return CompletableFuture.completedFuture(
+            return CompletableFuture.completedFuture(new Attempt(
                     new EnsResolution(trimmed, null, -1,
-                            root == io.myotis.ens.EnsResolutionRoot.FINALIZED, unwrap(e)));
+                            root == io.myotis.ens.EnsResolutionRoot.FINALIZED, unwrap(e)),
+                    false));
         }
         final boolean verified = call.beaconVerified();
         return call.resolver().resolveAddress(trimmed, call.blockCtx())
                 .orTimeout(ENS_TIMEOUT_SEC, TimeUnit.SECONDS)
                 .handle((opt, ex) -> {
+                    final boolean usedOffchain = call.offchainExecutor().usedOffchain();
                     if (ex != null) {
                         // Log the full stack: library wrappers (e.g. Caffeine's
                         // IllegalStateException(className)) mask the real
                         // Android-incompat cause, which unwrap() now chains.
                         LogBuffer.e(TAG, "[ens] resolveAddress failed for " + trimmed, ex);
-                        return new EnsResolution(trimmed, null, call.blockNumber(), verified, unwrap(ex));
+                        return new Attempt(new EnsResolution(
+                                trimmed, null, call.blockNumber(), verified, unwrap(ex)), usedOffchain);
                     }
                     if (opt == null || opt.isEmpty()) {
-                        return new EnsResolution(trimmed, null, call.blockNumber(), verified,
-                                "name does not resolve");
+                        return new Attempt(new EnsResolution(trimmed, null, call.blockNumber(), verified,
+                                "name does not resolve"), usedOffchain);
                     }
-                    return new EnsResolution(trimmed, opt.get().toHex(), call.blockNumber(), verified, null);
+                    return new Attempt(new EnsResolution(
+                            trimmed, opt.get().toHex(), call.blockNumber(), verified, null), usedOffchain);
                 });
     }
 
     private record EnsCall(io.myotis.ens.EnsResolver resolver,
                            io.myotis.evm.BlockContext blockCtx,
                            long blockNumber,
-                           boolean beaconVerified) {}
+                           boolean beaconVerified,
+                           io.myotis.evm.CcipReadEvmExecutor offchainExecutor) {}
+
+    /** An {@link #attemptResolve} outcome plus whether it used an ERC-3668 gateway. */
+    private record Attempt(EnsResolution resolution, boolean usedOffchain) {}
 
     /**
      * Build the EVM/ENS stack. The {@code root} selects which state the ENS
@@ -709,7 +735,7 @@ public final class NodeService extends Service {
                 new io.myotis.evm.CcipReadEvmExecutor(prefetching, ccip);
         io.myotis.ens.EnsResolver resolver =
                 io.myotis.ens.EnsResolver.forChainId(executor, conn.getNetwork().networkId());
-        return new EnsCall(resolver, blockCtx, blockNumber, verified);
+        return new EnsCall(resolver, blockCtx, blockNumber, verified, executor);
     }
 
     /**
@@ -855,6 +881,10 @@ public final class NodeService extends Service {
             }
 
             localDisc = new DiscV4Service(nodeKey, network.bootnodes(), entry -> {
+                // Pause acquiring new peers while an ENS resolution runs: its snap
+                // round-trips share the event loop with outbound dials, and a dial
+                // burst inflates resolution latency. Existing peers stay.
+                if (connectorRef.isSnapHeavy()) return;
                 if (entry.tcpPort() <= 0 || attempted.size() >= MAX_ATTEMPTED) return;
                 String nodeIdHex = entry.nodeId().toHexString();
                 if (blacklistedNodeIds.contains(nodeIdHex)) return;

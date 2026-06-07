@@ -66,6 +66,28 @@ public final class RLPxConnector implements AutoCloseable {
     private final PeerReadyCallback peerReadyCallback;
     private final Set<EthHandler> activeHandlers = ConcurrentHashMap.newKeySet();
 
+    /**
+     * Re-entrant counter of in-progress snap-heavy operations (ENS resolution).
+     * While > 0, the discovery dial loop should hold off on opening NEW peer
+     * connections: an ENS resolution issues a long, latency-sensitive chain of
+     * snap round-trips on the shared NioEventLoopGroup, and a burst of
+     * concurrent outbound dials (each an ECIES handshake + up to a 10 s pending
+     * connect) competes for those same event-loop threads, inflating per-read
+     * latency. Existing peers are untouched — we only pause acquiring new ones
+     * for the (seconds-long) duration of the query.
+     */
+    private final java.util.concurrent.atomic.AtomicInteger snapHeavyOps =
+        new java.util.concurrent.atomic.AtomicInteger(0);
+
+    /** Mark the start of a snap-heavy op (ENS resolution); pair with {@link #exitSnapHeavy()}. */
+    public void enterSnapHeavy() { snapHeavyOps.incrementAndGet(); }
+
+    /** Mark the end of a snap-heavy op. */
+    public void exitSnapHeavy() { snapHeavyOps.decrementAndGet(); }
+
+    /** True while at least one snap-heavy op is in progress — the dial loop pauses new connects. */
+    public boolean isSnapHeavy() { return snapHeavyOps.get() > 0; }
+
     public RLPxConnector(NodeKey localKey, int tcpPort, NetworkConfig network,
                          Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders,
                          PeerReadyCallback peerReadyCallback) {
