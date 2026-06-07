@@ -110,6 +110,7 @@ class MainActivity : ComponentActivity() {
                         onToggle = ::toggleService,
                         onOpenNetworkSettings = ::openWifiSettings,
                         onClearCaches = ::clearPeerCaches,
+                        onResetSync = ::resetSyncState,
                     )
                 }
             }
@@ -165,6 +166,10 @@ class MainActivity : ComponentActivity() {
     private fun clearPeerCaches() {
         boundServiceState.value?.clearCaches()
     }
+
+    private fun resetSyncState() {
+        boundServiceState.value?.resetSyncState()
+    }
 }
 
 @Composable
@@ -173,6 +178,7 @@ private fun NodeScreen(
     onToggle: () -> Unit,
     onOpenNetworkSettings: () -> Unit,
     onClearCaches: () -> Unit,
+    onResetSync: () -> Unit,
 ) {
     // Snapshot + uptime tick are owned by the parent so both tabs can read
     // them — the Query tab needs `beaconState` to decide whether to warn the
@@ -235,6 +241,7 @@ private fun NodeScreen(
                 onToggle = onToggle,
                 onOpenNetworkSettings = onOpenNetworkSettings,
                 onClearCaches = onClearCaches,
+                onResetSync = onResetSync,
             )
             1 -> QueryTab(
                 snapshot = snapshot,
@@ -298,6 +305,7 @@ private fun StatusTab(
     onToggle: () -> Unit,
     onOpenNetworkSettings: () -> Unit,
     onClearCaches: () -> Unit,
+    onResetSync: () -> Unit,
 ) {
     // SelectionContainer wraps the whole tab so long-pressing any text
     // (peer rows, stats, hashes) lets the user copy from the standard
@@ -335,6 +343,18 @@ private fun StatusTab(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text("Clear peer caches")
+                }
+            }
+
+            item {
+                OutlinedButton(
+                    onClick = onResetSync,
+                    enabled = serviceProvider() != null,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    // Deletes the persisted sync-committee snapshot so the next
+                    // start re-bootstraps from the embedded checkpoint (debugging).
+                    Text("Reset sync state")
                 }
             }
 

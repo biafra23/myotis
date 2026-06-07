@@ -52,6 +52,8 @@ public final class NodeService extends Service {
     private static final String CHANNEL_ID = "ethp2p_node";
     private static final int NOTIFICATION_ID = 1;
     private static final int DEFAULT_PORT = 30303;
+    /** Persisted verified sync-committee snapshot filename (in getCacheDir()). */
+    private static final String SYNC_SNAPSHOT_FILE = "sync-state.snapshot";
     private static final long BACKOFF_INCOMPATIBLE_MS = 10 * 60 * 1000L;
     private static final long BACKOFF_TRANSIENT_MS = 30 * 1000L;
     // Dial cap: the JVM daemon allows 2000, which is fine on a workstation but
@@ -666,10 +668,20 @@ public final class NodeService extends Service {
             NodeKey nodeKey = NodeKey.loadOrGenerate(keyFile);
             LogBuffer.i(TAG, "Node ID: " + nodeKey.nodeId().toHexString());
 
-            Path cacheFile = new java.io.File(getFilesDir(), "peers.cache").toPath();
+            // Reconstructible network state lives in getCacheDir() (not getFilesDir())
+            // so the OS / user "Clear cache" wipes peer caches + sync snapshot and
+            // resets bootstrapping, while identity (nodekey) and query history in
+            // getFilesDir() survive. cacheDir can also be evicted under storage
+            // pressure — harmless, we fall back to the embedded checkpoint.
+            Path cacheFile = new java.io.File(getCacheDir(), "peers.cache").toPath();
             localCache = new AndroidPeerCache(cacheFile);
             List<AndroidPeerCache.CachedPeer> cached = localCache.load();
             localCachedCount = cached.size();
+            // Reconnect snap/1-capable peers first: state queries (get-account /
+            // ENS) need a snap peer, and snap peers are a minority of eth peers,
+            // so dialing them ahead of plain-eth peers makes queries work sooner
+            // after a restart instead of waiting for re-discovery.
+            cached.sort((a, b) -> Boolean.compare(b.snap(), a.snap()));
 
             final AndroidPeerCache cacheRef = localCache;
             localConnector = new RLPxConnector(nodeKey, DEFAULT_PORT, network,
@@ -744,7 +756,7 @@ public final class NodeService extends Service {
             // Seed CL peer cache before BLC is constructed so cached peers are
             // available at startup. Cache file lives next to nodekey/peers.cache
             // in the app's filesDir; same eviction-on-failure semantics as JVM.
-            Path clCacheFile = new java.io.File(getFilesDir(), "cl-peers.cache").toPath();
+            Path clCacheFile = new java.io.File(getCacheDir(), "cl-peers.cache").toPath();
             localClCache = new AndroidCLPeerCache(clCacheFile);
             List<String> clCached = localClCache.load();
             localCachedClCount = clCached.size();
@@ -796,6 +808,17 @@ public final class NodeService extends Service {
             localBlc.setBlobParameters(
                     network.activeBlobParamsEpoch(),
                     network.activeBlobParamsMaxBlobs());
+            // Seed peers proven to serve catch-up last session (with the period
+            // they served) and persist new ones, so a cold start prefers the
+            // peers that actually retained the checkpoint's light-client updates
+            // instead of fanning out across discovery peers that don't serve LC.
+            localBlc.setProvenCatchUpServers(clCacheRef.servedPeriods());
+            localBlc.setOnCatchUpServed(clCacheRef::recordServed);
+            // Persist/resume verified sync-committee state across restarts (day-to-day
+            // fast path): next launch resumes from here and only catches up the delta
+            // instead of re-bootstrapping from the embedded checkpoint. In getCacheDir()
+            // so "Clear cache" / Reset sync state wipes it.
+            localBlc.setSnapshotFile(new java.io.File(getCacheDir(), SYNC_SNAPSHOT_FILE).toPath());
             blcRef.set(localBlc);
 
             // Publish atomically vs. shutdown() — if shutdown won the race
@@ -970,7 +993,7 @@ public final class NodeService extends Service {
         } else {
             // Node is stopped: no live AndroidPeerCache instance exists, so
             // delete the on-disk file directly.
-            java.io.File cacheFile = new java.io.File(getFilesDir(), "peers.cache");
+            java.io.File cacheFile = new java.io.File(getCacheDir(), "peers.cache");
             if (cacheFile.exists() && !cacheFile.delete()) {
                 LogBuffer.w(TAG, "failed to delete " + cacheFile);
             }
@@ -979,11 +1002,29 @@ public final class NodeService extends Service {
         if (clpc != null) {
             clpc.clear();
         } else {
-            java.io.File clCacheFile = new java.io.File(getFilesDir(), "cl-peers.cache");
+            java.io.File clCacheFile = new java.io.File(getCacheDir(), "cl-peers.cache");
             if (clCacheFile.exists() && !clCacheFile.delete()) {
                 LogBuffer.w(TAG, "failed to delete " + clCacheFile);
             }
         }
+    }
+
+    /**
+     * Delete the persisted sync-committee snapshot so the next start re-bootstraps
+     * from the embedded checkpoint and re-runs the full catch-up. For debugging the
+     * bootstrap/catch-up path without wiping peer caches. The running store keeps
+     * its in-memory state; this only affects the NEXT start.
+     */
+    public void resetSyncState() {
+        LogBuffer.i(TAG, "resetting persisted sync state from UI");
+        new Thread(() -> {
+            java.io.File snap = new java.io.File(getCacheDir(), SYNC_SNAPSHOT_FILE);
+            if (snap.exists() && !snap.delete()) {
+                LogBuffer.w(TAG, "failed to delete " + snap);
+            } else {
+                LogBuffer.i(TAG, "sync snapshot cleared; restart to re-bootstrap from checkpoint");
+            }
+        }, "ethp2p-reset-sync").start();
     }
 
     public Snapshot snapshot() {

@@ -1392,8 +1392,17 @@ public class CommandHandler {
 
         String peersJson = buildBeaconPeersJson();
         BeaconSyncState.State state = beaconSyncState.getSyncState(clGenesisTime);
+        // Sync-committee period progress, surfaced next to `state` so catch-up
+        // progress is visible at a glance: currentPeriod / targetPeriod.
+        // currentPeriod is the committee we hold (0 before bootstrap); targetPeriod
+        // is the wall-clock period we're catching up to.
+        long currentPeriod = beaconSyncState.getCurrentSyncCommitteePeriod();
+        long targetPeriod = BeaconChainSpec.currentPeriod(clGenesisTime);
+        String periodProgress = "\"currentPeriod\":" + currentPeriod
+                + ",\"targetPeriod\":" + targetPeriod;
         if (state == BeaconSyncState.State.SYNCING) {
             return "{\"ok\":true,\"state\":\"SYNCING\","
+                    + periodProgress + ","
                     + peerStats
                     + ",\"finalizedSlot\":0,\"optimisticSlot\":0"
                     + ",\"executionStateRoot\":null"
@@ -1405,15 +1414,14 @@ public class CommandHandler {
         long finalizedSlot = beaconSyncState.getFinalizedSlot();
         long optimisticSlot = beaconSyncState.getOptimisticSlot();
         long finalizedPeriod = finalizedSlot / (32 * 256); // SLOTS_PER_EPOCH * EPOCHS_PER_SYNC_COMMITTEE_PERIOD
-        long committeePeriod = beaconSyncState.getCurrentSyncCommitteePeriod();
-        long wallPeriod = BeaconChainSpec.currentPeriod(clGenesisTime);
         return "{\"ok\":true,\"state\":\"" + state.name() + "\","
+                + periodProgress + ","
                 + peerStats
                 + ",\"finalizedSlot\":" + finalizedSlot
                 + ",\"optimisticSlot\":" + optimisticSlot
                 + ",\"finalizedPeriod\":" + finalizedPeriod
-                + ",\"syncCommitteePeriod\":" + committeePeriod
-                + ",\"wallClockPeriod\":" + wallPeriod
+                + ",\"syncCommitteePeriod\":" + currentPeriod
+                + ",\"wallClockPeriod\":" + targetPeriod
                 + ",\"executionStateRoot\":" + stateRootHex
                 + ",\"executionBlockNumber\":" + beaconSyncState.getExecutionBlockNumber()
                 + ",\"knownStateRoots\":" + beaconSyncState.getKnownStateRootCount()

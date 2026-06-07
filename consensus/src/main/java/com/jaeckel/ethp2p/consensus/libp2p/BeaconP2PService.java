@@ -97,6 +97,14 @@ public class BeaconP2PService implements AutoCloseable {
     private final Map<String, String> peerAgentVersions = new ConcurrentHashMap<>();
 
     /**
+     * Peer's advertised {@code earliest_available_slot} from its Status (v2),
+     * keyed by peer ID. Lets catch-up skip peers that can't serve an old period
+     * instead of fanning out to all of them and relying on luck. Absent until
+     * the Status exchange completes; v1 peers report 0 (serve-from-genesis).
+     */
+    private final Map<String, Long> peerEarliestSlot = new ConcurrentHashMap<>();
+
+    /**
      * Supplies the local {@link StatusMessage} used when a peer opens {@code /status}
      * on us (responder role). May be {@code null} if the caller did not provide one —
      * in that case we fall back to the previous behavior of rejecting inbound
@@ -689,9 +697,10 @@ public class BeaconP2PService implements AutoCloseable {
                 StatusMessage peer = v2
                         ? StatusMessage.decode(decoded.sszPayload())
                         : StatusMessage.decodeV1(decoded.sszPayload());
-                log.info("[beacon-p2p] auto-Status({}) with {} (agent={}): peer={}",
+                peerEarliestSlot.put(pid, peer.earliestAvailableSlot());
+                log.info("[beacon-p2p] auto-Status({}) with {} (agent={}): earliestSlot={} peer={}",
                         v2 ? "v2" : "v1", pid,
-                        peerAgentVersions.getOrDefault(pid, "?"), peer);
+                        peerAgentVersions.getOrDefault(pid, "?"), peer.earliestAvailableSlot(), peer);
             } catch (Exception e) {
                 log.debug("[beacon-p2p] auto-Status({}) decode failed with {}: {} ({} bytes)",
                         v2 ? "v2" : "v1", pid, e.getMessage(),
@@ -720,6 +729,42 @@ public class BeaconP2PService implements AutoCloseable {
      * or a raw peerId string. Returns {@code null} if unknown.
      */
     public String cachedAgent(String multiaddrOrPeerId) {
+        String peerId = extractPeerId(multiaddrOrPeerId);
+        return peerId == null ? null : peerAgentVersions.get(peerId);
+    }
+
+    /**
+     * The peer's advertised {@code earliest_available_slot} from its Status, or
+     * {@code -1} if we haven't completed a Status exchange with it yet. A value
+     * of 0 means "serves from genesis" (also what v1 peers report). Accepts a
+     * multiaddr or a raw peerId.
+     */
+    public long earliestAvailableSlot(String multiaddrOrPeerId) {
+        String peerId = extractPeerId(multiaddrOrPeerId);
+        if (peerId == null) return -1L;
+        Long v = peerEarliestSlot.get(peerId);
+        return v == null ? -1L : v;
+    }
+
+    /**
+     * Whether the peer's Identify-advertised protocol list includes the
+     * light_client_updates_by_range req/resp protocol — i.e. whether it can
+     * serve sync-committee catch-up at all. Returns {@code null} when Identify
+     * hasn't completed yet (unknown), so callers can keep unknown peers rather
+     * than starve. Many CL nodes match our fork digest but don't serve
+     * light-client data, and requesting updates_by_range from them just fails
+     * protocol negotiation.
+     */
+    public Boolean servesLightClientUpdates(String multiaddrOrPeerId) {
+        String peerId = extractPeerId(multiaddrOrPeerId);
+        if (peerId == null) return null;
+        List<String> protos = peerProtocols.get(peerId);
+        if (protos == null) return null;
+        return protos.stream().anyMatch(p -> p.contains("light_client_updates_by_range"));
+    }
+
+    /** Extract the {@code /p2p/<peerId>} component from a multiaddr, or pass through a raw peerId. */
+    private static String extractPeerId(String multiaddrOrPeerId) {
         if (multiaddrOrPeerId == null) return null;
         String peerId = multiaddrOrPeerId;
         int idx = multiaddrOrPeerId.indexOf("/p2p/");
@@ -728,7 +773,7 @@ public class BeaconP2PService implements AutoCloseable {
             int slash = peerId.indexOf('/');
             if (slash >= 0) peerId = peerId.substring(0, slash);
         }
-        return peerAgentVersions.get(peerId);
+        return peerId;
     }
 
     /**

@@ -17,7 +17,12 @@ import java.util.concurrent.ConcurrentHashMap;
  * Persists Consensus Layer peers that successfully served light client responses
  * so they can be reconnected on restart without discovery.
  *
- * <p>File format: one multiaddr per line (e.g. {@code /ip4/1.2.3.4/tcp/9000/p2p/16Uiu2...}).
+ * <p>File format: one peer per line, {@code multiaddr[\t<lowestServedPeriod>]}.
+ * The optional trailing sync-committee period records the oldest period this peer
+ * actually served during catch-up — proof it retains light-client updates that
+ * deep. On restart we prefer peers whose served period covers the checkpoint,
+ * instead of fanning out to discovery peers that don't serve catch-up at all.
+ * The field is optional so older cache files load unchanged.
  *
  * <p>Peers are evicted after {@link #FAILURE_THRESHOLD} consecutive failures so the
  * cache does not accumulate dead peers across restarts. Any success resets a peer's
@@ -30,9 +35,13 @@ public final class CLPeerCache {
     /** Consecutive failures before a peer is evicted from the cache. */
     public static final int FAILURE_THRESHOLD = 3;
 
+    private static final char SEP = '\t';
+
     private final Path cacheFile;
     private final Set<String> seen = ConcurrentHashMap.newKeySet();
     private final Map<String, Integer> failures = new ConcurrentHashMap<>();
+    /** multiaddr -> lowest sync-committee period it served during catch-up. */
+    private final Map<String, Long> servedPeriod = new ConcurrentHashMap<>();
 
     public CLPeerCache(Path cacheFile) {
         this.cacheFile = cacheFile;
@@ -69,10 +78,31 @@ public final class CLPeerCache {
         if (count >= FAILURE_THRESHOLD) {
             if (seen.remove(multiaddr)) {
                 failures.remove(multiaddr);
+                servedPeriod.remove(multiaddr);
                 rewriteFile();
                 log.info("[cl-cache] Evicted peer after {} consecutive failures: {}", count, multiaddr);
             }
         }
+    }
+
+    /**
+     * Record that a peer served catch-up down to {@code period}. Keeps the lowest
+     * period seen (deepest history) so a peer that once served the checkpoint is
+     * remembered as such. Persisted so restarts prefer proven catch-up servers.
+     */
+    public synchronized void recordServed(String multiaddr, long period) {
+        if (multiaddr == null || multiaddr.isEmpty()) return;
+        failures.remove(multiaddr);
+        seen.add(multiaddr);
+        Long prev = servedPeriod.get(multiaddr);
+        if (prev != null && prev <= period) return; // already know it goes deeper
+        servedPeriod.put(multiaddr, period);
+        rewriteFile();
+    }
+
+    /** multiaddr -> lowest served period, for peers proven to serve catch-up. */
+    public Map<String, Long> servedPeriods() {
+        return new java.util.HashMap<>(servedPeriod);
     }
 
     /** Load all cached CL peer multiaddrs. Returns empty list if file doesn't exist. */
@@ -84,11 +114,20 @@ public final class CLPeerCache {
             for (String line : Files.readAllLines(cacheFile)) {
                 line = line.strip();
                 if (line.isEmpty() || !line.startsWith("/")) continue;
-                result.add(line);
-                seen.add(line);
+                String multiaddr = line;
+                int sep = line.indexOf(SEP);
+                if (sep >= 0) {
+                    multiaddr = line.substring(0, sep);
+                    try {
+                        servedPeriod.put(multiaddr, Long.parseLong(line.substring(sep + 1).strip()));
+                    } catch (NumberFormatException ignored) {}
+                }
+                result.add(multiaddr);
+                seen.add(multiaddr);
             }
             if (!result.isEmpty()) {
-                log.info("[cl-cache] Loaded {} cached CL peer(s) from {}", result.size(), cacheFile);
+                log.info("[cl-cache] Loaded {} cached CL peer(s) from {} ({} proven catch-up servers)",
+                        result.size(), cacheFile, servedPeriod.size());
             }
         } catch (Exception e) {
             log.warn("[cl-cache] Failed to read CL peer cache: {}", e.getMessage());
@@ -111,10 +150,18 @@ public final class CLPeerCache {
 
     private synchronized void rewriteFile() {
         try {
-            // Stable order: sorted lines, idempotent across rewrites
-            List<String> lines = new ArrayList<>(seen);
-            java.util.Collections.sort(lines);
-            Files.writeString(cacheFile, String.join("\n", lines) + (lines.isEmpty() ? "" : "\n"));
+            // Stable order: sorted lines, idempotent across rewrites. Append the
+            // served period when known so it survives the rewrite.
+            List<String> peers = new ArrayList<>(seen);
+            java.util.Collections.sort(peers);
+            StringBuilder sb = new StringBuilder();
+            for (String p : peers) {
+                sb.append(p);
+                Long sp = servedPeriod.get(p);
+                if (sp != null) sb.append(SEP).append(sp);
+                sb.append('\n');
+            }
+            Files.writeString(cacheFile, sb.toString());
         } catch (IOException e) {
             log.warn("[cl-cache] Failed to rewrite cache after eviction: {}", e.getMessage());
         }

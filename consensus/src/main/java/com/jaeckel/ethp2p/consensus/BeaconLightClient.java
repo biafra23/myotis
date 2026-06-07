@@ -4,6 +4,7 @@ import com.jaeckel.ethp2p.consensus.libp2p.BeaconP2PService;
 import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
 import com.jaeckel.ethp2p.consensus.lightclient.LightClientProcessor;
 import com.jaeckel.ethp2p.consensus.lightclient.LightClientStore;
+import com.jaeckel.ethp2p.consensus.lightclient.LightClientStoreSnapshot;
 import com.jaeckel.ethp2p.consensus.ssz.SszUtil;
 import com.jaeckel.ethp2p.consensus.types.BeaconBlockHeader;
 import com.jaeckel.ethp2p.consensus.types.BeaconBlockParser;
@@ -25,6 +26,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -79,6 +81,134 @@ public class BeaconLightClient implements AutoCloseable {
 
     private volatile Thread syncThread;
     private volatile boolean running;
+
+    // Peers proven NOT to serve light_client_updates_by_range (protocol
+    // negotiation failed). They match our fork digest and may have deep history,
+    // so neither the agent nor earliest-slot filter excludes them — but they
+    // can't serve catch-up, so every batch wastes a stream negotiating a
+    // protocol they don't have. Remember and skip them.
+    private final Set<String> peersNoLcUpdates = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    // Peers proven to serve catch-up, multiaddr -> lowest sync-committee period
+    // they served. Seeded from the CL peer cache at startup so a cold start can
+    // immediately prefer peers that actually retained the checkpoint period last
+    // time, instead of fanning out across discovery peers (most of which don't
+    // serve light-client updates at all). Updated live on every catch-up success.
+    private final Map<String, Long> provenCatchUpServers =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    /** Notified (multiaddr, servedPeriod) whenever a peer advances catch-up, for cache persistence. */
+    private volatile java.util.function.BiConsumer<String, Long> onCatchUpServed;
+
+    /** Seed proven catch-up servers (multiaddr -> lowest served period) from a cache. */
+    public void setProvenCatchUpServers(Map<String, Long> seed) {
+        if (seed != null) provenCatchUpServers.putAll(seed);
+    }
+
+    /** Set the callback persisting (multiaddr, servedPeriod) when a peer advances catch-up. */
+    public void setOnCatchUpServed(java.util.function.BiConsumer<String, Long> cb) {
+        this.onCatchUpServed = cb;
+    }
+
+    // Persisted verified-store snapshot (day-to-day resume). Null disables persistence.
+    private volatile java.nio.file.Path snapshotFile;
+    // Period last written, to avoid rewriting the (~50KB) snapshot when nothing advanced.
+    private volatile long lastPersistedPeriod = -1L;
+
+    /** File to persist/restore the verified light-client store. Set before {@link #start()}. */
+    public void setSnapshotFile(java.nio.file.Path file) {
+        this.snapshotFile = file;
+    }
+
+    /**
+     * Restore the store from a persisted snapshot if one exists, is for this chain,
+     * and is newer than the embedded checkpoint. Returns true if we resumed (and a
+     * fresh bootstrap should be skipped).
+     */
+    private boolean tryResumeFromSnapshot() {
+        java.nio.file.Path file = snapshotFile;
+        if (file == null) return false;
+        try {
+            if (!java.nio.file.Files.exists(file)) return false;
+            byte[] data = java.nio.file.Files.readAllBytes(file);
+            LightClientStore.Snapshot snap =
+                    LightClientStoreSnapshot.deserialize(data, genesisValidatorsRoot);
+            if (snap == null) {
+                log.info("[beacon] Ignoring sync snapshot (absent/corrupt/foreign) — bootstrapping fresh");
+                return false;
+            }
+            long checkpointPeriod = BeaconChainSpec.computeSyncCommitteePeriod(checkpointSlot);
+            if (snap.currentSyncCommitteePeriod() <= checkpointPeriod) {
+                // Not newer than the checkpoint we'd bootstrap from anyway — no benefit.
+                return false;
+            }
+            store.restore(snap);
+            lastPersistedPeriod = snap.currentSyncCommitteePeriod();
+            updateSyncState();
+            log.info("[beacon] Resumed from persisted snapshot at period {} (slot {}) — "
+                            + "catching up only periods since",
+                    snap.currentSyncCommitteePeriod(), snap.finalizedSlot());
+            return true;
+        } catch (Exception e) {
+            log.warn("[beacon] Snapshot resume failed ({}) — bootstrapping fresh", e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Persist the verified store to disk so the next launch resumes from here.
+     * Atomic (temp file + move) so a crash mid-write can't leave a torn snapshot.
+     * No-op when nothing advanced since the last write.
+     */
+    private void persistSnapshot() {
+        java.nio.file.Path file = snapshotFile;
+        if (file == null) return;
+        LightClientStore.Snapshot snap = store.snapshot();
+        if (snap == null) return;
+        if (snap.currentSyncCommitteePeriod() == lastPersistedPeriod) return;
+        byte[] data = LightClientStoreSnapshot.serialize(snap, genesisValidatorsRoot);
+        if (data == null) return;
+        try {
+            java.nio.file.Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
+            java.nio.file.Files.write(tmp, data);
+            try {
+                java.nio.file.Files.move(tmp, file,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            } catch (java.nio.file.AtomicMoveNotSupportedException amnse) {
+                java.nio.file.Files.move(tmp, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+            lastPersistedPeriod = snap.currentSyncCommitteePeriod();
+            log.debug("[beacon] Persisted sync snapshot at period {} ({} bytes)",
+                    snap.currentSyncCommitteePeriod(), data.length);
+        } catch (Exception e) {
+            log.debug("[beacon] Snapshot persist failed: {}", e.getMessage());
+        }
+    }
+
+    /** Remember a peer that served catch-up from {@code period} (lowest wins) and persist it. */
+    private void recordCatchUpServer(String peer, long period) {
+        if (peer == null) return;
+        provenCatchUpServers.merge(peer, period, Math::min);
+        java.util.function.BiConsumer<String, Long> cb = onCatchUpServed;
+        if (cb != null) {
+            try { cb.accept(peer, period); }
+            catch (Exception e) { log.debug("[beacon] onCatchUpServed failed: {}", e.getMessage()); }
+        }
+    }
+
+    // Catch-up update verification (BLS sync-aggregate verify) is CPU-heavy —
+    // ~17s per update on Android/ART even after parallelizing pubkey
+    // decompression. It must NOT run on a netty event loop thread: that both
+    // blocks libp2p I/O on that loop and ties the verify to stream timers.
+    // Single-threaded because the apply path serializes on the store monitor
+    // anyway and the per-verify parallelStream already fans out across cores;
+    // a wider pool would just oversubscribe.
+    private final java.util.concurrent.ExecutorService catchUpExecutor =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "beacon-catchup-apply");
+                t.setDaemon(true);
+                return t;
+            });
 
     /**
      * Construct a BeaconLightClient.
@@ -259,8 +389,16 @@ public class BeaconLightClient implements AutoCloseable {
         // This lets bootstrap() prioritize peers advertising light_client protocols.
         preConnectAndIdentify();
 
-        // Phase 1: bootstrap with BLS verification (strongest trust)
-        bootstrap();
+        // Phase 1: resume from a persisted snapshot (day-to-day fast path) — if we
+        // have verified state newer than the embedded checkpoint from a prior run,
+        // pick up there and only catch up the periods since. Falls through to a
+        // fresh bootstrap from the embedded checkpoint when there's no usable
+        // snapshot (first run, wiped cache, or a corrupt/foreign file).
+        boolean resumed = tryResumeFromSnapshot();
+        if (!resumed) {
+            // Bootstrap with BLS verification from the embedded checkpoint.
+            bootstrap();
+        }
 
         // Phase 1b: catch up sync committee if bootstrap is from an older period
         if (store.isInitialized()) {
@@ -837,8 +975,12 @@ public class BeaconLightClient implements AutoCloseable {
 
             if (!attemptCatchUpBatch(committeePeriod, periodsToFetch, currentSlotEstimate)) {
                 log.warn("[beacon] Catch-up batch {} made no progress — will retry on next sync cycle", batch);
+                persistSnapshot(); // checkpoint whatever progress this call did make
                 return;
             }
+            // Persist after each advancing batch so a restart resumes near here
+            // rather than redoing the whole catch-up from the embedded checkpoint.
+            persistSnapshot();
         }
 
         long finalPeriod = store.getCurrentSyncCommitteePeriod();
@@ -861,12 +1003,65 @@ public class BeaconLightClient implements AutoCloseable {
         // bypassing the Lodestar exclusion here masks those failures.
         List<String> peers = peersPrioritized(lastBootstrapPeer);
         int count = (int) Math.min(periodsToFetch, 128);
+        // Skip peers whose advertised earliest_available_slot proves they can't
+        // serve the period we need — their light-client-update history starts
+        // later, so they'd only return far-future updates the period-gate
+        // discards. This turns catch-up from "fan out to every peer and hope one
+        // retains period N" into "ask the peers that actually have it", which is
+        // the difference between stalling at an old checkpoint and progressing.
+        // Peers that cover the period OR haven't completed a Status exchange yet
+        // (earliest == -1) are kept; we never starve the batch.
+        long neededSlot = bootstrapPeriod * BeaconChainSpec.SLOTS_PER_SYNC_COMMITTEE_PERIOD;
+        List<String> capable = new ArrayList<>(peers.size());
+        int skippedShallow = 0;
+        int skippedNoLc = 0;
+        for (String p : peers) {
+            // Skip peers proven not to serve light_client_updates_by_range, OR
+            // whose Identify protocol list shows they don't advertise it. Both
+            // catch the dominant failure on a cold pool: fork-digest-matching CL
+            // nodes that simply don't serve light-client data, which otherwise
+            // burn the whole batch on ProtocolNegotiationFailed.
+            if (peersNoLcUpdates.contains(p)
+                    || Boolean.FALSE.equals(p2pService.servesLightClientUpdates(p))) {
+                skippedNoLc++;
+                continue;
+            }
+            long earliest = p2pService.earliestAvailableSlot(p);
+            if (earliest >= 0 && earliest > neededSlot) {
+                skippedShallow++;
+                continue;
+            }
+            capable.add(p);
+        }
+        if (!capable.isEmpty()) {
+            peers = capable;
+        }
+        // Force-include + front-load peers proven (last session) to serve this
+        // period. They actually retained the checkpoint's light-client updates,
+        // the strongest signal we have — stronger than the runtime filters, which
+        // are cold at startup and can wrongly drop a good peer (Identify/Status
+        // not yet exchanged). This is what turns a cold start from "fan out and
+        // hope" into "ask the peers that worked last time".
+        int provenCount = 0;
+        if (!provenCatchUpServers.isEmpty()) {
+            java.util.LinkedHashSet<String> ordered = new java.util.LinkedHashSet<>();
+            for (String p : copyPeers(false)) {
+                Long sp = provenCatchUpServers.get(p);
+                if (sp != null && sp <= bootstrapPeriod && !peersNoLcUpdates.contains(p)) {
+                    ordered.add(p);
+                }
+            }
+            provenCount = ordered.size();
+            ordered.addAll(peers);
+            peers = new ArrayList<>(ordered);
+        }
         // {@link BeaconP2PService#doReqResp} detects a dying connection and
         // retries with a fresh one, so we no longer pre-emptively disconnect
         // every peer here — that was costing us Lighthouse/Teku connections
         // that would otherwise have stayed alive and kept our peer score up.
-        log.info("[beacon] Catch-up: requesting {} update(s) from period {} across {} usable peer(s)",
-                count, bootstrapPeriod, peers.size());
+        log.info("[beacon] Catch-up: requesting {} update(s) from period {} across {} capable peer(s) "
+                        + "(skipped {} too-shallow, {} no-LC, {} proven)",
+                count, bootstrapPeriod, peers.size(), skippedShallow, skippedNoLc, provenCount);
 
         CompletableFuture<Boolean> winner = new CompletableFuture<>();
         java.util.concurrent.atomic.AtomicInteger remaining =
@@ -886,13 +1081,22 @@ public class BeaconLightClient implements AutoCloseable {
             // so it can actually close the underlying libp2p stream when it
             // fires — otherwise channelRead0 would keep buffering bytes.
             p2pService.requestUpdatesByRange(peer, bootstrapPeriod, count, 15_000L)
-                    .whenComplete((responses, ex) -> {
+                    .whenCompleteAsync((responses, ex) -> {
                         if (ex != null) {
                             Throwable root = ex;
                             while (root.getCause() != null) root = root.getCause();
                             failCount.incrementAndGet();
-                            log.debug("[beacon] Catch-up updates_by_range failed from {}: {}",
-                                    peer, root.getMessage());
+                            String rmsg = root.getMessage() != null ? root.getMessage()
+                                    : root.getClass().getSimpleName();
+                            // A protocol-negotiation failure means this peer does
+                            // not serve light_client_updates_by_range at all —
+                            // remember it so future batches skip it instead of
+                            // re-negotiating a protocol it doesn't have.
+                            if (rmsg.contains("ProtocolNegotiation")
+                                    || rmsg.contains("Protocol negotiation")) {
+                                peersNoLcUpdates.add(peer);
+                            }
+                            log.debug("[beacon] Catch-up updates_by_range failed from {}: {}", peer, rmsg);
                             notifyPeerFailure(peer);
                             if (remaining.decrementAndGet() == 0 && !winner.isDone()) {
                                 winner.complete(false);
@@ -910,7 +1114,9 @@ public class BeaconLightClient implements AutoCloseable {
                                 }
                                 return;
                             }
-                            int applied = applyCatchUpResponses(responses, slotEstimate);
+                            // Records the peer as a proven catch-up server on its
+                            // first applied update (see recordCatchUpServer).
+                            int applied = applyCatchUpResponses(responses, slotEstimate, peer, bootstrapPeriod);
                             if (applied > 0) {
                                 long newPeriod = BeaconChainSpec.computeSyncCommitteePeriod(store.getFinalizedSlot());
                                 notifyPeerSuccess(peer);
@@ -926,17 +1132,21 @@ public class BeaconLightClient implements AutoCloseable {
                                 }
                             }
                         }
-                    });
+                    }, catchUpExecutor);
         }
 
         try {
-            // 20s outer wall = per-attempt 15s timeout + ~5s slack for the
-            // last future's whenComplete to settle and complete `winner`.
-            // Pre-fix this was 60s, but with hung futures now bounded at 15s
-            // the longer wall just kept a doomed batch alive — the catch-up
-            // loop retries with a fresh batch immediately, which usually
-            // finds a fast peer in the next attempt.
-            boolean result = winner.get(20, TimeUnit.SECONDS);
+            // Generous outer wall — a pure backstop, NOT the normal completion
+            // path. A batch where no peer serves the needed period now fails
+            // fast: with the cheap signature-period gate in processUpdate,
+            // non-applicable responses reject in ~ms, so every peer settles
+            // (network timeout ≤15s) and `remaining` hits 0 → winner=false in
+            // ~15s. Only the batch whose peer DOES serve the store period runs
+            // long, because it BLS-verifies and applies each update it advances
+            // — ~17s per update on Android/ART (vs ~0.5s on the JVM daemon), and
+            // a single updates_by_range response can carry dozens of periods.
+            // The wall must not cut that genuine progress off mid-apply.
+            boolean result = winner.get(600, TimeUnit.SECONDS);
             if (!result) {
                 log.warn("[beacon] Catch-up batch: no peer advanced store (tried {}, {} failed, {} returned empty/unusable)",
                         peers.size(), failCount.get(), emptyCount.get());
@@ -953,13 +1163,22 @@ public class BeaconLightClient implements AutoCloseable {
      * Decode and process a list of catch-up response SSZ blobs, returning the number applied.
      * Must be called while holding the {@code store} monitor.
      */
-    private int applyCatchUpResponses(List<byte[]> responses, long currentSlotEstimate) {
+    private int applyCatchUpResponses(List<byte[]> responses, long currentSlotEstimate,
+                                      String peer, long servedFromPeriod) {
         int applied = 0;
         for (byte[] responseSsz : responses) {
             try {
                 LightClientUpdate update = LightClientUpdate.decode(responseSsz);
                 if (processor.processUpdate(update)) {
                     applied++;
+                    if (applied == 1) {
+                        // First update applied from this peer — it demonstrably
+                        // serves catch-up from servedFromPeriod. Record it NOW (not
+                        // after the whole response, which can be dozens of updates
+                        // ≈ minutes of BLS verifies) so the proof survives even if
+                        // we restart mid-catch-up.
+                        recordCatchUpServer(peer, servedFromPeriod);
+                    }
                     // Rotate BEFORE updateSyncState so the committee-period pushed to
                     // BeaconSyncState reflects the post-rotation value — otherwise
                     // beacon-status' SYNCED gate flips late by one update cycle.
@@ -1195,6 +1414,16 @@ public class BeaconLightClient implements AutoCloseable {
             long wallPeriod = BeaconChainSpec.currentPeriod(clGenesisTime);
             if (wallPeriod > store.getCurrentSyncCommitteePeriod()) {
                 catchUpSyncCommittee();
+                // If still behind, skip the finality poll below. While the
+                // committee is stale, every finality update is signed by a
+                // committee we don't hold and fails BLS verify — iterating 16
+                // such peers (up to ~10s each) burns the whole 12s cycle and
+                // starves the next catch-up retry, which is exactly what leaves
+                // CATCHING_UP stuck for minutes. Returning here lets the sync
+                // loop fire another catch-up batch in ~12s instead of ~90s.
+                if (wallPeriod > store.getCurrentSyncCommitteePeriod()) {
+                    return;
+                }
             }
         }
 
@@ -1234,6 +1463,9 @@ public class BeaconLightClient implements AutoCloseable {
                     updateSyncState();
                     fillChainStateRoots(peer, true);
                     notifyPeerSuccess(peer);
+                    // Steady-state advance — persist so a restart resumes here
+                    // (no-op unless the committee period actually moved).
+                    persistSnapshot();
                     log.debug("[beacon] Finality update applied from {}, finalizedSlot={}",
                             peer, store.getFinalizedSlot());
                     return;
@@ -1597,7 +1829,10 @@ public class BeaconLightClient implements AutoCloseable {
                 Thread.currentThread().interrupt();
             }
         }
+        // Persist final verified state so the next launch resumes from here.
+        persistSnapshot();
         p2pService.close();
+        catchUpExecutor.shutdownNow();
         log.info("[beacon] Light client stopped");
     }
 

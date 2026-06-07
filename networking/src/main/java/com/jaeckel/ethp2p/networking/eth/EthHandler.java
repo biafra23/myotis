@@ -481,11 +481,33 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 } else if (msg.code() == snapGetTrieNodes) {
                     handleSnapGetTrieNodes(ctx, msg);
                 } else {
-                    log.debug("[eth] Unhandled message 0x{} ({} bytes) from {}",
-                        Integer.toHexString(msg.code()), msg.payload().length, remoteAddress);
+                    log.debug("[eth] Ignoring 0x{} ({}, {} bytes) from {}",
+                        Integer.toHexString(msg.code()), ignoredEthMessageReason(msg.code()),
+                        msg.payload().length, remoteAddress);
                 }
             }
         }
+    }
+
+    /**
+     * Human-readable reason an eth-protocol message is intentionally not consumed.
+     * These aren't missing handlers: a light wallet verifies state via header
+     * chain + snap proofs, so transaction-pool and block-propagation gossip
+     * (which every full node broadcasts unsolicited) has no use here and is
+     * dropped on purpose. Codes are absolute wire ids (eth base 0x10).
+     */
+    private static String ignoredEthMessageReason(int code) {
+        return switch (code) {
+            case 0x11 -> "NewBlockHashes — pre-Merge block gossip, obsolete; light wallet tracks heads via the beacon chain";
+            case 0x12 -> "Transactions — mempool broadcast, not needed for state verification";
+            case 0x17 -> "NewBlock — pre-Merge block propagation, obsolete post-Merge";
+            case 0x18 -> "NewPooledTransactionHashes — mempool announcement, not needed for state verification";
+            case 0x19 -> "GetPooledTransactions — peer asking us for mempool txs; we serve none";
+            case 0x1a -> "PooledTransactions — mempool response we never requested";
+            case 0x1d -> "GetReceipts — peer asking us for receipts; we serve none";
+            case 0x1e -> "Receipts — not requested; wallet verifies via state proofs";
+            default   -> "unrecognised eth/snap message code for the negotiated protocol";
+        };
     }
 
     // -------------------------------------------------------------------------

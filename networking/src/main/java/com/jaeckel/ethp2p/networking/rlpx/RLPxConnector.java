@@ -42,9 +42,14 @@ public final class RLPxConnector implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(RLPxConnector.class);
 
-    /** Callback when a peer reaches READY state: (address, publicKeyHex). */
+    /**
+     * Callback when a peer reaches READY state. {@code snapSupported} reports
+     * whether the peer negotiated snap/1 (known by READY, since capabilities are
+     * exchanged in Hello) — lets the peer cache record which cached peers can
+     * serve state, so a restart can reconnect snap peers first.
+     */
     public interface PeerReadyCallback {
-        void onPeerReady(InetSocketAddress address, String publicKeyHex);
+        void onPeerReady(InetSocketAddress address, String publicKeyHex, boolean snapSupported);
     }
 
     /** Callback when a peer connection closes, with incompatibility info and node identity. */
@@ -88,12 +93,17 @@ public final class RLPxConnector implements AutoCloseable {
         log.info("[rlpx] Connecting to {} ...", peerAddr);
 
         String pubKeyHex = peerPublicKey.bytes().toHexString();
+        // Filled in below once the EthHandler exists; onReady reads its snap
+        // negotiation state (set during the Hello exchange, before READY).
+        final EthHandler[] handlerRef = new EthHandler[1];
         Runnable onReady = () -> {
             if (peerReadyCallback != null) {
-                peerReadyCallback.onPeerReady(peerAddr, pubKeyHex);
+                boolean snap = handlerRef[0] != null && handlerRef[0].isSnapNegotiated();
+                peerReadyCallback.onPeerReady(peerAddr, pubKeyHex, snap);
             }
         };
         EthHandler ethHandler = new EthHandler(localKey, tcpPort, network, chainHead, onHeaders, onReady);
+        handlerRef[0] = ethHandler;
         ethHandler.setRemoteAddress(peerAddr.getAddress().getHostAddress() + ":" + peerAddr.getPort());
 
         Bootstrap bootstrap = new Bootstrap()

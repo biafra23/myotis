@@ -100,6 +100,11 @@ public final class Main {
         return cacheFile(networkName).resolveSibling("cl-peers" + suffix + ".cache");
     }
 
+    static Path syncSnapshotFile(String networkName) {
+        String suffix = "mainnet".equals(networkName) ? "" : "-" + networkName;
+        return cacheFile(networkName).resolveSibling("sync-state" + suffix + ".snapshot");
+    }
+
 
     public static void main(String[] args) throws Exception {
         // Parse --network and --port flags from anywhere in args
@@ -134,6 +139,13 @@ public final class Main {
         if (cmdArgs.length > 0 && "purge-cache".equals(cmdArgs[0])) {
             PeerCache.purge(cacheFile(networkName));
             CLPeerCache.purge(clCacheFile(networkName));
+            try {
+                if (java.nio.file.Files.deleteIfExists(syncSnapshotFile(networkName))) {
+                    System.out.println("Sync snapshot purged: " + syncSnapshotFile(networkName));
+                }
+            } catch (java.io.IOException e) {
+                System.err.println("Failed to purge sync snapshot: " + e.getMessage());
+            }
             return;
         }
 
@@ -251,6 +263,9 @@ public final class Main {
 
         // 5. Connect to cached peers immediately
         List<PeerCache.CachedPeer> cached = peerCache.load();
+        // Reconnect snap/1-capable peers first so state queries (get-account,
+        // get-storage) have a snap peer available sooner after a restart.
+        cached.sort((a, b) -> Boolean.compare(b.snap(), a.snap()));
         for (PeerCache.CachedPeer peer : cached) {
             String peerKey = peer.address().getAddress().getHostAddress()
                     + ":" + peer.address().getPort();
@@ -427,6 +442,15 @@ public final class Main {
         beaconLightClient.setBlobParameters(
                 network.activeBlobParamsEpoch(),
                 network.activeBlobParamsMaxBlobs());
+        // Prefer peers proven to serve catch-up last session (seeded with the
+        // period they served), and persist new ones, so restarts target peers
+        // that actually retain the checkpoint period instead of discovery noise.
+        beaconLightClient.setProvenCatchUpServers(clPeerCache.servedPeriods());
+        beaconLightClient.setOnCatchUpServed(clPeerCache::recordServed);
+        // Persist/resume verified sync-committee state so restarts resume from the
+        // last verified period and only catch up the delta (architecture-doc §
+        // "recent sync committee data persisted locally"). purge-cache removes it.
+        beaconLightClient.setSnapshotFile(syncSnapshotFile(network.name()));
         // Off by default (short-session clients churn the mesh). Enable
         // with `-Pgossipsub=true` via gradle or `--gossipsub` on the CLI.
         beaconLightClient.setGossipsubEnabled(gossipsubEnabled);
