@@ -1003,6 +1003,7 @@ public class CommandHandler {
         // it yields no address (record not yet finalized) or can't be served do we
         // fall back to the peer head (returned with beaconVerified=false).
         EnsCallContext fin = null;
+        Exception finErr = null;
         try {
             fin = prepareEnsCall(io.myotis.ens.EnsResolutionRoot.FINALIZED);
             java.util.Optional<io.myotis.evm.Address> resolved =
@@ -1011,17 +1012,24 @@ public class CommandHandler {
                 return resolveEnsJson(name, resolved.get().toHex(), true, fin.blockNumber);
             }
             // No record at the finalized block — fall through to the head.
-        } catch (Exception finErr) {
+        } catch (Exception e) {
+            finErr = e;
             log.debug("[ens] finalized resolution failed for {} ({}); falling back to head",
-                name, unwrapMessage(finErr));
+                name, unwrapMessage(e));
         }
         // If the finalized attempt already consumed an ERC-3668 offchain (CCIP)
         // answer, the result is determined by the gateway, not by which EL state
         // root we ran against — re-resolving at the peer head would just repeat
         // the same (slow, multi-round-trip) gateway calls for the same answer.
-        // Skip the fallback and report unresolved. (If finalized had produced an
-        // address we'd have returned above.)
+        // (If finalized had produced an address we'd have returned above.)
         if (fin != null && fin.offchainExecutor().usedOffchain()) {
+            if (finErr != null) {
+                // The offchain gateway FAILED (e.g. HTTP 429 rate-limit) rather than
+                // returning a valid empty record. Surface that as a transient error
+                // — reporting "does not resolve" here would wrongly imply the name
+                // has no address.
+                return jsonError("ENS gateway error (try again): " + unwrapMessage(finErr));
+            }
             log.debug("[ens] {} used an offchain gateway at finalized; skipping head fallback", name);
             return "{\"ok\":true,\"resolved\":false"
                 + ",\"name\":\"" + escapeJson(name) + "\""
