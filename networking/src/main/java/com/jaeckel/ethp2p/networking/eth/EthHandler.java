@@ -216,7 +216,14 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
 
     /** Called by RLPxHandler when a decoded message arrives. */
     public void onMessage(ChannelHandlerContext ctx, RLPxHandler.RLPxMessage msg) {
-        log.info("[eth] Received message code=0x{} state={}", Integer.toHexString(msg.code()), state);
+        // TRACE, not INFO: this runs on the netty event-loop thread for EVERY
+        // inbound message, and full-node peers flood us with mempool gossip
+        // (Transactions 0x12 / NewPooledTransactionHashes 0x18) — hundreds per
+        // second. At INFO each one formats + writes to logcat and the in-app
+        // LogBuffer ring on the event loop, starving snap-response processing
+        // and inflating ENS-resolution RTTs from ~100ms to multiple seconds on
+        // Android. Keep it for deep debugging only.
+        log.trace("[eth] Received message code=0x{} state={}", Integer.toHexString(msg.code()), state);
         switch (state) {
             case AWAITING_HELLO -> handleHello(ctx, msg);
             case AWAITING_STATUS -> handleStatus(ctx, msg);
@@ -481,7 +488,12 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 } else if (msg.code() == snapGetTrieNodes) {
                     handleSnapGetTrieNodes(ctx, msg);
                 } else {
-                    log.debug("[eth] Ignoring 0x{} ({}, {} bytes) from {}",
+                    // TRACE, not DEBUG: the ignored codes are dominated by
+                    // high-frequency mempool gossip (0x12 / 0x18) every full-node
+                    // peer broadcasts unsolicited. Logging each at DEBUG on the
+                    // event loop (logcat + LogBuffer) was a major source of
+                    // event-loop contention during snap-heavy ENS resolution.
+                    log.trace("[eth] Ignoring 0x{} ({}, {} bytes) from {}",
                         Integer.toHexString(msg.code()), ignoredEthMessageReason(msg.code()),
                         msg.payload().length, remoteAddress);
                 }
@@ -867,6 +879,17 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         return result;
     }
 
+    /**
+     * Soft response-size cap for single-key snap proofs (GetAccountRange /
+     * GetStorageRanges). We only ever need the boundary proof for one key, not a
+     * state-sync page. Per the snap/1 spec this is a soft limit on the account
+     * /slot data and the responder still returns at least one entry plus the
+     * COMPLETE proof, so the proof we verify is never truncated. 4 KiB keeps the
+     * discarded data page tiny (~30x smaller than the old 128 KiB), which is what
+     * makes ENS resolution feasible over Android's mobile/wifi link.
+     */
+    private static final long SNAP_RESPONSE_BYTES = 4 * 1024L;
+
     private CompletableFuture<AccountRangeMessage.DecodeResult> sendGetAccountRange(
             ChannelHandlerContext ctx,
             org.apache.tuweni.bytes.Bytes32 accountHash,
@@ -874,9 +897,18 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         long reqId = requestId.getAndIncrement();
         CompletableFuture<AccountRangeMessage.DecodeResult> future = new CompletableFuture<>();
         pendingSnapRequests.put(reqId, future);
+        // Keep the full [origin, ffff] range — its absent/boundary-proof
+        // semantics are what the verifier (and the CCIP resolution path) rely on
+        // — but cap responseBytes hard. The peer returns at least one account
+        // plus the COMPLETE boundary proof regardless of the cap, so the proof we
+        // actually use is never truncated, while the discarded account page
+        // shrinks from ~128 KB (~2700 accounts) to a few KB. The old 128 KB page
+        // was fine on a LAN daemon but cost seconds per read on Android's
+        // mobile/wifi link (plus parsing 2700 RLP entries on ART), which blew the
+        // ENS-resolution timeout budget (jesse.cb.id timed out).
         org.apache.tuweni.bytes.Bytes32 limitHash = org.apache.tuweni.bytes.Bytes32.fromHexString(
             "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        byte[] payload = GetAccountRangeMessage.encode(reqId, stateRoot, accountHash, limitHash, 128 * 1024L);
+        byte[] payload = GetAccountRangeMessage.encode(reqId, stateRoot, accountHash, limitHash, SNAP_RESPONSE_BYTES);
         log.info("[snap] GetAccountRange reqId={} accountHash={} stateRoot={}",
             reqId, accountHash.toShortHexString(), stateRoot.toShortHexString());
         rlpxHandler.sendMessage(ctx, snapGetAccountRange, payload);
@@ -984,10 +1016,13 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         long reqId = requestId.getAndIncrement();
         CompletableFuture<StorageRangesMessage.DecodeResult> future = new CompletableFuture<>();
         pendingStorageRequests.put(reqId, future);
+        // Same fix as sendGetAccountRange: keep the [origin, ffff] range for its
+        // boundary-proof semantics but cap responseBytes so we don't pull a
+        // ~128 KB slot page (~2700 slots) we discard — only the proof is used.
         org.apache.tuweni.bytes.Bytes32 limitHash = org.apache.tuweni.bytes.Bytes32.fromHexString(
             "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         byte[] payload = GetStorageRangesMessage.encode(
-            reqId, stateRoot, accountHash, storageKeyHash, limitHash, 128 * 1024L);
+            reqId, stateRoot, accountHash, storageKeyHash, limitHash, SNAP_RESPONSE_BYTES);
         log.info("[snap] GetStorageRanges reqId={} accountHash={} slotHash={} stateRoot={}",
             reqId, accountHash.toShortHexString(), storageKeyHash.toShortHexString(),
             stateRoot.toShortHexString());
