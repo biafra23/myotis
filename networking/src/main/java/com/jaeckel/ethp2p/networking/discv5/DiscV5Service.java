@@ -65,7 +65,19 @@ public final class DiscV5Service implements AutoCloseable {
      * <p>CL convention is to run discv5 on the libp2p port (9000), so the
      * caller typically passes that rather than the EL 30303.
      */
-    public void start(int udpPort) {
+    public void start(int requestedUdpPort) {
+        // discv5's UDP bind port. CL convention is 9000, but on some hosts that
+        // port is already taken — notably ot-daemon (OpenThread) on Play-image
+        // Android emulators, which holds 0.0.0.0:9000 and is unkillable without
+        // root. A failed bind kills peer discovery and therefore beacon sync. A
+        // light client never accepts inbound discv5, so if the requested port
+        // isn't bindable we fall back to an OS-chosen free port; outbound
+        // discovery (querying bootnodes) works identically.
+        int udpPort = pickBindablePort(requestedUdpPort);
+        if (udpPort != requestedUdpPort) {
+            log.info("[discv5] UDP {} unavailable; binding free UDP {} instead (light client needs no inbound)",
+                    requestedUdpPort, udpPort);
+        }
         DefaultSigner signer = new DefaultSigner(nodeKey.secretKey());
 
         NodeRecord localRecord = new NodeRecordBuilder()
@@ -101,6 +113,24 @@ public final class DiscV5Service implements AutoCloseable {
             // 15s (same cadence as discv4-refresh) to surface new peers.
             scheduler.scheduleAtFixedRate(this::pollAndNotify, 5, 15, TimeUnit.SECONDS);
         });
+    }
+
+    /**
+     * Return {@code preferred} if a UDP socket can bind it, otherwise an
+     * OS-chosen free UDP port. The bind probe mirrors what discv5's Netty
+     * bootstrap does, so it detects the same conflicts (e.g. ot-daemon on 9000).
+     */
+    private static int pickBindablePort(int preferred) {
+        try (java.net.DatagramSocket probe = new java.net.DatagramSocket(preferred)) {
+            return probe.getLocalPort();
+        } catch (java.io.IOException taken) {
+            try (java.net.DatagramSocket free = new java.net.DatagramSocket(0)) {
+                return free.getLocalPort();
+            } catch (java.io.IOException e) {
+                // Couldn't get a free port either; let the real bind try + log.
+                return preferred;
+            }
+        }
     }
 
     /**
