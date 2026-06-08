@@ -8,6 +8,7 @@ import io.myotis.evm.EvmExecutor;
 import io.myotis.evm.abi.AbiEncoder;
 import io.myotis.evm.abi.FunctionSignature;
 import io.myotis.evm.ens.Namehash;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
@@ -24,15 +25,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Unit tests for {@link EnsResolver}.
  *
- * <p>Forward tests mock the Universal Resolver's
- * {@code resolve(bytes name, bytes data)} call. Reverse tests still mock
- * the step-by-step Registry → reverse-resolver path (the resolver's
- * reverse path stayed step-by-step in Phase 4).
+ * <p>Forward resolution is <b>direct</b>: no UniversalResolver and no shared CCIP
+ * batch gateway. The resolver is discovered via the Registry (ENSIP-10 walk),
+ * then called directly — {@code resolve(bytes,bytes)} for ENSIP-10 (wildcard /
+ * offchain) resolvers, or the record method directly for a legacy resolver. So
+ * these tests mock that exact sequence: {@code registry.resolver(node)} →
+ * {@code resolver.supportsInterface(0x9061b923)} → the record call.
  *
  * <p>The {@link MockExecutor} maps {@code (target, calldata) → response}
- * deterministically, with a separate channel for "this call should fail
- * with EvmExecutionException(Reverted)" to test the UR-revert-as-empty
- * pathway.
+ * deterministically, with a separate channel for reverts.
  */
 class EnsResolverTest {
 
@@ -42,32 +43,40 @@ class EnsResolverTest {
             "0xce01f8eee7E479C928F8919abD53E553a36CeF67");
     private static final Address PUBLIC_RESOLVER = Address.fromHex(
             "0x231b0Ee14048e9dCcD1d247744d114a4EB5E8E63");
+    private static final Address WILDCARD_RESOLVER = Address.fromHex(
+            "0xce01f8eee7E479C928F8919abD53E553a36CeF67");
     private static final Address VITALIK = Address.fromHex(
             "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
 
-    // ---- Forward resolution (UR path) -------------------------------------
+    /** IExtendedResolver (ENSIP-10) interface id. */
+    private static final byte[] EXTENDED_ID = {(byte) 0x90, 0x61, (byte) 0xb9, 0x23};
+
+    @BeforeEach
+    void resetCache() {
+        // The resolver-discovery cache is process-static (it must survive the
+        // per-resolution EnsResolver instances in production); clear it so tests
+        // don't inherit each other's mocked discovery.
+        EnsResolver.clearResolverCache();
+    }
+
+    // ---- Forward resolution: legacy (direct record call) ------------------
 
     @Test
     void resolveAddressVitalikEth() throws Exception {
         var mock = new MockExecutor();
-        mock.respond(UR, callUrResolveAddr("vitalik.eth"),
-                encodeUrAddrResponse(VITALIK, PUBLIC_RESOLVER));
+        programLegacy(mock, "vitalik.eth", innerAddr("vitalik.eth"), encodeAddress(VITALIK));
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         Optional<Address> result = resolver.resolveAddress("vitalik.eth", ctx()).get();
         assertEquals(Optional.of(VITALIK), result);
-        assertEquals(1, mock.callCount(),
-                "UR-based forward resolution issues exactly one callView");
     }
 
     @Test
-    void resolveAddressUrRevertReturnsEmpty() throws Exception {
-        // The Universal Resolver may revert with a custom error
-        // (ResolverNotFound, etc.) for unregistered names. Treat as
-        // "no answer" rather than propagate the revert.
+    void resolveAddressNoResolverReturnsEmpty() throws Exception {
+        // No resolver set on the name or any parent → unregistered → empty.
         var mock = new MockExecutor();
-        mock.revertOn(UR, callUrResolveAddr("not-registered.eth"),
-                /* revert data = empty */ new byte[0]);
+        mock.respond(REGISTRY, callRegistryResolver("not-registered.eth"), encodeAddress(Address.ZERO));
+        mock.respond(REGISTRY, callRegistryResolver("eth"), encodeAddress(Address.ZERO));
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         Optional<Address> result = resolver.resolveAddress("not-registered.eth", ctx()).get();
@@ -75,12 +84,10 @@ class EnsResolverTest {
     }
 
     @Test
-    void resolveAddressEmptyResultBytesReturnsEmpty() throws Exception {
-        // The UR returns successfully but with an empty inner-call result
-        // (resolver returned no addr record).
+    void resolveAddressZeroAddrReturnsEmpty() throws Exception {
+        // Resolver exists but addr() returns the zero address (no record).
         var mock = new MockExecutor();
-        mock.respond(UR, callUrResolveAddr("ghost.eth"),
-                encodeUrAddrResponse(Address.ZERO, PUBLIC_RESOLVER));
+        programLegacy(mock, "ghost.eth", innerAddr("ghost.eth"), encodeAddress(Address.ZERO));
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         Optional<Address> result = resolver.resolveAddress("ghost.eth", ctx()).get();
@@ -88,31 +95,42 @@ class EnsResolverTest {
     }
 
     @Test
-    void resolveAddressOffchainLookupRevertIsRethrown() {
-        // The Universal Resolver's wildcard resolver may revert with an
-        // ERC-3668 OffchainLookup. When the caller hasn't wrapped the
-        // executor in CcipReadEvmExecutor, that revert must surface as a
-        // distinct error — not be swallowed as "name not found." This
-        // distinguishes "you forgot CCIP-Read wiring" from "the name
-        // genuinely doesn't resolve."
+    void resolveAddressShortResponseReturnsEmpty() throws Exception {
         var mock = new MockExecutor();
-        // Build a minimal, valid OffchainLookup payload so
-        // OffchainLookupRevert.tryParse() recognises it.
-        byte[] offchainLookupPayload = io.myotis.evm.ccipread.OffchainLookupRevert.SELECTOR;
-        // The selector alone isn't a valid full payload, but we need a
-        // representative payload that the parser recognises. Build one via
-        // AbiEncoder so it round-trips:
-        byte[] body = AbiEncoder.encodeRaw(
-                AbiEncoder.address(io.myotis.evm.Address.ZERO),                  // sender
-                AbiEncoder.stringArray(java.util.List.of("test://gateway")),     // urls
-                AbiEncoder.bytes(new byte[0]),                                   // callData
-                new io.myotis.evm.abi.AbiValue(false, new byte[32]),             // callbackFunction
-                AbiEncoder.bytes(new byte[0]));                                  // extraData
-        byte[] full = new byte[4 + body.length];
-        System.arraycopy(offchainLookupPayload, 0, full, 0, 4);
-        System.arraycopy(body, 0, full, 4, body.length);
+        programLegacy(mock, "weird.eth", innerAddr("weird.eth"), new byte[]{1, 2, 3, 4, 5, 6, 7, 8});
 
-        mock.revertOn(UR, callUrResolveAddr("ccip-read.eth"), full);
+        var resolver = new EnsResolver(mock, REGISTRY, UR);
+        Optional<Address> result = resolver.resolveAddress("weird.eth", ctx()).get();
+        assertTrue(result.isEmpty());
+    }
+
+    // ---- Forward resolution: wildcard (ENSIP-10 resolve()) ----------------
+
+    @Test
+    void resolveAddressWildcardViaExtendedResolver() throws Exception {
+        // jesse.cb.id: resolver lives on the parent (cb.id) and implements
+        // ENSIP-10, so we call resolve(name, addr-call) directly on it.
+        var mock = new MockExecutor();
+        Address resolved = Address.fromHex("0x849151d7D0bF1F34b70d5caD5149D28CC2308bf1");
+        // resolver found at the parent "cb.id" (wildcard), not the exact node.
+        mock.respond(REGISTRY, callRegistryResolver("jesse.cb.id"), encodeAddress(Address.ZERO));
+        mock.respond(REGISTRY, callRegistryResolver("cb.id"), encodeAddress(WILDCARD_RESOLVER));
+        mock.respond(WILDCARD_RESOLVER, callSupportsExtended(), encodeBool(true));
+        mock.respond(WILDCARD_RESOLVER, resolveCalldata("jesse.cb.id", innerAddr("jesse.cb.id")),
+                encodeBytes(encodeAddress(resolved)));
+
+        var resolver = new EnsResolver(mock, REGISTRY, UR);
+        Optional<Address> result = resolver.resolveAddress("jesse.cb.id", ctx()).get();
+        assertEquals(Optional.of(resolved), result);
+    }
+
+    @Test
+    void resolveAddressOffchainLookupRevertIsRethrown() {
+        // An ENSIP-10 resolver may revert with an ERC-3668 OffchainLookup. With no
+        // CcipReadEvmExecutor wrapping, that must surface as a distinct error.
+        var mock = new MockExecutor();
+        programExtendedRevert(mock, "ccip-read.eth",
+                resolveCalldata("ccip-read.eth", innerAddr("ccip-read.eth")), offchainLookupPayload());
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         try {
@@ -130,26 +148,13 @@ class EnsResolverTest {
         }
     }
 
-    @Test
-    void resolveAddressShortResponseReturnsEmpty() throws Exception {
-        // UR returned non-conforming bytes (less than the 64 head bytes
-        // a (bytes, address) tuple needs). Treat as no answer.
-        var mock = new MockExecutor();
-        mock.respond(UR, callUrResolveAddr("weird.eth"),
-                new byte[]{1, 2, 3, 4, 5, 6, 7, 8});
-
-        var resolver = new EnsResolver(mock, REGISTRY, UR);
-        Optional<Address> result = resolver.resolveAddress("weird.eth", ctx()).get();
-        assertTrue(result.isEmpty());
-    }
-
-    // ---- Extended record types (UR path) ----------------------------------
+    // ---- Extended record types (direct legacy path) ----------------------
 
     @Test
     void resolveTextHappyPath() throws Exception {
         var mock = new MockExecutor();
-        mock.respond(UR, callUrResolveText("vitalik.eth", "avatar"),
-                encodeUrDynamicResponse(encodeString("ipfs://Qm..."), PUBLIC_RESOLVER));
+        programLegacy(mock, "vitalik.eth", innerText("vitalik.eth", "avatar"),
+                encodeString("ipfs://Qm..."));
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         Optional<String> result = resolver.resolveText("vitalik.eth", "avatar", ctx()).get();
@@ -159,9 +164,8 @@ class EnsResolverTest {
     @Test
     void resolveTextEmptyResultReturnsEmpty() throws Exception {
         var mock = new MockExecutor();
-        // Inner result decodes to an empty string (length=0).
-        mock.respond(UR, callUrResolveText("vitalik.eth", "no-such-key"),
-                encodeUrDynamicResponse(encodeString(""), PUBLIC_RESOLVER));
+        programLegacy(mock, "vitalik.eth", innerText("vitalik.eth", "no-such-key"),
+                encodeString(""));
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         Optional<String> result = resolver.resolveText("vitalik.eth", "no-such-key", ctx()).get();
@@ -169,23 +173,10 @@ class EnsResolverTest {
     }
 
     @Test
-    void resolveTextUrRevertReturnsEmpty() throws Exception {
-        var mock = new MockExecutor();
-        mock.revertOn(UR, callUrResolveText("ghost.eth", "avatar"), new byte[0]);
-
-        var resolver = new EnsResolver(mock, REGISTRY, UR);
-        Optional<String> result = resolver.resolveText("ghost.eth", "avatar", ctx()).get();
-        assertTrue(result.isEmpty());
-    }
-
-    @Test
     void resolveContenthashHappyPath() throws Exception {
         var mock = new MockExecutor();
-        // multicodec for ipfs is 0xe3 0x01 0x01 0x70 ...; we don't validate
-        // the prefix here, just that the bytes round-trip unchanged.
         byte[] expected = HexFormat.of().parseHex("e30101701220deadbeef");
-        mock.respond(UR, callUrResolveContenthash("vitalik.eth"),
-                encodeUrDynamicResponse(encodeBytes(expected), PUBLIC_RESOLVER));
+        programLegacy(mock, "vitalik.eth", innerContenthash("vitalik.eth"), encodeBytes(expected));
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         Optional<byte[]> result = resolver.resolveContenthash("vitalik.eth", ctx()).get();
@@ -196,8 +187,7 @@ class EnsResolverTest {
     @Test
     void resolveContenthashEmptyReturnsEmpty() throws Exception {
         var mock = new MockExecutor();
-        mock.respond(UR, callUrResolveContenthash("ghost.eth"),
-                encodeUrDynamicResponse(encodeBytes(new byte[0]), PUBLIC_RESOLVER));
+        programLegacy(mock, "ghost.eth", innerContenthash("ghost.eth"), encodeBytes(new byte[0]));
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         Optional<byte[]> result = resolver.resolveContenthash("ghost.eth", ctx()).get();
@@ -207,12 +197,9 @@ class EnsResolverTest {
     @Test
     void resolveMultiCoinAddressBitcoin() throws Exception {
         var mock = new MockExecutor();
-        // SLIP-44 coinType 0 = Bitcoin. The "address" is the script payload
-        // bytes; we don't validate format here, just round-trip.
         byte[] btcPayload = HexFormat.of().parseHex(
                 "76a914f3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a388ac");
-        mock.respond(UR, callUrResolveAddrCoin("vitalik.eth", 0L),
-                encodeUrDynamicResponse(encodeBytes(btcPayload), PUBLIC_RESOLVER));
+        programLegacy(mock, "vitalik.eth", innerAddrCoin("vitalik.eth", 0L), encodeBytes(btcPayload));
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         Optional<byte[]> result =
@@ -228,12 +215,10 @@ class EnsResolverTest {
                 "1111111111111111111111111111111111111111111111111111111111111111");
         byte[] y = HexFormat.of().parseHex(
                 "2222222222222222222222222222222222222222222222222222222222222222");
-        // Pubkey returns (bytes32 x, bytes32 y) — 64 bytes head, no tail.
         byte[] innerReturn = new byte[64];
         System.arraycopy(x, 0, innerReturn, 0, 32);
         System.arraycopy(y, 0, innerReturn, 32, 32);
-        mock.respond(UR, callUrResolvePubkey("vitalik.eth"),
-                encodeUrDynamicResponse(innerReturn, PUBLIC_RESOLVER));
+        programLegacy(mock, "vitalik.eth", innerPubkey("vitalik.eth"), innerReturn);
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         Optional<EnsResolver.Pubkey> result = resolver.resolvePubkey("vitalik.eth", ctx()).get();
@@ -245,9 +230,7 @@ class EnsResolverTest {
     @Test
     void resolvePubkeyAllZeroReturnsEmpty() throws Exception {
         var mock = new MockExecutor();
-        // Both coordinates zero → no pubkey set.
-        mock.respond(UR, callUrResolvePubkey("ghost.eth"),
-                encodeUrDynamicResponse(new byte[64], PUBLIC_RESOLVER));
+        programLegacy(mock, "ghost.eth", innerPubkey("ghost.eth"), new byte[64]);
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         Optional<EnsResolver.Pubkey> result = resolver.resolvePubkey("ghost.eth", ctx()).get();
@@ -257,14 +240,11 @@ class EnsResolverTest {
     @Test
     void resolveAbiHappyPath() throws Exception {
         var mock = new MockExecutor();
-        // ABI returns (uint256 contentType, bytes data). Build the head/tail
-        // by hand: head[0]=contentType (32 bytes), head[1]=offset to tail.
         byte[] data = HexFormat.of().parseHex("deadbeefcafebabe");
         byte[] innerReturn = AbiEncoder.encodeRaw(
-                AbiEncoder.uint256(1L),       // contentType = Solidity ABI JSON
+                AbiEncoder.uint256(1L),
                 AbiEncoder.bytes(data));
-        mock.respond(UR, callUrResolveAbi("vitalik.eth", 0xFL),
-                encodeUrDynamicResponse(innerReturn, PUBLIC_RESOLVER));
+        programLegacy(mock, "vitalik.eth", innerAbi("vitalik.eth", 0xFL), innerReturn);
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         Optional<EnsResolver.AbiRecord> result =
@@ -280,8 +260,7 @@ class EnsResolverTest {
         byte[] innerReturn = AbiEncoder.encodeRaw(
                 AbiEncoder.uint256(0L),
                 AbiEncoder.bytes(new byte[0]));
-        mock.respond(UR, callUrResolveAbi("ghost.eth", 0xFL),
-                encodeUrDynamicResponse(innerReturn, PUBLIC_RESOLVER));
+        programLegacy(mock, "ghost.eth", innerAbi("ghost.eth", 0xFL), innerReturn);
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         Optional<EnsResolver.AbiRecord> result =
@@ -293,9 +272,9 @@ class EnsResolverTest {
     void resolveDnsRecordHappyPath() throws Exception {
         var mock = new MockExecutor();
         byte[] dnsNameWire = DnsEncoder.encode("example.com");
-        byte[] rdata = HexFormat.of().parseHex("c0a80101"); // 192.168.1.1 (A record)
-        mock.respond(UR, callUrResolveDnsRecord("vitalik.eth", dnsNameWire, 1),
-                encodeUrDynamicResponse(encodeBytes(rdata), PUBLIC_RESOLVER));
+        byte[] rdata = HexFormat.of().parseHex("c0a80101");
+        programLegacy(mock, "vitalik.eth", innerDnsRecord("vitalik.eth", dnsNameWire, 1),
+                encodeBytes(rdata));
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         Optional<byte[]> result =
@@ -308,10 +287,9 @@ class EnsResolverTest {
     void resolveInterfaceImplementerHappyPath() throws Exception {
         var mock = new MockExecutor();
         Address impl = Address.fromHex("0x4242424242424242424242424242424242424242");
-        // EIP-165 selector for ERC-721 Metadata: 0x5b5e139f
         byte[] interfaceId = HexFormat.of().parseHex("5b5e139f");
-        mock.respond(UR, callUrResolveInterface("vitalik.eth", interfaceId),
-                encodeUrDynamicResponse(encodeAddress(impl), PUBLIC_RESOLVER));
+        programLegacy(mock, "vitalik.eth", innerInterface("vitalik.eth", interfaceId),
+                encodeAddress(impl));
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         Optional<Address> result =
@@ -329,19 +307,11 @@ class EnsResolverTest {
 
     @Test
     void offchainLookupRevertIsRethrownForEveryRecordType() {
-        // Sanity: the OffchainLookup-rethrow gate in dispatchUR applies to
-        // all record types, not just addr. Pick text as the representative.
+        // The OffchainLookup-rethrow gate applies to all record types; text here.
         var mock = new MockExecutor();
-        byte[] body = AbiEncoder.encodeRaw(
-                AbiEncoder.address(io.myotis.evm.Address.ZERO),
-                AbiEncoder.stringArray(java.util.List.of("test://gateway")),
-                AbiEncoder.bytes(new byte[0]),
-                new io.myotis.evm.abi.AbiValue(false, new byte[32]),
-                AbiEncoder.bytes(new byte[0]));
-        byte[] full = new byte[4 + body.length];
-        System.arraycopy(io.myotis.evm.ccipread.OffchainLookupRevert.SELECTOR, 0, full, 0, 4);
-        System.arraycopy(body, 0, full, 4, body.length);
-        mock.revertOn(UR, callUrResolveText("ccip-read.eth", "avatar"), full);
+        programExtendedRevert(mock, "ccip-read.eth",
+                resolveCalldata("ccip-read.eth", innerText("ccip-read.eth", "avatar")),
+                offchainLookupPayload());
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         try {
@@ -394,9 +364,8 @@ class EnsResolverTest {
         // Resolver.name(reverseNode) → "vitalik.eth"
         mock.respond(PUBLIC_RESOLVER, callResolverName(reverseName),
                 encodeString("vitalik.eth"));
-        // Forward verification: now via UR
-        mock.respond(UR, callUrResolveAddr("vitalik.eth"),
-                encodeUrAddrResponse(VITALIK, PUBLIC_RESOLVER));
+        // Forward verification of vitalik.eth — now via the direct path.
+        programLegacy(mock, "vitalik.eth", innerAddr("vitalik.eth"), encodeAddress(VITALIK));
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         Optional<String> result = resolver.resolveName(VITALIK, ctx()).get();
@@ -405,9 +374,6 @@ class EnsResolverTest {
 
     @Test
     void resolveNameRejectsImpersonationAttempt() throws Exception {
-        // Reverse resolver claims someone else's address resolves to
-        // vitalik.eth, but a forward UR call for vitalik.eth returns
-        // VITALIK's address — not the impersonator. ENSIP-3 says reject.
         var mock = new MockExecutor();
         Address impersonator = Address.fromHex(
                 "0x9999999999999999999999999999999999999999");
@@ -418,8 +384,7 @@ class EnsResolverTest {
         mock.respond(PUBLIC_RESOLVER, callResolverName(reverseName),
                 encodeString("vitalik.eth"));
         // Forward verification: vitalik.eth → VITALIK (NOT impersonator)
-        mock.respond(UR, callUrResolveAddr("vitalik.eth"),
-                encodeUrAddrResponse(VITALIK, PUBLIC_RESOLVER));
+        programLegacy(mock, "vitalik.eth", innerAddr("vitalik.eth"), encodeAddress(VITALIK));
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         Optional<String> result = resolver.resolveName(impersonator, ctx()).get();
@@ -447,7 +412,6 @@ class EnsResolverTest {
         String reverseName = ReverseLookup.nameFor(VITALIK);
         mock.respond(REGISTRY, callRegistryResolver(reverseName),
                 encodeAddress(PUBLIC_RESOLVER));
-        // Resolver returns empty data for name(bytes32).
         mock.respond(PUBLIC_RESOLVER, callResolverName(reverseName), new byte[0]);
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
@@ -455,88 +419,49 @@ class EnsResolverTest {
         assertTrue(result.isEmpty());
     }
 
-    // ---- Calldata builders ------------------------------------------------
+    // ---- Direct-path programming helpers ----------------------------------
 
-    private static byte[] callUrResolveAddr(String name) {
-        byte[] dnsName = DnsEncoder.encode(name);
-        byte[] node = Namehash.of(name);
-        byte[] innerCall = AbiEncoder.encodeCall(
-                FunctionSignature.of("addr(bytes32)"),
-                AbiEncoder.bytes32(node));
-        return AbiEncoder.encodeCall(
-                FunctionSignature.of("resolve(bytes,bytes)"),
-                AbiEncoder.bytes(dnsName),
-                AbiEncoder.bytes(innerCall));
+    /** Program an exact-match legacy resolver: registry → resolver, supportsInterface=false, direct record call. */
+    private static void programLegacy(MockExecutor mock, String name, byte[] innerCalldata, byte[] innerReturn) {
+        mock.respond(REGISTRY, callRegistryResolver(name), encodeAddress(PUBLIC_RESOLVER));
+        mock.respond(PUBLIC_RESOLVER, callSupportsExtended(), encodeBool(false));
+        mock.respond(PUBLIC_RESOLVER, innerCalldata, innerReturn);
     }
 
-    private static byte[] callUrResolveText(String name, String key) {
-        byte[] inner = AbiEncoder.encodeCall(
-                FunctionSignature.of("text(bytes32,string)"),
-                AbiEncoder.bytes32(Namehash.of(name)),
-                AbiEncoder.string(key));
-        return wrapInUrResolve(name, inner);
+    /** Program an exact-match ENSIP-10 resolver whose resolve() reverts with the given data. */
+    private static void programExtendedRevert(MockExecutor mock, String name, byte[] resolveCalldata, byte[] revertData) {
+        mock.respond(REGISTRY, callRegistryResolver(name), encodeAddress(WILDCARD_RESOLVER));
+        mock.respond(WILDCARD_RESOLVER, callSupportsExtended(), encodeBool(true));
+        mock.revertOn(WILDCARD_RESOLVER, resolveCalldata, revertData);
     }
 
-    private static byte[] callUrResolveContenthash(String name) {
-        byte[] inner = AbiEncoder.encodeCall(
-                FunctionSignature.of("contenthash(bytes32)"),
-                AbiEncoder.bytes32(Namehash.of(name)));
-        return wrapInUrResolve(name, inner);
+    private static byte[] offchainLookupPayload() {
+        byte[] body = AbiEncoder.encodeRaw(
+                AbiEncoder.address(Address.ZERO),
+                AbiEncoder.stringArray(java.util.List.of("test://gateway")),
+                AbiEncoder.bytes(new byte[0]),
+                new io.myotis.evm.abi.AbiValue(false, new byte[32]),
+                AbiEncoder.bytes(new byte[0]));
+        byte[] full = new byte[4 + body.length];
+        System.arraycopy(io.myotis.evm.ccipread.OffchainLookupRevert.SELECTOR, 0, full, 0, 4);
+        System.arraycopy(body, 0, full, 4, body.length);
+        return full;
     }
 
-    private static byte[] callUrResolveAddrCoin(String name, long coinType) {
-        byte[] inner = AbiEncoder.encodeCall(
-                FunctionSignature.of("addr(bytes32,uint256)"),
-                AbiEncoder.bytes32(Namehash.of(name)),
-                AbiEncoder.uint256(coinType));
-        return wrapInUrResolve(name, inner);
-    }
-
-    private static byte[] callUrResolvePubkey(String name) {
-        byte[] inner = AbiEncoder.encodeCall(
-                FunctionSignature.of("pubkey(bytes32)"),
-                AbiEncoder.bytes32(Namehash.of(name)));
-        return wrapInUrResolve(name, inner);
-    }
-
-    private static byte[] callUrResolveAbi(String name, long contentTypes) {
-        byte[] inner = AbiEncoder.encodeCall(
-                FunctionSignature.of("ABI(bytes32,uint256)"),
-                AbiEncoder.bytes32(Namehash.of(name)),
-                AbiEncoder.uint256(contentTypes));
-        return wrapInUrResolve(name, inner);
-    }
-
-    private static byte[] callUrResolveDnsRecord(String name, byte[] dnsNameWire, int resource) {
-        byte[] inner = AbiEncoder.encodeCall(
-                FunctionSignature.of("dnsRecord(bytes32,bytes,uint16)"),
-                AbiEncoder.bytes32(Namehash.of(name)),
-                AbiEncoder.bytes(dnsNameWire),
-                AbiEncoder.uint256(resource));
-        return wrapInUrResolve(name, inner);
-    }
-
-    private static byte[] callUrResolveInterface(String name, byte[] interfaceId) {
-        byte[] padded = new byte[32];
-        System.arraycopy(interfaceId, 0, padded, 0, 4);
-        byte[] inner = AbiEncoder.encodeCall(
-                FunctionSignature.of("interfaceImplementer(bytes32,bytes4)"),
-                AbiEncoder.bytes32(Namehash.of(name)),
-                AbiEncoder.bytes32(padded));
-        return wrapInUrResolve(name, inner);
-    }
-
-    private static byte[] wrapInUrResolve(String name, byte[] innerCall) {
-        return AbiEncoder.encodeCall(
-                FunctionSignature.of("resolve(bytes,bytes)"),
-                AbiEncoder.bytes(DnsEncoder.encode(name)),
-                AbiEncoder.bytes(innerCall));
-    }
+    // ---- Calldata builders: discovery + inner record calls ---------------
 
     private static byte[] callRegistryResolver(String name) {
         return AbiEncoder.encodeCall(
                 FunctionSignature.of("resolver(bytes32)"),
                 AbiEncoder.bytes32(Namehash.of(name)));
+    }
+
+    private static byte[] callSupportsExtended() {
+        byte[] padded = new byte[32];
+        System.arraycopy(EXTENDED_ID, 0, padded, 0, 4);
+        return AbiEncoder.encodeCall(
+                FunctionSignature.of("supportsInterface(bytes4)"),
+                AbiEncoder.bytes32(padded));
     }
 
     private static byte[] callResolverName(String reverseName) {
@@ -545,44 +470,88 @@ class EnsResolverTest {
                 AbiEncoder.bytes32(Namehash.of(reverseName)));
     }
 
-    /** ABI-encode a single address as a 32-byte uint256. */
+    private static byte[] innerAddr(String name) {
+        return AbiEncoder.encodeCall(
+                FunctionSignature.of("addr(bytes32)"),
+                AbiEncoder.bytes32(Namehash.of(name)));
+    }
+
+    private static byte[] innerText(String name, String key) {
+        return AbiEncoder.encodeCall(
+                FunctionSignature.of("text(bytes32,string)"),
+                AbiEncoder.bytes32(Namehash.of(name)),
+                AbiEncoder.string(key));
+    }
+
+    private static byte[] innerContenthash(String name) {
+        return AbiEncoder.encodeCall(
+                FunctionSignature.of("contenthash(bytes32)"),
+                AbiEncoder.bytes32(Namehash.of(name)));
+    }
+
+    private static byte[] innerAddrCoin(String name, long coinType) {
+        return AbiEncoder.encodeCall(
+                FunctionSignature.of("addr(bytes32,uint256)"),
+                AbiEncoder.bytes32(Namehash.of(name)),
+                AbiEncoder.uint256(coinType));
+    }
+
+    private static byte[] innerPubkey(String name) {
+        return AbiEncoder.encodeCall(
+                FunctionSignature.of("pubkey(bytes32)"),
+                AbiEncoder.bytes32(Namehash.of(name)));
+    }
+
+    private static byte[] innerAbi(String name, long contentTypes) {
+        return AbiEncoder.encodeCall(
+                FunctionSignature.of("ABI(bytes32,uint256)"),
+                AbiEncoder.bytes32(Namehash.of(name)),
+                AbiEncoder.uint256(contentTypes));
+    }
+
+    private static byte[] innerDnsRecord(String name, byte[] dnsNameWire, int resource) {
+        return AbiEncoder.encodeCall(
+                FunctionSignature.of("dnsRecord(bytes32,bytes,uint16)"),
+                AbiEncoder.bytes32(Namehash.of(name)),
+                AbiEncoder.bytes(dnsNameWire),
+                AbiEncoder.uint256(resource));
+    }
+
+    private static byte[] innerInterface(String name, byte[] interfaceId) {
+        byte[] padded = new byte[32];
+        System.arraycopy(interfaceId, 0, padded, 0, 4);
+        return AbiEncoder.encodeCall(
+                FunctionSignature.of("interfaceImplementer(bytes32,bytes4)"),
+                AbiEncoder.bytes32(Namehash.of(name)),
+                AbiEncoder.bytes32(padded));
+    }
+
+    /** ENSIP-10 resolve(name, innerCall) calldata sent to a wildcard resolver. */
+    private static byte[] resolveCalldata(String name, byte[] innerCall) {
+        return AbiEncoder.encodeCall(
+                FunctionSignature.of("resolve(bytes,bytes)"),
+                AbiEncoder.bytes(DnsEncoder.encode(name)),
+                AbiEncoder.bytes(innerCall));
+    }
+
+    // ---- ABI encoders for mock return values ------------------------------
+
     private static byte[] encodeAddress(Address a) {
         return AbiEncoder.encodeRaw(AbiEncoder.address(a));
     }
 
-    /** ABI-encode a single dynamic string. */
     private static byte[] encodeString(String s) {
         return AbiEncoder.encodeRaw(AbiEncoder.string(s));
     }
 
-    /** ABI-encode a single dynamic bytes value. */
     private static byte[] encodeBytes(byte[] data) {
         return AbiEncoder.encodeRaw(AbiEncoder.bytes(data));
     }
 
-    /**
-     * Encode the Universal Resolver's {@code resolve()} return for any
-     * dynamic-typed inner call:
-     * {@code (bytes innerReturn, address resolver)} — the {@code innerReturn}
-     * payload is whatever the inner function returned, supplied raw.
-     */
-    private static byte[] encodeUrDynamicResponse(byte[] innerReturn, Address resolver) {
-        return AbiEncoder.encodeRaw(
-                AbiEncoder.bytes(innerReturn),
-                AbiEncoder.address(resolver));
-    }
-
-    /**
-     * Encode the Universal Resolver's {@code resolve()} return for an
-     * {@code addr(bytes32)} inner call: {@code (bytes result, address resolver)}.
-     * The {@code result} bytes are themselves the 32-byte ABI encoding of
-     * the resolved address.
-     */
-    private static byte[] encodeUrAddrResponse(Address resolved, Address resolver) {
-        byte[] innerReturn = encodeAddress(resolved);
-        return AbiEncoder.encodeRaw(
-                AbiEncoder.bytes(innerReturn),
-                AbiEncoder.address(resolver));
+    private static byte[] encodeBool(boolean v) {
+        byte[] word = new byte[32];
+        word[31] = (byte) (v ? 1 : 0);
+        return word;
     }
 
     private static BlockContext ctx() {
