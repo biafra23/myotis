@@ -1095,8 +1095,24 @@ public final class NodeService extends Service {
             // Upstream proxy URL (DEBUG/dev only) comes from BuildConfig.RPC_UPSTREAM
             // (set in gitignored local.properties); blank → strict (no proxy).
             String upstream = BuildConfig.RPC_UPSTREAM;
+            // Verified-read backend: delegate to the node's shared connector +
+            // beacon state. Phase B serves chain id + verified head; more methods
+            // are added here as they're implemented.
+            final RLPxConnector backendConn = conn;
+            final BeaconSyncState backendState = beaconState;
+            final long backendGenesis = genesisTime;
+            io.myotis.jsonrpc.MyotisRpcBackend backend = new io.myotis.jsonrpc.MyotisRpcBackend() {
+                @Override public long chainId() { return backendConn.getNetwork().networkId(); }
+                @Override public Long headBlockNumber() {
+                    long n = backendState.getOptimisticBlockNumber();
+                    return n > 0 ? Long.valueOf(n) : null;
+                }
+                @Override public String syncState() {
+                    return backendState.getSyncState(backendGenesis).name();
+                }
+            };
             io.myotis.jsonrpc.MyotisRpcServer s =
-                    new io.myotis.jsonrpc.MyotisRpcServer(8545, upstream, "0.0.0.0");
+                    new io.myotis.jsonrpc.MyotisRpcServer(8545, upstream, "0.0.0.0", backend);
             s.start();
             this.rpcServer = s;
         } catch (Throwable t) {

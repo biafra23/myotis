@@ -24,6 +24,7 @@ import kotlinx.serialization.json.put
 class RpcRouter(
     private val proxy: UpstreamProxy?,
     private val logger: MethodLogger,
+    private val backend: MyotisRpcBackend? = null,
 ) {
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
@@ -34,13 +35,18 @@ class RpcRouter(
             return errorEnvelope(JsonNull, -32700, "Parse error")
         }
 
-        // Single request: may be a local method.
+        // Single request: try local + verified handlers before proxying.
         if (root is JsonObject) {
             val method = root["method"]?.jsonPrimitive?.contentOrNull
             val id = root["id"] ?: JsonNull
             if (method == "myotis_rpcCoverage") {
                 logger.record(method, "LOCAL", 0)
                 return resultEnvelope(id, logger.coverage())
+            }
+            val verified = tryVerified(method, id)
+            if (verified != null) {
+                logger.record(method!!, "VERIFIED", 0)
+                return verified
             }
         }
 
@@ -63,6 +69,26 @@ class RpcRouter(
         methods.forEach { logger.record(it, "PROXY", latencyMs) }
         return response
     }
+
+    /**
+     * Verified handlers (Phase B). Returns a JSON-RPC response string, or null to
+     * fall through to the proxy — either because the method isn't served verified
+     * yet, or because the node can't answer it verified right now (e.g. not synced).
+     */
+    private fun tryVerified(method: String?, id: JsonElement): String? {
+        val b = backend ?: return null
+        return when (method) {
+            // Chain id is config-derived — always answerable, no sync needed.
+            "eth_chainId" -> resultEnvelope(id, JsonPrimitive(hexQuantity(b.chainId())))
+            "net_version" -> resultEnvelope(id, JsonPrimitive(b.chainId().toString()))
+            // Verified beacon head; null (not synced) -> proxy.
+            "eth_blockNumber" -> b.headBlockNumber()?.let { resultEnvelope(id, JsonPrimitive(hexQuantity(it))) }
+            else -> null
+        }
+    }
+
+    /** Ethereum JSON-RPC QUANTITY encoding: minimal hex, no leading zeros, 0 -> "0x0". */
+    private fun hexQuantity(v: Long): String = "0x" + java.lang.Long.toHexString(v)
 
     private fun JsonObject.method(): String? = this["method"]?.jsonPrimitive?.contentOrNull
 

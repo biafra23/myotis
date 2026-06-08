@@ -31,12 +31,13 @@ class MyotisRpcServer(
     private val port: Int,
     private val upstreamUrl: String? = null,
     private val host: String = "0.0.0.0",
+    private val backend: MyotisRpcBackend? = null,
 ) {
     private val log = LoggerFactory.getLogger(MyotisRpcServer::class.java)
 
     private val proxy: UpstreamProxy? = upstreamUrl?.takeIf { it.isNotBlank() }?.let { UpstreamProxy(it) }
     private val logger = MethodLogger()
-    private val router = RpcRouter(proxy, logger)
+    private val router = RpcRouter(proxy, logger, backend)
 
     @Volatile
     private var engine: EmbeddedServer<*, *>? = null
