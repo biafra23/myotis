@@ -125,6 +125,29 @@ public class LightClientProcessor {
             return false;
         }
 
+        // Cheap applicability gate BEFORE the expensive BLS verify. An update's
+        // sync aggregate is signed by the committee of signature_slot's period,
+        // so it can only verify against our current committee when that period
+        // matches store_period (or store_period+1 once we already hold the next
+        // committee) — per spec validate_light_client_update. This is critical
+        // on Android: each BLS sync-aggregate verify costs ~17-30s on ART, and a
+        // catch-up updates_by_range response routinely contains far-future
+        // periods (e.g. period 1766 while the store is at 1728). Without this
+        // gate every such update burns a full verify only to fail the committee
+        // check, so catch-up from an old checkpoint never makes progress.
+        long storePeriod = store.getCurrentSyncCommitteePeriod();
+        long sigPeriod = BeaconChainSpec.computeSyncCommitteePeriod(update.signatureSlot());
+        boolean haveNext = store.getNextSyncCommittee() != null;
+        boolean applicable = haveNext
+                ? (sigPeriod == storePeriod || sigPeriod == storePeriod + 1)
+                : (sigPeriod == storePeriod);
+        if (!applicable) {
+            log.debug("[lc-processor] Update skipped pre-verify: signaturePeriod={} not applicable to "
+                            + "storePeriod={} (haveNext={}, attestedSlot={})",
+                    sigPeriod, storePeriod, haveNext, attestedSlot);
+            return false;
+        }
+
         // Verify sync aggregate over attested header
         if (!SyncCommitteeVerifier.verify(
                 update.syncAggregate(),

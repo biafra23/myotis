@@ -20,16 +20,18 @@ import java.util.concurrent.ConcurrentHashMap;
  * uses {@code android.util.Log} and the app's filesDir-rooted path supplied by
  * the caller, so we don't pull in slf4j-android or hardcode {@code /tmp}.
  *
- * <p>Record format: {@code ip\tport\tpublicKeyHex\n} (tab-separated, UTF-8).
- * Tabs can't appear in {@link java.net.InetAddress#getHostAddress()} output,
- * so the format stays unambiguous for IPv6 literals.
+ * <p>Record format: {@code ip\tport\tpublicKeyHex[\tsnap]\n} (tab-separated,
+ * UTF-8). Tabs can't appear in {@link java.net.InetAddress#getHostAddress()}
+ * output, so the format stays unambiguous for IPv6 literals. The trailing
+ * {@code snap} flag ("1"/"0") records snap/1 capability and is optional, so
+ * pre-existing cache files load unchanged (missing flag → not snap-capable).
  */
 public final class AndroidPeerCache {
 
     private static final String TAG = "ethp2p.cache";
     private static final char SEP = '\t';
 
-    public record CachedPeer(InetSocketAddress address, String publicKeyHex) {}
+    public record CachedPeer(InetSocketAddress address, String publicKeyHex, boolean snap) {}
 
     private final Path cacheFile;
     private final Set<String> seen = ConcurrentHashMap.newKeySet();
@@ -42,14 +44,14 @@ public final class AndroidPeerCache {
      * Synchronized because RLPxConnector calls this from Netty worker threads;
      * without it two simultaneous writes can interleave and corrupt a line.
      */
-    public synchronized void add(InetSocketAddress address, String publicKeyHex) {
+    public synchronized void add(InetSocketAddress address, String publicKeyHex, boolean snap) {
         // getHostString() over getAddress().getHostAddress() — the latter NPEs
         // if the address is unresolved. RLPxConnector hands us resolved
         // addresses, but getHostString() returns the literal ip string
         // directly and skips the defensive branch.
         String key = address.getHostString() + SEP + address.getPort();
         if (!seen.add(key)) return;
-        String line = key + SEP + publicKeyHex + "\n";
+        String line = key + SEP + publicKeyHex + SEP + (snap ? "1" : "0") + "\n";
         try (FileOutputStream out = new FileOutputStream(cacheFile.toFile(), true)) {
             out.write(line.getBytes(StandardCharsets.UTF_8));
         } catch (IOException e) {
@@ -86,8 +88,18 @@ public final class AndroidPeerCache {
                     }
                     String ip = line.substring(0, firstSep);
                     int port = Integer.parseInt(line.substring(firstSep + 1, secondSep));
-                    String pubKeyHex = line.substring(secondSep + 1);
-                    result.add(new CachedPeer(new InetSocketAddress(ip, port), pubKeyHex));
+                    // Optional trailing snap flag (3rd separator). Older lines
+                    // without it parse as pubKeyHex with snap=false.
+                    String pubKeyHex;
+                    boolean snap = false;
+                    int thirdSep = line.indexOf(SEP, secondSep + 1);
+                    if (thirdSep >= 0) {
+                        pubKeyHex = line.substring(secondSep + 1, thirdSep);
+                        snap = "1".equals(line.substring(thirdSep + 1));
+                    } else {
+                        pubKeyHex = line.substring(secondSep + 1);
+                    }
+                    result.add(new CachedPeer(new InetSocketAddress(ip, port), pubKeyHex, snap));
                     seen.add(ip + SEP + port);
                 } catch (Exception e) {
                     LogBuffer.w(TAG, "skipping malformed peer line: " + e.getMessage());

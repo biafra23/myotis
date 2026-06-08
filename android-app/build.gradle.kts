@@ -4,6 +4,16 @@ plugins {
     alias(libs.plugins.compose.compiler)
 }
 
+// === Android-compatible Besu (biafra23/besu fork) ======================
+// Besu's evm + algorithms modules assume JDK/runtime APIs Android's ART lacks
+// (the JDK-9 Provider(String,String,String) ctor; Caffeine's StripedBuffer
+// reflecting into Thread.threadLocalRandomProbe). The biafra23/besu fork
+// patches both (BesuProvider → API-1 ctor; CodeCache → LinkedHashMap LRU, no
+// Caffeine) and publishes them via JitPack. See besu-android-fork/README.md.
+// We swap only these two modules to the fork — scoped to :android-app so the
+// JVM daemon stays on upstream Besu, where those APIs work.
+val besuForkVersion = "24.12.2-android.2"
+
 // The JitPack netty-kotlin fork republishes netty-common/buffer/etc. with the
 // same fully-qualified classes; the JVM tolerates the shadowing but the dexer
 // doesn't. vertx-core (transitive via tuweni-crypto) drags upstream netty in,
@@ -18,6 +28,49 @@ plugins {
 configurations.all {
     exclude(group = "io.netty")
     exclude(group = "org.apache.logging.log4j")
+    // Swap Besu's evm + algorithms to the Android-patched fork (biafra23/besu via
+    // JitPack); everything else stays upstream. Eager `all` so AGP's classpaths
+    // pick up the resolutionStrategy before they resolve.
+    resolutionStrategy.dependencySubstitution {
+        substitute(module("org.hyperledger.besu:evm"))
+            .using(module("com.github.biafra23.besu:evm:$besuForkVersion"))
+        substitute(module("org.hyperledger.besu.internal:algorithms"))
+            .using(module("com.github.biafra23.besu:algorithms:$besuForkVersion"))
+        // The fork's POMs import org.hyperledger.besu:bom:24.12.2, which Besu
+        // never publishes to Maven Central; redirect it to the fork-published
+        // bom. The fork is pinned to version 24.12.2, so its other sibling refs
+        // (besu-datatypes, internal:rlp) are the real released 24.12.2 on
+        // Central and need no redirect — keeping them un-forked also avoids
+        // duplicate org.hyperledger.besu.datatypes.* classes at dex time.
+        substitute(platform(module("org.hyperledger.besu:bom")))
+            .using(platform(module("com.github.biafra23.besu:bom:$besuForkVersion")))
+    }
+    // Besu (via :myotis-evm) pulls the pre-rename tuweni coordinates
+    // io.tmio:tuweni-* 2.4.2, whose org.apache.tuweni.* classes collide with
+    // our JitPack fork (com.github.biafra23.tuweni-kotlin 2.7.2-jvm17.1) —
+    // D8 rejects the duplicates. Strip io.tmio and route Besu's tuweni to the
+    // fork (same package, newer version; API-compatible for the units/bytes
+    // Besu uses).
+    exclude(group = "io.tmio")
+    // Requesting the STANDARD_JVM Guava variant (below) clashes with the
+    // `android` variant that Besu pulls transitively — both provide the guava
+    // capability. Resolve the conflict toward the JRE variant, which is the one
+    // whose com.google.common.base.Supplier extends java.util.function.Supplier
+    // (what Besu's crypto.Hash needs).
+    // Guava declares two capabilities (its own, plus the legacy
+    // com.google.collections:google-collections); both see the variant clash.
+    listOf("com.google.guava:guava", "com.google.collections:google-collections").forEach { cap ->
+        resolutionStrategy.capabilitiesResolution.withCapability(cap) {
+            val jre = candidates.firstOrNull { it.variantName.contains("jre", ignoreCase = true) }
+            if (jre != null) {
+                select(jre)
+                because("Besu needs the JRE variant of Guava on Android")
+            }
+        }
+    }
+    // (No Caffeine pin needed: the fork's CodeCache drops Caffeine, so nothing
+    // on the EVM path loads a Caffeine class — its StripedBuffer/System.Logger
+    // Android incompatibilities never trigger.)
 }
 
 android {
@@ -115,6 +168,34 @@ dependencies {
     implementation(project(":core"))
     implementation(project(":networking"))
     implementation(project(":consensus"))
+    // ENS resolution runs the ENS contracts in a local Besu EVM over
+    // SNAP-verified state. :myotis-evm is needed directly (not just
+    // transitively) because the SnapPeer/CcipGateway/BlockContext/Address
+    // types are referenced from our adapter + NodeService, and Gradle hides
+    // a transitive `implementation` dep from the consumer's compile classpath.
+    implementation(project(":myotis-ens"))
+    implementation(project(":myotis-evm"))
+
+    // Force the JRE *variant* of Guava. Guava publishes jre and android
+    // variants under one module; on an Android project Gradle's
+    // org.gradle.jvm.environment=android attribute selects the `android`
+    // variant, whose com.google.common.base.Supplier does NOT extend
+    // java.util.function.Supplier. Besu's crypto.Hash memoizes a Supplier and
+    // invokes it as java.util.function.Supplier, so the android variant throws
+    // IncompatibleClassChangeError at runtime. The JRE variant's Supplier does
+    // extend it (native at minSdk 29). A version force can't fix this — it's
+    // variant selection — so request STANDARD_JVM explicitly for guava.
+    implementation("com.google.guava:guava") {
+        attributes {
+            attribute(
+                org.gradle.api.attributes.java.TargetJvmEnvironment.TARGET_JVM_ENVIRONMENT_ATTRIBUTE,
+                objects.named(
+                    org.gradle.api.attributes.java.TargetJvmEnvironment::class.java,
+                    org.gradle.api.attributes.java.TargetJvmEnvironment.STANDARD_JVM
+                )
+            )
+        }
+    }
 
     // core/networking expose tuweni and netty only as `implementation`, so
     // add what the service code references directly.

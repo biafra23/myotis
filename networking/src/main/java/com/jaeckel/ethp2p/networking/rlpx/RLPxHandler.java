@@ -68,7 +68,11 @@ public final class RLPxHandler extends ByteToMessageDecoder {
 
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
-        log.debug("[rlpx] decode() called, state={}, readableBytes={}", state, in.readableBytes());
+        // TRACE, not DEBUG: netty calls decode() on every inbound read across
+        // every peer connection — a very hot path under the mempool gossip
+        // full nodes flood us with. At DEBUG this floods logcat + the in-app
+        // LogBuffer from the event loop and contends with snap-response work.
+        log.trace("[rlpx] decode() called, state={}, readableBytes={}", state, in.readableBytes());
         switch (state) {
             case HANDSHAKE_READ -> decodeAck(ctx, in);
             case FRAMED -> decodeFrames(ctx, in);

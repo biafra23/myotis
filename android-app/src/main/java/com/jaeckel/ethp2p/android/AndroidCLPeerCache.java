@@ -30,12 +30,15 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class AndroidCLPeerCache {
 
     private static final String TAG = "ethp2p.cl-cache";
+    private static final char SEP = '\t';
 
     public static final int FAILURE_THRESHOLD = 3;
 
     private final Path cacheFile;
     private final Set<String> seen = ConcurrentHashMap.newKeySet();
     private final Map<String, Integer> failures = new ConcurrentHashMap<>();
+    /** multiaddr -> lowest sync-committee period it served during catch-up. */
+    private final Map<String, Long> servedPeriod = new ConcurrentHashMap<>();
 
     public AndroidCLPeerCache(Path cacheFile) {
         this.cacheFile = cacheFile;
@@ -52,6 +55,26 @@ public final class AndroidCLPeerCache {
         }
     }
 
+    /**
+     * Record that a peer served catch-up down to {@code period}. Keeps the lowest
+     * period (deepest history). Persisted as {@code multiaddr\t<period>} so a
+     * restart can prefer peers proven to serve the checkpoint period.
+     */
+    public synchronized void recordServed(String multiaddr, long period) {
+        if (multiaddr == null || multiaddr.isEmpty()) return;
+        failures.remove(multiaddr);
+        seen.add(multiaddr);
+        Long prev = servedPeriod.get(multiaddr);
+        if (prev != null && prev <= period) return;
+        servedPeriod.put(multiaddr, period);
+        rewriteFile();
+    }
+
+    /** multiaddr -> lowest served period, for peers proven to serve catch-up. */
+    public Map<String, Long> servedPeriods() {
+        return new java.util.HashMap<>(servedPeriod);
+    }
+
     public void markFailure(String multiaddr) {
         if (multiaddr == null || multiaddr.isEmpty()) return;
         if (!seen.contains(multiaddr)) return;
@@ -59,6 +82,7 @@ public final class AndroidCLPeerCache {
         if (count >= FAILURE_THRESHOLD) {
             if (seen.remove(multiaddr)) {
                 failures.remove(multiaddr);
+                servedPeriod.remove(multiaddr);
                 rewriteFile();
                 LogBuffer.i(TAG, "evicted peer after " + count + " failures: " + multiaddr);
             }
@@ -74,11 +98,20 @@ public final class AndroidCLPeerCache {
             while ((line = r.readLine()) != null) {
                 line = line.strip();
                 if (line.isEmpty() || !line.startsWith("/")) continue;
-                result.add(line);
-                seen.add(line);
+                String multiaddr = line;
+                int sep = line.indexOf(SEP);
+                if (sep >= 0) {
+                    multiaddr = line.substring(0, sep);
+                    try {
+                        servedPeriod.put(multiaddr, Long.parseLong(line.substring(sep + 1).strip()));
+                    } catch (NumberFormatException ignored) {}
+                }
+                result.add(multiaddr);
+                seen.add(multiaddr);
             }
             if (!result.isEmpty()) {
-                LogBuffer.i(TAG, "loaded " + result.size() + " cached CL peer(s)");
+                LogBuffer.i(TAG, "loaded " + result.size() + " cached CL peer(s) ("
+                        + servedPeriod.size() + " proven catch-up servers)");
             }
         } catch (IOException e) {
             LogBuffer.w(TAG, "read failed: " + e.getMessage());
@@ -89,18 +122,21 @@ public final class AndroidCLPeerCache {
     public synchronized void clear() {
         seen.clear();
         failures.clear();
+        servedPeriod.clear();
         if (!cacheFile.toFile().delete() && cacheFile.toFile().exists()) {
             LogBuffer.w(TAG, "failed to delete cache file " + cacheFile);
         }
     }
 
     private synchronized void rewriteFile() {
-        List<String> lines = new ArrayList<>(seen);
-        Collections.sort(lines);
+        List<String> peers = new ArrayList<>(seen);
+        Collections.sort(peers);
         try (Writer w = new OutputStreamWriter(
                 new FileOutputStream(cacheFile.toFile(), false), StandardCharsets.UTF_8)) {
-            for (String line : lines) {
-                w.write(line);
+            for (String p : peers) {
+                w.write(p);
+                Long sp = servedPeriod.get(p);
+                if (sp != null) { w.write(SEP); w.write(Long.toString(sp)); }
                 w.write('\n');
             }
         } catch (IOException e) {

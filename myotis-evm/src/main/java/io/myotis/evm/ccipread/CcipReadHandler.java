@@ -124,7 +124,60 @@ public final class CcipReadHandler {
                 : null;
 
         return gateway.request(method, substituted, body)
-                .thenApply(CcipReadHandler::parseDataField);
+                .thenApply(CcipReadHandler::parseDataField)
+                .thenApply(CcipReadHandler::rejectGatewayHttpError);
+    }
+
+    /** ERC-7884 {@code HttpError(uint16,string)} selector — gateways wrap upstream
+     *  HTTP failures (rate limits, 5xx) in this even when the transport returns
+     *  200. Treat it as a gateway failure, not a valid "no record" answer. */
+    private static final byte[] HTTP_ERROR_SELECTOR = {(byte) 0xca, (byte) 0x7a, (byte) 0x4e, (byte) 0x75};
+
+    /**
+     * If the gateway body encodes an {@code HttpError} (e.g. a proxied 429 "Too
+     * Many Requests" or a 5xx), throw so {@link #tryUrlsSerially} records it and
+     * fails over / surfaces a transient gateway error — rather than passing the
+     * error blob to the resolver callback, which would silently decode it to an
+     * empty record and look like "name does not resolve". Otherwise pass the
+     * response through unchanged.
+     */
+    private static byte[] rejectGatewayHttpError(byte[] data) {
+        if (data == null || indexOf(data, HTTP_ERROR_SELECTOR) < 0) return data;
+        // The HttpError carries a uint16 status and a string, but both are nested
+        // inside the gateway's batch wrapper at offsets that are awkward to parse
+        // robustly; the human-readable message ("Too Many Requests", "Bad
+        // Gateway", …) is the reliable signal, so surface that.
+        String message = scanAsciiMessage(data);
+        throw new java.util.concurrent.CompletionException(new java.io.IOException(
+                "gateway HttpError" + (message.isEmpty() ? "" : ": " + message)));
+    }
+
+    private static int indexOf(byte[] haystack, byte[] needle) {
+        outer:
+        for (int i = 0; i + needle.length <= haystack.length; i++) {
+            for (int j = 0; j < needle.length; j++) {
+                if (haystack[i + j] != needle[j]) continue outer;
+            }
+            return i;
+        }
+        return -1;
+    }
+
+    /** Longest run of printable ASCII (>= 4 chars) in the blob — the error text. */
+    private static String scanAsciiMessage(byte[] data) {
+        String best = "";
+        StringBuilder cur = new StringBuilder();
+        for (byte b : data) {
+            int c = b & 0xff;
+            if (c >= 0x20 && c <= 0x7e) {
+                cur.append((char) c);
+            } else {
+                if (cur.length() > best.length()) best = cur.toString();
+                cur.setLength(0);
+            }
+        }
+        if (cur.length() > best.length()) best = cur.toString();
+        return best.length() >= 4 ? best.trim() : "";
     }
 
     /** Returns the bytes hex-encoded under {@code data}, or null if absent. */

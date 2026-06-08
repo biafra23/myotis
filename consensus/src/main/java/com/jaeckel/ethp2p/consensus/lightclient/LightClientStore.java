@@ -157,4 +157,43 @@ public class LightClientStore {
     public synchronized boolean isInitialized() {
         return currentSyncCommittee != null;
     }
+
+    /**
+     * Immutable, consistent view of the full store state — everything needed to
+     * resume verification after a restart without re-bootstrapping from the
+     * embedded checkpoint. Captured atomically under the store monitor.
+     */
+    public record Snapshot(
+            LightClientHeader finalizedHeader,
+            LightClientHeader optimisticHeader,
+            SyncCommittee currentSyncCommittee,
+            SyncCommittee nextSyncCommittee,   // nullable
+            long finalizedSlot,
+            long optimisticSlot,
+            long currentSyncCommitteePeriod) {}
+
+    /** Atomically capture the full store state for persistence. Null until initialized. */
+    public synchronized Snapshot snapshot() {
+        if (currentSyncCommittee == null || finalizedHeader == null) return null;
+        return new Snapshot(finalizedHeader, optimisticHeader, currentSyncCommittee,
+                nextSyncCommittee, finalizedSlot, optimisticSlot, currentSyncCommitteePeriod);
+    }
+
+    /**
+     * Restore the full store state from a persisted {@link Snapshot} (resume
+     * after restart). Unlike {@link #initialize}, this preserves the exact
+     * committee period and the next committee — i.e. it picks up verification
+     * exactly where the previous run left off, so catch-up only needs to cover
+     * periods since then. The snapshot must come from our own prior, BLS-verified
+     * run; callers gate on it being newer than the embedded checkpoint.
+     */
+    public synchronized void restore(Snapshot s) {
+        this.finalizedHeader = s.finalizedHeader();
+        this.optimisticHeader = s.optimisticHeader();
+        this.currentSyncCommittee = s.currentSyncCommittee();
+        this.nextSyncCommittee = s.nextSyncCommittee();
+        this.finalizedSlot = s.finalizedSlot();
+        this.optimisticSlot = s.optimisticSlot();
+        this.currentSyncCommitteePeriod = s.currentSyncCommitteePeriod();
+    }
 }

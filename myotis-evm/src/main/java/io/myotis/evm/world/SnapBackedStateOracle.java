@@ -62,6 +62,22 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
     private final BytecodeCache bytecodeCache;
     private final int maxAttempts;
 
+    /**
+     * Per-oracle (i.e. per-resolution) memoization of account-record fetches,
+     * keyed by {@code stateRoot:address}. A single ENS resolution issues many
+     * SLOADs against the same few contracts (registry, resolver, …) and
+     * {@link #fetchStorage} re-derives the account record on every slot — so
+     * without this, reading N storage slots of a contract would trigger N
+     * redundant account proofs, i.e. N extra snap round-trips. On Android each
+     * round-trip is ~2-6 s, so those dominate latency. The account record at a
+     * fixed stateRoot is immutable and already proof-verified, so memoizing the
+     * in-flight fetch is safe (view calls never mutate state) and collapses the
+     * N fetches into one shared request. Failed fetches are evicted so a later
+     * read can still retry across peers.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<String, CompletableFuture<AccountWithStorageRoot>>
+            accountCache = new java.util.concurrent.ConcurrentHashMap<>();
+
     public SnapBackedStateOracle(Supplier<SnapPeer> peerSupplier, BytecodeCache bytecodeCache) {
         this(peerSupplier, bytecodeCache, DEFAULT_MAX_ATTEMPTS);
     }
@@ -148,9 +164,20 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
         Bytes addressBytes = Bytes.wrap(address.toByteArray());
         Bytes32 accountHash = Bytes32.wrap(Hash.keccak256(addressBytes).toArrayUnsafe());
 
-        return tryWithRetries(peer -> peer
-                .getTrieNodes(root, List.of(SnapPeer.PathSet.account(accountHash)))
-                .thenApply(nodes -> verifyAndDecodeAccount(root, accountHash, address, nodes)));
+        String key = root.toHexString() + ':' + addressBytes.toHexString();
+        return accountCache.computeIfAbsent(key, k -> {
+            CompletableFuture<AccountWithStorageRoot> f = tryWithRetries(peer -> peer
+                    .getTrieNodes(root, List.of(SnapPeer.PathSet.account(accountHash)))
+                    .thenApply(nodes -> verifyAndDecodeAccount(root, accountHash, address, nodes)));
+            // Evict failed fetches so a later read can retry across peers. Use
+            // *Async so the removal never runs synchronously inside
+            // computeIfAbsent (which would be a reentrant map mutation); the
+            // value-conditional remove keeps a racing re-fetch intact.
+            f.whenCompleteAsync((v, e) -> {
+                if (e != null) accountCache.remove(k, f);
+            }, java.util.concurrent.ForkJoinPool.commonPool());
+            return f;
+        });
     }
 
     /**

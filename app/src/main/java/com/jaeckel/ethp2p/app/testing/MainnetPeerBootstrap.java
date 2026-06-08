@@ -84,7 +84,7 @@ public final class MainnetPeerBootstrap {
         // and we don't care about header push notifications or peer-cache
         // population here.
         RLPxConnector connector = new RLPxConnector(
-                nodeKey, localPort, network, headers -> {}, (addr, pubKeyHex) -> {});
+                nodeKey, localPort, network, headers -> {}, (addr, pubKeyHex, snap) -> {});
 
         try {
             connector.connect(enode.address(), enode.publicKey());

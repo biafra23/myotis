@@ -16,13 +16,16 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Persists peers that reached READY state so they can be reconnected on restart.
  *
- * File format: one line per peer, {@code ip:port:publicKeyHex}
+ * File format: one line per peer, {@code ip:port:publicKeyHex[:snap]} where the
+ * trailing {@code snap} flag ("1"/"0") records whether the peer negotiated
+ * snap/1. The flag is optional so pre-existing cache files load unchanged
+ * (missing flag → not snap-capable).
  */
 public final class PeerCache {
 
     private static final Logger log = LoggerFactory.getLogger(PeerCache.class);
 
-    public record CachedPeer(InetSocketAddress address, String publicKeyHex) {}
+    public record CachedPeer(InetSocketAddress address, String publicKeyHex, boolean snap) {}
 
     private final Path cacheFile;
     private final Set<String> seen = ConcurrentHashMap.newKeySet();
@@ -32,15 +35,15 @@ public final class PeerCache {
     }
 
     /** Add a peer to the cache file. Thread-safe, deduplicates by address. */
-    public void add(InetSocketAddress address, String publicKeyHex) {
+    public void add(InetSocketAddress address, String publicKeyHex, boolean snap) {
         String key = address.getAddress().getHostAddress() + ":" + address.getPort();
         if (!seen.add(key)) return;
 
-        String line = key + ":" + publicKeyHex;
+        String line = key + ":" + publicKeyHex + ":" + (snap ? "1" : "0");
         try {
             Files.writeString(cacheFile, line + "\n",
                     StandardOpenOption.CREATE, StandardOpenOption.APPEND);
-            log.info("[cache] Saved READY peer {}", key);
+            log.info("[cache] Saved READY peer {} (snap={})", key, snap);
         } catch (IOException e) {
             log.warn("[cache] Failed to write peer cache: {}", e.getMessage());
         }
@@ -55,16 +58,28 @@ public final class PeerCache {
             for (String line : Files.readAllLines(cacheFile)) {
                 line = line.strip();
                 if (line.isEmpty()) continue;
-                // format: ip:port:publicKeyHex
+                // format: ip:port:publicKeyHex[:snap]
                 int firstColon = line.indexOf(':');
                 int secondColon = line.indexOf(':', firstColon + 1);
                 if (firstColon < 0 || secondColon < 0) continue;
 
                 String ip = line.substring(0, firstColon);
                 int port = Integer.parseInt(line.substring(firstColon + 1, secondColon));
-                String pubKeyHex = line.substring(secondColon + 1);
+                String rest = line.substring(secondColon + 1);
+                // Optional trailing snap flag. pubKeyHex is colon-free hex, so a
+                // remaining ':' separates the flag; older lines have none.
+                String pubKeyHex = rest;
+                boolean snap = false;
+                int flagColon = rest.lastIndexOf(':');
+                if (flagColon >= 0) {
+                    String suffix = rest.substring(flagColon + 1);
+                    if (suffix.equals("0") || suffix.equals("1")) {
+                        pubKeyHex = rest.substring(0, flagColon);
+                        snap = suffix.equals("1");
+                    }
+                }
 
-                result.add(new CachedPeer(new InetSocketAddress(ip, port), pubKeyHex));
+                result.add(new CachedPeer(new InetSocketAddress(ip, port), pubKeyHex, snap));
                 seen.add(ip + ":" + port);
             }
             log.info("[cache] Loaded {} cached peers from {}", result.size(), cacheFile);

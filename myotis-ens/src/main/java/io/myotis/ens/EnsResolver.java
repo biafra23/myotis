@@ -20,12 +20,15 @@ import java.util.function.Function;
 /**
  * Forward + reverse + record-type resolver for ENS names.
  *
- * <p>All forward record-type calls go through the Universal Resolver:
- * a single {@code resolve(bytes name, bytes data)} that walks the
- * registry/resolver chain, handles wildcard names (ENSIP-10), and
- * surfaces ERC-3668 OffchainLookup reverts at the call boundary so a
- * {@code CcipReadEvmExecutor} wrapping the supplied executor can fetch
- * the off-chain response transparently.
+ * <p>Forward record-type calls resolve <b>directly</b> — no UniversalResolver
+ * and, crucially, no shared CCIP batch gateway (e.g. {@code ccip-v2.ens.xyz}).
+ * We discover the resolver via the Registry over snap (an ENSIP-10 walk: exact
+ * node, then each parent), then call it directly: {@code resolve(bytes,bytes)}
+ * for ENSIP-10 (wildcard / offchain) resolvers, or the record method directly
+ * for a legacy resolver. For an offchain name the ERC-3668 OffchainLookup we
+ * follow is the resolver's OWN gateway (e.g. Coinbase for cb.id) — so a
+ * {@code CcipReadEvmExecutor} wrapping the executor fetches it with no
+ * third-party relay in the path. Resolver discovery is cached per registry+name.
  *
  * <p>Supported records:
  * <ul>
@@ -77,6 +80,8 @@ public final class EnsResolver {
             FunctionSignature.of("resolver(bytes32)");
     private static final FunctionSignature NAME =
             FunctionSignature.of("name(bytes32)");
+    private static final FunctionSignature SUPPORTS_INTERFACE =
+            FunctionSignature.of("supportsInterface(bytes4)");
 
     private final EvmExecutor executor;
     private final Address registry;
@@ -145,7 +150,7 @@ public final class EnsResolver {
     public CompletableFuture<Optional<Address>> resolveAddress(String name, BlockContext blockContext) {
         byte[] node = Namehash.of(name);
         byte[] innerCall = AbiEncoder.encodeCall(ADDR, AbiEncoder.bytes32(node));
-        return dispatchUR(name, innerCall, blockContext, EnsResolver::decodeAddrResult);
+        return dispatchResolve(name, innerCall, blockContext, EnsResolver::decodeAddrResult);
     }
 
     /**
@@ -163,7 +168,7 @@ public final class EnsResolver {
         byte[] node = Namehash.of(name);
         byte[] innerCall = AbiEncoder.encodeCall(
                 ADDR_COIN, AbiEncoder.bytes32(node), AbiEncoder.uint256(coinType));
-        return dispatchUR(name, innerCall, blockContext, EnsResolver::decodeNonEmptyBytes);
+        return dispatchResolve(name, innerCall, blockContext, EnsResolver::decodeNonEmptyBytes);
     }
 
     /**
@@ -177,7 +182,7 @@ public final class EnsResolver {
         byte[] node = Namehash.of(name);
         byte[] innerCall = AbiEncoder.encodeCall(
                 TEXT, AbiEncoder.bytes32(node), AbiEncoder.string(key));
-        return dispatchUR(name, innerCall, blockContext, EnsResolver::decodeStringResult);
+        return dispatchResolve(name, innerCall, blockContext, EnsResolver::decodeStringResult);
     }
 
     /**
@@ -191,7 +196,7 @@ public final class EnsResolver {
             String name, BlockContext blockContext) {
         byte[] node = Namehash.of(name);
         byte[] innerCall = AbiEncoder.encodeCall(CONTENTHASH, AbiEncoder.bytes32(node));
-        return dispatchUR(name, innerCall, blockContext, EnsResolver::decodeNonEmptyBytes);
+        return dispatchResolve(name, innerCall, blockContext, EnsResolver::decodeNonEmptyBytes);
     }
 
     /**
@@ -204,7 +209,7 @@ public final class EnsResolver {
             String name, BlockContext blockContext) {
         byte[] node = Namehash.of(name);
         byte[] innerCall = AbiEncoder.encodeCall(PUBKEY, AbiEncoder.bytes32(node));
-        return dispatchUR(name, innerCall, blockContext, EnsResolver::decodePubkeyResult);
+        return dispatchResolve(name, innerCall, blockContext, EnsResolver::decodePubkeyResult);
     }
 
     /**
@@ -220,7 +225,7 @@ public final class EnsResolver {
         byte[] node = Namehash.of(name);
         byte[] innerCall = AbiEncoder.encodeCall(
                 ABI, AbiEncoder.bytes32(node), AbiEncoder.uint256(contentTypes));
-        return dispatchUR(name, innerCall, blockContext, EnsResolver::decodeAbiResult);
+        return dispatchResolve(name, innerCall, blockContext, EnsResolver::decodeAbiResult);
     }
 
     /**
@@ -242,7 +247,7 @@ public final class EnsResolver {
                 AbiEncoder.bytes32(node),
                 AbiEncoder.bytes(dnsName),
                 AbiEncoder.uint256(resource & 0xFFFFL));
-        return dispatchUR(name, innerCall, blockContext, EnsResolver::decodeNonEmptyBytes);
+        return dispatchResolve(name, innerCall, blockContext, EnsResolver::decodeNonEmptyBytes);
     }
 
     /**
@@ -265,7 +270,7 @@ public final class EnsResolver {
                 INTERFACE_IMPLEMENTER,
                 AbiEncoder.bytes32(node),
                 AbiEncoder.bytes32(padded));
-        return dispatchUR(name, innerCall, blockContext, EnsResolver::decodeAddrResult);
+        return dispatchResolve(name, innerCall, blockContext, EnsResolver::decodeAddrResult);
     }
 
     /**
@@ -326,37 +331,139 @@ public final class EnsResolver {
      *       reasoning as a generic UR revert.
      * </ul>
      */
-    private <T> CompletableFuture<Optional<T>> dispatchUR(
+    private <T> CompletableFuture<Optional<T>> dispatchResolve(
             String name, byte[] innerCall, BlockContext blockContext,
             Function<byte[], Optional<T>> innerResultDecoder) {
         byte[] dnsName = DnsEncoder.encode(name);
-        byte[] resolveCalldata = AbiEncoder.encodeCall(
-                RESOLVE,
-                AbiEncoder.bytes(dnsName),
-                AbiEncoder.bytes(innerCall));
-        return executor.callView(universalResolver, resolveCalldata, blockContext)
-                .handle((result, error) -> {
-                    if (error != null) {
-                        Throwable cause = unwrap(error);
-                        if (cause instanceof EvmExecutionException eee
-                                && eee.error() instanceof EvmExecutionError.Reverted r
-                                && OffchainLookupRevert.tryParse(r.data()).isPresent()) {
-                            throw new CompletionException(cause);
-                        }
-                        if (cause instanceof EvmExecutionException eee
-                                && eee.error() instanceof EvmExecutionError.Reverted) {
-                            return Optional.<T>empty();
-                        }
-                        throw new CompletionException(cause);
-                    }
-                    if (result == null || result.length < 64) return Optional.<T>empty();
-                    try {
-                        byte[] inner = AbiDecoder.dynamicBytes(result, 0);
-                        return innerResultDecoder.apply(inner);
-                    } catch (RuntimeException ex) {
-                        return Optional.<T>empty();
-                    }
-                });
+        return findResolver(name, blockContext).thenCompose(found -> {
+            if (found.isEmpty()) {
+                // No resolver set anywhere up the chain → unregistered / no record.
+                return CompletableFuture.completedFuture(Optional.<T>empty());
+            }
+            ResolverInfo ri = found.get();
+            if (ri.extended()) {
+                // ENSIP-10: call the resolver's resolve(name, data) DIRECTLY. For an
+                // offchain resolver this throws OffchainLookup pointing at the
+                // resolver's OWN gateway (e.g. Coinbase for cb.id), so
+                // CcipReadEvmExecutor fetches it with no third-party batch relay.
+                byte[] calldata = AbiEncoder.encodeCall(
+                        RESOLVE, AbiEncoder.bytes(dnsName), AbiEncoder.bytes(innerCall));
+                return executor.callView(ri.resolver(), calldata, blockContext)
+                        .handle((result, error) ->
+                                decodeOutcome(result, error, /* wrapped */ true, innerResultDecoder));
+            }
+            if (ri.exact()) {
+                // Legacy resolver (e.g. the ENS Public Resolver) that doesn't
+                // implement ENSIP-10: call the record method directly.
+                return executor.callView(ri.resolver(), innerCall, blockContext)
+                        .handle((result, error) ->
+                                decodeOutcome(result, error, /* wrapped */ false, innerResultDecoder));
+            }
+            // Resolver exists only on an ancestor and isn't ENSIP-10 wildcard-aware,
+            // so it cannot answer for this subname.
+            return CompletableFuture.completedFuture(Optional.<T>empty());
+        });
+    }
+
+    /**
+     * Shared outcome decoder. {@code wrapped} is true for ENSIP-10
+     * {@code resolve()} (whose return is {@code bytes} wrapping the inner-call
+     * return) and false for a direct legacy record call (the return IS the
+     * inner-call return). OffchainLookup is normally consumed by
+     * {@link io.myotis.evm.CcipReadEvmExecutor}; a plain revert maps to empty;
+     * any other failure propagates.
+     */
+    private static <T> Optional<T> decodeOutcome(
+            byte[] result, Throwable error, boolean wrapped,
+            Function<byte[], Optional<T>> innerResultDecoder) {
+        if (error != null) {
+            Throwable cause = unwrap(error);
+            if (cause instanceof EvmExecutionException eee
+                    && eee.error() instanceof EvmExecutionError.Reverted r
+                    && OffchainLookupRevert.tryParse(r.data()).isPresent()) {
+                throw new CompletionException(cause);
+            }
+            if (cause instanceof EvmExecutionException eee
+                    && eee.error() instanceof EvmExecutionError.Reverted) {
+                return Optional.empty();
+            }
+            throw new CompletionException(cause);
+        }
+        if (result == null) return Optional.empty();
+        if (wrapped && result.length < 64) return Optional.empty();
+        try {
+            byte[] inner = wrapped ? AbiDecoder.dynamicBytes(result, 0) : result;
+            return innerResultDecoder.apply(inner);
+        } catch (RuntimeException ex) {
+            return Optional.empty();
+        }
+    }
+
+    // ---- Resolver discovery (direct: no UniversalResolver, no batch gateway) --
+
+    private record ResolverInfo(Address resolver, boolean exact, boolean extended) {}
+    private record CachedResolver(ResolverInfo info, long expiresAtMs) {}
+    private record Found(Address resolver, boolean exact) {}
+
+    /** IExtendedResolver (ENSIP-10) interface id — {@code resolve(bytes,bytes)} support. */
+    private static final byte[] EXTENDED_RESOLVER_INTERFACE_ID = {(byte) 0x90, 0x61, (byte) 0xb9, 0x23};
+    private static final long RESOLVER_CACHE_TTL_MS = 5 * 60 * 1000L;
+    /** Per (registry,name) resolver-discovery cache so repeated lookups skip the walk. */
+    private static final java.util.concurrent.ConcurrentHashMap<String, CachedResolver> RESOLVER_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Test hook: drop cached resolver discovery so tests don't see each other's state. */
+    static void clearResolverCache() { RESOLVER_CACHE.clear(); }
+
+    /**
+     * Find the resolver responsible for {@code name} via the registry (ENSIP-10
+     * walk: exact node, then each parent, until a resolver is set) and detect
+     * whether it implements ENSIP-10. All reads are snap/EVM — no gateway.
+     * Cached per registry+name for a few minutes. Empty when no resolver is set
+     * anywhere up the chain.
+     */
+    private CompletableFuture<Optional<ResolverInfo>> findResolver(String name, BlockContext ctx) {
+        String cacheKey = registry.toHex() + ':' + name.toLowerCase(java.util.Locale.ROOT);
+        CachedResolver cached = RESOLVER_CACHE.get(cacheKey);
+        if (cached != null && cached.expiresAtMs() > System.currentTimeMillis()) {
+            return CompletableFuture.completedFuture(Optional.of(cached.info()));
+        }
+        String[] labels = name.isEmpty() ? new String[0] : name.split("\\.");
+        return walkResolver(labels, 0, ctx).thenCompose(found -> {
+            if (found.isEmpty()) {
+                return CompletableFuture.completedFuture(Optional.<ResolverInfo>empty());
+            }
+            Address resolver = found.get().resolver();
+            boolean exact = found.get().exact();
+            byte[] arg = new byte[32];
+            System.arraycopy(EXTENDED_RESOLVER_INTERFACE_ID, 0, arg, 0, 4);
+            byte[] supportsCall = AbiEncoder.encodeCall(SUPPORTS_INTERFACE, AbiEncoder.bytes32(arg));
+            return executor.callView(resolver, supportsCall, ctx)
+                    .handle(EnsResolver::decodeBool)
+                    .thenApply(extended -> {
+                        ResolverInfo info = new ResolverInfo(resolver, exact, extended);
+                        RESOLVER_CACHE.put(cacheKey, new CachedResolver(
+                                info, System.currentTimeMillis() + RESOLVER_CACHE_TTL_MS));
+                        return Optional.of(info);
+                    });
+        });
+    }
+
+    /** Try {@code registry.resolver(namehash(labels[i:]))}; recurse to the parent on zero/error. */
+    private CompletableFuture<Optional<Found>> walkResolver(String[] labels, int i, BlockContext ctx) {
+        if (i >= labels.length) return CompletableFuture.completedFuture(Optional.empty());
+        String suffix = String.join(".", java.util.Arrays.asList(labels).subList(i, labels.length));
+        byte[] node = Namehash.of(suffix);
+        byte[] calldata = AbiEncoder.encodeCall(RESOLVER, AbiEncoder.bytes32(node));
+        return executor.callView(registry, calldata, ctx)
+                .handle((res, err) -> err == null ? decodeAddressOrEmpty(res) : Optional.<Address>empty())
+                .thenCompose(addr -> addr.isPresent()
+                        ? CompletableFuture.completedFuture(Optional.of(new Found(addr.get(), i == 0)))
+                        : walkResolver(labels, i + 1, ctx));
+    }
+
+    private static boolean decodeBool(byte[] result, Throwable error) {
+        return error == null && result != null && result.length >= 32 && result[31] != 0;
     }
 
     // ---- Reverse-path step-by-step calls ----------------------------------

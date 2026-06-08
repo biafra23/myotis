@@ -15,6 +15,7 @@ import android.os.IBinder
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -33,6 +34,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -49,6 +51,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -108,6 +111,7 @@ class MainActivity : ComponentActivity() {
                         onToggle = ::toggleService,
                         onOpenNetworkSettings = ::openWifiSettings,
                         onClearCaches = ::clearPeerCaches,
+                        onResetSync = ::resetSyncState,
                     )
                 }
             }
@@ -163,6 +167,10 @@ class MainActivity : ComponentActivity() {
     private fun clearPeerCaches() {
         boundServiceState.value?.clearCaches()
     }
+
+    private fun resetSyncState() {
+        boundServiceState.value?.resetSyncState()
+    }
 }
 
 @Composable
@@ -171,6 +179,7 @@ private fun NodeScreen(
     onToggle: () -> Unit,
     onOpenNetworkSettings: () -> Unit,
     onClearCaches: () -> Unit,
+    onResetSync: () -> Unit,
 ) {
     // Snapshot + uptime tick are owned by the parent so both tabs can read
     // them — the Query tab needs `beaconState` to decide whether to warn the
@@ -180,6 +189,85 @@ private fun NodeScreen(
     var now by remember { mutableStateOf(System.currentTimeMillis()) }
     var selectedTab by remember { mutableStateOf(0) }
     val online = rememberIsOnline()
+
+    // Query-tab state is hoisted here, NOT inside QueryTab, so it survives
+    // switching tabs. QueryTab leaves the composition whenever another tab is
+    // selected, which would otherwise discard the result and cancel the
+    // in-flight query (its rememberCoroutineScope dies with it). NodeScreen
+    // stays composed across tab switches, so both the state and the coroutine
+    // launched from queryScope outlive navigating away and back.
+    var queryInput by rememberSaveable { mutableStateOf("") }
+    var queryState by remember { mutableStateOf<QueryState>(QueryState.Idle) }
+    var queryHistory by remember { mutableStateOf<List<AndroidQueryHistory.Entry>>(emptyList()) }
+    val queryScope = rememberCoroutineScope()
+
+    // Load persisted query history once the service is bound / running flips.
+    LaunchedEffect(running) {
+        val svc = serviceProvider() ?: return@LaunchedEffect
+        queryHistory = withContext(Dispatchers.IO) { svc.queryHistory().list() }
+    }
+
+    // Shared by the button and by tapping a history entry. One text input
+    // handles both addresses and ENS names: if it doesn't look like a 40-hex
+    // address we resolve it via ENS first, then look up the resolved address.
+    // Runs on queryScope (NodeScreen-scoped) so leaving the Query tab mid-query
+    // doesn't cancel it.
+    fun runQuery(raw: String) {
+        val svc = serviceProvider()
+        if (svc == null) {
+            queryState = QueryState.Failure("Service not bound")
+            return
+        }
+        val q = raw.trim()
+        if (q.isEmpty()) return
+        queryInput = q
+        queryState = QueryState.Loading
+        queryScope.launch {
+            // Bounce blocking work off to IO (snap-peer + EVM futures, sub-second
+            // happy path, up to ~60s on retry); keep the main dispatcher free.
+            // For ENS we update state between the two phases so the resolved
+            // address shows immediately, then the verified account fills in.
+            val outcome: QueryState = try {
+                if (NodeService.looksLikeEnsName(q)) {
+                    val res = withContext(Dispatchers.IO) { svc.resolveEns(q).await() }
+                    if (res.error != null || res.addressHex == null) {
+                        QueryState.Failure("ENS: ${res.error ?: "name does not resolve"}")
+                    } else {
+                        // Show the address now; verify the account next. If the
+                        // account phase fails, keep the resolved address visible.
+                        queryState = QueryState.ResolvedPendingAccount(res)
+                        try {
+                            QueryState.Success(
+                                withContext(Dispatchers.IO) { svc.requestAccount(res.addressHex).await() }, res)
+                        } catch (t: Throwable) {
+                            QueryState.ResolvedAccountFailed(
+                                res, t.cause?.message ?: t.message ?: t::class.java.simpleName)
+                        }
+                    }
+                } else {
+                    QueryState.Success(
+                        withContext(Dispatchers.IO) { svc.requestAccount(q).await() }, null)
+                }
+            } catch (t: Throwable) {
+                QueryState.Failure(t.cause?.message ?: t.message ?: t::class.java.simpleName)
+            }
+            queryState = outcome
+            // Record history when the query produced a usable result — a verified
+            // account, or at least a resolved address (even if the account lookup
+            // then failed). The resolution is the expensive part worth remembering.
+            val histLabel: String? = when (outcome) {
+                is QueryState.Success -> outcome.resolution?.addressHex ?: ""
+                is QueryState.ResolvedAccountFailed -> outcome.resolution.addressHex ?: ""
+                else -> null
+            }
+            if (histLabel != null) {
+                queryHistory = withContext(Dispatchers.IO) {
+                    svc.queryHistory().add(q, histLabel)
+                    svc.queryHistory().list()
+                }
+            }
+        }
+    }
 
     LaunchedEffect(Unit) {
         while (isActive) {
@@ -202,6 +290,10 @@ private fun NodeScreen(
     }
 
     Column(Modifier.fillMaxSize()) {
+        // App-wide sync banner above the tabs: indeterminate while bootstrapping,
+        // determinate as the light client catches up sync-committee periods, gone
+        // once SYNCED.
+        SyncProgressBar(snapshot)
         TabRow(selectedTabIndex = selectedTab) {
             Tab(
                 selected = selectedTab == 0,
@@ -229,13 +321,69 @@ private fun NodeScreen(
                 onToggle = onToggle,
                 onOpenNetworkSettings = onOpenNetworkSettings,
                 onClearCaches = onClearCaches,
+                onResetSync = onResetSync,
             )
             1 -> QueryTab(
                 snapshot = snapshot,
                 running = running,
-                serviceProvider = serviceProvider,
+                input = queryInput,
+                onInputChange = { queryInput = it },
+                state = queryState,
+                history = queryHistory,
+                onRunQuery = { runQuery(it) },
+                onClearHistory = {
+                    val svc = serviceProvider()
+                    if (svc != null) queryScope.launch {
+                        queryHistory = withContext(Dispatchers.IO) {
+                            svc.queryHistory().clear()
+                            svc.queryHistory().list()
+                        }
+                    }
+                },
             )
             else -> LogsTab()
+        }
+    }
+}
+
+/**
+ * App-wide beacon sync banner, drawn above the tab bar. Hidden when the node is
+ * stopped or SYNCED. While catching up sync-committee periods it's a determinate
+ * bar `(current - start) / (target - start)`; while bootstrapping (no anchor yet)
+ * or during the brief post-catch-up state-root fill it's indeterminate.
+ */
+@Composable
+private fun SyncProgressBar(snapshot: NodeService.Snapshot?) {
+    val s = snapshot ?: return
+    if (!s.running || s.beaconState == "SYNCED" || s.beaconState == "STOPPED") return
+
+    val start = s.syncStartPeriod
+    val current = s.syncCurrentPeriod
+    val target = s.syncTargetPeriod
+    val determinate = s.beaconState == "CATCHING_UP" && start >= 0 && target > start
+
+    Column(Modifier.fillMaxWidth()) {
+        val label = when {
+            !determinate -> "Bootstrapping light client…"
+            current >= target -> "Finishing sync…"
+            else -> "Catching up sync committees — period $current / $target"
+        }
+        Text(
+            label,
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 4.dp),
+        )
+        if (determinate) {
+            val fraction = ((current - start).coerceAtLeast(0).toFloat() /
+                (target - start).toFloat()).coerceIn(0f, 1f)
+            LinearProgressIndicator(
+                progress = { fraction },
+                modifier = Modifier.fillMaxWidth(),
+            )
+        } else {
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
         }
     }
 }
@@ -250,6 +398,7 @@ private fun StatusTab(
     onToggle: () -> Unit,
     onOpenNetworkSettings: () -> Unit,
     onClearCaches: () -> Unit,
+    onResetSync: () -> Unit,
 ) {
     // SelectionContainer wraps the whole tab so long-pressing any text
     // (peer rows, stats, hashes) lets the user copy from the standard
@@ -290,6 +439,18 @@ private fun StatusTab(
                 }
             }
 
+            item {
+                OutlinedButton(
+                    onClick = onResetSync,
+                    enabled = serviceProvider() != null,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    // Deletes the persisted sync-committee snapshot so the next
+                    // start re-bootstraps from the embedded checkpoint (debugging).
+                    Text("Reset sync state")
+                }
+            }
+
             val s = snapshot
             if (s == null || !s.running) {
                 item {
@@ -300,6 +461,7 @@ private fun StatusTab(
                 }
             } else {
                 item { StatusRow("uptime", formatUptime(now - s.startTimeMs)) }
+                item { Text("Execution layer (devp2p)", style = MaterialTheme.typography.titleSmall) }
                 item { StatusSummary(s) }
                 item { HorizontalDivider() }
                 item { Text("Beacon (consensus)", style = MaterialTheme.typography.titleSmall) }
@@ -318,7 +480,24 @@ private fun StatusTab(
 private sealed interface QueryState {
     data object Idle : QueryState
     data object Loading : QueryState
-    data class Success(val result: NodeService.AccountQueryResult) : QueryState
+    // ENS resolved → show the address right away while the (separate, fast)
+    // account lookup + beacon verification runs. Resolution is the slow part of
+    // an ENS query; the account verify is a cheap state-root match, so surfacing
+    // the address first makes the query feel responsive.
+    data class ResolvedPendingAccount(
+        val resolution: NodeService.EnsResolution,
+    ) : QueryState
+    data class Success(
+        val result: NodeService.AccountQueryResult,
+        // Non-null when the input was an ENS name we resolved first.
+        val resolution: NodeService.EnsResolution?,
+    ) : QueryState
+    // Resolution succeeded but the account lookup/verification failed — keep the
+    // resolved address on screen (it's still useful) rather than discarding it.
+    data class ResolvedAccountFailed(
+        val resolution: NodeService.EnsResolution,
+        val message: String,
+    ) : QueryState
     data class Failure(val message: String) : QueryState
 }
 
@@ -326,12 +505,13 @@ private sealed interface QueryState {
 private fun QueryTab(
     snapshot: NodeService.Snapshot?,
     running: Boolean,
-    serviceProvider: () -> NodeService?,
+    input: String,
+    onInputChange: (String) -> Unit,
+    state: QueryState,
+    history: List<AndroidQueryHistory.Entry>,
+    onRunQuery: (String) -> Unit,
+    onClearHistory: () -> Unit,
 ) {
-    var address by remember { mutableStateOf("") }
-    var state by remember { mutableStateOf<QueryState>(QueryState.Idle) }
-    val scope = rememberCoroutineScope()
-
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -367,10 +547,10 @@ private fun QueryTab(
 
         item {
             OutlinedTextField(
-                value = address,
-                onValueChange = { address = it.trim() },
-                label = { Text("Account address") },
-                placeholder = { Text("0x…") },
+                value = input,
+                onValueChange = onInputChange,
+                label = { Text("Address or ENS name") },
+                placeholder = { Text("0x… or vitalik.eth") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
                 enabled = state !is QueryState.Loading,
@@ -379,45 +559,107 @@ private fun QueryTab(
 
         item {
             Button(
-                onClick = {
-                    val svc = serviceProvider()
-                    if (svc == null) {
-                        state = QueryState.Failure("Service not bound")
-                        return@Button
-                    }
-                    state = QueryState.Loading
-                    scope.launch {
-                        state = try {
-                            // Bounce off the IO dispatcher because requestAccount
-                            // will block the calling thread on the snap peer
-                            // future internally; we don't want to occupy the
-                            // main dispatcher while peers respond (~hundreds of
-                            // ms in the happy path, 30s timeout on retry).
-                            val result = withContext(Dispatchers.IO) {
-                                svc.requestAccount(address).await()
-                            }
-                            QueryState.Success(result)
-                        } catch (t: Throwable) {
-                            QueryState.Failure(
-                                t.cause?.message ?: t.message
-                                    ?: t::class.java.simpleName
-                            )
-                        }
-                    }
-                },
-                enabled = running && address.isNotEmpty() && state !is QueryState.Loading,
+                onClick = { onRunQuery(input) },
+                enabled = running && input.isNotBlank() && state !is QueryState.Loading,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text("Get account")
+                Text("Look up")
             }
         }
 
         when (val st = state) {
             is QueryState.Idle -> { /* nothing */ }
-            is QueryState.Loading -> item { LoadingRow() }
-            is QueryState.Success -> item { AccountResultPanel(st.result) }
+            is QueryState.Loading -> item { LoadingRow("Resolving…") }
+            is QueryState.ResolvedPendingAccount -> {
+                item { EnsResolutionPanel(st.resolution) }
+                item { LoadingRow("Verifying account…") }
+            }
+            is QueryState.Success -> {
+                st.resolution?.let { item { EnsResolutionPanel(it) } }
+                item { AccountResultPanel(st.result) }
+            }
+            is QueryState.ResolvedAccountFailed -> {
+                item { EnsResolutionPanel(st.resolution) }
+                item { ErrorPanel("Account lookup failed: ${st.message}") }
+            }
             is QueryState.Failure -> item { ErrorPanel(st.message) }
         }
+
+        if (history.isNotEmpty()) {
+            item {
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("Recent", style = MaterialTheme.typography.titleSmall)
+                    OutlinedButton(onClick = onClearHistory) { Text("Clear") }
+                }
+            }
+            items(history) { entry ->
+                HistoryRow(
+                    entry = entry,
+                    enabled = running && state !is QueryState.Loading,
+                    onClick = { onRunQuery(entry.input) },
+                )
+            }
+        }
+    }
+}
+
+/** One tappable past-query row: tap to re-run with that input. */
+@Composable
+private fun HistoryRow(
+    entry: AndroidQueryHistory.Entry,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = enabled, onClick = onClick),
+    ) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(entry.input, style = MaterialTheme.typography.bodyMedium)
+            if (entry.label.isNotEmpty()) {
+                Text(
+                    "→ ${shortenHash(entry.label)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+/** Shows what an ENS name resolved to, above the account result. */
+@Composable
+private fun EnsResolutionPanel(res: NodeService.EnsResolution) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text("ENS", style = MaterialTheme.typography.titleSmall)
+        StatusRow("name", res.name)
+        StatusRow("resolved", res.addressHex ?: "—")
+        if (res.blockNumber >= 0) StatusRow("at block #", res.blockNumber.toString())
+        // The trust level of the mapping depends on which state it resolved
+        // against (NodeService.ensResolutionRoot). AUTO (default) tries the
+        // beacon-verified finalized state first and only falls back to a peer's
+        // head when finalized yields no answer; resolving over finalized anchors
+        // the name→address mapping cryptographically (beaconVerified=true), while
+        // the head fallback is proof-checked against the peer's *claimed* root but
+        // not beacon-attested (peer-claimed). res.beaconVerified reports which
+        // path produced this result; show the matching line so it's never
+        // confused with the account state's own verification below.
+        if (res.beaconVerified) {
+            StatusRow("mapping", "beacon-verified")
+        } else {
+            Text(
+                "The name→address mapping is peer-claimed (not beacon-verified). "
+                    + "The account state below is independently beacon-verified.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        HorizontalDivider()
     }
 }
 
@@ -584,7 +826,7 @@ private fun formatLogs(entries: List<LogBuffer.Entry>): String = buildString {
 }
 
 @Composable
-private fun LoadingRow() {
+private fun LoadingRow(message: String = "Querying snap peer…") {
     Row(
         Modifier.fillMaxWidth(),
         verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
@@ -592,7 +834,7 @@ private fun LoadingRow() {
     ) {
         CircularProgressIndicator(modifier = Modifier.height(20.dp))
         Spacer(Modifier.height(4.dp))
-        Text("Querying snap peer…", fontSize = 13.sp)
+        Text(message, fontSize = 13.sp)
     }
 }
 
@@ -799,8 +1041,6 @@ private fun StatusSummary(s: NodeService.Snapshot) {
         StatusRow("dialing", s.attemptedPeers.toString())
         StatusRow("in backoff", s.backedOffPeers.toString())
         StatusRow("blacklisted", s.blacklistedPeers.toString())
-        StatusRow("discv5 peers", s.discv5Peers.toString())
-        StatusRow("CL peers (eth2)", s.clPeersDiscovered.toString())
     }
 }
 
@@ -809,6 +1049,9 @@ private fun BeaconSummary(s: NodeService.Snapshot) {
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         StatusRow("state", s.beaconState)
         StatusRow("bootstrapped", s.beaconBootstrapped.toString())
+        // discv5 is the CL (eth2) discovery layer — belongs with the beacon stats.
+        StatusRow("discv5 peers", s.discv5Peers.toString())
+        StatusRow("CL peers (eth2)", s.clPeersDiscovered.toString())
         StatusRow("CL peers connected", s.clPeersConnected.toString())
         StatusRow("CL peers (light_client)", s.clPeersLightClient.toString())
         StatusRow("CL peers cached", s.clPeersCached.toString())

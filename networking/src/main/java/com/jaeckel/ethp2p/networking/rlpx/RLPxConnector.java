@@ -42,9 +42,14 @@ public final class RLPxConnector implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(RLPxConnector.class);
 
-    /** Callback when a peer reaches READY state: (address, publicKeyHex). */
+    /**
+     * Callback when a peer reaches READY state. {@code snapSupported} reports
+     * whether the peer negotiated snap/1 (known by READY, since capabilities are
+     * exchanged in Hello) — lets the peer cache record which cached peers can
+     * serve state, so a restart can reconnect snap peers first.
+     */
     public interface PeerReadyCallback {
-        void onPeerReady(InetSocketAddress address, String publicKeyHex);
+        void onPeerReady(InetSocketAddress address, String publicKeyHex, boolean snapSupported);
     }
 
     /** Callback when a peer connection closes, with incompatibility info and node identity. */
@@ -60,6 +65,28 @@ public final class RLPxConnector implements AutoCloseable {
     private final Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders;
     private final PeerReadyCallback peerReadyCallback;
     private final Set<EthHandler> activeHandlers = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Re-entrant counter of in-progress snap-heavy operations (ENS resolution).
+     * While > 0, the discovery dial loop should hold off on opening NEW peer
+     * connections: an ENS resolution issues a long, latency-sensitive chain of
+     * snap round-trips on the shared NioEventLoopGroup, and a burst of
+     * concurrent outbound dials (each an ECIES handshake + up to a 10 s pending
+     * connect) competes for those same event-loop threads, inflating per-read
+     * latency. Existing peers are untouched — we only pause acquiring new ones
+     * for the (seconds-long) duration of the query.
+     */
+    private final java.util.concurrent.atomic.AtomicInteger snapHeavyOps =
+        new java.util.concurrent.atomic.AtomicInteger(0);
+
+    /** Mark the start of a snap-heavy op (ENS resolution); pair with {@link #exitSnapHeavy()}. */
+    public void enterSnapHeavy() { snapHeavyOps.incrementAndGet(); }
+
+    /** Mark the end of a snap-heavy op. */
+    public void exitSnapHeavy() { snapHeavyOps.decrementAndGet(); }
+
+    /** True while at least one snap-heavy op is in progress — the dial loop pauses new connects. */
+    public boolean isSnapHeavy() { return snapHeavyOps.get() > 0; }
 
     public RLPxConnector(NodeKey localKey, int tcpPort, NetworkConfig network,
                          Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders,
@@ -88,12 +115,17 @@ public final class RLPxConnector implements AutoCloseable {
         log.info("[rlpx] Connecting to {} ...", peerAddr);
 
         String pubKeyHex = peerPublicKey.bytes().toHexString();
+        // Filled in below once the EthHandler exists; onReady reads its snap
+        // negotiation state (set during the Hello exchange, before READY).
+        final EthHandler[] handlerRef = new EthHandler[1];
         Runnable onReady = () -> {
             if (peerReadyCallback != null) {
-                peerReadyCallback.onPeerReady(peerAddr, pubKeyHex);
+                boolean snap = handlerRef[0] != null && handlerRef[0].isSnapNegotiated();
+                peerReadyCallback.onPeerReady(peerAddr, pubKeyHex, snap);
             }
         };
         EthHandler ethHandler = new EthHandler(localKey, tcpPort, network, chainHead, onHeaders, onReady);
+        handlerRef[0] = ethHandler;
         ethHandler.setRemoteAddress(peerAddr.getAddress().getHostAddress() + ":" + peerAddr.getPort());
 
         Bootstrap bootstrap = new Bootstrap()

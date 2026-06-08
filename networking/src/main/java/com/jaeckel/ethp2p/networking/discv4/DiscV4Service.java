@@ -54,6 +54,14 @@ public final class DiscV4Service implements AutoCloseable {
         Bootstrap b = new Bootstrap()
             .group(group)
             .channel(NioDatagramChannel.class)
+            // discv4 NEIGHBORS packets are large (~1.2KB, up to the 1280B spec
+            // cap). Netty's default datagram recv allocator can hand back a
+            // buffer smaller than the datagram on some stacks (observed on
+            // Android/ART: Ping/Pong arrive but NEIGHBORS never does), which
+            // truncates the read so the packet is silently dropped. Pin a recv
+            // buffer comfortably above the spec max so neighbors always fit.
+            .option(ChannelOption.RCVBUF_ALLOCATOR, new FixedRecvByteBufAllocator(4096))
+            .option(ChannelOption.SO_RCVBUF, 1 << 20)
             .handler(new ChannelInitializer<NioDatagramChannel>() {
                 @Override
                 protected void initChannel(NioDatagramChannel ch) {

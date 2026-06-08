@@ -84,16 +84,35 @@ public final class BlsVerifier {
             return false;
         }
         try {
-            ECP aggregated = deserializeG1(pubkeyBytes.get(0));
-            if (aggregated == null || aggregated.is_infinity()) return false;
-
-            for (int i = 1; i < pubkeyBytes.size(); i++) {
-                ECP pk = deserializeG1(pubkeyBytes.get(i));
+            // Pubkeys come from the Merkle-proven sync committee (committed to by a
+            // header signed by the previous committee) and proved possession at
+            // deposit (PoP/KeyValidate, incl. subgroup check). So we do NOT repeat
+            // the O(scalar-mul) per-pubkey subgroup check here — it cost ~512 full
+            // scalar multiplications per update, which on Android/ART made a single
+            // sync-aggregate verify take >70s and stalled catch-up entirely. This
+            // matches production clients (Lighthouse/Teku/Prysm/Lodestar), which
+            // validate pubkeys once at registration, not per signature. The
+            // signature (G2) subgroup check below is retained.
+            //
+            // Point decompression (a field square root per key) is independent
+            // per pubkey, so we fan it out across cores: on Android/ART the serial
+            // 512-key loop took ~30s, dwarfing everything else. parallelStream uses
+            // the common ForkJoinPool (parallelism = cores-1). The aggregation
+            // (ECP.add) is then a cheap sequential reduce — Milagro ECP isn't
+            // safe to mutate from multiple threads, but independent decompression
+            // into fresh ECP objects is.
+            List<ECP> points = pubkeyBytes.parallelStream()
+                    .map(b -> deserializeG1(b, false))
+                    .collect(java.util.stream.Collectors.toList());
+            ECP aggregated = new ECP(); // point at infinity
+            for (ECP pk : points) {
                 if (pk == null || pk.is_infinity()) return false;
                 aggregated.add(pk);
             }
+            if (aggregated.is_infinity()) return false;
             aggregated.affine();
 
+            // Signature is attacker-controlled wire data — keep its subgroup check.
             ECP2 sig = deserializeG2(signatureBytes);
             if (sig == null || sig.is_infinity()) return false;
 
@@ -116,6 +135,16 @@ public final class BlsVerifier {
      * Deserialize a 48-byte compressed G1 point (Zcash/Ethereum format) to Milagro ECP.
      */
     public static ECP deserializeG1(byte[] data) {
+        return deserializeG1(data, true);
+    }
+
+    /**
+     * Deserialize a 48-byte compressed G1 point. When {@code checkSubgroup} is
+     * false the (expensive) prime-order subgroup membership test is skipped —
+     * only safe for points already known to be valid subgroup elements (e.g.
+     * Merkle-proven sync-committee pubkeys that proved possession at deposit).
+     */
+    public static ECP deserializeG1(byte[] data, boolean checkSubgroup) {
         if (data == null || data.length != 48) return null;
 
         boolean compressed = (data[0] & 0x80) != 0;
@@ -149,7 +178,7 @@ public final class BlsVerifier {
         if (yLarger != sortFlag) {
             point.neg();
         }
-        if (!isInG1Subgroup(point)) return null;
+        if (checkSubgroup && !isInG1Subgroup(point)) return null;
         return point;
     }
 
