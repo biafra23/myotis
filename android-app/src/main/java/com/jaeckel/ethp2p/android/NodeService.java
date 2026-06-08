@@ -87,6 +87,7 @@ public final class NodeService extends Service {
     private DiscV4Service discV4;
     private DiscV5Service discV5;
     private RLPxConnector connector;
+    private io.myotis.jsonrpc.MyotisRpcServer rpcServer;
     private AndroidPeerCache peerCache;
     private AndroidCLPeerCache clPeerCache;
     private BeaconLightClient beaconLightClient;
@@ -1087,6 +1088,20 @@ public final class NodeService extends Service {
         this.clGenesisTime = genesisTime;
         this.cachedPeerCount = cachedCount;
         this.cachedClPeerCount = cachedClCount;
+        // JSON-RPC server (Phase-A scaffold): start the embedded Ktor endpoint so a
+        // wallet can reach the node (LAN, or host via `adb forward tcp:8545 tcp:8545`).
+        // Starts immediately — does not wait for beacon sync. Router/proxy land next.
+        try {
+            // Upstream proxy URL (DEBUG/dev only) comes from BuildConfig.RPC_UPSTREAM
+            // (set in gitignored local.properties); blank → strict (no proxy).
+            String upstream = BuildConfig.RPC_UPSTREAM;
+            io.myotis.jsonrpc.MyotisRpcServer s =
+                    new io.myotis.jsonrpc.MyotisRpcServer(8545, upstream, "0.0.0.0");
+            s.start();
+            this.rpcServer = s;
+        } catch (Throwable t) {
+            LogBuffer.w(TAG, "[rpc] failed to start JSON-RPC server: " + t);
+        }
         return true;
     }
 
@@ -1125,6 +1140,11 @@ public final class NodeService extends Service {
      * instead of failing with bind-in-use.
      */
     private synchronized void doShutdown() {
+        // Stop the JSON-RPC server first so its port is freed promptly.
+        if (rpcServer != null) {
+            try { rpcServer.stop(); } catch (Throwable ignored) {}
+            rpcServer = null;
+        }
         // Close BLC first: its libp2p host's outbound dials hold references
         // through to the discv5 callback's blcRef, and the sync thread can
         // be in the middle of an addPeer call when shutdown fires.

@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -73,6 +75,16 @@ configurations.all {
     // Android incompatibilities never trigger.)
 }
 
+// Optional JSON-RPC upstream-proxy URL (DEBUG/dev only) read from local.properties
+// (`rpc.upstream=...`), which is gitignored — the Infura key never enters the repo.
+// Empty when unset → the JSON-RPC server runs in strict (no-proxy) mode.
+val rpcUpstream: String = run {
+    val props = Properties()
+    val lp = rootProject.file("local.properties")
+    if (lp.exists()) lp.inputStream().use { props.load(it) }
+    props.getProperty("rpc.upstream", "")
+}
+
 android {
     namespace = "com.jaeckel.ethp2p.android"
     compileSdk = 34
@@ -83,6 +95,7 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"
+        buildConfigField("String", "RPC_UPSTREAM", "\"$rpcUpstream\"")
     }
 
     compileOptions {
@@ -98,6 +111,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     // Pin the debug signing identity to a keystore checked into the repo so
@@ -175,6 +189,10 @@ dependencies {
     // a transitive `implementation` dep from the consumer's compile classpath.
     implementation(project(":myotis-ens"))
     implementation(project(":myotis-evm"))
+
+    // Embedded JSON-RPC HTTP server (Ktor) so wallets like MetaMask can point
+    // at the phone. Hosted by NodeService.
+    implementation(project(":jsonrpc-server"))
 
     // Force the JRE *variant* of Guava. Guava publishes jre and android
     // variants under one module; on an Android project Gradle's
