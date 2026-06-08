@@ -79,7 +79,11 @@ public final class AndroidCcipGateway implements CcipGateway {
                 }
                 int status = conn.getResponseCode();
                 if (status >= 200 && status < 300) {
-                    result.complete(readAll(conn.getInputStream()));
+                    // Close the stream explicitly (don't rely on disconnect()) so the
+                    // underlying socket can be released back for connection reuse.
+                    try (InputStream in = conn.getInputStream()) {
+                        result.complete(readAll(in));
+                    }
                 } else {
                     result.completeExceptionally(
                             new IOException("HTTP " + status + " from " + url));
