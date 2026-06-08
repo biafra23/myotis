@@ -50,15 +50,24 @@ public final class AndroidQueryHistory {
      */
     public synchronized void add(String input, String label) {
         ensureLoaded();
-        String trimmed = input == null ? "" : input.strip();
+        // Strip the TSV delimiters (tab) and line breaks. The input field is
+        // free text, so a stray tab/newline would otherwise split one record
+        // across columns/lines and corrupt the file on read-back.
+        String trimmed = sanitize(input);
         if (trimmed.isEmpty()) return;
-        String safeLabel = label == null ? "" : label.strip();
+        String safeLabel = sanitize(label);
         entries.removeIf(e -> e.input().equalsIgnoreCase(trimmed));
         entries.add(0, new Entry(trimmed, System.currentTimeMillis(), safeLabel));
         while (entries.size() > MAX_ENTRIES) {
             entries.remove(entries.size() - 1);
         }
         rewrite();
+    }
+
+    /** Trim and replace TSV-breaking characters (tab, CR, LF) with spaces. */
+    private static String sanitize(String s) {
+        if (s == null) return "";
+        return s.strip().replace('\t', ' ').replace('\r', ' ').replace('\n', ' ');
     }
 
     /** Snapshot of history, most-recent-first. */

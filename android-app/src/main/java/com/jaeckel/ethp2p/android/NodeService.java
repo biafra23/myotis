@@ -571,37 +571,51 @@ public final class NodeService extends Service {
     @SuppressLint("NewApi")
     private CompletableFuture<Attempt> attemptResolve(String trimmed,
                                                       io.myotis.ens.EnsResolutionRoot root) {
-        final EnsCall call;
-        try {
-            call = prepareEnsCall(root);
-        } catch (Exception e) {
-            // FINALIZED can throw (no finalized header yet, snap peer can't serve
-            // the block). Return a null-address result so AUTO can fall back.
-            return CompletableFuture.completedFuture(new Attempt(
-                    new EnsResolution(trimmed, null, -1,
-                            root == io.myotis.ens.EnsResolutionRoot.FINALIZED, unwrap(e)),
-                    false));
-        }
-        final boolean verified = call.beaconVerified();
-        return call.resolver().resolveAddress(trimmed, call.blockCtx())
-                .orTimeout(ENS_TIMEOUT_SEC, TimeUnit.SECONDS)
-                .handle((opt, ex) -> {
-                    final boolean usedOffchain = call.offchainExecutor().usedOffchain();
-                    if (ex != null) {
-                        // Log the full stack: library wrappers (e.g. Caffeine's
-                        // IllegalStateException(className)) mask the real
-                        // Android-incompat cause, which unwrap() now chains.
-                        LogBuffer.e(TAG, "[ens] resolveAddress failed for " + trimmed, ex);
+        // prepareEnsCall is blocking — it probes peer heads (up to ~10s of network
+        // round-trips) before pinning one. Run it on the EVM pool, never on the
+        // caller's thread, so resolveEns is safe to invoke from the UI thread
+        // without risking an ANR. The probe and the EVM execution that follows
+        // share the single EVM thread, which keeps the pinned-peer oracle
+        // contention-free (see evmPool's rationale above).
+        return CompletableFuture.<EnsCall>supplyAsync(() -> {
+            try {
+                return prepareEnsCall(root);
+            } catch (Exception e) {
+                throw new java.util.concurrent.CompletionException(e);
+            }
+        }, evmPool).thenCompose(call -> {
+            final boolean verified = call.beaconVerified();
+            return call.resolver().resolveAddress(trimmed, call.blockCtx())
+                    .orTimeout(ENS_TIMEOUT_SEC, TimeUnit.SECONDS)
+                    .handle((opt, ex) -> {
+                        final boolean usedOffchain = call.offchainExecutor().usedOffchain();
+                        if (ex != null) {
+                            // Log the full stack: library wrappers (e.g. Caffeine's
+                            // IllegalStateException(className)) mask the real
+                            // Android-incompat cause, which unwrap() now chains.
+                            LogBuffer.e(TAG, "[ens] resolveAddress failed for " + trimmed, ex);
+                            return new Attempt(new EnsResolution(
+                                    trimmed, null, call.blockNumber(), verified, unwrap(ex)), usedOffchain);
+                        }
+                        if (opt == null || opt.isEmpty()) {
+                            return new Attempt(new EnsResolution(trimmed, null, call.blockNumber(), verified,
+                                    "name does not resolve"), usedOffchain);
+                        }
                         return new Attempt(new EnsResolution(
-                                trimmed, null, call.blockNumber(), verified, unwrap(ex)), usedOffchain);
-                    }
-                    if (opt == null || opt.isEmpty()) {
-                        return new Attempt(new EnsResolution(trimmed, null, call.blockNumber(), verified,
-                                "name does not resolve"), usedOffchain);
-                    }
-                    return new Attempt(new EnsResolution(
-                            trimmed, opt.get().toHex(), call.blockNumber(), verified, null), usedOffchain);
-                });
+                                trimmed, opt.get().toHex(), call.blockNumber(), verified, null), usedOffchain);
+                    });
+        }).exceptionally(ex -> {
+            // Only prepareEnsCall reaches here — the handle() above never throws.
+            // FINALIZED can fail (no finalized header yet, snap peer can't serve the
+            // block); return a null-address result so AUTO can fall back. Peel the
+            // CompletionException wrapper so the surfaced error matches the cause.
+            Throwable cause = (ex instanceof java.util.concurrent.CompletionException
+                    && ex.getCause() != null) ? ex.getCause() : ex;
+            return new Attempt(
+                    new EnsResolution(trimmed, null, -1,
+                            root == io.myotis.ens.EnsResolutionRoot.FINALIZED, unwrap(cause)),
+                    false);
+        });
     }
 
     private record EnsCall(io.myotis.ens.EnsResolver resolver,
