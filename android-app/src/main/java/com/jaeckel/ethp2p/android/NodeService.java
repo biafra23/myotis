@@ -91,6 +91,7 @@ public final class NodeService extends Service {
     private volatile DiscV5Service discV5;
     private volatile RLPxConnector connector;
     private io.myotis.jsonrpc.MyotisRpcServer rpcServer;
+    private java.util.concurrent.ScheduledExecutorService headWarmer;
     private AndroidPeerCache peerCache;
     private AndroidCLPeerCache clPeerCache;
     private volatile BeaconLightClient beaconLightClient;
@@ -811,12 +812,7 @@ public final class NodeService extends Service {
         // peer-probe + headerChain anchor.
         if (build) {
             try {
-                EnsCall ctx = prepareEnsCall(io.myotis.ens.EnsResolutionRoot.PEER_HEAD);
-                if (!anchorHeadToBeacon(ctx.blockNumber(), ctx.blockCtx().stateRoot())) {
-                    throw new IllegalStateException(
-                            "peer head not beacon-anchored (block #" + ctx.blockNumber() + ")");
-                }
-                future.complete(ctx);
+                future.complete(buildAnchoredHead());
             } catch (Throwable t) {
                 future.completeExceptionally(t);
                 synchronized (rpcCallCtxLock) {
@@ -830,6 +826,55 @@ public final class NodeService extends Service {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             throw (cause instanceof Exception) ? (Exception) cause : new Exception(cause);
         }
+    }
+
+    /**
+     * Pre-warm and keep-warm the shared anchored head: build it as soon as a snap
+     * peer is ready (retrying every few seconds), so a wallet's first read hits a
+     * ready cache instead of triggering a cold build — shrinking the post-start
+     * window where reads fall back to the proxy down to "time until first usable
+     * snap peer". Cheap when warm: verifiedHeadCallContext reuses a fresh context.
+     */
+    private void startHeadWarmer() {
+        if (headWarmer != null) return;
+        headWarmer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "rpc-head-warmer");
+            t.setDaemon(true);
+            return t;
+        });
+        headWarmer.scheduleWithFixedDelay(() -> {
+            if (!RUNNING.get()) return;
+            try {
+                verifiedHeadCallContext();
+            } catch (Exception ignored) {
+                // No usable snap peer / anchorable head yet — retry next tick.
+            }
+        }, 3, 5, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Build a fully beacon-verified head context, preferring the freshest
+     * snap-servable head (PEER_HEAD, anchored to finalized via headerChain) and
+     * falling back to the beacon-finalized root (verified directly by the light
+     * client, ~12 min stale) when no peer serves a fresh head. Both paths are
+     * cryptographically anchored to the beacon chain — so under poor snap
+     * conditions reads stay verified (just staler) instead of all proxying.
+     */
+    private EnsCall buildAnchoredHead() throws Exception {
+        try {
+            EnsCall ctx = prepareEnsCall(io.myotis.ens.EnsResolutionRoot.PEER_HEAD);
+            if (anchorHeadToBeacon(ctx.blockNumber(), ctx.blockCtx().stateRoot())) {
+                return ctx;
+            }
+            LogBuffer.i(TAG, "[rpc] fresh head not beacon-anchored (block #"
+                    + ctx.blockNumber() + "); falling back to finalized");
+        } catch (Exception headEx) {
+            LogBuffer.i(TAG, "[rpc] no snap-servable fresh head (" + unwrap(headEx)
+                    + "); falling back to finalized");
+        }
+        // Fallback: the beacon-finalized execution root, verified directly by the
+        // light client (no headerChain needed). Throws if no peer retains it.
+        return prepareEnsCall(io.myotis.ens.EnsResolutionRoot.FINALIZED);
     }
 
     /** True iff {@code peerStateRoot} at {@code peerBlock} chains back to the
@@ -1049,27 +1094,29 @@ public final class NodeService extends Service {
             org.apache.tuweni.crypto.Hash.keccak256(
                     org.apache.tuweni.bytes.Bytes.fromHexString("0x00000000219ab540356cBB839Cbe05303d7705Fa"));
 
-    /** First ready snap peer that returns a non-empty account proof at {@code root}, or null. */
+    /** First ready snap peer that returns a non-empty account proof at {@code root},
+     *  or null. Probes all peers CONCURRENTLY (same rationale as the PEER_HEAD probe)
+     *  and awards the first to serve the root. */
     private com.jaeckel.ethp2p.networking.eth.EthHandler firstPeerServing(
             List<com.jaeckel.ethp2p.networking.eth.EthHandler> peers,
             org.apache.tuweni.bytes.Bytes32 root) {
+        java.util.List<CompletableFuture<com.jaeckel.ethp2p.networking.eth.EthHandler>> probes =
+                new java.util.ArrayList<>();
         for (com.jaeckel.ethp2p.networking.eth.EthHandler peer : peers) {
-            if (peer.isReady() && !peer.isSnapServingFailed() && servesRoot(peer, root)) {
-                return peer;
-            }
+            if (!peer.isReady() || peer.isSnapServingFailed()) continue;
+            probes.add(peer.requestAccountByHashAsync(SNAP_PROBE_ACCOUNT_HASH, root)
+                    .thenApply(probe -> {
+                        if (probe.proof() == null || probe.proof().isEmpty()) {
+                            throw new java.util.concurrent.CompletionException(
+                                    new IllegalStateException("peer does not serve root"));
+                        }
+                        return peer;
+                    }));
         }
-        return null;
-    }
-
-    /** True if this peer returns a non-empty account proof for the probe account at {@code root}. */
-    private boolean servesRoot(com.jaeckel.ethp2p.networking.eth.EthHandler peer,
-                               org.apache.tuweni.bytes.Bytes32 root) {
         try {
-            com.jaeckel.ethp2p.networking.snap.messages.AccountRangeMessage.DecodeResult r =
-                    peer.requestAccountByHashAsync(SNAP_PROBE_ACCOUNT_HASH, root).get(10, TimeUnit.SECONDS);
-            return r.proof() != null && !r.proof().isEmpty();
+            return firstSuccess(probes, PEER_PROBE_TIMEOUT_SEC);
         } catch (Exception e) {
-            return false;
+            return null;
         }
     }
 
@@ -1421,6 +1468,7 @@ public final class NodeService extends Service {
                     new io.myotis.jsonrpc.MyotisRpcServer(8545, upstream, "0.0.0.0", backend);
             s.start();
             this.rpcServer = s;
+            startHeadWarmer();
         } catch (Throwable t) {
             LogBuffer.w(TAG, "[rpc] failed to start JSON-RPC server: " + t);
         }
@@ -1462,13 +1510,18 @@ public final class NodeService extends Service {
      * instead of failing with bind-in-use.
      */
     private synchronized void doShutdown() {
-        // Stop the JSON-RPC server first so its port is freed promptly.
+        // Stop the head pre-warmer + JSON-RPC server first so the port frees and no
+        // warm-tick builds against torn-down state.
+        if (headWarmer != null) {
+            headWarmer.shutdownNow();
+            headWarmer = null;
+        }
         if (rpcServer != null) {
             try { rpcServer.stop(); } catch (Throwable ignored) {}
             rpcServer = null;
         }
-        // Drop the cached eth_call context so a later Start doesn't briefly reuse
-        // a head pinned to a now-dead peer (it would fail safe to proxy anyway).
+        // Drop the cached head context so a later Start doesn't briefly reuse one
+        // pinned to a now-dead peer (it would fail safe to proxy anyway).
         synchronized (rpcCallCtxLock) { rpcCallCtx = null; }
         // Close BLC first: its libp2p host's outbound dials hold references
         // through to the discv5 callback's blcRef, and the sync thread can
