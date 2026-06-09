@@ -677,8 +677,19 @@ public final class NodeService extends Service {
     private final Object rpcCallCtxLock = new Object();
     private CompletableFuture<EnsCall> rpcCallCtx;   // in-flight/fresh build (dedup)
     private long rpcCallCtxAtMs;
-    private volatile EnsCall lastGoodHead;           // last successfully-built anchored head
-    private volatile long lastGoodHeadAtMs;          // when it was built (elapsedRealtime)
+    // Last successfully-built anchored head + its build time, as one immutable
+    // record behind a single volatile ref so head and timestamp are read/written
+    // atomically together (no torn read of new head with old timestamp).
+    private volatile HeadWithTimestamp lastGoodHead;
+    /** Runs the blocking, network-bound head build off the caller's thread so a
+     *  request blocks only up to its own timeout. Single-thread: the future
+     *  dedup means at most one build runs at a time. */
+    private final java.util.concurrent.ExecutorService headBuildPool =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "rpc-head-build");
+                t.setDaemon(true);
+                return t;
+            });
 
     /** keccak256("") — an account with this codeHash is an EOA (no contract code). */
     private static final byte[] EMPTY_CODE_HASH = Hash.keccak256(Bytes.EMPTY).toArrayUnsafe();
@@ -704,23 +715,26 @@ public final class NodeService extends Service {
         // beacon-anchored; a few seconds stale beats proxying, and it bridges the
         // brief windows where a TTL-expiry rebuild can't yet anchor the just-
         // advanced head. The background warmer keeps this fresh (~5-15s).
-        EnsCall good = lastGoodHead;
+        HeadWithTimestamp good = lastGoodHead;
         if (good != null
-                && android.os.SystemClock.elapsedRealtime() - lastGoodHeadAtMs < RPC_HEAD_MAX_STALE_MS) {
-            return good;
+                && android.os.SystemClock.elapsedRealtime() - good.builtAtMs() < RPC_HEAD_MAX_STALE_MS) {
+            return good.head();
         }
         // No usable head (cold start / sustained outage): wait briefly for a build
-        // before giving up — most gaps are short (a peer (re)connecting).
+        // before giving up — most gaps are short (a peer (re)connecting). The wait
+        // is strictly bounded: each build attempt is capped at the remaining time.
         long deadline = android.os.SystemClock.elapsedRealtime() + RPC_HEAD_WAIT_MS;
         Exception last = null;
         do {
+            long remainingMs = deadline - android.os.SystemClock.elapsedRealtime();
+            if (remainingMs <= 0) break;
             try {
-                return verifiedHeadCallContext();   // builds + refreshes lastGoodHead
+                return verifiedHeadCallContext(remainingMs, TimeUnit.MILLISECONDS);
             } catch (Exception e) {
                 last = e;
-                EnsCall g = lastGoodHead;           // a concurrent build may have just succeeded
-                if (g != null && android.os.SystemClock.elapsedRealtime() - lastGoodHeadAtMs < RPC_HEAD_MAX_STALE_MS) {
-                    return g;
+                HeadWithTimestamp g = lastGoodHead;   // a concurrent build may have just succeeded
+                if (g != null && android.os.SystemClock.elapsedRealtime() - g.builtAtMs() < RPC_HEAD_MAX_STALE_MS) {
+                    return g.head();
                 }
                 try { Thread.sleep(300); } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
@@ -832,13 +846,21 @@ public final class NodeService extends Service {
     /** Build (or reuse within {@link #RPC_HEAD_TTL_MS}) a snap-peer head context
      *  whose state root is anchored back to the beacon-finalized root, so reads +
      *  EVM calls run against cryptographically-verified state. Blocking. */
+    /** Full-budget variant for the background warmer. */
     private EnsCall verifiedHeadCallContext() throws Exception {
+        return verifiedHeadCallContext(RPC_ACCOUNT_TIMEOUT_SEC * 1000L, TimeUnit.MILLISECONDS);
+    }
+
+    private EnsCall verifiedHeadCallContext(long timeout, TimeUnit unit) throws Exception {
         CompletableFuture<EnsCall> future;
         boolean build = false;
         synchronized (rpcCallCtxLock) {
             long now = android.os.SystemClock.elapsedRealtime();
-            if (rpcCallCtx != null && !rpcCallCtx.isCompletedExceptionally()
-                    && now - rpcCallCtxAtMs < RPC_HEAD_TTL_MS) {
+            // Reuse an in-flight build (regardless of age — never start a parallel
+            // one) or a completed-OK result still within the TTL.
+            if (rpcCallCtx != null
+                    && (!rpcCallCtx.isDone()
+                        || (!rpcCallCtx.isCompletedExceptionally() && now - rpcCallCtxAtMs < RPC_HEAD_TTL_MS))) {
                 future = rpcCallCtx;
             } else {
                 future = new CompletableFuture<>();
@@ -847,25 +869,31 @@ public final class NodeService extends Service {
                 build = true;
             }
         }
-        // Build OUTSIDE the lock so a burst of concurrent eth_calls (a MetaMask
-        // page load fires hundreds) shares the one builder's future instead of
-        // serializing — or starving — on the monitor during the up-to-60s
-        // peer-probe + headerChain anchor.
+        // Build on a background thread so the caller only blocks up to `timeout`
+        // (honoring verifiedHeadFor's bounded wait even when this call triggers the
+        // build). A burst of concurrent reads shares the one builder's future.
         if (build) {
+            final CompletableFuture<EnsCall> f = future;
             try {
-                EnsCall ctx = buildAnchoredHead();
-                lastGoodHead = ctx;                                  // serve-stale fallback
-                lastGoodHeadAtMs = android.os.SystemClock.elapsedRealtime();
-                future.complete(ctx);
-            } catch (Throwable t) {
-                future.completeExceptionally(t);
-                synchronized (rpcCallCtxLock) {
-                    if (rpcCallCtx == future) rpcCallCtx = null;   // let the next call retry
-                }
+                headBuildPool.execute(() -> {
+                    try {
+                        EnsCall ctx = buildAnchoredHead();
+                        lastGoodHead = new HeadWithTimestamp(ctx, android.os.SystemClock.elapsedRealtime());
+                        f.complete(ctx);
+                    } catch (Throwable t) {
+                        f.completeExceptionally(t);
+                        synchronized (rpcCallCtxLock) {
+                            if (rpcCallCtx == f) rpcCallCtx = null;   // let the next call retry
+                        }
+                    }
+                });
+            } catch (java.util.concurrent.RejectedExecutionException rex) {  // shutting down
+                f.completeExceptionally(rex);
+                synchronized (rpcCallCtxLock) { if (rpcCallCtx == f) rpcCallCtx = null; }
             }
         }
         try {
-            return future.get(RPC_ACCOUNT_TIMEOUT_SEC, TimeUnit.SECONDS);
+            return future.get(timeout, unit);   // build continues in the background on timeout
         } catch (java.util.concurrent.ExecutionException e) {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             throw (cause instanceof Exception) ? (Exception) cause : new Exception(cause);
@@ -898,19 +926,28 @@ public final class NodeService extends Service {
 
     private void maintainSnapPeers() {
         if (!RUNNING.get()) return;
-        RLPxConnector conn = connector;
-        AndroidPeerCache pc = peerCache;
-        if (conn == null) return;
-        int snapPeers = conn.activeSnapHandlers().size();
-        if (snapPeers >= TARGET_SNAP_PEERS) return;
-        if (pc == null) return;
-        LogBuffer.i(TAG, "[peers] " + snapPeers + " snap peer(s) < target " + TARGET_SNAP_PEERS
-                + "; re-dialing cached snap peers");
-        long now = System.currentTimeMillis();
-        for (AndroidPeerCache.CachedPeer p : pc.load()) {
-            if (!p.snap()) continue;
-            if (conn.activeSnapHandlers().size() >= TARGET_SNAP_PEERS) break;
-            dialCachedSnapPeer(conn, p, now);
+        // Guard the whole body: an uncaught throw here would make
+        // scheduleWithFixedDelay silently stop all future runs.
+        try {
+            RLPxConnector conn = connector;
+            AndroidPeerCache pc = peerCache;
+            if (conn == null) return;
+            int snapPeers = conn.activeSnapHandlers().size();
+            if (snapPeers >= TARGET_SNAP_PEERS || pc == null) return;
+            LogBuffer.i(TAG, "[peers] " + snapPeers + " snap peer(s) < target " + TARGET_SNAP_PEERS
+                    + "; re-dialing cached snap peers");
+            long now = System.currentTimeMillis();
+            for (AndroidPeerCache.CachedPeer p : pc.load()) {
+                try {
+                    if (!p.snap()) continue;
+                    if (conn.activeSnapHandlers().size() >= TARGET_SNAP_PEERS) break;
+                    dialCachedSnapPeer(conn, p, now);
+                } catch (Exception e) {
+                    LogBuffer.w(TAG, "[peers] skipping cached peer: " + e.getMessage());
+                }
+            }
+        } catch (Throwable t) {
+            LogBuffer.e(TAG, "[peers] maintenance loop error", t);
         }
     }
 
@@ -1011,6 +1048,10 @@ public final class NodeService extends Service {
     private record PeerHead(com.jaeckel.ethp2p.networking.eth.EthHandler peer,
                             com.jaeckel.ethp2p.core.types.BlockHeader header) {}
 
+    /** A built anchored head plus when it was built (elapsedRealtime), held as one
+     *  immutable unit so the serve-stale check reads both atomically. */
+    private record HeadWithTimestamp(EnsCall head, long builtAtMs) {}
+
     /**
      * Resolve to the first future that completes <em>successfully</em> (non-null),
      * ignoring failures; if every future fails, throw the last failure; if none
@@ -1029,7 +1070,13 @@ public final class NodeService extends Service {
         for (CompletableFuture<T> f : futures) {
             f.whenComplete((v, e) -> {
                 if (e == null && v != null) {
-                    result.complete(v);
+                    if (result.complete(v)) {
+                        // First winner: cancel the rest so losing probes don't keep
+                        // burning CPU/battery/data in the background on mobile.
+                        for (CompletableFuture<T> other : futures) {
+                            if (other != f) other.cancel(true);
+                        }
+                    }
                 } else {
                     if (e != null) lastErr.set(e);
                     if (remaining.decrementAndGet() == 0) {
@@ -1828,6 +1875,7 @@ public final class NodeService extends Service {
         RUNNING.set(false);
         evmPool.shutdownNow();
         ccipPool.shutdownNow();
+        headBuildPool.shutdownNow();
         new Thread(this::doShutdown, "ethp2p-shutdown").start();
         super.onDestroy();
     }
