@@ -678,6 +678,17 @@ public class CommandHandler {
                     found != null ? found.balance().toString() : null,
                     result.stateRoot(), result.blockNumber());
 
+            // storageRoot/codeHash from the proof-verified leaf, not the peer's
+            // slim body — a peer can forge those two while keeping nonce/balance
+            // honest, and the slim values would otherwise ride along as "verified".
+            MerklePatriciaVerifier.VerifiedAccount verifiedAcct =
+                    (found != null && result.stateRoot() != null && !result.proof().isEmpty())
+                            ? MerklePatriciaVerifier.verifyAndExtractAccount(
+                                    result.stateRoot().toArrayUnsafe(), address.toArrayUnsafe(),
+                                    result.proof().stream().map(Bytes::toArrayUnsafe).toList(),
+                                    found.nonce(), found.balance().toString())
+                            : null;
+
             if (found == null) {
                 return "{\"ok\":true,\"exists\":false"
                     + ",\"address\":\"" + addr + "\""
@@ -690,8 +701,12 @@ public class CommandHandler {
                 + ",\"accountHash\":\"" + found.accountHash().toHexString() + "\""
                 + ",\"nonce\":" + found.nonce()
                 + ",\"balance\":\"" + found.balance() + "\""
-                + ",\"storageRoot\":\"" + found.storageRoot().toHexString() + "\""
-                + ",\"codeHash\":\"" + found.codeHash().toHexString() + "\""
+                + ",\"storageRoot\":\"" + (verifiedAcct != null
+                        ? Bytes.wrap(verifiedAcct.storageRoot()).toHexString()
+                        : found.storageRoot().toHexString()) + "\""
+                + ",\"codeHash\":\"" + (verifiedAcct != null
+                        ? Bytes.wrap(verifiedAcct.codeHash()).toHexString()
+                        : found.codeHash().toHexString()) + "\""
                 + ",\"proof\":" + proofJson
                 + ",\"verification\":" + verificationJson + "}";
         } catch (Exception e) {
@@ -775,10 +790,26 @@ public class CommandHandler {
             if (account == null) {
                 return jsonError("Contract account not found");
             }
-            Bytes32 storageRoot = account.storageRoot();
 
             // Step 2: fetch storage slot using the same peer state root for consistency
             Bytes32 snapStateRoot = accountResult.stateRoot();
+
+            // Take storageRoot from the PROOF-VERIFIED account leaf, not the peer's
+            // slim body. Otherwise a peer could forge storageRoot (keeping nonce/
+            // balance honest) plus a matching storage proof and fabricate a
+            // "verified" slot value. snapStateRoot is anchored to the beacon below.
+            List<byte[]> accountProofBytes = accountResult.proof().stream()
+                    .map(Bytes::toArrayUnsafe).toList();
+            MerklePatriciaVerifier.VerifiedAccount verifiedAccount =
+                    snapStateRoot == null ? null
+                            : MerklePatriciaVerifier.verifyAndExtractAccount(
+                                    snapStateRoot.toArrayUnsafe(),
+                                    contractAddress.toArrayUnsafe(), accountProofBytes,
+                                    account.nonce(), account.balance().toString());
+            if (verifiedAccount == null) {
+                return jsonError("Contract account proof did not verify against peer state root");
+            }
+            Bytes32 storageRoot = Bytes32.wrap(verifiedAccount.storageRoot());
             StorageRangesMessage.DecodeResult storageResult =
                 connector.requestStorage(contractAddress, storageKeyHash, snapStateRoot)
                     .get(30, TimeUnit.SECONDS);

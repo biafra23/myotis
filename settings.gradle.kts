@@ -36,4 +36,4 @@ dependencyResolutionManagement {
     }
 }
 
-include("core", "networking", "consensus", "app", "android-app", "myotis-evm", "myotis-ens")
+include("core", "networking", "consensus", "app", "android-app", "myotis-evm", "myotis-ens", "jsonrpc-server")

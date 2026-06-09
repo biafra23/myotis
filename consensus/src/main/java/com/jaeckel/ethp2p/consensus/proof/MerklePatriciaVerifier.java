@@ -51,15 +51,41 @@ public class MerklePatriciaVerifier {
     public static boolean verify(byte[] stateRoot, byte[] address,
                                   List<byte[]> proofNodes,
                                   long expectedNonce, String expectedBalance) {
+        return verifyAndExtractAccount(stateRoot, address, proofNodes,
+                expectedNonce, expectedBalance) != null;
+    }
 
-        if (proofNodes == null || proofNodes.isEmpty()) return false;
-        if (stateRoot == null || stateRoot.length != 32) return false;
-        if (address == null || address.length != 20) return false;
+    /** The account fields not covered by the nonce/balance check, taken from the
+     *  proof-verified leaf (NOT a peer's slim account body). */
+    public record VerifiedAccount(byte[] storageRoot, byte[] codeHash) {}
+
+    /**
+     * Verify the account proof against {@code stateRoot} and return the leaf's
+     * {@code storageRoot} + {@code codeHash}, or {@code null} if the proof is
+     * invalid or {@code expectedNonce}/{@code expectedBalance} don't match.
+     *
+     * <p>Critically, {@code storageRoot} and {@code codeHash} are read out of the
+     * <em>proof-verified</em> account leaf — the RLP blob whose hash chains to the
+     * trusted {@code stateRoot} — and NOT from the peer's separately-decoded "slim"
+     * account body. A snap peer fully controls both halves of its response, so a
+     * malicious peer can keep nonce+balance honest (which is all the leaf check
+     * compares) while forging the slim body's {@code storageRoot}/{@code codeHash};
+     * callers that then read storage/code against the forged root would verify
+     * bogus values. Returning the leaf's values closes that vector — callers must
+     * use these, not the slim body's.
+     */
+    public static VerifiedAccount verifyAndExtractAccount(
+            byte[] stateRoot, byte[] address, List<byte[]> proofNodes,
+            long expectedNonce, String expectedBalance) {
+
+        if (proofNodes == null || proofNodes.isEmpty()) return null;
+        if (stateRoot == null || stateRoot.length != 32) return null;
+        if (address == null || address.length != 20) return null;
 
         byte[] keyHash = keccak256(address);
         byte[] leafValue = traverseProof(stateRoot, keyHash, proofNodes);
-        if (leafValue == null) return false;
-        return verifyAccountValue(leafValue, expectedNonce, expectedBalance);
+        if (leafValue == null) return null;
+        return decodeAndCheckAccount(leafValue, expectedNonce, expectedBalance);
     }
 
     /**
@@ -233,15 +259,23 @@ public class MerklePatriciaVerifier {
      *
      * Account RLP: [nonce (integer), balance (integer), storageRoot (bytes32), codeHash (bytes32)]
      */
-    private static boolean verifyAccountValue(byte[] accountRlp,
-                                               long expectedNonce,
-                                               String expectedBalance) {
-        if (accountRlp == null || accountRlp.length == 0) return false;
+    /**
+     * Decode a proof-verified account leaf {@code RLP[nonce, balance, storageRoot,
+     * codeHash]}, check nonce/balance against the expected values, and return the
+     * leaf's storageRoot + codeHash. Returns null on a decode failure or a
+     * nonce/balance mismatch.
+     */
+    private static VerifiedAccount decodeAndCheckAccount(byte[] accountRlp,
+                                                         long expectedNonce,
+                                                         String expectedBalance) {
+        if (accountRlp == null || accountRlp.length == 0) return null;
 
         try {
             Bytes rlpBytes = Bytes.wrap(accountRlp);
             long[] nonceHolder = new long[1];
             BigInteger[] balanceHolder = new BigInteger[1];
+            byte[][] storageRootHolder = new byte[1][];
+            byte[][] codeHashHolder = new byte[1][];
 
             RLP.decodeList(rlpBytes, reader -> {
                 // nonce: uint
@@ -256,17 +290,17 @@ public class MerklePatriciaVerifier {
                     balanceHolder[0] = new BigInteger(1, balanceBytes.toArrayUnsafe());
                 }
 
-                // storageRoot and codeHash (32 bytes each) — we skip validation here;
-                // the state root check already validates consistency
-                reader.readValue(); // storageRoot
-                reader.readValue(); // codeHash
+                // storageRoot + codeHash come straight from the proven leaf so
+                // callers get cryptographically-anchored values (see javadoc).
+                storageRootHolder[0] = reader.readValue().toArrayUnsafe();
+                codeHashHolder[0] = reader.readValue().toArrayUnsafe();
 
                 return null;
             });
 
             // Validate expected nonce if requested
             if (expectedNonce >= 0 && nonceHolder[0] != expectedNonce) {
-                return false;
+                return null;
             }
 
             // Validate expected balance if requested
@@ -278,14 +312,14 @@ public class MerklePatriciaVerifier {
                     expected = new BigInteger(expectedBalance, 10);
                 }
                 if (!balanceHolder[0].equals(expected)) {
-                    return false;
+                    return null;
                 }
             }
 
-            return true;
+            return new VerifiedAccount(storageRootHolder[0], codeHashHolder[0]);
 
         } catch (Exception e) {
-            return false;
+            return null;
         }
     }
 
