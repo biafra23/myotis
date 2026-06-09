@@ -45,4 +45,17 @@ interface MyotisRpcBackend {
 
     /** eth_getTransactionCount: account nonce, or null to proxy. */
     fun getTransactionCount(address: ByteArray, block: String): Long?
+
+    /**
+     * eth_getCode: the account's contract bytecode (empty for an EOA), verified
+     * against the proven codeHash, or null to proxy.
+     */
+    fun getCode(address: ByteArray, block: String): ByteArray?
+
+    /**
+     * eth_getStorageAt: the 32-byte value at storage key [slot] (a 32-byte
+     * big-endian key), proven against the account's verified storageRoot, or null
+     * to proxy (including absent slots, which can't be positively proven here).
+     */
+    fun getStorageAt(address: ByteArray, slot: ByteArray, block: String): ByteArray?
 }

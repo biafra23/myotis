@@ -116,6 +116,21 @@ class RpcRouter(
                 val nonce = withContext(Dispatchers.IO) { b.getTransactionCount(addr, block) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexQuantity(nonce)))
             }
+            "eth_getCode" -> {
+                val p = root.params()
+                val addr = (p?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
+                val block = p.blockTag(1)
+                val code = withContext(Dispatchers.IO) { b.getCode(addr, block) } ?: return null
+                resultEnvelope(id, JsonPrimitive(hexData(code)))
+            }
+            "eth_getStorageAt" -> {
+                val p = root.params()
+                val addr = (p?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
+                val slot = (p?.getOrNull(1))?.asWord32() ?: return null
+                val block = p.blockTag(2)
+                val v = withContext(Dispatchers.IO) { b.getStorageAt(addr, slot, block) } ?: return null
+                resultEnvelope(id, JsonPrimitive(hexData(v)))
+            }
             else -> null
         }
     }
@@ -126,6 +141,23 @@ class RpcRouter(
     /** The block tag at [index] (e.g. "latest"), defaulting to "latest" when absent. */
     private fun JsonArray?.blockTag(index: Int): String =
         (this?.getOrNull(index) as? JsonPrimitive)?.contentOrNull ?: "latest"
+
+    /** Decode a storage position (QUANTITY or 32-byte DATA) to a left-padded
+     *  32-byte big-endian key; null if not a hex string or wider than 32 bytes. */
+    private fun JsonElement.asWord32(): ByteArray? {
+        val s = (this as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull ?: return null
+        var h = if (s.startsWith("0x") || s.startsWith("0X")) s.substring(2) else s
+        if (h.length % 2 != 0) h = "0$h"           // tolerate odd-length QUANTITY (e.g. "0x0")
+        if (h.length > 64) return null
+        return try {
+            val raw = ByteArray(h.length / 2) {
+                ((h[it * 2].digitToInt(16) shl 4) or h[it * 2 + 1].digitToInt(16)).toByte()
+            }
+            ByteArray(32).also { raw.copyInto(it, 32 - raw.size) }
+        } catch (e: IllegalArgumentException) {
+            null
+        }
+    }
 
     /** Decode a `0x…` hex JSON string to bytes; null if not a hex string. */
     private fun JsonElement.asHexBytes(): ByteArray? {

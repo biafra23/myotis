@@ -281,15 +281,21 @@ public final class NodeService extends Service {
         String balance = found != null ? found.balance().toString() : null;
 
         boolean peerProofValid = false;
+        MerklePatriciaVerifier.VerifiedAccount verifiedAcct = null;
         if (result.stateRoot() != null && !result.proof().isEmpty()) {
             List<byte[]> proofBytes = new ArrayList<>(result.proof().size());
             for (Bytes b : result.proof()) proofBytes.add(b.toArrayUnsafe());
-            peerProofValid = MerklePatriciaVerifier.verify(
+            // verifyAndExtractAccount returns the storageRoot/codeHash from the
+            // proof-verified leaf — NOT the peer's slim body — so a peer can't
+            // forge those two fields while keeping nonce/balance honest.
+            verifiedAcct = MerklePatriciaVerifier.verifyAndExtractAccount(
                     result.stateRoot().toArrayUnsafe(),
                     address.toArrayUnsafe(),
                     proofBytes, nonce, balance);
+            peerProofValid = (verifiedAcct != null);
         }
         final boolean peerProofValidFinal = peerProofValid;
+        final MerklePatriciaVerifier.VerifiedAccount verifiedAcctFinal = verifiedAcct;
 
         Verification v = new Verification();
 
@@ -305,7 +311,7 @@ public final class NodeService extends Service {
                 v.blsVerified = match.blsVerified();
                 v.verifyMethod = "stateRootMatch";
                 return CompletableFuture.completedFuture(
-                        finalizeResult(addr, foundFinal, result, peerProofValidFinal, v));
+                        finalizeResult(addr, foundFinal, result, peerProofValidFinal, verifiedAcctFinal, v));
             }
         }
 
@@ -358,29 +364,40 @@ public final class NodeService extends Service {
                             } else {
                                 v.failReason = "headerChainInvalid";
                             }
-                            return finalizeResult(addr, foundFinal, result, peerProofValidFinal, v);
+                            return finalizeResult(addr, foundFinal, result, peerProofValidFinal, verifiedAcctFinal, v);
                         });
             }
         }
 
         return CompletableFuture.completedFuture(
-                finalizeResult(addr, foundFinal, result, peerProofValidFinal, v));
+                finalizeResult(addr, foundFinal, result, peerProofValidFinal, verifiedAcctFinal, v));
     }
 
     private static AccountQueryResult finalizeResult(String addr,
                                                       AccountRangeMessage.AccountData found,
                                                       AccountRangeMessage.DecodeResult result,
                                                       boolean peerProofValid,
+                                                      MerklePatriciaVerifier.VerifiedAccount verified,
                                                       Verification v) {
         long nonce = found != null ? found.nonce() : -1;
         String balance = found != null ? found.balance().toString() : null;
+        // storageRoot/codeHash come from the proof-verified leaf when we have it,
+        // so they're cryptographically anchored rather than peer-claimed. Fall
+        // back to the slim body only when the proof didn't verify — in which case
+        // the result is already flagged beaconChainVerified=false.
+        String storageRootHex = verified != null
+                ? Bytes.wrap(verified.storageRoot()).toHexString()
+                : (found != null ? found.storageRoot().toHexString() : null);
+        String codeHashHex = verified != null
+                ? Bytes.wrap(verified.codeHash()).toHexString()
+                : (found != null ? found.codeHash().toHexString() : null);
         return new AccountQueryResult(
                 addr,
                 found != null,
                 nonce,
                 balance,
-                found != null ? found.storageRoot().toHexString() : null,
-                found != null ? found.codeHash().toHexString() : null,
+                storageRootHex,
+                codeHashHex,
                 result.blockNumber(),
                 result.stateRoot() != null ? result.stateRoot().toHexString() : null,
                 peerProofValid,
@@ -673,6 +690,109 @@ public final class NodeService extends Service {
             LogBuffer.i(TAG, "[rpc] account read not verifiable now: " + unwrap(e));
             return null;
         }
+    }
+
+    /** keccak256("") — an account with this codeHash is an EOA (no contract code). */
+    private static final byte[] EMPTY_CODE_HASH = Hash.keccak256(Bytes.EMPTY).toArrayUnsafe();
+
+    /** First ready snap-serving peer, or null. */
+    private com.jaeckel.ethp2p.networking.eth.EthHandler firstReadySnapPeer() {
+        RLPxConnector conn = connector;
+        if (conn == null) return null;
+        for (com.jaeckel.ethp2p.networking.eth.EthHandler p : conn.activeSnapHandlers()) {
+            if (p.isReady() && !p.isSnapServingFailed()) return p;
+        }
+        return null;
+    }
+
+    /** eth_getCode: bytecode verified against the proven codeHash, or null to proxy. */
+    private byte[] rpcCode(byte[] address, String block) {
+        if (!isLatestTag(block) || address == null || address.length != 20) return null;
+        AccountQueryResult r = rpcAccount(address, block);   // codeHashHex is from the proven leaf
+        if (r == null) return null;
+        if (!r.exists()) return new byte[0];                 // no account → no code
+        try {
+            byte[] codeHash = Bytes.fromHexString(r.codeHashHex()).toArrayUnsafe();
+            if (java.util.Arrays.equals(codeHash, EMPTY_CODE_HASH)) return new byte[0];  // EOA
+            com.jaeckel.ethp2p.networking.eth.EthHandler peer = firstReadySnapPeer();
+            if (peer == null) return null;
+            java.util.List<Bytes> codes =
+                    new com.jaeckel.ethp2p.android.snap.EthHandlerSnapPeer(peer)
+                            .getByteCodes(java.util.List.of(Bytes32.wrap(codeHash)))
+                            .get(30, TimeUnit.SECONDS);
+            if (codes.isEmpty()) return null;
+            Bytes code = codes.get(0);
+            // Content-addressed: the bytecode is verified iff keccak256(code)==codeHash.
+            if (!java.util.Arrays.equals(Hash.keccak256(code).toArrayUnsafe(), codeHash)) return null;
+            return code.toArrayUnsafe();
+        } catch (Exception e) {
+            LogBuffer.i(TAG, "[rpc] eth_getCode not verifiable now: " + unwrap(e));
+            return null;
+        }
+    }
+
+    /** eth_getStorageAt: the 32-byte value at {@code slot32}, proven against the
+     *  account's verified storageRoot. Returns null (→ proxy) for absent slots,
+     *  which a single inclusion proof can't positively prove here. */
+    private byte[] rpcStorageAt(byte[] address, byte[] slot32, String block) {
+        if (!isLatestTag(block) || address == null || address.length != 20
+                || slot32 == null || slot32.length != 32) return null;
+        try {
+            // Verified account read → PROVEN storageRoot + the beacon-anchored peer
+            // state root the storage proof must be fetched against.
+            AccountQueryResult r = rpcAccount(address, block);
+            if (r == null || !r.exists()
+                    || r.storageRootHex() == null || r.peerStateRootHex() == null) return null;
+            RLPxConnector conn = connector;
+            if (conn == null) return null;
+            Bytes32 storageRoot = Bytes32.fromHexString(r.storageRootHex());
+            Bytes32 snapStateRoot = Bytes32.fromHexString(r.peerStateRootHex());
+            Bytes contractAddress = Bytes.wrap(address);
+            Bytes32 storageKeyHash = Hash.keccak256(Bytes.wrap(slot32));
+            com.jaeckel.ethp2p.networking.snap.messages.StorageRangesMessage.DecodeResult storageResult =
+                    conn.requestStorage(contractAddress, storageKeyHash, snapStateRoot)
+                            .get(RPC_ACCOUNT_TIMEOUT_SEC, TimeUnit.SECONDS);
+            if (storageResult.proof().isEmpty()) return null;
+            java.util.List<byte[]> proofBytes = storageResult.proof().stream()
+                    .map(Bytes::toArrayUnsafe).toList();
+            byte[] provenLeaf = MerklePatriciaVerifier.verifyStorageProof(
+                    storageRoot.toArrayUnsafe(), slot32, proofBytes);
+            if (provenLeaf == null) return null;   // absent or invalid → proxy
+            // The trie leaf stores RLP(value); cross-check the peer's slim slotValue
+            // against it so a forged slotValue in the slots() list can't slip through.
+            com.jaeckel.ethp2p.networking.snap.messages.StorageRangesMessage.StorageData found =
+                    storageResult.slots().stream()
+                            .filter(s -> s.slotHash().equals(storageKeyHash)).findFirst().orElse(null);
+            byte[] value = (found != null && !found.slotValue().isEmpty())
+                    ? found.slotValue().toArrayUnsafe() : new byte[0];
+            if (!java.util.Arrays.equals(rlpEncodeShort(value), provenLeaf)) {
+                return null;   // slim value inconsistent with the proven leaf
+            }
+            return leftPad32(value);
+        } catch (Exception e) {
+            LogBuffer.i(TAG, "[rpc] eth_getStorageAt not verifiable now: " + unwrap(e));
+            return null;
+        }
+    }
+
+    /** RLP-encode a minimal big-endian value ≤ 32 bytes (a storage slot value):
+     *  a single byte < 0x80 is itself; otherwise a short-string header (0x80+len)
+     *  precedes the bytes. Used to compare the peer's slim slotValue to the
+     *  proof-verified trie leaf (which holds RLP(value)). */
+    private static byte[] rlpEncodeShort(byte[] v) {
+        if (v.length == 1 && (v[0] & 0xFF) < 0x80) return v;
+        byte[] out = new byte[v.length + 1];
+        out[0] = (byte) (0x80 + v.length);   // v.length ≤ 32 < 56, so single-byte header
+        System.arraycopy(v, 0, out, 1, v.length);
+        return out;
+    }
+
+    /** Right-align {@code v} into a 32-byte big-endian word. */
+    private static byte[] leftPad32(byte[] v) {
+        if (v.length >= 32) return java.util.Arrays.copyOfRange(v, v.length - 32, v.length);
+        byte[] out = new byte[32];
+        System.arraycopy(v, 0, out, 32 - v.length, v.length);
+        return out;
     }
 
     /** Build (or reuse within {@link #RPC_CALL_TTL_MS}) a snap-peer head context
@@ -1217,6 +1337,12 @@ public final class NodeService extends Service {
                     AccountQueryResult r = rpcAccount(address, block);
                     if (r == null) return null;
                     return r.exists() ? Long.valueOf(r.nonce()) : Long.valueOf(0L);
+                }
+                @Override public byte[] getCode(byte[] address, String block) {
+                    return rpcCode(address, block);
+                }
+                @Override public byte[] getStorageAt(byte[] address, byte[] slot, String block) {
+                    return rpcStorageAt(address, slot, block);
                 }
             };
             io.myotis.jsonrpc.MyotisRpcServer s =

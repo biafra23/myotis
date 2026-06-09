@@ -4,6 +4,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -26,10 +27,13 @@ class RpcRouterTest {
         var balance: BigInteger? = null,
         var nonce: Long? = null,
         var head: Long? = 0x100,
+        var code: ByteArray? = null,
+        var storage: ByteArray? = null,
     ) : MyotisRpcBackend {
         var lastTo: ByteArray? = null
         var lastData: ByteArray? = null
         var lastBlock: String? = null
+        var lastSlot: ByteArray? = null
         override fun chainId() = 1L
         override fun headBlockNumber() = head
         override fun syncState() = "SYNCED"
@@ -38,6 +42,10 @@ class RpcRouterTest {
         }
         override fun getBalance(address: ByteArray, block: String): BigInteger? = balance
         override fun getTransactionCount(address: ByteArray, block: String): Long? = nonce
+        override fun getCode(address: ByteArray, block: String): ByteArray? = code
+        override fun getStorageAt(address: ByteArray, slot: ByteArray, block: String): ByteArray? {
+            lastSlot = slot; return storage
+        }
     }
 
     private fun route(backend: MyotisRpcBackend?, body: String, proxy: UpstreamProxy? = null): String =
@@ -105,6 +113,41 @@ class RpcRouterTest {
     @Test fun getBalance_backendNull_fallsThrough() {
         assertTrue(hasError(route(FakeBackend(balance = null),
             """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"]}""")))
+    }
+
+    @Test fun getCode_encodesBytecodeAsData() {
+        val b = FakeBackend(code = byteArrayOf(0x60, 0x80.toByte(), 0x60, 0x40))
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_getCode",
+               "params":["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","latest"]}""")
+        assertEquals("0x60806040", result(resp))
+    }
+
+    @Test fun getCode_emptyForEoa() {
+        val resp = route(FakeBackend(code = ByteArray(0)),
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getCode","params":["0xabc0000000000000000000000000000000000001"]}""")
+        assertEquals("0x", result(resp))
+    }
+
+    @Test fun getStorageAt_decodesSlotToWord_andEncodesValueAsData() {
+        val b = FakeBackend(storage = ByteArray(32).also { it[31] = 0x2a }) // value 0x2a
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_getStorageAt",
+               "params":["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","0x0","latest"]}""")
+        // slot "0x0" -> 32-byte zero word
+        assertArrayEquals(ByteArray(32), b.lastSlot)
+        assertEquals("0x000000000000000000000000000000000000000000000000000000000000002a", result(resp))
+    }
+
+    @Test fun getStorageAt_paddsShortSlotKeyTo32Bytes() {
+        val b = FakeBackend(storage = ByteArray(32))
+        route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_getStorageAt",
+               "params":["0xabc0000000000000000000000000000000000001","0x7b","latest"]}""")
+        val expected = ByteArray(32).also { it[31] = 0x7b }   // 0x7b right-aligned
+        assertArrayEquals(expected, b.lastSlot)
+    }
+
+    @Test fun getStorageAt_backendNull_fallsThrough() {
+        assertTrue(hasError(route(FakeBackend(storage = null),
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getStorageAt","params":["0xabc0000000000000000000000000000000000001","0x1"]}""")))
     }
 
     @Test fun chainId_and_blockNumber_stillVerified() {
