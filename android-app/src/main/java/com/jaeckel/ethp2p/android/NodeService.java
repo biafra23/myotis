@@ -695,6 +695,25 @@ public final class NodeService extends Service {
     /** keccak256("") — an account with this codeHash is an EOA (no contract code). */
     private static final byte[] EMPTY_CODE_HASH = Hash.keccak256(Bytes.EMPTY).toArrayUnsafe();
 
+    /** eth_sendRawTransaction: gossip the user-signed tx to peers; return its hash
+     *  (keccak256 of the raw bytes), or null (→ proxy) if no peer took it. Myotis
+     *  never signs or originates a tx — this only relays bytes the user submitted. */
+    private byte[] rpcSendRawTransaction(byte[] rawTx) {
+        RLPxConnector conn = connector;
+        if (conn == null || rawTx == null || rawTx.length == 0) return null;
+        try {
+            int sent = conn.broadcastTransaction(rawTx);
+            if (sent == 0) return null;   // no peer reached → let the proxy relay it
+            byte[] txHash = Hash.keccak256(Bytes.wrap(rawTx)).toArrayUnsafe();
+            LogBuffer.i(TAG, "[rpc] eth_sendRawTransaction broadcast to " + sent
+                    + " peer(s), hash=" + Bytes.wrap(txHash).toHexString());
+            return txHash;
+        } catch (Exception e) {
+            LogBuffer.i(TAG, "[rpc] eth_sendRawTransaction failed: " + unwrap(e));
+            return null;
+        }
+    }
+
     /** First ready snap-serving peer, or null. */
     private com.jaeckel.ethp2p.networking.eth.EthHandler firstReadySnapPeer() {
         RLPxConnector conn = connector;
@@ -1370,6 +1389,9 @@ public final class NodeService extends Service {
                 }
                 @Override public byte[] getStorageAt(byte[] address, byte[] slot, String block) {
                     return rpcStorageAt(address, slot, block);
+                }
+                @Override public byte[] sendRawTransaction(byte[] rawTx) {
+                    return rpcSendRawTransaction(rawTx);
                 }
             };
             io.myotis.jsonrpc.MyotisRpcServer s =

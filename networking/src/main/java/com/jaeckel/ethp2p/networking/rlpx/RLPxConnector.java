@@ -270,6 +270,23 @@ public final class RLPxConnector implements AutoCloseable {
     }
 
     /**
+     * Gossip a raw signed transaction to <em>every</em> READY eth peer (eth
+     * Transactions 0x12). A light client doesn't relay the mempool, so peers may
+     * not re-propagate our gossip — broadcasting widely maximizes the chance the
+     * tx reaches a block producer.
+     *
+     * @return the number of peers the tx was sent to
+     */
+    public int broadcastTransaction(byte[] rawTx) {
+        int sent = 0;
+        for (EthHandler handler : activeHandlers) {
+            if (handler.isReady() && handler.sendTransactions(rawTx)) sent++;
+        }
+        log.info("[rlpx] Broadcast transaction to {} peer(s)", sent);
+        return sent;
+    }
+
+    /**
      * Fetch a single account from the snap/1 state trie via any active READY + snap peer.
      * Automatically retries with the next snap peer if the first one fails.
      *
