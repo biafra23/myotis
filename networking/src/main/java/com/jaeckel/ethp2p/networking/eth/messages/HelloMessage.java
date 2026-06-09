@@ -38,6 +38,15 @@ public final class HelloMessage {
             writer.writeInt(PROTOCOL_VERSION);
             writer.writeString("ethp2p/0.1.0");
             writer.writeList(capWriter -> {
+                // Capabilities must be ascending (name, then version). eth/66 is the
+                // floor: it has request-IDs (which our GetBlockHeaders/snap requests
+                // need) — eth/65 does not — and the same Status + snap layout as
+                // 67/68, so accepting it widens the usable snap-peer pool.
+                // eth/66
+                capWriter.writeList(cap -> {
+                    cap.writeString("eth");
+                    cap.writeInt(66);
+                });
                 // eth/67
                 capWriter.writeList(cap -> {
                     cap.writeString("eth");
