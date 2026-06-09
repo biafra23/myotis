@@ -216,6 +216,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             pendingStorageRequests.values().forEach(f -> f.completeExceptionally(cause));
             pendingStorageRequests.clear();
         }
+        if (!pendingReceiptRequests.isEmpty()) {
+            pendingReceiptRequests.values().forEach(f -> f.completeExceptionally(cause));
+            pendingReceiptRequests.clear();
+        }
         super.channelInactive(ctx);
     }
 
@@ -471,6 +475,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 }
             }
             case ETH_RECEIPTS -> {
+                long reqId = peekRequestId(msg.payload());
                 try {
                     ReceiptsMessage.DecodeResult decoded = ReceiptsMessage.decode(msg.payload());
                     log.info("[eth] Received receipts for {} block(s) (reqId={})",
@@ -480,6 +485,12 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     if (future != null) future.complete(decoded.perBlockReceipts());
                 } catch (Exception e) {
                     log.error("[eth] Failed to decode Receipts", e);
+                    // Don't leave the requester hanging on a malformed response.
+                    if (reqId >= 0) {
+                        CompletableFuture<List<List<org.apache.tuweni.bytes.Bytes>>> future =
+                                pendingReceiptRequests.remove(reqId);
+                        if (future != null) future.completeExceptionally(e);
+                    }
                 }
             }
             case P2P_PING -> sendPong(ctx);
@@ -528,6 +539,19 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
      * (which every full node broadcasts unsolicited) has no use here and is
      * dropped on purpose. Codes are absolute wire ids (eth base 0x10).
      */
+    /** Read just the leading requestId of a {@code [requestId, ...]} payload; -1 if
+     *  unreadable. Lets the ETH_RECEIPTS handler fail the right pending future when the
+     *  full decode throws, instead of leaving the requester hung. */
+    private static long peekRequestId(byte[] payload) {
+        try {
+            return org.apache.tuweni.rlp.RLP.decodeList(
+                    org.apache.tuweni.bytes.Bytes.wrap(payload),
+                    reader -> reader.readLong());
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
     private static String ignoredEthMessageReason(int code) {
         return switch (code) {
             case 0x11 -> "NewBlockHashes — pre-Merge block gossip, obsolete; light wallet tracks heads via the beacon chain";

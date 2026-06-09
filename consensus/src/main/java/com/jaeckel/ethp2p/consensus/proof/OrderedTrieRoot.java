@@ -51,6 +51,10 @@ public final class OrderedTrieRoot {
      *  not hashed — the tx/receipt-trie convention). Package-private: lets tests drive
      *  the branch/extension/leaf machinery with crafted keys. */
     static Bytes32 rootOf(List<Bytes> keys, List<Bytes> values) {
+        if (keys.size() != values.size()) {
+            throw new IllegalArgumentException(
+                    "keys/values size mismatch: " + keys.size() + " != " + values.size());
+        }
         if (keys.isEmpty()) return EMPTY_ROOT;
         List<Entry> entries = new ArrayList<>(keys.size());
         for (int i = 0; i < keys.size(); i++) {
