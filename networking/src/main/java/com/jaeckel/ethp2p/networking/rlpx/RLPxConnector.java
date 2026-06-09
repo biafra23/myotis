@@ -270,6 +270,29 @@ public final class RLPxConnector implements AutoCloseable {
     }
 
     /**
+     * Request consensus-encoded receipts for the given block hashes from any active READY
+     * peer. The future completes with one receipt list per block (request order). Callers
+     * MUST verify the result against a trusted {@code header.receiptsRoot} before use.
+     *
+     * @return a future, or a failed future if no peer is available
+     */
+    public CompletableFuture<List<List<Bytes>>> requestReceipts(Bytes32... hashes) {
+        Iterator<EthHandler> it = activeHandlers.iterator();
+        while (it.hasNext()) {
+            EthHandler handler = it.next();
+            if (!handler.isReady()) continue;
+            CompletableFuture<List<List<Bytes>>> future = handler.requestReceiptsAsync(hashes);
+            if (future != null) {
+                log.info("[rlpx] Routed GetReceipts({} hashes) to active peer", hashes.length);
+                return future;
+            }
+            it.remove();
+        }
+        return CompletableFuture.failedFuture(
+                new IllegalStateException("No active peer with completed eth handshake"));
+    }
+
+    /**
      * Gossip a raw signed transaction to <em>every</em> READY eth peer (eth
      * Transactions 0x12). A light client doesn't relay the mempool, so peers may
      * not re-propagate our gossip — broadcasting widely maximizes the chance the
