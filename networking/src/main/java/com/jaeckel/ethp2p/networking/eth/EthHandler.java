@@ -235,8 +235,11 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     // -------------------------------------------------------------------------
     // State: AWAITING_HELLO
     // -------------------------------------------------------------------------
-    // Eth versions we advertise in our Hello
-    private static final java.util.Set<Integer> OUR_ETH_VERSIONS = java.util.Set.of(67, 68, 69);
+    // Eth versions we support. eth/66 is the floor: it introduced request-IDs
+    // (our GetBlockHeaders / snap requests rely on them) and shares the Status +
+    // snap-base layout with 67/68 — accepting it widens the usable snap-peer pool.
+    // eth/65 and below lack request-IDs and stay rejected.
+    private static final java.util.Set<Integer> OUR_ETH_VERSIONS = java.util.Set.of(66, 67, 68, 69);
 
     private void handleHello(ChannelHandlerContext ctx, RLPxHandler.RLPxMessage msg) {
         if (msg.code() == P2P_HELLO) {
@@ -250,7 +253,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 .mapToInt(HelloMessage.Capability::version)
                 .max().orElse(-1);
             if (bestEthVersion < 0) {
-                log.warn("[eth] Peer does not support eth/67+, disconnecting (caps={})", hello.capabilities);
+                log.warn("[eth] Peer does not support eth/66+, disconnecting (caps={})", hello.capabilities);
                 ctx.close();
                 return;
             }
