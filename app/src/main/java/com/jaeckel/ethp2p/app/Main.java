@@ -31,6 +31,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -74,6 +75,10 @@ public final class Main {
     private static final int DEFAULT_PORT = 30303;
     private static final long BACKOFF_INCOMPATIBLE_MS = 10 * 60 * 1000L; // 10 min for wrong-chain peers
     private static final long BACKOFF_TRANSIENT_MS = 30 * 1000L; // 30s for transient failures (too many peers, etc.)
+    // Cap on how many DNS-resolved (EIP-1459) EL enodes we RLPx-dial directly at startup,
+    // bypassing discv4. Enough to land a snap peer on NAT'd hosts (Android emulator) without
+    // a dial storm where discv4 already works.
+    private static final int DNS_DIRECT_DIAL_LIMIT = 50;
 
     /** Socket path; override via {@code ETHP2P_SOCKET} env var. Network-specific suffix for non-mainnet. */
     static Path socketPath(String networkName) {
@@ -294,6 +299,47 @@ public final class Main {
                         peer.address(), e.getMessage());
                 attempted.remove(peerKey);
             }
+        }
+
+        // 5b. Directly RLPx-dial DNS-resolved EL enodes (EIP-1459), bypassing discv4.
+        // discv4's endpoint proof needs the remote to send us an *unsolicited* inbound
+        // PING before it returns NEIGHBORS — which QEMU/SLIRP user-mode NAT (the Android
+        // emulator's default) silently drops, so discv4 never bootstraps there. RLPx is
+        // an *outbound* TCP connection, which SLIRP allows, and the ENR carries the
+        // peer's secp256k1 key + TCP endpoint — everything connect() needs. So we get
+        // EL/snap peers on the emulator with no discv4 and no TAP networking. Harmless
+        // on the daemon (just a faster warm start). Capped so this doesn't become a dial
+        // storm on platforms where discv4 already populates the table.
+        int directDialed = 0;
+        for (Enr enr : dnsElEnrs) {
+            if (directDialed >= DNS_DIRECT_DIAL_LIMIT) break;
+            Optional<InetSocketAddress> tcp = enr.tcpAddress();
+            Optional<SECP256K1.PublicKey> pub = enr.publicKey();
+            if (tcp.isEmpty() || pub.isEmpty()) continue;
+            InetSocketAddress peerTcp = tcp.get();
+            String peerKey = peerTcp.getAddress().getHostAddress() + ":" + peerTcp.getPort();
+            if (!attempted.add(peerKey)) continue;
+            directDialed++;
+            try {
+                log.info("[main] Direct RLPx dial of DNS EL enode {}", peerTcp);
+                connector.connect(peerTcp, pub.get(), (incompatible, nodeIdHex) -> {
+                            if (incompatible) {
+                                blacklistedNodeIds.add(nodeIdHex);
+                            }
+                            long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
+                            backoff.putIfAbsent(peerKey, System.currentTimeMillis() + backoffMs);
+                            attempted.remove(peerKey);
+                        })
+                        .addListener(future -> {
+                            if (!future.isSuccess()) attempted.remove(peerKey);
+                        });
+            } catch (Exception e) {
+                log.warn("[main] Failed direct dial of DNS EL enode {}: {}", peerTcp, e.getMessage());
+                attempted.remove(peerKey);
+            }
+        }
+        if (directDialed > 0) {
+            log.info("[main] Direct-dialed {} DNS EL enode(s) (discv4-independent path)", directDialed);
         }
 
         // 6. discv4 discovery

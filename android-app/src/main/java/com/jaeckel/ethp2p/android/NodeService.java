@@ -7,6 +7,9 @@ import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.net.ConnectivityManager;
+import android.net.LinkProperties;
+import android.net.Network;
 import android.os.Binder;
 import android.os.IBinder;
 import com.jaeckel.ethp2p.android.log.LogBuffer;
@@ -16,9 +19,11 @@ import com.jaeckel.ethp2p.consensus.BeaconSyncState;
 import com.jaeckel.ethp2p.consensus.libp2p.BeaconP2PService;
 import com.jaeckel.ethp2p.consensus.proof.MerklePatriciaVerifier;
 import com.jaeckel.ethp2p.core.crypto.NodeKey;
+import com.jaeckel.ethp2p.core.enr.Enr;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
 import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
 import com.jaeckel.ethp2p.networking.discv5.DiscV5Service;
+import com.jaeckel.ethp2p.networking.dns.DnsEnrResolver;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
 import com.jaeckel.ethp2p.networking.snap.messages.AccountRangeMessage;
@@ -29,12 +34,17 @@ import org.apache.tuweni.crypto.Hash;
 import org.apache.tuweni.bytes.Bytes;
 import org.apache.tuweni.crypto.SECP256K1;
 
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -60,6 +70,28 @@ public final class NodeService extends Service {
     // abusive on a phone (battery, data, NAT table, file descriptors). attempted
     // is removed only when a peer drops, so this bounds in-flight dial churn.
     private static final int MAX_ATTEMPTED = 200;
+    // How many DNS-resolved (EIP-1459) EL enodes to RLPx-dial directly at startup,
+    // bypassing discv4. This is the EL discovery path that works on the Android
+    // emulator: QEMU/SLIRP user-mode NAT drops the unsolicited inbound discv4 PING
+    // that endpoint-proof needs, but allows the outbound RLPx TCP connection these
+    // direct dials make. Kept small to bound dial churn on a phone.
+    private static final int DNS_DIRECT_DIAL_LIMIT = 30;
+    // Per-maintenance-cycle cap for topping up dials from the DNS ENR pool when below
+    // the snap-peer target. Keeps churning through the pool (like discv4 would) without
+    // a flood; over several 10s cycles it works through the resolved list.
+    private static final int DNS_MAINTAIN_DIAL_BATCH = 15;
+    // Hard ceiling on sustained DNS-pool dials per rolling minute. The maintainer only
+    // tops up while below the snap target, but a NAT-restricted node (mobile CGNAT,
+    // emulator) can sit below target indefinitely — without this cap it would dial
+    // continuously and drain battery/data and pressure the carrier's NAT table (the
+    // very NAT that broke discv4). 60/min keeps progress while staying phone-friendly.
+    private static final int DNS_DIALS_PER_MIN = 60;
+    // Max ENRs retained in the rolling DNS candidate pool (bounds memory; the mainnet
+    // tree has thousands of entries but we only need enough turnover to find open slots).
+    private static final int DNS_POOL_MAX = 600;
+    // Re-walk the ENR tree at most this often (only while below target) to grow and
+    // refresh the candidate pool without hammering DNS.
+    private static final long DNS_REFRESH_INTERVAL_MS = 4 * 60 * 1000L;
     // Keep a working set of snap peers connected so a verified request almost
     // always finds one even as peers churn. Below this we proactively re-dial
     // known snap peers from the cache; 4 leaves headroom so transient churn
@@ -88,6 +120,21 @@ public final class NodeService extends Service {
     private final Set<String> attempted = ConcurrentHashMap.newKeySet();
     private final Map<String, Long> backoff = new ConcurrentHashMap<>();
     private final Set<String> blacklistedNodeIds = ConcurrentHashMap.newKeySet();
+
+    // EIP-1459 DNS-resolved EL enodes — a rolling, fork-filtered candidate pool the
+    // snap-peer maintainer keeps dialing from. This is the discv4 substitute whenever
+    // snap peers run low: on NAT'd hosts (mobile CGNAT, the emulator) discv4 can't
+    // bootstrap, so without a replenishing pool the node would never reach enough
+    // current-fork mainnet snap peers. Refreshed (re-walked + merged) only while below
+    // the snap target, throttled by DNS_REFRESH_INTERVAL_MS, capped at DNS_POOL_MAX.
+    private volatile List<Enr> dnsElEnrs = List.of();
+    private final AtomicBoolean dnsResolving = new AtomicBoolean(false);
+    private volatile long lastDnsResolveMs = 0L;
+    private volatile NetworkConfig dnsNetwork;
+    // Rolling-minute rate limit for DNS-pool dials (see DNS_DIALS_PER_MIN).
+    private volatile long dnsDialWindowStartMs = 0L;
+    private final java.util.concurrent.atomic.AtomicInteger dnsDialsInWindow =
+            new java.util.concurrent.atomic.AtomicInteger(0);
 
     // Service-lifecycle fields: written on the start/shutdown worker, read from
     // the Netty event loop, the Ktor IO dispatcher (JSON-RPC backend), and the UI
@@ -933,21 +980,174 @@ public final class NodeService extends Service {
             AndroidPeerCache pc = peerCache;
             if (conn == null) return;
             int snapPeers = conn.activeSnapHandlers().size();
-            if (snapPeers >= TARGET_SNAP_PEERS || pc == null) return;
-            LogBuffer.i(TAG, "[peers] " + snapPeers + " snap peer(s) < target " + TARGET_SNAP_PEERS
-                    + "; re-dialing cached snap peers");
+            if (snapPeers >= TARGET_SNAP_PEERS) return;
             long now = System.currentTimeMillis();
-            for (AndroidPeerCache.CachedPeer p : pc.load()) {
-                try {
-                    if (!p.snap()) continue;
-                    if (conn.activeSnapHandlers().size() >= TARGET_SNAP_PEERS) break;
-                    dialCachedSnapPeer(conn, p, now);
-                } catch (Exception e) {
-                    LogBuffer.w(TAG, "[peers] skipping cached peer: " + e.getMessage());
+            LogBuffer.i(TAG, "[peers] " + snapPeers + " snap peer(s) < target " + TARGET_SNAP_PEERS
+                    + "; re-dialing cached snap peers + DNS pool");
+            // 1) Re-dial known snap peers from the cache.
+            if (pc != null) {
+                for (AndroidPeerCache.CachedPeer p : pc.load()) {
+                    try {
+                        if (!p.snap()) continue;
+                        if (conn.activeSnapHandlers().size() >= TARGET_SNAP_PEERS) break;
+                        dialCachedSnapPeer(conn, p, now);
+                    } catch (Exception e) {
+                        LogBuffer.w(TAG, "[peers] skipping cached peer: " + e.getMessage());
+                    }
                 }
+            }
+            // 2) Top up from the DNS-resolved ENR pool — the discv4 substitute whenever
+            //    snap peers run low (mobile CGNAT / emulator, where discv4 can't bootstrap
+            //    and the cache is thin). Per-cycle batch + a rolling-minute rate cap keep
+            //    a permanently-starved node from draining battery/data and pressuring the
+            //    carrier NAT; the pool is fork-filtered so dials land on viable peers.
+            List<Enr> pool = dnsElEnrs;
+            if (!pool.isEmpty() && conn.activeSnapHandlers().size() < TARGET_SNAP_PEERS) {
+                int budget = Math.min(DNS_MAINTAIN_DIAL_BATCH, dnsDialBudget());
+                int dialed = 0;
+                for (Enr enr : pool) {
+                    if (dialed >= budget || attempted.size() >= MAX_ATTEMPTED) break;
+                    if (dialEnr(conn, enr, now)) {
+                        dialed++;
+                        dnsDialsInWindow.incrementAndGet();
+                    }
+                }
+                if (dialed > 0) {
+                    LogBuffer.i(TAG, "[peers] topped up " + dialed + " dial(s) from DNS ENR pool ("
+                            + pool.size() + " known)");
+                }
+            }
+            // 3) Grow/refresh the candidate pool by re-walking the tree — only while
+            //    still below target and no more often than DNS_REFRESH_INTERVAL_MS.
+            if (conn.activeSnapHandlers().size() < TARGET_SNAP_PEERS
+                    && !dnsResolving.get()
+                    && System.currentTimeMillis() - lastDnsResolveMs > DNS_REFRESH_INTERVAL_MS) {
+                Thread t = new Thread(this::refreshDnsPool, "dns-el-refresh");
+                t.setDaemon(true);
+                t.start();
             }
         } catch (Throwable t) {
             LogBuffer.e(TAG, "[peers] maintenance loop error", t);
+        }
+    }
+
+    /**
+     * Re-walk the EL ENR trees, fork-filter the result, and merge it into the rolling
+     * candidate pool (dedup by enode address, capped at {@link #DNS_POOL_MAX}). Guarded
+     * so only one walk runs at a time. forkID filtering keeps the limited dial budget
+     * off wrong-chain / stale-fork nodes that would reject us at the eth Status exchange.
+     */
+    private void refreshDnsPool() {
+        NetworkConfig net = dnsNetwork;
+        if (net == null || !dnsResolving.compareAndSet(false, true)) return;
+        try {
+            DnsEnrResolver resolver = new DnsEnrResolver();
+            // dnsjava has no system resolver config on Android, so feed it the active
+            // network's DNS servers; it falls back to public DNS over TCP if those are
+            // dead (the emulator: 10.0.2.3 UDP relay broken, outbound TCP:53 works).
+            resolver.setDnsServerIps(activeNetworkDnsServers());
+            List<Enr> resolved = resolver.resolveAllFromStrings(
+                    net.elEnrTreeUrls(), Duration.ofSeconds(25));
+            lastDnsResolveMs = System.currentTimeMillis();
+
+            byte[] ourFork = net.forkIdHash();
+            // Keep existing pool entries (keyed by enode address), then merge in newly
+            // resolved, fork-compatible ones up to the cap.
+            LinkedHashMap<String, Enr> merged = new LinkedHashMap<>();
+            for (Enr e : dnsElEnrs) {
+                e.tcpAddress().ifPresent(a ->
+                        merged.put(a.getHostString() + ":" + a.getPort(), e));
+            }
+            int added = 0, dropped = 0;
+            for (Enr e : resolved) {
+                if (merged.size() >= DNS_POOL_MAX) break;
+                Optional<InetSocketAddress> tcp = e.tcpAddress();
+                if (tcp.isEmpty() || e.publicKey().isEmpty()) continue;
+                // Keep enodes whose advertised fork matches ours, plus those that don't
+                // advertise one (unknown — worth a try). Drop clearly different forks
+                // (wrong chain or stale): they reject us at the eth Status exchange.
+                Optional<byte[]> fork = e.ethForkIdHash();
+                if (fork.isPresent() && !Arrays.equals(fork.get(), ourFork)) { dropped++; continue; }
+                String key = tcp.get().getHostString() + ":" + tcp.get().getPort();
+                if (merged.putIfAbsent(key, e) == null) added++;
+            }
+            dnsElEnrs = new ArrayList<>(merged.values());
+            LogBuffer.i(TAG, "DNS EL pool: +" + added + " new, " + dropped
+                    + " off-fork dropped, " + dnsElEnrs.size() + " total");
+        } catch (Exception e) {
+            LogBuffer.w(TAG, "DNS EL pool refresh failed: " + e.getMessage());
+        } finally {
+            dnsResolving.set(false);
+        }
+    }
+
+    /** Remaining DNS-pool dials allowed in the current rolling minute (see
+     *  {@link #DNS_DIALS_PER_MIN}). Resets the window lazily. */
+    private int dnsDialBudget() {
+        long now = System.currentTimeMillis();
+        if (now - dnsDialWindowStartMs >= 60_000L) {
+            dnsDialWindowStartMs = now;
+            dnsDialsInWindow.set(0);
+        }
+        return Math.max(0, DNS_DIALS_PER_MIN - dnsDialsInWindow.get());
+    }
+
+    /** DNS server IPs for the active network, for EIP-1459 ENR-tree TXT lookups.
+     *  dnsjava has no system resolver config on Android, so we feed it these
+     *  explicitly. Returns empty (→ resolver uses public-DNS fallback) on any error. */
+    private List<String> activeNetworkDnsServers() {
+        try {
+            ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+            if (cm == null) return List.of();
+            Network active = cm.getActiveNetwork();
+            if (active == null) return List.of();
+            LinkProperties lp = cm.getLinkProperties(active);
+            if (lp == null) return List.of();
+            List<String> ips = new ArrayList<>();
+            for (InetAddress dns : lp.getDnsServers()) {
+                ips.add(dns.getHostAddress());
+            }
+            return ips;
+        } catch (Exception e) {
+            LogBuffer.w(TAG, "could not read active-network DNS servers: " + e.getMessage());
+            return List.of();
+        }
+    }
+
+    /** Dial one DNS-resolved (EIP-1459) EL enode over RLPx — the discv4-independent
+     *  peer source used on NAT'd hosts (the emulator). Same attempted/backoff/blacklist
+     *  bookkeeping as the other dial paths; returns true if a connect was started. */
+    private boolean dialEnr(RLPxConnector conn, Enr enr, long now) {
+        Optional<InetSocketAddress> tcp = enr.tcpAddress();
+        Optional<SECP256K1.PublicKey> pub = enr.publicKey();
+        if (tcp.isEmpty() || pub.isEmpty()) return false;
+        InetSocketAddress peerTcp = tcp.get();
+        String peerKey = peerTcp.getHostString() + ":" + peerTcp.getPort();
+        Long expiry = backoff.get(peerKey);
+        if (expiry != null) {
+            if (now < expiry) return false;
+            backoff.remove(peerKey);
+        }
+        if (attempted.size() >= MAX_ATTEMPTED || !attempted.add(peerKey)) return false;
+        try {
+            conn.connect(peerTcp, pub.get(), (incompatible, idHex) -> {
+                if (incompatible) blacklistedNodeIds.add(idHex);
+                long ms = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
+                backoff.putIfAbsent(peerKey, System.currentTimeMillis() + ms);
+                attempted.remove(peerKey);
+            }).addListener(future -> {
+                // TCP-level failure (timeout/refused): free the slot and back off briefly
+                // so a dead enode doesn't pin `attempted` and starve the pool.
+                if (!future.isSuccess()) {
+                    backoff.putIfAbsent(peerKey, System.currentTimeMillis() + BACKOFF_TRANSIENT_MS);
+                    attempted.remove(peerKey);
+                }
+            });
+            return true;
+        } catch (Exception e) {
+            LogBuffer.w(TAG, "DNS EL dial failed: " + e.getMessage());
+            attempted.remove(peerKey);
+            return false;
         }
     }
 
@@ -1378,6 +1578,31 @@ public final class NodeService extends Service {
                     attempted.remove(peerKey);
                 }
             }
+
+            // EIP-1459 DNS discovery + direct RLPx dial — the discv4-independent peer
+            // source used whenever snap peers run low. discv4 can't bootstrap behind a
+            // restrictive NAT (mobile CGNAT, the emulator's QEMU/SLIRP): its endpoint
+            // proof needs the remote to send us an *unsolicited* inbound PING, which
+            // such NATs drop. But the ENR trees give us EL enodes (key + TCP endpoint)
+            // directly, and an RLPx dial is an *outbound* TCP connection the NAT allows.
+            // Runs on its own thread (resolution can take many seconds) so it never
+            // delays discv4/discv5/beacon startup; the maintainer keeps it topped up.
+            this.dnsNetwork = network;
+            final RLPxConnector dnsConnector = connectorRef;
+            Thread dnsDialThread = new Thread(() -> {
+                refreshDnsPool();
+                long now = System.currentTimeMillis();
+                int directDialed = 0;
+                for (Enr enr : dnsElEnrs) {
+                    if (directDialed >= DNS_DIRECT_DIAL_LIMIT
+                            || attempted.size() >= MAX_ATTEMPTED) break;
+                    if (dialEnr(dnsConnector, enr, now)) directDialed++;
+                }
+                LogBuffer.i(TAG, "DNS EL discovery: direct-dialed " + directDialed
+                        + " of " + dnsElEnrs.size() + " pooled enode(s) (discv4-independent path)");
+            }, "dns-el-dial");
+            dnsDialThread.setDaemon(true);
+            dnsDialThread.start();
 
             localDisc = new DiscV4Service(nodeKey, network.bootnodes(), entry -> {
                 // Pause acquiring new peers while an ENS resolution runs: its snap

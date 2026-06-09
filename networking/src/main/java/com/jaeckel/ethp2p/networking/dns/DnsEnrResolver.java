@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * EIP-1459 DNS ENR tree resolver.
@@ -50,13 +51,33 @@ public final class DnsEnrResolver {
     static final int DEFAULT_MAX_NODES = 512;
     /** Maximum branch depth to walk. */
     static final int DEFAULT_MAX_DEPTH = 16;
+    /** Grace beyond the deadline to let an in-flight tree walk return its partial
+     *  results before we snapshot them. Covers one last lookup (which may try a few
+     *  servers). Without it, results collected right at the deadline are dropped. */
+    private static final Duration SHUTDOWN_GRACE = Duration.ofSeconds(5);
 
     private final TxtResolver txtResolver;
     private final int maxNodes;
     private final int maxDepth;
 
+    /** Explicit DNS server IPs to query, highest priority first. Empty = use the
+     *  JVM/system resolver config. dnsjava's default {@code SimpleResolver()} relies
+     *  on {@code ResolverConfig} reading /etc/resolv.conf, which is absent on Android
+     *  (the lookup then fails with "network error"), so the Android layer must inject
+     *  the active network's DNS servers here via {@link #setDnsServerIps}. */
+    private volatile List<String> dnsServerIps = List.of();
+
     public DnsEnrResolver() {
-        this(DnsEnrResolver::defaultTxtLookup, DEFAULT_MAX_NODES, DEFAULT_MAX_DEPTH);
+        this.maxNodes = DEFAULT_MAX_NODES;
+        this.maxDepth = DEFAULT_MAX_DEPTH;
+        this.txtResolver = this::instanceTxtLookup;
+    }
+
+    /** Set the DNS server IP(s) used for TXT lookups (e.g. the active network's
+     *  resolvers from Android's ConnectivityManager). Queried before the public-DNS
+     *  fallbacks. Safe to call before {@code resolveAll*}. */
+    public void setDnsServerIps(List<String> ips) {
+        this.dnsServerIps = ips == null ? List.of() : List.copyOf(ips);
     }
 
     /** Package-private for tests. */
@@ -73,10 +94,13 @@ public final class DnsEnrResolver {
         long deadline = start + timeout.toNanos();
         List<Enr> all = java.util.Collections.synchronizedList(new ArrayList<>());
 
-        // Each resolve() call respects the deadline and returns partial results, so
-        // the ExecutorService's close() (which waits on submitted tasks) is bounded
-        // by the per-tree walk rather than the timeout we're trying to enforce here.
-        try (ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor()) {
+        // A plain fixed thread pool — NOT Executors.newVirtualThreadPerTaskExecutor():
+        // virtual threads are a Java 21 API absent on Android/ART (NoSuchMethodError),
+        // and this resolver must run on Android. Likewise we shut down explicitly
+        // instead of try-with-resources, since ExecutorService.close() is a Java 19+
+        // AutoCloseable method that isn't guaranteed on the Android runtime.
+        ExecutorService exec = Executors.newFixedThreadPool(Math.min(urls.size(), 8));
+        try {
             for (EnrTreeUrl url : urls) {
                 exec.submit(() -> {
                     try {
@@ -86,6 +110,20 @@ public final class DnsEnrResolver {
                     }
                 });
             }
+            exec.shutdown();
+            // resolve() self-bounds by `deadline` and returns its PARTIAL list shortly
+            // after the deadline (it checks between lookups). We must wait for that
+            // return so all.addAll() runs — NOT cut off AT the deadline, which would
+            // snapshot an empty `all` and drop everything the walk collected. So wait
+            // the remaining time PLUS a grace window covering one last in-flight lookup.
+            long graceNanos = (deadline - System.nanoTime()) + SHUTDOWN_GRACE.toNanos();
+            if (graceNanos > 0) {
+                exec.awaitTermination(graceNanos, TimeUnit.NANOSECONDS);
+            }
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        } finally {
+            exec.shutdownNow();
         }
         log.info("[dns] resolved {} ENR(s) from {} tree(s) in {} ms",
                 all.size(), urls.size(), (System.nanoTime() - start) / 1_000_000);
@@ -227,12 +265,59 @@ public final class DnsEnrResolver {
 
     /** Per-DNS-query timeout. Caps blocking on a single unresponsive nameserver so
      *  the overall deadline in {@link #resolveAll} can actually fire. */
-    private static final Duration LOOKUP_TIMEOUT = Duration.ofSeconds(3);
+    private static final Duration LOOKUP_TIMEOUT = Duration.ofSeconds(2);
 
-    private static String defaultTxtLookup(String name) throws Exception {
+    /** A DNS server to try. {@code ip == null} uses dnsjava's system-config resolver
+     *  (works off-Android, no-op on Android). {@code tcp} forces DNS-over-TCP, which
+     *  the Android emulator's SLIRP NAT forwards to public resolvers even when its own
+     *  UDP DNS relay (10.0.2.3) is broken — the failure mode we actually hit. */
+    private record DnsServer(String ip, boolean tcp) {
+        @Override public String toString() {
+            return (ip == null ? "system" : ip) + (tcp ? "/tcp" : "");
+        }
+    }
+
+    /** Public DNS fallbacks, tried after explicit/system servers. Over TCP because
+     *  that's the path proven reachable on the emulator when UDP DNS is dead. */
+    private static final List<DnsServer> PUBLIC_DNS_FALLBACKS =
+            List.of(new DnsServer("1.1.1.1", true), new DnsServer("8.8.8.8", true));
+
+    /** The server that last answered, tried first on subsequent lookups. A tree walk
+     *  is many TXT lookups; without this every one would re-pay the dead-primary tax
+     *  (broken emulator DNS) before failing over. Pin it once, then go straight there. */
+    private volatile DnsServer lastGood;
+
+    /** Try each candidate DNS server until one resolves the TXT record.
+     *  Order: last-good → explicit {@link #dnsServerIps} → system → public DNS. */
+    private String instanceTxtLookup(String name) throws Exception {
+        List<DnsServer> candidates = new ArrayList<>();
+        DnsServer pinned = lastGood;
+        if (pinned != null) candidates.add(pinned);
+        for (String ip : dnsServerIps) candidates.add(new DnsServer(ip, false));
+        if (dnsServerIps.isEmpty()) candidates.add(new DnsServer(null, false));
+        candidates.addAll(PUBLIC_DNS_FALLBACKS);
+        Exception last = null;
+        for (DnsServer cand : candidates) {
+            try {
+                String result = txtLookupVia(name, cand);
+                lastGood = cand;
+                return result;
+            } catch (Exception e) {
+                last = e;
+                log.debug("[dns] TXT {} via {} failed: {}", name, cand, e.getMessage());
+            }
+        }
+        throw last != null ? last
+                : new IllegalStateException("no DNS server resolved " + name);
+    }
+
+    private static String txtLookupVia(String name, DnsServer server) throws Exception {
         Lookup lookup = new Lookup(name, Type.TXT);
-        org.xbill.DNS.SimpleResolver resolver = new org.xbill.DNS.SimpleResolver();
+        org.xbill.DNS.SimpleResolver resolver = (server.ip() == null)
+                ? new org.xbill.DNS.SimpleResolver()
+                : new org.xbill.DNS.SimpleResolver(server.ip());
         resolver.setTimeout(LOOKUP_TIMEOUT);
+        if (server.tcp()) resolver.setTCP(true);
         lookup.setResolver(resolver);
         Record[] records = lookup.run();
         if (lookup.getResult() != Lookup.SUCCESSFUL || records == null || records.length == 0) {

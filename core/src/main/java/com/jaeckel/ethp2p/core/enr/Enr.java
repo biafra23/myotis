@@ -149,6 +149,54 @@ public final class Enr {
     public record Eth2Field(byte[] forkDigest, byte[] nextForkVersion, long nextForkEpoch) {}
 
     /**
+     * EL "eth" ENR field (EIP-868): the 4-byte EIP-2124 fork hash of the node's
+     * current chain state. Layout is {@code eth = [[fork_hash, fork_next], ...]} — an
+     * RLP list whose first element is the {@code ForkID} tuple.
+     *
+     * <p>{@link #decode} drops list-valued ENR entries, so this re-parses {@link #rawRlp}
+     * in isolation (fully guarded — a malformed entry yields empty, never throws).
+     * Callers use it to filter discovered EL enodes down to peers on the same fork as
+     * us, so dials aren't wasted on wrong-chain or stale-fork nodes that would reject us.
+     */
+    public Optional<byte[]> ethForkIdHash() {
+        try {
+            Bytes[] holder = {null};
+            RLP.decodeList(rawRlp, reader -> {
+                reader.skipNext(); // signature
+                reader.readLong(); // seq
+                while (!reader.isComplete()) {
+                    String key = reader.readString();
+                    boolean isList = reader.nextIsList();
+                    if (key.equals("eth") && isList) {
+                        reader.readList(outer -> {
+                            if (!outer.isComplete() && outer.nextIsList()) {
+                                outer.readList(idReader -> {
+                                    if (!idReader.isComplete() && !idReader.nextIsList()) {
+                                        holder[0] = idReader.readValue(); // fork_hash
+                                    }
+                                    return null;
+                                });
+                            }
+                            return null;
+                        });
+                    } else if (isList) {
+                        reader.skipNext();
+                    } else {
+                        reader.readValue();
+                    }
+                }
+                return null;
+            });
+            if (holder[0] != null && holder[0].size() >= 4) {
+                return Optional.of(holder[0].slice(0, 4).toArrayUnsafe());
+            }
+            return Optional.empty();
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
      * Derive a libp2p multiaddr string from this ENR.
      * Format: {@code /ip4/<ip>/tcp/<port>/p2p/<peer-id>}
      *
