@@ -753,8 +753,10 @@ public final class NodeService extends Service {
                     conn.requestStorage(contractAddress, storageKeyHash, snapStateRoot)
                             .get(RPC_ACCOUNT_TIMEOUT_SEC, TimeUnit.SECONDS);
             if (storageResult.proof().isEmpty()) return null;
-            java.util.List<byte[]> proofBytes = storageResult.proof().stream()
-                    .map(Bytes::toArrayUnsafe).toList();
+            // Plain loop (not Stream.toList — that's API 34, minSdk is 29).
+            java.util.List<byte[]> proofBytes =
+                    new java.util.ArrayList<>(storageResult.proof().size());
+            for (Bytes pb : storageResult.proof()) proofBytes.add(pb.toArrayUnsafe());
             byte[] provenLeaf = MerklePatriciaVerifier.verifyStorageProof(
                     storageRoot.toArrayUnsafe(), slot32, proofBytes);
             if (provenLeaf == null) return null;   // absent or invalid → proxy
