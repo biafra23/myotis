@@ -65,7 +65,39 @@ public final class DiscV5Service implements AutoCloseable {
      * <p>CL convention is to run discv5 on the libp2p port (9000), so the
      * caller typically passes that rather than the EL 30303.
      */
-    public void start(int udpPort) {
+    public void start(int requestedUdpPort) {
+        // discv5's UDP bind port. CL convention is 9000, but on some hosts that
+        // port is already taken — notably ot-daemon (OpenThread) on Play-image
+        // Android emulators, which holds 0.0.0.0:9000 and is unkillable without
+        // root. A failed bind kills peer discovery and therefore beacon sync. A
+        // light client never accepts inbound discv5, so if the requested port
+        // isn't bindable we fall back to an OS-chosen free port; outbound
+        // discovery (querying bootnodes) works identically.
+        int udpPort = pickBindablePort(requestedUdpPort);
+        if (udpPort != requestedUdpPort) {
+            log.info("[discv5] UDP {} unavailable; binding free UDP {} instead (light client needs no inbound)",
+                    requestedUdpPort, udpPort);
+        }
+
+        scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "discv5-poll");
+            t.setDaemon(true);
+            return t;
+        });
+
+        startSystem(udpPort, /* retryOnBindConflict= */ true);
+    }
+
+    /**
+     * Build the discovery system on {@code udpPort} and kick its async bootstrap.
+     *
+     * <p>{@link #pickBindablePort} leaves a TOCTOU window: the chosen port can be
+     * taken between the probe closing and the library's real bind. If that bind
+     * loses the race (and {@code retryOnBindConflict}), rebuild once on a fresh
+     * OS-chosen free port so the fallback is robust under contention. The retry
+     * never retries itself, so a persistently unbindable host fails cleanly.
+     */
+    private void startSystem(int udpPort, boolean retryOnBindConflict) {
         DefaultSigner signer = new DefaultSigner(nodeKey.secretKey());
 
         NodeRecord localRecord = new NodeRecordBuilder()
@@ -81,16 +113,18 @@ public final class DiscV5Service implements AutoCloseable {
                 .bootnodes(bootnodeEnrs.toArray(new String[0]))
                 .build();
 
-        scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "discv5-poll");
-            t.setDaemon(true);
-            return t;
-        });
-
         // Kick the library's bootstrap off; arm the poll task from the
         // completion callback so it doesn't fire before the UDP bind is done.
         system.start().whenComplete((v, ex) -> {
             if (ex != null) {
+                if (retryOnBindConflict && isBindConflict(ex)) {
+                    int retryPort = freeEphemeralPort(udpPort);
+                    log.warn("[discv5] bind on UDP {} lost a race ({}); retrying on free UDP {}",
+                            udpPort, ex.toString(), retryPort);
+                    try { system.stop(); } catch (Exception ignored) {}
+                    startSystem(retryPort, /* retryOnBindConflict= */ false);
+                    return;
+                }
                 log.warn("[discv5] start failed on UDP {}: {}", udpPort, ex.toString());
                 scheduler.shutdownNow();
                 return;
@@ -101,6 +135,51 @@ public final class DiscV5Service implements AutoCloseable {
             // 15s (same cadence as discv4-refresh) to surface new peers.
             scheduler.scheduleAtFixedRate(this::pollAndNotify, 5, 15, TimeUnit.SECONDS);
         });
+    }
+
+    /**
+     * Return {@code preferred} if a UDP socket can bind it, otherwise an
+     * OS-chosen free UDP port. The bind probe mirrors what discv5's Netty
+     * bootstrap does, so it detects the same conflicts (e.g. ot-daemon on 9000).
+     *
+     * <p>{@code preferred <= 0} already means "let the OS pick" (and a probe would
+     * only add a TOCTOU gap), and out-of-range values would make the probe throw
+     * {@link IllegalArgumentException}; in both cases we hand the value straight
+     * back so the caller/library surfaces it rather than crashing here.
+     */
+    private static int pickBindablePort(int preferred) {
+        if (preferred <= 0 || preferred > 65535) {
+            return preferred;
+        }
+        try (java.net.DatagramSocket probe = new java.net.DatagramSocket(preferred)) {
+            return probe.getLocalPort();
+        } catch (Exception taken) { // SocketException + SecurityException etc.
+            return freeEphemeralPort(preferred);
+        }
+    }
+
+    /** An OS-chosen free UDP port, or {@code fallback} if one couldn't be probed. */
+    private static int freeEphemeralPort(int fallback) {
+        try (java.net.DatagramSocket free = new java.net.DatagramSocket(0)) {
+            return free.getLocalPort();
+        } catch (Exception e) {
+            // Couldn't grab a free port either; let the real bind try + log.
+            return fallback;
+        }
+    }
+
+    /** True if {@code ex} (or any cause) is a UDP bind conflict ("address in use"). */
+    private static boolean isBindConflict(Throwable ex) {
+        for (Throwable t = ex; t != null; t = t.getCause()) {
+            if (t instanceof java.net.BindException) {
+                return true;
+            }
+            String msg = t.getMessage();
+            if (msg != null && msg.contains("Address already in use")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
