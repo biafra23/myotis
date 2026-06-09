@@ -27,6 +27,9 @@ dependencies {
 
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)
+    // Tuweni's Hash.keccak256 resolves "KECCAK-256" via a JCE provider; the trie
+    // proof tests build fixtures with it, so BouncyCastle must be on the test path.
+    testImplementation(libs.bouncycastle)
     testRuntimeOnly(libs.logback.classic)
 }
 
