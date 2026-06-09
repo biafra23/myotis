@@ -1061,15 +1061,19 @@ public final class NodeService extends Service {
             int added = 0, dropped = 0;
             for (Enr e : resolved) {
                 if (merged.size() >= DNS_POOL_MAX) break;
-                Optional<InetSocketAddress> tcp = e.tcpAddress();
-                if (tcp.isEmpty() || e.publicKey().isEmpty()) continue;
-                // Keep enodes whose advertised fork matches ours, plus those that don't
-                // advertise one (unknown — worth a try). Drop clearly different forks
-                // (wrong chain or stale): they reject us at the eth Status exchange.
-                Optional<byte[]> fork = e.ethForkIdHash();
-                if (fork.isPresent() && !Arrays.equals(fork.get(), ourFork)) { dropped++; continue; }
-                String key = tcp.get().getHostString() + ":" + tcp.get().getPort();
-                if (merged.putIfAbsent(key, e) == null) added++;
+                try {
+                    Optional<InetSocketAddress> tcp = e.tcpAddress();
+                    if (tcp.isEmpty() || e.publicKey().isEmpty()) continue;
+                    // Keep enodes whose advertised fork matches ours, plus those that don't
+                    // advertise one (unknown — worth a try). Drop clearly different forks
+                    // (wrong chain or stale): they reject us at the eth Status exchange.
+                    Optional<byte[]> fork = e.ethForkIdHash();
+                    if (fork.isPresent() && !Arrays.equals(fork.get(), ourFork)) { dropped++; continue; }
+                    String key = tcp.get().getHostString() + ":" + tcp.get().getPort();
+                    if (merged.putIfAbsent(key, e) == null) added++;
+                } catch (Exception ex) {
+                    dropped++; // malformed ENR — skip, don't abort the refresh
+                }
             }
             dnsElEnrs = new ArrayList<>(merged.values());
             LogBuffer.i(TAG, "DNS EL pool: +" + added + " new, " + dropped
@@ -1118,35 +1122,39 @@ public final class NodeService extends Service {
      *  peer source used on NAT'd hosts (the emulator). Same attempted/backoff/blacklist
      *  bookkeeping as the other dial paths; returns true if a connect was started. */
     private boolean dialEnr(RLPxConnector conn, Enr enr, long now) {
-        Optional<InetSocketAddress> tcp = enr.tcpAddress();
-        Optional<SECP256K1.PublicKey> pub = enr.publicKey();
-        if (tcp.isEmpty() || pub.isEmpty()) return false;
-        InetSocketAddress peerTcp = tcp.get();
-        String peerKey = peerTcp.getHostString() + ":" + peerTcp.getPort();
-        Long expiry = backoff.get(peerKey);
-        if (expiry != null) {
-            if (now < expiry) return false;
-            backoff.remove(peerKey);
-        }
-        if (attempted.size() >= MAX_ATTEMPTED || !attempted.add(peerKey)) return false;
+        // Fully guarded (including the ENR accessors below) so a single malformed
+        // entry can never abort a caller's dial loop — callers can ignore exceptions.
+        String peerKey = null;
         try {
+            Optional<InetSocketAddress> tcp = enr.tcpAddress();
+            Optional<SECP256K1.PublicKey> pub = enr.publicKey();
+            if (tcp.isEmpty() || pub.isEmpty()) return false;
+            InetSocketAddress peerTcp = tcp.get();
+            peerKey = peerTcp.getHostString() + ":" + peerTcp.getPort();
+            Long expiry = backoff.get(peerKey);
+            if (expiry != null) {
+                if (now < expiry) return false;
+                backoff.remove(peerKey);
+            }
+            if (attempted.size() >= MAX_ATTEMPTED || !attempted.add(peerKey)) return false;
+            final String key = peerKey;
             conn.connect(peerTcp, pub.get(), (incompatible, idHex) -> {
                 if (incompatible) blacklistedNodeIds.add(idHex);
                 long ms = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
-                backoff.putIfAbsent(peerKey, System.currentTimeMillis() + ms);
-                attempted.remove(peerKey);
+                backoff.putIfAbsent(key, System.currentTimeMillis() + ms);
+                attempted.remove(key);
             }).addListener(future -> {
                 // TCP-level failure (timeout/refused): free the slot and back off briefly
                 // so a dead enode doesn't pin `attempted` and starve the pool.
                 if (!future.isSuccess()) {
-                    backoff.putIfAbsent(peerKey, System.currentTimeMillis() + BACKOFF_TRANSIENT_MS);
-                    attempted.remove(peerKey);
+                    backoff.putIfAbsent(key, System.currentTimeMillis() + BACKOFF_TRANSIENT_MS);
+                    attempted.remove(key);
                 }
             });
             return true;
         } catch (Exception e) {
             LogBuffer.w(TAG, "DNS EL dial failed: " + e.getMessage());
-            attempted.remove(peerKey);
+            if (peerKey != null) attempted.remove(peerKey);
             return false;
         }
     }

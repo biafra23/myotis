@@ -313,29 +313,33 @@ public final class Main {
         int directDialed = 0;
         for (Enr enr : dnsElEnrs) {
             if (directDialed >= DNS_DIRECT_DIAL_LIMIT) break;
-            Optional<InetSocketAddress> tcp = enr.tcpAddress();
-            Optional<SECP256K1.PublicKey> pub = enr.publicKey();
-            if (tcp.isEmpty() || pub.isEmpty()) continue;
-            InetSocketAddress peerTcp = tcp.get();
-            String peerKey = peerTcp.getAddress().getHostAddress() + ":" + peerTcp.getPort();
-            if (!attempted.add(peerKey)) continue;
-            directDialed++;
+            // Whole body guarded so a single malformed ENR can't abort the loop;
+            // getHostString() avoids an NPE if the ENR address is unresolved.
+            String peerKey = null;
             try {
+                Optional<InetSocketAddress> tcp = enr.tcpAddress();
+                Optional<SECP256K1.PublicKey> pub = enr.publicKey();
+                if (tcp.isEmpty() || pub.isEmpty()) continue;
+                InetSocketAddress peerTcp = tcp.get();
+                peerKey = peerTcp.getHostString() + ":" + peerTcp.getPort();
+                if (!attempted.add(peerKey)) continue;
+                directDialed++;
+                final String key = peerKey;
                 log.info("[main] Direct RLPx dial of DNS EL enode {}", peerTcp);
                 connector.connect(peerTcp, pub.get(), (incompatible, nodeIdHex) -> {
                             if (incompatible) {
                                 blacklistedNodeIds.add(nodeIdHex);
                             }
                             long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
-                            backoff.putIfAbsent(peerKey, System.currentTimeMillis() + backoffMs);
-                            attempted.remove(peerKey);
+                            backoff.putIfAbsent(key, System.currentTimeMillis() + backoffMs);
+                            attempted.remove(key);
                         })
                         .addListener(future -> {
-                            if (!future.isSuccess()) attempted.remove(peerKey);
+                            if (!future.isSuccess()) attempted.remove(key);
                         });
             } catch (Exception e) {
-                log.warn("[main] Failed direct dial of DNS EL enode {}: {}", peerTcp, e.getMessage());
-                attempted.remove(peerKey);
+                log.warn("[main] Failed direct dial of DNS EL enode: {}", e.getMessage());
+                if (peerKey != null) attempted.remove(peerKey);
             }
         }
         if (directDialed > 0) {
