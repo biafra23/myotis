@@ -695,14 +695,18 @@ private fun LogsTab() {
     }
 
     var filter by remember { mutableStateOf("") }
-    // Filter on tag + message (case-insensitive substring). The unfiltered view
-    // shows the whole buffer (no line cap); filtering just narrows it. The
-    // LazyColumn renders either lazily, so neither needs a cap.
-    val shown = remember(entries, filter) {
-        if (filter.isBlank()) entries
-        else entries.filter {
-            it.tag.contains(filter, ignoreCase = true) ||
-                it.message.contains(filter, ignoreCase = true)
+    // Filter on tag + message (case-insensitive substring), computed OFF the main
+    // thread — substring-scanning up to MAX_LINES (50k) entries on every keystroke
+    // / 4 Hz buffer poll would jank the UI and laggy the typing. The unfiltered
+    // view shows the whole buffer (no line cap); the LazyColumn renders lazily.
+    var shown by remember { mutableStateOf<List<LogBuffer.Entry>>(emptyList()) }
+    LaunchedEffect(entries, filter) {
+        shown = if (filter.isBlank()) entries
+        else withContext(Dispatchers.Default) {
+            entries.filter {
+                it.tag.contains(filter, ignoreCase = true) ||
+                    it.message.contains(filter, ignoreCase = true)
+            }
         }
     }
 
