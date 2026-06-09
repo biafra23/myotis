@@ -41,6 +41,18 @@ class TransactionsMessageTest {
     }
 
     @Test
+    void skipsNullAndEmptyElementsAndNullVararg() {
+        byte[] emptyList = {(byte) 0xc0};   // RLP encoding of an empty list
+        assertArrayEquals(emptyList, TransactionsMessage.encode());                 // no args
+        assertArrayEquals(emptyList, TransactionsMessage.encode((byte[][]) null));   // null vararg
+        assertArrayEquals(emptyList, TransactionsMessage.encode(null, new byte[0])); // null + empty skipped
+        // A null/empty element next to a real one is dropped, leaving just the real one.
+        byte[] legacy = {(byte) 0xc2, 0x01, 0x02};
+        assertArrayEquals(TransactionsMessage.encode(legacy),
+                TransactionsMessage.encode(null, legacy, new byte[0]));
+    }
+
+    @Test
     void multipleTxsKeepOrderAndPerTxForm() {
         byte[] legacy = {(byte) 0xc2, 0x01, 0x02};   // nested list
         byte[] typed = {0x02, 0x7f};                 // typed -> 2-byte string 0x82 02 7f

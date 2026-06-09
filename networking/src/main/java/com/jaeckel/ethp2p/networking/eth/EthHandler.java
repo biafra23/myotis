@@ -782,7 +782,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
      */
     public boolean sendTransactions(byte[]... rawTxs) {
         ChannelHandlerContext ctx = readyCtx;
-        if (ctx == null || state != State.READY) return false;
+        if (ctx == null || state != State.READY || rawTxs == null || rawTxs.length == 0) return false;
         byte[] payload = com.jaeckel.ethp2p.networking.eth.messages.TransactionsMessage.encode(rawTxs);
         rlpxHandler.sendMessage(ctx, ETH_TRANSACTIONS, payload);
         return true;

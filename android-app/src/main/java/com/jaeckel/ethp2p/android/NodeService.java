@@ -84,15 +84,18 @@ public final class NodeService extends Service {
     private final Map<String, Long> backoff = new ConcurrentHashMap<>();
     private final Set<String> blacklistedNodeIds = ConcurrentHashMap.newKeySet();
 
-    private DiscV4Service discV4;
-    private DiscV5Service discV5;
-    private RLPxConnector connector;
+    // Service-lifecycle fields: written on the start/shutdown worker, read from
+    // the Netty event loop, the Ktor IO dispatcher (JSON-RPC backend), and the UI
+    // thread (snapshot()). volatile so readers never see a stale/null reference.
+    private volatile DiscV4Service discV4;
+    private volatile DiscV5Service discV5;
+    private volatile RLPxConnector connector;
     private io.myotis.jsonrpc.MyotisRpcServer rpcServer;
     private AndroidPeerCache peerCache;
     private AndroidCLPeerCache clPeerCache;
-    private BeaconLightClient beaconLightClient;
-    private BeaconSyncState beaconSyncState;
-    private long clGenesisTime;
+    private volatile BeaconLightClient beaconLightClient;
+    private volatile BeaconSyncState beaconSyncState;
+    private volatile long clGenesisTime;
     private volatile int cachedPeerCount;
     private volatile int cachedClPeerCount;
     private volatile long startTimeMs;

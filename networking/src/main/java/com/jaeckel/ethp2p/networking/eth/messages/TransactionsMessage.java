@@ -27,10 +27,13 @@ public final class TransactionsMessage {
 
     private TransactionsMessage() {}
 
-    /** Encode one or more raw signed transactions into a Transactions message. */
+    /** Encode one or more raw signed transactions into a Transactions message.
+     *  Null/empty elements (and a null vararg) are skipped, yielding an empty list. */
     public static byte[] encode(byte[]... rawTxs) {
         return RLP.encodeList(writer -> {
+            if (rawTxs == null) return;
             for (byte[] rawTx : rawTxs) {
+                if (rawTx == null || rawTx.length == 0) continue;
                 Bytes tx = Bytes.wrap(rawTx);
                 if (isTyped(rawTx)) {
                     // EIP-2718 typed tx: carried as an RLP byte string.
@@ -50,6 +53,6 @@ public final class TransactionsMessage {
      * valid first byte of a transaction.)
      */
     private static boolean isTyped(byte[] rawTx) {
-        return rawTx.length > 0 && (rawTx[0] & 0xff) <= 0x7f;
+        return rawTx != null && rawTx.length > 0 && (rawTx[0] & 0xff) <= 0x7f;
     }
 }
