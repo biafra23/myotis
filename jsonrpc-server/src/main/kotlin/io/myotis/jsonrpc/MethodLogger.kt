@@ -39,7 +39,12 @@ class MethodLogger {
             "LOCAL" -> s.local.incrementAndGet()
             else -> s.error.incrementAndGet()
         }
-        log.info("[rpc] method={} path={} latencyMs={}", method, path, latencyMs)
+        // PROXY (relayed upstream, unverified) and ERROR are the noteworthy
+        // outcomes — log them at WARN so they stand out; VERIFIED/LOCAL stay INFO.
+        when (path) {
+            "VERIFIED", "LOCAL" -> log.info("[rpc] method={} path={} latencyMs={}", method, path, latencyMs)
+            else -> log.warn("[rpc] method={} path={} latencyMs={}", method, path, latencyMs)
+        }
     }
 
     /** Coverage map as a JSON object: method -> {count, verified, proxied, error, local}. */
