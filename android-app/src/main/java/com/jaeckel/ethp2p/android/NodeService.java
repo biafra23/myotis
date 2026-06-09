@@ -665,10 +665,20 @@ public final class NodeService extends Service {
     private static final long RPC_ACCOUNT_TIMEOUT_SEC = HEADER_CHAIN_TIMEOUT_SEC + 10;
     /** Overall budget for the (parallel) snap-peer head probe. */
     private static final long PEER_PROBE_TIMEOUT_SEC = 15;
+    /** Keep serving the last successfully-built head up to this age while a refresh
+     *  is in flight. It's still beacon-anchored, just a few blocks stale — serving
+     *  it bridges transient rebuild gaps (head just advanced, peers' flat state not
+     *  yet caught up) instead of proxying. The warmer keeps it fresh (~5-15s). */
+    private static final long RPC_HEAD_MAX_STALE_MS = 30_000;
+    /** When there's no usable head at all (cold start / long outage), wait up to
+     *  this long for one to be built before falling back to the proxy. */
+    private static final long RPC_HEAD_WAIT_MS = 5_000;
 
     private final Object rpcCallCtxLock = new Object();
-    private CompletableFuture<EnsCall> rpcCallCtx;   // cached beacon-anchored head context
+    private CompletableFuture<EnsCall> rpcCallCtx;   // in-flight/fresh build (dedup)
     private long rpcCallCtxAtMs;
+    private volatile EnsCall lastGoodHead;           // last successfully-built anchored head
+    private volatile long lastGoodHeadAtMs;          // when it was built (elapsedRealtime)
 
     /** keccak256("") — an account with this codeHash is an EOA (no contract code). */
     private static final byte[] EMPTY_CODE_HASH = Hash.keccak256(Bytes.EMPTY).toArrayUnsafe();
@@ -690,12 +700,37 @@ public final class NodeService extends Service {
      */
     private EnsCall verifiedHeadFor(String block) {
         if (!isLatestTag(block)) return null;
-        try {
-            return verifiedHeadCallContext();
-        } catch (Exception e) {
-            LogBuffer.i(TAG, "[rpc] no verified head -> proxy: " + unwrap(e));
-            return null;
+        // Fast path: serve the last good head if it's recent enough. It stays
+        // beacon-anchored; a few seconds stale beats proxying, and it bridges the
+        // brief windows where a TTL-expiry rebuild can't yet anchor the just-
+        // advanced head. The background warmer keeps this fresh (~5-15s).
+        EnsCall good = lastGoodHead;
+        if (good != null
+                && android.os.SystemClock.elapsedRealtime() - lastGoodHeadAtMs < RPC_HEAD_MAX_STALE_MS) {
+            return good;
         }
+        // No usable head (cold start / sustained outage): wait briefly for a build
+        // before giving up — most gaps are short (a peer (re)connecting).
+        long deadline = android.os.SystemClock.elapsedRealtime() + RPC_HEAD_WAIT_MS;
+        Exception last = null;
+        do {
+            try {
+                return verifiedHeadCallContext();   // builds + refreshes lastGoodHead
+            } catch (Exception e) {
+                last = e;
+                EnsCall g = lastGoodHead;           // a concurrent build may have just succeeded
+                if (g != null && android.os.SystemClock.elapsedRealtime() - lastGoodHeadAtMs < RPC_HEAD_MAX_STALE_MS) {
+                    return g;
+                }
+                try { Thread.sleep(300); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        } while (android.os.SystemClock.elapsedRealtime() < deadline);
+        LogBuffer.i(TAG, "[rpc] no verified head after " + RPC_HEAD_WAIT_MS + "ms -> proxy: "
+                + (last != null ? unwrap(last) : "timeout"));
+        return null;
     }
 
     /** eth_call over the shared anchored head. Returns raw ABI bytes, or null to proxy. */
@@ -818,7 +853,10 @@ public final class NodeService extends Service {
         // peer-probe + headerChain anchor.
         if (build) {
             try {
-                future.complete(buildAnchoredHead());
+                EnsCall ctx = buildAnchoredHead();
+                lastGoodHead = ctx;                                  // serve-stale fallback
+                lastGoodHeadAtMs = android.os.SystemClock.elapsedRealtime();
+                future.complete(ctx);
             } catch (Throwable t) {
                 future.completeExceptionally(t);
                 synchronized (rpcCallCtxLock) {
@@ -1591,9 +1629,10 @@ public final class NodeService extends Service {
             try { rpcServer.stop(); } catch (Throwable ignored) {}
             rpcServer = null;
         }
-        // Drop the cached head context so a later Start doesn't briefly reuse one
-        // pinned to a now-dead peer (it would fail safe to proxy anyway).
+        // Drop the cached head context + last-good head so a later Start doesn't
+        // briefly reuse one pinned to a now-dead peer (fails safe to proxy anyway).
         synchronized (rpcCallCtxLock) { rpcCallCtx = null; }
+        lastGoodHead = null;
         // Close BLC first: its libp2p host's outbound dials hold references
         // through to the discv5 callback's blcRef, and the sync thread can
         // be in the middle of an addPeer call when shutdown fires.
