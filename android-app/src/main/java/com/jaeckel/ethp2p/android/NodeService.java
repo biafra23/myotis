@@ -687,7 +687,15 @@ public final class NodeService extends Service {
             AccountQueryResult r = requestAccount(Bytes.wrap(address).toHexString())
                     .get(RPC_ACCOUNT_TIMEOUT_SEC, TimeUnit.SECONDS);
             // Only serve cryptographically-anchored results; otherwise fall to proxy.
-            if (r.failReason() != null || !r.beaconChainVerified()) return null;
+            if (r.failReason() != null || !r.beaconChainVerified()) {
+                // Was previously silent here (only exceptions logged) — an
+                // un-anchored result gave no clue why it proxied.
+                LogBuffer.i(TAG, "[rpc] account read -> proxy: failReason=" + r.failReason()
+                        + " beaconVerified=" + r.beaconChainVerified()
+                        + " peerProofValid=" + r.peerProofValid()
+                        + " peerBlock=" + r.blockNumber());
+                return null;
+            }
             return r;
         } catch (Exception e) {
             LogBuffer.i(TAG, "[rpc] account read not verifiable now: " + unwrap(e));
