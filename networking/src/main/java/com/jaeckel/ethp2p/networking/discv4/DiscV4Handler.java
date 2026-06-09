@@ -50,17 +50,35 @@ public final class DiscV4Handler extends SimpleChannelInboundHandler<DatagramPac
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, DatagramPacket msg) {
         ByteBuf buf = msg.content();
-        byte[] bytes = new byte[buf.readableBytes()];
+        int size = buf.readableBytes();
+        byte[] bytes = new byte[size];
         buf.readBytes(bytes);
         Bytes raw = Bytes.wrap(bytes);
         InetSocketAddress sender = msg.sender();
 
         try {
             Packet.Parsed parsed = Packet.parse(raw);
+            // Diagnostic: log every inbound datagram's size + type. On the Android
+            // emulator (QEMU/SLIRP user-mode NAT) this tells us whether ANY inbound
+            // discv4 UDP arrives, and crucially whether *unsolicited* PINGs ever do —
+            // discv4's endpoint proof needs the remote to PING us before it returns
+            // NEIGHBORS, and SLIRP drops unsolicited inbound. Replies (PONG/NEIGHBORS)
+            // on flows we initiated traverse the NAT; an unsolicited PING does not.
+            log.debug("[discv4-rx] {} bytes type={} from {}", size, typeName(parsed.type()), sender);
             handlePacket(ctx, parsed, sender);
         } catch (Exception e) {
-            log.debug("Discarding invalid packet from {}: {}", sender, e.getMessage());
+            log.debug("[discv4-rx] {} bytes UNPARSEABLE from {}: {}", size, sender, e.getMessage());
         }
+    }
+
+    private static String typeName(byte type) {
+        return switch (type) {
+            case Packet.TYPE_PING -> "PING";
+            case Packet.TYPE_PONG -> "PONG";
+            case Packet.TYPE_FIND_NODE -> "FINDNODE";
+            case Packet.TYPE_NEIGHBORS -> "NEIGHBORS";
+            default -> "0x" + Integer.toHexString(type & 0xff);
+        };
     }
 
     private void handlePacket(ChannelHandlerContext ctx, Packet.Parsed p, InetSocketAddress sender) {
