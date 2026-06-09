@@ -42,6 +42,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -693,6 +694,22 @@ private fun LogsTab() {
         }
     }
 
+    var filter by remember { mutableStateOf("") }
+    // Filter on tag + message (case-insensitive substring), computed OFF the main
+    // thread — substring-scanning up to MAX_LINES (50k) entries on every keystroke
+    // / 4 Hz buffer poll would jank the UI and laggy the typing. The unfiltered
+    // view shows the whole buffer (no line cap); the LazyColumn renders lazily.
+    var shown by remember { mutableStateOf<List<LogBuffer.Entry>>(emptyList()) }
+    LaunchedEffect(entries, filter) {
+        shown = if (filter.isBlank()) entries
+        else withContext(Dispatchers.Default) {
+            entries.filter {
+                it.tag.contains(filter, ignoreCase = true) ||
+                    it.message.contains(filter, ignoreCase = true)
+            }
+        }
+    }
+
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
@@ -718,9 +735,9 @@ private fun LogsTab() {
     // Pin to the latest item whenever a new line arrives AND we're following.
     // Using scrollToItem (instant) rather than animateScrollToItem keeps
     // pace with rapid log streams without queuing animations.
-    LaunchedEffect(entries.size, autoFollow) {
-        if (autoFollow && entries.isNotEmpty()) {
-            listState.scrollToItem(entries.size - 1)
+    LaunchedEffect(shown.size, autoFollow) {
+        if (autoFollow && shown.isNotEmpty()) {
+            listState.scrollToItem(shown.size - 1)
         }
     }
 
@@ -734,7 +751,8 @@ private fun LogsTab() {
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    "${entries.size} line${if (entries.size == 1) "" else "s"}" +
+                    "${shown.size}${if (filter.isNotBlank()) " / ${entries.size}" else ""} " +
+                        "line${if (shown.size == 1) "" else "s"}" +
                         if (autoFollow) " · live" else " · paused",
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -742,15 +760,27 @@ private fun LogsTab() {
                 )
                 OutlinedButton(
                     onClick = {
-                        clipboard.setText(AnnotatedString(formatLogs(entries)))
+                        clipboard.setText(AnnotatedString(formatLogs(shown)))
                     },
-                    enabled = entries.isNotEmpty(),
-                ) { Text("Copy all") }
+                    enabled = shown.isNotEmpty(),
+                ) { Text("Copy") }
                 OutlinedButton(
                     onClick = { LogBuffer.clear() },
                     enabled = entries.isNotEmpty(),
                 ) { Text("Clear") }
             }
+            OutlinedTextField(
+                value = filter,
+                onValueChange = { filter = it },
+                label = { Text("Filter — tag or message") },
+                singleLine = true,
+                trailingIcon = if (filter.isNotEmpty()) {
+                    { TextButton(onClick = { filter = "" }) { Text("✕") } }
+                } else null,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+            )
             HorizontalDivider()
             // SelectionContainer here gives a long-press → Copy gesture on
             // any visible line. It's compatible with LazyColumn — selection
@@ -765,7 +795,7 @@ private fun LogsTab() {
                     // Keying by sequence keeps the user's scroll position
                     // anchored to a specific log line as older entries fall
                     // off the front of the ring buffer.
-                    items(entries, key = { it.sequence }) { entry ->
+                    items(shown, key = { it.sequence }) { entry ->
                         LogLineRow(entry)
                     }
                 }
@@ -779,7 +809,7 @@ private fun LogsTab() {
             Button(
                 onClick = {
                     scope.launch {
-                        if (entries.isNotEmpty()) listState.scrollToItem(entries.size - 1)
+                        if (shown.isNotEmpty()) listState.scrollToItem(shown.size - 1)
                     }
                 },
                 modifier = Modifier

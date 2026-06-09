@@ -19,8 +19,14 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class LogBuffer {
 
-    /** Capacity of the ring buffer. ~3 MB at typical 600-char lines. */
-    public static final int MAX_LINES = 5000;
+    /**
+     * Capacity of the ring buffer. Raised from 5000 so the in-app Logs viewer
+     * retains a long debugging session unfiltered (the node logs dozens of
+     * lines/sec, so 5000 was only a few minutes). ~12 MB at typical 600-char
+     * lines — fine on a phone; the viewer renders lazily so size doesn't hurt
+     * scroll perf. Still bounded so a long-running session can't OOM.
+     */
+    public static final int MAX_LINES = 50_000;
 
     /**
      * @param sequence monotonic id assigned at append time. Stable across
