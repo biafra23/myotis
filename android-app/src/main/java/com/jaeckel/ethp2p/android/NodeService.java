@@ -619,6 +619,101 @@ public final class NodeService extends Service {
         });
     }
 
+    // -------------------------------------------------------------------------
+    // JSON-RPC verified reads (Phase B). These bridge the Kotlin MyotisRpcBackend
+    // to the same verified machinery the Query tab uses: requestAccount() for
+    // balances/nonces (head-anchored via headerChain) and the prepareEnsCall EVM
+    // stack for eth_call. All blocking — called off the Ktor IO dispatcher.
+    // -------------------------------------------------------------------------
+
+    /** Reuse one anchored head context across a burst of eth_calls (a MetaMask
+     *  page load fires hundreds) instead of re-probing peers + re-anchoring each
+     *  time; short enough that "latest" stays within a few seconds of the head. */
+    private static final long RPC_CALL_TTL_MS = 4_000;
+    /** Per-eth_call EVM budget (CCIP gateways can add a round-trip). */
+    private static final long RPC_CALL_TIMEOUT_SEC = 30;
+    /** Account read budget — includes the headerChain anchoring fetch. */
+    private static final long RPC_ACCOUNT_TIMEOUT_SEC = HEADER_CHAIN_TIMEOUT_SEC + 10;
+
+    private final Object rpcCallCtxLock = new Object();
+    private EnsCall rpcCallCtx;       // cached beacon-anchored head call context
+    private long rpcCallCtxAtMs;
+
+    /** Only fresh-head tags are served verified for now; others → proxy. */
+    private static boolean isLatestTag(String block) {
+        return block == null || block.isEmpty()
+                || block.equals("latest") || block.equals("pending");
+    }
+
+    /** eth_call over a beacon-anchored head. Returns raw ABI bytes, or null to proxy. */
+    private byte[] rpcCall(byte[] to, byte[] data, String block) {
+        if (!isLatestTag(block) || to == null || to.length != 20) return null;
+        try {
+            EnsCall ctx = verifiedHeadCallContext();
+            return ctx.offchainExecutor()
+                    .callView(io.myotis.evm.Address.of(to), data == null ? new byte[0] : data,
+                            ctx.blockCtx())
+                    .get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            LogBuffer.i(TAG, "[rpc] eth_call not verifiable now: " + unwrap(e));
+            return null;
+        }
+    }
+
+    /** Verified account read (balance/nonce). Null unless beacon-anchored → proxy. */
+    private AccountQueryResult rpcAccount(byte[] address, String block) {
+        if (!isLatestTag(block) || address == null || address.length != 20) return null;
+        try {
+            AccountQueryResult r = requestAccount(Bytes.wrap(address).toHexString())
+                    .get(RPC_ACCOUNT_TIMEOUT_SEC, TimeUnit.SECONDS);
+            // Only serve cryptographically-anchored results; otherwise fall to proxy.
+            if (r.failReason() != null || !r.beaconChainVerified()) return null;
+            return r;
+        } catch (Exception e) {
+            LogBuffer.i(TAG, "[rpc] account read not verifiable now: " + unwrap(e));
+            return null;
+        }
+    }
+
+    /** Build (or reuse within {@link #RPC_CALL_TTL_MS}) a snap-peer head context
+     *  whose state root is anchored back to the beacon-finalized root, so the EVM
+     *  call runs against cryptographically-verified state. Blocking. */
+    private EnsCall verifiedHeadCallContext() throws Exception {
+        synchronized (rpcCallCtxLock) {
+            long now = android.os.SystemClock.elapsedRealtime();
+            if (rpcCallCtx != null && now - rpcCallCtxAtMs < RPC_CALL_TTL_MS) {
+                return rpcCallCtx;
+            }
+            EnsCall ctx = prepareEnsCall(io.myotis.ens.EnsResolutionRoot.PEER_HEAD);
+            if (!anchorHeadToBeacon(ctx.blockNumber(), ctx.blockCtx().stateRoot())) {
+                throw new IllegalStateException(
+                        "peer head not beacon-anchored (block #" + ctx.blockNumber() + ")");
+            }
+            rpcCallCtx = ctx;
+            rpcCallCtxAtMs = android.os.SystemClock.elapsedRealtime();
+            return ctx;
+        }
+    }
+
+    /** True iff {@code peerStateRoot} at {@code peerBlock} chains back to the
+     *  beacon-finalized execution root (same headerChain method as get-account). */
+    private boolean anchorHeadToBeacon(long peerBlock, byte[] peerStateRoot) throws Exception {
+        com.jaeckel.ethp2p.consensus.BeaconLightClient blc = beaconLightClient;
+        RLPxConnector conn = connector;
+        if (blc == null || conn == null) return false;
+        com.jaeckel.ethp2p.consensus.types.LightClientHeader fin =
+                blc.getStore().getFinalizedHeader();
+        if (fin == null) return false;
+        com.jaeckel.ethp2p.consensus.types.ExecutionPayloadHeader exec = fin.execution();
+        if (exec.blockNumber() == peerBlock) {
+            // Head is exactly the finalized block — roots must match directly.
+            return java.util.Arrays.equals(exec.stateRoot(), peerStateRoot);
+        }
+        return verifyHeaderChainBatched(conn, exec.blockNumber(), peerBlock,
+                exec.stateRoot(), peerStateRoot)
+                .get(HEADER_CHAIN_TIMEOUT_SEC + 5, TimeUnit.SECONDS);
+    }
+
     private record EnsCall(io.myotis.ens.EnsResolver resolver,
                            io.myotis.evm.BlockContext blockCtx,
                            long blockNumber,
@@ -1110,6 +1205,19 @@ public final class NodeService extends Service {
                 @Override public String syncState() {
                     return backendState.getSyncState(backendGenesis).name();
                 }
+                @Override public byte[] call(byte[] to, byte[] data, String block) {
+                    return rpcCall(to, data, block);
+                }
+                @Override public java.math.BigInteger getBalance(byte[] address, String block) {
+                    AccountQueryResult r = rpcAccount(address, block);
+                    if (r == null) return null;
+                    return r.exists() ? new java.math.BigInteger(r.balanceWei()) : java.math.BigInteger.ZERO;
+                }
+                @Override public Long getTransactionCount(byte[] address, String block) {
+                    AccountQueryResult r = rpcAccount(address, block);
+                    if (r == null) return null;
+                    return r.exists() ? Long.valueOf(r.nonce()) : Long.valueOf(0L);
+                }
             };
             io.myotis.jsonrpc.MyotisRpcServer s =
                     new io.myotis.jsonrpc.MyotisRpcServer(8545, upstream, "0.0.0.0", backend);
@@ -1161,6 +1269,9 @@ public final class NodeService extends Service {
             try { rpcServer.stop(); } catch (Throwable ignored) {}
             rpcServer = null;
         }
+        // Drop the cached eth_call context so a later Start doesn't briefly reuse
+        // a head pinned to a now-dead peer (it would fail safe to proxy anyway).
+        synchronized (rpcCallCtxLock) { rpcCallCtx = null; }
         // Close BLC first: its libp2p host's outbound dials hold references
         // through to the discv5 callback's blcRef, and the sync thread can
         // be in the middle of an addPeer call when shutdown fires.
