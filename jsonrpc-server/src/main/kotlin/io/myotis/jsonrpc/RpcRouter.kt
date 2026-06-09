@@ -31,6 +31,10 @@ class RpcRouter(
 ) {
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
+    private companion object {
+        private val HEX_DIGITS = "0123456789abcdef".toCharArray()
+    }
+
     suspend fun handle(body: String): String {
         val root = try {
             json.parseToJsonElement(body)
@@ -68,7 +72,15 @@ class RpcRouter(
         }
 
         val t0 = System.nanoTime()
-        val response = proxy.forward(body)
+        val response = try {
+            proxy.forward(body)
+        } catch (e: Exception) {
+            // Upstream down/timeout: return a JSON-RPC error, not a raw HTTP 500,
+            // so the wallet can handle it.
+            methods.forEach { logger.record(it, "ERROR", (System.nanoTime() - t0) / 1_000_000) }
+            val id = (root as? JsonObject)?.get("id") ?: JsonNull
+            return errorEnvelope(id, -32603, "upstream proxy error: ${e.message}")
+        }
         val latencyMs = (System.nanoTime() - t0) / 1_000_000
         methods.forEach { logger.record(it, "PROXY", latencyMs) }
         return response
@@ -97,7 +109,10 @@ class RpcRouter(
                 val p = root.params()
                 val callObj = p?.getOrNull(0) as? JsonObject ?: return null
                 val to = callObj["to"]?.asHexBytes() ?: return null   // contract creation (to=null) -> proxy
-                val data = (callObj["data"] ?: callObj["input"])?.asHexBytes() ?: ByteArray(0)
+                // Absent/null calldata -> empty; present-but-malformed -> proxy
+                // (don't silently run the call with empty calldata).
+                val dataElement = (callObj["data"] ?: callObj["input"])?.takeUnless { it is JsonNull }
+                val data = if (dataElement != null) (dataElement.asHexBytes() ?: return null) else ByteArray(0)
                 val block = p.blockTag(1)
                 val out = withContext(Dispatchers.IO) { b.call(to, data, block) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexData(out)))
@@ -147,7 +162,8 @@ class RpcRouter(
     private fun JsonElement.asWord32(): ByteArray? {
         val s = (this as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull ?: return null
         var h = if (s.startsWith("0x") || s.startsWith("0X")) s.substring(2) else s
-        if (h.length % 2 != 0) h = "0$h"           // tolerate odd-length QUANTITY (e.g. "0x0")
+        if (h.isEmpty()) return null                // "0x" is not a valid slot
+        if (h.length % 2 != 0) h = "0$h"            // tolerate odd-length QUANTITY (e.g. "0x0")
         if (h.length > 64) return null
         return try {
             val raw = ByteArray(h.length / 2) {
@@ -175,9 +191,19 @@ class RpcRouter(
     private fun hexQuantity(v: Long): String = "0x" + java.lang.Long.toHexString(v)
     private fun hexQuantity(v: java.math.BigInteger): String = "0x" + v.toString(16)
 
-    /** Ethereum JSON-RPC DATA encoding: 0x-prefixed, every byte rendered (leading zeros kept). */
-    private fun hexData(b: ByteArray): String =
-        b.joinToString(prefix = "0x", separator = "") { "%02x".format(it.toInt() and 0xff) }
+    /** Ethereum JSON-RPC DATA encoding: 0x-prefixed, every byte rendered (leading
+     *  zeros kept). Allocation-free — eth_getCode returns up to ~24KB of bytecode,
+     *  so a String-per-byte encoder would churn the GC hard on Android. */
+    private fun hexData(b: ByteArray): String {
+        val out = CharArray(b.size * 2 + 2)
+        out[0] = '0'; out[1] = 'x'
+        for (i in b.indices) {
+            val v = b[i].toInt() and 0xff
+            out[i * 2 + 2] = HEX_DIGITS[v ushr 4]
+            out[i * 2 + 3] = HEX_DIGITS[v and 0x0f]
+        }
+        return String(out)
+    }
 
     private fun JsonObject.method(): String? = this["method"]?.jsonPrimitive?.contentOrNull
 

@@ -653,7 +653,7 @@ public final class NodeService extends Service {
     private static final long RPC_ACCOUNT_TIMEOUT_SEC = HEADER_CHAIN_TIMEOUT_SEC + 10;
 
     private final Object rpcCallCtxLock = new Object();
-    private EnsCall rpcCallCtx;       // cached beacon-anchored head call context
+    private CompletableFuture<EnsCall> rpcCallCtx;   // cached beacon-anchored head call context
     private long rpcCallCtxAtMs;
 
     /** Only fresh-head tags are served verified for now; others → proxy. */
@@ -799,19 +799,44 @@ public final class NodeService extends Service {
      *  whose state root is anchored back to the beacon-finalized root, so the EVM
      *  call runs against cryptographically-verified state. Blocking. */
     private EnsCall verifiedHeadCallContext() throws Exception {
+        CompletableFuture<EnsCall> future;
+        boolean build = false;
         synchronized (rpcCallCtxLock) {
             long now = android.os.SystemClock.elapsedRealtime();
-            if (rpcCallCtx != null && now - rpcCallCtxAtMs < RPC_CALL_TTL_MS) {
-                return rpcCallCtx;
+            if (rpcCallCtx != null && !rpcCallCtx.isCompletedExceptionally()
+                    && now - rpcCallCtxAtMs < RPC_CALL_TTL_MS) {
+                future = rpcCallCtx;
+            } else {
+                future = new CompletableFuture<>();
+                rpcCallCtx = future;
+                rpcCallCtxAtMs = now;
+                build = true;
             }
-            EnsCall ctx = prepareEnsCall(io.myotis.ens.EnsResolutionRoot.PEER_HEAD);
-            if (!anchorHeadToBeacon(ctx.blockNumber(), ctx.blockCtx().stateRoot())) {
-                throw new IllegalStateException(
-                        "peer head not beacon-anchored (block #" + ctx.blockNumber() + ")");
+        }
+        // Build OUTSIDE the lock so a burst of concurrent eth_calls (a MetaMask
+        // page load fires hundreds) shares the one builder's future instead of
+        // serializing — or starving — on the monitor during the up-to-60s
+        // peer-probe + headerChain anchor.
+        if (build) {
+            try {
+                EnsCall ctx = prepareEnsCall(io.myotis.ens.EnsResolutionRoot.PEER_HEAD);
+                if (!anchorHeadToBeacon(ctx.blockNumber(), ctx.blockCtx().stateRoot())) {
+                    throw new IllegalStateException(
+                            "peer head not beacon-anchored (block #" + ctx.blockNumber() + ")");
+                }
+                future.complete(ctx);
+            } catch (Throwable t) {
+                future.completeExceptionally(t);
+                synchronized (rpcCallCtxLock) {
+                    if (rpcCallCtx == future) rpcCallCtx = null;   // let the next call retry
+                }
             }
-            rpcCallCtx = ctx;
-            rpcCallCtxAtMs = android.os.SystemClock.elapsedRealtime();
-            return ctx;
+        }
+        try {
+            return future.get(RPC_ACCOUNT_TIMEOUT_SEC, TimeUnit.SECONDS);
+        } catch (java.util.concurrent.ExecutionException e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            throw (cause instanceof Exception) ? (Exception) cause : new Exception(cause);
         }
     }
 

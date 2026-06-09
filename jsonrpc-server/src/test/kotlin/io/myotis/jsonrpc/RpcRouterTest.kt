@@ -84,6 +84,29 @@ class RpcRouterTest {
         assertNull(b.lastTo)                                       // backend never invoked
     }
 
+    @Test fun ethCall_malformedData_fallsThrough() {            // present-but-bad calldata -> proxy, not empty
+        val b = FakeBackend(callResult = byteArrayOf(9))
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x00000000219ab540356cBB839Cbe05303d7705Fa","data":"0xZZ"}]}""")
+        assertTrue(hasError(resp))
+        assertNull(b.lastTo)                                       // backend never invoked
+    }
+
+    @Test fun ethCall_nullData_treatedAsEmptyCalldata() {
+        val b = FakeBackend(callResult = byteArrayOf(1))
+        route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x00000000219ab540356cBB839Cbe05303d7705Fa","data":null}]}""")
+        assertEquals(0, b.lastData!!.size)                         // null calldata -> empty, still served
+    }
+
+    @Test fun getStorageAt_emptyHexSlot_fallsThrough() {          // "0x" is not a valid slot
+        val b = FakeBackend(storage = ByteArray(32))
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_getStorageAt",
+               "params":["0xabc0000000000000000000000000000000000001","0x"]}""")
+        assertTrue(hasError(resp))
+        assertNull(b.lastSlot)
+    }
+
     @Test fun ethCall_backendNull_fallsThrough() {
         val b = FakeBackend(callResult = null)                     // no verified answer
         val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_call",
