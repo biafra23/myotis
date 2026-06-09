@@ -58,4 +58,12 @@ interface MyotisRpcBackend {
      * to proxy (including absent slots, which can't be positively proven here).
      */
     fun getStorageAt(address: ByteArray, slot: ByteArray, block: String): ByteArray?
+
+    /**
+     * eth_sendRawTransaction: gossip an already-signed [rawTx] to the devp2p
+     * network and return its hash (keccak256 of the raw bytes), or null if it
+     * couldn't be broadcast (no peer) so the router can fall back to the proxy.
+     * Myotis never signs — the wallet user does; this only relays the bytes.
+     */
+    fun sendRawTransaction(rawTx: ByteArray): ByteArray?
 }

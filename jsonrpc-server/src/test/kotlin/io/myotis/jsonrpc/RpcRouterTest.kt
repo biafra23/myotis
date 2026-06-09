@@ -46,6 +46,11 @@ class RpcRouterTest {
         override fun getStorageAt(address: ByteArray, slot: ByteArray, block: String): ByteArray? {
             lastSlot = slot; return storage
         }
+        var lastRawTx: ByteArray? = null
+        var txHash: ByteArray? = null
+        override fun sendRawTransaction(rawTx: ByteArray): ByteArray? {
+            lastRawTx = rawTx; return txHash
+        }
     }
 
     private fun route(backend: MyotisRpcBackend?, body: String, proxy: UpstreamProxy? = null): String =
@@ -171,6 +176,19 @@ class RpcRouterTest {
     @Test fun getStorageAt_backendNull_fallsThrough() {
         assertTrue(hasError(route(FakeBackend(storage = null),
             """{"jsonrpc":"2.0","id":1,"method":"eth_getStorageAt","params":["0xabc0000000000000000000000000000000000001","0x1"]}""")))
+    }
+
+    @Test fun sendRawTransaction_decodesRaw_andReturnsHashAsData() {
+        val b = FakeBackend().apply { txHash = ByteArray(32).also { it[31] = 0xfe.toByte() } }
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_sendRawTransaction",
+               "params":["0x02f8650182..."]}""".replace("...", "aabb"))
+        assertEquals("0x" + "00".repeat(31) + "fe", result(resp))
+        assertEquals("0x02f8650182aabb", b.lastRawTx!!.toHex())   // raw bytes passed through verbatim
+    }
+
+    @Test fun sendRawTransaction_noPeer_fallsThrough() {          // backend null -> proxy/strict
+        assertTrue(hasError(route(FakeBackend(),                  // txHash defaults to null
+            """{"jsonrpc":"2.0","id":1,"method":"eth_sendRawTransaction","params":["0x02aabb"]}""")))
     }
 
     @Test fun chainId_and_blockNumber_stillVerified() {

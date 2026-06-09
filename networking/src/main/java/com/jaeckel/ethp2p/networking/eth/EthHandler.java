@@ -53,6 +53,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
 
     // eth/68 offsets from capability base (0x10)
     private static final int ETH_STATUS = 0x10;
+    private static final int ETH_TRANSACTIONS = 0x12;
     private static final int ETH_GET_BLOCK_HEADERS = 0x13;
     private static final int ETH_BLOCK_HEADERS = 0x14;
     private static final int ETH_GET_BLOCK_BODIES = 0x15;
@@ -770,6 +771,21 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 }
                 return headers.get(0).header();
             });
+    }
+
+    /**
+     * Broadcast one or more raw signed transactions to this peer (eth Transactions
+     * 0x12). Fire-and-forget — Transactions has no response. The wallet user signs
+     * and submits the tx; we only gossip the bytes so they reach a block producer.
+     *
+     * @return false if this handler is not in READY state (nothing sent)
+     */
+    public boolean sendTransactions(byte[]... rawTxs) {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY || rawTxs == null || rawTxs.length == 0) return false;
+        byte[] payload = com.jaeckel.ethp2p.networking.eth.messages.TransactionsMessage.encode(rawTxs);
+        rlpxHandler.sendMessage(ctx, ETH_TRANSACTIONS, payload);
+        return true;
     }
 
     /**

@@ -146,6 +146,11 @@ class RpcRouter(
                 val v = withContext(Dispatchers.IO) { b.getStorageAt(addr, slot, block) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexData(v)))
             }
+            "eth_sendRawTransaction" -> {
+                val raw = (root.params()?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
+                val hash = withContext(Dispatchers.IO) { b.sendRawTransaction(raw) } ?: return null
+                resultEnvelope(id, JsonPrimitive(hexData(hash)))
+            }
             else -> null
         }
     }
