@@ -60,6 +60,11 @@ public final class NodeService extends Service {
     // abusive on a phone (battery, data, NAT table, file descriptors). attempted
     // is removed only when a peer drops, so this bounds in-flight dial churn.
     private static final int MAX_ATTEMPTED = 200;
+    // Keep a working set of snap peers connected so a verified request almost
+    // always finds one even as peers churn. Below this we proactively re-dial
+    // known snap peers from the cache; 4 leaves headroom so transient churn
+    // doesn't drop us below the ~2 a request realistically needs.
+    private static final int TARGET_SNAP_PEERS = 4;
     // Same bound the JVM daemon uses (CommandHandler.MAX_HEADER_CHAIN_GAP).
     // Caps how many headers we'll fetch to bridge from the beacon-finalized
     // block to the peer's head — i.e. the maximum gap the headerChain
@@ -92,6 +97,7 @@ public final class NodeService extends Service {
     private volatile RLPxConnector connector;
     private io.myotis.jsonrpc.MyotisRpcServer rpcServer;
     private java.util.concurrent.ScheduledExecutorService headWarmer;
+    private java.util.concurrent.ScheduledExecutorService peerMaintainer;
     private AndroidPeerCache peerCache;
     private AndroidCLPeerCache clPeerCache;
     private volatile BeaconLightClient beaconLightClient;
@@ -835,6 +841,66 @@ public final class NodeService extends Service {
      * window where reads fall back to the proxy down to "time until first usable
      * snap peer". Cheap when warm: verifiedHeadCallContext reuses a fresh context.
      */
+    /**
+     * Keep a working set of snap peers connected ({@link #TARGET_SNAP_PEERS}) so a
+     * verified request almost always finds one — the main cause of proxy fallbacks
+     * is windows with too few snap peers. When below target we re-dial known snap
+     * peers from the cache (discovery refills the rest). NOT gated by isSnapHeavy:
+     * we want to maintain peers even while reads are in flight.
+     */
+    private void startPeerMaintainer() {
+        if (peerMaintainer != null) return;
+        peerMaintainer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "snap-peer-maintainer");
+            t.setDaemon(true);
+            return t;
+        });
+        peerMaintainer.scheduleWithFixedDelay(this::maintainSnapPeers, 5, 10, TimeUnit.SECONDS);
+    }
+
+    private void maintainSnapPeers() {
+        if (!RUNNING.get()) return;
+        RLPxConnector conn = connector;
+        AndroidPeerCache pc = peerCache;
+        if (conn == null) return;
+        int snapPeers = conn.activeSnapHandlers().size();
+        if (snapPeers >= TARGET_SNAP_PEERS) return;
+        if (pc == null) return;
+        LogBuffer.i(TAG, "[peers] " + snapPeers + " snap peer(s) < target " + TARGET_SNAP_PEERS
+                + "; re-dialing cached snap peers");
+        long now = System.currentTimeMillis();
+        for (AndroidPeerCache.CachedPeer p : pc.load()) {
+            if (!p.snap()) continue;
+            if (conn.activeSnapHandlers().size() >= TARGET_SNAP_PEERS) break;
+            dialCachedSnapPeer(conn, p, now);
+        }
+    }
+
+    /** Dial a cached snap peer with the same backoff/blacklist/attempted bookkeeping
+     *  the discovery path uses. A dup dial to an already-connected peer is rejected
+     *  by the remote and backs off — harmless. */
+    private void dialCachedSnapPeer(RLPxConnector conn, AndroidPeerCache.CachedPeer p, long now) {
+        String peerKey = p.address().getHostString() + ":" + p.address().getPort();
+        Long expiry = backoff.get(peerKey);
+        if (expiry != null) {
+            if (now < expiry) return;
+            backoff.remove(peerKey);
+        }
+        if (attempted.size() >= MAX_ATTEMPTED || !attempted.add(peerKey)) return;
+        try {
+            SECP256K1.PublicKey pubKey =
+                    SECP256K1.PublicKey.fromBytes(Bytes.fromHexString(p.publicKeyHex()));
+            conn.connect(p.address(), pubKey, (incompatible, idHex) -> {
+                if (incompatible) blacklistedNodeIds.add(idHex);
+                long ms = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
+                backoff.putIfAbsent(peerKey, System.currentTimeMillis() + ms);
+                attempted.remove(peerKey);
+            });
+        } catch (Exception e) {
+            attempted.remove(peerKey);
+        }
+    }
+
     private void startHeadWarmer() {
         if (headWarmer != null) return;
         headWarmer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
@@ -1469,6 +1535,7 @@ public final class NodeService extends Service {
             s.start();
             this.rpcServer = s;
             startHeadWarmer();
+            startPeerMaintainer();
         } catch (Throwable t) {
             LogBuffer.w(TAG, "[rpc] failed to start JSON-RPC server: " + t);
         }
@@ -1515,6 +1582,10 @@ public final class NodeService extends Service {
         if (headWarmer != null) {
             headWarmer.shutdownNow();
             headWarmer = null;
+        }
+        if (peerMaintainer != null) {
+            peerMaintainer.shutdownNow();
+            peerMaintainer = null;
         }
         if (rpcServer != null) {
             try { rpcServer.stop(); } catch (Throwable ignored) {}
