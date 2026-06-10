@@ -57,6 +57,12 @@ class RpcRouterTest {
         override fun getTransactionReceipt(txHash: ByteArray): String? {
             lastReceiptTxHash = txHash; return receiptJson
         }
+        var lastBlockTag: String? = null
+        var lastFullTx: Boolean? = null
+        var blockJson: String? = null
+        override fun getBlockByNumber(block: String, fullTransactions: Boolean): String? {
+            lastBlockTag = block; lastFullTx = fullTransactions; return blockJson
+        }
     }
 
     private fun route(backend: MyotisRpcBackend?, body: String, proxy: UpstreamProxy? = null): String =
@@ -244,6 +250,40 @@ class RpcRouterTest {
             """{"jsonrpc":"2.0","id":7,"method":"eth_getTransactionReceipt","params":["0x${"ab".repeat(32)}"]}""")
         assertTrue(hasError(resp))
         assertEquals(-32000, errorCode(resp))                    // implemented but can't answer right now
+    }
+
+    @Test fun getBlockByNumber_verified_embedsBlockObject_andPassesTagAndFlag() {
+        val b = FakeBackend().apply { blockJson = """{"number":"0x10","baseFeePerGas":"0x7"}""" }
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":3,"method":"eth_getBlockByNumber","params":["latest",false]}""")
+        val obj = json.parseToJsonElement(resp).jsonObject["result"]!!.jsonObject
+        assertEquals("0x10", obj["number"]!!.jsonPrimitive.content)
+        assertEquals("0x7", obj["baseFeePerGas"]!!.jsonPrimitive.content)
+        assertEquals("latest", b.lastBlockTag)
+        assertEquals(false, b.lastFullTx)
+    }
+
+    @Test fun getBlockByNumber_futureBlock_returnsNullResult() {
+        // backend returns the literal "null" for a non-existent/future block → result: null.
+        val resp = route(FakeBackend().apply { blockJson = "null" },
+            """{"jsonrpc":"2.0","id":3,"method":"eth_getBlockByNumber","params":["0x7fffffff",false]}""")
+        assertTrue(!hasError(resp))
+        assertTrue(json.parseToJsonElement(resp).jsonObject["result"] is kotlinx.serialization.json.JsonNull)
+    }
+
+    @Test fun getBlockByNumber_nonBooleanFullTxFlag_fallsThrough() {
+        // present-but-non-boolean flag (1) must not be coerced to false → strict error.
+        val resp = route(FakeBackend().apply { blockJson = """{"number":"0x1"}""" },
+            """{"jsonrpc":"2.0","id":3,"method":"eth_getBlockByNumber","params":["latest",1]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32000, errorCode(resp))
+    }
+
+    @Test fun getBlockByNumber_cannotVerify_errors() {
+        val resp = route(FakeBackend(),  // blockJson null → can't verify → strict error
+            """{"jsonrpc":"2.0","id":3,"method":"eth_getBlockByNumber","params":["latest",false]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32000, errorCode(resp))
     }
 
     @Test fun strict_batch_returnsPerRequestResponses() {

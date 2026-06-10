@@ -9,6 +9,7 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
@@ -40,7 +41,7 @@ class RpcRouter(
         private val VERIFIED_METHODS = setOf(
             "eth_chainId", "net_version", "eth_blockNumber", "eth_call", "eth_getBalance",
             "eth_getTransactionCount", "eth_getCode", "eth_getStorageAt",
-            "eth_sendRawTransaction", "eth_getTransactionReceipt",
+            "eth_sendRawTransaction", "eth_getTransactionReceipt", "eth_getBlockByNumber",
         )
     }
 
@@ -188,6 +189,22 @@ class RpcRouter(
                 // actually couldn't check.
                 val receiptJson = withContext(Dispatchers.IO) { b.getTransactionReceipt(txHash) } ?: return null
                 resultEnvelope(id, json.parseToJsonElement(receiptJson)) // "null" → JsonNull result
+            }
+            "eth_getBlockByNumber" -> {
+                val p = root.params()
+                val block = p.blockTag(0)                          // tag or 0x hex number
+                // Default false only when the flag is ABSENT; a present-but-non-boolean
+                // value (number, "yes", object) falls through rather than being silently
+                // coerced to false and returning the wrong shape.
+                val fullParam = p?.getOrNull(1)
+                val fullTx: Boolean = when {
+                    fullParam == null || fullParam is JsonNull -> false
+                    else -> (fullParam as? JsonPrimitive)?.booleanOrNull ?: return null
+                }
+                // Object string when found; "null" for a future/unknown block; Kotlin null
+                // (can't verify) → fall through to the strict error.
+                val blockJson = withContext(Dispatchers.IO) { b.getBlockByNumber(block, fullTx) } ?: return null
+                resultEnvelope(id, json.parseToJsonElement(blockJson))
             }
             else -> null
         }

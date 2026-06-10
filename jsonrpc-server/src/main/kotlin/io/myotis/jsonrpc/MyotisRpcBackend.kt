@@ -78,4 +78,13 @@ interface MyotisRpcBackend {
      * A JSON string keeps the nested receipt+logs host-built (no Map→JSON in the router).
      */
     fun getTransactionReceipt(txHash: ByteArray): String?
+
+    /**
+     * eth_getBlockByNumber for [block] (a tag like "latest" or a 0x hex number), verified
+     * from a beacon-anchored header (no snap state needed). Returns the block as a JSON
+     * object string (transactions as hashes); the literal "null" for a non-existent
+     * (future) block; or Kotlin null when it can't be answered verified (not synced / too
+     * far back / [fullTransactions]=true, which isn't served verified yet) → router errors.
+     */
+    fun getBlockByNumber(block: String, fullTransactions: Boolean): String?
 }
