@@ -917,8 +917,8 @@ public final class NodeService extends Service {
             long start = headNum - count + 1;
             List<BlockHeadersMessage.VerifiedHeader> window = conn
                     .requestBlockHeadersBatched(start, count)
-                    .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
-                    .get();
+                    // Future.get(timeout) — NOT CompletableFuture.orTimeout (API 31, minSdk 29).
+                    .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
             // Anchor the window: its last header must BE the verified head (stateRoot
             // match) and every header must hash-link to the next's parentHash.
             if (!windowAnchoredToHead(window, headStateRoot)) {
@@ -940,10 +940,9 @@ public final class NodeService extends Service {
                 Bytes32 blockHash = window.get(hi).hash();
                 List<BlockBodiesMessage.BlockBody> bodies;
                 try {
-                    bodies = bodyFutures.get(hi)
-                            .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS).get();
+                    bodies = bodyFutures.get(hi).get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
                 } catch (Exception e) {
-                    continue; // body fetch failed for this block — skip it
+                    continue; // body fetch failed/timed out for this block — skip it
                 }
                 if (bodies.isEmpty()) continue;
                 List<Bytes> txs = bodies.get(0).transactions();
@@ -961,8 +960,7 @@ public final class NodeService extends Service {
                 // Found. Fetch + verify the block's receipts against receiptsRoot.
                 List<List<Bytes>> rcptBlocks = conn
                         .requestReceipts(blockHash)
-                        .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
-                        .get();
+                        .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
                 if (rcptBlocks.isEmpty()) return null;
                 List<Bytes> receipts = rcptBlocks.get(0);
                 if (!OrderedTrieRoot.verify(receipts, h.receiptsRoot)) {
