@@ -87,4 +87,36 @@ interface MyotisRpcBackend {
      * far back / [fullTransactions]=true, which isn't served verified yet) → router errors.
      */
     fun getBlockByNumber(block: String, fullTransactions: Boolean): String?
+
+    // --- Fee suggestion (MetaMask's signing screen blocks on these) -----------
+    // Defaults return null (→ router errors) so hosts can adopt incrementally.
+
+    /**
+     * eth_gasPrice: a legacy-style total gas price suggestion (next baseFee + suggested
+     * tip), derived from beacon-verified headers + body-verified tips. Null to error.
+     */
+    fun gasPrice(): java.math.BigInteger? = null
+
+    /**
+     * eth_maxPriorityFeePerGas: suggested priority fee from recent blocks' verified
+     * transactions (effective tips, verified against transactionsRoot). Null to error.
+     */
+    fun maxPriorityFeePerGas(): java.math.BigInteger? = null
+
+    /**
+     * eth_feeHistory: the EIP-1559 fee history result as a pre-built JSON object string
+     * ({oldestBlock, baseFeePerGas[], gasUsedRatio[], reward[][]?}), computed from
+     * beacon-verified headers (+ verified bodies/receipts when [rewardPercentiles] is
+     * non-empty). [blockCount] may be clamped by the host (the result reflects what was
+     * served, per EIP-1559). Kotlin null when it can't be answered verified → router errors.
+     */
+    fun feeHistory(blockCount: Long, newestBlock: String, rewardPercentiles: DoubleArray?): String? = null
+
+    /**
+     * eth_estimateGas: gas estimate for executing the call/tx against verified state at
+     * the head. [value] is the wei value (null = 0). Null when it can't be answered
+     * verified (not synced / no snap peer / execution failure) → router errors.
+     */
+    fun estimateGas(from: ByteArray?, to: ByteArray?, data: ByteArray?,
+                    value: java.math.BigInteger?): java.math.BigInteger? = null
 }

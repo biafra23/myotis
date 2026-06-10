@@ -477,7 +477,12 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             case ETH_RECEIPTS -> {
                 long reqId = peekRequestId(msg.payload());
                 try {
-                    ReceiptsMessage.DecodeResult decoded = ReceiptsMessage.decode(msg.payload());
+                    // eth/69 (EIP-7642) receipts arrive bloomless + envelope-flattened;
+                    // decode69 recomputes the bloom and re-canonicalizes so downstream
+                    // receiptsRoot verification is identical across versions.
+                    ReceiptsMessage.DecodeResult decoded = negotiatedEthVersion >= 69
+                            ? ReceiptsMessage.decode69(msg.payload())
+                            : ReceiptsMessage.decode(msg.payload());
                     log.info("[eth] Received receipts for {} block(s) (reqId={})",
                             decoded.perBlockReceipts().size(), decoded.requestId());
                     CompletableFuture<List<List<org.apache.tuweni.bytes.Bytes>>> future =
