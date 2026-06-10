@@ -959,7 +959,10 @@ public final class NodeService extends Service {
         RLPxConnector conn = connector;
         if (conn == null || txHash == null || txHash.length != 32) return null;
         try {
-            EnsCall ctx = verifiedHeadCallContext();
+            // Use the resilient head path (cached good head fallback), not the fresh-head
+            // builder — the chain tip is often not beacon-anchored yet, which made this
+            // fail with -32000 even with healthy snap peers while state reads worked.
+            EnsCall ctx = anchoredHeadOrWait();
             if (ctx == null || !ctx.beaconVerified()) return null;
             long headNum = ctx.blockNumber();
             byte[] headStateRoot = ctx.blockCtx().stateRoot();
@@ -1115,7 +1118,9 @@ public final class NodeService extends Service {
         RLPxConnector conn = connector;
         if (conn == null || fullTx) return null;
         try {
-            EnsCall ctx = verifiedHeadCallContext();
+            // Resilient head path (cached good head), not the fresh-head builder which
+            // fails when the chain tip isn't beacon-anchored yet — see rpcGetTransactionReceipt.
+            EnsCall ctx = anchoredHeadOrWait();
             if (ctx == null || !ctx.beaconVerified()) return null;
             long headNum = ctx.blockNumber();
             byte[] headStateRoot = ctx.blockCtx().stateRoot();
