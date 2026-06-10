@@ -732,6 +732,10 @@ public final class NodeService extends Service {
     private static final long RPC_HEAD_TTL_MS = 12_000;
     /** Per-read/-call budget (snap round-trips; CCIP can add one for eth_call). */
     private static final long RPC_CALL_TIMEOUT_SEC = 30;
+    /** Snap-oracle per-fetch retry budget. Each attempt rotates to a different ready
+     *  snap peer (the probed peer first), so a slow/dead peer fails over instead of
+     *  burning the whole RPC_CALL_TIMEOUT on one peer. */
+    private static final int SNAP_ORACLE_MAX_ATTEMPTS = 4;
     /** Head-build budget — includes the headerChain anchoring fetch. */
     private static final long RPC_ACCOUNT_TIMEOUT_SEC = HEADER_CHAIN_TIMEOUT_SEC + 10;
     /** Overall budget for the (parallel) snap-peer head probe. */
@@ -2212,14 +2216,43 @@ public final class NodeService extends Service {
             pinned = headPeer;
         }
 
-        // Pin every SNAP request to the chosen peer (serves blockCtx's stateRoot).
-        final com.jaeckel.ethp2p.networking.eth.EthHandler finalPeer = pinned;
+        // Snap requests carry the stateRoot explicitly, so ANY connected snap peer
+        // that retains blockCtx's trie can serve them — not just the one we probed.
+        // The oracle retries across peers (peerSupplier.get() per attempt); rotate the
+        // supplier so a peer that times out fails over to others instead of funnelling
+        // all retries into one dead peer (every eth_call against that context then hit
+        // the 30s timeout while OTHER peers held the same state). The probed peer is
+        // tried first (known to serve this root); subsequent attempts round-robin the
+        // rest of the ready snap set.
+        final com.jaeckel.ethp2p.networking.eth.EthHandler probedPeer = pinned;
+        final RLPxConnector oracleConn = conn;
+        final java.util.concurrent.atomic.AtomicInteger rotation =
+                new java.util.concurrent.atomic.AtomicInteger();
         io.myotis.evm.world.SnapBackedStateOracle oracle =
                 new io.myotis.evm.world.SnapBackedStateOracle(
-                        () -> finalPeer.isReady() && !finalPeer.isSnapServingFailed()
-                                ? new com.jaeckel.ethp2p.android.snap.EthHandlerSnapPeer(finalPeer)
-                                : null,
-                        ensBytecodeCache);
+                        () -> {
+                            int n = rotation.getAndIncrement();
+                            if (n == 0 && probedPeer.isReady() && !probedPeer.isSnapServingFailed()) {
+                                return new com.jaeckel.ethp2p.android.snap.EthHandlerSnapPeer(probedPeer);
+                            }
+                            java.util.List<com.jaeckel.ethp2p.networking.eth.EthHandler> ready =
+                                    new java.util.ArrayList<>();
+                            for (com.jaeckel.ethp2p.networking.eth.EthHandler p :
+                                    oracleConn.activeSnapHandlers()) {
+                                if (p.isReady() && !p.isSnapServingFailed() && p != probedPeer) {
+                                    ready.add(p);
+                                }
+                            }
+                            if (probedPeer.isReady() && !probedPeer.isSnapServingFailed()) {
+                                ready.add(probedPeer); // keep it in rotation as a fallback too
+                            }
+                            if (ready.isEmpty()) return null;
+                            com.jaeckel.ethp2p.networking.eth.EthHandler chosen =
+                                    ready.get(Math.floorMod(n, ready.size()));
+                            return new com.jaeckel.ethp2p.android.snap.EthHandlerSnapPeer(chosen);
+                        },
+                        ensBytecodeCache,
+                        SNAP_ORACLE_MAX_ATTEMPTS);
         io.myotis.evm.DefaultEvmExecutor base =
                 new io.myotis.evm.DefaultEvmExecutor(oracle, ensBytecodeCache, evmPool);
         io.myotis.evm.PrefetchingEvmExecutor prefetching =
