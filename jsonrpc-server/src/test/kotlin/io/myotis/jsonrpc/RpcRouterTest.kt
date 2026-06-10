@@ -271,6 +271,14 @@ class RpcRouterTest {
         assertTrue(json.parseToJsonElement(resp).jsonObject["result"] is kotlinx.serialization.json.JsonNull)
     }
 
+    @Test fun getBlockByNumber_nonBooleanFullTxFlag_fallsThrough() {
+        // present-but-non-boolean flag (1) must not be coerced to false → strict error.
+        val resp = route(FakeBackend().apply { blockJson = """{"number":"0x1"}""" },
+            """{"jsonrpc":"2.0","id":3,"method":"eth_getBlockByNumber","params":["latest",1]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32000, errorCode(resp))
+    }
+
     @Test fun getBlockByNumber_cannotVerify_errors() {
         val resp = route(FakeBackend(),  // blockJson null → can't verify → strict error
             """{"jsonrpc":"2.0","id":3,"method":"eth_getBlockByNumber","params":["latest",false]}""")

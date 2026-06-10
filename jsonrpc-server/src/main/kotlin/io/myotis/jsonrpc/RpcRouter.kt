@@ -193,7 +193,14 @@ class RpcRouter(
             "eth_getBlockByNumber" -> {
                 val p = root.params()
                 val block = p.blockTag(0)                          // tag or 0x hex number
-                val fullTx = (p?.getOrNull(1) as? JsonPrimitive)?.booleanOrNull ?: false
+                // Default false only when the flag is ABSENT; a present-but-non-boolean
+                // value (number, "yes", object) falls through rather than being silently
+                // coerced to false and returning the wrong shape.
+                val fullParam = p?.getOrNull(1)
+                val fullTx: Boolean = when {
+                    fullParam == null || fullParam is JsonNull -> false
+                    else -> (fullParam as? JsonPrimitive)?.booleanOrNull ?: return null
+                }
                 // Object string when found; "null" for a future/unknown block; Kotlin null
                 // (can't verify) → fall through to the strict error.
                 val blockJson = withContext(Dispatchers.IO) { b.getBlockByNumber(block, fullTx) } ?: return null
