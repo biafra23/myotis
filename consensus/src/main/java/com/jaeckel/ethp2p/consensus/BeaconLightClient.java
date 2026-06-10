@@ -497,7 +497,26 @@ public class BeaconLightClient implements AutoCloseable {
     public boolean addPeer(String multiaddr) {
         if (multiaddr == null || multiaddr.isEmpty()) return false;
         if (!knownPeerAddrs.add(multiaddr)) return false;
-        clPeerMultiaddrs.add(Math.min(1, clPeerMultiaddrs.size()), multiaddr);
+        synchronized (clPeerMultiaddrs) {
+            clPeerMultiaddrs.add(Math.min(1, clPeerMultiaddrs.size()), multiaddr);
+            // Bound the discovered pool. discv5 feeds peers continuously, so an
+            // unbounded list grew to thousands — most fork-matched nodes that don't
+            // run a light-client server — making every period-rotation catch-up fan
+            // out across all of them. Over cap, evict from the tail (oldest add) but
+            // never a peer with positive signal (proven catch-up server / LC-confirmed).
+            // Drop it from knownPeerAddrs too so it can be re-discovered later.
+            if (clPeerMultiaddrs.size() > MAX_CL_PEERS) {
+                for (int i = clPeerMultiaddrs.size() - 1; i >= 0; i--) {
+                    String cand = clPeerMultiaddrs.get(i);
+                    if (!provenCatchUpServers.containsKey(cand)
+                            && !provenLightClient.contains(cand)) {
+                        clPeerMultiaddrs.remove(i);
+                        knownPeerAddrs.remove(cand);
+                        break;
+                    }
+                }
+            }
+        }
         return true;
     }
 
@@ -1146,8 +1165,22 @@ public class BeaconLightClient implements AutoCloseable {
      * nextSyncCommittee for each intermediate period and rotate until we reach the
      * current period.
      */
+    /** Cap on the live discovered CL peer pool ({@link #clPeerMultiaddrs}). discv5 feeds
+     *  it continuously; left unbounded it grew to thousands of mostly-dead/non-LC nodes. */
+    private static final int MAX_CL_PEERS = 1024;
     /** Max 128-period batches per catch-up call. Bounds wall-clock on very old checkpoints. */
     private static final int MAX_CATCHUP_BATCHES = 8;
+    /** Max peers dialed per catch-up batch. The discovered CL pool runs to thousands of
+     *  fork-matched nodes, most of which don't run a light-client server — fanning
+     *  updates_by_range at all of them burned minutes of ProtocolNegotiation/Timeout
+     *  churn at every period rotation. We always include the positive-signal peers
+     *  (proven catch-up servers + LC-confirmed) and fill the rest of this budget from a
+     *  rotating window of the unknown pool, so cold pools still get swept across cycles. */
+    private static final int CATCHUP_FANOUT_MAX = 48;
+    /** Rolling offset into the unknown-peer pool so successive catch-up batches sweep
+     *  different peers instead of re-dialing the same dead window every cycle. */
+    private final java.util.concurrent.atomic.AtomicInteger catchUpSweepOffset =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     private void catchUpSyncCommittee() {
         // Estimate current period from wall clock, using the network's CL genesis time.
@@ -1232,35 +1265,53 @@ public class BeaconLightClient implements AutoCloseable {
             }
             capable.add(p);
         }
-        if (!capable.isEmpty()) {
-            peers = capable;
+        if (capable.isEmpty()) capable = peers; // never starve the batch
+
+        // Split the capable pool into positive-signal peers (worth asking) and the
+        // unknown rest. Positive signal = proven (last session) to serve catch-up for
+        // this period, OR Identify-confirmed light-client support / advertises
+        // updates_by_range. These are the peers that actually retained light-client
+        // data; everything else is a fork-matched node that probably doesn't serve it.
+        java.util.LinkedHashSet<String> priority = new java.util.LinkedHashSet<>();
+        for (String p : capable) {
+            Long sp = provenCatchUpServers.get(p);
+            if (sp != null && sp <= bootstrapPeriod) priority.add(p);
         }
-        // Force-include + front-load peers proven (last session) to serve this
-        // period. They actually retained the checkpoint's light-client updates,
-        // the strongest signal we have — stronger than the runtime filters, which
-        // are cold at startup and can wrongly drop a good peer (Identify/Status
-        // not yet exchanged). This is what turns a cold start from "fan out and
-        // hope" into "ask the peers that worked last time".
-        int provenCount = 0;
-        if (!provenCatchUpServers.isEmpty()) {
-            java.util.LinkedHashSet<String> ordered = new java.util.LinkedHashSet<>();
-            for (String p : copyPeers(false)) {
-                Long sp = provenCatchUpServers.get(p);
-                if (sp != null && sp <= bootstrapPeriod && !peersNoLcUpdates.contains(p)) {
-                    ordered.add(p);
-                }
+        for (String p : capable) {
+            if (priority.contains(p)) continue;
+            if (provenLightClient.contains(p)
+                    || Boolean.TRUE.equals(p2pService.servesLightClientUpdates(p))) {
+                priority.add(p);
             }
-            provenCount = ordered.size();
-            ordered.addAll(peers);
-            peers = new ArrayList<>(ordered);
         }
+        int provenCount = priority.size();
+        List<String> rest = new ArrayList<>(capable.size());
+        for (String p : capable) {
+            if (!priority.contains(p)) rest.add(p);
+        }
+
+        // Cap the fan-out: all positive-signal peers, then fill the remaining budget
+        // from a ROTATING window of the unknown pool so each retry cycle tries fresh
+        // peers (a cold pool of thousands still gets swept over a handful of cycles)
+        // instead of re-dialing the same dead window and re-burning minutes.
+        List<String> fanout = new ArrayList<>(priority);
+        int budget = CATCHUP_FANOUT_MAX - fanout.size();
+        if (budget > 0 && !rest.isEmpty()) {
+            int off = Math.floorMod(catchUpSweepOffset.getAndAdd(budget), rest.size());
+            int take = Math.min(budget, rest.size());
+            for (int i = 0; i < take; i++) {
+                fanout.add(rest.get((off + i) % rest.size()));
+            }
+        }
+        peers = fanout;
         // {@link BeaconP2PService#doReqResp} detects a dying connection and
         // retries with a fresh one, so we no longer pre-emptively disconnect
         // every peer here — that was costing us Lighthouse/Teku connections
         // that would otherwise have stayed alive and kept our peer score up.
-        log.info("[beacon] Catch-up: requesting {} update(s) from period {} across {} capable peer(s) "
-                        + "(skipped {} too-shallow, {} no-LC, {} proven)",
-                count, bootstrapPeriod, peers.size(), skippedShallow, skippedNoLc, provenCount);
+        log.info("[beacon] Catch-up: requesting {} update(s) from period {} across {} peer(s) "
+                        + "({} proven/LC, {}/{} unknown pool; skipped {} too-shallow, {} no-LC)",
+                count, bootstrapPeriod, peers.size(), provenCount,
+                peers.size() - provenCount, rest.size(), skippedShallow, skippedNoLc);
 
         CompletableFuture<Boolean> winner = new CompletableFuture<>();
         java.util.concurrent.atomic.AtomicInteger remaining =
