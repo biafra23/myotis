@@ -756,11 +756,18 @@ public final class NodeService extends Service {
      *  wallet's first read error even though the verified result is seconds away. Kept
      *  under typical wallet RPC timeouts so the call returns verified-but-slow, not failed. */
     private static final long RPC_HEAD_BUILD_WAIT_MS = 25_000;
-    /** How far a number-pinned read's block may sit from the verified head and still be
-     *  served from the head's state. Wallets pin reads to the just-fetched latest block,
-     *  which can be a few blocks off our anchored (snap-servable) head; the head state is
-     *  the same for the queried account across such a small gap. Larger gaps → not served. */
+    /** How far ABOVE the verified head a number-pinned read may sit and still be served
+     *  (a wallet that just saw a newer block than our context). Small: a pin far above
+     *  head is a genuinely future/unknown block. */
     private static final long RPC_BLOCK_NUM_TOLERANCE = 16;
+    /** How far BELOW the context a number-pinned read may sit and still be served from
+     *  the context's (newer) state. Wallets pin "latest"-intent reads to the last block
+     *  they saw; when our calls are slow the chain advances past that pin before the read
+     *  lands, leaving it tens of blocks behind. Serving the context's state for such a
+     *  recent pin gives current-ish data (what the wallet wants) — far better than the
+     *  instant error that emptied MetaMask's asset list. Beyond this (~13 min) the pin is
+     *  genuinely historical and we can't represent it, so reject. */
+    private static final long RPC_BLOCK_NUM_LAG_TOLERANCE = 64;
 
     private final Object rpcCallCtxLock = new Object();
     private CompletableFuture<EnsCall> rpcCallCtx;   // in-flight/fresh build (dedup)
@@ -833,7 +840,7 @@ public final class NodeService extends Service {
             BeaconSyncState bss = beaconSyncState;
             long optimistic = bss != null ? bss.getOptimisticBlockNumber() : 0;
             long upperBound = Math.max(ctx.blockNumber(), optimistic) + RPC_BLOCK_NUM_TOLERANCE;
-            long lowerBound = ctx.blockNumber() - RPC_BLOCK_NUM_TOLERANCE;
+            long lowerBound = ctx.blockNumber() - RPC_BLOCK_NUM_LAG_TOLERANCE;
             if (requestedNum < lowerBound || requestedNum > upperBound) {
                 LogBuffer.i(TAG, "[rpc] requested block " + requestedNum + " outside servable ["
                         + lowerBound + ".." + upperBound + "] (ctx=" + ctx.blockNumber()
@@ -985,6 +992,17 @@ public final class NodeService extends Service {
     /** eth_sendRawTransaction: gossip the user-signed tx to peers; return its hash
      *  (keccak256 of the raw bytes), or null (→ proxy) if no peer took it. Myotis
      *  never signs or originates a tx — this only relays bytes the user submitted. */
+    /** Raw bytes of transactions this node broadcast, keyed by lowercase 0x tx hash, so
+     *  eth_getTransactionByHash can answer a just-sent tx as "pending" before it's mined
+     *  (we hold the signed bytes — serving them is not a trust assumption). Bounded LRU;
+     *  entries fall out as they age (they're served from verified blocks once mined). */
+    private final Map<String, byte[]> sentTxCache = java.util.Collections.synchronizedMap(
+            new java.util.LinkedHashMap<>(64, 0.75f, true) {
+                @Override protected boolean removeEldestEntry(Map.Entry<String, byte[]> e) {
+                    return size() > 256;
+                }
+            });
+
     private byte[] rpcSendRawTransaction(byte[] rawTx) {
         RLPxConnector conn = connector;
         if (conn == null || rawTx == null || rawTx.length == 0) return null;
@@ -992,6 +1010,7 @@ public final class NodeService extends Service {
             int sent = conn.broadcastTransaction(rawTx);
             if (sent == 0) return null;   // no peer reached → let the proxy relay it
             byte[] txHash = Hash.keccak256(Bytes.wrap(rawTx)).toArrayUnsafe();
+            sentTxCache.put(Bytes.wrap(txHash).toHexString(), rawTx.clone());
             LogBuffer.i(TAG, "[rpc] eth_sendRawTransaction broadcast to " + sent
                     + " peer(s), hash=" + Bytes.wrap(txHash).toHexString());
             return txHash;
@@ -999,6 +1018,104 @@ public final class NodeService extends Service {
             LogBuffer.i(TAG, "[rpc] eth_sendRawTransaction failed: " + unwrap(e));
             return null;
         }
+    }
+
+    /**
+     * eth_getTransactionByHash. Scans the recent beacon-verified block window for the tx
+     * (body verified vs transactionsRoot); if found, returns it with block context. If not
+     * yet mined but this node broadcast it, returns it as pending (blockNumber null) from
+     * the sent-tx cache. "null" for a verified-unknown tx; Kotlin null when not verifiable.
+     */
+    private String rpcGetTransactionByHash(byte[] txHash) {
+        RLPxConnector conn = connector;
+        if (conn == null || txHash == null || txHash.length != 32) return null;
+        Bytes32 want = Bytes32.wrap(txHash);
+        try {
+            HeaderAnchor anchor = headerAnchor();
+            if (anchor == null) {
+                // Can't verify chain inclusion right now — but if it's our own just-sent tx
+                // we can still honestly answer "pending" from the signed bytes we hold.
+                byte[] ourRaw = sentTxCache.get(want.toHexString());
+                return ourRaw != null ? buildTxJson(ourRaw, want, null, -1, -1) : null;
+            }
+            long headNum = anchor.number();
+            int count = (int) Math.min(RECEIPT_LOOKBACK_BLOCKS, headNum + 1);
+            long start = headNum - count + 1;
+            List<BlockHeadersMessage.VerifiedHeader> window = conn
+                    .requestBlockHeadersBatched(start, count)
+                    .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+            if (!anchor.anchors(window)) return null;
+
+            List<CompletableFuture<List<BlockBodiesMessage.BlockBody>>> bodyFutures =
+                    new ArrayList<>(window.size());
+            for (BlockHeadersMessage.VerifiedHeader vh : window) {
+                bodyFutures.add(conn.requestBlockBodies(vh.hash()));
+            }
+            for (int hi = window.size() - 1; hi >= 0; hi--) {
+                BlockHeader h = window.get(hi).header();
+                Bytes32 blockHash = window.get(hi).hash();
+                List<BlockBodiesMessage.BlockBody> bodies;
+                try {
+                    bodies = bodyFutures.get(hi).get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+                } catch (Exception e) { continue; }
+                if (bodies.isEmpty()) continue;
+                List<Bytes> txs = bodies.get(0).transactions();
+                if (!OrderedTrieRoot.verify(txs, h.transactionsRoot)) continue;
+                for (int i = 0; i < txs.size(); i++) {
+                    if (Hash.keccak256(txs.get(i)).equals(want)) {
+                        LogBuffer.i(TAG, "[rpc] eth_getTransactionByHash found in block #"
+                                + h.number + " index " + i);
+                        return buildTxJson(txs.get(i).toArrayUnsafe(), want, blockHash, h.number, i);
+                    }
+                }
+            }
+            // Verified head + anchored window, not in it. If it's our own broadcast, it's
+            // pending; otherwise a verified "unknown tx".
+            byte[] ourRaw = sentTxCache.get(want.toHexString());
+            return ourRaw != null ? buildTxJson(ourRaw, want, null, -1, -1) : "null";
+        } catch (Exception e) {
+            LogBuffer.i(TAG, "[rpc] eth_getTransactionByHash failed: " + unwrap(e));
+            return null;
+        }
+    }
+
+    /** Build the eth_getTransactionByHash JSON. blockHash null + blockNum/index < 0 = pending. */
+    private static String buildTxJson(byte[] rawTx, Bytes32 txHash,
+                                      Bytes32 blockHash, long blockNum, int index) {
+        com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.DecodedTx t =
+                com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.decode(Bytes.wrap(rawTx));
+        if (t == null) return "null"; // unknown tx type — can't render
+        StringBuilder sb = new StringBuilder(512);
+        sb.append("{\"hash\":\"").append(txHash.toHexString()).append("\"");
+        if (blockHash != null) {
+            sb.append(",\"blockHash\":\"").append(blockHash.toHexString()).append("\"");
+            sb.append(",\"blockNumber\":\"").append(hexQuantity(blockNum)).append("\"");
+            sb.append(",\"transactionIndex\":\"").append(hexQuantity(index)).append("\"");
+        } else {
+            sb.append(",\"blockHash\":null,\"blockNumber\":null,\"transactionIndex\":null");
+        }
+        sb.append(",\"type\":\"").append(hexQuantity(t.type())).append("\"");
+        if (t.chainId() != null) sb.append(",\"chainId\":\"").append(hexQuantity(t.chainId())).append("\"");
+        sb.append(",\"nonce\":\"").append(hexQuantity(t.nonce())).append("\"");
+        if (t.from() != null) sb.append(",\"from\":\"").append(t.from().toHexString()).append("\"");
+        if (!t.to().isEmpty()) sb.append(",\"to\":\"").append(t.to().toHexString()).append("\"");
+        else sb.append(",\"to\":null");
+        sb.append(",\"value\":\"0x").append(t.value().toString(16)).append("\"");
+        sb.append(",\"gas\":\"").append(hexQuantity(t.gas())).append("\"");
+        if (t.gasPrice() != null) {
+            sb.append(",\"gasPrice\":\"0x").append(t.gasPrice().toString(16)).append("\"");
+        }
+        if (t.maxFeePerGas() != null) {
+            sb.append(",\"maxFeePerGas\":\"0x").append(t.maxFeePerGas().toString(16)).append("\"");
+            sb.append(",\"maxPriorityFeePerGas\":\"0x")
+              .append(t.maxPriorityFeePerGas().toString(16)).append("\"");
+        }
+        sb.append(",\"input\":\"").append(t.input().isEmpty() ? "0x" : t.input().toHexString()).append("\"");
+        sb.append(",\"v\":\"0x").append(t.v().toString(16)).append("\"");
+        sb.append(",\"r\":\"0x").append(t.r().toString(16)).append("\"");
+        sb.append(",\"s\":\"0x").append(t.s().toString(16)).append("\"");
+        sb.append("}");
+        return sb.toString();
     }
 
     /**
@@ -1617,6 +1734,23 @@ public final class NodeService extends Service {
         EnsCall h = anchoredHeadOrWait();
         if (h == null) return null;
         try {
+            // Fast path: a value transfer with no calldata to a plain account costs
+            // exactly 21000 — no EVM execution, no 15% headroom (it's exact). This is
+            // MetaMask's send-ETH flow. We still fetch the recipient ONCE to confirm
+            // it has no code (a contract receive()/fallback, or a 7702 delegation,
+            // would execute and cost more) — but skip building+running the EVM, the
+            // bulk of the per-estimate work on ART.
+            boolean noData = data == null || data.length == 0;
+            if (noData) {
+                io.myotis.evm.world.AccountState acct = h.oracle()
+                        .fetchAccount(h.blockCtx().stateRoot(), io.myotis.evm.Address.of(to))
+                        .get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
+                byte[] codeHash = acct == null ? null : acct.codeHash();
+                if (codeHash != null && java.util.Arrays.equals(codeHash, EMPTY_CODE_HASH)) {
+                    return java.math.BigInteger.valueOf(21_000);
+                }
+                // Has code (contract / 7702 EOA) → fall through to the full EVM estimate.
+            }
             io.myotis.evm.UnsignedTransaction tx = new io.myotis.evm.UnsignedTransaction(
                     io.myotis.evm.Address.of(from != null ? from : new byte[20]),
                     io.myotis.evm.Address.of(to),
@@ -2683,6 +2817,9 @@ public final class NodeService extends Service {
                 }
                 @Override public String getTransactionReceipt(byte[] txHash) {
                     return rpcGetTransactionReceipt(txHash, "latest");
+                }
+                @Override public String getTransactionByHash(byte[] txHash) {
+                    return rpcGetTransactionByHash(txHash);
                 }
                 @Override public String getBlockByNumber(String block, boolean fullTx) {
                     return rpcGetBlockByNumber(block, fullTx);
