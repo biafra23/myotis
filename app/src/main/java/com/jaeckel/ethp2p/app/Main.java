@@ -506,10 +506,7 @@ public final class Main {
         // not to serve LC — instead of re-Identifying the whole fork-matched cache.
         beaconLightClient.setProvenLightClient(clPeerCache.lightClientConfirmed());
         beaconLightClient.setProvenNonLightClient(clPeerCache.lightClientDenied());
-        beaconLightClient.setOnLightClientVerdict((ma, isLc) -> {
-            if (isLc) clPeerCache.markLightClient(ma);
-            else clPeerCache.markNoLightClient(ma);
-        });
+        beaconLightClient.setOnLightClientVerdict(clPeerCache::markLightClientBatch);
         // Persist/resume verified sync-committee state so restarts resume from the
         // last verified period and only catch up the delta (architecture-doc §
         // "recent sync committee data persisted locally"). purge-cache removes it.

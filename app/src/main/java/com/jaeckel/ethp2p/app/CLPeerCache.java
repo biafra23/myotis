@@ -75,7 +75,7 @@ public final class CLPeerCache {
      * Record a failed interaction. After {@link #FAILURE_THRESHOLD} consecutive
      * failures, the peer is removed from the cache file.
      */
-    public void markFailure(String multiaddr) {
+    public synchronized void markFailure(String multiaddr) {
         if (multiaddr == null || multiaddr.isEmpty()) return;
         if (!seen.contains(multiaddr)) return; // not a cached peer; ignore
         int count = failures.merge(multiaddr, 1, Integer::sum);
@@ -129,6 +129,30 @@ public final class CLPeerCache {
         if (multiaddr == null || multiaddr.isEmpty() || lcConfirmed.contains(multiaddr)) return;
         seen.add(multiaddr);
         if (lcDenied.add(multiaddr)) rewriteFile();
+    }
+
+    /** Persist a whole Identify round's verdicts in a single rewrite. Avoids one disk
+     *  write per peer when dozens are identified in parallel at startup. A confirmation
+     *  overrides a prior denial; a denial never demotes a confirmed peer. */
+    public synchronized void markLightClientBatch(java.util.Collection<String> confirmed,
+                                                  java.util.Collection<String> denied) {
+        boolean changed = false;
+        if (confirmed != null) {
+            for (String ma : confirmed) {
+                if (ma == null || ma.isEmpty()) continue;
+                seen.add(ma);
+                changed |= lcConfirmed.add(ma);
+                changed |= lcDenied.remove(ma);
+            }
+        }
+        if (denied != null) {
+            for (String ma : denied) {
+                if (ma == null || ma.isEmpty() || lcConfirmed.contains(ma)) continue;
+                seen.add(ma);
+                changed |= lcDenied.add(ma);
+            }
+        }
+        if (changed) rewriteFile();
     }
 
     /** Peers whose Identify confirmed light_client support (dial first). */

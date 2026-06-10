@@ -99,6 +99,30 @@ public final class AndroidCLPeerCache {
         if (lcDenied.add(multiaddr)) rewriteFile();
     }
 
+    /** Persist a whole Identify round's verdicts in a single rewrite. Avoids one disk
+     *  write per peer when dozens are identified in parallel at startup. A confirmation
+     *  overrides a prior denial; a denial never demotes a confirmed peer. */
+    public synchronized void markLightClientBatch(java.util.Collection<String> confirmed,
+                                                  java.util.Collection<String> denied) {
+        boolean changed = false;
+        if (confirmed != null) {
+            for (String ma : confirmed) {
+                if (ma == null || ma.isEmpty()) continue;
+                seen.add(ma);
+                changed |= lcConfirmed.add(ma);
+                changed |= lcDenied.remove(ma);
+            }
+        }
+        if (denied != null) {
+            for (String ma : denied) {
+                if (ma == null || ma.isEmpty() || lcConfirmed.contains(ma)) continue;
+                seen.add(ma);
+                changed |= lcDenied.add(ma);
+            }
+        }
+        if (changed) rewriteFile();
+    }
+
     /** Peers whose Identify confirmed light_client support (dial first). */
     public Set<String> lightClientConfirmed() {
         return new java.util.HashSet<>(lcConfirmed);
@@ -109,7 +133,7 @@ public final class AndroidCLPeerCache {
         return new java.util.HashSet<>(lcDenied);
     }
 
-    public void markFailure(String multiaddr) {
+    public synchronized void markFailure(String multiaddr) {
         if (multiaddr == null || multiaddr.isEmpty()) return;
         if (!seen.contains(multiaddr)) return;
         int count = failures.merge(multiaddr, 1, Integer::sum);

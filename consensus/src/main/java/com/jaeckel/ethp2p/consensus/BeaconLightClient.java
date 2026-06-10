@@ -114,8 +114,9 @@ public class BeaconLightClient implements AutoCloseable {
     // servers instead of re-Identifying the whole fork-matched set (most of which are
     // full nodes without the light-client server).
     private final Set<String> provenLightClient = java.util.concurrent.ConcurrentHashMap.newKeySet();
-    /** Notified (multiaddr, supportsLightClient) when Identify resolves a peer's LC support. */
-    private volatile java.util.function.BiConsumer<String, Boolean> onLightClientVerdict;
+    /** Notified (confirmedLcMultiaddrs, deniedLcMultiaddrs) once per Identify round, batched so
+     *  the host persists the whole round in a single rewrite rather than once per peer. */
+    private volatile java.util.function.BiConsumer<java.util.Collection<String>, java.util.Collection<String>> onLightClientVerdict;
 
     /** Seed peers confirmed to support light_client (dial first) from a cache. */
     public void setProvenLightClient(java.util.Collection<String> seed) {
@@ -127,8 +128,10 @@ public class BeaconLightClient implements AutoCloseable {
         if (seed != null) peersNoLcUpdates.addAll(seed);
     }
 
-    /** Set the callback persisting a peer's light_client support verdict from Identify. */
-    public void setOnLightClientVerdict(java.util.function.BiConsumer<String, Boolean> cb) {
+    /** Set the callback persisting each Identify round's light_client verdicts
+     *  (confirmed multiaddrs, denied multiaddrs) — invoked once per round, batched. */
+    public void setOnLightClientVerdict(
+            java.util.function.BiConsumer<java.util.Collection<String>, java.util.Collection<String>> cb) {
         this.onLightClientVerdict = cb;
     }
 
@@ -562,14 +565,21 @@ public class BeaconLightClient implements AutoCloseable {
         for (BeaconP2PService.PeerInfo pi : connected) {
             lcByPeerId.put(pi.peerId(), pi.supportsLightClient());
         }
-        java.util.function.BiConsumer<String, Boolean> verdictCb = onLightClientVerdict;
+        List<String> newConfirmed = new ArrayList<>();
+        List<String> newDenied = new ArrayList<>();
         for (String ma : copyPeers(false)) {
             String pid = peerIdOf(ma);
             Boolean lc = pid != null ? lcByPeerId.get(pid) : null;
             if (lc == null) continue; // not Identified this round
-            if (lc) { provenLightClient.add(ma); peersNoLcUpdates.remove(ma); }
-            else { peersNoLcUpdates.add(ma); }
-            if (verdictCb != null) verdictCb.accept(ma, lc);
+            if (lc) { provenLightClient.add(ma); peersNoLcUpdates.remove(ma); newConfirmed.add(ma); }
+            else { peersNoLcUpdates.add(ma); provenLightClient.remove(ma); newDenied.add(ma); }
+        }
+        // Persist the whole round's verdicts in one shot — a per-peer callback would
+        // trigger a disk rewrite for each of dozens of peers identified in parallel.
+        java.util.function.BiConsumer<java.util.Collection<String>, java.util.Collection<String>> verdictCb =
+                onLightClientVerdict;
+        if (verdictCb != null && (!newConfirmed.isEmpty() || !newDenied.isEmpty())) {
+            verdictCb.accept(newConfirmed, newDenied);
         }
     }
 
@@ -1788,10 +1798,15 @@ public class BeaconLightClient implements AutoCloseable {
         return out;
     }
 
-    /** The peerId tail of a {@code .../p2p/<peerId>} multiaddr, or null. */
+    /** The peerId in a {@code .../p2p/<peerId>[/...]} multiaddr, or null. Strips any
+     *  trailing components (e.g. circuit-relay) after the peerId, like
+     *  {@code BeaconP2PService.extractPeerId}. */
     private static String peerIdOf(String multiaddr) {
         int i = multiaddr.lastIndexOf("/p2p/");
-        return i >= 0 ? multiaddr.substring(i + 5) : null;
+        if (i < 0) return null;
+        String pid = multiaddr.substring(i + 5);
+        int slash = pid.indexOf('/');
+        return slash >= 0 ? pid.substring(0, slash) : pid;
     }
 
     /**
