@@ -1091,6 +1091,7 @@ public final class NodeService extends Service {
                 default:
                     try { target = Long.decode(b); } catch (Exception e) { return null; }
             }
+            if (target < 0) return null;                    // invalid (negative) block number
             if (target > headNum) return "null";            // future/unknown block → eth null
             long back = headNum - target;
             if (back >= BLOCK_LOOKBACK_MAX) return null;     // too far to verify cheaply → error
