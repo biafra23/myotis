@@ -13,6 +13,7 @@ import com.jaeckel.ethp2p.consensus.types.LightClientFinalityUpdate;
 import com.jaeckel.ethp2p.consensus.types.LightClientHeader;
 import com.jaeckel.ethp2p.consensus.types.LightClientUpdate;
 import com.jaeckel.ethp2p.consensus.types.StatusMessage;
+import com.jaeckel.ethp2p.consensus.types.SyncCommittee;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -169,7 +170,12 @@ public class BeaconLightClient implements AutoCloseable {
             }
             store.restore(snap);
             lastPersistedPeriod = snap.currentSyncCommitteePeriod();
+            // Sidecar first: its roots predate the snapshot's finalized/optimistic roots
+            // that updateSyncState() records, and the window deque must stay oldest→newest
+            // (eviction polls the front; export/findStateRoot treat the tail as freshest).
+            restoreStateRootsSidecar(file);
             updateSyncState();
+            warmBlsPubkeyCache();
             log.info("[beacon] Resumed from persisted snapshot at period {} (slot {}) — "
                             + "catching up only periods since",
                     snap.currentSyncCommitteePeriod(), snap.finalizedSlot());
@@ -188,6 +194,10 @@ public class BeaconLightClient implements AutoCloseable {
     private void persistSnapshot() {
         java.nio.file.Path file = snapshotFile;
         if (file == null) return;
+        // The known-state-roots window advances on every finality poll, so persist it
+        // each call — independent of the period-change gate below that throttles the
+        // (large) committee snapshot to ~once per period.
+        persistStateRootsSidecar(file);
         LightClientStore.Snapshot snap = store.snapshot();
         if (snap == null) return;
         if (snap.currentSyncCommitteePeriod() == lastPersistedPeriod) return;
@@ -209,6 +219,110 @@ public class BeaconLightClient implements AutoCloseable {
         } catch (Exception e) {
             log.debug("[beacon] Snapshot persist failed: {}", e.getMessage());
         }
+    }
+
+    // Sidecar persistence for BeaconSyncState's known-state-roots window. Kept beside the
+    // committee snapshot ("<snapshot>.roots") rather than folded into the SSZ store
+    // snapshot, so the window can be rewritten cheaply every finality poll without
+    // touching the committee format. Compact format: version(1) + count(4) then per
+    // entry slot(8) + root(32) + verified(1). Only the freshest entries are kept.
+    private static final String ROOTS_SIDECAR_SUFFIX = ".roots";
+    private static final int ROOTS_SIDECAR_VERSION = 1;
+    private static final int ROOTS_SIDECAR_MAX = 64;
+    /** (newestSlot, count) of the last sidecar write — skip the flash write when the
+     *  window hasn't advanced (the 12s poll loop calls persistSnapshot every cycle). */
+    private volatile long rootsSidecarLastNewestSlot = -1;
+    private volatile int rootsSidecarLastCount = -1;
+
+    private java.nio.file.Path rootsSidecarPath(java.nio.file.Path snapshot) {
+        return snapshot.resolveSibling(snapshot.getFileName() + ROOTS_SIDECAR_SUFFIX);
+    }
+
+    private void persistStateRootsSidecar(java.nio.file.Path snapshot) {
+        try {
+            java.util.List<BeaconSyncState.SlottedStateRoot> all = syncState.exportKnownStateRoots();
+            if (all.isEmpty()) return;
+            // Keep only the freshest ROOTS_SIDECAR_MAX (export is oldest→newest).
+            int from = Math.max(0, all.size() - ROOTS_SIDECAR_MAX);
+            java.util.List<BeaconSyncState.SlottedStateRoot> keep = all.subList(from, all.size());
+            long newestSlot = keep.get(keep.size() - 1).slot();
+            if (newestSlot == rootsSidecarLastNewestSlot && keep.size() == rootsSidecarLastCount) {
+                return; // window unchanged since the last write
+            }
+            java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(1 + 4 + keep.size() * 41);
+            buf.put((byte) ROOTS_SIDECAR_VERSION);
+            buf.putInt(keep.size());
+            for (BeaconSyncState.SlottedStateRoot r : keep) {
+                buf.putLong(r.slot());
+                buf.put(r.stateRoot());                 // exactly 32 bytes (validated on record)
+                buf.put((byte) (r.blsVerified() ? 1 : 0));
+            }
+            java.nio.file.Path file = rootsSidecarPath(snapshot);
+            java.nio.file.Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
+            java.nio.file.Files.write(tmp, buf.array());
+            try {
+                java.nio.file.Files.move(tmp, file,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            } catch (java.nio.file.AtomicMoveNotSupportedException amnse) {
+                java.nio.file.Files.move(tmp, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+            rootsSidecarLastNewestSlot = newestSlot;
+            rootsSidecarLastCount = keep.size();
+        } catch (Exception e) {
+            log.debug("[beacon] roots sidecar persist failed: {}", e.getMessage());
+        }
+    }
+
+    private void restoreStateRootsSidecar(java.nio.file.Path snapshot) {
+        try {
+            java.nio.file.Path file = rootsSidecarPath(snapshot);
+            if (!java.nio.file.Files.exists(file)) return;
+            java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(java.nio.file.Files.readAllBytes(file));
+            if (buf.remaining() < 5 || buf.get() != ROOTS_SIDECAR_VERSION) return;
+            int count = buf.getInt();
+            if (count < 0 || count > ROOTS_SIDECAR_MAX || buf.remaining() < count * 41) return;
+            java.util.List<BeaconSyncState.SlottedStateRoot> roots = new java.util.ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                long slot = buf.getLong();
+                byte[] root = new byte[32];
+                buf.get(root);
+                boolean verified = buf.get() != 0;
+                roots.add(new BeaconSyncState.SlottedStateRoot(slot, root, verified));
+            }
+            syncState.importKnownStateRoots(roots);
+            log.info("[beacon] Restored {} known state root(s) from sidecar — SYNCED needs "
+                    + "one fresh finality poll, not {}", roots.size(), BeaconSyncState.FILL_THRESHOLD);
+        } catch (Exception e) {
+            log.debug("[beacon] roots sidecar restore failed: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Pre-decompress the current (and next, if known) sync committee's pubkeys into
+     * BlsVerifier's cache on a background thread, so the first finality-update verify
+     * after a resume pays only the pairing instead of ~512 G1 square roots (~35-55s
+     * on Android/ART). Safe to call repeatedly — already-cached keys are no-ops.
+     */
+    private void warmBlsPubkeyCache() {
+        Thread t = new Thread(() -> {
+            try {
+                java.util.List<byte[]> keys = new java.util.ArrayList<>();
+                SyncCommittee current = store.getCurrentSyncCommittee();
+                if (current != null) keys.addAll(java.util.Arrays.asList(current.pubkeys()));
+                SyncCommittee next = store.getNextSyncCommittee();
+                if (next != null) keys.addAll(java.util.Arrays.asList(next.pubkeys()));
+                if (keys.isEmpty()) return;
+                long t0 = System.nanoTime();
+                com.jaeckel.ethp2p.consensus.bls.BlsVerifier.warmPubkeyCache(keys);
+                log.info("[beacon] BLS pubkey cache warmed: {} keys in {}ms",
+                        keys.size(), (System.nanoTime() - t0) / 1_000_000);
+            } catch (Exception e) {
+                log.debug("[beacon] BLS cache warm failed: {}", e.getMessage());
+            }
+        }, "bls-cache-warmer");
+        t.setDaemon(true);
+        t.start();
     }
 
     /** Remember a peer that served catch-up from {@code period} (lowest wins) and persist it. */
@@ -411,16 +525,20 @@ public class BeaconLightClient implements AutoCloseable {
         // Phase 0: discover peers from beacon API before attempting connections
         discoverPeersFromBeaconApi();
 
-        // Pre-connect to peers and query Identify to learn protocol support.
-        // This lets bootstrap() prioritize peers advertising light_client protocols.
-        preConnectAndIdentify();
-
         // Phase 1: resume from a persisted snapshot (day-to-day fast path) — if we
         // have verified state newer than the embedded checkpoint from a prior run,
         // pick up there and only catch up the periods since. Falls through to a
         // fresh bootstrap from the embedded checkpoint when there's no usable
         // snapshot (first run, wiped cache, or a corrupt/foreign file).
+        // Runs BEFORE the network pre-connect: it's disk-only, and it kicks off the
+        // background BLS pubkey-cache warm so decompression overlaps the Identify
+        // round instead of stalling the first finality verify after it.
         boolean resumed = tryResumeFromSnapshot();
+
+        // Pre-connect to peers and query Identify to learn protocol support.
+        // This lets bootstrap() prioritize peers advertising light_client protocols.
+        preConnectAndIdentify();
+
         if (!resumed) {
             // Bootstrap with BLS verification from the embedded checkpoint.
             bootstrap();
@@ -525,9 +643,22 @@ public class BeaconLightClient implements AutoCloseable {
      * Waits up to 8 seconds for connections + Identify to complete.
      * This ensures bootstrap() can prioritize light-client-capable peers.
      */
+    /** Boot Identify fan-out cap. The CL cache can hold hundreds of fork-matched peers;
+     *  dialing them all at once cost ~60s of connection churn before the first poll
+     *  could start. copyPeers() orders confirmed-LC peers first, so a bounded slice
+     *  still reaches the peers that matter, and verdict learning for the rest
+     *  continues organically as later polls touch them. */
+    private static final int PRECONNECT_MAX_PEERS = 64;
+    /** Stop waiting on the Identify round once this many LC-capable peers are
+     *  connected — enough to start polling finality updates immediately. */
+    private static final int PRECONNECT_LC_EARLY_EXIT = 3;
+
     private void preConnectAndIdentify() {
         List<String> peers = copyPeers();
         if (peers.isEmpty()) return;
+        if (peers.size() > PRECONNECT_MAX_PEERS) {
+            peers = peers.subList(0, PRECONNECT_MAX_PEERS);
+        }
 
         log.info("[beacon] Pre-connecting to {} peer(s) for Identify...", peers.size());
         List<CompletableFuture<Void>> futures = new ArrayList<>();
@@ -541,11 +672,27 @@ public class BeaconLightClient implements AutoCloseable {
             futures.add(p2pService.queryIdentify(peer).handle((v, ex) -> null));
         }
 
-        try {
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-                    .get(10, TimeUnit.SECONDS);
-        } catch (Exception e) {
-            // Some peers may have timed out — that's fine
+        // Wait up to 10s, but bail as soon as a few LC-capable peers are connected —
+        // that's all the first finality poll needs; stragglers keep Identifying in
+        // the background and get picked up by later polls.
+        CompletableFuture<Void> all =
+                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+        long identifyDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (System.nanoTime() < identifyDeadline && !all.isDone()) {
+            long lcSoFar = p2pService.getConnectedPeers().stream()
+                    .filter(BeaconP2PService.PeerInfo::supportsLightClient).count();
+            if (lcSoFar >= PRECONNECT_LC_EARLY_EXIT) {
+                log.info("[beacon] {} LC peer(s) identified — starting without waiting for the rest",
+                        lcSoFar);
+                break;
+            }
+            try {
+                all.get(500, TimeUnit.MILLISECONDS);
+            } catch (java.util.concurrent.TimeoutException te) {
+                // keep polling
+            } catch (Exception e) {
+                break; // interrupted or all-failed — proceed with what we have
+            }
         }
 
         List<BeaconP2PService.PeerInfo> connected = p2pService.getConnectedPeers();

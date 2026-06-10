@@ -21,6 +21,15 @@ public class LightClientProcessor {
     private final byte[] forkVersion;
     private final byte[] genesisValidatorsRoot;
 
+    /** Aggregate signature of the last successfully applied finality update. The
+     *  signature commits to the attested header root (whose state root in turn commits
+     *  the finality branch), so a byte-identical signature is the same already-applied
+     *  update: any variant with different contents would fail verification anyway.
+     *  Lets the 12s poll loop skip re-verifying an unchanged head — each BLS verify
+     *  costs ~18s on Android/ART, so without this the steady-state loop burns a full
+     *  core re-proving the same update. */
+    private volatile byte[] lastAppliedFinalitySig;
+
     public LightClientProcessor(LightClientStore store, byte[] forkVersion, byte[] genesisValidatorsRoot) {
         this.store = store;
         this.forkVersion = forkVersion.clone();
@@ -52,6 +61,15 @@ public class LightClientProcessor {
         long attestedSlot = update.attestedHeader().beacon().slot();
         long finalizedSlot = update.finalizedHeader().beacon().slot();
         int participation = update.syncAggregate().countParticipants();
+
+        byte[] sig = update.syncAggregate().syncCommitteeSignature();
+        byte[] lastSig = lastAppliedFinalitySig;
+        if (lastSig != null && java.util.Arrays.equals(lastSig, sig)) {
+            log.debug("[lc-processor] Finality update is a duplicate of the already-applied one "
+                    + "(attestedSlot={}) — skipping re-verify", attestedSlot);
+            return true;
+        }
+
         log.debug("[lc-processor] Processing finality update: attestedSlot={}, finalizedSlot={}, " +
                 "signatureSlot={}, participation={}/512, finalityBranchLen={}",
                 attestedSlot, finalizedSlot, update.signatureSlot(),
@@ -96,6 +114,7 @@ public class LightClientProcessor {
         // (updateFinalized may have already advanced this.finalizedSlot).
         store.applyNextSyncCommitteeWhenPeriodChanges(oldFinalizedSlot, finalizedSlot);
 
+        lastAppliedFinalitySig = sig.clone();
         log.debug("[lc-processor] Finality update applied: finalizedSlot {} → {}", oldFinalizedSlot, finalizedSlot);
         return true;
     }
