@@ -134,7 +134,7 @@ Fee suggestions are also served verified: **`eth_gasPrice`**, **`eth_maxPriority
 ## 10. Wallet Integration — Verified JSON-RPC + Android
 **POC: Implemented (MetaMask end-to-end)**
 
-The `jsonrpc-server` module exposes the verification pipeline as a standard Ethereum JSON-RPC endpoint (Kotlin/Ktor) so an **unmodified wallet** can use a Myotis node directly. `RpcRouter` maps the API onto a host-agnostic `MyotisRpcBackend` interface; the Android `NodeService` and the CLI daemon each implement it against their own connector + beacon state. **Strict permissionless mode** is the default — there is no trusted-RPC fallback; an unservable request returns `-32601` (not served verified) or `-32000` (can't answer right now), never proxied data. (A dev-only upstream proxy exists solely to discover what a wallet calls and is disabled in strict mode.)
+The `jsonrpc-server` module exposes the verification pipeline as a standard Ethereum JSON-RPC endpoint (Kotlin/Ktor) so an **unmodified wallet** can use a Myotis node directly. `RpcRouter` maps the API onto a host-agnostic `MyotisRpcBackend` interface; the Android `NodeService` implements it against its connector + beacon state and starts the server. (The desktop daemon does not serve JSON-RPC — it exposes the same verified primitives over its CLI/IPC socket; the router is consumed only by `android-app`.) The server **binds loopback only** (`127.0.0.1:8545`) — the wallet is a same-device client and the endpoint is unauthenticated/TLS-less, so it is deliberately not reachable from other devices. **Strict permissionless mode** is the default — there is no trusted-RPC fallback; an unservable request returns `-32601` (not served verified) or `-32000` (can't answer right now), never proxied data. (A dev-only upstream proxy exists solely to discover what a wallet calls and is disabled in strict mode.)
 
 Verified methods served: `eth_chainId`, `net_version`, `eth_blockNumber`, `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`, `eth_call`, `eth_estimateGas`, `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory`, `eth_getBlockByNumber`, `eth_getTransactionReceipt`, `eth_getTransactionByHash`, `eth_sendRawTransaction`. (See README → *Wallet API* for the per-method verification basis.) Wallet-specific quirks handled: reads pinned to a near-head block number are served from the verified head's state (a stale historical pin is rejected); `eth_getBlockByNumber`/receipts work without a snap peer via the beacon optimistic anchor.
 
@@ -150,7 +150,7 @@ Verified methods served: `eth_chainId`, `net_version`, `eth_blockNumber`, `eth_g
 **Not implemented / rough edges:**
 - Cold head-context build latency (~15 s first call after a rebuild; warm ~1 s) — a snap-peer warm-context reliability problem.
 - `eth_getLogs`, `eth_subscribe`/WebSocket, batch nuances beyond the basics, and other less-common wallet methods.
-- **Endpoint security:** the server binds `0.0.0.0:8545` with no auth, rate limiting, or TLS — fine for a same-device wallet on a trusted network, a footgun on an open one. A loopback-only default and opt-in auth are planned.
+- **Endpoint security:** binds loopback only (`127.0.0.1:8545`) with no auth, rate limiting, or TLS — sufficient for the same-device wallet model, but there is no opt-in path yet for safely exposing it on a routable interface (would need auth/TLS first).
 
 ## Summary
 

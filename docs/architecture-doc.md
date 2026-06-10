@@ -374,7 +374,7 @@ Sections 1–9 produce verified data; a wallet needs a way to *ask for it*. Rath
 
 ### How It Works
 
-A host-agnostic router (`jsonrpc-server`, Kotlin/Ktor) maps the Ethereum JSON-RPC API onto a `MyotisRpcBackend` interface. Each host implements the backend against its own stack: the Android `NodeService` and the desktop daemon both delegate to the same `RLPxConnector` / beacon light client / local EVM described above. Every method is answered **only** from the verified pipeline:
+A host-agnostic router (`jsonrpc-server`, Kotlin/Ktor) maps the Ethereum JSON-RPC API onto a `MyotisRpcBackend` interface. The Android `NodeService` implements the backend against the same `RLPxConnector` / beacon light client / local EVM described above and starts the server. (The desktop daemon does not serve JSON-RPC; it exposes the same verified primitives over its CLI/IPC socket. The router is consumed only by the Android app.) Every method is answered **only** from the verified pipeline:
 
 | Method(s) | Verification basis |
 |---|---|
@@ -387,6 +387,8 @@ A host-agnostic router (`jsonrpc-server`, Kotlin/Ktor) maps the Ethereum JSON-RP
 ### Strict Permissionless Mode
 
 The defining property: **there is no trusted-RPC fallback**. When a request cannot be answered from verified data, the server returns a JSON-RPC error — `-32601` (not served verified at all) or `-32000` (implemented but not answerable right now: not synced, no snap peer, head not yet beacon-anchored) — rather than silently proxying an unverified answer. A wallet thus only ever displays data the node could prove. (A dev-only upstream proxy exists purely to map what a given wallet calls during development and is disabled in strict mode.)
+
+The endpoint **binds loopback only** (`127.0.0.1:8545`): the wallet is a same-device client, and the surface is unauthenticated with no TLS — so it is deliberately not exposed on a routable interface. Auth/TLS would be prerequisites for any opt-in remote binding.
 
 ### Running on a Phone
 

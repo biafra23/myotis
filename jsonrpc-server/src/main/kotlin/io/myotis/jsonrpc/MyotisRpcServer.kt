@@ -16,8 +16,8 @@ import io.ktor.http.HttpMethod
 import org.slf4j.LoggerFactory
 
 /**
- * Embedded JSON-RPC HTTP server for Myotis, runnable on both the Android app and
- * the CLI daemon (Ktor CIO engine — Android-safe).
+ * Embedded JSON-RPC HTTP server for Myotis (Ktor CIO engine — Android-safe).
+ * Consumed by the Android app, where the wallet runs on the same device.
  *
  * Phase A: stands up the endpoint + CORS + a router that relays every method to
  * the [upstreamUrl] (if set) and logs the coverage map. With no upstream it runs
@@ -26,11 +26,14 @@ import org.slf4j.LoggerFactory
  *
  * @param upstreamUrl DEBUG-only upstream RPC to proxy unhandled methods to; null
  *   = strict mode (no proxy). Never commit this value — inject at runtime.
+ * @param host bind address. Defaults to loopback ([127.0.0.1]) — the wallet is a
+ *   same-device client, and the endpoint is unauthenticated/TLS-less, so it must
+ *   not be exposed on a routable interface without an explicit opt-in.
  */
 class MyotisRpcServer(
     private val port: Int,
     private val upstreamUrl: String? = null,
-    private val host: String = "0.0.0.0",
+    private val host: String = "127.0.0.1",
     private val backend: MyotisRpcBackend? = null,
 ) {
     private val log = LoggerFactory.getLogger(MyotisRpcServer::class.java)

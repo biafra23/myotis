@@ -23,18 +23,14 @@ Built in Java 21 on the [tuweni](https://github.com/apache/incubator-tuweni) lib
 
 ## Wallet API — verified JSON-RPC over HTTP
 
-The Android app (and the desktop daemon) runs an embedded JSON-RPC server (Ktor, default `0.0.0.0:8545`) that a wallet talks to like any other Ethereum endpoint. Every method is answered **only** from cryptographically verified data; there is no trusted-RPC fallback in production (a dev-only upstream proxy exists purely to map what a wallet needs and is off in strict mode). When a request can't be served verified, the server returns a JSON-RPC error:
+The Android app runs an embedded JSON-RPC server (Ktor, **loopback-only `127.0.0.1:8545`**) that an on-device wallet talks to like any other Ethereum endpoint. Every method is answered **only** from cryptographically verified data; there is no trusted-RPC fallback in production (a dev-only upstream proxy exists purely to map what a wallet needs and is off in strict mode). When a request can't be served verified, the server returns a JSON-RPC error:
 
 - `-32601` — the method isn't served verified at all (the wallet can stop asking).
 - `-32000` — the method is implemented but can't be answered right now (not synced, no snap peer, or the head isn't beacon-anchored yet — retryable).
 
-> **⚠️ Security:** the default bind is `0.0.0.0:8545` — **unauthenticated and reachable by anything on the same network** (every device on your Wi-Fi/LAN). It has no auth, rate limiting, or TLS. The data it serves is read-only and verified, but `eth_sendRawTransaction` will relay any signed bytes it's handed, and an open port is a footgun on an untrusted network. For anything beyond a same-device wallet on a trusted network, bind to `127.0.0.1` (loopback only) or firewall the port. A localhost-only default and opt-in auth are planned.
+> **Security:** the server binds **loopback only** by default — the wallet is a same-device client, and the endpoint is unauthenticated with no TLS or rate limiting (and `eth_sendRawTransaction` relays whatever signed bytes it's handed), so it is deliberately not reachable from other devices. Exposing it on a routable interface would require an explicit, opt-in change.
 
-**Connecting MetaMask:** add a custom network pointing at the node's `http://<host>:8545` (chain id 1 for mainnet).
-
-- **On the phone (primary use):** MetaMask and the node run on the same device — point MetaMask at `http://localhost:8545`.
-- **Desktop daemon, desktop MetaMask:** same machine — `http://localhost:8545`, no tunnel needed.
-- **Reaching the device's RPC from a computer** (e.g. `curl` testing, or a desktop wallet hitting the phone's node): `adb forward tcp:8545 tcp:8545` maps a host port to the device's server, so `http://localhost:8545` on the host reaches the phone.
+**Connecting MetaMask:** MetaMask runs on the same device as the node. Add a custom network pointing at `http://localhost:8545` (chain id 1 for mainnet). The desktop daemon does **not** serve JSON-RPC — it exposes the same verified operations over its CLI/IPC socket (see *Query commands* below).
 
 ### Implemented (verified) methods
 
@@ -73,7 +69,7 @@ A number-pinned read (wallets pin every read to the block they just saw) is serv
 
 ## Run
 
-Myotis runs in two forms: the **Android app** (the wallet node) and the **desktop daemon/CLI** (the same engine for development). Both run the full devp2p + libp2p stack, the beacon light client, the local EVM, and the verified JSON-RPC server.
+Myotis runs in two forms: the **Android app** (the wallet node, with the verified JSON-RPC server for a same-device wallet) and the **desktop daemon/CLI** (the same engine for development, with a CLI/IPC command surface). Both run the full devp2p + libp2p stack, the beacon light client, and the local EVM.
 
 ### Android
 
@@ -82,11 +78,11 @@ Myotis runs in two forms: the **Android app** (the wallet node) and the **deskto
 ./gradlew :android-app:installDebug
 ```
 
-The app runs the node as a foreground `NodeService` (Start/Stop in the UI). Once it reaches `SYNCED`, the JSON-RPC server is live on `0.0.0.0:8545`; point an on-device MetaMask at `http://localhost:8545` (custom network, chain id 1). The app persists the sync snapshot, the known-state-root window, and light-client-capable peers, so warm restarts reach `SYNCED` in ~10 s. minSdk 29.
+The app runs the node as a foreground `NodeService` (Start/Stop in the UI). Once it reaches `SYNCED`, the JSON-RPC server is live on `127.0.0.1:8545`; point an on-device MetaMask at `http://localhost:8545` (custom network, chain id 1). The app persists the sync snapshot, the known-state-root window, and light-client-capable peers, so warm restarts reach `SYNCED` in ~10 s. minSdk 29.
 
 ### Desktop daemon
 
-The daemon discovers peers, maintains connections, listens for CLI commands on a Unix domain socket (`/tmp/ethp2p.sock`), and serves the same JSON-RPC API on `:8545`. A **client** invocation sends a single command to the running daemon and exits.
+The daemon discovers peers, maintains connections, and listens for CLI commands on a Unix domain socket (`/tmp/ethp2p.sock`); it exposes the verified operations as CLI commands (`get-account`, `get-storage`, `resolve-ens`, …), not JSON-RPC. A **client** invocation sends a single command to the running daemon and exits.
 
 ### Start the daemon
 
@@ -635,9 +631,9 @@ Eight Gradle modules:
 - **consensus** -- beacon chain light client (sync committee BLS verification), Merkle-Patricia proof verification
 - **myotis-evm** -- Hyperledger Besu EVM running against a SNAP-backed `StateOracle`. Powers ENS resolution, `eth_call`, and local gas estimation (`DefaultEvmExecutor.estimateGas` — intrinsic + EVM-metered + 15% safety buffer). Includes `CcipReadEvmExecutor` for ERC-3668 off-chain lookups and `PrefetchingEvmExecutor` (multi-hop speculative prefetch) to amortize SNAP round-trips.
 - **myotis-ens** -- ENS resolver (`EnsResolver`, `ReverseLookup`) using the Universal Resolver via the local EVM. Forward and reverse resolution, ENSIP-10 wildcards, ERC-3668 off-chain records.
-- **jsonrpc-server** -- host-agnostic verified JSON-RPC router (Kotlin/Ktor). `RpcRouter` maps the Ethereum API onto a `MyotisRpcBackend` interface; each host (Android `NodeService`, the CLI daemon) implements the backend against its own connector + beacon state. Strict permissionless mode by default.
-- **app** -- daemon/CLI entry point, Unix domain socket IPC server, peer caching, JSON-RPC backend
-- **android-app** -- the Android wallet node (`NodeService` foreground service). Runs the full devp2p + libp2p stack and the JSON-RPC server on-device, with Android-native peer/snapshot caching and a Compose UI; persists the sync snapshot, the known-state-root window, and light-client-capable peers for fast warm restarts (~10 s vs. a cold checkpoint bootstrap).
+- **jsonrpc-server** -- host-agnostic verified JSON-RPC router (Kotlin/Ktor). `RpcRouter` maps the Ethereum API onto a `MyotisRpcBackend` interface that the Android `NodeService` implements against its connector + beacon state. Strict permissionless mode by default; binds loopback only. (Consumed by `android-app`; the daemon uses its own CLI/IPC surface instead.)
+- **app** -- daemon/CLI entry point, Unix domain socket IPC server, peer caching
+- **android-app** -- the Android wallet node (`NodeService` foreground service). Runs the full devp2p + libp2p stack, the local EVM, and the JSON-RPC server on-device, with Android-native peer/snapshot caching and a Compose UI; persists the sync snapshot, the known-state-root window, and light-client-capable peers for fast warm restarts (~10 s vs. a cold checkpoint bootstrap).
 
 ### Protocol flow
 

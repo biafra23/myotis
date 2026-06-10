@@ -2843,8 +2843,11 @@ public final class NodeService extends Service {
                     return rpcEstimateGas(from, to, data, value);
                 }
             };
+            // Bind loopback-only: the wallet (MetaMask) runs on the same device and
+            // reaches us via localhost. Binding 0.0.0.0 would expose an unauthenticated,
+            // TLS-less RPC — incl. eth_sendRawTransaction relay — to the whole LAN.
             io.myotis.jsonrpc.MyotisRpcServer s =
-                    new io.myotis.jsonrpc.MyotisRpcServer(8545, upstream, "0.0.0.0", backend);
+                    new io.myotis.jsonrpc.MyotisRpcServer(8545, upstream, "127.0.0.1", backend);
             s.start();
             this.rpcServer = s;
             startHeadWarmer();
