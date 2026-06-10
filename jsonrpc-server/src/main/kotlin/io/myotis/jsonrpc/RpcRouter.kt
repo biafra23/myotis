@@ -33,6 +33,15 @@ class RpcRouter(
 
     private companion object {
         private val HEX_DIGITS = "0123456789abcdef".toCharArray()
+
+        /** Methods we have a verified implementation for. Used in strict mode to tell
+         *  "supported but can't answer right now" (-32000, retryable) from "we don't
+         *  serve this verified at all" (-32601). Keep in sync with tryVerified's cases. */
+        private val VERIFIED_METHODS = setOf(
+            "eth_chainId", "net_version", "eth_blockNumber", "eth_call", "eth_getBalance",
+            "eth_getTransactionCount", "eth_getCode", "eth_getStorageAt",
+            "eth_sendRawTransaction", "eth_getTransactionReceipt",
+        )
     }
 
     suspend fun handle(body: String): String {
@@ -65,10 +74,20 @@ class RpcRouter(
         }
 
         if (proxy == null) {
-            // Strict mode: nothing to verify yet, no upstream → report unavailable.
+            // Strict (permissionless) mode: no verified answer and no proxy. We refuse
+            // to serve unverified data — error instead. The MethodLogger still records
+            // every rejected method, so myotis_rpcCoverage keeps mapping what the wallet
+            // needs. Distinguish "method we don't implement verified" (-32601, so the
+            // wallet stops asking) from "implemented but can't answer right now — no
+            // peer / not synced" (-32000, retryable).
             methods.forEach { logger.record(it, "ERROR", 0) }
             val id = (root as? JsonObject)?.get("id") ?: JsonNull
-            return errorEnvelope(id, -32000, "no upstream configured (strict mode)")
+            val m = methods.firstOrNull() ?: "request"
+            return if (m in VERIFIED_METHODS) {
+                errorEnvelope(id, -32000, "method '$m' cannot be served verified right now (no peer / not synced)")
+            } else {
+                errorEnvelope(id, -32601, "method '$m' is not supported by this permissionless node")
+            }
         }
 
         val t0 = System.nanoTime()
@@ -153,9 +172,14 @@ class RpcRouter(
             }
             "eth_getTransactionReceipt" -> {
                 val txHash = (root.params()?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
-                // Backend returns a pre-built, verified receipt JSON object, or null (→ proxy).
-                val receiptJson = withContext(Dispatchers.IO) { b.getTransactionReceipt(txHash) } ?: return null
-                resultEnvelope(id, json.parseToJsonElement(receiptJson))
+                // Verified view: the receipt if found+verified, else JSON-null — eth's
+                // standard "unknown/pending" answer. This is itself a valid verified
+                // response (we don't see it confirmed in the recent verified chain), so
+                // it is NOT a proxy/strict fall-through: a wallet polling a just-sent tx
+                // keeps getting null until it's mined, never an error.
+                val receiptJson = withContext(Dispatchers.IO) { b.getTransactionReceipt(txHash) }
+                if (receiptJson != null) resultEnvelope(id, json.parseToJsonElement(receiptJson))
+                else resultEnvelope(id, JsonNull)
             }
             else -> null
         }

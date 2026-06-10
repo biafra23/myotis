@@ -67,6 +67,9 @@ class RpcRouterTest {
     private fun hasError(resp: String): Boolean =
         json.parseToJsonElement(resp).jsonObject["error"] != null
 
+    private fun errorCode(resp: String): Int =
+        json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject["code"]!!.jsonPrimitive.content.toInt()
+
     @Test fun ethCall_encodesResultAsData_andDecodesToAndData() {
         val b = FakeBackend(callResult = byteArrayOf(0, 6))
         val resp = route(b,
@@ -208,9 +211,29 @@ class RpcRouterTest {
         assertEquals("0x" + "ab".repeat(32), b.lastReceiptTxHash!!.toHex()) // hash decoded + passed in
     }
 
-    @Test fun getTransactionReceipt_notFound_fallsThrough() {     // backend null result -> proxy/strict
-        assertTrue(hasError(route(FakeBackend(),                  // receiptJson defaults to null
-            """{"jsonrpc":"2.0","id":7,"method":"eth_getTransactionReceipt","params":["0x${"ab".repeat(32)}"]}""")))
+    // ---- strict (permissionless, no-proxy) mode -------------------------------------
+
+    @Test fun strict_unimplementedMethod_errorsMethodNotSupported() {
+        val resp = route(FakeBackend(),                          // no proxy → strict
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{}]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32601, errorCode(resp))                    // not served by this permissionless node
+    }
+
+    @Test fun strict_implementedButUnavailable_errorsServerError() {
+        val resp = route(FakeBackend(balance = null),            // eth_getBalance handled, backend can't answer
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x${"11".repeat(20)}","latest"]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32000, errorCode(resp))                    // supported, but not verifiable right now
+    }
+
+    @Test fun strict_getTransactionReceipt_pending_returnsNullResult_notError() {
+        val resp = route(FakeBackend(),                          // receiptJson null = pending / not found
+            """{"jsonrpc":"2.0","id":7,"method":"eth_getTransactionReceipt","params":["0x${"ab".repeat(32)}"]}""")
+        assertTrue(!hasError(resp))                              // pending is a valid verified answer, not an error
+        val obj = json.parseToJsonElement(resp).jsonObject
+        assertTrue(obj.containsKey("result"))
+        assertTrue(obj["result"] is kotlinx.serialization.json.JsonNull)
     }
 
     @Test fun chainId_and_blockNumber_stillVerified() {
