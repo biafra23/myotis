@@ -7,13 +7,13 @@
 
 # myotis
 
-Myotis is a **trustless Ethereum wallet engine** — a full participant in Ethereum's peer-to-peer networks that runs **on an Android phone** (minSdk 29) and answers a wallet's requests with cryptographically verified data, with **no trusted RPC provider in the loop**. It speaks devp2p on the execution layer (discv4 discovery, RLPx encrypted transport, eth/67-69, and snap/1 state proofs) and libp2p on the consensus layer (a beacon-chain light client), and verifies every byte against sync-committee BLS signatures back to beacon-chain finality. The same engine runs as a desktop daemon/CLI for development.
+Myotis is a **trustless Ethereum wallet engine** — a full participant in Ethereum's peer-to-peer networks that runs **on an Android phone** (minSdk 29) and answers a wallet's requests with cryptographically verified data, with **no trusted RPC provider in the loop**. It speaks devp2p on the execution layer (discv4 discovery, RLPx encrypted transport, eth/66-69, and snap/1 state proofs) and libp2p on the consensus layer (a beacon-chain light client), and verifies every byte against sync-committee BLS signatures back to beacon-chain finality. The same engine runs as a desktop daemon/CLI for development.
 
 A built-in **JSON-RPC server** exposes a verified subset of the Ethereum API over HTTP, so an **unmodified MetaMask** — pointed at the phone — can read balances, simulate calls, estimate gas, suggest fees, and **broadcast a real transaction**, all served from locally verified state. Nothing is taken on a peer's word: account and storage reads carry Merkle-Patricia proofs against a beacon-anchored `stateRoot`; blocks, transactions, and receipts are verified against the header's `transactionsRoot`/`receiptsRoot`; `eth_call`/`eth_estimateGas` run in a local EVM over proof-served state. When a request can't be answered from verified data, it returns an error rather than falling back to a trusted source.
 
 > **Status:** End-to-end verified `send` works on a real device — MetaMask renders the confirm screen from verified balances, fees, and a local gas estimate, then broadcasts the signed transaction over devp2p, with no proxy and no permissioned service. The remaining gaps are listed in [Implementation Status](docs/implementation-status.md).
 
-Built in Java 21 on the [tuweni](https://github.com/apache/incubator-tuweni) libraries (RLP, SECP256K1, SSZ), with a pure-Java BLS verifier and an embedded Hyperledger Besu EVM. JVM 17 bytecode where the Android consumer needs it; long-term direction is Kotlin + Compose Multiplatform.
+Built in Java 21 on the [tuweni](https://github.com/apache/incubator-tuweni) libraries (RLP, SECP256K1, byte utilities; via a Kotlin-rewrite fork), with in-house SSZ and Merkle-Patricia verification, a pure-Java BLS verifier, and an embedded Hyperledger Besu EVM. JVM 17 bytecode where the Android consumer needs it; long-term direction is Kotlin + Compose Multiplatform.
 
 ## Documentation
 
@@ -115,7 +115,7 @@ queries:
 | Command | Requires |
 |---------|----------|
 | `status`, `peers`, `dial` | daemon running |
-| `beacon-status` | daemon running (returns `SYNCING` until ready) |
+| `beacon-status` | daemon running (state progresses `SYNCING` → `CATCHING_UP` → `SYNCED`) |
 | `get-headers`, `get-block`, `get-transactions` | at least one peer in `READY` state (check with `peers`) |
 | `get-account`, `get-storage` | at least one peer with `snap=true` in `READY` state |
 | `get-account`, `get-storage`, `get-block` (full beacon verification — `verifyMethod` populated, `beaconChainVerified=true`) | `beacon-status` returns `"state":"SYNCED"` |
@@ -127,10 +127,13 @@ the peer's `stateRoot` even before the beacon light client reaches
 with `failReason: "beaconNotSynced"`. Wait for `SYNCED` if you need
 the full beacon-anchored trust chain.
 
-The beacon light client typically reaches `SYNCED` within ~30–60
-seconds of daemon startup, depending on how quickly libp2p peers are
-discovered and how recent the embedded checkpoint is. Watch progress
-with:
+How long `SYNCED` takes depends on what's cached: a warm restart
+(persisted sync snapshot + state-root window + known light-client
+peers) reaches `SYNCED` in roughly 10 seconds; a cold start has to
+bootstrap from the embedded checkpoint and catch the sync committee
+up period by period (visible as `CATCHING_UP` with
+`currentPeriod`/`targetPeriod` progressing), which takes minutes
+when the checkpoint is old. Watch progress with:
 
 ```bash
 ./beacon-status.sh
@@ -175,13 +178,22 @@ Returns beacon chain light client sync state.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `state` | string | `"SYNCING"` or `"SYNCED"` |
-| `finalizedSlot` | long | Latest finalized beacon slot (0 if not synced) |
-| `optimisticSlot` | long | Latest optimistic (attested but not finalized) slot |
-| `syncCommitteePeriod` | long | Current sync committee period (finalizedSlot / 8192, only when `SYNCED`) |
-| `executionStateRoot` | string/null | Verified execution state root (null if not synced) |
-| `executionBlockNumber` | long | Finalized execution block number (only when `SYNCED`) |
-| `knownStateRoots` | int | State roots in the rolling window cache (only when `SYNCED`) |
+| `state` | string | `"SYNCING"` (no trust anchor yet), `"CATCHING_UP"` (anchor present, but the state-root window is still sparse or the held sync committee lags wall clock), or `"SYNCED"` (verification-ready; can regress to `CATCHING_UP` if the node falls behind) |
+| `currentPeriod` | long | Sync-committee period the store currently holds (0 before bootstrap) |
+| `targetPeriod` | long | Wall-clock sync-committee period being caught up to |
+| `uptimeSeconds` | long | Daemon uptime |
+| `discoveredPeers` | int | Live discv5 nodes |
+| `connectedPeers` | int | Connected libp2p beacon peers |
+| `lightClientPeers` | long | Connected peers advertising the light-client protocols |
+| `finalizedSlot` | long | Latest finalized beacon slot (0 while `SYNCING`) |
+| `optimisticSlot` | long | Latest optimistic (attested but not finalized) slot (0 while `SYNCING`) |
+| `finalizedPeriod` | long | `finalizedSlot / 8192` (absent while `SYNCING`) |
+| `syncCommitteePeriod` | long | Same as `currentPeriod` — the committee period the store verifies against, **not** `finalizedSlot / 8192` (absent while `SYNCING`) |
+| `wallClockPeriod` | long | Same as `targetPeriod` (absent while `SYNCING`) |
+| `executionStateRoot` | string/null | Verified execution state root (null while `SYNCING`) |
+| `executionBlockNumber` | long | Finalized execution block number (absent while `SYNCING`) |
+| `knownStateRoots` | int | State roots in the rolling window cache |
+| `fillThreshold` | int | Window size required for `SYNCED` (absent while `SYNCING`) |
 | `peers` | array | Connected beacon peers (see below) |
 
 **Peer fields** (in the `peers` array):
@@ -292,6 +304,20 @@ Returns account data with a Merkle-Patricia proof and cryptographic verification
 
 - **`stateRootMatch`** -- The peer's state root exactly matches a state root from a recent beacon block header stored in the rolling window cache. This is the most direct verification path.
 - **`headerChain`** -- The peer's block is ahead of the finalized beacon block, so a chain of consecutive block headers was fetched and verified from the beacon-finalized block to the peer's block. Verification checks: (1) the first header's state root matches the beacon-attested root, (2) each header's parent hash matches the previous header's hash, (3) the last header's state root matches the peer's root.
+
+**`failReason` values** (when `beaconChainVerified=false`; applies to both `get-account` and `get-storage`):
+
+| Value | Description |
+|-------|-------------|
+| `noPeerStateRoot` | The peer did not provide a state root to verify against. |
+| `peerProofInvalid` | The Merkle proof failed against the peer's claimed state root. |
+| `beaconNotSynced` | The beacon light client has not synced yet. |
+| `noPeerBlockNumber` | The peer's block number is unknown, so a header chain can't be anchored. |
+| `beaconBlockUnavailable` | The beacon state has no finalized execution block to anchor against. |
+| `peerBlockBehindFinalized` | The peer's block is older than the beacon-finalized block. |
+| `headerChainGapTooLarge` | The peer's block is more than 8,192 blocks from the beacon-finalized block. |
+| `headerChainInvalid` | A header chain was fetched but failed validation (hash mismatch or discontinuity). |
+| `headerChainError` | An error occurred while fetching or verifying the header chain. |
 
 ### Get storage
 
@@ -626,7 +652,7 @@ Eight Gradle modules:
   - `discv4` -- UDP peer discovery (ping/pong/findnode/neighbors)
   - `discv5` -- UDP CL peer discovery (wraps ConsenSys' `io.consensys.protocols:discovery`)
   - `rlpx` -- TCP transport with EIP-8 ECIES handshake and AES-256-CTR framed channel
-  - `eth` -- eth/67-69 sub-protocol (hello, status, block headers/bodies, receipts, transaction gossip)
+  - `eth` -- eth/66-69 sub-protocol (hello, status, block headers/bodies, receipts, transaction gossip)
   - `snap` -- snap/1 sub-protocol (account range, storage range, bytecode, with Merkle proofs)
 - **consensus** -- beacon chain light client (sync committee BLS verification), Merkle-Patricia proof verification
 - **myotis-evm** -- Hyperledger Besu EVM running against a SNAP-backed `StateOracle`. Powers ENS resolution, `eth_call`, and local gas estimation (`DefaultEvmExecutor.estimateGas` — intrinsic + EVM-metered + 15% safety buffer). Includes `CcipReadEvmExecutor` for ERC-3668 off-chain lookups and `PrefetchingEvmExecutor` (multi-hop speculative prefetch) to amortize SNAP round-trips.
@@ -651,14 +677,14 @@ DiscV4Service (UDP)
 Both discv4 (EL) and libp2p (CL) get their initial peer lists from three sources, merged at startup:
 
 1. **Hardcoded fallback** in `NetworkConfig` — a handful of IPv4 bootnodes and CL multiaddrs that ship with the binary.
-2. **On-disk cache** (`PeerCache`, `CLPeerCache`) — peers that responded successfully on a prior run, loaded from `~/.ethp2p/*-peers.cache`.
+2. **On-disk cache** (`PeerCache`, `CLPeerCache`) — peers that responded successfully on a prior run. The daemon writes `peers[-<network>].cache` / `cl-peers[-<network>].cache` (plus `sync-state[-<network>].snapshot`) into its working directory; the Android app keeps the same files in the app's cache dir (`getCacheDir()`).
 3. **EIP-1459 DNS-based ENR trees** — each network can list `enrtree://<base32-pubkey>@<domain>` URLs in `NetworkConfig.elEnrTreeUrls` / `clEnrTreeUrls`. At startup the daemon walks each tree over DNS TXT records, verifies the root record's secp256k1 signature against the embedded pubkey, and decodes the leaf ENRs. Results are merged into the EL bootnode list and the CL peer list. Mainnet currently pins the Ethereum Foundation canonical tree (`all.mainnet.ethdisco.net`); the resolver is implemented in `networking/dns/DnsEnrResolver`.
 
 DNS resolution is best-effort: on timeout, missing TXT records, or signature mismatch the daemon logs a warning and starts up with whatever the hardcoded + cached sources provide. Per-tree deadline defaults to 10 s.
 
 ### Key dependencies
 
-- **Tuweni 2.7.2** -- RLP encoding, SECP256K1, byte utilities
+- **Tuweni 2.7.2** (`tuweni-kotlin` fork, `2.7.2-jvm17.1`) -- RLP encoding, SECP256K1, byte utilities
 - **Netty 4.2.x (modified)** -- NIO transport. Uses a modified Netty archive based on 4.2 that has been rewritten in Kotlin. This is a proof-of-concept for migrating the Java codebase to Kotlin to enable use in a Compose Multiplatform project
 - **BouncyCastle** -- SECP256K1 crypto provider
 - **jvm-libp2p** -- beacon chain P2P networking (consensus module)
