@@ -229,10 +229,12 @@ public class BeaconLightClient implements AutoCloseable {
     private static final String ROOTS_SIDECAR_SUFFIX = ".roots";
     private static final int ROOTS_SIDECAR_VERSION = 1;
     private static final int ROOTS_SIDECAR_MAX = 64;
-    /** (newestSlot, count) of the last sidecar write — skip the flash write when the
-     *  window hasn't advanced (the 12s poll loop calls persistSnapshot every cycle). */
-    private volatile long rootsSidecarLastNewestSlot = -1;
-    private volatile int rootsSidecarLastCount = -1;
+    /** (newestSlot, count) of the last sidecar write, one immutable unit behind a
+     *  single volatile so concurrent persist calls can't pair a new slot with an old
+     *  count (torn read). Used to skip the flash write when the window hasn't
+     *  advanced — the 12s poll loop calls persistSnapshot every cycle. */
+    private record SidecarMark(long newestSlot, int count) {}
+    private volatile SidecarMark rootsSidecarLastWritten;
 
     private java.nio.file.Path rootsSidecarPath(java.nio.file.Path snapshot) {
         return snapshot.resolveSibling(snapshot.getFileName() + ROOTS_SIDECAR_SUFFIX);
@@ -246,7 +248,8 @@ public class BeaconLightClient implements AutoCloseable {
             int from = Math.max(0, all.size() - ROOTS_SIDECAR_MAX);
             java.util.List<BeaconSyncState.SlottedStateRoot> keep = all.subList(from, all.size());
             long newestSlot = keep.get(keep.size() - 1).slot();
-            if (newestSlot == rootsSidecarLastNewestSlot && keep.size() == rootsSidecarLastCount) {
+            SidecarMark last = rootsSidecarLastWritten;
+            if (last != null && newestSlot == last.newestSlot() && keep.size() == last.count()) {
                 return; // window unchanged since the last write
             }
             java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(1 + 4 + keep.size() * 41);
@@ -267,8 +270,7 @@ public class BeaconLightClient implements AutoCloseable {
             } catch (java.nio.file.AtomicMoveNotSupportedException amnse) {
                 java.nio.file.Files.move(tmp, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
             }
-            rootsSidecarLastNewestSlot = newestSlot;
-            rootsSidecarLastCount = keep.size();
+            rootsSidecarLastWritten = new SidecarMark(newestSlot, keep.size());
         } catch (Exception e) {
             log.debug("[beacon] roots sidecar persist failed: {}", e.getMessage());
         }

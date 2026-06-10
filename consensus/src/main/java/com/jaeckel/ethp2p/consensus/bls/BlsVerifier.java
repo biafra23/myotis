@@ -77,17 +77,16 @@ public final class BlsVerifier {
 
     /** Decompress a trusted (Merkle-proven, no subgroup check) G1 pubkey through the
      *  cache. Returns a private copy the caller may freely use; null for invalid keys
-     *  (never cached). */
+     *  (never cached). computeIfAbsent guarantees one decompression per key even when
+     *  a warm-up and a verify race on the same committee (the mapping function runs at
+     *  most once; concurrent callers for the same key block briefly and reuse it). The
+     *  overflow reset stays outside the compute — mutating the map from inside its own
+     *  mapping function is forbidden. */
     private static ECP cachedTrustedG1(byte[] pubkey) {
-        PubkeyKey key = new PubkeyKey(pubkey.clone());
-        ECP master = PUBKEY_CACHE.get(key);
-        if (master == null) {
-            master = deserializeG1(pubkey, false);
-            if (master == null) return null;
-            if (PUBKEY_CACHE.size() >= PUBKEY_CACHE_MAX) PUBKEY_CACHE.clear();
-            PUBKEY_CACHE.putIfAbsent(key, master);
-        }
-        return new ECP(master);
+        if (PUBKEY_CACHE.size() >= PUBKEY_CACHE_MAX) PUBKEY_CACHE.clear();
+        ECP master = PUBKEY_CACHE.computeIfAbsent(
+                new PubkeyKey(pubkey.clone()), k -> deserializeG1(k.bytes, false));
+        return master == null ? null : new ECP(master);
     }
 
     /**
