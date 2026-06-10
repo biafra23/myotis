@@ -48,6 +48,61 @@ public final class BlsVerifier {
         return halfP;
     }
 
+    // Decompressed-pubkey cache. G1 decompression (a field square root per key) is a
+    // pure function of the 48 key bytes, and sync-committee pubkeys are fixed for a
+    // ~27h period — yet fastAggregateVerify decompressed all ~512 on every update,
+    // which dominates a finality-update verify on Android/ART (~35-55s). Capacity
+    // covers current + next committee (2x512) with slack for rotation overlap; on
+    // overflow the whole map is reset (rotations are rare; no LRU bookkeeping).
+    // Values are master copies: Milagro ECP is mutable (reduce()/affine() normalize
+    // in place), so lookups hand out fresh copies — concurrent verifies must never
+    // share live point objects.
+    private static final int PUBKEY_CACHE_MAX = 4096;
+    private static final java.util.concurrent.ConcurrentHashMap<PubkeyKey, ECP> PUBKEY_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** byte[]-keyed map entry (arrays don't implement value equals/hashCode). */
+    private static final class PubkeyKey {
+        private final byte[] bytes;
+        private final int hash;
+        PubkeyKey(byte[] bytes) {
+            this.bytes = bytes;
+            this.hash = Arrays.hashCode(bytes);
+        }
+        @Override public boolean equals(Object o) {
+            return o instanceof PubkeyKey k && Arrays.equals(bytes, k.bytes);
+        }
+        @Override public int hashCode() { return hash; }
+    }
+
+    /** Decompress a trusted (Merkle-proven, no subgroup check) G1 pubkey through the
+     *  cache. Returns a private copy the caller may freely use; null for invalid keys
+     *  (never cached). */
+    private static ECP cachedTrustedG1(byte[] pubkey) {
+        PubkeyKey key = new PubkeyKey(pubkey.clone());
+        ECP master = PUBKEY_CACHE.get(key);
+        if (master == null) {
+            master = deserializeG1(pubkey, false);
+            if (master == null) return null;
+            if (PUBKEY_CACHE.size() >= PUBKEY_CACHE_MAX) PUBKEY_CACHE.clear();
+            PUBKEY_CACHE.putIfAbsent(key, master);
+        }
+        return new ECP(master);
+    }
+
+    /**
+     * Pre-decompress a set of committee pubkeys into the cache so the next
+     * fastAggregateVerify pays only the pairing, not ~512 square roots. Call off the
+     * hot path (e.g. right after a snapshot resume or committee rotation); decompression
+     * fans out across cores. Invalid keys are skipped — verify rejects them later.
+     */
+    public static void warmPubkeyCache(List<byte[]> pubkeyBytes) {
+        if (pubkeyBytes == null) return;
+        pubkeyBytes.parallelStream().forEach(b -> {
+            if (b != null && b.length == 48) cachedTrustedG1(b);
+        });
+    }
+
     private BlsVerifier() {}
 
     /**
@@ -97,12 +152,13 @@ public final class BlsVerifier {
             // Point decompression (a field square root per key) is independent
             // per pubkey, so we fan it out across cores: on Android/ART the serial
             // 512-key loop took ~30s, dwarfing everything else. parallelStream uses
-            // the common ForkJoinPool (parallelism = cores-1). The aggregation
-            // (ECP.add) is then a cheap sequential reduce — Milagro ECP isn't
-            // safe to mutate from multiple threads, but independent decompression
-            // into fresh ECP objects is.
+            // the common ForkJoinPool (parallelism = cores-1). Decompressed points
+            // are cached across calls (committees are period-stable), so a warm
+            // verify pays only copies + the pairing. The aggregation (ECP.add) is
+            // then a cheap sequential reduce — Milagro ECP isn't safe to mutate
+            // from multiple threads, but each cache lookup returns a private copy.
             List<ECP> points = pubkeyBytes.parallelStream()
-                    .map(b -> deserializeG1(b, false))
+                    .map(BlsVerifier::cachedTrustedG1)
                     .collect(java.util.stream.Collectors.toList());
             ECP aggregated = new ECP(); // point at infinity
             for (ECP pk : points) {
