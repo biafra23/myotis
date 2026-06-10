@@ -1350,9 +1350,15 @@ public final class NodeService extends Service {
         List<BlockBodiesMessage.BlockBody> bodies = conn
                 .requestBlockBodies(vh.hash())
                 .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
-        if (bodies.isEmpty()) return null;
+        if (bodies.isEmpty()) {
+            LogBuffer.i(TAG, "[rpc] tips: no body for block #" + h.number);
+            return null;
+        }
         List<Bytes> txs = bodies.get(0).transactions();
-        if (!OrderedTrieRoot.verify(txs, h.transactionsRoot)) return null;
+        if (!OrderedTrieRoot.verify(txs, h.transactionsRoot)) {
+            LogBuffer.i(TAG, "[rpc] tips: block #" + h.number + " body failed transactionsRoot verify");
+            return null;
+        }
         if (txs.isEmpty()) return java.util.Collections.emptyList();
 
         long[] gasUsed = null;
@@ -1360,10 +1366,17 @@ public final class NodeService extends Service {
             List<List<Bytes>> rcptBlocks = conn
                     .requestReceipts(vh.hash())
                     .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
-            if (rcptBlocks.isEmpty()) return null;
+            if (rcptBlocks.isEmpty()) {
+                LogBuffer.i(TAG, "[rpc] tips: no receipts for block #" + h.number);
+                return null;
+            }
             List<Bytes> receipts = rcptBlocks.get(0);
             if (receipts.size() != txs.size()
-                    || !OrderedTrieRoot.verify(receipts, h.receiptsRoot)) return null;
+                    || !OrderedTrieRoot.verify(receipts, h.receiptsRoot)) {
+                LogBuffer.i(TAG, "[rpc] tips: block #" + h.number + " receipts mismatch (got "
+                        + receipts.size() + " for " + txs.size() + " txs) or root verify failed");
+                return null;
+            }
             gasUsed = new long[txs.size()];
             long prevCum = 0;
             for (int i = 0; i < receipts.size(); i++) {
@@ -1378,7 +1391,12 @@ public final class NodeService extends Service {
         List<TxTip> out = new ArrayList<>(txs.size());
         for (int i = 0; i < txs.size(); i++) {
             TxFeeFields f = TxFeeFields.decode(txs.get(i));
-            if (f == null) return null; // verified body with an unparseable tx — bail
+            if (f == null) { // verified body with an unparseable tx — bail
+                LogBuffer.i(TAG, "[rpc] tips: block #" + h.number + " tx " + i
+                        + " undecodable (first byte 0x"
+                        + Integer.toHexString(txs.get(i).get(0) & 0xFF) + ")");
+                return null;
+            }
             out.add(new TxTip(f.effectiveTip(baseFee), gasUsed != null ? gasUsed[i] : 0));
         }
         return out;
@@ -1571,9 +1589,29 @@ public final class NodeService extends Service {
                     .get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
             return gas == null ? null : java.math.BigInteger.valueOf(gas);
         } catch (Exception e) {
-            LogBuffer.i(TAG, "[rpc] eth_estimateGas -> error: " + unwrap(e));
+            LogBuffer.i(TAG, "[rpc] eth_estimateGas -> error: " + describeEvmError(e));
             return null;
         }
+    }
+
+    /** Render an estimate/call failure, decoding EvmExecutionException revert data —
+     *  the estimator packs halt diagnostics ("halt=... state=...") into Reverted bytes,
+     *  which the default toString prints as an opaque [B@hash. */
+    private static String describeEvmError(Throwable e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof io.myotis.evm.EvmExecutionException ee
+                    && ee.error() instanceof io.myotis.evm.EvmExecutionError.Reverted rev) {
+                byte[] d = rev.data();
+                boolean printable = d.length > 0;
+                for (byte b : d) {
+                    if (b < 0x20 || b > 0x7e) { printable = false; break; }
+                }
+                return "Reverted: " + (printable
+                        ? new String(d, java.nio.charset.StandardCharsets.US_ASCII)
+                        : Bytes.wrap(d).toHexString());
+            }
+        }
+        return unwrap(e);
     }
 
     /** Render a storage value as a 32-byte big-endian word (drops BigInteger's
