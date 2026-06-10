@@ -740,9 +740,17 @@ public final class NodeService extends Service {
      *  it bridges transient rebuild gaps (head just advanced, peers' flat state not
      *  yet caught up) instead of proxying. The warmer keeps it fresh (~5-15s). */
     private static final long RPC_HEAD_MAX_STALE_MS = 30_000;
-    /** When there's no usable head at all (cold start / long outage), wait up to
-     *  this long for one to be built before falling back to the proxy. */
+    /** When there's no usable head at all (cold start / long outage) and no build is
+     *  in flight, wait only this long before giving up — a node with no snap peer can't
+     *  build a head, so blocking the caller longer just delays the inevitable error. */
     private static final long RPC_HEAD_WAIT_MS = 5_000;
+    /** When an anchored-head build IS already in flight (warmer or a prior read), ride
+     *  it up to this longer cap instead of erroring at {@link #RPC_HEAD_WAIT_MS}. A cold
+     *  anchored build on a phone (fetch+verify ~30 headers from beacon-finalized to head,
+     *  then the first snap account fetch) routinely takes 10-30s; giving up at 5s makes a
+     *  wallet's first read error even though the verified result is seconds away. Kept
+     *  under typical wallet RPC timeouts so the call returns verified-but-slow, not failed. */
+    private static final long RPC_HEAD_BUILD_WAIT_MS = 25_000;
     /** How far a number-pinned read's block may sit from the verified head and still be
      *  served from the head's state. Wallets pin reads to the just-fetched latest block,
      *  which can be a few blocks off our anchored (snap-servable) head; the head state is
@@ -829,13 +837,18 @@ public final class NodeService extends Service {
                 && android.os.SystemClock.elapsedRealtime() - good.builtAtMs() < RPC_HEAD_MAX_STALE_MS) {
             return good.head();
         }
-        // No usable head (cold start / sustained outage): wait briefly for a build
-        // before giving up — most gaps are short (a peer (re)connecting). The wait
-        // is strictly bounded: each build attempt is capped at the remaining time.
-        long deadline = android.os.SystemClock.elapsedRealtime() + RPC_HEAD_WAIT_MS;
+        // No usable head (cold start / sustained outage): wait for a build before
+        // giving up. The deadline is adaptive — recomputed each iteration: while an
+        // anchored-head build is actually in flight (warmer or a prior read), ride it
+        // up to RPC_HEAD_BUILD_WAIT_MS so a read arriving mid-build returns verified-
+        // but-slow; with no build possible (no snap peer) it falls back at the short
+        // RPC_HEAD_WAIT_MS. Each build attempt is capped at the remaining time.
+        long start = android.os.SystemClock.elapsedRealtime();
         Exception last = null;
-        do {
-            long remainingMs = deadline - android.os.SystemClock.elapsedRealtime();
+        while (true) {
+            long now = android.os.SystemClock.elapsedRealtime();
+            long deadline = start + (headBuildInFlight() ? RPC_HEAD_BUILD_WAIT_MS : RPC_HEAD_WAIT_MS);
+            long remainingMs = deadline - now;
             if (remainingMs <= 0) break;
             try {
                 return verifiedHeadCallContext(remainingMs, TimeUnit.MILLISECONDS);
@@ -850,10 +863,19 @@ public final class NodeService extends Service {
                     break;
                 }
             }
-        } while (android.os.SystemClock.elapsedRealtime() < deadline);
-        LogBuffer.i(TAG, "[rpc] no verified head after " + RPC_HEAD_WAIT_MS + "ms -> proxy: "
+        }
+        LogBuffer.i(TAG, "[rpc] no verified head after "
+                + (android.os.SystemClock.elapsedRealtime() - start) + "ms -> proxy: "
                 + (last != null ? unwrap(last) : "timeout"));
         return null;
+    }
+
+    /** True while an anchored-head build is in flight (warmer or a prior read), so a
+     *  waiting read can ride it instead of erroring early. */
+    private boolean headBuildInFlight() {
+        CompletableFuture<EnsCall> f;
+        synchronized (rpcCallCtxLock) { f = rpcCallCtx; }
+        return f != null && !f.isDone();
     }
 
     /** eth_call over the shared anchored head. Returns raw ABI bytes, or null to proxy. */
@@ -1700,6 +1722,21 @@ public final class NodeService extends Service {
             // get-account gets by retrying across peers. The first peer that passes
             // both is pinned for the whole resolution (one consistent root).
             final long minHead = conn.getNetwork().minSensibleHeadBlock();
+            // Live staleness floor: a peer whose head is BEHIND the beacon-finalized
+            // exec block can never anchor (anchorHeadToBeacon verifies the chain
+            // finalized→head, and finality has already passed it) — yet such a peer
+            // happily snap-serves its frozen root and can win the probe race below,
+            // forcing every build into the finalized fallback while fresh-headed
+            // peers sit connected. Observed on-device: two peers frozen at the same
+            // head for 5+ min starved number-pinned reads.
+            long finalizedFloor = -1;
+            com.jaeckel.ethp2p.consensus.BeaconLightClient blcFloor = beaconLightClient;
+            if (blcFloor != null) {
+                com.jaeckel.ethp2p.consensus.types.LightClientHeader finHdr =
+                        blcFloor.getStore().getFinalizedHeader();
+                if (finHdr != null) finalizedFloor = finHdr.execution().blockNumber();
+            }
+            final long headFloor = Math.max(minHead, finalizedFloor);
             // Probe every ready snap peer CONCURRENTLY — fetch its fresh head, then
             // probe that it snap-serves that head root — and award the FIRST to
             // qualify. The old serial walk paid each unresponsive peer's timeout in
@@ -1712,9 +1749,10 @@ public final class NodeService extends Service {
                         peer.requestFreshHeadHeaderAsync();
                 if (headFut == null) continue;
                 probes.add(headFut.thenCompose(fresh -> {
-                    if (fresh.number < minHead) {
+                    if (fresh.number < headFloor) {
                         throw new java.util.concurrent.CompletionException(
-                                new IllegalStateException("stale head #" + fresh.number));
+                                new IllegalStateException("stale head #" + fresh.number
+                                        + " (< floor #" + headFloor + ")"));
                     }
                     // servesRoot, but async: the peer must return a non-empty proof
                     // for the probe account at its head root.

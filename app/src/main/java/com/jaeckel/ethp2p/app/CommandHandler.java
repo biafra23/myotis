@@ -1190,6 +1190,17 @@ public class CommandHandler {
         // before pinning it. The first peer that passes both is pinned for the
         // whole resolution (all reads anchor to one consistent root).
         long minSensibleHead = connector.getNetwork().minSensibleHeadBlock();
+        // Live staleness floor: a peer whose head is behind the beacon-finalized exec
+        // block can never anchor to the beacon chain (finality already passed it), yet
+        // it still snap-serves its frozen root and would be pinned here — forcing the
+        // finalized fallback while fresh-headed peers sit connected.
+        if (beaconLightClient != null) {
+            com.jaeckel.ethp2p.consensus.types.LightClientHeader finHdr =
+                    beaconLightClient.getStore().getFinalizedHeader();
+            if (finHdr != null) {
+                minSensibleHead = Math.max(minSensibleHead, finHdr.execution().blockNumber());
+            }
+        }
         String lastError = null;
         for (com.jaeckel.ethp2p.networking.eth.EthHandler peer : snapPeers) {
             if (!peer.isReady() || peer.isSnapServingFailed()) {
@@ -1199,7 +1210,8 @@ public class CommandHandler {
                 BlockHeader head = peer.requestFreshHeadHeaderAsync().get(6, TimeUnit.SECONDS);
                 if (head.number < minSensibleHead) {
                     lastError = "peer " + peer.getRemoteAddress()
-                        + " returned stale head #" + head.number;
+                        + " returned stale head #" + head.number
+                        + " (< floor #" + minSensibleHead + ")";
                     continue;
                 }
                 if (!servesRoot(peer, head.stateRoot)) {
