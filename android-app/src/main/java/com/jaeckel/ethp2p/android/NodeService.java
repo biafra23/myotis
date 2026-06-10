@@ -2050,6 +2050,14 @@ public final class NodeService extends Service {
             // instead of fanning out across discovery peers that don't serve LC.
             localBlc.setProvenCatchUpServers(clCacheRef.servedPeriods());
             localBlc.setOnCatchUpServed(clCacheRef::recordServed);
+            // Seed light_client-capability verdicts from last session and persist new ones,
+            // so a restart dials confirmed light-client servers first and deprioritizes peers
+            // proven not to serve LC — instead of re-Identifying the whole fork-matched cache
+            // (most of which are full nodes without the light-client server). Cuts the
+            // SYNCING->SYNCED churn after a warm restart.
+            localBlc.setProvenLightClient(clCacheRef.lightClientConfirmed());
+            localBlc.setProvenNonLightClient(clCacheRef.lightClientDenied());
+            localBlc.setOnLightClientVerdict(clCacheRef::markLightClientBatch);
             // Persist/resume verified sync-committee state across restarts (day-to-day
             // fast path): next launch resumes from here and only catches up the delta
             // instead of re-bootstrapping from the embedded checkpoint. In getCacheDir()

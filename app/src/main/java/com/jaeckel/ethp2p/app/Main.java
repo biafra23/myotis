@@ -501,6 +501,12 @@ public final class Main {
         // that actually retain the checkpoint period instead of discovery noise.
         beaconLightClient.setProvenCatchUpServers(clPeerCache.servedPeriods());
         beaconLightClient.setOnCatchUpServed(clPeerCache::recordServed);
+        // Seed light_client-capability verdicts from last session and persist new ones, so a
+        // restart dials confirmed light-client servers first and deprioritizes peers proven
+        // not to serve LC — instead of re-Identifying the whole fork-matched cache.
+        beaconLightClient.setProvenLightClient(clPeerCache.lightClientConfirmed());
+        beaconLightClient.setProvenNonLightClient(clPeerCache.lightClientDenied());
+        beaconLightClient.setOnLightClientVerdict(clPeerCache::markLightClientBatch);
         // Persist/resume verified sync-committee state so restarts resume from the
         // last verified period and only catch up the delta (architecture-doc §
         // "recent sync committee data persisted locally"). purge-cache removes it.
