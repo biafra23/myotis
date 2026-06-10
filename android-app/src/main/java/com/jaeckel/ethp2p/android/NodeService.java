@@ -815,11 +815,25 @@ public final class NodeService extends Service {
         EnsCall ctx = anchoredHeadOrWait();
         if (ctx == null) return null;
         if (requestedNum >= 0) {
-            long delta = Math.abs(requestedNum - ctx.blockNumber());
-            if (delta > RPC_BLOCK_NUM_TOLERANCE) {
-                LogBuffer.i(TAG, "[rpc] requested block " + requestedNum + " is " + delta
-                        + " from verified head " + ctx.blockNumber()
-                        + " (> " + RPC_BLOCK_NUM_TOLERANCE + ") -> not served");
+            // A pinned number means "the latest block I saw" — wallets fetch
+            // eth_blockNumber (our beacon OPTIMISTIC head) and pin the very next reads
+            // to it. The serving context can legitimately sit behind that number: the
+            // finalized fallback is ~2 epochs older, a snap peer's head a few blocks.
+            // So accept anything between the context and the optimistic head (+slack):
+            // those reads get the same verified state a "latest" call would get from
+            // this context — rejecting them just because the context lags the chain
+            // turned every number-pinned call into an instant error whenever snap fell
+            // back to finalized (MetaMask: empty asset list, stuck confirm screen).
+            // Numbers BELOW the context keep the strict tolerance: the caller asked
+            // for genuinely older state, which this context cannot represent.
+            BeaconSyncState bss = beaconSyncState;
+            long optimistic = bss != null ? bss.getOptimisticBlockNumber() : 0;
+            long upperBound = Math.max(ctx.blockNumber(), optimistic) + RPC_BLOCK_NUM_TOLERANCE;
+            long lowerBound = ctx.blockNumber() - RPC_BLOCK_NUM_TOLERANCE;
+            if (requestedNum < lowerBound || requestedNum > upperBound) {
+                LogBuffer.i(TAG, "[rpc] requested block " + requestedNum + " outside servable ["
+                        + lowerBound + ".." + upperBound + "] (ctx=" + ctx.blockNumber()
+                        + ", optimistic=" + optimistic + ") -> not served");
                 return null;
             }
         }
@@ -881,15 +895,33 @@ public final class NodeService extends Service {
 
     /** eth_call over the shared anchored head. Returns raw ABI bytes, or null to proxy. */
     private byte[] rpcCall(byte[] to, byte[] data, String block) {
+        // Identify the call up front: target + 4-byte selector + calldata size + block
+        // tag. eth_call failures were undiagnosable as "eth_call -> proxy: Timeout" —
+        // with hundreds of MetaMask poll variants we need to know WHICH contract/method
+        // is being asked for (e.g. its confirm-screen simulation multicall).
+        String desc = (to != null && to.length == 20 ? Bytes.wrap(to).toHexString() : "?")
+                + " sel=" + (data != null && data.length >= 4
+                        ? Bytes.wrap(data, 0, 4).toHexString() : "0x")
+                + " dataLen=" + (data == null ? 0 : data.length)
+                + " block=" + block;
         EnsCall h = verifiedHeadFor(block);
-        if (h == null || to == null || to.length != 20) return null;
+        if (h == null || to == null || to.length != 20) {
+            LogBuffer.i(TAG, "[rpc] eth_call " + desc + " -> no verified head for block tag");
+            return null;
+        }
+        long t0 = android.os.SystemClock.elapsedRealtime();
         try {
-            return h.offchainExecutor()
+            byte[] out = h.offchainExecutor()
                     .callView(io.myotis.evm.Address.of(to), data == null ? new byte[0] : data,
                             h.blockCtx())
                     .get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
+            LogBuffer.i(TAG, "[rpc] eth_call " + desc + " ok in "
+                    + (android.os.SystemClock.elapsedRealtime() - t0) + "ms");
+            return out;
         } catch (Exception e) {
-            LogBuffer.i(TAG, "[rpc] eth_call -> proxy: " + unwrap(e));
+            LogBuffer.i(TAG, "[rpc] eth_call " + desc + " -> error after "
+                    + (android.os.SystemClock.elapsedRealtime() - t0) + "ms: "
+                    + describeEvmError(e));
             return null;
         }
     }

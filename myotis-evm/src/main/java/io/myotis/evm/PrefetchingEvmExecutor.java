@@ -129,8 +129,22 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
         Set<AccessTracker.SlotKey> seenSlots = new HashSet<>();
         Set<Address> seenAccounts = new HashSet<>();
 
+        // Sentinel mode stays ON while each iteration still DISCOVERS new accesses,
+        // so multi-hop access patterns get one parallel prefetch wave per hop instead
+        // of falling into serial blocking reads. The motivating case is MetaMask's
+        // SingleCallBalances sweep — balances(users[], tokens[]) over ~1000 tokens:
+        // iteration 0 (sentinel) discovers the 1000 token ACCOUNTS (their code isn't
+        // loaded yet, so no balanceOf executes); with iteration 1 forced real, the
+        // 1000 balance SLOTS were then fetched one blocking read at a time (~minutes,
+        // i.e. a guaranteed 30s RPC timeout — the wallet showed no balances at all).
+        // Sentinel iteration 1 instead RECORDS all 1000 slots and batch-fetches them
+        // in one wave; the real run then executes against a fully-warm cache.
+        // The last two iterations are always real, preserving the old convergence
+        // budget for paths the sentinel zeros diverged away from; results returned to
+        // the caller still come only from a real, fully-converged run.
+        boolean discovering = true;
         for (int iter = 0; iter < iterationCap; iter++) {
-            boolean sentinelMode = iter == 0;
+            boolean sentinelMode = discovering && iter < iterationCap - 2;
             view.setSentinelOnMiss(sentinelMode);
 
             // Per-iteration tracker, wired into both the tracer (records SLOAD
@@ -144,6 +158,7 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
             view.setAccessTracker(iterationTracker);
             PrefetchingTracer tracer = new PrefetchingTracer(iterationTracker);
 
+            long missesBefore = view.sentinelMissCount();
             byte[] result;
             try {
                 result = delegate.runOnTracedView(target, calldata, blockContext, view, tracer);
@@ -152,22 +167,43 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
                     // Real iteration produced an actual revert / halt — propagate.
                     throw e;
                 }
-                // Sentinel iteration 0 may revert because zero-valued state
+                // A sentinel iteration may revert because zero-valued state
                 // tripped a require()/divide-by-zero/etc. That's expected;
                 // we still have whatever access list was recorded up to the
                 // point of the revert. Continue to the prefetch wave.
-                log.debug("[prefetch] sentinel iteration 0 halted ({}); continuing with recorded access list",
-                        e.error());
+                log.debug("[prefetch] sentinel iteration {} halted ({}); continuing with recorded access list",
+                        iter, e.error());
                 result = null;
             }
 
             AccessTracker.Snapshot snap = iterationTracker.snapshot();
 
             if (sentinelMode) {
-                // Iteration 0's result is bogus by construction. Discard.
-                seenAccounts.addAll(snap.accounts());
-                seenSlots.addAll(snap.storage());
-                prefetchInParallel(view, blockContext.stateRoot(), snap.accounts(), snap.storage());
+                Set<AccessTracker.SlotKey> sentinelNewSlots = new HashSet<>(snap.storage());
+                sentinelNewSlots.removeAll(seenSlots);
+                Set<Address> sentinelNewAccounts = new HashSet<>(snap.accounts());
+                sentinelNewAccounts.removeAll(seenAccounts);
+                if (sentinelNewAccounts.isEmpty() && sentinelNewSlots.isEmpty()) {
+                    if (result != null && view.sentinelMissCount() == missesBefore) {
+                        // No new accesses AND no sentinel value was handed out: every
+                        // read hit the (verified) cache, so this run is byte-identical
+                        // to a real run — converged, no extra iteration needed.
+                        convergenceTracker.record(iter + 1);
+                        log.debug("[prefetch] converged after {} iteration(s) (hit-only sentinel run)",
+                                iter + 1);
+                        return result;
+                    }
+                    // Nothing new to prefetch, but a sentinel placeholder leaked into
+                    // (or reverted) this run — e.g. a prior wave's fetch failed. Run
+                    // real next so misses block-fetch serially and the result is true.
+                    discovering = false;
+                    continue;
+                }
+                // A sentinel iteration's result may be bogus by construction. Discard;
+                // batch-prefetch what it newly discovered and go discover the next hop.
+                seenAccounts.addAll(sentinelNewAccounts);
+                seenSlots.addAll(sentinelNewSlots);
+                prefetchInParallel(view, blockContext.stateRoot(), sentinelNewAccounts, sentinelNewSlots);
                 continue;
             }
 
@@ -218,15 +254,22 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
      * {@link SyncStateView#putStorage}, so the next iteration's reads hit the
      * cache and don't issue any oracle calls.
      */
+    /** Max prefetch requests in flight at once. A wallet balance sweep can record
+     *  ~1000 misses in one wave; firing them all concurrently floods the single
+     *  pinned snap peer (request-queue overflow / disconnects). Chunking keeps the
+     *  peer responsive while still collapsing a wave to ~(N/chunk) round trips. */
+    private static final int PREFETCH_CHUNK = 128;
+
     private void prefetchInParallel(SyncStateView view, byte[] stateRoot,
                                     Set<Address> accounts,
                                     Set<AccessTracker.SlotKey> slots) {
         SnapStateOracle oracle = delegate.oracle();
-        List<CompletableFuture<?>> futures = new ArrayList<>(accounts.size() + slots.size());
+        List<java.util.function.Supplier<CompletableFuture<?>>> work =
+                new ArrayList<>(accounts.size() + slots.size());
 
         for (Address address : accounts) {
             if (view.hasAccount(address)) continue;
-            futures.add(oracle.fetchAccount(stateRoot, address)
+            work.add(() -> oracle.fetchAccount(stateRoot, address)
                     .thenAccept(state -> view.putAccount(address, state))
                     .exceptionally(t -> {
                         log.debug("[prefetch] account fetch for {} failed: {}", address, t.getMessage());
@@ -235,7 +278,7 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
         }
         for (AccessTracker.SlotKey key : slots) {
             if (view.hasStorage(key.address(), UInt256.valueOf(key.slot()))) continue;
-            futures.add(oracle.fetchStorage(stateRoot, key.address(), key.slot())
+            work.add(() -> oracle.fetchStorage(stateRoot, key.address(), key.slot())
                     .thenAccept(value -> view.putStorage(
                             key.address(),
                             UInt256.valueOf(key.slot()),
@@ -247,17 +290,23 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
                     }));
         }
 
-        // Best-effort: wait for the batch to finish, but don't propagate
-        // individual failures here — if a prefetch failed, the next EVM run
-        // will hit the (still-uncached) miss and either succeed via the
-        // oracle's serial path or surface a clean error from there.
-        try {
-            CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new))
-                    .get(30, java.util.concurrent.TimeUnit.SECONDS);
-        } catch (Exception e) {
-            log.debug("[prefetch] batch fetch timed out / failed: {}", e.getMessage());
-            for (CompletableFuture<?> f : futures) {
-                if (!f.isDone()) f.cancel(false);
+        // Best-effort, chunked: wait for each chunk before firing the next, but don't
+        // propagate individual failures — if a prefetch failed, the next EVM run will
+        // hit the (still-uncached) miss and either succeed via the oracle's serial
+        // path or surface a clean error from there.
+        for (int from = 0; from < work.size(); from += PREFETCH_CHUNK) {
+            List<CompletableFuture<?>> chunk = new ArrayList<>(PREFETCH_CHUNK);
+            for (int i = from; i < Math.min(from + PREFETCH_CHUNK, work.size()); i++) {
+                chunk.add(work.get(i).get());
+            }
+            try {
+                CompletableFuture.allOf(chunk.toArray(CompletableFuture[]::new))
+                        .get(30, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (Exception e) {
+                log.debug("[prefetch] chunk fetch timed out / failed: {}", e.getMessage());
+                for (CompletableFuture<?> f : chunk) {
+                    if (!f.isDone()) f.cancel(false);
+                }
             }
         }
     }
