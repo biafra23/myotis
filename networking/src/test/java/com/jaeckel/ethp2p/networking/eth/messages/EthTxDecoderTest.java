@@ -97,6 +97,50 @@ class EthTxDecoderTest {
         assertArrayEquals(EXPECTED_FROM.toArray(), t.from().toArray());
     }
 
+    /** 0x04 || rlp([chainId, nonce, maxPriority, maxFee, gas, to, value, data, accessList,
+     *               authorizationList, yParity, r, s]) — EIP-7702. */
+    @Test
+    void recoversSenderFrom7702() {
+        // One authorization tuple [chainId, address, nonce, yParity, r, s].
+        java.util.function.Consumer<org.apache.tuweni.rlp.RLPWriter> writeAuthList = w ->
+                w.writeList(al -> al.writeList(tuple -> {
+                    tuple.writeLong(1);
+                    tuple.writeValue(TO);
+                    tuple.writeLong(0);
+                    tuple.writeInt(0);
+                    tuple.writeBigInteger(BigInteger.ONE);
+                    tuple.writeBigInteger(BigInteger.ONE);
+                }));
+        Bytes signing = Bytes.concatenate(Bytes.of(4), RLP.encodeList(w -> {
+            w.writeLong(1); w.writeLong(9);
+            w.writeBigInteger(BigInteger.valueOf(2_000_000_000L));
+            w.writeBigInteger(BigInteger.valueOf(40_000_000_000L));
+            w.writeLong(50000); w.writeValue(TO);
+            w.writeBigInteger(BigInteger.ZERO); w.writeValue(Bytes.fromHexString("0x1234"));
+            w.writeList(al -> {});             // accessList
+            writeAuthList.accept(w);           // authorizationList
+        }));
+        SECP256K1.Signature sig = SECP256K1.signHashed(Hash.keccak256(signing), KP);
+
+        Bytes raw = Bytes.concatenate(Bytes.of(4), RLP.encodeList(w -> {
+            w.writeLong(1); w.writeLong(9);
+            w.writeBigInteger(BigInteger.valueOf(2_000_000_000L));
+            w.writeBigInteger(BigInteger.valueOf(40_000_000_000L));
+            w.writeLong(50000); w.writeValue(TO);
+            w.writeBigInteger(BigInteger.ZERO); w.writeValue(Bytes.fromHexString("0x1234"));
+            w.writeList(al -> {});
+            writeAuthList.accept(w);
+            w.writeInt(sig.v()); w.writeBigInteger(sig.r()); w.writeBigInteger(sig.s());
+        }));
+
+        EthTxDecoder.DecodedTx t = EthTxDecoder.decode(raw);
+        assertNotNull(t);
+        assertEquals(4, t.type());
+        assertEquals(BigInteger.valueOf(40_000_000_000L), t.maxFeePerGas());
+        assertArrayEquals(Bytes.fromHexString("0x1234").toArray(), t.input().toArray());
+        assertArrayEquals(EXPECTED_FROM.toArray(), t.from().toArray());
+    }
+
     @Test
     void unknownTypeReturnsNull() {
         assertNull(EthTxDecoder.decode(Bytes.fromHexString("0x7fabcdef")));

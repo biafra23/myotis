@@ -1079,12 +1079,15 @@ public final class NodeService extends Service {
         }
     }
 
-    /** Build the eth_getTransactionByHash JSON. blockHash null + blockNum/index < 0 = pending. */
+    /** Build the eth_getTransactionByHash JSON. blockHash null + blockNum/index < 0 = pending.
+     *  Returns Java null (NOT the literal "null") when the tx can't be decoded: the tx WAS
+     *  found/held, so this is "can't render it verified" → the caller errors, never a
+     *  misleading "tx not found". */
     private static String buildTxJson(byte[] rawTx, Bytes32 txHash,
                                       Bytes32 blockHash, long blockNum, int index) {
         com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.DecodedTx t =
                 com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.decode(Bytes.wrap(rawTx));
-        if (t == null) return "null"; // unknown tx type — can't render
+        if (t == null) return null; // unrenderable tx type — can't-serve, not unknown-tx
         StringBuilder sb = new StringBuilder(512);
         sb.append("{\"hash\":\"").append(txHash.toHexString()).append("\"");
         if (blockHash != null) {
@@ -1111,9 +1114,15 @@ public final class NodeService extends Service {
               .append(t.maxPriorityFeePerGas().toString(16)).append("\"");
         }
         sb.append(",\"input\":\"").append(t.input().isEmpty() ? "0x" : t.input().toHexString()).append("\"");
+        // v is a QUANTITY (recovery id / EIP-155 v); typed txs also carry yParity (0/1).
         sb.append(",\"v\":\"0x").append(t.v().toString(16)).append("\"");
-        sb.append(",\"r\":\"0x").append(t.r().toString(16)).append("\"");
-        sb.append(",\"s\":\"0x").append(t.s().toString(16)).append("\"");
+        if (t.type() >= 1) {
+            sb.append(",\"yParity\":\"0x").append(t.v().toString(16)).append("\"");
+        }
+        // r and s are 32-byte DATA — left-pad, never QUANTITY (odd-length / unpadded
+        // breaks clients expecting exactly 32 bytes).
+        sb.append(",\"r\":\"").append(Bytes.wrap(word32(t.r())).toHexString()).append("\"");
+        sb.append(",\"s\":\"").append(Bytes.wrap(word32(t.s())).toHexString()).append("\"");
         sb.append("}");
         return sb.toString();
     }

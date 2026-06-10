@@ -16,15 +16,15 @@ import java.math.BigInteger;
  * no verification of its own (the sender recovery is just ECDSA over the signing hash —
  * a malformed signature yields a null {@code from}, not a trust hole).
  *
- * <p>Supports legacy (incl. EIP-155), EIP-2930 (type 1), EIP-1559 (type 2), and
- * EIP-4844 (type 3). Unknown types decode to null.
+ * <p>Supports legacy (incl. EIP-155), EIP-2930 (type 1), EIP-1559 (type 2),
+ * EIP-4844 (type 3), and EIP-7702 (type 4). Unknown types decode to null.
  */
 public final class EthTxDecoder {
 
     private EthTxDecoder() {}
 
     public record DecodedTx(
-            int type,                       // 0 legacy, 1 2930, 2 1559, 3 4844
+            int type,                       // 0 legacy, 1 2930, 2 1559, 3 4844, 4 7702
             Long chainId,                   // null for pre-155 legacy
             long nonce,
             BigInteger gasPrice,            // legacy / 2930; null for 1559+
@@ -48,6 +48,7 @@ public final class EthTxDecoder {
                 case 1 -> decode2930(raw);
                 case 2 -> decode1559(raw);
                 case 3 -> decode4844(raw);
+                case 4 -> decode7702(raw);
                 default -> null;
             };
         } catch (Exception e) {
@@ -175,6 +176,37 @@ public final class EthTxDecoder {
             }));
             Bytes from = recover(Hash.keccak256(signing), sigR, sigS, yParity.intValueExact());
             return new DecodedTx(3, chainId, nonce, null, maxPriority, maxFee, gas, to, value,
+                    input, yParity, sigR, sigS, from);
+        });
+    }
+
+    // 0x04 || rlp([chainId, nonce, maxPriority, maxFee, gas, to, value, data, accessList,
+    //              authorizationList, yParity, r, s]) — EIP-7702. Same fee model as 1559,
+    //              with an authorizationList (signed delegation tuples) before the sig.
+    private static DecodedTx decode7702(Bytes raw) {
+        Bytes body = raw.slice(1);
+        return RLP.decodeList(body, r -> {
+            long chainId = toLong(r.readValue());
+            long nonce = toLong(r.readValue());
+            BigInteger maxPriority = toBig(r.readValue());
+            BigInteger maxFee = toBig(r.readValue());
+            long gas = toLong(r.readValue());
+            Bytes to = r.readValue();
+            BigInteger value = toBig(r.readValue());
+            Bytes input = r.readValue();
+            Bytes accessList = rawList(r);
+            Bytes authList = rawList(r);
+            BigInteger yParity = toBig(r.readValue());
+            BigInteger sigR = toBig(r.readValue());
+            BigInteger sigS = toBig(r.readValue());
+            Bytes signing = Bytes.concatenate(Bytes.of(4), RLP.encodeList(w -> {
+                w.writeLong(chainId); w.writeLong(nonce); w.writeBigInteger(maxPriority);
+                w.writeBigInteger(maxFee); w.writeLong(gas); w.writeValue(to);
+                w.writeBigInteger(value); w.writeValue(input); w.writeRLP(accessList);
+                w.writeRLP(authList);
+            }));
+            Bytes from = recover(Hash.keccak256(signing), sigR, sigS, yParity.intValueExact());
+            return new DecodedTx(4, chainId, nonce, null, maxPriority, maxFee, gas, to, value,
                     input, yParity, sigR, sigS, from);
         });
     }
