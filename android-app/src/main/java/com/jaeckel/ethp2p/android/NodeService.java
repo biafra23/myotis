@@ -959,7 +959,10 @@ public final class NodeService extends Service {
         RLPxConnector conn = connector;
         if (conn == null || txHash == null || txHash.length != 32) return null;
         try {
-            EnsCall ctx = verifiedHeadCallContext();
+            // Use the resilient head path (cached good head fallback), not the fresh-head
+            // builder — the chain tip is often not beacon-anchored yet, which made this
+            // fail with -32000 even with healthy snap peers while state reads worked.
+            EnsCall ctx = anchoredHeadOrWait();
             if (ctx == null || !ctx.beaconVerified()) return null;
             long headNum = ctx.blockNumber();
             byte[] headStateRoot = ctx.blockCtx().stateRoot();
@@ -1115,7 +1118,9 @@ public final class NodeService extends Service {
         RLPxConnector conn = connector;
         if (conn == null || fullTx) return null;
         try {
-            EnsCall ctx = verifiedHeadCallContext();
+            // Resilient head path (cached good head), not the fresh-head builder which
+            // fails when the chain tip isn't beacon-anchored yet — see rpcGetTransactionReceipt.
+            EnsCall ctx = anchoredHeadOrWait();
             if (ctx == null || !ctx.beaconVerified()) return null;
             long headNum = ctx.blockNumber();
             byte[] headStateRoot = ctx.blockCtx().stateRoot();
@@ -1533,7 +1538,14 @@ public final class NodeService extends Service {
         try {
             EnsCall ctx = prepareEnsCall(io.myotis.ens.EnsResolutionRoot.PEER_HEAD);
             if (anchorHeadToBeacon(ctx.blockNumber(), ctx.blockCtx().stateRoot())) {
-                return ctx;
+                // anchorHeadToBeacon ran the full headerChain verify from beacon-finalized
+                // to this head, so it IS cryptographically anchored now — but prepareEnsCall
+                // initialized the PEER_HEAD flag to false. Reflect the verification in the
+                // returned context so beaconVerified() is true (eth_getBlockByNumber /
+                // eth_getTransactionReceipt gate on it; without this they reject the freshly
+                // anchored head and only the finalized fallback ever passed).
+                return new EnsCall(ctx.resolver(), ctx.blockCtx(), ctx.blockNumber(),
+                        true, ctx.offchainExecutor(), ctx.oracle());
             }
             LogBuffer.i(TAG, "[rpc] fresh head not beacon-anchored (block #"
                     + ctx.blockNumber() + "); falling back to finalized");
