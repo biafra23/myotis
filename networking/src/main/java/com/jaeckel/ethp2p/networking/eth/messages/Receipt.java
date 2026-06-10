@@ -33,6 +33,9 @@ public record Receipt(int type,
 
     /** Decode a receipt from its raw consensus bytes (as carried in eth Receipts). */
     public static Receipt decode(Bytes raw) {
+        if (raw == null || raw.isEmpty()) {
+            throw new IllegalArgumentException("receipt bytes are null/empty");
+        }
         int first = raw.get(0) & 0xFF;
         int type;
         Bytes payload;

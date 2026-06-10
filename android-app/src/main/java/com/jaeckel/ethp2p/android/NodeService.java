@@ -110,9 +110,12 @@ public final class NodeService extends Service {
     private static final int MAX_HEADER_CHAIN_GAP = 8192;
     private static final long HEADER_CHAIN_TIMEOUT_SEC = 60;
     // How many recent blocks below the verified head to scan for a tx in
-    // eth_getTransactionReceipt. ~32 blocks ≈ 6 min — enough for a wallet polling a
-    // just-submitted tx; older txs fall through to the proxy (can't be verified here).
-    private static final int RECEIPT_LOOKBACK_BLOCKS = 32;
+    // eth_getTransactionReceipt. Kept small to bound the bandwidth/battery cost of the
+    // (trustless) body scan on mobile: ~8 blocks ≈ 1.5 min covers a wallet polling a
+    // just-submitted tx. A pending/older tx isn't found here and falls through to the
+    // proxy. Bodies within the window are fetched concurrently, so latency ≈ one
+    // round-trip regardless of the count.
+    private static final int RECEIPT_LOOKBACK_BLOCKS = 8;
 
     // Static so MainActivity can reflect the correct button state after a
     // configuration change — the activity instance is recreated, but the
@@ -924,13 +927,24 @@ public final class NodeService extends Service {
             }
 
             Bytes32 want = Bytes32.wrap(txHash);
+            // Fire the body fetches concurrently rather than 32 sequential round-trips:
+            // worst case (tx pending / outside the window) is then ~one round-trip of
+            // latency instead of the sum. The window itself is the bandwidth bound.
+            List<CompletableFuture<List<BlockBodiesMessage.BlockBody>>> bodyFutures =
+                    new ArrayList<>(window.size());
+            for (BlockHeadersMessage.VerifiedHeader vh : window) {
+                bodyFutures.add(conn.requestBlockBodies(vh.hash()));
+            }
             for (int hi = window.size() - 1; hi >= 0; hi--) {
                 BlockHeader h = window.get(hi).header();
                 Bytes32 blockHash = window.get(hi).hash();
-                List<BlockBodiesMessage.BlockBody> bodies = conn
-                        .requestBlockBodies(blockHash)
-                        .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
-                        .get();
+                List<BlockBodiesMessage.BlockBody> bodies;
+                try {
+                    bodies = bodyFutures.get(hi)
+                            .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS).get();
+                } catch (Exception e) {
+                    continue; // body fetch failed for this block — skip it
+                }
                 if (bodies.isEmpty()) continue;
                 List<Bytes> txs = bodies.get(0).transactions();
                 // Verify the body before trusting which txs (and indices) it contains.
@@ -985,10 +999,16 @@ public final class NodeService extends Service {
     private static String buildReceiptJson(List<Bytes> receipts, int idx,
                                            BlockHeader h, Bytes32 blockHash, Bytes32 txHash) {
         Receipt r = Receipt.decode(receipts.get(idx));
-        long prevCum = idx > 0 ? Receipt.decode(receipts.get(idx - 1)).cumulativeGasUsed() : 0L;
-        long gasUsed = r.cumulativeGasUsed() - prevCum;
+        // Single pass over the preceding receipts: gasUsed needs receipt[idx-1]'s
+        // cumulative, logIndex needs the running log count — decode each only once.
+        long prevCum = 0L;
         int logBase = 0;
-        for (int j = 0; j < idx; j++) logBase += Receipt.decode(receipts.get(j)).logs().size();
+        for (int j = 0; j < idx; j++) {
+            Receipt prev = Receipt.decode(receipts.get(j));
+            logBase += prev.logs().size();
+            if (j == idx - 1) prevCum = prev.cumulativeGasUsed();
+        }
+        long gasUsed = r.cumulativeGasUsed() - prevCum;
 
         String txHashHex = txHash.toHexString();
         StringBuilder sb = new StringBuilder(256);
