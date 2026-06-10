@@ -743,6 +743,11 @@ public final class NodeService extends Service {
     /** When there's no usable head at all (cold start / long outage), wait up to
      *  this long for one to be built before falling back to the proxy. */
     private static final long RPC_HEAD_WAIT_MS = 5_000;
+    /** How far a number-pinned read's block may sit from the verified head and still be
+     *  served from the head's state. Wallets pin reads to the just-fetched latest block,
+     *  which can be a few blocks off our anchored (snap-servable) head; the head state is
+     *  the same for the queried account across such a small gap. Larger gaps → not served. */
+    private static final long RPC_BLOCK_NUM_TOLERANCE = 16;
 
     private final Object rpcCallCtxLock = new Object();
     private CompletableFuture<EnsCall> rpcCallCtx;   // in-flight/fresh build (dedup)
@@ -780,7 +785,41 @@ public final class NodeService extends Service {
      * is beacon-anchored, so reads against its {@code oracle} stay fully verified.
      */
     private EnsCall verifiedHeadFor(String block) {
-        if (!isLatestTag(block)) return null;
+        // Resolve the requested block. Latest-ish tags (and safe/finalized, which we
+        // don't track separately) serve the anchored head. A specific block NUMBER is
+        // served from the anchored head iff it's within RPC_BLOCK_NUM_TOLERANCE of it:
+        // we can only serve the head's snap state, but wallets (MetaMask) pin reads to
+        // the just-fetched latest number, which is at/near the head. Without this every
+        // number-pinned eth_getBalance/eth_call was rejected instantly (the empty-list bug).
+        long requestedNum = -1; // -1 = latest-ish
+        if (!isLatestTag(block)) {
+            if (!"safe".equals(block) && !"finalized".equals(block)) {
+                try {
+                    requestedNum = Long.decode(block);
+                } catch (Exception e) {
+                    LogBuffer.i(TAG, "[rpc] unsupported block tag '" + block + "' -> not served");
+                    return null;
+                }
+                if (requestedNum < 0) return null;
+            }
+        }
+        EnsCall ctx = anchoredHeadOrWait();
+        if (ctx == null) return null;
+        if (requestedNum >= 0) {
+            long delta = Math.abs(requestedNum - ctx.blockNumber());
+            if (delta > RPC_BLOCK_NUM_TOLERANCE) {
+                LogBuffer.i(TAG, "[rpc] requested block " + requestedNum + " is " + delta
+                        + " from verified head " + ctx.blockNumber()
+                        + " (> " + RPC_BLOCK_NUM_TOLERANCE + ") -> not served");
+                return null;
+            }
+        }
+        return ctx;
+    }
+
+    /** Resolve the shared beacon-anchored head context, waiting briefly for a fresh
+     *  build if none is available. Returns null if no verified head can be produced. */
+    private EnsCall anchoredHeadOrWait() {
         // Fast path: serve the last good head if it's recent enough. It stays
         // beacon-anchored; a few seconds stale beats proxying, and it bridges the
         // brief windows where a TTL-expiry rebuild can't yet anchor the just-
