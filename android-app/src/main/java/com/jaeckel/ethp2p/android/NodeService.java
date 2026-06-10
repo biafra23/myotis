@@ -124,6 +124,10 @@ public final class NodeService extends Service {
     // that discovery signal without serving unverified data. Flip to false only for
     // local debugging against an injected upstream.
     private static final boolean STRICT_NO_PROXY = true;
+    // Max blocks below the verified head we'll fetch+verify headers for to answer
+    // eth_getBlockByNumber by number. "latest" is 1 header; older numbers cost a header
+    // range, so bound it (MetaMask asks for "latest" for the fee market anyway).
+    private static final int BLOCK_LOOKBACK_MAX = 256;
 
     // Static so MainActivity can reflect the correct button state after a
     // configuration change — the activity instance is recreated, but the
@@ -1057,6 +1061,103 @@ public final class NodeService extends Service {
     /** Ethereum JSON-RPC QUANTITY: minimal hex, no leading zeros, 0 → "0x0". */
     private static String hexQuantity(long v) {
         return "0x" + Long.toHexString(v);
+    }
+
+    /**
+     * eth_getBlockByNumber, verified. Serves the block header fields from a
+     * beacon-anchored verified header plus the tx hashes from a body checked against
+     * transactionsRoot — no snap state needed (so it works even where eth_call can't).
+     * Returns the block JSON when verified; the literal "null" for a non-existent
+     * (future) block (eth's standard); Kotlin null when it can't verify (not synced)
+     * → router errors. fullTransactions=true (full tx objects, needs tx decode + sender
+     * recovery) is a follow-up — returns Kotlin null for now.
+     */
+    private String rpcGetBlockByNumber(String block, boolean fullTx) {
+        RLPxConnector conn = connector;
+        if (conn == null || fullTx) return null;
+        try {
+            EnsCall ctx = verifiedHeadCallContext();
+            if (ctx == null || !ctx.beaconVerified()) return null;
+            long headNum = ctx.blockNumber();
+            byte[] headStateRoot = ctx.blockCtx().stateRoot();
+
+            long target;
+            String b = (block == null) ? "latest" : block;
+            switch (b) {
+                case "latest": case "pending": case "safe": case "finalized":
+                    target = headNum; break;
+                case "earliest":
+                    return null; // genesis not served verified here (rarely needed)
+                default:
+                    try { target = Long.decode(b); } catch (Exception e) { return null; }
+            }
+            if (target > headNum) return "null";            // future/unknown block → eth null
+            long back = headNum - target;
+            if (back >= BLOCK_LOOKBACK_MAX) return null;     // too far to verify cheaply → error
+
+            List<BlockHeadersMessage.VerifiedHeader> window = conn
+                    .requestBlockHeadersBatched(target, (int) (back + 1))
+                    .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+            if (!windowAnchoredToHead(window, headStateRoot)) return null;
+            BlockHeadersMessage.VerifiedHeader vh = window.get(0); // target is first in [target..head]
+
+            List<BlockBodiesMessage.BlockBody> bodies = conn
+                    .requestBlockBodies(vh.hash())
+                    .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+            if (bodies.isEmpty()) return null;
+            List<Bytes> txs = bodies.get(0).transactions();
+            if (!OrderedTrieRoot.verify(txs, vh.header().transactionsRoot)) return null;
+
+            return buildBlockJson(vh, txs);
+        } catch (Exception e) {
+            LogBuffer.i(TAG, "[rpc] eth_getBlockByNumber failed: " + unwrap(e));
+            return null;
+        }
+    }
+
+    /** Build the eth_getBlockByNumber JSON from a VERIFIED header + verified tx list
+     *  (transactions as hashes; fullTransactions=true is handled upstream as a follow-up). */
+    private static String buildBlockJson(BlockHeadersMessage.VerifiedHeader vh, List<Bytes> txs) {
+        BlockHeader h = vh.header();
+        StringBuilder sb = new StringBuilder(1024);
+        sb.append("{\"number\":\"").append(hexQuantity(h.number)).append("\"");
+        sb.append(",\"hash\":\"").append(vh.hash().toHexString()).append("\"");
+        sb.append(",\"parentHash\":\"").append(h.parentHash.toHexString()).append("\"");
+        sb.append(",\"nonce\":\"").append(h.nonce.toHexString()).append("\"");
+        sb.append(",\"sha3Uncles\":\"").append(h.ommersHash.toHexString()).append("\"");
+        sb.append(",\"logsBloom\":\"").append(h.logsBloom.toHexString()).append("\"");
+        sb.append(",\"transactionsRoot\":\"").append(h.transactionsRoot.toHexString()).append("\"");
+        sb.append(",\"stateRoot\":\"").append(h.stateRoot.toHexString()).append("\"");
+        sb.append(",\"receiptsRoot\":\"").append(h.receiptsRoot.toHexString()).append("\"");
+        sb.append(",\"miner\":\"").append(h.beneficiary.toHexString()).append("\"");
+        sb.append(",\"difficulty\":\"0x").append(h.difficulty.toString(16)).append("\"");
+        sb.append(",\"extraData\":\"").append(h.extraData.toHexString()).append("\"");
+        sb.append(",\"gasLimit\":\"").append(hexQuantity(h.gasLimit)).append("\"");
+        sb.append(",\"gasUsed\":\"").append(hexQuantity(h.gasUsed)).append("\"");
+        sb.append(",\"timestamp\":\"").append(hexQuantity(h.timestamp)).append("\"");
+        sb.append(",\"mixHash\":\"").append(h.mixHashOrPrevRandao.toHexString()).append("\"");
+        if (h.baseFeePerGas != null) {
+            sb.append(",\"baseFeePerGas\":\"0x").append(h.baseFeePerGas.toString(16)).append("\"");
+        }
+        if (h.withdrawalsRoot != null) {
+            sb.append(",\"withdrawalsRoot\":\"").append(h.withdrawalsRoot.toHexString()).append("\"");
+        }
+        if (h.blobGasUsed >= 0) {
+            sb.append(",\"blobGasUsed\":\"").append(hexQuantity(h.blobGasUsed)).append("\"");
+        }
+        if (h.excessBlobGas >= 0) {
+            sb.append(",\"excessBlobGas\":\"").append(hexQuantity(h.excessBlobGas)).append("\"");
+        }
+        if (h.parentBeaconBlockRoot != null) {
+            sb.append(",\"parentBeaconBlockRoot\":\"").append(h.parentBeaconBlockRoot.toHexString()).append("\"");
+        }
+        sb.append(",\"transactions\":[");
+        for (int i = 0; i < txs.size(); i++) {
+            if (i > 0) sb.append(",");
+            sb.append("\"").append(Hash.keccak256(txs.get(i)).toHexString()).append("\"");
+        }
+        sb.append("],\"uncles\":[]}");
+        return sb.toString();
     }
 
     /** Render a storage value as a 32-byte big-endian word (drops BigInteger's
@@ -2030,6 +2131,9 @@ public final class NodeService extends Service {
                 }
                 @Override public String getTransactionReceipt(byte[] txHash) {
                     return rpcGetTransactionReceipt(txHash, "latest");
+                }
+                @Override public String getBlockByNumber(String block, boolean fullTx) {
+                    return rpcGetBlockByNumber(block, fullTx);
                 }
             };
             io.myotis.jsonrpc.MyotisRpcServer s =
