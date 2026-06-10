@@ -51,6 +51,11 @@ class RpcRouterTest {
         override fun sendRawTransaction(rawTx: ByteArray): ByteArray? {
             lastRawTx = rawTx; return txHash
         }
+        var lastReceiptTxHash: ByteArray? = null
+        var receiptJson: String? = null
+        override fun getTransactionReceipt(txHash: ByteArray): String? {
+            lastReceiptTxHash = txHash; return receiptJson
+        }
     }
 
     private fun route(backend: MyotisRpcBackend?, body: String, proxy: UpstreamProxy? = null): String =
@@ -189,6 +194,23 @@ class RpcRouterTest {
     @Test fun sendRawTransaction_noPeer_fallsThrough() {          // backend null -> proxy/strict
         assertTrue(hasError(route(FakeBackend(),                  // txHash defaults to null
             """{"jsonrpc":"2.0","id":1,"method":"eth_sendRawTransaction","params":["0x02aabb"]}""")))
+    }
+
+    @Test fun getTransactionReceipt_verified_embedsReceiptObject() {
+        val b = FakeBackend().apply {
+            receiptJson = """{"status":"0x1","blockNumber":"0x10","transactionHash":"0xab","logs":[]}"""
+        }
+        val resp = route(b, """{"jsonrpc":"2.0","id":7,"method":"eth_getTransactionReceipt",
+            "params":["0x${"ab".repeat(32)}"]}""")
+        val obj = json.parseToJsonElement(resp).jsonObject["result"]!!.jsonObject
+        assertEquals("0x1", obj["status"]!!.jsonPrimitive.content)        // verified object passed through
+        assertEquals("0x10", obj["blockNumber"]!!.jsonPrimitive.content)
+        assertEquals("0x" + "ab".repeat(32), b.lastReceiptTxHash!!.toHex()) // hash decoded + passed in
+    }
+
+    @Test fun getTransactionReceipt_notFound_fallsThrough() {     // backend null result -> proxy/strict
+        assertTrue(hasError(route(FakeBackend(),                  // receiptJson defaults to null
+            """{"jsonrpc":"2.0","id":7,"method":"eth_getTransactionReceipt","params":["0x${"ab".repeat(32)}"]}""")))
     }
 
     @Test fun chainId_and_blockNumber_stillVerified() {

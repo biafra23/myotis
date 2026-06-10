@@ -151,6 +151,12 @@ class RpcRouter(
                 val hash = withContext(Dispatchers.IO) { b.sendRawTransaction(raw) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexData(hash)))
             }
+            "eth_getTransactionReceipt" -> {
+                val txHash = (root.params()?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
+                // Backend returns a pre-built, verified receipt JSON object, or null (→ proxy).
+                val receiptJson = withContext(Dispatchers.IO) { b.getTransactionReceipt(txHash) } ?: return null
+                resultEnvelope(id, json.parseToJsonElement(receiptJson))
+            }
             else -> null
         }
     }

@@ -66,4 +66,13 @@ interface MyotisRpcBackend {
      * Myotis never signs — the wallet user does; this only relays the bytes.
      */
     fun sendRawTransaction(rawTx: ByteArray): ByteArray?
+
+    /**
+     * eth_getTransactionReceipt: the receipt for [txHash] as a pre-built JSON object
+     * string, verified against a beacon-anchored header's receiptsRoot, or null when it
+     * can't be answered verified (tx not in the recent verified window / pending / no
+     * peer) so the router falls back to the proxy. Returning a JSON string keeps the
+     * nested receipt+logs shape host-built without a Map→JSON conversion in the router.
+     */
+    fun getTransactionReceipt(txHash: ByteArray): String?
 }

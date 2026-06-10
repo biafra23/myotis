@@ -18,13 +18,17 @@ import com.jaeckel.ethp2p.consensus.BeaconLightClient;
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
 import com.jaeckel.ethp2p.consensus.libp2p.BeaconP2PService;
 import com.jaeckel.ethp2p.consensus.proof.MerklePatriciaVerifier;
+import com.jaeckel.ethp2p.consensus.proof.OrderedTrieRoot;
 import com.jaeckel.ethp2p.core.crypto.NodeKey;
 import com.jaeckel.ethp2p.core.enr.Enr;
+import com.jaeckel.ethp2p.core.types.BlockHeader;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
 import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
 import com.jaeckel.ethp2p.networking.discv5.DiscV5Service;
 import com.jaeckel.ethp2p.networking.dns.DnsEnrResolver;
+import com.jaeckel.ethp2p.networking.eth.messages.BlockBodiesMessage;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
+import com.jaeckel.ethp2p.networking.eth.messages.Receipt;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
 import com.jaeckel.ethp2p.networking.snap.messages.AccountRangeMessage;
 
@@ -105,6 +109,13 @@ public final class NodeService extends Service {
     // but the bound has to cover catch-up after the phone wakes from doze.
     private static final int MAX_HEADER_CHAIN_GAP = 8192;
     private static final long HEADER_CHAIN_TIMEOUT_SEC = 60;
+    // How many recent blocks below the verified head to scan for a tx in
+    // eth_getTransactionReceipt. Kept small to bound the bandwidth/battery cost of the
+    // (trustless) body scan on mobile: ~8 blocks ≈ 1.5 min covers a wallet polling a
+    // just-submitted tx. A pending/older tx isn't found here and falls through to the
+    // proxy. Bodies within the window are fetched concurrently, so latency ≈ one
+    // round-trip regardless of the count.
+    private static final int RECEIPT_LOOKBACK_BLOCKS = 8;
 
     // Static so MainActivity can reflect the correct button state after a
     // configuration change — the activity instance is recreated, but the
@@ -878,6 +889,163 @@ public final class NodeService extends Service {
             LogBuffer.i(TAG, "[rpc] eth_sendRawTransaction failed: " + unwrap(e));
             return null;
         }
+    }
+
+    /**
+     * eth_getTransactionReceipt — trustlessly. Scans a bounded window of recent blocks
+     * below the beacon-anchored verified head: for each, fetches the block body and
+     * verifies it against the header's {@code transactionsRoot} (rebuilding the tx trie)
+     * before trusting that the tx is in that block at a given index; then fetches the
+     * block's receipts and verifies them against the header's {@code receiptsRoot} before
+     * returning the matching receipt as JSON. Returns null (→ proxy / pending) if the tx
+     * isn't found verified in the window. Peer data is never trusted unverified.
+     *
+     * <p>Returns the verified core fields (status, gasUsed, logs, block context, type);
+     * from / to / contractAddress / effectiveGasPrice (which need tx decode + sender
+     * recovery) are a follow-up.
+     */
+    private String rpcGetTransactionReceipt(byte[] txHash, String block) {
+        RLPxConnector conn = connector;
+        if (conn == null || txHash == null || txHash.length != 32) return null;
+        try {
+            EnsCall ctx = verifiedHeadCallContext();
+            if (ctx == null || !ctx.beaconVerified()) return null;
+            long headNum = ctx.blockNumber();
+            byte[] headStateRoot = ctx.blockCtx().stateRoot();
+
+            int count = (int) Math.min(RECEIPT_LOOKBACK_BLOCKS, headNum + 1);
+            long start = headNum - count + 1;
+            List<BlockHeadersMessage.VerifiedHeader> window = conn
+                    .requestBlockHeadersBatched(start, count)
+                    // Future.get(timeout) — NOT CompletableFuture.orTimeout (API 31, minSdk 29).
+                    .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+            // Anchor the window: its last header must BE the verified head (stateRoot
+            // match) and every header must hash-link to the next's parentHash.
+            if (!windowAnchoredToHead(window, headStateRoot)) {
+                LogBuffer.i(TAG, "[rpc] eth_getTransactionReceipt: header window failed to anchor");
+                return null;
+            }
+
+            Bytes32 want = Bytes32.wrap(txHash);
+            // Fire the body fetches concurrently rather than 32 sequential round-trips:
+            // worst case (tx pending / outside the window) is then ~one round-trip of
+            // latency instead of the sum. The window itself is the bandwidth bound.
+            List<CompletableFuture<List<BlockBodiesMessage.BlockBody>>> bodyFutures =
+                    new ArrayList<>(window.size());
+            for (BlockHeadersMessage.VerifiedHeader vh : window) {
+                bodyFutures.add(conn.requestBlockBodies(vh.hash()));
+            }
+            for (int hi = window.size() - 1; hi >= 0; hi--) {
+                BlockHeader h = window.get(hi).header();
+                Bytes32 blockHash = window.get(hi).hash();
+                List<BlockBodiesMessage.BlockBody> bodies;
+                try {
+                    bodies = bodyFutures.get(hi).get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    continue; // body fetch failed/timed out for this block — skip it
+                }
+                if (bodies.isEmpty()) continue;
+                List<Bytes> txs = bodies.get(0).transactions();
+                // Verify the body before trusting which txs (and indices) it contains.
+                if (!OrderedTrieRoot.verify(txs, h.transactionsRoot)) {
+                    LogBuffer.i(TAG, "[rpc] block #" + h.number + " body failed transactionsRoot verify");
+                    continue;
+                }
+                int idx = -1;
+                for (int i = 0; i < txs.size(); i++) {
+                    if (Hash.keccak256(txs.get(i)).equals(want)) { idx = i; break; }
+                }
+                if (idx < 0) continue;
+
+                // Found. Fetch + verify the block's receipts against receiptsRoot.
+                List<List<Bytes>> rcptBlocks = conn
+                        .requestReceipts(blockHash)
+                        .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+                if (rcptBlocks.isEmpty()) return null;
+                List<Bytes> receipts = rcptBlocks.get(0);
+                if (!OrderedTrieRoot.verify(receipts, h.receiptsRoot)) {
+                    LogBuffer.i(TAG, "[rpc] block #" + h.number + " receipts failed receiptsRoot verify");
+                    return null;
+                }
+                if (idx >= receipts.size()) return null;
+                LogBuffer.i(TAG, "[rpc] eth_getTransactionReceipt verified tx in block #"
+                        + h.number + " index " + idx);
+                return buildReceiptJson(receipts, idx, h, blockHash, want);
+            }
+            return null; // not found in window → pending / out-of-range → proxy
+        } catch (Exception e) {
+            LogBuffer.i(TAG, "[rpc] eth_getTransactionReceipt failed: " + unwrap(e));
+            return null;
+        }
+    }
+
+    /** The contiguous header window [start..head] is valid iff its last header is the
+     *  beacon-verified head (stateRoot match) and each header hash-links to the next. */
+    private static boolean windowAnchoredToHead(List<BlockHeadersMessage.VerifiedHeader> window,
+                                                byte[] headStateRoot) {
+        if (window.isEmpty()) return false;
+        BlockHeader last = window.get(window.size() - 1).header();
+        if (!java.util.Arrays.equals(last.stateRoot.toArrayUnsafe(), headStateRoot)) return false;
+        for (int i = 0; i < window.size() - 1; i++) {
+            if (!window.get(i).hash().equals(window.get(i + 1).header().parentHash)) return false;
+        }
+        return true;
+    }
+
+    /** Build the eth_getTransactionReceipt JSON object from VERIFIED receipt bytes.
+     *  {@code txHash} is the body's tx hash (already confirmed == the requested hash). */
+    private static String buildReceiptJson(List<Bytes> receipts, int idx,
+                                           BlockHeader h, Bytes32 blockHash, Bytes32 txHash) {
+        Receipt r = Receipt.decode(receipts.get(idx));
+        // Single pass over the preceding receipts: gasUsed needs receipt[idx-1]'s
+        // cumulative, logIndex needs the running log count — decode each only once.
+        long prevCum = 0L;
+        int logBase = 0;
+        for (int j = 0; j < idx; j++) {
+            Receipt prev = Receipt.decode(receipts.get(j));
+            logBase += prev.logs().size();
+            if (j == idx - 1) prevCum = prev.cumulativeGasUsed();
+        }
+        long gasUsed = r.cumulativeGasUsed() - prevCum;
+
+        String txHashHex = txHash.toHexString();
+        StringBuilder sb = new StringBuilder(256);
+        sb.append("{\"transactionHash\":\"").append(txHashHex).append("\"");
+        sb.append(",\"transactionIndex\":\"").append(hexQuantity(idx)).append("\"");
+        sb.append(",\"blockHash\":\"").append(blockHash.toHexString()).append("\"");
+        sb.append(",\"blockNumber\":\"").append(hexQuantity(h.number)).append("\"");
+        sb.append(",\"cumulativeGasUsed\":\"").append(hexQuantity(r.cumulativeGasUsed())).append("\"");
+        sb.append(",\"gasUsed\":\"").append(hexQuantity(gasUsed)).append("\"");
+        if (r.hasStatus()) {
+            sb.append(",\"status\":\"").append(r.success() ? "0x1" : "0x0").append("\"");
+        }
+        sb.append(",\"type\":\"").append(hexQuantity(r.type())).append("\"");
+        sb.append(",\"logsBloom\":\"").append(r.logsBloom().toHexString()).append("\"");
+        sb.append(",\"logs\":[");
+        for (int k = 0; k < r.logs().size(); k++) {
+            Receipt.Log log = r.logs().get(k);
+            if (k > 0) sb.append(",");
+            sb.append("{\"address\":\"").append(log.address().toHexString()).append("\"");
+            sb.append(",\"topics\":[");
+            for (int t = 0; t < log.topics().size(); t++) {
+                if (t > 0) sb.append(",");
+                sb.append("\"").append(log.topics().get(t).toHexString()).append("\"");
+            }
+            sb.append("],\"data\":\"").append(log.data().toHexString()).append("\"");
+            sb.append(",\"blockNumber\":\"").append(hexQuantity(h.number)).append("\"");
+            sb.append(",\"blockHash\":\"").append(blockHash.toHexString()).append("\"");
+            sb.append(",\"transactionHash\":\"").append(txHashHex).append("\"");
+            sb.append(",\"transactionIndex\":\"").append(hexQuantity(idx)).append("\"");
+            sb.append(",\"logIndex\":\"").append(hexQuantity(logBase + k)).append("\"");
+            sb.append(",\"removed\":false}");
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+
+    /** Ethereum JSON-RPC QUANTITY: minimal hex, no leading zeros, 0 → "0x0". */
+    private static String hexQuantity(long v) {
+        return "0x" + Long.toHexString(v);
     }
 
     /** Render a storage value as a 32-byte big-endian word (drops BigInteger's
@@ -1846,6 +2014,9 @@ public final class NodeService extends Service {
                 }
                 @Override public byte[] sendRawTransaction(byte[] rawTx) {
                     return rpcSendRawTransaction(rawTx);
+                }
+                @Override public String getTransactionReceipt(byte[] txHash) {
+                    return rpcGetTransactionReceipt(txHash, "latest");
                 }
             };
             io.myotis.jsonrpc.MyotisRpcServer s =
