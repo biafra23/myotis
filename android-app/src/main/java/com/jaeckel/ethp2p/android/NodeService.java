@@ -1538,7 +1538,14 @@ public final class NodeService extends Service {
         try {
             EnsCall ctx = prepareEnsCall(io.myotis.ens.EnsResolutionRoot.PEER_HEAD);
             if (anchorHeadToBeacon(ctx.blockNumber(), ctx.blockCtx().stateRoot())) {
-                return ctx;
+                // anchorHeadToBeacon ran the full headerChain verify from beacon-finalized
+                // to this head, so it IS cryptographically anchored now — but prepareEnsCall
+                // initialized the PEER_HEAD flag to false. Reflect the verification in the
+                // returned context so beaconVerified() is true (eth_getBlockByNumber /
+                // eth_getTransactionReceipt gate on it; without this they reject the freshly
+                // anchored head and only the finalized fallback ever passed).
+                return new EnsCall(ctx.resolver(), ctx.blockCtx(), ctx.blockNumber(),
+                        true, ctx.offchainExecutor(), ctx.oracle());
             }
             LogBuffer.i(TAG, "[rpc] fresh head not beacon-anchored (block #"
                     + ctx.blockNumber() + "); falling back to finalized");
