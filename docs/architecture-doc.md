@@ -6,6 +6,8 @@ This document describes how a trustless Ethereum wallet library obtains and veri
 
 The trust model: the only external trust assumption is the sync committee mechanism (≥2/3 of a 512-validator subset is honest). Everything else is verified locally via Merkle proofs, signatures, or accumulator commitments.
 
+> **Implementation status (where the design meets reality):** The verification pipeline below is realized end-to-end and surfaced to wallets as a **verified JSON-RPC endpoint** (Section 10) running **on an Android phone**. An unmodified MetaMask pointed at the node reads balances, simulates calls, estimates gas, suggests fees, and **broadcasts a real transaction**, all from locally verified data — no trusted RPC provider. The parts of this document that are still aspirational (historical accumulators, TrueBlocks completeness proofs, background-sync scheduling) are called out in [Implementation Status](implementation-status.md); the data-acquisition and verification core is built.
+
 ### Data the Wallet Needs
 
 For each user-controlled address, the wallet must provide:
@@ -354,10 +356,41 @@ Identical to the SNAP / state-data trust model:
 - **Reverse ENS lookup**: address → name with mandatory forward-verification round-trip.
 - **Gas estimation** (`DefaultEvmExecutor.estimateGas`): Yellow-Paper-correct intrinsic + Besu-EVM-metered + 15% safety buffer. Acceptance corpus (ETH→EOA / ETH→contract / ERC-20 / ERC-721 / Uniswap V3) cross-checks against `eth_estimateGas` within 5%; an Anvil-fork broadcast test additionally confirms the estimate is sufficient on the wire (`gasUsed <= localEstimate`). No IPC surface yet — the API is ready for `myotis-tx-builder`.
 
+### Current Use Cases (continued)
+
+- **`eth_call`-equivalent view calls**: arbitrary contract reads (ERC-20 metadata, balances, multicall aggregations) are served via `eth_call` (Section 10). A multi-hop speculative-prefetch loop (`PrefetchingEvmExecutor`) batches the SLOAD round-trips so a many-token balance sweep resolves in a couple of network waves instead of one round-trip per slot.
+
 ### Future Use Cases
 
-- **`eth_call`-equivalent view calls**: arbitrary contract reads (ERC-20 metadata, NFT `tokenURI`, multicall aggregations) without an RPC concession.
-- **Pre-flight checks**: run a transaction locally before broadcasting to detect reverts (insufficient balance, stale approvals, slippage) and surface a useful error message rather than a confirmed-but-failed on-chain transaction.
+- **Pre-flight checks as a distinct surface**: `eth_call`/`eth_estimateGas` already run a transaction locally and surface reverts (insufficient balance, stale approvals, slippage) as errors; a dedicated "simulate" affordance that decodes the revert reason for the UI is the next step.
+
+---
+
+## 10. Wallet Integration — Verified JSON-RPC Endpoint
+
+### The Problem
+
+Sections 1–9 produce verified data; a wallet needs a way to *ask for it*. Rather than invent a bespoke API and require a custom wallet, Myotis speaks the language wallets already speak: **Ethereum JSON-RPC**. An unmodified wallet (MetaMask) points at the node as if it were any other RPC endpoint.
+
+### How It Works
+
+A host-agnostic router (`jsonrpc-server`, Kotlin/Ktor) maps the Ethereum JSON-RPC API onto a `MyotisRpcBackend` interface. Each host implements the backend against its own stack: the Android `NodeService` and the desktop daemon both delegate to the same `RLPxConnector` / beacon light client / local EVM described above. Every method is answered **only** from the verified pipeline:
+
+| Method(s) | Verification basis |
+|---|---|
+| `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` | snap/1 Merkle-Patricia proof against a beacon-anchored `stateRoot` (Section 5) |
+| `eth_call`, `eth_estimateGas` | local EVM over proof-served state (Sections 8–9) |
+| `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory` | base fee from verified headers; tips from bodies/receipts verified against `transactionsRoot`/`receiptsRoot` (Section 8) |
+| `eth_getBlockByNumber`, `eth_getTransactionReceipt`, `eth_getTransactionByHash` | header window anchored to the beacon head; bodies/receipts verified against `transactionsRoot`/`receiptsRoot` (Sections 4, 7) |
+| `eth_sendRawTransaction` | devp2p transaction gossip (Section 7) |
+
+### Strict Permissionless Mode
+
+The defining property: **there is no trusted-RPC fallback**. When a request cannot be answered from verified data, the server returns a JSON-RPC error — `-32601` (not served verified at all) or `-32000` (implemented but not answerable right now: not synced, no snap peer, head not yet beacon-anchored) — rather than silently proxying an unverified answer. A wallet thus only ever displays data the node could prove. (A dev-only upstream proxy exists purely to map what a given wallet calls during development and is disabled in strict mode.)
+
+### Running on a Phone
+
+The entire stack — devp2p, libp2p, light client, local EVM, and this JSON-RPC server — runs on-device as an Android foreground service (`android-app`, minSdk 29), addressing the *Resource Constraints* and *Feasibility* sections below in practice: a pure-Java BLS verifier (no JNI), ART-compatible discovery buffers, and persistence of the sync snapshot + known-state-root window + light-client-capable peers for ~10 s warm restarts. MetaMask on the same device, pointed at `localhost:8545`, completes a verified read-simulate-estimate-send flow with no permissioned service in the loop.
 
 ---
 
@@ -391,6 +424,12 @@ Identical to the SNAP / state-data trust model:
 
 7. TRANSACTION SUBMISSION (devp2p eth protocol)
    └─→ Broadcast signed transactions via gossip
+
+8. WALLET API (JSON-RPC over HTTP, strict permissionless)
+   └─→ MetaMask reads balance/nonce/code/storage, eth_call, estimateGas,
+       fees, blocks, receipts, getTransactionByHash, sendRawTransaction
+       └─→ Every method answered only from the verified pipeline above;
+           unservable → JSON-RPC error, never a proxied answer
 ```
 
 ### Network Participation Summary
@@ -405,6 +444,7 @@ Identical to the SNAP / state-data trust model:
 | discv5    | UDP DHT  | Consensus layer peer discovery              |
 | discv4    | UDP DHT  | Execution layer peer discovery              |
 | DNS       | TXT      | Bootstrap peer lists                        |
+| HTTP      | JSON-RPC | Verified wallet API served to MetaMask (strict, no proxy) |
 
 ### Trust Assumptions
 

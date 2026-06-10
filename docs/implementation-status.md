@@ -35,7 +35,7 @@ CL peers are seeded from four sources (in priority order): the persistent `CLPee
 - Supports legacy, EIP-2930, EIP-1559, EIP-4844 tx types
 
 **Not implemented:**
-- Transaction verification against `transactionsRoot` (the `verified` field is always `false`)
+- Transaction verification against `transactionsRoot` **on the TrueBlocks `get-transactions` path** (the `verified` field is always `false` there). Per-tx verification against `transactionsRoot` *does* now exist on the JSON-RPC path (`eth_getTransactionByHash`, Section 10) and for receipts (`eth_getTransactionReceipt`); wiring it into the TrueBlocks history scan is still pending.
 - Dynamic manifest CID discovery (hardcoded, stale)
 - Balance reconciliation for completeness checking
 
@@ -43,13 +43,13 @@ CL peers are seeded from four sources (in priority order): the persistent `CLPee
 **POC: Implemented**
 
 - Full devp2p stack: discv4 discovery, RLPx ECIES handshake, eth/67-69 protocol
-- `GetBlockHeaders` and `GetBlockBodies` implemented
+- `GetBlockHeaders`, `GetBlockBodies`, and `GetReceipts` implemented
+- `GetReceipts` with receipt verification against the header's `receiptsRoot` (rebuild the receipts trie and compare). Handles **eth/69 (EIP-7642) bloomless receipts** — the wire receipt omits `logsBloom`, so it's recomputed from the logs and the canonical encoding rebuilt before the root check, identical verification across eth/66-69. Powers `eth_getTransactionReceipt` and the `eth_feeHistory` reward percentiles.
 - Block header verification against beacon chain (direct state root match or header chain)
-- EIP-1459 DNS-based bootnode discovery (`DnsEnrResolver`, `EnrTreeUrl`) runs on startup and is merged with the hardcoded bootnode list. Mainnet EL tree is `enrtree://…@all.mainnet.ethdisco.net`; CL tree is intentionally empty pending a canonical tree.
+- EIP-1459 DNS-based bootnode discovery (`DnsEnrResolver`, `EnrTreeUrl`) runs on startup and is merged with the hardcoded bootnode list. Mainnet EL tree is `enrtree://…@all.mainnet.ethdisco.net`; CL tree is intentionally empty pending a canonical tree. EL DNS discovery doubles as a discv4-independent dial path on mobile/CGNAT networks where unsolicited inbound UDP is dropped.
 - Peer caching across sessions: the devp2p cache (`PeerCache`) is append-only with deduplication; the CL peer cache (`CLPeerCache`) evicts peers after 3 consecutive failures and resets the counter on success. Cache writes are synchronized so parallel appends and rewrites can't interleave.
 
 **Not implemented:**
-- `GetReceipts` — receipt fetching and verification against `receiptsRoot`
 - EIP-4444 fallback strategies
 
 ## 5. State Data — SNAP Protocol
@@ -93,9 +93,15 @@ Network coverage: mainnet, sepolia, holesky have canonical Registry + Universal 
 - L2 / cross-chain name handling beyond the Universal Resolver path
 
 ## 7. Submitting Signed Transactions — devp2p Transaction Gossip
-**Not implemented**
+**POC: Implemented**
 
-No `Transactions`, `NewPooledTransactionHashes`, or `GetPooledTransactions` message handling. The eth handler only covers handshake + block header/body + snap queries.
+- `eth_sendRawTransaction` broadcasts the user-signed raw bytes to connected `eth` peers via the `Transactions` message (`RLPxConnector.broadcastTransaction`), returns `keccak256(rawTx)`, and caches the bytes so `eth_getTransactionByHash` can report the tx as *pending* before it's mined. Myotis never signs — it only relays.
+- Confirmation tracking: `eth_getTransactionByHash` and `eth_getTransactionReceipt` scan the recent beacon-verified block window; once the tx appears in a block (verified vs `transactionsRoot`) the wallet sees `blockNumber` populate, and the receipt is verified against `receiptsRoot`.
+- Validated end-to-end on a real device: MetaMask builds and signs a transaction, Myotis broadcasts it over devp2p, and the receipt confirms on-chain — no proxy.
+
+**Not implemented:**
+- `NewPooledTransactionHashes` / `GetPooledTransactions` (announce-then-fetch gossip and mempool serving) — outbound broadcast uses the direct `Transactions` message only.
+- EIP-4844 blob-sidecar gossip (out of scope; L2-sequencer territory).
 
 ## 8. Gas Estimation
 **POC: Implemented**
@@ -106,23 +112,44 @@ Acceptance corpus (`MainnetGasEstimationIT`, env-gated): ETH→EOA, ETH→contra
 
 The headline end-to-end acceptance (`AnvilForkedBroadcastIT`) builds a transaction with the locally-estimated gas, broadcasts it to an Anvil fork of mainnet (via `anvil_impersonateAccount`), and asserts the receipt succeeds without OOG and `gasUsed <= localEstimate`. This proves the 15% safety buffer is actually sufficient on the wire — a property the 5%-of-reference cross-check alone can't guarantee.
 
-`baseFeePerGas` is exposed via `get-block`. The plan's wallet integration (switching the tx-builder from fixed limits to `estimateGas`) is deferred to whenever `myotis-tx-builder` lands; the API is ready. The local EVM (Section 9) gives us the simulation path natively — wiring it through to a `gas-estimate` IPC command is straightforward, just not done yet.
+Now exposed over JSON-RPC as **`eth_estimateGas`** (Section 10): a plain value transfer to a code-less account short-circuits to 21000 (no EVM run, exact — no buffer), and anything with calldata or a contract/7702 recipient runs the full metered estimate. Verified on-device against MetaMask's send flow (`0x5208` in ~0.16 s for a plain send).
+
+Fee suggestions are also served verified: **`eth_gasPrice`**, **`eth_maxPriorityFeePerGas`**, and **`eth_feeHistory`** derive base fee from verified headers and priority-fee tips from block bodies (verified vs `transactionsRoot`), with `eth_feeHistory`'s reward percentiles using a gas-used-weighted walk over receipts (verified vs `receiptsRoot`). `baseFeePerGas` remains available via `get-block` and `eth_getBlockByNumber`.
 
 ## 9. Local EVM Execution
 **POC: Implemented**
 
 `myotis-evm` embeds Hyperledger Besu's standalone `org.hyperledger.besu:evm` artifact and runs it against a SNAP-backed `StateOracle`.
 
-- `DefaultEvmExecutor` runs a transaction-shaped call against state served from snap/1; every read verified by Merkle-Patricia proof against a verified `stateRoot`.
-- `PrefetchingEvmExecutor` does a speculative dry-run to record accessed paths, then warm-loads them before the real run — eliminates the round-trip-per-SLOAD latency that would otherwise dominate.
+- `DefaultEvmExecutor` runs a transaction-shaped call against state served from snap/1; every read verified by Merkle-Patricia proof against a verified `stateRoot`. Resolves EIP-7702 delegation designators (`0xef0100‖address`) one hop so calls against delegated EOAs execute the delegate's code.
+- `PrefetchingEvmExecutor` runs a multi-hop speculative discovery loop (sentinel runs that record accesses without blocking), batch-fetches each hop's misses in parallel (semaphore-bounded so a 1000-token balance sweep doesn't flood one peer), then runs for real against a warm cache — eliminates the round-trip-per-SLOAD latency that would otherwise dominate. A result is only returned from a run where every read hit the verified cache.
 - `CcipReadEvmExecutor` handles ERC-3668 off-chain lookups (see Section 6).
 - Bytecode verified via `keccak256(code) == codeHash` against the proof-verified account. Block context (`block.number`, `coinbase`, `prevRandao`, `baseFeePerGas`, `gasLimit`, `chainId`) supplied from a verified header.
-- Currently used for ENS resolution; `:myotis-evm:test` covers the executor stack with deterministic fixtures.
+- Exposed over JSON-RPC as **`eth_call`** (arbitrary view calls — ERC-20 metadata, balances, multicall) and **`eth_estimateGas`** (Section 8); also drives ENS resolution. `:myotis-evm:test` covers the executor stack with deterministic fixtures.
 
 **Not implemented:**
-- `eth_call`-equivalent IPC command for arbitrary view calls (ERC-20 metadata, NFT `tokenURI`, multicall)
-- Gas-estimate IPC command (the executor's `estimateGas` works; Section 8 covers the implementation, just no daemon surface yet)
-- Pre-flight transaction simulation (catch reverts before broadcast)
+- Pre-flight transaction simulation as a distinct surface (catch reverts before broadcast) — `eth_call`/`eth_estimateGas` cover the mechanism; no dedicated "simulate" command.
+- Snap-peer reliability: a cold head-context build (header-chain anchor + first snap fetch on a fresh peer) can take ~15 s; warm calls are ~1 s.
+
+## 10. Wallet Integration — Verified JSON-RPC + Android
+**POC: Implemented (MetaMask end-to-end)**
+
+The `jsonrpc-server` module exposes the verification pipeline as a standard Ethereum JSON-RPC endpoint (Kotlin/Ktor) so an **unmodified wallet** can use a Myotis node directly. `RpcRouter` maps the API onto a host-agnostic `MyotisRpcBackend` interface; the Android `NodeService` and the CLI daemon each implement it against their own connector + beacon state. **Strict permissionless mode** is the default — there is no trusted-RPC fallback; an unservable request returns `-32601` (not served verified) or `-32000` (can't answer right now), never proxied data. (A dev-only upstream proxy exists solely to discover what a wallet calls and is disabled in strict mode.)
+
+Verified methods served: `eth_chainId`, `net_version`, `eth_blockNumber`, `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`, `eth_call`, `eth_estimateGas`, `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory`, `eth_getBlockByNumber`, `eth_getTransactionReceipt`, `eth_getTransactionByHash`, `eth_sendRawTransaction`. (See README → *Wallet API* for the per-method verification basis.) Wallet-specific quirks handled: reads pinned to a near-head block number are served from the verified head's state (a stale historical pin is rejected); `eth_getBlockByNumber`/receipts work without a snap peer via the beacon optimistic anchor.
+
+**Android** (`android-app`, minSdk 29) runs the entire stack on-device — devp2p, libp2p, the light client, the local EVM, and the JSON-RPC server — as a foreground `NodeService`. Mobile-specific work that made this real:
+
+- Pure-Java Milagro BLS replaces the jblst JNI dep (ART has no JNI for it); sync-committee verification is sped up with subgroup-skip, parallel + cached pubkey decompression, and a period gate so a finality verify is ~1 pairing rather than ~512 decompressions.
+- discv4 on ART needed a fixed receive-buffer allocator (large `NEIGHBORS` packets were truncated); EL DNS-ENR discovery provides a discv4-independent dial path on CGNAT networks.
+- Crypto-provider ordering for discv5 AES; Besu-on-Android compatibility (tuweni dedup, Guava JRE variant, Caffeine pin).
+- Warm-restart persistence: the verified sync snapshot, the known-state-root window (sidecar), and light-client-capable CL peers are all cached, so a restart reaches `SYNCED` in ~10 s instead of re-bootstrapping from the embedded checkpoint.
+
+**Validated:** MetaMask pointed at the device renders its confirm screen from verified balances, fees, and a local gas estimate, then broadcasts a real signed transaction — fully permissionless, no proxy.
+
+**Not implemented / rough edges:**
+- Cold head-context build latency (~15 s first call after a rebuild; warm ~1 s) — a snap-peer warm-context reliability problem.
+- `eth_getLogs`, `eth_subscribe`/WebSocket, batch nuances beyond the basics, and other less-common wallet methods.
 
 ## Summary
 
@@ -130,12 +157,13 @@ The headline end-to-end acceptance (`AnvilForkedBroadcastIT`) builds a transacti
 |--------------------------------------|-----------------|------------------------------------------------|
 | 1. Sync Committees (CL light client) | **Implemented** | —                                              |
 | 2. Historical Block Verification     | **Partial**     | No accumulator snapshots, 8192-block limit     |
-| 3. TrueBlocks Transaction History    | **Implemented** | No tx verification against `transactionsRoot`  |
-| 4. Block Data via devp2p             | **Implemented** | No `GetReceipts`, no EIP-4444                  |
+| 3. TrueBlocks Transaction History    | **Implemented** | TrueBlocks index unverified/stale; per-tx verification now exists via `eth_getTransactionByHash` |
+| 4. Block Data via devp2p             | **Implemented** | No EIP-4444 fallback                            |
 | 5. State Data via SNAP               | **Implemented** | No `GetTrieNodes`, no NFT/Vyper support        |
 | 6. ENS Resolution                    | **Implemented** | Reverse lookup has no IPC command surface yet  |
-| 7. Transaction Submission            | **Not started** | No tx gossip messages                          |
-| 8. Gas Estimation                    | **Implemented** | No IPC surface yet (executor API ready)        |
-| 9. Local EVM Execution               | **Implemented** | No generic view-call / gas-estimate IPC yet    |
+| 7. Transaction Submission            | **Implemented** | Direct `Transactions` broadcast only; no pooled-tx gossip |
+| 8. Gas Estimation                    | **Implemented** | —                                              |
+| 9. Local EVM Execution               | **Implemented** | Snap cold-context latency                       |
+| 10. Wallet Integration (JSON-RPC + Android) | **Implemented** | Cold-call latency; fewer-used RPC methods, no WS/`eth_getLogs` |
 
-The core verification pipeline (sync committees → state root → Merkle proofs → local EVM) is functional end-to-end. ENS resolution covers all eight record types with identical verification, including CCIP-Read on mainnet. The biggest remaining gaps are on the "wallet action" side: submitting transactions and exposing the EVM as a generic view-call / gas-estimate surface.
+The core verification pipeline (sync committees → state root → Merkle proofs → local EVM) is functional end-to-end, and is now exposed as a verified JSON-RPC endpoint that a stock MetaMask uses to read, estimate, and **send a real transaction** — running entirely on an Android phone, with no trusted RPC provider. The biggest remaining work is hardening: snap-peer/warm-context reliability (cold-call latency), historical-block verification (accumulators), and broader RPC-method coverage.
