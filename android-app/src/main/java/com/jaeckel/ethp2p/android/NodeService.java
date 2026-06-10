@@ -1722,6 +1722,21 @@ public final class NodeService extends Service {
             // get-account gets by retrying across peers. The first peer that passes
             // both is pinned for the whole resolution (one consistent root).
             final long minHead = conn.getNetwork().minSensibleHeadBlock();
+            // Live staleness floor: a peer whose head is BEHIND the beacon-finalized
+            // exec block can never anchor (anchorHeadToBeacon verifies the chain
+            // finalized→head, and finality has already passed it) — yet such a peer
+            // happily snap-serves its frozen root and can win the probe race below,
+            // forcing every build into the finalized fallback while fresh-headed
+            // peers sit connected. Observed on-device: two peers frozen at the same
+            // head for 5+ min starved number-pinned reads.
+            long finalizedFloor = -1;
+            com.jaeckel.ethp2p.consensus.BeaconLightClient blcFloor = beaconLightClient;
+            if (blcFloor != null) {
+                com.jaeckel.ethp2p.consensus.types.LightClientHeader finHdr =
+                        blcFloor.getStore().getFinalizedHeader();
+                if (finHdr != null) finalizedFloor = finHdr.execution().blockNumber();
+            }
+            final long headFloor = Math.max(minHead, finalizedFloor);
             // Probe every ready snap peer CONCURRENTLY — fetch its fresh head, then
             // probe that it snap-serves that head root — and award the FIRST to
             // qualify. The old serial walk paid each unresponsive peer's timeout in
@@ -1734,9 +1749,10 @@ public final class NodeService extends Service {
                         peer.requestFreshHeadHeaderAsync();
                 if (headFut == null) continue;
                 probes.add(headFut.thenCompose(fresh -> {
-                    if (fresh.number < minHead) {
+                    if (fresh.number < headFloor) {
                         throw new java.util.concurrent.CompletionException(
-                                new IllegalStateException("stale head #" + fresh.number));
+                                new IllegalStateException("stale head #" + fresh.number
+                                        + " (< floor #" + headFloor + ")"));
                     }
                     // servesRoot, but async: the peer must return a non-empty proof
                     // for the probe account at its head root.
