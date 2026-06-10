@@ -150,6 +150,7 @@ Verified methods served: `eth_chainId`, `net_version`, `eth_blockNumber`, `eth_g
 **Not implemented / rough edges:**
 - Cold head-context build latency (~15 s first call after a rebuild; warm ~1 s) — a snap-peer warm-context reliability problem.
 - `eth_getLogs`, `eth_subscribe`/WebSocket, batch nuances beyond the basics, and other less-common wallet methods.
+- **Endpoint security:** the server binds `0.0.0.0:8545` with no auth, rate limiting, or TLS — fine for a same-device wallet on a trusted network, a footgun on an open one. A loopback-only default and opt-in auth are planned.
 
 ## Summary
 

@@ -28,7 +28,13 @@ The Android app (and the desktop daemon) runs an embedded JSON-RPC server (Ktor,
 - `-32601` — the method isn't served verified at all (the wallet can stop asking).
 - `-32000` — the method is implemented but can't be answered right now (not synced, no snap peer, or the head isn't beacon-anchored yet — retryable).
 
-**Connecting MetaMask:** add a custom network pointing at the node's `http://<host>:8545` (chain id 1 for mainnet). On a phone, MetaMask and the node run side by side; for the desktop daemon use `adb forward tcp:8545 tcp:8545` from a connected device, or point a desktop MetaMask at the daemon's port directly.
+> **⚠️ Security:** the default bind is `0.0.0.0:8545` — **unauthenticated and reachable by anything on the same network** (every device on your Wi-Fi/LAN). It has no auth, rate limiting, or TLS. The data it serves is read-only and verified, but `eth_sendRawTransaction` will relay any signed bytes it's handed, and an open port is a footgun on an untrusted network. For anything beyond a same-device wallet on a trusted network, bind to `127.0.0.1` (loopback only) or firewall the port. A localhost-only default and opt-in auth are planned.
+
+**Connecting MetaMask:** add a custom network pointing at the node's `http://<host>:8545` (chain id 1 for mainnet).
+
+- **On the phone (primary use):** MetaMask and the node run on the same device — point MetaMask at `http://localhost:8545`.
+- **Desktop daemon, desktop MetaMask:** same machine — `http://localhost:8545`, no tunnel needed.
+- **Reaching the device's RPC from a computer** (e.g. `curl` testing, or a desktop wallet hitting the phone's node): `adb forward tcp:8545 tcp:8545` maps a host port to the device's server, so `http://localhost:8545` on the host reaches the phone.
 
 ### Implemented (verified) methods
 

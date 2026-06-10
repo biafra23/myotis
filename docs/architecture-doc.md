@@ -426,8 +426,10 @@ The entire stack — devp2p, libp2p, light client, local EVM, and this JSON-RPC 
    └─→ Broadcast signed transactions via gossip
 
 8. WALLET API (JSON-RPC over HTTP, strict permissionless)
-   └─→ MetaMask reads balance/nonce/code/storage, eth_call, estimateGas,
-       fees, blocks, receipts, getTransactionByHash, sendRawTransaction
+   └─→ MetaMask: eth_getBalance / eth_getTransactionCount / eth_getCode /
+       eth_getStorageAt, eth_call, eth_estimateGas, eth_gasPrice /
+       eth_maxPriorityFeePerGas / eth_feeHistory, eth_getBlockByNumber,
+       eth_getTransactionReceipt, eth_getTransactionByHash, eth_sendRawTransaction
        └─→ Every method answered only from the verified pipeline above;
            unservable → JSON-RPC error, never a proxied answer
 ```
