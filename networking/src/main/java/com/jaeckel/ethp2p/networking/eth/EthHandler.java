@@ -58,6 +58,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private static final int ETH_BLOCK_HEADERS = 0x14;
     private static final int ETH_GET_BLOCK_BODIES = 0x15;
     private static final int ETH_BLOCK_BODIES = 0x16;
+    private static final int ETH_GET_RECEIPTS = 0x1f; // eth msg 0x0f + base 0x10
+    private static final int ETH_RECEIPTS = 0x20;     // eth msg 0x10 + base 0x10
 
     // snap/1 message codes depend on negotiated eth version:
     //   eth/67-68: protocol length 17, snap base = 0x10 + 17 = 0x21
@@ -101,6 +103,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             pendingRequests = new ConcurrentHashMap<>();
     private final ConcurrentMap<Long, CompletableFuture<List<BlockBodiesMessage.BlockBody>>>
             pendingBodyRequests = new ConcurrentHashMap<>();
+    private final ConcurrentMap<Long, CompletableFuture<List<List<org.apache.tuweni.bytes.Bytes>>>>
+            pendingReceiptRequests = new ConcurrentHashMap<>();
     private final ConcurrentMap<Long, CompletableFuture<AccountRangeMessage.DecodeResult>>
             pendingSnapRequests = new ConcurrentHashMap<>();
     private final ConcurrentMap<Long, CompletableFuture<StorageRangesMessage.DecodeResult>>
@@ -211,6 +215,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         if (!pendingStorageRequests.isEmpty()) {
             pendingStorageRequests.values().forEach(f -> f.completeExceptionally(cause));
             pendingStorageRequests.clear();
+        }
+        if (!pendingReceiptRequests.isEmpty()) {
+            pendingReceiptRequests.values().forEach(f -> f.completeExceptionally(cause));
+            pendingReceiptRequests.clear();
         }
         super.channelInactive(ctx);
     }
@@ -466,6 +474,25 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     log.error("[eth] Failed to decode BlockBodies", e);
                 }
             }
+            case ETH_RECEIPTS -> {
+                long reqId = peekRequestId(msg.payload());
+                try {
+                    ReceiptsMessage.DecodeResult decoded = ReceiptsMessage.decode(msg.payload());
+                    log.info("[eth] Received receipts for {} block(s) (reqId={})",
+                            decoded.perBlockReceipts().size(), decoded.requestId());
+                    CompletableFuture<List<List<org.apache.tuweni.bytes.Bytes>>> future =
+                            pendingReceiptRequests.remove(decoded.requestId());
+                    if (future != null) future.complete(decoded.perBlockReceipts());
+                } catch (Exception e) {
+                    log.error("[eth] Failed to decode Receipts", e);
+                    // Don't leave the requester hanging on a malformed response.
+                    if (reqId >= 0) {
+                        CompletableFuture<List<List<org.apache.tuweni.bytes.Bytes>>> future =
+                                pendingReceiptRequests.remove(reqId);
+                        if (future != null) future.completeExceptionally(e);
+                    }
+                }
+            }
             case P2P_PING -> sendPong(ctx);
             case P2P_DISCONNECT -> {
                 int reason = decodeDisconnectReason(msg.payload());
@@ -512,6 +539,19 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
      * (which every full node broadcasts unsolicited) has no use here and is
      * dropped on purpose. Codes are absolute wire ids (eth base 0x10).
      */
+    /** Read just the leading requestId of a {@code [requestId, ...]} payload; -1 if
+     *  unreadable. Lets the ETH_RECEIPTS handler fail the right pending future when the
+     *  full decode throws, instead of leaving the requester hung. */
+    private static long peekRequestId(byte[] payload) {
+        try {
+            return org.apache.tuweni.rlp.RLP.decodeList(
+                    org.apache.tuweni.bytes.Bytes.wrap(payload),
+                    reader -> reader.readLong());
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
     private static String ignoredEthMessageReason(int code) {
         return switch (code) {
             case 0x11 -> "NewBlockHashes — pre-Merge block gossip, obsolete; light wallet tracks heads via the beacon chain";
@@ -807,6 +847,26 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         log.debug("[eth] GetBlockBodies (async) hashes={} reqId={}", hashes.length, reqId);
         byte[] payload = GetBlockBodiesMessage.encode(reqId, hashes);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_BODIES, payload);
+        return future;
+    }
+
+    /**
+     * Request consensus-encoded receipts for the given block hashes; the future completes
+     * with one receipt list per block (request order). Null if not in READY state. The
+     * caller verifies the receipts by rebuilding the receipts trie and comparing its root
+     * to the beacon-anchored header's {@code receiptsRoot} (peer data is never trusted).
+     */
+    public CompletableFuture<List<List<org.apache.tuweni.bytes.Bytes>>> requestReceiptsAsync(
+            org.apache.tuweni.bytes.Bytes32... hashes) {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) return null;
+
+        CompletableFuture<List<List<org.apache.tuweni.bytes.Bytes>>> future = new CompletableFuture<>();
+        long reqId = requestId.getAndIncrement();
+        pendingReceiptRequests.put(reqId, future);
+        log.debug("[eth] GetReceipts (async) hashes={} reqId={}", hashes.length, reqId);
+        byte[] payload = GetReceiptsMessage.encode(reqId, hashes);
+        rlpxHandler.sendMessage(ctx, ETH_GET_RECEIPTS, payload);
         return future;
     }
 
