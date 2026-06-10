@@ -68,11 +68,14 @@ interface MyotisRpcBackend {
     fun sendRawTransaction(rawTx: ByteArray): ByteArray?
 
     /**
-     * eth_getTransactionReceipt: the receipt for [txHash] as a pre-built JSON object
-     * string, verified against a beacon-anchored header's receiptsRoot, or null when it
-     * can't be answered verified (tx not in the recent verified window / pending / no
-     * peer) so the router falls back to the proxy. Returning a JSON string keeps the
-     * nested receipt+logs shape host-built without a Map→JSON conversion in the router.
+     * eth_getTransactionReceipt for [txHash], verified against a beacon-anchored
+     * header's receiptsRoot. Returns:
+     *  - the receipt as a pre-built JSON object string when found + verified;
+     *  - the literal "null" when VERIFIED-not-found (node synced, tx not in the recent
+     *    verified chain → eth's standard pending/unknown — a valid result);
+     *  - Kotlin null when it CAN'T be answered verified (not synced / no peer), so the
+     *    router errors rather than implying "pending on a healthy chain".
+     * A JSON string keeps the nested receipt+logs host-built (no Map→JSON in the router).
      */
     fun getTransactionReceipt(txHash: ByteArray): String?
 }

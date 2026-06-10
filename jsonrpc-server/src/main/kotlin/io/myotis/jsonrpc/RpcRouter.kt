@@ -50,59 +50,67 @@ class RpcRouter(
         } catch (e: Exception) {
             return errorEnvelope(JsonNull, -32700, "Parse error")
         }
-
-        // Single request: try local + verified handlers before proxying.
-        if (root is JsonObject) {
-            val method = root["method"]?.jsonPrimitive?.contentOrNull
-            val id = root["id"] ?: JsonNull
-            if (method == "myotis_rpcCoverage") {
-                logger.record(method, "LOCAL", 0)
-                return resultEnvelope(id, logger.coverage())
+        return when (root) {
+            is JsonObject -> handleOne(root, body)
+            is JsonArray -> {
+                // JSON-RPC 2.0 batch: each request gets its own response/error object so
+                // a wallet (MetaMask batches heavily) can match them by id — not a single
+                // error envelope. Elements are handled independently.
+                if (root.isEmpty()) return errorEnvelope(JsonNull, -32600, "Invalid Request")
+                val responses = root.map { el ->
+                    (el as? JsonObject)?.let { handleOne(it, null) }
+                        ?: errorEnvelope(JsonNull, -32600, "Invalid Request")
+                }
+                "[" + responses.joinToString(",") + "]"
             }
-            val t0 = System.nanoTime()
-            val verified = tryVerified(method, id, root)
-            if (verified != null) {
-                logger.record(method!!, "VERIFIED", (System.nanoTime() - t0) / 1_000_000)
-                return verified
-            }
+            else -> errorEnvelope(JsonNull, -32600, "Invalid Request")
         }
+    }
 
-        val methods: List<String> = when (root) {
-            is JsonArray -> root.mapNotNull { (it as? JsonObject)?.method() }
-            is JsonObject -> listOfNotNull(root.method())
-            else -> return errorEnvelope(JsonNull, -32600, "Invalid Request")
+    /**
+     * Handle one request object, returning its complete JSON-RPC response envelope.
+     * [wholeBody] is the original request text used for the single-request proxy path;
+     * null for a batch element (re-serialized and proxied individually).
+     */
+    private suspend fun handleOne(root: JsonObject, wholeBody: String?): String {
+        val method = root["method"]?.jsonPrimitive?.contentOrNull
+        val id = root["id"] ?: JsonNull
+        if (method == "myotis_rpcCoverage") {
+            logger.record(method, "LOCAL", 0)
+            return resultEnvelope(id, logger.coverage())
         }
-
+        val t0 = System.nanoTime()
+        val verified = tryVerified(method, id, root)
+        if (verified != null) {
+            logger.record(method!!, "VERIFIED", (System.nanoTime() - t0) / 1_000_000)
+            return verified
+        }
+        val m = method ?: "request"
         if (proxy == null) {
-            // Strict (permissionless) mode: no verified answer and no proxy. We refuse
-            // to serve unverified data — error instead. The MethodLogger still records
-            // every rejected method, so myotis_rpcCoverage keeps mapping what the wallet
-            // needs. Distinguish "method we don't implement verified" (-32601, so the
-            // wallet stops asking) from "implemented but can't answer right now — no
-            // peer / not synced" (-32000, retryable).
-            methods.forEach { logger.record(it, "ERROR", 0) }
-            val id = (root as? JsonObject)?.get("id") ?: JsonNull
-            val m = methods.firstOrNull() ?: "request"
+            // Strict (permissionless) mode: no verified answer, no proxy → error. We
+            // refuse to serve unverified data. The MethodLogger still records every
+            // rejected method, so myotis_rpcCoverage keeps mapping what the wallet needs.
+            // -32601 = we don't implement it verified (wallet can stop asking); -32000 =
+            // implemented but can't answer right now — no peer / not synced (retryable).
+            logger.record(m, "ERROR", 0)
             return if (m in VERIFIED_METHODS) {
                 errorEnvelope(id, -32000, "method '$m' cannot be served verified right now (no peer / not synced)")
             } else {
                 errorEnvelope(id, -32601, "method '$m' is not supported by this permissionless node")
             }
         }
-
-        val t0 = System.nanoTime()
-        val response = try {
-            proxy.forward(body)
+        // Dev-only proxy fallback (never used in production / strict mode).
+        val pt0 = System.nanoTime()
+        val forwardBody = wholeBody ?: json.encodeToString(JsonObject.serializer(), root)
+        return try {
+            val response = proxy.forward(forwardBody)
+            logger.record(m, "PROXY", (System.nanoTime() - pt0) / 1_000_000)
+            response
         } catch (e: Exception) {
-            // Upstream down/timeout: return a JSON-RPC error, not a raw HTTP 500,
-            // so the wallet can handle it.
-            methods.forEach { logger.record(it, "ERROR", (System.nanoTime() - t0) / 1_000_000) }
-            val id = (root as? JsonObject)?.get("id") ?: JsonNull
-            return errorEnvelope(id, -32603, "upstream proxy error: ${e.message}")
+            // Upstream down/timeout: JSON-RPC error, not a raw HTTP 500, so the wallet copes.
+            logger.record(m, "ERROR", (System.nanoTime() - pt0) / 1_000_000)
+            errorEnvelope(id, -32603, "upstream proxy error: ${e.message}")
         }
-        val latencyMs = (System.nanoTime() - t0) / 1_000_000
-        methods.forEach { logger.record(it, "PROXY", latencyMs) }
-        return response
     }
 
     /**
@@ -172,14 +180,14 @@ class RpcRouter(
             }
             "eth_getTransactionReceipt" -> {
                 val txHash = (root.params()?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
-                // Verified view: the receipt if found+verified, else JSON-null — eth's
-                // standard "unknown/pending" answer. This is itself a valid verified
-                // response (we don't see it confirmed in the recent verified chain), so
-                // it is NOT a proxy/strict fall-through: a wallet polling a just-sent tx
-                // keeps getting null until it's mined, never an error.
-                val receiptJson = withContext(Dispatchers.IO) { b.getTransactionReceipt(txHash) }
-                if (receiptJson != null) resultEnvelope(id, json.parseToJsonElement(receiptJson))
-                else resultEnvelope(id, JsonNull)
+                // Backend contract: a receipt JSON object when found+verified; the literal
+                // "null" for a VERIFIED "not seen yet" (synced, not in the recent chain →
+                // eth's standard pending/unknown, a valid result); or Kotlin-null when it
+                // CAN'T verify (not synced / no peer), which falls through to the strict
+                // error — so we never tell the wallet "pending on a healthy chain" when we
+                // actually couldn't check.
+                val receiptJson = withContext(Dispatchers.IO) { b.getTransactionReceipt(txHash) } ?: return null
+                resultEnvelope(id, json.parseToJsonElement(receiptJson)) // "null" → JsonNull result
             }
             else -> null
         }

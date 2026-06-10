@@ -980,10 +980,13 @@ public final class NodeService extends Service {
                         + h.number + " index " + idx);
                 return buildReceiptJson(receipts, idx, h, blockHash, want);
             }
-            return null; // not found in window → pending / out-of-range → proxy
+            // Verified head + anchored window, but the tx isn't in it → a VERIFIED
+            // "not seen yet": return the JSON-null literal (eth's pending/unknown), NOT
+            // Kotlin null (which means "couldn't verify" → router error).
+            return "null";
         } catch (Exception e) {
             LogBuffer.i(TAG, "[rpc] eth_getTransactionReceipt failed: " + unwrap(e));
-            return null;
+            return null; // couldn't verify → router errors (not a misleading "pending")
         }
     }
 
