@@ -169,8 +169,11 @@ public class BeaconLightClient implements AutoCloseable {
             }
             store.restore(snap);
             lastPersistedPeriod = snap.currentSyncCommitteePeriod();
-            updateSyncState();
+            // Sidecar first: its roots predate the snapshot's finalized/optimistic roots
+            // that updateSyncState() records, and the window deque must stay oldest→newest
+            // (eviction polls the front; export/findStateRoot treat the tail as freshest).
             restoreStateRootsSidecar(file);
+            updateSyncState();
             log.info("[beacon] Resumed from persisted snapshot at period {} (slot {}) — "
                             + "catching up only periods since",
                     snap.currentSyncCommitteePeriod(), snap.finalizedSlot());
