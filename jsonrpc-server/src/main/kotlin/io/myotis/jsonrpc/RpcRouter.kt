@@ -11,6 +11,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
@@ -42,6 +43,7 @@ class RpcRouter(
             "eth_chainId", "net_version", "eth_blockNumber", "eth_call", "eth_getBalance",
             "eth_getTransactionCount", "eth_getCode", "eth_getStorageAt",
             "eth_sendRawTransaction", "eth_getTransactionReceipt", "eth_getBlockByNumber",
+            "eth_gasPrice", "eth_maxPriorityFeePerGas", "eth_feeHistory", "eth_estimateGas",
         )
     }
 
@@ -205,6 +207,65 @@ class RpcRouter(
                 // (can't verify) → fall through to the strict error.
                 val blockJson = withContext(Dispatchers.IO) { b.getBlockByNumber(block, fullTx) } ?: return null
                 resultEnvelope(id, json.parseToJsonElement(blockJson))
+            }
+            "eth_gasPrice" -> {
+                val price = withContext(Dispatchers.IO) { b.gasPrice() } ?: return null
+                resultEnvelope(id, JsonPrimitive(hexQuantity(price)))
+            }
+            "eth_maxPriorityFeePerGas" -> {
+                val tip = withContext(Dispatchers.IO) { b.maxPriorityFeePerGas() } ?: return null
+                resultEnvelope(id, JsonPrimitive(hexQuantity(tip)))
+            }
+            "eth_feeHistory" -> {
+                val p = root.params()
+                // blockCount is a QUANTITY (hex) per spec, but some clients send a JSON
+                // number — accept both.
+                val countPrim = p?.getOrNull(0) as? JsonPrimitive ?: return null
+                val blockCount = countPrim.contentOrNull?.let { s ->
+                    if (s.startsWith("0x") || s.startsWith("0X")) s.substring(2).toLongOrNull(16)
+                    else s.toLongOrNull()
+                } ?: return null
+                if (blockCount <= 0) return null
+                val newest = p.blockTag(1)
+                // Percentiles must be monotonically non-decreasing in [0,100]; a request
+                // without them gets baseFee/gasUsedRatio only (no reward array).
+                val pctArr: DoubleArray? = when (val pe = p.getOrNull(2)) {
+                    null, is JsonNull -> null
+                    is JsonArray -> {
+                        val vals = DoubleArray(pe.size)
+                        for (i in pe.indices) {
+                            val d = (pe[i] as? JsonPrimitive)?.doubleOrNull ?: return null
+                            if (d < 0.0 || d > 100.0) return null
+                            if (i > 0 && vals[i - 1] > d) return null
+                            vals[i] = d
+                        }
+                        vals
+                    }
+                    else -> return null
+                }
+                val historyJson = withContext(Dispatchers.IO) { b.feeHistory(blockCount, newest, pctArr) }
+                    ?: return null
+                resultEnvelope(id, json.parseToJsonElement(historyJson))
+            }
+            "eth_estimateGas" -> {
+                val p = root.params()
+                val callObj = p?.getOrNull(0) as? JsonObject ?: return null
+                val from = (callObj["from"]?.takeUnless { it is JsonNull })?.let { it.asHexBytes() ?: return null }
+                // to=null is contract creation — supported (estimates the deploy).
+                val to = (callObj["to"]?.takeUnless { it is JsonNull })?.let { it.asHexBytes() ?: return null }
+                val dataElement = (callObj["data"] ?: callObj["input"])?.takeUnless { it is JsonNull }
+                val data = if (dataElement != null) (dataElement.asHexBytes() ?: return null) else null
+                val valueElement = callObj["value"]?.takeUnless { it is JsonNull }
+                val value = if (valueElement != null) {
+                    val s = (valueElement as? JsonPrimitive)?.contentOrNull ?: return null
+                    try {
+                        if (s.startsWith("0x") || s.startsWith("0X"))
+                            java.math.BigInteger(s.substring(2).ifEmpty { "0" }, 16)
+                        else java.math.BigInteger(s)
+                    } catch (e: NumberFormatException) { return null }
+                } else null
+                val gas = withContext(Dispatchers.IO) { b.estimateGas(from, to, data, value) } ?: return null
+                resultEnvelope(id, JsonPrimitive(hexQuantity(gas)))
             }
             else -> null
         }

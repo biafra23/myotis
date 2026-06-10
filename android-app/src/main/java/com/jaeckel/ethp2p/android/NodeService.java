@@ -29,6 +29,7 @@ import com.jaeckel.ethp2p.networking.dns.DnsEnrResolver;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockBodiesMessage;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
 import com.jaeckel.ethp2p.networking.eth.messages.Receipt;
+import com.jaeckel.ethp2p.networking.eth.messages.TxFeeFields;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
 import com.jaeckel.ethp2p.networking.snap.messages.AccountRangeMessage;
 
@@ -981,13 +982,12 @@ public final class NodeService extends Service {
         RLPxConnector conn = connector;
         if (conn == null || txHash == null || txHash.length != 32) return null;
         try {
-            // Use the resilient head path (cached good head fallback), not the fresh-head
-            // builder — the chain tip is often not beacon-anchored yet, which made this
-            // fail with -32000 even with healthy snap peers while state reads worked.
-            EnsCall ctx = anchoredHeadOrWait();
-            if (ctx == null || !ctx.beaconVerified()) return null;
-            long headNum = ctx.blockNumber();
-            byte[] headStateRoot = ctx.blockCtx().stateRoot();
+            // Headers-only anchor (snap head preferred, beacon optimistic fallback):
+            // receipts need verified headers + bodies, not snap state, so this path
+            // keeps working through snap-peer outages — see headerAnchor().
+            HeaderAnchor anchor = headerAnchor();
+            if (anchor == null) return null;
+            long headNum = anchor.number();
 
             int count = (int) Math.min(RECEIPT_LOOKBACK_BLOCKS, headNum + 1);
             long start = headNum - count + 1;
@@ -995,9 +995,9 @@ public final class NodeService extends Service {
                     .requestBlockHeadersBatched(start, count)
                     // Future.get(timeout) — NOT CompletableFuture.orTimeout (API 31, minSdk 29).
                     .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
-            // Anchor the window: its last header must BE the verified head (stateRoot
-            // match) and every header must hash-link to the next's parentHash.
-            if (!windowAnchoredToHead(window, headStateRoot)) {
+            // Anchor the window: its last header must BE the verified head and every
+            // header must hash-link to the next's parentHash.
+            if (!anchor.anchors(window)) {
                 LogBuffer.i(TAG, "[rpc] eth_getTransactionReceipt: header window failed to anchor");
                 return null;
             }
@@ -1065,10 +1065,61 @@ public final class NodeService extends Service {
         if (window.isEmpty()) return false;
         BlockHeader last = window.get(window.size() - 1).header();
         if (!java.util.Arrays.equals(last.stateRoot.toArrayUnsafe(), headStateRoot)) return false;
+        return windowHashLinked(window);
+    }
+
+    /** Like {@link #windowAnchoredToHead} but anchored by the head's block HASH —
+     *  used with the beacon optimistic anchor, whose exec blockHash is what the
+     *  light client verified. */
+    private static boolean windowAnchoredToHash(List<BlockHeadersMessage.VerifiedHeader> window,
+                                                byte[] headBlockHash) {
+        if (window.isEmpty()) return false;
+        if (!java.util.Arrays.equals(
+                window.get(window.size() - 1).hash().toArrayUnsafe(), headBlockHash)) return false;
+        return windowHashLinked(window);
+    }
+
+    private static boolean windowHashLinked(List<BlockHeadersMessage.VerifiedHeader> window) {
         for (int i = 0; i < window.size() - 1; i++) {
             if (!window.get(i).hash().equals(window.get(i + 1).header().parentHash)) return false;
         }
         return true;
+    }
+
+    /** A beacon-verified header anchor: block {@code number} plus either the head's
+     *  {@code stateRoot} (snap-built head) or its block {@code hash} (beacon optimistic
+     *  exec payload) — exactly one is non-null. */
+    private record HeaderAnchor(long number, byte[] stateRoot, byte[] blockHash) {
+        boolean anchors(List<BlockHeadersMessage.VerifiedHeader> window) {
+            return stateRoot != null ? windowAnchoredToHead(window, stateRoot)
+                                     : windowAnchoredToHash(window, blockHash);
+        }
+    }
+
+    /**
+     * Resolve a beacon-verified header anchor for block/receipt serving — paths that
+     * need verified HEADERS but no snap state. Prefers the snap-built anchored head
+     * (freshest, the chain tip); falls back to the beacon optimistic execution payload
+     * (light-client-verified blockHash, at worst ~1 epoch stale) when no snap peer is
+     * available — so eth_getBlockByNumber / eth_getTransactionReceipt keep working
+     * through snap-peer outages (e.g. a cold start before discovery finds snap peers,
+     * where MetaMask's block tracker previously died and hung the UI).
+     */
+    private HeaderAnchor headerAnchor() {
+        RLPxConnector c = connector;
+        // Only pay the anchored-head wait when a snap peer exists to build from.
+        if (c != null && !c.activeSnapHandlers().isEmpty()) {
+            EnsCall ctx = anchoredHeadOrWait();
+            if (ctx != null && ctx.beaconVerified()) {
+                return new HeaderAnchor(ctx.blockNumber(), ctx.blockCtx().stateRoot(), null);
+            }
+        }
+        BeaconSyncState bss = beaconSyncState;
+        if (bss == null) return null;
+        long n = bss.getOptimisticBlockNumber();
+        byte[] h = bss.getOptimisticBlockHash();
+        if (n <= 0 || h == null) return null;
+        return new HeaderAnchor(n, null, h);
     }
 
     /** Build the eth_getTransactionReceipt JSON object from VERIFIED receipt bytes.
@@ -1140,12 +1191,12 @@ public final class NodeService extends Service {
         RLPxConnector conn = connector;
         if (conn == null || fullTx) return null;
         try {
-            // Resilient head path (cached good head), not the fresh-head builder which
-            // fails when the chain tip isn't beacon-anchored yet — see rpcGetTransactionReceipt.
-            EnsCall ctx = anchoredHeadOrWait();
-            if (ctx == null || !ctx.beaconVerified()) return null;
-            long headNum = ctx.blockNumber();
-            byte[] headStateRoot = ctx.blockCtx().stateRoot();
+            // Headers-only anchor: snap-built head when available, beacon optimistic
+            // exec payload otherwise — block serving must survive snap-peer outages
+            // (MetaMask's block tracker polls this and hangs the UI without it).
+            HeaderAnchor anchor = headerAnchor();
+            if (anchor == null) return null;
+            long headNum = anchor.number();
 
             long target;
             String b = (block == null) ? "latest" : block;
@@ -1165,7 +1216,7 @@ public final class NodeService extends Service {
             List<BlockHeadersMessage.VerifiedHeader> window = conn
                     .requestBlockHeadersBatched(target, (int) (back + 1))
                     .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
-            if (!windowAnchoredToHead(window, headStateRoot)) return null;
+            if (!anchor.anchors(window)) return null;
             BlockHeadersMessage.VerifiedHeader vh = window.get(0); // target is first in [target..head]
 
             List<BlockBodiesMessage.BlockBody> bodies = conn
@@ -1225,6 +1276,304 @@ public final class NodeService extends Service {
         }
         sb.append("],\"uncles\":[]}");
         return sb.toString();
+    }
+
+    // ---- Fee suggestion (verified) ----------------------------------------
+    // MetaMask's signing screen blocks on fee data (eth_feeHistory / eth_gasPrice /
+    // eth_maxPriorityFeePerGas) — without it the confirm UI sits in skeleton-loading
+    // forever. All fee data here is derived from VERIFIED sources only: baseFee /
+    // gasUsed / gasLimit from beacon-anchored headers, priority-fee tips from block
+    // bodies verified against transactionsRoot (+ receipts verified against
+    // receiptsRoot for gas-used percentile weighting).
+
+    /** Max blocks served per eth_feeHistory call (clamped per EIP-1559; MetaMask asks 5-10). */
+    private static final int FEE_HISTORY_MAX_BLOCKS = 10;
+    /** Blocks scanned for the priority-fee suggestion. */
+    private static final int TIP_SUGGEST_BLOCKS = 3;
+    /** Floor for the suggested tip: 0.1 gwei — keeps suggestions inclusive-but-sane
+     *  when recent blocks are empty or full of zero-tip txs. */
+    private static final java.math.BigInteger MIN_SUGGESTED_TIP =
+            java.math.BigInteger.valueOf(100_000_000L);
+    /** Tip suggestion cache TTL (~one block) — MetaMask polls fees every few seconds,
+     *  and each recompute fetches TIP_SUGGEST_BLOCKS bodies. */
+    private static final long TIP_CACHE_TTL_MS = 12_000;
+    private volatile java.math.BigInteger cachedSuggestedTip;
+    private volatile long cachedSuggestedTipAtMs;
+
+    /** Next block's base fee per the EIP-1559 update rule, from the parent header. */
+    private static java.math.BigInteger nextBaseFee(BlockHeader h) {
+        java.math.BigInteger base = h.baseFeePerGas;
+        if (base == null) return java.math.BigInteger.ZERO; // pre-London (not mainnet today)
+        long gasTarget = h.gasLimit / 2;
+        if (gasTarget <= 0 || h.gasUsed == gasTarget) return base;
+        java.math.BigInteger target = java.math.BigInteger.valueOf(gasTarget);
+        if (h.gasUsed > gasTarget) {
+            java.math.BigInteger delta = base
+                    .multiply(java.math.BigInteger.valueOf(h.gasUsed - gasTarget))
+                    .divide(target)
+                    .divide(java.math.BigInteger.valueOf(8))
+                    .max(java.math.BigInteger.ONE);
+            return base.add(delta);
+        }
+        java.math.BigInteger delta = base
+                .multiply(java.math.BigInteger.valueOf(gasTarget - h.gasUsed))
+                .divide(target)
+                .divide(java.math.BigInteger.valueOf(8));
+        return base.subtract(delta);
+    }
+
+    /** Fetch the beacon-anchored header window [head-count+1 .. head]; null if it
+     *  can't be fetched or doesn't anchor. */
+    private List<BlockHeadersMessage.VerifiedHeader> anchoredHeaderWindow(
+            HeaderAnchor anchor, int count) throws Exception {
+        RLPxConnector conn = connector;
+        if (conn == null) return null;
+        long start = Math.max(0, anchor.number() - count + 1);
+        List<BlockHeadersMessage.VerifiedHeader> window = conn
+                .requestBlockHeadersBatched(start, (int) (anchor.number() - start + 1))
+                .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+        return anchor.anchors(window) ? window : null;
+    }
+
+    /** A tx's effective priority fee plus the gas it used (receipt cumulative diff). */
+    private record TxTip(java.math.BigInteger tip, long gasUsed) {}
+
+    /** Per-tx (effectiveTip, gasUsed) of a block, from a body verified against
+     *  transactionsRoot (+ receipts verified against receiptsRoot when
+     *  {@code needGasWeights}). Null when the block can't be verified; empty for
+     *  an empty block. */
+    private List<TxTip> verifiedBlockTips(BlockHeadersMessage.VerifiedHeader vh,
+                                          boolean needGasWeights) throws Exception {
+        RLPxConnector conn = connector;
+        if (conn == null) return null;
+        BlockHeader h = vh.header();
+        List<BlockBodiesMessage.BlockBody> bodies = conn
+                .requestBlockBodies(vh.hash())
+                .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+        if (bodies.isEmpty()) return null;
+        List<Bytes> txs = bodies.get(0).transactions();
+        if (!OrderedTrieRoot.verify(txs, h.transactionsRoot)) return null;
+        if (txs.isEmpty()) return java.util.Collections.emptyList();
+
+        long[] gasUsed = null;
+        if (needGasWeights) {
+            List<List<Bytes>> rcptBlocks = conn
+                    .requestReceipts(vh.hash())
+                    .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+            if (rcptBlocks.isEmpty()) return null;
+            List<Bytes> receipts = rcptBlocks.get(0);
+            if (receipts.size() != txs.size()
+                    || !OrderedTrieRoot.verify(receipts, h.receiptsRoot)) return null;
+            gasUsed = new long[txs.size()];
+            long prevCum = 0;
+            for (int i = 0; i < receipts.size(); i++) {
+                long cum = Receipt.decode(receipts.get(i)).cumulativeGasUsed();
+                gasUsed[i] = cum - prevCum;
+                prevCum = cum;
+            }
+        }
+
+        java.math.BigInteger baseFee =
+                h.baseFeePerGas != null ? h.baseFeePerGas : java.math.BigInteger.ZERO;
+        List<TxTip> out = new ArrayList<>(txs.size());
+        for (int i = 0; i < txs.size(); i++) {
+            TxFeeFields f = TxFeeFields.decode(txs.get(i));
+            if (f == null) return null; // verified body with an unparseable tx — bail
+            out.add(new TxTip(f.effectiveTip(baseFee), gasUsed != null ? gasUsed[i] : 0));
+        }
+        return out;
+    }
+
+    /** Suggested priority fee: median effective tip over the last
+     *  {@link #TIP_SUGGEST_BLOCKS} verified blocks, floored at
+     *  {@link #MIN_SUGGESTED_TIP}. Cached for ~one block. Null → can't verify. */
+    private java.math.BigInteger rpcMaxPriorityFeePerGas() {
+        java.math.BigInteger cached = cachedSuggestedTip;
+        if (cached != null && android.os.SystemClock.elapsedRealtime() - cachedSuggestedTipAtMs
+                < TIP_CACHE_TTL_MS) {
+            return cached;
+        }
+        try {
+            HeaderAnchor anchor = headerAnchor();
+            if (anchor == null) return null;
+            List<BlockHeadersMessage.VerifiedHeader> window =
+                    anchoredHeaderWindow(anchor, TIP_SUGGEST_BLOCKS);
+            if (window == null) return null;
+            List<java.math.BigInteger> tips = new ArrayList<>();
+            for (BlockHeadersMessage.VerifiedHeader vh : window) {
+                List<TxTip> blockTips = verifiedBlockTips(vh, false);
+                if (blockTips == null) continue; // one unverifiable block doesn't kill the suggestion
+                for (TxTip t : blockTips) tips.add(t.tip());
+            }
+            java.math.BigInteger tip;
+            if (tips.isEmpty()) {
+                tip = MIN_SUGGESTED_TIP;
+            } else {
+                java.util.Collections.sort(tips);
+                tip = tips.get(tips.size() / 2).max(MIN_SUGGESTED_TIP);
+            }
+            cachedSuggestedTip = tip;
+            cachedSuggestedTipAtMs = android.os.SystemClock.elapsedRealtime();
+            return tip;
+        } catch (Exception e) {
+            LogBuffer.i(TAG, "[rpc] eth_maxPriorityFeePerGas failed: " + unwrap(e));
+            return null;
+        }
+    }
+
+    /** Legacy-style total gas price: next block's base fee + the suggested tip. */
+    private java.math.BigInteger rpcGasPrice() {
+        try {
+            HeaderAnchor anchor = headerAnchor();
+            if (anchor == null) return null;
+            List<BlockHeadersMessage.VerifiedHeader> window = anchoredHeaderWindow(anchor, 1);
+            if (window == null || window.isEmpty()) return null;
+            java.math.BigInteger tip = rpcMaxPriorityFeePerGas();
+            if (tip == null) return null;
+            return nextBaseFee(window.get(window.size() - 1).header()).add(tip);
+        } catch (Exception e) {
+            LogBuffer.i(TAG, "[rpc] eth_gasPrice failed: " + unwrap(e));
+            return null;
+        }
+    }
+
+    /**
+     * eth_feeHistory from verified data. baseFeePerGas / gasUsedRatio come from the
+     * beacon-anchored header window; reward percentiles (when requested) from bodies
+     * verified against transactionsRoot + receipts verified against receiptsRoot,
+     * using geth's gas-used-weighted percentile walk. blockCount is clamped to
+     * {@link #FEE_HISTORY_MAX_BLOCKS}; the result reflects what was served.
+     */
+    private String rpcFeeHistory(long blockCount, String newestBlock, double[] percentiles) {
+        try {
+            HeaderAnchor anchor = headerAnchor();
+            if (anchor == null) return null;
+            long headNum = anchor.number();
+
+            long newest;
+            String nb = (newestBlock == null) ? "latest" : newestBlock;
+            switch (nb) {
+                case "latest": case "pending": case "safe": case "finalized":
+                    newest = headNum; break;
+                case "earliest":
+                    return null;
+                default:
+                    try { newest = Long.decode(nb); } catch (Exception e) { return null; }
+            }
+            if (newest < 0 || newest > headNum) return null;
+
+            int count = (int) Math.min(Math.min(blockCount, FEE_HISTORY_MAX_BLOCKS), newest + 1);
+            long oldest = newest - count + 1;
+            if (headNum - oldest >= BLOCK_LOOKBACK_MAX) return null; // too far back to verify cheaply
+
+            // One anchored window [oldest..head]; the requested span is its first
+            // `count` entries (the window may extend past `newest` up to the head —
+            // that's what anchors it, and it gives the ACTUAL next-block baseFee).
+            List<BlockHeadersMessage.VerifiedHeader> window =
+                    anchoredHeaderWindow(anchor, (int) (headNum - oldest + 1));
+            if (window == null || window.size() < count) return null;
+
+            StringBuilder sb = new StringBuilder(256);
+            sb.append("{\"oldestBlock\":\"").append(hexQuantity(oldest)).append("\"");
+
+            sb.append(",\"baseFeePerGas\":[");
+            for (int i = 0; i < count; i++) {
+                if (i > 0) sb.append(",");
+                java.math.BigInteger bf = window.get(i).header().baseFeePerGas;
+                sb.append("\"0x").append((bf != null ? bf : java.math.BigInteger.ZERO).toString(16)).append("\"");
+            }
+            // Entry count+1: the next block after `newest` — its actual baseFee when the
+            // window extends past newest, else the EIP-1559 prediction from `newest`.
+            java.math.BigInteger nextBf = (count < window.size())
+                    ? (window.get(count).header().baseFeePerGas != null
+                        ? window.get(count).header().baseFeePerGas : java.math.BigInteger.ZERO)
+                    : nextBaseFee(window.get(count - 1).header());
+            sb.append(",\"0x").append(nextBf.toString(16)).append("\"]");
+
+            sb.append(",\"gasUsedRatio\":[");
+            for (int i = 0; i < count; i++) {
+                if (i > 0) sb.append(",");
+                BlockHeader h = window.get(i).header();
+                double ratio = h.gasLimit > 0 ? (double) h.gasUsed / (double) h.gasLimit : 0.0;
+                sb.append(ratio);
+            }
+            sb.append("]");
+
+            if (percentiles != null) {
+                sb.append(",\"reward\":[");
+                for (int i = 0; i < count; i++) {
+                    if (i > 0) sb.append(",");
+                    List<TxTip> tips = verifiedBlockTips(window.get(i), true);
+                    if (tips == null) return null; // strict: no unverified rewards
+                    sb.append(rewardJson(tips, percentiles));
+                }
+                sb.append("]");
+            }
+            sb.append("}");
+            return sb.toString();
+        } catch (Exception e) {
+            LogBuffer.i(TAG, "[rpc] eth_feeHistory failed: " + unwrap(e));
+            return null;
+        }
+    }
+
+    /** Gas-used-weighted percentile rewards for one block (geth's algorithm): sort txs
+     *  by tip, walk percentile thresholds over cumulative gasUsed. Empty block → zeros. */
+    private static String rewardJson(List<TxTip> tips, double[] percentiles) {
+        StringBuilder sb = new StringBuilder(percentiles.length * 12 + 2);
+        sb.append("[");
+        if (tips.isEmpty()) {
+            for (int p = 0; p < percentiles.length; p++) {
+                if (p > 0) sb.append(",");
+                sb.append("\"0x0\"");
+            }
+            return sb.append("]").toString();
+        }
+        List<TxTip> sorted = new ArrayList<>(tips);
+        sorted.sort(java.util.Comparator.comparing(TxTip::tip));
+        long totalGas = 0;
+        for (TxTip t : sorted) totalGas += t.gasUsed();
+        int idx = 0;
+        long cumGas = sorted.get(0).gasUsed();
+        for (int p = 0; p < percentiles.length; p++) {
+            if (p > 0) sb.append(",");
+            double threshold = totalGas * percentiles[p] / 100.0;
+            while (cumGas < threshold && idx < sorted.size() - 1) {
+                idx++;
+                cumGas += sorted.get(idx).gasUsed();
+            }
+            sb.append("\"0x").append(sorted.get(idx).tip().toString(16)).append("\"");
+        }
+        return sb.append("]").toString();
+    }
+
+    /**
+     * eth_estimateGas over the shared anchored head: runs the call in the local EVM
+     * against snap-verified state with full gas accounting (intrinsic + execution +
+     * 15% headroom — see {@code DefaultEvmExecutor.estimateGas}). A reverting tx gets
+     * an error, not a number — the wallet must not broadcast it. Contract creation
+     * (to=null) isn't served verified yet → null → router errors.
+     */
+    private java.math.BigInteger rpcEstimateGas(byte[] from, byte[] to, byte[] data,
+                                                java.math.BigInteger value) {
+        if (to == null || to.length != 20) return null;
+        if (from != null && from.length != 20) return null;
+        EnsCall h = anchoredHeadOrWait();
+        if (h == null) return null;
+        try {
+            io.myotis.evm.UnsignedTransaction tx = new io.myotis.evm.UnsignedTransaction(
+                    io.myotis.evm.Address.of(from != null ? from : new byte[20]),
+                    io.myotis.evm.Address.of(to),
+                    value != null ? value : java.math.BigInteger.ZERO,
+                    data != null ? data : new byte[0],
+                    null);
+            Long gas = h.offchainExecutor().estimateGas(tx, h.blockCtx())
+                    .get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
+            return gas == null ? null : java.math.BigInteger.valueOf(gas);
+        } catch (Exception e) {
+            LogBuffer.i(TAG, "[rpc] eth_estimateGas -> error: " + unwrap(e));
+            return null;
+        }
     }
 
     /** Render a storage value as a 32-byte big-endian word (drops BigInteger's
@@ -2232,6 +2581,20 @@ public final class NodeService extends Service {
                 }
                 @Override public String getBlockByNumber(String block, boolean fullTx) {
                     return rpcGetBlockByNumber(block, fullTx);
+                }
+                @Override public java.math.BigInteger gasPrice() {
+                    return rpcGasPrice();
+                }
+                @Override public java.math.BigInteger maxPriorityFeePerGas() {
+                    return rpcMaxPriorityFeePerGas();
+                }
+                @Override public String feeHistory(long blockCount, String newestBlock,
+                                                   double[] rewardPercentiles) {
+                    return rpcFeeHistory(blockCount, newestBlock, rewardPercentiles);
+                }
+                @Override public java.math.BigInteger estimateGas(byte[] from, byte[] to,
+                                                                  byte[] data, java.math.BigInteger value) {
+                    return rpcEstimateGas(from, to, data, value);
                 }
             };
             io.myotis.jsonrpc.MyotisRpcServer s =

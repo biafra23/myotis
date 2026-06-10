@@ -63,6 +63,30 @@ class RpcRouterTest {
         override fun getBlockByNumber(block: String, fullTransactions: Boolean): String? {
             lastBlockTag = block; lastFullTx = fullTransactions; return blockJson
         }
+        var gasPriceWei: BigInteger? = null
+        override fun gasPrice(): BigInteger? = gasPriceWei
+        var tipWei: BigInteger? = null
+        override fun maxPriorityFeePerGas(): BigInteger? = tipWei
+        var lastFeeBlockCount: Long? = null
+        var lastFeeNewest: String? = null
+        var lastFeePercentiles: DoubleArray? = null
+        var feeHistoryJson: String? = null
+        override fun feeHistory(blockCount: Long, newestBlock: String,
+                                rewardPercentiles: DoubleArray?): String? {
+            lastFeeBlockCount = blockCount; lastFeeNewest = newestBlock
+            lastFeePercentiles = rewardPercentiles
+            return feeHistoryJson
+        }
+        var lastEstFrom: ByteArray? = null
+        var lastEstTo: ByteArray? = null
+        var lastEstData: ByteArray? = null
+        var lastEstValue: BigInteger? = null
+        var estimateResult: BigInteger? = null
+        override fun estimateGas(from: ByteArray?, to: ByteArray?, data: ByteArray?,
+                                 value: BigInteger?): BigInteger? {
+            lastEstFrom = from; lastEstTo = to; lastEstData = data; lastEstValue = value
+            return estimateResult
+        }
     }
 
     private fun route(backend: MyotisRpcBackend?, body: String, proxy: UpstreamProxy? = null): String =
@@ -282,6 +306,94 @@ class RpcRouterTest {
     @Test fun getBlockByNumber_cannotVerify_errors() {
         val resp = route(FakeBackend(),  // blockJson null → can't verify → strict error
             """{"jsonrpc":"2.0","id":3,"method":"eth_getBlockByNumber","params":["latest",false]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32000, errorCode(resp))
+    }
+
+    @Test fun gasPrice_verified_encodesQuantity() {
+        val b = FakeBackend().apply { gasPriceWei = BigInteger.valueOf(0x9184e72a000L) } // 10 gwei
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_gasPrice","params":[]}""")
+        assertEquals("0x9184e72a000", result(resp))
+    }
+
+    @Test fun gasPrice_cannotVerify_errorsRetryable() {
+        val resp = route(FakeBackend(), """{"jsonrpc":"2.0","id":1,"method":"eth_gasPrice","params":[]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32000, errorCode(resp))                    // implemented, retryable — not -32601
+    }
+
+    @Test fun maxPriorityFeePerGas_verified_encodesQuantity() {
+        val b = FakeBackend().apply { tipWei = BigInteger.valueOf(100_000_000L) } // 0.1 gwei
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_maxPriorityFeePerGas","params":[]}""")
+        assertEquals("0x5f5e100", result(resp))
+    }
+
+    @Test fun feeHistory_decodesHexCount_tagAndPercentiles_embedsResult() {
+        val b = FakeBackend().apply {
+            feeHistoryJson = """{"oldestBlock":"0xfc","baseFeePerGas":["0x7","0x8"],"gasUsedRatio":[0.5]}"""
+        }
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_feeHistory","params":["0x5","latest",[10,20.5,30]]}""")
+        val obj = json.parseToJsonElement(resp).jsonObject["result"]!!.jsonObject
+        assertEquals("0xfc", obj["oldestBlock"]!!.jsonPrimitive.content)
+        assertEquals(5L, b.lastFeeBlockCount)
+        assertEquals("latest", b.lastFeeNewest)
+        assertArrayEquals(doubleArrayOf(10.0, 20.5, 30.0), b.lastFeePercentiles!!, 0.0)
+    }
+
+    @Test fun feeHistory_acceptsPlainNumberCount_andNoPercentiles() {
+        val b = FakeBackend().apply { feeHistoryJson = """{"oldestBlock":"0x1"}""" }
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_feeHistory","params":[5,"0x100"]}""")
+        assertTrue(!hasError(resp))
+        assertEquals(5L, b.lastFeeBlockCount)
+        assertEquals("0x100", b.lastFeeNewest)
+        assertNull(b.lastFeePercentiles)
+    }
+
+    @Test fun feeHistory_rejectsBadPercentiles() {
+        val b = FakeBackend().apply { feeHistoryJson = """{"oldestBlock":"0x1"}""" }
+        // descending percentiles → invalid per EIP-1559 → strict error, backend not invoked
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_feeHistory","params":["0x5","latest",[30,10]]}""")
+        assertTrue(hasError(resp))
+        assertNull(b.lastFeeBlockCount)
+        // out-of-range percentile
+        val resp2 = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_feeHistory","params":["0x5","latest",[101]]}""")
+        assertTrue(hasError(resp2))
+        assertNull(b.lastFeeBlockCount)
+    }
+
+    @Test fun estimateGas_decodesCallObject_encodesQuantity() {
+        val b = FakeBackend().apply { estimateResult = BigInteger.valueOf(21000) }
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas",
+               "params":[{"from":"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+                          "to":"0x00000000219ab540356cBB839Cbe05303d7705Fa",
+                          "value":"0xde0b6b3a7640000","data":"0xab"}]}""")
+        assertEquals("0x5208", result(resp))
+        assertEquals(0xd8.toByte(), b.lastEstFrom!![0])
+        assertEquals(20, b.lastEstTo!!.size)
+        assertEquals(BigInteger("de0b6b3a7640000", 16), b.lastEstValue)  // 1 ETH
+        assertEquals("0xab", b.lastEstData!!.toHex())
+    }
+
+    @Test fun estimateGas_minimalParams_passesNulls() {
+        val b = FakeBackend().apply { estimateResult = BigInteger.valueOf(53000) }
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas",
+               "params":[{"to":"0x00000000219ab540356cBB839Cbe05303d7705Fa"}]}""")
+        assertEquals("0xcf08", result(resp))
+        assertNull(b.lastEstFrom)
+        assertNull(b.lastEstData)
+        assertNull(b.lastEstValue)
+    }
+
+    @Test fun estimateGas_revertingTx_errors() {
+        // Backend null (reverting tx / can't verify) → strict -32000, never a number.
+        val resp = route(FakeBackend(),
+            """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas",
+               "params":[{"to":"0x00000000219ab540356cBB839Cbe05303d7705Fa"}]}""")
         assertTrue(hasError(resp))
         assertEquals(-32000, errorCode(resp))
     }

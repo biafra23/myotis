@@ -98,6 +98,14 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
                 () -> runConvergent(target, calldata, blockContext), executor);
     }
 
+    /** Estimation delegates directly: the prefetch/convergence loop exists to batch
+     *  oracle round-trips for reads; the estimator already runs against the same
+     *  snap-backed view and its gas accounting must not be re-run to convergence. */
+    @Override
+    public CompletableFuture<Long> estimateGas(UnsignedTransaction tx, BlockContext blockContext) {
+        return delegate.estimateGas(tx, blockContext);
+    }
+
     private byte[] runConvergent(Address target, byte[] calldata, BlockContext blockContext) {
         SnapStateOracle oracle = delegate.oracle();
         BytecodeCache bytecodeCache = delegate.bytecodeCache();
