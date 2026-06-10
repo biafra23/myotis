@@ -42,7 +42,7 @@ CL peers are seeded from four sources (in priority order): the persistent `CLPee
 ## 4. Fetching and Verifying Block Data — devp2p
 **POC: Implemented**
 
-- Full devp2p stack: discv4 discovery, RLPx ECIES handshake, eth/67-69 protocol
+- Full devp2p stack: discv4 discovery, RLPx ECIES handshake, eth/66-69 protocol
 - `GetBlockHeaders`, `GetBlockBodies`, and `GetReceipts` implemented
 - `GetReceipts` with receipt verification against the header's `receiptsRoot` (rebuild the receipts trie and compare). Handles **eth/69 (EIP-7642) bloomless receipts** — the wire receipt omits `logsBloom`, so it's recomputed from the logs and the canonical encoding rebuilt before the root check, identical verification across eth/66-69. Powers `eth_getTransactionReceipt` and the `eth_feeHistory` reward percentiles.
 - Block header verification against beacon chain (direct state root match or header chain)
@@ -60,9 +60,9 @@ CL peers are seeded from four sources (in priority order): the persistent `CLPee
 - `GetStorageRanges` with storage proof verification
 - ERC-20 balance lookup via `keccak256(abi.encode(holder, slot))` mapping
 - Full beacon chain cross-verification (proof -> state root -> beacon finalized root)
+- `GetTrieNodes` / `TrieNodes` wired at the wire layer (snap message offsets 0x06/0x07; the absolute multiplexed codes depend on the negotiated eth version — `EthHandler` recomputes them from the snap base after Hello). The EVM's snap bridge deliberately routes through `GetAccountRange`/`GetStorageRanges` instead, because only the range responses carry the full root-to-leaf Merkle proof the oracle needs.
 
 **Not implemented:**
-- `GetTrieNodes` (alternative trie path approach)
 - NFT ownership queries (same mechanism but not exposed via IPC)
 - Vyper storage slot layout support
 
@@ -160,7 +160,7 @@ Verified methods served: `eth_chainId`, `net_version`, `eth_blockNumber`, `eth_g
 | 2. Historical Block Verification     | **Partial**     | No accumulator snapshots, 8192-block limit     |
 | 3. TrueBlocks Transaction History    | **Implemented** | TrueBlocks index unverified/stale; per-tx verification now exists via `eth_getTransactionByHash` |
 | 4. Block Data via devp2p             | **Implemented** | No EIP-4444 fallback                            |
-| 5. State Data via SNAP               | **Implemented** | No `GetTrieNodes`, no NFT/Vyper support        |
+| 5. State Data via SNAP               | **Implemented** | No NFT/Vyper support                            |
 | 6. ENS Resolution                    | **Implemented** | Reverse lookup has no IPC command surface yet  |
 | 7. Transaction Submission            | **Implemented** | Direct `Transactions` broadcast only; no pooled-tx gossip |
 | 8. Gas Estimation                    | **Implemented** | —                                              |
