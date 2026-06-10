@@ -170,6 +170,7 @@ public class BeaconLightClient implements AutoCloseable {
             store.restore(snap);
             lastPersistedPeriod = snap.currentSyncCommitteePeriod();
             updateSyncState();
+            restoreStateRootsSidecar(file);
             log.info("[beacon] Resumed from persisted snapshot at period {} (slot {}) — "
                             + "catching up only periods since",
                     snap.currentSyncCommitteePeriod(), snap.finalizedSlot());
@@ -188,6 +189,10 @@ public class BeaconLightClient implements AutoCloseable {
     private void persistSnapshot() {
         java.nio.file.Path file = snapshotFile;
         if (file == null) return;
+        // The known-state-roots window advances on every finality poll, so persist it
+        // each call — independent of the period-change gate below that throttles the
+        // (large) committee snapshot to ~once per period.
+        persistStateRootsSidecar(file);
         LightClientStore.Snapshot snap = store.snapshot();
         if (snap == null) return;
         if (snap.currentSyncCommitteePeriod() == lastPersistedPeriod) return;
@@ -208,6 +213,73 @@ public class BeaconLightClient implements AutoCloseable {
                     snap.currentSyncCommitteePeriod(), data.length);
         } catch (Exception e) {
             log.debug("[beacon] Snapshot persist failed: {}", e.getMessage());
+        }
+    }
+
+    // Sidecar persistence for BeaconSyncState's known-state-roots window. Kept beside the
+    // committee snapshot ("<snapshot>.roots") rather than folded into the SSZ store
+    // snapshot, so the window can be rewritten cheaply every finality poll without
+    // touching the committee format. Compact format: version(1) + count(4) then per
+    // entry slot(8) + root(32) + verified(1). Only the freshest entries are kept.
+    private static final String ROOTS_SIDECAR_SUFFIX = ".roots";
+    private static final int ROOTS_SIDECAR_VERSION = 1;
+    private static final int ROOTS_SIDECAR_MAX = 64;
+
+    private java.nio.file.Path rootsSidecarPath(java.nio.file.Path snapshot) {
+        return snapshot.resolveSibling(snapshot.getFileName() + ROOTS_SIDECAR_SUFFIX);
+    }
+
+    private void persistStateRootsSidecar(java.nio.file.Path snapshot) {
+        try {
+            java.util.List<BeaconSyncState.SlottedStateRoot> all = syncState.exportKnownStateRoots();
+            if (all.isEmpty()) return;
+            // Keep only the freshest ROOTS_SIDECAR_MAX (export is oldest→newest).
+            int from = Math.max(0, all.size() - ROOTS_SIDECAR_MAX);
+            java.util.List<BeaconSyncState.SlottedStateRoot> keep = all.subList(from, all.size());
+            java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(1 + 4 + keep.size() * 41);
+            buf.put((byte) ROOTS_SIDECAR_VERSION);
+            buf.putInt(keep.size());
+            for (BeaconSyncState.SlottedStateRoot r : keep) {
+                buf.putLong(r.slot());
+                buf.put(r.stateRoot());                 // exactly 32 bytes (validated on record)
+                buf.put((byte) (r.blsVerified() ? 1 : 0));
+            }
+            java.nio.file.Path file = rootsSidecarPath(snapshot);
+            java.nio.file.Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
+            java.nio.file.Files.write(tmp, buf.array());
+            try {
+                java.nio.file.Files.move(tmp, file,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            } catch (java.nio.file.AtomicMoveNotSupportedException amnse) {
+                java.nio.file.Files.move(tmp, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (Exception e) {
+            log.debug("[beacon] roots sidecar persist failed: {}", e.getMessage());
+        }
+    }
+
+    private void restoreStateRootsSidecar(java.nio.file.Path snapshot) {
+        try {
+            java.nio.file.Path file = rootsSidecarPath(snapshot);
+            if (!java.nio.file.Files.exists(file)) return;
+            java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(java.nio.file.Files.readAllBytes(file));
+            if (buf.remaining() < 5 || buf.get() != ROOTS_SIDECAR_VERSION) return;
+            int count = buf.getInt();
+            if (count < 0 || count > ROOTS_SIDECAR_MAX || buf.remaining() < count * 41) return;
+            java.util.List<BeaconSyncState.SlottedStateRoot> roots = new java.util.ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                long slot = buf.getLong();
+                byte[] root = new byte[32];
+                buf.get(root);
+                boolean verified = buf.get() != 0;
+                roots.add(new BeaconSyncState.SlottedStateRoot(slot, root, verified));
+            }
+            syncState.importKnownStateRoots(roots);
+            log.info("[beacon] Restored {} known state root(s) from sidecar — SYNCED needs "
+                    + "one fresh finality poll, not {}", roots.size(), BeaconSyncState.FILL_THRESHOLD);
+        } catch (Exception e) {
+            log.debug("[beacon] roots sidecar restore failed: {}", e.getMessage());
         }
     }
 
