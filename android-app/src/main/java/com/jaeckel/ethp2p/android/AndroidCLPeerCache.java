@@ -39,6 +39,10 @@ public final class AndroidCLPeerCache {
     private final Map<String, Integer> failures = new ConcurrentHashMap<>();
     /** multiaddr -> lowest sync-committee period it served during catch-up. */
     private final Map<String, Long> servedPeriod = new ConcurrentHashMap<>();
+    /** Peers whose Identify confirmed light_client protocol support — dial these first. */
+    private final Set<String> lcConfirmed = ConcurrentHashMap.newKeySet();
+    /** Peers proven NOT to serve light_client (no LC protocols / negotiation failure) — dial last. */
+    private final Set<String> lcDenied = ConcurrentHashMap.newKeySet();
 
     public AndroidCLPeerCache(Path cacheFile) {
         this.cacheFile = cacheFile;
@@ -75,6 +79,36 @@ public final class AndroidCLPeerCache {
         return new java.util.HashMap<>(servedPeriod);
     }
 
+    /** Record that a peer's Identify confirmed light_client protocol support. Persisted so
+     *  a restart dials known light-client servers first instead of re-Identifying the whole
+     *  fork-matched cache (most of which are full nodes without the light-client server). */
+    public synchronized void markLightClient(String multiaddr) {
+        if (multiaddr == null || multiaddr.isEmpty()) return;
+        seen.add(multiaddr);
+        boolean changed = lcConfirmed.add(multiaddr);
+        changed |= lcDenied.remove(multiaddr);
+        if (changed) rewriteFile();
+    }
+
+    /** Record that a peer is proven NOT to serve light_client (no LC protocols on Identify,
+     *  or a protocol-negotiation failure). Deprioritized on a restart, not evicted. A
+     *  later confirmation (markLightClient) overrides this. */
+    public synchronized void markNoLightClient(String multiaddr) {
+        if (multiaddr == null || multiaddr.isEmpty() || lcConfirmed.contains(multiaddr)) return;
+        seen.add(multiaddr);
+        if (lcDenied.add(multiaddr)) rewriteFile();
+    }
+
+    /** Peers whose Identify confirmed light_client support (dial first). */
+    public Set<String> lightClientConfirmed() {
+        return new java.util.HashSet<>(lcConfirmed);
+    }
+
+    /** Peers proven not to serve light_client (dial last / skip). */
+    public Set<String> lightClientDenied() {
+        return new java.util.HashSet<>(lcDenied);
+    }
+
     public void markFailure(String multiaddr) {
         if (multiaddr == null || multiaddr.isEmpty()) return;
         if (!seen.contains(multiaddr)) return;
@@ -83,6 +117,8 @@ public final class AndroidCLPeerCache {
             if (seen.remove(multiaddr)) {
                 failures.remove(multiaddr);
                 servedPeriod.remove(multiaddr);
+                lcConfirmed.remove(multiaddr);
+                lcDenied.remove(multiaddr);
                 rewriteFile();
                 LogBuffer.i(TAG, "evicted peer after " + count + " failures: " + multiaddr);
             }
@@ -98,20 +134,26 @@ public final class AndroidCLPeerCache {
             while ((line = r.readLine()) != null) {
                 line = line.strip();
                 if (line.isEmpty() || !line.startsWith("/")) continue;
-                String multiaddr = line;
-                int sep = line.indexOf(SEP);
-                if (sep >= 0) {
-                    multiaddr = line.substring(0, sep);
-                    try {
-                        servedPeriod.put(multiaddr, Long.parseLong(line.substring(sep + 1).strip()));
-                    } catch (NumberFormatException ignored) {}
+                // multiaddr [TAB token]...  token = <period int> | "lc" | "nolc"
+                String[] parts = line.split(String.valueOf(SEP));
+                String multiaddr = parts[0].strip();
+                if (multiaddr.isEmpty() || !multiaddr.startsWith("/")) continue;
+                for (int i = 1; i < parts.length; i++) {
+                    String tok = parts[i].strip();
+                    if (tok.equals("lc")) lcConfirmed.add(multiaddr);
+                    else if (tok.equals("nolc")) lcDenied.add(multiaddr);
+                    else {
+                        try { servedPeriod.put(multiaddr, Long.parseLong(tok)); }
+                        catch (NumberFormatException ignored) {}
+                    }
                 }
                 result.add(multiaddr);
                 seen.add(multiaddr);
             }
             if (!result.isEmpty()) {
                 LogBuffer.i(TAG, "loaded " + result.size() + " cached CL peer(s) ("
-                        + servedPeriod.size() + " proven catch-up servers)");
+                        + servedPeriod.size() + " catch-up servers, "
+                        + lcConfirmed.size() + " light-client, " + lcDenied.size() + " non-LC)");
             }
         } catch (IOException e) {
             LogBuffer.w(TAG, "read failed: " + e.getMessage());
@@ -123,6 +165,8 @@ public final class AndroidCLPeerCache {
         seen.clear();
         failures.clear();
         servedPeriod.clear();
+        lcConfirmed.clear();
+        lcDenied.clear();
         if (!cacheFile.toFile().delete() && cacheFile.toFile().exists()) {
             LogBuffer.w(TAG, "failed to delete cache file " + cacheFile);
         }
@@ -137,6 +181,8 @@ public final class AndroidCLPeerCache {
                 w.write(p);
                 Long sp = servedPeriod.get(p);
                 if (sp != null) { w.write(SEP); w.write(Long.toString(sp)); }
+                if (lcConfirmed.contains(p)) { w.write(SEP); w.write("lc"); }
+                else if (lcDenied.contains(p)) { w.write(SEP); w.write("nolc"); }
                 w.write('\n');
             }
         } catch (IOException e) {

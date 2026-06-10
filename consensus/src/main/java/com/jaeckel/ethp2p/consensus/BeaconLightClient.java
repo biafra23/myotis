@@ -109,6 +109,29 @@ public class BeaconLightClient implements AutoCloseable {
         this.onCatchUpServed = cb;
     }
 
+    // Peers whose Identify confirmed light_client protocol support — dialed first by
+    // copyPeers(). Seeded from the CL cache so a restart prioritizes known light-client
+    // servers instead of re-Identifying the whole fork-matched set (most of which are
+    // full nodes without the light-client server).
+    private final Set<String> provenLightClient = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** Notified (multiaddr, supportsLightClient) when Identify resolves a peer's LC support. */
+    private volatile java.util.function.BiConsumer<String, Boolean> onLightClientVerdict;
+
+    /** Seed peers confirmed to support light_client (dial first) from a cache. */
+    public void setProvenLightClient(java.util.Collection<String> seed) {
+        if (seed != null) provenLightClient.addAll(seed);
+    }
+
+    /** Seed peers proven NOT to serve light_client (dial last) from a cache. */
+    public void setProvenNonLightClient(java.util.Collection<String> seed) {
+        if (seed != null) peersNoLcUpdates.addAll(seed);
+    }
+
+    /** Set the callback persisting a peer's light_client support verdict from Identify. */
+    public void setOnLightClientVerdict(java.util.function.BiConsumer<String, Boolean> cb) {
+        this.onLightClientVerdict = cb;
+    }
+
     // Persisted verified-store snapshot (day-to-day resume). Null disables persistence.
     private volatile java.nio.file.Path snapshotFile;
     // Period last written, to avoid rewriting the (~50KB) snapshot when nothing advanced.
@@ -530,6 +553,23 @@ public class BeaconLightClient implements AutoCloseable {
             if (pi.supportsLightClient()) {
                 log.info("[beacon]   LC peer: {} agent={}", pi.peerId(), pi.agentVersion());
             }
+        }
+
+        // Record each peer's light_client verdict (keyed by multiaddr) for in-session
+        // prioritization + cache persistence, so a restart dials known light-client
+        // servers first. Identify is per-peerId; map it back to our multiaddrs.
+        java.util.Map<String, Boolean> lcByPeerId = new java.util.HashMap<>();
+        for (BeaconP2PService.PeerInfo pi : connected) {
+            lcByPeerId.put(pi.peerId(), pi.supportsLightClient());
+        }
+        java.util.function.BiConsumer<String, Boolean> verdictCb = onLightClientVerdict;
+        for (String ma : copyPeers(false)) {
+            String pid = peerIdOf(ma);
+            Boolean lc = pid != null ? lcByPeerId.get(pid) : null;
+            if (lc == null) continue; // not Identified this round
+            if (lc) { provenLightClient.add(ma); peersNoLcUpdates.remove(ma); }
+            else { peersNoLcUpdates.add(ma); }
+            if (verdictCb != null) verdictCb.accept(ma, lc);
         }
     }
 
@@ -1715,7 +1755,9 @@ public class BeaconLightClient implements AutoCloseable {
     private List<String> copyPeers(boolean applyAgentFilter) {
         synchronized (clPeerMultiaddrs) {
             List<String> all = List.copyOf(clPeerMultiaddrs);
-            if (!applyAgentFilter || EXCLUDED_AGENT_SUBSTRING == null) return all;
+            if (!applyAgentFilter || EXCLUDED_AGENT_SUBSTRING == null) {
+                return orderByLightClient(all);
+            }
             // Drop peers whose Identify agent matches the exclusion substring.
             // Useful for isolating debugging: pretending Lodestar doesn't exist
             // forces us to actually get Lighthouse/Teku/Nimbus/Prysm working.
@@ -1727,8 +1769,29 @@ public class BeaconLightClient implements AutoCloseable {
                 }
                 filtered.add(p);
             }
-            return filtered;
+            return orderByLightClient(filtered);
         }
+    }
+
+    /** Confirmed light_client servers first, proven non-LC peers last, rest in between —
+     *  so finality polls / bootstrap hit peers that actually serve light-client first. */
+    private List<String> orderByLightClient(List<String> peers) {
+        if (provenLightClient.isEmpty() && peersNoLcUpdates.isEmpty()) return peers;
+        List<String> first = new ArrayList<>(), mid = new ArrayList<>(), last = new ArrayList<>();
+        for (String p : peers) {
+            if (provenLightClient.contains(p)) first.add(p);
+            else if (peersNoLcUpdates.contains(p)) last.add(p);
+            else mid.add(p);
+        }
+        List<String> out = new ArrayList<>(peers.size());
+        out.addAll(first); out.addAll(mid); out.addAll(last);
+        return out;
+    }
+
+    /** The peerId tail of a {@code .../p2p/<peerId>} multiaddr, or null. */
+    private static String peerIdOf(String multiaddr) {
+        int i = multiaddr.lastIndexOf("/p2p/");
+        return i >= 0 ? multiaddr.substring(i + 5) : null;
     }
 
     /**
