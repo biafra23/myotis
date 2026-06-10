@@ -72,6 +72,18 @@ public final class SyncStateView {
      */
     private volatile boolean sentinelOnMiss = false;
 
+    /** Count of sentinel values handed out (cache misses while {@link #sentinelOnMiss}
+     *  is on). Lets the convergence loop tell a sentinel run that was ALL cache hits
+     *  (its result is real — every read returned verified data) from one that may
+     *  have computed on placeholders. */
+    private final java.util.concurrent.atomic.AtomicLong sentinelMisses =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /** Total sentinel values handed out so far; diff across a run to detect misses. */
+    public long sentinelMissCount() {
+        return sentinelMisses.get();
+    }
+
     public SyncStateView(
             SnapStateOracle oracle,
             byte[] stateRoot,
@@ -108,6 +120,7 @@ public final class SyncStateView {
         if (sentinelOnMiss) {
             // Empty default; intentionally NOT cached so a subsequent run
             // with the flag cleared will fetch the real value.
+            sentinelMisses.incrementAndGet();
             return new AccountState(address, 0L, BigInteger.ZERO, EMPTY_CODE_HASH);
         }
         try {
@@ -130,6 +143,7 @@ public final class SyncStateView {
             // from a real zero — but the access is recorded in the tracker
             // either way, and the convergence loop will re-run with the
             // flag cleared to confirm.
+            sentinelMisses.incrementAndGet();
             return UInt256.ZERO;
         }
         try {
@@ -155,6 +169,7 @@ public final class SyncStateView {
             // re-enters with real bytecode populated. The PrefetchingEvmExecutor
             // pre-populates the *target* contract's bytecode synchronously so
             // iter 0's run reaches actual bytecode at the top level.
+            sentinelMisses.incrementAndGet();
             return new byte[0];
         }
         try {

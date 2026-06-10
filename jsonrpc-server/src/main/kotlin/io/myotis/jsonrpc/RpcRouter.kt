@@ -44,6 +44,7 @@ class RpcRouter(
             "eth_getTransactionCount", "eth_getCode", "eth_getStorageAt",
             "eth_sendRawTransaction", "eth_getTransactionReceipt", "eth_getBlockByNumber",
             "eth_gasPrice", "eth_maxPriorityFeePerGas", "eth_feeHistory", "eth_estimateGas",
+            "eth_getTransactionByHash",
         )
     }
 
@@ -191,6 +192,13 @@ class RpcRouter(
                 // actually couldn't check.
                 val receiptJson = withContext(Dispatchers.IO) { b.getTransactionReceipt(txHash) } ?: return null
                 resultEnvelope(id, json.parseToJsonElement(receiptJson)) // "null" → JsonNull result
+            }
+            "eth_getTransactionByHash" -> {
+                val txHash = (root.params()?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
+                // Object string when found (mined or pending-from-our-cache); "null" for a
+                // verified-unknown tx; Kotlin null (can't verify) → strict error.
+                val txJson = withContext(Dispatchers.IO) { b.getTransactionByHash(txHash) } ?: return null
+                resultEnvelope(id, json.parseToJsonElement(txJson))
             }
             "eth_getBlockByNumber" -> {
                 val p = root.params()

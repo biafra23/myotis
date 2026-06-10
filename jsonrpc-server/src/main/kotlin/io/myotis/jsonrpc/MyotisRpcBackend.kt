@@ -80,6 +80,18 @@ interface MyotisRpcBackend {
     fun getTransactionReceipt(txHash: ByteArray): String?
 
     /**
+     * eth_getTransactionByHash for [txHash]. Returns:
+     *  - the tx as a pre-built JSON object string when found — either in a recent
+     *    beacon-verified block (blockHash/blockNumber/transactionIndex set) or, for a tx
+     *    this node itself broadcast and not yet mined, from the local sent-tx cache
+     *    (blockNumber null = pending; the node holds the signed bytes, so no trust);
+     *  - the literal "null" for a VERIFIED "unknown tx" (synced, not in the recent chain
+     *    and not one we sent — eth's standard);
+     *  - Kotlin null when it CAN'T be answered verified (not synced / no peer) → router errors.
+     */
+    fun getTransactionByHash(txHash: ByteArray): String? = null
+
+    /**
      * eth_getBlockByNumber for [block] (a tag like "latest" or a 0x hex number), verified
      * from a beacon-anchored header (no snap state needed). Returns the block as a JSON
      * object string (transactions as hashes); the literal "null" for a non-existent

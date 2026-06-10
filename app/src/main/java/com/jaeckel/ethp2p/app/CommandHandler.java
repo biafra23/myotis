@@ -1281,16 +1281,39 @@ public class CommandHandler {
      * channel close), but every retry targets this one peer — the one expected to
      * have {@code blockCtx}'s stateRoot in its snapshot.
      */
+    /** Snap-oracle per-fetch retry budget; each attempt rotates to a different ready
+     *  snap peer so a slow/dead peer fails over instead of eating the whole budget. */
+    private static final int SNAP_ORACLE_MAX_ATTEMPTS = 4;
+
     private io.myotis.evm.CcipReadEvmExecutor buildEnsResolver(
             com.jaeckel.ethp2p.networking.eth.EthHandler pinnedPeer,
             io.myotis.evm.BlockContext blockCtx) {
-        final com.jaeckel.ethp2p.networking.eth.EthHandler finalPeer = pinnedPeer;
+        // Snap requests carry the stateRoot explicitly, so ANY connected snap peer that
+        // retains blockCtx's trie can serve them. Rotate the oracle's supplier (probed
+        // peer first, then round-robin the ready set) so a peer that stalls on
+        // GetAccountRange fails over instead of funnelling every retry into one dead
+        // peer — the single-peer pin made each eth_call against a stalled peer eat the
+        // full timeout while other peers held the same state.
+        final com.jaeckel.ethp2p.networking.eth.EthHandler probedPeer = pinnedPeer;
+        final java.util.concurrent.atomic.AtomicInteger rotation =
+            new java.util.concurrent.atomic.AtomicInteger();
         io.myotis.evm.world.SnapBackedStateOracle oracle =
             new io.myotis.evm.world.SnapBackedStateOracle(
-                () -> finalPeer.isReady() && !finalPeer.isSnapServingFailed()
-                    ? new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(finalPeer)
-                    : null,
-                ensBytecodeCache);
+                () -> {
+                    int n = rotation.getAndIncrement();
+                    if (n == 0 && probedPeer.isReady() && !probedPeer.isSnapServingFailed()) {
+                        return new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(probedPeer);
+                    }
+                    // activeSnapHandlers() already filters to ready, snap-negotiated,
+                    // non-failed peers (probedPeer included if still healthy) — no re-check.
+                    java.util.List<com.jaeckel.ethp2p.networking.eth.EthHandler> ready =
+                        connector.activeSnapHandlers();
+                    if (ready.isEmpty()) return null;
+                    return new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(
+                        ready.get(Math.floorMod(n, ready.size())));
+                },
+                ensBytecodeCache,
+                SNAP_ORACLE_MAX_ATTEMPTS);
         io.myotis.evm.DefaultEvmExecutor base = new io.myotis.evm.DefaultEvmExecutor(
             oracle, ensBytecodeCache, EVM_POOL);
         io.myotis.evm.PrefetchingEvmExecutor prefetching =
