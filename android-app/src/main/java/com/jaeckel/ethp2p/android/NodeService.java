@@ -2369,17 +2369,12 @@ public final class NodeService extends Service {
                             if (n == 0 && probedPeer.isReady() && !probedPeer.isSnapServingFailed()) {
                                 return new com.jaeckel.ethp2p.android.snap.EthHandlerSnapPeer(probedPeer);
                             }
+                            // activeSnapHandlers() already returns only ready, snap-negotiated,
+                            // non-failed peers — no need to re-check here. probedPeer is in that
+                            // list too (if still healthy), so it stays in the rotation as a
+                            // fallback without a separate add.
                             java.util.List<com.jaeckel.ethp2p.networking.eth.EthHandler> ready =
-                                    new java.util.ArrayList<>();
-                            for (com.jaeckel.ethp2p.networking.eth.EthHandler p :
-                                    oracleConn.activeSnapHandlers()) {
-                                if (p.isReady() && !p.isSnapServingFailed() && p != probedPeer) {
-                                    ready.add(p);
-                                }
-                            }
-                            if (probedPeer.isReady() && !probedPeer.isSnapServingFailed()) {
-                                ready.add(probedPeer); // keep it in rotation as a fallback too
-                            }
+                                    oracleConn.activeSnapHandlers();
                             if (ready.isEmpty()) return null;
                             com.jaeckel.ethp2p.networking.eth.EthHandler chosen =
                                     ready.get(Math.floorMod(n, ready.size()));

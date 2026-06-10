@@ -1304,12 +1304,10 @@ public class CommandHandler {
                     if (n == 0 && probedPeer.isReady() && !probedPeer.isSnapServingFailed()) {
                         return new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(probedPeer);
                     }
+                    // activeSnapHandlers() already filters to ready, snap-negotiated,
+                    // non-failed peers (probedPeer included if still healthy) — no re-check.
                     java.util.List<com.jaeckel.ethp2p.networking.eth.EthHandler> ready =
-                        new java.util.ArrayList<>();
-                    for (com.jaeckel.ethp2p.networking.eth.EthHandler p : connector.activeSnapHandlers()) {
-                        if (p.isReady() && !p.isSnapServingFailed() && p != probedPeer) ready.add(p);
-                    }
-                    if (probedPeer.isReady() && !probedPeer.isSnapServingFailed()) ready.add(probedPeer);
+                        connector.activeSnapHandlers();
                     if (ready.isEmpty()) return null;
                     return new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(
                         ready.get(Math.floorMod(n, ready.size())));

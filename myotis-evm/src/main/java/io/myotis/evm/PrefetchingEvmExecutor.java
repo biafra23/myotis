@@ -256,9 +256,13 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
      */
     /** Max prefetch requests in flight at once. A wallet balance sweep can record
      *  ~1000 misses in one wave; firing them all concurrently floods the single
-     *  pinned snap peer (request-queue overflow / disconnects). Chunking keeps the
-     *  peer responsive while still collapsing a wave to ~(N/chunk) round trips. */
-    private static final int PREFETCH_CHUNK = 128;
+     *  pinned snap peer (request-queue overflow / disconnects). A semaphore caps
+     *  concurrency without an artificial per-chunk barrier — as each request
+     *  completes its permit frees and the next starts, so one slow request only
+     *  occupies its own slot, not the whole next batch. */
+    private static final int PREFETCH_MAX_IN_FLIGHT = 128;
+    /** Overall best-effort budget for one prefetch wave. */
+    private static final long PREFETCH_WAVE_TIMEOUT_SEC = 30;
 
     private void prefetchInParallel(SyncStateView view, byte[] stateRoot,
                                     Set<Address> accounts,
@@ -289,24 +293,36 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
                         return null;
                     }));
         }
+        if (work.isEmpty()) return;
 
-        // Best-effort, chunked: wait for each chunk before firing the next, but don't
-        // propagate individual failures — if a prefetch failed, the next EVM run will
-        // hit the (still-uncached) miss and either succeed via the oracle's serial
-        // path or surface a clean error from there.
-        for (int from = 0; from < work.size(); from += PREFETCH_CHUNK) {
-            List<CompletableFuture<?>> chunk = new ArrayList<>(PREFETCH_CHUNK);
-            for (int i = from; i < Math.min(from + PREFETCH_CHUNK, work.size()); i++) {
-                chunk.add(work.get(i).get());
-            }
+        // Semaphore-bounded: keep up to PREFETCH_MAX_IN_FLIGHT requests running, the
+        // calling worker thread blocking on acquire to pace submission. Each fetch
+        // self-times-out (per-request timeout in the wire layer) and releases its
+        // permit, so a slow request frees its slot without stalling the others — no
+        // head-of-line blocking across batches. Best-effort: a failed/cancelled
+        // prefetch just becomes a cache miss the real EVM run block-fetches.
+        java.util.concurrent.Semaphore permits =
+                new java.util.concurrent.Semaphore(PREFETCH_MAX_IN_FLIGHT);
+        List<CompletableFuture<?>> futures = new ArrayList<>(work.size());
+        for (java.util.function.Supplier<CompletableFuture<?>> w : work) {
+            permits.acquireUninterruptibly();
+            CompletableFuture<?> f;
             try {
-                CompletableFuture.allOf(chunk.toArray(CompletableFuture[]::new))
-                        .get(30, java.util.concurrent.TimeUnit.SECONDS);
-            } catch (Exception e) {
-                log.debug("[prefetch] chunk fetch timed out / failed: {}", e.getMessage());
-                for (CompletableFuture<?> f : chunk) {
-                    if (!f.isDone()) f.cancel(false);
-                }
+                f = w.get();
+            } catch (RuntimeException ex) {        // synchronous failure: don't leak the permit
+                permits.release();
+                log.debug("[prefetch] submit failed: {}", ex.getMessage());
+                continue;
+            }
+            futures.add(f.whenComplete((v, e) -> permits.release()));
+        }
+        try {
+            CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new))
+                    .get(PREFETCH_WAVE_TIMEOUT_SEC, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (Exception e) {
+            log.debug("[prefetch] wave timed out / failed: {}", e.getMessage());
+            for (CompletableFuture<?> f : futures) {
+                if (!f.isDone()) f.cancel(false);
             }
         }
     }
