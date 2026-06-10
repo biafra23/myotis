@@ -60,8 +60,7 @@ CL peers are seeded from four sources (in priority order): the persistent `CLPee
 - `GetStorageRanges` with storage proof verification
 - ERC-20 balance lookup via `keccak256(abi.encode(holder, slot))` mapping
 - Full beacon chain cross-verification (proof -> state root -> beacon finalized root)
-
-- `GetTrieNodes` / `TrieNodes` wired at the wire layer (message codes 0x27/0x28, request/response plumbing in `EthHandler`). The EVM's snap bridge deliberately routes through `GetAccountRange`/`GetStorageRanges` instead, because only the range responses carry the full root-to-leaf Merkle proof the oracle needs.
+- `GetTrieNodes` / `TrieNodes` wired at the wire layer (snap message offsets 0x06/0x07; the absolute multiplexed codes depend on the negotiated eth version — `EthHandler` recomputes them from the snap base after Hello). The EVM's snap bridge deliberately routes through `GetAccountRange`/`GetStorageRanges` instead, because only the range responses carry the full root-to-leaf Merkle proof the oracle needs.
 
 **Not implemented:**
 - NFT ownership queries (same mechanism but not exposed via IPC)
