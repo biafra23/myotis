@@ -116,6 +116,14 @@ public final class NodeService extends Service {
     // proxy. Bodies within the window are fetched concurrently, so latency ≈ one
     // round-trip regardless of the count.
     private static final int RECEIPT_LOOKBACK_BLOCKS = 8;
+    // Permissionless mode: do NOT fall back to the (permissioned) upstream proxy. A
+    // method we can't answer from cryptographically-verified data ERRORS instead of
+    // silently returning unverified upstream data — that is the whole point of Myotis.
+    // The proxy was only ever a transition aid to learn what MetaMask calls; the
+    // MethodLogger / myotis_rpcCoverage still records every rejected method, so we keep
+    // that discovery signal without serving unverified data. Flip to false only for
+    // local debugging against an injected upstream.
+    private static final boolean STRICT_NO_PROXY = true;
 
     // Static so MainActivity can reflect the correct button state after a
     // configuration change — the activity instance is recreated, but the
@@ -972,10 +980,13 @@ public final class NodeService extends Service {
                         + h.number + " index " + idx);
                 return buildReceiptJson(receipts, idx, h, blockHash, want);
             }
-            return null; // not found in window → pending / out-of-range → proxy
+            // Verified head + anchored window, but the tx isn't in it → a VERIFIED
+            // "not seen yet": return the JSON-null literal (eth's pending/unknown), NOT
+            // Kotlin null (which means "couldn't verify" → router error).
+            return "null";
         } catch (Exception e) {
             LogBuffer.i(TAG, "[rpc] eth_getTransactionReceipt failed: " + unwrap(e));
-            return null;
+            return null; // couldn't verify → router errors (not a misleading "pending")
         }
     }
 
@@ -1978,8 +1989,10 @@ public final class NodeService extends Service {
         // Starts immediately — does not wait for beacon sync. Router/proxy land next.
         try {
             // Upstream proxy URL (DEBUG/dev only) comes from BuildConfig.RPC_UPSTREAM
-            // (set in gitignored local.properties); blank → strict (no proxy).
-            String upstream = BuildConfig.RPC_UPSTREAM;
+            // (set in gitignored local.properties); blank → strict (no proxy). In
+            // permissionless mode we force it off regardless, so unverifiable methods
+            // error instead of proxying.
+            String upstream = STRICT_NO_PROXY ? null : BuildConfig.RPC_UPSTREAM;
             // Verified-read backend: delegate to the node's shared connector +
             // beacon state. Phase B serves chain id + verified head; more methods
             // are added here as they're implemented.

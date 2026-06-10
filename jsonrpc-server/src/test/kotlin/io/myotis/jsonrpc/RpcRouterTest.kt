@@ -2,6 +2,7 @@ package io.myotis.jsonrpc
 
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.jupiter.api.Assertions.assertArrayEquals
@@ -66,6 +67,9 @@ class RpcRouterTest {
 
     private fun hasError(resp: String): Boolean =
         json.parseToJsonElement(resp).jsonObject["error"] != null
+
+    private fun errorCode(resp: String): Int =
+        json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject["code"]!!.jsonPrimitive.content.toInt()
 
     @Test fun ethCall_encodesResultAsData_andDecodesToAndData() {
         val b = FakeBackend(callResult = byteArrayOf(0, 6))
@@ -208,9 +212,54 @@ class RpcRouterTest {
         assertEquals("0x" + "ab".repeat(32), b.lastReceiptTxHash!!.toHex()) // hash decoded + passed in
     }
 
-    @Test fun getTransactionReceipt_notFound_fallsThrough() {     // backend null result -> proxy/strict
-        assertTrue(hasError(route(FakeBackend(),                  // receiptJson defaults to null
-            """{"jsonrpc":"2.0","id":7,"method":"eth_getTransactionReceipt","params":["0x${"ab".repeat(32)}"]}""")))
+    // ---- strict (permissionless, no-proxy) mode -------------------------------------
+
+    @Test fun strict_unimplementedMethod_errorsMethodNotSupported() {
+        val resp = route(FakeBackend(),                          // no proxy → strict
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{}]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32601, errorCode(resp))                    // not served by this permissionless node
+    }
+
+    @Test fun strict_implementedButUnavailable_errorsServerError() {
+        val resp = route(FakeBackend(balance = null),            // eth_getBalance handled, backend can't answer
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x${"11".repeat(20)}","latest"]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32000, errorCode(resp))                    // supported, but not verifiable right now
+    }
+
+    @Test fun strict_getTransactionReceipt_verifiedPending_returnsNullResult_notError() {
+        // "null" = verified "not seen yet" (synced, not in recent chain) → result: null.
+        val resp = route(FakeBackend().apply { receiptJson = "null" },
+            """{"jsonrpc":"2.0","id":7,"method":"eth_getTransactionReceipt","params":["0x${"ab".repeat(32)}"]}""")
+        assertTrue(!hasError(resp))                              // pending is a valid verified answer, not an error
+        val obj = json.parseToJsonElement(resp).jsonObject
+        assertTrue(obj.containsKey("result"))
+        assertTrue(obj["result"] is kotlinx.serialization.json.JsonNull)
+    }
+
+    @Test fun strict_getTransactionReceipt_cannotVerify_errors() {
+        // Kotlin-null (not synced / no peer) → strict error, NOT a misleading null result.
+        val resp = route(FakeBackend(),                          // receiptJson defaults to null
+            """{"jsonrpc":"2.0","id":7,"method":"eth_getTransactionReceipt","params":["0x${"ab".repeat(32)}"]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32000, errorCode(resp))                    // implemented but can't answer right now
+    }
+
+    @Test fun strict_batch_returnsPerRequestResponses() {
+        // Batch must yield an array of individual responses (JSON-RPC 2.0), each matchable
+        // by id — not a single error envelope. Mixes a verified hit and an unsupported method.
+        val b = FakeBackend(head = 0x123)
+        val resp = route(b, """[
+            {"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]},
+            {"jsonrpc":"2.0","id":2,"method":"eth_getLogs","params":[{}]}
+        ]""")
+        val arr = json.parseToJsonElement(resp).jsonArray
+        assertEquals(2, arr.size)
+        assertEquals("0x123", arr[0].jsonObject["result"]!!.jsonPrimitive.content)        // verified
+        assertEquals(-32601, arr[1].jsonObject["error"]!!.jsonObject["code"]!!.jsonPrimitive.content.toInt()) // unsupported
+        assertEquals(1, arr[0].jsonObject["id"]!!.jsonPrimitive.content.toInt())          // ids preserved
+        assertEquals(2, arr[1].jsonObject["id"]!!.jsonPrimitive.content.toInt())
     }
 
     @Test fun chainId_and_blockNumber_stillVerified() {
