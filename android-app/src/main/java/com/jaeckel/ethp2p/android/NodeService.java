@@ -1297,8 +1297,11 @@ public final class NodeService extends Service {
     /** Tip suggestion cache TTL (~one block) — MetaMask polls fees every few seconds,
      *  and each recompute fetches TIP_SUGGEST_BLOCKS bodies. */
     private static final long TIP_CACHE_TTL_MS = 12_000;
-    private volatile java.math.BigInteger cachedSuggestedTip;
-    private volatile long cachedSuggestedTipAtMs;
+    /** Suggested tip + when it was computed, one immutable unit behind a single
+     *  volatile so a reader can't pair a fresh tip with a stale timestamp
+     *  (same pattern as {@link HeadWithTimestamp}). */
+    private record TipWithTimestamp(java.math.BigInteger tip, long atMs) {}
+    private volatile TipWithTimestamp cachedSuggestedTip;
 
     /** Next block's base fee per the EIP-1559 update rule, from the parent header. */
     private static java.math.BigInteger nextBaseFee(BlockHeader h) {
@@ -1393,8 +1396,8 @@ public final class NodeService extends Service {
             TxFeeFields f = TxFeeFields.decode(txs.get(i));
             if (f == null) { // verified body with an unparseable tx — bail
                 LogBuffer.i(TAG, "[rpc] tips: block #" + h.number + " tx " + i
-                        + " undecodable (first byte 0x"
-                        + Integer.toHexString(txs.get(i).get(0) & 0xFF) + ")");
+                        + " undecodable (" + (txs.get(i).isEmpty() ? "empty"
+                        : "first byte 0x" + Integer.toHexString(txs.get(i).get(0) & 0xFF)) + ")");
                 return null;
             }
             out.add(new TxTip(f.effectiveTip(baseFee), gasUsed != null ? gasUsed[i] : 0));
@@ -1406,10 +1409,10 @@ public final class NodeService extends Service {
      *  {@link #TIP_SUGGEST_BLOCKS} verified blocks, floored at
      *  {@link #MIN_SUGGESTED_TIP}. Cached for ~one block. Null → can't verify. */
     private java.math.BigInteger rpcMaxPriorityFeePerGas() {
-        java.math.BigInteger cached = cachedSuggestedTip;
-        if (cached != null && android.os.SystemClock.elapsedRealtime() - cachedSuggestedTipAtMs
-                < TIP_CACHE_TTL_MS) {
-            return cached;
+        TipWithTimestamp cached = cachedSuggestedTip;
+        if (cached != null
+                && android.os.SystemClock.elapsedRealtime() - cached.atMs() < TIP_CACHE_TTL_MS) {
+            return cached.tip();
         }
         try {
             HeaderAnchor anchor = headerAnchor();
@@ -1430,8 +1433,7 @@ public final class NodeService extends Service {
                 java.util.Collections.sort(tips);
                 tip = tips.get(tips.size() / 2).max(MIN_SUGGESTED_TIP);
             }
-            cachedSuggestedTip = tip;
-            cachedSuggestedTipAtMs = android.os.SystemClock.elapsedRealtime();
+            cachedSuggestedTip = new TipWithTimestamp(tip, android.os.SystemClock.elapsedRealtime());
             return tip;
         } catch (Exception e) {
             LogBuffer.i(TAG, "[rpc] eth_maxPriorityFeePerGas failed: " + unwrap(e));
