@@ -224,8 +224,19 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
                 sink.complete(value);
                 return;
             }
+            Throwable cause = unwrap(error);
+            // A definitive can't-serve failure (empty proof for a non-empty root, or no
+            // state at all) means this peer doesn't retain stateRoot's trie. Tell it so,
+            // so a routing peerSupplier can rotate AWAY from it for this head instead of
+            // re-handing it out every retry — the dominant cost of a heavy multicall
+            // against a fresh head a chunk of the peer set hasn't caught up to.
+            if (cause instanceof EvmExecutionException ee
+                    && (ee.error() instanceof EvmExecutionError.InvalidProof
+                        || ee.error() instanceof EvmExecutionError.StateUnavailable)) {
+                try { peer.reportRootUnavailable(); } catch (RuntimeException ignore) {}
+            }
             log.warn("[snap-oracle] attempt {} failed: {}", attemptIdx, error.getMessage());
-            attempt(op, attemptIdx + 1, unwrap(error), sink);
+            attempt(op, attemptIdx + 1, cause, sink);
         });
     }
 
