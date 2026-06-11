@@ -1500,6 +1500,43 @@ public final class NodeService extends Service {
      *  (same pattern as {@link HeadWithTimestamp}). */
     private record TipWithTimestamp(java.math.BigInteger tip, long atMs) {}
     private volatile TipWithTimestamp cachedSuggestedTip;
+    /** Pre-computed (gasPrice, tip) snapshot, refreshed by the head warmer.
+     *  eth_gasPrice / eth_maxPriorityFeePerGas serve from this in microseconds
+     *  instead of paying the cold path (header anchor + header window + 3 block
+     *  bodies over devp2p, observed 6-18s on-device) on the wallet's poll.
+     *  MetaMask's confirm screen sits in skeleton until a fee poll returns and
+     *  only re-polls every few minutes, so one slow answer stalls the screen for
+     *  minutes. The snapshot is derived from the same verified data as the cold
+     *  path — precomputing changes freshness, not trust. Serving a snapshot a
+     *  minute or two old is fine: it's a fee suggestion, and the wallet re-polls. */
+    private record FeeSnapshot(java.math.BigInteger gasPrice, java.math.BigInteger tip, long atMs) {}
+    private volatile FeeSnapshot feeSnapshot;
+    /** Refresh the snapshot when older than this (head warmer cadence is 5s). */
+    private static final long FEE_SNAPSHOT_REFRESH_MS = 12_000;
+    /** Don't serve a snapshot older than this — fall through to the cold path. */
+    private static final long FEE_SNAPSHOT_MAX_SERVE_MS = 10 * 60_000;
+    private final java.util.concurrent.atomic.AtomicBoolean feeRefreshing =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
+    /** Recompute the fee snapshot if stale; called from the head-warmer tick (and
+     *  as a side effect of a cold-path fee RPC). Single-flight; never throws. */
+    private void refreshFeeSnapshotIfStale() {
+        FeeSnapshot snap = feeSnapshot;
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (snap != null && now - snap.atMs() < FEE_SNAPSHOT_REFRESH_MS) return;
+        if (!feeRefreshing.compareAndSet(false, true)) return;
+        try {
+            java.math.BigInteger price = computeGasPriceCold();
+            java.math.BigInteger tip = cachedSuggestedTip != null ? cachedSuggestedTip.tip() : null;
+            if (price != null && tip != null) {
+                feeSnapshot = new FeeSnapshot(price, tip, android.os.SystemClock.elapsedRealtime());
+            }
+        } catch (Throwable t) {
+            LogBuffer.i(TAG, "[rpc] fee snapshot refresh failed: " + unwrap(t));
+        } finally {
+            feeRefreshing.set(false);
+        }
+    }
 
     /** Next block's base fee per the EIP-1559 update rule, from the parent header. */
     private static java.math.BigInteger nextBaseFee(BlockHeader h) {
@@ -1607,6 +1644,17 @@ public final class NodeService extends Service {
      *  {@link #TIP_SUGGEST_BLOCKS} verified blocks, floored at
      *  {@link #MIN_SUGGESTED_TIP}. Cached for ~one block. Null → can't verify. */
     private java.math.BigInteger rpcMaxPriorityFeePerGas() {
+        // Serve the pre-computed snapshot first — same freshness contract as
+        // eth_gasPrice (the head warmer refreshes it; the wallet re-polls).
+        FeeSnapshot snap = feeSnapshot;
+        if (snap != null && android.os.SystemClock.elapsedRealtime() - snap.atMs()
+                < FEE_SNAPSHOT_MAX_SERVE_MS) {
+            return snap.tip();
+        }
+        return computeMaxPriorityFeeCold();
+    }
+
+    private java.math.BigInteger computeMaxPriorityFeeCold() {
         TipWithTimestamp cached = cachedSuggestedTip;
         if (cached != null
                 && android.os.SystemClock.elapsedRealtime() - cached.atMs() < TIP_CACHE_TTL_MS) {
@@ -1639,14 +1687,35 @@ public final class NodeService extends Service {
         }
     }
 
-    /** Legacy-style total gas price: next block's base fee + the suggested tip. */
+    /** Legacy-style total gas price: next block's base fee + the suggested tip.
+     *  Served from the pre-computed {@link #feeSnapshot} when available (the head
+     *  warmer keeps it fresh) so the wallet's fee poll returns in microseconds;
+     *  falls back to the cold path only before the first snapshot exists. */
     private java.math.BigInteger rpcGasPrice() {
+        FeeSnapshot snap = feeSnapshot;
+        if (snap != null && android.os.SystemClock.elapsedRealtime() - snap.atMs()
+                < FEE_SNAPSHOT_MAX_SERVE_MS) {
+            return snap.gasPrice();
+        }
+        java.math.BigInteger price = computeGasPriceCold();
+        if (price != null) {
+            java.math.BigInteger tip = cachedSuggestedTip != null ? cachedSuggestedTip.tip() : null;
+            if (tip != null) {
+                feeSnapshot = new FeeSnapshot(price, tip, android.os.SystemClock.elapsedRealtime());
+            }
+        }
+        return price;
+    }
+
+    /** The cold gas-price computation (header anchor + window + tip from verified
+     *  bodies). Seconds-slow on-device; callers should prefer {@link #feeSnapshot}. */
+    private java.math.BigInteger computeGasPriceCold() {
         try {
             HeaderAnchor anchor = headerAnchor();
             if (anchor == null) return null;
             List<BlockHeadersMessage.VerifiedHeader> window = anchoredHeaderWindow(anchor, 1);
             if (window == null || window.isEmpty()) return null;
-            java.math.BigInteger tip = rpcMaxPriorityFeePerGas();
+            java.math.BigInteger tip = computeMaxPriorityFeeCold();
             if (tip == null) return null;
             return nextBaseFee(window.get(window.size() - 1).header()).add(tip);
         } catch (Exception e) {
@@ -2214,6 +2283,14 @@ public final class NodeService extends Service {
                 verifiedHeadCallContext();
             } catch (Exception ignored) {
                 // No usable snap peer / anchorable head yet — retry next tick.
+            }
+            // Keep the fee snapshot warm too: the wallet's confirm screen blocks on
+            // its fee poll, and the cold computation takes seconds — paying it here
+            // (off the RPC path) makes eth_gasPrice effectively instant.
+            try {
+                refreshFeeSnapshotIfStale();
+            } catch (Throwable ignored) {
+                // never kill the warmer tick
             }
         }, 3, 5, TimeUnit.SECONDS);
     }
