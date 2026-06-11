@@ -3013,7 +3013,11 @@ public final class NodeService extends Service {
         discV5 = null;
         closeQuietly(discV4);
         discV4 = null;
-        peerCache = null;
+        // Flush + stop the peer cache's async writer before dropping the reference.
+        if (peerCache != null) {
+            try { peerCache.close(); } catch (Exception ignored) {}
+            peerCache = null;
+        }
         clPeerCache = null;
         attempted.clear();
         backoff.clear();

@@ -3,12 +3,11 @@ package com.jaeckel.ethp2p.android;
 import com.jaeckel.ethp2p.android.log.LogBuffer;
 
 import java.io.BufferedReader;
+import java.io.Closeable;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.io.OutputStreamWriter;
-import java.io.Writer;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -18,6 +17,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Android-native peer cache. Mirrors {@code PeerCache} in the :app module but
@@ -47,8 +49,19 @@ import java.util.concurrent.ConcurrentHashMap;
  * are deprioritized, never evicted — state roots change, and a peer that
  * couldn't serve an old pivot may serve the current one (and is still a fine
  * plain-eth peer for headers/blocks).
+ *
+ * <p><b>Threading.</b> The in-memory maps are the authoritative copy and are
+ * mutated only under {@code synchronized(this)}. Disk writes are offloaded to a
+ * single daemon thread ({@link #diskWriter}) so the snap response callbacks
+ * (which run on the Netty event loop) and the RLPx worker threads never block on
+ * file I/O. Each write task is submitted <em>while holding the monitor</em>, so
+ * submission order matches the in-memory state-capture order and the
+ * single-threaded executor applies them in that order — the file converges to
+ * the in-memory state. Persistence is best-effort: a process kill can drop a
+ * queued write, which is fine because the cache is reconstructible (peers are
+ * re-discovered) and was never fsync'd even when writes were synchronous.
  */
-public final class AndroidPeerCache {
+public final class AndroidPeerCache implements Closeable {
 
     private static final String TAG = "ethp2p.cache";
     private static final char SEP = '\t';
@@ -72,6 +85,17 @@ public final class AndroidPeerCache {
     private final Set<String> snapConfirmed = ConcurrentHashMap.newKeySet();
     private final Set<String> snapDenied = ConcurrentHashMap.newKeySet();
     private final Map<String, Integer> snapFailures = new ConcurrentHashMap<>();
+    /** True once the on-disk file has been read into {@link #entries} (or shown
+     *  absent), after which {@link #load()} serves from memory without disk I/O. */
+    private boolean loaded = false;
+
+    /** Serializes all file writes off the caller's (Netty) thread. Single-threaded
+     *  so submission order == apply order; daemon so it never blocks JVM exit. */
+    private final ExecutorService diskWriter = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "peer-cache-writer");
+        t.setDaemon(true);
+        return t;
+    });
 
     public AndroidPeerCache(Path cacheFile) {
         this.cacheFile = cacheFile;
@@ -85,21 +109,18 @@ public final class AndroidPeerCache {
     }
 
     /**
-     * Synchronized because RLPxConnector calls this from Netty worker threads;
-     * without it two simultaneous writes can interleave and corrupt a line.
+     * Record a newly-handshaked peer. Updates the in-memory map and appends its
+     * line to disk (asynchronously). No-op if already known.
      */
     public synchronized void add(InetSocketAddress address, String publicKeyHex, boolean snap) {
         String key = keyOf(address);
         if (entries.containsKey(key)) return;
         entries.put(key, new PeerRec(publicKeyHex, snap));
-        // Fast path: append the new line (UNKNOWN quality) rather than rewriting
-        // the whole file on every newly-handshaked peer.
-        String line = key + SEP + publicKeyHex + SEP + (snap ? "1" : "0") + "\n";
-        try (FileOutputStream out = new FileOutputStream(cacheFile.toFile(), true)) {
-            out.write(line.getBytes(StandardCharsets.UTF_8));
-        } catch (IOException e) {
-            LogBuffer.w(TAG, "write failed: " + e.getMessage());
-        }
+        // Append fast path: a single new line (UNKNOWN quality) rather than
+        // rewriting the whole file on every newly-handshaked peer.
+        byte[] line = (key + SEP + publicKeyHex + SEP + (snap ? "1" : "0") + "\n")
+                .getBytes(StandardCharsets.UTF_8);
+        submitWrite(() -> writeBytes(line, true));
     }
 
     /**
@@ -113,7 +134,7 @@ public final class AndroidPeerCache {
         snapFailures.remove(key);
         boolean changed = snapConfirmed.add(key);
         changed |= snapDenied.remove(key);
-        if (changed) rewriteFile();
+        if (changed) rewriteAsync();
     }
 
     /**
@@ -131,29 +152,67 @@ public final class AndroidPeerCache {
             boolean changed = snapDenied.add(key);
             changed |= snapConfirmed.remove(key);
             if (changed) {
-                rewriteFile();
+                rewriteAsync();
                 LogBuffer.i(TAG, "snap peer denied after " + count + " failures: " + key);
             }
         }
     }
 
     /**
-     * Delete the cache file and forget every peer we've written. Next call
-     * to {@link #add} will recreate the file.
+     * Forget every peer and delete the cache file. Memory is the authoritative
+     * copy, so it's cleared synchronously and {@link #loaded} stays true (an
+     * immediately-following {@link #load()} correctly returns the now-empty set
+     * without racing the asynchronous file delete).
      */
     public synchronized void clear() {
         entries.clear();
         snapConfirmed.clear();
         snapDenied.clear();
         snapFailures.clear();
-        if (!cacheFile.toFile().delete() && cacheFile.toFile().exists()) {
-            LogBuffer.w(TAG, "failed to delete cache file " + cacheFile);
-        }
+        loaded = true;
+        submitWrite(() -> {
+            if (!cacheFile.toFile().delete() && cacheFile.toFile().exists()) {
+                LogBuffer.w(TAG, "failed to delete cache file " + cacheFile);
+            }
+        });
     }
 
+    /**
+     * Return all cached peers. Reads and parses the file on the first call, then
+     * serves from the in-memory copy — so the periodic peer-maintenance loop
+     * doesn't re-read/parse the file every few seconds.
+     */
     public synchronized List<CachedPeer> load() {
-        List<CachedPeer> result = new ArrayList<>();
-        if (!cacheFile.toFile().exists()) return result;
+        if (!loaded) loadFromDisk();
+        List<CachedPeer> result = new ArrayList<>(entries.size());
+        for (Map.Entry<String, PeerRec> e : entries.entrySet()) {
+            String key = e.getKey();
+            int tab = key.indexOf(SEP);
+            if (tab < 0) continue;
+            String ip = key.substring(0, tab);
+            int port;
+            try {
+                port = Integer.parseInt(key.substring(tab + 1));
+            } catch (NumberFormatException ex) {
+                continue;
+            }
+            PeerRec rec = e.getValue();
+            SnapQuality quality = snapConfirmed.contains(key) ? SnapQuality.CONFIRMED
+                    : snapDenied.contains(key) ? SnapQuality.DENIED
+                    : SnapQuality.UNKNOWN;
+            result.add(new CachedPeer(
+                    new InetSocketAddress(ip, port), rec.publicKeyHex(), rec.snap(), quality));
+        }
+        return result;
+    }
+
+    /** Read the file into the in-memory maps. Runs at most once (guarded by
+     *  {@link #loaded}); each line parses independently so a malformed entry is
+     *  skipped without aborting the rest. */
+    private void loadFromDisk() {
+        loaded = true;
+        if (!cacheFile.toFile().exists()) return;
+        int conf = 0, den = 0, count = 0;
         try (BufferedReader r = new BufferedReader(new InputStreamReader(
                 new FileInputStream(cacheFile.toFile()), StandardCharsets.UTF_8))) {
             String line;
@@ -180,40 +239,70 @@ public final class AndroidPeerCache {
                     }
                     String key = ip + SEP + port;
                     entries.put(key, new PeerRec(pubKeyHex, snap));
-                    if (quality == SnapQuality.CONFIRMED) snapConfirmed.add(key);
-                    else if (quality == SnapQuality.DENIED) snapDenied.add(key);
-                    result.add(new CachedPeer(
-                            new InetSocketAddress(ip, port), pubKeyHex, snap, quality));
+                    if (quality == SnapQuality.CONFIRMED) { snapConfirmed.add(key); conf++; }
+                    else if (quality == SnapQuality.DENIED) { snapDenied.add(key); den++; }
+                    count++;
                 } catch (Exception e) {
                     LogBuffer.w(TAG, "skipping malformed peer line: " + e.getMessage());
                 }
             }
-            int conf = snapConfirmed.size(), den = snapDenied.size();
-            if (!result.isEmpty() && (conf > 0 || den > 0)) {
-                LogBuffer.i(TAG, "loaded " + result.size() + " cached peer(s) ("
+            if (count > 0 && (conf > 0 || den > 0)) {
+                LogBuffer.i(TAG, "loaded " + count + " cached peer(s) ("
                         + conf + " snap-confirmed, " + den + " snap-denied)");
             }
         } catch (IOException e) {
             LogBuffer.w(TAG, "read failed: " + e.getMessage());
         }
-        return result;
     }
 
-    private synchronized void rewriteFile() {
-        try (Writer w = new OutputStreamWriter(
-                new FileOutputStream(cacheFile.toFile(), false), StandardCharsets.UTF_8)) {
-            for (Map.Entry<String, PeerRec> e : entries.entrySet()) {
-                String key = e.getKey();
-                PeerRec rec = e.getValue();
-                w.write(key);                       // ip\tport
-                w.write(SEP); w.write(rec.publicKeyHex());
-                w.write(SEP); w.write(rec.snap() ? "1" : "0");
-                if (snapConfirmed.contains(key)) { w.write(SEP); w.write("snapok"); }
-                else if (snapDenied.contains(key)) { w.write(SEP); w.write("snapbad"); }
-                w.write('\n');
-            }
+    /** Render the full file content from the in-memory state (called under the
+     *  monitor) and submit it as a truncating rewrite. */
+    private void rewriteAsync() {
+        StringBuilder sb = new StringBuilder(entries.size() * 96);
+        for (Map.Entry<String, PeerRec> e : entries.entrySet()) {
+            String key = e.getKey();
+            PeerRec rec = e.getValue();
+            sb.append(key)                                  // ip\tport
+              .append(SEP).append(rec.publicKeyHex())
+              .append(SEP).append(rec.snap() ? "1" : "0");
+            if (snapConfirmed.contains(key)) sb.append(SEP).append("snapok");
+            else if (snapDenied.contains(key)) sb.append(SEP).append("snapbad");
+            sb.append('\n');
+        }
+        byte[] data = sb.toString().getBytes(StandardCharsets.UTF_8);
+        submitWrite(() -> writeBytes(data, false));
+    }
+
+    /** Submit a file op to the writer thread; tolerate a shutdown executor. */
+    private void submitWrite(Runnable task) {
+        try {
+            diskWriter.execute(task);
+        } catch (java.util.concurrent.RejectedExecutionException ignore) {
+            // Cache already closed (node stopping) — drop the write; memory is
+            // authoritative and the next start re-reads whatever did land.
+        }
+    }
+
+    /** Write {@code data} to the cache file on the writer thread. */
+    private void writeBytes(byte[] data, boolean append) {
+        try (FileOutputStream out = new FileOutputStream(cacheFile.toFile(), append)) {
+            out.write(data);
         } catch (IOException e) {
-            LogBuffer.w(TAG, "rewrite failed: " + e.getMessage());
+            LogBuffer.w(TAG, "write failed: " + e.getMessage());
+        }
+    }
+
+    /** Stop the writer thread, draining any queued writes first. */
+    @Override
+    public void close() {
+        diskWriter.shutdown();
+        try {
+            if (!diskWriter.awaitTermination(2, TimeUnit.SECONDS)) {
+                diskWriter.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            diskWriter.shutdownNow();
         }
     }
 }
