@@ -249,8 +249,26 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
         });
     }
 
+    /**
+     * Peel the real cause out of the executor's wrapper exceptions. A single
+     * snap fetch fans out through nested {@code CompletableFuture.allOf(...).join()}
+     * stages, each of which re-wraps a failure in its own
+     * {@link CompletionException} (and {@code ExecutionException} from any
+     * {@code get()}). Unwrapping only one layer would leave the
+     * {@code TimeoutException}/{@code IOException}/{@code InvalidProof} root cause
+     * buried, so the {@code cantServe} routing check would miss it and never
+     * deny the hanging peer. Recurse to the innermost non-wrapper cause, with a
+     * self-cause guard so a malformed cycle can't spin forever.
+     */
     private static Throwable unwrap(Throwable t) {
-        return t instanceof CompletionException && t.getCause() != null ? t.getCause() : t;
+        Throwable cur = t;
+        while ((cur instanceof CompletionException
+                || cur instanceof java.util.concurrent.ExecutionException)
+                && cur.getCause() != null
+                && cur.getCause() != cur) {
+            cur = cur.getCause();
+        }
+        return cur;
     }
 
     private AccountWithStorageRoot verifyAndDecodeAccount(
