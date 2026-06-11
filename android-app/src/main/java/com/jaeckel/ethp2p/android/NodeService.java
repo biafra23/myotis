@@ -847,6 +847,26 @@ public final class NodeService extends Service {
     // record behind a single volatile ref so head and timestamp are read/written
     // atomically together (no torn read of new head with old timestamp).
     private volatile HeadWithTimestamp lastGoodHead;
+    /**
+     * Frozen anchored context per pinned block NUMBER. A wallet (MetaMask) pins a
+     * confirm to one block and retries the same heavy calls against it for minutes.
+     * Serving each retry against the <em>current</em> head — which the warmer rebuilds
+     * to a new stateRoot every ~12-15s — reset the stateRoot-keyed StateProofCache on
+     * every rebuild, so a 1000-slot BalanceChecker / Multicall3 simulation re-fetched
+     * from scratch each retry and never converged (the persistent confirm-screen hang,
+     * uptime-independent). Freezing the context — and thus its stateRoot — per pinned
+     * number makes all retries hit one stable root, so the cache accumulates and the
+     * call converges in a couple of tries. Bounded LRU (wallets pin a few recent
+     * blocks); each entry ages out at {@link #RPC_HEAD_SERVE_STALE_MAX_MS}.
+     */
+    private final java.util.Map<Long, HeadWithTimestamp> pinnedHeadByNumber =
+            java.util.Collections.synchronizedMap(
+                    new java.util.LinkedHashMap<>(16, 0.75f, true) {
+                        @Override protected boolean removeEldestEntry(
+                                java.util.Map.Entry<Long, HeadWithTimestamp> e) {
+                            return size() > 16;
+                        }
+                    });
     /** Runs the blocking, network-bound head build off the caller's thread so a
      *  request blocks only up to its own timeout. Single-thread: the future
      *  dedup means at most one build runs at a time. */
@@ -894,6 +914,16 @@ public final class NodeService extends Service {
                 if (requestedNum < 0) return null;
             }
         }
+        // Pinned-number fast path: reuse the context already frozen to this number so
+        // its (fixed) stateRoot lets the StateProofCache accumulate across the wallet's
+        // minutes-long retries instead of resetting every time the head rebuilds.
+        if (requestedNum >= 0) {
+            HeadWithTimestamp frozen = pinnedHeadByNumber.get(requestedNum);
+            if (frozen != null && android.os.SystemClock.elapsedRealtime() - frozen.builtAtMs()
+                    < RPC_HEAD_SERVE_STALE_MAX_MS) {
+                return frozen.head();
+            }
+        }
         EnsCall ctx = anchoredHeadOrWait();
         if (ctx == null) return null;
         if (requestedNum >= 0) {
@@ -918,6 +948,10 @@ public final class NodeService extends Service {
                         + ", optimistic=" + optimistic + ") -> not served");
                 return null;
             }
+            // Freeze this context for the number so every subsequent retry pinned to it
+            // resolves the SAME root (cache accumulation). First pin wins; it ages out.
+            pinnedHeadByNumber.putIfAbsent(requestedNum,
+                    new HeadWithTimestamp(ctx, android.os.SystemClock.elapsedRealtime()));
         }
         return ctx;
     }
@@ -3215,6 +3249,7 @@ public final class NodeService extends Service {
         // briefly reuse one pinned to a now-dead peer (fails safe to proxy anyway).
         synchronized (rpcCallCtxLock) { rpcCallCtx = null; }
         lastGoodHead = null;
+        pinnedHeadByNumber.clear();
         // Close BLC first: its libp2p host's outbound dials hold references
         // through to the discv5 callback's blcRef, and the sync thread can
         // be in the middle of an addPeer call when shutdown fires.
