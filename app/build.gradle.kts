@@ -75,4 +75,14 @@ tasks.register<JavaExec>("run") {
         ?: emptyList()
     appArgs.addAll(cmdArgs)
     args(appArgs)
+    // Force our logback config over the one trueblocks-kotlin bundles on the
+    // classpath. Daemon (no -Pargs) → truncate-on-start devp2p.log; client command
+    // → console-only so it never wipes the running daemon's log.
+    systemProperty(
+        "logback.configurationFile",
+        if (cmdArgs.isEmpty()) "logback-daemon.xml" else "logback-client.xml",
+    )
+    // Stable daemon log at the repo root regardless of the JVM working dir (which
+    // defaults to the :app module dir). `tail -F devp2p.log` from the repo root.
+    systemProperty("myotis.logfile", rootProject.file("devp2p.log").absolutePath)
 }
