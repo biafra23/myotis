@@ -804,6 +804,17 @@ public final class NodeService extends Service {
      *  instant error that emptied MetaMask's asset list. Beyond this (~13 min) the pin is
      *  genuinely historical and we can't represent it, so reject. */
     private static final long RPC_BLOCK_NUM_LAG_TOLERANCE = 64;
+    /** Last-resort stale-serve horizon: when rebuilds keep failing (a heavy token
+     *  sweep starving the snap peers, a peer-set outage), serve the last anchored
+     *  head up to the SAME horizon the pinned-number check accepts —
+     *  {@link #RPC_BLOCK_NUM_LAG_TOLERANCE} blocks (~13min at 12s slots). The
+     *  context's verification never expires (it's beacon-anchored); only its
+     *  freshness ages, and a wallet read against ~minutes-old verified state is
+     *  strictly better than an instant error: MetaMask pins reads to a recent
+     *  block number and re-polls anyway. Without this, every read during a
+     *  sustained rebuild outage died with "no verified head" (the confirm-screen
+     *  instant-ERROR storm) even though a perfectly servable context existed. */
+    private static final long RPC_HEAD_SERVE_STALE_MAX_MS = RPC_BLOCK_NUM_LAG_TOLERANCE * 12_000;
 
     private final Object rpcCallCtxLock = new Object();
     private CompletableFuture<EnsCall> rpcCallCtx;   // in-flight/fresh build (dedup)
@@ -925,6 +936,19 @@ public final class NodeService extends Service {
                     break;
                 }
             }
+        }
+        // Last resort: a stale-but-anchored head beats erroring. Its verification
+        // hasn't expired — it's just old — and verifiedHeadFor's pinned-number
+        // bounds still reject pins this context genuinely can't represent. The
+        // warmer keeps retrying fresh builds in the background regardless.
+        HeadWithTimestamp stale = lastGoodHead;
+        if (stale != null && android.os.SystemClock.elapsedRealtime() - stale.builtAtMs()
+                < RPC_HEAD_SERVE_STALE_MAX_MS) {
+            LogBuffer.i(TAG, "[rpc] serving STALE anchored head (block #"
+                    + stale.head().blockNumber() + ", "
+                    + (android.os.SystemClock.elapsedRealtime() - stale.builtAtMs()) / 1000
+                    + "s old) — rebuild failing: " + (last != null ? unwrap(last) : "timeout"));
+            return stale.head();
         }
         LogBuffer.i(TAG, "[rpc] no verified head after "
                 + (android.os.SystemClock.elapsedRealtime() - start) + "ms -> proxy: "
