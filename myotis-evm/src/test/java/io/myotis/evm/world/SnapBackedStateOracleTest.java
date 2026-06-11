@@ -146,6 +146,110 @@ class SnapBackedStateOracleTest {
         assertEquals(0, peer.rootUnavailableCalls.get());
     }
 
+    @Test
+    void hangingPeerIsReportedRootUnavailable() {
+        // A peer that accepts the request then times out (or the connection drops) is as
+        // useless for this head as an empty-proof one — it must be flagged so the routing
+        // supplier rotates away from it, not re-dialed every retry (the confirm-screen hang).
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        Bytes32 root = Bytes32.fromHexString(
+                "0x2222222222222222222222222222222222222222222222222222222222222222");
+        AtomicInteger reported = new AtomicInteger();
+        SnapPeer hanging = new SnapPeer() {
+            @Override public CompletableFuture<List<Bytes>> getTrieNodes(Bytes32 sr, List<PathSet> p) {
+                return CompletableFuture.failedFuture(new java.util.concurrent.TimeoutException("hung"));
+            }
+            @Override public CompletableFuture<List<Bytes>> getByteCodes(List<Bytes32> h) {
+                return CompletableFuture.failedFuture(new java.util.concurrent.TimeoutException("hung"));
+            }
+            @Override public void reportRootUnavailable() { reported.incrementAndGet(); }
+        };
+
+        var oracle = new SnapBackedStateOracle(() -> hanging, BytecodeCache.inMemory(), 3);
+        try {
+            oracle.fetchAccount(root.toArrayUnsafe(), addr).get();
+            fail("expected fetchAccount to fail");
+        } catch (ExecutionException e) {
+            assertInstanceOf(java.util.concurrent.TimeoutException.class, e.getCause(),
+                    "the surfaced failure must be the timeout, not an unrelated error");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            fail("interrupted");
+        }
+        assertEquals(3, reported.get(), "each timeout must report the peer root-unavailable");
+    }
+
+    @Test
+    void channelClosedIsReportedRootUnavailable() {
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        Bytes32 root = Bytes32.fromHexString(
+                "0x3333333333333333333333333333333333333333333333333333333333333333");
+        AtomicInteger reported = new AtomicInteger();
+        SnapPeer dropped = new SnapPeer() {
+            @Override public CompletableFuture<List<Bytes>> getTrieNodes(Bytes32 sr, List<PathSet> p) {
+                return CompletableFuture.failedFuture(new java.io.IOException("Channel closed"));
+            }
+            @Override public CompletableFuture<List<Bytes>> getByteCodes(List<Bytes32> h) {
+                return CompletableFuture.failedFuture(new java.io.IOException("Channel closed"));
+            }
+            @Override public void reportRootUnavailable() { reported.incrementAndGet(); }
+        };
+
+        var oracle = new SnapBackedStateOracle(() -> dropped, BytecodeCache.inMemory(), 2);
+        try {
+            oracle.fetchAccount(root.toArrayUnsafe(), addr).get();
+            fail("expected fetchAccount to fail");
+        } catch (ExecutionException e) {
+            assertInstanceOf(java.io.IOException.class, e.getCause(),
+                    "the surfaced failure must be the channel-closed IOException");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            fail("interrupted");
+        }
+        assertEquals(2, reported.get());
+    }
+
+    @Test
+    void deeplyWrappedTimeoutIsStillReportedRootUnavailable() {
+        // The real fetch path fans out through nested allOf(...).join() stages, each of
+        // which re-wraps the failure in another CompletionException. The root-cause
+        // unwrap must peel ALL of them, not just one — otherwise the TimeoutException
+        // stays buried, cantServe is false, and the hanging peer is never denied.
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        Bytes32 root = Bytes32.fromHexString(
+                "0x4444444444444444444444444444444444444444444444444444444444444444");
+        AtomicInteger reported = new AtomicInteger();
+        SnapPeer hangingDeep = new SnapPeer() {
+            @Override public CompletableFuture<List<Bytes>> getTrieNodes(Bytes32 sr, List<PathSet> p) {
+                java.util.concurrent.CompletionException nested =
+                        new java.util.concurrent.CompletionException(
+                                new java.util.concurrent.CompletionException(
+                                        new java.util.concurrent.TimeoutException("hung")));
+                return CompletableFuture.failedFuture(nested);
+            }
+            @Override public CompletableFuture<List<Bytes>> getByteCodes(List<Bytes32> h) {
+                return CompletableFuture.failedFuture(new java.util.concurrent.TimeoutException("hung"));
+            }
+            @Override public void reportRootUnavailable() { reported.incrementAndGet(); }
+        };
+
+        var oracle = new SnapBackedStateOracle(() -> hangingDeep, BytecodeCache.inMemory(), 2);
+        try {
+            oracle.fetchAccount(root.toArrayUnsafe(), addr).get();
+            fail("expected fetchAccount to fail");
+        } catch (ExecutionException e) {
+            // unwrap() must have peeled every CompletionException layer, so the
+            // surfaced cause is the bare TimeoutException — not a wrapper.
+            assertInstanceOf(java.util.concurrent.TimeoutException.class, e.getCause(),
+                    "the multiply-wrapped timeout must be unwrapped to its root cause");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            fail("interrupted");
+        }
+        assertEquals(2, reported.get(),
+                "a multiply-wrapped timeout must still be unwrapped and denied");
+    }
+
     // ---- Storage fetch -----------------------------------------------------
 
     @Test
