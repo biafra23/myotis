@@ -269,8 +269,12 @@ public final class Main {
         // 5. Connect to cached peers immediately
         List<PeerCache.CachedPeer> cached = peerCache.load();
         // Reconnect snap/1-capable peers first so state queries (get-account,
-        // get-storage) have a snap peer available sooner after a restart.
-        cached.sort((a, b) -> Boolean.compare(b.snap(), a.snap()));
+        // get-storage) have a snap peer available sooner after a restart. Within
+        // the snap set, peers proven to serve proofs (CONFIRMED) come ahead of
+        // unproven ones, and known hangers (DENIED) come last — so a restart
+        // converges on a working snap peer instead of re-timing-out the bad
+        // ones first (mirrors NodeService's snapDialRank ordering).
+        cached.sort(java.util.Comparator.comparingInt(Main::snapDialRank));
         for (PeerCache.CachedPeer peer : cached) {
             String peerKey = peer.address().getAddress().getHostAddress()
                     + ":" + peer.address().getPort();
@@ -552,15 +556,82 @@ public final class Main {
             return;
         }
 
+        // 8b. Verified JSON-RPC endpoint: the shared VerifiedRpcBackend (same
+        // implementation the Android app hosts in NodeService) served over the
+        // Ktor MyotisRpcServer. Bound loopback-only — the endpoint is
+        // unauthenticated and TLS-less, so it must not be exposed on a routable
+        // interface — and STRICT (null upstream): the daemon never proxies; a
+        // method that can't be answered cryptographically verified errors.
+        // Best-effort: if port 8545 is taken (another node / dev tool), the
+        // daemon keeps running without RPC instead of crashing.
+        io.myotis.rpc.VerifiedRpcBackend rpcBackendTmp = null;
+        io.myotis.jsonrpc.MyotisRpcServer rpcServerTmp = null;
+        try {
+            // Deterministic port check up front: Ktor's CIO engine surfaces a bind
+            // failure asynchronously, which a try/catch around start() can miss.
+            try (java.net.ServerSocket probe = new java.net.ServerSocket()) {
+                probe.setReuseAddress(true);
+                probe.bind(new InetSocketAddress("127.0.0.1", 8545));
+            }
+            // Persist per-peer snap-serving verdicts into the EL peer cache so
+            // proven snap-servers are dialed first on restart and repeat hangers
+            // are deprioritized (same wiring as NodeService → AndroidPeerCache).
+            io.myotis.rpc.SnapQualitySink snapQualitySink = new io.myotis.rpc.SnapQualitySink() {
+                @Override public void recordSnapServed(InetSocketAddress address) {
+                    peerCache.recordSnapServed(address);
+                }
+                @Override public void recordSnapFailure(InetSocketAddress address) {
+                    peerCache.recordSnapFailure(address);
+                }
+            };
+            io.myotis.rpc.RpcLogger rpcLogger = new io.myotis.rpc.RpcLogger() {
+                @Override public void info(String message) { log.info(message); }
+                @Override public void warn(String message) { log.warn(message); }
+            };
+            io.myotis.rpc.VerifiedRpcBackend backend = new io.myotis.rpc.VerifiedRpcBackend(
+                    connector, beaconLightClient, beaconSyncState,
+                    new com.jaeckel.ethp2p.app.rpc.JavaHttpCcipGateway(),
+                    rpcLogger, io.myotis.rpc.RpcClock.monotonic(), snapQualitySink);
+            backend.start();
+            try {
+                io.myotis.jsonrpc.MyotisRpcServer rpcServer =
+                        new io.myotis.jsonrpc.MyotisRpcServer(8545, null, "127.0.0.1", backend);
+                rpcServer.start();
+                rpcServerTmp = rpcServer;
+                rpcBackendTmp = backend;
+                log.info("JSON-RPC listening on http://127.0.0.1:8545 (verified, strict)");
+            } catch (Throwable serverEx) {
+                backend.close();
+                throw serverEx;
+            }
+        } catch (java.io.IOException bindEx) {
+            log.warn("[rpc] port 8545 unavailable ({}); continuing without JSON-RPC",
+                    bindEx.getMessage());
+        } catch (Throwable t) {
+            log.warn("[rpc] failed to start JSON-RPC server; continuing without it: {}",
+                    t.toString());
+        }
+        final io.myotis.rpc.VerifiedRpcBackend rpcBackend = rpcBackendTmp;
+        final io.myotis.jsonrpc.MyotisRpcServer rpcServer = rpcServerTmp;
+
         // 9. Shutdown hook for Ctrl-C / SIGTERM — cleanup happens here
         //    because the JVM may exit before the main thread resumes after await().
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log.info("[daemon] Shutdown hook triggered");
+            // Stop the RPC endpoint first so the port frees and no in-flight
+            // request builds against torn-down components.
+            if (rpcServer != null) {
+                try { rpcServer.stop(); } catch (Throwable ignored) {}
+            }
+            if (rpcBackend != null) {
+                try { rpcBackend.close(); } catch (Throwable ignored) {}
+            }
             beaconLightClient.close();
             server.close();
             connector.close();
             discV5.close();
             discV4.close();
+            peerCache.close();   // last: drain queued cache writes after the final add()
             try { fileLock.release(); lockChannel.close(); } catch (Exception ignored) {}
             stopLatch.countDown();
             log.info("[daemon] Done.");
@@ -570,11 +641,18 @@ public final class Main {
         stopLatch.await();
 
         // Cleanup for graceful "stop" command (shutdown hook handles Ctrl-C/SIGTERM)
+        if (rpcServer != null) {
+            try { rpcServer.stop(); } catch (Throwable ignored) {}
+        }
+        if (rpcBackend != null) {
+            try { rpcBackend.close(); } catch (Throwable ignored) {}
+        }
         beaconLightClient.close();
         server.close();
         connector.close();
         discV5.close();
         discV4.close();
+        peerCache.close();
         try { fileLock.release(); lockChannel.close(); } catch (Exception ignored) {}
         log.info("[daemon] Done.");
     }
@@ -582,6 +660,22 @@ public final class Main {
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
+
+    /**
+     * Dial-priority rank for a cached peer (lower = dialed first): proven
+     * snap-servers, then snap-capable-but-unproven, then known snap hangers, then
+     * plain-eth peers. Denied snap peers still outrank non-snap peers — state
+     * roots change, so a peer that couldn't serve an old pivot may serve the
+     * current head, and it's still snap-capable. Mirrors NodeService.snapDialRank.
+     */
+    private static int snapDialRank(PeerCache.CachedPeer p) {
+        if (!p.snap()) return 3;
+        return switch (p.snapQuality()) {
+            case CONFIRMED -> 0;
+            case UNKNOWN -> 1;
+            case DENIED -> 2;
+        };
+    }
 
     /**
      * Check if a daemon is actually listening on the socket.
