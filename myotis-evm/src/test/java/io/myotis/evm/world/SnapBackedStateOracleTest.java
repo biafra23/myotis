@@ -169,7 +169,13 @@ class SnapBackedStateOracleTest {
         try {
             oracle.fetchAccount(root.toArrayUnsafe(), addr).get();
             fail("expected fetchAccount to fail");
-        } catch (Exception ignored) { /* expected */ }
+        } catch (ExecutionException e) {
+            assertInstanceOf(java.util.concurrent.TimeoutException.class, e.getCause(),
+                    "the surfaced failure must be the timeout, not an unrelated error");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            fail("interrupted");
+        }
         assertEquals(3, reported.get(), "each timeout must report the peer root-unavailable");
     }
 
@@ -193,7 +199,13 @@ class SnapBackedStateOracleTest {
         try {
             oracle.fetchAccount(root.toArrayUnsafe(), addr).get();
             fail("expected fetchAccount to fail");
-        } catch (Exception ignored) { /* expected */ }
+        } catch (ExecutionException e) {
+            assertInstanceOf(java.io.IOException.class, e.getCause(),
+                    "the surfaced failure must be the channel-closed IOException");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            fail("interrupted");
+        }
         assertEquals(2, reported.get());
     }
 
@@ -225,7 +237,15 @@ class SnapBackedStateOracleTest {
         try {
             oracle.fetchAccount(root.toArrayUnsafe(), addr).get();
             fail("expected fetchAccount to fail");
-        } catch (Exception ignored) { /* expected */ }
+        } catch (ExecutionException e) {
+            // unwrap() must have peeled every CompletionException layer, so the
+            // surfaced cause is the bare TimeoutException — not a wrapper.
+            assertInstanceOf(java.util.concurrent.TimeoutException.class, e.getCause(),
+                    "the multiply-wrapped timeout must be unwrapped to its root cause");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            fail("interrupted");
+        }
         assertEquals(2, reported.get(),
                 "a multiply-wrapped timeout must still be unwrapped and denied");
     }
