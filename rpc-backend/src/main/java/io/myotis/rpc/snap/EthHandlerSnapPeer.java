@@ -60,7 +60,15 @@ public final class EthHandlerSnapPeer implements SnapPeer {
 
     @Override
     public void reportRootUnavailable() {
-        if (onRootUnavailable != null) onRootUnavailable.run();
+        // The oracle reports this from a future-completion handler that runs on the
+        // Netty event loop; a host's deny callback may block (lock contention, sync
+        // persistence), so offload like onRootServed — a shared adapter must not let
+        // a host callback stall network processing.
+        if (onRootUnavailable != null) {
+            CompletableFuture.runAsync(() -> {
+                try { onRootUnavailable.run(); } catch (RuntimeException ignore) {}
+            });
+        }
     }
 
     @Override
