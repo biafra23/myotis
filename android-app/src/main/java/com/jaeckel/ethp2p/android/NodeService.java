@@ -189,15 +189,75 @@ public final class NodeService extends Service {
     // survive Stop/Start; shut down in onDestroy.
     private final io.myotis.evm.world.BytecodeCache ensBytecodeCache =
             io.myotis.evm.world.BytecodeCache.inMemory();
-    // Single thread: Besu EVM execution is CPU-bound and the oracle is pinned
-    // to one peer, so serializing avoids contention. Daemon thread so it never
-    // blocks process exit.
-    private final java.util.concurrent.ExecutorService evmPool =
-            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
-                Thread t = new Thread(r, "android-evm");
+    // Cross-call cache of proof-verified account/storage state, keyed by stateRoot.
+    // Shared across every head-context oracle so a wallet's repeated retries of a
+    // heavy eth_call (MetaMask's ~1000-token BalanceChecker sweep / Multicall3
+    // simulation) reuse already-fetched slots instead of re-proving hundreds each
+    // time — turning a 30s-timeout retry-storm into a couple of converging attempts.
+    // Bounded LRU per kind; ~64k storage slots ≈ a few MB.
+    private static final int STATE_PROOF_CACHE_MAX = 65_536;
+    private final io.myotis.evm.world.StateProofCache stateProofCache =
+            io.myotis.evm.world.StateProofCache.inMemory(STATE_PROOF_CACHE_MAX);
+    // EVM pool. Was a single thread ("EVM is CPU-bound, oracle pinned to one
+    // peer") — but the oracle rotates across peers now, and an EVM task spends
+    // most of its wall-clock BLOCKED on snap fetch waves, not executing. A wallet
+    // confirm screen fires ~20 eth_calls at once; serialized behind one thread
+    // they queue for minutes and every one of them blows the 30s RPC deadline
+    // (observed on-device). A small pool lets calls overlap their fetch waits.
+    // Kept modest (3) so Besu interpretation can't peg the CPU alongside BLS.
+    private static final int EVM_POOL_THREADS = 3;
+    /** Calldata size at/below which an eth_call rides the reserved small lane. A
+     *  wallet confirm screen's calls are tiny (36-byte balanceOf probes, ~516-byte
+     *  Multicall3 simulations) while the background token sweep is ~32KB; without a
+     *  reserved lane the sweep's 30s+ executions occupy every EVM thread and the
+     *  confirm screen's calls queue to death behind them (observed live: the
+     *  simulation timing out at 30s four times in a row during a sweep storm). */
+    private static final int EVM_SMALL_CALLDATA_MAX = 4_096;
+    /** Set by the RPC handler around callView/estimateGas invocations; read by the
+     *  routing {@link #evmPool} when supplyAsync submits on the same thread. */
+    private static final ThreadLocal<Boolean> EVM_SMALL_LANE = new ThreadLocal<>();
+    /** Heavy lane: the token sweeps and other large calls (2 threads). */
+    private final java.util.concurrent.ExecutorService evmPoolHeavy =
+            java.util.concurrent.Executors.newFixedThreadPool(EVM_POOL_THREADS - 1, r -> {
+                Thread t = new Thread(r, "android-evm-heavy");
                 t.setDaemon(true);
                 return t;
             });
+    /** Small lane: one thread reserved for small-calldata calls so interactive
+     *  reads never queue behind a sweep. */
+    private final java.util.concurrent.ExecutorService evmPoolSmall =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "android-evm-small");
+                t.setDaemon(true);
+                return t;
+            });
+    /** Tasks older than this when dequeued are skipped: their RPC caller (30s
+     *  deadline) has long since given up, so running them would burn EVM-thread
+     *  time for nobody — observed as a queue of dead confirm-screen calls
+     *  starving the live retries that followed them. Slightly above the longest
+     *  RPC wait so a still-awaited task is never dropped early. */
+    private static final long EVM_TASK_MAX_QUEUE_AGE_MS = 35_000;
+    /** Executor handed to the EVM stack: routes to the small or heavy lane (via the
+     *  {@link #EVM_SMALL_LANE} hint the RPC handler sets on its own thread before
+     *  invoking callView — supplyAsync calls execute() synchronously on that thread,
+     *  so the hint is visible here; continuations submitted from other threads
+     *  default to the heavy lane). Both lanes drop tasks that sat queued past
+     *  {@link #EVM_TASK_MAX_QUEUE_AGE_MS}: a skipped task leaves its
+     *  CompletableFuture incomplete — safe, because the only waiter timed out and
+     *  abandoned it long before. */
+    private final java.util.concurrent.Executor evmPool = task -> {
+        final long enqueuedAtMs = android.os.SystemClock.elapsedRealtime();
+        boolean small = Boolean.TRUE.equals(EVM_SMALL_LANE.get());
+        (small ? evmPoolSmall : evmPoolHeavy).execute(() -> {
+            long ageMs = android.os.SystemClock.elapsedRealtime() - enqueuedAtMs;
+            if (ageMs > EVM_TASK_MAX_QUEUE_AGE_MS) {
+                LogBuffer.i(TAG, "[evm] skipping task queued " + ageMs
+                        + "ms (caller deadline long past)");
+                return;
+            }
+            task.run();
+        });
+    };
     // CCIP-Read gateway HTTP is blocking; keep it off the single EVM thread.
     private final java.util.concurrent.ExecutorService ccipPool =
             java.util.concurrent.Executors.newCachedThreadPool(r -> {
@@ -768,6 +828,17 @@ public final class NodeService extends Service {
      *  instant error that emptied MetaMask's asset list. Beyond this (~13 min) the pin is
      *  genuinely historical and we can't represent it, so reject. */
     private static final long RPC_BLOCK_NUM_LAG_TOLERANCE = 64;
+    /** Last-resort stale-serve horizon: when rebuilds keep failing (a heavy token
+     *  sweep starving the snap peers, a peer-set outage), serve the last anchored
+     *  head up to the SAME horizon the pinned-number check accepts —
+     *  {@link #RPC_BLOCK_NUM_LAG_TOLERANCE} blocks (~13min at 12s slots). The
+     *  context's verification never expires (it's beacon-anchored); only its
+     *  freshness ages, and a wallet read against ~minutes-old verified state is
+     *  strictly better than an instant error: MetaMask pins reads to a recent
+     *  block number and re-polls anyway. Without this, every read during a
+     *  sustained rebuild outage died with "no verified head" (the confirm-screen
+     *  instant-ERROR storm) even though a perfectly servable context existed. */
+    private static final long RPC_HEAD_SERVE_STALE_MAX_MS = RPC_BLOCK_NUM_LAG_TOLERANCE * 12_000;
 
     private final Object rpcCallCtxLock = new Object();
     private CompletableFuture<EnsCall> rpcCallCtx;   // in-flight/fresh build (dedup)
@@ -776,6 +847,26 @@ public final class NodeService extends Service {
     // record behind a single volatile ref so head and timestamp are read/written
     // atomically together (no torn read of new head with old timestamp).
     private volatile HeadWithTimestamp lastGoodHead;
+    /**
+     * Frozen anchored context per pinned block NUMBER. A wallet (MetaMask) pins a
+     * confirm to one block and retries the same heavy calls against it for minutes.
+     * Serving each retry against the <em>current</em> head — which the warmer rebuilds
+     * to a new stateRoot every ~12-15s — reset the stateRoot-keyed StateProofCache on
+     * every rebuild, so a 1000-slot BalanceChecker / Multicall3 simulation re-fetched
+     * from scratch each retry and never converged (the persistent confirm-screen hang,
+     * uptime-independent). Freezing the context — and thus its stateRoot — per pinned
+     * number makes all retries hit one stable root, so the cache accumulates and the
+     * call converges in a couple of tries. Bounded LRU (wallets pin a few recent
+     * blocks); each entry ages out at {@link #RPC_HEAD_SERVE_STALE_MAX_MS}.
+     */
+    private final java.util.Map<Long, HeadWithTimestamp> pinnedHeadByNumber =
+            java.util.Collections.synchronizedMap(
+                    new java.util.LinkedHashMap<>(16, 0.75f, true) {
+                        @Override protected boolean removeEldestEntry(
+                                java.util.Map.Entry<Long, HeadWithTimestamp> e) {
+                            return size() > 16;
+                        }
+                    });
     /** Runs the blocking, network-bound head build off the caller's thread so a
      *  request blocks only up to its own timeout. Single-thread: the future
      *  dedup means at most one build runs at a time. */
@@ -823,6 +914,16 @@ public final class NodeService extends Service {
                 if (requestedNum < 0) return null;
             }
         }
+        // Pinned-number fast path: reuse the context already frozen to this number so
+        // its (fixed) stateRoot lets the StateProofCache accumulate across the wallet's
+        // minutes-long retries instead of resetting every time the head rebuilds.
+        if (requestedNum >= 0) {
+            HeadWithTimestamp frozen = pinnedHeadByNumber.get(requestedNum);
+            if (frozen != null && android.os.SystemClock.elapsedRealtime() - frozen.builtAtMs()
+                    < RPC_HEAD_SERVE_STALE_MAX_MS) {
+                return frozen.head();
+            }
+        }
         EnsCall ctx = anchoredHeadOrWait();
         if (ctx == null) return null;
         if (requestedNum >= 0) {
@@ -846,6 +947,17 @@ public final class NodeService extends Service {
                         + lowerBound + ".." + upperBound + "] (ctx=" + ctx.blockNumber()
                         + ", optimistic=" + optimistic + ") -> not served");
                 return null;
+            }
+            // Freeze this context for the number so every subsequent retry pinned to it
+            // resolves the SAME root (cache accumulation). First pin wins; it ages out.
+            // On a concurrent first-read race the putIfAbsent loser must serve the
+            // WINNER's context, not its own — otherwise two contexts with different
+            // stateRoots briefly serve the same pinned number, splitting the
+            // StateProofCache across roots for that block.
+            HeadWithTimestamp existing = pinnedHeadByNumber.putIfAbsent(requestedNum,
+                    new HeadWithTimestamp(ctx, android.os.SystemClock.elapsedRealtime()));
+            if (existing != null) {
+                return existing.head();
             }
         }
         return ctx;
@@ -890,6 +1002,19 @@ public final class NodeService extends Service {
                 }
             }
         }
+        // Last resort: a stale-but-anchored head beats erroring. Its verification
+        // hasn't expired — it's just old — and verifiedHeadFor's pinned-number
+        // bounds still reject pins this context genuinely can't represent. The
+        // warmer keeps retrying fresh builds in the background regardless.
+        HeadWithTimestamp stale = lastGoodHead;
+        if (stale != null && android.os.SystemClock.elapsedRealtime() - stale.builtAtMs()
+                < RPC_HEAD_SERVE_STALE_MAX_MS) {
+            LogBuffer.i(TAG, "[rpc] serving STALE anchored head (block #"
+                    + stale.head().blockNumber() + ", "
+                    + (android.os.SystemClock.elapsedRealtime() - stale.builtAtMs()) / 1000
+                    + "s old) — rebuild failing: " + (last != null ? unwrap(last) : "timeout"));
+            return stale.head();
+        }
         LogBuffer.i(TAG, "[rpc] no verified head after "
                 + (android.os.SystemClock.elapsedRealtime() - start) + "ms -> proxy: "
                 + (last != null ? unwrap(last) : "timeout"));
@@ -921,6 +1046,12 @@ public final class NodeService extends Service {
             return null;
         }
         long t0 = android.os.SystemClock.elapsedRealtime();
+        // Route small calls onto the reserved EVM lane so a confirm screen's tiny
+        // probes/simulations never queue behind a ~32KB token-sweep storm. The hint
+        // is read synchronously by evmPool when callView's supplyAsync submits on
+        // this thread; cleared in finally so the handler thread doesn't leak it.
+        boolean smallLane = (data == null || data.length <= EVM_SMALL_CALLDATA_MAX);
+        if (smallLane) EVM_SMALL_LANE.set(Boolean.TRUE);
         try {
             byte[] out = h.offchainExecutor()
                     .callView(io.myotis.evm.Address.of(to), data == null ? new byte[0] : data,
@@ -934,6 +1065,8 @@ public final class NodeService extends Service {
                     + (android.os.SystemClock.elapsedRealtime() - t0) + "ms: "
                     + describeEvmError(e));
             return null;
+        } finally {
+            if (smallLane) EVM_SMALL_LANE.remove();
         }
     }
 
@@ -1464,6 +1597,43 @@ public final class NodeService extends Service {
      *  (same pattern as {@link HeadWithTimestamp}). */
     private record TipWithTimestamp(java.math.BigInteger tip, long atMs) {}
     private volatile TipWithTimestamp cachedSuggestedTip;
+    /** Pre-computed (gasPrice, tip) snapshot, refreshed by the head warmer.
+     *  eth_gasPrice / eth_maxPriorityFeePerGas serve from this in microseconds
+     *  instead of paying the cold path (header anchor + header window + 3 block
+     *  bodies over devp2p, observed 6-18s on-device) on the wallet's poll.
+     *  MetaMask's confirm screen sits in skeleton until a fee poll returns and
+     *  only re-polls every few minutes, so one slow answer stalls the screen for
+     *  minutes. The snapshot is derived from the same verified data as the cold
+     *  path — precomputing changes freshness, not trust. Serving a snapshot a
+     *  minute or two old is fine: it's a fee suggestion, and the wallet re-polls. */
+    private record FeeSnapshot(java.math.BigInteger gasPrice, java.math.BigInteger tip, long atMs) {}
+    private volatile FeeSnapshot feeSnapshot;
+    /** Refresh the snapshot when older than this (head warmer cadence is 5s). */
+    private static final long FEE_SNAPSHOT_REFRESH_MS = 12_000;
+    /** Don't serve a snapshot older than this — fall through to the cold path. */
+    private static final long FEE_SNAPSHOT_MAX_SERVE_MS = 10 * 60_000;
+    private final java.util.concurrent.atomic.AtomicBoolean feeRefreshing =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
+    /** Recompute the fee snapshot if stale; called from the head-warmer tick (and
+     *  as a side effect of a cold-path fee RPC). Single-flight; never throws. */
+    private void refreshFeeSnapshotIfStale() {
+        FeeSnapshot snap = feeSnapshot;
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (snap != null && now - snap.atMs() < FEE_SNAPSHOT_REFRESH_MS) return;
+        if (!feeRefreshing.compareAndSet(false, true)) return;
+        try {
+            java.math.BigInteger price = computeGasPriceCold();
+            java.math.BigInteger tip = cachedSuggestedTip != null ? cachedSuggestedTip.tip() : null;
+            if (price != null && tip != null) {
+                feeSnapshot = new FeeSnapshot(price, tip, android.os.SystemClock.elapsedRealtime());
+            }
+        } catch (Throwable t) {
+            LogBuffer.i(TAG, "[rpc] fee snapshot refresh failed: " + unwrap(t));
+        } finally {
+            feeRefreshing.set(false);
+        }
+    }
 
     /** Next block's base fee per the EIP-1559 update rule, from the parent header. */
     private static java.math.BigInteger nextBaseFee(BlockHeader h) {
@@ -1571,6 +1741,17 @@ public final class NodeService extends Service {
      *  {@link #TIP_SUGGEST_BLOCKS} verified blocks, floored at
      *  {@link #MIN_SUGGESTED_TIP}. Cached for ~one block. Null → can't verify. */
     private java.math.BigInteger rpcMaxPriorityFeePerGas() {
+        // Serve the pre-computed snapshot first — same freshness contract as
+        // eth_gasPrice (the head warmer refreshes it; the wallet re-polls).
+        FeeSnapshot snap = feeSnapshot;
+        if (snap != null && android.os.SystemClock.elapsedRealtime() - snap.atMs()
+                < FEE_SNAPSHOT_MAX_SERVE_MS) {
+            return snap.tip();
+        }
+        return computeMaxPriorityFeeCold();
+    }
+
+    private java.math.BigInteger computeMaxPriorityFeeCold() {
         TipWithTimestamp cached = cachedSuggestedTip;
         if (cached != null
                 && android.os.SystemClock.elapsedRealtime() - cached.atMs() < TIP_CACHE_TTL_MS) {
@@ -1603,14 +1784,35 @@ public final class NodeService extends Service {
         }
     }
 
-    /** Legacy-style total gas price: next block's base fee + the suggested tip. */
+    /** Legacy-style total gas price: next block's base fee + the suggested tip.
+     *  Served from the pre-computed {@link #feeSnapshot} when available (the head
+     *  warmer keeps it fresh) so the wallet's fee poll returns in microseconds;
+     *  falls back to the cold path only before the first snapshot exists. */
     private java.math.BigInteger rpcGasPrice() {
+        FeeSnapshot snap = feeSnapshot;
+        if (snap != null && android.os.SystemClock.elapsedRealtime() - snap.atMs()
+                < FEE_SNAPSHOT_MAX_SERVE_MS) {
+            return snap.gasPrice();
+        }
+        java.math.BigInteger price = computeGasPriceCold();
+        if (price != null) {
+            java.math.BigInteger tip = cachedSuggestedTip != null ? cachedSuggestedTip.tip() : null;
+            if (tip != null) {
+                feeSnapshot = new FeeSnapshot(price, tip, android.os.SystemClock.elapsedRealtime());
+            }
+        }
+        return price;
+    }
+
+    /** The cold gas-price computation (header anchor + window + tip from verified
+     *  bodies). Seconds-slow on-device; callers should prefer {@link #feeSnapshot}. */
+    private java.math.BigInteger computeGasPriceCold() {
         try {
             HeaderAnchor anchor = headerAnchor();
             if (anchor == null) return null;
             List<BlockHeadersMessage.VerifiedHeader> window = anchoredHeaderWindow(anchor, 1);
             if (window == null || window.isEmpty()) return null;
-            java.math.BigInteger tip = rpcMaxPriorityFeePerGas();
+            java.math.BigInteger tip = computeMaxPriorityFeeCold();
             if (tip == null) return null;
             return nextBaseFee(window.get(window.size() - 1).header()).add(tip);
         } catch (Exception e) {
@@ -1842,6 +2044,10 @@ public final class NodeService extends Service {
                         EnsCall ctx = buildAnchoredHead();
                         lastGoodHead = new HeadWithTimestamp(ctx, android.os.SystemClock.elapsedRealtime());
                         f.complete(ctx);
+                        // After the future is completed (readers unblocked), prime the
+                        // confirm-critical contracts at this root so a wallet's first
+                        // confirm-screen calls start from warm state — see the method doc.
+                        primeConfirmContracts(ctx);
                     } catch (Throwable t) {
                         f.completeExceptionally(t);
                         synchronized (rpcCallCtxLock) {
@@ -2179,6 +2385,14 @@ public final class NodeService extends Service {
             } catch (Exception ignored) {
                 // No usable snap peer / anchorable head yet — retry next tick.
             }
+            // Keep the fee snapshot warm too: the wallet's confirm screen blocks on
+            // its fee poll, and the cold computation takes seconds — paying it here
+            // (off the RPC path) makes eth_gasPrice effectively instant.
+            try {
+                refreshFeeSnapshotIfStale();
+            } catch (Throwable ignored) {
+                // never kill the warmer tick
+            }
         }, 3, 5, TimeUnit.SECONDS);
     }
 
@@ -2212,6 +2426,46 @@ public final class NodeService extends Service {
         // Fallback: the beacon-finalized execution root, verified directly by the
         // light client (no headerChain needed). Throws if no peer retains it.
         return prepareEnsCall(io.myotis.ens.EnsResolutionRoot.FINALIZED);
+    }
+
+    /** Contracts every MetaMask confirm flow hits: the ENS Registry (recipient
+     *  reverse-resolution), Multicall3 (the confirm screen's transaction
+     *  simulation) and the BalanceChecker (token sweep). */
+    private static final String[] CONFIRM_WARM_CONTRACTS = {
+            "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e",
+            "0xcA11bde05977b3631167028862bE2a173976CA11",
+            "0xb1F8e55c7f64D203C1400B9D8555d050F94aDF39",
+    };
+
+    /**
+     * Prime the confirm-critical contracts at a freshly-built head: fetch each
+     * account record (banked per-root in the {@link #stateProofCache}) and its
+     * bytecode (banked forever in the {@link #ensBytecodeCache} — code is keyed by
+     * hash, so this is one fetch per contract per process lifetime). Without this,
+     * the FIRST confirm after a node restart paid the cold fetch waves inside the
+     * wallet's own 30s call deadline and timed out (observed live: the Multicall3
+     * simulation and ENS resolver probes erroring at 30s on a cold root while warm
+     * runs take 1-3s). Runs on the head-build thread after the context future has
+     * completed, so readers are never delayed by it. Best-effort: failures just
+     * mean the next real call pays the (retryable) cold cost as before.
+     */
+    private void primeConfirmContracts(EnsCall ctx) {
+        try {
+            byte[] root = ctx.blockCtx().stateRoot();
+            java.util.List<CompletableFuture<?>> warms = new java.util.ArrayList<>();
+            for (String hex : CONFIRM_WARM_CONTRACTS) {
+                io.myotis.evm.Address addr = io.myotis.evm.Address.fromHex(hex);
+                warms.add(ctx.oracle().fetchAccount(root, addr)
+                        .thenCompose(acct -> ctx.oracle().fetchBytecode(acct.codeHash()))
+                        .exceptionally(t -> null));   // best-effort per contract
+            }
+            CompletableFuture.allOf(warms.toArray(new CompletableFuture<?>[0]))
+                    .get(20, TimeUnit.SECONDS);
+            LogBuffer.i(TAG, "[rpc] primed " + CONFIRM_WARM_CONTRACTS.length
+                    + " confirm-critical contract(s) at block #" + ctx.blockNumber());
+        } catch (Throwable t) {
+            LogBuffer.i(TAG, "[rpc] confirm-contract prime skipped: " + unwrap(t));
+        }
     }
 
     /** True iff {@code peerStateRoot} at {@code peerBlock} chains back to the
@@ -2477,7 +2731,8 @@ public final class NodeService extends Service {
                                     () -> recordSnapQuality(snapQualityCache, chosen, true));
                         },
                         ensBytecodeCache,
-                        SNAP_ORACLE_MAX_ATTEMPTS);
+                        SNAP_ORACLE_MAX_ATTEMPTS,
+                        stateProofCache);
         io.myotis.evm.DefaultEvmExecutor base =
                 new io.myotis.evm.DefaultEvmExecutor(oracle, ensBytecodeCache, evmPool);
         io.myotis.evm.PrefetchingEvmExecutor prefetching =
@@ -3001,6 +3256,7 @@ public final class NodeService extends Service {
         // briefly reuse one pinned to a now-dead peer (fails safe to proxy anyway).
         synchronized (rpcCallCtxLock) { rpcCallCtx = null; }
         lastGoodHead = null;
+        pinnedHeadByNumber.clear();
         // Close BLC first: its libp2p host's outbound dials hold references
         // through to the discv5 callback's blcRef, and the sync thread can
         // be in the middle of an addPeer call when shutdown fires.
@@ -3198,7 +3454,8 @@ public final class NodeService extends Service {
         // worker holds the same lock as startAndPublish, so a subsequent
         // service start can't race with a half-finished close.
         RUNNING.set(false);
-        evmPool.shutdownNow();
+        evmPoolHeavy.shutdownNow();
+        evmPoolSmall.shutdownNow();
         ccipPool.shutdownNow();
         headBuildPool.shutdownNow();
         new Thread(this::doShutdown, "ethp2p-shutdown").start();

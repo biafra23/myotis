@@ -299,6 +299,86 @@ class SnapBackedStateOracleTest {
         assertEquals(BigInteger.ZERO, got);
     }
 
+    @Test
+    void sharedStateCacheServesStorageAcrossOraclesWithoutRefetch() throws Exception {
+        // The fix for the confirm-screen retry-storm: a node-level StateProofCache
+        // shared across head-context oracle instances. A verified storage value must
+        // survive an oracle rebuild so a wallet's repeated retries reuse it instead of
+        // re-proving every slot. Prove it: oracle 1 populates the shared cache; oracle 2
+        // (a "later head-context", given a peer that serves NOTHING) must still answer
+        // from cache with zero round-trips.
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        BigInteger slot = BigInteger.valueOf(7);
+        BigInteger value = new BigInteger("1234567890123456789");
+
+        Bytes32 slotHash = Bytes32.wrap(Hash.keccak256(paddedSlot(slot)).toArrayUnsafe());
+        Bytes valueRlp = RLP.encode(w -> w.writeBigInteger(value));
+        var storageTrie = TrieFixture.singleLeaf(slotHash, valueRlp);
+        Bytes accountValue = encodeAccount(0L, BigInteger.ZERO, storageTrie.root,
+                Bytes32.wrap(Hash.keccak256(Bytes.EMPTY).toArrayUnsafe()));
+        var accountTrie = TrieFixture.singleLeaf(keccak(addr.toByteArray()), accountValue);
+
+        FixturePeer peer = new FixturePeer();
+        peer.addAccountProof(accountTrie.root, accountTrie.proof);
+        peer.addStorageProof(accountTrie.root, storageTrie.proof);
+
+        StateProofCache shared = StateProofCache.inMemory(1024);
+        var oracle1 = new SnapBackedStateOracle(() -> peer, BytecodeCache.inMemory(),
+                SnapBackedStateOracle.DEFAULT_MAX_ATTEMPTS, shared);
+        assertEquals(value, oracle1.fetchStorage(accountTrie.root.toArrayUnsafe(), addr, slot).get());
+
+        SnapPeer deadPeer = new SnapPeer() {
+            @Override public CompletableFuture<List<Bytes>> getTrieNodes(Bytes32 r, List<PathSet> p) {
+                return CompletableFuture.failedFuture(new java.io.IOException("no peer available"));
+            }
+            @Override public CompletableFuture<List<Bytes>> getByteCodes(List<Bytes32> h) {
+                return CompletableFuture.failedFuture(new java.io.IOException("no peer available"));
+            }
+        };
+        var oracle2 = new SnapBackedStateOracle(() -> deadPeer, BytecodeCache.inMemory(),
+                SnapBackedStateOracle.DEFAULT_MAX_ATTEMPTS, shared);
+        assertEquals(value, oracle2.fetchStorage(accountTrie.root.toArrayUnsafe(), addr, slot).get(),
+                "second oracle must serve the slot from the shared cache, no peer round-trip");
+    }
+
+    @Test
+    void noopStateCacheStillRefetchesAcrossOracles() throws Exception {
+        // Control for the test above: with the default noop cache, a fresh oracle has
+        // no memory, so a dead peer DOES fail — confirming the pass above is the cache
+        // working, not the fixture being lenient.
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        BigInteger slot = BigInteger.valueOf(7);
+        BigInteger value = new BigInteger("1234567890123456789");
+        Bytes32 slotHash = Bytes32.wrap(Hash.keccak256(paddedSlot(slot)).toArrayUnsafe());
+        Bytes valueRlp = RLP.encode(w -> w.writeBigInteger(value));
+        var storageTrie = TrieFixture.singleLeaf(slotHash, valueRlp);
+        Bytes accountValue = encodeAccount(0L, BigInteger.ZERO, storageTrie.root,
+                Bytes32.wrap(Hash.keccak256(Bytes.EMPTY).toArrayUnsafe()));
+        var accountTrie = TrieFixture.singleLeaf(keccak(addr.toByteArray()), accountValue);
+        FixturePeer peer = new FixturePeer();
+        peer.addAccountProof(accountTrie.root, accountTrie.proof);
+        peer.addStorageProof(accountTrie.root, storageTrie.proof);
+
+        var oracle1 = new SnapBackedStateOracle(() -> peer, BytecodeCache.inMemory()); // noop cache
+        assertEquals(value, oracle1.fetchStorage(accountTrie.root.toArrayUnsafe(), addr, slot).get());
+
+        SnapPeer deadPeer = new SnapPeer() {
+            @Override public CompletableFuture<List<Bytes>> getTrieNodes(Bytes32 r, List<PathSet> p) {
+                return CompletableFuture.failedFuture(new java.io.IOException("no peer available"));
+            }
+            @Override public CompletableFuture<List<Bytes>> getByteCodes(List<Bytes32> h) {
+                return CompletableFuture.failedFuture(new java.io.IOException("no peer available"));
+            }
+        };
+        var oracle2 = new SnapBackedStateOracle(() -> deadPeer, BytecodeCache.inMemory());
+        try {
+            oracle2.fetchStorage(accountTrie.root.toArrayUnsafe(), addr, slot).get();
+            fail("without a shared cache, a dead peer must fail");
+        } catch (ExecutionException expected) {
+            // expected — no cache, no peer, no value
+        }
+    }
+
     // ---- Bytecode fetch ----------------------------------------------------
 
     @Test
