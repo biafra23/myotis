@@ -950,8 +950,15 @@ public final class NodeService extends Service {
             }
             // Freeze this context for the number so every subsequent retry pinned to it
             // resolves the SAME root (cache accumulation). First pin wins; it ages out.
-            pinnedHeadByNumber.putIfAbsent(requestedNum,
+            // On a concurrent first-read race the putIfAbsent loser must serve the
+            // WINNER's context, not its own — otherwise two contexts with different
+            // stateRoots briefly serve the same pinned number, splitting the
+            // StateProofCache across roots for that block.
+            HeadWithTimestamp existing = pinnedHeadByNumber.putIfAbsent(requestedNum,
                     new HeadWithTimestamp(ctx, android.os.SystemClock.elapsedRealtime()));
+            if (existing != null) {
+                return existing.head();
+            }
         }
         return ctx;
     }
