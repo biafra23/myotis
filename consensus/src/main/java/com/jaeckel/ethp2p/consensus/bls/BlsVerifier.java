@@ -84,9 +84,15 @@ public final class BlsVerifier {
                         java.util.concurrent.ForkJoinWorkerThread t =
                                 java.util.concurrent.ForkJoinPool
                                         .defaultForkJoinWorkerThreadFactory.newThread(pool);
-                        t.setName("bls-decompress-" + t.getPoolIndex());
-                        t.setPriority(Thread.MIN_PRIORITY);
-                        t.setDaemon(true);
+                        // The default factory can return null if a worker can't be
+                        // created (resource limits / security restrictions); the pool
+                        // treats null as "no thread now" and retries later. Guard so we
+                        // don't NPE configuring it.
+                        if (t != null) {
+                            t.setName("bls-decompress-" + t.getPoolIndex());
+                            t.setPriority(Thread.MIN_PRIORITY);
+                            t.setDaemon(true);
+                        }
                         return t;
                     },
                     null, false);
