@@ -592,8 +592,10 @@ public final class Main {
                     connector, beaconLightClient, beaconSyncState,
                     new com.jaeckel.ethp2p.app.rpc.JavaHttpCcipGateway(),
                     rpcLogger, io.myotis.rpc.RpcClock.monotonic(), snapQualitySink);
-            backend.start();
             try {
+                // start() spins up the head warmer; a throw here (or in the server
+                // start below) must still close the backend so its threads don't leak.
+                backend.start();
                 io.myotis.jsonrpc.MyotisRpcServer rpcServer =
                         new io.myotis.jsonrpc.MyotisRpcServer(8545, null, "127.0.0.1", backend);
                 rpcServer.start();
