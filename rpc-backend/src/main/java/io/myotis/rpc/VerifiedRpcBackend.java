@@ -1610,6 +1610,23 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                 return new HeaderAnchor(ctx.blockNumber(), ctx.blockCtx().stateRoot(), null);
             }
         }
+        // Stale-but-verified fallback BEFORE the optimistic head. A recently-built
+        // anchored head is a block we actually verified and can re-anchor a header
+        // window against (by stateRoot); the beacon OPTIMISTIC head below is a newer
+        // block with no snap-servable state, so a header window fetched + verified
+        // against it returns null and the caller hard-errors. During the transient
+        // snap-peer gaps this node sees (head momentarily un-rebuildable), that turned
+        // eth_feeHistory / eth_getBlockByNumber into -32000 errors — and MetaMask's
+        // fee step loops on a feeHistory error, hanging the send screen after the
+        // amount is entered. Preferring lastGoodHead keeps those methods answering
+        // verified-but-slightly-stale data through the gap (same contract as the head
+        // context's own stale-serve and the gasPrice/maxPriorityFee FeeSnapshot path).
+        HeadWithTimestamp good = lastGoodHead;
+        if (good != null && good.head().beaconVerified()
+                && clock.elapsedMillis() - good.builtAtMs() < RPC_HEAD_SERVE_STALE_MAX_MS) {
+            return new HeaderAnchor(good.head().blockNumber(),
+                    good.head().blockCtx().stateRoot(), null);
+        }
         BeaconSyncState bss = beaconSyncState;
         if (bss == null) return null;
         long n = bss.getOptimisticBlockNumber();
