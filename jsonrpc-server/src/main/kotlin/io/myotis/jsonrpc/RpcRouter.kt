@@ -44,7 +44,7 @@ class RpcRouter(
             "eth_getTransactionCount", "eth_getCode", "eth_getStorageAt",
             "eth_sendRawTransaction", "eth_getTransactionReceipt", "eth_getBlockByNumber",
             "eth_gasPrice", "eth_maxPriorityFeePerGas", "eth_feeHistory", "eth_estimateGas",
-            "eth_getTransactionByHash",
+            "eth_getTransactionByHash", "web3_clientVersion",
         )
     }
 
@@ -133,6 +133,10 @@ class RpcRouter(
             // Chain id is config-derived — always answerable, no sync needed.
             "eth_chainId" -> resultEnvelope(id, JsonPrimitive(hexQuantity(b.chainId())))
             "net_version" -> resultEnvelope(id, JsonPrimitive(b.chainId().toString()))
+            // Client identity string — no chain data, no verification. rotki's node
+            // connectivity check calls this first and rejects the node if it errors,
+            // so a static identifier (not a proxy/-32601) is what lets rotki connect.
+            "web3_clientVersion" -> resultEnvelope(id, JsonPrimitive("Myotis/verified-light-client"))
             // Verified beacon head; null (not synced) -> proxy.
             "eth_blockNumber" -> b.headBlockNumber()?.let { resultEnvelope(id, JsonPrimitive(hexQuantity(it))) }
 

@@ -14,6 +14,11 @@ dependencies {
     implementation(project(":consensus"))
     implementation(project(":myotis-evm"))
     implementation(project(":myotis-ens"))
+    // Verified JSON-RPC endpoint: the shared backend (:rpc-backend) served over
+    // the Ktor HTTP server (:jsonrpc-server) on 127.0.0.1:8545 — same pair the
+    // Android app hosts in NodeService.
+    implementation(project(":jsonrpc-server"))
+    implementation(project(":rpc-backend"))
     // :app source references io.netty.channel.* (via :networking's RLPxConnector
     // API). With io.netty excluded group-wide, the fork must be on :app's compile
     // classpath explicitly (:networking declares it as implementation, so it

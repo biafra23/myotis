@@ -1016,8 +1016,9 @@ public class CommandHandler {
      * deadline-style guards, not for trust decisions, and the headers we read
      * came from peers we already trust to serve snap data.
      *
-     * <p>The CCIP-Read gateway transport is a tiny inline {@link CcipGateway}
-     * impl over {@code java.net.http.HttpClient}. That's JVM-only and so not
+     * <p>The CCIP-Read gateway transport is
+     * {@link com.jaeckel.ethp2p.app.rpc.JavaHttpCcipGateway}, backed by
+     * {@code java.net.http.HttpClient}. That's JVM-only and so not
      * suitable for the Android wallet — but {@code :app} is the daemon, not
      * the Android consumer, and the daemon already runs on JVM 21. The
      * Android module supplies a Ktor-backed {@link CcipGateway} per the
@@ -1332,7 +1333,8 @@ public class CommandHandler {
         io.myotis.evm.PrefetchingEvmExecutor prefetching =
             new io.myotis.evm.PrefetchingEvmExecutor(base);
         io.myotis.evm.ccipread.CcipReadHandler ccipHandler =
-            new io.myotis.evm.ccipread.CcipReadHandler(new JavaHttpCcipGateway());
+            new io.myotis.evm.ccipread.CcipReadHandler(
+                new com.jaeckel.ethp2p.app.rpc.JavaHttpCcipGateway());
         // Returned (not just wrapped) so the caller can later read usedOffchain()
         // to decide whether an AUTO head-fallback is worthwhile.
         return new io.myotis.evm.CcipReadEvmExecutor(prefetching, ccipHandler);
@@ -1525,50 +1527,6 @@ public class CommandHandler {
             return head + ",\"resolved\":true,\"implementer\":\"" + value.get().toHex() + "\"}";
         } catch (Exception e) {
             return jsonError(unwrapMessage(e));
-        }
-    }
-
-    /**
-     * JVM-only {@link io.myotis.evm.ccipread.CcipGateway} backed by
-     * {@code java.net.http.HttpClient}. Used by the daemon, where JVM 21 is
-     * guaranteed. Android consumers must supply a Ktor-backed gateway per
-     * {@code CLAUDE.md} (java.net.http isn't covered by Android core library
-     * desugaring below API 33).
-     *
-     * <p>Per ERC-3668 §6.1, any non-2xx HTTP status code must be treated as
-     * an error so {@link io.myotis.evm.ccipread.CcipReadHandler} can fall
-     * through to the next URL in the gateway list. We surface non-2xx as a
-     * failed future carrying an {@link java.io.IOException} with the status
-     * code and URL, which the handler's {@code exceptionallyCompose} catches
-     * and folds into the per-URL diagnostic list.
-     */
-    private static final class JavaHttpCcipGateway implements io.myotis.evm.ccipread.CcipGateway {
-        private static final java.net.http.HttpClient CLIENT = java.net.http.HttpClient.newBuilder()
-                .connectTimeout(java.time.Duration.ofSeconds(10))
-                .build();
-
-        @Override
-        public java.util.concurrent.CompletableFuture<String> request(Method method, String url, String body) {
-            java.net.http.HttpRequest.Builder rb = java.net.http.HttpRequest.newBuilder()
-                    .uri(java.net.URI.create(url))
-                    .timeout(java.time.Duration.ofSeconds(15));
-            if (method == Method.POST) {
-                rb.header("Content-Type", "application/json");
-                rb.POST(java.net.http.HttpRequest.BodyPublishers.ofString(
-                        body == null ? "" : body));
-            } else {
-                rb.GET();
-            }
-            return CLIENT.sendAsync(rb.build(),
-                    java.net.http.HttpResponse.BodyHandlers.ofString())
-                    .thenCompose(resp -> {
-                        int status = resp.statusCode();
-                        if (status >= 200 && status < 300) {
-                            return java.util.concurrent.CompletableFuture.completedFuture(resp.body());
-                        }
-                        return java.util.concurrent.CompletableFuture.failedFuture(
-                                new java.io.IOException("HTTP " + status + " from " + url));
-                    });
         }
     }
 
