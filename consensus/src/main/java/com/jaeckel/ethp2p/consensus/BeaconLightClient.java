@@ -646,7 +646,12 @@ public class BeaconLightClient implements AutoCloseable {
                 if (knownPeerAddrs.add(multiaddr)) {
                     // Insert after the local peer (index 0) so discovered peers
                     // are tried before unreachable hardcoded bootstrap ENRs.
-                    clPeerMultiaddrs.add(Math.min(1, clPeerMultiaddrs.size()), multiaddr);
+                    // Synchronize on the same monitor as addPeer's eviction loop and
+                    // copyPeers' snapshot so a concurrent add can't interleave with the
+                    // eviction iteration (ConcurrentModificationException).
+                    synchronized (clPeerMultiaddrs) {
+                        clPeerMultiaddrs.add(Math.min(1, clPeerMultiaddrs.size()), multiaddr);
+                    }
                     added++;
                 }
             }
@@ -1304,6 +1309,13 @@ public class BeaconLightClient implements AutoCloseable {
             }
         }
         peers = fanout;
+        if (peers.isEmpty()) {
+            // No peers to ask (e.g. before discovery has populated the pool). Bail now —
+            // otherwise remaining starts at 0, winner never completes, and winner.get(600s)
+            // below blocks the whole sync loop for 10 minutes.
+            log.warn("[beacon] Catch-up: no capable peers for period {} — retry next cycle", bootstrapPeriod);
+            return false;
+        }
         // {@link BeaconP2PService#doReqResp} detects a dying connection and
         // retries with a fresh one, so we no longer pre-emptively disconnect
         // every peer here — that was costing us Lighthouse/Teku connections
