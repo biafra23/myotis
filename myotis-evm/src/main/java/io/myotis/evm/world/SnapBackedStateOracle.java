@@ -16,6 +16,7 @@ import java.math.BigInteger;
 import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.function.Supplier;
@@ -61,6 +62,10 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
     private final Supplier<SnapPeer> peerSupplier;
     private final BytecodeCache bytecodeCache;
     private final int maxAttempts;
+    /** Cross-call, node-level cache of verified account/storage state keyed by
+     *  stateRoot — survives head-context rebuilds so a wallet's repeated retries of
+     *  the same heavy call reuse fetched slots instead of re-proving them. */
+    private final StateProofCache stateCache;
 
     /**
      * Per-oracle (i.e. per-resolution) memoization of account-record fetches,
@@ -79,16 +84,25 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
             accountCache = new java.util.concurrent.ConcurrentHashMap<>();
 
     public SnapBackedStateOracle(Supplier<SnapPeer> peerSupplier, BytecodeCache bytecodeCache) {
-        this(peerSupplier, bytecodeCache, DEFAULT_MAX_ATTEMPTS);
+        this(peerSupplier, bytecodeCache, DEFAULT_MAX_ATTEMPTS, StateProofCache.noop());
     }
 
     public SnapBackedStateOracle(
             Supplier<SnapPeer> peerSupplier,
             BytecodeCache bytecodeCache,
             int maxAttempts) {
+        this(peerSupplier, bytecodeCache, maxAttempts, StateProofCache.noop());
+    }
+
+    public SnapBackedStateOracle(
+            Supplier<SnapPeer> peerSupplier,
+            BytecodeCache bytecodeCache,
+            int maxAttempts,
+            StateProofCache stateCache) {
         this.peerSupplier = peerSupplier;
         this.bytecodeCache = bytecodeCache;
         this.maxAttempts = maxAttempts;
+        this.stateCache = stateCache == null ? StateProofCache.noop() : stateCache;
     }
 
     @Override
@@ -99,8 +113,16 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
 
     @Override
     public CompletableFuture<BigInteger> fetchStorage(byte[] stateRoot, Address address, BigInteger slot) {
+        byte[] addr = address.toByteArray();
+        // Cross-call cache hit: the verified value at this (stateRoot, addr, slot)
+        // is returned with zero round-trips. This is what lets a wallet's repeated
+        // retries of a 1000-slot balance sweep converge instead of re-proving every
+        // slot each time.
+        Optional<BigInteger> cached = stateCache.getStorage(stateRoot, addr, slot);
+        if (cached.isPresent()) return CompletableFuture.completedFuture(cached.get());
+
         Bytes32 root = Bytes32.wrap(stateRoot.clone());
-        Bytes addressBytes = Bytes.wrap(address.toByteArray());
+        Bytes addressBytes = Bytes.wrap(addr);
         Bytes32 accountHash = Bytes32.wrap(Hash.keccak256(addressBytes).toArrayUnsafe());
         Bytes32 slotKey = paddedSlotKey(slot);
         Bytes32 slotHash = Bytes32.wrap(Hash.keccak256(slotKey).toArrayUnsafe());
@@ -113,11 +135,16 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
             Bytes32 storageRoot = awr.storageRoot();
             if (MerklePatriciaProofVerifier.EMPTY_TRIE_ROOT.equals(storageRoot)) {
                 // Account has no storage at all; every slot is zero.
+                stateCache.putStorage(stateRoot, addr, slot, BigInteger.ZERO);
                 return CompletableFuture.completedFuture(BigInteger.ZERO);
             }
             return tryWithRetries(peer -> peer
                     .getTrieNodes(root, List.of(SnapPeer.PathSet.storageSlot(accountHash, slotHash)))
-                    .thenApply(nodes -> verifyAndDecodeStorage(storageRoot, slotHash, address, nodes)));
+                    .thenApply(nodes -> verifyAndDecodeStorage(storageRoot, slotHash, address, nodes)))
+                    .thenApply(value -> {
+                        stateCache.putStorage(stateRoot, addr, slot, value);
+                        return value;
+                    });
         });
     }
 
@@ -160,8 +187,19 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
      * mismatched proof is rotated out of consideration immediately.
      */
     private CompletableFuture<AccountWithStorageRoot> fetchAccountWithRoot(byte[] stateRoot, Address address) {
+        byte[] addr = address.toByteArray();
+        // Cross-call L2: a verified account record at this stateRoot, reused across
+        // head-context rebuilds and calls (the per-oracle accountCache below is only
+        // an in-flight dedup for one resolution).
+        Optional<StateProofCache.AccountEntry> cachedAccount = stateCache.getAccount(stateRoot, addr);
+        if (cachedAccount.isPresent()) {
+            StateProofCache.AccountEntry e = cachedAccount.get();
+            return CompletableFuture.completedFuture(
+                    new AccountWithStorageRoot(e.account(), Bytes32.wrap(e.storageRoot())));
+        }
+
         Bytes32 root = Bytes32.wrap(stateRoot.clone());
-        Bytes addressBytes = Bytes.wrap(address.toByteArray());
+        Bytes addressBytes = Bytes.wrap(addr);
         Bytes32 accountHash = Bytes32.wrap(Hash.keccak256(addressBytes).toArrayUnsafe());
 
         String key = root.toHexString() + ':' + addressBytes.toHexString();
@@ -169,12 +207,17 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
             CompletableFuture<AccountWithStorageRoot> f = tryWithRetries(peer -> peer
                     .getTrieNodes(root, List.of(SnapPeer.PathSet.account(accountHash)))
                     .thenApply(nodes -> verifyAndDecodeAccount(root, accountHash, address, nodes)));
-            // Evict failed fetches so a later read can retry across peers. Use
-            // *Async so the removal never runs synchronously inside
-            // computeIfAbsent (which would be a reentrant map mutation); the
-            // value-conditional remove keeps a racing re-fetch intact.
+            // Evict failed fetches so a later read can retry across peers; on success
+            // promote the verified record to the cross-call cache. Use *Async so
+            // neither runs synchronously inside computeIfAbsent (a reentrant map
+            // mutation); the value-conditional remove keeps a racing re-fetch intact.
             f.whenCompleteAsync((v, e) -> {
-                if (e != null) accountCache.remove(k, f);
+                if (e != null) {
+                    accountCache.remove(k, f);
+                } else if (v != null) {
+                    stateCache.putAccount(stateRoot, addr,
+                            new StateProofCache.AccountEntry(v.account(), v.storageRoot().toArrayUnsafe()));
+                }
             }, java.util.concurrent.ForkJoinPool.commonPool());
             return f;
         });

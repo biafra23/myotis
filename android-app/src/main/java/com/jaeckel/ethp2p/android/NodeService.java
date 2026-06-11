@@ -189,6 +189,15 @@ public final class NodeService extends Service {
     // survive Stop/Start; shut down in onDestroy.
     private final io.myotis.evm.world.BytecodeCache ensBytecodeCache =
             io.myotis.evm.world.BytecodeCache.inMemory();
+    // Cross-call cache of proof-verified account/storage state, keyed by stateRoot.
+    // Shared across every head-context oracle so a wallet's repeated retries of a
+    // heavy eth_call (MetaMask's ~1000-token BalanceChecker sweep / Multicall3
+    // simulation) reuse already-fetched slots instead of re-proving hundreds each
+    // time — turning a 30s-timeout retry-storm into a couple of converging attempts.
+    // Bounded LRU per kind; ~64k storage slots ≈ a few MB.
+    private static final int STATE_PROOF_CACHE_MAX = 65_536;
+    private final io.myotis.evm.world.StateProofCache stateProofCache =
+            io.myotis.evm.world.StateProofCache.inMemory(STATE_PROOF_CACHE_MAX);
     // Single thread: Besu EVM execution is CPU-bound and the oracle is pinned
     // to one peer, so serializing avoids contention. Daemon thread so it never
     // blocks process exit.
@@ -2477,7 +2486,8 @@ public final class NodeService extends Service {
                                     () -> recordSnapQuality(snapQualityCache, chosen, true));
                         },
                         ensBytecodeCache,
-                        SNAP_ORACLE_MAX_ATTEMPTS);
+                        SNAP_ORACLE_MAX_ATTEMPTS,
+                        stateProofCache);
         io.myotis.evm.DefaultEvmExecutor base =
                 new io.myotis.evm.DefaultEvmExecutor(oracle, ensBytecodeCache, evmPool);
         io.myotis.evm.PrefetchingEvmExecutor prefetching =

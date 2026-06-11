@@ -255,12 +255,19 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
      * cache and don't issue any oracle calls.
      */
     /** Max prefetch requests in flight at once. A wallet balance sweep can record
-     *  ~1000 misses in one wave; firing them all concurrently floods the single
-     *  pinned snap peer (request-queue overflow / disconnects). A semaphore caps
-     *  concurrency without an artificial per-chunk barrier — as each request
-     *  completes its permit frees and the next starts, so one slow request only
-     *  occupies its own slot, not the whole next batch. */
-    private static final int PREFETCH_MAX_IN_FLIGHT = 128;
+     *  ~1000 misses in one wave; firing them all concurrently floods the handful of
+     *  snap peers (request-queue overflow / disconnects) AND monopolizes them so that
+     *  cheap interactive reads issued concurrently — eth_getBalance, nonce,
+     *  eth_getBlockByNumber, and the head-context probe — queue behind hundreds of
+     *  prefetch requests and balloon to tens of seconds (observed 9-28s on a wallet
+     *  confirm screen). The bound is deliberately well below the per-peer request
+     *  ceiling so a single heavy call leaves peer capacity for those interactive
+     *  reads; the cross-call StateProofCache makes the resulting extra retry waves
+     *  cheap (cache hits), so capping concurrency costs little throughput. A semaphore
+     *  caps it without an artificial per-chunk barrier — as each request completes its
+     *  permit frees and the next starts, so one slow request only occupies its own
+     *  slot, not the whole next batch. */
+    private static final int PREFETCH_MAX_IN_FLIGHT = 48;
     /** Overall best-effort budget for one prefetch wave. */
     private static final long PREFETCH_WAVE_TIMEOUT_SEC = 30;
 
