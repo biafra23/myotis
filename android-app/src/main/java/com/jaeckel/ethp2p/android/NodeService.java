@@ -2003,6 +2003,10 @@ public final class NodeService extends Service {
                         EnsCall ctx = buildAnchoredHead();
                         lastGoodHead = new HeadWithTimestamp(ctx, android.os.SystemClock.elapsedRealtime());
                         f.complete(ctx);
+                        // After the future is completed (readers unblocked), prime the
+                        // confirm-critical contracts at this root so a wallet's first
+                        // confirm-screen calls start from warm state — see the method doc.
+                        primeConfirmContracts(ctx);
                     } catch (Throwable t) {
                         f.completeExceptionally(t);
                         synchronized (rpcCallCtxLock) {
@@ -2381,6 +2385,46 @@ public final class NodeService extends Service {
         // Fallback: the beacon-finalized execution root, verified directly by the
         // light client (no headerChain needed). Throws if no peer retains it.
         return prepareEnsCall(io.myotis.ens.EnsResolutionRoot.FINALIZED);
+    }
+
+    /** Contracts every MetaMask confirm flow hits: the ENS Registry (recipient
+     *  reverse-resolution), Multicall3 (the confirm screen's transaction
+     *  simulation) and the BalanceChecker (token sweep). */
+    private static final String[] CONFIRM_WARM_CONTRACTS = {
+            "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e",
+            "0xcA11bde05977b3631167028862bE2a173976CA11",
+            "0xb1F8e55c7f64D203C1400B9D8555d050F94aDF39",
+    };
+
+    /**
+     * Prime the confirm-critical contracts at a freshly-built head: fetch each
+     * account record (banked per-root in the {@link #stateProofCache}) and its
+     * bytecode (banked forever in the {@link #ensBytecodeCache} — code is keyed by
+     * hash, so this is one fetch per contract per process lifetime). Without this,
+     * the FIRST confirm after a node restart paid the cold fetch waves inside the
+     * wallet's own 30s call deadline and timed out (observed live: the Multicall3
+     * simulation and ENS resolver probes erroring at 30s on a cold root while warm
+     * runs take 1-3s). Runs on the head-build thread after the context future has
+     * completed, so readers are never delayed by it. Best-effort: failures just
+     * mean the next real call pays the (retryable) cold cost as before.
+     */
+    private void primeConfirmContracts(EnsCall ctx) {
+        try {
+            byte[] root = ctx.blockCtx().stateRoot();
+            java.util.List<CompletableFuture<?>> warms = new java.util.ArrayList<>();
+            for (String hex : CONFIRM_WARM_CONTRACTS) {
+                io.myotis.evm.Address addr = io.myotis.evm.Address.fromHex(hex);
+                warms.add(ctx.oracle().fetchAccount(root, addr)
+                        .thenCompose(acct -> ctx.oracle().fetchBytecode(acct.codeHash()))
+                        .exceptionally(t -> null));   // best-effort per contract
+            }
+            CompletableFuture.allOf(warms.toArray(new CompletableFuture<?>[0]))
+                    .get(20, TimeUnit.SECONDS);
+            LogBuffer.i(TAG, "[rpc] primed " + CONFIRM_WARM_CONTRACTS.length
+                    + " confirm-critical contract(s) at block #" + ctx.blockNumber());
+        } catch (Throwable t) {
+            LogBuffer.i(TAG, "[rpc] confirm-contract prime skipped: " + unwrap(t));
+        }
     }
 
     /** True iff {@code peerStateRoot} at {@code peerBlock} chains back to the
