@@ -23,17 +23,28 @@ public final class JavaHttpCcipGateway implements io.myotis.evm.ccipread.CcipGat
 
     @Override
     public java.util.concurrent.CompletableFuture<String> request(Method method, String url, String body) {
-        java.net.http.HttpRequest.Builder rb = java.net.http.HttpRequest.newBuilder()
-                .uri(java.net.URI.create(url))
-                .timeout(java.time.Duration.ofSeconds(15));
-        if (method == Method.POST) {
-            rb.header("Content-Type", "application/json");
-            rb.POST(java.net.http.HttpRequest.BodyPublishers.ofString(
-                    body == null ? "" : body));
-        } else {
-            rb.GET();
+        // Build the request inside the try: URI.create() throws
+        // IllegalArgumentException on a malformed gateway URL (CCIP gateway URLs
+        // are contract-supplied, so untrusted), and a synchronous throw here would
+        // bypass CcipReadHandler's .thenApply failover and propagate to the caller.
+        // Always hand back a (possibly failed) future so the failover chain holds.
+        java.net.http.HttpRequest request;
+        try {
+            java.net.http.HttpRequest.Builder rb = java.net.http.HttpRequest.newBuilder()
+                    .uri(java.net.URI.create(url))
+                    .timeout(java.time.Duration.ofSeconds(15));
+            if (method == Method.POST) {
+                rb.header("Content-Type", "application/json");
+                rb.POST(java.net.http.HttpRequest.BodyPublishers.ofString(
+                        body == null ? "" : body));
+            } else {
+                rb.GET();
+            }
+            request = rb.build();
+        } catch (RuntimeException e) {
+            return java.util.concurrent.CompletableFuture.failedFuture(e);
         }
-        return CLIENT.sendAsync(rb.build(),
+        return CLIENT.sendAsync(request,
                 java.net.http.HttpResponse.BodyHandlers.ofString())
                 .thenCompose(resp -> {
                     int status = resp.statusCode();
