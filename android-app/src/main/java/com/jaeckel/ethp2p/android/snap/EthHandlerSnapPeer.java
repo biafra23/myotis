@@ -31,16 +31,31 @@ public final class EthHandlerSnapPeer implements SnapPeer {
 
     private final EthHandler handler;
     private final Runnable onRootUnavailable;
+    private final Runnable onRootServed;
 
     public EthHandlerSnapPeer(EthHandler handler) {
-        this(handler, null);
+        this(handler, null, null);
     }
 
     /** @param onRootUnavailable run when the oracle reports this peer can't serve the
      *  current state root, so the routing supplier can deprioritize it for this head. */
     public EthHandlerSnapPeer(EthHandler handler, Runnable onRootUnavailable) {
+        this(handler, onRootUnavailable, null);
+    }
+
+    /**
+     * @param onRootUnavailable run when the oracle reports this peer can't serve the
+     *  current state root (deprioritize it for this head).
+     * @param onRootServed run when this peer returns a usable (non-empty) proof, so
+     *  the EL peer cache can record it as a proven snap-serving peer to dial first
+     *  on a restart. The two callbacks are mutually exclusive per fetch: a non-empty
+     *  proof fires {@code onRootServed}; an empty one is treated by the oracle as
+     *  no-state and ultimately fires {@code onRootUnavailable}.
+     */
+    public EthHandlerSnapPeer(EthHandler handler, Runnable onRootUnavailable, Runnable onRootServed) {
         this.handler = handler;
         this.onRootUnavailable = onRootUnavailable;
+        this.onRootServed = onRootServed;
     }
 
     @Override
@@ -81,6 +96,13 @@ public final class EthHandlerSnapPeer implements SnapPeer {
                 List<Bytes> all = new ArrayList<>();
                 for (CompletableFuture<List<Bytes>> f : perSet) {
                     all.addAll(f.join());
+                }
+                // A non-empty proof means this peer actually retains the trie for
+                // this root — the durable "snap-serving" signal the EL cache wants.
+                // Empty proofs fall through to the oracle's no-state path, which
+                // calls reportRootUnavailable instead.
+                if (!all.isEmpty() && onRootServed != null) {
+                    try { onRootServed.run(); } catch (RuntimeException ignore) {}
                 }
                 return all;
             });
