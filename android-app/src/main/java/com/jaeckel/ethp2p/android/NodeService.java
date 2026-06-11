@@ -206,9 +206,28 @@ public final class NodeService extends Service {
     // (observed on-device). A small pool lets calls overlap their fetch waits.
     // Kept modest (3) so Besu interpretation can't peg the CPU alongside BLS.
     private static final int EVM_POOL_THREADS = 3;
-    private final java.util.concurrent.ExecutorService evmPoolDelegate =
-            java.util.concurrent.Executors.newFixedThreadPool(EVM_POOL_THREADS, r -> {
-                Thread t = new Thread(r, "android-evm");
+    /** Calldata size at/below which an eth_call rides the reserved small lane. A
+     *  wallet confirm screen's calls are tiny (36-byte balanceOf probes, ~516-byte
+     *  Multicall3 simulations) while the background token sweep is ~32KB; without a
+     *  reserved lane the sweep's 30s+ executions occupy every EVM thread and the
+     *  confirm screen's calls queue to death behind them (observed live: the
+     *  simulation timing out at 30s four times in a row during a sweep storm). */
+    private static final int EVM_SMALL_CALLDATA_MAX = 4_096;
+    /** Set by the RPC handler around callView/estimateGas invocations; read by the
+     *  routing {@link #evmPool} when supplyAsync submits on the same thread. */
+    private static final ThreadLocal<Boolean> EVM_SMALL_LANE = new ThreadLocal<>();
+    /** Heavy lane: the token sweeps and other large calls (2 threads). */
+    private final java.util.concurrent.ExecutorService evmPoolHeavy =
+            java.util.concurrent.Executors.newFixedThreadPool(EVM_POOL_THREADS - 1, r -> {
+                Thread t = new Thread(r, "android-evm-heavy");
+                t.setDaemon(true);
+                return t;
+            });
+    /** Small lane: one thread reserved for small-calldata calls so interactive
+     *  reads never queue behind a sweep. */
+    private final java.util.concurrent.ExecutorService evmPoolSmall =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "android-evm-small");
                 t.setDaemon(true);
                 return t;
             });
@@ -218,13 +237,18 @@ public final class NodeService extends Service {
      *  starving the live retries that followed them. Slightly above the longest
      *  RPC wait so a still-awaited task is never dropped early. */
     private static final long EVM_TASK_MAX_QUEUE_AGE_MS = 35_000;
-    /** Executor handed to the EVM stack: delegates to {@link #evmPoolDelegate}
-     *  but drops tasks that sat queued past {@link #EVM_TASK_MAX_QUEUE_AGE_MS}.
-     *  A skipped task leaves its CompletableFuture incomplete — safe, because
-     *  the only waiter timed out and abandoned it long before. */
+    /** Executor handed to the EVM stack: routes to the small or heavy lane (via the
+     *  {@link #EVM_SMALL_LANE} hint the RPC handler sets on its own thread before
+     *  invoking callView — supplyAsync calls execute() synchronously on that thread,
+     *  so the hint is visible here; continuations submitted from other threads
+     *  default to the heavy lane). Both lanes drop tasks that sat queued past
+     *  {@link #EVM_TASK_MAX_QUEUE_AGE_MS}: a skipped task leaves its
+     *  CompletableFuture incomplete — safe, because the only waiter timed out and
+     *  abandoned it long before. */
     private final java.util.concurrent.Executor evmPool = task -> {
         final long enqueuedAtMs = android.os.SystemClock.elapsedRealtime();
-        evmPoolDelegate.execute(() -> {
+        boolean small = Boolean.TRUE.equals(EVM_SMALL_LANE.get());
+        (small ? evmPoolSmall : evmPoolHeavy).execute(() -> {
             long ageMs = android.os.SystemClock.elapsedRealtime() - enqueuedAtMs;
             if (ageMs > EVM_TASK_MAX_QUEUE_AGE_MS) {
                 LogBuffer.i(TAG, "[evm] skipping task queued " + ageMs
@@ -981,6 +1005,12 @@ public final class NodeService extends Service {
             return null;
         }
         long t0 = android.os.SystemClock.elapsedRealtime();
+        // Route small calls onto the reserved EVM lane so a confirm screen's tiny
+        // probes/simulations never queue behind a ~32KB token-sweep storm. The hint
+        // is read synchronously by evmPool when callView's supplyAsync submits on
+        // this thread; cleared in finally so the handler thread doesn't leak it.
+        boolean smallLane = (data == null || data.length <= EVM_SMALL_CALLDATA_MAX);
+        if (smallLane) EVM_SMALL_LANE.set(Boolean.TRUE);
         try {
             byte[] out = h.offchainExecutor()
                     .callView(io.myotis.evm.Address.of(to), data == null ? new byte[0] : data,
@@ -994,6 +1024,8 @@ public final class NodeService extends Service {
                     + (android.os.SystemClock.elapsedRealtime() - t0) + "ms: "
                     + describeEvmError(e));
             return null;
+        } finally {
+            if (smallLane) EVM_SMALL_LANE.remove();
         }
     }
 
@@ -3336,7 +3368,8 @@ public final class NodeService extends Service {
         // worker holds the same lock as startAndPublish, so a subsequent
         // service start can't race with a half-finished close.
         RUNNING.set(false);
-        evmPoolDelegate.shutdownNow();
+        evmPoolHeavy.shutdownNow();
+        evmPoolSmall.shutdownNow();
         ccipPool.shutdownNow();
         headBuildPool.shutdownNow();
         new Thread(this::doShutdown, "ethp2p-shutdown").start();
