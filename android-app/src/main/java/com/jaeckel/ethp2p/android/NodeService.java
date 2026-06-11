@@ -198,15 +198,42 @@ public final class NodeService extends Service {
     private static final int STATE_PROOF_CACHE_MAX = 65_536;
     private final io.myotis.evm.world.StateProofCache stateProofCache =
             io.myotis.evm.world.StateProofCache.inMemory(STATE_PROOF_CACHE_MAX);
-    // Single thread: Besu EVM execution is CPU-bound and the oracle is pinned
-    // to one peer, so serializing avoids contention. Daemon thread so it never
-    // blocks process exit.
-    private final java.util.concurrent.ExecutorService evmPool =
-            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+    // EVM pool. Was a single thread ("EVM is CPU-bound, oracle pinned to one
+    // peer") — but the oracle rotates across peers now, and an EVM task spends
+    // most of its wall-clock BLOCKED on snap fetch waves, not executing. A wallet
+    // confirm screen fires ~20 eth_calls at once; serialized behind one thread
+    // they queue for minutes and every one of them blows the 30s RPC deadline
+    // (observed on-device). A small pool lets calls overlap their fetch waits.
+    // Kept modest (3) so Besu interpretation can't peg the CPU alongside BLS.
+    private static final int EVM_POOL_THREADS = 3;
+    private final java.util.concurrent.ExecutorService evmPoolDelegate =
+            java.util.concurrent.Executors.newFixedThreadPool(EVM_POOL_THREADS, r -> {
                 Thread t = new Thread(r, "android-evm");
                 t.setDaemon(true);
                 return t;
             });
+    /** Tasks older than this when dequeued are skipped: their RPC caller (30s
+     *  deadline) has long since given up, so running them would burn EVM-thread
+     *  time for nobody — observed as a queue of dead confirm-screen calls
+     *  starving the live retries that followed them. Slightly above the longest
+     *  RPC wait so a still-awaited task is never dropped early. */
+    private static final long EVM_TASK_MAX_QUEUE_AGE_MS = 35_000;
+    /** Executor handed to the EVM stack: delegates to {@link #evmPoolDelegate}
+     *  but drops tasks that sat queued past {@link #EVM_TASK_MAX_QUEUE_AGE_MS}.
+     *  A skipped task leaves its CompletableFuture incomplete — safe, because
+     *  the only waiter timed out and abandoned it long before. */
+    private final java.util.concurrent.Executor evmPool = task -> {
+        final long enqueuedAtMs = android.os.SystemClock.elapsedRealtime();
+        evmPoolDelegate.execute(() -> {
+            long ageMs = android.os.SystemClock.elapsedRealtime() - enqueuedAtMs;
+            if (ageMs > EVM_TASK_MAX_QUEUE_AGE_MS) {
+                LogBuffer.i(TAG, "[evm] skipping task queued " + ageMs
+                        + "ms (caller deadline long past)");
+                return;
+            }
+            task.run();
+        });
+    };
     // CCIP-Read gateway HTTP is blocking; keep it off the single EVM thread.
     private final java.util.concurrent.ExecutorService ccipPool =
             java.util.concurrent.Executors.newCachedThreadPool(r -> {
@@ -3208,7 +3235,7 @@ public final class NodeService extends Service {
         // worker holds the same lock as startAndPublish, so a subsequent
         // service start can't race with a half-finished close.
         RUNNING.set(false);
-        evmPool.shutdownNow();
+        evmPoolDelegate.shutdownNow();
         ccipPool.shutdownNow();
         headBuildPool.shutdownNow();
         new Thread(this::doShutdown, "ethp2p-shutdown").start();
