@@ -30,9 +30,22 @@ import java.util.concurrent.CompletableFuture;
 public final class EthHandlerSnapPeer implements SnapPeer {
 
     private final EthHandler handler;
+    private final Runnable onRootUnavailable;
 
     public EthHandlerSnapPeer(EthHandler handler) {
+        this(handler, null);
+    }
+
+    /** @param onRootUnavailable run when the oracle reports this peer can't serve the
+     *  current state root, so the routing supplier can deprioritize it for this head. */
+    public EthHandlerSnapPeer(EthHandler handler, Runnable onRootUnavailable) {
         this.handler = handler;
+        this.onRootUnavailable = onRootUnavailable;
+    }
+
+    @Override
+    public void reportRootUnavailable() {
+        if (onRootUnavailable != null) onRootUnavailable.run();
     }
 
     @Override

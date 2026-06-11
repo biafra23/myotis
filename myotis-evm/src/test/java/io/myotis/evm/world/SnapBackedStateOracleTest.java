@@ -124,6 +124,26 @@ class SnapBackedStateOracleTest {
         }
         // Supplier was consulted once per attempt.
         assertEquals(3, attempts.get());
+        // Each InvalidProof tells the peer it can't serve this root, so a routing
+        // supplier can rotate away from it (the fix for empty-proof churn).
+        assertEquals(3, peer.rootUnavailableCalls.get());
+    }
+
+    @Test
+    void successDoesNotReportRootUnavailable() throws Exception {
+        // A peer that serves a valid account proof must NOT be flagged root-unavailable.
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        Bytes accountValue = encodeAccount(42L, new BigInteger("1000000000000000000"),
+                TrieFixture.EMPTY_TRIE_ROOT,
+                Bytes32.wrap(Hash.keccak256(Bytes.EMPTY).toArrayUnsafe()));
+        var trie = TrieFixture.singleLeaf(keccak(addr.toByteArray()), accountValue);
+
+        FixturePeer peer = new FixturePeer();
+        peer.addTrieNodes(trie.root, trie.proof);
+
+        var oracle = new SnapBackedStateOracle(() -> peer, BytecodeCache.inMemory());
+        oracle.fetchAccount(trie.root.toArrayUnsafe(), addr).get();
+        assertEquals(0, peer.rootUnavailableCalls.get());
     }
 
     // ---- Storage fetch -----------------------------------------------------
@@ -327,6 +347,13 @@ class SnapBackedStateOracleTest {
                 if (code != null) result.add(code);
             }
             return CompletableFuture.completedFuture(result);
+        }
+
+        final AtomicInteger rootUnavailableCalls = new AtomicInteger();
+
+        @Override
+        public void reportRootUnavailable() {
+            rootUnavailableCalls.incrementAndGet();
         }
     }
 }

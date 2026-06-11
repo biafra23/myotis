@@ -735,7 +735,7 @@ public final class NodeService extends Service {
     /** Snap-oracle per-fetch retry budget. Each attempt rotates to a different ready
      *  snap peer (the probed peer first), so a slow/dead peer fails over instead of
      *  burning the whole RPC_CALL_TIMEOUT on one peer. */
-    private static final int SNAP_ORACLE_MAX_ATTEMPTS = 4;
+    private static final int SNAP_ORACLE_MAX_ATTEMPTS = 8;
     /** Head-build budget — includes the headerChain anchoring fetch. */
     private static final long RPC_ACCOUNT_TIMEOUT_SEC = HEADER_CHAIN_TIMEOUT_SEC + 10;
     /** Overall budget for the (parallel) snap-peer head probe. */
@@ -2371,23 +2371,35 @@ public final class NodeService extends Service {
         final RLPxConnector oracleConn = conn;
         final java.util.concurrent.atomic.AtomicInteger rotation =
                 new java.util.concurrent.atomic.AtomicInteger();
+        // Peers that returned an empty proof / no-state for THIS head's stateRoot — they
+        // don't retain its trie (a chunk of the pool lags the head). Deny them for this
+        // context so the rotation converges on peers that actually serve the root instead
+        // of re-handing out empty-proof peers and exhausting every fetch's retries (the
+        // cause of heavy-multicall eth_call 30s failures). Per-context; cleared next build.
+        final java.util.Set<com.jaeckel.ethp2p.networking.eth.EthHandler> rootDenied =
+                java.util.concurrent.ConcurrentHashMap.newKeySet();
         io.myotis.evm.world.SnapBackedStateOracle oracle =
                 new io.myotis.evm.world.SnapBackedStateOracle(
                         () -> {
                             int n = rotation.getAndIncrement();
-                            if (n == 0 && probedPeer.isReady() && !probedPeer.isSnapServingFailed()) {
-                                return new com.jaeckel.ethp2p.android.snap.EthHandlerSnapPeer(probedPeer);
+                            if (n == 0 && probedPeer.isReady() && !probedPeer.isSnapServingFailed()
+                                    && !rootDenied.contains(probedPeer)) {
+                                final com.jaeckel.ethp2p.networking.eth.EthHandler pp = probedPeer;
+                                return new com.jaeckel.ethp2p.android.snap.EthHandlerSnapPeer(
+                                        pp, () -> rootDenied.add(pp));
                             }
                             // activeSnapHandlers() already returns only ready, snap-negotiated,
-                            // non-failed peers — no need to re-check here. probedPeer is in that
-                            // list too (if still healthy), so it stays in the rotation as a
-                            // fallback without a separate add.
+                            // non-failed peers; drop the ones denied for this root.
                             java.util.List<com.jaeckel.ethp2p.networking.eth.EthHandler> ready =
-                                    oracleConn.activeSnapHandlers();
+                                    new java.util.ArrayList<>();
+                            for (com.jaeckel.ethp2p.networking.eth.EthHandler p : oracleConn.activeSnapHandlers()) {
+                                if (!rootDenied.contains(p)) ready.add(p);
+                            }
                             if (ready.isEmpty()) return null;
-                            com.jaeckel.ethp2p.networking.eth.EthHandler chosen =
+                            final com.jaeckel.ethp2p.networking.eth.EthHandler chosen =
                                     ready.get(Math.floorMod(n, ready.size()));
-                            return new com.jaeckel.ethp2p.android.snap.EthHandlerSnapPeer(chosen);
+                            return new com.jaeckel.ethp2p.android.snap.EthHandlerSnapPeer(
+                                    chosen, () -> rootDenied.add(chosen));
                         },
                         ensBytecodeCache,
                         SNAP_ORACLE_MAX_ATTEMPTS);
