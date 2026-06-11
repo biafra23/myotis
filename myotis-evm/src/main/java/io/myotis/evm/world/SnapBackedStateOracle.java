@@ -225,14 +225,23 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
                 return;
             }
             Throwable cause = unwrap(error);
-            // A definitive can't-serve failure (empty proof for a non-empty root, or no
-            // state at all) means this peer doesn't retain stateRoot's trie. Tell it so,
-            // so a routing peerSupplier can rotate AWAY from it for this head instead of
-            // re-handing it out every retry — the dominant cost of a heavy multicall
-            // against a fresh head a chunk of the peer set hasn't caught up to.
-            if (cause instanceof EvmExecutionException ee
-                    && (ee.error() instanceof EvmExecutionError.InvalidProof
-                        || ee.error() instanceof EvmExecutionError.StateUnavailable)) {
+            // This peer can't serve stateRoot for this head, via any of:
+            //   - empty proof for a non-empty root / no state at all (InvalidProof /
+            //     StateUnavailable) — it doesn't retain the trie;
+            //   - it accepted the request then HUNG (TimeoutException) or the connection
+            //     dropped (IOException) — equally useless for this short-lived context.
+            // Tell it so, so a routing peerSupplier rotates AWAY from it for this head.
+            // The head context is shared across an eth_call burst (confirm screen fires
+            // many), so denying a hanger once makes the whole burst converge on responsive
+            // peers instead of re-dialing the same hangers and eating the 30s budget on
+            // each call — the cause of the "stuck confirmation" hangs on a flaky peer set.
+            boolean cantServe =
+                    (cause instanceof EvmExecutionException ee
+                        && (ee.error() instanceof EvmExecutionError.InvalidProof
+                            || ee.error() instanceof EvmExecutionError.StateUnavailable))
+                    || cause instanceof java.util.concurrent.TimeoutException
+                    || cause instanceof java.io.IOException;
+            if (cantServe) {
                 try { peer.reportRootUnavailable(); } catch (RuntimeException ignore) {}
             }
             log.warn("[snap-oracle] attempt {} failed: {}", attemptIdx, error.getMessage());

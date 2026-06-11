@@ -146,6 +146,57 @@ class SnapBackedStateOracleTest {
         assertEquals(0, peer.rootUnavailableCalls.get());
     }
 
+    @Test
+    void hangingPeerIsReportedRootUnavailable() {
+        // A peer that accepts the request then times out (or the connection drops) is as
+        // useless for this head as an empty-proof one — it must be flagged so the routing
+        // supplier rotates away from it, not re-dialed every retry (the confirm-screen hang).
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        Bytes32 root = Bytes32.fromHexString(
+                "0x2222222222222222222222222222222222222222222222222222222222222222");
+        AtomicInteger reported = new AtomicInteger();
+        SnapPeer hanging = new SnapPeer() {
+            @Override public CompletableFuture<List<Bytes>> getTrieNodes(Bytes32 sr, List<PathSet> p) {
+                return CompletableFuture.failedFuture(new java.util.concurrent.TimeoutException("hung"));
+            }
+            @Override public CompletableFuture<List<Bytes>> getByteCodes(List<Bytes32> h) {
+                return CompletableFuture.failedFuture(new java.util.concurrent.TimeoutException("hung"));
+            }
+            @Override public void reportRootUnavailable() { reported.incrementAndGet(); }
+        };
+
+        var oracle = new SnapBackedStateOracle(() -> hanging, BytecodeCache.inMemory(), 3);
+        try {
+            oracle.fetchAccount(root.toArrayUnsafe(), addr).get();
+            fail("expected fetchAccount to fail");
+        } catch (Exception ignored) { /* expected */ }
+        assertEquals(3, reported.get(), "each timeout must report the peer root-unavailable");
+    }
+
+    @Test
+    void channelClosedIsReportedRootUnavailable() {
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        Bytes32 root = Bytes32.fromHexString(
+                "0x3333333333333333333333333333333333333333333333333333333333333333");
+        AtomicInteger reported = new AtomicInteger();
+        SnapPeer dropped = new SnapPeer() {
+            @Override public CompletableFuture<List<Bytes>> getTrieNodes(Bytes32 sr, List<PathSet> p) {
+                return CompletableFuture.failedFuture(new java.io.IOException("Channel closed"));
+            }
+            @Override public CompletableFuture<List<Bytes>> getByteCodes(List<Bytes32> h) {
+                return CompletableFuture.failedFuture(new java.io.IOException("Channel closed"));
+            }
+            @Override public void reportRootUnavailable() { reported.incrementAndGet(); }
+        };
+
+        var oracle = new SnapBackedStateOracle(() -> dropped, BytecodeCache.inMemory(), 2);
+        try {
+            oracle.fetchAccount(root.toArrayUnsafe(), addr).get();
+            fail("expected fetchAccount to fail");
+        } catch (Exception ignored) { /* expected */ }
+        assertEquals(2, reported.get());
+    }
+
     // ---- Storage fetch -----------------------------------------------------
 
     @Test
