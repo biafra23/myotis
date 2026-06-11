@@ -1899,11 +1899,17 @@ public final class NodeService extends Service {
             long now = System.currentTimeMillis();
             LogBuffer.i(TAG, "[peers] " + snapPeers + " snap peer(s) < target " + TARGET_SNAP_PEERS
                     + "; re-dialing cached snap peers + DNS pool");
-            // 1) Re-dial known snap peers from the cache.
+            // 1) Re-dial known snap peers from the cache, proven snap-servers first
+            //    (same ordering as cold start) so a starved node reconnects a
+            //    working snap peer before retrying known hangers.
             if (pc != null) {
+                List<AndroidPeerCache.CachedPeer> snapCached = new ArrayList<>();
                 for (AndroidPeerCache.CachedPeer p : pc.load()) {
+                    if (p.snap()) snapCached.add(p);
+                }
+                snapCached.sort(java.util.Comparator.comparingInt(NodeService::snapDialRank));
+                for (AndroidPeerCache.CachedPeer p : snapCached) {
                     try {
-                        if (!p.snap()) continue;
                         if (conn.activeSnapHandlers().size() >= TARGET_SNAP_PEERS) break;
                         dialCachedSnapPeer(conn, p, now);
                     } catch (Exception e) {
@@ -2097,6 +2103,66 @@ public final class NodeService extends Service {
         } catch (Exception e) {
             attempted.remove(peerKey);
         }
+    }
+
+    /**
+     * Feed a snap-serving verdict for {@code peer} into the EL peer cache so good
+     * snap peers are remembered across restarts (dialed first) and repeat hangers
+     * deprioritized. {@code served=true} on a usable proof, {@code false} on a
+     * root-unavailable (empty/invalid proof, timeout, IO). No-op if the cache is
+     * absent or the handler's remote address can't be parsed.
+     */
+    private static void recordSnapQuality(AndroidPeerCache cache,
+            com.jaeckel.ethp2p.networking.eth.EthHandler peer, boolean served) {
+        if (cache == null || peer == null) return;
+        InetSocketAddress addr = remoteAddressOf(peer);
+        if (addr == null) return;
+        try {
+            if (served) cache.recordSnapServed(addr);
+            else cache.recordSnapFailure(addr);
+        } catch (RuntimeException ignore) {
+            // Never let cache bookkeeping disrupt an in-flight RPC.
+        }
+    }
+
+    /**
+     * Parse {@link com.jaeckel.ethp2p.networking.eth.EthHandler#getRemoteAddress()}
+     * ("ip:port", or "[v6]:port") into an unresolved {@link InetSocketAddress} whose
+     * {@code getHostString()} matches the key {@link AndroidPeerCache} stored at dial
+     * time. Returns {@code null} on a missing/malformed address.
+     */
+    private static InetSocketAddress remoteAddressOf(
+            com.jaeckel.ethp2p.networking.eth.EthHandler peer) {
+        String ra = peer.getRemoteAddress();
+        if (ra == null || ra.isEmpty()) return null;
+        int colon = ra.lastIndexOf(':');
+        if (colon <= 0 || colon == ra.length() - 1) return null;
+        String host = ra.substring(0, colon);
+        if (host.startsWith("[") && host.endsWith("]")) {
+            host = host.substring(1, host.length() - 1);
+        }
+        try {
+            int port = Integer.parseInt(ra.substring(colon + 1));
+            return InetSocketAddress.createUnresolved(host, port);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Dial-priority rank for a cached peer (lower = dialed first): proven
+     * snap-servers, then snap-capable-but-unproven, then known snap hangers, then
+     * plain-eth peers. Denied snap peers still outrank non-snap peers — state
+     * roots change, so a peer that couldn't serve an old pivot may serve the
+     * current head, and it's still snap-capable.
+     */
+    private static int snapDialRank(AndroidPeerCache.CachedPeer p) {
+        if (!p.snap()) return 3;
+        return switch (p.snapQuality()) {
+            case CONFIRMED -> 0;
+            case UNKNOWN -> 1;
+            case DENIED -> 2;
+        };
     }
 
     private void startHeadWarmer() {
@@ -2378,6 +2444,11 @@ public final class NodeService extends Service {
         // cause of heavy-multicall eth_call 30s failures). Per-context; cleared next build.
         final java.util.Set<com.jaeckel.ethp2p.networking.eth.EthHandler> rootDenied =
                 java.util.concurrent.ConcurrentHashMap.newKeySet();
+        // Persisted EL-cache quality signal: a non-empty proof confirms the peer
+        // as snap-serving (dialed first on restart); the same root-unavailable
+        // event that deprioritizes it for this head also feeds a failure verdict
+        // so repeat hangers are deprioritized across restarts.
+        final AndroidPeerCache snapQualityCache = peerCache;
         io.myotis.evm.world.SnapBackedStateOracle oracle =
                 new io.myotis.evm.world.SnapBackedStateOracle(
                         () -> {
@@ -2386,7 +2457,9 @@ public final class NodeService extends Service {
                                     && !rootDenied.contains(probedPeer)) {
                                 final com.jaeckel.ethp2p.networking.eth.EthHandler pp = probedPeer;
                                 return new com.jaeckel.ethp2p.android.snap.EthHandlerSnapPeer(
-                                        pp, () -> rootDenied.add(pp));
+                                        pp,
+                                        () -> { rootDenied.add(pp); recordSnapQuality(snapQualityCache, pp, false); },
+                                        () -> recordSnapQuality(snapQualityCache, pp, true));
                             }
                             // activeSnapHandlers() already returns only ready, snap-negotiated,
                             // non-failed peers; drop the ones denied for this root.
@@ -2399,7 +2472,9 @@ public final class NodeService extends Service {
                             final com.jaeckel.ethp2p.networking.eth.EthHandler chosen =
                                     ready.get(Math.floorMod(n, ready.size()));
                             return new com.jaeckel.ethp2p.android.snap.EthHandlerSnapPeer(
-                                    chosen, () -> rootDenied.add(chosen));
+                                    chosen,
+                                    () -> { rootDenied.add(chosen); recordSnapQuality(snapQualityCache, chosen, false); },
+                                    () -> recordSnapQuality(snapQualityCache, chosen, true));
                         },
                         ensBytecodeCache,
                         SNAP_ORACLE_MAX_ATTEMPTS);
@@ -2529,8 +2604,11 @@ public final class NodeService extends Service {
             // Reconnect snap/1-capable peers first: state queries (get-account /
             // ENS) need a snap peer, and snap peers are a minority of eth peers,
             // so dialing them ahead of plain-eth peers makes queries work sooner
-            // after a restart instead of waiting for re-discovery.
-            cached.sort((a, b) -> Boolean.compare(b.snap(), a.snap()));
+            // after a restart instead of waiting for re-discovery. Within the snap
+            // set, peers proven to serve proofs (CONFIRMED) come ahead of unproven
+            // ones, and known hangers (DENIED) come last — so a restart converges
+            // on a working snap peer instead of re-timing-out the bad ones first.
+            cached.sort(java.util.Comparator.comparingInt(NodeService::snapDialRank));
 
             final AndroidPeerCache cacheRef = localCache;
             localConnector = new RLPxConnector(nodeKey, DEFAULT_PORT, network,
@@ -2935,7 +3013,11 @@ public final class NodeService extends Service {
         discV5 = null;
         closeQuietly(discV4);
         discV4 = null;
-        peerCache = null;
+        // Flush + stop the peer cache's async writer before dropping the reference.
+        if (peerCache != null) {
+            try { peerCache.close(); } catch (Exception ignored) {}
+            peerCache = null;
+        }
         clPeerCache = null;
         attempted.clear();
         backoff.clear();
