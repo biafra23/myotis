@@ -100,9 +100,14 @@ public final class EthHandlerSnapPeer implements SnapPeer {
                 // A non-empty proof means this peer actually retains the trie for
                 // this root — the durable "snap-serving" signal the EL cache wants.
                 // Empty proofs fall through to the oracle's no-state path, which
-                // calls reportRootUnavailable instead.
+                // calls reportRootUnavailable instead. Offloaded: this completion
+                // chain runs on the Netty event loop, and a host's quality sink may
+                // block (lock contention, sync persistence) — a shared adapter must
+                // not let a host callback stall network processing.
                 if (!all.isEmpty() && onRootServed != null) {
-                    try { onRootServed.run(); } catch (RuntimeException ignore) {}
+                    CompletableFuture.runAsync(() -> {
+                        try { onRootServed.run(); } catch (RuntimeException ignore) {}
+                    });
                 }
                 return all;
             });
