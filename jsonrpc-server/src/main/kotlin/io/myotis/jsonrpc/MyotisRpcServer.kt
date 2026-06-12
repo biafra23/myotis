@@ -7,6 +7,8 @@ import io.ktor.server.engine.EmbeddedServer
 import io.ktor.server.plugins.cors.routing.CORS
 import io.ktor.server.request.receiveText
 import io.ktor.server.response.respondText
+import io.ktor.server.response.respondTextWriter
+import kotlinx.coroutines.async
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
@@ -71,6 +73,13 @@ class MyotisRpcServer(
         }
     }
 
+    private companion object {
+        /** How often to trickle a keep-alive whitespace byte while a response is still
+         *  being computed. Short enough to reset any sane per-read socket timeout
+         *  (OkHttp defaults to 10s), long enough to stay invisible for normal calls. */
+        const val HEARTBEAT_INTERVAL_MS = 5_000L
+    }
+
     @Volatile
     private var engine: EmbeddedServer<*, *>? = null
 
@@ -87,9 +96,35 @@ class MyotisRpcServer(
                 get("/health") { call.respondText("ok") }
                 post("/") {
                     val body = call.receiveText()
-                    val response = router.handle(body)
-                    capture(body, response)
-                    call.respondText(response, ContentType.Application.Json)
+                    // Heartbeat-streamed response: compute the answer concurrently and,
+                    // while it's pending, trickle a whitespace byte every few seconds on
+                    // the (chunked) response. JSON permits leading whitespace before the
+                    // top-level value (RFC 8259), so clients parse the eventual payload
+                    // unchanged — but the trickle resets per-read HTTP timeouts (OkHttp
+                    // on Android / MetaMask Mobile resets its read deadline on every
+                    // byte). That frees slow verified calls (a ~1000-token BalanceChecker
+                    // sweep over devp2p needs >30s on mobile peers) from the wallet's
+                    // socket timeout: the wallet waits as long as WE keep feeding bytes,
+                    // and our backend cap (RPC_CALL_TIMEOUT) is the real deadline.
+                    // Fast calls (<1 heartbeat) get zero padding — byte-identical to the
+                    // old behavior.
+                    val pending = kotlinx.coroutines.CoroutineScope(
+                        kotlinx.coroutines.Dispatchers.IO).async {
+                        router.handle(body)
+                    }
+                    call.respondTextWriter(ContentType.Application.Json) {
+                        var response: String? = null
+                        while (response == null) {
+                            response = kotlinx.coroutines.withTimeoutOrNull(
+                                HEARTBEAT_INTERVAL_MS) { pending.await() }
+                            if (response == null) {
+                                write(" ")
+                                flush()
+                            }
+                        }
+                        write(response)
+                        capture(body, response)
+                    }
                 }
             }
         }
