@@ -230,6 +230,10 @@ public final class NodeService extends Service {
             long syncStartPeriod,
             long syncCurrentPeriod,
             long syncTargetPeriod,
+            // Age (ms) of the last verified RPC head, Long.MAX_VALUE if none built yet.
+            // The readiness traffic-light's green gate: a recent head means wallet
+            // calls serve instead of hitting "no verified head".
+            long verifiedHeadAgeMs,
             List<RLPxConnector.PeerInfo> readyPeerList) {}
 
     /** Result of a get-account query. Mirrors the JVM daemon's JSON response shape. */
@@ -1419,7 +1423,7 @@ public final class NodeService extends Service {
                     bs.state, bs.bootstrapped, bs.connected, bs.lc,
                     cachedClPeerCount, bs.finalizedSlot, bs.execBlockNum, bs.execBlockHashHex,
                     bs.syncStartPeriod, bs.syncCurrentPeriod, bs.syncTargetPeriod,
-                    List.of());
+                    Long.MAX_VALUE, List.of());
         }
         List<RLPxConnector.PeerInfo> active = connector.getActivePeers();
         List<RLPxConnector.PeerInfo> ready = new ArrayList<>();
@@ -1435,13 +1439,15 @@ public final class NodeService extends Service {
                 .comparing(RLPxConnector.PeerInfo::snapSupported).reversed()
                 .thenComparing(p -> p.clientId() == null ? "" : p.clientId()));
         int tableSize = discV4 != null ? discV4.table().size() : 0;
+        io.myotis.rpc.VerifiedRpcBackend backend = rpcBackend;
+        long headAge = backend != null ? backend.verifiedHeadAgeMs() : Long.MAX_VALUE;
         return new Snapshot(true, startTimeMs, tableSize, active.size(), ready.size(), snapCount,
                 cachedPeerCount, attempted.size(), countActiveBackoff(),
                 blacklistedNodeIds.size(), discv5Live, clPeersDiscovered.get(),
                 bs.state, bs.bootstrapped, bs.connected, bs.lc,
                 cachedClPeerCount, bs.finalizedSlot, bs.execBlockNum, bs.execBlockHashHex,
                 bs.syncStartPeriod, bs.syncCurrentPeriod, bs.syncTargetPeriod,
-                ready);
+                headAge, ready);
     }
 
     /** Per-snapshot beacon view, computed once so the record fields stay consistent. */

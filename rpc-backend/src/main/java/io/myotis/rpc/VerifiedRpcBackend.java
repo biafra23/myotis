@@ -838,6 +838,15 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         return good == null ? Long.MAX_VALUE : clock.elapsedMillis() - good.builtAtMs();
     }
 
+    /** Public readiness probe: age (ms) of the last verified head, {@code Long.MAX_VALUE}
+     *  if none built yet. A host UI surfaces "warmed up" from this — a recent head means
+     *  wallet reads/calls (eth_call, balances, the confirm-screen simulation) will serve
+     *  rather than hit the "no verified head" path. This is the third readiness gate
+     *  beyond beacon-SYNCED and snap-peers-connected, and the one nothing else exposes. */
+    public long verifiedHeadAgeMs() {
+        return headAgeMs();
+    }
+
     /** True while an anchored-head build is in flight (warmer or a prior read), so a
      *  waiting read can ride it instead of erroring early. */
     private boolean headBuildInFlight() {
