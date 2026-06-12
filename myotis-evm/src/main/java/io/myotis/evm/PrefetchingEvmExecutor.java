@@ -275,6 +275,31 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
                                     Set<Address> accounts,
                                     Set<AccessTracker.SlotKey> slots) {
         SnapStateOracle oracle = delegate.oracle();
+
+        // Coalesce the discovered access list into a few BATCHED GetTrieNodes requests
+        // (one path-set per account, chunked) instead of one round-trip per item — a
+        // 1000-token sweep's ~1000 sequential proofs become ~16. Best-effort warm of the
+        // proof cache; the per-item loop below then reads back from the (now-warm) cache
+        // and re-fetches anything the batch couldn't verify, so this only ever SAVES
+        // round-trips and never changes the result or the verification.
+        java.util.Map<Address, java.util.Set<java.math.BigInteger>> batch = new java.util.HashMap<>();
+        for (Address a : accounts) batch.computeIfAbsent(a, k -> new java.util.HashSet<>());
+        for (AccessTracker.SlotKey key : slots) {
+            batch.computeIfAbsent(key.address(), k -> new java.util.HashSet<>()).add(key.slot());
+        }
+        if (!batch.isEmpty()) {
+            try {
+                oracle.fetchBatch(stateRoot, batch)
+                        .get(PREFETCH_WAVE_TIMEOUT_SEC, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                // Restore the interrupt so the executor/caller sees the cancellation.
+                Thread.currentThread().interrupt();
+                log.debug("[prefetch] batch warm interrupted: {}", e.getMessage());
+            } catch (Exception e) {
+                log.debug("[prefetch] batch warm failed/timeout: {}", e.getMessage());
+            }
+        }
+
         List<java.util.function.Supplier<CompletableFuture<?>>> work =
                 new ArrayList<>(accounts.size() + slots.size());
 

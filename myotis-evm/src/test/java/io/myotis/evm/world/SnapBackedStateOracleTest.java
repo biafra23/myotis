@@ -18,6 +18,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -297,6 +298,149 @@ class SnapBackedStateOracleTest {
         BigInteger got = oracle.fetchStorage(
                 trie.root.toArrayUnsafe(), addr, BigInteger.valueOf(42)).get();
         assertEquals(BigInteger.ZERO, got);
+    }
+
+    @Test
+    void fetchBatchVerifiesAndWarmsCacheInOneRequest() throws Exception {
+        // A real peer answers a PathSet(account,[slot]) GetTrieNodes with BOTH the
+        // account-walk and storage-walk nodes COMBINED. fetchBatch must verify each
+        // (account against stateRoot, slot against storageRoot) from that one combined
+        // response and warm the proof cache — so a later fetchAccount/fetchStorage
+        // needs ZERO further round-trips. This is the coalescing that turns a
+        // 1000-token sweep's ~1000 sequential proofs into a handful.
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        BigInteger slot = BigInteger.valueOf(7);
+        BigInteger value = new BigInteger("1234567890123456789");
+        long nonce = 5L;
+        BigInteger balance = new BigInteger("999000000000000000");
+
+        Bytes32 slotHash = Bytes32.wrap(Hash.keccak256(paddedSlot(slot)).toArrayUnsafe());
+        Bytes valueRlp = RLP.encode(w -> w.writeBigInteger(value));
+        var storageTrie = TrieFixture.singleLeaf(slotHash, valueRlp);
+        Bytes accountValue = encodeAccount(nonce, balance, storageTrie.root,
+                Bytes32.wrap(Hash.keccak256(Bytes.EMPTY).toArrayUnsafe()));
+        var accountTrie = TrieFixture.singleLeaf(keccak(addr.toByteArray()), accountValue);
+
+        List<Bytes> combined = new ArrayList<>();
+        combined.addAll(accountTrie.proof);
+        combined.addAll(storageTrie.proof);
+        AtomicInteger calls = new AtomicInteger();
+        SnapPeer peer = new SnapPeer() {
+            @Override public CompletableFuture<List<Bytes>> getTrieNodes(Bytes32 sr, List<PathSet> p) {
+                calls.incrementAndGet();
+                return CompletableFuture.completedFuture(combined);
+            }
+            @Override public CompletableFuture<List<Bytes>> getByteCodes(List<Bytes32> h) {
+                return CompletableFuture.completedFuture(List.of());
+            }
+            @Override public void reportRootUnavailable() { }
+        };
+        // fetchBatch warms the SHARED proof cache — give the oracle a real one (the
+        // 2-arg ctor uses a noop cache, into which a warm would vanish).
+        var oracle = new SnapBackedStateOracle(
+                () -> peer, BytecodeCache.inMemory(), 8, StateProofCache.inMemory(1024));
+        byte[] root = accountTrie.root.toArrayUnsafe();
+
+        Map<Address, Set<BigInteger>> req = new HashMap<>();
+        req.put(addr, Set.of(slot));
+        oracle.fetchBatch(root, req).get();
+        assertEquals(1, calls.get(), "the batch must issue exactly one GetTrieNodes");
+
+        int before = calls.get();
+        assertEquals(value, oracle.fetchStorage(root, addr, slot).get(),
+                "the verified slot value must be warmed into the cache");
+        assertEquals(balance, oracle.fetchAccount(root, addr).get().balance(),
+                "the verified account must be warmed into the cache");
+        assertEquals(before, calls.get(),
+                "reads after a batch warm must hit the cache, not the peer");
+    }
+
+    @Test
+    void fetchBatchOnForgedProofLeavesCacheCold() throws Exception {
+        // A peer that returns garbage nodes: the batch's verify must REJECT it (the
+        // chunk fails + is left uncached), never poisoning the cache with unverified
+        // state. The follow-up fetchStorage then re-fetches per-item (and here fails
+        // too) — but crucially the batch never weakened the trust path.
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        BigInteger slot = BigInteger.valueOf(7);
+        Bytes32 root = Bytes32.fromHexString(
+                "0x5555555555555555555555555555555555555555555555555555555555555555");
+        SnapPeer forging = new SnapPeer() {
+            @Override public CompletableFuture<List<Bytes>> getTrieNodes(Bytes32 sr, List<PathSet> p) {
+                return CompletableFuture.completedFuture(List.of(Bytes.fromHexString("0xdeadbeef")));
+            }
+            @Override public CompletableFuture<List<Bytes>> getByteCodes(List<Bytes32> h) {
+                return CompletableFuture.completedFuture(List.of());
+            }
+            @Override public void reportRootUnavailable() { }
+        };
+        var oracle = new SnapBackedStateOracle(() -> forging, BytecodeCache.inMemory(), 2);
+
+        Map<Address, Set<BigInteger>> req = new HashMap<>();
+        req.put(addr, Set.of(slot));
+        // Best-effort: the batch completes (doesn't throw) but caches nothing forged.
+        oracle.fetchBatch(root.toArrayUnsafe(), req).get();
+
+        // The cache stayed cold — a real fetch still has to verify from scratch (and
+        // here fails, because the peer forges). The point: no unverified value was cached.
+        try {
+            oracle.fetchStorage(root.toArrayUnsafe(), addr, slot).get();
+            fail("a forged proof must not yield a value");
+        } catch (ExecutionException expected) {
+            // verifier rejected the garbage — correct.
+        }
+    }
+
+    @Test
+    void fetchBatchRetryServesAlreadyVerifiedItemsFromCache() throws Exception {
+        // Retry robustness across peer rotation. Attempt 1 proves the account but NOT
+        // the slot, so the slot verify fails and the whole chunk retries on the next
+        // peer. Attempt 2 proves the slot but NOT the account. Because verifyAndCacheChunk
+        // queries the cache LIVE, the account verified+cached on attempt 1 is served from
+        // cache on the retry, so the chunk completes even though no single response
+        // carried both proofs. A static "cached when the batch was built?" snapshot would
+        // force re-verifying the account from the retry response (which lacks it) and fail.
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        BigInteger slot = BigInteger.valueOf(7);
+        BigInteger value = new BigInteger("1234567890123456789");
+        long nonce = 5L;
+        BigInteger balance = new BigInteger("999000000000000000");
+
+        Bytes32 slotHash = Bytes32.wrap(Hash.keccak256(paddedSlot(slot)).toArrayUnsafe());
+        Bytes valueRlp = RLP.encode(w -> w.writeBigInteger(value));
+        var storageTrie = TrieFixture.singleLeaf(slotHash, valueRlp);
+        Bytes accountValue = encodeAccount(nonce, balance, storageTrie.root,
+                Bytes32.wrap(Hash.keccak256(Bytes.EMPTY).toArrayUnsafe()));
+        var accountTrie = TrieFixture.singleLeaf(keccak(addr.toByteArray()), accountValue);
+
+        AtomicInteger attempt = new AtomicInteger();
+        SnapPeer rotating = new SnapPeer() {
+            @Override public CompletableFuture<List<Bytes>> getTrieNodes(Bytes32 sr, List<PathSet> p) {
+                // 1st: account proof only (slot fails → chunk retries).
+                // 2nd+: storage proof only (account must come from the warm cache).
+                int n = attempt.incrementAndGet();
+                return CompletableFuture.completedFuture(n == 1 ? accountTrie.proof : storageTrie.proof);
+            }
+            @Override public CompletableFuture<List<Bytes>> getByteCodes(List<Bytes32> h) {
+                return CompletableFuture.completedFuture(List.of());
+            }
+            @Override public void reportRootUnavailable() { }
+        };
+        var oracle = new SnapBackedStateOracle(
+                () -> rotating, BytecodeCache.inMemory(), 8, StateProofCache.inMemory(1024));
+        byte[] root = accountTrie.root.toArrayUnsafe();
+
+        Map<Address, Set<BigInteger>> req = new HashMap<>();
+        req.put(addr, Set.of(slot));
+        oracle.fetchBatch(root, req).get();
+        assertTrue(attempt.get() >= 2, "the slot miss must have forced at least one retry");
+
+        int after = attempt.get();
+        assertEquals(value, oracle.fetchStorage(root, addr, slot).get(),
+                "slot warmed by the retry that succeeded via the cached account");
+        assertEquals(balance, oracle.fetchAccount(root, addr).get().balance(),
+                "account warmed on the first attempt, retained across the retry");
+        assertEquals(after, attempt.get(), "reads after the batch warm must hit the cache, not the peer");
     }
 
     @Test

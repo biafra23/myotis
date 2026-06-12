@@ -36,4 +36,21 @@ public interface SnapStateOracle {
 
     /** Fetch bytecode by its keccak256 hash. */
     CompletableFuture<byte[]> fetchBytecode(byte[] codeHash);
+
+    /**
+     * Best-effort batch WARM of {@code request} (account &rarr; the storage slots
+     * wanted under it) into the oracle's proof cache, coalesced into a few
+     * {@code GetTrieNodes} round-trips (one path-set per account, chunked) instead of
+     * one round-trip per item. Verification is identical to {@link #fetchAccount} /
+     * {@link #fetchStorage} — each account/slot proof is independently checked against
+     * its (state / storage) root; only the REQUESTS coalesce. Callers must treat it as
+     * a pure cache warmer: read the actual values back via fetchAccount/fetchStorage
+     * (which hit the warmed cache), so an item the batch couldn't verify simply
+     * becomes a normal per-item fetch. Default no-op for oracles without a proof cache.
+     */
+    default CompletableFuture<Void> fetchBatch(
+            byte[] stateRoot,
+            java.util.Map<Address, ? extends java.util.Set<BigInteger>> request) {
+        return CompletableFuture.completedFuture(null);
+    }
 }
