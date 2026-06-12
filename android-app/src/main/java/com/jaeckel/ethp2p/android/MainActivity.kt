@@ -431,7 +431,9 @@ private fun SyncProgressBar(snapshot: NodeService.Snapshot?) {
 
 /**
  * Readiness traffic-light — a thin full-width strip atop the tab bar encoding the
- * THREE gates a wallet transaction needs, the way nothing else in the UI does:
+ * three gates a wallet transaction needs, the way nothing else in the UI does. The
+ * three gates (running+SYNCED, warm verified head, deep snap pool) surface as FOUR
+ * tiers, since "no gate passed" is its own state:
  *
  *  - **red**   — not running, or consensus light client not SYNCED yet. The node
  *                can't serve anything verified; don't transact.
@@ -439,37 +441,58 @@ private fun SyncProgressBar(snapshot: NodeService.Snapshot?) {
  *                head-build failing). Wallet calls error `-32000 no verified head`,
  *                so MetaMask's confirm screen stalls. "Almost — wait."
  *  - **green** — a verified head was built within [READY_HEAD_WARM_MS]. eth_call /
- *                balances / the confirm-screen simulation will serve. Safe to send.
+ *                balances / a SIMPLE confirm-screen will serve. Safe to send, but a
+ *                heavy confirm screen (MetaMask's ~1000-token sweep) may still stall
+ *                while the snap pool is shallow.
+ *  - **bright + thick green** — head warm AND a DEEP snap pool ([DEEP_POOL_SNAP_PEERS]+
+ *                peers). The EVM prefetch fans ~48 concurrent fetches across enough
+ *                peers that even a heavy confirm screen converges. Fully ready.
  *
- * The green gate reads [NodeService.Snapshot.verifiedHeadAgeMs] (from the shared
- * backend's warmer). Threshold is generous vs. the head TTL+build time on mobile
- * (~12s TTL + 20-26s build) so a healthy node stays green between rebuilds instead
- * of flickering amber.
+ * The green gates read [NodeService.Snapshot.verifiedHeadAgeMs] (shared backend's
+ * warmer) and [NodeService.Snapshot.snapPeers]. The head threshold is generous vs.
+ * the head TTL+build time on mobile (~12s TTL + 20-26s build) so a healthy node
+ * stays green between rebuilds instead of flickering amber.
  */
 private const val READY_HEAD_WARM_MS = 45_000L
+/** Snap peers needed before a HEAVY confirm screen converges. MetaMask's ~1000-token
+ *  BalanceChecker sweep + Multicall3 simulation drive the EVM prefetch to fan out
+ *  ~48 concurrent snap fetches; those only finish in time when spread across a deep
+ *  pool. Below this the node serves simple reads (plain green) but heavy screens
+ *  stall; at/above it they converge (bright, thick green). On-device: a cold phone
+ *  needs minutes of dialing to reach this — the bright bar is the honest "go" signal. */
+private const val DEEP_POOL_SNAP_PEERS = 16
 
 @Composable
 private fun ReadinessStrip(snapshot: NodeService.Snapshot?) {
     val s = snapshot
-    // Color AND a spoken label, derived together so they can never disagree. The
-    // label is exposed via semantics so the readiness state is discoverable by
-    // TalkBack and not conveyed by color alone (red/amber/green is invisible to
-    // color-vision deficiencies). The strip stays a thin non-interactive line by
-    // design; the description is its only a11y surface.
-    val (target, label) = when {
-        s == null || !s.running -> Color(0xFFD32F2F) to "Node readiness: not running"
-        s.beaconState != "SYNCED" -> Color(0xFFD32F2F) to "Node readiness: not synced"
-        s.verifiedHeadAgeMs <= READY_HEAD_WARM_MS ->
-            Color(0xFF2E7D32) to "Node readiness: ready to transact"
-        else -> Color(0xFFF9A825) to "Node readiness: warming up, not ready to transact"
+    // Color, thickness AND a spoken label, derived together so they can never
+    // disagree. The label is exposed via semantics so readiness is discoverable by
+    // TalkBack and not conveyed by color/thickness alone (invisible to color-vision
+    // deficiencies). The strip stays a thin non-interactive line; the description is
+    // its only a11y surface.
+    val (target, height, label) = when {
+        s == null || !s.running ->
+            Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not running")
+        s.beaconState != "SYNCED" ->
+            Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not synced")
+        s.verifiedHeadAgeMs > READY_HEAD_WARM_MS ->
+            Triple(Color(0xFFF9A825), 3.dp, "Node readiness: warming up, not ready to transact")
+        s.snapPeers >= DEEP_POOL_SNAP_PEERS ->
+            Triple(Color(0xFF00E676), 6.dp,
+                "Node readiness: fully ready — deep peer pool, heavy confirm screens will load")
+        else ->
+            Triple(Color(0xFF2E7D32), 3.dp,
+                "Node readiness: ready for simple reads; peer pool still filling for heavy confirm screens")
     }
-    // Ease between states so a transient amber blip during a rebuild reads as a
-    // gentle pulse, not a jarring flash.
+    // Ease between states so a transient blip reads as a gentle pulse, not a flash —
+    // and the thickness grows smoothly when the pool crosses the deep-pool gate.
     val color by animateColorAsState(targetValue = target, label = "readiness")
+    val barHeight by androidx.compose.animation.core.animateDpAsState(
+        targetValue = height, label = "readiness-height")
     Box(
         Modifier
             .fillMaxWidth()
-            .height(3.dp)
+            .height(barHeight)
             .background(color)
             .semantics { contentDescription = label },
     )
