@@ -88,6 +88,14 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     private static final long RPC_ACCOUNT_TIMEOUT_SEC = HEADER_CHAIN_TIMEOUT_SEC + 10;
     /** Overall budget for the (parallel) snap-peer head probe. */
     private static final long PEER_PROBE_TIMEOUT_SEC = 15;
+    /** Tight timeout for the pre-stale-serve servability probe: we're already in the
+     *  degraded last-resort path, so a doomed read should fail in a few seconds, not
+     *  rotate the peer set for the full 30s callView. */
+    private static final long RPC_STALE_PROBE_TIMEOUT_SEC = 3;
+    /** A stale-head servability verdict is cached this long (keyed by root) so a burst
+     *  of confirm-screen calls on one root shares a single probe. Short — a peer can
+     *  drop the root between bursts, but within a couple seconds the verdict holds. */
+    private static final long STALE_PROBE_CACHE_MS = 2_000;
     /** Keep serving the last successfully-built head up to this age while a refresh
      *  is in flight. It's still beacon-anchored, just a few blocks stale — serving
      *  it bridges transient rebuild gaps (head just advanced, peers' flat state not
@@ -762,7 +770,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                 return frozen.head();
             }
         }
-        RpcCallContext ctx = anchoredHeadOrWait(RPC_STATE_HEAD_MAX_STALE_MS);
+        RpcCallContext ctx = anchoredHeadOrWait(RPC_STATE_HEAD_MAX_STALE_MS, true);
         if (ctx == null) return null;
         if (requestedNum >= 0) {
             // A pinned number means "the latest block I saw" — wallets fetch
@@ -806,8 +814,11 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  {@code maxStaleMs} caps how old a last-resort stale head may be: STATE-execution
      *  callers pass the tight {@link #RPC_STATE_HEAD_MAX_STALE_MS} (the root must still
      *  be snap-servable); header-only callers pass the long {@link
-     *  #RPC_HEAD_SERVE_STALE_MAX_MS}. */
-    private RpcCallContext anchoredHeadOrWait(long maxStaleMs) {
+     *  #RPC_HEAD_SERVE_STALE_MAX_MS}. {@code probeStaleServe} (state reads only) probes
+     *  that a connected peer actually serves the stale head's root before returning it
+     *  — so a doomed read fast-errors in ~{@link #RPC_STALE_PROBE_TIMEOUT_SEC}s instead
+     *  of handing the dead root to a 30s callView that StateUnavailable-times-out. */
+    private RpcCallContext anchoredHeadOrWait(long maxStaleMs, boolean probeStaleServe) {
         // Fast path: serve the last good head if it's recent enough. It stays
         // beacon-anchored; a few seconds stale beats erroring, and it bridges the
         // brief windows where a TTL-expiry rebuild can't yet anchor the just-
@@ -850,6 +861,18 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         // warmer keeps retrying fresh builds in the background regardless.
         HeadWithTimestamp stale = lastGoodHead.get();
         if (stale != null && clock.elapsedMillis() - stale.builtAtMs() < maxStaleMs) {
+            // Probe-before-serve for STATE reads: the rebuild just failed, so this aged
+            // root may no longer be snap-servable. A quick probe (~RPC_STALE_PROBE_TIMEOUT
+            // s) that some peer still serves it turns the common "serve dead root → 30s
+            // StateUnavailable timeout, ×20 across a confirm-screen burst" into a fast
+            // clean error the wallet can retry. Header-only callers skip the probe (they
+            // anchor headers, not state). Cached briefly so a burst shares one probe.
+            if (probeStaleServe && !anyPeerServesRoot(stale.head().blockCtx().stateRoot())) {
+                log.info("[rpc] STALE head #" + stale.head().blockNumber() + " ("
+                        + (clock.elapsedMillis() - stale.builtAtMs()) / 1000
+                        + "s old) not snap-servable by any peer -> fast-error (skip 30s callView)");
+                return null;
+            }
             log.info("[rpc] serving STALE anchored head (block #"
                     + stale.head().blockNumber() + ", "
                     + (clock.elapsedMillis() - stale.builtAtMs()) / 1000
@@ -1231,6 +1254,10 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  or null. Probes all peers CONCURRENTLY (same rationale as the PEER_HEAD probe)
      *  and awards the first to serve the root. */
     private EthHandler firstPeerServing(List<EthHandler> peers, Bytes32 root) {
+        return firstPeerServing(peers, root, PEER_PROBE_TIMEOUT_SEC);
+    }
+
+    private EthHandler firstPeerServing(List<EthHandler> peers, Bytes32 root, long timeoutSec) {
         List<CompletableFuture<EthHandler>> probes = new ArrayList<>();
         for (EthHandler peer : peers) {
             if (!peer.isReady() || peer.isSnapServingFailed()) continue;
@@ -1244,10 +1271,37 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                     }));
         }
         try {
-            return firstSuccess(probes, PEER_PROBE_TIMEOUT_SEC);
+            return firstSuccess(probes, timeoutSec);
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /** Quick liveness probe (≤{@link #RPC_STALE_PROBE_TIMEOUT_SEC}s) that at least one
+     *  connected snap peer serves {@code stateRoot} right now — used before handing a
+     *  STALE head to a state callView so a doomed read fails fast instead of timing out.
+     *  Verdict cached for {@link #STALE_PROBE_CACHE_MS} keyed by root so a confirm-screen
+     *  burst on one root shares a single probe rather than hammering every peer N times. */
+    private volatile byte[] probedRoot;
+    private volatile boolean probedRootServable;
+    private volatile long probedRootAtMs;
+
+    private boolean anyPeerServesRoot(byte[] stateRoot) {
+        if (stateRoot == null) return false;
+        long now = clock.elapsedMillis();
+        byte[] cachedRoot = probedRoot;
+        if (cachedRoot != null && java.util.Arrays.equals(cachedRoot, stateRoot)
+                && now - probedRootAtMs < STALE_PROBE_CACHE_MS) {
+            return probedRootServable;
+        }
+        RLPxConnector c = connector;
+        List<EthHandler> peers = (c == null) ? List.of() : c.activeSnapHandlers();
+        boolean ok = !peers.isEmpty()
+                && firstPeerServing(peers, Bytes32.wrap(stateRoot), RPC_STALE_PROBE_TIMEOUT_SEC) != null;
+        probedRoot = stateRoot.clone();
+        probedRootServable = ok;
+        probedRootAtMs = now;
+        return ok;
     }
 
     /**
@@ -1910,7 +1964,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         // Header anchoring needs verified headers, not snap STATE — so it keeps the
         // long stale window (a stale head still anchors a fetched header window).
         if (c != null && !c.activeSnapHandlers().isEmpty()) {
-            RpcCallContext ctx = anchoredHeadOrWait(RPC_HEAD_SERVE_STALE_MAX_MS);
+            RpcCallContext ctx = anchoredHeadOrWait(RPC_HEAD_SERVE_STALE_MAX_MS, false);
             if (ctx != null && ctx.beaconVerified()) {
                 return new HeaderAnchor(ctx.blockNumber(), ctx.blockCtx().stateRoot(), null);
             }
@@ -2395,7 +2449,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                                                 java.math.BigInteger value) {
         if (to == null || to.length != 20) return null;
         if (from != null && from.length != 20) return null;
-        RpcCallContext h = anchoredHeadOrWait(RPC_STATE_HEAD_MAX_STALE_MS);
+        RpcCallContext h = anchoredHeadOrWait(RPC_STATE_HEAD_MAX_STALE_MS, true);
         if (h == null) return null;
         try {
             // Fast path: a value transfer with no calldata to a plain account costs
