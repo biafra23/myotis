@@ -132,10 +132,15 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  dangerous: a wallet that signs a tx against a too-low nonce gets it rejected
      *  ("nonce too low") or silently replaces a still-pending tx. Balance / eth_call
      *  / block reads tolerate ~13 min of staleness because the wallet re-polls and a
-     *  slightly-old verified value is harmless; the nonce drives what the user signs,
-     *  so we serve it only from a head no older than a couple of slots — beyond that
-     *  we error and let the wallet retry rather than hand it an outdated nonce. */
-    private static final long RPC_NONCE_SERVE_STALE_MAX_MS = RPC_HEAD_MAX_STALE_MS;
+     *  slightly-old verified value is harmless; the nonce drives what the user signs.
+     *  Two minutes, NOT the 30s head-freshness bound: on a phone an anchored-head
+     *  build takes 20-26s, so the head's age routinely peaks just past 30s between
+     *  warmer ticks — at 30s the gate killed real MetaMask confirm flows on marginal
+     *  misses (observed on-device: "head 32244ms stale -> not serving nonce"). Two
+     *  minutes still guards genuinely outdated nonces (the wallet itself tracks its
+     *  own pending txs; the gate only protects against same-account txs from
+     *  elsewhere landing in the gap), while tolerating mobile build cadence. */
+    private static final long RPC_NONCE_SERVE_STALE_MAX_MS = 120_000;
 
     /** keccak256("") — an account with this codeHash is an EOA (no contract code). */
     private static final byte[] EMPTY_CODE_HASH = Hash.keccak256(Bytes.EMPTY).toArrayUnsafe();
@@ -561,6 +566,123 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     public java.math.BigInteger estimateGas(byte[] from, byte[] to, byte[] data,
                                             java.math.BigInteger value) {
         return rpcEstimateGas(from, to, data, value);
+    }
+
+    // ---------------------------------------------------------------------
+    // ENS forward resolution (name -> address) — shared by the daemon CLI and
+    // the Android UI so the resolution POLICY lives once. Built on the same
+    // verified prepareEnsCall EVM/ENS stack the RPC reads use.
+    // ---------------------------------------------------------------------
+
+    /** One resolution attempt against a specific root + whether a CCIP gateway answered. */
+    private record EnsAttempt(EnsResolution resolution, boolean usedOffchain) {}
+
+    /**
+     * Verified ENS forward resolution. {@code AUTO} resolves against the
+     * beacon-verified FINALIZED state first and only falls back to the (fresher,
+     * peer-claimed → marked unverified) PEER_HEAD when finalized yields no record
+     * AND didn't already consume an ERC-3668 offchain answer (re-resolving would
+     * just repeat the same gateway round-trips for the same non-answer). A specific
+     * root resolves only against that root. Never throws — failures surface as an
+     * {@link EnsResolution} carrying the reason in {@code error()}.
+     *
+     * <p>Blocking work (peer-head probing, EVM execution) runs on the EVM pool, so
+     * this is safe to call from a UI/event thread. Pauses peer acquisition for the
+     * resolution's duration so its snap round-trips aren't starved by dial bursts.
+     */
+    public CompletableFuture<EnsResolution> resolveEns(
+            String name, io.myotis.ens.EnsResolutionRoot mode) {
+        final String trimmed = name == null ? "" : name.trim();
+        RLPxConnector conn = connector;
+        if (conn == null) {
+            return CompletableFuture.completedFuture(
+                    new EnsResolution(trimmed, null, -1, false, "node not running"));
+        }
+        if (trimmed.isEmpty()) {
+            return CompletableFuture.completedFuture(
+                    new EnsResolution(trimmed, null, -1, false, "empty name"));
+        }
+        final io.myotis.ens.EnsResolutionRoot m =
+                (mode == null) ? io.myotis.ens.EnsResolutionRoot.AUTO : mode;
+        conn.enterSnapHeavy();
+        // The composition below can throw SYNCHRONOUSLY before any future is returned —
+        // supplyAsync(supplier, evmPool) rethrows a RejectedExecutionException if the pool
+        // is shut down / saturated. That would escape past the whenComplete cleanup and
+        // leak the snap-heavy state we just entered (and break the "never throws"
+        // contract). Guard it: on a synchronous failure, release snap-heavy and fold the
+        // error into a completed result like every async failure path does.
+        try {
+            final CompletableFuture<EnsResolution> result;
+            if (m == io.myotis.ens.EnsResolutionRoot.AUTO) {
+                result = attemptResolveEns(trimmed, io.myotis.ens.EnsResolutionRoot.FINALIZED)
+                        .thenCompose(fin -> {
+                            // Verified hit, or an offchain (CCIP) answer already determined
+                            // by the gateway (not by which state root we ran against) → done.
+                            if (fin.resolution().addressHex() != null || fin.usedOffchain()) {
+                                return CompletableFuture.completedFuture(fin.resolution());
+                            }
+                            // No record at the finalized block (or it couldn't be served) →
+                            // fall back to the peer head for a fresher, peer-claimed answer.
+                            return attemptResolveEns(trimmed, io.myotis.ens.EnsResolutionRoot.PEER_HEAD)
+                                    .thenApply(EnsAttempt::resolution);
+                        });
+            } else {
+                result = attemptResolveEns(trimmed, m).thenApply(EnsAttempt::resolution);
+            }
+            return result.whenComplete((r, ex) -> conn.exitSnapHeavy());
+        } catch (Throwable t) {
+            conn.exitSnapHeavy();
+            return CompletableFuture.completedFuture(
+                    new EnsResolution(trimmed, null, -1, false, unwrap(t)));
+        }
+    }
+
+    /** One resolution attempt against {@code root}. Never throws (folds every failure
+     *  into an {@link EnsAttempt} so {@link #resolveEns}'s AUTO fallback can compose). */
+    private CompletableFuture<EnsAttempt> attemptResolveEns(
+            String trimmed, io.myotis.ens.EnsResolutionRoot root) {
+        // prepareEnsCall is blocking (peer-head probing) — run it on the EVM pool, never
+        // the caller's thread, so this is UI-thread-safe. The probe and the EVM execution
+        // that follows share the pool, keeping the pinned-peer oracle contention-free.
+        return CompletableFuture.<RpcCallContext>supplyAsync(() -> {
+            try {
+                return prepareEnsCall(root);
+            } catch (Exception e) {
+                throw new java.util.concurrent.CompletionException(e);
+            }
+        }, evmPool).thenCompose(call -> {
+            final boolean verified = call.beaconVerified();
+            return call.resolver().resolveAddress(trimmed, call.blockCtx())
+                    .orTimeout(ENS_TIMEOUT_SEC, TimeUnit.SECONDS)
+                    .handle((opt, ex) -> {
+                        final boolean usedOffchain = call.offchainExecutor().usedOffchain();
+                        if (ex != null) {
+                            log.info("[ens] resolveAddress failed for " + trimmed
+                                    + ": " + unwrap(ex));
+                            return new EnsAttempt(new EnsResolution(
+                                    trimmed, null, call.blockNumber(), verified, unwrap(ex)),
+                                    usedOffchain);
+                        }
+                        if (opt == null || opt.isEmpty()) {
+                            return new EnsAttempt(new EnsResolution(trimmed, null,
+                                    call.blockNumber(), verified, "name does not resolve"),
+                                    usedOffchain);
+                        }
+                        return new EnsAttempt(new EnsResolution(
+                                trimmed, opt.get().toHex(), call.blockNumber(), verified, null),
+                                usedOffchain);
+                    });
+        }).exceptionally(ex -> {
+            // Only prepareEnsCall reaches here. FINALIZED can legitimately fail (no
+            // finalized header yet, or no snap peer retains it) — return a null-address
+            // result so AUTO can fall back. Peel the CompletionException wrapper.
+            Throwable cause = (ex instanceof java.util.concurrent.CompletionException
+                    && ex.getCause() != null) ? ex.getCause() : ex;
+            return new EnsAttempt(
+                    new EnsResolution(trimmed, null, -1,
+                            root == io.myotis.ens.EnsResolutionRoot.FINALIZED, unwrap(cause)),
+                    false);
+        });
     }
 
     // ---------------------------------------------------------------------
@@ -1849,15 +1971,44 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     /** Per-tx (effectiveTip, gasUsed) of a block, from a body verified against
      *  transactionsRoot (+ receipts verified against receiptsRoot when
      *  {@code needGasWeights}). Null when the block can't be verified; empty for
-     *  an empty block. */
+     *  an empty block. Blocking wrapper around {@link #verifiedBlockTipsAsync}. */
     private List<TxTip> verifiedBlockTips(BlockHeadersMessage.VerifiedHeader vh,
                                           boolean needGasWeights) throws Exception {
+        CompletableFuture<List<TxTip>> f = verifiedBlockTipsAsync(vh, needGasWeights);
+        if (f == null) return null;
+        return f.get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+    }
+
+    /** Async {@link #verifiedBlockTips}: kicks off the body (and, when
+     *  {@code needGasWeights}, receipt) fetch immediately and verifies/decodes when
+     *  both land. Lets eth_feeHistory pipeline ALL its blocks' fetches concurrently —
+     *  the old per-block blocking loop cost 2 sequential round-trips per block
+     *  (observed 64s for one MetaMask feeHistory call on-device, which times out the
+     *  wallet's fee poll and skeletons the confirm screen); concurrent fetches make
+     *  the wall-clock one slowest-block round-trip. Completes with null (never
+     *  exceptionally from verification) when the block can't be verified. */
+    private CompletableFuture<List<TxTip>> verifiedBlockTipsAsync(
+            BlockHeadersMessage.VerifiedHeader vh, boolean needGasWeights) {
         RLPxConnector conn = connector;
         if (conn == null) return null;
         BlockHeader h = vh.header();
-        List<BlockBodiesMessage.BlockBody> bodies = conn
-                .requestBlockBodies(vh.hash())
-                .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+        CompletableFuture<List<BlockBodiesMessage.BlockBody>> bodiesF =
+                conn.requestBlockBodies(vh.hash())
+                        .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+        CompletableFuture<List<List<Bytes>>> rcptF = needGasWeights
+                ? conn.requestReceipts(vh.hash())
+                        .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
+                : CompletableFuture.completedFuture(null);
+        return bodiesF.thenCombine(rcptF, (bodies, rcptBlocks) ->
+                decodeBlockTips(h, bodies, rcptBlocks, needGasWeights));
+    }
+
+    /** Verify + decode one block's tips from its fetched body (and receipts when
+     *  {@code needGasWeights}). Null when verification fails. */
+    private List<TxTip> decodeBlockTips(BlockHeader h,
+                                        List<BlockBodiesMessage.BlockBody> bodies,
+                                        List<List<Bytes>> rcptBlocks,
+                                        boolean needGasWeights) {
         if (bodies.isEmpty()) {
             log.info("[rpc] tips: no body for block #" + h.number);
             return null;
@@ -1871,10 +2022,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
 
         long[] gasUsed = null;
         if (needGasWeights) {
-            List<List<Bytes>> rcptBlocks = conn
-                    .requestReceipts(vh.hash())
-                    .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
-            if (rcptBlocks.isEmpty()) {
+            if (rcptBlocks == null || rcptBlocks.isEmpty()) {
                 log.info("[rpc] tips: no receipts for block #" + h.number);
                 return null;
             }
@@ -2060,10 +2208,21 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             sb.append("]");
 
             if (percentiles != null) {
+                // Launch every block's body+receipt fetch CONCURRENTLY before consuming
+                // any: the old one-block-at-a-time loop paid 2 sequential round-trips per
+                // block (64s observed on-device for one MetaMask poll — far past the
+                // wallet's timeout, skeletoning the confirm screen). Pipelined, the
+                // wall-clock is one slowest-block fetch.
+                List<CompletableFuture<List<TxTip>>> tipFutures = new ArrayList<>(count);
+                for (int i = 0; i < count; i++) {
+                    tipFutures.add(verifiedBlockTipsAsync(window.get(i), true));
+                }
                 sb.append(",\"reward\":[");
                 for (int i = 0; i < count; i++) {
                     if (i > 0) sb.append(",");
-                    List<TxTip> tips = verifiedBlockTips(window.get(i), true);
+                    CompletableFuture<List<TxTip>> f = tipFutures.get(i);
+                    List<TxTip> tips = (f == null) ? null
+                            : f.get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
                     if (tips == null) return serveStaleFeeHistory(key); // strict: no unverified rewards
                     sb.append(rewardJson(tips, percentiles));
                 }
