@@ -132,10 +132,15 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  dangerous: a wallet that signs a tx against a too-low nonce gets it rejected
      *  ("nonce too low") or silently replaces a still-pending tx. Balance / eth_call
      *  / block reads tolerate ~13 min of staleness because the wallet re-polls and a
-     *  slightly-old verified value is harmless; the nonce drives what the user signs,
-     *  so we serve it only from a head no older than a couple of slots — beyond that
-     *  we error and let the wallet retry rather than hand it an outdated nonce. */
-    private static final long RPC_NONCE_SERVE_STALE_MAX_MS = RPC_HEAD_MAX_STALE_MS;
+     *  slightly-old verified value is harmless; the nonce drives what the user signs.
+     *  Two minutes, NOT the 30s head-freshness bound: on a phone an anchored-head
+     *  build takes 20-26s, so the head's age routinely peaks just past 30s between
+     *  warmer ticks — at 30s the gate killed real MetaMask confirm flows on marginal
+     *  misses (observed on-device: "head 32244ms stale -> not serving nonce"). Two
+     *  minutes still guards genuinely outdated nonces (the wallet itself tracks its
+     *  own pending txs; the gate only protects against same-account txs from
+     *  elsewhere landing in the gap), while tolerating mobile build cadence. */
+    private static final long RPC_NONCE_SERVE_STALE_MAX_MS = 120_000;
 
     /** keccak256("") — an account with this codeHash is an EOA (no contract code). */
     private static final byte[] EMPTY_CODE_HASH = Hash.keccak256(Bytes.EMPTY).toArrayUnsafe();
@@ -1966,15 +1971,44 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     /** Per-tx (effectiveTip, gasUsed) of a block, from a body verified against
      *  transactionsRoot (+ receipts verified against receiptsRoot when
      *  {@code needGasWeights}). Null when the block can't be verified; empty for
-     *  an empty block. */
+     *  an empty block. Blocking wrapper around {@link #verifiedBlockTipsAsync}. */
     private List<TxTip> verifiedBlockTips(BlockHeadersMessage.VerifiedHeader vh,
                                           boolean needGasWeights) throws Exception {
+        CompletableFuture<List<TxTip>> f = verifiedBlockTipsAsync(vh, needGasWeights);
+        if (f == null) return null;
+        return f.get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+    }
+
+    /** Async {@link #verifiedBlockTips}: kicks off the body (and, when
+     *  {@code needGasWeights}, receipt) fetch immediately and verifies/decodes when
+     *  both land. Lets eth_feeHistory pipeline ALL its blocks' fetches concurrently —
+     *  the old per-block blocking loop cost 2 sequential round-trips per block
+     *  (observed 64s for one MetaMask feeHistory call on-device, which times out the
+     *  wallet's fee poll and skeletons the confirm screen); concurrent fetches make
+     *  the wall-clock one slowest-block round-trip. Completes with null (never
+     *  exceptionally from verification) when the block can't be verified. */
+    private CompletableFuture<List<TxTip>> verifiedBlockTipsAsync(
+            BlockHeadersMessage.VerifiedHeader vh, boolean needGasWeights) {
         RLPxConnector conn = connector;
         if (conn == null) return null;
         BlockHeader h = vh.header();
-        List<BlockBodiesMessage.BlockBody> bodies = conn
-                .requestBlockBodies(vh.hash())
-                .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+        CompletableFuture<List<BlockBodiesMessage.BlockBody>> bodiesF =
+                conn.requestBlockBodies(vh.hash())
+                        .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+        CompletableFuture<List<List<Bytes>>> rcptF = needGasWeights
+                ? conn.requestReceipts(vh.hash())
+                        .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
+                : CompletableFuture.completedFuture(null);
+        return bodiesF.thenCombine(rcptF, (bodies, rcptBlocks) ->
+                decodeBlockTips(h, bodies, rcptBlocks, needGasWeights));
+    }
+
+    /** Verify + decode one block's tips from its fetched body (and receipts when
+     *  {@code needGasWeights}). Null when verification fails. */
+    private List<TxTip> decodeBlockTips(BlockHeader h,
+                                        List<BlockBodiesMessage.BlockBody> bodies,
+                                        List<List<Bytes>> rcptBlocks,
+                                        boolean needGasWeights) {
         if (bodies.isEmpty()) {
             log.info("[rpc] tips: no body for block #" + h.number);
             return null;
@@ -1988,10 +2022,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
 
         long[] gasUsed = null;
         if (needGasWeights) {
-            List<List<Bytes>> rcptBlocks = conn
-                    .requestReceipts(vh.hash())
-                    .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
-            if (rcptBlocks.isEmpty()) {
+            if (rcptBlocks == null || rcptBlocks.isEmpty()) {
                 log.info("[rpc] tips: no receipts for block #" + h.number);
                 return null;
             }
@@ -2177,10 +2208,21 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             sb.append("]");
 
             if (percentiles != null) {
+                // Launch every block's body+receipt fetch CONCURRENTLY before consuming
+                // any: the old one-block-at-a-time loop paid 2 sequential round-trips per
+                // block (64s observed on-device for one MetaMask poll — far past the
+                // wallet's timeout, skeletoning the confirm screen). Pipelined, the
+                // wall-clock is one slowest-block fetch.
+                List<CompletableFuture<List<TxTip>>> tipFutures = new ArrayList<>(count);
+                for (int i = 0; i < count; i++) {
+                    tipFutures.add(verifiedBlockTipsAsync(window.get(i), true));
+                }
                 sb.append(",\"reward\":[");
                 for (int i = 0; i < count; i++) {
                     if (i > 0) sb.append(",");
-                    List<TxTip> tips = verifiedBlockTips(window.get(i), true);
+                    CompletableFuture<List<TxTip>> f = tipFutures.get(i);
+                    List<TxTip> tips = (f == null) ? null
+                            : f.get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
                     if (tips == null) return serveStaleFeeHistory(key); // strict: no unverified rewards
                     sb.append(rewardJson(tips, percentiles));
                 }
