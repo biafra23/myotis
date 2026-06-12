@@ -1203,6 +1203,15 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         // cause of heavy-multicall eth_call 30s failures). Per-context; cleared next build.
         final java.util.Set<EthHandler> rootDenied =
                 java.util.concurrent.ConcurrentHashMap.newKeySet();
+        // Peers PROVEN to serve THIS root (returned a non-empty proof). Once the first
+        // fetch wave discovers which peers retain the trie, every later fetch goes
+        // STRAIGHT to a known server (load-balanced) instead of re-rolling the dice on
+        // untried peers — most of which lag the head and would deny+retry. This is what
+        // turns "16 peers, ~4 usable, rediscovered every wave" into "lock onto the ~4
+        // servers and stay there", which also lets a rebuild converge fast and the head
+        // stay up through peer churn. The probed peer seeds it.
+        final java.util.Set<EthHandler> rootServed =
+                java.util.concurrent.ConcurrentHashMap.newKeySet();
         // Persisted EL-cache quality signal (via the injected SnapQualitySink): a
         // non-empty proof confirms the peer as snap-serving (dialed first on
         // restart); the same root-unavailable event that deprioritizes it for this
@@ -1212,13 +1221,31 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                 new io.myotis.evm.world.SnapBackedStateOracle(
                         () -> {
                             int n = rotation.getAndIncrement();
+                            // PREFER peers already proven to serve this root — load-balance
+                            // across just them (skip the deny+retry discovery cost).
+                            List<EthHandler> served = new ArrayList<>();
+                            for (EthHandler p : rootServed) {
+                                if (p.isReady() && !p.isSnapServingFailed()
+                                        && !rootDenied.contains(p)) served.add(p);
+                            }
+                            if (!served.isEmpty()) {
+                                final EthHandler chosen = served.get(Math.floorMod(n, served.size()));
+                                return new EthHandlerSnapPeer(
+                                        chosen,
+                                        () -> { rootDenied.add(chosen); rootServed.remove(chosen);
+                                                recordSnapQuality(chosen, false); },
+                                        () -> { rootServed.add(chosen); recordSnapQuality(chosen, true); });
+                            }
+                            // Discovery phase (none proven yet): probed peer first (known to
+                            // serve), then round-robin the rest of the ready snap set.
                             if (n == 0 && probedPeer.isReady() && !probedPeer.isSnapServingFailed()
                                     && !rootDenied.contains(probedPeer)) {
                                 final EthHandler pp = probedPeer;
                                 return new EthHandlerSnapPeer(
                                         pp,
-                                        () -> { rootDenied.add(pp); recordSnapQuality(pp, false); },
-                                        () -> recordSnapQuality(pp, true));
+                                        () -> { rootDenied.add(pp); rootServed.remove(pp);
+                                                recordSnapQuality(pp, false); },
+                                        () -> { rootServed.add(pp); recordSnapQuality(pp, true); });
                             }
                             // activeSnapHandlers() already returns only ready, snap-negotiated,
                             // non-failed peers; drop the ones denied for this root.
@@ -1231,8 +1258,9 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                                     ready.get(Math.floorMod(n, ready.size()));
                             return new EthHandlerSnapPeer(
                                     chosen,
-                                    () -> { rootDenied.add(chosen); recordSnapQuality(chosen, false); },
-                                    () -> recordSnapQuality(chosen, true));
+                                    () -> { rootDenied.add(chosen); rootServed.remove(chosen);
+                                            recordSnapQuality(chosen, false); },
+                                    () -> { rootServed.add(chosen); recordSnapQuality(chosen, true); });
                         },
                         bytecodeCache,
                         SNAP_ORACLE_MAX_ATTEMPTS,
@@ -1530,6 +1558,21 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  verification (every served root is still beacon-anchored and proof-checked). */
     private void evictUnservableHead(RpcCallContext doomed) {
         if (doomed == null) return;
+        // Don't collapse the head on a TRANSIENT failure. A single StateUnavailable can
+        // come from the oracle's rotation denying peers that merely timed out (slow /
+        // overloaded under a confirm-screen fetch burst), not peers that truly lack the
+        // root. Nulling lastGoodHead on that strands the nonce (eth_getTransactionCount)
+        // and every state read until a full rebuild — observed on-device: the head went
+        // to Long.MAX_VALUE-stale mid-send and the Confirm button did nothing. Re-probe
+        // first: if ANY connected peer still serves this root, KEEP the head — the pool
+        // dipped but the head is alive. Only evict when the root is genuinely unservable
+        // by the whole pool (the real pruned-root case eviction exists for). The probe
+        // verdict is cached (STALE_PROBE_CACHE_MS), so a burst of failures shares one.
+        if (anyPeerServesRoot(doomed.blockCtx().stateRoot())) {
+            log.info("[rpc] StateUnavailable on head #" + doomed.blockNumber()
+                    + " but a peer still serves its root — keeping head (transient)");
+            return;
+        }
         pinnedHeadByNumber.values().removeIf(hw -> hw.head() == doomed);
         boolean evicted = false;
         // Compare-and-set, NOT a plain null: only clear lastGoodHead if it still holds
