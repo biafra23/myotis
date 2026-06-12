@@ -13,10 +13,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.math.BigInteger;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.function.Supplier;
@@ -146,6 +149,101 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
                         return value;
                     });
         });
+    }
+
+    /** Max path-sets (accounts) per GetTrieNodes request. Bounds the response size a
+     *  peer must assemble (each path-set is ~one account proof + its slot proofs ≈
+     *  several KB), keeping any one request servable while still collapsing a
+     *  1000-account sweep from ~1000 round-trips to ~16. */
+    private static final int BATCH_PATHSET_CHUNK = 64;
+
+    /** Per-account batch work: the address + its hash + the UNCACHED slots wanted
+     *  ({@code slots}) paired index-for-index with their keccak hashes ({@code
+     *  slotHashes}, used both for the GetTrieNodes path and the slot-proof verify). */
+    private record BatchItem(Address address, byte[] addr, Bytes32 accountHash,
+                             List<BigInteger> slots, List<Bytes32> slotHashes,
+                             boolean accountCached) {}
+
+    @Override
+    public CompletableFuture<Void> fetchBatch(
+            byte[] stateRoot, Map<Address, ? extends Set<BigInteger>> request) {
+        if (request == null || request.isEmpty()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        Bytes32 root = Bytes32.wrap(stateRoot.clone());
+        // Build per-account work, skipping anything already in the proof cache so a
+        // partially-warm sweep only fetches the misses.
+        List<BatchItem> items = new ArrayList<>();
+        for (Map.Entry<Address, ? extends Set<BigInteger>> entry : request.entrySet()) {
+            Address address = entry.getKey();
+            byte[] addr = address.toByteArray();
+            Bytes32 accountHash = Bytes32.wrap(Hash.keccak256(Bytes.wrap(addr)).toArrayUnsafe());
+            boolean accountCached = stateCache.getAccount(stateRoot, addr).isPresent();
+            List<BigInteger> slots = new ArrayList<>();
+            List<Bytes32> slotHashes = new ArrayList<>();
+            for (BigInteger slot : entry.getValue()) {
+                if (stateCache.getStorage(stateRoot, addr, slot).isPresent()) continue;
+                slots.add(slot);
+                slotHashes.add(Bytes32.wrap(Hash.keccak256(paddedSlotKey(slot)).toArrayUnsafe()));
+            }
+            if (accountCached && slots.isEmpty()) continue;  // fully cached → nothing to do
+            items.add(new BatchItem(address, addr, accountHash, slots, slotHashes, accountCached));
+        }
+        if (items.isEmpty()) return CompletableFuture.completedFuture(null);
+
+        List<CompletableFuture<Void>> chunkFutures = new ArrayList<>();
+        for (int i = 0; i < items.size(); i += BATCH_PATHSET_CHUNK) {
+            final List<BatchItem> chunk = items.subList(i, Math.min(i + BATCH_PATHSET_CHUNK, items.size()));
+            List<SnapPeer.PathSet> paths = new ArrayList<>(chunk.size());
+            for (BatchItem it : chunk) {
+                List<Bytes> storagePaths = new ArrayList<>(it.slotHashes().size());
+                storagePaths.addAll(it.slotHashes());   // Bytes32 -> Bytes per element
+                paths.add(new SnapPeer.PathSet(it.accountHash(), storagePaths));
+            }
+            // tryWithRetries rotates peers exactly like the per-item path: a peer that
+            // returns an incomplete/forged proof for ANY item in the chunk fails its
+            // verify and the whole chunk retries on the next peer. Best-effort overall —
+            // a chunk that can't be verified after retries is left uncached (the caller's
+            // per-item path re-fetches it), so the batch never weakens correctness.
+            CompletableFuture<Void> cf = tryWithRetries(peer -> peer.getTrieNodes(root, paths)
+                    .thenApply(nodes -> { verifyAndCacheChunk(stateRoot, root, chunk, nodes); return (Void) null; }))
+                    .exceptionally(t -> {
+                        log.debug("[snap-oracle] batch chunk ({} accounts) failed: {}",
+                                chunk.size(), t.getMessage());
+                        return null;
+                    });
+            chunkFutures.add(cf);
+        }
+        return CompletableFuture.allOf(chunkFutures.toArray(CompletableFuture[]::new));
+    }
+
+    /** Verify + cache every account/slot in {@code chunk} from the ONE combined node
+     *  list the peer returned. Each proof is checked with the same verifier the
+     *  per-item path uses (the verifier builds a hash→node map, so a combined node set
+     *  verifies each key independently); a bad proof throws InvalidProof, failing the
+     *  whole chunk so tryWithRetries rotates to another peer. */
+    private void verifyAndCacheChunk(byte[] stateRoot, Bytes32 root,
+                                     List<BatchItem> chunk, List<Bytes> nodes) {
+        for (BatchItem it : chunk) {
+            AccountWithStorageRoot awr;
+            Optional<StateProofCache.AccountEntry> cached =
+                    it.accountCached() ? stateCache.getAccount(stateRoot, it.addr()) : Optional.empty();
+            if (cached.isPresent()) {
+                awr = new AccountWithStorageRoot(cached.get().account(),
+                        Bytes32.wrap(cached.get().storageRoot()));
+            } else {
+                awr = verifyAndDecodeAccount(root, it.accountHash(), it.address(), nodes);
+                stateCache.putAccount(stateRoot, it.addr(),
+                        new StateProofCache.AccountEntry(awr.account(), awr.storageRoot().toArrayUnsafe()));
+            }
+            Bytes32 storageRoot = awr.storageRoot();
+            boolean emptyStorage = MerklePatriciaProofVerifier.EMPTY_TRIE_ROOT.equals(storageRoot);
+            for (int s = 0; s < it.slots().size(); s++) {
+                BigInteger value = emptyStorage ? BigInteger.ZERO
+                        : verifyAndDecodeStorage(storageRoot, it.slotHashes().get(s), it.address(), nodes);
+                stateCache.putStorage(stateRoot, it.addr(), it.slots().get(s), value);
+            }
+        }
     }
 
     @Override
