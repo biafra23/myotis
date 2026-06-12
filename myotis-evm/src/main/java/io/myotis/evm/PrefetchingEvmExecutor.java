@@ -291,6 +291,10 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
             try {
                 oracle.fetchBatch(stateRoot, batch)
                         .get(PREFETCH_WAVE_TIMEOUT_SEC, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                // Restore the interrupt so the executor/caller sees the cancellation.
+                Thread.currentThread().interrupt();
+                log.debug("[prefetch] batch warm interrupted: {}", e.getMessage());
             } catch (Exception e) {
                 log.debug("[prefetch] batch warm failed/timeout: {}", e.getMessage());
             }

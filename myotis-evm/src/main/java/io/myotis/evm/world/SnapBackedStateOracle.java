@@ -161,8 +161,7 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
      *  ({@code slots}) paired index-for-index with their keccak hashes ({@code
      *  slotHashes}, used both for the GetTrieNodes path and the slot-proof verify). */
     private record BatchItem(Address address, byte[] addr, Bytes32 accountHash,
-                             List<BigInteger> slots, List<Bytes32> slotHashes,
-                             boolean accountCached) {}
+                             List<BigInteger> slots, List<Bytes32> slotHashes) {}
 
     @Override
     public CompletableFuture<Void> fetchBatch(
@@ -187,7 +186,7 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
                 slotHashes.add(Bytes32.wrap(Hash.keccak256(paddedSlotKey(slot)).toArrayUnsafe()));
             }
             if (accountCached && slots.isEmpty()) continue;  // fully cached → nothing to do
-            items.add(new BatchItem(address, addr, accountHash, slots, slotHashes, accountCached));
+            items.add(new BatchItem(address, addr, accountHash, slots, slotHashes));
         }
         if (items.isEmpty()) return CompletableFuture.completedFuture(null);
 
@@ -225,9 +224,13 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
     private void verifyAndCacheChunk(byte[] stateRoot, Bytes32 root,
                                      List<BatchItem> chunk, List<Bytes> nodes) {
         for (BatchItem it : chunk) {
+            // Query the cache live (not a static per-build snapshot): on a chunk retry
+            // against a different peer, items the previous attempt already verified are
+            // served from cache, so the new peer's response need not re-prove them. A
+            // static "was it cached when the batch was built?" flag would instead force
+            // re-verification and fail the retry whenever the new peer omits those proofs.
             AccountWithStorageRoot awr;
-            Optional<StateProofCache.AccountEntry> cached =
-                    it.accountCached() ? stateCache.getAccount(stateRoot, it.addr()) : Optional.empty();
+            Optional<StateProofCache.AccountEntry> cached = stateCache.getAccount(stateRoot, it.addr());
             if (cached.isPresent()) {
                 awr = new AccountWithStorageRoot(cached.get().account(),
                         Bytes32.wrap(cached.get().storageRoot()));
@@ -239,9 +242,11 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
             Bytes32 storageRoot = awr.storageRoot();
             boolean emptyStorage = MerklePatriciaProofVerifier.EMPTY_TRIE_ROOT.equals(storageRoot);
             for (int s = 0; s < it.slots().size(); s++) {
+                BigInteger slot = it.slots().get(s);
+                if (stateCache.getStorage(stateRoot, it.addr(), slot).isPresent()) continue;
                 BigInteger value = emptyStorage ? BigInteger.ZERO
                         : verifyAndDecodeStorage(storageRoot, it.slotHashes().get(s), it.address(), nodes);
-                stateCache.putStorage(stateRoot, it.addr(), it.slots().get(s), value);
+                stateCache.putStorage(stateRoot, it.addr(), slot, value);
             }
         }
     }

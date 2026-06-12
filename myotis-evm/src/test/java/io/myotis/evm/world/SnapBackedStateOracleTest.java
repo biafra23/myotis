@@ -392,6 +392,58 @@ class SnapBackedStateOracleTest {
     }
 
     @Test
+    void fetchBatchRetryServesAlreadyVerifiedItemsFromCache() throws Exception {
+        // Retry robustness across peer rotation. Attempt 1 proves the account but NOT
+        // the slot, so the slot verify fails and the whole chunk retries on the next
+        // peer. Attempt 2 proves the slot but NOT the account. Because verifyAndCacheChunk
+        // queries the cache LIVE, the account verified+cached on attempt 1 is served from
+        // cache on the retry, so the chunk completes even though no single response
+        // carried both proofs. A static "cached when the batch was built?" snapshot would
+        // force re-verifying the account from the retry response (which lacks it) and fail.
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        BigInteger slot = BigInteger.valueOf(7);
+        BigInteger value = new BigInteger("1234567890123456789");
+        long nonce = 5L;
+        BigInteger balance = new BigInteger("999000000000000000");
+
+        Bytes32 slotHash = Bytes32.wrap(Hash.keccak256(paddedSlot(slot)).toArrayUnsafe());
+        Bytes valueRlp = RLP.encode(w -> w.writeBigInteger(value));
+        var storageTrie = TrieFixture.singleLeaf(slotHash, valueRlp);
+        Bytes accountValue = encodeAccount(nonce, balance, storageTrie.root,
+                Bytes32.wrap(Hash.keccak256(Bytes.EMPTY).toArrayUnsafe()));
+        var accountTrie = TrieFixture.singleLeaf(keccak(addr.toByteArray()), accountValue);
+
+        AtomicInteger attempt = new AtomicInteger();
+        SnapPeer rotating = new SnapPeer() {
+            @Override public CompletableFuture<List<Bytes>> getTrieNodes(Bytes32 sr, List<PathSet> p) {
+                // 1st: account proof only (slot fails → chunk retries).
+                // 2nd+: storage proof only (account must come from the warm cache).
+                int n = attempt.incrementAndGet();
+                return CompletableFuture.completedFuture(n == 1 ? accountTrie.proof : storageTrie.proof);
+            }
+            @Override public CompletableFuture<List<Bytes>> getByteCodes(List<Bytes32> h) {
+                return CompletableFuture.completedFuture(List.of());
+            }
+            @Override public void reportRootUnavailable() { }
+        };
+        var oracle = new SnapBackedStateOracle(
+                () -> rotating, BytecodeCache.inMemory(), 8, StateProofCache.inMemory(1024));
+        byte[] root = accountTrie.root.toArrayUnsafe();
+
+        Map<Address, Set<BigInteger>> req = new HashMap<>();
+        req.put(addr, Set.of(slot));
+        oracle.fetchBatch(root, req).get();
+        assertTrue(attempt.get() >= 2, "the slot miss must have forced at least one retry");
+
+        int after = attempt.get();
+        assertEquals(value, oracle.fetchStorage(root, addr, slot).get(),
+                "slot warmed by the retry that succeeded via the cached account");
+        assertEquals(balance, oracle.fetchAccount(root, addr).get().balance(),
+                "account warmed on the first attempt, retained across the retry");
+        assertEquals(after, attempt.get(), "reads after the batch warm must hit the cache, not the peer");
+    }
+
+    @Test
     void sharedStateCacheServesStorageAcrossOraclesWithoutRefetch() throws Exception {
         // The fix for the confirm-screen retry-storm: a node-level StateProofCache
         // shared across head-context oracle instances. A verified storage value must
