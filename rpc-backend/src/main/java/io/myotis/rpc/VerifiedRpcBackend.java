@@ -1345,14 +1345,24 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             } else {
                 leader = true;
                 flight = mine;
-                h.offchainExecutor()
-                        .callView(io.myotis.evm.Address.of(to),
-                                data == null ? new byte[0] : data, h.blockCtx())
-                        .whenComplete((out, ex) -> {
-                            inflightCalls.remove(flightKey, mine);
-                            if (ex != null) mine.completeExceptionally(ex);
-                            else mine.complete(out);
-                        });
+                // callView can throw SYNCHRONOUSLY (e.g. RejectedExecutionException from
+                // a saturated/shutting-down pool) — without this guard, `mine` would stay
+                // forever-incomplete AND forever-registered, poisoning every later
+                // identical call into a guaranteed timeout. On a sync throw, deregister
+                // and complete exceptionally so waiters fail fast and a retry re-executes.
+                try {
+                    h.offchainExecutor()
+                            .callView(io.myotis.evm.Address.of(to),
+                                    data == null ? new byte[0] : data, h.blockCtx())
+                            .whenComplete((out, ex) -> {
+                                inflightCalls.remove(flightKey, mine);
+                                if (ex != null) mine.completeExceptionally(ex);
+                                else mine.complete(out);
+                            });
+                } catch (Throwable t) {
+                    inflightCalls.remove(flightKey, mine);
+                    mine.completeExceptionally(t);
+                }
             }
             byte[] out = flight.get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
             log.info("[rpc] eth_call " + desc + " ok in "
