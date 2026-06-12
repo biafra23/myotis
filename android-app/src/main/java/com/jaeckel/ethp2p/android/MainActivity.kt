@@ -117,6 +117,15 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        // Auto-start the node when the app launches so the user doesn't have to
+        // tap "Start node". Gated on savedInstanceState == null so it only fires
+        // on a genuinely fresh launch — NOT on a config-change recreation
+        // (rotation) or process-death restore, which would otherwise re-prompt
+        // for the notification permission and override an explicit Stop. The
+        // start path itself is a no-op when the service is already running.
+        if (savedInstanceState == null) {
+            ensureNodeStarted()
+        }
     }
 
     override fun onStart() {
@@ -136,14 +145,27 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun toggleService() {
-        val svc = Intent(this, NodeService::class.java)
         if (NodeService.isRunning()) {
             // We're bound with BIND_AUTO_CREATE from onStart, which keeps the
             // service alive even after stopService. Ask the service to tear
             // down networking explicitly; it will also call stopSelf so the
             // foreground notification clears immediately.
-            boundServiceState.value?.shutdown() ?: stopService(svc)
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            boundServiceState.value?.shutdown()
+                ?: stopService(Intent(this, NodeService::class.java))
+        } else {
+            ensureNodeStarted()
+        }
+    }
+
+    /**
+     * Start the node if it isn't already running, first requesting the
+     * POST_NOTIFICATIONS permission on Android 13+ so the foreground-service
+     * notification is visible. Shared by the Start button and the auto-start
+     * on launch; a no-op when the service is already running.
+     */
+    private fun ensureNodeStarted() {
+        if (NodeService.isRunning()) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             // Defer startForegroundService until the permission dialog
