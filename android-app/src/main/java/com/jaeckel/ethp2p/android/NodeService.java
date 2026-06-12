@@ -99,9 +99,20 @@ public final class NodeService extends Service {
     private static final long DNS_REFRESH_INTERVAL_MS = 4 * 60 * 1000L;
     // Keep a working set of snap peers connected so a verified request almost
     // always finds one even as peers churn. Below this we proactively re-dial
-    // known snap peers from the cache; 4 leaves headroom so transient churn
-    // doesn't drop us below the ~2 a request realistically needs.
-    private static final int TARGET_SNAP_PEERS = 4;
+    // known snap peers from the cache (CONFIRMED-quality first, via snapDialRank).
+    //
+    // 12, not 4: being a snap peer is NOT the same as retaining the state at the
+    // head root we anchor. Geth prunes trie state beyond ~128 blocks and snap-serves
+    // from a flat layer that lags the head, so at any moment only SOME connected snap
+    // peers can serve the current root — the rest fail with StateUnavailable. On-device
+    // captures showed eth_call/the confirm-screen Multicall3 sim failing for minutes
+    // with several snap peers connected: 4 wasn't a deep enough pool to reliably hold
+    // one peer whose retained state covers the head. A deeper pool makes the
+    // probe-and-pin build (firstPeerServing / the PEER_HEAD race) far likelier to find
+    // a state-servable peer. The daemon holds ~36 organically with no ill effect;
+    // 12 lightweight eth/snap connections is a fine bound for a phone actively serving
+    // a wallet in the foreground.
+    private static final int TARGET_SNAP_PEERS = 32;
     // Same bound the JVM daemon uses (CommandHandler.MAX_HEADER_CHAIN_GAP).
     // Caps how many headers we'll fetch to bridge from the beacon-finalized
     // block to the peer's head — i.e. the maximum gap the headerChain
