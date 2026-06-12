@@ -108,22 +108,28 @@ class MyotisRpcServer(
                     // and our backend cap (RPC_CALL_TIMEOUT) is the real deadline.
                     // Fast calls (<1 heartbeat) get zero padding — byte-identical to the
                     // old behavior.
-                    val pending = kotlinx.coroutines.CoroutineScope(
-                        kotlinx.coroutines.Dispatchers.IO).async {
-                        router.handle(body)
-                    }
-                    call.respondTextWriter(ContentType.Application.Json) {
-                        var response: String? = null
-                        while (response == null) {
-                            response = kotlinx.coroutines.withTimeoutOrNull(
-                                HEARTBEAT_INTERVAL_MS) { pending.await() }
-                            if (response == null) {
-                                write(" ")
-                                flush()
-                            }
+                    // coroutineScope (NOT a standalone CoroutineScope): the compute is a
+                    // CHILD of this request's coroutine, so if the client disconnects /
+                    // the request is cancelled, the pending job is cancelled too rather
+                    // than leaking — structured concurrency. (Its 120s backend deadline
+                    // also bounds it regardless.)
+                    kotlinx.coroutines.coroutineScope {
+                        val pending = async(kotlinx.coroutines.Dispatchers.IO) {
+                            router.handle(body)
                         }
-                        write(response)
-                        capture(body, response)
+                        call.respondTextWriter(ContentType.Application.Json) {
+                            var response: String? = null
+                            while (response == null) {
+                                response = kotlinx.coroutines.withTimeoutOrNull(
+                                    HEARTBEAT_INTERVAL_MS) { pending.await() }
+                                if (response == null) {
+                                    write(" ")
+                                    flush()
+                                }
+                            }
+                            write(response)
+                            capture(body, response)
+                        }
                     }
                 }
             }
