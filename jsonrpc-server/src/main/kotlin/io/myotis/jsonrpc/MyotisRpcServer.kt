@@ -42,6 +42,35 @@ class MyotisRpcServer(
     private val logger = MethodLogger()
     private val router = RpcRouter(proxy, logger, backend)
 
+    /**
+     * Optional request/response capture for debugging + replay. Off unless the
+     * system property {@code myotis.rpc.capture} names a file: then every
+     * exchange is appended as one JSON line {@code {"t":<ms>,"req":<body>,"resp":<body>}}.
+     * Lets us record a real client session (e.g. a MetaMask send) once and replay
+     * it at the daemon on a loop while hardening the backend — no browser needed.
+     * Synchronized append; best-effort (capture failures never affect serving).
+     */
+    private val captureFile: java.io.File? =
+        System.getProperty("myotis.rpc.capture")?.takeIf { it.isNotBlank() }?.let { java.io.File(it) }
+
+    private suspend fun capture(req: String, resp: String) {
+        val f = captureFile ?: return
+        // Off the Ktor request thread: the append is blocking disk I/O, so run it on
+        // the IO dispatcher. (Capture is a debug feature, off by default; this keeps
+        // it from stalling request handling when it IS on.)
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val line = buildString {
+                    append("{\"t\":").append(System.currentTimeMillis())
+                    append(",\"req\":").append(req.trim())
+                    append(",\"resp\":").append(resp.trim())
+                    append("}\n")
+                }
+                synchronized(this@MyotisRpcServer) { f.appendText(line) }
+            } catch (_: Exception) { /* capture is best-effort */ }
+        }
+    }
+
     @Volatile
     private var engine: EmbeddedServer<*, *>? = null
 
@@ -59,6 +88,7 @@ class MyotisRpcServer(
                 post("/") {
                     val body = call.receiveText()
                     val response = router.handle(body)
+                    capture(body, response)
                     call.respondText(response, ContentType.Application.Json)
                 }
             }

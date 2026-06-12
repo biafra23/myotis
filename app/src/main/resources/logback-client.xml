@@ -1,0 +1,21 @@
+<!-- Client-command logging config. Forced via -Dlogback.configurationFile=logback-client.xml
+     in the :app `run` task whenever -Pargs is present (status/peers/get-account/etc).
+     Console-only on purpose: a short-lived client invocation must NOT open (and with
+     append=false TRUNCATE) the daemon's devp2p.log, which would wipe the running
+     service's log out from under a `tail -F`. -->
+<configuration>
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <logger name="com.jaeckel.ethp2p" level="INFO"/>
+    <logger name="io.netty" level="WARN"/>
+    <logger name="org.apache.tuweni" level="WARN"/>
+    <logger name="io.libp2p" level="WARN"/>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>
