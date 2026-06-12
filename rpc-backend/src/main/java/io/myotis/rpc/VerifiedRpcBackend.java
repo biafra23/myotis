@@ -1287,21 +1287,34 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  read/written atomically together — a reader can't pair a fresh root with a stale
      *  timestamp/verdict (same pattern as {@link HeadWithTimestamp} / {@code FeeSnapshot}). */
     private volatile ProbeVerdict lastRootProbe;
+    /** Serializes the probe itself: a confirm-screen burst of ~20 state reads hitting an
+     *  expired verdict at once must run ONE network probe, not 20 concurrent ones that
+     *  hammer every peer with duplicate requests (a thundering herd on exactly the
+     *  degraded path). Losers block on the lock and reuse the winner's fresh verdict. */
+    private final Object rootProbeLock = new Object();
 
     private boolean anyPeerServesRoot(byte[] stateRoot) {
         if (stateRoot == null) return false;
-        long now = clock.elapsedMillis();
         ProbeVerdict v = lastRootProbe;
         if (v != null && java.util.Arrays.equals(v.root(), stateRoot)
-                && now - v.atMs() < STALE_PROBE_CACHE_MS) {
+                && clock.elapsedMillis() - v.atMs() < STALE_PROBE_CACHE_MS) {
             return v.servable();
         }
-        RLPxConnector c = connector;
-        List<EthHandler> peers = (c == null) ? List.of() : c.activeSnapHandlers();
-        boolean ok = !peers.isEmpty()
-                && firstPeerServing(peers, Bytes32.wrap(stateRoot), RPC_STALE_PROBE_TIMEOUT_SEC) != null;
-        lastRootProbe = new ProbeVerdict(stateRoot.clone(), ok, now);
-        return ok;
+        synchronized (rootProbeLock) {
+            // Re-check under the lock: the thread that held it before us probably just
+            // probed this exact root — reuse its verdict instead of re-probing.
+            v = lastRootProbe;
+            if (v != null && java.util.Arrays.equals(v.root(), stateRoot)
+                    && clock.elapsedMillis() - v.atMs() < STALE_PROBE_CACHE_MS) {
+                return v.servable();
+            }
+            RLPxConnector c = connector;
+            List<EthHandler> peers = (c == null) ? List.of() : c.activeSnapHandlers();
+            boolean ok = !peers.isEmpty()
+                    && firstPeerServing(peers, Bytes32.wrap(stateRoot), RPC_STALE_PROBE_TIMEOUT_SEC) != null;
+            lastRootProbe = new ProbeVerdict(stateRoot.clone(), ok, clock.elapsedMillis());
+            return ok;
+        }
     }
 
     /**
