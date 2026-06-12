@@ -1314,30 +1314,77 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             return null;
         }
         long t0 = clock.elapsedMillis();
+        // SINGLE-FLIGHT identical calls. MetaMask fires the same eth_call 4-6x
+        // concurrently (observed live: its ~32KB BalanceChecker token sweep, and the
+        // confirm screen's Multicall3 simulation retries) — each copy independently
+        // re-running the same EVM execution and, far worse, the same snap fetch waves
+        // against the few mobile peers. On a phone that multiplies hundreds of
+        // account/storage round-trips by N for ONE answer, starving the gating calls
+        // (fee simulation, estimateGas) into 30s timeouts. Key the in-flight execution
+        // by (stateRoot, to, calldata): identical inputs against the same verified
+        // context compute the identical verified result, so duplicates can safely
+        // share one execution — this changes scheduling, never verification. Each
+        // waiter keeps its own 30s deadline; the entry is removed when the execution
+        // completes so a later retry re-executes fresh.
+        String flightKey = Bytes.wrap(h.blockCtx().stateRoot()).toHexString()
+                + ":" + Bytes.wrap(to).toHexString()
+                + ":" + (data == null ? "0x" : Hash.keccak256(Bytes.wrap(data)).toHexString());
         // Route small calls onto the reserved EVM lane so a confirm screen's tiny
         // probes/simulations never queue behind a ~32KB token-sweep storm. The hint
         // is read synchronously by evmPool when callView's supplyAsync submits on
         // this thread; cleared in finally so the handler thread doesn't leak it.
         boolean smallLane = (data == null || data.length <= EVM_SMALL_CALLDATA_MAX);
         if (smallLane) EVM_SMALL_LANE.set(Boolean.TRUE);
+        boolean leader = false;
+        CompletableFuture<byte[]> flight;
         try {
-            byte[] out = h.offchainExecutor()
-                    .callView(io.myotis.evm.Address.of(to), data == null ? new byte[0] : data,
-                            h.blockCtx())
-                    .get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
+            CompletableFuture<byte[]> mine = new CompletableFuture<>();
+            CompletableFuture<byte[]> existing = inflightCalls.putIfAbsent(flightKey, mine);
+            if (existing != null) {
+                flight = existing;   // duplicate: ride the leader's execution
+            } else {
+                leader = true;
+                flight = mine;
+                // callView can throw SYNCHRONOUSLY (e.g. RejectedExecutionException from
+                // a saturated/shutting-down pool) — without this guard, `mine` would stay
+                // forever-incomplete AND forever-registered, poisoning every later
+                // identical call into a guaranteed timeout. On a sync throw, deregister
+                // and complete exceptionally so waiters fail fast and a retry re-executes.
+                try {
+                    h.offchainExecutor()
+                            .callView(io.myotis.evm.Address.of(to),
+                                    data == null ? new byte[0] : data, h.blockCtx())
+                            .whenComplete((out, ex) -> {
+                                inflightCalls.remove(flightKey, mine);
+                                if (ex != null) mine.completeExceptionally(ex);
+                                else mine.complete(out);
+                            });
+                } catch (Throwable t) {
+                    inflightCalls.remove(flightKey, mine);
+                    mine.completeExceptionally(t);
+                }
+            }
+            byte[] out = flight.get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
             log.info("[rpc] eth_call " + desc + " ok in "
-                    + (clock.elapsedMillis() - t0) + "ms");
+                    + (clock.elapsedMillis() - t0) + "ms" + (leader ? "" : " (deduped)"));
             return out;
         } catch (Exception e) {
             log.info("[rpc] eth_call " + desc + " -> error after "
-                    + (clock.elapsedMillis() - t0) + "ms: "
-                    + describeEvmError(e));
+                    + (clock.elapsedMillis() - t0) + "ms"
+                    + (leader ? "" : " (deduped)") + ": " + describeEvmError(e));
             if (isStateUnavailable(e)) evictUnservableHead(h);
             return null;
         } finally {
             if (smallLane) EVM_SMALL_LANE.remove();
         }
     }
+
+    /** In-flight eth_call executions keyed by (stateRoot, to, keccak(calldata)) so
+     *  concurrent identical calls share ONE EVM execution + snap fetch wave. Entries
+     *  remove themselves on completion (see rpcCall); bounded by the number of
+     *  distinct concurrent calls a wallet makes (~tens). */
+    private final Map<String, CompletableFuture<byte[]>> inflightCalls =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
     /** Verified account record at the shared anchored head, or null (→ error). The
      *  oracle hash-verifies the account against the anchored stateRoot (storageRoot
