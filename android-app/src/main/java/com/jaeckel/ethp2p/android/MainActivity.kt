@@ -15,6 +15,8 @@ import android.os.IBinder
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -295,6 +297,11 @@ private fun NodeScreen(
         // determinate as the light client catches up sync-committee periods, gone
         // once SYNCED.
         SyncProgressBar(snapshot)
+        // Readiness traffic-light: a thin strip atop the tabs. red = consensus not
+        // synced; amber = synced but no warm verified head yet (wallet calls will
+        // error -32000); green = warmed up, safe to transact. The third gate that
+        // nothing else surfaced — turns "is it ready?" from an adb curl into a glance.
+        ReadinessStrip(snapshot)
         TabRow(selectedTabIndex = selectedTab) {
             Tab(
                 selected = selectedTab == 0,
@@ -387,6 +394,45 @@ private fun SyncProgressBar(snapshot: NodeService.Snapshot?) {
             LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
         }
     }
+}
+
+/**
+ * Readiness traffic-light — a thin full-width strip atop the tab bar encoding the
+ * THREE gates a wallet transaction needs, the way nothing else in the UI does:
+ *
+ *  - **red**   — not running, or consensus light client not SYNCED yet. The node
+ *                can't serve anything verified; don't transact.
+ *  - **amber** — beacon SYNCED but no warm verified RPC head (snap peers absent /
+ *                head-build failing). Wallet calls error `-32000 no verified head`,
+ *                so MetaMask's confirm screen stalls. "Almost — wait."
+ *  - **green** — a verified head was built within [READY_HEAD_WARM_MS]. eth_call /
+ *                balances / the confirm-screen simulation will serve. Safe to send.
+ *
+ * The green gate reads [NodeService.Snapshot.verifiedHeadAgeMs] (from the shared
+ * backend's warmer). Threshold is generous vs. the head TTL+build time on mobile
+ * (~12s TTL + 20-26s build) so a healthy node stays green between rebuilds instead
+ * of flickering amber.
+ */
+private const val READY_HEAD_WARM_MS = 45_000L
+
+@Composable
+private fun ReadinessStrip(snapshot: NodeService.Snapshot?) {
+    val s = snapshot
+    val target = when {
+        s == null || !s.running -> Color(0xFFD32F2F)                       // red
+        s.beaconState != "SYNCED" -> Color(0xFFD32F2F)                     // red
+        s.verifiedHeadAgeMs <= READY_HEAD_WARM_MS -> Color(0xFF2E7D32)     // green
+        else -> Color(0xFFF9A825)                                         // amber
+    }
+    // Ease between states so a transient amber blip during a rebuild reads as a
+    // gentle pulse, not a jarring flash.
+    val color by animateColorAsState(targetValue = target, label = "readiness")
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .height(3.dp)
+            .background(color),
+    )
 }
 
 @Composable
