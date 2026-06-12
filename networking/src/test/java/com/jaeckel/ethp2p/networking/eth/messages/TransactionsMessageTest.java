@@ -1,11 +1,16 @@
 package com.jaeckel.ethp2p.networking.eth.messages;
 
+import org.apache.tuweni.bytes.Bytes;
+import org.apache.tuweni.bytes.Bytes32;
+import org.apache.tuweni.crypto.Hash;
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Wire-format tests for the eth Transactions (0x12) encoder. Assertions are
@@ -13,6 +18,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * codec hinges on, independent of any decoder.
  */
 class TransactionsMessageTest {
+
+    static {
+        java.security.Security.addProvider(new org.bouncycastle.jce.provider.BouncyCastleProvider());
+    }
 
     @Test
     void legacyTxEmbeddedVerbatimAsNestedList() {
@@ -60,5 +69,30 @@ class TransactionsMessageTest {
         // outer list of 6 payload bytes: 0xc6 || (c2 01 02) || (82 02 7f)
         assertArrayEquals(
                 new byte[]{(byte) 0xc6, (byte) 0xc2, 0x01, 0x02, (byte) 0x82, 0x02, 0x7f}, msg);
+    }
+
+    @Test
+    void hashesAreKeccakOfEachTxsCanonicalBytes() {
+        // legacy tx = its own RLP list; typed tx = type||payload byte string. The hash
+        // is keccak over those canonical bytes — exactly what eth_sendRawTransaction
+        // returns and what a block's transactionsRoot is built from.
+        byte[] legacy = {(byte) 0xc2, 0x01, 0x02};
+        byte[] typed = {0x02, 0x7f};
+        byte[] msg = TransactionsMessage.encode(legacy, typed);
+        List<Bytes32> hashes = TransactionsMessage.hashes(msg, 256);
+        assertEquals(2, hashes.size());
+        assertEquals(Bytes32.wrap(Hash.keccak256(Bytes.wrap(legacy))), hashes.get(0));
+        assertEquals(Bytes32.wrap(Hash.keccak256(Bytes.wrap(typed))), hashes.get(1));
+    }
+
+    @Test
+    void hashesCapsAtMaxAndToleratesGarbage() {
+        // null / not-a-list / empty all yield no hashes — never throw on the event loop.
+        assertTrue(TransactionsMessage.hashes(null, 256).isEmpty());
+        assertTrue(TransactionsMessage.hashes(new byte[0], 256).isEmpty());
+        assertTrue(TransactionsMessage.hashes(new byte[]{0x01, 0x02, 0x03}, 256).isEmpty());
+        // the cap bounds event-loop work even for a large batch.
+        byte[] two = TransactionsMessage.encode(new byte[]{0x02, 0x7f}, new byte[]{0x02, 0x7e});
+        assertEquals(1, TransactionsMessage.hashes(two, 1).size());
     }
 }

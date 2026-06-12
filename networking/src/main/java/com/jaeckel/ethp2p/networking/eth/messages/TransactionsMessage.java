@@ -1,7 +1,13 @@
 package com.jaeckel.ethp2p.networking.eth.messages;
 
 import org.apache.tuweni.bytes.Bytes;
+import org.apache.tuweni.bytes.Bytes32;
+import org.apache.tuweni.crypto.Hash;
 import org.apache.tuweni.rlp.RLP;
+import org.apache.tuweni.rlp.RLPReader;
+
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * eth/Transactions (message code 0x12) — mempool broadcast.
@@ -54,5 +60,50 @@ public final class TransactionsMessage {
      */
     private static boolean isTyped(byte[] rawTx) {
         return rawTx != null && rawTx.length > 0 && (rawTx[0] & 0xff) <= 0x7f;
+    }
+
+    /**
+     * Decode the {@code keccak256} hash of each transaction in an inbound Transactions
+     * message, without fully decoding the tx fields. A tx's hash is keccak over its
+     * <em>canonical</em> bytes: for a legacy tx that's the RLP list itself; for a typed
+     * (EIP-2718) tx it's the {@code type || payload} byte string carried inside the
+     * outer list. Used only to match the firehose against our own broadcast hashes, so
+     * it caps at {@code max} hashes and treats any malformed input as "no hashes"
+     * (gossip is best-effort — a bad peer message must never throw on the event loop).
+     */
+    public static List<Bytes32> hashes(byte[] payload, int max) {
+        List<Bytes32> out = new ArrayList<>();
+        if (payload == null || payload.length == 0 || max <= 0) return out;
+        try {
+            RLP.decodeList(Bytes.wrap(payload), reader -> {
+                while (!reader.isComplete() && out.size() < max) {
+                    if (reader.nextIsList()) {
+                        // legacy tx: hash its canonical RLP-list encoding
+                        out.add(Bytes32.wrap(Hash.keccak256(rawList(reader)).toArrayUnsafe()));
+                    } else {
+                        // typed tx: byte string of type||payload — hash the inner bytes
+                        out.add(Bytes32.wrap(Hash.keccak256(reader.readValue()).toArrayUnsafe()));
+                    }
+                }
+                return null;
+            });
+        } catch (Exception e) {
+            // Best-effort: return whatever we decoded before the malformed element.
+        }
+        return out;
+    }
+
+    /** Re-encode the canonical RLP of the (possibly nested) list at the reader head so
+     *  it can be hashed. Mirrors the helper in {@code EthTxDecoder}. */
+    private static Bytes rawList(RLPReader reader) {
+        List<Bytes> children = new ArrayList<>();
+        reader.readList(inner -> {
+            while (!inner.isComplete()) {
+                if (inner.nextIsList()) children.add(rawList(inner));
+                else children.add(RLP.encodeValue(inner.readValue()));
+            }
+            return null;
+        });
+        return RLP.encodeList(w -> children.forEach(w::writeRLP));
     }
 }

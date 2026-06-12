@@ -43,7 +43,8 @@ import java.util.concurrent.TimeUnit;
  * (stops every executor this backend owns). The injected components are NOT
  * closed here — the host owns them.
  */
-public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBackend, AutoCloseable {
+public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBackend,
+        com.jaeckel.ethp2p.networking.eth.TxGossipObserver, AutoCloseable {
 
     // ---------------------------------------------------------------------
     // Constants (ported from NodeService's RPC region)
@@ -191,6 +192,12 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  nonce the chain will never reach. 90s comfortably covers normal inclusion (a few
      *  blocks) while bounding the wedge window if a send never lands. */
     private static final long PENDING_NONCE_TTL_MS = 90_000;
+
+    /** How long we keep watching a broadcast tx for its hash to come back over gossip.
+     *  Generous vs. typical inclusion (a few blocks): once a tx mines we stop watching
+     *  it explicitly (verified inclusion), and the warmer evicts anything older than
+     *  this so the gossip-decode hot path goes quiet when nothing of ours is live. */
+    private static final long SENT_TX_WATCH_TTL_MS = 180_000;
 
     /** keccak256("") — an account with this codeHash is an EOA (no contract code). */
     private static final byte[] EMPTY_CODE_HASH = Hash.keccak256(Bytes.EMPTY).toArrayUnsafe();
@@ -381,6 +388,12 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  dropped/replaced — never wedge the account). */
     private final PendingNonceTracker pendingNonces = new PendingNonceTracker(PENDING_NONCE_TTL_MS);
 
+    /** Mini-mempool of our own broadcast txs, watched for their hashes returning over
+     *  devp2p gossip (Transactions 0x12 / NewPooledTransactionHashes 0x18) to confirm
+     *  propagation. Fed by {@link #onTxHashSeen} (the {@code TxGossipObserver} this
+     *  backend registers on the connector); cleared on verified mining or TTL. */
+    private final SentTxTracker sentTxWatch = new SentTxTracker(SENT_TX_WATCH_TTL_MS);
+
     /** Suggested tip + when it was computed, one immutable unit behind a single
      *  volatile so a reader can't pair a fresh tip with a stale timestamp
      *  (same pattern as {@link HeadWithTimestamp}). */
@@ -488,6 +501,9 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      */
     public synchronized void start() {
         if (headWarmer != null || closed) return;
+        // Register as the mempool-gossip observer so peers report tx hashes for our
+        // mini-mempool. Cheap when idle: handlers consult watchingAny() first.
+        connector.setTxGossipObserver(this);
         headWarmer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "rpc-head-warmer");
             t.setDaemon(true);
@@ -508,6 +524,13 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             } catch (Throwable ignored) {
                 // never kill the warmer tick
             }
+            // Age out gossip-watch entries for sends that never mined, so the
+            // event-loop gossip-decode path goes quiet once nothing of ours is live.
+            try {
+                sentTxWatch.evictExpired(clock.elapsedMillis());
+            } catch (Throwable ignored) {
+                // never kill the warmer tick
+            }
         }, 3, 5, TimeUnit.SECONDS);
     }
 
@@ -516,6 +539,13 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     @Override
     public synchronized void close() {
         closed = true;
+        // Stop receiving gossip callbacks before tearing down (connector is the host's
+        // to close, but our observer registration is ours to retract).
+        try {
+            connector.setTxGossipObserver(null);
+        } catch (Exception ignored) {
+            // connector may already be torn down — nothing to retract.
+        }
         if (headWarmer != null) {
             headWarmer.shutdownNow();
             headWarmer = null;
@@ -1659,6 +1689,8 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             byte[] txHash = Hash.keccak256(Bytes.wrap(rawTx)).toArrayUnsafe();
             sentTxCache.put(Bytes.wrap(txHash).toHexString(), rawTx.clone());
             recordPendingNonce(rawTx);
+            // Watch for this hash to come back over gossip (propagation confirmation).
+            sentTxWatch.watch(Bytes32.wrap(txHash), clock.elapsedMillis());
             log.info("[rpc] eth_sendRawTransaction broadcast to " + sent
                     + " peer(s), hash=" + Bytes.wrap(txHash).toHexString());
             return txHash;
@@ -1674,6 +1706,28 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  bytes (ECDSA recovery — our own tx, no trust involved). Keeps only the highest
      *  nonce per sender; a malformed/undecodable tx is silently skipped (we already
      *  broadcast it — the overlay is best-effort, not a gate). */
+    // ---------------------------------------------------------------------
+    // TxGossipObserver: watch our own broadcast txs propagate over gossip
+    // ---------------------------------------------------------------------
+
+    /** Hot-path guard read by every peer's gossip handler — true only while we hold an
+     *  unconfirmed broadcast of our own, so the firehose is otherwise dropped untouched. */
+    @Override
+    public boolean watchingAny() {
+        return sentTxWatch.watchingAny();
+    }
+
+    /** A tx hash observed on the network. We only act when it's one of OUR broadcasts
+     *  (cheap miss otherwise), logging the first sighting as propagation confirmation. */
+    @Override
+    public void onTxHashSeen(Bytes32 txHash) {
+        long ms = sentTxWatch.markSeen(txHash, clock.elapsedMillis());
+        if (ms >= 0) {
+            log.info("[mini-mempool] our tx " + txHash.toHexString()
+                    + " seen propagating on the network " + ms + "ms after broadcast");
+        }
+    }
+
     private void recordPendingNonce(byte[] rawTx) {
         try {
             var t = com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.decode(Bytes.wrap(rawTx));
@@ -1751,6 +1805,8 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                     if (Hash.keccak256(txs.get(i)).equals(want)) {
                         log.info("[rpc] eth_getTransactionByHash found in block #"
                                 + h.number + " index " + i);
+                        // Verified inclusion: stop watching it for gossip propagation.
+                        sentTxWatch.confirmMined(want);
                         return buildTxJson(txs.get(i).toArrayUnsafe(), want, blockHash, h.number, i);
                     }
                 }
