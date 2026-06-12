@@ -22,6 +22,14 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p>Time is supplied by the caller (a monotonic {@link RpcClock} millis) so the tracker
  * stays a pure, deterministically-testable unit with no clock dependency of its own.
+ *
+ * <p><strong>Trust:</strong> the nonce this produces is NOT proof-backed against chain
+ * state — unlike the mined count it overlays. That is intentional and bounded: "pending"
+ * is un-provable, the increment derives from our own ECDSA-authenticated broadcast, it
+ * only ever raises above the verified mined floor, and a wrong view self-heals via TTL
+ * (worst case a delayed tx, never forged state). The full rationale lives at the call
+ * site in {@code VerifiedRpcBackend.getTransactionCount}; do not reuse this for any tag
+ * a caller treats as settled ("latest"/numbered).
  */
 final class PendingNonceTracker {
 

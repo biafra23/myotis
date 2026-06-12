@@ -613,12 +613,29 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         io.myotis.evm.world.AccountState a = rpcAccountState(address, block);
         if (a == null) return null;
         long mined = a.nonce();
-        // "pending" is the tag MetaMask uses to pick the next nonce for a new tx. A
-        // light node has no mempool, so overlay our own just-broadcast sends: report
-        // next = ourPendingNonce + 1 so a second back-to-back send doesn't reuse the
-        // first's nonce. "latest"/numbered tags stay exactly the mined count. The
-        // overlay only ever RAISES the nonce (max of mined and our pending+1) and only
-        // for txs we relayed ourselves — never serves a value below the verified chain.
+        // TRUST NOTE — the value returned for "latest"/numbered tags IS cryptographically
+        // verified: it's the account nonce proven by a SNAP proof against a beacon-verified
+        // state root. The "pending" overlay below is the one exception, and deliberately so:
+        //
+        //   * "pending" is by definition UN-provable — there is no state root for "not yet
+        //     mined", so the SNAP-proof standard cannot apply to it. The honest meaning of
+        //     "pending" is "latest mined + what's in flight".
+        //   * The overlay's increment is NOT proof-backed against chain state, but it isn't
+        //     arbitrary either: ourPendingNonce comes from a tx WE signed and broadcast
+        //     (sender recovered by ECDSA from our own signature) — authenticated intent, not
+        //     a peer's claim. We never trust a peer for it.
+        //   * It only ever RAISES the nonce: max(verified mined, ourPending + 1). It can
+        //     never report BELOW the proven mined count, and only ever for txs we relayed
+        //     ourselves.
+        //   * Worst case if our view is wrong (the tx was dropped/replaced): the wallet
+        //     signs against a too-high nonce and that tx waits until the gap fills; the
+        //     PENDING_NONCE_TTL_MS self-heals it. The failure mode is a delayed tx, never
+        //     acceptance of forged chain state.
+        //
+        // So this is consistent with the "everything verified" anchor (the un-provable tag
+        // gets our own authenticated knowledge, bounded above the verified floor) — but the
+        // asymmetry is real: do NOT extend this overlay to "latest"/numbered tags, which
+        // callers and on-chain logic treat as settled, proof-backed values.
         if (block != null && block.equals("pending")) {
             return Long.valueOf(pendingNonceOverlay(address, mined));
         }
