@@ -185,6 +185,13 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  elsewhere landing in the gap), while tolerating mobile build cadence. */
     private static final long RPC_NONCE_SERVE_STALE_MAX_MS = 120_000;
 
+    /** How long a broadcast-but-unmined nonce stays in {@link #pendingNonces}. After
+     *  this the overlay drops it even if the mined count never caught up, so a tx that
+     *  was dropped or replaced by the network can't permanently wedge the account at a
+     *  nonce the chain will never reach. 90s comfortably covers normal inclusion (a few
+     *  blocks) while bounding the wedge window if a send never lands. */
+    private static final long PENDING_NONCE_TTL_MS = 90_000;
+
     /** keccak256("") — an account with this codeHash is an EOA (no contract code). */
     private static final byte[] EMPTY_CODE_HASH = Hash.keccak256(Bytes.EMPTY).toArrayUnsafe();
 
@@ -360,6 +367,19 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                     return size() > 256;
                 }
             });
+
+    /** Highest nonce this node has broadcast for a sender but not yet seen mined,
+     *  keyed by lowercase 0x sender address, with the broadcast timestamp. A light
+     *  node has no mempool, so without this two back-to-back sends from the same
+     *  account collide on one nonce: the second reads {@code eth_getTransactionCount}
+     *  while the first is still pending, gets the not-yet-incremented mined count, and
+     *  reuses the first tx's nonce (MetaMask's "confirm screen hangs on the second
+     *  send" symptom). We relayed these txs ourselves and hold the signed bytes, so
+     *  reporting their nonce as pending is our own honest knowledge of the mempool we
+     *  fed, not a trust assumption. The tracker expires an entry when the chain's mined
+     *  count passes it (tx mined) or after {@link #PENDING_NONCE_TTL_MS} (tx likely
+     *  dropped/replaced — never wedge the account). */
+    private final PendingNonceTracker pendingNonces = new PendingNonceTracker(PENDING_NONCE_TTL_MS);
 
     /** Suggested tip + when it was computed, one immutable unit behind a single
      *  volatile so a reader can't pair a fresh tip with a stale timestamp
@@ -561,7 +581,18 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             return null;
         }
         io.myotis.evm.world.AccountState a = rpcAccountState(address, block);
-        return a == null ? null : Long.valueOf(a.nonce());
+        if (a == null) return null;
+        long mined = a.nonce();
+        // "pending" is the tag MetaMask uses to pick the next nonce for a new tx. A
+        // light node has no mempool, so overlay our own just-broadcast sends: report
+        // next = ourPendingNonce + 1 so a second back-to-back send doesn't reuse the
+        // first's nonce. "latest"/numbered tags stay exactly the mined count. The
+        // overlay only ever RAISES the nonce (max of mined and our pending+1) and only
+        // for txs we relayed ourselves — never serves a value below the verified chain.
+        if (block != null && block.equals("pending")) {
+            return Long.valueOf(pendingNonceOverlay(address, mined));
+        }
+        return Long.valueOf(mined);
     }
 
     @Override
@@ -1627,6 +1658,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             if (sent == 0) return null;   // no peer reached → let the router report it
             byte[] txHash = Hash.keccak256(Bytes.wrap(rawTx)).toArrayUnsafe();
             sentTxCache.put(Bytes.wrap(txHash).toHexString(), rawTx.clone());
+            recordPendingNonce(rawTx);
             log.info("[rpc] eth_sendRawTransaction broadcast to " + sent
                     + " peer(s), hash=" + Bytes.wrap(txHash).toHexString());
             return txHash;
@@ -1634,6 +1666,40 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             log.info("[rpc] eth_sendRawTransaction failed: " + unwrap(e));
             return null;
         }
+    }
+
+    /** Record the (sender, nonce) of a tx we just broadcast so a follow-up
+     *  eth_getTransactionCount("pending") from that sender reports next = nonce + 1
+     *  instead of reusing this still-pending nonce. Decodes the sender from the signed
+     *  bytes (ECDSA recovery — our own tx, no trust involved). Keeps only the highest
+     *  nonce per sender; a malformed/undecodable tx is silently skipped (we already
+     *  broadcast it — the overlay is best-effort, not a gate). */
+    private void recordPendingNonce(byte[] rawTx) {
+        try {
+            var t = com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.decode(Bytes.wrap(rawTx));
+            if (t == null || t.from() == null) return;
+            String key = t.from().toHexString().toLowerCase();
+            pendingNonces.record(key, t.nonce(), clock.elapsedMillis());
+            log.info("[rpc] pending-nonce: " + key + " -> " + t.nonce() + " (broadcast)");
+        } catch (Exception e) {
+            // best-effort overlay; never fail the send over bookkeeping
+        }
+    }
+
+    /** Overlay our own broadcast-but-unmined nonce onto a freshly-read mined count.
+     *  Returns {@code max(minedCount, ourPendingNonce + 1)} while the chain hasn't yet
+     *  reflected our send, so a second back-to-back send from the same account gets the
+     *  next nonce instead of colliding. Only consulted for the "pending" tag. */
+    private long pendingNonceOverlay(byte[] address, long minedCount) {
+        String key = Bytes.wrap(address).toHexString().toLowerCase();
+        long now = clock.elapsedMillis();
+        long pending = pendingNonces.pendingNonce(key);
+        long next = pendingNonces.overlay(key, minedCount, now);
+        if (next != minedCount) {
+            log.info("[rpc] pending-nonce: " + key + " overlay mined=" + minedCount
+                    + " -> " + next + " (our nonce " + pending + " still pending)");
+        }
+        return next;
     }
 
     // ---------------------------------------------------------------------
