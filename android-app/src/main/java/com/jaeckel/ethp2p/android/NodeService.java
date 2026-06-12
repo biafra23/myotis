@@ -112,7 +112,7 @@ public final class NodeService extends Service {
     // a state-servable peer. The daemon holds ~36 organically with no ill effect;
     // 12 lightweight eth/snap connections is a fine bound for a phone actively serving
     // a wallet in the foreground.
-    private static final int TARGET_SNAP_PEERS = 12;
+    private static final int TARGET_SNAP_PEERS = 32;
     // Same bound the JVM daemon uses (CommandHandler.MAX_HEADER_CHAIN_GAP).
     // Caps how many headers we'll fetch to bridge from the beacon-finalized
     // block to the peer's head — i.e. the maximum gap the headerChain
