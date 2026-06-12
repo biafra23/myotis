@@ -564,6 +564,111 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     }
 
     // ---------------------------------------------------------------------
+    // ENS forward resolution (name -> address) — shared by the daemon CLI and
+    // the Android UI so the resolution POLICY lives once. Built on the same
+    // verified prepareEnsCall EVM/ENS stack the RPC reads use.
+    // ---------------------------------------------------------------------
+
+    /** One resolution attempt against a specific root + whether a CCIP gateway answered. */
+    private record EnsAttempt(EnsResolution resolution, boolean usedOffchain) {}
+
+    /**
+     * Verified ENS forward resolution. {@code AUTO} resolves against the
+     * beacon-verified FINALIZED state first and only falls back to the (fresher,
+     * peer-claimed → marked unverified) PEER_HEAD when finalized yields no record
+     * AND didn't already consume an ERC-3668 offchain answer (re-resolving would
+     * just repeat the same gateway round-trips for the same non-answer). A specific
+     * root resolves only against that root. Never throws — failures surface as an
+     * {@link EnsResolution} carrying the reason in {@code error()}.
+     *
+     * <p>Blocking work (peer-head probing, EVM execution) runs on the EVM pool, so
+     * this is safe to call from a UI/event thread. Pauses peer acquisition for the
+     * resolution's duration so its snap round-trips aren't starved by dial bursts.
+     */
+    public CompletableFuture<EnsResolution> resolveEns(
+            String name, io.myotis.ens.EnsResolutionRoot mode) {
+        final String trimmed = name == null ? "" : name.trim();
+        RLPxConnector conn = connector;
+        if (conn == null) {
+            return CompletableFuture.completedFuture(
+                    new EnsResolution(trimmed, null, -1, false, "node not running"));
+        }
+        if (trimmed.isEmpty()) {
+            return CompletableFuture.completedFuture(
+                    new EnsResolution(trimmed, null, -1, false, "empty name"));
+        }
+        final io.myotis.ens.EnsResolutionRoot m =
+                (mode == null) ? io.myotis.ens.EnsResolutionRoot.AUTO : mode;
+        conn.enterSnapHeavy();
+        final CompletableFuture<EnsResolution> result;
+        if (m == io.myotis.ens.EnsResolutionRoot.AUTO) {
+            result = attemptResolveEns(trimmed, io.myotis.ens.EnsResolutionRoot.FINALIZED)
+                    .thenCompose(fin -> {
+                        // Verified hit, or an offchain (CCIP) answer already determined
+                        // by the gateway (not by which state root we ran against) → done.
+                        if (fin.resolution().addressHex() != null || fin.usedOffchain()) {
+                            return CompletableFuture.completedFuture(fin.resolution());
+                        }
+                        // No record at the finalized block (or it couldn't be served) →
+                        // fall back to the peer head for a fresher, peer-claimed answer.
+                        return attemptResolveEns(trimmed, io.myotis.ens.EnsResolutionRoot.PEER_HEAD)
+                                .thenApply(EnsAttempt::resolution);
+                    });
+        } else {
+            result = attemptResolveEns(trimmed, m).thenApply(EnsAttempt::resolution);
+        }
+        return result.whenComplete((r, ex) -> conn.exitSnapHeavy());
+    }
+
+    /** One resolution attempt against {@code root}. Never throws (folds every failure
+     *  into an {@link EnsAttempt} so {@link #resolveEns}'s AUTO fallback can compose). */
+    private CompletableFuture<EnsAttempt> attemptResolveEns(
+            String trimmed, io.myotis.ens.EnsResolutionRoot root) {
+        // prepareEnsCall is blocking (peer-head probing) — run it on the EVM pool, never
+        // the caller's thread, so this is UI-thread-safe. The probe and the EVM execution
+        // that follows share the pool, keeping the pinned-peer oracle contention-free.
+        return CompletableFuture.<RpcCallContext>supplyAsync(() -> {
+            try {
+                return prepareEnsCall(root);
+            } catch (Exception e) {
+                throw new java.util.concurrent.CompletionException(e);
+            }
+        }, evmPool).thenCompose(call -> {
+            final boolean verified = call.beaconVerified();
+            return call.resolver().resolveAddress(trimmed, call.blockCtx())
+                    .orTimeout(ENS_TIMEOUT_SEC, TimeUnit.SECONDS)
+                    .handle((opt, ex) -> {
+                        final boolean usedOffchain = call.offchainExecutor().usedOffchain();
+                        if (ex != null) {
+                            log.info("[ens] resolveAddress failed for " + trimmed
+                                    + ": " + unwrap(ex));
+                            return new EnsAttempt(new EnsResolution(
+                                    trimmed, null, call.blockNumber(), verified, unwrap(ex)),
+                                    usedOffchain);
+                        }
+                        if (opt == null || opt.isEmpty()) {
+                            return new EnsAttempt(new EnsResolution(trimmed, null,
+                                    call.blockNumber(), verified, "name does not resolve"),
+                                    usedOffchain);
+                        }
+                        return new EnsAttempt(new EnsResolution(
+                                trimmed, opt.get().toHex(), call.blockNumber(), verified, null),
+                                usedOffchain);
+                    });
+        }).exceptionally(ex -> {
+            // Only prepareEnsCall reaches here. FINALIZED can legitimately fail (no
+            // finalized header yet, or no snap peer retains it) — return a null-address
+            // result so AUTO can fall back. Peel the CompletionException wrapper.
+            Throwable cause = (ex instanceof java.util.concurrent.CompletionException
+                    && ex.getCause() != null) ? ex.getCause() : ex;
+            return new EnsAttempt(
+                    new EnsResolution(trimmed, null, -1,
+                            root == io.myotis.ens.EnsResolutionRoot.FINALIZED, unwrap(cause)),
+                    false);
+        });
+    }
+
+    // ---------------------------------------------------------------------
     // Shared anchored-head context resolution
     // ---------------------------------------------------------------------
 
