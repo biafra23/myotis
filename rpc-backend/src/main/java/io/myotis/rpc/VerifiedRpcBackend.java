@@ -78,8 +78,21 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  amortizing the expensive (and fallback-prone) peer-probe + headerChain anchor
      *  across the whole burst. */
     private static final long RPC_HEAD_TTL_MS = 12_000;
-    /** Per-read/-call budget (snap round-trips; CCIP can add one for eth_call). */
-    private static final long RPC_CALL_TIMEOUT_SEC = 30;
+    /** Budget for ONE blocking snap-fetch wave ({@code .get()}); NOT a hard
+     *  per-request cap. A method that does sequential fetches spends it per fetch —
+     *  e.g. eth_getCode (fetchAccount then fetchBytecode) and an eth_call whose EVM
+     *  walks several SLOADs can exceed it in wall-clock; the response heartbeat
+     *  (below) is what keeps such a request's socket alive, so there's no fixed
+     *  request ceiling by design — the real bound is the wallet giving up.
+     *  120s per wave, not the wallet-timeout-shaped 30s of old: the HTTP layer now
+     *  heartbeats the response (whitespace trickle, see MyotisRpcServer) so the
+     *  wallet's socket stays alive as long as WE keep computing — the bottleneck
+     *  calls (MetaMask's ~1000-token BalanceChecker sweep, the Multicall3 confirm
+     *  simulation on thin mobile peers) can now CONVERGE in one attempt, accumulating
+     *  StateProofCache slots for the whole window, instead of being killed at 30s and
+     *  restarted from scratch by the wallet's retry (which kept mobile from ever
+     *  finishing). */
+    private static final long RPC_CALL_TIMEOUT_SEC = 120;
     /** Snap-oracle per-fetch retry budget. Each attempt rotates to a different ready
      *  snap peer (the probed peer first), so a slow/dead peer fails over instead of
      *  burning the whole RPC_CALL_TIMEOUT on one peer. */
@@ -201,12 +214,13 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     /** Set by the RPC handler around callView/estimateGas invocations; read by the
      *  routing {@link #evmPool} when supplyAsync submits on the same thread. */
     private static final ThreadLocal<Boolean> EVM_SMALL_LANE = new ThreadLocal<>();
-    /** Tasks older than this when dequeued are skipped: their RPC caller (30s
-     *  deadline) has long since given up, so running them would burn EVM-thread
-     *  time for nobody — observed as a queue of dead confirm-screen calls
-     *  starving the live retries that followed them. Slightly above the longest
-     *  RPC wait so a still-awaited task is never dropped early. */
-    private static final long EVM_TASK_MAX_QUEUE_AGE_MS = 35_000;
+    /** Tasks older than this when dequeued are skipped: their RPC caller has long
+     *  since given up, so running them would burn EVM-thread time for nobody —
+     *  observed as a queue of dead confirm-screen calls starving the live retries
+     *  that followed them. Slightly above the longest RPC wait (RPC_CALL_TIMEOUT_SEC,
+     *  now 120s under response heartbeating) so a still-awaited task is never
+     *  dropped early. */
+    private static final long EVM_TASK_MAX_QUEUE_AGE_MS = RPC_CALL_TIMEOUT_SEC * 1000 + 5_000;
 
     /** Max blocks served per eth_feeHistory call (clamped per EIP-1559; MetaMask asks 5-10). */
     private static final int FEE_HISTORY_MAX_BLOCKS = 10;
