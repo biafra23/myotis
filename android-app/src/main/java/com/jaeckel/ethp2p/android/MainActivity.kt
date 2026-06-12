@@ -431,7 +431,9 @@ private fun SyncProgressBar(snapshot: NodeService.Snapshot?) {
 
 /**
  * Readiness traffic-light — a thin full-width strip atop the tab bar encoding the
- * THREE gates a wallet transaction needs, the way nothing else in the UI does:
+ * three gates a wallet transaction needs, the way nothing else in the UI does. The
+ * three gates (running+SYNCED, warm verified head, deep snap pool) surface as FOUR
+ * tiers, since "no gate passed" is its own state:
  *
  *  - **red**   — not running, or consensus light client not SYNCED yet. The node
  *                can't serve anything verified; don't transact.
