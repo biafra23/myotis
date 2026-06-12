@@ -1254,6 +1254,16 @@ public final class NodeService extends Service {
             // start() spins up the head warmer (replaces the old startHeadWarmer()).
             backend.start();
             this.rpcBackend = backend;
+            // DEBUG builds: arm MyotisRpcServer's request-capture tap (same JSONL the
+            // daemon records with -Dmyotis.rpc.capture) so a wallet session on-device
+            // can be pulled and diffed against a desktop capture / fed to the replay
+            // harness:  adb pull /sdcard/Android/data/<pkg>/files/rpc-capture.jsonl
+            // app-private external storage, debug-only — release builds never capture.
+            if (BuildConfig.DEBUG && System.getProperty("myotis.rpc.capture") == null) {
+                java.io.File cap = new java.io.File(getExternalFilesDir(null), "rpc-capture.jsonl");
+                System.setProperty("myotis.rpc.capture", cap.getAbsolutePath());
+                LogBuffer.i(TAG, "[rpc] capture tap -> " + cap.getAbsolutePath());
+            }
             // Bind loopback-only: the wallet (MetaMask) runs on the same device and
             // reaches us via localhost. Binding 0.0.0.0 would expose an unauthenticated,
             // TLS-less RPC — incl. eth_sendRawTransaction relay — to the whole LAN.
