@@ -600,24 +600,36 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         final io.myotis.ens.EnsResolutionRoot m =
                 (mode == null) ? io.myotis.ens.EnsResolutionRoot.AUTO : mode;
         conn.enterSnapHeavy();
-        final CompletableFuture<EnsResolution> result;
-        if (m == io.myotis.ens.EnsResolutionRoot.AUTO) {
-            result = attemptResolveEns(trimmed, io.myotis.ens.EnsResolutionRoot.FINALIZED)
-                    .thenCompose(fin -> {
-                        // Verified hit, or an offchain (CCIP) answer already determined
-                        // by the gateway (not by which state root we ran against) → done.
-                        if (fin.resolution().addressHex() != null || fin.usedOffchain()) {
-                            return CompletableFuture.completedFuture(fin.resolution());
-                        }
-                        // No record at the finalized block (or it couldn't be served) →
-                        // fall back to the peer head for a fresher, peer-claimed answer.
-                        return attemptResolveEns(trimmed, io.myotis.ens.EnsResolutionRoot.PEER_HEAD)
-                                .thenApply(EnsAttempt::resolution);
-                    });
-        } else {
-            result = attemptResolveEns(trimmed, m).thenApply(EnsAttempt::resolution);
+        // The composition below can throw SYNCHRONOUSLY before any future is returned —
+        // supplyAsync(supplier, evmPool) rethrows a RejectedExecutionException if the pool
+        // is shut down / saturated. That would escape past the whenComplete cleanup and
+        // leak the snap-heavy state we just entered (and break the "never throws"
+        // contract). Guard it: on a synchronous failure, release snap-heavy and fold the
+        // error into a completed result like every async failure path does.
+        try {
+            final CompletableFuture<EnsResolution> result;
+            if (m == io.myotis.ens.EnsResolutionRoot.AUTO) {
+                result = attemptResolveEns(trimmed, io.myotis.ens.EnsResolutionRoot.FINALIZED)
+                        .thenCompose(fin -> {
+                            // Verified hit, or an offchain (CCIP) answer already determined
+                            // by the gateway (not by which state root we ran against) → done.
+                            if (fin.resolution().addressHex() != null || fin.usedOffchain()) {
+                                return CompletableFuture.completedFuture(fin.resolution());
+                            }
+                            // No record at the finalized block (or it couldn't be served) →
+                            // fall back to the peer head for a fresher, peer-claimed answer.
+                            return attemptResolveEns(trimmed, io.myotis.ens.EnsResolutionRoot.PEER_HEAD)
+                                    .thenApply(EnsAttempt::resolution);
+                        });
+            } else {
+                result = attemptResolveEns(trimmed, m).thenApply(EnsAttempt::resolution);
+            }
+            return result.whenComplete((r, ex) -> conn.exitSnapHeavy());
+        } catch (Throwable t) {
+            conn.exitSnapHeavy();
+            return CompletableFuture.completedFuture(
+                    new EnsResolution(trimmed, null, -1, false, unwrap(t)));
         }
-        return result.whenComplete((r, ex) -> conn.exitSnapHeavy());
     }
 
     /** One resolution attempt against {@code root}. Never throws (folds every failure
