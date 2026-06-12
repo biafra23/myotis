@@ -131,7 +131,6 @@ public final class RLPxConnector implements AutoCloseable {
         EthHandler ethHandler = new EthHandler(localKey, tcpPort, network, chainHead, onHeaders, onReady);
         handlerRef[0] = ethHandler;
         ethHandler.setRemoteAddress(peerAddr.getAddress().getHostAddress() + ":" + peerAddr.getPort());
-        ethHandler.setTxGossipObserver(txGossipObserver);   // null until a consumer registers
 
         Bootstrap bootstrap = new Bootstrap()
             .group(group)
@@ -161,6 +160,12 @@ public final class RLPxConnector implements AutoCloseable {
         connectFuture.addListener((ChannelFuture f) -> {
             if (f.isSuccess()) {
                 activeHandlers.add(ethHandler);
+                // Apply the gossip observer AFTER joining activeHandlers, closing the
+                // race with setTxGossipObserver: that setter writes the (volatile) field
+                // then iterates active handlers, so ordering it "add then read field"
+                // here guarantees delivery on every interleaving — either the setter's
+                // iteration sees this handler, or this read sees the setter's write.
+                ethHandler.setTxGossipObserver(txGossipObserver);
             } else {
                 log.debug("[rlpx] Connection to {} failed: {}", peerAddr, f.cause().getMessage());
             }

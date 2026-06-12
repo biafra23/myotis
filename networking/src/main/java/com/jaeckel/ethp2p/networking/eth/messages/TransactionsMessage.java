@@ -79,10 +79,10 @@ public final class TransactionsMessage {
                 while (!reader.isComplete() && out.size() < max) {
                     if (reader.nextIsList()) {
                         // legacy tx: hash its canonical RLP-list encoding
-                        out.add(Bytes32.wrap(Hash.keccak256(rawList(reader)).toArrayUnsafe()));
+                        out.add(Hash.keccak256(rawList(reader)));
                     } else {
                         // typed tx: byte string of type||payload — hash the inner bytes
-                        out.add(Bytes32.wrap(Hash.keccak256(reader.readValue()).toArrayUnsafe()));
+                        out.add(Hash.keccak256(reader.readValue()));
                     }
                 }
                 return null;
