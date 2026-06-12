@@ -237,6 +237,13 @@ private fun NodeScreen(
     var queryHistory by remember { mutableStateOf<List<AndroidQueryHistory.Entry>>(emptyList()) }
     val queryScope = rememberCoroutineScope()
 
+    // Logs-tab filter is hoisted here too, for the same reason as the Query
+    // state above: LogsTab leaves the composition when another tab is selected,
+    // so a filter kept in its own `remember` would reset to empty on every
+    // visit. Holding it in NodeScreen (and persisting it via rememberSaveable)
+    // keeps the filter sticky across tab switches and process recreation.
+    var logsFilter by rememberSaveable { mutableStateOf("") }
+
     // Load persisted query history once the service is bound / running flips.
     LaunchedEffect(running) {
         val svc = serviceProvider() ?: return@LaunchedEffect
@@ -382,7 +389,10 @@ private fun NodeScreen(
                     }
                 },
             )
-            else -> LogsTab()
+            else -> LogsTab(
+                filter = logsFilter,
+                onFilterChange = { logsFilter = it },
+            )
         }
     }
 }
@@ -761,7 +771,10 @@ private fun EnsResolutionPanel(res: NodeService.EnsResolution) {
  * across them is impractical.
  */
 @Composable
-private fun LogsTab() {
+private fun LogsTab(
+    filter: String,
+    onFilterChange: (String) -> Unit,
+) {
     // Poll the LogBuffer's monotonic version counter rather than the buffer
     // itself — re-snapshotting only on change keeps the recomposition cost
     // bounded even when the consensus stack is logging dozens of lines/sec.
@@ -780,7 +793,6 @@ private fun LogsTab() {
         }
     }
 
-    var filter by remember { mutableStateOf("") }
     // Filter on tag + message (case-insensitive substring), computed OFF the main
     // thread — substring-scanning up to MAX_LINES (50k) entries on every keystroke
     // / 4 Hz buffer poll would jank the UI and laggy the typing. The unfiltered
@@ -857,11 +869,11 @@ private fun LogsTab() {
             }
             OutlinedTextField(
                 value = filter,
-                onValueChange = { filter = it },
+                onValueChange = onFilterChange,
                 label = { Text("Filter — tag or message") },
                 singleLine = true,
                 trailingIcon = if (filter.isNotEmpty()) {
-                    { TextButton(onClick = { filter = "" }) { Text("✕") } }
+                    { TextButton(onClick = { onFilterChange("") }) { Text("✕") } }
                 } else null,
                 modifier = Modifier
                     .fillMaxWidth()
