@@ -501,8 +501,9 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         // too low and the tx is rejected or replaces a pending one. If the verified
         // head is older than RPC_NONCE_SERVE_STALE_MAX_MS, error so the wallet
         // retries against a current head instead of receiving an outdated nonce.
-        if (headAgeMs() > RPC_NONCE_SERVE_STALE_MAX_MS) {
-            log.info("[rpc] eth_getTransactionCount: head " + headAgeMs()
+        long headAge = headAgeMs();  // read once: the head can advance between calls
+        if (headAge > RPC_NONCE_SERVE_STALE_MAX_MS) {
+            log.info("[rpc] eth_getTransactionCount: head " + headAge
                     + "ms stale (> " + RPC_NONCE_SERVE_STALE_MAX_MS
                     + "ms) -> not serving nonce");
             return null;
