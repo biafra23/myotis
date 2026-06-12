@@ -71,6 +71,7 @@ import androidx.compose.ui.unit.sp
 import com.jaeckel.ethp2p.android.log.LogBuffer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.isActive
@@ -802,6 +803,13 @@ private fun LogsTab(
         shown = if (filter.isBlank()) entries
         else withContext(Dispatchers.Default) {
             entries.filter {
+                // Cooperative cancellation: a new keystroke cancels this effect, but
+                // Collection.filter isn't cancellation-aware on its own, so a 50k-entry
+                // scan would run to completion on Dispatchers.Default even though its
+                // result is already superseded. ensureActive() bails the moment the
+                // coroutine is cancelled, so rapid typing drops stale passes instead of
+                // piling concurrent scans onto the CPU.
+                ensureActive()
                 it.tag.contains(filter, ignoreCase = true) ||
                     it.message.contains(filter, ignoreCase = true)
             }
