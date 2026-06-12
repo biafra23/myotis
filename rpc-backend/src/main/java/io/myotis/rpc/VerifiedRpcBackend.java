@@ -93,6 +93,28 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  it bridges transient rebuild gaps (head just advanced, peers' flat state not
      *  yet caught up) instead of proxying. The warmer keeps it fresh (~5-15s). */
     private static final long RPC_HEAD_MAX_STALE_MS = 30_000;
+    /** Max age a head context may have and still be served for a STATE-EXECUTION read
+     *  (eth_call / getBalance / getCode / getStorageAt / estimateGas) — far tighter
+     *  than the header-only {@link #RPC_HEAD_SERVE_STALE_MAX_MS} (~13 min). A state read
+     *  must run against a stateRoot snap peers STILL retain: Geth keeps ~128 blocks of
+     *  trie state and serves snap from a flat layer that lags the head, so a pinned root
+     *  older than this is pruned out from under us — every connected peer denies it and
+     *  the oracle rotation throws StateUnavailable, but only after burning the full 30s
+     *  RPC_CALL_TIMEOUT rotating the set (the 1329-occurrence on-device storm). Beyond
+     *  this we rebuild against a fresh, just-probed servable root or fast-error, never
+     *  hand a doomed root to a 30s callView. Header-only reads keep the long stale
+     *  window — their data needs no snap state.
+     *
+     *  <p>Two minutes, NOT the 30s warmer-fresh threshold: a root a few slots old
+     *  (~10 blocks / 2 min) is still well within what snap peers retain, and on a phone
+     *  an anchored-head rebuild takes 20-26s so the head's age routinely peaks at
+     *  30-50s in HEALTHY operation between warmer ticks — a 30s cap would reject those
+     *  perfectly-servable roots and manufacture -32000s. The roots that actually fail
+     *  are minutes-old (the ~12-min beacon-finalized fallback, or a per-number pin held
+     *  across a long retry storm). This bound catches those preemptively; the real
+     *  storm-killer is {@link #evictUnservableHead} dropping a root the moment the
+     *  oracle reports no peer serves it. */
+    private static final long RPC_STATE_HEAD_MAX_STALE_MS = 120_000;
     /** When there's no usable head at all (cold start / long outage) and no build is
      *  in flight, wait only this long before giving up — a node with no snap peer can't
      *  build a head, so blocking the caller longer just delays the inevitable error. */
@@ -279,9 +301,12 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     private CompletableFuture<RpcCallContext> rpcCallCtx;   // in-flight/fresh build (dedup)
     private long rpcCallCtxAtMs;
     // Last successfully-built anchored head + its build time, as one immutable
-    // record behind a single volatile ref so head and timestamp are read/written
-    // atomically together (no torn read of new head with old timestamp).
-    private volatile HeadWithTimestamp lastGoodHead;
+    // record behind a single ref so head and timestamp are read/written atomically
+    // together (no torn read of new head with old timestamp). AtomicReference (not a
+    // bare volatile) so eviction can compare-and-set: nulling a doomed head must not
+    // clobber a fresher head the warmer set between the evictor's read and write.
+    private final java.util.concurrent.atomic.AtomicReference<HeadWithTimestamp> lastGoodHead =
+            new java.util.concurrent.atomic.AtomicReference<>();
     /**
      * Frozen anchored context per pinned block NUMBER. A wallet (MetaMask) pins a
      * confirm to one block and retries the same heavy calls against it for minutes.
@@ -459,7 +484,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         // Drop the cached head context + last-good head so a later restart doesn't
         // briefly reuse one pinned to a now-dead peer (fails safe to error anyway).
         synchronized (rpcCallCtxLock) { rpcCallCtx = null; }
-        lastGoodHead = null;
+        lastGoodHead.set(null);
         pinnedHeadByNumber.clear();
         lastGoodLatestBlock = null;
         lastGoodFeeHistory = null;
@@ -728,12 +753,16 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         // minutes-long retries instead of resetting every time the head rebuilds.
         if (requestedNum >= 0) {
             HeadWithTimestamp frozen = pinnedHeadByNumber.get(requestedNum);
+            // State-read reuse bound: a frozen root older than a few slots is pruned by
+            // snap peers (StateUnavailable). Cap reuse tight so retries on a pinned
+            // number rebuild against a servable root rather than re-pay a 30s rotation on
+            // a dead one — the StateProofCache still accumulates within the window.
             if (frozen != null && clock.elapsedMillis() - frozen.builtAtMs()
-                    < RPC_HEAD_SERVE_STALE_MAX_MS) {
+                    < RPC_STATE_HEAD_MAX_STALE_MS) {
                 return frozen.head();
             }
         }
-        RpcCallContext ctx = anchoredHeadOrWait();
+        RpcCallContext ctx = anchoredHeadOrWait(RPC_STATE_HEAD_MAX_STALE_MS);
         if (ctx == null) return null;
         if (requestedNum >= 0) {
             // A pinned number means "the latest block I saw" — wallets fetch
@@ -773,13 +802,17 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     }
 
     /** Resolve the shared beacon-anchored head context, waiting briefly for a fresh
-     *  build if none is available. Returns null if no verified head can be produced. */
-    private RpcCallContext anchoredHeadOrWait() {
+     *  build if none is available. Returns null if no verified head can be produced.
+     *  {@code maxStaleMs} caps how old a last-resort stale head may be: STATE-execution
+     *  callers pass the tight {@link #RPC_STATE_HEAD_MAX_STALE_MS} (the root must still
+     *  be snap-servable); header-only callers pass the long {@link
+     *  #RPC_HEAD_SERVE_STALE_MAX_MS}. */
+    private RpcCallContext anchoredHeadOrWait(long maxStaleMs) {
         // Fast path: serve the last good head if it's recent enough. It stays
         // beacon-anchored; a few seconds stale beats erroring, and it bridges the
         // brief windows where a TTL-expiry rebuild can't yet anchor the just-
         // advanced head. The background warmer keeps this fresh (~5-15s).
-        HeadWithTimestamp good = lastGoodHead;
+        HeadWithTimestamp good = lastGoodHead.get();
         if (good != null
                 && clock.elapsedMillis() - good.builtAtMs() < RPC_HEAD_MAX_STALE_MS) {
             return good.head();
@@ -801,7 +834,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                 return verifiedHeadCallContext(remainingMs, TimeUnit.MILLISECONDS);
             } catch (Exception e) {
                 last = e;
-                HeadWithTimestamp g = lastGoodHead;   // a concurrent build may have just succeeded
+                HeadWithTimestamp g = lastGoodHead.get();   // a concurrent build may have just succeeded
                 if (g != null && clock.elapsedMillis() - g.builtAtMs() < RPC_HEAD_MAX_STALE_MS) {
                     return g.head();
                 }
@@ -815,13 +848,13 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         // hasn't expired — it's just old — and verifiedHeadFor's pinned-number
         // bounds still reject pins this context genuinely can't represent. The
         // warmer keeps retrying fresh builds in the background regardless.
-        HeadWithTimestamp stale = lastGoodHead;
-        if (stale != null && clock.elapsedMillis() - stale.builtAtMs()
-                < RPC_HEAD_SERVE_STALE_MAX_MS) {
+        HeadWithTimestamp stale = lastGoodHead.get();
+        if (stale != null && clock.elapsedMillis() - stale.builtAtMs() < maxStaleMs) {
             log.info("[rpc] serving STALE anchored head (block #"
                     + stale.head().blockNumber() + ", "
                     + (clock.elapsedMillis() - stale.builtAtMs()) / 1000
-                    + "s old) — rebuild failing: " + (last != null ? unwrap(last) : "timeout"));
+                    + "s old, cap " + maxStaleMs / 1000 + "s) — rebuild failing: "
+                    + (last != null ? unwrap(last) : "timeout"));
             return stale.head();
         }
         log.info("[rpc] no verified head after "
@@ -834,7 +867,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  if none has been built yet. Used to hold nonce serving to a tighter freshness
      *  bound than the general stale-serve horizon. */
     private long headAgeMs() {
-        HeadWithTimestamp good = lastGoodHead;
+        HeadWithTimestamp good = lastGoodHead.get();
         return good == null ? Long.MAX_VALUE : clock.elapsedMillis() - good.builtAtMs();
     }
 
@@ -890,7 +923,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                 headBuildPool.execute(() -> {
                     try {
                         RpcCallContext ctx = buildAnchoredHead();
-                        lastGoodHead = new HeadWithTimestamp(ctx, clock.elapsedMillis());
+                        lastGoodHead.set(new HeadWithTimestamp(ctx, clock.elapsedMillis()));
                         f.complete(ctx);
                         // After the future is completed (readers unblocked), prime the
                         // confirm-critical contracts at this root so a wallet's first
@@ -1299,6 +1332,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             log.info("[rpc] eth_call " + desc + " -> error after "
                     + (clock.elapsedMillis() - t0) + "ms: "
                     + describeEvmError(e));
+            if (isStateUnavailable(e)) evictUnservableHead(h);
             return null;
         } finally {
             if (smallLane) EVM_SMALL_LANE.remove();
@@ -1318,6 +1352,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                     .get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
         } catch (Exception e) {
             log.info("[rpc] account read -> error: " + unwrap(e));
+            if (isStateUnavailable(e)) evictUnservableHead(h);
             return null;
         }
     }
@@ -1334,6 +1369,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             return h.oracle().fetchBytecode(codeHash).get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
         } catch (Exception e) {
             log.info("[rpc] eth_getCode -> error: " + unwrap(e));
+            if (isStateUnavailable(e)) evictUnservableHead(h);
             return null;
         }
     }
@@ -1353,7 +1389,59 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             return word32(value);
         } catch (Exception e) {
             log.info("[rpc] eth_getStorageAt -> error: " + unwrap(e));
+            if (isStateUnavailable(e)) evictUnservableHead(h);
             return null;
+        }
+    }
+
+    /** True iff the throwable chain carries the oracle's "no connected snap peer serves
+     *  this stateRoot" verdict ({@link io.myotis.evm.EvmExecutionError.StateUnavailable}).
+     *  That root has been pruned out from under the cached context; the wrapper
+     *  ({@link #evictUnservableHead}) drops it so the next read rebuilds. */
+    private static boolean isStateUnavailable(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof io.myotis.evm.EvmExecutionException ee
+                    && ee.error() instanceof io.myotis.evm.EvmExecutionError.StateUnavailable) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Evict a head context whose stateRoot no connected snap peer can serve, so the
+     *  next state read rebuilds against a fresh, snap-servable root instead of re-paying
+     *  a full 30s oracle rotation on the same dead root (the StateUnavailable storm).
+     *  Drops it from both caches — the per-number pin and the shared last-good head.
+     *  Trust is untouched: this only invalidates a freshness cache, never relaxes
+     *  verification (every served root is still beacon-anchored and proof-checked). */
+    private void evictUnservableHead(RpcCallContext doomed) {
+        if (doomed == null) return;
+        pinnedHeadByNumber.values().removeIf(hw -> hw.head() == doomed);
+        boolean evicted = false;
+        // Compare-and-set, NOT a plain null: only clear lastGoodHead if it still holds
+        // the doomed context. A bare `lastGoodHead = null` would race the warmer/builder
+        // — if it set a FRESH head between our read and write, we'd wipe a perfectly good
+        // head and force a needless rebuild. CAS nulls only the doomed one.
+        HeadWithTimestamp g = lastGoodHead.get();
+        if (g != null && g.head() == doomed && lastGoodHead.compareAndSet(g, null)) {
+            evicted = true;
+        }
+        // Also drop the build-dedup future if it completed with this doomed context:
+        // verifiedHeadCallContext reuses a completed-OK rpcCallCtx for up to
+        // RPC_HEAD_TTL_MS (12s), so without this the very next read (which calls
+        // anchoredHeadOrWait -> verifiedHeadCallContext after we nulled lastGoodHead)
+        // would be handed the same dead context straight back and skip the rebuild.
+        synchronized (rpcCallCtxLock) {
+            if (rpcCallCtx != null && rpcCallCtx.isDone()
+                    && !rpcCallCtx.isCompletedExceptionally()
+                    && rpcCallCtx.getNow(null) == doomed) {
+                rpcCallCtx = null;
+                evicted = true;
+            }
+        }
+        if (evicted) {
+            log.info("[rpc] evicted unservable head #" + doomed.blockNumber()
+                    + " (no snap peer retains its state) — will rebuild");
         }
     }
 
@@ -1819,8 +1907,10 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     private HeaderAnchor headerAnchor() {
         RLPxConnector c = connector;
         // Only pay the anchored-head wait when a snap peer exists to build from.
+        // Header anchoring needs verified headers, not snap STATE — so it keeps the
+        // long stale window (a stale head still anchors a fetched header window).
         if (c != null && !c.activeSnapHandlers().isEmpty()) {
-            RpcCallContext ctx = anchoredHeadOrWait();
+            RpcCallContext ctx = anchoredHeadOrWait(RPC_HEAD_SERVE_STALE_MAX_MS);
             if (ctx != null && ctx.beaconVerified()) {
                 return new HeaderAnchor(ctx.blockNumber(), ctx.blockCtx().stateRoot(), null);
             }
@@ -1836,7 +1926,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         // amount is entered. Preferring lastGoodHead keeps those methods answering
         // verified-but-slightly-stale data through the gap (same contract as the head
         // context's own stale-serve and the gasPrice/maxPriorityFee FeeSnapshot path).
-        HeadWithTimestamp good = lastGoodHead;
+        HeadWithTimestamp good = lastGoodHead.get();
         if (good != null && good.head().beaconVerified()
                 && clock.elapsedMillis() - good.builtAtMs() < RPC_HEAD_SERVE_STALE_MAX_MS) {
             return new HeaderAnchor(good.head().blockNumber(),
@@ -2305,7 +2395,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                                                 java.math.BigInteger value) {
         if (to == null || to.length != 20) return null;
         if (from != null && from.length != 20) return null;
-        RpcCallContext h = anchoredHeadOrWait();
+        RpcCallContext h = anchoredHeadOrWait(RPC_STATE_HEAD_MAX_STALE_MS);
         if (h == null) return null;
         try {
             // Fast path: a value transfer with no calldata to a plain account costs
@@ -2336,6 +2426,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             return gas == null ? null : java.math.BigInteger.valueOf(gas);
         } catch (Exception e) {
             log.info("[rpc] eth_estimateGas -> error: " + describeEvmError(e));
+            if (isStateUnavailable(e)) evictUnservableHead(h);
             return null;
         }
     }
