@@ -17,6 +17,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -418,11 +420,17 @@ private const val READY_HEAD_WARM_MS = 45_000L
 @Composable
 private fun ReadinessStrip(snapshot: NodeService.Snapshot?) {
     val s = snapshot
-    val target = when {
-        s == null || !s.running -> Color(0xFFD32F2F)                       // red
-        s.beaconState != "SYNCED" -> Color(0xFFD32F2F)                     // red
-        s.verifiedHeadAgeMs <= READY_HEAD_WARM_MS -> Color(0xFF2E7D32)     // green
-        else -> Color(0xFFF9A825)                                         // amber
+    // Color AND a spoken label, derived together so they can never disagree. The
+    // label is exposed via semantics so the readiness state is discoverable by
+    // TalkBack and not conveyed by color alone (red/amber/green is invisible to
+    // color-vision deficiencies). The strip stays a thin non-interactive line by
+    // design; the description is its only a11y surface.
+    val (target, label) = when {
+        s == null || !s.running -> Color(0xFFD32F2F) to "Node readiness: not running"
+        s.beaconState != "SYNCED" -> Color(0xFFD32F2F) to "Node readiness: not synced"
+        s.verifiedHeadAgeMs <= READY_HEAD_WARM_MS ->
+            Color(0xFF2E7D32) to "Node readiness: ready to transact"
+        else -> Color(0xFFF9A825) to "Node readiness: warming up, not ready to transact"
     }
     // Ease between states so a transient amber blip during a rebuild reads as a
     // gentle pulse, not a jarring flash.
@@ -431,7 +439,8 @@ private fun ReadinessStrip(snapshot: NodeService.Snapshot?) {
         Modifier
             .fillMaxWidth()
             .height(3.dp)
-            .background(color),
+            .background(color)
+            .semantics { contentDescription = label },
     )
 }
 
