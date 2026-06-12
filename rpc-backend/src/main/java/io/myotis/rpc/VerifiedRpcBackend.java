@@ -301,9 +301,12 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     private CompletableFuture<RpcCallContext> rpcCallCtx;   // in-flight/fresh build (dedup)
     private long rpcCallCtxAtMs;
     // Last successfully-built anchored head + its build time, as one immutable
-    // record behind a single volatile ref so head and timestamp are read/written
-    // atomically together (no torn read of new head with old timestamp).
-    private volatile HeadWithTimestamp lastGoodHead;
+    // record behind a single ref so head and timestamp are read/written atomically
+    // together (no torn read of new head with old timestamp). AtomicReference (not a
+    // bare volatile) so eviction can compare-and-set: nulling a doomed head must not
+    // clobber a fresher head the warmer set between the evictor's read and write.
+    private final java.util.concurrent.atomic.AtomicReference<HeadWithTimestamp> lastGoodHead =
+            new java.util.concurrent.atomic.AtomicReference<>();
     /**
      * Frozen anchored context per pinned block NUMBER. A wallet (MetaMask) pins a
      * confirm to one block and retries the same heavy calls against it for minutes.
@@ -481,7 +484,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         // Drop the cached head context + last-good head so a later restart doesn't
         // briefly reuse one pinned to a now-dead peer (fails safe to error anyway).
         synchronized (rpcCallCtxLock) { rpcCallCtx = null; }
-        lastGoodHead = null;
+        lastGoodHead.set(null);
         pinnedHeadByNumber.clear();
         lastGoodLatestBlock = null;
         lastGoodFeeHistory = null;
@@ -809,7 +812,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         // beacon-anchored; a few seconds stale beats erroring, and it bridges the
         // brief windows where a TTL-expiry rebuild can't yet anchor the just-
         // advanced head. The background warmer keeps this fresh (~5-15s).
-        HeadWithTimestamp good = lastGoodHead;
+        HeadWithTimestamp good = lastGoodHead.get();
         if (good != null
                 && clock.elapsedMillis() - good.builtAtMs() < RPC_HEAD_MAX_STALE_MS) {
             return good.head();
@@ -831,7 +834,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                 return verifiedHeadCallContext(remainingMs, TimeUnit.MILLISECONDS);
             } catch (Exception e) {
                 last = e;
-                HeadWithTimestamp g = lastGoodHead;   // a concurrent build may have just succeeded
+                HeadWithTimestamp g = lastGoodHead.get();   // a concurrent build may have just succeeded
                 if (g != null && clock.elapsedMillis() - g.builtAtMs() < RPC_HEAD_MAX_STALE_MS) {
                     return g.head();
                 }
@@ -845,7 +848,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         // hasn't expired — it's just old — and verifiedHeadFor's pinned-number
         // bounds still reject pins this context genuinely can't represent. The
         // warmer keeps retrying fresh builds in the background regardless.
-        HeadWithTimestamp stale = lastGoodHead;
+        HeadWithTimestamp stale = lastGoodHead.get();
         if (stale != null && clock.elapsedMillis() - stale.builtAtMs() < maxStaleMs) {
             log.info("[rpc] serving STALE anchored head (block #"
                     + stale.head().blockNumber() + ", "
@@ -864,7 +867,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  if none has been built yet. Used to hold nonce serving to a tighter freshness
      *  bound than the general stale-serve horizon. */
     private long headAgeMs() {
-        HeadWithTimestamp good = lastGoodHead;
+        HeadWithTimestamp good = lastGoodHead.get();
         return good == null ? Long.MAX_VALUE : clock.elapsedMillis() - good.builtAtMs();
     }
 
@@ -920,7 +923,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                 headBuildPool.execute(() -> {
                     try {
                         RpcCallContext ctx = buildAnchoredHead();
-                        lastGoodHead = new HeadWithTimestamp(ctx, clock.elapsedMillis());
+                        lastGoodHead.set(new HeadWithTimestamp(ctx, clock.elapsedMillis()));
                         f.complete(ctx);
                         // After the future is completed (readers unblocked), prime the
                         // confirm-critical contracts at this root so a wallet's first
@@ -1414,10 +1417,13 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     private void evictUnservableHead(RpcCallContext doomed) {
         if (doomed == null) return;
         pinnedHeadByNumber.values().removeIf(hw -> hw.head() == doomed);
-        HeadWithTimestamp g = lastGoodHead;
         boolean evicted = false;
-        if (g != null && g.head() == doomed) {
-            lastGoodHead = null;   // force a fresh build on the next read / warmer tick
+        // Compare-and-set, NOT a plain null: only clear lastGoodHead if it still holds
+        // the doomed context. A bare `lastGoodHead = null` would race the warmer/builder
+        // — if it set a FRESH head between our read and write, we'd wipe a perfectly good
+        // head and force a needless rebuild. CAS nulls only the doomed one.
+        HeadWithTimestamp g = lastGoodHead.get();
+        if (g != null && g.head() == doomed && lastGoodHead.compareAndSet(g, null)) {
             evicted = true;
         }
         // Also drop the build-dedup future if it completed with this doomed context:
@@ -1920,7 +1926,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         // amount is entered. Preferring lastGoodHead keeps those methods answering
         // verified-but-slightly-stale data through the gap (same contract as the head
         // context's own stale-serve and the gasPrice/maxPriorityFee FeeSnapshot path).
-        HeadWithTimestamp good = lastGoodHead;
+        HeadWithTimestamp good = lastGoodHead.get();
         if (good != null && good.head().beaconVerified()
                 && clock.elapsedMillis() - good.builtAtMs() < RPC_HEAD_SERVE_STALE_MAX_MS) {
             return new HeaderAnchor(good.head().blockNumber(),
