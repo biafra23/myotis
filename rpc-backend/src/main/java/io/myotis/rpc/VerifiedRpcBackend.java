@@ -127,6 +127,15 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  sustained rebuild outage died with "no verified head" (the confirm-screen
      *  instant-ERROR storm) even though a perfectly servable context existed. */
     private static final long RPC_HEAD_SERVE_STALE_MAX_MS = RPC_BLOCK_NUM_LAG_TOLERANCE * 12_000;
+    /** Nonce (eth_getTransactionCount) staleness ceiling — far TIGHTER than the
+     *  general {@link #RPC_HEAD_SERVE_STALE_MAX_MS}. A stale nonce is uniquely
+     *  dangerous: a wallet that signs a tx against a too-low nonce gets it rejected
+     *  ("nonce too low") or silently replaces a still-pending tx. Balance / eth_call
+     *  / block reads tolerate ~13 min of staleness because the wallet re-polls and a
+     *  slightly-old verified value is harmless; the nonce drives what the user signs,
+     *  so we serve it only from a head no older than a couple of slots — beyond that
+     *  we error and let the wallet retry rather than hand it an outdated nonce. */
+    private static final long RPC_NONCE_SERVE_STALE_MAX_MS = RPC_HEAD_MAX_STALE_MS;
 
     /** keccak256("") — an account with this codeHash is an EOA (no contract code). */
     private static final byte[] EMPTY_CODE_HASH = Hash.keccak256(Bytes.EMPTY).toArrayUnsafe();
@@ -319,6 +328,26 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     private final java.util.concurrent.atomic.AtomicBoolean feeRefreshing =
             new java.util.concurrent.atomic.AtomicBoolean();
 
+    /** Last successfully-built latest/head block JSON (its number + when built), so a
+     *  transient fetch failure on eth_getBlockByNumber can serve verified-but-stale
+     *  data instead of erroring. MetaMask's block tracker polls "latest" and the
+     *  re-fetch of a header window + bodies per call oscillates with the head context;
+     *  a -32000 there empties the asset list / hangs the confirm screen. Only ever
+     *  served for LATEST-ish tags or an exact number match within {@link
+     *  #RPC_HEAD_SERVE_STALE_MAX_MS} — a number-pinned read for a different block must
+     *  stay exact (error), never substitute a different block's data. */
+    private record BlockSnapshot(String json, long number, long atMs) {}
+    private volatile BlockSnapshot lastGoodLatestBlock;
+    /** Last successfully-built eth_feeHistory result, keyed by the EXACT request
+     *  signature (blockCount|newestBlock|percentiles). Served on a transient fetch
+     *  failure only when the next request's signature matches and it's within {@link
+     *  #RPC_HEAD_SERVE_STALE_MAX_MS}: an identical request yields identical verified
+     *  data (just computed earlier), so this is correct-but-stale, never wrong. Fees
+     *  drift slowly and the wallet re-polls, so a couple-minute-old fee history beats
+     *  the -32000 that loops MetaMask's fee step and hangs the send screen. */
+    private record FeeHistorySnapshot(String key, String json, long atMs) {}
+    private volatile FeeHistorySnapshot lastGoodFeeHistory;
+
     /** Flipped by {@link #close()}; gates the warmer tick (mirrors NodeService's RUNNING). */
     private volatile boolean closed;
 
@@ -427,6 +456,8 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         synchronized (rpcCallCtxLock) { rpcCallCtx = null; }
         lastGoodHead = null;
         pinnedHeadByNumber.clear();
+        lastGoodLatestBlock = null;
+        lastGoodFeeHistory = null;
     }
 
     // ---------------------------------------------------------------------
@@ -464,6 +495,18 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
 
     @Override
     public Long getTransactionCount(byte[] address, String block) {
+        // Nonce safety: gate on a FRESH head. Unlike balance/eth_call/block reads
+        // (which serve up to ~13 min stale because the wallet re-polls and old-but-
+        // verified is harmless), a stale nonce is what the wallet SIGNS against —
+        // too low and the tx is rejected or replaces a pending one. If the verified
+        // head is older than RPC_NONCE_SERVE_STALE_MAX_MS, error so the wallet
+        // retries against a current head instead of receiving an outdated nonce.
+        if (headAgeMs() > RPC_NONCE_SERVE_STALE_MAX_MS) {
+            log.info("[rpc] eth_getTransactionCount: head " + headAgeMs()
+                    + "ms stale (> " + RPC_NONCE_SERVE_STALE_MAX_MS
+                    + "ms) -> not serving nonce");
+            return null;
+        }
         io.myotis.evm.world.AccountState a = rpcAccountState(address, block);
         return a == null ? null : Long.valueOf(a.nonce());
     }
@@ -662,6 +705,14 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                 + (clock.elapsedMillis() - start) + "ms -> error: "
                 + (last != null ? unwrap(last) : "timeout"));
         return null;
+    }
+
+    /** Age (ms) of the last successfully-built anchored head, or {@code Long.MAX_VALUE}
+     *  if none has been built yet. Used to hold nonce serving to a tighter freshness
+     *  bound than the general stale-serve horizon. */
+    private long headAgeMs() {
+        HeadWithTimestamp good = lastGoodHead;
+        return good == null ? Long.MAX_VALUE : clock.elapsedMillis() - good.builtAtMs();
     }
 
     /** True while an anchored-head build is in flight (warmer or a prior read), so a
@@ -1462,25 +1513,33 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     private String rpcGetBlockByNumber(String block, boolean fullTx) {
         RLPxConnector conn = connector;
         if (conn == null || fullTx) return null;
+        // Classify the request up front so a fetch failure can decide whether stale-
+        // serving is safe: only LATEST-ish tags (the wallet's block tracker) may fall
+        // back to the cached head block; a number-pin must stay exact (see serveStaleBlock).
+        String b = (block == null) ? "latest" : block;
+        boolean isTag;
+        switch (b) {
+            case "latest": case "pending": case "safe": case "finalized":
+                isTag = true; break;
+            case "earliest":
+                return null; // genesis not served verified here (rarely needed)
+            default:
+                isTag = false;
+        }
+        long pinned = -1;
+        if (!isTag) {
+            try { pinned = Long.decode(b); } catch (Exception e) { return null; }
+            if (pinned < 0) return null;                    // invalid (negative) block number
+        }
         try {
             // Headers-only anchor: snap-built head when available, beacon optimistic
             // exec payload otherwise — block serving must survive snap-peer outages
             // (MetaMask's block tracker polls this and hangs the UI without it).
             HeaderAnchor anchor = headerAnchor();
-            if (anchor == null) return null;
+            if (anchor == null) return serveStaleBlock(isTag, pinned);
             long headNum = anchor.number();
 
-            long target;
-            String b = (block == null) ? "latest" : block;
-            switch (b) {
-                case "latest": case "pending": case "safe": case "finalized":
-                    target = headNum; break;
-                case "earliest":
-                    return null; // genesis not served verified here (rarely needed)
-                default:
-                    try { target = Long.decode(b); } catch (Exception e) { return null; }
-            }
-            if (target < 0) return null;                    // invalid (negative) block number
+            long target = isTag ? headNum : pinned;
             if (target > headNum) return "null";            // future/unknown block → eth null
             long back = headNum - target;
             if (back >= BLOCK_LOOKBACK_MAX) return null;     // too far to verify cheaply → error
@@ -1488,21 +1547,45 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             List<BlockHeadersMessage.VerifiedHeader> window = conn
                     .requestBlockHeadersBatched(target, (int) (back + 1))
                     .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
-            if (!anchor.anchors(window)) return null;
+            if (!anchor.anchors(window)) return serveStaleBlock(isTag, pinned);
             BlockHeadersMessage.VerifiedHeader vh = window.get(0); // target is first in [target..head]
 
             List<BlockBodiesMessage.BlockBody> bodies = conn
                     .requestBlockBodies(vh.hash())
                     .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
-            if (bodies.isEmpty()) return null;
+            if (bodies.isEmpty()) return serveStaleBlock(isTag, pinned);
             List<Bytes> txs = bodies.get(0).transactions();
-            if (!OrderedTrieRoot.verify(txs, vh.header().transactionsRoot)) return null;
+            if (!OrderedTrieRoot.verify(txs, vh.header().transactionsRoot)) return serveStaleBlock(isTag, pinned);
 
-            return buildBlockJson(vh, txs);
+            String json = buildBlockJson(vh, txs);
+            // Cache the head block (target == headNum) as the last-good latest; a fetch
+            // failure on a later "latest" poll then serves this verified block bounded-stale
+            // instead of erroring. Historical pins aren't cached (they aren't "latest").
+            if (target == headNum) {
+                lastGoodLatestBlock = new BlockSnapshot(json, target, clock.elapsedMillis());
+            }
+            return json;
         } catch (Exception e) {
             log.info("[rpc] eth_getBlockByNumber failed: " + unwrap(e));
-            return null;
+            return serveStaleBlock(isTag, pinned);
         }
+    }
+
+    /** Serve the last-good latest block when a fresh fetch couldn't complete. Returns
+     *  null (→ error) unless we have a cached head block within {@link
+     *  #RPC_HEAD_SERVE_STALE_MAX_MS} AND serving it is correct: any LATEST-ish tag gets
+     *  the freshest verified block we hold; a number-pin gets it ONLY when it names that
+     *  exact block. A pin for a different block must never receive substitute data. */
+    private String serveStaleBlock(boolean isTag, long pinned) {
+        BlockSnapshot snap = lastGoodLatestBlock;
+        if (snap == null) return null;
+        if (clock.elapsedMillis() - snap.atMs() >= RPC_HEAD_SERVE_STALE_MAX_MS) return null;
+        if (isTag || pinned == snap.number()) {
+            log.info("[rpc] eth_getBlockByNumber serving STALE block #" + snap.number()
+                    + " (" + (clock.elapsedMillis() - snap.atMs()) / 1000 + "s old)");
+            return snap.json();
+        }
+        return null;
     }
 
     /** Build the eth_getBlockByNumber JSON from a VERIFIED header + verified tx list
@@ -1918,9 +2001,12 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      * {@link #FEE_HISTORY_MAX_BLOCKS}; the result reflects what was served.
      */
     private String rpcFeeHistory(long blockCount, String newestBlock, double[] percentiles) {
+        // Exact request signature — a later identical request that can't be rebuilt is
+        // served from lastGoodFeeHistory (same params => same verified data, just older).
+        String key = blockCount + "|" + newestBlock + "|" + java.util.Arrays.toString(percentiles);
         try {
             HeaderAnchor anchor = headerAnchor();
-            if (anchor == null) return null;
+            if (anchor == null) return serveStaleFeeHistory(key);
             long headNum = anchor.number();
 
             long newest;
@@ -1944,7 +2030,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             // that's what anchors it, and it gives the ACTUAL next-block baseFee).
             List<BlockHeadersMessage.VerifiedHeader> window =
                     anchoredHeaderWindow(anchor, (int) (headNum - oldest + 1));
-            if (window == null || window.size() < count) return null;
+            if (window == null || window.size() < count) return serveStaleFeeHistory(key);
 
             StringBuilder sb = new StringBuilder(256);
             sb.append("{\"oldestBlock\":\"").append(hexQuantity(oldest)).append("\"");
@@ -1977,17 +2063,32 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                 for (int i = 0; i < count; i++) {
                     if (i > 0) sb.append(",");
                     List<TxTip> tips = verifiedBlockTips(window.get(i), true);
-                    if (tips == null) return null; // strict: no unverified rewards
+                    if (tips == null) return serveStaleFeeHistory(key); // strict: no unverified rewards
                     sb.append(rewardJson(tips, percentiles));
                 }
                 sb.append("]");
             }
             sb.append("}");
-            return sb.toString();
+            String json = sb.toString();
+            lastGoodFeeHistory = new FeeHistorySnapshot(key, json, clock.elapsedMillis());
+            return json;
         } catch (Exception e) {
             log.info("[rpc] eth_feeHistory failed: " + unwrap(e));
-            return null;
+            return serveStaleFeeHistory(key);
         }
+    }
+
+    /** Serve the last-good feeHistory when a fresh build couldn't complete: only when
+     *  the cached result was for the SAME request signature and is within {@link
+     *  #RPC_HEAD_SERVE_STALE_MAX_MS}. Same params => identical verified data, so this is
+     *  correct-but-stale (never wrong); fees drift slowly and the wallet re-polls. */
+    private String serveStaleFeeHistory(String key) {
+        FeeHistorySnapshot snap = lastGoodFeeHistory;
+        if (snap == null || !snap.key().equals(key)) return null;
+        if (clock.elapsedMillis() - snap.atMs() >= RPC_HEAD_SERVE_STALE_MAX_MS) return null;
+        log.info("[rpc] eth_feeHistory serving STALE result ("
+                + (clock.elapsedMillis() - snap.atMs()) / 1000 + "s old)");
+        return snap.json();
     }
 
     /** Gas-used-weighted percentile rewards for one block (geth's algorithm): sort txs
