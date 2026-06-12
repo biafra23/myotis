@@ -1260,9 +1260,18 @@ public final class NodeService extends Service {
             // harness:  adb pull /sdcard/Android/data/<pkg>/files/rpc-capture.jsonl
             // app-private external storage, debug-only — release builds never capture.
             if (BuildConfig.DEBUG && System.getProperty("myotis.rpc.capture") == null) {
-                java.io.File cap = new java.io.File(getExternalFilesDir(null), "rpc-capture.jsonl");
-                System.setProperty("myotis.rpc.capture", cap.getAbsolutePath());
-                LogBuffer.i(TAG, "[rpc] capture tap -> " + cap.getAbsolutePath());
+                // getExternalFilesDir(null) returns null when external storage is
+                // unavailable (unmounted/emulated-but-not-ready); new File(null, name)
+                // would resolve to a relative path in the process CWD. Skip arming the
+                // tap rather than write somewhere unexpected — it's a debug aid.
+                java.io.File dir = getExternalFilesDir(null);
+                if (dir != null) {
+                    java.io.File cap = new java.io.File(dir, "rpc-capture.jsonl");
+                    System.setProperty("myotis.rpc.capture", cap.getAbsolutePath());
+                    LogBuffer.i(TAG, "[rpc] capture tap -> " + cap.getAbsolutePath());
+                } else {
+                    LogBuffer.w(TAG, "[rpc] capture tap NOT armed: external files dir unavailable");
+                }
             }
             // Bind loopback-only: the wallet (MetaMask) runs on the same device and
             // reaches us via localhost. Binding 0.0.0.0 would expose an unauthenticated,
