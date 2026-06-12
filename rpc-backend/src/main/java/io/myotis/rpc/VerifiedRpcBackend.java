@@ -1282,25 +1282,25 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  STALE head to a state callView so a doomed read fails fast instead of timing out.
      *  Verdict cached for {@link #STALE_PROBE_CACHE_MS} keyed by root so a confirm-screen
      *  burst on one root shares a single probe rather than hammering every peer N times. */
-    private volatile byte[] probedRoot;
-    private volatile boolean probedRootServable;
-    private volatile long probedRootAtMs;
+    private record ProbeVerdict(byte[] root, boolean servable, long atMs) {}
+    /** One immutable unit behind a single volatile so root, verdict and timestamp are
+     *  read/written atomically together — a reader can't pair a fresh root with a stale
+     *  timestamp/verdict (same pattern as {@link HeadWithTimestamp} / {@code FeeSnapshot}). */
+    private volatile ProbeVerdict lastRootProbe;
 
     private boolean anyPeerServesRoot(byte[] stateRoot) {
         if (stateRoot == null) return false;
         long now = clock.elapsedMillis();
-        byte[] cachedRoot = probedRoot;
-        if (cachedRoot != null && java.util.Arrays.equals(cachedRoot, stateRoot)
-                && now - probedRootAtMs < STALE_PROBE_CACHE_MS) {
-            return probedRootServable;
+        ProbeVerdict v = lastRootProbe;
+        if (v != null && java.util.Arrays.equals(v.root(), stateRoot)
+                && now - v.atMs() < STALE_PROBE_CACHE_MS) {
+            return v.servable();
         }
         RLPxConnector c = connector;
         List<EthHandler> peers = (c == null) ? List.of() : c.activeSnapHandlers();
         boolean ok = !peers.isEmpty()
                 && firstPeerServing(peers, Bytes32.wrap(stateRoot), RPC_STALE_PROBE_TIMEOUT_SEC) != null;
-        probedRoot = stateRoot.clone();
-        probedRootServable = ok;
-        probedRootAtMs = now;
+        lastRootProbe = new ProbeVerdict(stateRoot.clone(), ok, now);
         return ok;
     }
 
