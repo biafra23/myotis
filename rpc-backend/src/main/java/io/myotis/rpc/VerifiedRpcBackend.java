@@ -1415,8 +1415,25 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         if (doomed == null) return;
         pinnedHeadByNumber.values().removeIf(hw -> hw.head() == doomed);
         HeadWithTimestamp g = lastGoodHead;
+        boolean evicted = false;
         if (g != null && g.head() == doomed) {
             lastGoodHead = null;   // force a fresh build on the next read / warmer tick
+            evicted = true;
+        }
+        // Also drop the build-dedup future if it completed with this doomed context:
+        // verifiedHeadCallContext reuses a completed-OK rpcCallCtx for up to
+        // RPC_HEAD_TTL_MS (12s), so without this the very next read (which calls
+        // anchoredHeadOrWait -> verifiedHeadCallContext after we nulled lastGoodHead)
+        // would be handed the same dead context straight back and skip the rebuild.
+        synchronized (rpcCallCtxLock) {
+            if (rpcCallCtx != null && rpcCallCtx.isDone()
+                    && !rpcCallCtx.isCompletedExceptionally()
+                    && rpcCallCtx.getNow(null) == doomed) {
+                rpcCallCtx = null;
+                evicted = true;
+            }
+        }
+        if (evicted) {
             log.info("[rpc] evicted unservable head #" + doomed.blockNumber()
                     + " (no snap peer retains its state) — will rebuild");
         }
