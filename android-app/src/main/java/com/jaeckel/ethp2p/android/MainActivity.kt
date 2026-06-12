@@ -121,6 +121,22 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        // Auto-start the node when the app launches so the user doesn't have to
+        // tap "Start node". Start *silently* via startForegroundService — a
+        // foreground service runs fine on Android 13+ even without
+        // POST_NOTIFICATIONS (the notification is just hidden), so we do NOT
+        // prompt for it here: requesting on a cold launch has no user context,
+        // drives high denial rates, and would re-prompt on every fresh launch
+        // once denied. The permission is requested only from the explicit
+        // Start-node button (ensureNodeStarted), where the user has context.
+        //
+        // Gated on savedInstanceState == null so it fires only on a genuinely
+        // fresh launch — NOT a config-change recreation (rotation) or
+        // process-death restore, which would override an explicit Stop — and on
+        // !isRunning so relaunching while the service is already up is a no-op.
+        if (savedInstanceState == null && !NodeService.isRunning()) {
+            startNodeService()
+        }
     }
 
     override fun onStart() {
@@ -140,14 +156,29 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun toggleService() {
-        val svc = Intent(this, NodeService::class.java)
         if (NodeService.isRunning()) {
             // We're bound with BIND_AUTO_CREATE from onStart, which keeps the
             // service alive even after stopService. Ask the service to tear
             // down networking explicitly; it will also call stopSelf so the
             // foreground notification clears immediately.
-            boundServiceState.value?.shutdown() ?: stopService(svc)
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            boundServiceState.value?.shutdown()
+                ?: stopService(Intent(this, NodeService::class.java))
+        } else {
+            ensureNodeStarted()
+        }
+    }
+
+    /**
+     * Start the node if it isn't already running, first requesting the
+     * POST_NOTIFICATIONS permission on Android 13+ so the foreground-service
+     * notification is visible. Used by the explicit Start-node button, where
+     * prompting has clear user context. (Auto-start on launch deliberately
+     * skips this and starts silently — see onCreate.) A no-op when the service
+     * is already running.
+     */
+    private fun ensureNodeStarted() {
+        if (NodeService.isRunning()) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             // Defer startForegroundService until the permission dialog
