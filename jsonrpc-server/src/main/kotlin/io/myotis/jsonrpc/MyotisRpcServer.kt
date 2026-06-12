@@ -53,17 +53,22 @@ class MyotisRpcServer(
     private val captureFile: java.io.File? =
         System.getProperty("myotis.rpc.capture")?.takeIf { it.isNotBlank() }?.let { java.io.File(it) }
 
-    private fun capture(req: String, resp: String) {
+    private suspend fun capture(req: String, resp: String) {
         val f = captureFile ?: return
-        try {
-            val line = buildString {
-                append("{\"t\":").append(System.currentTimeMillis())
-                append(",\"req\":").append(req.trim())
-                append(",\"resp\":").append(resp.trim())
-                append("}\n")
-            }
-            synchronized(this) { f.appendText(line) }
-        } catch (_: Exception) { /* capture is best-effort */ }
+        // Off the Ktor request thread: the append is blocking disk I/O, so run it on
+        // the IO dispatcher. (Capture is a debug feature, off by default; this keeps
+        // it from stalling request handling when it IS on.)
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val line = buildString {
+                    append("{\"t\":").append(System.currentTimeMillis())
+                    append(",\"req\":").append(req.trim())
+                    append(",\"resp\":").append(resp.trim())
+                    append("}\n")
+                }
+                synchronized(this@MyotisRpcServer) { f.appendText(line) }
+            } catch (_: Exception) { /* capture is best-effort */ }
+        }
     }
 
     @Volatile

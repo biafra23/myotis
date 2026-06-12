@@ -43,7 +43,7 @@ def latestify(params):
     return out
 
 def key(req):
-    m = req.get("method"); p = req.get("params", [])
+    m = req.get("method"); p = req.get("params") or []
     to = data = ""
     if m == "eth_call" and p and isinstance(p[0], dict):
         to = (p[0].get("to") or "").lower(); data = (p[0].get("input") or p[0].get("data") or "")
@@ -54,7 +54,7 @@ def is_gating(req):
     if m in SKIP_METHODS or m in BEST_EFFORT:
         return False
     if m == "eth_call":
-        p = req.get("params", [])
+        p = req.get("params") or []
         if p and isinstance(p[0], dict) and (p[0].get("to") or "").lower() == BALANCE_CHECKER:
             return False  # background token sweep
     return True
@@ -67,13 +67,14 @@ def main():
 
     # Load + dedupe unique requests, preserving first-seen order.
     uniq = collections.OrderedDict()
-    for line in open(a.session):
-        line = line.strip()
-        if not line: continue
-        try: req = json.loads(line)["req"]
-        except Exception: continue
-        if not isinstance(req, dict) or "method" not in req: continue
-        uniq.setdefault(key(req), req)
+    with open(a.session) as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try: req = json.loads(line)["req"]
+            except Exception: continue
+            if not isinstance(req, dict) or "method" not in req: continue
+            uniq.setdefault(key(req), req)
 
     gating_fail = []; results = collections.Counter()
     print(f"replaying {len(uniq)} unique requests from {a.session} -> {a.url}\n")
@@ -83,7 +84,7 @@ def main():
             results["skipped"] += 1; continue
         if not is_gating(req):
             results["nongating-skip"] += 1; continue   # background calls: don't replay
-        body = {"jsonrpc": "2.0", "id": 1, "method": m, "params": latestify(req.get("params", []))}
+        body = {"jsonrpc": "2.0", "id": 1, "method": m, "params": latestify(req.get("params") or [])}
         ok = False; last = ""
         for attempt in range(a.retries):
             try:
