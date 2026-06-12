@@ -194,6 +194,13 @@ dependencies {
     // at the phone. Hosted by NodeService.
     implementation(project(":jsonrpc-server"))
 
+    // Shared verified-RPC backend (the single VerifiedRpcBackend the :app daemon
+    // also constructs). NodeService delegates every verified read/call + ENS
+    // resolution to it, so the verified machinery — and the confirm-screen fixes —
+    // live once for both Android and the daemon. Pulls RpcLogger/RpcClock/
+    // SnapQualitySink (the host seams) onto the compile classpath too.
+    implementation(project(":rpc-backend"))
+
     // Force the JRE *variant* of Guava. Guava publishes jre and android
     // variants under one module; on an Android project Gradle's
     // org.gradle.jvm.environment=android attribute selects the `android`
