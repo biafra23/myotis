@@ -4,6 +4,7 @@ import com.jaeckel.ethp2p.core.crypto.NodeKey;
 import com.jaeckel.ethp2p.networking.ChainHead;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
 import com.jaeckel.ethp2p.networking.eth.EthHandler;
+import com.jaeckel.ethp2p.networking.eth.TxGossipObserver;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockBodiesMessage;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
 import com.jaeckel.ethp2p.networking.snap.messages.AccountRangeMessage;
@@ -65,6 +66,9 @@ public final class RLPxConnector implements AutoCloseable {
     private final Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders;
     private final PeerReadyCallback peerReadyCallback;
     private final Set<EthHandler> activeHandlers = ConcurrentHashMap.newKeySet();
+    /** Optional mempool-gossip sink, applied to every handler so a node can watch its
+     *  own broadcast txs propagate. Null until a consumer (the RPC backend) registers. */
+    private volatile TxGossipObserver txGossipObserver;
 
     /**
      * Re-entrant counter of in-progress snap-heavy operations (ENS resolution).
@@ -156,6 +160,12 @@ public final class RLPxConnector implements AutoCloseable {
         connectFuture.addListener((ChannelFuture f) -> {
             if (f.isSuccess()) {
                 activeHandlers.add(ethHandler);
+                // Apply the gossip observer AFTER joining activeHandlers, closing the
+                // race with setTxGossipObserver: that setter writes the (volatile) field
+                // then iterates active handlers, so ordering it "add then read field"
+                // here guarantees delivery on every interleaving — either the setter's
+                // iteration sees this handler, or this read sees the setter's write.
+                ethHandler.setTxGossipObserver(txGossipObserver);
             } else {
                 log.debug("[rlpx] Connection to {} failed: {}", peerAddr, f.cause().getMessage());
             }
@@ -307,6 +317,19 @@ public final class RLPxConnector implements AutoCloseable {
         }
         log.info("[rlpx] Broadcast transaction to {} peer(s)", sent);
         return sent;
+    }
+
+    /**
+     * Register (or clear, with null) the mempool-gossip observer. Stored for handlers
+     * created later and pushed to every currently-active handler, so a node that just
+     * broadcast a tx can watch for that hash returning over Transactions (0x12) /
+     * NewPooledTransactionHashes (0x18) gossip. Idempotent.
+     */
+    public void setTxGossipObserver(TxGossipObserver observer) {
+        this.txGossipObserver = observer;
+        for (EthHandler handler : activeHandlers) {
+            handler.setTxGossipObserver(observer);
+        }
     }
 
     /**

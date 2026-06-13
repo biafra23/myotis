@@ -43,7 +43,8 @@ import java.util.concurrent.TimeUnit;
  * (stops every executor this backend owns). The injected components are NOT
  * closed here — the host owns them.
  */
-public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBackend, AutoCloseable {
+public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBackend,
+        com.jaeckel.ethp2p.networking.eth.TxGossipObserver, AutoCloseable {
 
     // ---------------------------------------------------------------------
     // Constants (ported from NodeService's RPC region)
@@ -184,6 +185,19 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  own pending txs; the gate only protects against same-account txs from
      *  elsewhere landing in the gap), while tolerating mobile build cadence. */
     private static final long RPC_NONCE_SERVE_STALE_MAX_MS = 120_000;
+
+    /** How long a broadcast-but-unmined nonce stays in {@link #pendingNonces}. After
+     *  this the overlay drops it even if the mined count never caught up, so a tx that
+     *  was dropped or replaced by the network can't permanently wedge the account at a
+     *  nonce the chain will never reach. 90s comfortably covers normal inclusion (a few
+     *  blocks) while bounding the wedge window if a send never lands. */
+    private static final long PENDING_NONCE_TTL_MS = 90_000;
+
+    /** How long we keep watching a broadcast tx for its hash to come back over gossip.
+     *  Generous vs. typical inclusion (a few blocks): once a tx mines we stop watching
+     *  it explicitly (verified inclusion), and the warmer evicts anything older than
+     *  this so the gossip-decode hot path goes quiet when nothing of ours is live. */
+    private static final long SENT_TX_WATCH_TTL_MS = 180_000;
 
     /** keccak256("") — an account with this codeHash is an EOA (no contract code). */
     private static final byte[] EMPTY_CODE_HASH = Hash.keccak256(Bytes.EMPTY).toArrayUnsafe();
@@ -361,6 +375,25 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                 }
             });
 
+    /** Highest nonce this node has broadcast for a sender but not yet seen mined,
+     *  keyed by lowercase 0x sender address, with the broadcast timestamp. A light
+     *  node has no mempool, so without this two back-to-back sends from the same
+     *  account collide on one nonce: the second reads {@code eth_getTransactionCount}
+     *  while the first is still pending, gets the not-yet-incremented mined count, and
+     *  reuses the first tx's nonce (MetaMask's "confirm screen hangs on the second
+     *  send" symptom). We relayed these txs ourselves and hold the signed bytes, so
+     *  reporting their nonce as pending is our own honest knowledge of the mempool we
+     *  fed, not a trust assumption. The tracker expires an entry when the chain's mined
+     *  count passes it (tx mined) or after {@link #PENDING_NONCE_TTL_MS} (tx likely
+     *  dropped/replaced — never wedge the account). */
+    private final PendingNonceTracker pendingNonces = new PendingNonceTracker(PENDING_NONCE_TTL_MS);
+
+    /** Mini-mempool of our own broadcast txs, watched for their hashes returning over
+     *  devp2p gossip (Transactions 0x12 / NewPooledTransactionHashes 0x18) to confirm
+     *  propagation. Fed by {@link #onTxHashSeen} (the {@code TxGossipObserver} this
+     *  backend registers on the connector); cleared on verified mining or TTL. */
+    private final SentTxTracker sentTxWatch = new SentTxTracker(SENT_TX_WATCH_TTL_MS);
+
     /** Suggested tip + when it was computed, one immutable unit behind a single
      *  volatile so a reader can't pair a fresh tip with a stale timestamp
      *  (same pattern as {@link HeadWithTimestamp}). */
@@ -468,6 +501,9 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      */
     public synchronized void start() {
         if (headWarmer != null || closed) return;
+        // Register as the mempool-gossip observer so peers report tx hashes for our
+        // mini-mempool. Cheap when idle: handlers consult watchingAny() first.
+        connector.setTxGossipObserver(this);
         headWarmer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "rpc-head-warmer");
             t.setDaemon(true);
@@ -488,6 +524,13 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             } catch (Throwable ignored) {
                 // never kill the warmer tick
             }
+            // Age out gossip-watch entries for sends that never mined, so the
+            // event-loop gossip-decode path goes quiet once nothing of ours is live.
+            try {
+                sentTxWatch.evictExpired(clock.elapsedMillis());
+            } catch (Throwable ignored) {
+                // never kill the warmer tick
+            }
         }, 3, 5, TimeUnit.SECONDS);
     }
 
@@ -496,6 +539,13 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     @Override
     public synchronized void close() {
         closed = true;
+        // Stop receiving gossip callbacks before tearing down (connector is the host's
+        // to close, but our observer registration is ours to retract).
+        try {
+            connector.setTxGossipObserver(null);
+        } catch (Exception ignored) {
+            // connector may already be torn down — nothing to retract.
+        }
         if (headWarmer != null) {
             headWarmer.shutdownNow();
             headWarmer = null;
@@ -561,7 +611,35 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             return null;
         }
         io.myotis.evm.world.AccountState a = rpcAccountState(address, block);
-        return a == null ? null : Long.valueOf(a.nonce());
+        if (a == null) return null;
+        long mined = a.nonce();
+        // TRUST NOTE — the value returned for "latest"/numbered tags IS cryptographically
+        // verified: it's the account nonce proven by a SNAP proof against a beacon-verified
+        // state root. The "pending" overlay below is the one exception, and deliberately so:
+        //
+        //   * "pending" is by definition UN-provable — there is no state root for "not yet
+        //     mined", so the SNAP-proof standard cannot apply to it. The honest meaning of
+        //     "pending" is "latest mined + what's in flight".
+        //   * The overlay's increment is NOT proof-backed against chain state, but it isn't
+        //     arbitrary either: ourPendingNonce comes from a tx WE signed and broadcast
+        //     (sender recovered by ECDSA from our own signature) — authenticated intent, not
+        //     a peer's claim. We never trust a peer for it.
+        //   * It only ever RAISES the nonce: max(verified mined, ourPending + 1). It can
+        //     never report BELOW the proven mined count, and only ever for txs we relayed
+        //     ourselves.
+        //   * Worst case if our view is wrong (the tx was dropped/replaced): the wallet
+        //     signs against a too-high nonce and that tx waits until the gap fills; the
+        //     PENDING_NONCE_TTL_MS self-heals it. The failure mode is a delayed tx, never
+        //     acceptance of forged chain state.
+        //
+        // So this is consistent with the "everything verified" anchor (the un-provable tag
+        // gets our own authenticated knowledge, bounded above the verified floor) — but the
+        // asymmetry is real: do NOT extend this overlay to "latest"/numbered tags, which
+        // callers and on-chain logic treat as settled, proof-backed values.
+        if (block != null && block.equals("pending")) {
+            return Long.valueOf(pendingNonceOverlay(address, mined));
+        }
+        return Long.valueOf(mined);
     }
 
     @Override
@@ -1627,6 +1705,9 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             if (sent == 0) return null;   // no peer reached → let the router report it
             byte[] txHash = Hash.keccak256(Bytes.wrap(rawTx)).toArrayUnsafe();
             sentTxCache.put(Bytes.wrap(txHash).toHexString(), rawTx.clone());
+            recordPendingNonce(rawTx);
+            // Watch for this hash to come back over gossip (propagation confirmation).
+            sentTxWatch.watch(Bytes32.wrap(txHash), clock.elapsedMillis());
             log.info("[rpc] eth_sendRawTransaction broadcast to " + sent
                     + " peer(s), hash=" + Bytes.wrap(txHash).toHexString());
             return txHash;
@@ -1634,6 +1715,62 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             log.info("[rpc] eth_sendRawTransaction failed: " + unwrap(e));
             return null;
         }
+    }
+
+    /** Record the (sender, nonce) of a tx we just broadcast so a follow-up
+     *  eth_getTransactionCount("pending") from that sender reports next = nonce + 1
+     *  instead of reusing this still-pending nonce. Decodes the sender from the signed
+     *  bytes (ECDSA recovery — our own tx, no trust involved). Keeps only the highest
+     *  nonce per sender; a malformed/undecodable tx is silently skipped (we already
+     *  broadcast it — the overlay is best-effort, not a gate). */
+    // ---------------------------------------------------------------------
+    // TxGossipObserver: watch our own broadcast txs propagate over gossip
+    // ---------------------------------------------------------------------
+
+    /** Hot-path guard read by every peer's gossip handler — true only while we hold an
+     *  unconfirmed broadcast of our own, so the firehose is otherwise dropped untouched. */
+    @Override
+    public boolean watchingAny() {
+        return sentTxWatch.watchingAny();
+    }
+
+    /** A tx hash observed on the network. We only act when it's one of OUR broadcasts
+     *  (cheap miss otherwise), logging the first sighting as propagation confirmation. */
+    @Override
+    public void onTxHashSeen(Bytes32 txHash) {
+        long ms = sentTxWatch.markSeen(txHash, clock.elapsedMillis());
+        if (ms >= 0) {
+            log.info("[mini-mempool] our tx " + txHash.toHexString()
+                    + " seen propagating on the network " + ms + "ms after broadcast");
+        }
+    }
+
+    private void recordPendingNonce(byte[] rawTx) {
+        try {
+            var t = com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.decode(Bytes.wrap(rawTx));
+            if (t == null || t.from() == null) return;
+            String key = t.from().toHexString().toLowerCase();
+            pendingNonces.record(key, t.nonce(), clock.elapsedMillis());
+            log.info("[rpc] pending-nonce: " + key + " -> " + t.nonce() + " (broadcast)");
+        } catch (Exception e) {
+            // best-effort overlay; never fail the send over bookkeeping
+        }
+    }
+
+    /** Overlay our own broadcast-but-unmined nonce onto a freshly-read mined count.
+     *  Returns {@code max(minedCount, ourPendingNonce + 1)} while the chain hasn't yet
+     *  reflected our send, so a second back-to-back send from the same account gets the
+     *  next nonce instead of colliding. Only consulted for the "pending" tag. */
+    private long pendingNonceOverlay(byte[] address, long minedCount) {
+        String key = Bytes.wrap(address).toHexString().toLowerCase();
+        long now = clock.elapsedMillis();
+        long pending = pendingNonces.pendingNonce(key);
+        long next = pendingNonces.overlay(key, minedCount, now);
+        if (next != minedCount) {
+            log.info("[rpc] pending-nonce: " + key + " overlay mined=" + minedCount
+                    + " -> " + next + " (our nonce " + pending + " still pending)");
+        }
+        return next;
     }
 
     // ---------------------------------------------------------------------
@@ -1685,6 +1822,8 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                     if (Hash.keccak256(txs.get(i)).equals(want)) {
                         log.info("[rpc] eth_getTransactionByHash found in block #"
                                 + h.number + " index " + i);
+                        // Verified inclusion: stop watching it for gossip propagation.
+                        sentTxWatch.confirmMined(want);
                         return buildTxJson(txs.get(i).toArrayUnsafe(), want, blockHash, h.number, i);
                     }
                 }

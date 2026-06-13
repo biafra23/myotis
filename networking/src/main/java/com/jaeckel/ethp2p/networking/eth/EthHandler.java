@@ -136,6 +136,22 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private volatile long readyTimestamp; // when we entered READY state
     private int negotiatedEthVersion = 68; // default, updated during Hello negotiation
 
+    /** Optional sink for mempool-gossip tx hashes, set by the connector. When present
+     *  AND {@link TxGossipObserver#watchingAny()} is true, inbound Transactions (0x12)
+     *  and NewPooledTransactionHashes (0x18) are decoded and their hashes reported so a
+     *  node can watch its own just-broadcast tx propagate. Null / not-watching = the
+     *  firehose stays dropped untouched (its normal cheap path). */
+    private volatile TxGossipObserver txGossipObserver;
+
+    /** Hard cap on hashes decoded per gossip message — bounds event-loop work even if a
+     *  peer announces a huge batch while we happen to be watching. */
+    private static final int MAX_GOSSIP_HASHES_PER_MSG = 256;
+
+    /** Set the gossip observer (idempotent; the connector calls this on every handler). */
+    public void setTxGossipObserver(TxGossipObserver observer) {
+        this.txGossipObserver = observer;
+    }
+
     public EthHandler(NodeKey nodeKey, int tcpPort, NetworkConfig network,
                       ChainHead chainHead,
                       Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders,
@@ -523,6 +539,13 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     handleSnapTrieNodes(msg);
                 } else if (msg.code() == snapGetTrieNodes) {
                     handleSnapGetTrieNodes(ctx, msg);
+                } else if ((msg.code() == ETH_TRANSACTIONS || msg.code() == NewPooledTransactionHashesMessage.CODE)
+                        && isWatchingGossip()) {
+                    // Mempool gossip we'd normally drop — but a watcher (a node with an
+                    // unconfirmed broadcast of its own) wants to see that hash come back.
+                    // Only reached while watchingAny() is true, so the firehose stays
+                    // free the rest of the time.
+                    matchOwnTxGossip(msg);
                 } else {
                     // TRACE, not DEBUG: the ignored codes are dominated by
                     // high-frequency mempool gossip (0x12 / 0x18) every full-node
@@ -834,6 +857,32 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         byte[] payload = com.jaeckel.ethp2p.networking.eth.messages.TransactionsMessage.encode(rawTxs);
         rlpxHandler.sendMessage(ctx, ETH_TRANSACTIONS, payload);
         return true;
+    }
+
+    /** Cheap event-loop guard: is an observer present and actively watching for hashes?
+     *  Read once into a local so a concurrent clear can't NPE between check and use. */
+    private boolean isWatchingGossip() {
+        TxGossipObserver o = txGossipObserver;
+        return o != null && o.watchingAny();
+    }
+
+    /**
+     * Decode the tx hashes from an inbound Transactions (0x12) / NewPooledTransactionHashes
+     * (0x18) gossip message and report each to the observer, which matches them against the
+     * node's own broadcast txs. Only invoked while {@link #isWatchingGossip()} holds, so the
+     * decode cost is paid only during the short window a send of ours is unconfirmed.
+     * Best-effort throughout: the decoders never throw on malformed peer input, and a null
+     * observer race is a no-op.
+     */
+    private void matchOwnTxGossip(RLPxHandler.RLPxMessage msg) {
+        TxGossipObserver observer = txGossipObserver;
+        if (observer == null) return;
+        List<org.apache.tuweni.bytes.Bytes32> hashes = msg.code() == ETH_TRANSACTIONS
+                ? com.jaeckel.ethp2p.networking.eth.messages.TransactionsMessage
+                        .hashes(msg.payload(), MAX_GOSSIP_HASHES_PER_MSG)
+                : com.jaeckel.ethp2p.networking.eth.messages.NewPooledTransactionHashesMessage
+                        .hashes(msg.payload(), negotiatedEthVersion, MAX_GOSSIP_HASHES_PER_MSG);
+        for (org.apache.tuweni.bytes.Bytes32 h : hashes) observer.onTxHashSeen(h);
     }
 
     /**
