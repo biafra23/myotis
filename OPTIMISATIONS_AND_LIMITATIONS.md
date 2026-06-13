@@ -48,14 +48,22 @@ source of every limitation.
   servable head for a few seconds to tens of seconds**, and verified reads must honestly
   error (`-32000 no verified head / not synced`) rather than guess.
 
-- **CGNAT / Starlink / cellular path instability.** Behind carrier-grade NAT the public
-  endpoint is shared and the NAT mapping churns; inbound reachability for discovery
-  fails, and long-lived snap connections drop or stall. Successful-request latency can
-  look fine while a *fraction* of a large fetch wave silently stalls — which is exactly
-  what kills a 3000-fetch sweep. A network switch (e.g. to a clean VPN exit) "fixes" it
-  by giving stable connections and a fresh peer set — this presents as if our IP were
-  "demoted", but it is a path/NAT artifact, not peer-reputation blacklisting (peers
-  serve us identically before and after; see §2 mitigations).
+- **CGNAT / Starlink / cellular path instability — HYPOTHESIS, under verification.** A
+  proposed (not yet proven) factor: behind carrier-grade NAT the public endpoint is
+  shared and the NAT mapping churns, inbound reachability for discovery fails, and
+  long-lived snap connections may drop or stall — so *successful*-request latency can look
+  fine (~40–260 ms observed on both a VPN and a no-VPN path) while a *fraction* of a large
+  fetch wave silently stalls, which would be enough to push a 3000-fetch sweep past
+  budget. A network switch (e.g. to a clean VPN exit) appearing to "fix" it would then be
+  stable connections + a fresh peer set, not peer-reputation blacklisting (peers served us
+  identically before and after the switch).
+  **Caveat:** this is inferred, not measured — the logs show successful round-trips, not
+  the stall/loss tail that would confirm it, and the device-class factor (§1.2) is a
+  confounder. The decisive test is to hold the device constant (a flagship, removing the
+  CPU variable) and compare networks, measuring the **snap-request stall rate**
+  (requests sent that get *no* response, vs. answered): a high stall rate on the
+  suspect path vs. a clean one would confirm it; comparable stall rates would refute it.
+  Until that data exists, treat CGNAT as a *suspected* contributor, not an established one.
 
 - **Cross-block state-root churn defeats naive caching.** The proof cache is keyed by
   world state root. The wallet re-pins its polls to the *newest* block each time, so the
@@ -63,6 +71,28 @@ source of every limitation.
   restarts cold against a new root.
 
 ### 1.2 Phone CPU / runtime limits
+
+- **Device class drives the *experience*, not just correctness.** It functions across
+  device classes — but the latency, not whether it works, is what makes it acceptable or
+  not. Every cost in this section compounds with CPU speed. Measured directly with the
+  **same code, same account, same network** on two devices:
+  - **Pixel 10 Pro Fold** (Tensor G5, 2025): comfortable — confirm screen renders, the
+    Confirm button activates, and back-to-back ETH and ERC-20 sends confirm.
+  - **Pixel 7** (Tensor G2, 2022; `GS201`, 8 GB): **works, but users won't like it.** The
+    send flow does complete — sends confirm — but slowly. Measured on one send: **~3–5 min**
+    from opening the confirm sheet to an *active* Confirm button, and on the order of
+    **~15 min** to a fully-settled screen (fee value rendered), during which MetaMask ran
+    a **continuous storm of ~9–18 `eth_call` errors every 30 s** (the declined sweep it
+    keeps retrying, plus transient no-head errors) — a **~32 %** session error rate
+    overall. Correct and functional, but far past the patience of a real user.
+
+  The weaker CPU slows BLS verification, EVM execution, and head builds *simultaneously*,
+  so the head lags further behind the chain tip, each rebuild takes longer, and the
+  no-verified-head windows widen — which the wallet experiences as a burst of `-32000`
+  errors and retries before the screen settles. This is a hardware floor we can't
+  optimise past: it stays *correct* on older silicon, but the wait grows, so treat
+  current-flagship class as the bar for an experience users will actually accept, and
+  expect noticeably worse responsiveness on older/cheaper devices.
 
 - **ART is much slower than a JIT JVM for crypto.** Pure-Java BLS (Milagro) verification
   runs ~**76× slower** on Android ART than on the desktop JVM, which made beacon
@@ -238,6 +268,11 @@ Multicall3 simulations.
 - **A cold-start / peer-dip window still errors honestly** for a few seconds after
   launch or during a snap-peer dip — by design (we error rather than guess), but it is
   why "let it reach the green readiness strip first" matters before transacting.
+- **Device class sets the experience bar.** It works on a 2022 mid-tier phone (Pixel 7)
+  — sends confirm — but only after a wait users won't accept; it's comfortable on a
+  current flagship (Pixel 10 Pro Fold). Correctness is constant across the range; only
+  responsiveness changes, and below flagship class the wait is the product problem (see
+  §1.2).
 - **Path quality still dominates outcomes.** On a clean, low-latency, non-CGNAT path the
   node is comfortably usable; on a degraded path (CGNAT/Starlink with stalls) heavy work
   suffers. We cannot fix the uplink, so the durable direction is to make the node *less
