@@ -94,6 +94,24 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  restarted from scratch by the wallet's retry (which kept mobile from ever
      *  finishing). */
     private static final long RPC_CALL_TIMEOUT_SEC = 120;
+    /** Calldata size at/above which an eth_call is treated as a HEAVY batch sweep and
+     *  given {@link #RPC_HEAVY_CALL_BUDGET_SEC} instead of the full {@link
+     *  #RPC_CALL_TIMEOUT_SEC}. 16 KiB cleanly separates MetaMask's ~32 KiB BalanceChecker
+     *  token sweep (balances(address[],address[]) over ~1000 tokens, ~3000 verified snap
+     *  fetches) from the confirm screen's sub-1 KiB Multicall3 simulations, which stay on
+     *  the full budget. A sweep is non-gating (a token-balance DISPLAY poll, not anything
+     *  the send needs), so bounding it short stops it from hanging the confirm screen for
+     *  two minutes per poll on a thin mobile peer set. */
+    private static final int HEAVY_CALL_CALLDATA_MIN = 16 * 1024;
+    /** EXPERIMENT toggle: when true, a HEAVY sweep (see {@link #HEAVY_CALL_CALLDATA_MIN})
+     *  is declined with an immediate error BEFORE any head resolution / EVM execution /
+     *  peer traffic — the cleanest test of "is this non-gating balance poll what hangs the
+     *  confirm screen?". Declining is honest (we return an error, never fabricated
+     *  balances) and frees the thin mobile peer set entirely for the gating calls the send
+     *  actually needs. If sends flow with this on, the sweep was the culprit and the next
+     *  step is a convergent/cached version that can also DISPLAY balances; if it still
+     *  hangs, the sweep is ruled out. Flip to false to restore normal (verified) serving. */
+    private static final boolean DECLINE_HEAVY_SWEEP = true;
     /** Snap-oracle per-fetch retry budget. Each attempt rotates to a different ready
      *  snap peer (the probed peer first), so a slow/dead peer fails over instead of
      *  burning the whole RPC_CALL_TIMEOUT on one peer. */
@@ -1495,6 +1513,14 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                         ? Bytes.wrap(data, 0, 4).toHexString() : "0x")
                 + " dataLen=" + (data == null ? 0 : data.length)
                 + " block=" + block;
+        // EXPERIMENT: decline the heavy batch sweep up front (no head resolution, no EVM,
+        // no peer traffic) so it can't hang the confirm screen or starve the gating calls.
+        // Honest error, never fabricated balances. See DECLINE_HEAVY_SWEEP.
+        if (DECLINE_HEAVY_SWEEP && data != null && data.length >= HEAVY_CALL_CALLDATA_MIN) {
+            log.info("[rpc] eth_call " + desc
+                    + " -> HEAVY batch sweep declined up front (non-gating balance poll)");
+            return null;
+        }
         RpcCallContext h = verifiedHeadFor(block);
         if (h == null || to == null || to.length != 20) {
             log.info("[rpc] eth_call " + desc + " -> no verified head for block tag");
@@ -2070,7 +2096,29 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             long headNum = anchor.number();
 
             long target = isTag ? headNum : pinned;
-            if (target > headNum) return "null";            // future/unknown block → eth null
+            if (target > headNum) {
+                // The pin is AHEAD of the preferred anchor. This is the NORMAL state on
+                // mobile, not an unknown block: eth_blockNumber advertises the CL
+                // optimistic number (advances every slot), while the snap-built /
+                // lastGood anchor trails it by the head build time (30-60s on a phone,
+                // i.e. several blocks). MetaMask pins reads to the number we just
+                // advertised, so denying it wedges the wallet's block tracker — observed
+                // live as eth_getBlockByNumber returning the "null" literal for 96% of
+                // polls (778 of 806), stalling tx tracking and the confirm screen.
+                // The beacon OPTIMISTIC payload is itself a light-client-verified anchor
+                // at/past the pin — re-anchor on it (its exec blockHash, via
+                // windowAnchoredToHash) and serve the block fully verified. Only a pin
+                // past even the optimistic number is genuinely future/unknown → "null".
+                BeaconSyncState bss = beaconSyncState;
+                long optimisticNum = bss == null ? -1 : bss.getOptimisticBlockNumber();
+                byte[] optimisticHash = bss == null ? null : bss.getOptimisticBlockHash();
+                if (optimisticNum >= target && optimisticHash != null) {
+                    anchor = new HeaderAnchor(optimisticNum, null, optimisticHash);
+                    headNum = optimisticNum;
+                } else {
+                    return "null";          // beyond the verified chain tip → eth null
+                }
+            }
             long back = headNum - target;
             if (back >= BLOCK_LOOKBACK_MAX) return null;     // too far to verify cheaply → error
 
