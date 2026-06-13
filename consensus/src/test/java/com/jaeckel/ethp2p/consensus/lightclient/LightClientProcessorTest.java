@@ -121,6 +121,58 @@ class LightClientProcessorTest {
     }
 
     @Test
+    void rejectsInvalidExecutionBranch() {
+        LightClientFinalityUpdate valid = buildValidFinalityUpdate(900L, 901L);
+
+        // Corrupt one node of the finalized header's execution branch so its execution
+        // payload no longer proves against the beacon body root. The beacon header is
+        // untouched, so the BLS signature and finality branch still verify — only the
+        // execution-branch check can reject this update.
+        LightClientHeader fin = valid.finalizedHeader();
+        byte[][] corruptBranch = new byte[4][];
+        for (int i = 0; i < 4; i++) corruptBranch[i] = Arrays.copyOf(fin.executionBranch()[i], 32);
+        corruptBranch[0][0] ^= 0x01;
+        LightClientHeader corruptFinalized =
+                new LightClientHeader(fin.beacon(), fin.execution(), corruptBranch);
+
+        LightClientFinalityUpdate tampered = new LightClientFinalityUpdate(
+                valid.attestedHeader(), corruptFinalized, valid.finalityBranch(),
+                valid.syncAggregate(), valid.signatureSlot());
+
+        assertFalse(processor.processFinalityUpdate(tampered));
+        assertEquals(100L, store.getFinalizedSlot());
+    }
+
+    @Test
+    void rejectsForgedExecutionPayload() {
+        LightClientFinalityUpdate valid = buildValidFinalityUpdate(950L, 951L);
+
+        // Keep the genuine execution branch but swap in a different execution payload
+        // (attacker-chosen state root). The branch now proves the original payload, not
+        // the forged one, so verifyExecutionBranch must reject it.
+        LightClientHeader fin = valid.finalizedHeader();
+        ExecutionPayloadHeader forged = TestUtil.dummyExecutionPayloadHeader();
+        byte[] forgedStateRoot = new byte[32];
+        forgedStateRoot[0] = (byte) 0xAB; // differs from the all-zero dummy state root
+        ExecutionPayloadHeader forgedPayload = new ExecutionPayloadHeader(
+                forged.parentHash(), forged.feeRecipient(), forgedStateRoot, forged.receiptsRoot(),
+                forged.logsBloom(), forged.prevRandao(), forged.blockNumber(), forged.gasLimit(),
+                forged.gasUsed(), forged.timestamp(), forged.extraData(), forged.baseFeePerGas(),
+                forged.blockHash(), forged.transactionsRoot(), forged.withdrawalsRoot(),
+                forged.blobGasUsed(), forged.excessBlobGas(), forged.depositRequestsRoot(),
+                forged.withdrawalRequestsRoot(), forged.consolidationRequestsRoot());
+        LightClientHeader forgedFinalized =
+                new LightClientHeader(fin.beacon(), forgedPayload, fin.executionBranch());
+
+        LightClientFinalityUpdate tampered = new LightClientFinalityUpdate(
+                valid.attestedHeader(), forgedFinalized, valid.finalityBranch(),
+                valid.syncAggregate(), valid.signatureSlot());
+
+        assertFalse(processor.processFinalityUpdate(tampered));
+        assertEquals(100L, store.getFinalizedSlot());
+    }
+
+    @Test
     void rejectsNullCommittee() {
         // Fresh store without initialization
         LightClientStore emptyStore = new LightClientStore();

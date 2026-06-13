@@ -1131,6 +1131,7 @@ public class BeaconLightClient implements AutoCloseable {
 
                             if (!LightClientProcessor.verifyExecutionBranch(bootstrap.header())) {
                                 log.warn("[beacon] Bootstrap execution branch invalid from {}", peer);
+                                notifyPeerFailure(peer);
                                 if (remaining.decrementAndGet() == 0 && !winnerFuture.isDone()) {
                                     winnerFuture.completeExceptionally(
                                             new RuntimeException("All peers failed bootstrap"));

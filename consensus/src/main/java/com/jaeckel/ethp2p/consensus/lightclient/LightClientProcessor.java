@@ -112,7 +112,7 @@ public class LightClientProcessor {
         // this branch does.
         if (!verifyExecutionBranch(update.attestedHeader())
                 || !verifyExecutionBranch(update.finalizedHeader())) {
-            log.info("[lc-processor] Finality update rejected (attestedSlot={}): execution branch Merkle proof failed",
+            log.debug("[lc-processor] Finality update rejected (attestedSlot={}): execution branch Merkle proof failed",
                     attestedSlot);
             return false;
         }
@@ -274,6 +274,12 @@ public class LightClientProcessor {
      *         execution_payload field of {@code header.beacon.body}
      */
     public static boolean verifyExecutionBranch(LightClientHeader header) {
+        if (header == null
+                || header.beacon() == null
+                || header.execution() == null
+                || header.executionBranch() == null) {
+            return false;
+        }
         return SszUtil.verifyMerkleBranch(
                 header.execution().hashTreeRoot(),
                 header.executionBranch(),
