@@ -121,6 +121,58 @@ class LightClientProcessorTest {
     }
 
     @Test
+    void rejectsInvalidExecutionBranch() {
+        LightClientFinalityUpdate valid = buildValidFinalityUpdate(900L, 901L);
+
+        // Corrupt one node of the finalized header's execution branch so its execution
+        // payload no longer proves against the beacon body root. The beacon header is
+        // untouched, so the BLS signature and finality branch still verify — only the
+        // execution-branch check can reject this update.
+        LightClientHeader fin = valid.finalizedHeader();
+        byte[][] corruptBranch = new byte[4][];
+        for (int i = 0; i < 4; i++) corruptBranch[i] = Arrays.copyOf(fin.executionBranch()[i], 32);
+        corruptBranch[0][0] ^= 0x01;
+        LightClientHeader corruptFinalized =
+                new LightClientHeader(fin.beacon(), fin.execution(), corruptBranch);
+
+        LightClientFinalityUpdate tampered = new LightClientFinalityUpdate(
+                valid.attestedHeader(), corruptFinalized, valid.finalityBranch(),
+                valid.syncAggregate(), valid.signatureSlot());
+
+        assertFalse(processor.processFinalityUpdate(tampered));
+        assertEquals(100L, store.getFinalizedSlot());
+    }
+
+    @Test
+    void rejectsForgedExecutionPayload() {
+        LightClientFinalityUpdate valid = buildValidFinalityUpdate(950L, 951L);
+
+        // Keep the genuine execution branch but swap in a different execution payload
+        // (attacker-chosen state root). The branch now proves the original payload, not
+        // the forged one, so verifyExecutionBranch must reject it.
+        LightClientHeader fin = valid.finalizedHeader();
+        ExecutionPayloadHeader forged = TestUtil.dummyExecutionPayloadHeader();
+        byte[] forgedStateRoot = new byte[32];
+        forgedStateRoot[0] = (byte) 0xAB; // differs from the all-zero dummy state root
+        ExecutionPayloadHeader forgedPayload = new ExecutionPayloadHeader(
+                forged.parentHash(), forged.feeRecipient(), forgedStateRoot, forged.receiptsRoot(),
+                forged.logsBloom(), forged.prevRandao(), forged.blockNumber(), forged.gasLimit(),
+                forged.gasUsed(), forged.timestamp(), forged.extraData(), forged.baseFeePerGas(),
+                forged.blockHash(), forged.transactionsRoot(), forged.withdrawalsRoot(),
+                forged.blobGasUsed(), forged.excessBlobGas(), forged.depositRequestsRoot(),
+                forged.withdrawalRequestsRoot(), forged.consolidationRequestsRoot());
+        LightClientHeader forgedFinalized =
+                new LightClientHeader(fin.beacon(), forgedPayload, fin.executionBranch());
+
+        LightClientFinalityUpdate tampered = new LightClientFinalityUpdate(
+                valid.attestedHeader(), forgedFinalized, valid.finalityBranch(),
+                valid.syncAggregate(), valid.signatureSlot());
+
+        assertFalse(processor.processFinalityUpdate(tampered));
+        assertEquals(100L, store.getFinalizedSlot());
+    }
+
+    @Test
     void rejectsNullCommittee() {
         // Fresh store without initialization
         LightClientStore emptyStore = new LightClientStore();
@@ -137,9 +189,9 @@ class LightClientProcessorTest {
         long signatureSlot = 801L;
 
         // Build finalized header and its Merkle proof in attested state
-        BeaconBlockHeader finalizedBeacon = new BeaconBlockHeader(
-                finalizedSlot, 0L, new byte[32], new byte[32], new byte[32]);
-        byte[] finalizedRoot = finalizedBeacon.hashTreeRoot();
+        LightClientHeader finalizedHeader = TestUtil.consistentLightClientHeader(
+                finalizedSlot, 0L, new byte[32], new byte[32]);
+        byte[] finalizedRoot = finalizedHeader.beacon().hashTreeRoot();
 
         // Build depth-6 tree for finality branch
         int finalityLeafIdx = BeaconChainSpec.FINALIZED_ROOT_GINDEX % 64;
@@ -150,12 +202,10 @@ class LightClientProcessorTest {
 
         // The attested header's stateRoot is the Merkle root for the finality tree
         byte[] attestedStateRoot = finalityTree[1];
-        BeaconBlockHeader attestedBeacon = new BeaconBlockHeader(
-                signatureSlot, 0L, new byte[32], attestedStateRoot, new byte[32]);
-        LightClientHeader attestedHeader = TestUtil.dummyLightClientHeader(attestedBeacon);
-        LightClientHeader finalizedHeader = TestUtil.dummyLightClientHeader(finalizedBeacon);
+        LightClientHeader attestedHeader = TestUtil.consistentLightClientHeader(
+                signatureSlot, 0L, new byte[32], attestedStateRoot);
 
-        SyncAggregate agg = buildSyncAggregate(attestedBeacon, 512);
+        SyncAggregate agg = buildSyncAggregate(attestedHeader.beacon(), 512);
 
         // Build a next sync committee with corrupt branch
         byte[][] corruptCommitteeBranch = new byte[5][32];
@@ -212,10 +262,10 @@ class LightClientProcessorTest {
 
     private LightClientFinalityUpdate buildFinalityUpdateWithParticipation(
             long finalizedSlot, long signatureSlot, int participantCount) {
-        // Build finalized header
-        BeaconBlockHeader finalizedBeacon = new BeaconBlockHeader(
-                finalizedSlot, 0L, new byte[32], new byte[32], new byte[32]);
-        byte[] finalizedRoot = finalizedBeacon.hashTreeRoot();
+        // Build finalized header (execution payload genuinely committed to its body root)
+        LightClientHeader finalizedHeader = TestUtil.consistentLightClientHeader(
+                finalizedSlot, 0L, new byte[32], new byte[32]);
+        byte[] finalizedRoot = finalizedHeader.beacon().hashTreeRoot();
 
         // Build depth-6 tree for finality branch
         // The finalized root sits at gindex 105 in the state tree.
@@ -229,12 +279,10 @@ class LightClientProcessorTest {
 
         // The attested header's stateRoot must be the Merkle root
         byte[] attestedStateRoot = tree[1];
-        BeaconBlockHeader attestedBeacon = new BeaconBlockHeader(
-                signatureSlot, 0L, new byte[32], attestedStateRoot, new byte[32]);
-        LightClientHeader attestedHeader = TestUtil.dummyLightClientHeader(attestedBeacon);
-        LightClientHeader finalizedHeader = TestUtil.dummyLightClientHeader(finalizedBeacon);
+        LightClientHeader attestedHeader = TestUtil.consistentLightClientHeader(
+                signatureSlot, 0L, new byte[32], attestedStateRoot);
 
-        SyncAggregate agg = buildSyncAggregate(attestedBeacon, participantCount);
+        SyncAggregate agg = buildSyncAggregate(attestedHeader.beacon(), participantCount);
 
         return new LightClientFinalityUpdate(
                 attestedHeader, finalizedHeader, finalityBranch, agg, signatureSlot);

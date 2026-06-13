@@ -1040,6 +1040,11 @@ public class BeaconLightClient implements AutoCloseable {
                 return false;
             }
 
+            if (!LightClientProcessor.verifyExecutionBranch(bootstrap.header())) {
+                log.warn("[beacon] HTTP bootstrap execution branch invalid");
+                return false;
+            }
+
             store.initialize(bootstrap.header(), bootstrap.currentSyncCommittee());
             updateSyncState();
             log.info("[beacon] HTTP bootstrap complete, slot={}", bootstrap.header().beacon().slot());
@@ -1117,6 +1122,16 @@ public class BeaconLightClient implements AutoCloseable {
 
                             if (!branchValid) {
                                 log.warn("[beacon] Bootstrap sync committee branch invalid from {}", peer);
+                                if (remaining.decrementAndGet() == 0 && !winnerFuture.isDone()) {
+                                    winnerFuture.completeExceptionally(
+                                            new RuntimeException("All peers failed bootstrap"));
+                                }
+                                return;
+                            }
+
+                            if (!LightClientProcessor.verifyExecutionBranch(bootstrap.header())) {
+                                log.warn("[beacon] Bootstrap execution branch invalid from {}", peer);
+                                notifyPeerFailure(peer);
                                 if (remaining.decrementAndGet() == 0 && !winnerFuture.isDone()) {
                                     winnerFuture.completeExceptionally(
                                             new RuntimeException("All peers failed bootstrap"));
