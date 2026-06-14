@@ -70,6 +70,19 @@ source of every limitation.
   root changes every ~12 s slot and a heavy call that didn't finish in one block's window
   restarts cold against a new root.
 
+- **Gas meters reads too — and on a light node it meters *fetches*.** An `eth_call` is
+  "free" only in that it pays no ETH and persists nothing; it still runs the **same metered
+  EVM** as a real transaction. Gas is the EVM's *halting / metering* mechanism, not just a
+  fee: a Turing-complete call needs a ceiling or it could loop forever, and gas is also
+  *semantically visible* (`gasleft()`, CALL stipends, EIP-150's 63/64 rule), so the limit
+  can change what a call returns. So every `eth_call` runs under a gas limit (myotis uses a
+  30 M default when the caller gives none). On a **light node this doubles as a network
+  bound**: every gas-consuming state op (`SLOAD`, cold account access, a `CALL` into a
+  contract) is a snap **fetch — a round-trip**. So the gas ceiling caps how many peer
+  fetches one call can trigger — which is exactly why the 662-token BalanceChecker sweep
+  ends in `OutOfGas` rather than fetching forever. The gas limit is the per-call *total
+  work* bound; the §2.7 lane gate is the *concurrency* bound — complementary.
+
 ### 1.2 Phone CPU / runtime limits
 
 - **Device class drives the *experience*, not just correctness.** It functions across
@@ -255,7 +268,9 @@ Notes from measuring the unbounded version on-device:
   (30 M); the ~662-token sweep exceeds it and returns `OutOfGas` in ~700 ms **on a healthy
   pool** — a natural fast-fail, but only because batched prefetch gathered the state
   quickly. The work isn't skipped, so on a thin pool that same call is slow; the lane gate
-  is what keeps it from dragging the gating calls down with it.
+  is what keeps it from dragging the gating calls down with it. (The `OutOfGas` isn't a
+  payment thing — it's the gas *meter* hitting its ceiling, which on a light node also caps
+  the fetch count; see §1.1 "Gas meters reads too".)
 - **Token balances still may not render** (the sweep can't complete on a light node within
   any sane gas/time budget). The durable path to actually *display* them is a convergent,
   cached balance flow (pin one stable root so the proof cache accumulates across polls, or
