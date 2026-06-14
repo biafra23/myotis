@@ -1,11 +1,30 @@
 name: Desktop Installers
 
 # Builds native desktop installers for Linux, Windows and macOS with jpackage
-# (via the Compose Desktop Gradle plugin) and, on a version tag, attaches them to
-# the GitHub Release. Manual runs (workflow_dispatch) build + upload artifacts only.
+# (via the Compose Desktop Gradle plugin). On a version tag the installers are
+# attached to the GitHub Release; on pull requests (and manual dispatch) they are
+# uploaded as downloadable workflow artifacts only — no Release is published.
 on:
   push:
     tags: [ "v*" ]
+  pull_request:
+    # Only when something that can change the installers is touched — a full
+    # 4-OS jpackage matrix is expensive to run on every push.
+    paths:
+      - 'desktop-app/**'
+      - 'app/**'
+      - 'core/**'
+      - 'networking/**'
+      - 'consensus/**'
+      - 'myotis-evm/**'
+      - 'myotis-ens/**'
+      - 'jsonrpc-server/**'
+      - 'rpc-backend/**'
+      - 'gradle/**'
+      - 'gradle.properties'
+      - 'settings.gradle.kts'
+      - 'build.gradle.kts'
+      - '.github/workflows/desktop-release.yml'
   workflow_dispatch:
 
 jobs:
