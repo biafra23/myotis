@@ -275,6 +275,10 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     // ---------------------------------------------------------------------
 
     private final RLPxConnector connector;
+    /** Caps a HEAVY-lane EVM execution to ~half the live snap peers per concurrent snap
+     *  request, so a token sweep can't starve the gating calls that share the pool.
+     *  Initialised in the constructor (needs the connector for the live peer count). */
+    private final SnapLaneGate snapLaneGate;
     private final BeaconLightClient beaconLightClient;
     private final BeaconSyncState beaconSyncState;
     private final RpcLogger log;
@@ -468,6 +472,10 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                               RpcClock clock,
                               SnapQualitySink snapQuality) {
         this.connector = java.util.Objects.requireNonNull(connector, "connector");
+        // Heavy-lane snap concurrency cap = half the live snap peers (dynamic). The 30s
+        // wait is only a deadlock safety net — permits free as in-flight requests complete.
+        this.snapLaneGate = new SnapLaneGate(
+                () -> this.connector.activeSnapHandlers().size(), 30_000L);
         this.beaconLightClient = java.util.Objects.requireNonNull(beaconLightClient, "beaconLightClient");
         this.beaconSyncState = java.util.Objects.requireNonNull(beaconSyncState, "beaconSyncState");
         this.ccipGateway = java.util.Objects.requireNonNull(ccipGateway, "ccipGateway");
@@ -486,7 +494,14 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                             + "ms (caller deadline long past)");
                     return;
                 }
-                task.run();
+                // Mark the lane on the pool thread so snap fetches issued during this task
+                // know whether to acquire a heavy permit (see SnapLaneGate / EthHandlerSnapPeer).
+                SnapLaneGate.enterLane(!small);
+                try {
+                    task.run();
+                } finally {
+                    SnapLaneGate.clearLane();
+                }
             });
         };
     }
@@ -1326,7 +1341,8 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                                         chosen,
                                         () -> { rootDenied.add(chosen); rootServed.remove(chosen);
                                                 recordSnapQuality(chosen, false); },
-                                        () -> { rootServed.add(chosen); recordSnapQuality(chosen, true); });
+                                        () -> { rootServed.add(chosen); recordSnapQuality(chosen, true); },
+                                        snapLaneGate);
                             }
                             // Discovery phase (none proven yet): probed peer first (known to
                             // serve), then round-robin the rest of the ready snap set.
@@ -1337,7 +1353,8 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                                         pp,
                                         () -> { rootDenied.add(pp); rootServed.remove(pp);
                                                 recordSnapQuality(pp, false); },
-                                        () -> { rootServed.add(pp); recordSnapQuality(pp, true); });
+                                        () -> { rootServed.add(pp); recordSnapQuality(pp, true); },
+                                        snapLaneGate);
                             }
                             // activeSnapHandlers() already returns only ready, snap-negotiated,
                             // non-failed peers; drop the ones denied for this root.
@@ -2070,7 +2087,29 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             long headNum = anchor.number();
 
             long target = isTag ? headNum : pinned;
-            if (target > headNum) return "null";            // future/unknown block → eth null
+            if (target > headNum) {
+                // The pin is AHEAD of the preferred anchor. This is the NORMAL state on
+                // mobile, not an unknown block: eth_blockNumber advertises the CL
+                // optimistic number (advances every slot), while the snap-built /
+                // lastGood anchor trails it by the head build time (30-60s on a phone,
+                // i.e. several blocks). MetaMask pins reads to the number we just
+                // advertised, so denying it wedges the wallet's block tracker — observed
+                // live as eth_getBlockByNumber returning the "null" literal for 96% of
+                // polls (778 of 806), stalling tx tracking and the confirm screen.
+                // The beacon OPTIMISTIC payload is itself a light-client-verified anchor
+                // at/past the pin — re-anchor on it (its exec blockHash, via
+                // windowAnchoredToHash) and serve the block fully verified. Only a pin
+                // past even the optimistic number is genuinely future/unknown → "null".
+                // beaconSyncState is non-null (constructor requireNonNull), so read directly.
+                long optimisticNum = beaconSyncState.getOptimisticBlockNumber();
+                byte[] optimisticHash = beaconSyncState.getOptimisticBlockHash();
+                if (optimisticNum >= target && optimisticHash != null) {
+                    anchor = new HeaderAnchor(optimisticNum, null, optimisticHash);
+                    headNum = optimisticNum;
+                } else {
+                    return "null";          // beyond the verified chain tip → eth null
+                }
+            }
             long back = headNum - target;
             if (back >= BLOCK_LOOKBACK_MAX) return null;     // too far to verify cheaply → error
 

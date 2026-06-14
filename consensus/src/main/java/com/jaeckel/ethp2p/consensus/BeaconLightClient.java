@@ -90,24 +90,66 @@ public class BeaconLightClient implements AutoCloseable {
     // protocol they don't have. Remember and skip them.
     private final Set<String> peersNoLcUpdates = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
-    // Peers proven to serve catch-up, multiaddr -> lowest sync-committee period
-    // they served. Seeded from the CL peer cache at startup so a cold start can
-    // immediately prefer peers that actually retained the checkpoint period last
-    // time, instead of fanning out across discovery peers (most of which don't
-    // serve light-client updates at all). Updated live on every catch-up success.
-    private final Map<String, Long> provenCatchUpServers =
+    // Peers proven to serve catch-up, multiaddr -> {low, high} sync-committee period
+    // range they served. Seeded from the CL peer cache at startup so a cold start can
+    // immediately prefer peers that actually retained the period we need last time,
+    // instead of fanning out across discovery peers (most of which don't serve
+    // light-client updates at all). Updated live on every catch-up success. Tracking
+    // both ends (not just the floor) lets prioritization ask "does this peer's range
+    // cover period N?" instead of assuming monotonic-forward coverage from the floor.
+    private final Map<String, long[]> provenCatchUpRanges =
             new java.util.concurrent.ConcurrentHashMap<>();
-    /** Notified (multiaddr, servedPeriod) whenever a peer advances catch-up, for cache persistence. */
-    private volatile java.util.function.BiConsumer<String, Long> onCatchUpServed;
+    /** Notified (multiaddr, low, high) whenever a peer advances catch-up, for cache persistence. */
+    private volatile ServedRangeListener onCatchUpServed;
 
-    /** Seed proven catch-up servers (multiaddr -> lowest served period) from a cache. */
-    public void setProvenCatchUpServers(Map<String, Long> seed) {
-        if (seed != null) provenCatchUpServers.putAll(seed);
+    // Peers proven to serve a LightClientBootstrap, multiaddr -> the (deepest) checkpoint
+    // period they served. Seeded from the cache; also seeds lastBootstrapPeer so a cold
+    // start front-loads a peer that demonstrably retained the checkpoint committee.
+    private final Map<String, Long> provenBootstrapPeers =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    /** Notified (multiaddr, bootstrapPeriod) whenever a peer serves a bootstrap, for cache persistence. */
+    private volatile java.util.function.BiConsumer<String, Long> onBootstrapServed;
+
+    /** Listener for a peer that served catch-up across the period range {@code [low, high]}.
+     *  A 3-arg shape (Java has no {@code TriConsumer}) kept on plain types so the API stays
+     *  multiplatform-friendly (no {@code CompletableFuture}). */
+    @FunctionalInterface
+    public interface ServedRangeListener {
+        void accept(String peer, long low, long high);
     }
 
-    /** Set the callback persisting (multiaddr, servedPeriod) when a peer advances catch-up. */
-    public void setOnCatchUpServed(java.util.function.BiConsumer<String, Long> cb) {
+    /** Seed proven catch-up servers (multiaddr -> {low, high} served range) from a cache. */
+    public void setProvenCatchUpServers(Map<String, long[]> seed) {
+        if (seed == null) return;
+        // Defensive copy to a fixed length-2 array: the map is caller-owned and arrays are
+        // mutable, so storing references directly would let later mutation (or a short array)
+        // corrupt prioritization or throw AIOOBE on the r[0]/r[1] reads.
+        seed.forEach((ma, r) -> {
+            if (ma == null || r == null || r.length < 2) return;
+            provenCatchUpRanges.put(ma, new long[]{r[0], r[1]});
+        });
+    }
+
+    /** Set the callback persisting (multiaddr, low, high) when a peer advances catch-up. */
+    public void setOnCatchUpServed(ServedRangeListener cb) {
         this.onCatchUpServed = cb;
+    }
+
+    /** Seed proven bootstrap peers (multiaddr -> bootstrap period) from a cache. Also seeds
+     *  {@link #lastBootstrapPeer} (highest-period entry) so it is tried first on a cold start. */
+    public void setProvenBootstrapPeers(Map<String, Long> seed) {
+        if (seed == null || seed.isEmpty()) return;
+        provenBootstrapPeers.putAll(seed);
+        if (lastBootstrapPeer == null) {
+            provenBootstrapPeers.entrySet().stream()
+                    .max(Map.Entry.comparingByValue())
+                    .ifPresent(e -> lastBootstrapPeer = e.getKey());
+        }
+    }
+
+    /** Set the callback persisting (multiaddr, bootstrapPeriod) when a peer serves a bootstrap. */
+    public void setOnBootstrapServed(java.util.function.BiConsumer<String, Long> cb) {
+        this.onBootstrapServed = cb;
     }
 
     // Peers whose Identify confirmed light_client protocol support — dialed first by
@@ -327,14 +369,26 @@ public class BeaconLightClient implements AutoCloseable {
         t.start();
     }
 
-    /** Remember a peer that served catch-up from {@code period} (lowest wins) and persist it. */
-    private void recordCatchUpServer(String peer, long period) {
+    /** Remember a peer that served catch-up across {@code [low, high]} (range widens) and persist it. */
+    private void recordCatchUpServer(String peer, long low, long high) {
         if (peer == null) return;
-        provenCatchUpServers.merge(peer, period, Math::min);
-        java.util.function.BiConsumer<String, Long> cb = onCatchUpServed;
+        provenCatchUpRanges.merge(peer, new long[]{low, high},
+                (a, b) -> new long[]{Math.min(a[0], b[0]), Math.max(a[1], b[1])});
+        ServedRangeListener cb = onCatchUpServed;
+        if (cb != null) {
+            try { cb.accept(peer, low, high); }
+            catch (Exception e) { log.debug("[beacon] onCatchUpServed failed: {}", e.getMessage()); }
+        }
+    }
+
+    /** Remember a peer that served a LightClientBootstrap for {@code period} (deepest wins) and persist it. */
+    private void recordBootstrapServer(String peer, long period) {
+        if (peer == null) return;
+        provenBootstrapPeers.merge(peer, period, Math::max);
+        java.util.function.BiConsumer<String, Long> cb = onBootstrapServed;
         if (cb != null) {
             try { cb.accept(peer, period); }
-            catch (Exception e) { log.debug("[beacon] onCatchUpServed failed: {}", e.getMessage()); }
+            catch (Exception e) { log.debug("[beacon] onBootstrapServed failed: {}", e.getMessage()); }
         }
     }
 
@@ -508,7 +562,8 @@ public class BeaconLightClient implements AutoCloseable {
             if (clPeerMultiaddrs.size() > MAX_CL_PEERS) {
                 for (int i = clPeerMultiaddrs.size() - 1; i >= 0; i--) {
                     String cand = clPeerMultiaddrs.get(i);
-                    if (!provenCatchUpServers.containsKey(cand)
+                    if (!provenCatchUpRanges.containsKey(cand)
+                            && !provenBootstrapPeers.containsKey(cand)
                             && !provenLightClient.contains(cand)) {
                         clPeerMultiaddrs.remove(i);
                         knownPeerAddrs.remove(cand);
@@ -1149,6 +1204,11 @@ public class BeaconLightClient implements AutoCloseable {
                                     winnerFuture.complete(response);
                                     successPeer = peer;
                                     lastBootstrapPeer = peer;
+                                    // Remember (and persist) that this peer served the
+                                    // bootstrap for this checkpoint period, so a restart
+                                    // front-loads it as a proven light-client server.
+                                    recordBootstrapServer(peer, BeaconChainSpec.computeSyncCommitteePeriod(
+                                            bootstrap.header().beacon().slot()));
                                     // Cache the bootstrap so we can relay it to any peer
                                     // that asks us for the same block root.
                                     p2pService.cacheBootstrap(checkpointRoot, response);
@@ -1293,10 +1353,21 @@ public class BeaconLightClient implements AutoCloseable {
         // updates_by_range. These are the peers that actually retained light-client
         // data; everything else is a fork-matched node that probably doesn't serve it.
         java.util.LinkedHashSet<String> priority = new java.util.LinkedHashSet<>();
+        // Tier 1: proven last session to serve a range that actually COVERS this period.
+        // The range check (not just floor <= period) avoids the false positive where a peer
+        // that only served [100,110] was assumed to cover period 900.
         for (String p : capable) {
-            Long sp = provenCatchUpServers.get(p);
-            if (sp != null && sp <= bootstrapPeriod) priority.add(p);
+            long[] r = provenCatchUpRanges.get(p);
+            if (r != null && r[0] <= bootstrapPeriod && bootstrapPeriod <= r[1]) priority.add(p);
         }
+        // Tier 2: proven to serve a bootstrap at/below this period — it retained at least
+        // the checkpoint committee that deep, a strong signal it also serves catch-up here.
+        for (String p : capable) {
+            if (priority.contains(p)) continue;
+            Long bp = provenBootstrapPeers.get(p);
+            if (bp != null && bp <= bootstrapPeriod) priority.add(p);
+        }
+        // Tier 3: Identify-confirmed light-client support / advertises updates_by_range.
         for (String p : capable) {
             if (priority.contains(p)) continue;
             if (provenLightClient.contains(p)
@@ -1453,8 +1524,9 @@ public class BeaconLightClient implements AutoCloseable {
                         // serves catch-up from servedFromPeriod. Record it NOW (not
                         // after the whole response, which can be dozens of updates
                         // ≈ minutes of BLS verifies) so the proof survives even if
-                        // we restart mid-catch-up.
-                        recordCatchUpServer(peer, servedFromPeriod);
+                        // we restart mid-catch-up. The range is widened to the deepest
+                        // period actually delivered after the loop below.
+                        recordCatchUpServer(peer, servedFromPeriod, servedFromPeriod);
                     }
                     // Rotate BEFORE updateSyncState so the committee-period pushed to
                     // BeaconSyncState reflects the post-rotation value — otherwise
@@ -1471,6 +1543,12 @@ public class BeaconLightClient implements AutoCloseable {
             } catch (Exception e) {
                 log.debug("[beacon] Failed to decode/process catch-up update: {}", e.getMessage());
             }
+        }
+        if (applied > 0) {
+            // Widen the served range to the deepest period this peer actually delivered.
+            // Read the store (the source of truth) rather than computing start+applied-1,
+            // which would mis-count if any update in the batch was skipped as inapplicable.
+            recordCatchUpServer(peer, servedFromPeriod, store.getCurrentSyncCommitteePeriod());
         }
         return applied;
     }
