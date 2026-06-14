@@ -146,13 +146,10 @@ public final class DaemonRuntime implements AutoCloseable {
 
     public void start() throws Exception {
         final NetworkConfig network = config.network();
-        final int port = config.port();
-        final boolean gossipsubEnabled = config.gossipsubEnabled();
-        final Path socketPath = config.socketPath();
         final Path lockPath = config.lockPath();
 
         log.info("=== ethp2p Daemon ({}) ===", network.name());
-        log.info("IPC socket: {}", socketPath);
+        log.info("IPC socket: {}", config.socketPath());
 
         // 0. Acquire exclusive lock file — auto-released on process death (even kill -9)
         lockChannel = FileChannel.open(lockPath,
@@ -163,6 +160,27 @@ public final class DaemonRuntime implements AutoCloseable {
             lockChannel = null;
             throw new DaemonStartException("Daemon already running (lock held: " + lockPath + ")");
         }
+
+        // From here the lock is held. Any failure in the remaining startup MUST release it
+        // (and close whatever was partially started) rather than leak it. The CLI tolerated a
+        // leak because a failed start ended in System.exit and the OS dropped the lock; the
+        // embedded GUI process survives, so a leaked lock would make every retry in the same
+        // session fail with "Daemon already running".
+        boolean ok = false;
+        try {
+            startLocked();
+            ok = true;
+        } finally {
+            if (!ok) close();
+        }
+    }
+
+    /** Startup steps that run while the daemon lock is held (see {@link #start()}). */
+    private void startLocked() throws Exception {
+        final NetworkConfig network = config.network();
+        final int port = config.port();
+        final boolean gossipsubEnabled = config.gossipsubEnabled();
+        final Path socketPath = config.socketPath();
 
         // 1. Load or generate node key
         NodeKey nodeKey = NodeKey.loadOrGenerate(config.nodeKeyFile());
@@ -183,8 +201,23 @@ public final class DaemonRuntime implements AutoCloseable {
                 () -> dnsResolver.resolveAllFromStrings(network.elEnrTreeUrls(), dnsDeadline));
         CompletableFuture<List<Enr>> clFuture = CompletableFuture.supplyAsync(
                 () -> dnsResolver.resolveAllFromStrings(network.clEnrTreeUrls(), dnsDeadline));
-        List<Enr> dnsElEnrs = elFuture.join();
-        List<Enr> dnsClEnrs = clFuture.join();
+        // The resolver is contractually best-effort (returns empty on timeout / bad TXT /
+        // bad signature), but guard the joins anyway so an unexpected resolver failure can
+        // never abort startup — DNS discovery is an optimization, not a precondition.
+        List<Enr> dnsElEnrs;
+        try {
+            dnsElEnrs = elFuture.join();
+        } catch (Exception e) {
+            log.warn("[main] DNS EL ENR resolution failed; continuing without it: {}", e.getMessage());
+            dnsElEnrs = List.of();
+        }
+        List<Enr> dnsClEnrs;
+        try {
+            dnsClEnrs = clFuture.join();
+        } catch (Exception e) {
+            log.warn("[main] DNS CL ENR resolution failed; continuing without it: {}", e.getMessage());
+            dnsClEnrs = List.of();
+        }
 
         List<InetSocketAddress> mergedBootnodes = new ArrayList<>(network.bootnodes());
         // Dedupe by (host, port) so trees that overlap with the hardcoded list
@@ -238,7 +271,10 @@ public final class DaemonRuntime implements AutoCloseable {
         // ones first (mirrors NodeService's snapDialRank ordering).
         cached.sort(java.util.Comparator.comparingInt(DaemonRuntime::snapDialRank));
         for (PeerCache.CachedPeer peer : cached) {
-            String peerKey = peer.address().getAddress().getHostAddress()
+            // getHostString() never NPEs on an unresolved address (unlike
+            // getAddress().getHostAddress()); for the IP-literal cache keys it returns the
+            // same string, so the attempted/backoff dedup key is unchanged.
+            String peerKey = peer.address().getHostString()
                     + ":" + peer.address().getPort();
             attempted.add(peerKey);
             try {
@@ -348,7 +384,7 @@ public final class DaemonRuntime implements AutoCloseable {
                     ? "Cannot bind UDP port " + port + ": " + cause.getMessage()
                     + "\nIs another instance already running?"
                     : "Failed to start discovery: " + e.getMessage();
-            close();
+            // Cleanup is handled by start()'s finally (which calls close()).
             throw new DaemonStartException(msg);
         }
         log.info("[daemon] discv4 started on UDP port {}. Waiting for peers...", port);
@@ -494,11 +530,10 @@ public final class DaemonRuntime implements AutoCloseable {
         try {
             server.start();
         } catch (BindException e) {
-            close();
+            // Cleanup is handled by start()'s finally (which calls close()).
             throw new DaemonStartException("Cannot bind IPC socket " + socketPath + ": " + e.getMessage()
                     + "\nIs another instance already running?");
         } catch (Exception e) {
-            close();
             throw new DaemonStartException("Failed to start IPC server: " + e.getMessage());
         }
 

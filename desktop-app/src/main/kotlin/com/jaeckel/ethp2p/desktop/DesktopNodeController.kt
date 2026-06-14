@@ -59,11 +59,12 @@ class DesktopNodeController(private val scope: CoroutineScope) {
         if (current == NodeStatus.RUNNING || current == NodeStatus.STARTING) return
         _state.value = NodeUiState(status = NodeStatus.STARTING, network = networkName)
         scope.launch(Dispatchers.IO) {
+            var rt: DaemonRuntime? = null
             try {
                 val network = NetworkConfig.byName(networkName)
                 clGenesisTime = network.clGenesisTime()
                 val config = AppPaths.daemonConfig(network, DEFAULT_PORT, gossipsub)
-                val rt = DaemonRuntime(config)
+                rt = DaemonRuntime(config)
                 rt.start()
                 runtime = rt
                 _state.value = _state.value.copy(status = NodeStatus.RUNNING)
@@ -71,6 +72,13 @@ class DesktopNodeController(private val scope: CoroutineScope) {
                 startPolling()
             } catch (e: Throwable) {
                 log.error("Failed to start embedded daemon", e)
+                // DaemonRuntime.start() already self-cleans on failure; close() again here is
+                // an idempotent no-op, and covers the case where rt was created but start()
+                // threw before its own guard engaged.
+                try {
+                    rt?.close()
+                } catch (ignored: Throwable) {
+                }
                 runtime = null
                 _state.value = _state.value.copy(
                     status = NodeStatus.ERROR,
