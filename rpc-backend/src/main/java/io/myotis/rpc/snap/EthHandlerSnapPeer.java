@@ -4,6 +4,7 @@ import com.jaeckel.ethp2p.networking.eth.EthHandler;
 import com.jaeckel.ethp2p.networking.snap.messages.AccountRangeMessage;
 import com.jaeckel.ethp2p.networking.snap.messages.ByteCodesMessage;
 import com.jaeckel.ethp2p.networking.snap.messages.StorageRangesMessage;
+import io.myotis.rpc.SnapLaneGate;
 import io.myotis.evm.world.SnapPeer;
 import org.apache.tuweni.bytes.Bytes;
 import org.apache.tuweni.bytes.Bytes32;
@@ -32,15 +33,23 @@ public final class EthHandlerSnapPeer implements SnapPeer {
     private final EthHandler handler;
     private final Runnable onRootUnavailable;
     private final Runnable onRootServed;
+    /** Optional concurrency gate: when the current EVM thread is the HEAVY lane, each snap
+     *  request holds a permit so a sweep can't use more than its share of the peer pool.
+     *  Null = no gating (small/legacy callers). */
+    private final SnapLaneGate laneGate;
 
     public EthHandlerSnapPeer(EthHandler handler) {
-        this(handler, null, null);
+        this(handler, null, null, null);
     }
 
     /** @param onRootUnavailable run when the oracle reports this peer can't serve the
      *  current state root, so the routing supplier can deprioritize it for this head. */
     public EthHandlerSnapPeer(EthHandler handler, Runnable onRootUnavailable) {
-        this(handler, onRootUnavailable, null);
+        this(handler, onRootUnavailable, null, null);
+    }
+
+    public EthHandlerSnapPeer(EthHandler handler, Runnable onRootUnavailable, Runnable onRootServed) {
+        this(handler, onRootUnavailable, onRootServed, null);
     }
 
     /**
@@ -52,10 +61,12 @@ public final class EthHandlerSnapPeer implements SnapPeer {
      *  proof fires {@code onRootServed}; an empty one is treated by the oracle as
      *  no-state and ultimately fires {@code onRootUnavailable}.
      */
-    public EthHandlerSnapPeer(EthHandler handler, Runnable onRootUnavailable, Runnable onRootServed) {
+    public EthHandlerSnapPeer(EthHandler handler, Runnable onRootUnavailable,
+                              Runnable onRootServed, SnapLaneGate laneGate) {
         this.handler = handler;
         this.onRootUnavailable = onRootUnavailable;
         this.onRootServed = onRootServed;
+        this.laneGate = laneGate;
     }
 
     @Override
@@ -73,6 +84,20 @@ public final class EthHandlerSnapPeer implements SnapPeer {
 
     @Override
     public CompletableFuture<List<Bytes>> getTrieNodes(Bytes32 stateRoot, List<PathSet> paths) {
+        // Heavy-lane permit: blocks here (on the EVM pool thread that issued this fetch)
+        // until a slot frees, capping how many snap peers a sweep uses at once. Small-lane
+        // callers and the no-gate constructors return false immediately (unthrottled).
+        final boolean permit = laneGate != null && laneGate.acquireIfHeavy();
+        try {
+            CompletableFuture<List<Bytes>> result = doGetTrieNodes(stateRoot, paths);
+            return permit ? result.whenComplete((r, e) -> laneGate.release()) : result;
+        } catch (RuntimeException ex) {
+            if (permit) laneGate.release();
+            throw ex;
+        }
+    }
+
+    private CompletableFuture<List<Bytes>> doGetTrieNodes(Bytes32 stateRoot, List<PathSet> paths) {
         List<CompletableFuture<List<Bytes>>> perSet = new ArrayList<>(paths.size());
         for (PathSet p : paths) {
             Bytes32 accountHash = Bytes32.wrap(p.accountPath());
@@ -123,7 +148,14 @@ public final class EthHandlerSnapPeer implements SnapPeer {
 
     @Override
     public CompletableFuture<List<Bytes>> getByteCodes(List<Bytes32> hashes) {
-        return handler.requestByteCodesAsync(hashes)
-                .thenApply(ByteCodesMessage.DecodeResult::codes);
+        final boolean permit = laneGate != null && laneGate.acquireIfHeavy();
+        try {
+            CompletableFuture<List<Bytes>> result = handler.requestByteCodesAsync(hashes)
+                    .thenApply(ByteCodesMessage.DecodeResult::codes);
+            return permit ? result.whenComplete((r, e) -> laneGate.release()) : result;
+        } catch (RuntimeException ex) {
+            if (permit) laneGate.release();
+            throw ex;
+        }
     }
 }
