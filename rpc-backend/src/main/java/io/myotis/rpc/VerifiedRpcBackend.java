@@ -3,6 +3,7 @@ package io.myotis.rpc;
 import com.jaeckel.ethp2p.consensus.BeaconLightClient;
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
 import com.jaeckel.ethp2p.consensus.proof.OrderedTrieRoot;
+import com.jaeckel.ethp2p.core.trie.MerklePatriciaProofVerifier;
 import com.jaeckel.ethp2p.core.types.BlockHeader;
 import com.jaeckel.ethp2p.networking.eth.EthHandler;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockBodiesMessage;
@@ -16,6 +17,7 @@ import io.myotis.rpc.snap.EthHandlerSnapPeer;
 import org.apache.tuweni.bytes.Bytes;
 import org.apache.tuweni.bytes.Bytes32;
 import org.apache.tuweni.crypto.Hash;
+import org.apache.tuweni.rlp.RLP;
 
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
@@ -650,6 +652,11 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     @Override
     public byte[] getStorageAt(byte[] address, byte[] slot, String block) {
         return rpcStorageAt(address, slot, block);
+    }
+
+    @Override
+    public String getProof(byte[] address, java.util.List<byte[]> storageKeys, String block) {
+        return rpcGetProof(address, storageKeys, block);
     }
 
     @Override
@@ -1626,6 +1633,167 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             if (isStateUnavailable(e)) evictUnservableHead(h);
             return null;
         }
+    }
+
+    /**
+     * eth_getProof (EIP-1186): build the account proof + per-slot storage proofs
+     * against the verified head's beacon-anchored state root, re-verify every proof
+     * here (inclusion or exclusion), and emit the standard JSON object plus a
+     * {@code myotisVerification} block. Returns null (→ router errors) when the head
+     * can't be served verified or any proof fails to verify — a fabricated or
+     * unverifiable proof is never returned.
+     *
+     * <p>All values come from the PROOF-VERIFIED trie nodes (account leaf for
+     * balance/nonce/storageRoot/codeHash; storage leaves for slot values), never a
+     * peer's slim body — the same anti-forgery stance as get-account/get-storage.
+     */
+    private String rpcGetProof(byte[] address, java.util.List<byte[]> storageKeys, String block) {
+        RpcCallContext h = verifiedHeadFor(block);
+        if (h == null || address == null || address.length != 20) return null;
+        java.util.List<byte[]> keys = storageKeys != null ? storageKeys : java.util.List.of();
+        for (byte[] k : keys) {
+            if (k == null || k.length != 32) return null;  // malformed key → error, don't guess
+        }
+        Bytes32 stateRoot = Bytes32.wrap(h.blockCtx().stateRoot());
+        Bytes addr = Bytes.wrap(address);
+        Bytes32 accountHash = Hash.keccak256(addr);
+        try {
+            // --- Account proof -------------------------------------------------
+            com.jaeckel.ethp2p.networking.snap.messages.AccountRangeMessage.DecodeResult acct =
+                    connector.requestAccount(addr, stateRoot).get(RPC_ACCOUNT_TIMEOUT_SEC, TimeUnit.SECONDS);
+            java.util.List<Bytes> accountProof = acct.proof();
+            MerklePatriciaProofVerifier.Result accRes =
+                    MerklePatriciaProofVerifier.verify(stateRoot, accountHash.toArrayUnsafe(), accountProof);
+
+            java.math.BigInteger balance;
+            long nonce;
+            Bytes32 storageRoot;
+            Bytes32 codeHash;
+            if (accRes instanceof MerklePatriciaProofVerifier.Result.Found f) {
+                AccountLeaf leaf = decodeAccountLeaf(f.value());
+                if (leaf == null) return null;
+                balance = leaf.balance();
+                nonce = leaf.nonce();
+                storageRoot = leaf.storageRoot();
+                codeHash = leaf.codeHash();
+            } else if (accRes instanceof MerklePatriciaProofVerifier.Result.Absent) {
+                balance = java.math.BigInteger.ZERO;
+                nonce = 0L;
+                storageRoot = MerklePatriciaProofVerifier.EMPTY_TRIE_ROOT;
+                codeHash = Bytes32.wrap(EMPTY_CODE_HASH);
+            } else {
+                log.info("[rpc] eth_getProof: account proof invalid for " + addr.toShortHexString()
+                        + ": " + ((MerklePatriciaProofVerifier.Result.Invalid) accRes).reason());
+                return null;  // never serve an unverifiable proof
+            }
+
+            // --- Storage proofs ------------------------------------------------
+            // A slot in an empty storage trie (EOA, fresh contract, or absent account)
+            // is provably zero with no trie to query — short-circuit the network call
+            // and return the canonical empty proof, as Geth does.
+            boolean emptyStorage = storageRoot.equals(MerklePatriciaProofVerifier.EMPTY_TRIE_ROOT);
+            StringBuilder storageSb = new StringBuilder("[");
+            for (int i = 0; i < keys.size(); i++) {
+                Bytes keyBytes = Bytes.wrap(keys.get(i));
+                java.math.BigInteger value = java.math.BigInteger.ZERO;
+                java.util.List<Bytes> slotProof = java.util.List.of();
+                if (!emptyStorage) {
+                    Bytes32 keyHash = Hash.keccak256(keyBytes);
+                    com.jaeckel.ethp2p.networking.snap.messages.StorageRangesMessage.DecodeResult sr =
+                            connector.requestStorage(addr, keyHash, stateRoot)
+                                    .get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
+                    slotProof = sr.proof();
+                    MerklePatriciaProofVerifier.Result slotRes =
+                            MerklePatriciaProofVerifier.verify(storageRoot, keyHash.toArrayUnsafe(), slotProof);
+                    if (slotRes instanceof MerklePatriciaProofVerifier.Result.Found sf) {
+                        // Storage leaf value is RLP(bytes); the verifier already stripped the
+                        // RLP header, so this is the big-endian value with leading zeros trimmed.
+                        value = sf.value().isEmpty()
+                                ? java.math.BigInteger.ZERO
+                                : new java.math.BigInteger(1, sf.value().toArrayUnsafe());
+                    } else if (!(slotRes instanceof MerklePatriciaProofVerifier.Result.Absent)) {
+                        log.info("[rpc] eth_getProof: storage proof invalid for slot "
+                                + keyBytes.toShortHexString() + ": "
+                                + ((MerklePatriciaProofVerifier.Result.Invalid) slotRes).reason());
+                        return null;
+                    }
+                }
+                if (i > 0) storageSb.append(",");
+                storageSb.append("{\"key\":\"").append(keyBytes.toHexString()).append("\"")
+                        .append(",\"value\":\"").append(quantity(value)).append("\"")
+                        .append(",\"proof\":").append(proofArray(slotProof)).append("}");
+            }
+            storageSb.append("]");
+
+            // --- Assemble EIP-1186 object + Myotis verification metadata -------
+            StringBuilder sb = new StringBuilder("{");
+            sb.append("\"address\":\"").append(addr.toHexString()).append("\"");
+            sb.append(",\"accountProof\":").append(proofArray(accountProof));
+            sb.append(",\"balance\":\"").append(quantity(balance)).append("\"");
+            sb.append(",\"codeHash\":\"").append(codeHash.toHexString()).append("\"");
+            sb.append(",\"nonce\":\"").append(quantity(nonce)).append("\"");
+            sb.append(",\"storageHash\":\"").append(storageRoot.toHexString()).append("\"");
+            sb.append(",\"storageProof\":").append(storageSb);
+            // Non-standard: lets a Myotis-aware client confirm the stateRoot these proofs
+            // anchor to was itself beacon (sync-committee) verified — a vanilla client
+            // verifying only the MPT path still has to trust the root's provenance.
+            sb.append(",\"myotisVerification\":{")
+                    .append("\"beaconVerified\":").append(h.beaconVerified())
+                    .append(",\"blockNumber\":").append(h.blockNumber())
+                    .append(",\"stateRoot\":\"").append(stateRoot.toHexString()).append("\"")
+                    .append("}");
+            sb.append("}");
+            return sb.toString();
+        } catch (Exception e) {
+            log.info("[rpc] eth_getProof -> error: " + unwrap(e));
+            if (isStateUnavailable(e)) evictUnservableHead(h);
+            return null;
+        }
+    }
+
+    /** Proof-verified account leaf fields, decoded from RLP[nonce, balance, storageRoot, codeHash]. */
+    private record AccountLeaf(long nonce, java.math.BigInteger balance,
+                               Bytes32 storageRoot, Bytes32 codeHash) {}
+
+    /** Decode an account leaf {@code RLP[nonce, balance, storageRoot, codeHash]}, or null. */
+    private static AccountLeaf decodeAccountLeaf(Bytes accountRlp) {
+        if (accountRlp == null || accountRlp.isEmpty()) return null;
+        try {
+            long[] nonce = new long[1];
+            java.math.BigInteger[] balance = new java.math.BigInteger[1];
+            Bytes32[] storageRoot = new Bytes32[1];
+            Bytes32[] codeHash = new Bytes32[1];
+            RLP.decodeList(accountRlp, reader -> {
+                Bytes nonceBytes = reader.readValue();
+                nonce[0] = nonceBytes.isEmpty() ? 0L : nonceBytes.toLong();
+                Bytes balBytes = reader.readValue();
+                balance[0] = balBytes.isEmpty()
+                        ? java.math.BigInteger.ZERO
+                        : new java.math.BigInteger(1, balBytes.toArrayUnsafe());
+                storageRoot[0] = Bytes32.leftPad(reader.readValue());
+                codeHash[0] = Bytes32.leftPad(reader.readValue());
+                return null;
+            });
+            return new AccountLeaf(nonce[0], balance[0], storageRoot[0], codeHash[0]);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** JSON array of 0x-hex RLP trie nodes. */
+    private static String proofArray(java.util.List<Bytes> nodes) {
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < nodes.size(); i++) {
+            if (i > 0) sb.append(",");
+            sb.append("\"").append(nodes.get(i).toHexString()).append("\"");
+        }
+        return sb.append("]").toString();
+    }
+
+    /** Ethereum JSON-RPC QUANTITY: minimal hex, no leading zeros, 0 -> "0x0". */
+    private static String quantity(long v) { return "0x" + Long.toHexString(v); }
+    private static String quantity(java.math.BigInteger v) {
+        return v.signum() == 0 ? "0x0" : "0x" + v.toString(16);
     }
 
     /** True iff the throwable chain carries the oracle's "no connected snap peer serves

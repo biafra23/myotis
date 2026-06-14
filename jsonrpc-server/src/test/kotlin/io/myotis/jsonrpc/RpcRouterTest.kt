@@ -47,6 +47,13 @@ class RpcRouterTest {
         override fun getStorageAt(address: ByteArray, slot: ByteArray, block: String): ByteArray? {
             lastSlot = slot; return storage
         }
+        var lastProofAddr: ByteArray? = null
+        var lastProofKeys: List<ByteArray>? = null
+        var lastProofBlock: String? = null
+        var proofJson: String? = null
+        override fun getProof(address: ByteArray, storageKeys: List<ByteArray>, block: String): String? {
+            lastProofAddr = address; lastProofKeys = storageKeys; lastProofBlock = block; return proofJson
+        }
         var lastRawTx: ByteArray? = null
         var txHash: ByteArray? = null
         override fun sendRawTransaction(rawTx: ByteArray): ByteArray? {
@@ -215,6 +222,53 @@ class RpcRouterTest {
     @Test fun getStorageAt_backendNull_fallsThrough() {
         assertTrue(hasError(route(FakeBackend(storage = null),
             """{"jsonrpc":"2.0","id":1,"method":"eth_getStorageAt","params":["0xabc0000000000000000000000000000000000001","0x1"]}""")))
+    }
+
+    // ---- eth_getProof ---------------------------------------------------------------
+
+    @Test fun getProof_verified_embedsObject_andDecodesAddrKeysBlock() {
+        val b = FakeBackend().apply {
+            proofJson = """{"address":"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "balance":"0x0","nonce":"0x1","codeHash":"0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+                "storageHash":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+                "accountProof":["0xabcd"],"storageProof":[{"key":"0x00","value":"0x2a","proof":["0xbeef"]}]}"""
+        }
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_getProof",
+            "params":["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",["0x0","0x7b"],"latest"]}""")
+        val obj = json.parseToJsonElement(resp).jsonObject["result"]!!.jsonObject
+        assertEquals("0x1", obj["nonce"]!!.jsonPrimitive.content)            // verified object passed through
+        assertEquals(1, obj["storageProof"]!!.jsonArray.size)
+        assertEquals(20, b.lastProofAddr!!.size)
+        assertEquals(0xA0.toByte(), b.lastProofAddr!![0])
+        assertEquals("latest", b.lastProofBlock)
+        // both slot keys decoded + left-padded to 32 bytes
+        assertEquals(2, b.lastProofKeys!!.size)
+        assertArrayEquals(ByteArray(32), b.lastProofKeys!![0])               // "0x0"
+        assertArrayEquals(ByteArray(32).also { it[31] = 0x7b }, b.lastProofKeys!![1])
+    }
+
+    @Test fun getProof_noStorageKeys_passesEmptyList() {
+        val b = FakeBackend().apply { proofJson = """{"address":"0x00","accountProof":[],"storageProof":[]}""" }
+        route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_getProof",
+            "params":["0xabc0000000000000000000000000000000000001",[]]}""")
+        assertTrue(b.lastProofKeys!!.isEmpty())
+        assertEquals("latest", b.lastProofBlock)                             // block defaults when absent
+    }
+
+    @Test fun getProof_malformedSlotKey_fallsThrough() {
+        val b = FakeBackend().apply { proofJson = """{"address":"0x00"}""" }
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_getProof",
+            "params":["0xabc0000000000000000000000000000000000001",["0xZZ"]]}""")
+        assertTrue(hasError(resp))
+        assertNull(b.lastProofKeys)                                          // backend never invoked
+    }
+
+    @Test fun getProof_cannotVerify_errorsRetryable() {
+        val resp = route(FakeBackend(),  // proofJson null → can't serve verified → strict error
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getProof",
+               "params":["0xabc0000000000000000000000000000000000001",["0x0"]]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32000, errorCode(resp))                                // implemented, retryable — not -32601
     }
 
     @Test fun sendRawTransaction_decodesRaw_andReturnsHashAsData() {

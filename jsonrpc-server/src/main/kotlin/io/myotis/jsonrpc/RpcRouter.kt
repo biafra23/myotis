@@ -41,7 +41,7 @@ class RpcRouter(
          *  serve this verified at all" (-32601). Keep in sync with tryVerified's cases. */
         private val VERIFIED_METHODS = setOf(
             "eth_chainId", "net_version", "eth_blockNumber", "eth_call", "eth_getBalance",
-            "eth_getTransactionCount", "eth_getCode", "eth_getStorageAt",
+            "eth_getTransactionCount", "eth_getCode", "eth_getStorageAt", "eth_getProof",
             "eth_sendRawTransaction", "eth_getTransactionReceipt", "eth_getBlockByNumber",
             "eth_gasPrice", "eth_maxPriorityFeePerGas", "eth_feeHistory", "eth_estimateGas",
             "eth_getTransactionByHash", "web3_clientVersion",
@@ -180,6 +180,22 @@ class RpcRouter(
                 val block = p.blockTag(2)
                 val v = withContext(Dispatchers.IO) { b.getStorageAt(addr, slot, block) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexData(v)))
+            }
+            "eth_getProof" -> {
+                val p = root.params()
+                val addr = (p?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
+                // params[1] is an array of storage keys (QUANTITY or 32-byte DATA);
+                // each is normalized to a left-padded 32-byte key. A present-but-
+                // non-array, or any malformed key, falls through rather than guessing.
+                val keysElem = p?.getOrNull(1)
+                val keys: List<ByteArray> = when (keysElem) {
+                    null, is JsonNull -> emptyList()
+                    is JsonArray -> keysElem.map { it.asWord32() ?: return null }
+                    else -> return null
+                }
+                val block = p.blockTag(2)
+                val proofJson = withContext(Dispatchers.IO) { b.getProof(addr, keys, block) } ?: return null
+                resultEnvelope(id, json.parseToJsonElement(proofJson))
             }
             "eth_sendRawTransaction" -> {
                 val raw = (root.params()?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null

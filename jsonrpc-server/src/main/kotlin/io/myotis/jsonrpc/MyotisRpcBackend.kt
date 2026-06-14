@@ -60,6 +60,21 @@ interface MyotisRpcBackend {
     fun getStorageAt(address: ByteArray, slot: ByteArray, block: String): ByteArray?
 
     /**
+     * eth_getProof (EIP-1186): a pre-built JSON object string carrying the account's
+     * {balance, nonce, codeHash, storageHash}, the {@code accountProof} (RLP trie
+     * nodes proving the account against the verified state root), and one
+     * {@code storageProof} entry {key,value,proof[]} per requested 32-byte
+     * [storageKeys] slot. The proofs and values are extracted from the SNAP-served
+     * trie nodes and re-verified here against the beacon-anchored state root — an
+     * absent account/slot yields the canonical empty/zero values with its exclusion
+     * proof. Returns Kotlin null when it can't be served verified (not synced, no
+     * snap peer, or a historical block the peers have pruned), so the router errors
+     * rather than emitting an unverified or fabricated proof. A JSON string keeps the
+     * nested proof arrays host-built (no array assembly in the router).
+     */
+    fun getProof(address: ByteArray, storageKeys: List<ByteArray>, block: String): String? = null
+
+    /**
      * eth_sendRawTransaction: gossip an already-signed [rawTx] to the devp2p
      * network and return its hash (keccak256 of the raw bytes), or null if it
      * couldn't be broadcast (no peer) so the router can fall back to the proxy.
