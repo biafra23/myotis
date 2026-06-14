@@ -503,8 +503,12 @@ public final class Main {
         // Prefer peers proven to serve catch-up last session (seeded with the
         // period they served), and persist new ones, so restarts target peers
         // that actually retain the checkpoint period instead of discovery noise.
-        beaconLightClient.setProvenCatchUpServers(clPeerCache.servedPeriods());
+        beaconLightClient.setProvenCatchUpServers(clPeerCache.servedRanges());
         beaconLightClient.setOnCatchUpServed(clPeerCache::recordServed);
+        // Persist which peer served the bootstrap (and for which period) so a restart
+        // front-loads a proven light-client server instead of re-fanning discovery.
+        beaconLightClient.setProvenBootstrapPeers(clPeerCache.bootstrapPeers());
+        beaconLightClient.setOnBootstrapServed(clPeerCache::recordBootstrap);
         // Seed light_client-capability verdicts from last session and persist new ones, so a
         // restart dials confirmed light-client servers first and deprioritizes peers proven
         // not to serve LC — instead of re-Identifying the whole fork-matched cache.

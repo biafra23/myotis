@@ -1127,8 +1127,12 @@ public final class NodeService extends Service {
             // they served) and persist new ones, so a cold start prefers the
             // peers that actually retained the checkpoint's light-client updates
             // instead of fanning out across discovery peers that don't serve LC.
-            localBlc.setProvenCatchUpServers(clCacheRef.servedPeriods());
+            localBlc.setProvenCatchUpServers(clCacheRef.servedRanges());
             localBlc.setOnCatchUpServed(clCacheRef::recordServed);
+            // Persist which peer served the bootstrap (and for which period) so a restart
+            // front-loads a proven light-client server instead of re-fanning discovery.
+            localBlc.setProvenBootstrapPeers(clCacheRef.bootstrapPeers());
+            localBlc.setOnBootstrapServed(clCacheRef::recordBootstrap);
             // Seed light_client-capability verdicts from last session and persist new ones,
             // so a restart dials confirmed light-client servers first and deprioritizes peers
             // proven not to serve LC — instead of re-Identifying the whole fork-matched cache
