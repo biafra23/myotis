@@ -2100,9 +2100,9 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                 // at/past the pin — re-anchor on it (its exec blockHash, via
                 // windowAnchoredToHash) and serve the block fully verified. Only a pin
                 // past even the optimistic number is genuinely future/unknown → "null".
-                BeaconSyncState bss = beaconSyncState;
-                long optimisticNum = bss == null ? -1 : bss.getOptimisticBlockNumber();
-                byte[] optimisticHash = bss == null ? null : bss.getOptimisticBlockHash();
+                // beaconSyncState is non-null (constructor requireNonNull), so read directly.
+                long optimisticNum = beaconSyncState.getOptimisticBlockNumber();
+                byte[] optimisticHash = beaconSyncState.getOptimisticBlockHash();
                 if (optimisticNum >= target && optimisticHash != null) {
                     anchor = new HeaderAnchor(optimisticNum, null, optimisticHash);
                     headNum = optimisticNum;
