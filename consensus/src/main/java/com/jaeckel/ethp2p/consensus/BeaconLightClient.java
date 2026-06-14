@@ -120,7 +120,14 @@ public class BeaconLightClient implements AutoCloseable {
 
     /** Seed proven catch-up servers (multiaddr -> {low, high} served range) from a cache. */
     public void setProvenCatchUpServers(Map<String, long[]> seed) {
-        if (seed != null) provenCatchUpRanges.putAll(seed);
+        if (seed == null) return;
+        // Defensive copy to a fixed length-2 array: the map is caller-owned and arrays are
+        // mutable, so storing references directly would let later mutation (or a short array)
+        // corrupt prioritization or throw AIOOBE on the r[0]/r[1] reads.
+        seed.forEach((ma, r) -> {
+            if (ma == null || r == null || r.length < 2) return;
+            provenCatchUpRanges.put(ma, new long[]{r[0], r[1]});
+        });
     }
 
     /** Set the callback persisting (multiaddr, low, high) when a peer advances catch-up. */

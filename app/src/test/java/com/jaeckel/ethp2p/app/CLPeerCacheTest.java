@@ -98,6 +98,19 @@ class CLPeerCacheTest {
     }
 
     @Test
+    void duplicateTokensOnOneLineMergeNotOverwrite(@TempDir Path dir) throws Exception {
+        // A hand-edited/merged line with multiple range and bootstrap tokens must widen the
+        // range (union) and keep the deepest bootstrap, not let the last token silently win.
+        Path file = dir.resolve("cl-peers.cache");
+        Files.writeString(file, MA + "\t128-130\t125-135\t512\tb200\tb256\n");
+        CLPeerCache cache = new CLPeerCache(file);
+        cache.load();
+        assertEquals(125L, cache.servedRanges().get(MA)[0], "low must be the smallest seen");
+        assertEquals(512L, cache.servedRanges().get(MA)[1], "high must be the largest seen");
+        assertEquals(256L, cache.bootstrapPeers().get(MA), "bootstrap must keep the deepest period");
+    }
+
+    @Test
     void evictionClearsRangeAndBootstrap(@TempDir Path dir) {
         CLPeerCache cache = new CLPeerCache(dir.resolve("c.cache"));
         cache.add(MA);

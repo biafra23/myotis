@@ -243,19 +243,19 @@ public final class CLPeerCache {
                     if (tok.equals("lc")) lcConfirmed.add(multiaddr);
                     else if (tok.equals("nolc")) lcDenied.add(multiaddr);
                     else if (tok.startsWith("b")) {
-                        try { bootstrapPeriod.put(multiaddr, Long.parseLong(tok.substring(1))); }
+                        // Keep the deepest bootstrap period if a line carries more than one.
+                        try { bootstrapPeriod.merge(multiaddr, Long.parseLong(tok.substring(1)), Math::max); }
                         catch (NumberFormatException ignored) {}
                     } else {
                         int dash = tok.indexOf('-');
                         try {
-                            if (dash > 0) {
-                                long lo = Long.parseLong(tok.substring(0, dash));
-                                long hi = Long.parseLong(tok.substring(dash + 1));
-                                servedRange.put(multiaddr, new Range(lo, hi));
-                            } else {
-                                long p = Long.parseLong(tok); // legacy floor -> degenerate range
-                                servedRange.put(multiaddr, new Range(p, p));
-                            }
+                            Range incoming = dash > 0
+                                    ? new Range(Long.parseLong(tok.substring(0, dash)),
+                                                Long.parseLong(tok.substring(dash + 1)))
+                                    : new Range(Long.parseLong(tok), Long.parseLong(tok)); // legacy floor
+                            // Widen (not overwrite) if a line carries multiple range/legacy tokens,
+                            // so duplicates keep the envelope instead of silently dropping data.
+                            servedRange.merge(multiaddr, incoming, Range::union);
                         } catch (NumberFormatException ignored) {}
                     }
                 }
