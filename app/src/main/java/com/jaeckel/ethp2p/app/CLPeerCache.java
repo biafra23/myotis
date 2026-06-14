@@ -17,12 +17,21 @@ import java.util.concurrent.ConcurrentHashMap;
  * Persists Consensus Layer peers that successfully served light client responses
  * so they can be reconnected on restart without discovery.
  *
- * <p>File format: one peer per line, {@code multiaddr[\t<lowestServedPeriod>]}.
- * The optional trailing sync-committee period records the oldest period this peer
- * actually served during catch-up — proof it retains light-client updates that
- * deep. On restart we prefer peers whose served period covers the checkpoint,
- * instead of fanning out to discovery peers that don't serve catch-up at all.
- * The field is optional so older cache files load unchanged.
+ * <p>File format: one peer per line, {@code multiaddr[\t<token>]...}. Each optional
+ * tab-separated token is self-describing by prefix and order-independent:
+ * <ul>
+ *   <li>{@code <low>-<high>} — the sync-committee period <em>range</em> this peer
+ *       demonstrably served during catch-up. Knowing both ends (not just the floor)
+ *       lets restart prefer peers whose range actually <em>covers</em> the period we
+ *       need, instead of assuming monotonic-forward coverage from the floor alone.</li>
+ *   <li>{@code b<period>} — the sync-committee period of a {@code LightClientBootstrap}
+ *       this peer served. Proof it retained the checkpoint committee; seeds the
+ *       preferred bootstrap peer on restart.</li>
+ *   <li>{@code lc} / {@code nolc} — Identify confirmed / denied light_client support.</li>
+ *   <li>a bare {@code <period>} integer — legacy lowest-served-period from older cache
+ *       files; loaded as the degenerate range {@code [period, period]}.</li>
+ * </ul>
+ * All tokens are optional, so older cache files load unchanged.
  *
  * <p>Peers are evicted after {@link #FAILURE_THRESHOLD} consecutive failures so the
  * cache does not accumulate dead peers across restarts. Any success resets a peer's
@@ -40,8 +49,10 @@ public final class CLPeerCache {
     private final Path cacheFile;
     private final Set<String> seen = ConcurrentHashMap.newKeySet();
     private final Map<String, Integer> failures = new ConcurrentHashMap<>();
-    /** multiaddr -> lowest sync-committee period it served during catch-up. */
-    private final Map<String, Long> servedPeriod = new ConcurrentHashMap<>();
+    /** multiaddr -> the sync-committee period range it demonstrably served during catch-up. */
+    private final Map<String, Range> servedRange = new ConcurrentHashMap<>();
+    /** multiaddr -> the sync-committee period of a LightClientBootstrap it served (deepest kept). */
+    private final Map<String, Long> bootstrapPeriod = new ConcurrentHashMap<>();
     /** Peers whose Identify confirmed light_client protocol support — dial these first. */
     private final Set<String> lcConfirmed = ConcurrentHashMap.newKeySet();
     /** Peers proven NOT to serve light_client (no LC protocols / negotiation failure) — dial last. */
@@ -49,6 +60,17 @@ public final class CLPeerCache {
 
     public CLPeerCache(Path cacheFile) {
         this.cacheFile = cacheFile;
+    }
+
+    /** A demonstrably-served sync-committee period envelope {@code [low, high]}. Immutable;
+     *  {@link #union} widens it. {@code low} never grows, {@code high} never shrinks. */
+    public record Range(long low, long high) {
+        public Range {
+            if (high < low) { long t = low; low = high; high = t; } // normalize hand-edited files
+        }
+        Range union(Range o) {
+            return new Range(Math.min(low, o.low), Math.max(high, o.high));
+        }
     }
 
     /**
@@ -82,7 +104,8 @@ public final class CLPeerCache {
         if (count >= FAILURE_THRESHOLD) {
             if (seen.remove(multiaddr)) {
                 failures.remove(multiaddr);
-                servedPeriod.remove(multiaddr);
+                servedRange.remove(multiaddr);
+                bootstrapPeriod.remove(multiaddr);
                 lcConfirmed.remove(multiaddr);
                 lcDenied.remove(multiaddr);
                 rewriteFile();
@@ -92,23 +115,60 @@ public final class CLPeerCache {
     }
 
     /**
-     * Record that a peer served catch-up down to {@code period}. Keeps the lowest
-     * period seen (deepest history) so a peer that once served the checkpoint is
-     * remembered as such. Persisted so restarts prefer proven catch-up servers.
+     * Record that a peer served catch-up across the period range {@code [low, high]}.
+     * Widens any existing range (lowest low / highest high) so a peer's full served
+     * envelope is remembered. Persisted so restarts prefer peers whose range covers
+     * the period we need.
      */
-    public synchronized void recordServed(String multiaddr, long period) {
+    public synchronized void recordServed(String multiaddr, long low, long high) {
         if (multiaddr == null || multiaddr.isEmpty()) return;
         failures.remove(multiaddr);
         seen.add(multiaddr);
-        Long prev = servedPeriod.get(multiaddr);
-        if (prev != null && prev <= period) return; // already know it goes deeper
-        servedPeriod.put(multiaddr, period);
+        Range incoming = new Range(low, high);
+        Range prev = servedRange.get(multiaddr);
+        Range merged = prev == null ? incoming : prev.union(incoming);
+        if (merged.equals(prev)) return; // no widening — nothing to persist
+        servedRange.put(multiaddr, merged);
         rewriteFile();
     }
 
-    /** multiaddr -> lowest served period, for peers proven to serve catch-up. */
+    /** Convenience overload for a single served period (degenerate range {@code [p, p]}). */
+    public synchronized void recordServed(String multiaddr, long period) {
+        recordServed(multiaddr, period, period);
+    }
+
+    /**
+     * Record that a peer served a {@code LightClientBootstrap} for {@code period}. Keeps
+     * the deepest (highest) checkpoint period a peer ever served — proof it retains the
+     * checkpoint committee. Persisted so a restart prefers it as the bootstrap peer.
+     */
+    public synchronized void recordBootstrap(String multiaddr, long period) {
+        if (multiaddr == null || multiaddr.isEmpty()) return;
+        failures.remove(multiaddr);
+        seen.add(multiaddr);
+        Long prev = bootstrapPeriod.get(multiaddr);
+        if (prev != null && prev >= period) return; // already know a deeper bootstrap
+        bootstrapPeriod.put(multiaddr, period);
+        rewriteFile();
+    }
+
+    /** multiaddr -> {low, high} served period range, for peers proven to serve catch-up. */
+    public Map<String, long[]> servedRanges() {
+        Map<String, long[]> out = new java.util.HashMap<>();
+        servedRange.forEach((ma, r) -> out.put(ma, new long[]{r.low(), r.high()}));
+        return out;
+    }
+
+    /** multiaddr -> lowest served period (range floor), for peers proven to serve catch-up. */
     public Map<String, Long> servedPeriods() {
-        return new java.util.HashMap<>(servedPeriod);
+        Map<String, Long> out = new java.util.HashMap<>();
+        servedRange.forEach((ma, r) -> out.put(ma, r.low()));
+        return out;
+    }
+
+    /** multiaddr -> bootstrap period served, for peers proven to serve a LightClientBootstrap. */
+    public Map<String, Long> bootstrapPeers() {
+        return new java.util.HashMap<>(bootstrapPeriod);
     }
 
     /** Record that a peer's Identify confirmed light_client protocol support. Persisted so
@@ -174,7 +234,7 @@ public final class CLPeerCache {
             for (String line : Files.readAllLines(cacheFile)) {
                 line = line.strip();
                 if (line.isEmpty() || !line.startsWith("/")) continue;
-                // multiaddr [TAB token]...  token = <period int> | "lc" | "nolc"
+                // multiaddr [TAB token]...  token = <low>-<high> | b<period> | <period int> | lc | nolc
                 String[] parts = line.split(String.valueOf(SEP));
                 String multiaddr = parts[0].strip();
                 if (multiaddr.isEmpty() || !multiaddr.startsWith("/")) continue;
@@ -182,9 +242,21 @@ public final class CLPeerCache {
                     String tok = parts[i].strip();
                     if (tok.equals("lc")) lcConfirmed.add(multiaddr);
                     else if (tok.equals("nolc")) lcDenied.add(multiaddr);
-                    else {
-                        try { servedPeriod.put(multiaddr, Long.parseLong(tok)); }
+                    else if (tok.startsWith("b")) {
+                        try { bootstrapPeriod.put(multiaddr, Long.parseLong(tok.substring(1))); }
                         catch (NumberFormatException ignored) {}
+                    } else {
+                        int dash = tok.indexOf('-');
+                        try {
+                            if (dash > 0) {
+                                long lo = Long.parseLong(tok.substring(0, dash));
+                                long hi = Long.parseLong(tok.substring(dash + 1));
+                                servedRange.put(multiaddr, new Range(lo, hi));
+                            } else {
+                                long p = Long.parseLong(tok); // legacy floor -> degenerate range
+                                servedRange.put(multiaddr, new Range(p, p));
+                            }
+                        } catch (NumberFormatException ignored) {}
                     }
                 }
                 result.add(multiaddr);
@@ -192,8 +264,8 @@ public final class CLPeerCache {
             }
             if (!result.isEmpty()) {
                 log.info("[cl-cache] Loaded {} cached CL peer(s) from {} ({} catch-up servers, "
-                                + "{} light-client, {} non-LC)",
-                        result.size(), cacheFile, servedPeriod.size(),
+                                + "{} bootstrap peers, {} light-client, {} non-LC)",
+                        result.size(), cacheFile, servedRange.size(), bootstrapPeriod.size(),
                         lcConfirmed.size(), lcDenied.size());
             }
         } catch (Exception e) {
@@ -224,8 +296,10 @@ public final class CLPeerCache {
             StringBuilder sb = new StringBuilder();
             for (String p : peers) {
                 sb.append(p);
-                Long sp = servedPeriod.get(p);
-                if (sp != null) sb.append(SEP).append(sp);
+                Range r = servedRange.get(p);
+                if (r != null) sb.append(SEP).append(r.low()).append('-').append(r.high());
+                Long bp = bootstrapPeriod.get(p);
+                if (bp != null) sb.append(SEP).append('b').append(bp);
                 if (lcConfirmed.contains(p)) sb.append(SEP).append("lc");
                 else if (lcDenied.contains(p)) sb.append(SEP).append("nolc");
                 sb.append('\n');

@@ -64,8 +64,8 @@ class BeaconLightClientPeerPoolTest {
         String lc = addr(2);
         c.addPeer(proven);
         c.addPeer(lc);
-        // Mark positive signal (the eviction guard reads these sets).
-        c.setProvenCatchUpServers(Map.of(proven, 1700L));
+        // Mark positive signal (the eviction guard reads these maps/sets).
+        c.setProvenCatchUpServers(Map.of(proven, new long[]{1700L, 1710L}));
         c.setProvenLightClient(List.of(lc));
 
         for (int i = 1000; i < 1000 + cap() + 500; i++) {
@@ -75,6 +75,32 @@ class BeaconLightClientPeerPoolTest {
         assertTrue(p.contains(proven), "proven catch-up server must survive eviction");
         assertTrue(p.contains(lc), "LC-confirmed peer must survive eviction");
         assertTrue(p.size() <= cap());
+    }
+
+    @Test
+    void neverEvictsProvenBootstrapPeers() throws Exception {
+        BeaconLightClient c = newClient();
+        String boot = addr(3);
+        c.addPeer(boot);
+        c.setProvenBootstrapPeers(Map.of(boot, 1700L));
+
+        for (int i = 2000; i < 2000 + cap() + 500; i++) {
+            c.addPeer(addr(i));
+        }
+        assertTrue(pool(c).contains(boot), "proven bootstrap peer must survive eviction");
+    }
+
+    @Test
+    void seedsLastBootstrapPeerToHighestPeriod() throws Exception {
+        BeaconLightClient c = newClient();
+        String shallow = addr(4);
+        String deep = addr(5);
+        c.setProvenBootstrapPeers(Map.of(shallow, 1700L, deep, 1750L));
+
+        Field f = BeaconLightClient.class.getDeclaredField("lastBootstrapPeer");
+        f.setAccessible(true);
+        assertEquals(deep, f.get(c),
+                "lastBootstrapPeer should seed to the highest-period bootstrap peer");
     }
 
     @Test
