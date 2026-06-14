@@ -27,6 +27,13 @@ on:
       - '.github/workflows/desktop-release.yml'
   workflow_dispatch:
 
+# Supersede in-progress runs for the same ref so a new push doesn't pile a second
+# 4-OS matrix on top of one that's still building (or stuck). Per-ref grouping keeps
+# distinct release tags independent.
+concurrency:
+  group: desktop-installers-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   package:
     name: Package (${{ matrix.os }})
@@ -58,12 +65,19 @@ jobs:
         if: runner.os != 'Windows'
         run: chmod +x gradlew
 
+      # jpackage builds the .rpm via rpmbuild and the .deb via dpkg/fakeroot. dpkg is
+      # preinstalled on ubuntu-latest but rpmbuild is NOT, so the .rpm target fails
+      # without this. Required (no `|| true`).
+      - name: Install Linux packaging tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y rpm fakeroot
+
       # Optional: generate the Linux app icon from the SVG. Best-effort — the build
       # wires icons only when present and falls back to a default icon otherwise.
       - name: Generate Linux icon
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update && sudo apt-get install -y librsvg2-bin imagemagick || true
+          sudo apt-get install -y librsvg2-bin imagemagick || true
           ./tools/make-icons.sh || true
 
       - name: Resolve version
