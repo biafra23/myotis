@@ -94,24 +94,6 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  restarted from scratch by the wallet's retry (which kept mobile from ever
      *  finishing). */
     private static final long RPC_CALL_TIMEOUT_SEC = 120;
-    /** Calldata size at/above which an eth_call is treated as a HEAVY batch sweep and
-     *  given {@link #RPC_HEAVY_CALL_BUDGET_SEC} instead of the full {@link
-     *  #RPC_CALL_TIMEOUT_SEC}. 16 KiB cleanly separates MetaMask's ~32 KiB BalanceChecker
-     *  token sweep (balances(address[],address[]) over ~1000 tokens, ~3000 verified snap
-     *  fetches) from the confirm screen's sub-1 KiB Multicall3 simulations, which stay on
-     *  the full budget. A sweep is non-gating (a token-balance DISPLAY poll, not anything
-     *  the send needs), so bounding it short stops it from hanging the confirm screen for
-     *  two minutes per poll on a thin mobile peer set. */
-    private static final int HEAVY_CALL_CALLDATA_MIN = 16 * 1024;
-    /** EXPERIMENT toggle: when true, a HEAVY sweep (see {@link #HEAVY_CALL_CALLDATA_MIN})
-     *  is declined with an immediate error BEFORE any head resolution / EVM execution /
-     *  peer traffic — the cleanest test of "is this non-gating balance poll what hangs the
-     *  confirm screen?". Declining is honest (we return an error, never fabricated
-     *  balances) and frees the thin mobile peer set entirely for the gating calls the send
-     *  actually needs. If sends flow with this on, the sweep was the culprit and the next
-     *  step is a convergent/cached version that can also DISPLAY balances; if it still
-     *  hangs, the sweep is ruled out. Flip to false to restore normal (verified) serving. */
-    private static final boolean DECLINE_HEAVY_SWEEP = true;
     /** Snap-oracle per-fetch retry budget. Each attempt rotates to a different ready
      *  snap peer (the probed peer first), so a slow/dead peer fails over instead of
      *  burning the whole RPC_CALL_TIMEOUT on one peer. */
@@ -293,6 +275,10 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     // ---------------------------------------------------------------------
 
     private final RLPxConnector connector;
+    /** Caps a HEAVY-lane EVM execution to ~half the live snap peers per concurrent snap
+     *  request, so a token sweep can't starve the gating calls that share the pool.
+     *  Initialised in the constructor (needs the connector for the live peer count). */
+    private final SnapLaneGate snapLaneGate;
     private final BeaconLightClient beaconLightClient;
     private final BeaconSyncState beaconSyncState;
     private final RpcLogger log;
@@ -486,6 +472,10 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                               RpcClock clock,
                               SnapQualitySink snapQuality) {
         this.connector = java.util.Objects.requireNonNull(connector, "connector");
+        // Heavy-lane snap concurrency cap = half the live snap peers (dynamic). The 30s
+        // wait is only a deadlock safety net — permits free as in-flight requests complete.
+        this.snapLaneGate = new SnapLaneGate(
+                () -> this.connector.activeSnapHandlers().size(), 30_000L);
         this.beaconLightClient = java.util.Objects.requireNonNull(beaconLightClient, "beaconLightClient");
         this.beaconSyncState = java.util.Objects.requireNonNull(beaconSyncState, "beaconSyncState");
         this.ccipGateway = java.util.Objects.requireNonNull(ccipGateway, "ccipGateway");
@@ -504,7 +494,14 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                             + "ms (caller deadline long past)");
                     return;
                 }
-                task.run();
+                // Mark the lane on the pool thread so snap fetches issued during this task
+                // know whether to acquire a heavy permit (see SnapLaneGate / EthHandlerSnapPeer).
+                SnapLaneGate.enterLane(!small);
+                try {
+                    task.run();
+                } finally {
+                    SnapLaneGate.clearLane();
+                }
             });
         };
     }
@@ -1344,7 +1341,8 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                                         chosen,
                                         () -> { rootDenied.add(chosen); rootServed.remove(chosen);
                                                 recordSnapQuality(chosen, false); },
-                                        () -> { rootServed.add(chosen); recordSnapQuality(chosen, true); });
+                                        () -> { rootServed.add(chosen); recordSnapQuality(chosen, true); },
+                                        snapLaneGate);
                             }
                             // Discovery phase (none proven yet): probed peer first (known to
                             // serve), then round-robin the rest of the ready snap set.
@@ -1355,7 +1353,8 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                                         pp,
                                         () -> { rootDenied.add(pp); rootServed.remove(pp);
                                                 recordSnapQuality(pp, false); },
-                                        () -> { rootServed.add(pp); recordSnapQuality(pp, true); });
+                                        () -> { rootServed.add(pp); recordSnapQuality(pp, true); },
+                                        snapLaneGate);
                             }
                             // activeSnapHandlers() already returns only ready, snap-negotiated,
                             // non-failed peers; drop the ones denied for this root.
@@ -1513,14 +1512,6 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                         ? Bytes.wrap(data, 0, 4).toHexString() : "0x")
                 + " dataLen=" + (data == null ? 0 : data.length)
                 + " block=" + block;
-        // EXPERIMENT: decline the heavy batch sweep up front (no head resolution, no EVM,
-        // no peer traffic) so it can't hang the confirm screen or starve the gating calls.
-        // Honest error, never fabricated balances. See DECLINE_HEAVY_SWEEP.
-        if (DECLINE_HEAVY_SWEEP && data != null && data.length >= HEAVY_CALL_CALLDATA_MIN) {
-            log.info("[rpc] eth_call " + desc
-                    + " -> HEAVY batch sweep declined up front (non-gating balance poll)");
-            return null;
-        }
         RpcCallContext h = verifiedHeadFor(block);
         if (h == null || to == null || to.length != 20) {
             log.info("[rpc] eth_call " + desc + " -> no verified head for block tag");

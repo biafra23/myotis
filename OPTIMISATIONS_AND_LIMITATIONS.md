@@ -166,10 +166,23 @@ wallet's socket alive so a genuinely long call gets a **120 s** budget
 retried from scratch. *Attacks:* latency (§1.1) — lets bottleneck calls converge in one
 attempt.
 
-### 2.7 EVM lane separation (small vs heavy)
-Calls with calldata ≤ `EVM_SMALL_CALLDATA_MAX` (4 KB) run on a **reserved small lane**,
-so a confirm screen's tiny probes/simulations never queue behind a ~32 KB token-sweep
-storm. *Attacks:* heavy-call starvation of gating calls (§1.1).
+### 2.7 EVM lane separation — threads *and* peers *(this PR)*
+Two complementary limits keep a heavy call (token sweep / big multicall) from holding up
+the gating calls a send needs:
+- **Thread lane:** calls with calldata ≤ `EVM_SMALL_CALLDATA_MAX` (4 KB) run on a
+  **reserved small lane** (a dedicated EVM thread), so a confirm screen's tiny
+  probes/simulations never queue behind a sweep's CPU.
+- **Peer lane (`SnapLaneGate`):** threads aren't the contended resource — the thin snap
+  *peer* pool is. Both lanes fetch from the same `activeSnapHandlers()` with no
+  reservation, so a sweep firing dozens of concurrent `GetTrieNodes` requests would queue
+  the gating fetches behind it at the *network* level. The gate caps a **heavy-lane**
+  execution to **half the live snap peers** per concurrent snap request (dynamic, min 1),
+  leaving the other half free for small/interactive calls (which never acquire a permit).
+  The heavy call still runs to genuine completion / `OutOfGas` / timeout — it's bounded,
+  **not rejected**. (This replaced an earlier `DECLINE_HEAVY_SWEEP` experiment that
+  fast-failed the sweep by calldata size — a fake rejection that also blocked names from
+  ever rendering; the lane is the honest version.)
+*Attacks:* heavy-call starvation of gating calls, at both the CPU and peer level (§1.1).
 
 ### 2.8 Deeper, quality-biased snap pool — #46 #47 #60 #63 #66
 - Target snap-peer count raised toward daemon parity (`TARGET_SNAP_PEERS` = 32 on
@@ -228,22 +241,25 @@ session succeed. *Attacks:* slow head builds (§1.2).
   firehose stays free otherwise.
 *Attacks:* no mempool (§1.3).
 
-### 2.12 Decline the heavy balance sweep *(this PR, behind `DECLINE_HEAVY_SWEEP`)*
+### 2.12 The heavy balance sweep — bounded, not rejected
 The ~32 KB BalanceChecker token sweep (§1.1) is a **non-gating balance *display* poll** —
-the *send* needs only nonce/fee/estimateGas/sendRawTransaction. Because it cannot
-complete on a phone and (worse) hogs the thin peer set, we **decline it up front** with
-an honest error — before any head resolution, EVM execution, or peer traffic — so it
-can neither hang the confirm screen nor starve the gating calls. Declining is honest
-(an error, never fabricated balances). Detected by calldata ≥ `HEAVY_CALL_CALLDATA_MIN`
-(16 KB), which cleanly separates the 32 KB sweep from the confirm screen's sub-1 KB
-Multicall3 simulations.
+the *send* needs only nonce/fee/estimateGas/sendRawTransaction. An earlier experiment
+(`DECLINE_HEAVY_SWEEP`) fast-failed it up front by calldata size, which kept the confirm
+screen responsive but was a **fake rejection** — and it meant balances could *never*
+render. That's been replaced by the peer-lane gate (§2.7): the sweep now **runs**, capped
+to half the snap peers so it can't starve the gating calls, and ends in genuine
+completion / `OutOfGas` / timeout.
 
-> **Trade-off / follow-up.** With this on, **token balances may not display** (the call
-> is declined). It is a first-cut behind a toggle. The intended successor is a
-> *convergent, cached* balance path that returns fast **and** eventually shows verified
-> balances — e.g. pinning the sweep to one stable root so the cache accumulates across
-> polls, and/or a background warmer for the active address — without ever fabricating a
-> zero.
+Notes from measuring the unbounded version on-device:
+- With MetaMask sending **no gas limit**, myotis applies its `DEFAULT_GAS_LIMIT`
+  (30 M); the ~662-token sweep exceeds it and returns `OutOfGas` in ~700 ms **on a healthy
+  pool** — a natural fast-fail, but only because batched prefetch gathered the state
+  quickly. The work isn't skipped, so on a thin pool that same call is slow; the lane gate
+  is what keeps it from dragging the gating calls down with it.
+- **Token balances still may not render** (the sweep can't complete on a light node within
+  any sane gas/time budget). The durable path to actually *display* them is a convergent,
+  cached balance flow (pin one stable root so the proof cache accumulates across polls, or
+  a background warmer for the active address) — never a fabricated zero.
 
 ### 2.13 Android runtime mitigations
 - **BLS on ART** (#48 and follow-ups): bound + deprioritise G1 decompression, subgroup-
