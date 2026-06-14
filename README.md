@@ -69,7 +69,26 @@ A number-pinned read (wallets pin every read to the block they just saw) is serv
 
 ## Run
 
-Myotis runs in two forms: the **Android app** (the wallet node, with the verified JSON-RPC server for a same-device wallet) and the **desktop daemon/CLI** (the same engine for development, with a CLI/IPC command surface). Both run the full devp2p + libp2p stack, the beacon light client, and the local EVM.
+Myotis runs in three forms: the **Android app** (the wallet node, with the verified JSON-RPC server for a same-device wallet), the **desktop app** (an installable Compose GUI that embeds the same node), and the **desktop daemon/CLI** (the same engine for development, with a CLI/IPC command surface). All run the full devp2p + libp2p stack, the beacon light client, and the local EVM.
+
+### Desktop app (download & install)
+
+The desktop app is a Compose GUI that embeds the node in-process — start/stop the daemon, watch beacon sync + peers, and run verified account lookups — and ships as a native installer per OS.
+
+- **Download:** grab the installer for your platform from the [GitHub Releases](../../releases) page (published by the *Desktop Installers* workflow on each `vX.Y.Z` tag):
+  - **Linux** — `.deb` or `.rpm`
+  - **Windows** — `.msi` or `.exe`
+  - **macOS** — `.dmg` (separate Apple-Silicon / Intel builds)
+- **Build from source** (produces the installer for the current OS under `desktop-app/build/compose/binaries/main-release/`):
+  ```bash
+  ./gradlew :desktop-app:packageReleaseDistributionForCurrentOS
+  # or just run it without packaging:
+  ./gradlew :desktop-app:run
+  ```
+
+Each installer bundles its own JDK 21 runtime — no separate Java install needed. Node data (keys, peer caches, verified-state snapshot) lives in a per-user directory: `~/.local/share/myotis` (Linux), `~/Library/Application Support/Myotis` (macOS), or `%LOCALAPPDATA%\Myotis` (Windows).
+
+> **Unsigned builds:** releases are not yet code-signed, so the OS will warn on first launch. On **macOS**, right-click the app → *Open* (or `xattr -dr com.apple.quarantine /Applications/Myotis.app`). On **Windows**, click *More info → Run anyway* on the SmartScreen prompt. Signing/notarization is a planned follow-up.
 
 ### Android
 
