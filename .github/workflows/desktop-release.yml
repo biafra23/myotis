@@ -83,7 +83,18 @@ jobs:
           if [ -n "${{ steps.ver.outputs.value }}" ]; then
             ARGS="$ARGS -PappVersion=${{ steps.ver.outputs.value }}"
           fi
-          ./gradlew $ARGS
+          # Retry transient dependency-resolution failures: the Compose Desktop plugin
+          # fetches small internal artifacts (e.g. gradle-plugin-internal-jdk-version-probe)
+          # only from Maven Central, which intermittently returns HTTP 403 — and Gradle
+          # treats 403 as fatal (no fall-through to other repos). A couple of retries ride
+          # out the transient CDN blip instead of failing the whole installer matrix.
+          ok=0
+          for attempt in 1 2 3; do
+            if ./gradlew $ARGS; then ok=1; break; fi
+            echo "::warning::Gradle attempt $attempt failed; retrying in $((attempt*20))s"
+            sleep $((attempt*20))
+          done
+          [ "$ok" = "1" ]
 
       # jpackage names macOS .dmg/.pkg without an arch, so the arm64 and x64 builds
       # would collide as release assets. Suffix them with the runner arch.
