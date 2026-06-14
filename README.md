@@ -79,6 +79,7 @@ The desktop app is a Compose GUI that embeds the node in-process — start/stop 
   - **Linux** — `.deb` or `.rpm`
   - **Windows** — `.msi` or `.exe`
   - **macOS** — `.dmg` (separate Apple-Silicon / Intel builds)
+- **Unreleased / dev builds:** the *Desktop Installers* workflow also runs on pull requests, uploading the per-OS installers as downloadable run **artifacts** (`myotis-installers-<os>`, 14-day retention) without publishing a Release — open the workflow run and look under *Artifacts*.
 - **Build from source** (produces the installer for the current OS under `desktop-app/build/compose/binaries/main-release/`):
   ```bash
   ./gradlew :desktop-app:packageReleaseDistributionForCurrentOS
