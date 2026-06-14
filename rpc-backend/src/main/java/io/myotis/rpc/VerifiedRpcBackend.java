@@ -1688,20 +1688,30 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             }
 
             // --- Storage proofs ------------------------------------------------
-            // A slot in an empty storage trie (EOA, fresh contract, or absent account)
-            // is provably zero with no trie to query — short-circuit the network call
-            // and return the canonical empty proof, as Geth does.
+            // Pipeline the per-slot SNAP requests: launch them all up front, then await,
+            // so total latency is ~one round-trip rather than the sum over N keys. A slot
+            // in an empty storage trie (EOA, fresh contract, or absent account) is provably
+            // zero with no trie to query, so skip the network there and emit the canonical
+            // empty proof, as Geth does.
             boolean emptyStorage = storageRoot.equals(MerklePatriciaProofVerifier.EMPTY_TRIE_ROOT);
+            java.util.List<Bytes32> keyHashes = new java.util.ArrayList<>(keys.size());
+            java.util.List<CompletableFuture<
+                    com.jaeckel.ethp2p.networking.snap.messages.StorageRangesMessage.DecodeResult>>
+                    slotFutures = new java.util.ArrayList<>(keys.size());
+            for (byte[] k : keys) {
+                Bytes32 keyHash = Hash.keccak256(Bytes.wrap(k));
+                keyHashes.add(keyHash);
+                slotFutures.add(emptyStorage ? null : connector.requestStorage(addr, keyHash, stateRoot));
+            }
             StringBuilder storageSb = new StringBuilder("[");
             for (int i = 0; i < keys.size(); i++) {
                 Bytes keyBytes = Bytes.wrap(keys.get(i));
                 java.math.BigInteger value = java.math.BigInteger.ZERO;
                 java.util.List<Bytes> slotProof = java.util.List.of();
                 if (!emptyStorage) {
-                    Bytes32 keyHash = Hash.keccak256(keyBytes);
+                    Bytes32 keyHash = keyHashes.get(i);
                     com.jaeckel.ethp2p.networking.snap.messages.StorageRangesMessage.DecodeResult sr =
-                            connector.requestStorage(addr, keyHash, stateRoot)
-                                    .get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
+                            slotFutures.get(i).get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
                     slotProof = sr.proof();
                     MerklePatriciaProofVerifier.Result slotRes =
                             MerklePatriciaProofVerifier.verify(storageRoot, keyHash.toArrayUnsafe(), slotProof);
@@ -1744,6 +1754,12 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                     .append("}");
             sb.append("}");
             return sb.toString();
+        } catch (InterruptedException e) {
+            // Future.get() clears the interrupt flag on throw — restore it so the
+            // blocking call's cancellation still propagates to the IO worker.
+            Thread.currentThread().interrupt();
+            log.info("[rpc] eth_getProof -> interrupted");
+            return null;
         } catch (Exception e) {
             log.info("[rpc] eth_getProof -> error: " + unwrap(e));
             if (isStateUnavailable(e)) evictUnservableHead(h);
