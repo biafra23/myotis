@@ -185,15 +185,19 @@ jobs:
           fi
 
       # createReleaseDistributable produces build/compose/binaries/main-release/app/Myotis.app.
-      # --rerun-tasks forces the runtime-image + app-image tasks to re-execute so the cached
-      # (or just-built other-arch) image is never reused — javaHome is not a tracked task
-      # input, so without this the second pass could silently ship the first pass's runtime.
+      # It bundles BOTH a jlink runtime image and the arch-specific Skiko native lib
+      # (Contents/app/libskiko-macos-<arch>.dylib). Both follow the arch of the JDK/JVM
+      # Gradle runs under — jpackage's runtime via the default javaHome, Skiko via
+      # compose.desktop.currentOs — so each arch must run Gradle under the matching JDK
+      # (the x64 pass via Rosetta). --rerun-tasks forces the runtime-image + app-image tasks
+      # to re-execute so the other arch's cached output is never reused; --no-daemon keeps the
+      # two arch builds from ever sharing a Gradle daemon.
       - name: Build arm64 app-image
         shell: bash
         env:
           JAVA_HOME: ${{ steps.jdk_arm.outputs.path }}
         run: |
-          ARGS=":desktop-app:createReleaseDistributable --rerun-tasks --stacktrace -PdesktopJavaHome=${{ steps.jdk_arm.outputs.path }}"
+          ARGS=":desktop-app:createReleaseDistributable --rerun-tasks --no-daemon --stacktrace"
           if [ -n "${{ steps.ver.outputs.value }}" ]; then
             ARGS="$ARGS -PappVersion=${{ steps.ver.outputs.value }}"
           fi
@@ -210,10 +214,10 @@ jobs:
       - name: Build x64 app-image
         shell: bash
         env:
-          JAVA_HOME: ${{ steps.jdk_arm.outputs.path }}   # Gradle stays native arm64; only jlink/jpackage use x64
+          JAVA_HOME: ${{ steps.jdk_x64.outputs.path }}   # Rosetta: x64 JVM => x64 runtime image + x64 Skiko
         run: |
           rm -rf desktop-app/build/compose/binaries/main-release/app
-          ARGS=":desktop-app:createReleaseDistributable --rerun-tasks --stacktrace -PdesktopJavaHome=${{ steps.jdk_x64.outputs.path }}"
+          ARGS=":desktop-app:createReleaseDistributable --rerun-tasks --no-daemon --stacktrace"
           if [ -n "${{ steps.ver.outputs.value }}" ]; then
             ARGS="$ARGS -PappVersion=${{ steps.ver.outputs.value }}"
           fi
@@ -227,12 +231,18 @@ jobs:
           rm -rf /tmp/x64 && mkdir -p /tmp/x64
           cp -R desktop-app/build/compose/binaries/main-release/app/Myotis.app /tmp/x64/
 
-      # lipo every Mach-O file that exists in both bundles into a fat binary; everything
-      # else (resources, the runtime's java classes, symlinks) is identical across arches
-      # and comes from the arm64 copy untouched. Then re-sign ad-hoc: lipo invalidates the
-      # per-arch ad-hoc signatures jpackage applied, and an inconsistent signature makes
-      # Gatekeeper refuse to launch. (CI has no Developer ID cert, so this matches the
-      # per-arch builds' existing unnotarized, ad-hoc-signed status — no regression.)
+      # Merge the two bundles into one universal .app. The universal bundle is seeded from a
+      # copy of the arm64 bundle, then:
+      #   - files present in BOTH paths as Mach-O of DIFFERENT archs (launcher, libjvm, most
+      #     runtime .dylibs) are replaced with a fat arm64+x86_64 binary via lipo;
+      #   - files present only in the x64 bundle (notably libskiko-macos-x64.dylib — the
+      #     arch is in the filename, so the two Skiko libs coexist rather than lipo together)
+      #     are copied across so the universal app carries both arches' native libs.
+      # Equal-arch / non-Mach-O files are left as the arm64 copy (lipo would reject equal
+      # archs anyway). Then re-sign ad-hoc: lipo/copies invalidate the per-arch ad-hoc
+      # signatures jpackage applied, and an inconsistent signature makes Gatekeeper refuse to
+      # launch. (CI has no Developer ID cert, so this matches the per-arch builds' existing
+      # unnotarized, ad-hoc-signed status — no regression.)
       - name: Merge into universal app-image
         shell: bash
         run: |
@@ -242,16 +252,28 @@ jobs:
           UNI=/tmp/universal/Myotis.app
           rm -rf /tmp/universal && mkdir -p /tmp/universal
           cp -R "$ARM" "$UNI"
-          merged=0
+          merged=0; copied=0
+          # Pass 1: arm64 files that also exist in x64 as a different-arch Mach-O -> fat binary.
           while IFS= read -r f; do
-            if lipo -info "$ARM/$f" >/dev/null 2>&1 && lipo -info "$X64/$f" >/dev/null 2>&1; then
+            [ -f "$X64/$f" ] || continue
+            aarch=$(lipo -archs "$ARM/$f" 2>/dev/null) || continue   # skip non-Mach-O
+            xarch=$(lipo -archs "$X64/$f" 2>/dev/null) || continue
+            if [ "$aarch" != "$xarch" ]; then
               lipo -create "$ARM/$f" "$X64/$f" -output "$UNI/$f"
               merged=$((merged+1))
             fi
           done < <(cd "$ARM" && find . -type f)
-          echo "Merged $merged Mach-O files into universal binaries"
+          # Pass 2: x64-only files (e.g. libskiko-macos-x64.dylib) -> bring them across.
+          while IFS= read -r f; do
+            if [ ! -e "$ARM/$f" ]; then
+              mkdir -p "$(dirname "$UNI/$f")"
+              cp -p "$X64/$f" "$UNI/$f"
+              copied=$((copied+1))
+            fi
+          done < <(cd "$X64" && find . -type f)
+          echo "Merged $merged fat binaries; copied $copied x64-only files"
           # Fail loudly if the merge didn't actually produce fat binaries for the two files
-          # that matter most — the launcher and the JVM.
+          # that matter most — the launcher and the JVM — and confirm both Skiko libs are present.
           launcher="$UNI/Contents/MacOS/Myotis"
           libjvm="$UNI/Contents/runtime/Contents/Home/lib/server/libjvm.dylib"
           echo "launcher archs: $(lipo -archs "$launcher")"
@@ -262,6 +284,11 @@ jobs:
               *arm64*x86_64*|*x86_64*arm64*) ;;
               *) echo "::error::$bin is not universal (archs: $archs)"; exit 1 ;;
             esac
+          done
+          for skiko in libskiko-macos-arm64.dylib libskiko-macos-x64.dylib; do
+            if [ ! -e "$UNI/Contents/app/$skiko" ]; then
+              echo "::error::missing $skiko in universal bundle — Compose would fail to start on that arch"; exit 1
+            fi
           done
           codesign --remove-signature "$UNI" 2>/dev/null || true
           codesign --force --deep --sign - "$UNI"

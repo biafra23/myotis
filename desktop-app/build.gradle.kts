@@ -83,13 +83,6 @@ compose.desktop {
         // bundle under the same resource name.
         jvmArgs += listOf("-Dlogback.configurationFile=logback-desktop.xml")
 
-        // jpackage/jlink run from this JDK (defaults to the Gradle JVM). CI builds the
-        // macOS *universal* installer by running createReleaseDistributable twice — once
-        // with an arm64 JDK, once with an x64 JDK under Rosetta — then lipo-merging the two
-        // .app bundles. -PdesktopJavaHome selects the JDK for a given pass; unset leaves
-        // normal local/desktop builds on the Gradle JVM, unchanged.
-        (findProperty("desktopJavaHome") as String?)?.takeIf { it.isNotBlank() }?.let { javaHome = it }
-
         nativeDistributions {
             targetFormats(
                 TargetFormat.Deb, TargetFormat.Rpm,   // Linux
