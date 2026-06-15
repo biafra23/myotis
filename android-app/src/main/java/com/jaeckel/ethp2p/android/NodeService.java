@@ -1825,7 +1825,8 @@ public final class NodeService extends Service {
                     return n > 0 ? Long.valueOf(n) : null;
                 }
                 @Override public String syncState() {
-                    return backendState.getSyncState(backendGenesis).name();
+                    return backendState.getSyncState(backendGenesis,
+                            backendConn.getNetwork().secondsPerSlot()).name();
                 }
                 @Override public byte[] call(byte[] to, byte[] data, String block) {
                     return rpcCall(to, data, block);
@@ -2068,8 +2069,12 @@ public final class NodeService extends Service {
         byte[] execHash = bss.getExecutionBlockHash();
         String execHashHex = execHash == null ? null
                 : org.apache.tuweni.bytes.Bytes.wrap(execHash).toHexString();
+        // Network slot time (Gnosis is 5s, not 12) drives the wall-clock period; without
+        // it the target period — and thus the CATCHING_UP/SYNCED classification — is wrong.
+        RLPxConnector conn = connector;
+        int secondsPerSlot = conn != null ? conn.getNetwork().secondsPerSlot() : 12;
         return new BeaconStats(
-                bss.getSyncState(genesis).name(),
+                bss.getSyncState(genesis, secondsPerSlot).name(),
                 blc.isBootstrapped(),
                 peers.size(),
                 lc,
@@ -2078,7 +2083,7 @@ public final class NodeService extends Service {
                 execHashHex,
                 bss.getCatchUpStartPeriod(),
                 bss.getCurrentSyncCommitteePeriod(),
-                com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec.currentPeriod(genesis));
+                com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec.currentPeriod(genesis, secondsPerSlot));
     }
 
     private int countActiveBackoff() {

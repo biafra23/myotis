@@ -9,6 +9,7 @@ import java.math.BigInteger;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * Network-specific configuration for Ethereum chains.
@@ -386,7 +387,7 @@ public record NetworkConfig(
 
     /** Look up a network by name (case-insensitive). */
     public static NetworkConfig byName(String name) {
-        return switch (name.toLowerCase()) {
+        return switch (name.toLowerCase(Locale.ROOT)) {
             case "mainnet" -> MAINNET;
             case "sepolia" -> SEPOLIA;
             case "gnosis", "gbc", "xdai" -> GNOSIS;
@@ -403,7 +404,7 @@ public record NetworkConfig(
      * estimation in the light client.
      */
     public int secondsPerSlot() {
-        return (int) networkId == 100 ? 5 : 12;
+        return networkId == 100 ? 5 : 12;
     }
 
     /**
@@ -412,7 +413,7 @@ public record NetworkConfig(
      * period is 8192 on both presets, so that helper is shared.)
      */
     public int slotsPerEpoch() {
-        return (int) networkId == 100 ? 16 : 32;
+        return networkId == 100 ? 16 : 32;
     }
 
     // -------------------------------------------------------------------------
