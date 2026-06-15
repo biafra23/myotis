@@ -1,0 +1,16 @@
+[submodule "submodules/trueblocks-kotlin"]
+	path = submodules/trueblocks-kotlin
+	url = https://github.com/biafra23/trueblocks-kotlin
+	branch = main
+[submodule "submodules/netty-kotlin"]
+	path = submodules/netty-kotlin
+	url = https://github.com/biafra23/netty-kotlin
+	branch = main
+[submodule "submodules/tuweni-kotlin"]
+	path = submodules/tuweni-kotlin
+	url = https://github.com/biafra23/tuweni-kotlin
+	branch = kotlin-conversion
+[submodule "submodules/besu"]
+	path = submodules/besu
+	url = https://github.com/biafra23/besu
+	branch = 24.12.2-android
