@@ -88,9 +88,9 @@ public record NetworkConfig(
             // genesis_validators_root (mainnet)
             Bytes.fromHexString("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95").toArrayUnsafe(),
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshMainnetCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 14158720, 2026-04-20, period 1728)
-            Bytes.fromHexString("611c852c9c52812d1a8701d06c230617159b69d33b344704fb524558ee79ff5d").toArrayUnsafe(),
-            14158720L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized mainnet block root (slot 14560000, 2026-06-15, period 1777)
+            Bytes.fromHexString("58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e").toArrayUnsafe(),
+            14560000L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:mainnet:end
             // current fork version: Fulu (0x06000000) — activated at slot 13164544 (2025-12-03)
             new byte[]{0x06, 0x00, 0x00, 0x00},
@@ -232,9 +232,9 @@ public record NetworkConfig(
             // genesis_validators_root (Gnosis Beacon Chain)
             Bytes.fromHexString("f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47").toArrayUnsafe(),
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshGnosisCheckpoint`
-            // trusted checkpoint: recent finalized Gnosis block root (slot 28502048, 2026-06-15, period 3479)
-            Bytes.fromHexString("7231ca8ce28303d7366214986a2fe2f89f4f37d31fa712530efa2cc711bf77e3").toArrayUnsafe(),
-            28502048L, // checkpoint slot. Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized Gnosis block root (slot 28509120, 2026-06-15, period 3480)
+            Bytes.fromHexString("54de0afd8646abe6d3f5d64f3a3a4e25a948d5329deb31bbc85ed4ee4eaf5c81").toArrayUnsafe(),
+            28509120L, // checkpoint slot. Must stay in sync with the root above.
             // @checkpoint:gnosis:end
             // current fork version: Fulu on Gnosis (0x06000064), active since 2026-04-14
             new byte[]{0x06, 0x00, 0x00, 0x64},

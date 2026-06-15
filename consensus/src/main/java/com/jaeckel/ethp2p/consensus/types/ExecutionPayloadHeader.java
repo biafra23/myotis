@@ -262,14 +262,22 @@ public final class ExecutionPayloadHeader {
      * 14:  withdrawalsRoot    (bytes32)
      * 15:  blobGasUsed        (uint64)
      * 16:  excessBlobGas      (uint64)
-     * 17:  depositRequestsRoot    (bytes32)
-     * 18:  withdrawalRequestsRoot (bytes32)
-     * 19:  consolidationRequestsRoot (bytes32)
+     *
+     * NOTE: the container is 17 fields on Deneb AND Electra AND Fulu. Execution-layer
+     * requests (EIP-7685: deposits/withdrawals/consolidations) are NOT in the
+     * ExecutionPayloadHeader — they live in BeaconBlockBody.execution_requests. An early
+     * Electra devnet draft put three request roots here (fields 17-19), but that was
+     * removed before mainnet. Including them merkleizes the WRONG root (and NPEs on the
+     * null roots of a real 17-field header), which broke light-client bootstrap on every
+     * Deneb+ network (Gnosis Fulu, mainnet Fulu). The request-root fields below are kept
+     * decode-tolerant but are intentionally NOT part of hashTreeRoot.
      */
     public byte[] hashTreeRoot() {
         // MAX_EXTRA_DATA_BYTES = 32 in Ethereum consensus spec => chunkLimit = ceil(32/32) = 1
         final int MAX_EXTRA_DATA_CHUNKS = 1;
 
+        // 17 fields → merkleize pads to next power of two (32 leaves), matching beacon
+        // nodes' ExecutionPayloadHeader root for Deneb/Electra/Fulu.
         return SszUtil.hashTreeRootContainer(
                 SszUtil.hashTreeRootBytes32(parentHash),                          // 0
                 SszUtil.hashTreeRootBytes20(feeRecipient),                        // 1
@@ -287,10 +295,7 @@ public final class ExecutionPayloadHeader {
                 SszUtil.hashTreeRootBytes32(transactionsRoot),                    // 13
                 SszUtil.hashTreeRootBytes32(withdrawalsRoot),                     // 14
                 SszUtil.hashTreeRootUint64(blobGasUsed),                          // 15
-                SszUtil.hashTreeRootUint64(excessBlobGas),                        // 16
-                SszUtil.hashTreeRootBytes32(depositRequestsRoot),                 // 17
-                SszUtil.hashTreeRootBytes32(withdrawalRequestsRoot),              // 18
-                SszUtil.hashTreeRootBytes32(consolidationRequestsRoot)            // 19
+                SszUtil.hashTreeRootUint64(excessBlobGas)                         // 16
         );
     }
 

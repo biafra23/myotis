@@ -167,6 +167,7 @@ tasks.register("refreshMainnetCheckpoint") {
             append(indent).append("// @checkpoint:mainnet:begin — managed by `./gradlew refreshMainnetCheckpoint`").append(eol)
             append(indent).append("// trusted checkpoint: recent finalized mainnet block root (slot $minSlot, $date, period $period)").append(eol)
             append(indent).append("Bytes.fromHexString(\"$finalRoot\").toArrayUnsafe(),").append(eol)
+            append(indent).append("${minSlot}L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.").append(eol)
             append(indent).append("// @checkpoint:mainnet:end")
         }
         val updated = original.substring(0, beginLineStart) + replacement + original.substring(endMarkerEnd)
