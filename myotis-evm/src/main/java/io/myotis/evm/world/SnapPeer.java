@@ -57,4 +57,23 @@ public interface SnapPeer {
      * keccak256 matches the requested hash.
      */
     CompletableFuture<List<Bytes>> getByteCodes(List<Bytes32> hashes);
+
+    /**
+     * Signal that this peer could not serve the requested state root for the current
+     * head, so a peer-routing implementation can deprioritize it and rotate to one
+     * that actually retains the state — instead of re-dialing it across every retry.
+     *
+     * <p>The oracle calls this for any failure that makes the peer useless for this
+     * short-lived head context, whether or not the peer is permanently broken:
+     * <ul>
+     *   <li>an empty proof for a non-empty root, or no state at all — it doesn't
+     *       retain that stateRoot's trie ({@code InvalidProof} / {@code StateUnavailable});</li>
+     *   <li>it accepted the request then hung ({@code TimeoutException}) or the
+     *       connection dropped ({@code IOException}) — equally useless here.</li>
+     * </ul>
+     * Because timeouts/drops can be transient, an implementation should treat this as
+     * a per-head deprioritization signal, not a permanent eviction — the same peer may
+     * serve a later head. Default no-op for fixture/test implementations.
+     */
+    default void reportRootUnavailable() {}
 }

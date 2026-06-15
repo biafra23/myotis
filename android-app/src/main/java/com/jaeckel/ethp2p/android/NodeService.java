@@ -18,13 +18,18 @@ import com.jaeckel.ethp2p.consensus.BeaconLightClient;
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
 import com.jaeckel.ethp2p.consensus.libp2p.BeaconP2PService;
 import com.jaeckel.ethp2p.consensus.proof.MerklePatriciaVerifier;
+import com.jaeckel.ethp2p.consensus.proof.OrderedTrieRoot;
 import com.jaeckel.ethp2p.core.crypto.NodeKey;
 import com.jaeckel.ethp2p.core.enr.Enr;
+import com.jaeckel.ethp2p.core.types.BlockHeader;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
 import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
 import com.jaeckel.ethp2p.networking.discv5.DiscV5Service;
 import com.jaeckel.ethp2p.networking.dns.DnsEnrResolver;
+import com.jaeckel.ethp2p.networking.eth.messages.BlockBodiesMessage;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
+import com.jaeckel.ethp2p.networking.eth.messages.Receipt;
+import com.jaeckel.ethp2p.networking.eth.messages.TxFeeFields;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
 import com.jaeckel.ethp2p.networking.snap.messages.AccountRangeMessage;
 
@@ -94,9 +99,20 @@ public final class NodeService extends Service {
     private static final long DNS_REFRESH_INTERVAL_MS = 4 * 60 * 1000L;
     // Keep a working set of snap peers connected so a verified request almost
     // always finds one even as peers churn. Below this we proactively re-dial
-    // known snap peers from the cache; 4 leaves headroom so transient churn
-    // doesn't drop us below the ~2 a request realistically needs.
-    private static final int TARGET_SNAP_PEERS = 4;
+    // known snap peers from the cache (CONFIRMED-quality first, via snapDialRank).
+    //
+    // 12, not 4: being a snap peer is NOT the same as retaining the state at the
+    // head root we anchor. Geth prunes trie state beyond ~128 blocks and snap-serves
+    // from a flat layer that lags the head, so at any moment only SOME connected snap
+    // peers can serve the current root — the rest fail with StateUnavailable. On-device
+    // captures showed eth_call/the confirm-screen Multicall3 sim failing for minutes
+    // with several snap peers connected: 4 wasn't a deep enough pool to reliably hold
+    // one peer whose retained state covers the head. A deeper pool makes the
+    // probe-and-pin build (firstPeerServing / the PEER_HEAD race) far likelier to find
+    // a state-servable peer. The daemon holds ~36 organically with no ill effect;
+    // 12 lightweight eth/snap connections is a fine bound for a phone actively serving
+    // a wallet in the foreground.
+    private static final int TARGET_SNAP_PEERS = 32;
     // Same bound the JVM daemon uses (CommandHandler.MAX_HEADER_CHAIN_GAP).
     // Caps how many headers we'll fetch to bridge from the beacon-finalized
     // block to the peer's head — i.e. the maximum gap the headerChain
@@ -105,6 +121,25 @@ public final class NodeService extends Service {
     // but the bound has to cover catch-up after the phone wakes from doze.
     private static final int MAX_HEADER_CHAIN_GAP = 8192;
     private static final long HEADER_CHAIN_TIMEOUT_SEC = 60;
+    // How many recent blocks below the verified head to scan for a tx in
+    // eth_getTransactionReceipt. Kept small to bound the bandwidth/battery cost of the
+    // (trustless) body scan on mobile: ~8 blocks ≈ 1.5 min covers a wallet polling a
+    // just-submitted tx. A pending/older tx isn't found here and falls through to the
+    // proxy. Bodies within the window are fetched concurrently, so latency ≈ one
+    // round-trip regardless of the count.
+    private static final int RECEIPT_LOOKBACK_BLOCKS = 8;
+    // Permissionless mode: do NOT fall back to the (permissioned) upstream proxy. A
+    // method we can't answer from cryptographically-verified data ERRORS instead of
+    // silently returning unverified upstream data — that is the whole point of Myotis.
+    // The proxy was only ever a transition aid to learn what MetaMask calls; the
+    // MethodLogger / myotis_rpcCoverage still records every rejected method, so we keep
+    // that discovery signal without serving unverified data. Flip to false only for
+    // local debugging against an injected upstream.
+    private static final boolean STRICT_NO_PROXY = true;
+    // Max blocks below the verified head we'll fetch+verify headers for to answer
+    // eth_getBlockByNumber by number. "latest" is 1 header; older numbers cost a header
+    // range, so bound it (MetaMask asks for "latest" for the fee market anyway).
+    private static final int BLOCK_LOOKBACK_MAX = 256;
 
     // Static so MainActivity can reflect the correct button state after a
     // configuration change — the activity instance is recreated, but the
@@ -143,7 +178,9 @@ public final class NodeService extends Service {
     private volatile DiscV5Service discV5;
     private volatile RLPxConnector connector;
     private io.myotis.jsonrpc.MyotisRpcServer rpcServer;
-    private java.util.concurrent.ScheduledExecutorService headWarmer;
+    /** Shared verified-RPC backend (head anchoring, snap-proof reads, ENS, fees).
+     *  Hosts the RPC server's MyotisRpcBackend and serves resolveEns(). */
+    private volatile io.myotis.rpc.VerifiedRpcBackend rpcBackend;
     private java.util.concurrent.ScheduledExecutorService peerMaintainer;
     private AndroidPeerCache peerCache;
     private AndroidCLPeerCache clPeerCache;
@@ -159,21 +196,6 @@ public final class NodeService extends Service {
     private final java.util.concurrent.atomic.AtomicInteger clPeersDiscovered =
             new java.util.concurrent.atomic.AtomicInteger();
 
-    // --- ENS resolution (local Besu EVM over SNAP-verified state) ---------
-    // Mirrors the JVM daemon's CommandHandler.prepareEnsCall stack. Bytecode
-    // cache + EVM pool are service-lifecycle (not node-lifecycle) so they
-    // survive Stop/Start; shut down in onDestroy.
-    private final io.myotis.evm.world.BytecodeCache ensBytecodeCache =
-            io.myotis.evm.world.BytecodeCache.inMemory();
-    // Single thread: Besu EVM execution is CPU-bound and the oracle is pinned
-    // to one peer, so serializing avoids contention. Daemon thread so it never
-    // blocks process exit.
-    private final java.util.concurrent.ExecutorService evmPool =
-            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
-                Thread t = new Thread(r, "android-evm");
-                t.setDaemon(true);
-                return t;
-            });
     // CCIP-Read gateway HTTP is blocking; keep it off the single EVM thread.
     private final java.util.concurrent.ExecutorService ccipPool =
             java.util.concurrent.Executors.newCachedThreadPool(r -> {
@@ -219,6 +241,10 @@ public final class NodeService extends Service {
             long syncStartPeriod,
             long syncCurrentPeriod,
             long syncTargetPeriod,
+            // Age (ms) of the last verified RPC head, Long.MAX_VALUE if none built yet.
+            // The readiness traffic-light's green gate: a recent head means wallet
+            // calls serve instead of hitting "no verified head".
+            long verifiedHeadAgeMs,
             List<RLPxConnector.PeerInfo> readyPeerList) {}
 
     /** Result of a get-account query. Mirrors the JVM daemon's JSON response shape. */
@@ -600,360 +626,20 @@ public final class NodeService extends Service {
     @SuppressLint("NewApi") // CompletableFuture.orTimeout — see requestAccount
     public CompletableFuture<EnsResolution> resolveEns(String name) {
         final String trimmed = name == null ? "" : name.trim();
-        if (!RUNNING.get() || connector == null) {
+        // Delegate to the shared backend — the AUTO → FINALIZED → PEER_HEAD policy,
+        // snap-heavy pause, and CCIP handling all live there now (one impl for daemon
+        // + Android). Map its neutral io.myotis.rpc.EnsResolution back to the public
+        // NodeService.EnsResolution the UI (MainActivity) consumes.
+        io.myotis.rpc.VerifiedRpcBackend b = rpcBackend;
+        if (!RUNNING.get() || b == null) {
             return CompletableFuture.completedFuture(
                     new EnsResolution(trimmed, null, -1, false, "node not running"));
         }
-        if (trimmed.isEmpty()) {
-            return CompletableFuture.completedFuture(
-                    new EnsResolution(trimmed, null, -1, false, "empty name"));
-        }
-        io.myotis.ens.EnsResolutionRoot mode = ensResolutionRoot;
-        // Pause acquiring new peers for the duration of the resolution so its snap
-        // round-trips aren't starved by outbound-dial bursts on the shared event
-        // loop. Released when the (async) resolution completes. See isSnapHeavy().
-        final RLPxConnector conn = connector;
-        conn.enterSnapHeavy();
-        final CompletableFuture<EnsResolution> result;
-        if (mode == io.myotis.ens.EnsResolutionRoot.AUTO) {
-            result = attemptResolve(trimmed, io.myotis.ens.EnsResolutionRoot.FINALIZED)
-                    .thenCompose(fin -> {
-                        // Verified hit → done.
-                        if (fin.resolution().addressHex() != null) {
-                            return CompletableFuture.completedFuture(fin.resolution());
-                        }
-                        // If finalized already consumed an ERC-3668 offchain (CCIP)
-                        // answer, the result is determined by the gateway, not by
-                        // which EL state root we ran against — re-resolving at the
-                        // peer head would just repeat the same slow, multi-round-trip
-                        // gateway calls for the same (non-)answer. Don't fall back.
-                        if (fin.usedOffchain()) {
-                            return CompletableFuture.completedFuture(fin.resolution());
-                        }
-                        // Otherwise (no record at the finalized block, or finalized
-                        // couldn't be served) fall back to the peer head for a
-                        // fresher, peer-claimed answer.
-                        return attemptResolve(trimmed, io.myotis.ens.EnsResolutionRoot.PEER_HEAD)
-                                .thenApply(Attempt::resolution);
-                    });
-        } else {
-            result = attemptResolve(trimmed, mode).thenApply(Attempt::resolution);
-        }
-        return result.whenComplete((r, ex) -> conn.exitSnapHeavy());
+        return b.resolveEns(trimmed, ensResolutionRoot)
+                .thenApply(r -> new EnsResolution(
+                        r.name(), r.addressHex(), r.blockNumber(), r.verified(), r.error()));
     }
 
-    /** One resolution attempt against a specific root. Never throws. */
-    @SuppressLint("NewApi")
-    private CompletableFuture<Attempt> attemptResolve(String trimmed,
-                                                      io.myotis.ens.EnsResolutionRoot root) {
-        // prepareEnsCall is blocking — it probes peer heads (up to ~10s of network
-        // round-trips) before pinning one. Run it on the EVM pool, never on the
-        // caller's thread, so resolveEns is safe to invoke from the UI thread
-        // without risking an ANR. The probe and the EVM execution that follows
-        // share the single EVM thread, which keeps the pinned-peer oracle
-        // contention-free (see evmPool's rationale above).
-        return CompletableFuture.<EnsCall>supplyAsync(() -> {
-            try {
-                return prepareEnsCall(root);
-            } catch (Exception e) {
-                throw new java.util.concurrent.CompletionException(e);
-            }
-        }, evmPool).thenCompose(call -> {
-            final boolean verified = call.beaconVerified();
-            return call.resolver().resolveAddress(trimmed, call.blockCtx())
-                    .orTimeout(ENS_TIMEOUT_SEC, TimeUnit.SECONDS)
-                    .handle((opt, ex) -> {
-                        final boolean usedOffchain = call.offchainExecutor().usedOffchain();
-                        if (ex != null) {
-                            // Log the full stack: library wrappers (e.g. Caffeine's
-                            // IllegalStateException(className)) mask the real
-                            // Android-incompat cause, which unwrap() now chains.
-                            LogBuffer.e(TAG, "[ens] resolveAddress failed for " + trimmed, ex);
-                            return new Attempt(new EnsResolution(
-                                    trimmed, null, call.blockNumber(), verified, unwrap(ex)), usedOffchain);
-                        }
-                        if (opt == null || opt.isEmpty()) {
-                            return new Attempt(new EnsResolution(trimmed, null, call.blockNumber(), verified,
-                                    "name does not resolve"), usedOffchain);
-                        }
-                        return new Attempt(new EnsResolution(
-                                trimmed, opt.get().toHex(), call.blockNumber(), verified, null), usedOffchain);
-                    });
-        }).exceptionally(ex -> {
-            // Only prepareEnsCall reaches here — the handle() above never throws.
-            // FINALIZED can fail (no finalized header yet, snap peer can't serve the
-            // block); return a null-address result so AUTO can fall back. Peel the
-            // CompletionException wrapper so the surfaced error matches the cause.
-            Throwable cause = (ex instanceof java.util.concurrent.CompletionException
-                    && ex.getCause() != null) ? ex.getCause() : ex;
-            return new Attempt(
-                    new EnsResolution(trimmed, null, -1,
-                            root == io.myotis.ens.EnsResolutionRoot.FINALIZED, unwrap(cause)),
-                    false);
-        });
-    }
-
-    // -------------------------------------------------------------------------
-    // JSON-RPC verified reads (Phase B). These bridge the Kotlin MyotisRpcBackend
-    // to the same verified machinery the Query tab uses: requestAccount() for
-    // balances/nonces (head-anchored via headerChain) and the prepareEnsCall EVM
-    // stack for eth_call. All blocking — called off the Ktor IO dispatcher.
-    // -------------------------------------------------------------------------
-
-    /** Reuse one beacon-anchored head context across a burst of reads (a MetaMask
-     *  page load fires hundreds of eth_calls + account reads) instead of re-probing
-     *  peers + re-anchoring per call. ~12s keeps "latest" within ~1 block while
-     *  amortizing the expensive (and fallback-prone) peer-probe + headerChain anchor
-     *  across the whole burst. */
-    private static final long RPC_HEAD_TTL_MS = 12_000;
-    /** Per-read/-call budget (snap round-trips; CCIP can add one for eth_call). */
-    private static final long RPC_CALL_TIMEOUT_SEC = 30;
-    /** Head-build budget — includes the headerChain anchoring fetch. */
-    private static final long RPC_ACCOUNT_TIMEOUT_SEC = HEADER_CHAIN_TIMEOUT_SEC + 10;
-    /** Overall budget for the (parallel) snap-peer head probe. */
-    private static final long PEER_PROBE_TIMEOUT_SEC = 15;
-    /** Keep serving the last successfully-built head up to this age while a refresh
-     *  is in flight. It's still beacon-anchored, just a few blocks stale — serving
-     *  it bridges transient rebuild gaps (head just advanced, peers' flat state not
-     *  yet caught up) instead of proxying. The warmer keeps it fresh (~5-15s). */
-    private static final long RPC_HEAD_MAX_STALE_MS = 30_000;
-    /** When there's no usable head at all (cold start / long outage), wait up to
-     *  this long for one to be built before falling back to the proxy. */
-    private static final long RPC_HEAD_WAIT_MS = 5_000;
-
-    private final Object rpcCallCtxLock = new Object();
-    private CompletableFuture<EnsCall> rpcCallCtx;   // in-flight/fresh build (dedup)
-    private long rpcCallCtxAtMs;
-    // Last successfully-built anchored head + its build time, as one immutable
-    // record behind a single volatile ref so head and timestamp are read/written
-    // atomically together (no torn read of new head with old timestamp).
-    private volatile HeadWithTimestamp lastGoodHead;
-    /** Runs the blocking, network-bound head build off the caller's thread so a
-     *  request blocks only up to its own timeout. Single-thread: the future
-     *  dedup means at most one build runs at a time. */
-    private final java.util.concurrent.ExecutorService headBuildPool =
-            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
-                Thread t = new Thread(r, "rpc-head-build");
-                t.setDaemon(true);
-                return t;
-            });
-
-    /** keccak256("") — an account with this codeHash is an EOA (no contract code). */
-    private static final byte[] EMPTY_CODE_HASH = Hash.keccak256(Bytes.EMPTY).toArrayUnsafe();
-
-    /** Only fresh-head tags are served verified for now; others → proxy. */
-    private static boolean isLatestTag(String block) {
-        return block == null || block.isEmpty()
-                || block.equals("latest") || block.equals("pending");
-    }
-
-    /**
-     * The shared beacon-anchored head context for "latest"-ish reads, or null
-     * (→ proxy, logged). Every verified RPC read/call resolves the head HERE so
-     * the head is anchored to the beacon-finalized root once per {@link
-     * #RPC_HEAD_TTL_MS} window and reused — instead of each call independently
-     * re-fetching a head + re-running the headerChain anchor (the slow, fragile
-     * step that produced the high proxy-fallback rate). The context's stateRoot
-     * is beacon-anchored, so reads against its {@code oracle} stay fully verified.
-     */
-    private EnsCall verifiedHeadFor(String block) {
-        if (!isLatestTag(block)) return null;
-        // Fast path: serve the last good head if it's recent enough. It stays
-        // beacon-anchored; a few seconds stale beats proxying, and it bridges the
-        // brief windows where a TTL-expiry rebuild can't yet anchor the just-
-        // advanced head. The background warmer keeps this fresh (~5-15s).
-        HeadWithTimestamp good = lastGoodHead;
-        if (good != null
-                && android.os.SystemClock.elapsedRealtime() - good.builtAtMs() < RPC_HEAD_MAX_STALE_MS) {
-            return good.head();
-        }
-        // No usable head (cold start / sustained outage): wait briefly for a build
-        // before giving up — most gaps are short (a peer (re)connecting). The wait
-        // is strictly bounded: each build attempt is capped at the remaining time.
-        long deadline = android.os.SystemClock.elapsedRealtime() + RPC_HEAD_WAIT_MS;
-        Exception last = null;
-        do {
-            long remainingMs = deadline - android.os.SystemClock.elapsedRealtime();
-            if (remainingMs <= 0) break;
-            try {
-                return verifiedHeadCallContext(remainingMs, TimeUnit.MILLISECONDS);
-            } catch (Exception e) {
-                last = e;
-                HeadWithTimestamp g = lastGoodHead;   // a concurrent build may have just succeeded
-                if (g != null && android.os.SystemClock.elapsedRealtime() - g.builtAtMs() < RPC_HEAD_MAX_STALE_MS) {
-                    return g.head();
-                }
-                try { Thread.sleep(300); } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
-        } while (android.os.SystemClock.elapsedRealtime() < deadline);
-        LogBuffer.i(TAG, "[rpc] no verified head after " + RPC_HEAD_WAIT_MS + "ms -> proxy: "
-                + (last != null ? unwrap(last) : "timeout"));
-        return null;
-    }
-
-    /** eth_call over the shared anchored head. Returns raw ABI bytes, or null to proxy. */
-    private byte[] rpcCall(byte[] to, byte[] data, String block) {
-        EnsCall h = verifiedHeadFor(block);
-        if (h == null || to == null || to.length != 20) return null;
-        try {
-            return h.offchainExecutor()
-                    .callView(io.myotis.evm.Address.of(to), data == null ? new byte[0] : data,
-                            h.blockCtx())
-                    .get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
-        } catch (Exception e) {
-            LogBuffer.i(TAG, "[rpc] eth_call -> proxy: " + unwrap(e));
-            return null;
-        }
-    }
-
-    /** Verified account record at the shared anchored head, or null (→ proxy). The
-     *  oracle hash-verifies the account against the anchored stateRoot (storageRoot
-     *  + codeHash come from the proven trie leaf), and verifies account ABSENCE via
-     *  an exclusion proof — so a missing account is a verified zero, not a proxy. */
-    private io.myotis.evm.world.AccountState rpcAccountState(byte[] address, String block) {
-        EnsCall h = verifiedHeadFor(block);
-        if (h == null || address == null || address.length != 20) return null;
-        try {
-            return h.oracle()
-                    .fetchAccount(h.blockCtx().stateRoot(), io.myotis.evm.Address.of(address))
-                    .get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
-        } catch (Exception e) {
-            LogBuffer.i(TAG, "[rpc] account read -> proxy: " + unwrap(e));
-            return null;
-        }
-    }
-
-    /** eth_getCode: bytecode verified (keccak256(code)==proven codeHash), or null to proxy. */
-    private byte[] rpcCode(byte[] address, String block) {
-        EnsCall h = verifiedHeadFor(block);
-        if (h == null || address == null || address.length != 20) return null;
-        try {
-            byte[] codeHash = h.oracle()
-                    .fetchAccount(h.blockCtx().stateRoot(), io.myotis.evm.Address.of(address))
-                    .get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS).codeHash();
-            if (java.util.Arrays.equals(codeHash, EMPTY_CODE_HASH)) return new byte[0];  // EOA
-            return h.oracle().fetchBytecode(codeHash).get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
-        } catch (Exception e) {
-            LogBuffer.i(TAG, "[rpc] eth_getCode -> proxy: " + unwrap(e));
-            return null;
-        }
-    }
-
-    /** eth_getStorageAt: the 32-byte value at {@code slot32}, proven against the
-     *  account's verified storageRoot (absent slots verify as zero via the oracle's
-     *  exclusion proof). Null → proxy. */
-    private byte[] rpcStorageAt(byte[] address, byte[] slot32, String block) {
-        EnsCall h = verifiedHeadFor(block);
-        if (h == null || address == null || address.length != 20
-                || slot32 == null || slot32.length != 32) return null;
-        try {
-            java.math.BigInteger value = h.oracle()
-                    .fetchStorage(h.blockCtx().stateRoot(), io.myotis.evm.Address.of(address),
-                            new java.math.BigInteger(1, slot32))
-                    .get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
-            return word32(value);
-        } catch (Exception e) {
-            LogBuffer.i(TAG, "[rpc] eth_getStorageAt -> proxy: " + unwrap(e));
-            return null;
-        }
-    }
-
-    /** eth_sendRawTransaction: gossip the user-signed tx to peers; return its hash
-     *  (keccak256 of the raw bytes), or null (→ proxy) if no peer took it. Myotis
-     *  never signs or originates a tx — this only relays bytes the user submitted. */
-    private byte[] rpcSendRawTransaction(byte[] rawTx) {
-        RLPxConnector conn = connector;
-        if (conn == null || rawTx == null || rawTx.length == 0) return null;
-        try {
-            int sent = conn.broadcastTransaction(rawTx);
-            if (sent == 0) return null;   // no peer reached → let the proxy relay it
-            byte[] txHash = Hash.keccak256(Bytes.wrap(rawTx)).toArrayUnsafe();
-            LogBuffer.i(TAG, "[rpc] eth_sendRawTransaction broadcast to " + sent
-                    + " peer(s), hash=" + Bytes.wrap(txHash).toHexString());
-            return txHash;
-        } catch (Exception e) {
-            LogBuffer.i(TAG, "[rpc] eth_sendRawTransaction failed: " + unwrap(e));
-            return null;
-        }
-    }
-
-    /** Render a storage value as a 32-byte big-endian word (drops BigInteger's
-     *  two's-complement sign byte, left-pads short magnitudes). */
-    private static byte[] word32(java.math.BigInteger v) {
-        byte[] out = new byte[32];
-        byte[] mag = v.toByteArray();
-        int len = Math.min(mag.length, 32);
-        System.arraycopy(mag, mag.length - len, out, 32 - len, len);
-        return out;
-    }
-
-    /** Build (or reuse within {@link #RPC_HEAD_TTL_MS}) a snap-peer head context
-     *  whose state root is anchored back to the beacon-finalized root, so reads +
-     *  EVM calls run against cryptographically-verified state. Blocking. */
-    /** Full-budget variant for the background warmer. */
-    private EnsCall verifiedHeadCallContext() throws Exception {
-        return verifiedHeadCallContext(RPC_ACCOUNT_TIMEOUT_SEC * 1000L, TimeUnit.MILLISECONDS);
-    }
-
-    private EnsCall verifiedHeadCallContext(long timeout, TimeUnit unit) throws Exception {
-        CompletableFuture<EnsCall> future;
-        boolean build = false;
-        synchronized (rpcCallCtxLock) {
-            long now = android.os.SystemClock.elapsedRealtime();
-            // Reuse an in-flight build (regardless of age — never start a parallel
-            // one) or a completed-OK result still within the TTL.
-            if (rpcCallCtx != null
-                    && (!rpcCallCtx.isDone()
-                        || (!rpcCallCtx.isCompletedExceptionally() && now - rpcCallCtxAtMs < RPC_HEAD_TTL_MS))) {
-                future = rpcCallCtx;
-            } else {
-                future = new CompletableFuture<>();
-                rpcCallCtx = future;
-                rpcCallCtxAtMs = now;
-                build = true;
-            }
-        }
-        // Build on a background thread so the caller only blocks up to `timeout`
-        // (honoring verifiedHeadFor's bounded wait even when this call triggers the
-        // build). A burst of concurrent reads shares the one builder's future.
-        if (build) {
-            final CompletableFuture<EnsCall> f = future;
-            try {
-                headBuildPool.execute(() -> {
-                    try {
-                        EnsCall ctx = buildAnchoredHead();
-                        lastGoodHead = new HeadWithTimestamp(ctx, android.os.SystemClock.elapsedRealtime());
-                        f.complete(ctx);
-                    } catch (Throwable t) {
-                        f.completeExceptionally(t);
-                        synchronized (rpcCallCtxLock) {
-                            if (rpcCallCtx == f) rpcCallCtx = null;   // let the next call retry
-                        }
-                    }
-                });
-            } catch (java.util.concurrent.RejectedExecutionException rex) {  // shutting down
-                f.completeExceptionally(rex);
-                synchronized (rpcCallCtxLock) { if (rpcCallCtx == f) rpcCallCtx = null; }
-            }
-        }
-        try {
-            return future.get(timeout, unit);   // build continues in the background on timeout
-        } catch (java.util.concurrent.ExecutionException e) {
-            Throwable cause = e.getCause() != null ? e.getCause() : e;
-            throw (cause instanceof Exception) ? (Exception) cause : new Exception(cause);
-        }
-    }
-
-    /**
-     * Pre-warm and keep-warm the shared anchored head: build it as soon as a snap
-     * peer is ready (retrying every few seconds), so a wallet's first read hits a
-     * ready cache instead of triggering a cold build — shrinking the post-start
-     * window where reads fall back to the proxy down to "time until first usable
-     * snap peer". Cheap when warm: verifiedHeadCallContext reuses a fresh context.
-     */
     /**
      * Keep a working set of snap peers connected ({@link #TARGET_SNAP_PEERS}) so a
      * verified request almost always finds one — the main cause of proxy fallbacks
@@ -984,11 +670,17 @@ public final class NodeService extends Service {
             long now = System.currentTimeMillis();
             LogBuffer.i(TAG, "[peers] " + snapPeers + " snap peer(s) < target " + TARGET_SNAP_PEERS
                     + "; re-dialing cached snap peers + DNS pool");
-            // 1) Re-dial known snap peers from the cache.
+            // 1) Re-dial known snap peers from the cache, proven snap-servers first
+            //    (same ordering as cold start) so a starved node reconnects a
+            //    working snap peer before retrying known hangers.
             if (pc != null) {
+                List<AndroidPeerCache.CachedPeer> snapCached = new ArrayList<>();
                 for (AndroidPeerCache.CachedPeer p : pc.load()) {
+                    if (p.snap()) snapCached.add(p);
+                }
+                snapCached.sort(java.util.Comparator.comparingInt(NodeService::snapDialRank));
+                for (AndroidPeerCache.CachedPeer p : snapCached) {
                     try {
-                        if (!p.snap()) continue;
                         if (conn.activeSnapHandlers().size() >= TARGET_SNAP_PEERS) break;
                         dialCachedSnapPeer(conn, p, now);
                     } catch (Exception e) {
@@ -1184,306 +876,22 @@ public final class NodeService extends Service {
         }
     }
 
-    private void startHeadWarmer() {
-        if (headWarmer != null) return;
-        headWarmer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "rpc-head-warmer");
-            t.setDaemon(true);
-            return t;
-        });
-        headWarmer.scheduleWithFixedDelay(() -> {
-            if (!RUNNING.get()) return;
-            try {
-                verifiedHeadCallContext();
-            } catch (Exception ignored) {
-                // No usable snap peer / anchorable head yet — retry next tick.
-            }
-        }, 3, 5, TimeUnit.SECONDS);
-    }
+    /**
 
     /**
-     * Build a fully beacon-verified head context, preferring the freshest
-     * snap-servable head (PEER_HEAD, anchored to finalized via headerChain) and
-     * falling back to the beacon-finalized root (verified directly by the light
-     * client, ~12 min stale) when no peer serves a fresh head. Both paths are
-     * cryptographically anchored to the beacon chain — so under poor snap
-     * conditions reads stay verified (just staler) instead of all proxying.
+     * Dial-priority rank for a cached peer (lower = dialed first): proven
+     * snap-servers, then snap-capable-but-unproven, then known snap hangers, then
+     * plain-eth peers. Denied snap peers still outrank non-snap peers — state
+     * roots change, so a peer that couldn't serve an old pivot may serve the
+     * current head, and it's still snap-capable.
      */
-    private EnsCall buildAnchoredHead() throws Exception {
-        try {
-            EnsCall ctx = prepareEnsCall(io.myotis.ens.EnsResolutionRoot.PEER_HEAD);
-            if (anchorHeadToBeacon(ctx.blockNumber(), ctx.blockCtx().stateRoot())) {
-                return ctx;
-            }
-            LogBuffer.i(TAG, "[rpc] fresh head not beacon-anchored (block #"
-                    + ctx.blockNumber() + "); falling back to finalized");
-        } catch (Exception headEx) {
-            LogBuffer.i(TAG, "[rpc] no snap-servable fresh head (" + unwrap(headEx)
-                    + "); falling back to finalized");
-        }
-        // Fallback: the beacon-finalized execution root, verified directly by the
-        // light client (no headerChain needed). Throws if no peer retains it.
-        return prepareEnsCall(io.myotis.ens.EnsResolutionRoot.FINALIZED);
-    }
-
-    /** True iff {@code peerStateRoot} at {@code peerBlock} chains back to the
-     *  beacon-finalized execution root (same headerChain method as get-account). */
-    private boolean anchorHeadToBeacon(long peerBlock, byte[] peerStateRoot) throws Exception {
-        com.jaeckel.ethp2p.consensus.BeaconLightClient blc = beaconLightClient;
-        RLPxConnector conn = connector;
-        if (blc == null || conn == null) return false;
-        com.jaeckel.ethp2p.consensus.types.LightClientHeader fin =
-                blc.getStore().getFinalizedHeader();
-        if (fin == null) return false;
-        com.jaeckel.ethp2p.consensus.types.ExecutionPayloadHeader exec = fin.execution();
-        if (exec.blockNumber() == peerBlock) {
-            // Head is exactly the finalized block — roots must match directly.
-            return java.util.Arrays.equals(exec.stateRoot(), peerStateRoot);
-        }
-        return verifyHeaderChainBatched(conn, exec.blockNumber(), peerBlock,
-                exec.stateRoot(), peerStateRoot)
-                .get(HEADER_CHAIN_TIMEOUT_SEC + 5, TimeUnit.SECONDS);
-    }
-
-    private record EnsCall(io.myotis.ens.EnsResolver resolver,
-                           io.myotis.evm.BlockContext blockCtx,
-                           long blockNumber,
-                           boolean beaconVerified,
-                           io.myotis.evm.CcipReadEvmExecutor offchainExecutor,
-                           io.myotis.evm.world.SnapBackedStateOracle oracle) {}
-
-    /** A snap peer paired with the fresh head it both reported and snap-serves. */
-    private record PeerHead(com.jaeckel.ethp2p.networking.eth.EthHandler peer,
-                            com.jaeckel.ethp2p.core.types.BlockHeader header) {}
-
-    /** A built anchored head plus when it was built (elapsedRealtime), held as one
-     *  immutable unit so the serve-stale check reads both atomically. */
-    private record HeadWithTimestamp(EnsCall head, long builtAtMs) {}
-
-    /**
-     * Resolve to the first future that completes <em>successfully</em> (non-null),
-     * ignoring failures; if every future fails, throw the last failure; if none
-     * resolves within {@code timeoutSec}, throw {@link java.util.concurrent.TimeoutException}.
-     * Hung futures are simply never awaited again — harmless, and bounded by the
-     * overall timeout. Used to run the snap-peer head probes in parallel.
-     */
-    private static <T> T firstSuccess(java.util.List<CompletableFuture<T>> futures, long timeoutSec)
-            throws Exception {
-        if (futures.isEmpty()) throw new IllegalStateException("no ready snap peers");
-        CompletableFuture<T> result = new CompletableFuture<>();
-        java.util.concurrent.atomic.AtomicInteger remaining =
-                new java.util.concurrent.atomic.AtomicInteger(futures.size());
-        java.util.concurrent.atomic.AtomicReference<Throwable> lastErr =
-                new java.util.concurrent.atomic.AtomicReference<>();
-        for (CompletableFuture<T> f : futures) {
-            f.whenComplete((v, e) -> {
-                if (e == null && v != null) {
-                    if (result.complete(v)) {
-                        // First winner: cancel the rest so losing probes don't keep
-                        // burning CPU/battery/data in the background on mobile.
-                        for (CompletableFuture<T> other : futures) {
-                            if (other != f) other.cancel(true);
-                        }
-                    }
-                } else {
-                    if (e != null) lastErr.set(e);
-                    if (remaining.decrementAndGet() == 0) {
-                        Throwable le = lastErr.get();
-                        result.completeExceptionally(le != null ? le
-                                : new IllegalStateException("no peer qualified"));
-                    }
-                }
-            });
-        }
-        try {
-            return result.get(timeoutSec, TimeUnit.SECONDS);
-        } catch (java.util.concurrent.ExecutionException ee) {
-            Throwable c = ee.getCause() != null ? ee.getCause() : ee;
-            throw (c instanceof Exception) ? (Exception) c : new Exception(c);
-        }
-    }
-
-    /** An {@link #attemptResolve} outcome plus whether it used an ERC-3668 gateway. */
-    private record Attempt(EnsResolution resolution, boolean usedOffchain) {}
-
-    /**
-     * Build the EVM/ENS stack. The {@code root} selects which state the ENS
-     * contracts run against — see {@link io.myotis.ens.EnsResolutionRoot}:
-     * FINALIZED (default) anchors resolution to the light client's
-     * beacon-verified finalized state (verified mapping, no head probe);
-     * PEER_HEAD uses a snap peer's latest head (freshest, but peer-claimed).
-     * Mirrors {@code CommandHandler.prepareEnsCall}. Blocking — call off the UI thread.
-     */
-    private EnsCall prepareEnsCall(io.myotis.ens.EnsResolutionRoot root) throws Exception {
-        RLPxConnector conn = connector;
-        if (conn == null) throw new IllegalStateException("node not running");
-        List<com.jaeckel.ethp2p.networking.eth.EthHandler> snapPeers = conn.activeSnapHandlers();
-        if (snapPeers.isEmpty()) {
-            throw new IllegalStateException("No active peer with snap/1 support");
-        }
-
-        io.myotis.evm.BlockContext blockCtx;
-        long blockNumber;
-        boolean verified;
-        com.jaeckel.ethp2p.networking.eth.EthHandler pinned;
-
-        if (root == io.myotis.ens.EnsResolutionRoot.FINALIZED) {
-            // Resolve against the beacon-verified finalized execution header — the
-            // resulting name→address mapping is anchored to a beacon-attested root
-            // (snap proofs verify against it). ~12 min stale (finality lag). A snap
-            // peer must still retain that block's state, which they often DON'T
-            // (Geth prunes trie state beyond ~128 blocks and serves snap from a
-            // flat layer lagging the head). So we don't blindly pin a peer — we
-            // probe each one for the finalized root and pin the first that actually
-            // serves it. If none do, we throw and AUTO falls back to the head.
-            com.jaeckel.ethp2p.consensus.BeaconLightClient blc = beaconLightClient;
-            if (blc == null) throw new IllegalStateException("beacon light client not running");
-            com.jaeckel.ethp2p.consensus.types.LightClientHeader fin = blc.getStore().getFinalizedHeader();
-            if (fin == null) throw new IllegalStateException("no beacon-verified finalized header yet");
-            com.jaeckel.ethp2p.consensus.types.ExecutionPayloadHeader exec = fin.execution();
-            org.apache.tuweni.bytes.Bytes32 finRoot =
-                    org.apache.tuweni.bytes.Bytes32.wrap(exec.stateRoot());
-            pinned = firstPeerServing(snapPeers, finRoot);
-            if (pinned == null) {
-                throw new IllegalStateException(
-                        "no snap peer retains the beacon-finalized state (block #"
-                        + exec.blockNumber() + ")");
-            }
-            blockCtx = new io.myotis.evm.BlockContext(
-                    exec.stateRoot(),
-                    exec.blockNumber(),
-                    exec.timestamp(),
-                    leUint256ToBigInteger(exec.baseFeePerGas()),
-                    io.myotis.evm.Address.of(exec.feeRecipient()),
-                    exec.prevRandao(),
-                    java.math.BigInteger.valueOf(conn.getNetwork().networkId()),
-                    exec.gasLimit());
-            blockNumber = exec.blockNumber();
-            verified = true;
-        } else {
-            // PEER_HEAD: each peer's bleeding-edge head root is frequently NOT yet
-            // snap-servable (the flat state lags the head). Walk every peer: fetch
-            // its fresh head, then PROBE that the peer actually serves a snap
-            // account at that root before pinning it — the same resilience
-            // get-account gets by retrying across peers. The first peer that passes
-            // both is pinned for the whole resolution (one consistent root).
-            final long minHead = conn.getNetwork().minSensibleHeadBlock();
-            // Probe every ready snap peer CONCURRENTLY — fetch its fresh head, then
-            // probe that it snap-serves that head root — and award the FIRST to
-            // qualify. The old serial walk paid each unresponsive peer's timeout in
-            // turn (the dominant build cost, and a frequent proxy-fallback trigger);
-            // running the probes in parallel collapses that to ~one round-trip.
-            java.util.List<CompletableFuture<PeerHead>> probes = new java.util.ArrayList<>();
-            for (com.jaeckel.ethp2p.networking.eth.EthHandler peer : snapPeers) {
-                if (!peer.isReady() || peer.isSnapServingFailed()) continue;
-                CompletableFuture<com.jaeckel.ethp2p.core.types.BlockHeader> headFut =
-                        peer.requestFreshHeadHeaderAsync();
-                if (headFut == null) continue;
-                probes.add(headFut.thenCompose(fresh -> {
-                    if (fresh.number < minHead) {
-                        throw new java.util.concurrent.CompletionException(
-                                new IllegalStateException("stale head #" + fresh.number));
-                    }
-                    // servesRoot, but async: the peer must return a non-empty proof
-                    // for the probe account at its head root.
-                    return peer.requestAccountByHashAsync(SNAP_PROBE_ACCOUNT_HASH, fresh.stateRoot)
-                            .thenApply(probe -> {
-                                if (probe.proof() == null || probe.proof().isEmpty()) {
-                                    throw new java.util.concurrent.CompletionException(
-                                            new IllegalStateException(
-                                                    "peer does not snap-serve head root (block #"
-                                                            + fresh.number + ")"));
-                                }
-                                return new PeerHead(peer, fresh);
-                            });
-                }));
-            }
-            PeerHead chosen;
-            try {
-                chosen = firstSuccess(probes, PEER_PROBE_TIMEOUT_SEC);
-            } catch (Exception e) {
-                throw new IllegalStateException(
-                        "No snap peer served a fresh head root (" + unwrap(e) + ")");
-            }
-            com.jaeckel.ethp2p.networking.eth.EthHandler headPeer = chosen.peer();
-            com.jaeckel.ethp2p.core.types.BlockHeader header = chosen.header();
-            blockCtx = new io.myotis.evm.BlockContext(
-                    header.stateRoot.toArrayUnsafe(),
-                    header.number,
-                    header.timestamp,
-                    header.baseFeePerGas,
-                    io.myotis.evm.Address.of(header.beneficiary.toArrayUnsafe()),
-                    header.mixHashOrPrevRandao.toArrayUnsafe(),
-                    java.math.BigInteger.valueOf(conn.getNetwork().networkId()),
-                    header.gasLimit);
-            blockNumber = header.number;
-            verified = false;
-            pinned = headPeer;
-        }
-
-        // Pin every SNAP request to the chosen peer (serves blockCtx's stateRoot).
-        final com.jaeckel.ethp2p.networking.eth.EthHandler finalPeer = pinned;
-        io.myotis.evm.world.SnapBackedStateOracle oracle =
-                new io.myotis.evm.world.SnapBackedStateOracle(
-                        () -> finalPeer.isReady() && !finalPeer.isSnapServingFailed()
-                                ? new com.jaeckel.ethp2p.android.snap.EthHandlerSnapPeer(finalPeer)
-                                : null,
-                        ensBytecodeCache);
-        io.myotis.evm.DefaultEvmExecutor base =
-                new io.myotis.evm.DefaultEvmExecutor(oracle, ensBytecodeCache, evmPool);
-        io.myotis.evm.PrefetchingEvmExecutor prefetching =
-                new io.myotis.evm.PrefetchingEvmExecutor(base);
-        io.myotis.evm.ccipread.CcipReadHandler ccip =
-                new io.myotis.evm.ccipread.CcipReadHandler(
-                        new com.jaeckel.ethp2p.android.ens.AndroidCcipGateway(ccipPool));
-        io.myotis.evm.CcipReadEvmExecutor executor =
-                new io.myotis.evm.CcipReadEvmExecutor(prefetching, ccip);
-        io.myotis.ens.EnsResolver resolver =
-                io.myotis.ens.EnsResolver.forChainId(executor, conn.getNetwork().networkId());
-        return new EnsCall(resolver, blockCtx, blockNumber, verified, executor, oracle);
-    }
-
-    /**
-     * Probe account used only to confirm a peer can actually serve snap state at a
-     * given root before we pin it for a whole ENS resolution. The beacon deposit
-     * contract is present in every post-Merge state, so a non-empty proof for it
-     * means the peer retains that root's trie.
-     */
-    private static final org.apache.tuweni.bytes.Bytes32 SNAP_PROBE_ACCOUNT_HASH =
-            org.apache.tuweni.crypto.Hash.keccak256(
-                    org.apache.tuweni.bytes.Bytes.fromHexString("0x00000000219ab540356cBB839Cbe05303d7705Fa"));
-
-    /** First ready snap peer that returns a non-empty account proof at {@code root},
-     *  or null. Probes all peers CONCURRENTLY (same rationale as the PEER_HEAD probe)
-     *  and awards the first to serve the root. */
-    private com.jaeckel.ethp2p.networking.eth.EthHandler firstPeerServing(
-            List<com.jaeckel.ethp2p.networking.eth.EthHandler> peers,
-            org.apache.tuweni.bytes.Bytes32 root) {
-        java.util.List<CompletableFuture<com.jaeckel.ethp2p.networking.eth.EthHandler>> probes =
-                new java.util.ArrayList<>();
-        for (com.jaeckel.ethp2p.networking.eth.EthHandler peer : peers) {
-            if (!peer.isReady() || peer.isSnapServingFailed()) continue;
-            probes.add(peer.requestAccountByHashAsync(SNAP_PROBE_ACCOUNT_HASH, root)
-                    .thenApply(probe -> {
-                        if (probe.proof() == null || probe.proof().isEmpty()) {
-                            throw new java.util.concurrent.CompletionException(
-                                    new IllegalStateException("peer does not serve root"));
-                        }
-                        return peer;
-                    }));
-        }
-        try {
-            return firstSuccess(probes, PEER_PROBE_TIMEOUT_SEC);
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    /** Convert an SSZ uint256 (32-byte little-endian) to a non-negative BigInteger. */
-    private static java.math.BigInteger leUint256ToBigInteger(byte[] le) {
-        byte[] be = new byte[le.length];
-        for (int i = 0; i < le.length; i++) be[i] = le[le.length - 1 - i];
-        return new java.math.BigInteger(1, be);
+    private static int snapDialRank(AndroidPeerCache.CachedPeer p) {
+        if (!p.snap()) return 3;
+        return switch (p.snapQuality()) {
+            case CONFIRMED -> 0;
+            case UNKNOWN -> 1;
+            case DENIED -> 2;
+        };
     }
 
     /**
@@ -1555,8 +963,11 @@ public final class NodeService extends Service {
             // Reconnect snap/1-capable peers first: state queries (get-account /
             // ENS) need a snap peer, and snap peers are a minority of eth peers,
             // so dialing them ahead of plain-eth peers makes queries work sooner
-            // after a restart instead of waiting for re-discovery.
-            cached.sort((a, b) -> Boolean.compare(b.snap(), a.snap()));
+            // after a restart instead of waiting for re-discovery. Within the snap
+            // set, peers proven to serve proofs (CONFIRMED) come ahead of unproven
+            // ones, and known hangers (DENIED) come last — so a restart converges
+            // on a working snap peer instead of re-timing-out the bad ones first.
+            cached.sort(java.util.Comparator.comparingInt(NodeService::snapDialRank));
 
             final AndroidPeerCache cacheRef = localCache;
             localConnector = new RLPxConnector(nodeKey, DEFAULT_PORT, network,
@@ -1716,8 +1127,20 @@ public final class NodeService extends Service {
             // they served) and persist new ones, so a cold start prefers the
             // peers that actually retained the checkpoint's light-client updates
             // instead of fanning out across discovery peers that don't serve LC.
-            localBlc.setProvenCatchUpServers(clCacheRef.servedPeriods());
+            localBlc.setProvenCatchUpServers(clCacheRef.servedRanges());
             localBlc.setOnCatchUpServed(clCacheRef::recordServed);
+            // Persist which peer served the bootstrap (and for which period) so a restart
+            // front-loads a proven light-client server instead of re-fanning discovery.
+            localBlc.setProvenBootstrapPeers(clCacheRef.bootstrapPeers());
+            localBlc.setOnBootstrapServed(clCacheRef::recordBootstrap);
+            // Seed light_client-capability verdicts from last session and persist new ones,
+            // so a restart dials confirmed light-client servers first and deprioritizes peers
+            // proven not to serve LC — instead of re-Identifying the whole fork-matched cache
+            // (most of which are full nodes without the light-client server). Cuts the
+            // SYNCING->SYNCED churn after a warm restart.
+            localBlc.setProvenLightClient(clCacheRef.lightClientConfirmed());
+            localBlc.setProvenNonLightClient(clCacheRef.lightClientDenied());
+            localBlc.setOnLightClientVerdict(clCacheRef::markLightClientBatch);
             // Persist/resume verified sync-committee state across restarts (day-to-day
             // fast path): next launch resumes from here and only catches up the delta
             // instead of re-bootstrapping from the embedded checkpoint. In getCacheDir()
@@ -1810,50 +1233,68 @@ public final class NodeService extends Service {
         // Starts immediately — does not wait for beacon sync. Router/proxy land next.
         try {
             // Upstream proxy URL (DEBUG/dev only) comes from BuildConfig.RPC_UPSTREAM
-            // (set in gitignored local.properties); blank → strict (no proxy).
-            String upstream = BuildConfig.RPC_UPSTREAM;
-            // Verified-read backend: delegate to the node's shared connector +
-            // beacon state. Phase B serves chain id + verified head; more methods
-            // are added here as they're implemented.
-            final RLPxConnector backendConn = conn;
-            final BeaconSyncState backendState = beaconState;
-            final long backendGenesis = genesisTime;
-            io.myotis.jsonrpc.MyotisRpcBackend backend = new io.myotis.jsonrpc.MyotisRpcBackend() {
-                @Override public long chainId() { return backendConn.getNetwork().networkId(); }
-                @Override public Long headBlockNumber() {
-                    long n = backendState.getOptimisticBlockNumber();
-                    return n > 0 ? Long.valueOf(n) : null;
+            // (set in gitignored local.properties); blank → strict (no proxy). In
+            // permissionless mode we force it off regardless, so unverifiable methods
+            // error instead of proxying.
+            String upstream = STRICT_NO_PROXY ? null : BuildConfig.RPC_UPSTREAM;
+            // Verified-read backend: the SHARED VerifiedRpcBackend — the very class the
+            // :app daemon constructs — wired to this node's connector + beacon state via
+            // the host seams below. Every verified read/call AND ENS resolution delegates
+            // here, so the verified machinery (head anchoring, snap-proof reads, fee
+            // snapshots, the confirm-screen resilience) lives once for both Android and
+            // the daemon instead of a drifting inline copy.
+            final AndroidPeerCache snapCache = cache;
+            io.myotis.rpc.SnapQualitySink snapQualitySink = new io.myotis.rpc.SnapQualitySink() {
+                @Override public void recordSnapServed(java.net.InetSocketAddress address) {
+                    snapCache.recordSnapServed(address);
                 }
-                @Override public String syncState() {
-                    return backendState.getSyncState(backendGenesis,
-                            backendConn.getNetwork().secondsPerSlot()).name();
-                }
-                @Override public byte[] call(byte[] to, byte[] data, String block) {
-                    return rpcCall(to, data, block);
-                }
-                @Override public java.math.BigInteger getBalance(byte[] address, String block) {
-                    io.myotis.evm.world.AccountState a = rpcAccountState(address, block);
-                    return a == null ? null : a.balance();
-                }
-                @Override public Long getTransactionCount(byte[] address, String block) {
-                    io.myotis.evm.world.AccountState a = rpcAccountState(address, block);
-                    return a == null ? null : Long.valueOf(a.nonce());
-                }
-                @Override public byte[] getCode(byte[] address, String block) {
-                    return rpcCode(address, block);
-                }
-                @Override public byte[] getStorageAt(byte[] address, byte[] slot, String block) {
-                    return rpcStorageAt(address, slot, block);
-                }
-                @Override public byte[] sendRawTransaction(byte[] rawTx) {
-                    return rpcSendRawTransaction(rawTx);
+                @Override public void recordSnapFailure(java.net.InetSocketAddress address) {
+                    snapCache.recordSnapFailure(address);
                 }
             };
+            io.myotis.rpc.RpcLogger rpcLogger = new io.myotis.rpc.RpcLogger() {
+                @Override public void info(String message) { LogBuffer.i(TAG, message); }
+                @Override public void warn(String message) { LogBuffer.w(TAG, message); }
+            };
+            // Deep-sleep-aware monotonic clock: unlike the daemon, a phone dozes, and
+            // elapsedRealtime keeps counting while suspended — so a head/fee snapshot that
+            // aged across a sleep is correctly seen as stale (System.nanoTime would not).
+            io.myotis.rpc.RpcClock rpcClock = new io.myotis.rpc.RpcClock() {
+                @Override public long elapsedMillis() { return android.os.SystemClock.elapsedRealtime(); }
+            };
+            io.myotis.rpc.VerifiedRpcBackend backend = new io.myotis.rpc.VerifiedRpcBackend(
+                    conn, blc, beaconState,
+                    new com.jaeckel.ethp2p.android.ens.AndroidCcipGateway(ccipPool),
+                    rpcLogger, rpcClock, snapQualitySink);
+            // start() spins up the head warmer (replaces the old startHeadWarmer()).
+            backend.start();
+            this.rpcBackend = backend;
+            // DEBUG builds: arm MyotisRpcServer's request-capture tap (same JSONL the
+            // daemon records with -Dmyotis.rpc.capture) so a wallet session on-device
+            // can be pulled and diffed against a desktop capture / fed to the replay
+            // harness:  adb pull /sdcard/Android/data/<pkg>/files/rpc-capture.jsonl
+            // app-private external storage, debug-only — release builds never capture.
+            if (BuildConfig.DEBUG && System.getProperty("myotis.rpc.capture") == null) {
+                // getExternalFilesDir(null) returns null when external storage is
+                // unavailable (unmounted/emulated-but-not-ready); new File(null, name)
+                // would resolve to a relative path in the process CWD. Skip arming the
+                // tap rather than write somewhere unexpected — it's a debug aid.
+                java.io.File dir = getExternalFilesDir(null);
+                if (dir != null) {
+                    java.io.File cap = new java.io.File(dir, "rpc-capture.jsonl");
+                    System.setProperty("myotis.rpc.capture", cap.getAbsolutePath());
+                    LogBuffer.i(TAG, "[rpc] capture tap -> " + cap.getAbsolutePath());
+                } else {
+                    LogBuffer.w(TAG, "[rpc] capture tap NOT armed: external files dir unavailable");
+                }
+            }
+            // Bind loopback-only: the wallet (MetaMask) runs on the same device and
+            // reaches us via localhost. Binding 0.0.0.0 would expose an unauthenticated,
+            // TLS-less RPC — incl. eth_sendRawTransaction relay — to the whole LAN.
             io.myotis.jsonrpc.MyotisRpcServer s =
-                    new io.myotis.jsonrpc.MyotisRpcServer(8545, upstream, "0.0.0.0", backend);
+                    new io.myotis.jsonrpc.MyotisRpcServer(8545, upstream, "127.0.0.1", backend);
             s.start();
             this.rpcServer = s;
-            startHeadWarmer();
             startPeerMaintainer();
         } catch (Throwable t) {
             LogBuffer.w(TAG, "[rpc] failed to start JSON-RPC server: " + t);
@@ -1896,12 +1337,8 @@ public final class NodeService extends Service {
      * instead of failing with bind-in-use.
      */
     private synchronized void doShutdown() {
-        // Stop the head pre-warmer + JSON-RPC server first so the port frees and no
-        // warm-tick builds against torn-down state.
-        if (headWarmer != null) {
-            headWarmer.shutdownNow();
-            headWarmer = null;
-        }
+        // Stop the JSON-RPC server + backend first so the port frees and no warm-tick
+        // builds against torn-down state (the head warmer lives in the backend now).
         if (peerMaintainer != null) {
             peerMaintainer.shutdownNow();
             peerMaintainer = null;
@@ -1910,10 +1347,13 @@ public final class NodeService extends Service {
             try { rpcServer.stop(); } catch (Throwable ignored) {}
             rpcServer = null;
         }
-        // Drop the cached head context + last-good head so a later Start doesn't
-        // briefly reuse one pinned to a now-dead peer (fails safe to proxy anyway).
-        synchronized (rpcCallCtxLock) { rpcCallCtx = null; }
-        lastGoodHead = null;
+        // Close the shared backend AFTER the server: stops its head warmer + EVM pools
+        // and drops its cached head/pin state, so a later Start doesn't reuse a context
+        // pinned to a now-dead peer (the backend fails safe to error regardless).
+        if (rpcBackend != null) {
+            try { rpcBackend.close(); } catch (Throwable ignored) {}
+            rpcBackend = null;
+        }
         // Close BLC first: its libp2p host's outbound dials hold references
         // through to the discv5 callback's blcRef, and the sync thread can
         // be in the middle of an addPeer call when shutdown fires.
@@ -1926,7 +1366,11 @@ public final class NodeService extends Service {
         discV5 = null;
         closeQuietly(discV4);
         discV4 = null;
-        peerCache = null;
+        // Flush + stop the peer cache's async writer before dropping the reference.
+        if (peerCache != null) {
+            try { peerCache.close(); } catch (Exception ignored) {}
+            peerCache = null;
+        }
         clPeerCache = null;
         attempted.clear();
         backoff.clear();
@@ -2013,7 +1457,7 @@ public final class NodeService extends Service {
                     bs.state, bs.bootstrapped, bs.connected, bs.lc,
                     cachedClPeerCount, bs.finalizedSlot, bs.execBlockNum, bs.execBlockHashHex,
                     bs.syncStartPeriod, bs.syncCurrentPeriod, bs.syncTargetPeriod,
-                    List.of());
+                    Long.MAX_VALUE, List.of());
         }
         List<RLPxConnector.PeerInfo> active = connector.getActivePeers();
         List<RLPxConnector.PeerInfo> ready = new ArrayList<>();
@@ -2029,13 +1473,15 @@ public final class NodeService extends Service {
                 .comparing(RLPxConnector.PeerInfo::snapSupported).reversed()
                 .thenComparing(p -> p.clientId() == null ? "" : p.clientId()));
         int tableSize = discV4 != null ? discV4.table().size() : 0;
+        io.myotis.rpc.VerifiedRpcBackend backend = rpcBackend;
+        long headAge = backend != null ? backend.verifiedHeadAgeMs() : Long.MAX_VALUE;
         return new Snapshot(true, startTimeMs, tableSize, active.size(), ready.size(), snapCount,
                 cachedPeerCount, attempted.size(), countActiveBackoff(),
                 blacklistedNodeIds.size(), discv5Live, clPeersDiscovered.get(),
                 bs.state, bs.bootstrapped, bs.connected, bs.lc,
                 cachedClPeerCount, bs.finalizedSlot, bs.execBlockNum, bs.execBlockHashHex,
                 bs.syncStartPeriod, bs.syncCurrentPeriod, bs.syncTargetPeriod,
-                ready);
+                headAge, ready);
     }
 
     /** Per-snapshot beacon view, computed once so the record fields stay consistent. */
@@ -2111,9 +1557,7 @@ public final class NodeService extends Service {
         // worker holds the same lock as startAndPublish, so a subsequent
         // service start can't race with a half-finished close.
         RUNNING.set(false);
-        evmPool.shutdownNow();
         ccipPool.shutdownNow();
-        headBuildPool.shutdownNow();
         new Thread(this::doShutdown, "ethp2p-shutdown").start();
         super.onDestroy();
     }

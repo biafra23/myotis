@@ -2,6 +2,7 @@ package com.jaeckel.ethp2p.consensus;
 
 import com.jaeckel.ethp2p.consensus.bls.BlsVerifier;
 import com.jaeckel.ethp2p.consensus.bls.HashToCurve;
+import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
 import com.jaeckel.ethp2p.consensus.ssz.SszUtil;
 import com.jaeckel.ethp2p.consensus.types.BeaconBlockHeader;
 import com.jaeckel.ethp2p.consensus.types.ExecutionPayloadHeader;
@@ -132,6 +133,29 @@ public final class TestUtil {
      */
     public static LightClientHeader dummyLightClientHeader(BeaconBlockHeader beacon) {
         return new LightClientHeader(beacon, dummyExecutionPayloadHeader(), zeroExecutionBranch());
+    }
+
+    /**
+     * Build a LightClientHeader whose execution payload is genuinely committed to the
+     * beacon body root via a real execution branch, so it passes
+     * {@code LightClientProcessor.verifyExecutionBranch}. The beacon header uses the
+     * given slot/proposer/parent/state roots and a {@code bodyRoot} derived from the
+     * (dummy) execution payload — callers that need the beacon's hash-tree-root should
+     * read it from {@code header.beacon()} rather than constructing the beacon separately.
+     */
+    public static LightClientHeader consistentLightClientHeader(
+            long slot, long proposerIndex, byte[] parentRoot, byte[] stateRoot) {
+        ExecutionPayloadHeader exec = dummyExecutionPayloadHeader();
+        // execution_payload sits at generalized index 25 (depth 4) under the body root,
+        // i.e. leaf index 9 of a 16-leaf tree.
+        int leafIdx = BeaconChainSpec.EXECUTION_PAYLOAD_GINDEX % (1 << BeaconChainSpec.EXECUTION_PAYLOAD_DEPTH);
+        byte[][] leaves = new byte[1 << BeaconChainSpec.EXECUTION_PAYLOAD_DEPTH][32];
+        leaves[leafIdx] = exec.hashTreeRoot();
+        byte[][] tree = buildMerkleTree(leaves);
+        byte[][] branch = extractBranch(tree, BeaconChainSpec.EXECUTION_PAYLOAD_DEPTH, leafIdx);
+        byte[] bodyRoot = tree[1];
+        BeaconBlockHeader beacon = new BeaconBlockHeader(slot, proposerIndex, parentRoot, stateRoot, bodyRoot);
+        return new LightClientHeader(beacon, exec, branch);
     }
 
     /**

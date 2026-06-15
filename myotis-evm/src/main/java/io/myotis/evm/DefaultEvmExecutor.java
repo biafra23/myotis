@@ -123,9 +123,7 @@ public final class DefaultEvmExecutor implements EvmExecutor {
                 org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(blockContext.coinbase().toByteArray()));
 
         var targetAccount = scope.get(besuTarget);
-        Bytes contractCode = targetAccount == null ? Bytes.EMPTY : targetAccount.getCode();
-        Hash contractCodeHash = targetAccount == null ? Hash.EMPTY : targetAccount.getCodeHash();
-        Code code = evm.getCode(contractCodeHash, contractCode);
+        Code code = resolveCode(evm, scope, targetAccount);
 
         Wei value = Wei.of(tx.value());
 
@@ -181,6 +179,33 @@ public final class DefaultEvmExecutor implements EvmExecutor {
                 new EvmExecutionError.Reverted(detail.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
     }
 
+    /** EIP-7702 delegation designator prefix: an EOA whose code is
+     *  {@code 0xef0100 || address} executes the delegate's code in its own context. */
+    private static final Bytes DELEGATION_PREFIX = Bytes.fromHexString("0xef0100");
+
+    /**
+     * The code to execute for a call target, resolving an EIP-7702 delegation
+     * designator one hop (the spec forbids chains — a delegate that itself holds
+     * a designator is NOT followed; executing those raw bytes then correctly
+     * yields an invalid-opcode halt). Without this, a plain call/estimate against
+     * a delegated EOA (increasingly common post-Pectra) executed the raw
+     * {@code 0xEF...} designator and died with INVALID_OPERATION.
+     */
+    private static Code resolveCode(EVM evm,
+            org.hyperledger.besu.evm.worldstate.WorldUpdater scope,
+            org.hyperledger.besu.evm.account.Account targetAccount) {
+        Bytes contractCode = targetAccount == null ? Bytes.EMPTY : targetAccount.getCode();
+        Hash contractCodeHash = targetAccount == null ? Hash.EMPTY : targetAccount.getCodeHash();
+        if (contractCode.size() == 23 && contractCode.slice(0, 3).equals(DELEGATION_PREFIX)) {
+            org.hyperledger.besu.datatypes.Address delegate =
+                    org.hyperledger.besu.datatypes.Address.wrap(contractCode.slice(3, 20));
+            var delegateAccount = scope.get(delegate);
+            contractCode = delegateAccount == null ? Bytes.EMPTY : delegateAccount.getCode();
+            contractCodeHash = delegateAccount == null ? Hash.EMPTY : delegateAccount.getCodeHash();
+        }
+        return evm.getCode(contractCodeHash, contractCode);
+    }
+
     /**
      * Yellow-Paper-Appendix-G intrinsic gas cost for a transaction:
      * 21000 base, 4 per zero byte of calldata, 16 per non-zero byte
@@ -229,9 +254,7 @@ public final class DefaultEvmExecutor implements EvmExecutor {
                 org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(blockContext.coinbase().toByteArray()));
 
         var targetAccount = scope.get(besuTarget);
-        Bytes contractCode = targetAccount == null ? Bytes.EMPTY : targetAccount.getCode();
-        Hash contractCodeHash = targetAccount == null ? Hash.EMPTY : targetAccount.getCodeHash();
-        Code code = evm.getCode(contractCodeHash, contractCode);
+        Code code = resolveCode(evm, scope, targetAccount);
 
         MessageFrame frame = MessageFrame.builder()
                 .type(MessageFrame.Type.MESSAGE_CALL)

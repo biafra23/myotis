@@ -66,4 +66,69 @@ interface MyotisRpcBackend {
      * Myotis never signs — the wallet user does; this only relays the bytes.
      */
     fun sendRawTransaction(rawTx: ByteArray): ByteArray?
+
+    /**
+     * eth_getTransactionReceipt for [txHash], verified against a beacon-anchored
+     * header's receiptsRoot. Returns:
+     *  - the receipt as a pre-built JSON object string when found + verified;
+     *  - the literal "null" when VERIFIED-not-found (node synced, tx not in the recent
+     *    verified chain → eth's standard pending/unknown — a valid result);
+     *  - Kotlin null when it CAN'T be answered verified (not synced / no peer), so the
+     *    router errors rather than implying "pending on a healthy chain".
+     * A JSON string keeps the nested receipt+logs host-built (no Map→JSON in the router).
+     */
+    fun getTransactionReceipt(txHash: ByteArray): String?
+
+    /**
+     * eth_getTransactionByHash for [txHash]. Returns:
+     *  - the tx as a pre-built JSON object string when found — either in a recent
+     *    beacon-verified block (blockHash/blockNumber/transactionIndex set) or, for a tx
+     *    this node itself broadcast and not yet mined, from the local sent-tx cache
+     *    (blockNumber null = pending; the node holds the signed bytes, so no trust);
+     *  - the literal "null" for a VERIFIED "unknown tx" (synced, not in the recent chain
+     *    and not one we sent — eth's standard);
+     *  - Kotlin null when it CAN'T be answered verified (not synced / no peer) → router errors.
+     */
+    fun getTransactionByHash(txHash: ByteArray): String? = null
+
+    /**
+     * eth_getBlockByNumber for [block] (a tag like "latest" or a 0x hex number), verified
+     * from a beacon-anchored header (no snap state needed). Returns the block as a JSON
+     * object string (transactions as hashes); the literal "null" for a non-existent
+     * (future) block; or Kotlin null when it can't be answered verified (not synced / too
+     * far back / [fullTransactions]=true, which isn't served verified yet) → router errors.
+     */
+    fun getBlockByNumber(block: String, fullTransactions: Boolean): String?
+
+    // --- Fee suggestion (MetaMask's signing screen blocks on these) -----------
+    // Defaults return null (→ router errors) so hosts can adopt incrementally.
+
+    /**
+     * eth_gasPrice: a legacy-style total gas price suggestion (next baseFee + suggested
+     * tip), derived from beacon-verified headers + body-verified tips. Null to error.
+     */
+    fun gasPrice(): java.math.BigInteger? = null
+
+    /**
+     * eth_maxPriorityFeePerGas: suggested priority fee from recent blocks' verified
+     * transactions (effective tips, verified against transactionsRoot). Null to error.
+     */
+    fun maxPriorityFeePerGas(): java.math.BigInteger? = null
+
+    /**
+     * eth_feeHistory: the EIP-1559 fee history result as a pre-built JSON object string
+     * ({oldestBlock, baseFeePerGas[], gasUsedRatio[], reward[][]?}), computed from
+     * beacon-verified headers (+ verified bodies/receipts when [rewardPercentiles] is
+     * non-empty). [blockCount] may be clamped by the host (the result reflects what was
+     * served, per EIP-1559). Kotlin null when it can't be answered verified → router errors.
+     */
+    fun feeHistory(blockCount: Long, newestBlock: String, rewardPercentiles: DoubleArray?): String? = null
+
+    /**
+     * eth_estimateGas: gas estimate for executing the call/tx against verified state at
+     * the head. [value] is the wei value (null = 0). Null when it can't be answered
+     * verified (not synced / no snap peer / execution failure) → router errors.
+     */
+    fun estimateGas(from: ByteArray?, to: ByteArray?, data: ByteArray?,
+                    value: java.math.BigInteger?): java.math.BigInteger? = null
 }

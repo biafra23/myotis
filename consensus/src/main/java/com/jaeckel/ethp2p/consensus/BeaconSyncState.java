@@ -2,7 +2,10 @@ package com.jaeckel.ethp2p.consensus;
 
 import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.List;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -309,6 +312,31 @@ public class BeaconSyncState {
         // Evict oldest entries if window is full
         while (knownStateRoots.size() > MAX_KNOWN_ROOTS) {
             knownStateRoots.pollFirst();
+        }
+    }
+
+    /**
+     * Snapshot the rolling window (oldest→newest) so it can be persisted across
+     * restarts. The entries were validated via finality-update BLS signatures; see
+     * {@link #importKnownStateRoots}.
+     */
+    public List<SlottedStateRoot> exportKnownStateRoots() {
+        return new ArrayList<>(knownStateRoots);
+    }
+
+    /**
+     * Re-import persisted window entries (e.g. from a snapshot sidecar) using the same
+     * dedup/cap path as live recording. Lets a warm restart reach SYNCED without first
+     * re-observing {@link #FILL_THRESHOLD} live finality polls. Soundness: this only
+     * pre-fills the "have we seen enough finality" counter — {@code getSyncState} still
+     * gates SYNCED on {@link #isSynced()} (a fresh post-restart update) and on the sync
+     * committee period being current, so a long-offline restart can't report SYNCED on
+     * stale roots alone.
+     */
+    public void importKnownStateRoots(Collection<SlottedStateRoot> roots) {
+        if (roots == null) return;
+        for (SlottedStateRoot r : roots) {
+            if (r != null) recordStateRoot(r.slot(), r.stateRoot(), r.blsVerified());
         }
     }
 

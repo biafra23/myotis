@@ -2,6 +2,7 @@ package com.jaeckel.ethp2p.consensus.lightclient;
 
 import com.jaeckel.ethp2p.consensus.ssz.SszUtil;
 import com.jaeckel.ethp2p.consensus.types.LightClientFinalityUpdate;
+import com.jaeckel.ethp2p.consensus.types.LightClientHeader;
 import com.jaeckel.ethp2p.consensus.types.LightClientUpdate;
 import com.jaeckel.ethp2p.consensus.types.SyncCommittee;
 import org.slf4j.Logger;
@@ -20,6 +21,15 @@ public class LightClientProcessor {
     private final LightClientStore store;
     private final byte[] forkVersion;
     private final byte[] genesisValidatorsRoot;
+
+    /** Aggregate signature of the last successfully applied finality update. The
+     *  signature commits to the attested header root (whose state root in turn commits
+     *  the finality branch), so a byte-identical signature is the same already-applied
+     *  update: any variant with different contents would fail verification anyway.
+     *  Lets the 12s poll loop skip re-verifying an unchanged head — each BLS verify
+     *  costs ~18s on Android/ART, so without this the steady-state loop burns a full
+     *  core re-proving the same update. */
+    private volatile byte[] lastAppliedFinalitySig;
 
     public LightClientProcessor(LightClientStore store, byte[] forkVersion, byte[] genesisValidatorsRoot) {
         this.store = store;
@@ -52,6 +62,15 @@ public class LightClientProcessor {
         long attestedSlot = update.attestedHeader().beacon().slot();
         long finalizedSlot = update.finalizedHeader().beacon().slot();
         int participation = update.syncAggregate().countParticipants();
+
+        byte[] sig = update.syncAggregate().syncCommitteeSignature();
+        byte[] lastSig = lastAppliedFinalitySig;
+        if (lastSig != null && java.util.Arrays.equals(lastSig, sig)) {
+            log.debug("[lc-processor] Finality update is a duplicate of the already-applied one "
+                    + "(attestedSlot={}) — skipping re-verify", attestedSlot);
+            return true;
+        }
+
         log.debug("[lc-processor] Processing finality update: attestedSlot={}, finalizedSlot={}, " +
                 "signatureSlot={}, participation={}/512, finalityBranchLen={}",
                 attestedSlot, finalizedSlot, update.signatureSlot(),
@@ -87,6 +106,17 @@ public class LightClientProcessor {
             return false;
         }
 
+        // Bind each header's execution payload to its beacon body. The headers we store
+        // here feed the execution-layer verification chain (EL state root / block hash),
+        // and the sync-committee signature does NOT cover the execution payload — only
+        // this branch does.
+        if (!verifyExecutionBranch(update.attestedHeader())
+                || !verifyExecutionBranch(update.finalizedHeader())) {
+            log.debug("[lc-processor] Finality update rejected (attestedSlot={}): execution branch Merkle proof failed",
+                    attestedSlot);
+            return false;
+        }
+
         long oldFinalizedSlot = store.getFinalizedSlot();
         store.updateFinalized(update.finalizedHeader(), finalizedSlot);
         store.updateOptimistic(update.attestedHeader(), update.signatureSlot());
@@ -96,6 +126,7 @@ public class LightClientProcessor {
         // (updateFinalized may have already advanced this.finalizedSlot).
         store.applyNextSyncCommitteeWhenPeriodChanges(oldFinalizedSlot, finalizedSlot);
 
+        lastAppliedFinalitySig = sig.clone();
         log.debug("[lc-processor] Finality update applied: finalizedSlot {} → {}", oldFinalizedSlot, finalizedSlot);
         return true;
     }
@@ -174,6 +205,16 @@ public class LightClientProcessor {
             return false;
         }
 
+        // Bind each header's execution payload to its beacon body (see
+        // verifyExecutionBranch): the sync-committee signature covers only the beacon
+        // header, so without this an attacker could swap in a forged execution payload.
+        if (!verifyExecutionBranch(update.attestedHeader())
+                || !verifyExecutionBranch(update.finalizedHeader())) {
+            log.info("[lc-processor] Update rejected (attestedSlot={}): execution branch Merkle proof failed",
+                    attestedSlot);
+            return false;
+        }
+
         // Verify and store next sync committee if present.
         // Always verify and store when the store has no next committee (e.g. after rotation).
         SyncCommittee nextSyncCommittee = update.nextSyncCommittee();
@@ -212,6 +253,39 @@ public class LightClientProcessor {
 
     public LightClientStore getStore() {
         return store;
+    }
+
+    /**
+     * Verify that a light client header's {@code execution} payload header is the one
+     * committed to its beacon block body — i.e. {@code is_valid_light_client_header}
+     * from the consensus spec (Capella+).
+     *
+     * <p>The sync-committee BLS signature only covers the <i>beacon</i> header; the
+     * execution payload (carrying the EL state root and block hash that the whole
+     * execution-layer verification chain anchors to) is bound to the beacon header
+     * solely through this Merkle branch. Without checking it, a peer can forward a
+     * genuine, correctly-signed beacon header while swapping in a forged
+     * {@link com.jaeckel.ethp2p.consensus.types.ExecutionPayloadHeader} with an
+     * attacker-chosen state root / block hash, and every downstream account/storage
+     * proof would verify against forged state.
+     *
+     * @param header the light client header whose execution payload must be proven
+     * @return true if {@code header.execution} is proven to live at the
+     *         execution_payload field of {@code header.beacon.body}
+     */
+    public static boolean verifyExecutionBranch(LightClientHeader header) {
+        if (header == null
+                || header.beacon() == null
+                || header.execution() == null
+                || header.executionBranch() == null) {
+            return false;
+        }
+        return SszUtil.verifyMerkleBranch(
+                header.execution().hashTreeRoot(),
+                header.executionBranch(),
+                BeaconChainSpec.EXECUTION_PAYLOAD_DEPTH,
+                BeaconChainSpec.EXECUTION_PAYLOAD_GINDEX,
+                header.beacon().bodyRoot());
     }
 
     private static String bytesToHex(byte[] bytes) {

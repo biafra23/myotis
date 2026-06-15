@@ -14,6 +14,11 @@ dependencies {
     implementation(project(":consensus"))
     implementation(project(":myotis-evm"))
     implementation(project(":myotis-ens"))
+    // Verified JSON-RPC endpoint: the shared backend (:rpc-backend) served over
+    // the Ktor HTTP server (:jsonrpc-server) on 127.0.0.1:8545 — same pair the
+    // Android app hosts in NodeService.
+    implementation(project(":jsonrpc-server"))
+    implementation(project(":rpc-backend"))
     // :app source references io.netty.channel.* (via :networking's RLPxConnector
     // API). With io.netty excluded group-wide, the fork must be on :app's compile
     // classpath explicitly (:networking declares it as implementation, so it
@@ -70,4 +75,14 @@ tasks.register<JavaExec>("run") {
         ?: emptyList()
     appArgs.addAll(cmdArgs)
     args(appArgs)
+    // Force our logback config over the one trueblocks-kotlin bundles on the
+    // classpath. Daemon (no -Pargs) → truncate-on-start devp2p.log; client command
+    // → console-only so it never wipes the running daemon's log.
+    systemProperty(
+        "logback.configurationFile",
+        if (cmdArgs.isEmpty()) "logback-daemon.xml" else "logback-client.xml",
+    )
+    // Stable daemon log at the repo root regardless of the JVM working dir (which
+    // defaults to the :app module dir). `tail -F devp2p.log` from the repo root.
+    systemProperty("myotis.logfile", rootProject.file("devp2p.log").absolutePath)
 }

@@ -44,7 +44,7 @@ Five Gradle modules:
 - **networking** — Three protocol layers, all Netty-based:
   - `discv4` — UDP peer discovery using Kademlia DHT (ping/pong/findnode/neighbors)
   - `rlpx` — TCP transport: EIP-8 ECIES handshake → AES-256-CTR framed channel
-  - `eth` — eth/67-68 sub-protocol on top of RLPx (hello → status → ready)
+  - `eth` — eth/66-69 sub-protocol on top of RLPx (hello → status → ready)
 - **consensus** — Sync-committee light client (libp2p, BLS, SSZ)
 - **app** — Daemon/CLI entry point, Unix domain socket IPC server, peer caching
 - **myotis-evm** — Local EVM execution (Besu) against SNAP-verified state for view calls and gas estimation

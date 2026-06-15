@@ -15,6 +15,10 @@ import android.os.IBinder
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.foundation.background
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -67,6 +71,7 @@ import androidx.compose.ui.unit.sp
 import com.jaeckel.ethp2p.android.log.LogBuffer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.isActive
@@ -117,6 +122,22 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        // Auto-start the node when the app launches so the user doesn't have to
+        // tap "Start node". Start *silently* via startForegroundService — a
+        // foreground service runs fine on Android 13+ even without
+        // POST_NOTIFICATIONS (the notification is just hidden), so we do NOT
+        // prompt for it here: requesting on a cold launch has no user context,
+        // drives high denial rates, and would re-prompt on every fresh launch
+        // once denied. The permission is requested only from the explicit
+        // Start-node button (ensureNodeStarted), where the user has context.
+        //
+        // Gated on savedInstanceState == null so it fires only on a genuinely
+        // fresh launch — NOT a config-change recreation (rotation) or
+        // process-death restore, which would override an explicit Stop — and on
+        // !isRunning so relaunching while the service is already up is a no-op.
+        if (savedInstanceState == null && !NodeService.isRunning()) {
+            startNodeService()
+        }
     }
 
     override fun onStart() {
@@ -136,14 +157,29 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun toggleService() {
-        val svc = Intent(this, NodeService::class.java)
         if (NodeService.isRunning()) {
             // We're bound with BIND_AUTO_CREATE from onStart, which keeps the
             // service alive even after stopService. Ask the service to tear
             // down networking explicitly; it will also call stopSelf so the
             // foreground notification clears immediately.
-            boundServiceState.value?.shutdown() ?: stopService(svc)
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            boundServiceState.value?.shutdown()
+                ?: stopService(Intent(this, NodeService::class.java))
+        } else {
+            ensureNodeStarted()
+        }
+    }
+
+    /**
+     * Start the node if it isn't already running, first requesting the
+     * POST_NOTIFICATIONS permission on Android 13+ so the foreground-service
+     * notification is visible. Used by the explicit Start-node button, where
+     * prompting has clear user context. (Auto-start on launch deliberately
+     * skips this and starts silently — see onCreate.) A no-op when the service
+     * is already running.
+     */
+    private fun ensureNodeStarted() {
+        if (NodeService.isRunning()) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             // Defer startForegroundService until the permission dialog
@@ -201,6 +237,13 @@ private fun NodeScreen(
     var queryState by remember { mutableStateOf<QueryState>(QueryState.Idle) }
     var queryHistory by remember { mutableStateOf<List<AndroidQueryHistory.Entry>>(emptyList()) }
     val queryScope = rememberCoroutineScope()
+
+    // Logs-tab filter is hoisted here too, for the same reason as the Query
+    // state above: LogsTab leaves the composition when another tab is selected,
+    // so a filter kept in its own `remember` would reset to empty on every
+    // visit. Holding it in NodeScreen (and persisting it via rememberSaveable)
+    // keeps the filter sticky across tab switches and process recreation.
+    var logsFilter by rememberSaveable { mutableStateOf("") }
 
     // Load persisted query history once the service is bound / running flips.
     LaunchedEffect(running) {
@@ -295,6 +338,11 @@ private fun NodeScreen(
         // determinate as the light client catches up sync-committee periods, gone
         // once SYNCED.
         SyncProgressBar(snapshot)
+        // Readiness traffic-light: a thin strip atop the tabs. red = consensus not
+        // synced; amber = synced but no warm verified head yet (wallet calls will
+        // error -32000); green = warmed up, safe to transact. The third gate that
+        // nothing else surfaced — turns "is it ready?" from an adb curl into a glance.
+        ReadinessStrip(snapshot)
         TabRow(selectedTabIndex = selectedTab) {
             Tab(
                 selected = selectedTab == 0,
@@ -342,7 +390,10 @@ private fun NodeScreen(
                     }
                 },
             )
-            else -> LogsTab()
+            else -> LogsTab(
+                filter = logsFilter,
+                onFilterChange = { logsFilter = it },
+            )
         }
     }
 }
@@ -387,6 +438,75 @@ private fun SyncProgressBar(snapshot: NodeService.Snapshot?) {
             LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
         }
     }
+}
+
+/**
+ * Readiness traffic-light — a thin full-width strip atop the tab bar encoding the
+ * three gates a wallet transaction needs, the way nothing else in the UI does. The
+ * three gates (running+SYNCED, warm verified head, deep snap pool) surface as FOUR
+ * tiers, since "no gate passed" is its own state:
+ *
+ *  - **red**   — not running, or consensus light client not SYNCED yet. The node
+ *                can't serve anything verified; don't transact.
+ *  - **amber** — beacon SYNCED but no warm verified RPC head (snap peers absent /
+ *                head-build failing). Wallet calls error `-32000 no verified head`,
+ *                so MetaMask's confirm screen stalls. "Almost — wait."
+ *  - **green** — a verified head was built within [READY_HEAD_WARM_MS]. eth_call /
+ *                balances / a SIMPLE confirm-screen will serve. Safe to send, but a
+ *                heavy confirm screen (MetaMask's ~1000-token sweep) may still stall
+ *                while the snap pool is shallow.
+ *  - **bright + thick green** — head warm AND a DEEP snap pool ([DEEP_POOL_SNAP_PEERS]+
+ *                peers). The EVM prefetch fans ~48 concurrent fetches across enough
+ *                peers that even a heavy confirm screen converges. Fully ready.
+ *
+ * The green gates read [NodeService.Snapshot.verifiedHeadAgeMs] (shared backend's
+ * warmer) and [NodeService.Snapshot.snapPeers]. The head threshold is generous vs.
+ * the head TTL+build time on mobile (~12s TTL + 20-26s build) so a healthy node
+ * stays green between rebuilds instead of flickering amber.
+ */
+private const val READY_HEAD_WARM_MS = 45_000L
+/** Snap peers needed before a HEAVY confirm screen converges. MetaMask's ~1000-token
+ *  BalanceChecker sweep + Multicall3 simulation drive the EVM prefetch to fan out
+ *  ~48 concurrent snap fetches; those only finish in time when spread across a deep
+ *  pool. Below this the node serves simple reads (plain green) but heavy screens
+ *  stall; at/above it they converge (bright, thick green). On-device: a cold phone
+ *  needs minutes of dialing to reach this — the bright bar is the honest "go" signal. */
+private const val DEEP_POOL_SNAP_PEERS = 16
+
+@Composable
+private fun ReadinessStrip(snapshot: NodeService.Snapshot?) {
+    val s = snapshot
+    // Color, thickness AND a spoken label, derived together so they can never
+    // disagree. The label is exposed via semantics so readiness is discoverable by
+    // TalkBack and not conveyed by color/thickness alone (invisible to color-vision
+    // deficiencies). The strip stays a thin non-interactive line; the description is
+    // its only a11y surface.
+    val (target, height, label) = when {
+        s == null || !s.running ->
+            Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not running")
+        s.beaconState != "SYNCED" ->
+            Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not synced")
+        s.verifiedHeadAgeMs > READY_HEAD_WARM_MS ->
+            Triple(Color(0xFFF9A825), 3.dp, "Node readiness: warming up, not ready to transact")
+        s.snapPeers >= DEEP_POOL_SNAP_PEERS ->
+            Triple(Color(0xFF00E676), 6.dp,
+                "Node readiness: fully ready — deep peer pool, heavy confirm screens will load")
+        else ->
+            Triple(Color(0xFF2E7D32), 3.dp,
+                "Node readiness: ready for simple reads; peer pool still filling for heavy confirm screens")
+    }
+    // Ease between states so a transient blip reads as a gentle pulse, not a flash —
+    // and the thickness grows smoothly when the pool crosses the deep-pool gate.
+    val color by animateColorAsState(targetValue = target, label = "readiness")
+    val barHeight by androidx.compose.animation.core.animateDpAsState(
+        targetValue = height, label = "readiness-height")
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .height(barHeight)
+            .background(color)
+            .semantics { contentDescription = label },
+    )
 }
 
 @Composable
@@ -675,7 +795,10 @@ private fun EnsResolutionPanel(res: NodeService.EnsResolution) {
  * across them is impractical.
  */
 @Composable
-private fun LogsTab() {
+private fun LogsTab(
+    filter: String,
+    onFilterChange: (String) -> Unit,
+) {
     // Poll the LogBuffer's monotonic version counter rather than the buffer
     // itself — re-snapshotting only on change keeps the recomposition cost
     // bounded even when the consensus stack is logging dozens of lines/sec.
@@ -694,7 +817,6 @@ private fun LogsTab() {
         }
     }
 
-    var filter by remember { mutableStateOf("") }
     // Filter on tag + message (case-insensitive substring), computed OFF the main
     // thread — substring-scanning up to MAX_LINES (50k) entries on every keystroke
     // / 4 Hz buffer poll would jank the UI and laggy the typing. The unfiltered
@@ -704,6 +826,13 @@ private fun LogsTab() {
         shown = if (filter.isBlank()) entries
         else withContext(Dispatchers.Default) {
             entries.filter {
+                // Cooperative cancellation: a new keystroke cancels this effect, but
+                // Collection.filter isn't cancellation-aware on its own, so a 50k-entry
+                // scan would run to completion on Dispatchers.Default even though its
+                // result is already superseded. ensureActive() bails the moment the
+                // coroutine is cancelled, so rapid typing drops stale passes instead of
+                // piling concurrent scans onto the CPU.
+                ensureActive()
                 it.tag.contains(filter, ignoreCase = true) ||
                     it.message.contains(filter, ignoreCase = true)
             }
@@ -771,11 +900,11 @@ private fun LogsTab() {
             }
             OutlinedTextField(
                 value = filter,
-                onValueChange = { filter = it },
+                onValueChange = onFilterChange,
                 label = { Text("Filter — tag or message") },
                 singleLine = true,
                 trailingIcon = if (filter.isNotEmpty()) {
-                    { TextButton(onClick = { filter = "" }) { Text("✕") } }
+                    { TextButton(onClick = { onFilterChange("") }) { Text("✕") } }
                 } else null,
                 modifier = Modifier
                     .fillMaxWidth()

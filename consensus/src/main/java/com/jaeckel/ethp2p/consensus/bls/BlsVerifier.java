@@ -48,6 +48,114 @@ public final class BlsVerifier {
         return halfP;
     }
 
+    // Decompressed-pubkey cache. G1 decompression (a field square root per key) is a
+    // pure function of the 48 key bytes, and sync-committee pubkeys are fixed for a
+    // ~27h period — yet fastAggregateVerify decompressed all ~512 on every update,
+    // which dominates a finality-update verify on Android/ART (~35-55s). Capacity
+    // covers current + next committee (2x512) with slack for rotation overlap; on
+    // overflow the whole map is reset (rotations are rare; no LRU bookkeeping).
+    // Values are master copies: Milagro ECP is mutable (reduce()/affine() normalize
+    // in place), so lookups hand out fresh copies — concurrent verifies must never
+    // share live point objects.
+    private static final int PUBKEY_CACHE_MAX = 4096;
+    private static final java.util.concurrent.ConcurrentHashMap<PubkeyKey, ECP> PUBKEY_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    // Dedicated pool for the parallel G1 decompression below — NOT the common
+    // ForkJoinPool. parallelStream() defaults to the common pool (parallelism =
+    // cores-1), so a committee warm-up or a burst of catch-up verifies pegged
+    // every core at normal priority. On a foreground Android app that starved the
+    // UI thread for >5s and triggered input-dispatch ANRs (the Compose hit-test /
+    // frame work simply couldn't get scheduled). Two levers fix that without
+    // meaningfully slowing sync:
+    //   1) bound parallelism to leave cores free for rendering/input — half the
+    //      cores (min 1), so a hot decompress can never occupy the whole CPU;
+    //   2) run the workers at MIN_PRIORITY so the scheduler always prefers the
+    //      foreground UI thread when they do compete.
+    // The decompression is embarrassingly parallel and cache-backed, so even at
+    // half width a cold committee warm-up still finishes in a few seconds, and a
+    // warm verify pays only copies + the pairing.
+    private static final int BLS_PARALLELISM =
+            Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
+    private static final java.util.concurrent.ForkJoinPool BLS_DECOMPRESS_POOL =
+            new java.util.concurrent.ForkJoinPool(
+                    BLS_PARALLELISM,
+                    pool -> {
+                        java.util.concurrent.ForkJoinWorkerThread t =
+                                java.util.concurrent.ForkJoinPool
+                                        .defaultForkJoinWorkerThreadFactory.newThread(pool);
+                        // The default factory can return null if a worker can't be
+                        // created (resource limits / security restrictions); the pool
+                        // treats null as "no thread now" and retries later. Guard so we
+                        // don't NPE configuring it.
+                        if (t != null) {
+                            t.setName("bls-decompress-" + t.getPoolIndex());
+                            t.setPriority(Thread.MIN_PRIORITY);
+                            t.setDaemon(true);
+                        }
+                        return t;
+                    },
+                    null, false);
+
+    /**
+     * Run a parallel-stream pipeline on {@link #BLS_DECOMPRESS_POOL} instead of the
+     * common ForkJoinPool. Submitting the task to a specific pool makes the parallel
+     * stream's fork/join work execute on that pool's (bounded, low-priority) workers.
+     * If the pool rejects the task (e.g. during shutdown), fall back to running it
+     * directly on the calling thread so verification never silently fails.
+     */
+    private static <T> T onDecompressPool(java.util.function.Supplier<T> task) {
+        try {
+            return BLS_DECOMPRESS_POOL.submit(task::get).join();
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            return task.get();
+        }
+    }
+
+    /** byte[]-keyed map entry (arrays don't implement value equals/hashCode). */
+    private static final class PubkeyKey {
+        private final byte[] bytes;
+        private final int hash;
+        PubkeyKey(byte[] bytes) {
+            this.bytes = bytes;
+            this.hash = Arrays.hashCode(bytes);
+        }
+        @Override public boolean equals(Object o) {
+            return o instanceof PubkeyKey k && Arrays.equals(bytes, k.bytes);
+        }
+        @Override public int hashCode() { return hash; }
+    }
+
+    /** Decompress a trusted (Merkle-proven, no subgroup check) G1 pubkey through the
+     *  cache. Returns a private copy the caller may freely use; null for invalid keys
+     *  (never cached). computeIfAbsent guarantees one decompression per key even when
+     *  a warm-up and a verify race on the same committee (the mapping function runs at
+     *  most once; concurrent callers for the same key block briefly and reuse it). The
+     *  overflow reset stays outside the compute — mutating the map from inside its own
+     *  mapping function is forbidden. */
+    private static ECP cachedTrustedG1(byte[] pubkey) {
+        if (PUBKEY_CACHE.size() >= PUBKEY_CACHE_MAX) PUBKEY_CACHE.clear();
+        ECP master = PUBKEY_CACHE.computeIfAbsent(
+                new PubkeyKey(pubkey.clone()), k -> deserializeG1(k.bytes, false));
+        return master == null ? null : new ECP(master);
+    }
+
+    /**
+     * Pre-decompress a set of committee pubkeys into the cache so the next
+     * fastAggregateVerify pays only the pairing, not ~512 square roots. Call off the
+     * hot path (e.g. right after a snapshot resume or committee rotation); decompression
+     * fans out across cores. Invalid keys are skipped — verify rejects them later.
+     */
+    public static void warmPubkeyCache(List<byte[]> pubkeyBytes) {
+        if (pubkeyBytes == null) return;
+        onDecompressPool(() -> {
+            pubkeyBytes.parallelStream().forEach(b -> {
+                if (b != null && b.length == 48) cachedTrustedG1(b);
+            });
+            return null;
+        });
+    }
+
     private BlsVerifier() {}
 
     /**
@@ -96,14 +204,17 @@ public final class BlsVerifier {
             //
             // Point decompression (a field square root per key) is independent
             // per pubkey, so we fan it out across cores: on Android/ART the serial
-            // 512-key loop took ~30s, dwarfing everything else. parallelStream uses
-            // the common ForkJoinPool (parallelism = cores-1). The aggregation
-            // (ECP.add) is then a cheap sequential reduce — Milagro ECP isn't
-            // safe to mutate from multiple threads, but independent decompression
-            // into fresh ECP objects is.
-            List<ECP> points = pubkeyBytes.parallelStream()
-                    .map(b -> deserializeG1(b, false))
-                    .collect(java.util.stream.Collectors.toList());
+            // 512-key loop took ~30s, dwarfing everything else. We use a dedicated
+            // bounded, low-priority pool (BLS_DECOMPRESS_POOL) rather than the common
+            // ForkJoinPool so a verify burst can't saturate every core and starve the
+            // foreground UI thread (input-dispatch ANRs). Decompressed points are
+            // cached across calls (committees are period-stable), so a warm verify
+            // pays only copies + the pairing. The aggregation (ECP.add) is then a
+            // cheap sequential reduce — Milagro ECP isn't safe to mutate from
+            // multiple threads, but each cache lookup returns a private copy.
+            List<ECP> points = onDecompressPool(() -> pubkeyBytes.parallelStream()
+                    .map(BlsVerifier::cachedTrustedG1)
+                    .collect(java.util.stream.Collectors.toList()));
             ECP aggregated = new ECP(); // point at infinity
             for (ECP pk : points) {
                 if (pk == null || pk.is_infinity()) return false;

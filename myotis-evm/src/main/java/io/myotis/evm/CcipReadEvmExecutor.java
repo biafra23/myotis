@@ -75,6 +75,14 @@ public final class CcipReadEvmExecutor implements EvmExecutor {
         return tryWithCcipRead(target, calldata, blockContext, 0);
     }
 
+    /** Estimation passes straight through — CCIP-Read (ERC-3668) only applies to
+     *  OffchainLookup reverts during view reads, not to gas metering of a
+     *  to-be-broadcast transaction (a tx that reverts must NOT get an estimate). */
+    @Override
+    public CompletableFuture<Long> estimateGas(UnsignedTransaction tx, BlockContext blockContext) {
+        return delegate.estimateGas(tx, blockContext);
+    }
+
     private CompletableFuture<byte[]> tryWithCcipRead(
             Address target, byte[] calldata, BlockContext ctx, int depth) {
         return delegate.callView(target, calldata, ctx)

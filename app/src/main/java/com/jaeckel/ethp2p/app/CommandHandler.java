@@ -1029,8 +1029,9 @@ public class CommandHandler {
      * deadline-style guards, not for trust decisions, and the headers we read
      * came from peers we already trust to serve snap data.
      *
-     * <p>The CCIP-Read gateway transport is a tiny inline {@link CcipGateway}
-     * impl over {@code java.net.http.HttpClient}. That's JVM-only and so not
+     * <p>The CCIP-Read gateway transport is
+     * {@link com.jaeckel.ethp2p.app.rpc.JavaHttpCcipGateway}, backed by
+     * {@code java.net.http.HttpClient}. That's JVM-only and so not
      * suitable for the Android wallet — but {@code :app} is the daemon, not
      * the Android consumer, and the daemon already runs on JVM 21. The
      * Android module supplies a Ktor-backed {@link CcipGateway} per the
@@ -1203,6 +1204,17 @@ public class CommandHandler {
         // before pinning it. The first peer that passes both is pinned for the
         // whole resolution (all reads anchor to one consistent root).
         long minSensibleHead = connector.getNetwork().minSensibleHeadBlock();
+        // Live staleness floor: a peer whose head is behind the beacon-finalized exec
+        // block can never anchor to the beacon chain (finality already passed it), yet
+        // it still snap-serves its frozen root and would be pinned here — forcing the
+        // finalized fallback while fresh-headed peers sit connected.
+        if (beaconLightClient != null) {
+            com.jaeckel.ethp2p.consensus.types.LightClientHeader finHdr =
+                    beaconLightClient.getStore().getFinalizedHeader();
+            if (finHdr != null) {
+                minSensibleHead = Math.max(minSensibleHead, finHdr.execution().blockNumber());
+            }
+        }
         String lastError = null;
         for (com.jaeckel.ethp2p.networking.eth.EthHandler peer : snapPeers) {
             if (!peer.isReady() || peer.isSnapServingFailed()) {
@@ -1212,7 +1224,8 @@ public class CommandHandler {
                 BlockHeader head = peer.requestFreshHeadHeaderAsync().get(6, TimeUnit.SECONDS);
                 if (head.number < minSensibleHead) {
                     lastError = "peer " + peer.getRemoteAddress()
-                        + " returned stale head #" + head.number;
+                        + " returned stale head #" + head.number
+                        + " (< floor #" + minSensibleHead + ")";
                     continue;
                 }
                 if (!servesRoot(peer, head.stateRoot)) {
@@ -1282,22 +1295,59 @@ public class CommandHandler {
      * channel close), but every retry targets this one peer — the one expected to
      * have {@code blockCtx}'s stateRoot in its snapshot.
      */
+    /** Snap-oracle per-fetch retry budget; each attempt rotates to a different ready
+     *  snap peer so a slow/dead peer fails over instead of eating the whole budget. */
+    private static final int SNAP_ORACLE_MAX_ATTEMPTS = 8;
+
     private io.myotis.evm.CcipReadEvmExecutor buildEnsResolver(
             com.jaeckel.ethp2p.networking.eth.EthHandler pinnedPeer,
             io.myotis.evm.BlockContext blockCtx) {
-        final com.jaeckel.ethp2p.networking.eth.EthHandler finalPeer = pinnedPeer;
+        // Snap requests carry the stateRoot explicitly, so ANY connected snap peer that
+        // retains blockCtx's trie can serve them. Rotate the oracle's supplier (probed
+        // peer first, then round-robin the ready set) so a peer that stalls on
+        // GetAccountRange fails over instead of funnelling every retry into one dead
+        // peer — the single-peer pin made each eth_call against a stalled peer eat the
+        // full timeout while other peers held the same state.
+        final com.jaeckel.ethp2p.networking.eth.EthHandler probedPeer = pinnedPeer;
+        final java.util.concurrent.atomic.AtomicInteger rotation =
+            new java.util.concurrent.atomic.AtomicInteger();
+        // Peers that returned an empty proof / no-state for this head's stateRoot — deny
+        // them for this context so the rotation converges on peers that actually serve
+        // the root (see NodeService for the rationale). Per-context.
+        final java.util.Set<com.jaeckel.ethp2p.networking.eth.EthHandler> rootDenied =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
         io.myotis.evm.world.SnapBackedStateOracle oracle =
             new io.myotis.evm.world.SnapBackedStateOracle(
-                () -> finalPeer.isReady() && !finalPeer.isSnapServingFailed()
-                    ? new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(finalPeer)
-                    : null,
-                ensBytecodeCache);
+                () -> {
+                    int n = rotation.getAndIncrement();
+                    if (n == 0 && probedPeer.isReady() && !probedPeer.isSnapServingFailed()
+                            && !rootDenied.contains(probedPeer)) {
+                        final com.jaeckel.ethp2p.networking.eth.EthHandler pp = probedPeer;
+                        return new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(
+                            pp, () -> rootDenied.add(pp));
+                    }
+                    // activeSnapHandlers() already filters to ready, snap-negotiated,
+                    // non-failed peers; drop the ones denied for this root.
+                    java.util.List<com.jaeckel.ethp2p.networking.eth.EthHandler> ready =
+                        new java.util.ArrayList<>();
+                    for (com.jaeckel.ethp2p.networking.eth.EthHandler p : connector.activeSnapHandlers()) {
+                        if (!rootDenied.contains(p)) ready.add(p);
+                    }
+                    if (ready.isEmpty()) return null;
+                    final com.jaeckel.ethp2p.networking.eth.EthHandler chosen =
+                        ready.get(Math.floorMod(n, ready.size()));
+                    return new com.jaeckel.ethp2p.app.snap.EthHandlerSnapPeer(
+                        chosen, () -> rootDenied.add(chosen));
+                },
+                ensBytecodeCache,
+                SNAP_ORACLE_MAX_ATTEMPTS);
         io.myotis.evm.DefaultEvmExecutor base = new io.myotis.evm.DefaultEvmExecutor(
             oracle, ensBytecodeCache, EVM_POOL);
         io.myotis.evm.PrefetchingEvmExecutor prefetching =
             new io.myotis.evm.PrefetchingEvmExecutor(base);
         io.myotis.evm.ccipread.CcipReadHandler ccipHandler =
-            new io.myotis.evm.ccipread.CcipReadHandler(new JavaHttpCcipGateway());
+            new io.myotis.evm.ccipread.CcipReadHandler(
+                new com.jaeckel.ethp2p.app.rpc.JavaHttpCcipGateway());
         // Returned (not just wrapped) so the caller can later read usedOffchain()
         // to decide whether an AUTO head-fallback is worthwhile.
         return new io.myotis.evm.CcipReadEvmExecutor(prefetching, ccipHandler);
@@ -1490,50 +1540,6 @@ public class CommandHandler {
             return head + ",\"resolved\":true,\"implementer\":\"" + value.get().toHex() + "\"}";
         } catch (Exception e) {
             return jsonError(unwrapMessage(e));
-        }
-    }
-
-    /**
-     * JVM-only {@link io.myotis.evm.ccipread.CcipGateway} backed by
-     * {@code java.net.http.HttpClient}. Used by the daemon, where JVM 21 is
-     * guaranteed. Android consumers must supply a Ktor-backed gateway per
-     * {@code CLAUDE.md} (java.net.http isn't covered by Android core library
-     * desugaring below API 33).
-     *
-     * <p>Per ERC-3668 §6.1, any non-2xx HTTP status code must be treated as
-     * an error so {@link io.myotis.evm.ccipread.CcipReadHandler} can fall
-     * through to the next URL in the gateway list. We surface non-2xx as a
-     * failed future carrying an {@link java.io.IOException} with the status
-     * code and URL, which the handler's {@code exceptionallyCompose} catches
-     * and folds into the per-URL diagnostic list.
-     */
-    private static final class JavaHttpCcipGateway implements io.myotis.evm.ccipread.CcipGateway {
-        private static final java.net.http.HttpClient CLIENT = java.net.http.HttpClient.newBuilder()
-                .connectTimeout(java.time.Duration.ofSeconds(10))
-                .build();
-
-        @Override
-        public java.util.concurrent.CompletableFuture<String> request(Method method, String url, String body) {
-            java.net.http.HttpRequest.Builder rb = java.net.http.HttpRequest.newBuilder()
-                    .uri(java.net.URI.create(url))
-                    .timeout(java.time.Duration.ofSeconds(15));
-            if (method == Method.POST) {
-                rb.header("Content-Type", "application/json");
-                rb.POST(java.net.http.HttpRequest.BodyPublishers.ofString(
-                        body == null ? "" : body));
-            } else {
-                rb.GET();
-            }
-            return CLIENT.sendAsync(rb.build(),
-                    java.net.http.HttpResponse.BodyHandlers.ofString())
-                    .thenCompose(resp -> {
-                        int status = resp.statusCode();
-                        if (status >= 200 && status < 300) {
-                            return java.util.concurrent.CompletableFuture.completedFuture(resp.body());
-                        }
-                        return java.util.concurrent.CompletableFuture.failedFuture(
-                                new java.io.IOException("HTTP " + status + " from " + url));
-                    });
         }
     }
 
