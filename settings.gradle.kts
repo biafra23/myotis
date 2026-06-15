@@ -58,27 +58,20 @@ include("core", "networking", "consensus", "app", "android-app", "myotis-evm", "
 // ----------------------------------------------------------------------------
 // Source is pinned via git submodules under submodules/ (see .gitmodules), so
 // the build no longer depends on JitPack *rebuilding* these forks on demand.
+// Three forks are wired as composite builds below:
+//   • trueblocks-kotlin — single-module Gradle build (was main-SNAPSHOT).
+//   • tuweni-kotlin     — multi-module Gradle build; its version-less transitives
+//                         (the io.spring.dependency-management plugin writes
+//                         versions only into published POMs) are supplied via
+//                         dependency constraints in the main build.
+//   • besu              — the Android-patched fork; build-wide substitution
+//                         because a scoped one can't chain through includeBuild.
 //
-// Migrated: trueblocks-kotlin — a single-module Gradle build published by
-// JitPack as com.github.biafra23:trueblocks-kotlin:main-SNAPSHOT. A SNAPSHOT
-// coordinate is the worst case for JitPack reproducibility (rebuilt from HEAD),
-// so this is the highest-value, lowest-risk fork to localise: it has a single
-// consumer (:app) and no io.netty / io.consensys.tuweni group-exclude overlap.
-//
-// Not composite builds (see docs/jitpack-migration.md):
-//   • netty-kotlin  — a Maven project (pom.xml, group com.jaeckel) that Gradle's
-//                     includeBuild can't consume. Now OFF JitPack anyway: pulled
-//                     as a normal Maven dependency (com.jaeckel:netty-*:1.0-SNAPSHOT)
-//                     from the GitHub Pages repo declared in repositories above.
-//   • tuweni-kotlin — KEPT ON JITPACK: every dependency version comes from the
-//                     io.spring.dependency-management plugin, which writes
-//                     versions only into PUBLISHED POMs; composite-build
-//                     consumers see version-less transitives (io.vertx:vertx-core)
-//                     and fail to resolve.
-//   • besu          — KEPT ON JITPACK: a scoped composite is impossible
-//                     (android-app's substitution doesn't chain into includeBuild),
-//                     and the build-wide alternative moves the JVM daemon onto the
-//                     Android-only patched fork. Tag-pinned, so low JitPack risk.
+// The fourth fork, netty-kotlin, is NOT a composite build: it's a Maven project
+// (pom.xml, group com.jaeckel) that Gradle's includeBuild can't consume. It is
+// off JitPack too, pulled as a normal Maven dependency
+// (com.jaeckel:netty-*:1.0-SNAPSHOT) from the GitHub Pages repo declared above.
+// See docs/jitpack-migration.md.
 // ============================================================================
 includeBuild("submodules/trueblocks-kotlin") {
     dependencySubstitution {

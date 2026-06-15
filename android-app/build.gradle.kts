@@ -165,16 +165,17 @@ kotlin {
 dependencies {
     // See root build.gradle.kts: supply versions for tuweni's composite-build
     // version-less transitives (io.spring.dependency-management hides them from
-    // the live project metadata). Mirrors the old JitPack POMs, so android-app's
-    // classpath — and the D8 output — is unchanged.
+    // the live project metadata). Versions are centralised in the version catalog
+    // (tuweni-tx-*). Mirrors the old JitPack POMs, so android-app's classpath —
+    // and the D8 output — is unchanged.
     constraints {
-        implementation("io.vertx:vertx-core:4.5.11")
-        implementation("org.connid:framework:1.3.2")
-        implementation("org.connid:framework-internal:1.3.2")
-        implementation("com.github.jnr:jnr-ffi:2.2.14")
-        implementation("org.bouncycastle:bcprov-jdk15on:1.70")
-        implementation("commons-codec:commons-codec:1.16.0")
-        implementation("com.google.guava:guava:32.1.2-jre")
+        implementation(libs.tuweni.tx.vertx.core)
+        implementation(libs.tuweni.tx.connid.framework)
+        implementation(libs.tuweni.tx.connid.internal)
+        implementation(libs.tuweni.tx.jnr.ffi)
+        implementation(libs.tuweni.tx.bcprov)
+        implementation(libs.tuweni.tx.commons.codec)
+        implementation(libs.tuweni.tx.guava)
     }
 
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.3")

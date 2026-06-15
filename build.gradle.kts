@@ -13,6 +13,19 @@ plugins {
     java
 }
 
+// tuweni composite-build transitive version pins, applied as constraints in the
+// subprojects block below. Captured here at the root script's top level because
+// the type-safe `libs` accessor is not available inside `subprojects {}`.
+val tuweniTxPins = listOf(
+    libs.tuweni.tx.vertx.core,
+    libs.tuweni.tx.connid.framework,
+    libs.tuweni.tx.connid.internal,
+    libs.tuweni.tx.jnr.ffi,
+    libs.tuweni.tx.bcprov,
+    libs.tuweni.tx.commons.codec,
+    libs.tuweni.tx.guava,
+)
+
 allprojects {
     group = "com.jaeckel.ethp2p"
     version = "0.1.0-SNAPSHOT"
@@ -48,17 +61,11 @@ subprojects {
     // versions from the io.spring.dependency-management plugin, which writes them
     // only into PUBLISHED POMs. A composite build consumes the live project
     // metadata, where these transitives are version-less — supply the versions
-    // (from the fork's dependency-versions.gradle, matching what JitPack's POMs
-    // baked in). Constraints are no-ops in modules that don't pull tuweni.
+    // (centralised in gradle/libs.versions.toml as tuweni-tx-*, the same versions
+    // JitPack's POMs baked in). Constraints are no-ops in modules without tuweni.
     dependencies {
         constraints {
-            add("implementation", "io.vertx:vertx-core:4.5.11")
-            add("implementation", "org.connid:framework:1.3.2")
-            add("implementation", "org.connid:framework-internal:1.3.2")
-            add("implementation", "com.github.jnr:jnr-ffi:2.2.14")
-            add("implementation", "org.bouncycastle:bcprov-jdk15on:1.70")
-            add("implementation", "commons-codec:commons-codec:1.16.0")
-            add("implementation", "com.google.guava:guava:32.1.2-jre")
+            tuweniTxPins.forEach { addProvider("implementation", it) }
         }
     }
 
