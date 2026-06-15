@@ -12,8 +12,8 @@ recurring source of slow/flaky/non-reproducible builds) by vendoring the fork
 |---|---|---|---|---|---|
 | `com.github.biafra23:trueblocks-kotlin` | `main-SNAPSHOT` | `submodules/trueblocks-kotlin` | Gradle (single-module) | **Yes** | ✅ Migrated & verified |
 | `com.jaeckel:netty-*` (ex `com.github.biafra23.netty-kotlin:*`) | `1.0-SNAPSHOT` | `submodules/netty-kotlin` | **Maven** | n/a (Maven) | ✅ Off JitPack — GitHub Pages Maven repo |
-| `com.github.biafra23.tuweni-kotlin:*` | `2.7.2-jvm17.1` | `submodules/tuweni-kotlin` | Gradle (multi-module) | No (incompatible) | ⛔ Stays on JitPack — see below |
-| `com.github.biafra23.besu:*` | `24.12.2-android.2` | `submodules/besu` | Gradle (huge) | No (not cleanly) | ⛔ Stays on JitPack — see below |
+| `com.github.biafra23.tuweni-kotlin:*` | `2.7.2-jvm17.1` | `submodules/tuweni-kotlin` | Gradle (multi-module) | **Yes** | ✅ Migrated (composite + version constraints) |
+| `com.github.biafra23.besu:*` | `24.12.2-android.2` | `submodules/besu` | Gradle (huge) | **Yes** | ✅ Migrated (composite, build-wide) |
 
 All four sources are pinned as submodules regardless of composite-build status —
 that alone makes the fork inputs reproducible (a fixed commit instead of a
@@ -48,20 +48,28 @@ and `com.github.komputing.*` transitively, so the **JitPack repository is still
 required** to resolve those — we removed the JitPack *build* of trueblocks, not
 JitPack entirely.
 
-## Why JitPack can't be removed yet
+## JitPack still required (but no longer for the forks)
 
-`settings.gradle.kts` keeps the JitPack repository (de-duplicated to a single
-entry, ordered last) because it is still needed for:
+All four library **forks** are now off JitPack (tuweni + besu are composite
+builds, netty is a Pages repo, trueblocks is a composite build). But
+`settings.gradle.kts` still keeps the JitPack repository (ordered last) because
+two classes of **non-fork** dependency publish only there:
 
-1. **tuweni-kotlin** and **besu** — see below; neither can be a clean composite
-   build, so both still resolve from JitPack.
-2. **trueblocks-kotlin's transitive `com.github.*` deps** (ipfs-api-kotlin,
-   komputing kethereum/khex).
+1. **`com.github.multiformats:java-multibase`** — a *runtime* transitive of
+   `io.libp2p:jvm-libp2p` (used by `:consensus`). Not on Maven Central. This is
+   the dependency that makes JitPack unremovable from the main build today;
+   removing the repo breaks `:consensus:testRuntimeClasspath`.
+2. **trueblocks-kotlin's own transitive `com.github.*` deps** (komputing
+   kethereum/khex, `biafra23:ipfs-api-kotlin` → multiformats), resolved inside
+   the trueblocks composite via the submodule's own repo list.
+
+So the migration removed JitPack as a build dependency *for our forks* — the
+remaining usage is third-party libraries that are themselves JitPack-only.
 
 (netty-kotlin no longer needs JitPack — it's now consumed from a GitHub Pages
 Maven repo; see below.)
 
-## The other three forks (not composite builds)
+## The other three forks
 
 ### netty-kotlin — Maven; now consumed from a GitHub Pages Maven repo (off JitPack)
 
@@ -95,59 +103,86 @@ behaviour-preserving.
 `kotlin-maven-plugin` 2.1.10, i.e. a full reactor build, not a quick subset. The
 GitHub Pages publish sidesteps this entirely.)
 
-### tuweni-kotlin — central version management doesn't survive composite builds
+### tuweni-kotlin — composite build + version constraints (migrated)
 
 The fork sources **every dependency version** from the
 `io.spring.dependency-management` plugin (applied to `allprojects`), which reads
 `dependency-versions.gradle` (e.g. `io.vertx:vertx-core` → `4.5.11`). Module
 scripts then declare deps **without versions** — `bytes/build.gradle` has
 `api 'io.vertx:vertx-core'`, `crypto` has `implementation 'com.github.jnr:jnr-ffi'`,
-and so on.
-
-That plugin injects the versions into **published POMs** (so JitPack-built
+and so on. That plugin injects the versions into **published POMs** (so JitPack
 artifacts resolve fine), but a composite build consumes the **live project
-metadata**, where the versions are absent — so a consumer fails at resolution:
+metadata**, where the versions are absent — so a consumer first fails with:
 
 ```
 Could not find io.vertx:vertx-core:.
   Required by: project :networking > project :tuweni-kotlin:bytes
 ```
 
-(verified). It's systemic — bytes/crypto/rlp/units all reach version-less
-transitives. Pinning each leaked version in the main build would be a brittle
-mirror of the fork's BOM, defeating the stability goal. The clean fix lives in
-the fork: give deps explicit versions, or publish Gradle Module Metadata that
-carries the managed versions. Only `tuweni-{bytes,crypto,rlp,units}` are consumed.
+**Fix:** supply those versions as dependency constraints in the main build (root
+`build.gradle.kts` `subprojects` for the JVM modules, and `android-app`), taken
+from the fork's `dependency-versions.gradle` — the same versions JitPack's POMs
+baked in, all resolvable from Maven Central:
 
-### besu — no clean *scoped* composite
+```
+io.vertx:vertx-core:4.5.11            org.connid:framework:1.3.2
+com.github.jnr:jnr-ffi:2.2.14         org.connid:framework-internal:1.3.2
+org.bouncycastle:bcprov-jdk15on:1.70  commons-codec:commons-codec:1.16.0
+com.google.guava:guava:32.1.2-jre
+```
 
-Besu's `:evm` **builds fine from source here** (`./gradlew :evm:jar` ≈ 90 s; the
-version is pinned to `24.12.2` in `gradle.properties`, overriding git-versioning),
-so the build itself isn't the blocker — scoping is. Today the fork is swapped in
-**only for `:android-app`** (the JVM daemon stays on upstream Besu — the patches
-are Android-runtime-only; see `besu-android-fork/README.md`) via a config-level
-substitution `org.hyperledger.besu:* → com.github.biafra23.besu:*`. Two composite
-wirings were tested:
+**Second gotcha:** the composite declares `crypto → units` as `implementation`
+(runtime-only), whereas JitPack's custom POM exposed it at *compile* scope — so
+modules that touch `UInt64`/`UInt256` through tuweni APIs (networking, consensus,
+app, android-app) must declare `tuweni-units` directly. Only
+`tuweni-{bytes,crypto,rlp,units}` are consumed; their internal siblings (e.g.
+`:io`) resolve inside the included build.
 
-1. **Scoped** — `includeBuild` mapping only the fork coords
-   `com.github.biafra23.besu:* → project(...)`. Declaring explicit substitutions
-   *does* disable includeBuild's build-wide auto-substitution (verified:
-   `:myotis-evm` keeps `org.hyperledger.besu:evm:24.12.2`). **But** android-app's
-   config-level substitution output (`com.github.biafra23.besu:evm`) is **not**
-   re-fed through the includeBuild substitution, so android-app keeps resolving
-   the **JitPack module** (verified via `dependencyInsight`:
-   `org.hyperledger.besu:evm:24.12.2 -> com.github.biafra23.besu:evm:24.12.2-android.2`).
-   The composite is a no-op for the one module that needs it.
-2. **Build-wide** — substituting `org.hyperledger.besu:* → project` directly.
-   This works, but also moves the **JVM daemon** onto the Android-patched fork
-   (CodeCache without Caffeine; contradicts the documented design), and its
-   Android/D8 effect can't be verified without the Android SDK (absent here).
+```kotlin
+includeBuild("submodules/tuweni-kotlin") {
+    dependencySubstitution {
+        substitute(module("com.github.biafra23.tuweni-kotlin:tuweni-bytes")).using(project(":bytes"))
+        substitute(module("com.github.biafra23.tuweni-kotlin:tuweni-crypto")).using(project(":crypto"))
+        substitute(module("com.github.biafra23.tuweni-kotlin:tuweni-rlp")).using(project(":rlp"))
+        substitute(module("com.github.biafra23.tuweni-kotlin:tuweni-units")).using(project(":units"))
+    }
+}
+```
 
-Besu is **tag-pinned** on JitPack (`24.12.2-android.2`), not a flaky `-SNAPSHOT`,
-so the payoff is low and the risk to the tuned dexing is real. It stays on
-JitPack. A future clean migration would either accept build-wide substitution
-(JVM daemon on the fork, after Android verification) or add a build seam letting
-android-app point at the included project directly.
+### besu — composite build, build-wide (migrated)
+
+Besu's `:evm` builds fine from source (`./gradlew :evm:jar` ≈ 90 s; the version is
+pinned to `24.12.2` in `gradle.properties`, overriding git-versioning). The only
+real question was scoping. The fork used to be swapped in **only for
+`:android-app`** (JVM daemon on upstream Besu) via a config-level substitution
+`org.hyperledger.besu:* → com.github.biafra23.besu:*`. A *scoped* composite turned
+out impossible: that config-level substitution's output is **not** re-fed through
+the includeBuild substitution, so android-app kept resolving the JitPack module
+(verified via `dependencyInsight`). The wiring that works is **build-wide**:
+
+```kotlin
+includeBuild("submodules/besu") {
+    dependencySubstitution {
+        substitute(module("org.hyperledger.besu:evm")).using(project(":evm"))
+        substitute(module("org.hyperledger.besu:besu-datatypes")).using(project(":datatypes"))
+        substitute(module("org.hyperledger.besu.internal:algorithms")).using(project(":crypto:algorithms"))
+        substitute(module("org.hyperledger.besu.internal:rlp")).using(project(":ethereum:rlp"))
+        substitute(module("org.hyperledger.besu:bom")).using(project(":platform"))
+    }
+}
+```
+
+Explicit substitutions are required because Besu's publication coordinates don't
+match its project names (e.g. project `:datatypes` publishes as `besu-datatypes`),
+so auto-substitution doesn't fire. Build-wide moves the **JVM daemon** onto the
+fork too — acceptable because the patches are JVM-safe (API-1 `Provider` ctor;
+`LinkedHashMap` `CodeCache` instead of Caffeine) and the composite produces
+classes identical to the old JitPack fork (same source commit), so android-app's
+D8 path is unchanged. The per-module substitution in `android-app/build.gradle.kts`
+was removed; the `io.tmio` exclude and Guava jre-variant resolution stay. Verified:
+`:myotis-evm`/`:app`/`:android-app` all resolve `org.hyperledger.besu:evm ->
+project :besu:evm`, and a clean `build` of all JVM modules (with tests) is green.
+The android APK is verified by CI (no Android SDK in this sandbox).
 
 ## CI
 
