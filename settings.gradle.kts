@@ -37,16 +37,13 @@ dependencyResolutionManagement {
             name = "NettyKotlin"
             url = uri("https://biafra23.github.io/netty-kotlin/")
         }
-        // JitPack last — slowest / least reliable, which is the whole reason
-        // we're moving forks off it. Still required for: tuweni-kotlin and besu
-        // (com.github.biafra23.{tuweni-kotlin,besu}:*), plus trueblocks-kotlin's
-        // transitive com.github.* deps (ipfs-api-kotlin, komputing.*).
-        // NOTE: this repository was previously declared twice in this file
-        // (once unnamed, once as "JitPack"); de-duplicated to a single entry.
-        maven {
-            name = "JitPack"
-            url = uri("https://jitpack.io")
-        }
+        // NOTE: no jitpack.io repository here anymore. The forks that needed it
+        // are now local: tuweni-kotlin + besu are composite builds (includeBuild
+        // below), netty-kotlin is the NettyKotlin GitHub Pages repo above, and
+        // trueblocks-kotlin is a composite build. jitpack.io is still contacted
+        // ONLY from inside the trueblocks composite, whose own build.gradle.kts
+        // declares it for third-party transitives (komputing kethereum/khex,
+        // biafra23:ipfs-api-kotlin, multiformats) — see docs/jitpack-migration.md.
     }
 }
 
