@@ -4,12 +4,17 @@ name: Desktop Installers
 # (via the Compose Desktop Gradle plugin). On a version tag the installers are
 # attached to the GitHub Release; on pull requests (and manual dispatch) they are
 # uploaded as downloadable workflow artifacts only — no Release is published.
+#
+# macOS is built as a single *universal* (arm64 + x86_64) installer on one Apple
+# Silicon runner — see the `package-macos` job — instead of a per-arch matrix. This
+# avoids depending on the scarce/queued Intel `macos-13` runners while still shipping
+# a binary that runs natively on both Apple Silicon and Intel Macs.
 on:
   push:
     tags: [ "v*" ]
   pull_request:
     # Only when something that can change the installers is touched — a full
-    # 4-OS jpackage matrix is expensive to run on every push.
+    # jpackage build is expensive to run on every push.
     paths:
       - 'desktop-app/**'
       - 'app/**'
@@ -28,13 +33,15 @@ on:
   workflow_dispatch:
 
 # Supersede in-progress runs for the same ref so a new push doesn't pile a second
-# 4-OS matrix on top of one that's still building (or stuck). Per-ref grouping keeps
+# build on top of one that's still building (or stuck). Per-ref grouping keeps
 # distinct release tags independent.
 concurrency:
   group: desktop-installers-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # Linux (.deb + .rpm) and Windows (.msi + .exe). macOS is handled separately by
+  # `package-macos` because the universal build needs a bespoke two-JDK + lipo pipeline.
   package:
     name: Package (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -44,8 +51,6 @@ jobs:
         include:
           - os: ubuntu-latest    # .deb + .rpm
           - os: windows-latest   # .msi + .exe
-          - os: macos-14         # .dmg + .pkg (Apple Silicon / arm64)
-          - os: macos-13         # .dmg + .pkg (Intel / x64)
     permissions:
       contents: read
     steps:
@@ -110,19 +115,6 @@ jobs:
           done
           [ "$ok" = "1" ]
 
-      # jpackage names macOS .dmg/.pkg without an arch, so the arm64 and x64 builds
-      # would collide as release assets. Suffix them with the runner arch.
-      - name: Disambiguate macOS arch
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          cd desktop-app/build/compose/binaries/main-release
-          for f in dmg/*.dmg pkg/*.pkg; do
-            [ -e "$f" ] || continue
-            dir=$(dirname "$f"); base=$(basename "$f")
-            mv "$f" "$dir/${base%.*}-${{ runner.arch }}.${base##*.}"
-          done
-
       - name: Upload installers
         uses: actions/upload-artifact@v4
         with:
@@ -132,6 +124,190 @@ jobs:
             desktop-app/build/compose/binaries/main-release/rpm/*.rpm
             desktop-app/build/compose/binaries/main-release/msi/*.msi
             desktop-app/build/compose/binaries/main-release/exe/*.exe
+          if-no-files-found: warn
+          retention-days: 14
+
+  # macOS universal (arm64 + x86_64) installer, built on a single Apple Silicon runner.
+  #
+  # jpackage/jlink can only emit a runtime image for the arch they run as, so there is no
+  # one-shot universal build. Instead we build the app-image twice — once with a native
+  # arm64 JDK, once with an x64 JDK under Rosetta 2 — then lipo-merge the two .app bundles
+  # into a single fat bundle, re-sign it ad-hoc, and let jpackage wrap that into a
+  # universal .dmg / .pkg. This is the standard "merge two JREs with lipo" recipe.
+  package-macos:
+    name: Package (macOS universal)
+    runs-on: macos-14
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Two JDKs of the *same* version. arm64 is native and also runs Gradle + the final
+      # jpackage wrap; x64 runs under Rosetta only to emit the x86_64 runtime image.
+      # `path` outputs give us each JAVA_HOME without guessing setup-java's env-var names.
+      - name: Set up JDK 21 (arm64)
+        id: jdk_arm
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          architecture: 'aarch64'
+          cache: gradle
+
+      - name: Set up JDK 21 (x64)
+        id: jdk_x64
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          architecture: 'x64'
+
+      # The x64 jlink/jpackage binaries are x86_64; Rosetta 2 lets them run on the arm64
+      # runner. Idempotent and already present on GitHub's macOS arm runners — `|| true`
+      # keeps it from failing if it's a no-op.
+      - name: Ensure Rosetta 2
+        run: softwareupdate --install-rosetta --agree-to-license || true
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=" >> "$GITHUB_OUTPUT"
+          fi
+
+      # createReleaseDistributable produces build/compose/binaries/main-release/app/Myotis.app.
+      # --rerun-tasks forces the runtime-image + app-image tasks to re-execute so the cached
+      # (or just-built other-arch) image is never reused — javaHome is not a tracked task
+      # input, so without this the second pass could silently ship the first pass's runtime.
+      - name: Build arm64 app-image
+        shell: bash
+        env:
+          JAVA_HOME: ${{ steps.jdk_arm.outputs.path }}
+        run: |
+          ARGS=":desktop-app:createReleaseDistributable --rerun-tasks --stacktrace -PdesktopJavaHome=${{ steps.jdk_arm.outputs.path }}"
+          if [ -n "${{ steps.ver.outputs.value }}" ]; then
+            ARGS="$ARGS -PappVersion=${{ steps.ver.outputs.value }}"
+          fi
+          ok=0
+          for attempt in 1 2 3; do
+            if ./gradlew $ARGS; then ok=1; break; fi
+            echo "::warning::Gradle attempt $attempt failed; retrying in $((attempt*20))s"
+            sleep $((attempt*20))
+          done
+          [ "$ok" = "1" ]
+          rm -rf /tmp/arm64 && mkdir -p /tmp/arm64
+          cp -R desktop-app/build/compose/binaries/main-release/app/Myotis.app /tmp/arm64/
+
+      - name: Build x64 app-image
+        shell: bash
+        env:
+          JAVA_HOME: ${{ steps.jdk_arm.outputs.path }}   # Gradle stays native arm64; only jlink/jpackage use x64
+        run: |
+          rm -rf desktop-app/build/compose/binaries/main-release/app
+          ARGS=":desktop-app:createReleaseDistributable --rerun-tasks --stacktrace -PdesktopJavaHome=${{ steps.jdk_x64.outputs.path }}"
+          if [ -n "${{ steps.ver.outputs.value }}" ]; then
+            ARGS="$ARGS -PappVersion=${{ steps.ver.outputs.value }}"
+          fi
+          ok=0
+          for attempt in 1 2 3; do
+            if ./gradlew $ARGS; then ok=1; break; fi
+            echo "::warning::Gradle attempt $attempt failed; retrying in $((attempt*20))s"
+            sleep $((attempt*20))
+          done
+          [ "$ok" = "1" ]
+          rm -rf /tmp/x64 && mkdir -p /tmp/x64
+          cp -R desktop-app/build/compose/binaries/main-release/app/Myotis.app /tmp/x64/
+
+      # lipo every Mach-O file that exists in both bundles into a fat binary; everything
+      # else (resources, the runtime's java classes, symlinks) is identical across arches
+      # and comes from the arm64 copy untouched. Then re-sign ad-hoc: lipo invalidates the
+      # per-arch ad-hoc signatures jpackage applied, and an inconsistent signature makes
+      # Gatekeeper refuse to launch. (CI has no Developer ID cert, so this matches the
+      # per-arch builds' existing unnotarized, ad-hoc-signed status — no regression.)
+      - name: Merge into universal app-image
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARM=/tmp/arm64/Myotis.app
+          X64=/tmp/x64/Myotis.app
+          UNI=/tmp/universal/Myotis.app
+          rm -rf /tmp/universal && mkdir -p /tmp/universal
+          cp -R "$ARM" "$UNI"
+          merged=0
+          while IFS= read -r f; do
+            if lipo -info "$ARM/$f" >/dev/null 2>&1 && lipo -info "$X64/$f" >/dev/null 2>&1; then
+              lipo -create "$ARM/$f" "$X64/$f" -output "$UNI/$f"
+              merged=$((merged+1))
+            fi
+          done < <(cd "$ARM" && find . -type f)
+          echo "Merged $merged Mach-O files into universal binaries"
+          # Fail loudly if the merge didn't actually produce fat binaries for the two files
+          # that matter most — the launcher and the JVM.
+          launcher="$UNI/Contents/MacOS/Myotis"
+          libjvm="$UNI/Contents/runtime/Contents/Home/lib/server/libjvm.dylib"
+          echo "launcher archs: $(lipo -archs "$launcher")"
+          echo "libjvm archs:   $(lipo -archs "$libjvm")"
+          for bin in "$launcher" "$libjvm"; do
+            archs=$(lipo -archs "$bin")
+            case "$archs" in
+              *arm64*x86_64*|*x86_64*arm64*) ;;
+              *) echo "::error::$bin is not universal (archs: $archs)"; exit 1 ;;
+            esac
+          done
+          codesign --remove-signature "$UNI" 2>/dev/null || true
+          codesign --force --deep --sign - "$UNI"
+          codesign --verify --deep --strict "$UNI" && echo "ad-hoc signature OK"
+
+      # Wrap the universal .app into installers. --app-image packaging is arch-agnostic, so
+      # the native arm64 jpackage handles it. App version must match jpackage's rules: no
+      # pre-release suffix, and macOS rejects a leading-zero major (0.x -> 1.x), mirroring
+      # the Gradle build's macVersion coercion.
+      - name: Package universal dmg + pkg
+        shell: bash
+        env:
+          JAVA_HOME: ${{ steps.jdk_arm.outputs.path }}
+        run: |
+          set -euo pipefail
+          VER="${{ steps.ver.outputs.value }}"
+          VER="${VER:-1.0.0}"
+          VER="${VER%%-*}"
+          IFS=. read -r a b c <<< "$VER"
+          if [ "${a:-0}" = "0" ]; then a=1; fi
+          MACVER="${a:-1}.${b:-0}.${c:-0}"
+          echo "Packaging universal installers as version $MACVER"
+          OUT=desktop-app/build/compose/binaries/main-release
+          rm -rf "$OUT/dmg" "$OUT/pkg"
+          mkdir -p "$OUT/dmg" "$OUT/pkg"
+          for T in dmg pkg; do
+            "${{ steps.jdk_arm.outputs.path }}/bin/jpackage" \
+              --type "$T" \
+              --app-image /tmp/universal/Myotis.app \
+              --name Myotis \
+              --app-version "$MACVER" \
+              --dest "$OUT/$T"
+          done
+          # Mark the assets as universal (and avoid any name clash with future per-arch builds).
+          for f in "$OUT"/dmg/*.dmg "$OUT"/pkg/*.pkg; do
+            [ -e "$f" ] || continue
+            d=$(dirname "$f"); base=$(basename "$f")
+            mv "$f" "$d/${base%.*}-universal.${base##*.}"
+          done
+          ls -la "$OUT"/dmg "$OUT"/pkg
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: myotis-installers-macos-universal
+          path: |
             desktop-app/build/compose/binaries/main-release/dmg/*.dmg
             desktop-app/build/compose/binaries/main-release/pkg/*.pkg
           if-no-files-found: warn
@@ -139,7 +315,7 @@ jobs:
 
   release:
     name: Attach to Release
-    needs: package
+    needs: [ package, package-macos ]
     runs-on: ubuntu-latest
     if: github.ref_type == 'tag'
     permissions:
