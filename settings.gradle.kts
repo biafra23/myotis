@@ -88,17 +88,40 @@ includeBuild("submodules/trueblocks-kotlin") {
     }
 }
 
-// (tuweni-kotlin composite build attempted and reverted — see
-// docs/jitpack-migration.md: io.spring.dependency-management supplies versions
-// only in published POMs, not in the live project metadata composite builds
-// consume, so consumers fail to resolve version-less transitives e.g.
-// io.vertx:vertx-core. Stays on JitPack.)
+// tuweni-kotlin — multi-module Gradle build (JitPack-published as
+// com.github.biafra23.tuweni-kotlin:tuweni-<module>). Built from source here;
+// only the consumed modules (bytes/crypto/rlp/units) are mapped — their internal
+// siblings (e.g. :io) resolve inside the included build. The fork's
+// io.spring.dependency-management plugin writes dependency versions only into
+// published POMs, so a composite build sees version-less transitives; the main
+// build supplies those versions via dependency constraints (root build.gradle.kts
+// for the JVM modules + android-app). See docs/jitpack-migration.md.
+includeBuild("submodules/tuweni-kotlin") {
+    dependencySubstitution {
+        substitute(module("com.github.biafra23.tuweni-kotlin:tuweni-bytes")).using(project(":bytes"))
+        substitute(module("com.github.biafra23.tuweni-kotlin:tuweni-crypto")).using(project(":crypto"))
+        substitute(module("com.github.biafra23.tuweni-kotlin:tuweni-rlp")).using(project(":rlp"))
+        substitute(module("com.github.biafra23.tuweni-kotlin:tuweni-units")).using(project(":units"))
+    }
+}
 
-// (besu composite build attempted and reverted — see docs/jitpack-migration.md.
-// besu :evm builds fine from source here, but a *scoped* composite is impossible:
-// android-app's config-level substitution org.hyperledger.besu:evm ->
-// com.github.biafra23.besu:evm yields a final module selector that is NOT re-fed
-// through this includeBuild's substitution, so android-app keeps resolving the
-// JitPack module (verified via dependencyInsight). The only wiring that works is
-// build-wide org.hyperledger.besu:* -> project, which also moves the JVM daemon
-// onto the Android-patched fork. besu is tag-pinned on JitPack, so it stays.)
+// besu — the Android-patched fork (biafra23/besu), built from source. Besu's own
+// ~50-module Gradle build configures here, but only the modules actually
+// requested get built. The swap is build-wide (covers :android-app, which needs
+// the ART patches, AND the JVM daemon :myotis-evm/:app) — a scoped swap is
+// impossible (a config-level org.hyperledger.besu -> com.github.biafra23.besu
+// substitution doesn't chain into includeBuild), and the patches are JVM-safe
+// (API-1 Provider ctor; LinkedHashMap CodeCache), so the daemon is unaffected
+// functionally. Substitutions are EXPLICIT because Besu's publication coords
+// don't match its project names (auto-detection doesn't fire — e.g. project
+// :datatypes publishes as besu-datatypes). Mapping all five requested modules to
+// the included projects keeps a single, consistent Besu on the graph.
+includeBuild("submodules/besu") {
+    dependencySubstitution {
+        substitute(module("org.hyperledger.besu:evm")).using(project(":evm"))
+        substitute(module("org.hyperledger.besu:besu-datatypes")).using(project(":datatypes"))
+        substitute(module("org.hyperledger.besu.internal:algorithms")).using(project(":crypto:algorithms"))
+        substitute(module("org.hyperledger.besu.internal:rlp")).using(project(":ethereum:rlp"))
+        substitute(module("org.hyperledger.besu:bom")).using(project(":platform"))
+    }
+}

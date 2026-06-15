@@ -11,10 +11,10 @@ plugins {
 // (the JDK-9 Provider(String,String,String) ctor; Caffeine's StripedBuffer
 // reflecting into Thread.threadLocalRandomProbe). The biafra23/besu fork
 // patches both (BesuProvider → API-1 ctor; CodeCache → LinkedHashMap LRU, no
-// Caffeine) and publishes them via JitPack. See besu-android-fork/README.md.
-// We swap only these two modules to the fork — scoped to :android-app so the
-// JVM daemon stays on upstream Besu, where those APIs work.
-val besuForkVersion = "24.12.2-android.2"
+// Caffeine). It is now built from source as a Gradle composite build
+// (includeBuild("submodules/besu") in settings.gradle.kts) instead of being
+// pulled from JitPack, so the org.hyperledger.besu:* → fork swap happens there,
+// build-wide. See besu-android-fork/README.md and docs/jitpack-migration.md.
 
 // The JitPack netty-kotlin fork republishes netty-common/buffer/etc. with the
 // same fully-qualified classes; the JVM tolerates the shadowing but the dexer
@@ -30,23 +30,9 @@ val besuForkVersion = "24.12.2-android.2"
 configurations.all {
     exclude(group = "io.netty")
     exclude(group = "org.apache.logging.log4j")
-    // Swap Besu's evm + algorithms to the Android-patched fork (biafra23/besu via
-    // JitPack); everything else stays upstream. Eager `all` so AGP's classpaths
-    // pick up the resolutionStrategy before they resolve.
-    resolutionStrategy.dependencySubstitution {
-        substitute(module("org.hyperledger.besu:evm"))
-            .using(module("com.github.biafra23.besu:evm:$besuForkVersion"))
-        substitute(module("org.hyperledger.besu.internal:algorithms"))
-            .using(module("com.github.biafra23.besu:algorithms:$besuForkVersion"))
-        // The fork's POMs import org.hyperledger.besu:bom:24.12.2, which Besu
-        // never publishes to Maven Central; redirect it to the fork-published
-        // bom. The fork is pinned to version 24.12.2, so its other sibling refs
-        // (besu-datatypes, internal:rlp) are the real released 24.12.2 on
-        // Central and need no redirect — keeping them un-forked also avoids
-        // duplicate org.hyperledger.besu.datatypes.* classes at dex time.
-        substitute(platform(module("org.hyperledger.besu:bom")))
-            .using(platform(module("com.github.biafra23.besu:bom:$besuForkVersion")))
-    }
+    // (Besu's evm + algorithms are swapped to the Android-patched fork by the
+    // besu composite build wired in settings.gradle.kts — build-wide, so it also
+    // covers the JVM daemon. No per-module JitPack substitution needed here.)
     // Besu (via :myotis-evm) pulls the pre-rename tuweni coordinates
     // io.tmio:tuweni-* 2.4.2, whose org.apache.tuweni.* classes collide with
     // our JitPack fork (com.github.biafra23.tuweni-kotlin 2.7.2-jvm17.1) —
@@ -177,6 +163,20 @@ kotlin {
 }
 
 dependencies {
+    // See root build.gradle.kts: supply versions for tuweni's composite-build
+    // version-less transitives (io.spring.dependency-management hides them from
+    // the live project metadata). Mirrors the old JitPack POMs, so android-app's
+    // classpath — and the D8 output — is unchanged.
+    constraints {
+        implementation("io.vertx:vertx-core:4.5.11")
+        implementation("org.connid:framework:1.3.2")
+        implementation("org.connid:framework-internal:1.3.2")
+        implementation("com.github.jnr:jnr-ffi:2.2.14")
+        implementation("org.bouncycastle:bcprov-jdk15on:1.70")
+        implementation("commons-codec:commons-codec:1.16.0")
+        implementation("com.google.guava:guava:32.1.2-jre")
+    }
+
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.3")
 
     implementation(project(":core"))
@@ -226,6 +226,8 @@ dependencies {
     // add what the service code references directly.
     implementation(libs.tuweni.bytes)
     implementation(libs.tuweni.crypto)
+    // Composite tuweni exposes units only at runtime; declare it for compile.
+    implementation(libs.tuweni.units)
     implementation(libs.netty.transport)
 
     // consensus stack — BeaconLightClient, libp2p, BLS, snappy.

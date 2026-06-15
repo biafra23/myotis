@@ -15,6 +15,10 @@ dependencies {
     implementation(libs.tuweni.bytes)
     implementation(libs.tuweni.rlp)
     implementation(libs.tuweni.crypto)
+    // Composite tuweni exposes units only at runtime (crypto -> units is
+    // `implementation`); JitPack's POM had it at compile scope. UInt64 surfaces in
+    // tuweni/ENR APIs used here, so declare units explicitly for the compile path.
+    implementation(libs.tuweni.units)
     implementation(libs.netty.transport)
     implementation(libs.netty.codec)
     implementation(libs.netty.handler)

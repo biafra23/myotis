@@ -8,6 +8,9 @@ dependencies {
     implementation(libs.tuweni.bytes)
     implementation(libs.tuweni.rlp)
     implementation(libs.tuweni.crypto)
+    // Composite tuweni exposes units only at runtime; declare it for the compile
+    // path (UInt64/UInt256 surface in tuweni APIs used by the light client).
+    implementation(libs.tuweni.units)
     implementation(libs.snappy)
     implementation(libs.slf4j.api)
     implementation(libs.milagro)

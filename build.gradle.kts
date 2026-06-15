@@ -44,6 +44,24 @@ subprojects {
         exclude(group = "io.netty", module = "netty-transport-native-unix-common")
     }
 
+    // Composite-build tuweni (submodules/tuweni-kotlin) sources its dependency
+    // versions from the io.spring.dependency-management plugin, which writes them
+    // only into PUBLISHED POMs. A composite build consumes the live project
+    // metadata, where these transitives are version-less — supply the versions
+    // (from the fork's dependency-versions.gradle, matching what JitPack's POMs
+    // baked in). Constraints are no-ops in modules that don't pull tuweni.
+    dependencies {
+        constraints {
+            add("implementation", "io.vertx:vertx-core:4.5.11")
+            add("implementation", "org.connid:framework:1.3.2")
+            add("implementation", "org.connid:framework-internal:1.3.2")
+            add("implementation", "com.github.jnr:jnr-ffi:2.2.14")
+            add("implementation", "org.bouncycastle:bcprov-jdk15on:1.70")
+            add("implementation", "commons-codec:commons-codec:1.16.0")
+            add("implementation", "com.google.guava:guava:32.1.2-jre")
+        }
+    }
+
     tasks.test {
         useJUnitPlatform()
     }

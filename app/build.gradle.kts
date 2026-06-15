@@ -29,6 +29,8 @@ dependencies {
     implementation(libs.tuweni.bytes)
     implementation(libs.tuweni.rlp)
     implementation(libs.tuweni.crypto)
+    // Composite tuweni exposes units only at runtime; declare it for compile.
+    implementation(libs.tuweni.units)
     implementation(libs.trueblocks.kotlin)
     implementation(libs.slf4j.api)
     runtimeOnly(libs.logback.classic)
