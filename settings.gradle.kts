@@ -59,12 +59,15 @@ include("core", "networking", "consensus", "app", "android-app", "myotis-evm", "
 // NOT migrated to composite builds (kept on JitPack — see docs/jitpack-migration.md):
 //   • netty-kotlin  — a Maven project (pom.xml, group com.jaeckel); Gradle
 //                     includeBuild only consumes Gradle builds.
-//   • tuweni-kotlin — its projects use group io.consensys.tuweni, the very group
-//                     :networking excludes from the discovery lib; a composite
-//                     build re-collides the fork with upstream tuweni.
-//   • besu          — includeBuild auto-substitutes org.hyperledger.besu:* across
-//                     the WHOLE build, which would push the Android-only patched
-//                     EVM onto the JVM daemon (today the swap is :android-app-only).
+//   • tuweni-kotlin — every dependency version comes from the
+//                     io.spring.dependency-management plugin, which writes
+//                     versions only into PUBLISHED POMs; composite-build
+//                     consumers see version-less transitives (io.vertx:vertx-core)
+//                     and fail to resolve.
+//   • besu          — a scoped composite is impossible (android-app's
+//                     substitution doesn't chain into includeBuild), and the
+//                     build-wide alternative moves the JVM daemon onto the
+//                     Android-only patched fork. Tag-pinned, so low JitPack risk.
 // ============================================================================
 includeBuild("submodules/trueblocks-kotlin") {
     dependencySubstitution {
@@ -74,3 +77,18 @@ includeBuild("submodules/trueblocks-kotlin") {
             .using(project(":"))
     }
 }
+
+// (tuweni-kotlin composite build attempted and reverted — see
+// docs/jitpack-migration.md: io.spring.dependency-management supplies versions
+// only in published POMs, not in the live project metadata composite builds
+// consume, so consumers fail to resolve version-less transitives e.g.
+// io.vertx:vertx-core. Stays on JitPack.)
+
+// (besu composite build attempted and reverted — see docs/jitpack-migration.md.
+// besu :evm builds fine from source here, but a *scoped* composite is impossible:
+// android-app's config-level substitution org.hyperledger.besu:evm ->
+// com.github.biafra23.besu:evm yields a final module selector that is NOT re-fed
+// through this includeBuild's substitution, so android-app keeps resolving the
+// JitPack module (verified via dependencyInsight). The only wiring that works is
+// build-wide org.hyperledger.besu:* -> project, which also moves the JVM daemon
+// onto the Android-patched fork. besu is tag-pinned on JitPack, so it stays.)
