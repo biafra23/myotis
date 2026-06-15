@@ -13,6 +13,19 @@ plugins {
     java
 }
 
+// tuweni composite-build transitive version pins, applied as constraints in the
+// subprojects block below. Captured here at the root script's top level because
+// the type-safe `libs` accessor is not available inside `subprojects {}`.
+val tuweniTxPins = listOf(
+    libs.tuweni.tx.vertx.core,
+    libs.tuweni.tx.connid.framework,
+    libs.tuweni.tx.connid.internal,
+    libs.tuweni.tx.jnr.ffi,
+    libs.tuweni.tx.bcprov,
+    libs.tuweni.tx.commons.codec,
+    libs.tuweni.tx.guava,
+)
+
 allprojects {
     group = "com.jaeckel.ethp2p"
     version = "0.1.0-SNAPSHOT"
@@ -42,6 +55,18 @@ subprojects {
         exclude(group = "io.netty", module = "netty-transport-native-epoll")
         exclude(group = "io.netty", module = "netty-transport-native-kqueue")
         exclude(group = "io.netty", module = "netty-transport-native-unix-common")
+    }
+
+    // Composite-build tuweni (submodules/tuweni-kotlin) sources its dependency
+    // versions from the io.spring.dependency-management plugin, which writes them
+    // only into PUBLISHED POMs. A composite build consumes the live project
+    // metadata, where these transitives are version-less — supply the versions
+    // (centralised in gradle/libs.versions.toml as tuweni-tx-*, the same versions
+    // JitPack's POMs baked in). Constraints are no-ops in modules without tuweni.
+    dependencies {
+        constraints {
+            tuweniTxPins.forEach { addProvider("implementation", it) }
+        }
     }
 
     tasks.test {

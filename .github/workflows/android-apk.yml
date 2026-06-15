@@ -22,7 +22,11 @@ jobs:
         with:
           java-version: '21'
           distribution: 'temurin'
-          cache: gradle
+
+      # Official Gradle action: dependency + build caching (replaces setup-java's
+      # `cache: gradle`) and also caches the locally-built composite-build forks.
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Make gradlew executable
         run: chmod +x gradlew

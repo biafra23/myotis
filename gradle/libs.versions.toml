@@ -2,7 +2,10 @@
 tuweni = "2.7.2-jvm17.1"
 discovery = "26.4.0"
 #netty-kotlin = "c5a8303903"
-netty-kotlin = "main-SNAPSHOT"
+# biafra23/netty-kotlin, republished to a GitHub Pages Maven repo as
+# com.jaeckel:netty-*:1.0-SNAPSHOT (was the JitPack com.github.biafra23.netty-kotlin
+# fork at main-SNAPSHOT). Repo declared in settings.gradle.kts.
+netty-kotlin = "1.0-SNAPSHOT"
 #netty = "4.2.7.Final"
 bouncycastle = "1.78.1"
 junit = "5.10.0"
@@ -43,9 +46,21 @@ tuweni-merkle-trie  = { module = "com.github.biafra23.tuweni-kotlin:tuweni-merkl
 tuweni-ssz          = { module = "com.github.biafra23.tuweni-kotlin:tuweni-ssz",         version.ref = "tuweni" }
 tuweni-units        = { module = "com.github.biafra23.tuweni-kotlin:tuweni-units",       version.ref = "tuweni" }
 
-netty-transport     = { module = "com.github.biafra23.netty-kotlin:netty-transport",               version.ref = "netty-kotlin" }
-netty-codec         = { module = "com.github.biafra23.netty-kotlin:netty-codec",                   version.ref = "netty-kotlin" }
-netty-handler       = { module = "com.github.biafra23.netty-kotlin:netty-handler",                 version.ref = "netty-kotlin" }
+# tuweni-kotlin composite build: io.spring.dependency-management writes these
+# transitive versions only into PUBLISHED POMs, so a composite build sees them
+# version-less. Pinned here (from the fork's dependency-versions.gradle) and
+# applied as dependency constraints in build.gradle.kts + android-app.
+tuweni-tx-vertx-core       = { module = "io.vertx:vertx-core",              version = "4.5.11" }
+tuweni-tx-connid-framework = { module = "org.connid:framework",            version = "1.3.2" }
+tuweni-tx-connid-internal  = { module = "org.connid:framework-internal",   version = "1.3.2" }
+tuweni-tx-jnr-ffi          = { module = "com.github.jnr:jnr-ffi",          version = "2.2.14" }
+tuweni-tx-bcprov           = { module = "org.bouncycastle:bcprov-jdk15on", version = "1.70" }
+tuweni-tx-commons-codec    = { module = "commons-codec:commons-codec",     version = "1.16.0" }
+tuweni-tx-guava            = { module = "com.google.guava:guava",          version = "32.1.2-jre" }
+
+netty-transport     = { module = "com.jaeckel:netty-transport",               version.ref = "netty-kotlin" }
+netty-codec         = { module = "com.jaeckel:netty-codec",                   version.ref = "netty-kotlin" }
+netty-handler       = { module = "com.jaeckel:netty-handler",                 version.ref = "netty-kotlin" }
 
 bouncycastle        = { module = "org.bouncycastle:bcprov-jdk18on",        version.ref = "bouncycastle" }
 
