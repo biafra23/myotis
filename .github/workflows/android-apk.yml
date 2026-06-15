@@ -32,7 +32,9 @@ jobs:
       # sdkmanager calls needed for compileSdk 34.
 
       - name: Build debug APK
-        run: ./gradlew :android-app:assembleDebug --stacktrace
+        # --offline: jitpack 403 workaround (com.github.biafra23.tuweni-kotlin fork);
+        # build from the restored Gradle cache until the jitpack issue is resolved.
+        run: ./gradlew :android-app:assembleDebug --stacktrace --offline
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
