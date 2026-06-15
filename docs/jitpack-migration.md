@@ -11,7 +11,7 @@ recurring source of slow/flaky/non-reproducible builds) by vendoring the fork
 | Fork (JitPack coordinates) | Pinned version | Submodule | Build system | Composite build | Status |
 |---|---|---|---|---|---|
 | `com.github.biafra23:trueblocks-kotlin` | `main-SNAPSHOT` | `submodules/trueblocks-kotlin` | Gradle (single-module) | **Yes** | ✅ Migrated & verified |
-| `com.github.biafra23.netty-kotlin:*` | `main-SNAPSHOT` | `submodules/netty-kotlin` | **Maven** | No (impossible) | ⛔ Maven — to be republished independently |
+| `com.jaeckel:netty-*` (ex `com.github.biafra23.netty-kotlin:*`) | `1.0-SNAPSHOT` | `submodules/netty-kotlin` | **Maven** | n/a (Maven) | ✅ Off JitPack — GitHub Pages Maven repo |
 | `com.github.biafra23.tuweni-kotlin:*` | `2.7.2-jvm17.1` | `submodules/tuweni-kotlin` | Gradle (multi-module) | No (incompatible) | ⛔ Stays on JitPack — see below |
 | `com.github.biafra23.besu:*` | `24.12.2-android.2` | `submodules/besu` | Gradle (huge) | No (not cleanly) | ⛔ Stays on JitPack — see below |
 
@@ -53,33 +53,47 @@ JitPack entirely.
 `settings.gradle.kts` keeps the JitPack repository (de-duplicated to a single
 entry, ordered last) because it is still needed for:
 
-1. **netty-kotlin** — see below; it can't be a composite build.
+1. **tuweni-kotlin** and **besu** — see below; neither can be a clean composite
+   build, so both still resolve from JitPack.
 2. **trueblocks-kotlin's transitive `com.github.*` deps** (ipfs-api-kotlin,
    komputing kethereum/khex).
 
-## Blocked forks
+(netty-kotlin no longer needs JitPack — it's now consumed from a GitHub Pages
+Maven repo; see below.)
 
-### netty-kotlin — Maven, not Gradle (hard blocker)
+## The other three forks (not composite builds)
+
+### netty-kotlin — Maven; now consumed from a GitHub Pages Maven repo (off JitPack)
 
 `submodules/netty-kotlin` is the upstream Netty tree converted to Kotlin and
 **built with Maven** (`pom.xml`, group `com.jaeckel`). Gradle's `includeBuild`
-only consumes *Gradle* builds, so a composite build is impossible without a
-Gradle build script for the fork.
+only consumes *Gradle* builds, so a composite build is impossible — but netty is
+now **off JitPack anyway**: the maintainer published the fork to a static Maven
+repository on GitHub Pages, and the main build consumes it as a plain Maven
+dependency.
 
-**Decision:** the maintainer will republish netty-kotlin independently (its own
-registry/coordinates); the main build keeps consuming it from JitPack until then.
-The submodule stays pinned as source-of-record. A local `mvn install` was probed
-and is *not* a drop-in: building a subset (`-pl transport,codec,handler -am`)
-fails because intra-reactor modules depend on `tests`-classified jars
-(`com.jaeckel:netty-transport:jar:tests`) that a partial reactor doesn't produce,
-and the fork uses `kotlin-maven-plugin` (Kotlin 2.1.10) — a full reactor build,
-not a quick subset.
+Wired:
+- `settings.gradle.kts` repositories: `maven { url = uri("https://biafra23.github.io/netty-kotlin/") }`
+- `gradle/libs.versions.toml`: `com.github.biafra23.netty-kotlin:netty-{transport,codec,handler}:main-SNAPSHOT`
+  → `com.jaeckel:netty-{transport,codec,handler}:1.0-SNAPSHOT`
 
-Note the fork already uses group `com.jaeckel` (not `io.netty`), which is what
-lets the main build `exclude(group = "io.netty")` (killing the upstream Netty
-that vertx/libp2p/discovery drag in) while keeping the fork's `io.netty.*`
-classes. Any future approach (independent republish included) must preserve that
-distinct group.
+The Pages repo serves unique-timestamped snapshots (e.g. `1.0-20260615.192006-1`)
+with the parent POM and full transitive closure (common / buffer / resolver /
+transport-native-unix-common / codec-base) published, so Gradle resolves it
+normally. Verified: `./gradlew clean :app:compileJava` recompiles the whole JVM
+stack (networking / consensus / app) against `com.jaeckel:*`.
+
+The coords are `com.jaeckel:*` (not `io.netty`) — the same distinct group the
+JitPack fork used — so the project-wide `exclude(group = "io.netty")` still
+strips the upstream Netty that vertx/libp2p/discovery drag in while keeping this
+fork, and the transitive shape matches the old fork, so the swap is
+behaviour-preserving.
+
+(Earlier probe, kept for history: a local subset `mvn install`
+`-pl transport,codec,handler -am` fails — intra-reactor modules need
+`tests`-classified jars a partial reactor doesn't produce, and the fork uses
+`kotlin-maven-plugin` 2.1.10, i.e. a full reactor build, not a quick subset. The
+GitHub Pages publish sidesteps this entirely.)
 
 ### tuweni-kotlin — central version management doesn't survive composite builds
 

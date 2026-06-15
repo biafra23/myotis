@@ -28,10 +28,18 @@ dependencyResolutionManagement {
             name = "Hyperledger"
             url = uri("https://hyperledger.jfrog.io/artifactory/besu-maven")
         }
+        // biafra23/netty-kotlin, republished as a static Maven repo on GitHub
+        // Pages (com.jaeckel:netty-*:1.0-SNAPSHOT) — replaces the JitPack-built
+        // netty fork. The coords are com.jaeckel:* (not io.netty), so the
+        // project-wide exclude(group = "io.netty") still strips upstream Netty
+        // while keeping this fork. See docs/jitpack-migration.md.
+        maven {
+            name = "NettyKotlin"
+            url = uri("https://biafra23.github.io/netty-kotlin/")
+        }
         // JitPack last — slowest / least reliable, which is the whole reason
-        // we're moving forks to composite builds. Still required for forks that
-        // can't (yet) be local composite builds: netty-kotlin (a Maven build,
-        // which Gradle's includeBuild cannot consume) and trueblocks-kotlin's
+        // we're moving forks off it. Still required for: tuweni-kotlin and besu
+        // (com.github.biafra23.{tuweni-kotlin,besu}:*), plus trueblocks-kotlin's
         // transitive com.github.* deps (ipfs-api-kotlin, komputing.*).
         // NOTE: this repository was previously declared twice in this file
         // (once unnamed, once as "JitPack"); de-duplicated to a single entry.
@@ -56,17 +64,19 @@ include("core", "networking", "consensus", "app", "android-app", "myotis-evm", "
 // so this is the highest-value, lowest-risk fork to localise: it has a single
 // consumer (:app) and no io.netty / io.consensys.tuweni group-exclude overlap.
 //
-// NOT migrated to composite builds (kept on JitPack — see docs/jitpack-migration.md):
-//   • netty-kotlin  — a Maven project (pom.xml, group com.jaeckel); Gradle
-//                     includeBuild only consumes Gradle builds.
-//   • tuweni-kotlin — every dependency version comes from the
+// Not composite builds (see docs/jitpack-migration.md):
+//   • netty-kotlin  — a Maven project (pom.xml, group com.jaeckel) that Gradle's
+//                     includeBuild can't consume. Now OFF JitPack anyway: pulled
+//                     as a normal Maven dependency (com.jaeckel:netty-*:1.0-SNAPSHOT)
+//                     from the GitHub Pages repo declared in repositories above.
+//   • tuweni-kotlin — KEPT ON JITPACK: every dependency version comes from the
 //                     io.spring.dependency-management plugin, which writes
 //                     versions only into PUBLISHED POMs; composite-build
 //                     consumers see version-less transitives (io.vertx:vertx-core)
 //                     and fail to resolve.
-//   • besu          — a scoped composite is impossible (android-app's
-//                     substitution doesn't chain into includeBuild), and the
-//                     build-wide alternative moves the JVM daemon onto the
+//   • besu          — KEPT ON JITPACK: a scoped composite is impossible
+//                     (android-app's substitution doesn't chain into includeBuild),
+//                     and the build-wide alternative moves the JVM daemon onto the
 //                     Android-only patched fork. Tag-pinned, so low JitPack risk.
 // ============================================================================
 includeBuild("submodules/trueblocks-kotlin") {

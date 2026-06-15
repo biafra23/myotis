@@ -2,7 +2,10 @@
 tuweni = "2.7.2-jvm17.1"
 discovery = "26.4.0"
 #netty-kotlin = "c5a8303903"
-netty-kotlin = "main-SNAPSHOT"
+# biafra23/netty-kotlin, republished to a GitHub Pages Maven repo as
+# com.jaeckel:netty-*:1.0-SNAPSHOT (was the JitPack com.github.biafra23.netty-kotlin
+# fork at main-SNAPSHOT). Repo declared in settings.gradle.kts.
+netty-kotlin = "1.0-SNAPSHOT"
 #netty = "4.2.7.Final"
 bouncycastle = "1.78.1"
 junit = "5.10.0"
@@ -43,9 +46,9 @@ tuweni-merkle-trie  = { module = "com.github.biafra23.tuweni-kotlin:tuweni-merkl
 tuweni-ssz          = { module = "com.github.biafra23.tuweni-kotlin:tuweni-ssz",         version.ref = "tuweni" }
 tuweni-units        = { module = "com.github.biafra23.tuweni-kotlin:tuweni-units",       version.ref = "tuweni" }
 
-netty-transport     = { module = "com.github.biafra23.netty-kotlin:netty-transport",               version.ref = "netty-kotlin" }
-netty-codec         = { module = "com.github.biafra23.netty-kotlin:netty-codec",                   version.ref = "netty-kotlin" }
-netty-handler       = { module = "com.github.biafra23.netty-kotlin:netty-handler",                 version.ref = "netty-kotlin" }
+netty-transport     = { module = "com.jaeckel:netty-transport",               version.ref = "netty-kotlin" }
+netty-codec         = { module = "com.jaeckel:netty-codec",                   version.ref = "netty-kotlin" }
+netty-handler       = { module = "com.jaeckel:netty-handler",                 version.ref = "netty-kotlin" }
 
 bouncycastle        = { module = "org.bouncycastle:bcprov-jdk18on",        version.ref = "bouncycastle" }
 
