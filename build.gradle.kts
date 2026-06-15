@@ -259,19 +259,40 @@ tasks.register("refreshGnosisCheckpoint") {
             throw GradleException("No Gnosis endpoint returned a finalized header")
         }
 
-        // Normalize to the oldest observed finalized slot so all responders agree.
+        // Normalize to the oldest observed finalized slot so all responders can agree,
+        // then re-query the endpoints that reported a *newer* slot for the header AT minSlot.
+        // Beacon nodes are routinely a few slots out of sync, so filtering to those that
+        // happened to report exactly minSlot would usually leave a single endpoint and
+        // silently skip cross-validation. The standard /eth/v1/beacon/headers/{slot}
+        // endpoint lets every responder be checked at the same slot (mirrors the
+        // mainnet task's Phase 2).
         val minSlot = probed.minOf { it.slot }
-        val atMin = probed.filter { it.slot == minSlot }
-        val distinct = atMin.map { it.root }.toSet()
+        val resolved = probed.mapNotNull { f ->
+            if (f.slot == minSlot) {
+                f
+            } else {
+                val body = fetch("${f.base}/eth/v1/beacon/headers/$minSlot")
+                val root = body?.let { rootRe.find(it)?.groupValues?.get(2)?.lowercase() }
+                if (root == null) {
+                    logger.warn("[refresh] ${f.base} could not resolve slot $minSlot"); null
+                } else {
+                    Hdr(f.base, minSlot, root)
+                }
+            }
+        }
+        if (resolved.isEmpty()) {
+            throw GradleException("No Gnosis endpoint could resolve slot $minSlot")
+        }
+        val distinct = resolved.map { it.root }.toSet()
         if (distinct.size != 1) {
-            val detail = atMin.joinToString("\n  ") { "${it.base} → 0x${it.root}" }
+            val detail = resolved.joinToString("\n  ") { "${it.base} → 0x${it.root}" }
             throw GradleException(
                 "Cross-validation FAILED at slot $minSlot. Endpoints disagreed:\n  $detail\n" +
                 "Aborting; NetworkConfig.java not modified.")
         }
         val finalRoot = distinct.single()
-        if (atMin.size < 2) {
-            logger.warn("[refresh] WARNING: only ${atMin.size} endpoint served slot $minSlot — " +
+        if (resolved.size < 2) {
+            logger.warn("[refresh] WARNING: only ${resolved.size} endpoint served slot $minSlot — " +
                 "checkpoint NOT cross-validated. Verify 0x$finalRoot against a Gnosis explorer.")
         }
 
