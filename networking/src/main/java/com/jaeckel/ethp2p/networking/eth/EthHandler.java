@@ -339,7 +339,13 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             if (onReady != null) onReady.run();
             // Request the peer's advertised best block by hash
             requestBlockHeadersByHash(ctx, status.bestHash);
-            requestBlockHeaders(ctx, 21_000_000L, 1);
+            // Sanity-probe a known post-merge block. Use the network's sensible-head
+            // floor rather than a hardcoded mainnet block: 21_000_000 is post-merge on
+            // mainnet but PRE-merge (AuRa) on Gnosis (merged at 25.3M), whose legacy
+            // header layout fails to decode. minSensibleHeadBlock() is post-merge on
+            // every configured network. Skip when unknown (0).
+            long probeBlock = network.minSensibleHeadBlock();
+            if (probeBlock > 0) requestBlockHeaders(ctx, probeBlock, 1);
         } else if (msg.code() == P2P_PING) {
             sendPong(ctx);
         } else if (msg.code() == P2P_DISCONNECT) {

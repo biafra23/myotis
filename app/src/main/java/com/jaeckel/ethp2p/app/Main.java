@@ -496,6 +496,9 @@ public final class Main {
         beaconLightClient.setBlobParameters(
                 network.activeBlobParamsEpoch(),
                 network.activeBlobParamsMaxBlobs());
+        // Network slot-timing preset (mainnet 12s/32, Gnosis 5s/16). Affects
+        // wall-clock sync-committee period estimation and Status finalized_epoch.
+        beaconLightClient.setBeaconPreset(network.secondsPerSlot(), network.slotsPerEpoch());
         // Prefer peers proven to serve catch-up last session (seeded with the
         // period they served), and persist new ones, so restarts target peers
         // that actually retain the checkpoint period instead of discovery noise.
@@ -519,7 +522,7 @@ public final class Main {
                 clPeers.size(), clPeers.size() - network.clPeerMultiaddrs().size());
 
         // 8. IPC server
-        CommandHandler commandHandler = new CommandHandler(discV4, discV5, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState, beaconLightClient, network.clGenesisTime());
+        CommandHandler commandHandler = new CommandHandler(discV4, discV5, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState, beaconLightClient, network.clGenesisTime(), network.secondsPerSlot());
         DaemonServer server = new DaemonServer(socketPath, commandHandler);
         try {
             server.start();

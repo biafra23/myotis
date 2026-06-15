@@ -60,6 +60,7 @@ public class CommandHandler {
     private final BeaconSyncState beaconSyncState;
     private final BeaconLightClient beaconLightClient; // nullable
     private final long clGenesisTime; // beacon chain genesis time (seconds since epoch)
+    private final int secondsPerSlot; // network slot time (mainnet 12, Gnosis 5)
 
     // Shared across every ENS resolution: a single bytecode cache amortizes
     // Registry + Universal Resolver fetches across requests and between the
@@ -96,6 +97,17 @@ public class CommandHandler {
                           CountDownLatch stopLatch, Map<String, Long> backoff,
                           Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState,
                           BeaconLightClient beaconLightClient, long clGenesisTime) {
+        this(discV4, discV5, connector, stopLatch, backoff, blacklistedNodeIds,
+                beaconSyncState, beaconLightClient, clGenesisTime,
+                BeaconChainSpec.SECONDS_PER_SLOT);
+    }
+
+    public CommandHandler(DiscV4Service discV4, DiscV5Service discV5,
+                          RLPxConnector connector,
+                          CountDownLatch stopLatch, Map<String, Long> backoff,
+                          Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState,
+                          BeaconLightClient beaconLightClient, long clGenesisTime,
+                          int secondsPerSlot) {
         this.discV4 = discV4;
         this.discV5 = discV5;
         this.connector = connector;
@@ -106,6 +118,7 @@ public class CommandHandler {
         this.beaconSyncState = beaconSyncState;
         this.beaconLightClient = beaconLightClient;
         this.clGenesisTime = clGenesisTime;
+        this.secondsPerSlot = secondsPerSlot;
     }
 
     /** Parse and dispatch one JSON-Lines request; returns a JSON-Lines response. */
@@ -1542,13 +1555,13 @@ public class CommandHandler {
                 + ",\"lightClientPeers\":" + lightClientPeers;
 
         String peersJson = buildBeaconPeersJson();
-        BeaconSyncState.State state = beaconSyncState.getSyncState(clGenesisTime);
+        BeaconSyncState.State state = beaconSyncState.getSyncState(clGenesisTime, secondsPerSlot);
         // Sync-committee period progress, surfaced next to `state` so catch-up
         // progress is visible at a glance: currentPeriod / targetPeriod.
         // currentPeriod is the committee we hold (0 before bootstrap); targetPeriod
         // is the wall-clock period we're catching up to.
         long currentPeriod = beaconSyncState.getCurrentSyncCommitteePeriod();
-        long targetPeriod = BeaconChainSpec.currentPeriod(clGenesisTime);
+        long targetPeriod = BeaconChainSpec.currentPeriod(clGenesisTime, secondsPerSlot);
         String periodProgress = "\"currentPeriod\":" + currentPeriod
                 + ",\"targetPeriod\":" + targetPeriod;
         if (state == BeaconSyncState.State.SYNCING) {
@@ -1564,7 +1577,7 @@ public class CommandHandler {
         String stateRootHex = stateRoot != null ? "\"0x" + bytesToHex(stateRoot) + "\"" : "null";
         long finalizedSlot = beaconSyncState.getFinalizedSlot();
         long optimisticSlot = beaconSyncState.getOptimisticSlot();
-        long finalizedPeriod = finalizedSlot / (32 * 256); // SLOTS_PER_EPOCH * EPOCHS_PER_SYNC_COMMITTEE_PERIOD
+        long finalizedPeriod = finalizedSlot / BeaconChainSpec.SLOTS_PER_SYNC_COMMITTEE_PERIOD; // 8192 (32*256 == 16*512)
         return "{\"ok\":true,\"state\":\"" + state.name() + "\","
                 + periodProgress + ","
                 + peerStats
@@ -1683,7 +1696,7 @@ public class CommandHandler {
         long finalizedBlockNum = fin.blockNumber();
         byte[] beaconRoot = fin.stateRoot();
         long finalizedPeriod = beaconSyncState.getFinalizedPeriod();
-        long wallClockPeriod = BeaconChainSpec.currentPeriod(clGenesisTime);
+        long wallClockPeriod = BeaconChainSpec.currentPeriod(clGenesisTime, secondsPerSlot);
         long periodLag = wallClockPeriod - finalizedPeriod;
 
         if (!beaconChainVerified) {
