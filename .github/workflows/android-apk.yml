@@ -22,7 +22,11 @@ jobs:
         with:
           java-version: '21'
           distribution: 'temurin'
-          cache: gradle
+
+      # Robust Gradle dependency + plugin caching (restores the base-branch cache
+      # so AGP / Besu / JitPack-fork artifacts come from cache, not flaky repos).
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Make gradlew executable
         run: chmod +x gradlew
@@ -31,10 +35,18 @@ jobs:
       # AGP picks up automatically when local.properties is absent. No extra
       # sdkmanager calls needed for compileSdk 34.
 
+      # Retry to ride out transient external-repo resolution blips. NOT --offline:
+      # offline turns a single cache miss (e.g. a changed build file) into a hard
+      # failure, which is what broke this job before.
       - name: Build debug APK
-        # --offline: jitpack 403 workaround (com.github.biafra23.tuweni-kotlin fork);
-        # build from the restored Gradle cache until the jitpack issue is resolved.
-        run: ./gradlew :android-app:assembleDebug --stacktrace --offline
+        run: |
+          for attempt in 1 2 3; do
+            ./gradlew :android-app:assembleDebug --stacktrace && exit 0
+            echo "::warning::APK build attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
+            sleep 25
+          done
+          echo "::error::APK build failed after 3 attempts"
+          exit 1
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
