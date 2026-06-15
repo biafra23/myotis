@@ -37,13 +37,17 @@ dependencyResolutionManagement {
             name = "NettyKotlin"
             url = uri("https://biafra23.github.io/netty-kotlin/")
         }
-        // NOTE: no jitpack.io repository here anymore. The forks that needed it
-        // are now local: tuweni-kotlin + besu are composite builds (includeBuild
-        // below), netty-kotlin is the NettyKotlin GitHub Pages repo above, and
-        // trueblocks-kotlin is a composite build. jitpack.io is still contacted
-        // ONLY from inside the trueblocks composite, whose own build.gradle.kts
-        // declares it for third-party transitives (komputing kethereum/khex,
-        // biafra23:ipfs-api-kotlin, multiformats) — see docs/jitpack-migration.md.
+        // JitPack — ordered last (slowest / least reliable). The library FORKS no
+        // longer need it (tuweni-kotlin + besu are composite builds via
+        // includeBuild below; netty-kotlin is the NettyKotlin Pages repo above),
+        // but it's still REQUIRED for non-fork dependencies that publish only on
+        // JitPack: com.github.multiformats:java-multibase (a runtime transitive of
+        // io.libp2p:jvm-libp2p, used by :consensus) and trueblocks-kotlin's own
+        // transitives (komputing kethereum/khex, biafra23:ipfs-api-kotlin).
+        maven {
+            name = "JitPack"
+            url = uri("https://jitpack.io")
+        }
     }
 }
 
