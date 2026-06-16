@@ -67,8 +67,6 @@ public final class NodeService extends Service {
     private static final String CHANNEL_ID = "ethp2p_node";
     private static final int NOTIFICATION_ID = 1;
     private static final int DEFAULT_PORT = 30303;
-    /** Persisted verified sync-committee snapshot filename (in getCacheDir()). */
-    private static final String SYNC_SNAPSHOT_FILE = "sync-state.snapshot";
     private static final long BACKOFF_INCOMPATIBLE_MS = 10 * 60 * 1000L;
     private static final long BACKOFF_TRANSIENT_MS = 30 * 1000L;
     // Dial cap: the JVM daemon allows 2000, which is fine on a workstation but
@@ -112,7 +110,11 @@ public final class NodeService extends Service {
     // a state-servable peer. The daemon holds ~36 organically with no ill effect;
     // 12 lightweight eth/snap connections is a fine bound for a phone actively serving
     // a wallet in the foreground.
-    private static final int TARGET_SNAP_PEERS = 32;
+    /** Default node snap-peer target; overridable via settings ({@link #snapTarget}). */
+    public static final int DEFAULT_SNAP_TARGET = 32;
+    /** Live snap-peer target, read from settings at boot; the maintainer reads it each tick
+     *  so a settings change applies without a restart. */
+    private volatile int targetSnapPeers = DEFAULT_SNAP_TARGET;
     // Same bound the JVM daemon uses (CommandHandler.MAX_HEADER_CHAIN_GAP).
     // Caps how many headers we'll fetch to bridge from the beacon-finalized
     // block to the peer's head — i.e. the maximum gap the headerChain
@@ -148,6 +150,137 @@ public final class NodeService extends Service {
 
     public static boolean isRunning() {
         return RUNNING.get();
+    }
+
+    // ----- Settings (SharedPreferences "ethp2p"), shared by the service + Compose UI -----
+    private static final String PREFS_NAME = "ethp2p";
+    private static final String K_NETWORK = "network";
+    private static final String K_RPC_PORT = "rpcPort";
+    private static final String K_SNAP_TARGET = "snapTarget";
+    private static final String K_DEEP_POOL = "deepPoolThreshold";
+    public static final int DEFAULT_RPC_PORT = 8545;
+    // Gnosis defaults to a distinct port so both networks can be added to MetaMask
+    // at once: MetaMask refuses to save two RPC endpoints that share the same URL
+    // (host:port), so mainnet and Gnosis must not collide on 8545.
+    public static final int DEFAULT_RPC_PORT_GNOSIS = 8546;
+    public static final int DEFAULT_DEEP_POOL = 16;
+
+    // Active config of the running node, set at boot so the UI can show what's live.
+    private volatile String activeNetwork = "mainnet";
+    private volatile int activeRpcPort = DEFAULT_RPC_PORT;
+    // When true, doShutdown() restarts the service after teardown (network switch /
+    // rpc-port change). Set via restartWithCurrentSettings(); avoids the
+    // start-before-teardown race against onStartCommand's RUNNING guard.
+    private volatile boolean restartAfterShutdown = false;
+
+    private static int clampInt(int v, int lo, int hi, int dflt) {
+        if (v < lo || v > hi) return (dflt < lo || dflt > hi) ? lo : dflt;
+        return v;
+    }
+    private static android.content.SharedPreferences prefs(android.content.Context c) {
+        return c.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE);
+    }
+    /**
+     * Canonicalize a network name to one {@link NetworkConfig#byName} accepts AND that
+     * the per-network helpers (which test {@code "gnosis".equals(network)}) handle
+     * consistently. Unknown/corrupt/empty values fall back to mainnet so a bad pref can
+     * never crash node startup (byName throws on unknown names) or silently desync the
+     * RPC-port/preset selection from the resolved chain.
+     */
+    private static String canonicalNetwork(String n) {
+        if (n == null) return "mainnet";
+        switch (n.toLowerCase(java.util.Locale.ROOT)) {
+            case "gnosis": case "gbc": case "xdai": return "gnosis";
+            case "sepolia": return "sepolia";
+            default: return "mainnet";
+        }
+    }
+    /** Selected chain ("mainnet"/"gnosis"/"sepolia"); defaults to mainnet. */
+    public static String selectedNetwork(android.content.Context c) {
+        return canonicalNetwork(prefs(c).getString(K_NETWORK, "mainnet"));
+    }
+    public static void setSelectedNetwork(android.content.Context c, String n) {
+        prefs(c).edit().putString(K_NETWORK, canonicalNetwork(n)).apply();
+    }
+    /** Per-network default RPC port: Gnosis → 8546, every other chain → 8545. */
+    public static int defaultRpcPort(String network) {
+        return "gnosis".equals(network) ? DEFAULT_RPC_PORT_GNOSIS : DEFAULT_RPC_PORT;
+    }
+    // The RPC port is stored per network so mainnet and Gnosis keep independent
+    // ports — a single shared key would force the same URL on both, which is
+    // exactly what MetaMask rejects. Mainnet keeps the legacy key (no migration);
+    // other chains get a "<key>_<network>" suffix.
+    private static String rpcPortKey(String network) {
+        return "gnosis".equals(network) ? K_RPC_PORT + "_gnosis" : K_RPC_PORT;
+    }
+    /** JSON-RPC server port for {@code network} (1024–65535; default per {@link #defaultRpcPort}). */
+    public static int rpcPortFor(android.content.Context c, String network) {
+        int dflt = defaultRpcPort(network);
+        return clampInt(prefs(c).getInt(rpcPortKey(network), dflt), 1024, 65535, dflt);
+    }
+    /** JSON-RPC server port for the currently selected network. */
+    public static int rpcPort(android.content.Context c) {
+        return rpcPortFor(c, selectedNetwork(c));
+    }
+    public static void setRpcPort(android.content.Context c, int p) {
+        String net = selectedNetwork(c);
+        int dflt = defaultRpcPort(net);
+        prefs(c).edit().putInt(rpcPortKey(net), clampInt(p, 1024, 65535, dflt)).apply();
+    }
+    /** Node snap-peer target (1–128, default 32). */
+    public static int snapTarget(android.content.Context c) {
+        return clampInt(prefs(c).getInt(K_SNAP_TARGET, DEFAULT_SNAP_TARGET), 1, 128, DEFAULT_SNAP_TARGET);
+    }
+    public static void setSnapTargetPref(android.content.Context c, int v) {
+        prefs(c).edit().putInt(K_SNAP_TARGET, clampInt(v, 1, 128, DEFAULT_SNAP_TARGET)).apply();
+    }
+    /** UI readiness "deep pool" threshold (1–128, default 16). */
+    public static int deepPoolThreshold(android.content.Context c) {
+        return clampInt(prefs(c).getInt(K_DEEP_POOL, DEFAULT_DEEP_POOL), 1, 128, DEFAULT_DEEP_POOL);
+    }
+    public static void setDeepPoolThreshold(android.content.Context c, int v) {
+        prefs(c).edit().putInt(K_DEEP_POOL, clampInt(v, 1, 128, DEFAULT_DEEP_POOL)).apply();
+    }
+    /** Active chain of the running node (for UI display). */
+    public String activeNetwork() { return activeNetwork; }
+
+    /** Live-update the snap-peer target (no restart) and persist it. */
+    public void setTargetSnapPeers(int v) {
+        int c = clampInt(v, 1, 128, DEFAULT_SNAP_TARGET);
+        this.targetSnapPeers = c;
+        setSnapTargetPref(this, c);
+    }
+    /** Switch the active chain: persist + restart on the new network. No-op if unchanged & running. */
+    public void switchNetwork(String name) {
+        setSelectedNetwork(this, name);
+        if (RUNNING.get()) {
+            if (name.equals(activeNetwork)) return;
+            restartWithCurrentSettings();
+        } else {
+            startForegroundService(new Intent(this, NodeService.class));
+        }
+    }
+    /** Restart the node to pick up settings that bind at boot (e.g. RPC port). */
+    public void restartNode() {
+        if (RUNNING.get()) restartWithCurrentSettings();
+        else startForegroundService(new Intent(this, NodeService.class));
+    }
+    private void restartWithCurrentSettings() {
+        // In-service restart: tear down on a worker but do NOT stopSelf()/stopForeground().
+        // Calling startForegroundService() from a background teardown can hit Android 12+
+        // background-start restrictions and flickers the notification; instead doShutdown()
+        // reboots startNode() in-process once teardown completes (service stays foreground).
+        restartAfterShutdown = true;
+        RUNNING.set(false);
+        new Thread(this::doShutdown, "ethp2p-shutdown").start();
+    }
+    /** Cache file in getCacheDir(), suffixed by the active (non-mainnet) network so chains don't share state. */
+    private java.io.File netCache(String base, String ext) {
+        // While running use the booted network; when stopped fall back to the selected
+        // network so a clear-cache / reset-sync targets the right files (not mainnet's).
+        String n = RUNNING.get() ? activeNetwork : selectedNetwork(this);
+        String suffix = (n == null || n.equals("mainnet")) ? "" : "-" + n;
+        return new java.io.File(getCacheDir(), base + suffix + ext);
     }
 
     // Promoted from startNode() locals so snapshot() can read them while the
@@ -245,7 +378,8 @@ public final class NodeService extends Service {
             // The readiness traffic-light's green gate: a recent head means wallet
             // calls serve instead of hitting "no verified head".
             long verifiedHeadAgeMs,
-            List<RLPxConnector.PeerInfo> readyPeerList) {}
+            List<RLPxConnector.PeerInfo> readyPeerList,
+            String network) {}            // active chain ("mainnet"/"gnosis")
 
     /** Result of a get-account query. Mirrors the JVM daemon's JSON response shape. */
     public record AccountQueryResult(
@@ -641,7 +775,7 @@ public final class NodeService extends Service {
     }
 
     /**
-     * Keep a working set of snap peers connected ({@link #TARGET_SNAP_PEERS}) so a
+     * Keep a working set of snap peers connected ({@link #targetSnapPeers}) so a
      * verified request almost always finds one — the main cause of proxy fallbacks
      * is windows with too few snap peers. When below target we re-dial known snap
      * peers from the cache (discovery refills the rest). NOT gated by isSnapHeavy:
@@ -666,9 +800,9 @@ public final class NodeService extends Service {
             AndroidPeerCache pc = peerCache;
             if (conn == null) return;
             int snapPeers = conn.activeSnapHandlers().size();
-            if (snapPeers >= TARGET_SNAP_PEERS) return;
+            if (snapPeers >= targetSnapPeers) return;
             long now = System.currentTimeMillis();
-            LogBuffer.i(TAG, "[peers] " + snapPeers + " snap peer(s) < target " + TARGET_SNAP_PEERS
+            LogBuffer.i(TAG, "[peers] " + snapPeers + " snap peer(s) < target " + targetSnapPeers
                     + "; re-dialing cached snap peers + DNS pool");
             // 1) Re-dial known snap peers from the cache, proven snap-servers first
             //    (same ordering as cold start) so a starved node reconnects a
@@ -681,7 +815,7 @@ public final class NodeService extends Service {
                 snapCached.sort(java.util.Comparator.comparingInt(NodeService::snapDialRank));
                 for (AndroidPeerCache.CachedPeer p : snapCached) {
                     try {
-                        if (conn.activeSnapHandlers().size() >= TARGET_SNAP_PEERS) break;
+                        if (conn.activeSnapHandlers().size() >= targetSnapPeers) break;
                         dialCachedSnapPeer(conn, p, now);
                     } catch (Exception e) {
                         LogBuffer.w(TAG, "[peers] skipping cached peer: " + e.getMessage());
@@ -694,7 +828,7 @@ public final class NodeService extends Service {
             //    a permanently-starved node from draining battery/data and pressuring the
             //    carrier NAT; the pool is fork-filtered so dials land on viable peers.
             List<Enr> pool = dnsElEnrs;
-            if (!pool.isEmpty() && conn.activeSnapHandlers().size() < TARGET_SNAP_PEERS) {
+            if (!pool.isEmpty() && conn.activeSnapHandlers().size() < targetSnapPeers) {
                 int budget = Math.min(DNS_MAINTAIN_DIAL_BATCH, dnsDialBudget());
                 int dialed = 0;
                 for (Enr enr : pool) {
@@ -711,7 +845,7 @@ public final class NodeService extends Service {
             }
             // 3) Grow/refresh the candidate pool by re-walking the tree — only while
             //    still below target and no more often than DNS_REFRESH_INTERVAL_MS.
-            if (conn.activeSnapHandlers().size() < TARGET_SNAP_PEERS
+            if (conn.activeSnapHandlers().size() < targetSnapPeers
                     && !dnsResolving.get()
                     && System.currentTimeMillis() - lastDnsResolveMs > DNS_REFRESH_INTERVAL_MS) {
                 Thread t = new Thread(this::refreshDnsPool, "dns-el-refresh");
@@ -945,7 +1079,12 @@ public final class NodeService extends Service {
         int localCachedClCount = 0;
         long localGenesisTime = 0L;
         try {
-            NetworkConfig network = NetworkConfig.byName("mainnet");
+            NetworkConfig network = NetworkConfig.byName(selectedNetwork(this));
+            this.activeNetwork = network.name();
+            this.targetSnapPeers = snapTarget(this);
+            this.activeRpcPort = rpcPort(this);
+            LogBuffer.i(TAG, "Booting on network=" + network.name()
+                    + " (snap target " + targetSnapPeers + ", rpc port " + activeRpcPort + ")");
             localGenesisTime = network.clGenesisTime();
             Path keyFile = new java.io.File(getFilesDir(), "nodekey.hex").toPath();
             NodeKey nodeKey = NodeKey.loadOrGenerate(keyFile);
@@ -956,7 +1095,7 @@ public final class NodeService extends Service {
             // resets bootstrapping, while identity (nodekey) and query history in
             // getFilesDir() survive. cacheDir can also be evicted under storage
             // pressure — harmless, we fall back to the embedded checkpoint.
-            Path cacheFile = new java.io.File(getCacheDir(), "peers.cache").toPath();
+            Path cacheFile = netCache("peers", ".cache").toPath();
             localCache = new AndroidPeerCache(cacheFile);
             List<AndroidPeerCache.CachedPeer> cached = localCache.load();
             localCachedCount = cached.size();
@@ -1071,7 +1210,7 @@ public final class NodeService extends Service {
             // Seed CL peer cache before BLC is constructed so cached peers are
             // available at startup. Cache file lives next to nodekey/peers.cache
             // in the app's filesDir; same eviction-on-failure semantics as JVM.
-            Path clCacheFile = new java.io.File(getCacheDir(), "cl-peers.cache").toPath();
+            Path clCacheFile = netCache("cl-peers", ".cache").toPath();
             localClCache = new AndroidCLPeerCache(clCacheFile);
             List<String> clCached = localClCache.load();
             localCachedClCount = clCached.size();
@@ -1123,6 +1262,13 @@ public final class NodeService extends Service {
             localBlc.setBlobParameters(
                     network.activeBlobParamsEpoch(),
                     network.activeBlobParamsMaxBlobs());
+            // Apply the network's beacon preset (slot time / slots-per-epoch). Without
+            // this the light client falls back to the mainnet preset (12s slots), so on
+            // Gnosis (5s slots) the wall-clock period estimate lands ~2.4x too low. The
+            // catch-up loop then concludes "sync committee is current" and never walks
+            // the committee to head, leaving every finality update verified against a
+            // stale committee — permanent CATCHING_UP. Mirrors Main.java's daemon wiring.
+            localBlc.setBeaconPreset(network.secondsPerSlot(), network.slotsPerEpoch());
             // Seed peers proven to serve catch-up last session (with the period
             // they served) and persist new ones, so a cold start prefers the
             // peers that actually retained the checkpoint's light-client updates
@@ -1145,7 +1291,7 @@ public final class NodeService extends Service {
             // fast path): next launch resumes from here and only catches up the delta
             // instead of re-bootstrapping from the embedded checkpoint. In getCacheDir()
             // so "Clear cache" / Reset sync state wipes it.
-            localBlc.setSnapshotFile(new java.io.File(getCacheDir(), SYNC_SNAPSHOT_FILE).toPath());
+            localBlc.setSnapshotFile(netCache("sync-state", ".snapshot").toPath());
             blcRef.set(localBlc);
 
             // Publish atomically vs. shutdown() — if shutdown won the race
@@ -1292,7 +1438,7 @@ public final class NodeService extends Service {
             // reaches us via localhost. Binding 0.0.0.0 would expose an unauthenticated,
             // TLS-less RPC — incl. eth_sendRawTransaction relay — to the whole LAN.
             io.myotis.jsonrpc.MyotisRpcServer s =
-                    new io.myotis.jsonrpc.MyotisRpcServer(8545, upstream, "127.0.0.1", backend);
+                    new io.myotis.jsonrpc.MyotisRpcServer(activeRpcPort, upstream, "127.0.0.1", backend);
             s.start();
             this.rpcServer = s;
             startPeerMaintainer();
@@ -1381,6 +1527,15 @@ public final class NodeService extends Service {
         startTimeMs = 0L;
         clPeersDiscovered.set(0);
         LogBuffer.i(TAG, "node shutdown complete");
+        if (restartAfterShutdown) {
+            restartAfterShutdown = false;
+            LogBuffer.i(TAG, "restarting node in-service to apply new settings (network/rpc port)");
+            // In-service reboot: the foreground service stayed up, so just re-run startNode()
+            // — no startForegroundService (avoids Android 12+ background-start limits + notif flicker).
+            startTimeMs = System.currentTimeMillis();
+            RUNNING.set(true);
+            new Thread(this::startNode, "ethp2p-boot").start();
+        }
     }
 
     /**
@@ -1412,7 +1567,7 @@ public final class NodeService extends Service {
         } else {
             // Node is stopped: no live AndroidPeerCache instance exists, so
             // delete the on-disk file directly.
-            java.io.File cacheFile = new java.io.File(getCacheDir(), "peers.cache");
+            java.io.File cacheFile = netCache("peers", ".cache");
             if (cacheFile.exists() && !cacheFile.delete()) {
                 LogBuffer.w(TAG, "failed to delete " + cacheFile);
             }
@@ -1421,7 +1576,7 @@ public final class NodeService extends Service {
         if (clpc != null) {
             clpc.clear();
         } else {
-            java.io.File clCacheFile = new java.io.File(getCacheDir(), "cl-peers.cache");
+            java.io.File clCacheFile = netCache("cl-peers", ".cache");
             if (clCacheFile.exists() && !clCacheFile.delete()) {
                 LogBuffer.w(TAG, "failed to delete " + clCacheFile);
             }
@@ -1437,7 +1592,7 @@ public final class NodeService extends Service {
     public void resetSyncState() {
         LogBuffer.i(TAG, "resetting persisted sync state from UI");
         new Thread(() -> {
-            java.io.File snap = new java.io.File(getCacheDir(), SYNC_SNAPSHOT_FILE);
+            java.io.File snap = netCache("sync-state", ".snapshot");
             if (snap.exists() && !snap.delete()) {
                 LogBuffer.w(TAG, "failed to delete " + snap);
             } else {
@@ -1457,7 +1612,7 @@ public final class NodeService extends Service {
                     bs.state, bs.bootstrapped, bs.connected, bs.lc,
                     cachedClPeerCount, bs.finalizedSlot, bs.execBlockNum, bs.execBlockHashHex,
                     bs.syncStartPeriod, bs.syncCurrentPeriod, bs.syncTargetPeriod,
-                    Long.MAX_VALUE, List.of());
+                    Long.MAX_VALUE, List.of(), selectedNetwork(this));
         }
         List<RLPxConnector.PeerInfo> active = connector.getActivePeers();
         List<RLPxConnector.PeerInfo> ready = new ArrayList<>();
@@ -1481,7 +1636,7 @@ public final class NodeService extends Service {
                 bs.state, bs.bootstrapped, bs.connected, bs.lc,
                 cachedClPeerCount, bs.finalizedSlot, bs.execBlockNum, bs.execBlockHashHex,
                 bs.syncStartPeriod, bs.syncCurrentPeriod, bs.syncTargetPeriod,
-                headAge, ready);
+                headAge, ready, activeNetwork);
     }
 
     /** Per-snapshot beacon view, computed once so the record fields stay consistent. */
