@@ -19,14 +19,19 @@ import java.net.InetSocketAddress;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -53,6 +58,12 @@ public final class ChainStack {
     private static final long BACKOFF_TRANSIENT_MS = 30 * 1000L;         // 30s, transient failures
     /** Cap on DNS-resolved (EIP-1459) EL enodes RLPx-dialed directly at startup, bypassing discv4. */
     private static final int DNS_DIRECT_DIAL_LIMIT = 50;
+    // Snap-peer maintainer tunables (ported from the Android NodeService).
+    private static final int MAX_ATTEMPTED = 200;
+    private static final int DNS_MAINTAIN_DIAL_BATCH = 15;   // per-cycle dial budget from the DNS pool
+    private static final int DNS_DIALS_PER_MIN = 60;         // rolling-minute rate cap
+    private static final int DNS_POOL_MAX = 600;             // candidate-pool size cap
+    private static final long DNS_REFRESH_INTERVAL_MS = 4 * 60 * 1000L;
 
     // -- injected configuration ------------------------------------------------
     private final NetworkConfig network;
@@ -69,6 +80,17 @@ public final class ChainStack {
     private final Map<String, Long> backoff = new ConcurrentHashMap<>();
     private final Set<String> blacklistedNodeIds = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean running = new AtomicBoolean(false);
+
+    // -- snap-peer maintainer (optional; enabled via configureSnapMaintainer) --
+    private volatile boolean maintainerEnabled = false;
+    private volatile int targetSnapPeers = 32;
+    private DnsServerProvider dnsServerProvider;            // null → resolver's default DNS
+    private volatile List<Enr> dnsElPool = List.of();
+    private final AtomicBoolean dnsResolving = new AtomicBoolean(false);
+    private volatile long lastDnsResolveMs = 0L;
+    private volatile long dnsDialWindowStartMs = 0L;
+    private final AtomicInteger dnsDialsInWindow = new AtomicInteger(0);
+    private volatile ScheduledExecutorService peerMaintainer;
 
     // -- live components (built in start()) ------------------------------------
     private volatile RLPxConnector connector;
@@ -95,6 +117,27 @@ public final class ChainStack {
         this.ccipGateway = ccipGateway;
         this.syncSnapshotFile = syncSnapshotFile;
         this.gossipsubEnabled = gossipsubEnabled;
+    }
+
+    /**
+     * Enable the snap-peer maintainer for this stack — a background loop that keeps
+     * {@code connector.activeSnapHandlers() >= targetSnapPeers} by re-dialing cached snap
+     * peers and a refreshing EIP-1459 DNS-resolved ENR pool (the discv4-independent path
+     * NAT'd mobile hosts rely on, where discv4 can't bootstrap). Must be called before
+     * {@link #start()}. {@code dnsServers} may be null → the resolver uses its default DNS.
+     *
+     * <p>Off by default: a bare daemon relies on continuous discv4 discovery; mobile (and
+     * any host wanting aggressive snap-peer retention) turns it on.
+     */
+    public void configureSnapMaintainer(int targetSnapPeers, DnsServerProvider dnsServers) {
+        this.maintainerEnabled = true;
+        this.targetSnapPeers = targetSnapPeers;
+        this.dnsServerProvider = dnsServers;
+    }
+
+    /** Live-update the snap-peer target (no restart). */
+    public void setTargetSnapPeers(int target) {
+        this.targetSnapPeers = target;
     }
 
     // -------------------------------------------------------------------------
@@ -125,6 +168,7 @@ public final class ChainStack {
                     () -> dnsResolver.resolveAllFromStrings(network.clEnrTreeUrls(), dnsDeadline));
             List<Enr> dnsElEnrs = elFuture.join();
             List<Enr> dnsClEnrs = clFuture.join();
+            this.dnsElPool = dnsElEnrs;  // seed the maintainer's candidate pool
 
             List<InetSocketAddress> mergedBootnodes = mergeBootnodes(dnsElEnrs);
 
@@ -150,6 +194,10 @@ public final class ChainStack {
             // 5. Verified JSON-RPC (best-effort; a bind failure here does not fail the stack).
             startRpc();
 
+            // 6. Snap-peer maintainer (optional): keep snap peers topped up from cache +
+            //    the refreshing DNS pool. The discv4-independent path NAT'd hosts need.
+            if (maintainerEnabled) startPeerMaintainer();
+
             return true;
         } catch (Throwable t) {
             log.error("[{}] stack failed to start: {}", network.name(), t.toString());
@@ -161,6 +209,8 @@ public final class ChainStack {
     /** Tear down this stack's components (reverse order) and release its caches. */
     public synchronized void shutdown() {
         running.set(false);
+        ScheduledExecutorService pm = peerMaintainer;
+        if (pm != null) { pm.shutdownNow(); peerMaintainer = null; }
         if (rpcServer != null) { try { rpcServer.stop(); } catch (Throwable ignored) {} }
         if (rpcBackend != null) { try { rpcBackend.close(); } catch (Throwable ignored) {} }
         if (beaconLightClient != null) { try { beaconLightClient.close(); } catch (Throwable ignored) {} }
@@ -442,5 +492,193 @@ public final class ChainStack {
             case UNKNOWN -> 1;
             case DENIED -> 2;
         };
+    }
+
+    // -------------------------------------------------------------------------
+    // Snap-peer maintainer (ported from NodeService; optional per-stack)
+    // -------------------------------------------------------------------------
+
+    private void startPeerMaintainer() {
+        if (peerMaintainer != null) return;
+        peerMaintainer = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "snap-peer-maintainer-" + network.name());
+            t.setDaemon(true);
+            return t;
+        });
+        peerMaintainer.scheduleWithFixedDelay(this::maintainSnapPeers, 5, 10, TimeUnit.SECONDS);
+    }
+
+    /** Keep {@code activeSnapHandlers() >= targetSnapPeers}: re-dial cached snap peers,
+     *  then top up from the DNS ENR pool (rate-capped), then refresh the pool if still low. */
+    private void maintainSnapPeers() {
+        if (!running.get()) return;
+        // Guard the whole body: an uncaught throw would make scheduleWithFixedDelay
+        // silently stop all future runs.
+        try {
+            RLPxConnector conn = connector;
+            if (conn == null) return;
+            int snapPeers = conn.activeSnapHandlers().size();
+            if (snapPeers >= targetSnapPeers) return;
+            long now = System.currentTimeMillis();
+            log.info("[{}][peers] {} snap peer(s) < target {}; re-dialing cached + DNS pool",
+                    network.name(), snapPeers, targetSnapPeers);
+            // 1) Re-dial known snap peers from the cache, proven snap-servers first.
+            List<CachedPeer> snapCached = new ArrayList<>();
+            for (CachedPeer p : peerCache.load()) {
+                if (p.snap()) snapCached.add(p);
+            }
+            snapCached.sort(Comparator.comparingInt(ChainStack::snapDialRank));
+            for (CachedPeer p : snapCached) {
+                if (conn.activeSnapHandlers().size() >= targetSnapPeers) break;
+                try {
+                    dialCachedSnapPeer(conn, p, now);
+                } catch (Exception e) {
+                    log.warn("[{}][peers] skipping cached peer: {}", network.name(), e.getMessage());
+                }
+            }
+            // 2) Top up from the DNS-resolved ENR pool (discv4 substitute on NAT'd hosts),
+            //    bounded by a per-cycle batch and a rolling-minute rate cap.
+            List<Enr> pool = dnsElPool;
+            if (!pool.isEmpty() && conn.activeSnapHandlers().size() < targetSnapPeers) {
+                int budget = Math.min(DNS_MAINTAIN_DIAL_BATCH, dnsDialBudget());
+                int dialed = 0;
+                for (Enr enr : pool) {
+                    if (dialed >= budget || attempted.size() >= MAX_ATTEMPTED) break;
+                    if (dialEnr(conn, enr, now)) {
+                        dialed++;
+                        dnsDialsInWindow.incrementAndGet();
+                    }
+                }
+                if (dialed > 0) {
+                    log.info("[{}][peers] topped up {} dial(s) from DNS ENR pool ({} known)",
+                            network.name(), dialed, pool.size());
+                }
+            }
+            // 3) Grow/refresh the candidate pool — only while still below target and no
+            //    more often than DNS_REFRESH_INTERVAL_MS.
+            if (conn.activeSnapHandlers().size() < targetSnapPeers
+                    && !dnsResolving.get()
+                    && System.currentTimeMillis() - lastDnsResolveMs > DNS_REFRESH_INTERVAL_MS) {
+                Thread t = new Thread(this::refreshDnsPool, "dns-el-refresh-" + network.name());
+                t.setDaemon(true);
+                t.start();
+            }
+        } catch (Throwable t) {
+            log.warn("[{}][peers] maintenance loop error: {}", network.name(), t.toString());
+        }
+    }
+
+    /** Re-walk the EL ENR trees, fork-filter, and merge into the rolling candidate pool
+     *  (dedup by enode address, capped at {@link #DNS_POOL_MAX}). Guarded to one walk at a time. */
+    private void refreshDnsPool() {
+        if (!dnsResolving.compareAndSet(false, true)) return;
+        try {
+            DnsEnrResolver resolver = new DnsEnrResolver();
+            // On Android dnsjava has no system resolver config, so the host supplies DNS
+            // server IPs; on the daemon dnsServerProvider is null and the resolver uses
+            // its own default/public-DNS fallback.
+            if (dnsServerProvider != null) {
+                List<String> servers = dnsServerProvider.get();
+                if (servers != null && !servers.isEmpty()) resolver.setDnsServerIps(servers);
+            }
+            List<Enr> resolved = resolver.resolveAllFromStrings(
+                    network.elEnrTreeUrls(), Duration.ofSeconds(25));
+            lastDnsResolveMs = System.currentTimeMillis();
+
+            byte[] ourFork = network.forkIdHash();
+            LinkedHashMap<String, Enr> merged = new LinkedHashMap<>();
+            for (Enr e : dnsElPool) {
+                e.tcpAddress().ifPresent(a -> merged.put(a.getHostString() + ":" + a.getPort(), e));
+            }
+            int added = 0, dropped = 0;
+            for (Enr e : resolved) {
+                if (merged.size() >= DNS_POOL_MAX) break;
+                try {
+                    Optional<InetSocketAddress> tcp = e.tcpAddress();
+                    if (tcp.isEmpty() || e.publicKey().isEmpty()) continue;
+                    Optional<byte[]> fork = e.ethForkIdHash();
+                    if (fork.isPresent() && !Arrays.equals(fork.get(), ourFork)) { dropped++; continue; }
+                    String key = tcp.get().getHostString() + ":" + tcp.get().getPort();
+                    if (merged.putIfAbsent(key, e) == null) added++;
+                } catch (Exception ex) {
+                    dropped++; // malformed ENR — skip, don't abort the refresh
+                }
+            }
+            dnsElPool = new ArrayList<>(merged.values());
+            log.info("[{}] DNS EL pool: +{} new, {} off-fork dropped, {} total",
+                    network.name(), added, dropped, dnsElPool.size());
+        } catch (Exception e) {
+            log.warn("[{}] DNS EL pool refresh failed: {}", network.name(), e.getMessage());
+        } finally {
+            dnsResolving.set(false);
+        }
+    }
+
+    /** Remaining DNS-pool dials allowed in the current rolling minute (see DNS_DIALS_PER_MIN). */
+    private int dnsDialBudget() {
+        long now = System.currentTimeMillis();
+        if (now - dnsDialWindowStartMs >= 60_000L) {
+            dnsDialWindowStartMs = now;
+            dnsDialsInWindow.set(0);
+        }
+        return Math.max(0, DNS_DIALS_PER_MIN - dnsDialsInWindow.get());
+    }
+
+    /** Dial one DNS-resolved (EIP-1459) EL enode over RLPx — same attempted/backoff/blacklist
+     *  bookkeeping as the other dial paths; returns true if a connect was started. */
+    private boolean dialEnr(RLPxConnector conn, Enr enr, long now) {
+        String peerKey = null;
+        try {
+            Optional<InetSocketAddress> tcp = enr.tcpAddress();
+            Optional<SECP256K1.PublicKey> pub = enr.publicKey();
+            if (tcp.isEmpty() || pub.isEmpty()) return false;
+            InetSocketAddress peerTcp = tcp.get();
+            peerKey = peerTcp.getHostString() + ":" + peerTcp.getPort();
+            Long expiry = backoff.get(peerKey);
+            if (expiry != null) {
+                if (now < expiry) return false;
+                backoff.remove(peerKey);
+            }
+            if (attempted.size() >= MAX_ATTEMPTED || !attempted.add(peerKey)) return false;
+            final String key = peerKey;
+            conn.connect(peerTcp, pub.get(), (incompatible, idHex) -> {
+                if (incompatible) blacklistedNodeIds.add(idHex);
+                long ms = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
+                backoff.putIfAbsent(key, System.currentTimeMillis() + ms);
+                attempted.remove(key);
+            }).addListener(future -> {
+                if (!future.isSuccess()) {
+                    backoff.putIfAbsent(key, System.currentTimeMillis() + BACKOFF_TRANSIENT_MS);
+                    attempted.remove(key);
+                }
+            });
+            return true;
+        } catch (Exception e) {
+            log.warn("[{}] DNS EL dial failed: {}", network.name(), e.getMessage());
+            if (peerKey != null) attempted.remove(peerKey);
+            return false;
+        }
+    }
+
+    /** Dial a cached snap peer with the same backoff/blacklist/attempted bookkeeping. */
+    private void dialCachedSnapPeer(RLPxConnector conn, CachedPeer p, long now) {
+        String peerKey = p.address().getHostString() + ":" + p.address().getPort();
+        Long expiry = backoff.get(peerKey);
+        if (expiry != null) {
+            if (now < expiry) return;
+            backoff.remove(peerKey);
+        }
+        if (attempted.size() >= MAX_ATTEMPTED || !attempted.add(peerKey)) return;
+        try {
+            SECP256K1.PublicKey pubKey = SECP256K1.PublicKey.fromBytes(Bytes.fromHexString(p.publicKeyHex()));
+            conn.connect(p.address(), pubKey, (incompatible, idHex) -> {
+                if (incompatible) blacklistedNodeIds.add(idHex);
+                long ms = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
+                backoff.putIfAbsent(peerKey, System.currentTimeMillis() + ms);
+                attempted.remove(peerKey);
+            });
+        } catch (Exception e) {
+            attempted.remove(peerKey);
+        }
     }
 }
