@@ -130,6 +130,9 @@ public final class ChainStack {
      * any host wanting aggressive snap-peer retention) turns it on.
      */
     public void configureSnapMaintainer(int targetSnapPeers, DnsServerProvider dnsServers) {
+        if (running.get()) {
+            throw new IllegalStateException("configureSnapMaintainer must be called before start()");
+        }
         this.maintainerEnabled = true;
         this.targetSnapPeers = targetSnapPeers;
         this.dnsServerProvider = dnsServers;
@@ -161,6 +164,13 @@ public final class ChainStack {
 
             // 1. EIP-1459 DNS discovery (EL + CL trees), concurrent + best-effort.
             DnsEnrResolver dnsResolver = new DnsEnrResolver();
+            // Apply the host's DNS servers (Android: dnsjava has no system resolver config,
+            // so without these the initial EL/CL resolve — and the maintainer's pool seed —
+            // come back empty). Null/empty → resolver uses its default/public-DNS fallback.
+            if (dnsServerProvider != null) {
+                List<String> servers = dnsServerProvider.get();
+                if (servers != null && !servers.isEmpty()) dnsResolver.setDnsServerIps(servers);
+            }
             Duration dnsDeadline = Duration.ofSeconds(10);
             CompletableFuture<List<Enr>> elFuture = CompletableFuture.supplyAsync(
                     () -> dnsResolver.resolveAllFromStrings(network.elEnrTreeUrls(), dnsDeadline));
@@ -583,6 +593,9 @@ public final class ChainStack {
             }
             List<Enr> resolved = resolver.resolveAllFromStrings(
                     network.elEnrTreeUrls(), Duration.ofSeconds(25));
+            // The resolve can take ~25s; if the stack was shut down meanwhile, drop the
+            // result instead of merging into / writing the pool of a dead stack.
+            if (!running.get()) return;
             lastDnsResolveMs = System.currentTimeMillis();
 
             byte[] ourFork = network.forkIdHash();
@@ -605,7 +618,7 @@ public final class ChainStack {
                 }
             }
             dnsElPool = new ArrayList<>(merged.values());
-            log.info("[{}] DNS EL pool: +{} new, {} off-fork dropped, {} total",
+            log.info("[{}] DNS EL pool: +{} new, {} dropped (off-fork/malformed), {} total",
                     network.name(), added, dropped, dnsElPool.size());
         } catch (Exception e) {
             log.warn("[{}] DNS EL pool refresh failed: {}", network.name(), e.getMessage());
@@ -676,6 +689,14 @@ public final class ChainStack {
                 long ms = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
                 backoff.putIfAbsent(peerKey, System.currentTimeMillis() + ms);
                 attempted.remove(peerKey);
+            }).addListener(future -> {
+                // TCP-level failure (refused/timeout) fires here, not the handshake
+                // callback above — free the slot and back off so a dead peer can't pin
+                // `attempted` and eventually starve the pool at MAX_ATTEMPTED.
+                if (!future.isSuccess()) {
+                    backoff.putIfAbsent(peerKey, System.currentTimeMillis() + BACKOFF_TRANSIENT_MS);
+                    attempted.remove(peerKey);
+                }
             });
         } catch (Exception e) {
             attempted.remove(peerKey);

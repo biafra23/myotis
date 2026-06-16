@@ -18,7 +18,7 @@ public final class AndroidClPeerCacheAdapter implements ClPeerCachePort {
     private final AndroidCLPeerCache delegate;
 
     public AndroidClPeerCacheAdapter(AndroidCLPeerCache delegate) {
-        this.delegate = delegate;
+        this.delegate = java.util.Objects.requireNonNull(delegate, "delegate");
     }
 
     @Override public List<String> load() { return delegate.load(); }

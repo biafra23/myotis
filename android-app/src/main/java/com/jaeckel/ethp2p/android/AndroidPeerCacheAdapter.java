@@ -19,7 +19,7 @@ public final class AndroidPeerCacheAdapter implements PeerCachePort {
     private final AndroidPeerCache delegate;
 
     public AndroidPeerCacheAdapter(AndroidPeerCache delegate) {
-        this.delegate = delegate;
+        this.delegate = java.util.Objects.requireNonNull(delegate, "delegate");
     }
 
     @Override public void add(InetSocketAddress address, String publicKeyHex, boolean snap) {
