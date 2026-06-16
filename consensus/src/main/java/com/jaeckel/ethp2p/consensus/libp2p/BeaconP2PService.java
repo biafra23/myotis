@@ -20,7 +20,6 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.SimpleChannelInboundHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -254,21 +253,6 @@ public class BeaconP2PService implements AutoCloseable {
 
         // Log connection events and auto-query Identify for protocol support
         host.addConnectionHandler(conn -> {
-            // Fix: Muxer exception UnknownStreamIdMuxerException
-            // Swallowing it at the connection level so it doesn't kill the connection.
-            // This is a known race condition in jvm-libp2p 1.2.2 Yamux where frames
-            // arrive for a stream that was already closed locally.
-            conn.pushHandler(new ChannelInboundHandlerAdapter() {
-                @Override
-                public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-                    if (cause.getClass().getName().contains("UnknownStreamIdMuxerException")) {
-                        log.debug("[beacon-p2p] Swallowing Muxer exception: {}", cause.getMessage());
-                        return;
-                    }
-                    ctx.fireExceptionCaught(cause);
-                }
-            });
-
             String pid = conn.secureSession().getRemoteId().toString();
             String remote = conn.remoteAddress().toString();
             long openedAt = System.currentTimeMillis();
