@@ -263,23 +263,28 @@ public final class Main {
             servers.add(server);
         }
 
-        // 2. Shutdown hook for Ctrl-C / SIGTERM — cleanup happens here because the JVM
-        //    may exit before the main thread resumes after await(). A `stop` command on
-        //    ANY network's socket trips the shared latch and tears the whole process down.
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            log.info("[daemon] Shutdown hook triggered");
+        // 2. Run cleanup exactly once, whether reached via the await() below or the
+        //    shutdown hook (Ctrl-C / SIGTERM, or normal exit after await returns).
+        java.util.concurrent.atomic.AtomicBoolean cleaned = new java.util.concurrent.atomic.AtomicBoolean(false);
+        Runnable cleanup = () -> {
+            if (!cleaned.compareAndSet(false, true)) return;
             registry.shutdownAll();
             closeAll(servers);
             releaseAll(fileLocks, lockChannels);
+        };
+
+        // A `stop` command on ANY network's socket trips the shared latch and tears the
+        // whole process down. The hook covers the JVM-exits-before-main-resumes case.
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            log.info("[daemon] Shutdown hook triggered");
+            cleanup.run();
             stopLatch.countDown();
             log.info("[daemon] Done.");
         }, "shutdown-hook"));
 
-        // 3. Block until "stop" command or signal, then clean up (hook covers Ctrl-C).
+        // 3. Block until "stop" command or signal, then clean up.
         stopLatch.await();
-        registry.shutdownAll();
-        closeAll(servers);
-        releaseAll(fileLocks, lockChannels);
+        cleanup.run();
         log.info("[daemon] Done.");
     }
 

@@ -105,8 +105,13 @@ public final class ChainStack {
      * Build and start this network's stack. Returns {@code true} on success. On any
      * failure, closes whatever was constructed and returns {@code false} without
      * affecting sibling stacks (fault isolation).
+     *
+     * <p>{@code synchronized} on the same monitor as {@link #shutdown()} so the two
+     * never interleave: a {@code shutdown()} that races an in-progress {@code start()}
+     * waits until startup finishes, then tears the fully-built stack down — rather than
+     * flipping {@code running} mid-build and leaking the components started afterward.
      */
-    public boolean start() {
+    public synchronized boolean start() {
         if (!running.compareAndSet(false, true)) return true; // already started
         try {
             log.info("[{}] Node ID: {}", network.name(), nodeKey.nodeId().toHexString());
@@ -220,7 +225,9 @@ public final class ChainStack {
         List<CachedPeer> cached = new ArrayList<>(peerCache.load());
         cached.sort(Comparator.comparingInt(ChainStack::snapDialRank));
         for (CachedPeer peer : cached) {
-            String peerKey = peer.address().getAddress().getHostAddress() + ":" + peer.address().getPort();
+            // getHostString() (not getAddress().getHostAddress()) — the latter NPEs on
+            // an unresolved address; getHostString() returns the literal IP/host directly.
+            String peerKey = peer.address().getHostString() + ":" + peer.address().getPort();
             attempted.add(peerKey);
             try {
                 SECP256K1.PublicKey pubKey = SECP256K1.PublicKey.fromBytes(
