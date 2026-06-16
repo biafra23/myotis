@@ -1,4 +1,4 @@
-package com.jaeckel.ethp2p.app;
+package com.jaeckel.ethp2p.android;
 
 import io.myotis.node.ClPeerCachePort;
 
@@ -8,15 +8,16 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Adapts the daemon's file-backed {@link CLPeerCache} to the {@link ClPeerCachePort}
- * that {@code ChainStack} consumes. Pure delegation. {@code CLPeerCache} flushes its
- * writes inline (no {@code close()}), so {@link #close()} is a no-op.
+ * Adapts {@link AndroidCLPeerCache} to the {@link ClPeerCachePort} that {@code ChainStack}
+ * consumes. Pure delegation. {@code AndroidCLPeerCache} flushes writes inline (no
+ * {@code close()}), so {@link #close()} is a no-op. Mirrors the daemon's
+ * {@code ClPeerCacheAdapter}.
  */
-public final class ClPeerCacheAdapter implements ClPeerCachePort {
+public final class AndroidClPeerCacheAdapter implements ClPeerCachePort {
 
-    private final CLPeerCache delegate;
+    private final AndroidCLPeerCache delegate;
 
-    public ClPeerCacheAdapter(CLPeerCache delegate) {
+    public AndroidClPeerCacheAdapter(AndroidCLPeerCache delegate) {
         this.delegate = java.util.Objects.requireNonNull(delegate, "delegate");
     }
 
@@ -32,5 +33,5 @@ public final class ClPeerCacheAdapter implements ClPeerCachePort {
     @Override public void markLightClientBatch(Collection<String> confirmed, Collection<String> denied) {
         delegate.markLightClientBatch(confirmed, denied);
     }
-    @Override public void close() { /* CLPeerCache flushes writes inline; nothing to close */ }
+    @Override public void close() { /* AndroidCLPeerCache flushes writes inline; nothing to close */ }
 }

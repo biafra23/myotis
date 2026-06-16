@@ -58,6 +58,8 @@ public final class Main {
     private static final Logger log = LoggerFactory.getLogger(Main.class);
 
     private static final int DEFAULT_PORT = 30303;
+    /** Snap-peer target the daemon's per-stack maintainer keeps topped up. */
+    private static final int SNAP_PEER_TARGET = 32;
 
     /** Socket path; override via {@code ETHP2P_SOCKET} env var. Network-specific suffix for non-mainnet. */
     static Path socketPath(String networkName) {
@@ -233,6 +235,11 @@ public final class Main {
                     new com.jaeckel.ethp2p.app.rpc.JavaHttpCcipGateway(),
                     syncSnapshotFile(network.name()),
                     gossipsubEnabled);
+            // Keep snap peers topped up from the cache + a refreshing EIP-1459 DNS pool —
+            // the discv4-independent path. Helps networks with scarce snap peers (Gnosis)
+            // retain a snap/1 peer for verified state reads. dnsServers=null → resolver's
+            // default DNS (the daemon, unlike Android, has system DNS config).
+            stack.configureSnapMaintainer(SNAP_PEER_TARGET, null);
 
             if (!stack.start()) {
                 System.err.println("Failed to start " + network.name() + " node stack");

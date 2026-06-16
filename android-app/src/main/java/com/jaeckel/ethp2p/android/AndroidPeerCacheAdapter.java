@@ -1,4 +1,4 @@
-package com.jaeckel.ethp2p.app;
+package com.jaeckel.ethp2p.android;
 
 import io.myotis.node.CachedPeer;
 import io.myotis.node.PeerCachePort;
@@ -9,16 +9,16 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Adapts the daemon's file-backed {@link PeerCache} to the {@link PeerCachePort}
- * that {@code ChainStack} consumes, so {@code node-core} stays independent of the
- * daemon module. Pure delegation plus a {@link PeerCache.SnapQuality} → shared
- * {@link SnapQuality} mapping.
+ * Adapts {@link AndroidPeerCache} to the {@link PeerCachePort} that {@code ChainStack}
+ * consumes, so {@code node-core} stays independent of the Android module. Pure
+ * delegation plus an {@link AndroidPeerCache.SnapQuality} → shared {@link SnapQuality}
+ * mapping. Mirrors the daemon's {@code PeerCacheAdapter}.
  */
-public final class PeerCacheAdapter implements PeerCachePort {
+public final class AndroidPeerCacheAdapter implements PeerCachePort {
 
-    private final PeerCache delegate;
+    private final AndroidPeerCache delegate;
 
-    public PeerCacheAdapter(PeerCache delegate) {
+    public AndroidPeerCacheAdapter(AndroidPeerCache delegate) {
         this.delegate = java.util.Objects.requireNonNull(delegate, "delegate");
     }
 
@@ -35,9 +35,9 @@ public final class PeerCacheAdapter implements PeerCachePort {
     }
 
     @Override public List<CachedPeer> load() {
-        List<PeerCache.CachedPeer> src = delegate.load();
+        List<AndroidPeerCache.CachedPeer> src = delegate.load();
         List<CachedPeer> out = new ArrayList<>(src.size());
-        for (PeerCache.CachedPeer p : src) {
+        for (AndroidPeerCache.CachedPeer p : src) {
             out.add(new CachedPeer(p.address(), p.publicKeyHex(), p.snap(), map(p.snapQuality())));
         }
         return out;
@@ -47,7 +47,7 @@ public final class PeerCacheAdapter implements PeerCachePort {
         delegate.close();
     }
 
-    private static SnapQuality map(PeerCache.SnapQuality q) {
+    private static SnapQuality map(AndroidPeerCache.SnapQuality q) {
         return switch (q) {
             case CONFIRMED -> SnapQuality.CONFIRMED;
             case UNKNOWN -> SnapQuality.UNKNOWN;
