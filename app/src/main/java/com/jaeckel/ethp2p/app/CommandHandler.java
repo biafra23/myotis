@@ -1208,20 +1208,38 @@ public class CommandHandler {
         // block can never anchor to the beacon chain (finality already passed it), yet
         // it still snap-serves its frozen root and would be pinned here — forcing the
         // finalized fallback while fresh-headed peers sit connected.
+        long finalizedNum = -1;
+        long optimisticHead = -1;
         if (beaconLightClient != null) {
             com.jaeckel.ethp2p.consensus.types.LightClientHeader finHdr =
                     beaconLightClient.getStore().getFinalizedHeader();
             if (finHdr != null) {
-                minSensibleHead = Math.max(minSensibleHead, finHdr.execution().blockNumber());
+                finalizedNum = finHdr.execution().blockNumber();
+                minSensibleHead = Math.max(minSensibleHead, finalizedNum);
             }
+            com.jaeckel.ethp2p.consensus.types.LightClientHeader optHdr =
+                    beaconLightClient.getStore().getOptimisticHeader();
+            if (optHdr != null) optimisticHead = optHdr.execution().blockNumber();
         }
+        // Probe each peer's LIVE head by NUMBER (forward window from the finalized block,
+        // which every fresh peer holds) rather than its frozen connect-time Status hash —
+        // the Status hash never advances and drifts below the floor as the chain moves.
+        // See EthHandler#requestFreshHeadHeaderAsync(long,int).
+        final boolean byNumberProbe = finalizedNum > 0;
+        final long probeFrom = finalizedNum;
+        final int probeWindow = byNumberProbe
+                ? (int) Math.max(16, Math.min(256,
+                    (optimisticHead > finalizedNum ? optimisticHead - finalizedNum : 0) + 16))
+                : 0;
         String lastError = null;
         for (com.jaeckel.ethp2p.networking.eth.EthHandler peer : snapPeers) {
             if (!peer.isReady() || peer.isSnapServingFailed()) {
                 continue;
             }
             try {
-                BlockHeader head = peer.requestFreshHeadHeaderAsync().get(6, TimeUnit.SECONDS);
+                BlockHeader head = (byNumberProbe
+                        ? peer.requestFreshHeadHeaderAsync(probeFrom, probeWindow)
+                        : peer.requestFreshHeadHeaderAsync()).get(6, TimeUnit.SECONDS);
                 if (head.number < minSensibleHead) {
                     lastError = "peer " + peer.getRemoteAddress()
                         + " returned stale head #" + head.number

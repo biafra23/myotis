@@ -851,6 +851,59 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     }
 
     /**
+     * Fetch this peer's CURRENT head header by NUMBER.
+     *
+     * <p>Unlike the no-arg {@link #requestFreshHeadHeaderAsync()} — which re-fetches the
+     * block hash the peer announced in its connect-time {@code Status}
+     * ({@link #peerBestBlockHash}) and therefore can never advance past the head the peer
+     * had when it connected — this asks the peer for a forward window of {@code window}
+     * headers starting at {@code fromNumber} and returns the HIGHEST header the peer
+     * actually serves: its live head as of now.
+     *
+     * <p>Pass {@code fromNumber} = the beacon-finalized block number (a block every
+     * fresh-enough peer is guaranteed to have) and {@code window} sized to span
+     * finalized→head, so the result lands at (or just above) the beacon-verified head.
+     * An empty response means the peer does not even hold the finalized block — i.e. it
+     * is behind the finality floor — and is surfaced as a failure so the caller skips it.
+     *
+     * <p>The returned header is NOT trusted here; the caller verifies it against the
+     * beacon anchor (finalized→head) before pinning it.
+     */
+    public CompletableFuture<com.jaeckel.ethp2p.core.types.BlockHeader> requestFreshHeadHeaderAsync(
+            long fromNumber, int window) {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) {
+            return CompletableFuture.failedFuture(
+                new IllegalStateException("EthHandler not READY"));
+        }
+        long reqId = requestId.getAndIncrement();
+        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> headerFut = new CompletableFuture<>();
+        pendingRequests.put(reqId, headerFut);
+        byte[] payload = GetBlockHeadersMessage.encodeByNumber(reqId, fromNumber, window, 0, false);
+        log.debug("[eth] GetBlockHeaders (live head probe from #{} window={}) reqId={}",
+            fromNumber, window, reqId);
+        rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
+        return headerFut.orTimeout(5, TimeUnit.SECONDS)
+            .whenComplete((r, ex) -> pendingRequests.remove(reqId))
+            .thenApply(headers -> {
+                if (headers.isEmpty()) {
+                    throw new RuntimeException(
+                        "Peer served no header at/above finalized #" + fromNumber
+                        + " (behind the finality floor)");
+                }
+                // The peer returns the contiguous slice it has from fromNumber upward;
+                // the highest-numbered entry is its live head (or fromNumber+window-1 if
+                // the peer is further ahead than the window spans). Pick the max rather
+                // than assume ordering.
+                com.jaeckel.ethp2p.core.types.BlockHeader best = headers.get(0).header();
+                for (BlockHeadersMessage.VerifiedHeader vh : headers) {
+                    if (vh.header().number > best.number) best = vh.header();
+                }
+                return best;
+            });
+    }
+
+    /**
      * Broadcast one or more raw signed transactions to this peer (eth Transactions
      * 0x12). Fire-and-forget — Transactions has no response. The wallet user signs
      * and submits the tx; we only gossip the bytes so they reach a block producer.

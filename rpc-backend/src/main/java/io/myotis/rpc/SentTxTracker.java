@@ -72,6 +72,16 @@ final class SentTxTracker {
         return w != null && w.seenAtMs() >= 0;
     }
 
+    /** Hashes of watched txs we have NOT yet seen echo back on gossip — i.e. our initial
+     *  broadcast may have reached too few / non-relaying peers, so they're candidates for
+     *  resilient re-broadcast. Once a tx is seen propagating, the network has it and it drops
+     *  off this list. */
+    java.util.List<Bytes32> unseen() {
+        java.util.List<Bytes32> out = new java.util.ArrayList<>();
+        watched.forEach((h, w) -> { if (w.seenAtMs() < 0) out.add(h); });
+        return out;
+    }
+
     /** Drop entries older than the TTL (a send that never mined and stopped mattering).
      *  @return how many were evicted. */
     int evictExpired(long nowMs) {
