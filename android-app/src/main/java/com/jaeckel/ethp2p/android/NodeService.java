@@ -180,13 +180,27 @@ public final class NodeService extends Service {
     private static android.content.SharedPreferences prefs(android.content.Context c) {
         return c.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE);
     }
-    /** Selected chain ("mainnet"/"gnosis"); defaults to mainnet. */
+    /**
+     * Canonicalize a network name to one {@link NetworkConfig#byName} accepts AND that
+     * the per-network helpers (which test {@code "gnosis".equals(network)}) handle
+     * consistently. Unknown/corrupt/empty values fall back to mainnet so a bad pref can
+     * never crash node startup (byName throws on unknown names) or silently desync the
+     * RPC-port/preset selection from the resolved chain.
+     */
+    private static String canonicalNetwork(String n) {
+        if (n == null) return "mainnet";
+        switch (n.toLowerCase(java.util.Locale.ROOT)) {
+            case "gnosis": case "gbc": case "xdai": return "gnosis";
+            case "sepolia": return "sepolia";
+            default: return "mainnet";
+        }
+    }
+    /** Selected chain ("mainnet"/"gnosis"/"sepolia"); defaults to mainnet. */
     public static String selectedNetwork(android.content.Context c) {
-        String n = prefs(c).getString(K_NETWORK, "mainnet");
-        return (n == null || n.isEmpty()) ? "mainnet" : n;
+        return canonicalNetwork(prefs(c).getString(K_NETWORK, "mainnet"));
     }
     public static void setSelectedNetwork(android.content.Context c, String n) {
-        prefs(c).edit().putString(K_NETWORK, n).apply();
+        prefs(c).edit().putString(K_NETWORK, canonicalNetwork(n)).apply();
     }
     /** Per-network default RPC port: Gnosis → 8546, every other chain → 8545. */
     public static int defaultRpcPort(String network) {
