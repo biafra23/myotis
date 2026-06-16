@@ -648,7 +648,11 @@ public class BeaconLightClient implements AutoCloseable {
         // If not yet synced, each cycle disconnects stale connections and retries.
         // Using the network slot time matters on Gnosis: a hardcoded 12s polled
         // finality 2.4x too slowly there, prolonging CATCHING_UP and staling the head.
-        long pollIntervalMs = secondsPerSlot * 1000L;
+        // Guard a misconfigured preset: a non-positive slot time would make
+        // Thread.sleep() throw (negative) or busy-loop the network (zero), so fall
+        // back to the mainnet default rather than crash or spin.
+        int slotSeconds = secondsPerSlot > 0 ? secondsPerSlot : BeaconChainSpec.SECONDS_PER_SLOT;
+        long pollIntervalMs = slotSeconds * 1000L;
         int cycleCount = 0;
         while (running) {
             try {
