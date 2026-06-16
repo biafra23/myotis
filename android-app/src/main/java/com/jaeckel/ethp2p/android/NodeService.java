@@ -1524,7 +1524,15 @@ public final class NodeService extends Service {
         cachedPeerCount = 0;
         cachedClPeerCount = 0;
         clGenesisTime = 0L;
-        startTimeMs = 0L;
+        // NB: do NOT clear startTimeMs here. doShutdown() runs on a worker thread
+        // and its teardown takes seconds; a quick Stop -> Start has onStartCommand()
+        // flip RUNNING back to true and stamp a fresh startTimeMs while we're still
+        // mid-teardown (startNode()'s synchronized startAndPublish blocks on the lock
+        // we hold). Writing startTimeMs = 0L here would clobber that fresh stamp, and
+        // since the UI shows the uptime row whenever running==true, uptime would jump
+        // to now - 0 (~epoch millis) and freeze. startTimeMs is owned by the next
+        // start (onStartCommand / the restart branch below both stamp it); the UI
+        // only reads it when running, so leaving the old value here is harmless.
         clPeersDiscovered.set(0);
         LogBuffer.i(TAG, "node shutdown complete");
         if (restartAfterShutdown) {
