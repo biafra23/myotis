@@ -25,8 +25,11 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 final class SentTxTracker {
 
-    /** When we broadcast it, and when we first saw it on gossip ({@code -1} until seen). */
-    private record Watch(long broadcastAtMs, long seenAtMs) {}
+    /** When we broadcast it, when we first saw it on gossip ({@code -1} until seen), and the
+     *  verified head block number at broadcast time ({@code -1} if unknown) — the latter lets
+     *  the receipt scanner deep-scan back to where the tx could first have been mined, instead
+     *  of only the recent forward window. */
+    private record Watch(long broadcastAtMs, long seenAtMs, long broadcastHeadNumber) {}
 
     private final Map<Bytes32, Watch> watched = new ConcurrentHashMap<>();
     private final long ttlMs;
@@ -35,9 +38,17 @@ final class SentTxTracker {
         this.ttlMs = ttlMs;
     }
 
-    /** Start watching a tx we just broadcast. */
-    void watch(Bytes32 hash, long nowMs) {
-        watched.put(hash, new Watch(nowMs, -1L));
+    /** Start watching a tx we just broadcast, recording the verified head block number at
+     *  broadcast time ({@code -1} if not known) so a late receipt lookup can scan back to it. */
+    void watch(Bytes32 hash, long nowMs, long headNumber) {
+        watched.put(hash, new Watch(nowMs, -1L, headNumber));
+    }
+
+    /** Verified head block number recorded when {@code hash} was broadcast, or {@code -1} if
+     *  it isn't one of ours / no head was known at broadcast. */
+    long broadcastHead(Bytes32 hash) {
+        Watch w = watched.get(hash);
+        return w == null ? -1L : w.broadcastHeadNumber();
     }
 
     /** O(1) hot-path guard: do we currently care about any gossip hash at all? */
@@ -56,7 +67,7 @@ final class SentTxTracker {
         watched.computeIfPresent(hash, (h, w) -> {
             if (w.seenAtMs() >= 0) return w;            // already counted — leave as is
             firstSeen[0] = w;
-            return new Watch(w.broadcastAtMs(), nowMs);
+            return new Watch(w.broadcastAtMs(), nowMs, w.broadcastHeadNumber());
         });
         return firstSeen[0] == null ? -1L : nowMs - firstSeen[0].broadcastAtMs();
     }
