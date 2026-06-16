@@ -47,6 +47,18 @@ import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -118,6 +130,8 @@ class MainActivity : ComponentActivity() {
                         onOpenNetworkSettings = ::openWifiSettings,
                         onClearCaches = ::clearPeerCaches,
                         onResetSync = ::resetSyncState,
+                        onSwitchNetwork = ::switchNetwork,
+                        onApplyTunables = ::applyTunables,
                     )
                 }
             }
@@ -208,8 +222,35 @@ class MainActivity : ComponentActivity() {
     private fun resetSyncState() {
         boundServiceState.value?.resetSyncState()
     }
+
+    /** Switch the active chain. Persists + restarts the node on the new network. */
+    private fun switchNetwork(name: String) {
+        val svc = boundServiceState.value
+        if (svc != null) {
+            svc.switchNetwork(name)
+        } else {
+            NodeService.setSelectedNetwork(this, name)
+            startNodeService()
+        }
+    }
+
+    /** Persist RPC port + snap-peer knobs. RPC-port change restarts; snap target applies live. */
+    private fun applyTunables(rpcPort: Int, snapTarget: Int, deepPool: Int) {
+        val oldPort = NodeService.rpcPort(this)
+        NodeService.setRpcPort(this, rpcPort)
+        val newPort = NodeService.rpcPort(this)
+        NodeService.setDeepPoolThreshold(this, deepPool)
+        val svc = boundServiceState.value
+        if (svc != null) {
+            svc.setTargetSnapPeers(snapTarget)          // live update + persists
+            if (newPort != oldPort) svc.restartNode()   // rebind the RPC server
+        } else {
+            NodeService.setSnapTargetPref(this, snapTarget)
+        }
+    }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun NodeScreen(
     serviceProvider: () -> NodeService?,
@@ -217,6 +258,8 @@ private fun NodeScreen(
     onOpenNetworkSettings: () -> Unit,
     onClearCaches: () -> Unit,
     onResetSync: () -> Unit,
+    onSwitchNetwork: (String) -> Unit,
+    onApplyTunables: (Int, Int, Int) -> Unit,
 ) {
     // Snapshot + uptime tick are owned by the parent so both tabs can read
     // them — the Query tab needs `beaconState` to decide whether to warn the
@@ -226,6 +269,11 @@ private fun NodeScreen(
     var now by remember { mutableStateOf(System.currentTimeMillis()) }
     var selectedTab by remember { mutableStateOf(0) }
     val online = rememberIsOnline()
+    val context = LocalContext.current
+    var showSettings by remember { mutableStateOf(false) }
+    // Readiness deep-pool threshold is configurable in Settings; seed from prefs and
+    // update live when saved so ReadinessStrip reflects it without a restart.
+    var deepPool by remember { mutableStateOf(NodeService.deepPoolThreshold(context)) }
 
     // Query-tab state is hoisted here, NOT inside QueryTab, so it survives
     // switching tabs. QueryTab leaves the composition whenever another tab is
@@ -333,16 +381,48 @@ private fun NodeScreen(
         }
     }
 
-    Column(Modifier.fillMaxSize()) {
+    if (showSettings) {
+        SettingsScreen(
+            activeNetwork = snapshot?.network ?: NodeService.selectedNetwork(context),
+            onSwitchNetwork = { name ->
+                showSettings = false
+                onSwitchNetwork(name)
+            },
+            onApplyTunables = { port, snap, deep ->
+                deepPool = deep
+                onApplyTunables(port, snap, deep)
+                showSettings = false
+            },
+            onBack = { showSettings = false },
+        )
+        return
+    }
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    val net = (snapshot?.network ?: NodeService.selectedNetwork(context))
+                        .replaceFirstChar { it.uppercase() }
+                    Text("Myotis · $net")
+                },
+                actions = {
+                    IconButton(onClick = { showSettings = true }) {
+                        Icon(Icons.Filled.Settings, contentDescription = "Settings")
+                    }
+                },
+            )
+        },
+    ) { padding ->
+      Column(Modifier.fillMaxSize().padding(padding)) {
         // App-wide sync banner above the tabs: indeterminate while bootstrapping,
         // determinate as the light client catches up sync-committee periods, gone
         // once SYNCED.
         SyncProgressBar(snapshot)
         // Readiness traffic-light: a thin strip atop the tabs. red = consensus not
         // synced; amber = synced but no warm verified head yet (wallet calls will
-        // error -32000); green = warmed up, safe to transact. The third gate that
-        // nothing else surfaced — turns "is it ready?" from an adb curl into a glance.
-        ReadinessStrip(snapshot)
+        // error -32000); green = warmed up, safe to transact. The deep-pool gate
+        // (bright/thick green) uses the configurable threshold from Settings.
+        ReadinessStrip(snapshot, deepPool)
         TabRow(selectedTabIndex = selectedTab) {
             Tab(
                 selected = selectedTab == 0,
@@ -394,6 +474,117 @@ private fun NodeScreen(
                 filter = logsFilter,
                 onFilterChange = { logsFilter = it },
             )
+        }
+      }
+    }
+}
+
+/**
+ * Settings page: switch the active chain (restarts the node) and tune the RPC
+ * port + snap-peer knobs. Reached from the top-bar gear.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SettingsScreen(
+    activeNetwork: String,
+    onSwitchNetwork: (String) -> Unit,
+    onApplyTunables: (Int, Int, Int) -> Unit,   // rpcPort, snapTarget, deepPoolThreshold
+    onBack: () -> Unit,
+) {
+    val context = LocalContext.current
+    var selectedNet by remember { mutableStateOf(NodeService.selectedNetwork(context)) }
+    var rpcPort by remember { mutableStateOf(NodeService.rpcPort(context).toString()) }
+    var snapTarget by remember { mutableStateOf(NodeService.snapTarget(context).toString()) }
+    var deepPool by remember { mutableStateOf(NodeService.deepPoolThreshold(context).toString()) }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Settings") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+            )
+        },
+    ) { padding ->
+        Column(
+            Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            Text("Network", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Active chain: ${activeNetwork.replaceFirstChar { it.uppercase() }}. " +
+                    "Switching restarts the node and re-syncs on the new chain.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            listOf("mainnet" to "Ethereum Mainnet", "gnosis" to "Gnosis Chain").forEach { (id, label) ->
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            if (id != selectedNet) { selectedNet = id; onSwitchNetwork(id) }
+                        }
+                        .padding(vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    RadioButton(
+                        selected = id == selectedNet,
+                        onClick = { if (id != selectedNet) { selectedNet = id; onSwitchNetwork(id) } },
+                    )
+                    Text(label)
+                }
+            }
+
+            HorizontalDivider()
+
+            Text("Node tuning", style = MaterialTheme.typography.titleMedium)
+            OutlinedTextField(
+                value = rpcPort,
+                onValueChange = { rpcPort = it.filter(Char::isDigit).take(5) },
+                label = { Text("JSON-RPC port (default 8545)") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = snapTarget,
+                onValueChange = { snapTarget = it.filter(Char::isDigit).take(3) },
+                label = { Text("Snap-peer target (default 32)") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = deepPool,
+                onValueChange = { deepPool = it.filter(Char::isDigit).take(3) },
+                label = { Text("Readiness “deep pool” threshold (default 16)") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                "An RPC-port change restarts the node; snap-peer target and the readiness " +
+                    "threshold apply live.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Button(
+                onClick = {
+                    onApplyTunables(
+                        rpcPort.toIntOrNull() ?: NodeService.DEFAULT_RPC_PORT,
+                        snapTarget.toIntOrNull() ?: NodeService.DEFAULT_SNAP_TARGET,
+                        deepPool.toIntOrNull() ?: NodeService.DEFAULT_DEEP_POOL,
+                    )
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Save") }
         }
     }
 }
@@ -474,7 +665,7 @@ private const val READY_HEAD_WARM_MS = 45_000L
 private const val DEEP_POOL_SNAP_PEERS = 16
 
 @Composable
-private fun ReadinessStrip(snapshot: NodeService.Snapshot?) {
+private fun ReadinessStrip(snapshot: NodeService.Snapshot?, deepPoolThreshold: Int = DEEP_POOL_SNAP_PEERS) {
     val s = snapshot
     // Color, thickness AND a spoken label, derived together so they can never
     // disagree. The label is exposed via semantics so readiness is discoverable by
@@ -488,7 +679,7 @@ private fun ReadinessStrip(snapshot: NodeService.Snapshot?) {
             Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not synced")
         s.verifiedHeadAgeMs > READY_HEAD_WARM_MS ->
             Triple(Color(0xFFF9A825), 3.dp, "Node readiness: warming up, not ready to transact")
-        s.snapPeers >= DEEP_POOL_SNAP_PEERS ->
+        s.snapPeers >= deepPoolThreshold ->
             Triple(Color(0xFF00E676), 6.dp,
                 "Node readiness: fully ready — deep peer pool, heavy confirm screens will load")
         else ->
