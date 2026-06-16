@@ -92,4 +92,31 @@ class NetworkConfigGnosisTest {
     void minSensibleHeadIsSet() {
         assertEquals(40_000_000L, G.minSensibleHeadBlock());
     }
+
+    @Test
+    void elBootEnodesAreDialableForGnosisOnly() {
+        // Gnosis publishes no EL enrtree, so it ships full enode://<pubkey>@host:port seeds for
+        // direct RLPx dialing. Networks that have an enrtree return an empty list.
+        assertTrue(NetworkConfig.MAINNET.elBootEnodes().isEmpty(), "mainnet has an enrtree");
+        assertTrue(NetworkConfig.SEPOLIA.elBootEnodes().isEmpty(), "sepolia has an enrtree");
+
+        var enodes = G.elBootEnodes();
+        assertFalse(enodes.isEmpty(), "Gnosis must ship static EL enode seeds");
+        assertEquals(16, enodes.size());
+        for (String enode : enodes) {
+            // Parse exactly as ChainStack does — proves each entry yields a valid pubkey + addr.
+            assertTrue(enode.startsWith("enode://"), enode);
+            String b = enode.substring(enode.indexOf("//") + 2);
+            int at = b.indexOf('@');
+            assertTrue(at > 0, "missing @ in " + enode);
+            // 64-byte uncompressed secp256k1 pubkey (128 hex chars), must decode to a key.
+            assertEquals(128, at, "pubkey must be 128 hex chars in " + enode);
+            assertNotNull(org.apache.tuweni.crypto.SECP256K1.PublicKey.fromBytes(
+                    Bytes.fromHexString(b.substring(0, at))), enode);
+            String hostPort = b.substring(at + 1);
+            int colon = hostPort.lastIndexOf(':');
+            assertTrue(colon > 0, "missing host:port in " + enode);
+            assertTrue(Integer.parseInt(hostPort.substring(colon + 1)) > 0, enode);
+        }
+    }
 }
