@@ -186,6 +186,7 @@ public final class ChainStack {
             this.connector = buildConnector();
             dialCachedPeers();
             directDialDnsEnodes(dnsElEnrs);
+            directDialStaticEnodes();   // enrtree substitute for chains without one (Gnosis)
 
             // 3. discv4.
             this.discV4 = buildDiscV4(mergedBootnodes);
@@ -268,11 +269,75 @@ public final class ChainStack {
                 if (seen.add(key)) merged.add(sa);
             });
         }
+        // Also seed discv4 from the static EL enodes (chains without an enrtree, e.g. Gnosis):
+        // their ip:port widen the ping set; their pubkeys feed the direct-dial path separately.
+        for (ParsedEnode pe : parseStaticEnodes()) {
+            String key = pe.address().getAddress().getHostAddress() + ":" + pe.address().getPort();
+            if (seen.add(key)) merged.add(pe.address());
+        }
         if (merged.size() > before) {
-            log.info("[{}] DNS discovery added {} EL bootnode(s) (total: {})",
+            log.info("[{}] discovery seeds added {} EL bootnode(s) (total: {})",
                     network.name(), merged.size() - before, merged.size());
         }
         return merged;
+    }
+
+    /** A parsed {@code enode://<pubkey>@<host>:<port>} — address + secp256k1 pubkey. */
+    private record ParsedEnode(InetSocketAddress address, SECP256K1.PublicKey pubkey) {}
+
+    /** Parse {@link NetworkConfig#elBootEnodes()} into dialable (address, pubkey) pairs,
+     *  skipping any malformed entry. */
+    private List<ParsedEnode> parseStaticEnodes() {
+        List<ParsedEnode> out = new ArrayList<>();
+        for (String enode : network.elBootEnodes()) {
+            try {
+                String b = enode.substring(enode.indexOf("//") + 2);
+                int at = b.indexOf('@');
+                SECP256K1.PublicKey pub = SECP256K1.PublicKey.fromBytes(Bytes.fromHexString(b.substring(0, at)));
+                String hostPort = b.substring(at + 1);
+                int colon = hostPort.lastIndexOf(':');
+                out.add(new ParsedEnode(
+                        new InetSocketAddress(hostPort.substring(0, colon),
+                                Integer.parseInt(hostPort.substring(colon + 1))),
+                        pub));
+            } catch (Exception e) {
+                log.warn("[{}] skipping malformed static EL enode '{}': {}",
+                        network.name(), enode, e.getMessage());
+            }
+        }
+        return out;
+    }
+
+    /** Direct-RLPx-dial the network's static EL enodes — the discv4-independent discovery seed
+     *  for chains with no EL enrtree (Gnosis): a NAT'd/mobile host reaches these known peers
+     *  over RLPx without bootstrapping discv4 UDP. Mirrors {@link #directDialDnsEnodes}'s
+     *  attempted/backoff bookkeeping; peers that connect are cached, so the snap-peer maintainer
+     *  keeps re-dialing them from the cache on later cycles. */
+    private void directDialStaticEnodes() {
+        int dialed = 0;
+        for (ParsedEnode pe : parseStaticEnodes()) {
+            if (dialed >= DNS_DIRECT_DIAL_LIMIT) break;
+            String peerKey = pe.address().getHostString() + ":" + pe.address().getPort();
+            if (!attempted.add(peerKey)) continue;
+            dialed++;
+            final String key = peerKey;
+            try {
+                connector.connect(pe.address(), pe.pubkey(), (incompatible, nodeIdHex) -> {
+                            if (incompatible) blacklistedNodeIds.add(nodeIdHex);
+                            backoff.putIfAbsent(key, System.currentTimeMillis()
+                                    + (incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS));
+                            attempted.remove(key);
+                        })
+                        .addListener(future -> { if (!future.isSuccess()) attempted.remove(key); });
+            } catch (Exception e) {
+                log.warn("[{}] direct dial of static EL enode {} failed: {}",
+                        network.name(), key, e.getMessage());
+                attempted.remove(key);
+            }
+        }
+        if (dialed > 0) {
+            log.info("[{}] Direct-dialed {} static EL enode(s)", network.name(), dialed);
+        }
     }
 
     private RLPxConnector buildConnector() {
