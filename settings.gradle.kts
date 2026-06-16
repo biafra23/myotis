@@ -1,4 +1,4 @@
-rootProject.name = "ethp2p"
+rootProject.name = "Myotis"
 
 pluginManagement {
     repositories {
