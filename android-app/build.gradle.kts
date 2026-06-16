@@ -201,6 +201,11 @@ dependencies {
     // SnapQualitySink (the host seams) onto the compile classpath too.
     implementation(project(":rpc-backend"))
 
+    // Shared per-network host core: ChainStack + NodeRegistry (same the :app daemon
+    // hosts). NodeService builds one ChainStack per enabled network via Android cache
+    // adapters, so the per-network EL+CL+RPC lifecycle lives once for both hosts.
+    implementation(project(":node-core"))
+
     // Force the JRE *variant* of Guava. Guava publishes jre and android
     // variants under one module; on an Android project Gradle's
     // org.gradle.jvm.environment=android attribute selects the `android`
