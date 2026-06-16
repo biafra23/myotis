@@ -272,7 +272,10 @@ public final class ChainStack {
         // Also seed discv4 from the static EL enodes (chains without an enrtree, e.g. Gnosis):
         // their ip:port widen the ping set; their pubkeys feed the direct-dial path separately.
         for (ParsedEnode pe : parseStaticEnodes()) {
-            String key = pe.address().getAddress().getHostAddress() + ":" + pe.address().getPort();
+            // getHostString() (not getAddress().getHostAddress()) — NPE-safe if the address is
+            // unresolved, and consistent with directDialStaticEnodes; Gnosis enodes are IP
+            // literals, so the key still matches the resolved bootnode keys above.
+            String key = pe.address().getHostString() + ":" + pe.address().getPort();
             if (seen.add(key)) merged.add(pe.address());
         }
         if (merged.size() > before) {
