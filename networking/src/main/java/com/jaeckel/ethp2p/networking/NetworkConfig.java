@@ -400,6 +400,15 @@ public record NetworkConfig(
     }
 
     /**
+     * All supported networks, in display order. Drives multi-network UIs and the
+     * daemon's registry so adding a network here is the single point of expansion
+     * (the static instance + a {@link #byName} case + this list).
+     */
+    public static List<NetworkConfig> allNetworks() {
+        return List.of(MAINNET, GNOSIS, SEPOLIA);
+    }
+
+    /**
      * Beacon-chain slot time in seconds. Mainnet and the mainnet-preset testnets
      * use 12; Gnosis Beacon Chain uses 5. Used for wall-clock sync-committee period
      * estimation in the light client.
@@ -415,6 +424,41 @@ public record NetworkConfig(
      */
     public int slotsPerEpoch() {
         return networkId == 100 ? 16 : 32;
+    }
+
+    // -------------------------------------------------------------------------
+    // Per-network default ports. Pinned per network (not index-allocated) so a
+    // wallet pointed at a given RPC port always reaches the same chain regardless
+    // of which other networks are enabled, and so adding a network carries its own
+    // ports. Distinct across networks so several can run in one process without
+    // colliding. Mainnet keeps the historical 30303/9000/8545 (proven path).
+    // -------------------------------------------------------------------------
+
+    /** RLPx TCP + discv4 UDP port. */
+    public int defaultElPort() {
+        return switch ((int) networkId) {
+            case 100 -> 30304;       // gnosis
+            case 11155111 -> 30305;  // sepolia
+            default -> 30303;        // mainnet (and unknown)
+        };
+    }
+
+    /** Consensus-layer discv5 UDP port. */
+    public int defaultDiscv5Port() {
+        return switch ((int) networkId) {
+            case 100 -> 9001;       // gnosis
+            case 11155111 -> 9002;  // sepolia
+            default -> 9000;        // mainnet (and unknown)
+        };
+    }
+
+    /** Verified JSON-RPC HTTP port. */
+    public int defaultRpcPort() {
+        return switch ((int) networkId) {
+            case 100 -> 8546;       // gnosis
+            case 11155111 -> 8547;  // sepolia
+            default -> 8545;        // mainnet (and unknown)
+        };
     }
 
     // -------------------------------------------------------------------------
