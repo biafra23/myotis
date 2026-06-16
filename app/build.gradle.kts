@@ -19,6 +19,10 @@ dependencies {
     // Android app hosts in NodeService.
     implementation(project(":jsonrpc-server"))
     implementation(project(":rpc-backend"))
+    // Shared per-network host core: ChainStack/NodeRegistry. The daemon supplies
+    // file-backed cache adapters + the JVM CCIP gateway and hosts the same stacks
+    // the Android app does.
+    implementation(project(":node-core"))
     // :app source references io.netty.channel.* (via :networking's RLPxConnector
     // API). With io.netty excluded group-wide, the fork must be on :app's compile
     // classpath explicitly (:networking declares it as implementation, so it
