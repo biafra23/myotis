@@ -1,0 +1,29 @@
+name: mm-replay tests
+
+on:
+  push:
+  pull_request:
+
+# Unit tests for the MetaMask replay harness (tools/mm-replay/replay.py) and the
+# golden session fixture. Pure stdlib Python — no Gradle, no external Maven
+# repos — so this job is fast and immune to the dependency-resolution flakiness
+# that affects the JVM builds. The full replay against a live daemon stays a
+# manual pre-PR check (it needs a synced node); this guards the harness logic
+# and the fixture contract automatically.
+jobs:
+  test:
+    name: replay harness unit tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Run replay unit tests
+        run: python3 -m unittest discover -s tools/mm-replay -p 'test_*.py' -v
