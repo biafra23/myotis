@@ -4,6 +4,7 @@ import com.jaeckel.ethp2p.core.crypto.NodeKey;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
 import io.myotis.node.ChainPorts;
 import io.myotis.node.ChainStack;
+import io.myotis.node.NodeRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -27,33 +28,30 @@ import java.util.concurrent.CountDownLatch;
  *   # Start daemon (blocks; creates /tmp/ethp2p.sock):
  *   ./gradlew :app:run
  *
- *   # Send a command to the running daemon (from a second terminal):
+ *   # Host several networks in ONE process, each on its own ports + IPC socket:
+ *   ./gradlew :app:run -Pnetwork=mainnet,gnosis
+ *
+ *   # Send a command to a running daemon (targets one network's socket):
  *   ./gradlew :app:run -Pargs=status
- *   ./gradlew :app:run -Pargs=peers
- *   ./gradlew :app:run -Pargs="get-headers 21000000 3"
+ *   ./gradlew :app:run -Pnetwork=gnosis -Pargs=beacon-status
  *   ./gradlew :app:run -Pargs=stop
  *
- *   # Purge cached peers:
+ *   # Purge cached peers / use a testnet:
  *   ./gradlew :app:run -Pargs=purge-cache
- *
- *   # Use a testnet (default: mainnet):
  *   ./gradlew :app:run -Pnetwork=sepolia
- *   ./gradlew :app:run -Pnetwork=sepolia -Pargs=peers
- *
- *   # Or use nc directly:
- *   echo '{"cmd":"status"}' | nc -U /tmp/ethp2p.sock
  * </pre>
  *
  * <h2>Behaviour</h2>
  * <ul>
- *   <li>If the IPC socket exists → client mode: send one command, print response, exit.
- *   <li>If the IPC socket is absent → daemon mode: run discovery + RLPx, serve commands.
+ *   <li>With command args → client mode: send one command to the (first) network's
+ *       socket, print the response, exit.
+ *   <li>Without args → daemon mode: host every {@code --network} in this process.
  * </ul>
  *
- * <p>The per-network node stack (EL + discv4 + discv5 + beacon light client + verified
+ * <p>Each network's node stack (EL + discv4 + discv5 + beacon light client + verified
  * JSON-RPC) lives in {@link ChainStack} (module {@code :node-core}), shared with the
- * Android app. This class owns the daemon-specific shell: the lock file, the Unix-socket
- * IPC server, and the shutdown latch.
+ * Android app, and is held by a {@link NodeRegistry}. This class owns the daemon shell:
+ * the per-network lock files + Unix-socket IPC servers, and the shutdown latch.
  */
 public final class Main {
 
@@ -91,16 +89,30 @@ public final class Main {
         return cacheFile(networkName).resolveSibling("sync-state" + suffix + ".snapshot");
     }
 
+    /**
+     * Node-identity key file. A single-network daemon keeps the shared {@code nodekey.hex}
+     * (unchanged). When hosting several networks in one process each gets a distinct key
+     * ({@code nodekey-<net>.hex}; mainnet keeps {@code nodekey.hex}) so each advertises its
+     * own ENR/fork-id instead of colliding under one node id in the discovery DHTs.
+     */
+    static Path nodeKeyFile(String networkName, boolean perNetwork) {
+        if (!perNetwork || "mainnet".equals(networkName)) return Path.of("nodekey.hex");
+        return Path.of("nodekey-" + networkName + ".hex");
+    }
+
 
     public static void main(String[] args) throws Exception {
-        // Parse --network and --port flags from anywhere in args
-        String networkName = "mainnet";
+        // Parse --network (comma-separated list), --port, --gossipsub from anywhere in args.
+        List<String> networkNames = new ArrayList<>();
         int port = DEFAULT_PORT;
         boolean gossipsubEnabled = false;
         List<String> remaining = new ArrayList<>();
         for (int i = 0; i < args.length; i++) {
             if ("--network".equals(args[i]) && i + 1 < args.length) {
-                networkName = args[++i];
+                for (String n : args[++i].split(",")) {
+                    String trimmed = n.trim();
+                    if (!trimmed.isEmpty() && !networkNames.contains(trimmed)) networkNames.add(trimmed);
+                }
             } else if ("--port".equals(args[i]) && i + 1 < args.length) {
                 port = Integer.parseInt(args[++i]);
             } else if ("--gossipsub".equals(args[i])) {
@@ -109,6 +121,7 @@ public final class Main {
                 remaining.add(args[i]);
             }
         }
+        if (networkNames.isEmpty()) networkNames.add("mainnet");
         // System property fallback so Android / other embedders can opt in
         // without touching CLI args.
         if (!gossipsubEnabled
@@ -117,17 +130,18 @@ public final class Main {
         }
         String[] cmdArgs = remaining.toArray(new String[0]);
 
-        Path socketPath = socketPath(networkName);
-        Path lockPath = lockPath(networkName);
-        boolean daemonAlive = isDaemonRunning(socketPath, lockPath);
+        // Client commands / purge target a single network — the first listed.
+        String primary = networkNames.get(0);
+        Path primarySocket = socketPath(primary);
+        Path primaryLock = lockPath(primary);
 
         // Handle purge-cache before socket check — works without a running daemon
         if (cmdArgs.length > 0 && "purge-cache".equals(cmdArgs[0])) {
-            PeerCache.purge(cacheFile(networkName));
-            CLPeerCache.purge(clCacheFile(networkName));
+            PeerCache.purge(cacheFile(primary));
+            CLPeerCache.purge(clCacheFile(primary));
             try {
-                if (java.nio.file.Files.deleteIfExists(syncSnapshotFile(networkName))) {
-                    System.out.println("Sync snapshot purged: " + syncSnapshotFile(networkName));
+                if (java.nio.file.Files.deleteIfExists(syncSnapshotFile(primary))) {
+                    System.out.println("Sync snapshot purged: " + syncSnapshotFile(primary));
                 }
             } catch (java.io.IOException e) {
                 System.err.println("Failed to purge sync snapshot: " + e.getMessage());
@@ -136,116 +150,152 @@ public final class Main {
         }
 
         if (cmdArgs.length > 0) {
-            // ── Client mode ──────────────────────────────────────────────────
-            if (!daemonAlive) {
-                System.err.println("Daemon not running (cannot connect to: " + socketPath + ")");
+            // ── Client mode (single network) ─────────────────────────────────
+            if (!isDaemonRunning(primarySocket, primaryLock)) {
+                System.err.println("Daemon not running (cannot connect to: " + primarySocket + ")");
                 System.err.println("Start the daemon first: ./gradlew :app:run");
                 System.exit(1);
             }
-            DaemonClient.sendCommand(cmdArgs, socketPath);
-        } else if (daemonAlive) {
-            // ── Daemon already running ────────────────────────────────────────
-            System.err.println("Daemon already running (socket: " + socketPath + ")");
-            System.err.println("Commands:");
-            System.err.println("  ./gradlew :app:run -Pargs=status");
-            System.err.println("  ./gradlew :app:run -Pargs=peers");
-            System.err.println("  ./gradlew :app:run -Pargs=\"get-headers 21000000 3\"");
-            System.err.println("  ./gradlew :app:run -Pargs=stop");
-            System.err.println("  ./gradlew :app:run -Pargs=purge-cache");
-            System.exit(1);
-        } else {
-            // ── Daemon mode ──────────────────────────────────────────────────
-            NetworkConfig network = NetworkConfig.byName(networkName);
-            runDaemon(socketPath, lockPath, network, port, gossipsubEnabled);
+            DaemonClient.sendCommand(cmdArgs, primarySocket);
+            return;
         }
+
+        // ── Daemon mode (one or more networks in this process) ───────────────
+        List<NetworkConfig> networks = new ArrayList<>();
+        for (String n : networkNames) networks.add(NetworkConfig.byName(n));
+        for (NetworkConfig net : networks) {
+            if (isDaemonRunning(socketPath(net.name()), lockPath(net.name()))) {
+                System.err.println("Daemon already running for " + net.name()
+                        + " (socket: " + socketPath(net.name()) + ")");
+                if (networks.size() == 1) {
+                    System.err.println("Commands:");
+                    System.err.println("  ./gradlew :app:run -Pargs=status");
+                    System.err.println("  ./gradlew :app:run -Pargs=peers");
+                    System.err.println("  ./gradlew :app:run -Pargs=stop");
+                }
+                System.exit(1);
+            }
+        }
+        runDaemon(networks, port, gossipsubEnabled);
     }
 
     // -------------------------------------------------------------------------
     // Daemon
     // -------------------------------------------------------------------------
 
-    private static void runDaemon(Path socketPath, Path lockPath, NetworkConfig network, int port,
+    private static void runDaemon(List<NetworkConfig> networks, int portOverride,
                                   boolean gossipsubEnabled) throws Exception {
-        log.info("=== ethp2p Daemon ({}) ===", network.name());
-        log.info("IPC socket: {}", socketPath);
+        boolean multi = networks.size() > 1;
+        log.info("=== ethp2p Daemon ({}) ===",
+                String.join(", ", networks.stream().map(NetworkConfig::name).toList()));
 
-        // 0. Acquire exclusive lock file — auto-released on process death (even kill -9)
-        FileChannel lockChannel = FileChannel.open(lockPath,
-                StandardOpenOption.CREATE, StandardOpenOption.WRITE);
-        FileLock fileLock = lockChannel.tryLock();
-        if (fileLock == null) {
-            System.err.println("Daemon already running (lock held: " + lockPath + ")");
-            lockChannel.close();
-            System.exit(1);
-            return;
+        // 0. Acquire every target network's exclusive lock up front; release all and
+        //    abort if any is held (another daemon already owns that network).
+        List<FileChannel> lockChannels = new ArrayList<>();
+        List<FileLock> fileLocks = new ArrayList<>();
+        for (NetworkConfig network : networks) {
+            FileChannel ch = FileChannel.open(lockPath(network.name()),
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            FileLock lk = ch.tryLock();
+            if (lk == null) {
+                System.err.println("Daemon already running (lock held: " + lockPath(network.name()) + ")");
+                ch.close();
+                releaseAll(fileLocks, lockChannels);
+                System.exit(1);
+                return;
+            }
+            lockChannels.add(ch);
+            fileLocks.add(lk);
         }
 
-        // 1. Node identity (one network per daemon today → the shared nodekey.hex).
-        NodeKey nodeKey = NodeKey.loadOrGenerate(Path.of("nodekey.hex"));
-
-        // 2. Latch that triggers graceful shutdown (stop command or SIGTERM).
         CountDownLatch stopLatch = new CountDownLatch(1);
+        NodeRegistry registry = new NodeRegistry();
+        List<DaemonServer> servers = new ArrayList<>();
 
-        // 3. File-backed peer caches, exposed to ChainStack via adapters.
-        PeerCache peerCache = new PeerCache(cacheFile(network.name()));
-        CLPeerCache clPeerCache = new CLPeerCache(clCacheFile(network.name()));
+        // 1. Build, start, and IPC-wire each network's stack.
+        for (NetworkConfig network : networks) {
+            log.info("IPC socket ({}): {}", network.name(), socketPath(network.name()));
 
-        // 4. The network's full stack. EL port honors the legacy --port flag (default
-        //    30303); CL discv5 stays 9000 and verified JSON-RPC stays 8545 — unchanged
-        //    single-network behavior. (Per-network default ports kick in once the
-        //    registry runs several stacks at once.)
-        ChainStack stack = new ChainStack(
-                network,
-                new ChainPorts(port, 9000, 8545),
-                nodeKey,
-                new PeerCacheAdapter(peerCache),
-                new ClPeerCacheAdapter(clPeerCache),
-                new com.jaeckel.ethp2p.app.rpc.JavaHttpCcipGateway(),
-                syncSnapshotFile(network.name()),
-                gossipsubEnabled);
+            // Single-network stays byte-identical: legacy --port/30303 + discv5 9000 +
+            // RPC 8545 + shared nodekey.hex. Multi-network uses pinned per-network ports
+            // + per-network identity so the stacks don't collide.
+            ChainPorts ports = multi
+                    ? ChainPorts.defaultsFor(network)
+                    : new ChainPorts(portOverride, 9000, 8545);
+            NodeKey nodeKey = NodeKey.loadOrGenerate(nodeKeyFile(network.name(), multi));
 
-        if (!stack.start()) {
-            System.err.println("Failed to start " + network.name() + " node stack");
-            try { fileLock.release(); lockChannel.close(); } catch (Exception ignored) {}
-            System.exit(1);
-            return;
+            PeerCache peerCache = new PeerCache(cacheFile(network.name()));
+            CLPeerCache clPeerCache = new CLPeerCache(clCacheFile(network.name()));
+            ChainStack stack = new ChainStack(
+                    network, ports, nodeKey,
+                    new PeerCacheAdapter(peerCache),
+                    new ClPeerCacheAdapter(clPeerCache),
+                    new com.jaeckel.ethp2p.app.rpc.JavaHttpCcipGateway(),
+                    syncSnapshotFile(network.name()),
+                    gossipsubEnabled);
+
+            if (!stack.start()) {
+                System.err.println("Failed to start " + network.name() + " node stack");
+                registry.shutdownAll();
+                closeAll(servers);
+                releaseAll(fileLocks, lockChannels);
+                System.exit(1);
+                return;
+            }
+            registry.add(stack);
+
+            CommandHandler commandHandler = new CommandHandler(
+                    stack.discV4(), stack.discV5(), stack.connector(), stopLatch,
+                    stack.backoff(), stack.blacklistedNodeIds(),
+                    stack.beaconSyncState(), stack.beaconLightClient(),
+                    network.clGenesisTime(), network.secondsPerSlot());
+            DaemonServer server = new DaemonServer(socketPath(network.name()), commandHandler);
+            try {
+                server.start();
+            } catch (Exception e) {
+                System.err.println("Failed to start IPC server for " + network.name() + ": " + e.getMessage());
+                registry.shutdownAll();
+                closeAll(servers);
+                releaseAll(fileLocks, lockChannels);
+                System.exit(1);
+                return;
+            }
+            servers.add(server);
         }
 
-        // 5. IPC server over the stack's live components.
-        CommandHandler commandHandler = new CommandHandler(
-                stack.discV4(), stack.discV5(), stack.connector(), stopLatch,
-                stack.backoff(), stack.blacklistedNodeIds(),
-                stack.beaconSyncState(), stack.beaconLightClient(),
-                network.clGenesisTime(), network.secondsPerSlot());
-        DaemonServer server = new DaemonServer(socketPath, commandHandler);
-        try {
-            server.start();
-        } catch (Exception e) {
-            System.err.println("Failed to start IPC server: " + e.getMessage());
-            stack.shutdown();
-            try { fileLock.release(); lockChannel.close(); } catch (Exception ignored) {}
-            System.exit(1);
-            return;
-        }
-
-        // 6. Shutdown hook for Ctrl-C / SIGTERM — cleanup happens here because the JVM
-        //    may exit before the main thread resumes after await().
+        // 2. Shutdown hook for Ctrl-C / SIGTERM — cleanup happens here because the JVM
+        //    may exit before the main thread resumes after await(). A `stop` command on
+        //    ANY network's socket trips the shared latch and tears the whole process down.
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log.info("[daemon] Shutdown hook triggered");
-            stack.shutdown();
-            try { server.close(); } catch (Throwable ignored) {}
-            try { fileLock.release(); lockChannel.close(); } catch (Exception ignored) {}
+            registry.shutdownAll();
+            closeAll(servers);
+            releaseAll(fileLocks, lockChannels);
             stopLatch.countDown();
             log.info("[daemon] Done.");
         }, "shutdown-hook"));
 
-        // 7. Block until "stop" command or signal, then clean up (the hook covers the
-        //    Ctrl-C/SIGTERM path).
+        // 3. Block until "stop" command or signal, then clean up (hook covers Ctrl-C).
         stopLatch.await();
-        stack.shutdown();
-        try { server.close(); } catch (Throwable ignored) {}
-        try { fileLock.release(); lockChannel.close(); } catch (Exception ignored) {}
+        registry.shutdownAll();
+        closeAll(servers);
+        releaseAll(fileLocks, lockChannels);
         log.info("[daemon] Done.");
+    }
+
+    private static void closeAll(List<DaemonServer> servers) {
+        for (DaemonServer s : servers) {
+            try { s.close(); } catch (Throwable ignored) {}
+        }
+    }
+
+    private static void releaseAll(List<FileLock> locks, List<FileChannel> channels) {
+        for (FileLock lk : locks) {
+            try { lk.release(); } catch (Exception ignored) {}
+        }
+        for (FileChannel ch : channels) {
+            try { ch.close(); } catch (Exception ignored) {}
+        }
     }
 
     // -------------------------------------------------------------------------
