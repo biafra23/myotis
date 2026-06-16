@@ -100,6 +100,16 @@ interface MyotisRpcBackend {
      */
     fun getBlockByNumber(block: String, fullTransactions: Boolean): String?
 
+    /**
+     * eth_getBlockByHash for [blockHash] (0x-prefixed 32-byte hash), verified. Wallets call
+     * this right after eth_getTransactionReceipt to finalize a tx as confirmed, so a missing
+     * implementation leaves mined txs stuck "pending"/"submitted". Same return contract as
+     * [getBlockByNumber]: block JSON object string; the literal "null" for an unknown / no-
+     * longer-canonical hash; or Kotlin null when it can't be answered verified → router errors.
+     * Defaulted so backends can adopt incrementally.
+     */
+    fun getBlockByHash(blockHash: String, fullTransactions: Boolean): String? = null
+
     // --- Fee suggestion (MetaMask's signing screen blocks on these) -----------
     // Defaults return null (→ router errors) so hosts can adopt incrementally.
 

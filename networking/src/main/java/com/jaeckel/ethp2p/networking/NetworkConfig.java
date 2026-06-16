@@ -386,6 +386,23 @@ public record NetworkConfig(
         };
     }
 
+    /**
+     * Floor (in wei) for the suggested EIP-1559 priority tip / legacy gas price on this
+     * network, used when recent blocks are empty or full of zero-tip txs so a suggestion is
+     * still "inclusive-but-sane". This MUST track the network's fee market: a one-size floor
+     * is wrong by orders of magnitude across chains. Mainnet/Sepolia run at gwei-scale tips,
+     * so 0.1 gwei is sane; Gnosis runs at ~10 wei base fee with sub-gwei tips, where a 0.1 gwei
+     * floor over-suggests by ~10^7× (harmless in absolute terms — fractions of a cent — but
+     * wrong, and misleading to wallets/dapps that read eth_gasPrice / eth_maxPriorityFeePerGas).
+     */
+    public java.math.BigInteger minSuggestedTipWei() {
+        return switch ((int) networkId) {
+            case 1, 11155111 -> java.math.BigInteger.valueOf(100_000_000L); // 0.1 gwei
+            case 100 -> java.math.BigInteger.valueOf(1_000_000L);           // gnosis: 0.001 gwei
+            default -> java.math.BigInteger.valueOf(1_000_000L);            // cheap-chain-safe default
+        };
+    }
+
     /** Look up a network by name (case-insensitive). */
     public static NetworkConfig byName(String name) {
         return switch (name.toLowerCase(Locale.ROOT)) {

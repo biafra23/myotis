@@ -59,13 +59,21 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     // phone waking from doze).
     private static final int MAX_HEADER_CHAIN_GAP = 8192;
     private static final long HEADER_CHAIN_TIMEOUT_SEC = 60;
-    // How many recent blocks below the verified head to scan for a tx in
-    // eth_getTransactionReceipt. Kept small to bound the bandwidth/battery cost of the
-    // (trustless) body scan on mobile: ~8 blocks ≈ 1.5 min covers a wallet polling a
-    // just-submitted tx. A pending/older tx isn't found here and falls through to the
-    // proxy. Bodies within the window are fetched concurrently, so latency ≈ one
-    // round-trip regardless of the count.
-    private static final int RECEIPT_LOOKBACK_BLOCKS = 8;
+    // tx lookup (eth_getTransactionReceipt / eth_getTransactionByHash) scans beacon-anchored
+    // blocks for the tx. A FLAT window was a trap: at ~8 blocks the tx was discoverable for
+    // only ~8 blocks (~40s on Gnosis's 5s blocks, ~1.5 min on mainnet) before the head
+    // scrolled its block out of view — permanently — so a genuinely-mined tx reported "not
+    // found" forever if the wallet didn't poll within that tiny window (acute on mobile with
+    // flaky peers). Instead {@link #locateMinedTx} scans INCREMENTALLY: each poll fetches only
+    // the blocks that appeared since the last poll and remembers how far it has scanned, so
+    // coverage grows to span the whole time a tx is watched at ~one block of fetch per poll.
+    // RECEIPT_INITIAL_LOOKBACK_BLOCKS: the first poll's lookback (catches a tx mined just
+    // before watching began). RECEIPT_MAX_SCAN_BLOCKS_PER_POLL: caps per-poll catch-up so a
+    // long gap (backgrounded/dozed app) can't trigger a huge fetch. RECEIPT_SCAN_TTL_MS: how
+    // long a tx's scan state is retained (and kept discoverable) before eviction.
+    private static final int RECEIPT_INITIAL_LOOKBACK_BLOCKS = 8;
+    private static final int RECEIPT_MAX_SCAN_BLOCKS_PER_POLL = 128;
+    private static final long RECEIPT_SCAN_TTL_MS = 10 * 60_000L;
     // Max blocks below the verified head we'll fetch+verify headers for to answer
     // eth_getBlockByNumber by number. "latest" is 1 header; older numbers cost a header
     // range, so bound it (MetaMask asks for "latest" for the fee market anyway).
@@ -198,6 +206,13 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  it explicitly (verified inclusion), and the warmer evicts anything older than
      *  this so the gossip-decode hot path goes quiet when nothing of ours is live. */
     private static final long SENT_TX_WATCH_TTL_MS = 180_000;
+    /** How often the warmer re-broadcasts still-pending, not-yet-propagated txs of ours.
+     *  The initial eth_sendRawTransaction push only reaches the peers connected at that
+     *  instant (as few as 0–3 on peer-thin chains like Gnosis), and a light client's peers
+     *  may not re-propagate — so a tx sent during a lull can reach nobody and never mine.
+     *  Re-pushing on this cadence picks up newly-connected peers until the tx is seen
+     *  propagating, mined, or ages out at {@link #SENT_TX_WATCH_TTL_MS}. */
+    private static final long TX_REBROADCAST_INTERVAL_MS = 20_000;
 
     /** keccak256("") — an account with this codeHash is an EOA (no contract code). */
     private static final byte[] EMPTY_CODE_HASH = Hash.keccak256(Bytes.EMPTY).toArrayUnsafe();
@@ -240,8 +255,10 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     private static final int FEE_HISTORY_MAX_BLOCKS = 10;
     /** Blocks scanned for the priority-fee suggestion. */
     private static final int TIP_SUGGEST_BLOCKS = 3;
-    /** Floor for the suggested tip: 0.1 gwei — keeps suggestions inclusive-but-sane
-     *  when recent blocks are empty or full of zero-tip txs. */
+    /** Fallback floor for the suggested tip (0.1 gwei), used only before the connector/network
+     *  is available. The live floor is network-aware — see {@link #minSuggestedTip()} and
+     *  {@code NetworkConfig#minSuggestedTipWei} — because 0.1 gwei over-suggests by orders of
+     *  magnitude on cheap chains like Gnosis (~10 wei base fee). */
     private static final java.math.BigInteger MIN_SUGGESTED_TIP =
             java.math.BigInteger.valueOf(100_000_000L);
     /** Tip suggestion cache TTL (~one block) — MetaMask polls fees every few seconds,
@@ -398,6 +415,36 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  backend registers on the connector); cleared on verified mining or TTL. */
     private final SentTxTracker sentTxWatch = new SentTxTracker(SENT_TX_WATCH_TTL_MS);
 
+    /** Verified location of a mined tx: the (beacon-anchored) header it sits in, the block
+     *  hash, the tx index, and the raw tx bytes. Cached per tx by {@link #locateMinedTx}. */
+    private record TxLocation(BlockHeader header, Bytes32 blockHash, int index, byte[] txBytes) {}
+
+    /** Per-tx incremental-scan cursor for {@link #locateMinedTx}: how far below/above we've
+     *  already scanned, the last-touched time (for TTL eviction), and the cached location once
+     *  found. {@code highScanned == Long.MIN_VALUE} means "never scanned". */
+    private static final class TxScanState {
+        long highScanned = Long.MIN_VALUE;
+        long lastTouchedMs;
+        TxLocation found;
+    }
+
+    /** Scan cursors keyed by lowercase 0x tx hash. Bounded by TTL eviction in the warmer tick. */
+    private final Map<String, TxScanState> txScanStates =
+            java.util.Collections.synchronizedMap(new java.util.HashMap<>());
+
+    /** Last time the warmer re-broadcast pending txs (see {@link #TX_REBROADCAST_INTERVAL_MS}). */
+    private volatile long lastTxRebroadcastMs;
+
+    /** Recently-verified block hash → number, so eth_getBlockByHash (which wallets call right
+     *  after a receipt to finalize a tx) can resolve to the verified by-number path. Populated
+     *  whenever we verify a block (receipt scan / getBlockByNumber). Bounded LRU. */
+    private final Map<String, Long> blockHashToNumber = java.util.Collections.synchronizedMap(
+            new java.util.LinkedHashMap<>(64, 0.75f, true) {
+                @Override protected boolean removeEldestEntry(Map.Entry<String, Long> e) {
+                    return size() > 512;
+                }
+            });
+
     /** Suggested tip + when it was computed, one immutable unit behind a single
      *  volatile so a reader can't pair a fresh tip with a stale timestamp
      *  (same pattern as {@link HeadWithTimestamp}). */
@@ -546,6 +593,28 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             } catch (Throwable ignored) {
                 // never kill the warmer tick
             }
+            // Age out per-tx receipt-scan cursors that nothing has polled recently, so the
+            // map can't grow unbounded across many lookups (see locateMinedTx).
+            try {
+                long cutoff = clock.elapsedMillis() - RECEIPT_SCAN_TTL_MS;
+                synchronized (txScanStates) {
+                    txScanStates.values().removeIf(s -> s.lastTouchedMs < cutoff);
+                }
+            } catch (Throwable ignored) {
+                // never kill the warmer tick
+            }
+            // Resilient re-broadcast: re-push still-pending, not-yet-propagated txs of ours to
+            // whatever peers are connected NOW (picks up peers that joined after the original
+            // send). See rebroadcastPendingTxs / TX_REBROADCAST_INTERVAL_MS.
+            try {
+                long now = clock.elapsedMillis();
+                if (now - lastTxRebroadcastMs >= TX_REBROADCAST_INTERVAL_MS) {
+                    lastTxRebroadcastMs = now;
+                    rebroadcastPendingTxs();
+                }
+            } catch (Throwable ignored) {
+                // never kill the warmer tick
+            }
         }, 3, 5, TimeUnit.SECONDS);
     }
 
@@ -690,6 +759,11 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     }
 
     @Override
+    public String getBlockByHash(String blockHash, boolean fullTransactions) {
+        return rpcGetBlockByHash(blockHash, fullTransactions);
+    }
+
+    @Override
     public java.math.BigInteger gasPrice() {
         return rpcGasPrice();
     }
@@ -794,6 +868,13 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             }
         }, evmPool).thenCompose(call -> {
             final boolean verified = call.beaconVerified();
+            if (call.resolver() == null) {
+                // Chain has no pinned ENS deployment (see prepareEnsCall): names can't be
+                // resolved here, but the verified head itself is fine for non-ENS reads.
+                return CompletableFuture.completedFuture(new EnsAttempt(new EnsResolution(
+                        trimmed, null, call.blockNumber(), verified,
+                        "ENS not available on chain id " + connector.getNetwork().networkId()), false));
+            }
             return call.resolver().resolveAddress(trimmed, call.blockCtx())
                     .orTimeout(ENS_TIMEOUT_SEC, TimeUnit.SECONDS)
                     .handle((opt, ex) -> {
@@ -1233,13 +1314,30 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             // peers sit connected. Observed on-device: two peers frozen at the same
             // head for 5+ min starved number-pinned reads.
             long finalizedFloor = -1;
+            long optimisticHeadNum = -1;
             BeaconLightClient blcFloor = beaconLightClient;
             if (blcFloor != null) {
                 com.jaeckel.ethp2p.consensus.types.LightClientHeader finHdr =
                         blcFloor.getStore().getFinalizedHeader();
                 if (finHdr != null) finalizedFloor = finHdr.execution().blockNumber();
+                com.jaeckel.ethp2p.consensus.types.LightClientHeader optHdr =
+                        blcFloor.getStore().getOptimisticHeader();
+                if (optHdr != null) optimisticHeadNum = optHdr.execution().blockNumber();
             }
             final long headFloor = Math.max(minHead, finalizedFloor);
+            // When we have a beacon finalized anchor, probe each peer for its LIVE head by
+            // NUMBER (forward window from the finalized block — which every fresh peer holds)
+            // instead of its frozen connect-time Status hash. The Status hash never advances,
+            // so a long-lived peer's "fresh head" drifts below headFloor as the chain moves and
+            // starves GREEN once the LC is synced (acute on chains with few, sticky snap peers
+            // like Gnosis). Window spans finalized→head so the result lands at/just above the
+            // beacon-verified head; cap it so the response stays small on mobile links.
+            final boolean byNumberProbe = finalizedFloor > 0;
+            final long probeFrom = finalizedFloor;
+            final int probeWindow = byNumberProbe
+                    ? (int) Math.max(16, Math.min(256,
+                        (optimisticHeadNum > finalizedFloor ? optimisticHeadNum - finalizedFloor : 0) + 16))
+                    : 0;
             // Probe every ready snap peer CONCURRENTLY — fetch its fresh head, then
             // probe that it snap-serves that head root — and award the FIRST to
             // qualify. The old serial walk paid each unresponsive peer's timeout in
@@ -1248,7 +1346,9 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             List<CompletableFuture<PeerHead>> probes = new ArrayList<>();
             for (EthHandler peer : snapPeers) {
                 if (!peer.isReady() || peer.isSnapServingFailed()) continue;
-                CompletableFuture<BlockHeader> headFut = peer.requestFreshHeadHeaderAsync();
+                CompletableFuture<BlockHeader> headFut = byNumberProbe
+                        ? peer.requestFreshHeadHeaderAsync(probeFrom, probeWindow)
+                        : peer.requestFreshHeadHeaderAsync();
                 if (headFut == null) continue;
                 probes.add(headFut.thenCompose(fresh -> {
                     if (fresh.number < headFloor) {
@@ -1384,8 +1484,18 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                 new io.myotis.evm.ccipread.CcipReadHandler(ccipGateway);
         io.myotis.evm.CcipReadEvmExecutor executor =
                 new io.myotis.evm.CcipReadEvmExecutor(prefetching, ccip);
-        io.myotis.ens.EnsResolver resolver =
-                io.myotis.ens.EnsResolver.forChainId(executor, conn.getNetwork().networkId());
+        // ENS is optional: only resolveEnsName() uses the resolver — get-account,
+        // get-storage and eth_call all run off executor/oracle/blockCtx. On chains with
+        // no pinned ENS deployment (e.g. Gnosis, chainId 100) forChainId() throws; that
+        // must NOT abort the whole verified-head build, or the head warmer can never pin
+        // a PEER_HEAD context and the node never reaches GREEN. Leave the resolver null
+        // and let resolveEnsName() fail gracefully for those chains.
+        io.myotis.ens.EnsResolver resolver;
+        try {
+            resolver = io.myotis.ens.EnsResolver.forChainId(executor, conn.getNetwork().networkId());
+        } catch (IllegalArgumentException noEns) {
+            resolver = null;
+        }
         return new RpcCallContext(resolver, blockCtx, blockNumber, verified, executor, oracle);
     }
 
@@ -1736,6 +1846,28 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         }
     }
 
+    /** Re-broadcast still-pending, not-yet-propagated txs of ours to ALL currently-READY peers.
+     *  Called on a cadence from the warmer (see {@link #TX_REBROADCAST_INTERVAL_MS}). Only txs
+     *  we have NOT yet seen echo back on gossip are re-pushed — once one propagates, the network
+     *  has it and re-pushing won't change whether it mines. Re-sending to a peer that already
+     *  holds the tx is harmless (it dedupes); the point is to reach peers that connected after
+     *  the original one-shot send, which on Gnosis may have reached almost no one. */
+    private void rebroadcastPendingTxs() {
+        SentTxTracker watch = sentTxWatch;
+        if (!watch.watchingAny()) return;
+        RLPxConnector conn = connector;
+        if (conn == null) return;
+        for (Bytes32 h : watch.unseen()) {
+            byte[] raw = sentTxCache.get(h.toHexString());
+            if (raw == null) continue; // bytes aged out of the LRU — can't re-push
+            int sent = conn.broadcastTransaction(raw);
+            if (sent > 0) {
+                log.info("[rpc] re-broadcast pending tx " + h.toHexString()
+                        + " to " + sent + " peer(s)");
+            }
+        }
+    }
+
     /** Record the (sender, nonce) of a tx we just broadcast so a follow-up
      *  eth_getTransactionCount("pending") from that sender reports next = nonce + 1
      *  instead of reusing this still-pending nonce. Decodes the sender from the signed
@@ -1807,52 +1939,187 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         if (conn == null || txHash == null || txHash.length != 32) return null;
         Bytes32 want = Bytes32.wrap(txHash);
         try {
-            HeaderAnchor anchor = headerAnchor();
-            if (anchor == null) {
-                // Can't verify chain inclusion right now — but if it's our own just-sent tx
-                // we can still honestly answer "pending" from the signed bytes we hold.
-                byte[] ourRaw = sentTxCache.get(want.toHexString());
-                return ourRaw != null ? buildTxJson(ourRaw, want, null, -1, -1) : null;
+            TxLocation loc = locateMinedTx(conn, want);
+            if (loc != null) {
+                // Verified inclusion: stop watching it for gossip propagation.
+                sentTxWatch.confirmMined(want);
+                log.info("[rpc] eth_getTransactionByHash found in block #"
+                        + loc.header().number + " index " + loc.index());
+                return buildTxJson(loc.txBytes(), want, loc.blockHash(),
+                        loc.header().number, loc.index());
             }
-            long headNum = anchor.number();
-            int count = (int) Math.min(RECEIPT_LOOKBACK_BLOCKS, headNum + 1);
-            long start = headNum - count + 1;
+            // Not located in the verified scan. If it's our own just-sent tx we can honestly
+            // answer "pending" from the signed bytes we hold.
+            byte[] ourRaw = sentTxCache.get(want.toHexString());
+            if (ourRaw != null) return buildTxJson(ourRaw, want, null, -1, -1);
+            // Otherwise: "null" (verified-unknown) when we have an anchor, Java null (can't
+            // verify → router error) when we don't.
+            return headerAnchor() == null ? null : "null";
+        } catch (Exception e) {
+            log.info("[rpc] eth_getTransactionByHash failed: " + unwrap(e));
+            return null;
+        }
+    }
+
+    /**
+     * Incrementally scan beacon-anchored blocks for {@code want}, remembering per-tx how far
+     * we have already scanned so each poll fetches only the blocks that appeared since the
+     * previous one. Returns the verified {@link TxLocation} once found (cached thereafter), or
+     * {@code null} if the tx has not been seen in the coverage scanned so far (or no header
+     * anchor is available yet).
+     *
+     * <p>This replaces the old flat {@code RECEIPT_LOOKBACK_BLOCKS} window, which made a mined
+     * tx discoverable for only ~8 blocks before the moving head scrolled it out of view for
+     * good. Coverage now grows to span the whole time a tx is watched while keeping per-poll
+     * cost to roughly the number of new blocks (usually one), capped at
+     * {@link #RECEIPT_MAX_SCAN_BLOCKS_PER_POLL} so a long polling gap can't trigger a huge
+     * fetch. Bodies are still verified against {@code transactionsRoot}; nothing is trusted.
+     */
+    private TxLocation locateMinedTx(RLPxConnector conn, Bytes32 want) throws Exception {
+        String key = want.toHexString();
+        long now = clock.elapsedMillis();
+        TxScanState st = txScanStates.computeIfAbsent(key, k -> new TxScanState());
+        synchronized (st) {
+            st.lastTouchedMs = now;
+
+            HeaderAnchor anchor = headerAnchor();
+            if (anchor == null) return st.found; // can't re-check now; prior verification stands
+            long head = anchor.number();
+
+            if (st.found != null) {
+                // A finalized block is immutable — trust the cache. While the tx's block is
+                // still near head it can be reorged out (the old flat-window code re-scanned
+                // live every poll, so it never went stale); re-confirm canonicality cheaply.
+                long finalizedNum = finalizedExecBlockNumber();
+                if (finalizedNum >= 0 && st.found.header().number <= finalizedNum) return st.found;
+                if (stillCanonical(conn, anchor, st.found)) return st.found;
+                // Reorged out: drop the cache and rescan the recent region from scratch.
+                st.found = null;
+                st.highScanned = Long.MIN_VALUE;
+            }
+            long from = (st.highScanned == Long.MIN_VALUE)
+                    ? head - RECEIPT_INITIAL_LOOKBACK_BLOCKS + 1
+                    : st.highScanned + 1;
+            // Cap catch-up after a gap; blocks below this are skipped (better than the old
+            // 8-block ceiling, and the tx is usually long-confirmed by then anyway).
+            long capFloor = head - RECEIPT_MAX_SCAN_BLOCKS_PER_POLL + 1;
+            if (from < capFloor) {
+                log.info("[rpc] tx scan: catch-up gap, skipping blocks #" + from + "..#"
+                        + (capFloor - 1) + " (cap " + RECEIPT_MAX_SCAN_BLOCKS_PER_POLL + ")");
+                from = capFloor;
+            }
+            if (from < 0) from = 0;
+            if (from > head) return null; // head hasn't advanced since last scan
+
+            int count = (int) (head - from + 1);
             List<BlockHeadersMessage.VerifiedHeader> window = conn
-                    .requestBlockHeadersBatched(start, count)
+                    .requestBlockHeadersBatched(from, count)
                     .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
-            if (!anchor.anchors(window)) return null;
+            // The window ends at the verified head and must hash-link back; if it can't be
+            // anchored, don't advance the cursor — retry the same range next poll.
+            if (!anchor.anchors(window)) {
+                log.info("[rpc] tx scan: header window failed to anchor");
+                return null;
+            }
+            st.highScanned = head;
 
             List<CompletableFuture<List<BlockBodiesMessage.BlockBody>>> bodyFutures =
                     new ArrayList<>(window.size());
             for (BlockHeadersMessage.VerifiedHeader vh : window) {
                 bodyFutures.add(conn.requestBlockBodies(vh.hash()));
             }
+            // Newest-first: a just-mined tx is found on the first body checked.
             for (int hi = window.size() - 1; hi >= 0; hi--) {
                 BlockHeader h = window.get(hi).header();
                 Bytes32 blockHash = window.get(hi).hash();
                 List<BlockBodiesMessage.BlockBody> bodies;
                 try {
                     bodies = bodyFutures.get(hi).get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
-                } catch (Exception e) { continue; }
+                } catch (Exception e) {
+                    continue; // body fetch failed/timed out for this block — skip it
+                }
                 if (bodies.isEmpty()) continue;
                 List<Bytes> txs = bodies.get(0).transactions();
-                if (!OrderedTrieRoot.verify(txs, h.transactionsRoot)) continue;
+                if (!OrderedTrieRoot.verify(txs, h.transactionsRoot)) {
+                    log.info("[rpc] block #" + h.number + " body failed transactionsRoot verify");
+                    continue;
+                }
                 for (int i = 0; i < txs.size(); i++) {
                     if (Hash.keccak256(txs.get(i)).equals(want)) {
-                        log.info("[rpc] eth_getTransactionByHash found in block #"
-                                + h.number + " index " + i);
-                        // Verified inclusion: stop watching it for gossip propagation.
-                        sentTxWatch.confirmMined(want);
-                        return buildTxJson(txs.get(i).toArrayUnsafe(), want, blockHash, h.number, i);
+                        TxLocation loc = new TxLocation(h, blockHash, i, txs.get(i).toArrayUnsafe());
+                        st.found = loc;
+                        // Pre-populate for the eth_getBlockByHash the wallet issues next.
+                        blockHashToNumber.put(blockHash.toHexString(), h.number);
+                        return loc;
                     }
                 }
             }
-            // Verified head + anchored window, not in it. If it's our own broadcast, it's
-            // pending; otherwise a verified "unknown tx".
-            byte[] ourRaw = sentTxCache.get(want.toHexString());
-            return ourRaw != null ? buildTxJson(ourRaw, want, null, -1, -1) : "null";
+            return null;
+        }
+    }
+
+    /** Beacon-finalized execution block number, or -1 if the light client has no finalized
+     *  header yet. A tx in a block at/below this height is immutable — its cached location can
+     *  be trusted without re-checking for reorgs. */
+    private long finalizedExecBlockNumber() {
+        BeaconLightClient blc = beaconLightClient;
+        if (blc == null) return -1;
+        try {
+            com.jaeckel.ethp2p.consensus.types.LightClientHeader fin =
+                    blc.getStore().getFinalizedHeader();
+            return fin != null ? fin.execution().blockNumber() : -1;
         } catch (Exception e) {
-            log.info("[rpc] eth_getTransactionByHash failed: " + unwrap(e));
+            return -1;
+        }
+    }
+
+    /** True if {@code loc}'s block is still on the canonical chain under {@code anchor}: re-fetch
+     *  the headers from that block up to the verified head, anchor them, and confirm the hash at
+     *  loc's height still matches. Conservatively returns true when it can't disprove canonicality
+     *  (transient peer hiccup, implausibly large range) so a glitch never flips a real receipt to
+     *  "unknown"; returns false only on a proven hash mismatch / head dropping below the block. */
+    private boolean stillCanonical(RLPxConnector conn, HeaderAnchor anchor, TxLocation loc)
+            throws Exception {
+        long head = anchor.number();
+        long blockNum = loc.header().number;
+        if (blockNum > head) return false; // head sits below it — deep reorg
+        long count = head - blockNum + 1;
+        if (count <= 0 || count > RECEIPT_MAX_SCAN_BLOCKS_PER_POLL) return true; // too far to recheck
+        List<BlockHeadersMessage.VerifiedHeader> window = conn
+                .requestBlockHeadersBatched(blockNum, (int) count)
+                .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+        if (window.isEmpty() || !anchor.anchors(window)) return true; // can't disprove → keep
+        return window.get(0).hash().equals(loc.blockHash());
+    }
+
+    /** Effective gas price actually paid per the receipt convention: the legacy/2930 gasPrice,
+     *  or for EIP-1559 txs {@code baseFee + min(maxPriorityFee, maxFee - baseFee)} using this
+     *  block's base fee. Null if the tx carries neither (shouldn't happen for a decoded tx). */
+    private static java.math.BigInteger effectiveGasPrice(
+            com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.DecodedTx tx, BlockHeader h) {
+        if (tx.gasPrice() != null) return tx.gasPrice();
+        if (tx.maxFeePerGas() == null) return null;
+        java.math.BigInteger base = h.baseFeePerGas != null ? h.baseFeePerGas : java.math.BigInteger.ZERO;
+        java.math.BigInteger prio = tx.maxPriorityFeePerGas() != null
+                ? tx.maxPriorityFeePerGas() : java.math.BigInteger.ZERO;
+        java.math.BigInteger room = tx.maxFeePerGas().subtract(base);
+        if (room.signum() < 0) room = java.math.BigInteger.ZERO;
+        return base.add(prio.min(room));
+    }
+
+    /** Contract address created by a {@code to == null} (creation) tx: {@code keccak256(rlp([from,
+     *  nonce]))[12:]}. Null for ordinary calls or if the sender couldn't be recovered. */
+    private static String contractAddressFor(
+            com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.DecodedTx tx) {
+        if (tx.from() == null) return null;
+        try {
+            Bytes rlp = org.apache.tuweni.rlp.RLP.encodeList(w -> {
+                w.writeValue(Bytes.wrap(tx.from().toArrayUnsafe()));
+                w.writeLong(tx.nonce());
+            });
+            Bytes32 hash = org.apache.tuweni.crypto.Hash.keccak256(rlp);
+            return hash.slice(12, 20).toHexString();
+        } catch (Exception e) {
             return null;
         }
     }
@@ -1922,77 +2189,35 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         RLPxConnector conn = connector;
         if (conn == null || txHash == null || txHash.length != 32) return null;
         try {
-            // Headers-only anchor (snap head preferred, beacon optimistic fallback):
-            // receipts need verified headers + bodies, not snap state, so this path
-            // keeps working through snap-peer outages — see headerAnchor().
-            HeaderAnchor anchor = headerAnchor();
-            if (anchor == null) return null;
-            long headNum = anchor.number();
-
-            int count = (int) Math.min(RECEIPT_LOOKBACK_BLOCKS, headNum + 1);
-            long start = headNum - count + 1;
-            List<BlockHeadersMessage.VerifiedHeader> window = conn
-                    .requestBlockHeadersBatched(start, count)
+            Bytes32 want = Bytes32.wrap(txHash);
+            // Incremental beacon-anchored scan (snap head preferred, beacon optimistic
+            // fallback): receipts need verified headers + bodies, not snap state, so this
+            // path keeps working through snap-peer outages — see headerAnchor()/locateMinedTx.
+            TxLocation loc = locateMinedTx(conn, want);
+            if (loc == null) {
+                // No anchor → couldn't verify (Java null → router error). Anchored but not
+                // seen yet → a VERIFIED "not seen": JSON-null literal (eth's pending/unknown).
+                return headerAnchor() == null ? null : "null";
+            }
+            BlockHeader h = loc.header();
+            // Fetch + verify the block's receipts against the (beacon-anchored) receiptsRoot.
+            List<List<Bytes>> rcptBlocks = conn
+                    .requestReceipts(loc.blockHash())
                     // Future.get(timeout) kept (over CompletableFuture.orTimeout) so the
                     // same code runs unmodified on Android API 29 hosts.
                     .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
-            // Anchor the window: its last header must BE the verified head and every
-            // header must hash-link to the next's parentHash.
-            if (!anchor.anchors(window)) {
-                log.info("[rpc] eth_getTransactionReceipt: header window failed to anchor");
+            if (rcptBlocks.isEmpty()) return null;
+            List<Bytes> receipts = rcptBlocks.get(0);
+            if (!OrderedTrieRoot.verify(receipts, h.receiptsRoot)) {
+                log.info("[rpc] block #" + h.number + " receipts failed receiptsRoot verify");
                 return null;
             }
-
-            Bytes32 want = Bytes32.wrap(txHash);
-            // Fire the body fetches concurrently rather than 32 sequential round-trips:
-            // worst case (tx pending / outside the window) is then ~one round-trip of
-            // latency instead of the sum. The window itself is the bandwidth bound.
-            List<CompletableFuture<List<BlockBodiesMessage.BlockBody>>> bodyFutures =
-                    new ArrayList<>(window.size());
-            for (BlockHeadersMessage.VerifiedHeader vh : window) {
-                bodyFutures.add(conn.requestBlockBodies(vh.hash()));
-            }
-            for (int hi = window.size() - 1; hi >= 0; hi--) {
-                BlockHeader h = window.get(hi).header();
-                Bytes32 blockHash = window.get(hi).hash();
-                List<BlockBodiesMessage.BlockBody> bodies;
-                try {
-                    bodies = bodyFutures.get(hi).get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
-                } catch (Exception e) {
-                    continue; // body fetch failed/timed out for this block — skip it
-                }
-                if (bodies.isEmpty()) continue;
-                List<Bytes> txs = bodies.get(0).transactions();
-                // Verify the body before trusting which txs (and indices) it contains.
-                if (!OrderedTrieRoot.verify(txs, h.transactionsRoot)) {
-                    log.info("[rpc] block #" + h.number + " body failed transactionsRoot verify");
-                    continue;
-                }
-                int idx = -1;
-                for (int i = 0; i < txs.size(); i++) {
-                    if (Hash.keccak256(txs.get(i)).equals(want)) { idx = i; break; }
-                }
-                if (idx < 0) continue;
-
-                // Found. Fetch + verify the block's receipts against receiptsRoot.
-                List<List<Bytes>> rcptBlocks = conn
-                        .requestReceipts(blockHash)
-                        .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
-                if (rcptBlocks.isEmpty()) return null;
-                List<Bytes> receipts = rcptBlocks.get(0);
-                if (!OrderedTrieRoot.verify(receipts, h.receiptsRoot)) {
-                    log.info("[rpc] block #" + h.number + " receipts failed receiptsRoot verify");
-                    return null;
-                }
-                if (idx >= receipts.size()) return null;
-                log.info("[rpc] eth_getTransactionReceipt verified tx in block #"
-                        + h.number + " index " + idx);
-                return buildReceiptJson(receipts, idx, h, blockHash, want);
-            }
-            // Verified head + anchored window, but the tx isn't in it → a VERIFIED
-            // "not seen yet": return the JSON-null literal (eth's pending/unknown), NOT
-            // Java null (which means "couldn't verify" → router error).
-            return "null";
+            if (loc.index() >= receipts.size()) return null;
+            // Verified inclusion: stop watching/re-broadcasting it (mirrors getTransactionByHash).
+            sentTxWatch.confirmMined(want);
+            log.info("[rpc] eth_getTransactionReceipt verified tx in block #"
+                    + h.number + " index " + loc.index());
+            return buildReceiptJson(receipts, loc.index(), h, loc.blockHash(), want, loc.txBytes());
         } catch (Exception e) {
             log.info("[rpc] eth_getTransactionReceipt failed: " + unwrap(e));
             return null; // couldn't verify → router errors (not a misleading "pending")
@@ -2002,8 +2227,16 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     /** Build the eth_getTransactionReceipt JSON object from VERIFIED receipt bytes.
      *  {@code txHash} is the body's tx hash (already confirmed == the requested hash). */
     private static String buildReceiptJson(List<Bytes> receipts, int idx,
-                                           BlockHeader h, Bytes32 blockHash, Bytes32 txHash) {
+                                           BlockHeader h, Bytes32 blockHash, Bytes32 txHash,
+                                           byte[] rawTx) {
         Receipt r = Receipt.decode(receipts.get(idx));
+        // Decode the (block-verified) tx so the receipt can carry from / to / contractAddress /
+        // effectiveGasPrice. Without these MetaMask won't reconcile the receipt with its pending
+        // tx and leaves it stuck "pending/submitted" even though we verified its inclusion.
+        com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.DecodedTx tx =
+                rawTx != null
+                        ? com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.decode(Bytes.wrap(rawTx))
+                        : null;
         // Single pass over the preceding receipts: gasUsed needs receipt[idx-1]'s
         // cumulative, logIndex needs the running log count — decode each only once.
         long prevCum = 0L;
@@ -2023,6 +2256,26 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         sb.append(",\"blockNumber\":\"").append(hexQuantity(h.number)).append("\"");
         sb.append(",\"cumulativeGasUsed\":\"").append(hexQuantity(r.cumulativeGasUsed())).append("\"");
         sb.append(",\"gasUsed\":\"").append(hexQuantity(gasUsed)).append("\"");
+        // from / to / contractAddress / effectiveGasPrice — required by MetaMask et al. to mark
+        // the tx confirmed. Derived from the verified tx bytes + this block's base fee.
+        if (tx != null) {
+            if (tx.from() != null) {
+                sb.append(",\"from\":\"").append(tx.from().toHexString()).append("\"");
+            }
+            if (!tx.to().isEmpty()) {
+                sb.append(",\"to\":\"").append(tx.to().toHexString()).append("\"");
+                sb.append(",\"contractAddress\":null");
+            } else {
+                sb.append(",\"to\":null");
+                String created = contractAddressFor(tx);
+                sb.append(",\"contractAddress\":")
+                  .append(created == null ? "null" : "\"" + created + "\"");
+            }
+            java.math.BigInteger eff = effectiveGasPrice(tx, h);
+            if (eff != null) {
+                sb.append(",\"effectiveGasPrice\":\"0x").append(eff.toString(16)).append("\"");
+            }
+        }
         if (r.hasStatus()) {
             sb.append(",\"status\":\"").append(r.success() ? "0x1" : "0x0").append("\"");
         }
@@ -2120,6 +2373,8 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                     .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
             if (!anchor.anchors(window)) return serveStaleBlock(isTag, pinned);
             BlockHeadersMessage.VerifiedHeader vh = window.get(0); // target is first in [target..head]
+            // Remember this verified hash↔number so eth_getBlockByHash can resolve it.
+            blockHashToNumber.put(vh.hash().toHexString(), vh.header().number);
 
             List<BlockBodiesMessage.BlockBody> bodies = conn
                     .requestBlockBodies(vh.hash())
@@ -2140,6 +2395,25 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             log.info("[rpc] eth_getBlockByNumber failed: " + unwrap(e));
             return serveStaleBlock(isTag, pinned);
         }
+    }
+
+    /** eth_getBlockByHash. Wallets call this immediately after a receipt to finalize a tx as
+     *  confirmed, so it must work or the tx stays "submitted"/"pending". We resolve the hash →
+     *  number from blocks we've already verified (receipt scan / getBlockByNumber), serve via
+     *  the verified by-number path, then confirm the block actually served still carries the
+     *  requested hash (guards a stale cache entry across a reorg). A hash we've never verified
+     *  → "null" (eth's unknown-block); the live confirm flow always pre-populates it via the
+     *  preceding eth_getTransactionReceipt. */
+    private String rpcGetBlockByHash(String blockHash, boolean fullTx) {
+        if (blockHash == null || fullTx) return null; // fullTx not served verified (mirrors by-number)
+        String key = blockHash.toLowerCase(java.util.Locale.ROOT);
+        Long number = blockHashToNumber.get(key);
+        if (number == null) return "null"; // not a block we've verified — unknown to us
+        String json = rpcGetBlockByNumber("0x" + Long.toHexString(number), false);
+        if (json == null || "null".equals(json)) return json;
+        // The verified by-number serve returns the CURRENTLY-canonical block at that height;
+        // make sure it's still the one asked for (else a reorg remapped number → hash).
+        return json.contains("\"hash\":\"" + key + "\"") ? json : "null";
     }
 
     /** Serve the last-good latest block when a fresh fetch couldn't complete. Returns
@@ -2522,6 +2796,17 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         return computeMaxPriorityFeeCold();
     }
 
+    /** Network-aware floor for the suggested tip (see NetworkConfig#minSuggestedTipWei).
+     *  Falls back to the {@link #MIN_SUGGESTED_TIP} default only before the connector/network
+     *  is available. */
+    private java.math.BigInteger minSuggestedTip() {
+        RLPxConnector conn = connector;
+        if (conn != null && conn.getNetwork() != null) {
+            return conn.getNetwork().minSuggestedTipWei();
+        }
+        return MIN_SUGGESTED_TIP;
+    }
+
     private java.math.BigInteger computeMaxPriorityFeeCold() {
         TipWithTimestamp cached = cachedSuggestedTip;
         if (cached != null
@@ -2540,12 +2825,15 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                 if (blockTips == null) continue; // one unverifiable block doesn't kill the suggestion
                 for (TxTip t : blockTips) tips.add(t.tip());
             }
+            // Network-aware floor: a hardcoded 0.1 gwei over-suggests by orders of magnitude
+            // on cheap chains like Gnosis (~10 wei base fee). See NetworkConfig#minSuggestedTipWei.
+            java.math.BigInteger minTip = minSuggestedTip();
             java.math.BigInteger tip;
             if (tips.isEmpty()) {
-                tip = MIN_SUGGESTED_TIP;
+                tip = minTip;
             } else {
                 java.util.Collections.sort(tips);
-                tip = tips.get(tips.size() / 2).max(MIN_SUGGESTED_TIP);
+                tip = tips.get(tips.size() / 2).max(minTip);
             }
             cachedSuggestedTip = new TipWithTimestamp(tip, clock.elapsedMillis());
             return tip;

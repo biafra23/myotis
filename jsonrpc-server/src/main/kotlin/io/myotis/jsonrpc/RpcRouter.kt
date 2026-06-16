@@ -44,7 +44,7 @@ class RpcRouter(
             "eth_getTransactionCount", "eth_getCode", "eth_getStorageAt",
             "eth_sendRawTransaction", "eth_getTransactionReceipt", "eth_getBlockByNumber",
             "eth_gasPrice", "eth_maxPriorityFeePerGas", "eth_feeHistory", "eth_estimateGas",
-            "eth_getTransactionByHash", "web3_clientVersion",
+            "eth_getTransactionByHash", "eth_getBlockByHash", "web3_clientVersion",
         )
     }
 
@@ -218,6 +218,19 @@ class RpcRouter(
                 // Object string when found; "null" for a future/unknown block; Kotlin null
                 // (can't verify) → fall through to the strict error.
                 val blockJson = withContext(Dispatchers.IO) { b.getBlockByNumber(block, fullTx) } ?: return null
+                resultEnvelope(id, json.parseToJsonElement(blockJson))
+            }
+            "eth_getBlockByHash" -> {
+                val p = root.params()
+                val blockHash = (p?.getOrNull(0) as? JsonPrimitive)?.content ?: return null
+                val fullParam = p?.getOrNull(1)
+                val fullTx: Boolean = when {
+                    fullParam == null || fullParam is JsonNull -> false
+                    else -> (fullParam as? JsonPrimitive)?.booleanOrNull ?: return null
+                }
+                // Object string when found; "null" for an unknown/non-canonical hash; Kotlin
+                // null (can't verify) → strict error.
+                val blockJson = withContext(Dispatchers.IO) { b.getBlockByHash(blockHash, fullTx) } ?: return null
                 resultEnvelope(id, json.parseToJsonElement(blockJson))
             }
             "eth_gasPrice" -> {
