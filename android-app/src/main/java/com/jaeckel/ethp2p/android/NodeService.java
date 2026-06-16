@@ -273,8 +273,11 @@ public final class NodeService extends Service {
     /** Shared verified-RPC backend (head anchoring, snap-proof reads, ENS, fees).
      *  Owned by the ChainStack; mirrored here so resolveEns()/snapshot() read it directly. */
     private volatile io.myotis.rpc.VerifiedRpcBackend rpcBackend;
-    private AndroidPeerCache peerCache;
-    private AndroidCLPeerCache clPeerCache;
+    // volatile: written on the boot thread, read on the ethp2p-clear-caches worker
+    // (doClearCaches) without holding bootLock — without the barrier that thread could
+    // see null while the node is running and fall back to deleting live cache files.
+    private volatile AndroidPeerCache peerCache;
+    private volatile AndroidCLPeerCache clPeerCache;
     private volatile BeaconLightClient beaconLightClient;
     private volatile BeaconSyncState beaconSyncState;
     private volatile long clGenesisTime;
@@ -849,6 +852,19 @@ public final class NodeService extends Service {
                     return;
                 }
                 started = s.start();
+                if (started) {
+                    // Publish component handles inside bootLock so they can't be overwritten by a
+                    // doShutdown() that raced in after start() returned: doShutdown() nulls these same
+                    // fields under bootLock, so either it ran first (we'd see RUNNING==false above and
+                    // never get here) or it blocks until we finish — no stale refs to a closed stack.
+                    this.connector = s.connector();
+                    this.discV4 = s.discV4();
+                    this.discV5 = s.discV5();
+                    this.beaconLightClient = s.beaconLightClient();
+                    this.beaconSyncState = s.beaconSyncState();
+                    this.rpcBackend = s.rpcBackend();
+                    this.clGenesisTime = network.clGenesisTime();
+                }
             }
             if (!started) {
                 LogBuffer.e(TAG, "node stack failed to start");
@@ -860,14 +876,6 @@ public final class NodeService extends Service {
                 stopSelf();
                 return;
             }
-            // Publish component handles so snapshot()/requestAccount()/resolveEns() read them.
-            this.connector = s.connector();
-            this.discV4 = s.discV4();
-            this.discV5 = s.discV5();
-            this.beaconLightClient = s.beaconLightClient();
-            this.beaconSyncState = s.beaconSyncState();
-            this.rpcBackend = s.rpcBackend();
-            this.clGenesisTime = network.clGenesisTime();
             LogBuffer.i(TAG, "node stack started on " + network.name()
                     + " (EL " + DEFAULT_PORT + ", RPC " + activeRpcPort + ")");
         } catch (Exception e) {
@@ -919,19 +927,21 @@ public final class NodeService extends Service {
         // against a racing startNode() so a Stop -> Start waits for the ports to free.
         io.myotis.node.ChainStack s = this.stack;
         if (s != null) {
+            // Null the published handles under the same lock the boot thread publishes them on, so a
+            // doShutdown() racing a still-running startNode() can't leave stale refs to a closed stack.
             synchronized (bootLock) {
                 try { s.shutdown(); } catch (Throwable ignored) {}
+                this.stack = null;
+                rpcBackend = null;
+                beaconLightClient = null;
+                beaconSyncState = null;
+                connector = null;
+                discV5 = null;
+                discV4 = null;
+                peerCache = null;
+                clPeerCache = null;
             }
-            this.stack = null;
         }
-        rpcBackend = null;
-        beaconLightClient = null;
-        beaconSyncState = null;
-        connector = null;
-        discV5 = null;
-        discV4 = null;
-        peerCache = null;
-        clPeerCache = null;
         cachedPeerCount = 0;
         cachedClPeerCount = 0;
         clGenesisTime = 0L;
