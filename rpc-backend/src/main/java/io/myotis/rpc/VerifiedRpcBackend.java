@@ -596,7 +596,9 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
 
     @Override
     public String syncState() {
-        return beaconSyncState.getSyncState(connector.getNetwork().clGenesisTime()).name();
+        return beaconSyncState.getSyncState(
+                connector.getNetwork().clGenesisTime(),
+                connector.getNetwork().secondsPerSlot()).name();
     }
 
     @Override

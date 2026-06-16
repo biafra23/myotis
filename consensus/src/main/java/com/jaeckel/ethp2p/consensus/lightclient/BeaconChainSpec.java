@@ -93,12 +93,27 @@ public final class BeaconChainSpec {
 
     /**
      * Estimate the current wall-clock sync committee period from a beacon chain
-     * genesis time (seconds since epoch). Callers should pass the genesis time of
-     * the network they're actually on (mainnet/sepolia/holesky differ).
+     * genesis time (seconds since epoch), assuming the mainnet 12s slot time.
+     * Prefer {@link #currentPeriod(long, int)} on networks whose slot time differs
+     * (e.g. Gnosis Beacon Chain at 5s).
      */
     public static long currentPeriod(long genesisTimeSec) {
+        return currentPeriod(genesisTimeSec, SECONDS_PER_SLOT);
+    }
+
+    /**
+     * Estimate the current wall-clock sync committee period for a network with the
+     * given seconds-per-slot. Gnosis Beacon Chain uses 5s slots vs mainnet's 12, so
+     * the wall-clock → slot conversion must use the network value or catch-up targets
+     * the wrong period.
+     *
+     * <p>Note: {@link #SLOTS_PER_SYNC_COMMITTEE_PERIOD} is 8192 on both presets
+     * ({@code 32*256 == 16*512}), so {@link #computeSyncCommitteePeriod(long)} needs
+     * no per-network variant — only this slot-time conversion does.
+     */
+    public static long currentPeriod(long genesisTimeSec, int secondsPerSlot) {
         long nowSec = System.currentTimeMillis() / 1000;
-        long slot = (nowSec - genesisTimeSec) / SECONDS_PER_SLOT;
+        long slot = (nowSec - genesisTimeSec) / secondsPerSlot;
         return computeSyncCommitteePeriod(slot);
     }
 }

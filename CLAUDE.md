@@ -20,9 +20,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Start daemon (mainnet, blocks until stopped)
 ./gradlew :app:run
 
-# Start daemon on a testnet
-./gradlew :app:run -Pnetwork=sepolia
-./gradlew :app:run -Pnetwork=holesky
+# Start daemon on another network
+./gradlew :app:run -Pnetwork=gnosis     # Gnosis Chain (chainId 100, its own beacon chain)
+./gradlew :app:run -Pnetwork=sepolia    # Ethereum testnet
+# (holesky was retired — the EF shut it down in Oct 2025: no peers, no checkpoint servers)
+
+# Run a second network alongside mainnet (separate daemon, separate port + socket)
+./gradlew :app:run -Pnetwork=gnosis -Pport=30304
 
 # Send IPC commands to running daemon
 ./gradlew :app:run -Pargs=status
@@ -111,3 +115,4 @@ Five Gradle modules:
 
 ## Integration-Test
 - When './gradlew :app:run -Pargs=beacon-status' returns "state":"SYNCED" then './gradlew :app:run -Pargs="get-storage 0x1A5F9352Af8aF974bFC03399e3767DF6370d82e4 1 0x308686553a1EAC2fE721Ac8B814De638975a276e"'  and './gradlew  :app:run -Pargs="get-account 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"' should return "verifyMethod":"headerChain"
+- Gnosis variant: with a gnosis daemon running (`./gradlew :app:run -Pnetwork=gnosis`), once `-Pnetwork=gnosis -Pargs=beacon-status` returns "state":"SYNCED", `-Pnetwork=gnosis -Pargs="get-account <addr>"` should return "verifyMethod":"headerChain". Refresh the trust anchor first with `./gradlew refreshGnosisCheckpoint` (single-source — see docs/multichain-design.md).

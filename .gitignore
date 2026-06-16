@@ -29,6 +29,8 @@ out/
 nodekey.hex
 app/peers.cache
 *.cache
+# Persisted light-client sync snapshots (per-network runtime state)
+*.snapshot
 app/devp2p.log
 app/devlibp2p.log
 .gradle-home/

@@ -73,6 +73,15 @@ public class BeaconLightClient implements AutoCloseable {
      */
     private volatile long activeBlobParamsEpoch;
     private volatile long activeBlobParamsMaxBlobs;
+    /**
+     * Network slot-timing preset. Mainnet (and the mainnet-preset testnets) use 12s
+     * slots / 32 slots-per-epoch; Gnosis Beacon Chain uses 5s slots / 16. Used for
+     * wall-clock sync-committee period estimation (catch-up targeting) and the Status
+     * {@code finalized_epoch}. Defaults to mainnet; override with
+     * {@link #setBeaconPreset(int, int)} before {@link #start()}.
+     */
+    private volatile int secondsPerSlot = BeaconChainSpec.SECONDS_PER_SLOT;
+    private volatile int slotsPerEpoch = BeaconChainSpec.SLOTS_PER_EPOCH;
     private final byte[] genesisValidatorsRoot; // 32-byte genesis validators root
     private final long clGenesisTime;         // beacon chain genesis time (seconds since epoch)
     private final java.util.function.Consumer<String> onPeerSuccess; // nullable; called with multiaddr on success
@@ -855,7 +864,7 @@ public class BeaconLightClient implements AutoCloseable {
             // finalized_* come from the bootstrap-verified finalized header —
             // the trust anchor peers run their ancestor/relevance check against.
             var fh = store.getFinalizedHeader();
-            finalizedEpoch = fh.beacon().slot() / 32;
+            finalizedEpoch = fh.beacon().slot() / slotsPerEpoch;
             finalizedRoot = fh.beacon().hashTreeRoot();
             // head_* must reflect our latest known block, not finalized: the
             // optimistic (attested) header trails wall-clock by ~1-2 slots vs
@@ -875,7 +884,7 @@ public class BeaconLightClient implements AutoCloseable {
             // Pre-bootstrap: claim the trusted weak-subjectivity checkpoint.
             // We haven't BLS-verified it yet, but it's a real mainnet block
             // root at a known slot, so peers' root_at_epoch check succeeds.
-            finalizedEpoch = checkpointSlot / 32;
+            finalizedEpoch = checkpointSlot / slotsPerEpoch;
             finalizedRoot = checkpointRoot.clone();
             headSlot = checkpointSlot;
             headRoot = checkpointRoot.clone();
@@ -952,6 +961,17 @@ public class BeaconLightClient implements AutoCloseable {
     public void setBlobParameters(long epoch, long maxBlobsPerBlock) {
         this.activeBlobParamsEpoch = epoch;
         this.activeBlobParamsMaxBlobs = maxBlobsPerBlock;
+    }
+
+    /**
+     * Set the network's beacon slot-timing preset. Must be called before
+     * {@link #start()}. Mainnet/mainnet-preset testnets: {@code (12, 32)};
+     * Gnosis Beacon Chain: {@code (5, 16)}. Affects wall-clock period estimation
+     * (catch-up targeting) and the Status {@code finalized_epoch}.
+     */
+    public void setBeaconPreset(int secondsPerSlot, int slotsPerEpoch) {
+        this.secondsPerSlot = secondsPerSlot;
+        this.slotsPerEpoch = slotsPerEpoch;
     }
 
     /**
@@ -1265,7 +1285,7 @@ public class BeaconLightClient implements AutoCloseable {
     private void catchUpSyncCommittee() {
         // Estimate current period from wall clock, using the network's CL genesis time.
         long now = System.currentTimeMillis() / 1000;
-        long currentSlotEstimate = (now - clGenesisTime) / 12;
+        long currentSlotEstimate = (now - clGenesisTime) / secondsPerSlot;
         long currentPeriod = BeaconChainSpec.computeSyncCommitteePeriod(currentSlotEstimate);
 
         for (int batch = 0; batch < MAX_CATCHUP_BATCHES && running; batch++) {
@@ -1766,7 +1786,7 @@ public class BeaconLightClient implements AutoCloseable {
             // committee we don't have and BLS verify fails indefinitely. We must
             // re-fetch a LightClientUpdate to rotate. This is a cheap no-op when
             // the committee is current.
-            long wallPeriod = BeaconChainSpec.currentPeriod(clGenesisTime);
+            long wallPeriod = BeaconChainSpec.currentPeriod(clGenesisTime, secondsPerSlot);
             if (wallPeriod > store.getCurrentSyncCommitteePeriod()) {
                 catchUpSyncCommittee();
                 // If still behind, skip the finality poll below. While the

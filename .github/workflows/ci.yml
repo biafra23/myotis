@@ -25,13 +25,29 @@ jobs:
         with:
           java-version: '21'
           distribution: 'temurin'
-          cache: gradle
+
+      # Robust Gradle dependency + plugin caching. Restores the base-branch cache
+      # (read-only on PRs) so artifacts that already built on main — Besu, AGP,
+      # the JitPack netty/tuweni forks — come from cache instead of being re-fetched
+      # from flaky external repos on every run.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      # Retry to ride out transient external-repo resolution blips (JitPack 403s,
+      # google()/Hyperledger timeouts) for any artifact not already cached. NOT
+      # --offline: offline turns a single cache miss into a hard failure.
       - name: Build with Gradle
-        run: ./gradlew build
+        run: |
+          for attempt in 1 2 3; do
+            ./gradlew build && exit 0
+            echo "::warning::Gradle build attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
+            sleep 25
+          done
+          echo "::error::Gradle build failed after 3 attempts"
+          exit 1
 
   release:
     name: Release
@@ -52,13 +68,22 @@ jobs:
         with:
           java-version: '21'
           distribution: 'temurin'
-          cache: gradle
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
       - name: Build with Gradle
-        run: ./gradlew build
+        run: |
+          for attempt in 1 2 3; do
+            ./gradlew build && exit 0
+            echo "::warning::Gradle build attempt $attempt failed; retrying in 25s"
+            sleep 25
+          done
+          echo "::error::Gradle build failed after 3 attempts"
+          exit 1
 
       - name: Release
         uses: softprops/action-gh-release@v2

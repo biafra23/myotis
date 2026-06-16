@@ -9,6 +9,7 @@ import java.math.BigInteger;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * Network-specific configuration for Ethereum chains.
@@ -87,9 +88,9 @@ public record NetworkConfig(
             // genesis_validators_root (mainnet)
             Bytes.fromHexString("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95").toArrayUnsafe(),
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshMainnetCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 14158720, 2026-04-20, period 1728)
-            Bytes.fromHexString("611c852c9c52812d1a8701d06c230617159b69d33b344704fb524558ee79ff5d").toArrayUnsafe(),
-            14158720L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized mainnet block root (slot 14560000, 2026-06-15, period 1777)
+            Bytes.fromHexString("58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e").toArrayUnsafe(),
+            14560000L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:mainnet:end
             // current fork version: Fulu (0x06000000) — activated at slot 13164544 (2025-12-03)
             new byte[]{0x06, 0x00, 0x00, 0x00},
@@ -201,35 +202,64 @@ public record NetworkConfig(
             List.of()  // CL discv5 bootnodes — not pinned for sepolia this PR
     );
 
-    public static final NetworkConfig HOLESKY = new NetworkConfig(
-            "holesky",
-            17000L,
-            Bytes32.fromHexString("b5f7f912443c940f21fd611f12828d75b534364ed9e95ca4e307729a4661bde4"),
-            Bytes32.fromHexString("b5f7f912443c940f21fd611f12828d75b534364ed9e95ca4e307729a4661bde4"), // genesis (testnets lenient)
-            new byte[]{(byte) 0x9b, (byte) 0xc6, (byte) 0xcb, (byte) 0x31}, // post-BPO2 (Fusaka)
+    // Gnosis Chain (xDai). EL chainId 100; its own Consensus Layer (Gnosis Beacon
+    // Chain) with a *different preset*: 5s slots, 16 slots/epoch, 512 epochs/period
+    // — see secondsPerSlot()/slotsPerEpoch(). Note SLOTS_PER_SYNC_COMMITTEE_PERIOD is
+    // still 8192 (16*512), same as mainnet (32*256). Gnosis is on Fulu, and its
+    // fork digest folds the Electra-baseline blob params (no explicit BLOB_SCHEDULE
+    // list) into the EIP-7892 XOR — see activeBlobParams below; verified against live
+    // peers' eth2 ENR digest 0x3237dab6.
+    public static final NetworkConfig GNOSIS = new NetworkConfig(
+            "gnosis",
+            100L,
+            Bytes32.fromHexString("4f1dd23188aab3a76b463e4af801b52b1248ef073c648cbdc4c9333d3da79756"),
+            Bytes32.fromHexString("4f1dd23188aab3a76b463e4af801b52b1248ef073c648cbdc4c9333d3da79756"), // genesis
+            // EL fork-id hash (EIP-2124), forkNext=0. PINNED from live Gnosis peers'
+            // eth Status (networkId=100 → forkId=0xcfca387c/0), the EIP-2124 fork-id for
+            // the Fulu/Osaka head. Remote peers validate our fork-id, so this must match
+            // the network or they disconnect with DiscSubprotocolError.
+            new byte[]{(byte) 0xcf, (byte) 0xca, (byte) 0x38, (byte) 0x7c},
             0L,
+            // EL discv4 bootnodes (ip:port from gnosischain/configs enodes).
             List.of(
-                    new InetSocketAddress("146.190.13.128", 30303),
-                    new InetSocketAddress("178.128.136.233", 30303)
+                    new InetSocketAddress("65.109.103.148", 30303),
+                    new InetSocketAddress("65.109.103.149", 30303),
+                    new InetSocketAddress("141.94.97.22", 30303),
+                    new InetSocketAddress("141.94.97.74", 30303),
+                    new InetSocketAddress("141.94.97.84", 30303),
+                    new InetSocketAddress("51.68.39.206", 30303)
             ),
-            // genesis_validators_root (holesky)
-            Bytes.fromHexString("9143aa7c615a7f7115e2b6aac319c03529df8242ae705fba9df39b79c59fa8b1").toArrayUnsafe(),
-            // trusted checkpoint: a recent finalized holesky block root
-            Bytes.fromHexString("e4571b4f4a3bffdc9b87e75de28b86e5d9e8e1ab2b27d8a66e3e4e9f9ebe7f4c").toArrayUnsafe(),
-            0L, // checkpoint slot — unknown for holesky, use 0 (spec-default). refresh job should fill this.
-            // current fork version: Electra on holesky (0x06017000)
-            new byte[]{0x06, 0x01, 0x70, 0x00},
-            0L, 0L, // no BPO active on holesky
-            null, // prior fork version not pinned for holesky
-            // CL peer multiaddrs for holesky
-            List.of(
-                    "/ip4/159.69.35.70/tcp/9000/p2p/16Uiu2HAmFMfXsymWEK6BFPQNPW3nPz57uB3TKpVNFDmeoW7WXNUA"
-            ),
+            // genesis_validators_root (Gnosis Beacon Chain)
+            Bytes.fromHexString("f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47").toArrayUnsafe(),
+            // @checkpoint:gnosis:begin — managed by `./gradlew refreshGnosisCheckpoint`
+            // trusted checkpoint: recent finalized Gnosis block root (slot 28509120, 2026-06-15, period 3480)
+            Bytes.fromHexString("54de0afd8646abe6d3f5d64f3a3a4e25a948d5329deb31bbc85ed4ee4eaf5c81").toArrayUnsafe(),
+            28509120L, // checkpoint slot. Must stay in sync with the root above.
+            // @checkpoint:gnosis:end
+            // current fork version: Fulu on Gnosis (0x06000064), active since 2026-04-14
+            new byte[]{0x06, 0x00, 0x00, 0x64},
+            // EIP-7892: Gnosis has no explicit BLOB_SCHEDULE, so clients fold the
+            // Electra-baseline blob params (ELECTRA_FORK_EPOCH=1337856, MAX_BLOBS_PER_BLOCK_ELECTRA=2)
+            // into the Fulu fork digest. Yields the live-verified eth2 digest 0x3237dab6.
+            1337856L, 2L,
+            new byte[]{0x05, 0x00, 0x00, 0x64}, // prior fork: Electra — accepted as a discv5 fork-digest fallback
+            // CL peer multiaddrs — none pinned; discv5 bootnodes below seed discovery.
+            List.of(),
             null,
-            1695902400L, // holesky beacon genesis: 2023-09-28 12:00:00 UTC
-            List.of(), // EL ENR trees — not pinned
+            1638993340L, // Gnosis beacon genesis: 2021-12-08 19:55:40 UTC
+            List.of(), // EL ENR trees — Gnosis has no enrtree
             List.of(), // CL ENR trees — not pinned
-            List.of()  // CL discv5 bootnodes — not pinned for holesky this PR
+            // CL discv5 bootnodes from gnosischain/configs bootstrap_nodes.txt
+            List.of(
+                    "enr:-Ly4QIAhiTHk6JdVhCdiLwT83wAolUFo5J4nI5HrF7-zJO_QEw3cmEGxC1jvqNNUN64Vu-xxqDKSM528vKRNCehZAfEBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCCS-QxAgAAZP__________gmlkgnY0gmlwhEFtZ5SJc2VjcDI1NmsxoQJwgL5C-30E8RJmW8gCb7sfwWvvfre7wGcCeV4X1G2wJYhzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA",
+                    "enr:-Ly4QDhEjlkf8fwO5uWAadexy88GXZneTuUCIPHhv98v8ZfXMtC0S1S_8soiT0CMEgoeLe9Db01dtkFQUnA9YcnYC_8Bh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCCS-QxAgAAZP__________gmlkgnY0gmlwhEFtZ5WJc2VjcDI1NmsxoQMRSho89q2GKx_l2FZhR1RmnSiQr6o_9hfXfQUuW6bjMohzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA",
+                    "enr:-Ly4QLKgv5M2D4DYJgo6s4NG_K4zu4sk5HOLCfGCdtgoezsbfRbfGpQ4iSd31M88ec3DHA5FWVbkgIas9EaJeXia0nwBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCCS-QxAgAAZP__________gmlkgnY0gmlwhI1eYRaJc2VjcDI1NmsxoQLpK_A47iNBkVjka9Mde1F-Kie-R0sq97MCNKCxt2HwOIhzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA",
+                    "enr:-Ly4QF_0qvji6xqXrhQEhwJR1W9h5dXV7ZjVCN_NlosKxcgZW6emAfB_KXxEiPgKr_-CZG8CWvTiojEohG1ewF7P368Bh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCCS-QxAgAAZP__________gmlkgnY0gmlwhI1eYUqJc2VjcDI1NmsxoQIpNRUT6llrXqEbjkAodsZOyWv8fxQkyQtSvH4sg2D7n4hzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA",
+                    "enr:-Ly4QCD5D99p36WafgTSxB6kY7D2V1ca71C49J4VWI2c8UZCCPYBvNRWiv0-HxOcbpuUdwPVhyWQCYm1yq2ZH0ukCbQBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCCS-QxAgAAZP__________gmlkgnY0gmlwhI1eYVSJc2VjcDI1NmsxoQJJMSV8iSZ8zvkgbi8cjIGEUVJeekLqT0LQha_co-siT4hzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA",
+                    "enr:-KK4QKXJq1QOVWuJAGige4uaT8LRPQGCVRf3lH3pxjaVScMRUfFW1eiiaz8RwOAYvw33D4EX-uASGJ5QVqVCqwccxa-Bi4RldGgykCGm-DYDAABk__________-CaWSCdjSCaXCEM0QnzolzZWNwMjU2azGhAhNvrRkpuK4MWTf3WqiOXSOePL8Zc-wKVpZ9FQx_BDadg3RjcIIjKIN1ZHCCIyg",
+                    "enr:-LO4QO87Rn2ejN3SZdXkx7kv8m11EZ3KWWqoIN5oXwQ7iXR9CVGd1dmSyWxOL1PGsdIqeMf66OZj4QGEJckSi6okCdWBpIdhdHRuZXRziAAAAABgAAAAhGV0aDKQPr_UhAQAAGT__________4JpZIJ2NIJpcIQj0iX1iXNlY3AyNTZrMaEDd-_eqFlWWJrUfEp8RhKT9NxdYaZoLHvsp3bbejPyOoeDdGNwgiMog3VkcIIjKA",
+                    "enr:-LK4QIJUAxX9uNgW4ACkq8AixjnSTcs9sClbEtWRq9F8Uy9OEExsr4ecpBTYpxX66cMk6pUHejCSX3wZkK2pOCCHWHEBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpA-v9SEBAAAZP__________gmlkgnY0gmlwhCPSnDuJc2VjcDI1NmsxoQNuaAjFE-ANkH3pbeBdPiEIwjR5kxFuKaBWxHkqFuPz5IN0Y3CCIyiDdWRwgiMo"
+            )
     );
 
     // Frontier (genesis) fork IDs — CRC32(genesis_hash), forkNext = first fork block
@@ -350,20 +380,40 @@ public record NetworkConfig(
         return switch ((int) networkId) {
             case 1 -> 20_000_000L;        // mainnet (current ~25M, 2026-05)
             case 11155111 -> 5_000_000L;  // sepolia
-            case 17000 -> 1_000_000L;     // holesky
+            case 100 -> 40_000_000L;      // gnosis (current ~43M, 2026-06)
             default -> 0L;
         };
     }
 
     /** Look up a network by name (case-insensitive). */
     public static NetworkConfig byName(String name) {
-        return switch (name.toLowerCase()) {
+        return switch (name.toLowerCase(Locale.ROOT)) {
             case "mainnet" -> MAINNET;
             case "sepolia" -> SEPOLIA;
-            case "holesky" -> HOLESKY;
+            case "gnosis", "gbc", "xdai" -> GNOSIS;
+            // holesky retired: the EF shut it down in Oct 2025 (no peers, no
+            // checkpoint servers). Use gnosis, or sepolia for an Ethereum testnet.
             default -> throw new IllegalArgumentException(
-                    "Unknown network: " + name + ". Supported: mainnet, sepolia, holesky");
+                    "Unknown network: " + name + ". Supported: mainnet, sepolia, gnosis");
         };
+    }
+
+    /**
+     * Beacon-chain slot time in seconds. Mainnet and the mainnet-preset testnets
+     * use 12; Gnosis Beacon Chain uses 5. Used for wall-clock sync-committee period
+     * estimation in the light client.
+     */
+    public int secondsPerSlot() {
+        return networkId == 100 ? 5 : 12;
+    }
+
+    /**
+     * Beacon-chain slots per epoch. Mainnet preset uses 32; Gnosis uses 16. Used for
+     * the Status {@code finalized_epoch} and epoch display. (Slots per sync-committee
+     * period is 8192 on both presets, so that helper is shared.)
+     */
+    public int slotsPerEpoch() {
+        return networkId == 100 ? 16 : 32;
     }
 
     // -------------------------------------------------------------------------

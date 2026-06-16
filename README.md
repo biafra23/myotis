@@ -96,10 +96,56 @@ The daemon discovers peers, maintains connections, and listens for CLI commands 
 
 The daemon runs in the foreground. It discovers peers via discv4 (Kademlia DHT), establishes RLPx encrypted connections, and performs eth protocol handshakes. A beacon chain light client syncs finalized state roots from the consensus layer.
 
+### Run the Gnosis Chain daemon
+
+Gnosis Chain (chainId 100) is a supported network with its **own** consensus
+layer (Gnosis Beacon Chain — 5s slots, 16 slots/epoch). Select it with
+`-Pnetwork=gnosis`:
+
+```bash
+# 1. Refresh the trusted checkpoint (weak-subjectivity anchor) for Gnosis.
+#    Do this before the first sync so the light client bootstraps from a recent
+#    finalized root that peers still serve.
+./gradlew refreshGnosisCheckpoint
+
+# 2. Start the Gnosis daemon.
+./gradlew :app:run -Pnetwork=gnosis
+```
+
+Each network is fully isolated: the Gnosis daemon uses its own IPC socket
+(`/tmp/ethp2p-gnosis.sock`), lock file, and peer/sync caches (suffixed
+`-gnosis`). Because of that, **every client command must also carry
+`-Pnetwork=gnosis`** so it talks to the right daemon:
+
+```bash
+./gradlew :app:run -Pnetwork=gnosis -Pargs=status
+./gradlew :app:run -Pnetwork=gnosis -Pargs=beacon-status      # SYNCING → CATCHING_UP → SYNCED
+./gradlew :app:run -Pnetwork=gnosis -Pargs=peers
+./gradlew :app:run -Pnetwork=gnosis -Pargs="get-account 0x<address>"
+./gradlew :app:run -Pnetwork=gnosis -Pargs=stop
+```
+
+To run Gnosis **alongside** mainnet on the same host, give it a separate port
+(mainnet keeps 30303) — the daemons are otherwise independent processes:
+
+```bash
+./gradlew :app:run -Pnetwork=gnosis -Pport=30304
+```
+
+> Note: verified-state queries (`get-account`/`get-storage`) require an active
+> EL peer that serves `snap/1`. Public Gnosis nodes are fewer and busier than
+> mainnet's, so the light client may reach `SYNCED` (beacon trust anchor ready)
+> before a snap-serving peer is held — retry once `peers` shows snap-capable
+> connections, or let the peer cache warm over runs.
+
 ### Stop the daemon
 
 ```bash
+# Mainnet
 ./gradlew :app:run -Pargs=stop
+
+# A specific network (e.g. Gnosis)
+./gradlew :app:run -Pnetwork=gnosis -Pargs=stop
 ```
 
 ## Query commands

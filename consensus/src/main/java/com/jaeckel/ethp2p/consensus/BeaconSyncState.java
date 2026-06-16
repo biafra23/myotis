@@ -256,15 +256,16 @@ public class BeaconSyncState {
      * and for clients deciding whether to issue verification queries.
      *
      * @param clGenesisTime CL genesis time (seconds since epoch) for the active network
+     * @param secondsPerSlot network slot time (mainnet 12, Gnosis 5) for wall-clock period estimation
      */
-    public State getSyncState(long clGenesisTime) {
+    public State getSyncState(long clGenesisTime, int secondsPerSlot) {
         if (!isSynced()) {
             return State.SYNCING;
         }
         if (getKnownStateRootCount() < FILL_THRESHOLD) {
             return State.CATCHING_UP;
         }
-        long wallPeriod = BeaconChainSpec.currentPeriod(clGenesisTime);
+        long wallPeriod = BeaconChainSpec.currentPeriod(clGenesisTime, secondsPerSlot);
         if (currentSyncCommitteePeriod < wallPeriod) {
             return State.CATCHING_UP;
         }
