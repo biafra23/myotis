@@ -159,6 +159,10 @@ public final class NodeService extends Service {
     private static final String K_SNAP_TARGET = "snapTarget";
     private static final String K_DEEP_POOL = "deepPoolThreshold";
     public static final int DEFAULT_RPC_PORT = 8545;
+    // Gnosis defaults to a distinct port so both networks can be added to MetaMask
+    // at once: MetaMask refuses to save two RPC endpoints that share the same URL
+    // (host:port), so mainnet and Gnosis must not collide on 8545.
+    public static final int DEFAULT_RPC_PORT_GNOSIS = 8546;
     public static final int DEFAULT_DEEP_POOL = 16;
 
     // Active config of the running node, set at boot so the UI can show what's live.
@@ -184,12 +188,30 @@ public final class NodeService extends Service {
     public static void setSelectedNetwork(android.content.Context c, String n) {
         prefs(c).edit().putString(K_NETWORK, n).apply();
     }
-    /** JSON-RPC server port (1024–65535, default 8545). */
+    /** Per-network default RPC port: Gnosis → 8546, every other chain → 8545. */
+    public static int defaultRpcPort(String network) {
+        return "gnosis".equals(network) ? DEFAULT_RPC_PORT_GNOSIS : DEFAULT_RPC_PORT;
+    }
+    // The RPC port is stored per network so mainnet and Gnosis keep independent
+    // ports — a single shared key would force the same URL on both, which is
+    // exactly what MetaMask rejects. Mainnet keeps the legacy key (no migration);
+    // other chains get a "<key>_<network>" suffix.
+    private static String rpcPortKey(String network) {
+        return "gnosis".equals(network) ? K_RPC_PORT + "_gnosis" : K_RPC_PORT;
+    }
+    /** JSON-RPC server port for {@code network} (1024–65535; default per {@link #defaultRpcPort}). */
+    public static int rpcPortFor(android.content.Context c, String network) {
+        int dflt = defaultRpcPort(network);
+        return clampInt(prefs(c).getInt(rpcPortKey(network), dflt), 1024, 65535, dflt);
+    }
+    /** JSON-RPC server port for the currently selected network. */
     public static int rpcPort(android.content.Context c) {
-        return clampInt(prefs(c).getInt(K_RPC_PORT, DEFAULT_RPC_PORT), 1024, 65535, DEFAULT_RPC_PORT);
+        return rpcPortFor(c, selectedNetwork(c));
     }
     public static void setRpcPort(android.content.Context c, int p) {
-        prefs(c).edit().putInt(K_RPC_PORT, clampInt(p, 1024, 65535, DEFAULT_RPC_PORT)).apply();
+        String net = selectedNetwork(c);
+        int dflt = defaultRpcPort(net);
+        prefs(c).edit().putInt(rpcPortKey(net), clampInt(p, 1024, 65535, dflt)).apply();
     }
     /** Node snap-peer target (1–128, default 32). */
     public static int snapTarget(android.content.Context c) {
@@ -1226,6 +1248,13 @@ public final class NodeService extends Service {
             localBlc.setBlobParameters(
                     network.activeBlobParamsEpoch(),
                     network.activeBlobParamsMaxBlobs());
+            // Apply the network's beacon preset (slot time / slots-per-epoch). Without
+            // this the light client falls back to the mainnet preset (12s slots), so on
+            // Gnosis (5s slots) the wall-clock period estimate lands ~2.4x too low. The
+            // catch-up loop then concludes "sync committee is current" and never walks
+            // the committee to head, leaving every finality update verified against a
+            // stale committee — permanent CATCHING_UP. Mirrors Main.java's daemon wiring.
+            localBlc.setBeaconPreset(network.secondsPerSlot(), network.slotsPerEpoch());
             // Seed peers proven to serve catch-up last session (with the period
             // they served) and persist new ones, so a cold start prefers the
             // peers that actually retained the checkpoint's light-client updates

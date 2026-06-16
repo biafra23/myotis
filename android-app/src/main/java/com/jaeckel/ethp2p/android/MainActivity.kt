@@ -52,6 +52,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -271,6 +273,7 @@ private fun NodeScreen(
     val online = rememberIsOnline()
     val context = LocalContext.current
     var showSettings by remember { mutableStateOf(false) }
+    val snackbarHostState = remember { SnackbarHostState() }
     // Readiness deep-pool threshold is configurable in Settings; seed from prefs and
     // update live when saved so ReadinessStrip reflects it without a restart.
     var deepPool by remember { mutableStateOf(NodeService.deepPoolThreshold(context)) }
@@ -387,6 +390,18 @@ private fun NodeScreen(
             onSwitchNetwork = { name ->
                 showSettings = false
                 onSwitchNetwork(name)
+                // Gnosis runs the JSON-RPC server on a distinct port (default 8546)
+                // because MetaMask won't save two RPC endpoints with the same URL.
+                // Surface it so the user knows which URL to point MetaMask at.
+                if (name == "gnosis") {
+                    val port = NodeService.rpcPortFor(context, "gnosis")
+                    queryScope.launch {
+                        snackbarHostState.showSnackbar(
+                            "Gnosis JSON-RPC is on port $port — add it to MetaMask as a " +
+                                "separate RPC URL (it can't reuse mainnet's).",
+                        )
+                    }
+                }
             },
             onApplyTunables = { port, snap, deep ->
                 deepPool = deep
@@ -398,6 +413,7 @@ private fun NodeScreen(
         return
     }
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
                 title = {
@@ -548,7 +564,7 @@ private fun SettingsScreen(
             OutlinedTextField(
                 value = rpcPort,
                 onValueChange = { rpcPort = it.filter(Char::isDigit).take(5) },
-                label = { Text("JSON-RPC port (default 8545)") },
+                label = { Text("JSON-RPC port (default ${NodeService.defaultRpcPort(selectedNet)})") },
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 modifier = Modifier.fillMaxWidth(),
