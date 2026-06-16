@@ -75,7 +75,7 @@ class GoldenSessionFixtureTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.rows = []
-        with open(SESSION) as f:
+        with open(SESSION, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
@@ -100,9 +100,14 @@ class GoldenSessionFixtureTests(unittest.TestCase):
 
     def test_exercises_the_non_gating_balance_checker_sweep(self):
         def is_sweep(req):
-            p = req.get("params") or [{}]
-            return req.get("method") == "eth_call" and isinstance(p[0], dict) \
+            p = req.get("params")
+            return (
+                req.get("method") == "eth_call"
+                and isinstance(p, list)
+                and len(p) > 0
+                and isinstance(p[0], dict)
                 and (p[0].get("to") or "").lower() == replay.BALANCE_CHECKER
+            )
         self.assertTrue(any(is_sweep(r["req"]) for r in self.rows),
                         "golden session should contain the BalanceChecker sweep (non-gating path)")
 
