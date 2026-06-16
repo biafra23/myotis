@@ -10,7 +10,7 @@
 
     <application
         android:name=".EthP2PApplication"
-        android:label="ethp2p"
+        android:label="Myotis"
         android:allowBackup="false"
         android:theme="@android:style/Theme.DeviceDefault.DayNight">
 
