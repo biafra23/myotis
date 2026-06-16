@@ -186,6 +186,8 @@ public final class ChainStack {
     public DiscV5Service discV5() { return discV5; }
     public BeaconSyncState beaconSyncState() { return beaconSyncState; }
     public BeaconLightClient beaconLightClient() { return beaconLightClient; }
+    /** The verified backend (for ENS resolution / verified reads), or null if RPC didn't start. */
+    public io.myotis.rpc.VerifiedRpcBackend rpcBackend() { return rpcBackend; }
     public Map<String, Long> backoff() { return backoff; }
     public Set<String> blacklistedNodeIds() { return blacklistedNodeIds; }
 
