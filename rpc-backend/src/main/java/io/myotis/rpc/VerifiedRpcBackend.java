@@ -424,7 +424,10 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
      *  found. {@code highScanned == Long.MIN_VALUE} means "never scanned". */
     private static final class TxScanState {
         long highScanned = Long.MIN_VALUE;
-        long lastTouchedMs;
+        // volatile: written under synchronized(st) in locateMinedTx but read under
+        // synchronized(txScanStates) in the warmer eviction tick without holding st's lock —
+        // volatile guarantees visibility and a non-torn 64-bit read across platforms.
+        volatile long lastTouchedMs;
         TxLocation found;
     }
 
@@ -1956,6 +1959,11 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             // verify → router error) when we don't.
             return headerAnchor() == null ? null : "null";
         } catch (Exception e) {
+            // Restore interrupt status if a wrapped Future.get() was interrupted, so
+            // cancellation propagates instead of being swallowed by the generic catch.
+            if (e instanceof InterruptedException || e.getCause() instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             log.info("[rpc] eth_getTransactionByHash failed: " + unwrap(e));
             return null;
         }
@@ -2219,6 +2227,9 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                     + h.number + " index " + loc.index());
             return buildReceiptJson(receipts, loc.index(), h, loc.blockHash(), want, loc.txBytes());
         } catch (Exception e) {
+            if (e instanceof InterruptedException || e.getCause() instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             log.info("[rpc] eth_getTransactionReceipt failed: " + unwrap(e));
             return null; // couldn't verify → router errors (not a misleading "pending")
         }
@@ -2233,10 +2244,17 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         // Decode the (block-verified) tx so the receipt can carry from / to / contractAddress /
         // effectiveGasPrice. Without these MetaMask won't reconcile the receipt with its pending
         // tx and leaves it stuck "pending/submitted" even though we verified its inclusion.
-        com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.DecodedTx tx =
-                rawTx != null
-                        ? com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.decode(Bytes.wrap(rawTx))
-                        : null;
+        // Decode defensively: rawTx is on-chain-verified, but a future/unknown tx type could
+        // make the decoder throw — fall back to null and emit a partial receipt (omitting the
+        // optional from/to/effectiveGasPrice fields) rather than failing the whole receipt.
+        com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.DecodedTx tx = null;
+        if (rawTx != null) {
+            try {
+                tx = com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.decode(Bytes.wrap(rawTx));
+            } catch (Exception decodeEx) {
+                tx = null;
+            }
+        }
         // Single pass over the preceding receipts: gasUsed needs receipt[idx-1]'s
         // cumulative, logIndex needs the running log count — decode each only once.
         long prevCum = 0L;
