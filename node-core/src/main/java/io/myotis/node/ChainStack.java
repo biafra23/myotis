@@ -251,6 +251,8 @@ public final class ChainStack {
     public io.myotis.rpc.VerifiedRpcBackend rpcBackend() { return rpcBackend; }
     public Map<String, Long> backoff() { return backoff; }
     public Set<String> blacklistedNodeIds() { return blacklistedNodeIds; }
+    /** Count of in-flight / recently-attempted dials (for host status snapshots). */
+    public int attemptedCount() { return attempted.size(); }
 
     // -------------------------------------------------------------------------
     // Construction helpers (faithful ports of Main.runDaemon)
