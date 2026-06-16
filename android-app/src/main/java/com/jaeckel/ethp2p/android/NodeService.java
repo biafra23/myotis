@@ -230,12 +230,19 @@ public final class NodeService extends Service {
         else startForegroundService(new Intent(this, NodeService.class));
     }
     private void restartWithCurrentSettings() {
+        // In-service restart: tear down on a worker but do NOT stopSelf()/stopForeground().
+        // Calling startForegroundService() from a background teardown can hit Android 12+
+        // background-start restrictions and flickers the notification; instead doShutdown()
+        // reboots startNode() in-process once teardown completes (service stays foreground).
         restartAfterShutdown = true;
-        shutdown(); // doShutdown() re-starts the service after teardown completes
+        RUNNING.set(false);
+        new Thread(this::doShutdown, "ethp2p-shutdown").start();
     }
     /** Cache file in getCacheDir(), suffixed by the active (non-mainnet) network so chains don't share state. */
     private java.io.File netCache(String base, String ext) {
-        String n = activeNetwork;
+        // While running use the booted network; when stopped fall back to the selected
+        // network so a clear-cache / reset-sync targets the right files (not mainnet's).
+        String n = RUNNING.get() ? activeNetwork : selectedNetwork(this);
         String suffix = (n == null || n.equals("mainnet")) ? "" : "-" + n;
         return new java.io.File(getCacheDir(), base + suffix + ext);
     }
@@ -1479,8 +1486,12 @@ public final class NodeService extends Service {
         LogBuffer.i(TAG, "node shutdown complete");
         if (restartAfterShutdown) {
             restartAfterShutdown = false;
-            LogBuffer.i(TAG, "restarting node to apply new settings (network/rpc port)");
-            startForegroundService(new Intent(this, NodeService.class));
+            LogBuffer.i(TAG, "restarting node in-service to apply new settings (network/rpc port)");
+            // In-service reboot: the foreground service stayed up, so just re-run startNode()
+            // — no startForegroundService (avoids Android 12+ background-start limits + notif flicker).
+            startTimeMs = System.currentTimeMillis();
+            RUNNING.set(true);
+            new Thread(this::startNode, "ethp2p-boot").start();
         }
     }
 
