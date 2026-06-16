@@ -38,3 +38,16 @@ Run it against a synced daemon before opening a PR that touches the RPC backend.
 A `-32000` failure means either a genuine regression OR the daemon is in a
 transient head-instability window — re-run; persistent failure on a healthy
 daemon is the regression signal.
+
+## Automated tests (CI)
+The full replay needs a live daemon, so it stays a manual check. The harness's
+*pure* logic — `latestify` (block→`latest`), `key` (dedup), `is_gating`
+(what MetaMask must have served) — and the golden fixture's contract are covered
+by stdlib `unittest` (no daemon, no pip), run in CI by `.github/workflows/mm-replay-tests.yml`:
+
+```bash
+python3 -m unittest discover -s tools/mm-replay -p 'test_*.py'
+```
+
+These guard against a silent change to the gating classification or fixture that
+would quietly weaken the manual replay gate.
