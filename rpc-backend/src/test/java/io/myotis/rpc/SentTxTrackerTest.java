@@ -26,7 +26,7 @@ class SentTxTrackerTest {
     @Test
     void firstSightingReportsLatencyThenStopsCounting() {
         SentTxTracker t = new SentTxTracker(TTL);
-        t.watch(H1, 1_000);
+        t.watch(H1, 1_000, -1L);
         assertTrue(t.watchingAny());
         assertFalse(t.wasSeen(H1));
         // first time the hash comes back: ms since broadcast.
@@ -40,8 +40,8 @@ class SentTxTrackerTest {
     @Test
     void watchesAreIndependentPerHash() {
         SentTxTracker t = new SentTxTracker(TTL);
-        t.watch(H1, 1_000);
-        t.watch(H2, 1_000);
+        t.watch(H1, 1_000, -1L);
+        t.watch(H2, 1_000, -1L);
         assertEquals(2, t.size());
         assertEquals(200, t.markSeen(H1, 1_200));
         // H2 never seen; an unrelated hash is still a miss.
@@ -55,16 +55,31 @@ class SentTxTrackerTest {
     @Test
     void confirmMinedStopsWatching() {
         SentTxTracker t = new SentTxTracker(TTL);
-        t.watch(H1, 1_000);
+        t.watch(H1, 1_000, -1L);
         t.confirmMined(H1);
         assertFalse(t.watchingAny());
         assertEquals(-1, t.markSeen(H1, 1_500));
     }
 
     @Test
+    void recordsBroadcastHeadAndPreservesItAcrossSighting() {
+        SentTxTracker t = new SentTxTracker(TTL);
+        // unknown hash -> -1
+        assertEquals(-1, t.broadcastHead(H1));
+        t.watch(H1, 1_000, 46_726_900L);
+        assertEquals(46_726_900L, t.broadcastHead(H1));
+        // a gossip sighting must not clobber the recorded broadcast head.
+        t.markSeen(H1, 1_500);
+        assertEquals(46_726_900L, t.broadcastHead(H1));
+        // a tx watched without a known head reports -1.
+        t.watch(H2, 1_000, -1L);
+        assertEquals(-1, t.broadcastHead(H2));
+    }
+
+    @Test
     void ttlEvictionClearsStaleWatchesAndQuietsTheGuard() {
         SentTxTracker t = new SentTxTracker(TTL);
-        t.watch(H1, 1_000);
+        t.watch(H1, 1_000, -1L);
         // within TTL: nothing evicted, still watching.
         assertEquals(0, t.evictExpired(1_000 + TTL));
         assertTrue(t.watchingAny());

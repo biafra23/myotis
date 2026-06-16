@@ -1838,8 +1838,12 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             byte[] txHash = Hash.keccak256(Bytes.wrap(rawTx)).toArrayUnsafe();
             sentTxCache.put(Bytes.wrap(txHash).toHexString(), rawTx.clone());
             recordPendingNonce(rawTx);
-            // Watch for this hash to come back over gossip (propagation confirmation).
-            sentTxWatch.watch(Bytes32.wrap(txHash), clock.elapsedMillis());
+            // Watch for this hash to come back over gossip (propagation confirmation), and record
+            // the head block at broadcast so a late receipt poll can deep-scan back to where the
+            // tx could first have been mined (see locateMinedTx) instead of only the recent window.
+            Long broadcastHead = headBlockNumber();
+            sentTxWatch.watch(Bytes32.wrap(txHash), clock.elapsedMillis(),
+                    broadcastHead != null ? broadcastHead : -1L);
             log.info("[rpc] eth_sendRawTransaction broadcast to " + sent
                     + " peer(s), hash=" + Bytes.wrap(txHash).toHexString());
             return txHash;
@@ -2008,6 +2012,15 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             long from = (st.highScanned == Long.MIN_VALUE)
                     ? head - RECEIPT_INITIAL_LOOKBACK_BLOCKS + 1
                     : st.highScanned + 1;
+            // For our OWN sent txs, the first scan reaches back to the head block recorded at
+            // broadcast — otherwise the forward-only window misses a tx mined >INITIAL_LOOKBACK
+            // blocks before the first SUCCESSFUL poll (e.g. peers were flaky for a minute, then
+            // the tx's block already scrolled out of the small window). Bounded by capFloor below;
+            // the sent-tx watch TTL keeps the broadcast head recent (well within the cap).
+            if (st.highScanned == Long.MIN_VALUE) {
+                long bcHead = sentTxWatch.broadcastHead(want);
+                if (bcHead >= 0 && bcHead < from) from = bcHead;
+            }
             // Cap catch-up after a gap; blocks below this are skipped (better than the old
             // 8-block ceiling, and the tx is usually long-confirmed by then anyway).
             long capFloor = head - RECEIPT_MAX_SCAN_BLOCKS_PER_POLL + 1;
