@@ -251,6 +251,22 @@ public final class ChainStack {
     public io.myotis.rpc.VerifiedRpcBackend rpcBackend() { return rpcBackend; }
     public Map<String, Long> backoff() { return backoff; }
     public Set<String> blacklistedNodeIds() { return blacklistedNodeIds; }
+    /** Count of in-flight / recently-attempted dials (for host status snapshots). */
+    public int attemptedCount() { return attempted.size(); }
+
+    /**
+     * Active (non-expired) dial-backoff entries, pruning expired ones as a side effect.
+     * The per-peer dial paths only drop a backoff entry when that peer is re-encountered, so a
+     * peer never seen again would leak its entry forever — over long uptimes the map would grow
+     * without bound and inflate the reported count. Hosts that surface this stat (e.g. a UI
+     * polling {@code snapshot()}) call this so the map is swept on the same cadence. {@code backoff}
+     * stores each entry's expiry timestamp, so an entry is active iff its expiry is still in the future.
+     */
+    public int pruneAndCountActiveBackoff() {
+        long now = System.currentTimeMillis();
+        backoff.values().removeIf(expiry -> expiry <= now);
+        return backoff.size();
+    }
 
     // -------------------------------------------------------------------------
     // Construction helpers (faithful ports of Main.runDaemon)
