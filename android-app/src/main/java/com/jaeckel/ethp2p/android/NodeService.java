@@ -195,16 +195,20 @@ public final class NodeService extends Service {
     public static String primaryNetwork(android.content.Context c) {
         return enabledNetworks(c).get(0);
     }
-    /** Per-network default RPC port: Gnosis → 8546, every other chain → 8545. */
+    /** Per-network default RPC port — delegate to {@link NetworkConfig#defaultRpcPort()} so the
+     *  defaults stay collision-free and consistent with {@code ChainPorts.defaultsFor()} (mainnet
+     *  8545, Gnosis 8546, Sepolia 8547). A NodeService-local table would silently put Sepolia on
+     *  8545 and collide with mainnet's RPC bind when both run. */
     public static int defaultRpcPort(String network) {
-        return "gnosis".equals(network) ? DEFAULT_RPC_PORT_GNOSIS : DEFAULT_RPC_PORT;
+        return NetworkConfig.byName(canonicalNetwork(network)).defaultRpcPort();
     }
-    // The RPC port is stored per network so mainnet and Gnosis keep independent
-    // ports — a single shared key would force the same URL on both, which is
-    // exactly what MetaMask rejects. Mainnet keeps the legacy key (no migration);
-    // other chains get a "<key>_<network>" suffix.
+    // The RPC port is stored per network so each chain keeps an independent port — a shared key
+    // would force the same URL on multiple chains, which MetaMask rejects and which collides on
+    // bind when they run concurrently. Mainnet keeps the legacy key (no migration); EVERY other
+    // chain gets a "<key>_<network>" suffix (not just Gnosis — Sepolia must not share mainnet's).
     private static String rpcPortKey(String network) {
-        return "gnosis".equals(network) ? K_RPC_PORT + "_gnosis" : K_RPC_PORT;
+        String n = canonicalNetwork(network);
+        return n.equals("mainnet") ? K_RPC_PORT : K_RPC_PORT + "_" + n;
     }
     /** JSON-RPC server port for {@code network} (1024–65535; default per {@link #defaultRpcPort}). */
     public static int rpcPortFor(android.content.Context c, String network) {
@@ -278,7 +282,9 @@ public final class NodeService extends Service {
         io.myotis.node.ChainStack s = stacks.get(n);
         forgetStack(n);
         new Thread(() -> {
-            if (s != null) { try { s.shutdown(); } catch (Throwable ignored) {} }
+            synchronized (bootLock(n)) {
+                if (s != null) { try { s.shutdown(); } catch (Throwable ignored) {} }
+            }
             stopIfNoStacksLeft();
         }, "ethp2p-disable-" + n).start();
     }
@@ -292,9 +298,15 @@ public final class NodeService extends Service {
         String n = canonicalNetwork(name);
         if (!RUNNING.get()) return;
         io.myotis.node.ChainStack old = stacks.remove(n);
+        // Only reboot a chain that's actually live. If it isn't (disabled / not yet built), do
+        // nothing — the new port is already persisted and applies on the next enable. Without this,
+        // saving settings would start a chain the user has turned off.
+        if (old == null) return;
         new Thread(() -> {
-            if (old != null) { try { old.shutdown(); } catch (Throwable ignored) {} }
-            buildAndStart(n);
+            synchronized (bootLock(n)) {
+                try { old.shutdown(); } catch (Throwable ignored) {}
+            }
+            buildAndStart(n);   // re-acquires bootLock(n) for its start() — frees ports first
         }, "ethp2p-reboot-" + n).start();
     }
 
@@ -307,9 +319,22 @@ public final class NodeService extends Service {
         clCaches.remove(n);
     }
 
-    /** Stop the whole foreground service once the last stack is gone. */
+    /** True if any network is still enabled (incl. the seeded default). */
+    private boolean anyNetworkEnabled() {
+        for (NetworkConfig nc : NetworkConfig.allNetworks()) {
+            if (isNetworkEnabled(this, nc.name())) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Stop the whole foreground service once the last stack is gone AND no network is still
+     * enabled — i.e. the user disabled the last chain. The enabled-set guard matters because a
+     * boot-bail can see the map transiently empty while other enabled chains are still spinning
+     * up; without it, disabling one chain mid-boot could wrongly stop the whole service.
+     */
     private void stopIfNoStacksLeft() {
-        if (stacks.isEmpty() && RUNNING.compareAndSet(true, false)) {
+        if (stacks.isEmpty() && !anyNetworkEnabled() && RUNNING.compareAndSet(true, false)) {
             LogBuffer.i(TAG, "no networks left enabled; stopping service");
             stopForeground(STOP_FOREGROUND_REMOVE);
             stopSelf();
@@ -339,6 +364,15 @@ public final class NodeService extends Service {
     // "Clear caches" can wipe the in-memory + on-disk cache of a running chain. Removed on shutdown.
     private final Map<String, AndroidPeerCache> elCaches = new ConcurrentHashMap<>();
     private final Map<String, AndroidCLPeerCache> clCaches = new ConcurrentHashMap<>();
+    // Per-network lifecycle lock: a network's start() and shutdown() (across DIFFERENT ChainStack
+    // instances) serialize on this, so a fast Stop→Start or disable→enable of the same chain has
+    // the new instance's start() wait for the old instance's shutdown() to free its ports instead
+    // of racing into a BindException. (Per-instance synchronization inside ChainStack can't cover
+    // two different instances — this is the cross-instance equivalent of the old single bootLock.)
+    private final Map<String, Object> bootLocks = new ConcurrentHashMap<>();
+    private Object bootLock(String network) {
+        return bootLocks.computeIfAbsent(canonicalNetwork(network), k -> new Object());
+    }
 
     // Service-global uptime stamp (the whole service, not a single chain). Owned by the
     // next start; never cleared in doShutdown — see the PR #82 note there.
@@ -926,31 +960,36 @@ public final class NodeService extends Service {
             // Android supplies the active network's DNS servers for EIP-1459 resolution.
             s.configureSnapMaintainer(snapTarget(this), this::activeNetworkDnsServers);
             // Publish into the registry before start() so a concurrent shutdown()/disable can
-            // find and tear it down; ChainStack's own synchronized start/shutdown handles the race.
+            // find and tear it down.
             stacks.put(n, s);
 
-            if (!RUNNING.get()) {            // a Stop raced in while we were constructing
-                LogBuffer.i(TAG, "[" + n + "] shutdown raced boot; tearing down constructed stack");
-                forgetStack(n);
-                s.shutdown();
-                return;
-            }
-            boolean started = s.start();
-            if (!started) {
-                LogBuffer.e(TAG, "[" + n + "] node stack failed to start");
-                forgetStack(n);
-                stopIfNoStacksLeft();
-                return;
-            }
-            // A whole-service Stop (shutdown()/onDestroy sets RUNNING=false then iterates stacks)
-            // could have run between the pre-start RUNNING check and here, and may have missed
-            // this entry if our stacks.put() landed after its iteration snapshot. Re-check and
-            // tear down so a Stop can never leave a started stack orphaned.
-            if (!RUNNING.get()) {
-                LogBuffer.i(TAG, "[" + n + "] shutdown raced start; tearing down");
-                forgetStack(n);
-                s.shutdown();
-                return;
+            // Serialize start() against this network's teardown (bootLock) so a Stop→Start /
+            // disable→enable has this new instance's start() wait for the old instance's
+            // shutdown() to free the ports. A whole-service Stop (RUNNING=false) or a per-network
+            // disableNetwork(n) (sets enabled_<n>=false before tearing down) could race this boot,
+            // so bail if either says the chain is no longer wanted — re-checked after start() too,
+            // since start() blocks and the race window spans it.
+            synchronized (bootLock(n)) {
+                if (!RUNNING.get() || !isNetworkEnabled(this, n)) {
+                    LogBuffer.i(TAG, "[" + n + "] stop/disable raced boot; tearing down constructed stack");
+                    forgetStack(n);
+                    s.shutdown();
+                    stopIfNoStacksLeft();
+                    return;
+                }
+                if (!s.start()) {
+                    LogBuffer.e(TAG, "[" + n + "] node stack failed to start");
+                    forgetStack(n);
+                    stopIfNoStacksLeft();
+                    return;
+                }
+                if (!RUNNING.get() || !isNetworkEnabled(this, n)) {
+                    LogBuffer.i(TAG, "[" + n + "] stop/disable raced start; tearing down");
+                    forgetStack(n);
+                    s.shutdown();
+                    stopIfNoStacksLeft();
+                    return;
+                }
             }
             LogBuffer.i(TAG, "[" + n + "] node stack started (EL " + ports.elPort()
                     + ", RPC " + ports.rpcPort() + ")");
@@ -986,9 +1025,12 @@ public final class NodeService extends Service {
     }
 
     /**
-     * Worker-thread close chain for a whole-service Stop. Synchronized so it serializes
-     * against {@link #buildAndStart}: a fast Stop → Start blocks boot until each stack's
-     * ports are released, instead of failing with bind-in-use. Tears down every live stack.
+     * Worker-thread close chain for a whole-service Stop: tears down every live stack. The
+     * {@code synchronized} keeps two whole-service teardowns from overlapping; the cross-instance
+     * Stop→Start port race is handled per network by {@link #bootLock} (held around each stack's
+     * shutdown() here and around the new instance's start() in {@link #buildAndStart}), so a fast
+     * Stop→Start blocks the new boot until the old stack's ports are released instead of failing
+     * with bind-in-use.
      */
     private synchronized void doShutdown() {
         // Shut down and drop every stack. Each ChainStack owns its own close order
@@ -996,7 +1038,11 @@ public final class NodeService extends Service {
         // serializes start()/shutdown() internally, so the next start() of the same
         // chain waits for its ports to free.
         for (Map.Entry<String, io.myotis.node.ChainStack> e : stacks.entrySet()) {
-            try { e.getValue().shutdown(); } catch (Throwable ignored) {}
+            // Hold the per-network lock so a racing buildAndStart for the same chain can't start a
+            // new instance while we're tearing the old one down (would race for the same ports).
+            synchronized (bootLock(e.getKey())) {
+                try { e.getValue().shutdown(); } catch (Throwable ignored) {}
+            }
         }
         stacks.clear();
         cachedElCounts.clear();
