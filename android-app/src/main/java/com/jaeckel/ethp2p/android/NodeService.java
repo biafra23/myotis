@@ -1146,7 +1146,10 @@ public final class NodeService extends Service {
     private Snapshot snapshotOf(String network, io.myotis.node.ChainStack s) {
         boolean running = RUNNING.get();
         int attemptedN = s.attemptedCount();
-        int backoffN = s.backoff().size();
+        // Active backoff count, pruning expired entries as we go — backoff().size() alone would
+        // count stale (expired) entries and let the map grow unbounded over long uptimes, since
+        // the dial path only drops an entry when that peer is re-encountered.
+        int backoffN = s.pruneAndCountActiveBackoff();
         int blacklistedN = s.blacklistedNodeIds().size();
         DiscV5Service discV5 = s.discV5();
         int discv5Live = discV5 != null ? discV5.liveNodeCount() : 0;
@@ -1236,8 +1239,8 @@ public final class NodeService extends Service {
         LogBuffer.i(TAG, "Stopping node (onDestroy)");
         // Same fire-and-forget pattern as shutdown(): the system gives us a
         // brief window to return from onDestroy and we don't want to spend
-        // it blocking on libp2p host shutdown / Netty graceful drain. The
-        // worker holds the same lock as startAndPublish, so a subsequent
+        // it blocking on libp2p host shutdown / Netty graceful drain. doShutdown()
+        // tears every stack down under each network's bootLock, so a subsequent
         // service start can't race with a half-finished close.
         RUNNING.set(false);
         ccipPool.shutdownNow();
