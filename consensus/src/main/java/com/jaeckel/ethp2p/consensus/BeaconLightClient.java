@@ -730,6 +730,14 @@ public class BeaconLightClient implements AutoCloseable {
                 log.info("[beacon] Discovered {} new CL peer(s) from beacon API (total: {})",
                         added, clPeerMultiaddrs.size());
             }
+        } catch (LinkageError e) {
+            // java.net.http is absent on Android (not desugared, unavailable below API 33 and
+            // not shipped at all on the Android runtime). This local-beacon-API peer discovery
+            // is a JVM-only *debug* aid — the real, trust-minimised peer discovery is libp2p/
+            // discv5 — so degrade gracefully instead of crashing the sync thread. NoClassDefFound
+            // is an Error, not an Exception, which is why it slipped past the catch below before.
+            log.debug("[beacon] Beacon API peer discovery unavailable on this runtime "
+                    + "(java.net.http absent — Android); using libp2p/discv5 discovery: {}", e.getMessage());
         } catch (Exception e) {
             log.debug("[beacon] Beacon API peer discovery failed: {}", e.getMessage());
         }
