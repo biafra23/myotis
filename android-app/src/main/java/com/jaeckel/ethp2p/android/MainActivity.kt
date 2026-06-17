@@ -441,9 +441,22 @@ private fun NodeScreen(
         topBar = {
             TopAppBar(
                 title = {
-                    val net = (currentSnapshot?.network ?: selectedChain ?: "Myotis")
-                        .replaceFirstChar { it.uppercase() }
-                    Text("Myotis · $net")
+                    // App name + network selector on one line. The highlighted chip is the
+                    // selected chain (drives Status + Query), so there's no separate "· <network>"
+                    // text or chip row beneath — the chip is the only place the network is shown.
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text("Myotis")
+                        snapshots.keys.forEach { c ->
+                            FilterChip(
+                                selected = c == selectedChain,
+                                onClick = { selectedChain = c },
+                                label = { Text(c.replaceFirstChar { it.uppercase() }) },
+                            )
+                        }
+                    }
                 },
                 actions = {
                     IconButton(onClick = { showSettings = true }) {
@@ -454,15 +467,6 @@ private fun NodeScreen(
         },
     ) { padding ->
       Column(Modifier.fillMaxSize().padding(padding)) {
-        // Chain selector: one chip per live network (Step 9). Drives Status + Query. Only shown
-        // when more than one chain is live — a single chain needs no selector.
-        if (snapshots.size > 1) {
-            ChainSelector(
-                chains = snapshots.keys.toList(),
-                selected = selectedChain,
-                onSelect = { selectedChain = it },
-            )
-        }
         // App-wide sync banner above the tabs: indeterminate while bootstrapping,
         // determinate as the light client catches up sync-committee periods, gone
         // once SYNCED.
@@ -528,29 +532,6 @@ private fun NodeScreen(
             )
         }
       }
-    }
-}
-
-/**
- * One per-network chip; tap to view that chain's Status/Query. Only shown when more than one
- * chain is live.
- */
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun ChainSelector(chains: List<String>, selected: String?, onSelect: (String) -> Unit) {
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 8.dp, vertical = 4.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        chains.forEach { c ->
-            FilterChip(
-                selected = c == selected,
-                onClick = { onSelect(c) },
-                label = { Text(c.replaceFirstChar { it.uppercase() }) },
-            )
-        }
     }
 }
 

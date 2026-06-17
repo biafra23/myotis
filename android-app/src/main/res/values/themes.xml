@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      The UI is Compose and draws its own Material3 TopAppBar ("Myotis" + the network chips).
+      The platform DayNight theme ships a native ActionBar, which rendered the app label
+      ("Myotis") as a redundant second bar above the Compose one. Disable it so the top is a
+      single bar. We keep the DeviceDefault.DayNight baseline only for the window / system-bar
+      colours; all in-app styling comes from MaterialTheme in Compose.
+    -->
+    <style name="Theme.Myotis" parent="@android:style/Theme.DeviceDefault.DayNight">
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+    </style>
+</resources>
