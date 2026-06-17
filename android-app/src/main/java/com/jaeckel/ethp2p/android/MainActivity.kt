@@ -48,6 +48,8 @@ import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.RadioButton
@@ -66,6 +68,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -82,6 +85,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jaeckel.ethp2p.android.log.LogBuffer
+import com.jaeckel.ethp2p.networking.NetworkConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -131,7 +135,7 @@ class MainActivity : ComponentActivity() {
                         onOpenNetworkSettings = ::openWifiSettings,
                         onClearCaches = ::clearPeerCaches,
                         onResetSync = ::resetSyncState,
-                        onSwitchNetwork = ::switchNetwork,
+                        onEnableNetwork = ::setNetworkEnabled,
                         onApplyTunables = ::applyTunables,
                     )
                 }
@@ -216,35 +220,41 @@ class MainActivity : ComponentActivity() {
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
 
-    private fun clearPeerCaches() {
-        boundServiceState.value?.clearCaches()
+    private fun clearPeerCaches(network: String) {
+        boundServiceState.value?.clearCaches(network)
     }
 
-    private fun resetSyncState() {
-        boundServiceState.value?.resetSyncState()
+    private fun resetSyncState(network: String) {
+        boundServiceState.value?.resetSyncState(network)
     }
 
-    /** Switch the active chain. Persists + restarts the node on the new network. */
-    private fun switchNetwork(name: String) {
+    /**
+     * Enable or disable a network (Step 9). Each network runs as its own concurrent stack.
+     * When the service isn't bound yet, persist the flag and start the service (which boots
+     * the whole enabled-set); otherwise toggle just that stack.
+     */
+    private fun setNetworkEnabled(name: String, on: Boolean) {
         val svc = boundServiceState.value
-        if (svc != null) {
-            svc.switchNetwork(name)
+        if (on) {
+            if (svc != null) svc.enableNetwork(name)
+            else { NodeService.setNetworkEnabled(this, name, true); startNodeService() }
         } else {
-            NodeService.setSelectedNetwork(this, name)
-            startNodeService()
+            if (svc != null) svc.disableNetwork(name)
+            else NodeService.setNetworkEnabled(this, name, false)
         }
     }
 
-    /** Persist RPC port + snap-peer knobs. RPC-port change restarts; snap target applies live. */
-    private fun applyTunables(rpcPort: Int, snapTarget: Int, deepPool: Int) {
-        val oldPort = NodeService.rpcPort(this)
-        NodeService.setRpcPort(this, rpcPort)
-        val newPort = NodeService.rpcPort(this)
+    /** Persist a network's RPC port + the shared snap-peer knobs. An RPC-port change reboots
+     *  only that network's stack; snap target applies live to all stacks. */
+    private fun applyTunables(network: String, rpcPort: Int, snapTarget: Int, deepPool: Int) {
+        val oldPort = NodeService.rpcPortFor(this, network)
+        NodeService.setRpcPort(this, network, rpcPort)
+        val newPort = NodeService.rpcPortFor(this, network)
         NodeService.setDeepPoolThreshold(this, deepPool)
         val svc = boundServiceState.value
         if (svc != null) {
-            svc.setTargetSnapPeers(snapTarget)          // live update + persists
-            if (newPort != oldPort) svc.restartNode()   // rebind the RPC server
+            svc.setTargetSnapPeers(snapTarget)               // live update + persists
+            if (newPort != oldPort) svc.rebootNetwork(network)  // rebind only this RPC server
         } else {
             NodeService.setSnapTargetPref(this, snapTarget)
         }
@@ -257,15 +267,16 @@ private fun NodeScreen(
     serviceProvider: () -> NodeService?,
     onToggle: () -> Unit,
     onOpenNetworkSettings: () -> Unit,
-    onClearCaches: () -> Unit,
-    onResetSync: () -> Unit,
-    onSwitchNetwork: (String) -> Unit,
-    onApplyTunables: (Int, Int, Int) -> Unit,
+    onClearCaches: (String) -> Unit,
+    onResetSync: (String) -> Unit,
+    onEnableNetwork: (String, Boolean) -> Unit,
+    onApplyTunables: (String, Int, Int, Int) -> Unit,
 ) {
-    // Snapshot + uptime tick are owned by the parent so both tabs can read
-    // them — the Query tab needs `beaconState` to decide whether to warn the
-    // user that responses can't be cryptographically verified yet.
-    var snapshot by remember { mutableStateOf<NodeService.Snapshot?>(null) }
+    // Per-network snapshots (Step 9): one stack per chain runs concurrently; the UI views one
+    // at a time via the chip selector. `selectedChain` is the chip in focus and drives Status +
+    // Query; null until the first poll lands. The uptime tick is owned here so both tabs read it.
+    var snapshots by remember { mutableStateOf<Map<String, NodeService.Snapshot>>(emptyMap()) }
+    var selectedChain by rememberSaveable { mutableStateOf<String?>(null) }
     var running by remember { mutableStateOf(NodeService.isRunning()) }
     var now by remember { mutableStateOf(System.currentTimeMillis()) }
     var selectedTab by remember { mutableStateOf(0) }
@@ -312,6 +323,11 @@ private fun NodeScreen(
             queryState = QueryState.Failure("Service not bound")
             return
         }
+        val chain = selectedChain ?: NodeService.primaryNetwork(context)
+        // ENS only exists on mainnet/Sepolia — on a chain without it (Gnosis) we never run
+        // ENS resolution; a typed name is rejected with a hint (the UI also labels the field
+        // "Address" there). Plain address balance/account queries work on every chain.
+        val ensCapable = NetworkConfig.byName(chain).hasEns()
         val q = raw.trim()
         if (q.isEmpty()) return
         queryInput = q
@@ -323,7 +339,11 @@ private fun NodeScreen(
             // address shows immediately, then the verified account fills in.
             val outcome: QueryState = try {
                 if (NodeService.looksLikeEnsName(q)) {
-                    val res = withContext(Dispatchers.IO) { svc.resolveEns(q).await() }
+                    if (!ensCapable) {
+                        QueryState.Failure(
+                            "ENS isn't available on ${chain.replaceFirstChar { it.uppercase() }} — enter a 0x address.")
+                    } else {
+                    val res = withContext(Dispatchers.IO) { svc.resolveEns(chain, q).await() }
                     if (res.error != null || res.addressHex == null) {
                         QueryState.Failure("ENS: ${res.error ?: "name does not resolve"}")
                     } else {
@@ -332,15 +352,16 @@ private fun NodeScreen(
                         queryState = QueryState.ResolvedPendingAccount(res)
                         try {
                             QueryState.Success(
-                                withContext(Dispatchers.IO) { svc.requestAccount(res.addressHex).await() }, res)
+                                withContext(Dispatchers.IO) { svc.requestAccount(chain, res.addressHex).await() }, res)
                         } catch (t: Throwable) {
                             QueryState.ResolvedAccountFailed(
                                 res, t.cause?.message ?: t.message ?: t::class.java.simpleName)
                         }
                     }
+                    }
                 } else {
                     QueryState.Success(
-                        withContext(Dispatchers.IO) { svc.requestAccount(q).await() }, null)
+                        withContext(Dispatchers.IO) { svc.requestAccount(chain, q).await() }, null)
                 }
             } catch (t: Throwable) {
                 QueryState.Failure(t.cause?.message ?: t.message ?: t::class.java.simpleName)
@@ -365,17 +386,24 @@ private fun NodeScreen(
 
     LaunchedEffect(Unit) {
         while (isActive) {
-            // snapshot() walks the connector's active handler list, sorts
-            // ready peers, and prunes the backoff map. Cheap on a phone but
-            // not free — keep it off the main thread so a pause inside the
-            // sort or a brief lock contention with Netty's READY transitions
+            // snapshots() walks each stack's active handler list, sorts ready peers, and reads
+            // the backoff map. Cheap on a phone but not free — keep it off the main thread so a
+            // pause inside the sort or brief lock contention with Netty's READY transitions
             // can't blow the frame budget.
-            val s = withContext(Dispatchers.Default) { serviceProvider()?.snapshot() }
+            val s = withContext(Dispatchers.Default) {
+                serviceProvider()?.snapshots() ?: emptyMap()
+            }
             running = NodeService.isRunning()
-            snapshot = s
+            snapshots = s
+            // Keep the selected chip valid: default to the first live network, and reset if the
+            // selected one went away (e.g. the user disabled it in Settings).
+            if (selectedChain == null || selectedChain !in s.keys) {
+                selectedChain = s.keys.firstOrNull()
+            }
             delay(2000)
         }
     }
+    val currentSnapshot = selectedChain?.let { snapshots[it] }
     LaunchedEffect(Unit) {
         while (isActive) {
             now = System.currentTimeMillis()
@@ -385,14 +413,11 @@ private fun NodeScreen(
 
     if (showSettings) {
         SettingsScreen(
-            activeNetwork = snapshot?.network ?: NodeService.selectedNetwork(context),
-            onSwitchNetwork = { name ->
-                showSettings = false
-                onSwitchNetwork(name)
-                // Gnosis runs the JSON-RPC server on a distinct port (default 8546)
-                // because MetaMask won't save two RPC endpoints with the same URL.
-                // Surface it so the user knows which URL to point MetaMask at.
-                if (name == "gnosis") {
+            onEnableNetwork = { name, on ->
+                onEnableNetwork(name, on)
+                // Gnosis runs the JSON-RPC server on a distinct port (default 8546) because
+                // MetaMask won't save two RPC endpoints with the same URL. Surface it on enable.
+                if (on && name == "gnosis") {
                     val port = NodeService.rpcPortFor(context, "gnosis")
                     queryScope.launch {
                         snackbarHostState.showSnackbar(
@@ -402,9 +427,9 @@ private fun NodeScreen(
                     }
                 }
             },
-            onApplyTunables = { port, snap, deep ->
+            onApplyTunables = { network, port, snap, deep ->
                 deepPool = deep
-                onApplyTunables(port, snap, deep)
+                onApplyTunables(network, port, snap, deep)
                 showSettings = false
             },
             onBack = { showSettings = false },
@@ -416,7 +441,7 @@ private fun NodeScreen(
         topBar = {
             TopAppBar(
                 title = {
-                    val net = (snapshot?.network ?: NodeService.selectedNetwork(context))
+                    val net = (currentSnapshot?.network ?: selectedChain ?: "Myotis")
                         .replaceFirstChar { it.uppercase() }
                     Text("Myotis · $net")
                 },
@@ -429,15 +454,24 @@ private fun NodeScreen(
         },
     ) { padding ->
       Column(Modifier.fillMaxSize().padding(padding)) {
+        // Chain selector: one chip per live network (Step 9). Drives Status + Query. Only shown
+        // when more than one chain is live — a single chain needs no selector.
+        if (snapshots.size > 1) {
+            ChainSelector(
+                chains = snapshots.keys.toList(),
+                selected = selectedChain,
+                onSelect = { selectedChain = it },
+            )
+        }
         // App-wide sync banner above the tabs: indeterminate while bootstrapping,
         // determinate as the light client catches up sync-committee periods, gone
         // once SYNCED.
-        SyncProgressBar(snapshot)
+        SyncProgressBar(currentSnapshot)
         // Readiness traffic-light: a thin strip atop the tabs. red = consensus not
         // synced; amber = synced but no warm verified head yet (wallet calls will
         // error -32000); green = warmed up, safe to transact. The deep-pool gate
         // (bright/thick green) uses the configurable threshold from Settings.
-        ReadinessStrip(snapshot, deepPool)
+        ReadinessStrip(currentSnapshot, deepPool)
         TabRow(selectedTabIndex = selectedTab) {
             Tab(
                 selected = selectedTab == 0,
@@ -455,20 +489,22 @@ private fun NodeScreen(
                 text = { Text("Logs") }
             )
         }
+        val chainForActions = selectedChain ?: NodeService.primaryNetwork(context)
         when (selectedTab) {
             0 -> StatusTab(
-                snapshot = snapshot,
+                snapshot = currentSnapshot,
                 running = running,
                 now = now,
                 online = online,
                 serviceProvider = serviceProvider,
                 onToggle = onToggle,
                 onOpenNetworkSettings = onOpenNetworkSettings,
-                onClearCaches = onClearCaches,
-                onResetSync = onResetSync,
+                onClearCaches = { onClearCaches(chainForActions) },
+                onResetSync = { onResetSync(chainForActions) },
             )
             1 -> QueryTab(
-                snapshot = snapshot,
+                snapshot = currentSnapshot,
+                chain = chainForActions,
                 running = running,
                 input = queryInput,
                 onInputChange = { queryInput = it },
@@ -486,6 +522,7 @@ private fun NodeScreen(
                 },
             )
             else -> LogsTab(
+                chains = snapshots.keys.toList(),
                 filter = logsFilter,
                 onFilterChange = { logsFilter = it },
             )
@@ -495,20 +532,53 @@ private fun NodeScreen(
 }
 
 /**
- * Settings page: switch the active chain (restarts the node) and tune the RPC
- * port + snap-peer knobs. Reached from the top-bar gear.
+ * One per-network chip; tap to view that chain's Status/Query. Only shown when more than one
+ * chain is live.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ChainSelector(chains: List<String>, selected: String?, onSelect: (String) -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        chains.forEach { c ->
+            FilterChip(
+                selected = c == selected,
+                onClick = { onSelect(c) },
+                label = { Text(c.replaceFirstChar { it.uppercase() }) },
+            )
+        }
+    }
+}
+
+/**
+ * Settings page: enable/disable each network (Step 9 — chains run concurrently) and tune the
+ * per-network RPC port + the shared snap-peer knobs. Reached from the top-bar gear.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SettingsScreen(
-    activeNetwork: String,
-    onSwitchNetwork: (String) -> Unit,
-    onApplyTunables: (Int, Int, Int) -> Unit,   // rpcPort, snapTarget, deepPoolThreshold
+    onEnableNetwork: (String, Boolean) -> Unit,
+    onApplyTunables: (String, Int, Int, Int) -> Unit,   // network, rpcPort, snapTarget, deepPool
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
-    var selectedNet by remember { mutableStateOf(NodeService.selectedNetwork(context)) }
-    var rpcPort by remember { mutableStateOf(NodeService.rpcPort(context).toString()) }
+    val networks = remember { NetworkConfig.allNetworks() }
+    // Per-network enabled toggle + RPC-port text, seeded from prefs. Toggling a switch acts
+    // immediately (boots/stops that chain's stack); the RPC port is deferred to Save.
+    val enabled = remember {
+        mutableStateMapOf<String, Boolean>().apply {
+            networks.forEach { put(it.name(), NodeService.isNetworkEnabled(context, it.name())) }
+        }
+    }
+    val rpcPorts = remember {
+        mutableStateMapOf<String, String>().apply {
+            networks.forEach { put(it.name(), NodeService.rpcPortFor(context, it.name()).toString()) }
+        }
+    }
     var snapTarget by remember { mutableStateOf(NodeService.snapTarget(context).toString()) }
     var deepPool by remember { mutableStateOf(NodeService.deepPoolThreshold(context).toString()) }
 
@@ -531,43 +601,41 @@ private fun SettingsScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Text("Network", style = MaterialTheme.typography.titleMedium)
+            Text("Networks", style = MaterialTheme.typography.titleMedium)
             Text(
-                "Active chain: ${activeNetwork.replaceFirstChar { it.uppercase() }}. " +
-                    "Switching restarts the node and re-syncs on the new chain.",
+                "Toggle a chain to run it. Each enabled chain runs concurrently as its own node " +
+                    "with its own JSON-RPC port — add each port to MetaMask as a separate RPC URL.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            listOf("mainnet" to "Ethereum Mainnet", "gnosis" to "Gnosis Chain").forEach { (id, label) ->
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .clickable {
-                            if (id != selectedNet) { selectedNet = id; onSwitchNetwork(id) }
-                        }
-                        .padding(vertical = 4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    RadioButton(
-                        selected = id == selectedNet,
-                        onClick = { if (id != selectedNet) { selectedNet = id; onSwitchNetwork(id) } },
+            networks.forEach { nc ->
+                val id = nc.name()
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(top = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(nc.displayName())
+                        Switch(
+                            checked = enabled[id] == true,
+                            onCheckedChange = { on -> enabled[id] = on; onEnableNetwork(id, on) },
+                        )
+                    }
+                    OutlinedTextField(
+                        value = rpcPorts[id] ?: "",
+                        onValueChange = { rpcPorts[id] = it.filter(Char::isDigit).take(5) },
+                        label = { Text("JSON-RPC port (default ${nc.defaultRpcPort()})") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.fillMaxWidth(),
                     )
-                    Text(label)
                 }
             }
 
             HorizontalDivider()
 
             Text("Node tuning", style = MaterialTheme.typography.titleMedium)
-            OutlinedTextField(
-                value = rpcPort,
-                onValueChange = { rpcPort = it.filter(Char::isDigit).take(5) },
-                label = { Text("JSON-RPC port (default ${NodeService.defaultRpcPort(selectedNet)})") },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                modifier = Modifier.fillMaxWidth(),
-            )
             OutlinedTextField(
                 value = snapTarget,
                 onValueChange = { snapTarget = it.filter(Char::isDigit).take(3) },
@@ -585,18 +653,22 @@ private fun SettingsScreen(
                 modifier = Modifier.fillMaxWidth(),
             )
             Text(
-                "An RPC-port change restarts the node; snap-peer target and the readiness " +
-                    "threshold apply live.",
+                "An RPC-port change reboots that chain; snap-peer target and the readiness " +
+                    "threshold apply live to every chain.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Button(
                 onClick = {
-                    onApplyTunables(
-                        rpcPort.toIntOrNull() ?: NodeService.DEFAULT_RPC_PORT,
-                        snapTarget.toIntOrNull() ?: NodeService.DEFAULT_SNAP_TARGET,
-                        deepPool.toIntOrNull() ?: NodeService.DEFAULT_DEEP_POOL,
-                    )
+                    val snap = snapTarget.toIntOrNull() ?: NodeService.DEFAULT_SNAP_TARGET
+                    val deep = deepPool.toIntOrNull() ?: NodeService.DEFAULT_DEEP_POOL
+                    // Apply per network: each call persists this chain's RPC port (rebooting it
+                    // only if the port changed) and re-applies the shared snap/deep knobs.
+                    networks.forEach { nc ->
+                        val id = nc.name()
+                        val port = rpcPorts[id]?.toIntOrNull() ?: nc.defaultRpcPort()
+                        onApplyTunables(id, port, snap, deep)
+                    }
                 },
                 modifier = Modifier.fillMaxWidth(),
             ) { Text("Save") }
@@ -831,6 +903,7 @@ private sealed interface QueryState {
 @Composable
 private fun QueryTab(
     snapshot: NodeService.Snapshot?,
+    chain: String,
     running: Boolean,
     input: String,
     onInputChange: (String) -> Unit,
@@ -839,6 +912,9 @@ private fun QueryTab(
     onRunQuery: (String) -> Unit,
     onClearHistory: () -> Unit,
 ) {
+    // ENS only resolves on chains that have it (mainnet/Sepolia). On others the field accepts
+    // addresses only, so we relabel it and drop the ENS hint.
+    val ensCapable = remember(chain) { NetworkConfig.byName(chain).hasEns() }
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -876,12 +952,22 @@ private fun QueryTab(
             OutlinedTextField(
                 value = input,
                 onValueChange = onInputChange,
-                label = { Text("Address or ENS name") },
-                placeholder = { Text("0x… or vitalik.eth") },
+                label = { Text(if (ensCapable) "Address or ENS name" else "Address") },
+                placeholder = { Text(if (ensCapable) "0x… or vitalik.eth" else "0x…") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
                 enabled = state !is QueryState.Loading,
             )
+        }
+        if (!ensCapable) {
+            item {
+                Text(
+                    "ENS isn't available on ${chain.replaceFirstChar { it.uppercase() }} — " +
+                        "enter a 0x address. Balance & nonce are still beacon-verified.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
 
         item {
@@ -1002,6 +1088,7 @@ private fun EnsResolutionPanel(res: NodeService.EnsResolution) {
  */
 @Composable
 private fun LogsTab(
+    chains: List<String>,
     filter: String,
     onFilterChange: (String) -> Unit,
 ) {
@@ -1103,6 +1190,31 @@ private fun LogsTab(
                     onClick = { LogBuffer.clear() },
                     enabled = entries.isNotEmpty(),
                 ) { Text("Clear") }
+            }
+            // Network filter chips (Step 9): the buffer is one combined stream for all chains,
+            // so tapping a chain chip just sets the text filter to its name (ChainStack lines
+            // are tagged "[<network>]"; deep subsystem lines may not be — best-effort). "All"
+            // clears the filter. Only shown when more than one chain is live.
+            if (chains.size > 1) {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    FilterChip(
+                        selected = filter.isBlank(),
+                        onClick = { onFilterChange("") },
+                        label = { Text("All") },
+                    )
+                    chains.forEach { c ->
+                        FilterChip(
+                            selected = filter.equals(c, ignoreCase = true),
+                            onClick = { onFilterChange(c) },
+                            label = { Text(c.replaceFirstChar { it.uppercase() }) },
+                        )
+                    }
+                }
             }
             OutlinedTextField(
                 value = filter,

@@ -94,6 +94,17 @@ class NetworkConfigGnosisTest {
     }
 
     @Test
+    void gnosisHasNoEns() {
+        // ENS is mainnet/Sepolia-only; Gnosis has no canonical registry (EnsResolver
+        // .forChainId throws for chainId 100), so the UI must not offer ENS lookups here.
+        assertFalse(G.hasEns(), "Gnosis must not advertise ENS");
+        assertTrue(NetworkConfig.MAINNET.hasEns(), "mainnet has ENS");
+        assertTrue(NetworkConfig.SEPOLIA.hasEns(), "sepolia has ENS");
+        assertEquals("Gnosis Chain", G.displayName());
+        assertEquals("Ethereum Mainnet", NetworkConfig.MAINNET.displayName());
+    }
+
+    @Test
     void elBootEnodesAreDialableForGnosisOnly() {
         // Gnosis publishes no EL enrtree, so it ships full enode://<pubkey>@host:port seeds for
         // direct RLPx dialing. Networks that have an enrtree return an empty list.

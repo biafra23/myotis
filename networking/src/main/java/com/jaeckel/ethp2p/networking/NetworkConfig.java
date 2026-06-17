@@ -515,6 +515,29 @@ public record NetworkConfig(
     }
 
     // -------------------------------------------------------------------------
+
+    /**
+     * Whether ENS name resolution is available on this chain. ENS is deployed only on
+     * Ethereum mainnet and Sepolia — {@link io.myotis.ens.EnsResolver#forChainId} pins
+     * the registry + UniversalResolver only for chainId 1 / 11155111 (holesky is retired)
+     * and throws for everything else (e.g. Gnosis 100, which has no canonical ENS). UIs
+     * gate the ENS query path on this; plain address balance/account queries work on every
+     * chain regardless.
+     */
+    public boolean hasEns() {
+        return networkId == 1 || networkId == 11155111;
+    }
+
+    /** Human-readable chain name for UI labels (the {@link #name} is the lowercase id). */
+    public String displayName() {
+        return switch ((int) networkId) {
+            case 100 -> "Gnosis Chain";
+            case 11155111 -> "Sepolia";
+            default -> "Ethereum Mainnet";
+        };
+    }
+
+    // -------------------------------------------------------------------------
     // Mainnet genesis block header RLP (pre-computed, verified at class load)
     // -------------------------------------------------------------------------
     private static final Bytes32 EMPTY_OMMERS =
