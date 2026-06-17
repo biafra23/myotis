@@ -17,6 +17,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.clickable
@@ -395,10 +397,12 @@ private fun NodeScreen(
             }
             running = NodeService.isRunning()
             snapshots = s
-            // Keep the selected chip valid: default to the first live network, and reset if the
-            // selected one went away (e.g. the user disabled it in Settings).
-            if (selectedChain == null || selectedChain !in s.keys) {
-                selectedChain = s.keys.firstOrNull()
+            // Keep the selected chip valid. When stopped, snapshots is empty, so fall back to the
+            // enabled-set — otherwise selectedChain would be wiped to null on every poll. Only reset
+            // when the current selection isn't among the available chains (e.g. disabled in Settings).
+            val activeChains = s.keys.ifEmpty { NodeService.enabledNetworks(context) }
+            if (selectedChain == null || selectedChain !in activeChains) {
+                selectedChain = activeChains.firstOrNull()
             }
             delay(2000)
         }
@@ -441,20 +445,33 @@ private fun NodeScreen(
         topBar = {
             TopAppBar(
                 title = {
-                    // App name + network selector on one line. The highlighted chip is the
-                    // selected chain (drives Status + Query), so there's no separate "· <network>"
-                    // text or chip row beneath — the chip is the only place the network is shown.
+                    // App name + network selector on one line. The highlighted chip is the selected
+                    // chain (drives Status + Query), so there's no separate "· <network>" text or
+                    // chip row beneath. When the node is stopped (snapshots empty) the chips fall back
+                    // to the enabled-set so the user still sees/selects networks, and the chips scroll
+                    // horizontally so a third network can't push the Settings action off-screen.
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         Text("Myotis")
-                        snapshots.keys.forEach { c ->
-                            FilterChip(
-                                selected = c == selectedChain,
-                                onClick = { selectedChain = c },
-                                label = { Text(c.replaceFirstChar { it.uppercase() }) },
-                            )
+                        val chipChains = snapshots.keys.toList()
+                            .ifEmpty { NodeService.enabledNetworks(context) }
+                        Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .horizontalScroll(rememberScrollState()),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            chipChains.forEach { c ->
+                                FilterChip(
+                                    selected = c == selectedChain
+                                        || (selectedChain == null && c == chipChains.firstOrNull()),
+                                    onClick = { selectedChain = c },
+                                    label = { Text(c.replaceFirstChar { it.uppercase() }) },
+                                )
+                            }
                         }
                     }
                 },
