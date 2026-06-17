@@ -30,6 +30,9 @@ dependencies {
     // Tuweni's Hash.keccak256 resolves "KECCAK-256" via a JCE provider; the trie
     // proof tests build fixtures with it, so BouncyCastle must be on the test path.
     testImplementation(libs.bouncycastle)
+    // BLS acceleration benchmark: jblst (blst JNI) vs the pure-Java Milagro path.
+    // Test scope only — not shipped; see docs/bls-rust-acceleration.md.
+    testImplementation(libs.jblst)
     testRuntimeOnly(libs.logback.classic)
 }
 
