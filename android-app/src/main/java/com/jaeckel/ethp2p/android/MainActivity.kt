@@ -17,6 +17,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.clickable
@@ -395,10 +397,12 @@ private fun NodeScreen(
             }
             running = NodeService.isRunning()
             snapshots = s
-            // Keep the selected chip valid: default to the first live network, and reset if the
-            // selected one went away (e.g. the user disabled it in Settings).
-            if (selectedChain == null || selectedChain !in s.keys) {
-                selectedChain = s.keys.firstOrNull()
+            // Keep the selected chip valid. When stopped, snapshots is empty, so fall back to the
+            // enabled-set — otherwise selectedChain would be wiped to null on every poll. Only reset
+            // when the current selection isn't among the available chains (e.g. disabled in Settings).
+            val activeChains = s.keys.ifEmpty { NodeService.enabledNetworks(context) }
+            if (selectedChain == null || selectedChain !in activeChains) {
+                selectedChain = activeChains.firstOrNull()
             }
             delay(2000)
         }
@@ -441,9 +445,35 @@ private fun NodeScreen(
         topBar = {
             TopAppBar(
                 title = {
-                    val net = (currentSnapshot?.network ?: selectedChain ?: "Myotis")
-                        .replaceFirstChar { it.uppercase() }
-                    Text("Myotis · $net")
+                    // App name + network selector on one line. The highlighted chip is the selected
+                    // chain (drives Status + Query), so there's no separate "· <network>" text or
+                    // chip row beneath. When the node is stopped (snapshots empty) the chips fall back
+                    // to the enabled-set so the user still sees/selects networks, and the chips scroll
+                    // horizontally so a third network can't push the Settings action off-screen.
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text("Myotis")
+                        val chipChains = snapshots.keys.toList()
+                            .ifEmpty { NodeService.enabledNetworks(context) }
+                        Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .horizontalScroll(rememberScrollState()),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            chipChains.forEach { c ->
+                                FilterChip(
+                                    selected = c == selectedChain
+                                        || (selectedChain == null && c == chipChains.firstOrNull()),
+                                    onClick = { selectedChain = c },
+                                    label = { Text(c.replaceFirstChar { it.uppercase() }) },
+                                )
+                            }
+                        }
+                    }
                 },
                 actions = {
                     IconButton(onClick = { showSettings = true }) {
@@ -454,15 +484,6 @@ private fun NodeScreen(
         },
     ) { padding ->
       Column(Modifier.fillMaxSize().padding(padding)) {
-        // Chain selector: one chip per live network (Step 9). Drives Status + Query. Only shown
-        // when more than one chain is live — a single chain needs no selector.
-        if (snapshots.size > 1) {
-            ChainSelector(
-                chains = snapshots.keys.toList(),
-                selected = selectedChain,
-                onSelect = { selectedChain = it },
-            )
-        }
         // App-wide sync banner above the tabs: indeterminate while bootstrapping,
         // determinate as the light client catches up sync-committee periods, gone
         // once SYNCED.
@@ -528,29 +549,6 @@ private fun NodeScreen(
             )
         }
       }
-    }
-}
-
-/**
- * One per-network chip; tap to view that chain's Status/Query. Only shown when more than one
- * chain is live.
- */
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun ChainSelector(chains: List<String>, selected: String?, onSelect: (String) -> Unit) {
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 8.dp, vertical = 4.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        chains.forEach { c ->
-            FilterChip(
-                selected = c == selected,
-                onClick = { onSelect(c) },
-                label = { Text(c.replaceFirstChar { it.uppercase() }) },
-            )
-        }
     }
 }
 
