@@ -25,6 +25,13 @@ public interface BlsBackend {
      */
     boolean fastAggregateVerify(List<byte[]> pubkeys, byte[] message, byte[] signature);
 
+    /**
+     * Optionally pre-decompress committee pubkeys off the hot path. Only the Milagro
+     * backend caches decompressed points; native backends decompress fast enough that
+     * this is a no-op for them.
+     */
+    default void warmPubkeyCache(List<byte[]> pubkeys) { }
+
     /** Human-readable backend name (for logs / benchmarks). */
     default String name() { return getClass().getSimpleName(); }
 }

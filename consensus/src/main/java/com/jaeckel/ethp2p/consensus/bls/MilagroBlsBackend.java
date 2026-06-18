@@ -16,5 +16,10 @@ public final class MilagroBlsBackend implements BlsBackend {
     }
 
     @Override
+    public void warmPubkeyCache(List<byte[]> pubkeys) {
+        BlsVerifier.warmPubkeyCache(pubkeys);
+    }
+
+    @Override
     public String name() { return "Milagro (pure-Java)"; }
 }

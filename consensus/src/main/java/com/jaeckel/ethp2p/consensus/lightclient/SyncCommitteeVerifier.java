@@ -1,6 +1,6 @@
 package com.jaeckel.ethp2p.consensus.lightclient;
 
-import com.jaeckel.ethp2p.consensus.bls.BlsVerifier;
+import com.jaeckel.ethp2p.consensus.bls.BlsBackends;
 import com.jaeckel.ethp2p.consensus.ssz.SszUtil;
 import com.jaeckel.ethp2p.consensus.types.BeaconBlockHeader;
 import com.jaeckel.ethp2p.consensus.types.ForkData;
@@ -66,8 +66,10 @@ public final class SyncCommitteeVerifier {
                 BeaconChainSpec.DOMAIN_SYNC_COMMITTEE, forkVersion, genesisValidatorsRoot);
         byte[] signingRoot = computeSigningRoot(attestedHeader.hashTreeRoot(), domain);
 
-        // 4. BLS fast-aggregate verify
-        boolean ok = BlsVerifier.fastAggregateVerify(pubkeys, signingRoot, syncAggregate.syncCommitteeSignature());
+        // 4. BLS fast-aggregate verify via the selected backend (native blst when
+        //    available, else pure-Java Milagro; per-verify timing is logged).
+        boolean ok = BlsBackends.active()
+                .fastAggregateVerify(pubkeys, signingRoot, syncAggregate.syncCommitteeSignature());
         if (!ok) {
             StringBuilder fvHex = new StringBuilder();
             for (byte b : forkVersion) fvHex.append(String.format("%02x", b));
