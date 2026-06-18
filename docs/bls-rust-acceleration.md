@@ -1,5 +1,46 @@
 # BLS acceleration: native blst behind a `BlsBackend` seam
 
+## Status: IMPLEMENTED on `prototype/bls-blst-acceleration` (desktop + Android)
+
+The seam, the native Rust crate, the timing/compare mechanism, and the Android build are
+all done and verified. Summary first; the original evaluation follows.
+
+**What's wired**
+- `BlsBackend` seam + `BlsBackends.active()` (selects via `-Dmyotis.bls.backend=auto|milagro|native|compare`),
+  always wrapped in `TimingBlsBackend` (logs per-verify ms + running stats).
+- `rust/myotis-bls` — a `blst` + `jni` cdylib; `NativeBlsBackend` calls it with the whole
+  committee flattened into one JNI crossing. One crate → desktop `.so` **and** Android ABIs.
+- Daemon: `./gradlew :app:run` puts the desktop `.so` on `java.library.path` and auto-selects
+  native; `-Pbls=compare` runs the head-to-head.
+- Android: `rust/build-android.sh` (cargo-ndk) builds `arm64-v8a` + `x86_64`
+  `libmyotis_bls.so` into `android-app/src/main/jniLibs` (confirmed packaged in the debug
+  APK); `EthP2PApplication` sets `compare` so logcat shows the A/B on-device.
+
+**Measured — `BlsBackendBenchmark`, real 511-pubkey mainnet aggregate, x86-64 desktop:**
+| backend | cold (ms) | warm (ms/op) |
+|---|---|---|
+| Milagro (pure-Java) | 128.1 | 30.28 |
+| jblst (blst SWIG) | 35.9 | 28.21 |
+| **blst (native/rust)** | **8.2** | **7.54** |
+
+**Measured — live Gnosis sync, daemon `compare` mode, real ~500-pubkey verifies:**
+```
+[bls-compare] pubkeys=503 Milagro=81.3ms native=8.1ms  speedup=10.0x agree=true
+[bls-compare] pubkeys=500 Milagro=72.7ms native=8.5ms  speedup=8.5x  agree=true
+[bls-compare] pubkeys=501 Milagro=50.0ms native=11.6ms speedup=4.3x  agree=true
+```
+Native is **4–15× faster and agrees on every real verify.** On Android/ART (Milagro cold =
+30–55 s per the in-code comments) the win is far larger — measure it on-device via the
+`[bls-compare]` logcat lines.
+
+**To compare on your phone:** build `:android-app:assembleDebug` (the `.so` is already in
+jniLibs / committed), install, and `adb logcat -s ComparingBlsBackend` while it syncs.
+Rebuild the libs with `rust/build-android.sh` (needs `cargo-ndk` + `ANDROID_NDK_HOME`).
+
+---
+
+
+
 ## Why
 `BlsVerifier` (Milagro AMCL, pure Java) is the light client's heaviest regular
 operation — a sync-committee `fastAggregateVerify` runs on every finality/optimistic
