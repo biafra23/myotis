@@ -38,4 +38,15 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    // If the native blst lib (rust/myotis-bls) has been built, put it on java.library.path
+    // so NativeBlsBackend.isAvailable() is true and BlsBackendBenchmark exercises it.
+    // Build with: (cd rust/myotis-bls && cargo build --release)
+    val nativeDir = rootProject.file("rust/myotis-bls/target/release")
+    if (nativeDir.exists()) {
+        val sep = System.getProperty("path.separator")
+        systemProperty(
+            "java.library.path",
+            nativeDir.absolutePath + sep + System.getProperty("java.library.path"),
+        )
+    }
 }

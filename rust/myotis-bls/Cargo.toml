@@ -1,0 +1,23 @@
+[package]
+name = "myotis-bls"
+version = "0.1.0"
+edition = "2021"
+description = "Native BLS12-381 fast-aggregate-verify (blst) behind a JNI shim for Myotis"
+license = "MIT OR Apache-2.0"
+
+[lib]
+# cdylib → libmyotis_bls.{so,dylib,dll}; the same crate builds for the desktop JVM and,
+# via cargo-ndk, for each Android ABI.
+crate-type = ["cdylib"]
+
+[dependencies]
+# Supranational blst: the BLS12-381 lib every major Ethereum CL client ships (C + asm).
+blst = "0.3"
+# JNI bindings so the JVM/Android can call in.
+jni = { version = "0.21", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

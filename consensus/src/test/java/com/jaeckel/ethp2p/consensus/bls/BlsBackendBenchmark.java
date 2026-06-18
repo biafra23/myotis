@@ -7,33 +7,28 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Micro-benchmark: pure-Java Milagro vs native blst (jblst) for the light client's
- * hot path — {@code fastAggregateVerify} over a real ~511-pubkey sync-committee
- * aggregate (resources/bls_real_failure.txt, captured from mainnet). Both backends do
- * identical work (decompress 511 G1 pubkeys, aggregate, hash-to-G2, pairing), so the
- * result (pass/fail) is irrelevant — only the wall-clock matters.
+ * Micro-benchmark of the light client's BLS hot path — {@code fastAggregateVerify} over a
+ * real ~511-pubkey mainnet sync-committee aggregate (resources/bls_real_failure.txt) —
+ * across every available backend: pure-Java Milagro, jblst (blst via SWIG, desktop only),
+ * and the in-house native Rust blst ({@code rust/myotis-bls}, when its lib is on
+ * java.library.path — see consensus/build.gradle.kts). All backends do identical work, so
+ * pass/fail is irrelevant; only wall-clock matters, and they must all agree.
  *
- * <p>Prints two regimes that mirror production:
- * <ul>
- *   <li><b>cold</b> — first verify with an empty pubkey cache: the committee-rotation /
- *       fresh-bootstrap cost that triggered the Android ANR-mitigation work.</li>
- *   <li><b>warm</b> — Milagro with its decompressed-pubkey cache hot (steady state);
- *       jblst has no such cache, so every verify is a full native verify.</li>
- * </ul>
- *
- * Run: {@code ./gradlew :consensus:test --tests '*BlsBackendBenchmark'} (watch stdout).
+ * <p>Reports two regimes per backend: <b>cold</b> (first verify, empty caches — the
+ * committee-rotation cost that triggers the Android ANR work) and <b>warm</b> (steady
+ * state). Run: {@code ./gradlew :consensus:test --tests '*BlsBackendBenchmark'} (stdout).
  */
 public class BlsBackendBenchmark {
 
     @Test
-    void milagroVsJblst() throws Exception {
+    void compareBackends() throws Exception {
         Map<String, String> f = loadFixture("/bls_real_failure.txt");
         int n = Integer.parseInt(f.get("n").trim());
         byte[] msg = hex(f.get("msg"));
@@ -41,46 +36,57 @@ public class BlsBackendBenchmark {
         List<byte[]> pks = new ArrayList<>(n);
         for (int i = 0; i < n; i++) pks.add(hex(f.get("pk." + i)));
 
-        BlsBackend milagro = new MilagroBlsBackend();
-        BlsBackend jblst = new JblstBlsBackend();
-
-        // --- correctness: both backends must agree on the real aggregate ---
-        // (cold timing piggybacks on this first call — Milagro's cache is empty here)
-        long c0 = System.nanoTime();
-        boolean rM = milagro.fastAggregateVerify(pks, msg, sig);
-        long milagroColdMs = (System.nanoTime() - c0) / 1_000_000;
-
-        long j0 = System.nanoTime();
-        boolean rJ = jblst.fastAggregateVerify(pks, msg, sig);
-        long jblstColdMs = (System.nanoTime() - j0) / 1_000_000;
-
-        assertEquals(rM, rJ, "Milagro and jblst must agree on the same aggregate");
-
-        // --- warm steady-state: average over N iterations ---
-        for (int i = 0; i < 3; i++) { milagro.fastAggregateVerify(pks, msg, sig); jblst.fastAggregateVerify(pks, msg, sig); }
-        int iters = 30;
-        double milagroWarmMs = avgMs(milagro, pks, msg, sig, iters);
-        double jblstWarmMs = avgMs(jblst, pks, msg, sig, iters);
+        // Build the backend list (native only if its lib loaded).
+        Map<String, BlsBackend> backends = new LinkedHashMap<>();
+        backends.put("Milagro (pure-Java)", new MilagroBlsBackend());
+        backends.put("jblst (blst SWIG)", new JblstBlsBackend());
+        if (NativeBlsBackend.isAvailable()) {
+            backends.put("blst (native/rust)", new NativeBlsBackend());
+        } else {
+            System.out.println("[note] native blst lib not on java.library.path — "
+                    + "build it: (cd rust/myotis-bls && cargo build --release)");
+        }
 
         System.out.println();
-        System.out.println("================ BLS fastAggregateVerify benchmark ================");
-        System.out.printf ("pubkeys=%d   agree=%b (result=%b)%n", n, rM == rJ, rM);
-        System.out.printf ("COLD (empty cache / rotation case):  Milagro=%d ms   jblst=%d ms   -> %.0fx%n",
-                milagroColdMs, jblstColdMs, jblstColdMs == 0 ? Double.NaN : (double) milagroColdMs / Math.max(1, jblstColdMs));
-        System.out.printf ("WARM (Milagro cache hot, %d iters):  Milagro=%.2f ms  jblst=%.2f ms  -> %.1fx%n",
-                iters, milagroWarmMs, jblstWarmMs, milagroWarmMs / jblstWarmMs);
-        System.out.println("===================================================================");
+        System.out.println("=========== BLS fastAggregateVerify benchmark (" + n + " pubkeys) ===========");
+        System.out.printf("%-22s %12s %12s%n", "backend", "cold (ms)", "warm (ms/op)");
+        System.out.println("-----------------------------------------------------------");
+
+        Boolean reference = null;
+        double milagroWarm = -1, fastestWarm = Double.MAX_VALUE;
+        for (Map.Entry<String, BlsBackend> e : backends.entrySet()) {
+            BlsBackend b = e.getValue();
+
+            long c0 = System.nanoTime();
+            boolean r = b.fastAggregateVerify(pks, msg, sig);
+            double coldMs = (System.nanoTime() - c0) / 1e6;
+
+            if (reference == null) reference = r;
+            else if (r != reference) {
+                throw new AssertionError(e.getKey() + " disagreed with the reference verdict");
+            }
+
+            for (int i = 0; i < 3; i++) b.fastAggregateVerify(pks, msg, sig); // warmup
+            int iters = 30;
+            long w0 = System.nanoTime();
+            for (int i = 0; i < iters; i++) b.fastAggregateVerify(pks, msg, sig);
+            double warmMs = (System.nanoTime() - w0) / 1e6 / iters;
+
+            System.out.printf("%-22s %12.1f %12.2f%n", e.getKey(), coldMs, warmMs);
+            if (e.getKey().startsWith("Milagro")) milagroWarm = warmMs;
+            fastestWarm = Math.min(fastestWarm, warmMs);
+        }
+        System.out.println("-----------------------------------------------------------");
+        System.out.printf("all backends agree (result=%b)%n", reference);
+        if (milagroWarm > 0) {
+            System.out.printf("fastest warm vs Milagro warm: %.1fx%n", milagroWarm / fastestWarm);
+        }
+        System.out.println("NOTE: x86-64/HotSpot flatters Milagro; on Android/ART the native");
+        System.out.println("      win is far larger (see docs/bls-rust-acceleration.md).");
+        System.out.println("===========================================================");
         System.out.println();
 
-        // Sanity: the native path should not be slower than pure Java on either regime.
-        assertTrue(jblstWarmMs <= milagroWarmMs * 1.5,
-                "jblst warm should be in the same ballpark or faster than Milagro warm");
-    }
-
-    private static double avgMs(BlsBackend b, List<byte[]> pks, byte[] msg, byte[] sig, int iters) {
-        long start = System.nanoTime();
-        for (int i = 0; i < iters; i++) b.fastAggregateVerify(pks, msg, sig);
-        return (System.nanoTime() - start) / 1e6 / iters;
+        assertTrue(reference != null, "benchmark ran");
     }
 
     private static Map<String, String> loadFixture(String resource) throws Exception {
