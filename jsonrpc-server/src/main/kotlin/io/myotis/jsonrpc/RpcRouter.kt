@@ -144,12 +144,28 @@ class RpcRouter(
                 val p = root.params()
                 val callObj = p?.getOrNull(0) as? JsonObject ?: return null
                 val to = callObj["to"]?.asHexBytes() ?: return null   // contract creation (to=null) -> proxy
+                // The caller (msg.sender). Absent/null -> anonymous (backend uses the
+                // zero-address default); present-but-malformed -> proxy. Threading this
+                // is what lets a wallet's confirm-screen simulation of a sender-gated
+                // call (ERC-20 transfer/approve, …) run as the real `from` instead of
+                // reverting "transfer from the zero address".
+                val from = (callObj["from"]?.takeUnless { it is JsonNull })?.let { it.asHexBytes() ?: return null }
                 // Absent/null calldata -> empty; present-but-malformed -> proxy
                 // (don't silently run the call with empty calldata).
                 val dataElement = (callObj["data"] ?: callObj["input"])?.takeUnless { it is JsonNull }
                 val data = if (dataElement != null) (dataElement.asHexBytes() ?: return null) else ByteArray(0)
+                // Optional call value (wei) — QUANTITY hex or decimal; malformed -> proxy.
+                val valueElement = callObj["value"]?.takeUnless { it is JsonNull }
+                val value = if (valueElement != null) {
+                    val s = (valueElement as? JsonPrimitive)?.contentOrNull ?: return null
+                    try {
+                        if (s.startsWith("0x") || s.startsWith("0X"))
+                            java.math.BigInteger(s.substring(2).ifEmpty { "0" }, 16)
+                        else java.math.BigInteger(s)
+                    } catch (e: NumberFormatException) { return null }
+                } else null
                 val block = p.blockTag(1)
-                val out = withContext(Dispatchers.IO) { b.call(to, data, block) } ?: return null
+                val out = withContext(Dispatchers.IO) { b.call(from, to, data, value, block) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexData(out)))
             }
             "eth_getBalance" -> {
