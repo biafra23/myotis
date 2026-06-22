@@ -93,9 +93,15 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
 
     @Override
     public CompletableFuture<byte[]> callView(Address target, byte[] calldata, BlockContext blockContext) {
+        return callView(null, target, calldata, null, blockContext);
+    }
+
+    @Override
+    public CompletableFuture<byte[]> callView(Address sender, Address target, byte[] calldata,
+                                              java.math.BigInteger value, BlockContext blockContext) {
         Executor executor = delegate.executor();
         return CompletableFuture.supplyAsync(
-                () -> runConvergent(target, calldata, blockContext), executor);
+                () -> runConvergent(sender, target, calldata, value, blockContext), executor);
     }
 
     /** Estimation delegates directly: the prefetch/convergence loop exists to batch
@@ -106,7 +112,8 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
         return delegate.estimateGas(tx, blockContext);
     }
 
-    private byte[] runConvergent(Address target, byte[] calldata, BlockContext blockContext) {
+    private byte[] runConvergent(Address sender, Address target, byte[] calldata,
+                                 java.math.BigInteger value, BlockContext blockContext) {
         SnapStateOracle oracle = delegate.oracle();
         BytecodeCache bytecodeCache = delegate.bytecodeCache();
 
@@ -161,7 +168,7 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
             long missesBefore = view.sentinelMissCount();
             byte[] result;
             try {
-                result = delegate.runOnTracedView(target, calldata, blockContext, view, tracer);
+                result = delegate.runOnTracedView(sender, target, calldata, value, blockContext, view, tracer);
             } catch (EvmExecutionException e) {
                 if (!sentinelMode) {
                     // Real iteration produced an actual revert / halt — propagate.

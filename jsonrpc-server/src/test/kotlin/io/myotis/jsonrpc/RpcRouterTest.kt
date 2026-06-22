@@ -31,15 +31,19 @@ class RpcRouterTest {
         var code: ByteArray? = null,
         var storage: ByteArray? = null,
     ) : MyotisRpcBackend {
+        var lastFrom: ByteArray? = null
         var lastTo: ByteArray? = null
         var lastData: ByteArray? = null
+        var lastValue: BigInteger? = null
         var lastBlock: String? = null
         var lastSlot: ByteArray? = null
         override fun chainId() = 1L
         override fun headBlockNumber() = head
         override fun syncState() = "SYNCED"
-        override fun call(to: ByteArray, data: ByteArray, block: String): ByteArray? {
-            lastTo = to; lastData = data; lastBlock = block; return callResult
+        override fun call(from: ByteArray?, to: ByteArray, data: ByteArray,
+                          value: BigInteger?, block: String): ByteArray? {
+            lastFrom = from; lastTo = to; lastData = data; lastValue = value; lastBlock = block
+            return callResult
         }
         override fun getBalance(address: ByteArray, block: String): BigInteger? = balance
         override fun getTransactionCount(address: ByteArray, block: String): Long? = nonce
@@ -111,6 +115,26 @@ class RpcRouterTest {
         assertEquals(0xA0.toByte(), b.lastTo!![0])
         assertEquals("0x313ce567", b.lastData!!.toHex())           // decoded calldata
         assertEquals("latest", b.lastBlock)
+    }
+
+    @Test fun ethCall_threadsFromAndValue_toBackend() {            // confirm-screen sim: msg.sender + value
+        val b = FakeBackend(callResult = byteArrayOf(0, 6))
+        route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"from":"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+                          "to":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+                          "data":"0xa9059cbb","value":"0x0"},"latest"]}""")
+        assertEquals(20, b.lastFrom!!.size)                        // from decoded + passed through
+        assertEquals(0xd8.toByte(), b.lastFrom!![0])
+        assertEquals(BigInteger.ZERO, b.lastValue)                 // value decoded
+    }
+
+    @Test fun ethCall_absentFrom_passesNull() {                    // anonymous read -> backend's zero-addr default
+        val b = FakeBackend(callResult = byteArrayOf(1))
+        route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x00000000219ab540356cBB839Cbe05303d7705Fa","data":"0xabcd"}]}""")
+        assertNull(b.lastFrom)                                     // no from -> null (not zero-length)
+        assertNull(b.lastValue)                                    // no value -> null
     }
 
     @Test fun ethCall_acceptsInputAlias_forData() {
