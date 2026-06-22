@@ -150,7 +150,105 @@ an I/O thread.
 
 ---
 
-## 3. Host surface A — the loopback JSON-RPC server (`jsonrpc-server`)
+## 3. Resource dispatch for large queries (the MetaMask "all balances at once" case)
+
+When a wallet loads it issues a **burst of state reads**. MetaMask in particular fetches many
+token balances at once — either as **one multicall `eth_call`** (a balance-checker / Multicall3
+contract doing N `balanceOf` SLOADs across N token contracts in a single call) or as **many
+parallel `eth_call`/`eth_getBalance` requests** (often a JSON-RPC 2.0 batch array). The naive path
+— one network round-trip per SLOAD against a thin set of snap peers — would take seconds to minutes
+and could starve the interactive calls a confirm screen blocks on. The engine handles this at **two
+levels**: *intra-call* (one big multicall) and *inter-call* (many requests at once).
+
+### 3.1 Intra-call: the speculative-prefetch convergence loop (`PrefetchingEvmExecutor`)
+
+A single multicall may touch hundreds of accounts and storage slots; the synchronous EVM would
+block on each miss serially. The prefetch executor turns that into a few **parallel waves** with a
+*sentinel-return* loop (cap `DEFAULT_ITERATION_CAP = 4`):
+
+```
+prime:  fetch the target (multicall) contract's account + bytecode synchronously         (~2 RTT)
+loop:
+  - run the EVM "sentinel-on-miss": every uncached read returns a zero/empty PLACEHOLDER
+    without blocking, and the access is RECORDED (not cached).
+  - discard the sentinel run's RESULT (placeholders make it bogus); keep its access list.
+  - batch-fetch all newly-discovered misses IN PARALLEL (prefetchInParallel), warming the cache.
+  - sentinel mode stays ON while an iteration still DISCOVERS new accesses → one parallel wave
+    per "hop"; the last two iterations run for REAL.
+  - converge when a run reads only cached values; return THAT run's result.
+    (A result is ONLY returned from a fully cache-hit — i.e. fully verified — run.)
+```
+
+For the 1000-token multicall this is exactly: **iteration 0** (sentinel) discovers the 1000 token
+*accounts* (their code isn't loaded yet, so no `balanceOf` runs); **iteration 1** (sentinel) loads
+that code and records all 1000 *storage slots*, batch-fetched in one wave; the final real run reads
+everything from cache. `balanceOf` is *data-independent* (slot = `keccak256(holder ‖ mappingSlot)`,
+computed from inputs), so it converges in ≤3 iterations; a call that doesn't converge within the
+cap **fails closed** rather than returning unverified data. Chained-dependency reads (deep proxy
+chains where one read's value is the next read's slot) can't be prefetched and fall back to serial
+blocking — same latency as baseline, never wrong.
+
+### 3.2 Batch coalescing + per-item verification (`SnapBackedStateOracle.fetchBatch`)
+
+Each prefetch wave is **coalesced**, not issued slot-by-slot:
+
+- An `account → {slots}` map is split into chunks of **`BATCH_PATHSET_CHUNK = 64` path-sets per
+  request**, issued **in parallel** (`allOf`).
+- Every item is **verified independently** from the one combined node set the peer returns (the MPT
+  verifier builds a `keccak256(node) → node` map, so each account/slot descends from the root on its
+  own). A forged/incomplete proof for *any* item fails that item's verify and **rotates the whole
+  chunk to another peer**; best-effort overall (an unverifiable chunk is left uncached and the
+  per-item path re-fetches it).
+- Net effect: a ~1000-account sweep collapses from ~1000 round-trips to **~16**.
+
+### 3.3 Peer fan-out bounding
+
+The thin snap-peer set — not threads — is the contended resource. Fetches **rotate across the
+connector's `activeSnapHandlers()`** (preferring proven `rootServed` peers, skipping `rootDenied`),
+and the parallel waves are **semaphore-bounded** so a 1000-token sweep doesn't flood one peer. On
+the dial side, a **"snap-heavy" gate pauses *new* peer dials** while a long snap round-trip chain
+runs, so discovery churn doesn't contend with the event loop mid-sweep.
+
+### 3.4 Inter-call: lanes, the lane gate, and caches (`VerifiedRpcBackend` + JSON-RPC router)
+
+When the burst arrives as **many separate requests** (or a batch array), three mechanisms keep a
+jumbo multicall from starving the small interactive calls a wallet blocks on (nonce, balance, fee):
+
+- **Two EVM lanes on separate pools.** Small-calldata calls (`calldata ≤ EVM_SMALL_CALLDATA_MAX =
+  4096` — plain `eth_getBalance`/nonce/fee/simple `eth_call`) run on a **reserved `evmPoolSmall` (1
+  thread)**; big multicalls run on **`evmPoolHeavy` (`EVM_POOL_THREADS − 1 = 2` threads)**. The lane
+  is chosen per request from a thread-local hint set by calldata size.
+- **`SnapLaneGate`.** A *heavy*-lane snap request must hold a permit, and the permit count is **half
+  the live snap peers** (recomputed on each acquire, min 1). The other half is always free for the
+  small/interactive lane (which never acquires). A jumbo multicall thus runs to genuine completion /
+  OOG / timeout — **just never using more than its share of peers at once** — so a concurrent
+  balance/nonce/fee read still gets through.
+- **Caches make repeats free.** A verified `(stateRoot, addr, slot) → value` is a *cryptographic
+  fact*, so the cross-call **`StateProofCache`** (LRU, `STATE_PROOF_CACHE_MAX = 65536`) and the
+  forever-valid **`BytecodeCache`** let MetaMask's repeated/retried sweeps converge instead of
+  re-proving. The anchored **head context is built once and reused for `RPC_HEAD_TTL_MS = 12 s`**, so
+  a burst shares one beacon-anchoring instead of re-walking the header chain per call.
+
+### 3.5 What a re-implementation must replicate
+
+1. A speculative **sentinel/prefetch loop** so a multicall resolves in a few parallel waves, not one
+   round-trip per SLOAD; **return a result only from a fully cache-hit (fully verified) run**; cap
+   iterations and fail closed.
+2. **Batch coalescing with independent per-item proof verification** and whole-chunk peer rotation
+   on any bad item.
+3. **Peer-fan-out bounding** (rotate across snap peers, semaphore per wave; pause new dials during a
+   sweep).
+4. **Lane separation + a fan-out gate** so heavy multicalls can't starve the small interactive reads.
+5. **Cross-call verified-state + bytecode caches and a short head-context TTL** so bursts and retries
+   converge.
+
+> Latency shape (design target, not yet measured end-to-end in the reference — its benchmark IT is
+> scaffolding): a data-independent multicall settles in ≤3 convergence iterations ≈ a small constant
+> number of RTTs regardless of token count, versus one-RTT-per-SLOAD for the naive path.
+
+---
+
+## 4. Host surface A — the loopback JSON-RPC server (`jsonrpc-server`)
 
 A standard Ethereum JSON-RPC HTTP endpoint so **unmodified wallets work**. Reference is Kotlin/Ktor
 (CIO), chosen to be Android-safe; a port can use any async HTTP framework.
@@ -179,7 +277,7 @@ Methods served (the verified set): `eth_chainId`, `net_version`, `web3_clientVer
 
 ---
 
-## 4. Host surface B — the desktop daemon + IPC (`app`)
+## 5. Host surface B — the desktop daemon + IPC (`app`)
 
 The desktop host: a long-running daemon plus a CLI that sends it commands. **In scope** for the
 re-implementation as the reference desktop host (mobile hosts replace this with direct FFI calls).
@@ -235,7 +333,7 @@ the **proof-verified leaf**, never the peer's slim body.
 
 ---
 
-## 5. Persistence
+## 6. Persistence
 
 See [README §9](README.md#9-persistence--storage) for the table. The reference uses flat files
 relative to the working directory (no database); each is reconstructible and abstracted behind a
@@ -253,7 +351,7 @@ port:
 
 ---
 
-## 6. Concurrency model (consolidated)
+## 7. Concurrency model (consolidated)
 
 - **devp2p/RLPx**: a shared async event-loop group; per-connection framing is single-threaded;
   requests correlated by an atomic id into per-type future maps.
@@ -272,7 +370,7 @@ port:
 
 ---
 
-## 7. Putting it together for a new host
+## 8. Putting it together for a new host
 
 To add a host (desktop, Android, iOS) on top of a re-implemented engine:
 

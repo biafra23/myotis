@@ -267,7 +267,9 @@ desktop + Android + iOS.
   I/O thread** — offload to a dedicated worker (a single BLS verify can cost 17–30 s on a
   phone). The light-client store is fully synchronized.
 - **EVM**: a small worker pool with a "small-calldata" fast lane and a gate capping heavy
-  SNAP fan-out to ~half the live snap peers (token-sweep fairness). The EVM is synchronous;
+  SNAP fan-out to ~half the live snap peers (token-sweep fairness) — see
+  [companion 04 §3](04-engine-and-hosts.md#3-resource-dispatch-for-large-queries-the-metamask-all-balances-at-once-case)
+  for how a jumbo balance query (MetaMask fetching all balances at once) is dispatched. The EVM is synchronous;
   a sync↔async bridge blocks on cache misses (so it must run on a worker, never an I/O thread).
 - **Hosts**: the desktop IPC server uses one lightweight thread per connection (reference:
   Java virtual threads); the JSON-RPC server uses async handlers that dispatch blocking

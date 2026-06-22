@@ -124,7 +124,10 @@ CcipReadEvmExecutor( PrefetchingEvmExecutor( DefaultEvmExecutor( SnapBackedState
 2. **`PrefetchingEvmExecutor`** — a multi-hop speculative loop: run with sentinel-on-miss to record
    every account/storage access, batch-fetch the misses in parallel (semaphore-bounded so a
    1000-token sweep doesn't flood one peer), warm the cache, repeat until a run hits the cache for
-   every read, then return *that* run's result. Eliminates the round-trip-per-SLOAD latency.
+   every read, then return *that* run's result. Eliminates the round-trip-per-SLOAD latency. See
+   [companion 04 §3](04-engine-and-hosts.md#3-resource-dispatch-for-large-queries-the-metamask-all-balances-at-once-case)
+   for the full large-query (MetaMask "all balances at once") dispatch story — intra-call waves,
+   batch coalescing, peer fan-out bounding, and inter-call lane/gate/cache fairness.
 3. **`CcipReadEvmExecutor`** — catches `OffchainLookup` reverts at the call boundary, fetches the
    gateway response, and re-enters the EVM with the resolver's callback (§6). CCIP is outermost
    because the revert is only observable there; it does **not** apply to `estimateGas`.
