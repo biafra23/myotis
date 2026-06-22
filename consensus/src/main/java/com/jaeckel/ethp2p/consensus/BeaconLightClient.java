@@ -1140,6 +1140,14 @@ public class BeaconLightClient implements AutoCloseable {
             log.info("[beacon] HTTP bootstrap complete, slot={}", bootstrap.header().beacon().slot());
             return true;
 
+        } catch (LinkageError e) {
+            // java.net.http is absent on the Android runtime (not desugared, not shipped at all).
+            // NoClassDefFoundError is an Error, not an Exception, so it slips past the catch below
+            // and would otherwise kill the beacon-sync thread. HTTP bootstrap is a JVM-only debug
+            // convenience; the real bootstrap path is P2P (see bootstrap()), so degrade gracefully.
+            log.debug("[beacon] HTTP bootstrap unavailable on this runtime "
+                    + "(java.net.http absent — Android); falling back to P2P bootstrap: {}", e.getMessage());
+            return false;
         } catch (Exception e) {
             Throwable root = e;
             while (root.getCause() != null) root = root.getCause();
@@ -1749,6 +1757,12 @@ public class BeaconLightClient implements AutoCloseable {
             log.info("[beacon] Seeded from beacon HTTP API, finalizedSlot={}, stateRoot={}",
                     finalizedSlot, stateRootHex);
 
+        } catch (LinkageError e) {
+            // java.net.http is absent on the Android runtime — NoClassDefFoundError (an Error, not an
+            // Exception) would otherwise escape this method. This HTTP seed is a JVM-only debug
+            // fallback; P2P seeding is the real path, so degrade gracefully instead of crashing.
+            log.debug("[beacon] Beacon API finality seed unavailable on this runtime "
+                    + "(java.net.http absent — Android): {}", e.getMessage());
         } catch (Exception e) {
             log.warn("[beacon] Beacon API finality seed failed: {}", e.getMessage());
         }
