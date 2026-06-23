@@ -88,7 +88,17 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private volatile boolean incompatibleNetwork; // confirmed wrong chain
     private volatile boolean snapNegotiated = false;
     private volatile String clientId;
-    private volatile boolean snapServingFailed = false;
+    /** How long an empty snap response benches a peer from the serving pool. NOT permanent:
+     *  an empty response usually means the peer's flat snapshot hadn't yet caught up to the
+     *  (often bleeding-edge) root we asked for — it serves a slightly older/newer root fine.
+     *  Permanent exclusion monotonically decayed the serving pool to zero over a long session
+     *  (every confirm-screen / balance-sweep storage fetch that came back empty retired
+     *  another good peer), so a node with 50+ snap-negotiated peers went amber and could not
+     *  build a verified head while the UI still counted them. A short cooldown routes around a
+     *  momentarily-lagging peer without throwing it away for the rest of the connection. */
+    private static final long SNAP_SERVING_COOLDOWN_MS = 30_000L;
+    /** Epoch-ms until which this peer is benched from the snap serving pool (0 = not benched). */
+    private volatile long snapServingFailedUntilMs = 0L;
     private volatile org.apache.tuweni.bytes.Bytes32 latestStateRoot;
     private volatile long latestStateRootBlockNumber = -1;
 
@@ -1341,9 +1351,16 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
 
     public boolean isSnapNegotiated() { return snapNegotiated; }
 
-    public boolean isSnapServingFailed() { return snapServingFailed; }
+    public boolean isSnapServingFailed() {
+        return System.currentTimeMillis() < snapServingFailedUntilMs;
+    }
 
-    public void markSnapServingFailed() { snapServingFailed = true; }
+    /** Bench this peer from the serving pool for {@link #SNAP_SERVING_COOLDOWN_MS}, after
+     *  which it automatically rejoins and gets another chance (its snapshot will have
+     *  advanced). Replaces the old permanent flag that decayed the pool to zero. */
+    public void markSnapServingFailed() {
+        snapServingFailedUntilMs = System.currentTimeMillis() + SNAP_SERVING_COOLDOWN_MS;
+    }
 
     public State getState() {
         return state;
