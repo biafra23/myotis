@@ -287,6 +287,36 @@ Notes from measuring the unbounded version on-device:
 - **discv5 free-port fallback**: avoid the emulator's OpenThread squatting on UDP 9000.
 *Attacks:* ART/runtime limits (§1.2).
 
+### 2.14 State-read freshness: why we kept it STRICT (a tried-and-reverted relaxation)
+The tight `RPC_STATE_HEAD_MAX_STALE_MS` = 120 s bound (§2.1) makes **state-execution** reads
+— `eth_call`, `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`, `eth_estimateGas` —
+**fast-error** (`-32000`) when no fresh snap-servable head exists. Observed live as
+**"fee calculation failed despite 18 SNAP peers"**: a peer's **flat state lags its own
+head**, so it advertises a head root it won't snap-serve; the build drops to the ~12-min
+finalized root, and if that peer also drops, every state read errors at once.
+
+The tempting fix — **relax** state reads to the same ~13-min stale-serve horizon
+(`RPC_HEAD_SERVE_STALE_MAX_MS`) header reads use, so they serve an older still-anchored root
+instead of erroring — **was implemented and then reverted**, because it made things *worse*:
+
+> The cheap stale-serve `anyPeerServesRoot` probe (§2.4) checks **one** account at the older
+> root. That can pass while the root isn't *fully* servable for a real execution — so
+> `eth_estimateGas` then ground the **entire 120 s `RPC_CALL_TIMEOUT`** fetching state no peer
+> serves, and the **confirm screen HUNG for two minutes** instead of failing fast. Measured
+> on-device: estimateGas `120.1 s → -32000` under relaxed vs `0.1–9 s → result` under strict
+> (the fresh head was available the whole time; relaxing only dragged the estimate onto a
+> stale, partially-unservable root). Staleness was never the real blocker — *no fully
+> servable root existed at that instant*, and a fast `-32000` the wallet retries beats a 2-min
+> freeze.
+
+So the default stays **strict / fast-fail**. The relaxation survives as an **explicit
+opt-in** for environments with reliably deep snap peers (where the older root *is* fully
+servable): system property `-Dmyotis.rpc.strictStateFreshness=false` (daemon), or the
+Android **Settings → Node tuning → "Relaxed state freshness"** toggle (OFF by default;
+applies on the next node restart). The durable fix for the underlying "fee calc fails under
+churn" is **better snap-peer quality/retention**, not staler serving. *Attacks:* peer churn /
+flat-state lag (§1.1).
+
 ---
 
 ## Part 3 — Where it stands

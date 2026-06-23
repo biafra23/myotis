@@ -514,6 +514,25 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     // Construction / lifecycle
     // ---------------------------------------------------------------------
 
+    /** System property to opt OUT of relaxed state-read freshness (back to the tight
+     *  2-min {@link #RPC_STATE_HEAD_MAX_STALE_MS} bound). The Android app surfaces this as
+     *  a Settings toggle (it sets the property before building its stacks); the daemon
+     *  takes {@code -Dmyotis.rpc.strictStateFreshness=true}. See docs/limitations.md. */
+    public static final String STRICT_STATE_FRESHNESS_PROP = "myotis.rpc.strictStateFreshness";
+
+    /** Max age a stale-but-anchored head may have and still be served for a STATE-execution
+     *  read (eth_call / getBalance / getCode / getStorageAt / estimateGas). RELAXED BY
+     *  DEFAULT to the same ~13-min horizon header reads and the beacon-finalized fallback
+     *  already use, so a fee estimate / balance read serves an older-but-still-snap-servable
+     *  anchored root instead of hard-erroring when only the bleeding-edge head is missing
+     *  (the common case: a peer's flat state lags its own head, so its head root isn't
+     *  snap-served). This stays cryptographically VERIFIED — the head is beacon-anchored and
+     *  its verification doesn't expire, and the stale-serve path PROBES that a peer actually
+     *  serves the root before returning it, so we never hand a doomed root to a 30s callView.
+     *  Only freshness ages. Opt back into the tight 2-min bound via
+     *  {@link #STRICT_STATE_FRESHNESS_PROP}. */
+    private final long stateHeadStaleCapMs;
+
     public VerifiedRpcBackend(RLPxConnector connector,
                               BeaconLightClient beaconLightClient,
                               BeaconSyncState beaconSyncState,
@@ -532,6 +551,21 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         this.log = log != null ? log : RpcLogger.noop();
         this.clock = clock != null ? clock : RpcClock.monotonic();
         this.snapQuality = snapQuality != null ? snapQuality : SnapQualitySink.noop();
+        // STRICT by default. Relaxing the cap *backfired*: the cheap single-account
+        // stale-serve probe can pass on an older root that isn't FULLY servable for a real
+        // execution, so eth_estimateGas / eth_call then grind the full 120 s RPC_CALL_TIMEOUT
+        // on unservable state instead of fast-erroring — a confirm-screen *hang* that is
+        // strictly worse than the prior instant -32000 (which the wallet retries). The
+        // staleness was never the true blocker; when no fully-servable root exists, failing
+        // fast is the right move. Relaxed stays available as an explicit OPT-IN for anyone who
+        // wants to experiment (e.g. a chain with reliably deep snap peers). Default true =
+        // strict; set the property false to opt into relaxed. See docs/limitations.md.
+        boolean strictFreshness = Boolean.parseBoolean(
+                System.getProperty(STRICT_STATE_FRESHNESS_PROP, "true"));
+        this.stateHeadStaleCapMs =
+                strictFreshness ? RPC_STATE_HEAD_MAX_STALE_MS : RPC_HEAD_SERVE_STALE_MAX_MS;
+        this.log.info("[rpc] state-read head staleness cap = " + (stateHeadStaleCapMs / 1000)
+                + "s (" + (strictFreshness ? "strict" : "relaxed") + ")");
         final RpcClock clk = this.clock;
         final RpcLogger lg = this.log;
         this.evmPool = task -> {
@@ -963,7 +997,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                 return frozen.head();
             }
         }
-        RpcCallContext ctx = anchoredHeadOrWait(RPC_STATE_HEAD_MAX_STALE_MS, true);
+        RpcCallContext ctx = anchoredHeadOrWait(stateHeadStaleCapMs, true);
         if (ctx == null) return null;
         if (requestedNum >= 0) {
             // A pinned number means "the latest block I saw" — wallets fetch
@@ -3065,7 +3099,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                                                 java.math.BigInteger value) {
         if (to == null || to.length != 20) return null;
         if (from != null && from.length != 20) return null;
-        RpcCallContext h = anchoredHeadOrWait(RPC_STATE_HEAD_MAX_STALE_MS, true);
+        RpcCallContext h = anchoredHeadOrWait(stateHeadStaleCapMs, true);
         if (h == null) return null;
         try {
             // Fast path: a value transfer with no calldata to a plain account costs
