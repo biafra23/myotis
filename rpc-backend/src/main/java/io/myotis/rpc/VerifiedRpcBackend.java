@@ -514,23 +514,21 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     // Construction / lifecycle
     // ---------------------------------------------------------------------
 
-    /** System property to opt OUT of relaxed state-read freshness (back to the tight
-     *  2-min {@link #RPC_STATE_HEAD_MAX_STALE_MS} bound). The Android app surfaces this as
-     *  a Settings toggle (it sets the property before building its stacks); the daemon
-     *  takes {@code -Dmyotis.rpc.strictStateFreshness=true}. See docs/limitations.md. */
+    /** System property controlling state-read freshness. Default is STRICT (the tight 2-min
+     *  {@link #RPC_STATE_HEAD_MAX_STALE_MS} bound, fast-fail); set
+     *  {@code -Dmyotis.rpc.strictStateFreshness=false} to opt INTO relaxed serving. The
+     *  Android app surfaces this as a Settings toggle (OFF by default; it sets the property
+     *  before building its stacks). See OPTIMISATIONS_AND_LIMITATIONS.md §2.14. */
     public static final String STRICT_STATE_FRESHNESS_PROP = "myotis.rpc.strictStateFreshness";
 
     /** Max age a stale-but-anchored head may have and still be served for a STATE-execution
-     *  read (eth_call / getBalance / getCode / getStorageAt / estimateGas). RELAXED BY
-     *  DEFAULT to the same ~13-min horizon header reads and the beacon-finalized fallback
-     *  already use, so a fee estimate / balance read serves an older-but-still-snap-servable
-     *  anchored root instead of hard-erroring when only the bleeding-edge head is missing
-     *  (the common case: a peer's flat state lags its own head, so its head root isn't
-     *  snap-served). This stays cryptographically VERIFIED — the head is beacon-anchored and
-     *  its verification doesn't expire, and the stale-serve path PROBES that a peer actually
-     *  serves the root before returning it, so we never hand a doomed root to a 30s callView.
-     *  Only freshness ages. Opt back into the tight 2-min bound via
-     *  {@link #STRICT_STATE_FRESHNESS_PROP}. */
+     *  read (eth_call / getBalance / getCode / getStorageAt / estimateGas). STRICT BY DEFAULT
+     *  (the tight 2-min {@link #RPC_STATE_HEAD_MAX_STALE_MS} bound) so a read fast-fails when
+     *  no fresh fully-servable root exists, rather than grinding the 120s call timeout on a
+     *  stale root that passes the cheap probe but isn't fully servable. The relaxed ~13-min
+     *  horizon ({@link #RPC_HEAD_SERVE_STALE_MAX_MS}) is an explicit OPT-IN via
+     *  {@link #STRICT_STATE_FRESHNESS_PROP} — see the constructor and
+     *  OPTIMISATIONS_AND_LIMITATIONS.md §2.14 for why relaxing the default backfired. */
     private final long stateHeadStaleCapMs;
 
     public VerifiedRpcBackend(RLPxConnector connector,
@@ -559,7 +557,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         // staleness was never the true blocker; when no fully-servable root exists, failing
         // fast is the right move. Relaxed stays available as an explicit OPT-IN for anyone who
         // wants to experiment (e.g. a chain with reliably deep snap peers). Default true =
-        // strict; set the property false to opt into relaxed. See docs/limitations.md.
+        // strict; set the property false to opt into relaxed. See OPTIMISATIONS_AND_LIMITATIONS.md §2.14.
         boolean strictFreshness = Boolean.parseBoolean(
                 System.getProperty(STRICT_STATE_FRESHNESS_PROP, "true"));
         this.stateHeadStaleCapMs =

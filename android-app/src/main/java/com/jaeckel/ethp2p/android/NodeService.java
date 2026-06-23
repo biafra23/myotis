@@ -245,7 +245,7 @@ public final class NodeService extends Service {
      *  estimateGas serve an older root — but that *backfired* into 120-s confirm-screen
      *  HANGS when the older root isn't fully servable, so strict (fast-fail) is the default;
      *  relaxed is an explicit opt-in. Read by VerifiedRpcBackend via a system property.
-     *  See docs/limitations.md. */
+     *  See OPTIMISATIONS_AND_LIMITATIONS.md §2.14. */
     public static boolean strictStateFreshness(android.content.Context c) {
         return prefs(c).getBoolean(K_STRICT_FRESHNESS, true);
     }
