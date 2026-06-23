@@ -154,14 +154,17 @@ class RpcRouter(
                 // (don't silently run the call with empty calldata).
                 val dataElement = (callObj["data"] ?: callObj["input"])?.takeUnless { it is JsonNull }
                 val data = if (dataElement != null) (dataElement.asHexBytes() ?: return null) else ByteArray(0)
-                // Optional call value (wei) — QUANTITY hex or decimal; malformed -> proxy.
+                // Optional call value (wei) — QUANTITY hex or decimal; malformed or
+                // negative -> proxy (wei is non-negative; a negative would throw in Wei.of).
                 val valueElement = callObj["value"]?.takeUnless { it is JsonNull }
                 val value = if (valueElement != null) {
                     val s = (valueElement as? JsonPrimitive)?.contentOrNull ?: return null
                     try {
-                        if (s.startsWith("0x") || s.startsWith("0X"))
+                        val parsed = if (s.startsWith("0x") || s.startsWith("0X"))
                             java.math.BigInteger(s.substring(2).ifEmpty { "0" }, 16)
                         else java.math.BigInteger(s)
+                        if (parsed.signum() < 0) return null
+                        parsed
                     } catch (e: NumberFormatException) { return null }
                 } else null
                 val block = p.blockTag(1)

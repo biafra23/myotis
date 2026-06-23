@@ -1624,6 +1624,13 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
             log.info("[rpc] eth_call -> malformed from (len=" + from.length + ")");
             return null;
         }
+        // Defence in depth (the router already screens this): wei is non-negative, and a
+        // negative value would throw IllegalArgumentException in Wei.of down in the executor.
+        // Return null so the router centrally manages the fallback instead.
+        if (value != null && value.signum() < 0) {
+            log.info("[rpc] eth_call -> negative value (" + value + ")");
+            return null;
+        }
         // Identify the call up front: caller + target + 4-byte selector + calldata size
         // + block tag. eth_call failures were undiagnosable as "eth_call -> proxy:
         // Timeout" — with hundreds of MetaMask poll variants we need to know WHICH
