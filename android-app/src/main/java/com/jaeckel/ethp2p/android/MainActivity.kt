@@ -1156,9 +1156,14 @@ private fun LogsTab(
     // then keep it fresh from a sample()-throttled view of the buffer so each scan has
     // room to complete (collectLatest only supersedes the prior *sampled* pass, not every
     // 250ms tick). The unfiltered view stays fully live — a cheap direct assignment.
+    //
+    // We observe the `lastVersion` Long (updated atomically with `entries`) rather than
+    // `entries` itself: snapshotFlow dedupes by structural equality, and an equals() over
+    // a 50k-entry list on every tick would be an O(N) main-thread cost. lastVersion gives
+    // the same change signal as an O(1) primitive compare; we then read `entries` inside.
     LaunchedEffect(filter) {
         if (filter.isBlank()) {
-            snapshotFlow { entries }.collect { shown = it }
+            snapshotFlow { lastVersion }.collect { shown = entries }
         } else {
             val matches = { e: LogBuffer.Entry ->
                 e.tag.contains(filter, ignoreCase = true) ||
@@ -1166,9 +1171,10 @@ private fun LogsTab(
             }
             // ensureActive() bails a superseded scan promptly rather than running it out.
             shown = withContext(Dispatchers.Default) { entries.filter { ensureActive(); matches(it) } }
-            snapshotFlow { entries }
+            snapshotFlow { lastVersion }
                 .sample(500L)
-                .collectLatest { snap ->
+                .collectLatest {
+                    val snap = entries
                     shown = withContext(Dispatchers.Default) { snap.filter { ensureActive(); matches(it) } }
                 }
         }
