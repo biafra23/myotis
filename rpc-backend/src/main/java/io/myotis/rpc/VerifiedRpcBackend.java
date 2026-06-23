@@ -674,8 +674,9 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     }
 
     @Override
-    public byte[] call(byte[] to, byte[] data, String block) {
-        return rpcCall(to, data, block);
+    public byte[] call(byte[] from, byte[] to, byte[] data,
+                       java.math.BigInteger value, String block) {
+        return rpcCall(from, to, data, value, block);
     }
 
     @Override
@@ -1617,12 +1618,31 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     // ---------------------------------------------------------------------
 
     /** eth_call over the shared anchored head. Returns raw ABI bytes, or null to error. */
-    private byte[] rpcCall(byte[] to, byte[] data, String block) {
-        // Identify the call up front: target + 4-byte selector + calldata size + block
-        // tag. eth_call failures were undiagnosable as "eth_call -> proxy: Timeout" —
-        // with hundreds of MetaMask poll variants we need to know WHICH contract/method
-        // is being asked for (e.g. its confirm-screen simulation multicall).
-        String desc = (to != null && to.length == 20 ? Bytes.wrap(to).toHexString() : "?")
+    private byte[] rpcCall(byte[] from, byte[] to, byte[] data,
+                           java.math.BigInteger value, String block) {
+        // Keep the early-rejection logs correlatable with the wallet call that triggered
+        // them: include target + 4-byte selector, matching the richer `desc` logging below.
+        String callCtx = " to=" + (to != null && to.length == 20 ? Bytes.wrap(to).toHexString() : "?")
+                + " sel=" + (data != null && data.length >= 4 ? Bytes.wrap(data, 0, 4).toHexString() : "0x");
+        if (from != null && from.length != 20) {
+            log.info("[rpc] eth_call -> malformed from (len=" + from.length + ")" + callCtx);
+            return null;
+        }
+        // Defence in depth (the router already screens this): wei is non-negative, and a
+        // negative value would throw IllegalArgumentException in Wei.of down in the executor.
+        // Return null so the router centrally manages the fallback instead.
+        if (value != null && value.signum() < 0) {
+            log.info("[rpc] eth_call -> negative value (" + value + ")" + callCtx);
+            return null;
+        }
+        // Identify the call up front: caller + target + 4-byte selector + calldata size
+        // + block tag. eth_call failures were undiagnosable as "eth_call -> proxy:
+        // Timeout" — with hundreds of MetaMask poll variants we need to know WHICH
+        // contract/method is being asked for (e.g. its confirm-screen simulation
+        // multicall), and by WHOM (a from-gated transfer/approve simulation differs
+        // from an anonymous read).
+        String desc = "from=" + (from != null && from.length == 20 ? Bytes.wrap(from).toHexString() : "0x0")
+                + " to=" + (to != null && to.length == 20 ? Bytes.wrap(to).toHexString() : "?")
                 + " sel=" + (data != null && data.length >= 4
                         ? Bytes.wrap(data, 0, 4).toHexString() : "0x")
                 + " dataLen=" + (data == null ? 0 : data.length)
@@ -1645,8 +1665,13 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         // share one execution — this changes scheduling, never verification. Each
         // waiter keeps its own 30s deadline; the entry is removed when the execution
         // completes so a later retry re-executes fresh.
+        // Key by (stateRoot, from, to, value, calldata): the sender and value are now
+        // part of the input — a transfer simulated by vitalik vs by the zero address
+        // computes a DIFFERENT verified result, so they must not share an execution.
         String flightKey = Bytes.wrap(h.blockCtx().stateRoot()).toHexString()
+                + ":" + (from == null ? "0x0" : Bytes.wrap(from).toHexString())
                 + ":" + Bytes.wrap(to).toHexString()
+                + ":" + (value == null ? "0" : value.toString())
                 + ":" + (data == null ? "0x" : Hash.keccak256(Bytes.wrap(data)).toHexString());
         // Route small calls onto the reserved EVM lane so a confirm screen's tiny
         // probes/simulations never queue behind a ~32KB token-sweep storm. The hint
@@ -1671,8 +1696,10 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                 // and complete exceptionally so waiters fail fast and a retry re-executes.
                 try {
                     h.offchainExecutor()
-                            .callView(io.myotis.evm.Address.of(to),
-                                    data == null ? new byte[0] : data, h.blockCtx())
+                            .callView(from == null ? null : io.myotis.evm.Address.of(from),
+                                    io.myotis.evm.Address.of(to),
+                                    data == null ? new byte[0] : data,
+                                    value, h.blockCtx())
                             .whenComplete((out, ex) -> {
                                 inflightCalls.remove(flightKey, mine);
                                 if (ex != null) mine.completeExceptionally(ex);

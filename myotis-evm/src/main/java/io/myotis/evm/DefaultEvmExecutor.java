@@ -64,7 +64,14 @@ public final class DefaultEvmExecutor implements EvmExecutor {
 
     @Override
     public CompletableFuture<byte[]> callView(Address target, byte[] calldata, BlockContext blockContext) {
-        return CompletableFuture.supplyAsync(() -> runOnce(target, calldata, blockContext), executor);
+        return callView(null, target, calldata, null, blockContext);
+    }
+
+    @Override
+    public CompletableFuture<byte[]> callView(Address sender, Address target, byte[] calldata,
+                                              java.math.BigInteger value, BlockContext blockContext) {
+        return CompletableFuture.supplyAsync(
+                () -> runOnce(sender, target, calldata, value, blockContext), executor);
     }
 
     @Override
@@ -220,10 +227,11 @@ public final class DefaultEvmExecutor implements EvmExecutor {
         return gas;
     }
 
-    private byte[] runOnce(Address target, byte[] calldata, BlockContext blockContext) {
+    private byte[] runOnce(Address sender, Address target, byte[] calldata,
+                           java.math.BigInteger value, BlockContext blockContext) {
         AccessTracker tracker = new AccessTracker();
         SyncStateView view = new SyncStateView(oracle, blockContext.stateRoot(), bytecodeCache, tracker);
-        return runOnTracedView(target, calldata, blockContext, view, OperationTracer.NO_TRACING);
+        return runOnTracedView(sender, target, calldata, value, blockContext, view, OperationTracer.NO_TRACING);
     }
 
     /**
@@ -235,7 +243,8 @@ public final class DefaultEvmExecutor implements EvmExecutor {
      * <p>Package-private: it's the seam the prefetch layer plugs into, but it's
      * not part of the public {@link EvmExecutor} contract.
      */
-    byte[] runOnTracedView(Address target, byte[] calldata, BlockContext blockContext,
+    byte[] runOnTracedView(Address sender, Address target, byte[] calldata,
+                           java.math.BigInteger value, BlockContext blockContext,
                            SyncStateView view, OperationTracer tracer) {
         CryptoProviders.ensureRegistered();
         EvmFactory.EvmAndPrecompiles bundle = EvmFactory.buildForBlock(blockContext);
@@ -246,10 +255,16 @@ public final class DefaultEvmExecutor implements EvmExecutor {
         // outer call doesn't pollute the read-through cache.
         org.hyperledger.besu.evm.worldstate.WorldUpdater scope = root.updater();
 
+        // A null sender means a from-less call → the anonymous VIEW_CALLER (Geth's
+        // default). When the caller DID supply a from (eth_call from a wallet), use
+        // it: contracts that gate on msg.sender (ERC-20 transfer/approve, …) must see
+        // the real caller, else they revert ("transfer from the zero address").
+        io.myotis.evm.Address effectiveSender = sender != null ? sender : VIEW_CALLER;
+        Wei callValue = value != null ? Wei.of(value) : Wei.ZERO;
         org.hyperledger.besu.datatypes.Address besuTarget =
                 org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(target.toByteArray()));
         org.hyperledger.besu.datatypes.Address besuSender =
-                org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(VIEW_CALLER.toByteArray()));
+                org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(effectiveSender.toByteArray()));
         org.hyperledger.besu.datatypes.Address besuCoinbase =
                 org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(blockContext.coinbase().toByteArray()));
 
@@ -267,8 +282,8 @@ public final class DefaultEvmExecutor implements EvmExecutor {
                 .blobGasPrice(Wei.ZERO)
                 .inputData(Bytes.wrap(calldata))
                 .sender(besuSender)
-                .value(Wei.ZERO)
-                .apparentValue(Wei.ZERO)
+                .value(callValue)
+                .apparentValue(callValue)
                 .code(code)
                 .blockValues(new BlockContextValues(blockContext))
                 .completer(f -> {})
@@ -283,7 +298,14 @@ public final class DefaultEvmExecutor implements EvmExecutor {
                     throw new UnsupportedOperationException(
                             "BLOCKHASH not implemented; needs a verified block-hash provider");
                 })
-                .isStatic(true)
+                // eth_call is a NON-static message call (matching Geth/Besu and our own
+                // estimateGas path): the simulated tx may SSTORE — every ERC-20
+                // transfer/approve does — and under isStatic(true) those state writes
+                // halt with ILLEGAL_STATE_CHANGE, so even with the correct sender a
+                // transfer simulation would fail. Writes are journalled into the
+                // per-call child updater and discarded when the future completes;
+                // nothing is committed, so view reads are unaffected.
+                .isStatic(false)
                 .build();
 
         MessageCallProcessor processor = new MessageCallProcessor(evm, bundle.precompiles());
