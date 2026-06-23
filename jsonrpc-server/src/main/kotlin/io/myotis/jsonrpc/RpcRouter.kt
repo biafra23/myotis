@@ -154,18 +154,12 @@ class RpcRouter(
                 // (don't silently run the call with empty calldata).
                 val dataElement = (callObj["data"] ?: callObj["input"])?.takeUnless { it is JsonNull }
                 val data = if (dataElement != null) (dataElement.asHexBytes() ?: return null) else ByteArray(0)
-                // Optional call value (wei) — QUANTITY hex or decimal; malformed or
-                // negative -> proxy (wei is non-negative; a negative would throw in Wei.of).
+                // Optional call value (wei) — QUANTITY, unsigned <=256-bit; malformed /
+                // negative / out-of-range -> proxy (a negative would throw in Wei.of).
                 val valueElement = callObj["value"]?.takeUnless { it is JsonNull }
                 val value = if (valueElement != null) {
                     val s = (valueElement as? JsonPrimitive)?.contentOrNull ?: return null
-                    try {
-                        val parsed = if (s.startsWith("0x") || s.startsWith("0X"))
-                            java.math.BigInteger(s.substring(2).ifEmpty { "0" }, 16)
-                        else java.math.BigInteger(s)
-                        if (parsed.signum() < 0) return null
-                        parsed
-                    } catch (e: NumberFormatException) { return null }
+                    parseWeiQuantity(s) ?: return null
                 } else null
                 val block = p.blockTag(1)
                 val out = withContext(Dispatchers.IO) { b.call(from, to, data, value, block) } ?: return null
@@ -302,11 +296,7 @@ class RpcRouter(
                 val valueElement = callObj["value"]?.takeUnless { it is JsonNull }
                 val value = if (valueElement != null) {
                     val s = (valueElement as? JsonPrimitive)?.contentOrNull ?: return null
-                    try {
-                        if (s.startsWith("0x") || s.startsWith("0X"))
-                            java.math.BigInteger(s.substring(2).ifEmpty { "0" }, 16)
-                        else java.math.BigInteger(s)
-                    } catch (e: NumberFormatException) { return null }
+                    parseWeiQuantity(s) ?: return null
                 } else null
                 val gas = withContext(Dispatchers.IO) { b.estimateGas(from, to, data, value) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexQuantity(gas)))
@@ -355,6 +345,24 @@ class RpcRouter(
     /** Ethereum JSON-RPC QUANTITY encoding: minimal hex, no leading zeros, 0 -> "0x0". */
     private fun hexQuantity(v: Long): String = "0x" + java.lang.Long.toHexString(v)
     private fun hexQuantity(v: java.math.BigInteger): String = "0x" + v.toString(16)
+
+    /** Parse a JSON-RPC QUANTITY (hex `0x…` or decimal) as a wei value, enforcing EVM
+     *  semantics: unsigned and <= 256 bits. Returns null for malformed / negative /
+     *  out-of-range input. The length cap is checked BEFORE constructing the BigInteger so
+     *  an absurdly long string can't amplify parsing cost (0x + 64 hex digits, or ~78
+     *  decimal digits, covers the full 2^256 range). Shared by eth_call and eth_estimateGas
+     *  so both apply identical value validation. */
+    private fun parseWeiQuantity(s: String): java.math.BigInteger? {
+        if (s.isEmpty() || s.length > 80) return null
+        return try {
+            val v = if (s.startsWith("0x") || s.startsWith("0X"))
+                java.math.BigInteger(s.substring(2).ifEmpty { "0" }, 16)
+            else java.math.BigInteger(s)
+            if (v.signum() < 0 || v.bitLength() > 256) null else v
+        } catch (e: NumberFormatException) {
+            null
+        }
+    }
 
     /** Ethereum JSON-RPC DATA encoding: 0x-prefixed, every byte rendered (leading
      *  zeros kept). Allocation-free — eth_getCode returns up to ~24KB of bytecode,

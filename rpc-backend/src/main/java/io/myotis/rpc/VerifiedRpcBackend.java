@@ -1620,15 +1620,19 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     /** eth_call over the shared anchored head. Returns raw ABI bytes, or null to error. */
     private byte[] rpcCall(byte[] from, byte[] to, byte[] data,
                            java.math.BigInteger value, String block) {
+        // Keep the early-rejection logs correlatable with the wallet call that triggered
+        // them: include target + 4-byte selector, matching the richer `desc` logging below.
+        String callCtx = " to=" + (to != null && to.length == 20 ? Bytes.wrap(to).toHexString() : "?")
+                + " sel=" + (data != null && data.length >= 4 ? Bytes.wrap(data, 0, 4).toHexString() : "0x");
         if (from != null && from.length != 20) {
-            log.info("[rpc] eth_call -> malformed from (len=" + from.length + ")");
+            log.info("[rpc] eth_call -> malformed from (len=" + from.length + ")" + callCtx);
             return null;
         }
         // Defence in depth (the router already screens this): wei is non-negative, and a
         // negative value would throw IllegalArgumentException in Wei.of down in the executor.
         // Return null so the router centrally manages the fallback instead.
         if (value != null && value.signum() < 0) {
-            log.info("[rpc] eth_call -> negative value (" + value + ")");
+            log.info("[rpc] eth_call -> negative value (" + value + ")" + callCtx);
             return null;
         }
         // Identify the call up front: caller + target + 4-byte selector + calldata size
