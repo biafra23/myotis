@@ -367,7 +367,7 @@ public class BeaconLightClient implements AutoCloseable {
                 if (next != null) keys.addAll(java.util.Arrays.asList(next.pubkeys()));
                 if (keys.isEmpty()) return;
                 long t0 = System.nanoTime();
-                com.jaeckel.ethp2p.consensus.bls.BlsVerifier.warmPubkeyCache(keys);
+                com.jaeckel.ethp2p.consensus.bls.BlsBackends.active().warmPubkeyCache(keys);
                 log.info("[beacon] BLS pubkey cache warmed: {} keys in {}ms",
                         keys.size(), (System.nanoTime() - t0) / 1_000_000);
             } catch (Exception e) {

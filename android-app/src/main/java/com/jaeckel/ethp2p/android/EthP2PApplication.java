@@ -28,5 +28,20 @@ public final class EthP2PApplication extends Application {
         // it on Android.
         Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME);
         Security.addProvider(new BouncyCastleProvider());
+
+        // BLS backend selection (must be set before the light client's first verify).
+        // DEBUGGABLE builds default to "compare": run BOTH the pure-Java Milagro path and
+        // the bundled native blst (jniLibs/<abi>/libmyotis_bls.so) on every sync-committee
+        // verify and log a per-verify head-to-head (tag: ComparingBlsBackend /
+        // "[bls-compare]") so the on-device speedup is directly measurable. RELEASE builds
+        // default to "auto" (native when present, else Milagro) — running Milagro too would
+        // double every verify and, since Milagro is ~30-55s cold on ART, defeat the whole
+        // point of native acceleration. Override anytime with -Dmyotis.bls.backend=
+        // auto|native|milagro|compare.
+        if (System.getProperty("myotis.bls.backend") == null) {
+            boolean debuggable = (getApplicationInfo().flags
+                    & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+            System.setProperty("myotis.bls.backend", debuggable ? "compare" : "auto");
+        }
     }
 }

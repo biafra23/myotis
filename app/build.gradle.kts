@@ -54,6 +54,19 @@ tasks.register<JavaExec>("run") {
     javaLauncher = javaToolchains.launcherFor {
         languageVersion = JavaLanguageVersion.of(21)
     }
+    // If the native blst lib (rust/myotis-bls) is built, put it on java.library.path so
+    // BlsBackends auto-selects the native backend (~15x faster BLS verify). Falls back to
+    // Milagro if absent. Build: (cd rust/myotis-bls && cargo build --release).
+    // Override choice with -Dmyotis.bls.backend=milagro|native|compare.
+    rootProject.file("rust/myotis-bls/target/release").takeIf { it.exists() }?.let {
+        systemProperty(
+            "java.library.path",
+            it.absolutePath + System.getProperty("path.separator") + System.getProperty("java.library.path"),
+        )
+    }
+    // -Pbls=milagro|native|compare|auto → -Dmyotis.bls.backend (e.g. compare logs a
+    // per-verify Milagro-vs-native head-to-head during a live sync).
+    (project.findProperty("bls") as String?)?.let { systemProperty("myotis.bls.backend", it) }
     // Pass -Pargs="status" / -Pargs="get-headers 21000000 3" etc. to the JVM main
     // Pass -Pnetwork=sepolia to select a testnet (default: mainnet)
     val appArgs = mutableListOf<String>()
