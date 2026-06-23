@@ -57,24 +57,34 @@ public class BlsBackendBenchmark {
         for (Map.Entry<String, BlsBackend> e : backends.entrySet()) {
             BlsBackend b = e.getValue();
 
-            long c0 = System.nanoTime();
-            boolean r = b.fastAggregateVerify(pks, msg, sig);
-            double coldMs = (System.nanoTime() - c0) / 1e6;
+            try {
+                long c0 = System.nanoTime();
+                boolean r = b.fastAggregateVerify(pks, msg, sig);
+                double coldMs = (System.nanoTime() - c0) / 1e6;
 
-            if (reference == null) reference = r;
-            else if (r != reference) {
-                throw new AssertionError(e.getKey() + " disagreed with the reference verdict");
+                if (reference == null) reference = r;
+                else if (r != reference) {
+                    throw new AssertionError(e.getKey() + " disagreed with the reference verdict");
+                }
+
+                for (int i = 0; i < 3; i++) b.fastAggregateVerify(pks, msg, sig); // warmup
+                int iters = 30;
+                long w0 = System.nanoTime();
+                for (int i = 0; i < iters; i++) b.fastAggregateVerify(pks, msg, sig);
+                double warmMs = (System.nanoTime() - w0) / 1e6 / iters;
+
+                System.out.printf("%-22s %12.1f %12.2f%n", e.getKey(), coldMs, warmMs);
+                if (e.getKey().startsWith("Milagro")) milagroWarm = warmMs;
+                fastestWarm = Math.min(fastestWarm, warmMs);
+            } catch (AssertionError disagreement) {
+                throw disagreement;   // a genuine verdict disagreement is a real failure
+            } catch (Throwable t) {
+                // A backend's native lib may be absent for this OS/arch (UnsatisfiedLinkError
+                // etc.). Skip it — this benchmark runs on many dev machines / CI environments —
+                // rather than failing the whole run or printing a misleading timing.
+                System.out.printf("%-22s %12s  (skipped: %s)%n",
+                        e.getKey(), "—", t.getClass().getSimpleName());
             }
-
-            for (int i = 0; i < 3; i++) b.fastAggregateVerify(pks, msg, sig); // warmup
-            int iters = 30;
-            long w0 = System.nanoTime();
-            for (int i = 0; i < iters; i++) b.fastAggregateVerify(pks, msg, sig);
-            double warmMs = (System.nanoTime() - w0) / 1e6 / iters;
-
-            System.out.printf("%-22s %12.1f %12.2f%n", e.getKey(), coldMs, warmMs);
-            if (e.getKey().startsWith("Milagro")) milagroWarm = warmMs;
-            fastestWarm = Math.min(fastestWarm, warmMs);
         }
         System.out.println("-----------------------------------------------------------");
         System.out.printf("all backends agree (result=%b)%n", reference);

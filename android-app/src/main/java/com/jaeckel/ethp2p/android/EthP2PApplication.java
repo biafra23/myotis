@@ -30,13 +30,18 @@ public final class EthP2PApplication extends Application {
         Security.addProvider(new BouncyCastleProvider());
 
         // BLS backend selection (must be set before the light client's first verify).
-        // "compare" runs BOTH the pure-Java Milagro path and the bundled native blst
-        // (jniLibs/<abi>/libmyotis_bls.so) on every sync-committee verify and logs a
-        // per-verify head-to-head to logcat (tag: ComparingBlsBackend / "[bls-compare]")
-        // so the on-device speedup is directly measurable. Switch to "auto" (native when
-        // present, else Milagro) or "native"/"milagro" for production / single-backend runs.
+        // DEBUGGABLE builds default to "compare": run BOTH the pure-Java Milagro path and
+        // the bundled native blst (jniLibs/<abi>/libmyotis_bls.so) on every sync-committee
+        // verify and log a per-verify head-to-head (tag: ComparingBlsBackend /
+        // "[bls-compare]") so the on-device speedup is directly measurable. RELEASE builds
+        // default to "auto" (native when present, else Milagro) — running Milagro too would
+        // double every verify and, since Milagro is ~30-55s cold on ART, defeat the whole
+        // point of native acceleration. Override anytime with -Dmyotis.bls.backend=
+        // auto|native|milagro|compare.
         if (System.getProperty("myotis.bls.backend") == null) {
-            System.setProperty("myotis.bls.backend", "compare");
+            boolean debuggable = (getApplicationInfo().flags
+                    & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+            System.setProperty("myotis.bls.backend", debuggable ? "compare" : "auto");
         }
     }
 }

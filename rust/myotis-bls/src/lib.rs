@@ -43,8 +43,12 @@ fn verify(
     message: JByteArray,
     signature: JByteArray,
 ) -> Option<bool> {
+    // Cap n before any `n * PK_LEN` arithmetic or `Vec::with_capacity(n)`: on 32-bit ABIs
+    // (armeabi-v7a) usize is 32-bit, so a huge `count` could overflow the length check and
+    // trigger a massive allocation / OOM panic that crashes the host. A sync committee is
+    // 512 pubkeys; 4096 is a generous, safe upper bound.
     let n = count.max(0) as usize;
-    if n == 0 {
+    if n == 0 || n > 4096 {
         return Some(false);
     }
     let pk_bytes = env.convert_byte_array(&pubkeys).ok()?;

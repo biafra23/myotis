@@ -36,7 +36,10 @@ public final class JblstBlsBackend implements BlsBackend {
             P2_Affine sig = new P2_Affine(signature);
             // hash_or_encode=true (hash-to-curve), POP DST, no augmentation.
             return sig.core_verify(aggregatedAffine, true, message, DST) == BLST_ERROR.BLST_SUCCESS;
-        } catch (Exception e) {
+        } catch (Throwable t) {
+            // Throwable, not Exception: the jblst native lib may be absent for this OS/arch,
+            // surfacing as UnsatisfiedLinkError (an Error). Return false like the other
+            // backends instead of crashing the benchmark/test JVM.
             return false;
         }
     }

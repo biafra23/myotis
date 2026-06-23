@@ -32,9 +32,20 @@ public final class ComparingBlsBackend implements BlsBackend {
         boolean trustedOk = trusted.fastAggregateVerify(pubkeys, message, signature);
         long trustedNs = System.nanoTime() - t0;
 
+        // The candidate is UNTRUSTED here — a native/JNI backend could throw
+        // (UnsatisfiedLinkError, a native panic, a device-specific linkage error). It must
+        // never disrupt the trusted verification flow, which is the whole point of this
+        // backend. Isolate it: on any Throwable, treat the candidate as failed and keep going.
         long t1 = System.nanoTime();
-        boolean candOk = candidate.fastAggregateVerify(pubkeys, message, signature);
-        long candNs = System.nanoTime() - t1;
+        boolean candOk = false;
+        long candNs = 0;
+        try {
+            candOk = candidate.fastAggregateVerify(pubkeys, message, signature);
+            candNs = System.nanoTime() - t1;
+        } catch (Throwable t) {
+            log.error("[bls-compare] Candidate backend {} threw during verification",
+                    candidate.name(), t);
+        }
 
         int pk = pubkeys == null ? 0 : pubkeys.size();
         double tMs = trustedNs / 1e6, cMs = candNs / 1e6;

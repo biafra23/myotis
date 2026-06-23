@@ -4,7 +4,7 @@
 # verify kicks in. See docs/bls-rust-acceleration.md.
 #
 # One-time setup:
-#   rustup target add aarch64-linux-android x86_64-linux-android armeabi-v7a-linux-android
+#   rustup target add aarch64-linux-android x86_64-linux-android armv7-linux-androideabi
 #   cargo install cargo-ndk
 #   export ANDROID_NDK_HOME=<sdk>/ndk/<version>   # e.g. 27.0.11718014
 #
