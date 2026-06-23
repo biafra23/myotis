@@ -96,9 +96,11 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
      *  another good peer), so a node with 50+ snap-negotiated peers went amber and could not
      *  build a verified head while the UI still counted them. A short cooldown routes around a
      *  momentarily-lagging peer without throwing it away for the rest of the connection. */
-    private static final long SNAP_SERVING_COOLDOWN_MS = 30_000L;
-    /** Epoch-ms until which this peer is benched from the snap serving pool (0 = not benched). */
-    private volatile long snapServingFailedUntilMs = 0L;
+    private static final long SNAP_SERVING_COOLDOWN_NS = TimeUnit.MILLISECONDS.toNanos(30_000L);
+    /** Monotonic {@link System#nanoTime()} deadline until which this peer is benched from the
+     *  snap serving pool (0 = not benched). nanoTime, not currentTimeMillis: a wall-clock
+     *  adjustment (NTP / manual) must not extend or prematurely expire the cooldown. */
+    private volatile long snapServingFailedUntilNs = 0L;
     private volatile org.apache.tuweni.bytes.Bytes32 latestStateRoot;
     private volatile long latestStateRootBlockNumber = -1;
 
@@ -1352,14 +1354,18 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     public boolean isSnapNegotiated() { return snapNegotiated; }
 
     public boolean isSnapServingFailed() {
-        return System.currentTimeMillis() < snapServingFailedUntilMs;
+        long until = snapServingFailedUntilNs;
+        // `now - until < 0` (not `now < until`) is the overflow-safe nanoTime comparison.
+        return until != 0L && (System.nanoTime() - until < 0);
     }
 
-    /** Bench this peer from the serving pool for {@link #SNAP_SERVING_COOLDOWN_MS}, after
+    /** Bench this peer from the serving pool for {@link #SNAP_SERVING_COOLDOWN_NS}, after
      *  which it automatically rejoins and gets another chance (its snapshot will have
      *  advanced). Replaces the old permanent flag that decayed the pool to zero. */
     public void markSnapServingFailed() {
-        snapServingFailedUntilMs = System.currentTimeMillis() + SNAP_SERVING_COOLDOWN_MS;
+        long until = System.nanoTime() + SNAP_SERVING_COOLDOWN_NS;
+        // nanoTime can legitimately be 0; remap so 0 keeps meaning "not benched".
+        snapServingFailedUntilNs = (until == 0L) ? 1L : until;
     }
 
     public State getState() {
