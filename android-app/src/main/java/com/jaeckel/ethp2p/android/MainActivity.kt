@@ -583,6 +583,7 @@ private fun SettingsScreen(
     var snapTarget by remember { mutableStateOf(NodeService.snapTarget(context).toString()) }
     var deepPool by remember { mutableStateOf(NodeService.deepPoolThreshold(context).toString()) }
     var strictFreshness by remember { mutableStateOf(NodeService.strictStateFreshness(context)) }
+    var nativeBls by remember { mutableStateOf(NodeService.nativeBlsEnabled(context)) }
 
     Scaffold(
         topBar = {
@@ -678,6 +679,32 @@ private fun SettingsScreen(
                     "On (opt-in, experimental): serve a slightly older verified root — but if " +
                     "it isn’t fully servable this can HANG the confirm screen for up to 2 min " +
                     "instead of failing fast. Applies on the next node (re)start.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Row(
+                Modifier.fillMaxWidth().padding(top = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Native BLS acceleration")
+                Switch(
+                    checked = nativeBls,
+                    onCheckedChange = { on ->
+                        nativeBls = on
+                        NodeService.setNativeBlsEnabled(context, on)
+                        // Apply immediately — flips the process-wide backend live (the
+                        // decompressed-pubkey cache is process-global, so the swap is cheap).
+                        NodeService.applyBlsBackend(context)
+                    },
+                )
+            }
+            Text(
+                "On (default): use the bundled native blst library for sync-committee BLS " +
+                    "verification (much faster than pure-Java; on debuggable builds it runs both " +
+                    "and logs a head-to-head). Off: force the pure-Java Milagro path — slower " +
+                    "(~30-55s cold on ART), but useful if the native library fails to load (e.g. " +
+                    "a 16 KB page-alignment issue on Android 15+). Applies immediately.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

@@ -38,10 +38,12 @@ public final class EthP2PApplication extends Application {
         // double every verify and, since Milagro is ~30-55s cold on ART, defeat the whole
         // point of native acceleration. Override anytime with -Dmyotis.bls.backend=
         // auto|native|milagro|compare.
+        // Seed from the user's "Native BLS acceleration" setting (default ON): OFF forces
+        // Milagro; ON keeps the build-type default (compare on debuggable, auto on release).
+        // The Settings toggle applies live via NodeService.applyBlsBackend (and every node
+        // start re-applies it) — this just sets the initial value for any pre-start verify.
         if (System.getProperty("myotis.bls.backend") == null) {
-            boolean debuggable = (getApplicationInfo().flags
-                    & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0;
-            System.setProperty("myotis.bls.backend", debuggable ? "compare" : "auto");
+            System.setProperty("myotis.bls.backend", NodeService.blsBackendChoice(this));
         }
     }
 }
