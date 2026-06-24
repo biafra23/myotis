@@ -43,11 +43,22 @@ bad = []
 for f in glob.glob(os.path.join(sys.argv[1], "*", "libmyotis_bls.so")):
     with open(f, "rb") as fh:
         d = fh.read()
+    if d[:4] != b"\x7fELF":
+        sys.exit(f"not an ELF file: {f}")
     end = "<" if d[5] == 1 else ">"
-    phoff = struct.unpack_from(end + "Q", d, 0x20)[0]
-    phentsize = struct.unpack_from(end + "H", d, 0x36)[0]
-    phnum = struct.unpack_from(end + "H", d, 0x38)[0]
-    aligns = [struct.unpack_from(end + "Q", d, phoff + i * phentsize + 0x30)[0]
+    # Handle both classes: arm64-v8a / x86_64 are ELF64, but armeabi-v7a (32-bit,
+    # mentioned in the build comments) is ELF32 with different header offsets.
+    if d[4] == 2:   # ELFCLASS64
+        phoff = struct.unpack_from(end + "Q", d, 0x20)[0]
+        phentsize = struct.unpack_from(end + "H", d, 0x36)[0]
+        phnum = struct.unpack_from(end + "H", d, 0x38)[0]
+        align_off, align_fmt = 0x30, end + "Q"   # p_align in Elf64_Phdr
+    else:           # ELFCLASS32
+        phoff = struct.unpack_from(end + "I", d, 0x1C)[0]
+        phentsize = struct.unpack_from(end + "H", d, 0x2A)[0]
+        phnum = struct.unpack_from(end + "H", d, 0x2C)[0]
+        align_off, align_fmt = 0x1C, end + "I"     # p_align in Elf32_Phdr
+    aligns = [struct.unpack_from(align_fmt, d, phoff + i * phentsize + align_off)[0]
               for i in range(phnum)
               if struct.unpack_from(end + "I", d, phoff + i * phentsize)[0] == 1]  # PT_LOAD
     ok = all(a >= 0x4000 for a in aligns)
