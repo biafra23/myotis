@@ -1,0 +1,20 @@
+# 16 KB page alignment for Android 15+ devices that use a 16 KB memory page size.
+#
+# NDK < r28 links shared objects with 4 KB-aligned PT_LOAD segments by default.
+# On a 16 KB-page device the dynamic linker rejects such a library at load time
+# ("dlopen failed: ... is not 16 KB aligned"), so NativeBlsBackend.isAvailable()
+# turns false (or the app crashes) on those devices. Forcing max-page-size makes
+# the linker emit 16 KB-aligned segments. NDK r28+ already defaults to this, where
+# the flag is a harmless no-op — so it's safe to keep regardless of NDK version.
+#
+# Per-target (not [build]) so it only affects Android cross-compiles, never host
+# builds/tests. Verify after building with rust/build-android.sh (it checks).
+
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.armv7-linux-androideabi]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
