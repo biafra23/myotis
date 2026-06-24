@@ -408,6 +408,33 @@ Milagro, ConsenSys discv5). Map each concern as follows. **Rust generally has th
 mature, batteries-included crates for every layer and is the recommended target**; Go is
 viable and benefits from go-ethereum covering most of the EL stack in one place.
 
+> **Guiding principle — prefer a mature library over bespoke code.** Whenever a mature,
+> well-maintained, performant library exists in the target language for a concern, **use it
+> instead of porting the JVM code or hand-rolling** — *including* libraries with **no analogue
+> in the JVM reference**. The table below is a starting point, **not a ceiling**: if the Rust/Go
+> ecosystem offers a solid crate/package for something the reference happened to hand-roll
+> (an MPT/trie verifier, an SSZ codec, an ABI coder, …), prefer the library. Reimplement only
+> when no suitable library exists. Every line of crypto/wire code you don't write is code you
+> don't have to audit, and these libraries are typically more battle-tested than a fresh port.
+>
+> **The hard constraint is mobile: every dependency must run on both Android and iOS.** A
+> library is disqualified — however good on desktop — if it can't build for mobile (desktop-JVM-
+> only, no NDK / `cargo-ndk` / Xcode target, a transitive that breaks on ART or iOS) or carries
+> an unacceptable binary/DEX-size or FFI cost. Several choices in the table are **deliberate
+> mobile workarounds, not preferences**: Milagro pure-Java was picked over jblst to dodge JNI,
+> the ABI codec is hand-rolled to keep DEX small, and `java.net.http` is banned below API 33.
+> So when the reference hand-rolls or avoids a library, **check *why* first** — then re-evaluate
+> for your language, because the constraint may not transfer. (Rust's `blst` *does* build for
+> Android via `cargo-ndk` — which is exactly why the project later adopted a native blst backend
+> over the pure-Java verifier; there a library rightly beats the hand-roll. See
+> [`docs/bls-rust-acceleration.md`](../bls-rust-acceleration.md).)
+>
+> **One caveat for the security-critical primitives** (the MPT proof verifier, SSZ light-client
+> merkleization + branch indices, the BLS verify equation + DST): a library is still encouraged,
+> but **validate that its exact semantics match this spec** — Found/Absent/Invalid behavior,
+> field orders, generalized indices, the `_POP_` DST, G1/G2 point handling. Use the library, but
+> prove it does precisely the right thing against the invariants in §11 and the companions.
+
 | Concern | JVM reference | Rust | Go |
 |---|---|---|---|
 | keccak-256 | Tuweni `Hash` / BouncyCastle | `tiny-keccak` / `sha3` | `golang.org/x/crypto/sha3` / go-ethereum `crypto` |
