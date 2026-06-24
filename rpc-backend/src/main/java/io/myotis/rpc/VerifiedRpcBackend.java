@@ -1783,20 +1783,27 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                                     data == null ? new byte[0] : data,
                                     value, h.blockCtx())
                             .whenComplete((out, ex) -> {
-                                inflightCalls.remove(flightKey, mine);
-                                if (ex != null) {
-                                    mine.completeExceptionally(ex);
-                                } else {
-                                    // Populate the replay cache from the LEADER's completion,
-                                    // which fires even if our waiter already timed out and gave
-                                    // up — so a call the wallet abandoned still lands warm for
-                                    // the retry. Verified before insertion (proven against this
-                                    // root by the oracle during execution). Store a clone: `out`
-                                    // is handed to the waiter below, so caching the same reference
-                                    // would let the waiter mutate the cached value.
-                                    callResultCache.put(flightKey,
-                                            out != null ? out.clone() : null, clock.elapsedMillis());
-                                    mine.complete(out);
+                                try {
+                                    if (ex != null) {
+                                        mine.completeExceptionally(ex);
+                                    } else {
+                                        // Populate the replay cache from the LEADER's completion,
+                                        // which fires even if our waiter already timed out and gave
+                                        // up — so a call the wallet abandoned still lands warm for
+                                        // the retry. Verified before insertion (proven against this
+                                        // root by the oracle during execution). Store a clone: `out`
+                                        // is handed to the waiter below, so caching the same reference
+                                        // would let the waiter mutate the cached value.
+                                        callResultCache.put(flightKey,
+                                                out != null ? out.clone() : null, clock.elapsedMillis());
+                                        mine.complete(out);
+                                    }
+                                } finally {
+                                    // Release the dedup guard only AFTER the cache is warm, so a
+                                    // concurrent identical call falls through to the warm result
+                                    // instead of racing into a redundant execution in the gap
+                                    // between guard-release and cache-fill.
+                                    inflightCalls.remove(flightKey, mine);
                                 }
                             });
                 } catch (Throwable t) {
@@ -3224,10 +3231,18 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                     value != null ? value : java.math.BigInteger.ZERO,
                     data != null ? data : new byte[0],
                     null);
-            Long gas = h.offchainExecutor().estimateGas(tx, h.blockCtx())
-                    .get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
+            java.util.concurrent.CompletableFuture<Long> est =
+                    h.offchainExecutor().estimateGas(tx, h.blockCtx());
+            // Warm the replay cache from the async completion, not just the returning
+            // thread: if the wallet's blocking get() below times out but the binary-search
+            // estimate finishes in the background, the result still lands warm for the
+            // retry — same rationale as the eth_call leader populating callResultCache
+            // after its waiter gave up.
+            est.whenComplete((g, ex) -> {
+                if (ex == null && g != null) estimateCache.put(estKey, g, clock.elapsedMillis());
+            });
+            Long gas = est.get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
             if (gas == null) return null;
-            estimateCache.put(estKey, gas, clock.elapsedMillis());
             return java.math.BigInteger.valueOf(gas);
         } catch (Exception e) {
             log.info("[rpc] eth_estimateGas -> error: " + describeEvmError(e));
