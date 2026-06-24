@@ -1753,7 +1753,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         if (cached != null) {
             log.info("[rpc] eth_call " + desc + " ok in "
                     + (clock.elapsedMillis() - t0) + "ms (cached)");
-            return cached;
+            return cached.clone();   // hand each reader its own copy; never expose the cached array
         }
         // Route small calls onto the reserved EVM lane so a confirm screen's tiny
         // probes/simulations never queue behind a ~32KB token-sweep storm. The hint
@@ -1791,8 +1791,11 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                                     // which fires even if our waiter already timed out and gave
                                     // up — so a call the wallet abandoned still lands warm for
                                     // the retry. Verified before insertion (proven against this
-                                    // root by the oracle during execution).
-                                    callResultCache.put(flightKey, out, clock.elapsedMillis());
+                                    // root by the oracle during execution). Store a clone: `out`
+                                    // is handed to the waiter below, so caching the same reference
+                                    // would let the waiter mutate the cached value.
+                                    callResultCache.put(flightKey,
+                                            out != null ? out.clone() : null, clock.elapsedMillis());
                                     mine.complete(out);
                                 }
                             });
