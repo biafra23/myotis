@@ -1,0 +1,55 @@
+name: Desktop DMG (macOS)
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    name: Build macOS .dmg
+    # macos-14 = Apple Silicon → an arm64 .dmg. jpackage only builds installers for the
+    # host OS, so the macOS .dmg can only be produced here (not on the Linux/ubuntu jobs).
+    runs-on: macos-14
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      # Compose Desktop's packageDmg wraps jpackage (bundles a jlink'd JRE + the app).
+      # NON-minified (main, not main-release): the Java backend (Netty / Besu / BouncyCastle /
+      # libp2p) is reflection-heavy and proguard would break it. Unsigned — Gatekeeper will
+      # need a right-click → Open the first time; notarization (Apple Developer ID) is a
+      # follow-up. Retry to ride out transient repo-resolution blips (mirrors the APK job).
+      - name: Build macOS .dmg
+        run: |
+          for attempt in 1 2 3; do
+            ./gradlew :app-desktop:packageDmg --stacktrace && exit 0
+            echo "::warning::DMG build attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
+            sleep 25
+          done
+          echo "::error::DMG build failed after 3 attempts"
+          exit 1
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: myotis-desktop-dmg-${{ github.sha }}
+          path: app-desktop/build/compose/binaries/main/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 30
