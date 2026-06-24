@@ -30,9 +30,23 @@ dependencies {
     // Tuweni's Hash.keccak256 resolves "KECCAK-256" via a JCE provider; the trie
     // proof tests build fixtures with it, so BouncyCastle must be on the test path.
     testImplementation(libs.bouncycastle)
+    // BLS acceleration benchmark: jblst (blst JNI) vs the pure-Java Milagro path.
+    // Test scope only — not shipped; see docs/bls-rust-acceleration.md.
+    testImplementation(libs.jblst)
     testRuntimeOnly(libs.logback.classic)
 }
 
 tasks.test {
     useJUnitPlatform()
+    // If the native blst lib (rust/myotis-bls) has been built, put it on java.library.path
+    // so NativeBlsBackend.isAvailable() is true and BlsBackendBenchmark exercises it.
+    // Build with: (cd rust/myotis-bls && cargo build --release)
+    val nativeDir = rootProject.file("rust/myotis-bls/target/release")
+    if (nativeDir.exists()) {
+        val sep = System.getProperty("path.separator")
+        systemProperty(
+            "java.library.path",
+            nativeDir.absolutePath + sep + System.getProperty("java.library.path"),
+        )
+    }
 }

@@ -17,11 +17,6 @@ import com.jaeckel.ethp2p.consensus.types.SyncCommittee;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -367,7 +362,7 @@ public class BeaconLightClient implements AutoCloseable {
                 if (next != null) keys.addAll(java.util.Arrays.asList(next.pubkeys()));
                 if (keys.isEmpty()) return;
                 long t0 = System.nanoTime();
-                com.jaeckel.ethp2p.consensus.bls.BlsVerifier.warmPubkeyCache(keys);
+                com.jaeckel.ethp2p.consensus.bls.BlsBackends.active().warmPubkeyCache(keys);
                 log.info("[beacon] BLS pubkey cache warmed: {} keys in {}ms",
                         keys.size(), (System.nanoTime() - t0) / 1_000_000);
             } catch (Exception e) {
@@ -684,15 +679,11 @@ public class BeaconLightClient implements AutoCloseable {
     private void discoverPeersFromBeaconApi() {
         if (beaconApiUrl == null || beaconApiUrl.isEmpty()) return;
         try {
-            HttpClient client = HttpClient.newBuilder()
-                    .connectTimeout(Duration.ofSeconds(5))
-                    .build();
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(beaconApiUrl + "/eth/v1/node/peers?state=connected"))
-                    .timeout(Duration.ofSeconds(10))
-                    .GET()
-                    .build();
-            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            // All java.net.http usage is isolated in BeaconApiHttp so a NoClassDefFoundError on
+            // Android is thrown HERE (first touch of that class) and caught below, never at this
+            // method's resolution / class verification. See BeaconApiHttp.
+            BeaconApiHttp.Response response = BeaconApiHttp.get(
+                    beaconApiUrl + "/eth/v1/node/peers?state=connected", null, 5, 10);
             if (response.statusCode() != 200) {
                 log.warn("[beacon] Beacon API returned status {}", response.statusCode());
                 return;
@@ -701,7 +692,7 @@ public class BeaconLightClient implements AutoCloseable {
             // Extract peer entries from JSON using regex (avoids adding a JSON library dependency).
             // Each peer object has "peer_id" and "last_seen_p2p_address" fields.
             // Many addresses lack the /p2p/<peer_id> suffix, so we construct it.
-            String body = response.body();
+            String body = new String(response.body(), java.nio.charset.StandardCharsets.UTF_8);
             // Match each peer object: extract peer_id and last_seen_p2p_address together
             Pattern peerPattern = Pattern.compile(
                     "\"peer_id\"\\s*:\\s*\"([^\"]+)\"[^}]*?\"last_seen_p2p_address\"\\s*:\\s*\"([^\"]+)\"");
@@ -1088,16 +1079,8 @@ public class BeaconLightClient implements AutoCloseable {
             String url = beaconApiUrl + "/eth/v1/beacon/light_client/bootstrap/" + rootHex;
             log.info("[beacon] Attempting HTTP bootstrap from {}", url);
 
-            HttpClient client = HttpClient.newBuilder()
-                    .connectTimeout(Duration.ofSeconds(5))
-                    .build();
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .timeout(Duration.ofSeconds(15))
-                    .header("Accept", "application/octet-stream")
-                    .GET()
-                    .build();
-            HttpResponse<byte[]> response = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
+            // java.net.http isolated in BeaconApiHttp — see the note in discoverPeersFromBeaconApi.
+            BeaconApiHttp.Response response = BeaconApiHttp.get(url, "application/octet-stream", 5, 15);
             if (response.statusCode() != 200) {
                 log.warn("[beacon] HTTP bootstrap returned status {} from {}", response.statusCode(), url);
                 return false;
@@ -1140,6 +1123,14 @@ public class BeaconLightClient implements AutoCloseable {
             log.info("[beacon] HTTP bootstrap complete, slot={}", bootstrap.header().beacon().slot());
             return true;
 
+        } catch (LinkageError e) {
+            // java.net.http is absent on the Android runtime (not desugared, not shipped at all).
+            // NoClassDefFoundError is an Error, not an Exception, so it slips past the catch below
+            // and would otherwise kill the beacon-sync thread. HTTP bootstrap is a JVM-only debug
+            // convenience; the real bootstrap path is P2P (see bootstrap()), so degrade gracefully.
+            log.debug("[beacon] HTTP bootstrap unavailable on this runtime "
+                    + "(java.net.http absent — Android); falling back to P2P bootstrap: {}", e.getMessage());
+            return false;
         } catch (Exception e) {
             Throwable root = e;
             while (root.getCause() != null) root = root.getCause();
@@ -1668,21 +1659,15 @@ public class BeaconLightClient implements AutoCloseable {
         if (beaconApiUrl == null || beaconApiUrl.isEmpty()) return;
         try {
             log.info("[beacon] Attempting seed from beacon HTTP API: {}", beaconApiUrl);
-            HttpClient client = HttpClient.newBuilder()
-                    .connectTimeout(Duration.ofSeconds(5))
-                    .build();
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(beaconApiUrl + "/eth/v1/beacon/light_client/finality_update"))
-                    .timeout(Duration.ofSeconds(10))
-                    .GET()
-                    .build();
-            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            // java.net.http isolated in BeaconApiHttp — see the note in discoverPeersFromBeaconApi.
+            BeaconApiHttp.Response response = BeaconApiHttp.get(
+                    beaconApiUrl + "/eth/v1/beacon/light_client/finality_update", null, 5, 10);
             if (response.statusCode() != 200) {
                 log.warn("[beacon] Beacon API finality update returned status {}", response.statusCode());
                 return;
             }
 
-            String body = response.body();
+            String body = new String(response.body(), java.nio.charset.StandardCharsets.UTF_8);
 
             // Extract finalized_header.execution.state_root from JSON
             Pattern stateRootPattern = Pattern.compile(
@@ -1749,6 +1734,12 @@ public class BeaconLightClient implements AutoCloseable {
             log.info("[beacon] Seeded from beacon HTTP API, finalizedSlot={}, stateRoot={}",
                     finalizedSlot, stateRootHex);
 
+        } catch (LinkageError e) {
+            // java.net.http is absent on the Android runtime — NoClassDefFoundError (an Error, not an
+            // Exception) would otherwise escape this method. This HTTP seed is a JVM-only debug
+            // fallback; P2P seeding is the real path, so degrade gracefully instead of crashing.
+            log.debug("[beacon] Beacon API finality seed unavailable on this runtime "
+                    + "(java.net.http absent — Android): {}", e.getMessage());
         } catch (Exception e) {
             log.warn("[beacon] Beacon API finality seed failed: {}", e.getMessage());
         }

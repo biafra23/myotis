@@ -1,4 +1,4 @@
-rootProject.name = "Myotis"
+rootProject.name = "myotis"
 
 pluginManagement {
     repositories {

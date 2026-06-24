@@ -225,6 +225,20 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     // Bounded LRU per kind; ~64k storage slots ≈ a few MB.
     private static final int STATE_PROOF_CACHE_MAX = 65_536;
 
+    /** How long a verified eth_call / estimateGas RESULT stays replayable (see
+     *  {@link #callResultCache}). The result is keyed by stateRoot, so its value is
+     *  ALWAYS correct for that state — this bound is staleness + memory, not safety.
+     *  Mirrors {@link #RPC_HEAD_SERVE_STALE_MAX_MS}, the same horizon a pinned head
+     *  itself stays servable, so a retry that still resolves to that head finds its
+     *  result warm. Where StateProofCache (above) saves the per-slot snap proofs so a
+     *  re-execution is cheaper, THIS cache saves the assembled answer so the common
+     *  case — an identical call against an unchanged root — skips re-execution entirely. */
+    private static final long CALL_RESULT_CACHE_TTL_MS = RPC_HEAD_SERVE_STALE_MAX_MS;
+    /** Bound on distinct cached call/estimate answers. A confirm screen's Multicall3
+     *  sweep + token list is a few hundred distinct calls; 512 covers a couple of those
+     *  in flight at once. Each value is a small return blob, so this is low-MB. */
+    private static final int CALL_RESULT_CACHE_MAX = 512;
+
     // EVM pool. Was a single thread ("EVM is CPU-bound, oracle pinned to one
     // peer") — but the oracle rotates across peers now, and an EVM task spends
     // most of its wall-clock BLOCKED on snap fetch waves, not executing. A wallet
@@ -396,6 +410,29 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                 }
             });
 
+    /** Replayable eth_call results, keyed by the SAME {@code stateRoot:from:to:value:keccak(calldata)}
+     *  string as {@link #inflightCalls}. An eth_call is deterministic given its anchored
+     *  stateRoot, so once a (root, from, target, value, calldata) tuple has executed-and-verified
+     *  the answer is reusable for as long as that root stays servable. The dominant real-world
+     *  pattern is a user retrying a hung confirm screen — tap Confirm, it spins past the
+     *  wallet's timeout, tap again — which re-issues the IDENTICAL call against the same
+     *  pinned head; we replay the cached answer in microseconds instead of re-running the
+     *  EVM + snap fetch waves on thin mobile peers. Crucially the leader's execution is NOT
+     *  cancelled when its waiter times out (see {@link #rpcCall}); it finishes in the
+     *  background and populates this cache, so even a call the wallet GAVE UP on lands here
+     *  and the retry finds it warm. Reuse is never a trust relaxation: the key pins the
+     *  exact stateRoot and every value was proof-verified against it before insertion — the
+     *  served bytes are bit-identical to re-executing. */
+    private final VerifiedResultCache<byte[]> callResultCache =
+            new VerifiedResultCache<>(CALL_RESULT_CACHE_MAX, CALL_RESULT_CACHE_TTL_MS);
+
+    /** Replayable eth_estimateGas results, keyed by {@code stateRoot:from:to:keccak(data):value}.
+     *  Same rationale as {@link #callResultCache}: an estimate is deterministic given the
+     *  anchored state, and estimateGas is a gating call on the confirm screen, so a retry
+     *  against the same pinned head replays instead of re-running the binary-search EVM. */
+    private final VerifiedResultCache<Long> estimateCache =
+            new VerifiedResultCache<>(CALL_RESULT_CACHE_MAX, CALL_RESULT_CACHE_TTL_MS);
+
     /** Highest nonce this node has broadcast for a sender but not yet seen mined,
      *  keyed by lowercase 0x sender address, with the broadcast timestamp. A light
      *  node has no mempool, so without this two back-to-back sends from the same
@@ -514,6 +551,23 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     // Construction / lifecycle
     // ---------------------------------------------------------------------
 
+    /** System property controlling state-read freshness. Default is STRICT (the tight 2-min
+     *  {@link #RPC_STATE_HEAD_MAX_STALE_MS} bound, fast-fail); set
+     *  {@code -Dmyotis.rpc.strictStateFreshness=false} to opt INTO relaxed serving. The
+     *  Android app surfaces this as a Settings toggle (OFF by default; it sets the property
+     *  before building its stacks). See OPTIMISATIONS_AND_LIMITATIONS.md §2.14. */
+    public static final String STRICT_STATE_FRESHNESS_PROP = "myotis.rpc.strictStateFreshness";
+
+    /** Max age a stale-but-anchored head may have and still be served for a STATE-execution
+     *  read (eth_call / getBalance / getCode / getStorageAt / estimateGas). STRICT BY DEFAULT
+     *  (the tight 2-min {@link #RPC_STATE_HEAD_MAX_STALE_MS} bound) so a read fast-fails when
+     *  no fresh fully-servable root exists, rather than grinding the 120s call timeout on a
+     *  stale root that passes the cheap probe but isn't fully servable. The relaxed ~13-min
+     *  horizon ({@link #RPC_HEAD_SERVE_STALE_MAX_MS}) is an explicit OPT-IN via
+     *  {@link #STRICT_STATE_FRESHNESS_PROP} — see the constructor and
+     *  OPTIMISATIONS_AND_LIMITATIONS.md §2.14 for why relaxing the default backfired. */
+    private final long stateHeadStaleCapMs;
+
     public VerifiedRpcBackend(RLPxConnector connector,
                               BeaconLightClient beaconLightClient,
                               BeaconSyncState beaconSyncState,
@@ -532,6 +586,21 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         this.log = log != null ? log : RpcLogger.noop();
         this.clock = clock != null ? clock : RpcClock.monotonic();
         this.snapQuality = snapQuality != null ? snapQuality : SnapQualitySink.noop();
+        // STRICT by default. Relaxing the cap *backfired*: the cheap single-account
+        // stale-serve probe can pass on an older root that isn't FULLY servable for a real
+        // execution, so eth_estimateGas / eth_call then grind the full 120 s RPC_CALL_TIMEOUT
+        // on unservable state instead of fast-erroring — a confirm-screen *hang* that is
+        // strictly worse than the prior instant -32000 (which the wallet retries). The
+        // staleness was never the true blocker; when no fully-servable root exists, failing
+        // fast is the right move. Relaxed stays available as an explicit OPT-IN for anyone who
+        // wants to experiment (e.g. a chain with reliably deep snap peers). Default true =
+        // strict; set the property false to opt into relaxed. See OPTIMISATIONS_AND_LIMITATIONS.md §2.14.
+        boolean strictFreshness = Boolean.parseBoolean(
+                System.getProperty(STRICT_STATE_FRESHNESS_PROP, "true"));
+        this.stateHeadStaleCapMs =
+                strictFreshness ? RPC_STATE_HEAD_MAX_STALE_MS : RPC_HEAD_SERVE_STALE_MAX_MS;
+        this.log.info("[rpc] state-read head staleness cap = " + (stateHeadStaleCapMs / 1000)
+                + "s (" + (strictFreshness ? "strict" : "relaxed") + ")");
         final RpcClock clk = this.clock;
         final RpcLogger lg = this.log;
         this.evmPool = task -> {
@@ -645,6 +714,8 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         synchronized (rpcCallCtxLock) { rpcCallCtx = null; }
         lastGoodHead.set(null);
         pinnedHeadByNumber.clear();
+        callResultCache.clear();
+        estimateCache.clear();
         lastGoodLatestBlock = null;
         lastGoodFeeHistory = null;
     }
@@ -674,8 +745,9 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     }
 
     @Override
-    public byte[] call(byte[] to, byte[] data, String block) {
-        return rpcCall(to, data, block);
+    public byte[] call(byte[] from, byte[] to, byte[] data,
+                       java.math.BigInteger value, String block) {
+        return rpcCall(from, to, data, value, block);
     }
 
     @Override
@@ -963,7 +1035,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                 return frozen.head();
             }
         }
-        RpcCallContext ctx = anchoredHeadOrWait(RPC_STATE_HEAD_MAX_STALE_MS, true);
+        RpcCallContext ctx = anchoredHeadOrWait(stateHeadStaleCapMs, true);
         if (ctx == null) return null;
         if (requestedNum >= 0) {
             // A pinned number means "the latest block I saw" — wallets fetch
@@ -1617,12 +1689,31 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     // ---------------------------------------------------------------------
 
     /** eth_call over the shared anchored head. Returns raw ABI bytes, or null to error. */
-    private byte[] rpcCall(byte[] to, byte[] data, String block) {
-        // Identify the call up front: target + 4-byte selector + calldata size + block
-        // tag. eth_call failures were undiagnosable as "eth_call -> proxy: Timeout" —
-        // with hundreds of MetaMask poll variants we need to know WHICH contract/method
-        // is being asked for (e.g. its confirm-screen simulation multicall).
-        String desc = (to != null && to.length == 20 ? Bytes.wrap(to).toHexString() : "?")
+    private byte[] rpcCall(byte[] from, byte[] to, byte[] data,
+                           java.math.BigInteger value, String block) {
+        // Keep the early-rejection logs correlatable with the wallet call that triggered
+        // them: include target + 4-byte selector, matching the richer `desc` logging below.
+        String callCtx = " to=" + (to != null && to.length == 20 ? Bytes.wrap(to).toHexString() : "?")
+                + " sel=" + (data != null && data.length >= 4 ? Bytes.wrap(data, 0, 4).toHexString() : "0x");
+        if (from != null && from.length != 20) {
+            log.info("[rpc] eth_call -> malformed from (len=" + from.length + ")" + callCtx);
+            return null;
+        }
+        // Defence in depth (the router already screens this): wei is non-negative, and a
+        // negative value would throw IllegalArgumentException in Wei.of down in the executor.
+        // Return null so the router centrally manages the fallback instead.
+        if (value != null && value.signum() < 0) {
+            log.info("[rpc] eth_call -> negative value (" + value + ")" + callCtx);
+            return null;
+        }
+        // Identify the call up front: caller + target + 4-byte selector + calldata size
+        // + block tag. eth_call failures were undiagnosable as "eth_call -> proxy:
+        // Timeout" — with hundreds of MetaMask poll variants we need to know WHICH
+        // contract/method is being asked for (e.g. its confirm-screen simulation
+        // multicall), and by WHOM (a from-gated transfer/approve simulation differs
+        // from an anonymous read).
+        String desc = "from=" + (from != null && from.length == 20 ? Bytes.wrap(from).toHexString() : "0x0")
+                + " to=" + (to != null && to.length == 20 ? Bytes.wrap(to).toHexString() : "?")
                 + " sel=" + (data != null && data.length >= 4
                         ? Bytes.wrap(data, 0, 4).toHexString() : "0x")
                 + " dataLen=" + (data == null ? 0 : data.length)
@@ -1645,9 +1736,25 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
         // share one execution — this changes scheduling, never verification. Each
         // waiter keeps its own 30s deadline; the entry is removed when the execution
         // completes so a later retry re-executes fresh.
+        // Key by (stateRoot, from, to, value, calldata): the sender and value are now
+        // part of the input — a transfer simulated by vitalik vs by the zero address
+        // computes a DIFFERENT verified result, so they must not share an execution.
         String flightKey = Bytes.wrap(h.blockCtx().stateRoot()).toHexString()
+                + ":" + (from == null ? "0x0" : Bytes.wrap(from).toHexString())
                 + ":" + Bytes.wrap(to).toHexString()
+                + ":" + (value == null ? "0" : value.toString())
                 + ":" + (data == null ? "0x" : Hash.keccak256(Bytes.wrap(data)).toHexString());
+        // Warm-result replay: a prior execution for this exact (root, target, calldata)
+        // already produced a verified answer — possibly one whose original waiter timed
+        // out but whose background leader finished and populated the cache. Replay it; the
+        // result is deterministic given the anchored stateRoot, so this skips the whole
+        // EVM + snap-fetch round entirely (the retried-confirm-screen fast path).
+        byte[] cached = callResultCache.get(flightKey, clock.elapsedMillis());
+        if (cached != null) {
+            log.info("[rpc] eth_call " + desc + " ok in "
+                    + (clock.elapsedMillis() - t0) + "ms (cached)");
+            return cached.clone();   // hand each reader its own copy; never expose the cached array
+        }
         // Route small calls onto the reserved EVM lane so a confirm screen's tiny
         // probes/simulations never queue behind a ~32KB token-sweep storm. The hint
         // is read synchronously by evmPool when callView's supplyAsync submits on
@@ -1671,12 +1778,33 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                 // and complete exceptionally so waiters fail fast and a retry re-executes.
                 try {
                     h.offchainExecutor()
-                            .callView(io.myotis.evm.Address.of(to),
-                                    data == null ? new byte[0] : data, h.blockCtx())
+                            .callView(from == null ? null : io.myotis.evm.Address.of(from),
+                                    io.myotis.evm.Address.of(to),
+                                    data == null ? new byte[0] : data,
+                                    value, h.blockCtx())
                             .whenComplete((out, ex) -> {
-                                inflightCalls.remove(flightKey, mine);
-                                if (ex != null) mine.completeExceptionally(ex);
-                                else mine.complete(out);
+                                try {
+                                    if (ex != null) {
+                                        mine.completeExceptionally(ex);
+                                    } else {
+                                        // Populate the replay cache from the LEADER's completion,
+                                        // which fires even if our waiter already timed out and gave
+                                        // up — so a call the wallet abandoned still lands warm for
+                                        // the retry. Verified before insertion (proven against this
+                                        // root by the oracle during execution). Store a clone: `out`
+                                        // is handed to the waiter below, so caching the same reference
+                                        // would let the waiter mutate the cached value.
+                                        callResultCache.put(flightKey,
+                                                out != null ? out.clone() : null, clock.elapsedMillis());
+                                        mine.complete(out);
+                                    }
+                                } finally {
+                                    // Release the dedup guard only AFTER the cache is warm, so a
+                                    // concurrent identical call falls through to the warm result
+                                    // instead of racing into a redundant execution in the gap
+                                    // between guard-release and cache-fill.
+                                    inflightCalls.remove(flightKey, mine);
+                                }
                             });
                 } catch (Throwable t) {
                     inflightCalls.remove(flightKey, mine);
@@ -3065,8 +3193,19 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                                                 java.math.BigInteger value) {
         if (to == null || to.length != 20) return null;
         if (from != null && from.length != 20) return null;
-        RpcCallContext h = anchoredHeadOrWait(RPC_STATE_HEAD_MAX_STALE_MS, true);
+        RpcCallContext h = anchoredHeadOrWait(stateHeadStaleCapMs, true);
         if (h == null) return null;
+        // Replay a verified estimate for this exact (root, from, to, data, value): an
+        // estimate is deterministic given the anchored state, so a retried confirm screen
+        // hitting the same pinned head skips the binary-search EVM run entirely.
+        String estKey = Bytes.wrap(h.blockCtx().stateRoot()).toHexString()
+                + ":" + (from == null ? "0x" : Bytes.wrap(from).toHexString())
+                + ":" + Bytes.wrap(to).toHexString()
+                + ":" + (data == null || data.length == 0
+                        ? "0x" : Hash.keccak256(Bytes.wrap(data)).toHexString())
+                + ":" + (value == null ? "0" : value.toString(16));
+        Long cachedGas = estimateCache.get(estKey, clock.elapsedMillis());
+        if (cachedGas != null) return java.math.BigInteger.valueOf(cachedGas);
         try {
             // Fast path: a value transfer with no calldata to a plain account costs
             // exactly 21000 — no EVM execution, no 15% headroom (it's exact). This is
@@ -3081,6 +3220,7 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                         .get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
                 byte[] codeHash = acct == null ? null : acct.codeHash();
                 if (codeHash != null && java.util.Arrays.equals(codeHash, EMPTY_CODE_HASH)) {
+                    estimateCache.put(estKey, 21_000L, clock.elapsedMillis());
                     return java.math.BigInteger.valueOf(21_000);
                 }
                 // Has code (contract / 7702 EOA) → fall through to the full EVM estimate.
@@ -3091,9 +3231,19 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
                     value != null ? value : java.math.BigInteger.ZERO,
                     data != null ? data : new byte[0],
                     null);
-            Long gas = h.offchainExecutor().estimateGas(tx, h.blockCtx())
-                    .get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
-            return gas == null ? null : java.math.BigInteger.valueOf(gas);
+            java.util.concurrent.CompletableFuture<Long> est =
+                    h.offchainExecutor().estimateGas(tx, h.blockCtx());
+            // Warm the replay cache from the async completion, not just the returning
+            // thread: if the wallet's blocking get() below times out but the binary-search
+            // estimate finishes in the background, the result still lands warm for the
+            // retry — same rationale as the eth_call leader populating callResultCache
+            // after its waiter gave up.
+            est.whenComplete((g, ex) -> {
+                if (ex == null && g != null) estimateCache.put(estKey, g, clock.elapsedMillis());
+            });
+            Long gas = est.get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
+            if (gas == null) return null;
+            return java.math.BigInteger.valueOf(gas);
         } catch (Exception e) {
             log.info("[rpc] eth_estimateGas -> error: " + describeEvmError(e));
             if (isStateUnavailable(e)) evictUnservableHead(h);

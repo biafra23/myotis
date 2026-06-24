@@ -125,6 +125,7 @@ public final class NodeService extends Service {
     private static final String K_RPC_PORT = "rpcPort";
     private static final String K_SNAP_TARGET = "snapTarget";
     private static final String K_DEEP_POOL = "deepPoolThreshold";
+    private static final String K_STRICT_FRESHNESS = "strictStateFreshness";
     public static final int DEFAULT_RPC_PORT = 8545;
     // Gnosis defaults to a distinct port so both networks can be added to MetaMask
     // at once: MetaMask refuses to save two RPC endpoints that share the same URL
@@ -238,6 +239,18 @@ public final class NodeService extends Service {
     }
     public static void setDeepPoolThreshold(android.content.Context c, int v) {
         prefs(c).edit().putInt(K_DEEP_POOL, clampInt(v, 1, 128, DEFAULT_DEEP_POOL)).apply();
+    }
+    /** Whether RPC state reads use the strict 2-min head-staleness bound. Default true
+     *  (strict). Relaxing it (toggle OFF strict / ON "relaxed") lets eth_call / balance /
+     *  estimateGas serve an older root — but that *backfired* into 120-s confirm-screen
+     *  HANGS when the older root isn't fully servable, so strict (fast-fail) is the default;
+     *  relaxed is an explicit opt-in. Read by VerifiedRpcBackend via a system property.
+     *  See OPTIMISATIONS_AND_LIMITATIONS.md §2.14. */
+    public static boolean strictStateFreshness(android.content.Context c) {
+        return prefs(c).getBoolean(K_STRICT_FRESHNESS, true);
+    }
+    public static void setStrictStateFreshness(android.content.Context c, boolean v) {
+        prefs(c).edit().putBoolean(K_STRICT_FRESHNESS, v).apply();
     }
     /** Live-update the snap-peer target (no restart) on every live stack and persist it. */
     public void setTargetSnapPeers(int v) {
@@ -402,7 +415,12 @@ public final class NodeService extends Service {
             int discoveredPeers,
             int connectedPeers,
             int readyPeers,
-            int snapPeers,
+            int snapPeers,            // peers that NEGOTIATED snap/1 (capability flag)
+            int snapServingPeers,     // peers actually in the serving pool right now
+                                      // (negotiated, READY, not benched by snapServingFailed) —
+                                      // this is what head builds / heavy confirm screens use.
+                                      // Can be far below snapPeers when peers bench out, which
+                                      // is what made "54 snap peers but amber/stuck" so confusing.
             int cachedPeers,
             int attemptedPeers,
             int backedOffPeers,
@@ -925,8 +943,14 @@ public final class NodeService extends Service {
         try {
             NetworkConfig network = NetworkConfig.byName(n);
             int rpcPort = rpcPortFor(this, n);
+            // VerifiedRpcBackend (built inside ChainStack.start() below) reads its state-read
+            // freshness mode from this process-wide property; mirror the user's Settings choice
+            // into it before the stack builds. Process-global, shared across all stacks.
+            System.setProperty(io.myotis.rpc.VerifiedRpcBackend.STRICT_STATE_FRESHNESS_PROP,
+                    String.valueOf(strictStateFreshness(this)));
             LogBuffer.i(TAG, "[" + n + "] booting (snap target " + snapTarget(this)
-                    + ", rpc port " + rpcPort + ")");
+                    + ", rpc port " + rpcPort
+                    + ", state-freshness " + (strictStateFreshness(this) ? "strict" : "relaxed") + ")");
 
             // Identity: legacy mainnet keeps nodekey.hex; other chains get a per-network key
             // so two chains in one process never share an identity.
@@ -1158,7 +1182,7 @@ public final class NodeService extends Service {
         BeaconStats bs = beaconStatsSnapshot(s);
         RLPxConnector connector = s.connector();
         if (!running || connector == null) {
-            return new Snapshot(running, startTimeMs, 0, 0, 0, 0,
+            return new Snapshot(running, startTimeMs, 0, 0, 0, 0, /*snapServing*/0,
                     cachedEl, attemptedN, backoffN,
                     blacklistedN, discv5Live, 0,
                     bs.state, bs.bootstrapped, bs.connected, bs.lc,
@@ -1183,7 +1207,11 @@ public final class NodeService extends Service {
         int tableSize = discV4 != null ? discV4.table().size() : 0;
         io.myotis.rpc.VerifiedRpcBackend backend = s.rpcBackend();
         long headAge = backend != null ? backend.verifiedHeadAgeMs() : Long.MAX_VALUE;
-        return new Snapshot(true, startTimeMs, tableSize, active.size(), ready.size(), snapCount,
+        // Serving pool = what head builds / heavy confirm screens actually use (filters out
+        // peers benched by snapServingFailed). Distinct from snapCount (negotiated) — surfacing
+        // it makes a serving-pool collapse visible instead of hidden behind the headline count.
+        int snapServing = connector.activeSnapHandlers().size();
+        return new Snapshot(true, startTimeMs, tableSize, active.size(), ready.size(), snapCount, snapServing,
                 cachedEl, attemptedN, backoffN,
                 blacklistedN, discv5Live, 0,
                 bs.state, bs.bootstrapped, bs.connected, bs.lc,

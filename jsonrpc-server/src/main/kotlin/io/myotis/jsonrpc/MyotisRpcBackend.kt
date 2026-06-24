@@ -36,9 +36,17 @@ interface MyotisRpcBackend {
 
     /**
      * eth_call: run [data] against contract [to] in a local EVM over verified
-     * state, returning the raw ABI return bytes. Null falls through to the proxy.
+     * state, as if sent by [from] carrying [value] wei, returning the raw ABI
+     * return bytes. Null falls through to the proxy.
+     *
+     * [from] is the simulated `msg.sender`; null means an anonymous zero-address
+     * caller (Geth's default for a from-less call). Contracts that gate on
+     * `msg.sender` — every ERC-20 transfer/approve, most dapp calls — need the
+     * real caller, else they revert ("transfer from the zero address"). [value]
+     * is the wei attached to the call; null means zero.
      */
-    fun call(to: ByteArray, data: ByteArray, block: String): ByteArray?
+    fun call(from: ByteArray?, to: ByteArray, data: ByteArray,
+             value: java.math.BigInteger?, block: String): ByteArray?
 
     /** eth_getBalance: account balance in wei, or null to proxy. */
     fun getBalance(address: ByteArray, block: String): java.math.BigInteger?

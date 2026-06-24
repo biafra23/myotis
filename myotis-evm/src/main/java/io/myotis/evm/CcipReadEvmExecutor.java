@@ -72,7 +72,13 @@ public final class CcipReadEvmExecutor implements EvmExecutor {
 
     @Override
     public CompletableFuture<byte[]> callView(Address target, byte[] calldata, BlockContext blockContext) {
-        return tryWithCcipRead(target, calldata, blockContext, 0);
+        return tryWithCcipRead(null, target, calldata, null, blockContext, 0);
+    }
+
+    @Override
+    public CompletableFuture<byte[]> callView(Address sender, Address target, byte[] calldata,
+                                              java.math.BigInteger value, BlockContext blockContext) {
+        return tryWithCcipRead(sender, target, calldata, value, blockContext, 0);
     }
 
     /** Estimation passes straight through — CCIP-Read (ERC-3668) only applies to
@@ -84,12 +90,14 @@ public final class CcipReadEvmExecutor implements EvmExecutor {
     }
 
     private CompletableFuture<byte[]> tryWithCcipRead(
-            Address target, byte[] calldata, BlockContext ctx, int depth) {
-        return delegate.callView(target, calldata, ctx)
-                .exceptionallyCompose(t -> handleException(t, ctx, depth));
+            Address sender, Address target, byte[] calldata, java.math.BigInteger value,
+            BlockContext ctx, int depth) {
+        return delegate.callView(sender, target, calldata, value, ctx)
+                .exceptionallyCompose(t -> handleException(sender, value, t, ctx, depth));
     }
 
-    private CompletableFuture<byte[]> handleException(Throwable t, BlockContext ctx, int depth) {
+    private CompletableFuture<byte[]> handleException(Address sender, java.math.BigInteger value,
+                                                      Throwable t, BlockContext ctx, int depth) {
         Throwable cause = unwrap(t);
         Optional<OffchainLookupRevert> lookup = extractLookup(cause);
         if (lookup.isEmpty()) {
@@ -113,9 +121,12 @@ public final class CcipReadEvmExecutor implements EvmExecutor {
         return handler.handle(lookup.get())
                 .thenCompose(gatewayResponse -> {
                     byte[] callbackCalldata = encodeCallback(lookup.get(), gatewayResponse);
-                    log.debug("[ccip] re-entering EVM (sender={}, depth={})",
+                    log.debug("[ccip] re-entering EVM (callbackTarget={}, depth={})",
                             lookup.get().sender(), depth + 1);
-                    return tryWithCcipRead(lookup.get().sender(), callbackCalldata, ctx, depth + 1);
+                    // The OffchainLookup's `sender` is the contract that raised it — the
+                    // callback TARGET. Keep the original msg.sender/value for the re-entry
+                    // so sender-gated callbacks still see the real caller.
+                    return tryWithCcipRead(sender, lookup.get().sender(), callbackCalldata, value, ctx, depth + 1);
                 });
     }
 

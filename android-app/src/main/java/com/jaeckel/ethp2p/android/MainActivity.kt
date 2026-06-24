@@ -19,6 +19,7 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.clickable
@@ -91,7 +92,9 @@ import com.jaeckel.ethp2p.networking.NetworkConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -579,6 +582,7 @@ private fun SettingsScreen(
     }
     var snapTarget by remember { mutableStateOf(NodeService.snapTarget(context).toString()) }
     var deepPool by remember { mutableStateOf(NodeService.deepPoolThreshold(context).toString()) }
+    var strictFreshness by remember { mutableStateOf(NodeService.strictStateFreshness(context)) }
 
     Scaffold(
         topBar = {
@@ -596,6 +600,10 @@ private fun SettingsScreen(
             Modifier
                 .fillMaxSize()
                 .padding(padding)
+                // Scrollable: on the cover display the Networks + Node tuning content
+                // (and the Save button) overflows the screen — without this the toggle
+                // and Save fall below the fold and are unreachable.
+                .verticalScroll(rememberScrollState())
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
@@ -649,6 +657,29 @@ private fun SettingsScreen(
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 modifier = Modifier.fillMaxWidth(),
+            )
+            Row(
+                Modifier.fillMaxWidth().padding(top = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Relaxed state freshness")
+                Switch(
+                    checked = !strictFreshness,
+                    onCheckedChange = { relaxed ->
+                        strictFreshness = !relaxed
+                        NodeService.setStrictStateFreshness(context, !relaxed)
+                    },
+                )
+            }
+            Text(
+                "Off (default, recommended): strict 2-minute freshness — fee calc / eth_call " +
+                    "fast-fail when no fresh servable root exists, and the wallet retries. " +
+                    "On (opt-in, experimental): serve a slightly older verified root — but if " +
+                    "it isn’t fully servable this can HANG the confirm screen for up to 2 min " +
+                    "instead of failing fast. Applies on the next node (re)start.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Text(
                 "An RPC-port change reboots that chain; snap-peer target and the readiness " +
@@ -736,7 +767,9 @@ private fun SyncProgressBar(snapshot: NodeService.Snapshot?) {
  *                peers that even a heavy confirm screen converges. Fully ready.
  *
  * The green gates read [NodeService.Snapshot.verifiedHeadAgeMs] (shared backend's
- * warmer) and [NodeService.Snapshot.snapPeers]. The head threshold is generous vs.
+ * warmer) and [NodeService.Snapshot.snapServingPeers] (the *serving* pool, not the
+ * negotiated count — heavy confirm screens converge on peers that actually serve).
+ * The head threshold is generous vs.
  * the head TTL+build time on mobile (~12s TTL + 20-26s build) so a healthy node
  * stays green between rebuilds instead of flickering amber.
  */
@@ -764,7 +797,7 @@ private fun ReadinessStrip(snapshot: NodeService.Snapshot?, deepPoolThreshold: I
             Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not synced")
         s.verifiedHeadAgeMs > READY_HEAD_WARM_MS ->
             Triple(Color(0xFFF9A825), 3.dp, "Node readiness: warming up, not ready to transact")
-        s.snapPeers >= deepPoolThreshold ->
+        s.snapServingPeers >= deepPoolThreshold ->
             Triple(Color(0xFF00E676), 6.dp,
                 "Node readiness: fully ready — deep peer pool, heavy confirm screens will load")
         else ->
@@ -1113,20 +1146,37 @@ private fun LogsTab(
     // / 4 Hz buffer poll would jank the UI and laggy the typing. The unfiltered
     // view shows the whole buffer (no line cap); the LazyColumn renders lazily.
     var shown by remember { mutableStateOf<List<LogBuffer.Entry>>(emptyList()) }
-    LaunchedEffect(entries, filter) {
-        shown = if (filter.isBlank()) entries
-        else withContext(Dispatchers.Default) {
-            entries.filter {
-                // Cooperative cancellation: a new keystroke cancels this effect, but
-                // Collection.filter isn't cancellation-aware on its own, so a 50k-entry
-                // scan would run to completion on Dispatchers.Default even though its
-                // result is already superseded. ensureActive() bails the moment the
-                // coroutine is cancelled, so rapid typing drops stale passes instead of
-                // piling concurrent scans onto the CPU.
-                ensureActive()
-                it.tag.contains(filter, ignoreCase = true) ||
-                    it.message.contains(filter, ignoreCase = true)
+    // Filtered view — keyed on `filter` ONLY, deliberately NOT on `entries`. The live
+    // buffer refreshes `entries` ~4x/s; the previous version keyed this effect on
+    // `entries` too, so every refresh cancelled and restarted the up-to-50k-entry
+    // case-insensitive scan. Under heavy log churn (most visibly with two networks
+    // running at once) the scan never finished before the next refresh killed it, so the
+    // filtered list stayed permanently empty — it looked like the filter was broken or
+    // that no requests were happening. Fix: run one immediate pass for responsiveness,
+    // then keep it fresh from a sample()-throttled view of the buffer so each scan has
+    // room to complete (collectLatest only supersedes the prior *sampled* pass, not every
+    // 250ms tick). The unfiltered view stays fully live — a cheap direct assignment.
+    //
+    // We observe the `lastVersion` Long (updated atomically with `entries`) rather than
+    // `entries` itself: snapshotFlow dedupes by structural equality, and an equals() over
+    // a 50k-entry list on every tick would be an O(N) main-thread cost. lastVersion gives
+    // the same change signal as an O(1) primitive compare; we then read `entries` inside.
+    LaunchedEffect(filter) {
+        if (filter.isBlank()) {
+            snapshotFlow { lastVersion }.collect { shown = entries }
+        } else {
+            val matches = { e: LogBuffer.Entry ->
+                e.tag.contains(filter, ignoreCase = true) ||
+                    e.message.contains(filter, ignoreCase = true)
             }
+            // ensureActive() bails a superseded scan promptly rather than running it out.
+            shown = withContext(Dispatchers.Default) { entries.filter { ensureActive(); matches(it) } }
+            snapshotFlow { lastVersion }
+                .sample(500L)
+                .collectLatest {
+                    val snap = entries
+                    shown = withContext(Dispatchers.Default) { snap.filter { ensureActive(); matches(it) } }
+                }
         }
     }
 
@@ -1512,6 +1562,9 @@ private fun StatusSummary(s: NodeService.Snapshot) {
         StatusRow("connected (RLPx)", s.connectedPeers.toString())
         StatusRow("ready (eth handshake)", s.readyPeers.toString())
         StatusRow("snap supported", s.snapPeers.toString())
+        // The pool head builds / heavy confirm screens actually draw from — when this drops
+        // well below "snap supported", reads stall even though the headline count looks fine.
+        StatusRow("snap serving", s.snapServingPeers.toString())
         StatusRow("cached at boot", s.cachedPeers.toString())
         StatusRow("dialing", s.attemptedPeers.toString())
         StatusRow("in backoff", s.backedOffPeers.toString())
