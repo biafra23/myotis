@@ -15,6 +15,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 
@@ -25,7 +26,10 @@ import androidx.compose.ui.unit.dp
  */
 @Composable
 fun NodeScreen(controller: NodeController, settings: Settings) {
-    val snapshots by controller.snapshots().collectAsState(initial = emptyMap())
+    // remember(controller): snapshots() returns a fresh Flow each call, so collecting it
+    // directly would re-subscribe on every recomposition. Retain it across recompositions.
+    val snapshotsFlow = remember(controller) { controller.snapshots() }
+    val snapshots by snapshotsFlow.collectAsState(initial = emptyMap())
     MaterialTheme {
         Column(Modifier.fillMaxSize().padding(16.dp)) {
             Text("Myotis", style = MaterialTheme.typography.headlineSmall)

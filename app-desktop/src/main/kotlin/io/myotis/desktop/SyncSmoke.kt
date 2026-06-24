@@ -18,7 +18,9 @@ fun main() = runBlocking {
     println("[smoke] enabling $net (dataDir=$dataDir)")
     controller.enableNetwork(net)
 
-    val deadline = System.currentTimeMillis() + 180_000
+    // nanoTime deadline — immune to wall-clock / NTP steps that could prematurely fire or
+    // never fire a currentTimeMillis() deadline.
+    val deadline = System.nanoTime() + 180_000_000_000L
     controller.snapshots().collect { snaps ->
         snaps[net]?.let { s ->
             println("[smoke] ${s.network} state=${s.beaconState} blk=${s.executionBlockNumber} " +
@@ -29,7 +31,7 @@ fun main() = runBlocking {
                 exitProcess(0)
             }
         }
-        if (System.currentTimeMillis() > deadline) {
+        if (System.nanoTime() - deadline >= 0) {  // overflow-safe nanoTime comparison
             println("[smoke] timeout (no SYNCED in 180s)")
             controller.shutdown()
             exitProcess(1)

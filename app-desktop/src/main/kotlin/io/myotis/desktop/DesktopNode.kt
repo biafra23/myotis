@@ -29,7 +29,11 @@ import kotlin.io.path.createDirectories
 class DesktopNodeController(private val dataDir: Path) : NodeController {
 
     private val registry = NodeRegistry()
-    private val startMs = System.currentTimeMillis()
+    // nanoTime, not currentTimeMillis: wall-clock / NTP steps must not skew uptime.
+    private val startNs = System.nanoTime()
+    // Serialize lifecycle ops (enable/disable/reboot/shutdown) — they're triggered from the
+    // UI thread but mutate the shared registry; `lock` guards against interleaving.
+    private val lock = Any()
 
     init {
         dataDir.createDirectories()
@@ -39,34 +43,52 @@ class DesktopNodeController(private val dataDir: Path) : NodeController {
         get() = !registry.isEmpty
 
     override fun enableNetwork(name: String) {
-        if (registry.get(name) != null) return
-        val network = NetworkConfig.byName(name)
-        val ports = ChainPorts.defaultsFor(network)
-        val keyFile = if (name == "mainnet") "nodekey.hex" else "nodekey-$name.hex"
-        val nodeKey = NodeKey.loadOrGenerate(dataDir.resolve(keyFile))
-        val suffix = if (name == "mainnet") "" else "-$name"
-        val peerCache = PeerCache(dataDir.resolve("peers$suffix.cache"))
-        val clPeerCache = CLPeerCache(dataDir.resolve("cl-peers$suffix.cache"))
-        val stack = ChainStack(
-            network, ports, nodeKey,
-            PeerCacheAdapter(peerCache), ClPeerCacheAdapter(clPeerCache),
-            JavaHttpCcipGateway(),
-            dataDir.resolve("sync-state$suffix.snapshot"),
-            false,
-        )
-        stack.configureSnapMaintainer(32, null)  // desktop has system DNS → null provider
-        registry.add(stack)
-        Thread({ stack.start() }, "desktop-boot-$name").apply { isDaemon = true }.start()
+        // All of this (key load/generate, cache init, stack.start()) does blocking disk I/O
+        // and network setup — never run it on the UI thread. Boot on a daemon thread, holding
+        // `lock` so concurrent enable/reboot calls can't double-add or race the registry.
+        Thread({
+            synchronized(lock) {
+                if (registry.get(name) != null) return@synchronized
+                val network = NetworkConfig.byName(name)
+                val ports = ChainPorts.defaultsFor(network)
+                val keyFile = if (name == "mainnet") "nodekey.hex" else "nodekey-$name.hex"
+                val nodeKey = NodeKey.loadOrGenerate(dataDir.resolve(keyFile))
+                val suffix = if (name == "mainnet") "" else "-$name"
+                val peerCache = PeerCache(dataDir.resolve("peers$suffix.cache"))
+                val clPeerCache = CLPeerCache(dataDir.resolve("cl-peers$suffix.cache"))
+                val stack = ChainStack(
+                    network, ports, nodeKey,
+                    PeerCacheAdapter(peerCache), ClPeerCacheAdapter(clPeerCache),
+                    JavaHttpCcipGateway(),
+                    dataDir.resolve("sync-state$suffix.snapshot"),
+                    false,
+                )
+                stack.configureSnapMaintainer(32, null)  // desktop has system DNS → null provider
+                registry.add(stack)
+                // If start() fails, drop the stack so a later enable can retry — leaving a
+                // dead entry in the registry would permanently block this network.
+                try {
+                    stack.start()
+                } catch (t: Throwable) {
+                    registry.remove(name)
+                    throw t
+                }
+            }
+        }, "desktop-boot-$name").apply { isDaemon = true }.start()
     }
 
-    override fun disableNetwork(name: String) = registry.remove(name)
+    override fun disableNetwork(name: String) {
+        synchronized(lock) { registry.remove(name) }
+    }
 
     override fun rebootNetwork(name: String) {
         disableNetwork(name)
         enableNetwork(name)
     }
 
-    override fun shutdown() = registry.shutdownAll()
+    override fun shutdown() {
+        synchronized(lock) { registry.shutdownAll() }
+    }
 
     override fun setTargetSnapPeers(target: Int) {
         registry.all().forEach { it.setTargetSnapPeers(target) }
@@ -101,24 +123,35 @@ class DesktopNodeController(private val dataDir: Path) : NodeController {
             syncCurrentPeriod = bss?.currentSyncCommitteePeriod ?: 0L,
             syncTargetPeriod = BeaconChainSpec.currentPeriod(net.clGenesisTime(), net.secondsPerSlot()),
             verifiedHeadAgeMs = 0L,
-            uptimeSeconds = (System.currentTimeMillis() - startMs) / 1000,
+            uptimeSeconds = (System.nanoTime() - startNs) / 1_000_000_000L,
         )
     }
 }
 
-/** Minimal in-memory desktop settings (Step 1). File-backed persistence is a follow-up. */
+/**
+ * Minimal in-memory desktop settings (Step 1). File-backed persistence is a follow-up.
+ * Read/written from both the UI thread and the boot threads, so every access is guarded by
+ * `synchronized(this)` over the non-thread-safe backing collections.
+ */
 class DesktopSettings : Settings {
     private val enabled = linkedSetOf("mainnet")
     private val ports = HashMap<String, Int>()
 
-    override fun enabledNetworks(): List<String> = enabled.toList()
-    override fun primaryNetwork(): String = enabled.firstOrNull() ?: "mainnet"
+    override fun enabledNetworks(): List<String> = synchronized(this) { enabled.toList() }
+    override fun primaryNetwork(): String = synchronized(this) { enabled.firstOrNull() ?: "mainnet" }
     override fun allNetworks(): List<String> = NetworkConfig.allNetworks().map { it.name() }
-    override fun isNetworkEnabled(name: String): Boolean = name in enabled
-    override fun setNetworkEnabled(name: String, on: Boolean) { if (on) enabled.add(name) else enabled.remove(name) }
-    override fun rpcPortFor(network: String): Int =
+    override fun isNetworkEnabled(name: String): Boolean = synchronized(this) { name in enabled }
+    override fun setNetworkEnabled(name: String, on: Boolean) = synchronized(this) {
+        if (on) enabled.add(name) else enabled.remove(name)
+        Unit
+    }
+    override fun rpcPortFor(network: String): Int = synchronized(this) {
         ports[network] ?: NetworkConfig.byName(network).defaultRpcPort()
-    override fun setRpcPort(network: String, port: Int) { ports[network] = port }
+    }
+    override fun setRpcPort(network: String, port: Int) = synchronized(this) {
+        ports[network] = port
+        Unit
+    }
     override fun snapTarget(): Int = 32
     override fun setSnapTarget(v: Int) {}
 }
