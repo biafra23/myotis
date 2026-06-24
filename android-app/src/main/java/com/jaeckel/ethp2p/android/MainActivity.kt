@@ -693,6 +693,9 @@ private fun SettingsScreen(
                     onCheckedChange = { on ->
                         nativeBls = on
                         NodeService.setNativeBlsEnabled(context, on)
+                        // Apply immediately — flips the process-wide backend live (the
+                        // decompressed-pubkey cache is process-global, so the swap is cheap).
+                        NodeService.applyBlsBackend(context)
                     },
                 )
             }
@@ -701,7 +704,7 @@ private fun SettingsScreen(
                     "verification (much faster than pure-Java; on debuggable builds it runs both " +
                     "and logs a head-to-head). Off: force the pure-Java Milagro path — slower " +
                     "(~30-55s cold on ART), but useful if the native library fails to load (e.g. " +
-                    "a 16 KB page-alignment issue on Android 15+). Applies on the next node (re)start.",
+                    "a 16 KB page-alignment issue on Android 15+). Applies immediately.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

@@ -258,12 +258,25 @@ public final class NodeService extends Service {
      *  ~30-55s cold on ART) regardless of whether the native lib loaded; useful to rule the
      *  native lib out when debugging (e.g. a 16 KB-alignment load failure) or to compare
      *  behavior. Mapped to the {@code myotis.bls.backend} property via {@link #blsBackendChoice}
-     *  and applied on the next node (re)start. See docs/bls-rust-acceleration.md. */
+     *  and applied live by {@link #applyBlsBackend} (also re-applied on each node start).
+     *  See docs/bls-rust-acceleration.md. */
     public static boolean nativeBlsEnabled(android.content.Context c) {
         return prefs(c).getBoolean(K_NATIVE_BLS, true);
     }
     public static void setNativeBlsEnabled(android.content.Context c, boolean v) {
         prefs(c).edit().putBoolean(K_NATIVE_BLS, v).apply();
+    }
+    /** Apply the current native-BLS setting to the process-wide BlsBackends selection now:
+     *  set the {@code myotis.bls.backend} property (read on a cold process) AND select() the
+     *  backend live — active() memoizes its first result, so the property alone wouldn't flip
+     *  a process that has already verified. Cheap to call anytime, including on a running node:
+     *  the decompressed-pubkey cache is process-global (BlsVerifier), so the swap preserves it.
+     *  Returns the applied choice (for logging). */
+    public static String applyBlsBackend(android.content.Context c) {
+        String choice = blsBackendChoice(c);
+        System.setProperty(com.jaeckel.ethp2p.consensus.bls.BlsBackends.PROP, choice);
+        com.jaeckel.ethp2p.consensus.bls.BlsBackends.select(choice);
+        return choice;
     }
     /** The {@code myotis.bls.backend} choice for the current setting: {@code milagro} when
      *  native BLS is disabled, otherwise the build-type default — {@code compare} on a
@@ -972,13 +985,10 @@ public final class NodeService extends Service {
             // into it before the stack builds. Process-global, shared across all stacks.
             System.setProperty(io.myotis.rpc.VerifiedRpcBackend.STRICT_STATE_FRESHNESS_PROP,
                     String.valueOf(strictStateFreshness(this)));
-            // Mirror the native-BLS toggle into the process-wide BlsBackends selection. set the
-            // property (read on a cold process) AND select() to override the memoized backend
-            // (active() caches its first result, so the property alone wouldn't flip a process
-            // that has already verified once). Process-global, shared across all stacks.
-            String blsChoice = blsBackendChoice(this);
-            System.setProperty(com.jaeckel.ethp2p.consensus.bls.BlsBackends.PROP, blsChoice);
-            com.jaeckel.ethp2p.consensus.bls.BlsBackends.select(blsChoice);
+            // Mirror the native-BLS toggle into the process-wide BlsBackends selection (set the
+            // property + select() the backend). The Settings switch also applies it live on
+            // toggle; re-applying here keeps a freshly (re)started stack consistent.
+            String blsChoice = applyBlsBackend(this);
             LogBuffer.i(TAG, "[" + n + "] booting (snap target " + snapTarget(this)
                     + ", rpc port " + rpcPort
                     + ", state-freshness " + (strictStateFreshness(this) ? "strict" : "relaxed")

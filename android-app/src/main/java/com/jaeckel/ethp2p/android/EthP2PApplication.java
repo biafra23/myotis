@@ -40,8 +40,8 @@ public final class EthP2PApplication extends Application {
         // auto|native|milagro|compare.
         // Seed from the user's "Native BLS acceleration" setting (default ON): OFF forces
         // Milagro; ON keeps the build-type default (compare on debuggable, auto on release).
-        // NodeService re-applies this on every node (re)start so a toggle takes effect without
-        // a process kill — this just sets the initial value for any pre-start verify.
+        // The Settings toggle applies live via NodeService.applyBlsBackend (and every node
+        // start re-applies it) — this just sets the initial value for any pre-start verify.
         if (System.getProperty("myotis.bls.backend") == null) {
             System.setProperty("myotis.bls.backend", NodeService.blsBackendChoice(this));
         }

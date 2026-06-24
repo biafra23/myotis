@@ -51,8 +51,9 @@ public final class BlsBackends {
      * selection. Lets a host flip the backend at runtime (e.g. a user toggling the
      * native acceleration setting) without restarting the process — {@link #active()}
      * caches its first result, so simply changing the system property afterward would
-     * have no effect. Drops the wrapped backend's warmed pubkey cache; the next verify
-     * (or the beacon's warmPubkeyCache on (re)start) repopulates it.
+     * have no effect. Cheap to call live: the decompressed-pubkey cache is process-global
+     * ({@link BlsVerifier#warmPubkeyCache}), so swapping the backend instance preserves the
+     * warmed keys — this only changes which verify path runs, not the cache.
      */
     public static synchronized void select(String choice) {
         active = build(choice);
