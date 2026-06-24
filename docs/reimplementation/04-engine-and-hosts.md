@@ -223,11 +223,18 @@ jumbo multicall from starving the small interactive calls a wallet blocks on (no
   small/interactive lane (which never acquires). A jumbo multicall thus runs to genuine completion /
   OOG / timeout — **just never using more than its share of peers at once** — so a concurrent
   balance/nonce/fee read still gets through.
-- **Caches make repeats free.** A verified `(stateRoot, addr, slot) → value` is a *cryptographic
-  fact*, so the cross-call **`StateProofCache`** (LRU, `STATE_PROOF_CACHE_MAX = 65536`) and the
-  forever-valid **`BytecodeCache`** let MetaMask's repeated/retried sweeps converge instead of
-  re-proving. The anchored **head context is built once and reused for `RPC_HEAD_TTL_MS = 12 s`**, so
-  a burst shares one beacon-anchoring instead of re-walking the header chain per call.
+- **Caches make repeats free**, at three levels. (1) The cross-call **`StateProofCache`** (LRU,
+  `STATE_PROOF_CACHE_MAX = 65536`) caches proof-verified `(stateRoot, addr, slot) → value` —
+  a *cryptographic fact*, so reuse is safe. (2) The forever-valid **`BytecodeCache`** (keyed by
+  `codeHash`). (3) A **`VerifiedResultCache`** caches whole *verified results* — `eth_call` return
+  bytes and `estimateGas` values — keyed by the anchored state (`stateRoot:to:keccak(calldata)` for
+  calls, `stateRoot:from:to:keccak(data):value` for estimates), TTL'd to mirror how long the head
+  context stays servable. Safe for the same reason: a result is a pure function of the pinned
+  `stateRoot`, so a retried confirm screen replays bit-identically while a "latest" read that rolled
+  to a new root simply misses and recomputes. Together these let MetaMask's repeated/retried sweeps
+  converge instead of re-proving. The anchored **head context is built once and reused for
+  `RPC_HEAD_TTL_MS = 12 s`**, so a burst shares one beacon-anchoring instead of re-walking the header
+  chain per call.
 
 ### 3.5 What a re-implementation must replicate
 

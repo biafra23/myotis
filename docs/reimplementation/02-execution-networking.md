@@ -277,7 +277,9 @@ futures complete exceptionally.
 - **GetBlockBodies / BlockBodies** `[reqId, [hash, …]]` / `[reqId, [[txs, uncles, withdrawals?], …]]`.
   Legacy txs (RLP list) re-encoded; typed txs (EIP-2718) kept as a byte string.
 - **GetReceipts / Receipts** `[reqId, [hash, …]]` / `[reqId, [[receipt, …], …]]`. Capture the **raw
-  consensus receipt bytes** (the trie value). **eth/69 (EIP-7642)** receipts are *bloomless* and
+  consensus receipt bytes** (the trie value). **eth/69 (EIP-7642** — the `eth` *wire-protocol* change
+"history expiry and simpler receipts"; distinct from the consensus-level **EIP-7668** "Remove bloom
+filters"**)** receipts are *bloomless* and
   envelope-flattened `[txType, statusOrState, cumGas, logs]` — **recompute the 2048-bit logs bloom**
   (M3:2048 — three bits from the low 11 bits of keccak byte-pairs) and re-canonicalize so
   `receiptsRoot` verification is version-agnostic.

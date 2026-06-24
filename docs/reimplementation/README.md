@@ -329,7 +329,7 @@ returns "absent/unanswerable" rather than guessing — the host maps that to an 
 | `getTransactionCount(addr, block)` | nonce | MPT account proof (+pending overlay for own txs) |
 | `getCode(addr, block)` | bytecode | bytecode vs proven `codeHash` |
 | `getStorageAt(addr, slot, block)` | 32 bytes | MPT storage proof vs proven `storageRoot` |
-| `call(to, data, block)` | ABI return bytes | local EVM over proof-served state |
+| `call(from, to, data, value, block)` | ABI return bytes | local EVM over proof-served state (threads real `from`/`value` — a zero sender reverts `msg.sender`-gated contracts) |
 | `estimateGas(from, to, data, value)` | gas | local EVM, intrinsic + metered + 15% buffer |
 | `gasPrice()` / `maxPriorityFeePerGas()` / `feeHistory(...)` | fees | base fee from headers, tips from verified bodies |
 | `getBlockByNumber/Hash(...)` | block JSON | beacon-anchored header (no snap needed) |
@@ -435,8 +435,11 @@ viable and benefits from go-ethereum covering most of the EL stack in one place.
    is an adapter to Besu's `WorldUpdater` SPI; re-target it to revm's `Database`/`DatabaseRef`
    trait or geth's `vm.StateDB`. Replicate the mainnet fork schedule and view-call frame setup
    (companion 03).
-2. **BLS + hash-to-curve**: the reference hand-rolls everything on Milagro (no JNI, for
-   Android). With `blst`/`gnark` you get `FastAggregateVerify` and RFC-9380 hash-to-G2 directly
+2. **BLS + hash-to-curve**: the reference keeps a pure-Java Milagro path but now also ships a
+   **native Rust `blst` backend** behind a `BlsBackend` seam (`rust/myotis-bls`, one crate →
+   desktop `.so` + Android ABIs; measured 4–15× faster — see
+   [`docs/bls-rust-acceleration.md`](../bls-rust-acceleration.md)). A Go/Rust port should just use
+   `blst`/`gnark` as the single backend: `FastAggregateVerify` and RFC-9380 hash-to-G2 come for free
    — **but you must use the exact DST** `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_` and
    minimal-pubkey-size (companion 01). For mobile FFI, prefer a Rust/`blst` static lib.
 3. **libp2p + discv5**: large surface; use the language's libp2p/discv5 libraries rather than
@@ -450,6 +453,13 @@ viable and benefits from go-ethereum covering most of the EL stack in one place.
 ## 8. Cross-Platform Packaging (the engine as a Desktop/Android/iOS framework)
 
 The goal is **one engine, three consumers**. Two viable strategies:
+
+> **Already validated in-tree:** the reference has taken the first concrete step down the Rust path
+> — `rust/myotis-bls` is a `blst`+`jni` cdylib that builds one crate into a desktop `.so` *and*
+> Android ABIs (`rust/build-android.sh`, cargo-ndk), loaded via a `BlsBackend` JNI seam. It proves
+> the "one Rust crate, both hosts" packaging below for the heaviest hot path (BLS); a full port
+> generalizes the same approach to the whole engine. See
+> [`docs/bls-rust-acceleration.md`](../bls-rust-acceleration.md).
 
 ### Rust (recommended)
 

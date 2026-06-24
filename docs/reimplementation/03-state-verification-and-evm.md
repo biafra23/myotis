@@ -107,7 +107,14 @@ The EVM is synchronous; the oracle is async. The bridge has three modes:
 ### 4.1 Public API
 
 - `EvmExecutor.callView(target, calldata, BlockContext) -> future<bytes>` (view call → raw ABI
-  return bytes).
+  return bytes). Zero `msg.sender`, zero value — used for ENS resolver reads and other anonymous
+  view calls.
+- `EvmExecutor.callView(sender, target, calldata, value, BlockContext) -> future<bytes>` — the
+  **sender/value-aware** overload, used by `eth_call`. A null `sender` means the zero address
+  (geth's default for a `from`-less call); a null `value` means zero. **This matters:** any contract
+  that gates on `msg.sender` (every ERC-20 `transfer`/`approve`, most dapp calls) reverts under a
+  zero sender (e.g. USDC "transfer from the zero address"), so a confirm-screen simulation that
+  carries a `from` must thread it through — running `eth_call` as the zero address is a real bug.
 - `EvmExecutor.estimateGas(UnsignedTransaction, BlockContext) -> future<long>`.
 - `Address` is a dedicated 20-byte type (deliberately **not** Besu's, to keep the EVM engine out of
   the public API — do the same in a port so the engine is swappable).
@@ -137,8 +144,9 @@ CcipReadEvmExecutor( PrefetchingEvmExecutor( DefaultEvmExecutor( SnapBackedState
 - Build a fork-correct EVM for the block (see §4.5), with the precompile set + gas calculator that
   match the fork.
 - Child `WorldUpdater` so commits/reverts don't pollute the read-through cache.
-- **Sender = zero address** for view calls (matches geth default); `gasPrice = 0`; `value = 0`;
-  `isStatic = true`.
+- **Sender**: zero address for anonymous view calls (ENS reads), but `eth_call` threads the
+  caller's real `from` and `value` through the sender/value-aware overload (§4.1) — a zero sender
+  reverts any `msg.sender`-gated contract. `gasPrice = 0`; `isStatic = true`.
 - `initialGas = 30,000,000` (`DEFAULT_GAS_LIMIT`).
 - **EIP-7702 delegation**: if the target's code is exactly 23 bytes and starts with `0xef0100`,
   follow the designator **one hop** (chains are not followed — that correctly yields invalid-opcode).

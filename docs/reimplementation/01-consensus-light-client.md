@@ -23,7 +23,7 @@ epochs) and an **optimistic** head.
 
 | Concern | Reference library | Notes for a port |
 |---|---|---|
-| BLS12-381 | **Milagro AMCL** (pure-Java, `org.apache.milagro.amcl.BLS381`) | Chosen to avoid JNI on Android. A port should use **`blst`** (Rust/Go) or `gnark-crypto` (Go) and call their `FastAggregateVerify` + RFC-9380 hash-to-G2 directly. |
+| BLS12-381 | **Pluggable `BlsBackend` seam** — `MilagroBlsBackend` (pure-Java AMCL, default/fallback) or `NativeBlsBackend` (Rust **`blst`** via JNI, `rust/myotis-bls`), selected by `BlsBackends.active()` | A port should use **`blst`** (Rust/Go) or `gnark-crypto` (Go) and call their `FastAggregateVerify` + RFC-9380 hash-to-G2 directly. See §8.0 and [`docs/bls-rust-acceleration.md`](../bls-rust-acceleration.md): native blst is **4–15× faster** than Milagro on real verifies (far more on ART), so a port should make it the primary backend, not the fallback. |
 | hash-to-curve | **hand-rolled RFC 9380** (`bls/HashToCurve.java`) | Not needed if you use `blst`/`gnark` (they implement it) — but you must pass the exact DST. |
 | libp2p | `io.libp2p:jvm-libp2p` (TCP, Noise-XX, yamux/mplex, gossip) | `rust-libp2p` / `go-libp2p`. |
 | discv5 | ConsenSys `io.consensys.protocols:discovery` (in the `networking` module, not here) | `discv5` crate / go-ethereum v5. |
@@ -157,6 +157,26 @@ client is forward-only from a recent checkpoint, so the current version always a
 
 Ethereum **minimal-pubkey-size**: pubkeys in **G1** (48-byte compressed), signatures in **G2**
 (96-byte compressed).
+
+### 8.0 Backend seam (Milagro vs native blst)
+
+BLS is the light client's heaviest regular operation (a `fastAggregateVerify` on every
+finality/optimistic update, ×N during catch-up). The reference puts it behind a `BlsBackend` seam
+(`fastAggregateVerify(pubkeys, message, signature)`) selected at runtime by `BlsBackends.active()`
+(`-Dmyotis.bls.backend=auto|milagro|native|compare`), wrapped in a `TimingBlsBackend`:
+
+- **`MilagroBlsBackend`** — the portable pure-Java AMCL verifier described in §8.1–§8.5. Default
+  fallback; needs an elaborate decompressed-pubkey cache + a bounded `ForkJoinPool` to survive on
+  ART (a *cold* sync-aggregate verify is cited at 30–55 s on Android).
+- **`NativeBlsBackend`** — a Rust **`blst`** cdylib (`rust/myotis-bls`, one crate → desktop `.so`
+  + Android ABIs via `cargo-ndk`), the whole committee flattened into one JNI crossing. **Measured
+  4–15× faster** on real ~500-pubkey verifies (desktop), and far more on ART — and it lets you
+  delete the cache/pool/warm-up machinery. blst is also more audited than Milagro.
+
+For a **Go/Rust re-implementation this seam mostly disappears**: use `blst`/`gnark` as the single
+backend and skip the pure-Java path entirely. The algorithm details in §8.1–§8.5 still matter for
+*correctness verification* (DST, point handling, the verify equation) even when a library does the
+math. Full evaluation + benchmarks: [`docs/bls-rust-acceleration.md`](../bls-rust-acceleration.md).
 
 ### 8.1 The only entry point: `fastAggregateVerify(pubkeys, message, signature)`
 
