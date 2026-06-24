@@ -5,6 +5,8 @@ pluginManagement {
         gradlePluginPortal()
         mavenCentral()
         google()
+        // Compose Multiplatform Gradle plugin (org.jetbrains.compose).
+        maven { url = uri("https://maven.pkg.jetbrains.space/public/p/compose/dev") }
     }
 }
 
@@ -36,4 +38,4 @@ dependencyResolutionManagement {
     }
 }
 
-include("core", "networking", "consensus", "app", "android-app", "myotis-evm", "myotis-ens", "jsonrpc-server", "rpc-backend", "node-core")
+include("core", "networking", "consensus", "app", "android-app", "myotis-evm", "myotis-ens", "jsonrpc-server", "rpc-backend", "node-core", "ui", "app-desktop")

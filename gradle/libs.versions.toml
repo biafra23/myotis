@@ -25,6 +25,9 @@ besu = "24.12.2"
 agp = "8.7.3"
 kotlin = "2.0.21"
 compose-bom = "2024.11.00"
+# Compose Multiplatform (shared UI for Android + Desktop, iOS later). 1.7.x pairs with
+# Kotlin 2.0.20+. Uses the Kotlin-2.0 compose-compiler plugin (already present).
+compose-multiplatform = "1.7.1"
 activity-compose = "1.9.3"
 # JSON-RPC server (:jsonrpc-server). Ktor server+client + kotlinx are chosen for
 # Android compatibility (no java.net.http / com.sun.net.httpserver) and to match
@@ -35,10 +38,13 @@ kotlinx-serialization = "1.7.3"
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
+android-library     = { id = "com.android.library",     version.ref = "agp" }
 kotlin-android      = { id = "org.jetbrains.kotlin.android",         version.ref = "kotlin" }
 kotlin-jvm          = { id = "org.jetbrains.kotlin.jvm",             version.ref = "kotlin" }
 kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
 compose-compiler    = { id = "org.jetbrains.kotlin.plugin.compose",  version.ref = "kotlin" }
+kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform",  version.ref = "kotlin" }
+compose-multiplatform = { id = "org.jetbrains.compose",             version.ref = "compose-multiplatform" }
 
 [libraries]
 tuweni-bytes        = { module = "com.github.biafra23.tuweni-kotlin:tuweni-bytes",       version.ref = "tuweni" }

@@ -19,8 +19,12 @@ allprojects {
 }
 
 subprojects {
-    // android-app uses the Android Gradle Plugin, not the java plugin
-    if (name == "android-app") {
+    // These bring their own plugins (Android Gradle Plugin / Kotlin Multiplatform /
+    // Compose), which are incompatible with the `java` plugin applied below:
+    //   android-app  → com.android.application
+    //   ui           → kotlin-multiplatform + com.android.library + compose
+    //   app-desktop  → kotlin.jvm + compose (desktop)
+    if (name in setOf("android-app", "ui", "app-desktop")) {
         configurations.all {
             exclude(group = "io.netty", module = "netty-transport-native-epoll")
             exclude(group = "io.netty", module = "netty-transport-native-kqueue")
