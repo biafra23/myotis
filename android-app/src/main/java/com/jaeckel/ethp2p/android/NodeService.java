@@ -126,6 +126,7 @@ public final class NodeService extends Service {
     private static final String K_SNAP_TARGET = "snapTarget";
     private static final String K_DEEP_POOL = "deepPoolThreshold";
     private static final String K_STRICT_FRESHNESS = "strictStateFreshness";
+    private static final String K_NATIVE_BLS = "nativeBls";
     public static final int DEFAULT_RPC_PORT = 8545;
     // Gnosis defaults to a distinct port so both networks can be added to MetaMask
     // at once: MetaMask refuses to save two RPC endpoints that share the same URL
@@ -251,6 +252,29 @@ public final class NodeService extends Service {
     }
     public static void setStrictStateFreshness(android.content.Context c, boolean v) {
         prefs(c).edit().putBoolean(K_STRICT_FRESHNESS, v).apply();
+    }
+    /** Whether the bundled native blst BLS backend may be used. Default true. When false,
+     *  BLS verification is forced onto the pure-Java Milagro path (slower — Milagro is
+     *  ~30-55s cold on ART) regardless of whether the native lib loaded; useful to rule the
+     *  native lib out when debugging (e.g. a 16 KB-alignment load failure) or to compare
+     *  behavior. Mapped to the {@code myotis.bls.backend} property via {@link #blsBackendChoice}
+     *  and applied on the next node (re)start. See docs/bls-rust-acceleration.md. */
+    public static boolean nativeBlsEnabled(android.content.Context c) {
+        return prefs(c).getBoolean(K_NATIVE_BLS, true);
+    }
+    public static void setNativeBlsEnabled(android.content.Context c, boolean v) {
+        prefs(c).edit().putBoolean(K_NATIVE_BLS, v).apply();
+    }
+    /** The {@code myotis.bls.backend} choice for the current setting: {@code milagro} when
+     *  native BLS is disabled, otherwise the build-type default — {@code compare} on a
+     *  debuggable build (runs Milagro AND native per verify and logs a head-to-head) or
+     *  {@code auto} on release (native when present, else Milagro). Keeping the ON case equal
+     *  to the prior default means enabling native BLS preserves today's behavior exactly. */
+    public static String blsBackendChoice(android.content.Context c) {
+        if (!nativeBlsEnabled(c)) return "milagro";
+        boolean debuggable = (c.getApplicationInfo().flags
+                & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+        return debuggable ? "compare" : "auto";
     }
     /** Live-update the snap-peer target (no restart) on every live stack and persist it. */
     public void setTargetSnapPeers(int v) {
@@ -948,9 +972,17 @@ public final class NodeService extends Service {
             // into it before the stack builds. Process-global, shared across all stacks.
             System.setProperty(io.myotis.rpc.VerifiedRpcBackend.STRICT_STATE_FRESHNESS_PROP,
                     String.valueOf(strictStateFreshness(this)));
+            // Mirror the native-BLS toggle into the process-wide BlsBackends selection. set the
+            // property (read on a cold process) AND select() to override the memoized backend
+            // (active() caches its first result, so the property alone wouldn't flip a process
+            // that has already verified once). Process-global, shared across all stacks.
+            String blsChoice = blsBackendChoice(this);
+            System.setProperty(com.jaeckel.ethp2p.consensus.bls.BlsBackends.PROP, blsChoice);
+            com.jaeckel.ethp2p.consensus.bls.BlsBackends.select(blsChoice);
             LogBuffer.i(TAG, "[" + n + "] booting (snap target " + snapTarget(this)
                     + ", rpc port " + rpcPort
-                    + ", state-freshness " + (strictStateFreshness(this) ? "strict" : "relaxed") + ")");
+                    + ", state-freshness " + (strictStateFreshness(this) ? "strict" : "relaxed")
+                    + ", bls " + blsChoice + ")");
 
             // Identity: legacy mainnet keeps nodekey.hex; other chains get a per-network key
             // so two chains in one process never share an identity.
