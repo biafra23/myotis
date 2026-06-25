@@ -24,6 +24,7 @@ kotlin {
                 implementation(compose.material3)
                 implementation(compose.ui)
                 implementation(libs.kotlinx.coroutines.core)
+                implementation(libs.kotlinx.datetime)  // local-time formatting in the Logs tab
             }
         }
     }

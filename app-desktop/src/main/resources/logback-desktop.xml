@@ -26,6 +26,10 @@
         <encoder><pattern>${PATTERN}</pattern></encoder>
     </appender>
 
+    <!-- Tees every event into DesktopLogSource (in-memory ring) so the in-app Logs tab can
+         render them. Subject to the same per-logger levels below as console/file. -->
+    <appender name="MEMORY" class="io.myotis.desktop.DesktopLogAppender"/>
+
     <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
         <file>${LOG_DIR}/myotis.log</file>
         <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
@@ -53,5 +57,6 @@
     <root level="INFO">
         <appender-ref ref="CONSOLE"/>
         <appender-ref ref="FILE"/>
+        <appender-ref ref="MEMORY"/>
     </root>
 </configuration>

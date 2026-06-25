@@ -54,7 +54,9 @@ dependencies {
     implementation(compose.desktop.currentOs)
     implementation(libs.kotlinx.coroutines.core)
 
-    runtimeOnly(libs.logback.classic)
+    // implementation (not runtimeOnly): DesktopLogAppender compiles against logback's
+    // AppenderBase/ILoggingEvent to tee logs into the in-app Logs tab's in-memory ring.
+    implementation(libs.logback.classic)
 }
 
 // Headless check that the Desktop controller drives node-core (no display needed).

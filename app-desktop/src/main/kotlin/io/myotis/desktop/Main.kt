@@ -23,7 +23,7 @@ fun main() {
             onCloseRequest = { controller.shutdown(); exitApplication() },
             title = "Myotis",
         ) {
-            NodeScreen(controller, settings)
+            NodeScreen(controller, settings, DesktopLogSource)
         }
     }
 }
