@@ -11,6 +11,17 @@ import java.time.format.DateTimeFormatter
 
 plugins {
     java
+    // Load the Android/Kotlin/Compose plugins once on the root classpath (apply false) so
+    // subprojects that apply them via alias don't each load their own copy — required once a
+    // Kotlin-Multiplatform module (:ui) is in the build, which fails hard on duplicate loads.
+    alias(libs.plugins.android.application) apply false
+    alias(libs.plugins.android.library) apply false
+    alias(libs.plugins.kotlin.android) apply false
+    alias(libs.plugins.kotlin.jvm) apply false
+    alias(libs.plugins.kotlin.multiplatform) apply false
+    alias(libs.plugins.kotlin.serialization) apply false
+    alias(libs.plugins.compose.compiler) apply false
+    alias(libs.plugins.compose.multiplatform) apply false
 }
 
 allprojects {
@@ -19,8 +30,12 @@ allprojects {
 }
 
 subprojects {
-    // android-app uses the Android Gradle Plugin, not the java plugin
-    if (name == "android-app") {
+    // These bring their own plugins (Android Gradle Plugin / Kotlin Multiplatform /
+    // Compose), which are incompatible with the `java` plugin applied below:
+    //   android-app  → com.android.application
+    //   ui           → kotlin-multiplatform + com.android.library + compose
+    //   app-desktop  → kotlin.jvm + compose (desktop)
+    if (name in setOf("android-app", "ui", "app-desktop")) {
         configurations.all {
             exclude(group = "io.netty", module = "netty-transport-native-epoll")
             exclude(group = "io.netty", module = "netty-transport-native-kqueue")

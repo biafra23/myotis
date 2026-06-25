@@ -206,6 +206,11 @@ dependencies {
     // adapters, so the per-network EL+CL+RPC lifecycle lives once for both hosts.
     implementation(project(":node-core"))
 
+    // Shared Compose-Multiplatform UI + the NodeController/Settings seam. The Android
+    // actuals (AndroidNodeController/AndroidSettings) back it with NodeService, so the
+    // same NodeScreen renders on Android and Desktop.
+    implementation(project(":ui"))
+
     // Force the JRE *variant* of Guava. Guava publishes jre and android
     // variants under one module; on an Android project Gradle's
     // org.gradle.jvm.environment=android attribute selects the `android`

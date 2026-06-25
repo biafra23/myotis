@@ -1,0 +1,57 @@
+<!-- Desktop logging config. Forced via -Dlogback.configurationFile=logback-desktop.xml
+     (set as a jvmArg in app-desktop/build.gradle.kts) so it wins over the logback.xml that
+     :app puts on the classpath — that default logs com.jaeckel.ethp2p at DEBUG to a
+     non-rotating ${user.dir}/devp2p.log, which floods the console and grows without bound.
+
+     Here instead:
+       * Rolling, size-capped FILE appender under ~/.myotis/logs (the app's data dir), so the
+         log can't grow unbounded: 10 MB/file, gzip-rolled daily, 7 days kept, 50 MB total.
+       * App log level is adjustable at launch:  -Dmyotis.log.level=DEBUG  (default INFO).
+         INFO keeps the noisy RLPx/eth/discovery DEBUG lines out of the console; bump to DEBUG
+         to diagnose. Third-party libraries stay pinned (netty/tuweni/libp2p at WARN) so a
+         DEBUG bump only makes OUR code verbose, not the whole dependency tree.
+     Override the log directory with -Dmyotis.logdir=/some/path if desired. -->
+<configuration>
+    <property name="LOG_DIR" value="${myotis.logdir:-${user.home}/.myotis/logs}"/>
+    <property name="APP_LEVEL" value="${myotis.log.level:-INFO}"/>
+    <!-- The P2P wire layer (eth/rlpx/discovery) is extremely chatty during normal sync — not
+         just INFO per-message traffic (snap AccountRange, eth headers) but WARN/ERROR-with-
+         stacktrace for every benign peer disconnect / connection reset as flaky peers churn.
+         Default it to ERROR so a GUI launch isn't a wall of stack traces; raise with
+         -Dmyotis.log.wire.level=WARN (or INFO/DEBUG) to actually watch the wire. -->
+    <property name="WIRE_LEVEL" value="${myotis.log.wire.level:-ERROR}"/>
+    <property name="PATTERN" value="%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"/>
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder><pattern>${PATTERN}</pattern></encoder>
+    </appender>
+
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/myotis.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/myotis.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+            <maxFileSize>10MB</maxFileSize>
+            <maxHistory>7</maxHistory>
+            <totalSizeCap>50MB</totalSizeCap>
+        </rollingPolicy>
+        <encoder><pattern>${PATTERN}</pattern></encoder>
+    </appender>
+
+    <!-- Our code — verbosity controlled by -Dmyotis.log.level (default INFO). -->
+    <logger name="com.jaeckel.ethp2p" level="${APP_LEVEL}"/>
+    <logger name="io.myotis" level="${APP_LEVEL}"/>
+    <!-- ...but the chatty per-message networking layer defaults to WARN. Raise it with
+         -Dmyotis.log.wire.level=INFO (or DEBUG) to watch the wire during diagnosis. -->
+    <logger name="com.jaeckel.ethp2p.networking" level="${WIRE_LEVEL}"/>
+
+    <!-- Third-party noise stays pinned regardless of APP_LEVEL. -->
+    <logger name="io.netty" level="WARN"/>
+    <logger name="org.apache.tuweni" level="WARN"/>
+    <logger name="io.libp2p" level="WARN"/>
+    <logger name="org.jetbrains.skiko" level="WARN"/>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="FILE"/>
+    </root>
+</configuration>
