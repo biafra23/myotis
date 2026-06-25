@@ -17,7 +17,6 @@ import com.jaeckel.ethp2p.android.log.LogBuffer;
 import com.jaeckel.ethp2p.consensus.BeaconLightClient;
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
 import com.jaeckel.ethp2p.consensus.libp2p.BeaconP2PService;
-import com.jaeckel.ethp2p.consensus.proof.MerklePatriciaVerifier;
 import com.jaeckel.ethp2p.consensus.proof.OrderedTrieRoot;
 import com.jaeckel.ethp2p.core.crypto.NodeKey;
 import com.jaeckel.ethp2p.core.types.BlockHeader;
@@ -25,14 +24,9 @@ import com.jaeckel.ethp2p.networking.NetworkConfig;
 import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
 import com.jaeckel.ethp2p.networking.discv5.DiscV5Service;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockBodiesMessage;
-import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
 import com.jaeckel.ethp2p.networking.eth.messages.Receipt;
 import com.jaeckel.ethp2p.networking.eth.messages.TxFeeFields;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
-import com.jaeckel.ethp2p.networking.snap.messages.AccountRangeMessage;
-
-import org.apache.tuweni.bytes.Bytes32;
-import org.apache.tuweni.crypto.Hash;
 
 import org.apache.tuweni.bytes.Bytes;
 import org.apache.tuweni.crypto.SECP256K1;
@@ -48,7 +42,6 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -82,14 +75,6 @@ public final class NodeService extends Service {
     /** Live snap-peer target, read from settings at boot; the maintainer reads it each tick
      *  so a settings change applies without a restart. */
     private volatile int targetSnapPeers = DEFAULT_SNAP_TARGET;
-    // Same bound the JVM daemon uses (CommandHandler.MAX_HEADER_CHAIN_GAP).
-    // Caps how many headers we'll fetch to bridge from the beacon-finalized
-    // block to the peer's head — i.e. the maximum gap the headerChain
-    // verification path will tolerate. In normal operation the gap is small
-    // (snap peers track head, BLC finality lags by ~12.8 minutes ≈ 64 blocks),
-    // but the bound has to cover catch-up after the phone wakes from doze.
-    private static final int MAX_HEADER_CHAIN_GAP = 8192;
-    private static final long HEADER_CHAIN_TIMEOUT_SEC = 60;
     // How many recent blocks below the verified head to scan for a tx in
     // eth_getTransactionReceipt. Kept small to bound the bandwidth/battery cost of the
     // (trustless) body scan on mobile: ~8 blocks ≈ 1.5 min covers a wallet polling a
@@ -544,259 +529,18 @@ public final class NodeService extends Service {
         return requestAccount(primaryNetwork(this), hexAddress);
     }
 
-    @SuppressLint("NewApi")
     public CompletableFuture<AccountQueryResult> requestAccount(String network, String hexAddress) {
         io.myotis.node.ChainStack stack = stacks.get(canonicalNetwork(network));
-        RLPxConnector connector = stack != null ? stack.connector() : null;
-        BeaconSyncState beaconSyncState = stack != null ? stack.beaconSyncState() : null;
-        if (!RUNNING.get() || connector == null) {
-            return CompletableFuture.failedFuture(
-                    new IllegalStateException("Node is not running on " + canonicalNetwork(network)));
-        }
-        if (hexAddress == null) {
-            return CompletableFuture.failedFuture(
-                    new IllegalArgumentException("Address is required"));
-        }
-        String hex = hexAddress.strip();
-        if (hex.startsWith("0x") || hex.startsWith("0X")) hex = hex.substring(2);
-        if (hex.length() != 40) {
-            return CompletableFuture.failedFuture(
-                    new IllegalArgumentException("Address must be 20 bytes (40 hex chars)"));
-        }
-        final String hexAddrFinal = hex;
-        Bytes address;
-        try {
-            address = Bytes.fromHexString(hex);
-        } catch (Exception e) {
-            return CompletableFuture.failedFuture(
-                    new IllegalArgumentException("Invalid hex address: " + e.getMessage()));
-        }
-        Bytes32 accountHash = Hash.keccak256(address);
-        BeaconSyncState bss = beaconSyncState;
-        RLPxConnector conn = connector;
-        return connector.requestAccount(address).thenCompose(result ->
-                buildAccountResult("0x" + hexAddrFinal, address, accountHash, result, bss, conn));
+        return io.myotis.node.VerifiedAccountQuery.query(stack, hexAddress)
+                .thenApply(NodeService::toAccountQueryResult);
     }
 
-    /**
-     * Mutable verification scratchpad. Keeps the two verification methods
-     * (headerChain + stateRootMatch) from threading 5 separate parameters
-     * through the async chain.
-     */
-    private static final class Verification {
-        boolean beaconChainVerified;
-        boolean blsVerified;
-        long matchedSlot = -1;
-        String verifyMethod;
-        String failReason;
-    }
-
-    private static CompletableFuture<AccountQueryResult> buildAccountResult(
-            String addr,
-            Bytes address,
-            Bytes32 accountHash,
-            AccountRangeMessage.DecodeResult result,
-            BeaconSyncState bss,
-            RLPxConnector connector) {
-        AccountRangeMessage.AccountData found = null;
-        for (AccountRangeMessage.AccountData a : result.accounts()) {
-            if (a.accountHash().equals(accountHash)) {
-                found = a;
-                break;
-            }
-        }
-        final AccountRangeMessage.AccountData foundFinal = found;
-        long nonce = found != null ? found.nonce() : -1;
-        String balance = found != null ? found.balance().toString() : null;
-
-        boolean peerProofValid = false;
-        MerklePatriciaVerifier.VerifiedAccount verifiedAcct = null;
-        if (result.stateRoot() != null && !result.proof().isEmpty()) {
-            List<byte[]> proofBytes = new ArrayList<>(result.proof().size());
-            for (Bytes b : result.proof()) proofBytes.add(b.toArrayUnsafe());
-            // verifyAndExtractAccount returns the storageRoot/codeHash from the
-            // proof-verified leaf — NOT the peer's slim body — so a peer can't
-            // forge those two fields while keeping nonce/balance honest.
-            verifiedAcct = MerklePatriciaVerifier.verifyAndExtractAccount(
-                    result.stateRoot().toArrayUnsafe(),
-                    address.toArrayUnsafe(),
-                    proofBytes, nonce, balance);
-            peerProofValid = (verifiedAcct != null);
-        }
-        final boolean peerProofValidFinal = peerProofValid;
-        final MerklePatriciaVerifier.VerifiedAccount verifiedAcctFinal = verifiedAcct;
-
-        Verification v = new Verification();
-
-        // Fast-path shortcut: if the BLC has already attested the peer's
-        // exact stateRoot, we're done — no header fetch needed. Rare, but
-        // free to check.
-        if (bss != null && result.stateRoot() != null) {
-            BeaconSyncState.SlottedStateRoot match =
-                    bss.findStateRoot(result.stateRoot().toArrayUnsafe());
-            if (match != null) {
-                v.beaconChainVerified = true;
-                v.matchedSlot = match.slot();
-                v.blsVerified = match.blsVerified();
-                v.verifyMethod = "stateRootMatch";
-                return CompletableFuture.completedFuture(
-                        finalizeResult(addr, foundFinal, result, peerProofValidFinal, verifiedAcctFinal, v));
-            }
-        }
-
-        // Main verification path: headerChain. Walk the failure ladder
-        // (mirrors CommandHandler.buildVerificationJson) — only run the
-        // fetch + chain verification if every prerequisite holds.
-        if (result.stateRoot() == null) {
-            v.failReason = "noPeerStateRoot";
-        } else if (!peerProofValid) {
-            v.failReason = "peerProofInvalid";
-        } else if (bss == null || !bss.isSynced()) {
-            v.failReason = "beaconNotSynced";
-        } else {
-            long peerBlockNumber = result.blockNumber();
-            // Read block number + state root from one atomic snapshot — reading them via
-            // two separate getters can pair a block number with a state root from a
-            // different finalized payload if an update lands between the calls.
-            BeaconSyncState.FinalizedExecution fin = bss.getFinalizedExecution();
-            long finalizedBlock = fin.blockNumber();
-            byte[] beaconRoot = fin.stateRoot();
-
-            if (peerBlockNumber <= 0) {
-                v.failReason = "noPeerBlockNumber";
-            } else if (finalizedBlock <= 0 || beaconRoot == null) {
-                v.failReason = "beaconBlockUnavailable";
-            } else if (peerBlockNumber <= finalizedBlock) {
-                v.failReason = "peerBlockBehindFinalized";
-            } else if (peerBlockNumber - finalizedBlock > MAX_HEADER_CHAIN_GAP) {
-                v.failReason = "headerChainGapTooLarge";
-            } else {
-                // headerChain: fetch [finalized .. peerBlock] inclusive
-                // from a single peer and verify the chain end-to-end.
-                final long finalizedSlot = bss.getFinalizedSlot();
-                LogBuffer.i(TAG, "[verify] headerChain: peerBlock=" + peerBlockNumber
-                        + ", finalizedBlock=" + finalizedBlock
-                        + ", gap=" + (peerBlockNumber - finalizedBlock));
-                return verifyHeaderChainBatched(
-                                connector, finalizedBlock, peerBlockNumber,
-                                beaconRoot, result.stateRoot().toArrayUnsafe())
-                        .handle((chainValid, ex) -> {
-                            if (ex != null) {
-                                LogBuffer.i(TAG, "[verify] headerChain error: " + ex.getMessage());
-                                v.failReason = "headerChainError";
-                            } else if (Boolean.TRUE.equals(chainValid)) {
-                                v.beaconChainVerified = true;
-                                v.matchedSlot = finalizedSlot;
-                                v.blsVerified = true;
-                                v.verifyMethod = "headerChain";
-                                v.failReason = null;
-                            } else {
-                                v.failReason = "headerChainInvalid";
-                            }
-                            return finalizeResult(addr, foundFinal, result, peerProofValidFinal, verifiedAcctFinal, v);
-                        });
-            }
-        }
-
-        return CompletableFuture.completedFuture(
-                finalizeResult(addr, foundFinal, result, peerProofValidFinal, verifiedAcctFinal, v));
-    }
-
-    private static AccountQueryResult finalizeResult(String addr,
-                                                      AccountRangeMessage.AccountData found,
-                                                      AccountRangeMessage.DecodeResult result,
-                                                      boolean peerProofValid,
-                                                      MerklePatriciaVerifier.VerifiedAccount verified,
-                                                      Verification v) {
-        long nonce = found != null ? found.nonce() : -1;
-        String balance = found != null ? found.balance().toString() : null;
-        // storageRoot/codeHash come from the proof-verified leaf when we have it,
-        // so they're cryptographically anchored rather than peer-claimed. Fall
-        // back to the slim body only when the proof didn't verify — in which case
-        // the result is already flagged beaconChainVerified=false.
-        String storageRootHex = verified != null
-                ? Bytes.wrap(verified.storageRoot()).toHexString()
-                : (found != null ? found.storageRoot().toHexString() : null);
-        String codeHashHex = verified != null
-                ? Bytes.wrap(verified.codeHash()).toHexString()
-                : (found != null ? found.codeHash().toHexString() : null);
+    private static AccountQueryResult toAccountQueryResult(io.myotis.node.VerifiedAccountQuery.Result r) {
         return new AccountQueryResult(
-                addr,
-                found != null,
-                nonce,
-                balance,
-                storageRootHex,
-                codeHashHex,
-                result.blockNumber(),
-                result.stateRoot() != null ? result.stateRoot().toHexString() : null,
-                peerProofValid,
-                v.beaconChainVerified,
-                v.blsVerified,
-                v.matchedSlot,
-                v.verifyMethod,
-                v.failReason);
-    }
-
-    /**
-     * Fetch headers in a single batch and verify the chain end-to-end.
-     * Returns a future that completes with {@code true} iff:
-     * <ul>
-     *   <li>the first header's stateRoot equals the beacon-finalized root,</li>
-     *   <li>the last header's stateRoot equals the peer's reported root,</li>
-     *   <li>and every header's hash equals the next header's parentHash.</li>
-     * </ul>
-     */
-    @SuppressLint("NewApi") // CompletableFuture.orTimeout — see requestAccount
-    private static CompletableFuture<Boolean> verifyHeaderChainBatched(
-            RLPxConnector connector, long finalizedBlock, long peerBlock,
-            byte[] beaconStateRoot, byte[] peerStateRoot) {
-        long totalLong = peerBlock - finalizedBlock + 1;
-        if (totalLong < 2 || totalLong > MAX_HEADER_CHAIN_GAP) {
-            LogBuffer.i(TAG, "[verify] headerChain gap " + totalLong
-                    + " out of range [2, " + MAX_HEADER_CHAIN_GAP + "]");
-            return CompletableFuture.completedFuture(false);
-        }
-        int total = (int) totalLong;
-        LogBuffer.i(TAG, "[verify] Fetching " + total + " headers from #"
-                + finalizedBlock + " to #" + peerBlock);
-        return connector.requestBlockHeadersBatched(finalizedBlock, total)
-                .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
-                .thenApply(headers -> {
-                    boolean valid = verifyHeaderChain(headers, beaconStateRoot, peerStateRoot);
-                    LogBuffer.i(TAG, "[verify] Full header chain (" + headers.size()
-                            + " blocks) valid: " + valid);
-                    return valid;
-                });
-    }
-
-    /**
-     * Pure verification of a contiguous header range. Identical algorithm to
-     * {@code CommandHandler#verifyHeaderChain} in the JVM daemon.
-     */
-    private static boolean verifyHeaderChain(List<BlockHeadersMessage.VerifiedHeader> headers,
-                                              byte[] expectedFirstStateRoot,
-                                              byte[] expectedLastStateRoot) {
-        if (headers.isEmpty()) return false;
-
-        byte[] firstStateRoot = headers.get(0).header().stateRoot.toArrayUnsafe();
-        if (!java.util.Arrays.equals(firstStateRoot, expectedFirstStateRoot)) return false;
-
-        byte[] lastStateRoot = headers.get(headers.size() - 1).header().stateRoot.toArrayUnsafe();
-        if (!java.util.Arrays.equals(lastStateRoot, expectedLastStateRoot)) return false;
-
-        for (int i = 0; i < headers.size() - 1; i++) {
-            Bytes32 currentHash = headers.get(i).hash();
-            Bytes32 nextParent = headers.get(i + 1).header().parentHash;
-            if (!currentHash.equals(nextParent)) {
-                LogBuffer.i(TAG, "[verify] hash chain break at index " + i
-                        + ": block #" + headers.get(i).header().number
-                        + " hash=" + currentHash.toShortHexString()
-                        + " != block #" + headers.get(i + 1).header().number
-                        + " parentHash=" + nextParent.toShortHexString());
-                return false;
-            }
-        }
-        return true;
+                r.address(), r.exists(), r.nonce(), r.balanceWei(),
+                r.storageRootHex(), r.codeHashHex(), r.blockNumber(),
+                r.peerStateRootHex(), r.peerProofValid(), r.beaconChainVerified(),
+                r.blsVerified(), r.matchedBeaconSlot(), r.verifyMethod(), r.failReason());
     }
 
     // ---------------------------------------------------------------------

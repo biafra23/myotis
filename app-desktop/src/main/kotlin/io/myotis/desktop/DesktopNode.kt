@@ -8,9 +8,13 @@ import com.jaeckel.ethp2p.app.rpc.JavaHttpCcipGateway
 import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec
 import com.jaeckel.ethp2p.core.crypto.NodeKey
 import com.jaeckel.ethp2p.networking.NetworkConfig
+import io.myotis.ens.EnsResolutionRoot
 import io.myotis.node.ChainPorts
 import io.myotis.node.ChainStack
 import io.myotis.node.NodeRegistry
+import io.myotis.node.VerifiedAccountQuery
+import io.myotis.ui.AccountResult
+import io.myotis.ui.EnsResult
 import io.myotis.ui.NetworkStatus
 import io.myotis.ui.NodeController
 import io.myotis.ui.NodeSnapshot
@@ -18,6 +22,7 @@ import io.myotis.ui.Settings
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.future.await
 import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.io.path.createDirectories
@@ -112,6 +117,27 @@ class DesktopNodeController(private val dataDir: Path) : NodeController {
 
     override fun setTargetSnapPeers(target: Int) {
         registry.all().forEach { it.setTargetSnapPeers(target) }
+    }
+
+    override suspend fun requestAccount(network: String, address: String): AccountResult {
+        // VerifiedAccountQuery handles a null/!running stack itself (failed future → throws).
+        val stack = registry.get(NetworkConfig.byName(network).name())
+        val r = VerifiedAccountQuery.query(stack, address).await()
+        return AccountResult(
+            r.address(), r.exists(), r.nonce(), r.balanceWei(),
+            r.storageRootHex(), r.codeHashHex(), r.blockNumber(), r.peerStateRootHex(),
+            r.peerProofValid(), r.beaconChainVerified(), r.blsVerified(), r.matchedBeaconSlot(),
+            r.verifyMethod(), r.failReason(),
+        )
+    }
+
+    override suspend fun resolveEns(network: String, name: String): EnsResult {
+        val stack = registry.get(NetworkConfig.byName(network).name())
+            ?: throw IllegalStateException("Node is not running on $network")
+        val backend = stack.rpcBackend()
+            ?: throw IllegalStateException("RPC backend not started on $network")
+        val r = backend.resolveEns(name.trim(), EnsResolutionRoot.AUTO).await()
+        return EnsResult(r.name(), r.addressHex(), r.blockNumber(), r.verified(), r.error())
     }
 
     /** Poll the live stacks every 2s and emit a per-network snapshot map for the UI. */
