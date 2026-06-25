@@ -5,7 +5,7 @@ import kotlinx.coroutines.flow.Flow
 /**
  * The backend operations the shared UI needs, abstracted so each platform supplies its own
  * actual: Android wraps `NodeService`; Desktop drives `node-core` in-process. commonMain
- * (the screens) depends only on this + {@link Settings} + the models below — never on the
+ * (the screens) depends only on this + [Settings] + the models below — never on the
  * Java/JVM backend, so the same UI compiles for Android, Desktop (and iOS later).
  */
 interface NodeController {

@@ -22,7 +22,7 @@ import java.nio.file.Path
 import kotlin.io.path.createDirectories
 
 /**
- * The Desktop actual of {@link NodeController}: drives the SAME Java backend (`node-core`
+ * The Desktop actual of [NodeController]: drives the SAME Java backend (`node-core`
  * `ChainStack`/`NodeRegistry`) the daemon and Android use, in-process — no Android Service,
  * no IPC. Reuses the daemon's file-backed caches + CCIP gateway from `:app`.
  */
@@ -39,8 +39,10 @@ class DesktopNodeController(private val dataDir: Path) : NodeController {
         dataDir.createDirectories()
     }
 
+    // A registered stack may still be booting (or have failed start()); report running only
+    // when at least one stack is actually up, not merely present in the registry.
     override val running: Boolean
-        get() = !registry.isEmpty
+        get() = registry.all().any { it.isRunning }
 
     override fun enableNetwork(name: String) {
         // All of this (key load/generate, cache init, stack.start()) does blocking disk I/O
@@ -65,14 +67,17 @@ class DesktopNodeController(private val dataDir: Path) : NodeController {
                 )
                 stack.configureSnapMaintainer(32, null)  // desktop has system DNS → null provider
                 registry.add(stack)
-                // If start() fails, drop the stack so a later enable can retry — leaving a
-                // dead entry in the registry would permanently block this network.
-                try {
+                // ChainStack.start() is fault-isolated: it returns false (and closes its own
+                // resources) on failure rather than throwing. Either way — false return or a
+                // stray throwable — drop the stack from the registry so a later enable can
+                // retry; leaving a dead entry would report "running" forever and block retries.
+                val ok = try {
                     stack.start()
                 } catch (t: Throwable) {
                     registry.remove(name)
                     throw t
                 }
+                if (!ok) registry.remove(name)
             }
         }, "desktop-boot-$name").apply { isDaemon = true }.start()
     }
@@ -110,19 +115,26 @@ class DesktopNodeController(private val dataDir: Path) : NodeController {
         val state = if (bss != null)
             bss.getSyncState(net.clGenesisTime(), net.secondsPerSlot()).name
         else "STARTING"
+        val active = conn?.activePeers ?: emptyList()
+        // "ready" = peers past the eth handshake, matching Android's filtered count (the raw
+        // active list also includes peers still negotiating Hello/Status).
+        val ready = active.count { "READY" == it.state() }
+        val backend = stack.rpcBackend()
         return NodeSnapshot(
             running = stack.isRunning,
             network = net.name(),
             beaconState = state,
-            connectedPeers = conn?.activePeers?.size ?: 0,
-            readyPeers = conn?.activePeers?.size ?: 0,
+            connectedPeers = active.size,
+            readyPeers = ready,
             snapPeers = conn?.activeSnapHandlers()?.size ?: 0,
             discoveredPeers = disc4?.table()?.size() ?: 0,
             executionBlockNumber = bss?.executionBlockNumber ?: 0L,
             finalizedSlot = bss?.finalizedSlot ?: 0L,
             syncCurrentPeriod = bss?.currentSyncCommitteePeriod ?: 0L,
             syncTargetPeriod = BeaconChainSpec.currentPeriod(net.clGenesisTime(), net.secondsPerSlot()),
-            verifiedHeadAgeMs = 0L,
+            // Real age of the last verified RPC head, or MAX_VALUE if RPC hasn't built one yet
+            // (same sentinel Android's NodeService uses; the UI renders it as "—").
+            verifiedHeadAgeMs = backend?.verifiedHeadAgeMs() ?: Long.MAX_VALUE,
             uptimeSeconds = (System.nanoTime() - startNs) / 1_000_000_000L,
         )
     }
@@ -136,6 +148,7 @@ class DesktopNodeController(private val dataDir: Path) : NodeController {
 class DesktopSettings : Settings {
     private val enabled = linkedSetOf("mainnet")
     private val ports = HashMap<String, Int>()
+    private var snap = 32
 
     override fun enabledNetworks(): List<String> = synchronized(this) { enabled.toList() }
     override fun primaryNetwork(): String = synchronized(this) { enabled.firstOrNull() ?: "mainnet" }
@@ -152,8 +165,8 @@ class DesktopSettings : Settings {
         ports[network] = port
         Unit
     }
-    override fun snapTarget(): Int = 32
-    override fun setSnapTarget(v: Int) {}
+    override fun snapTarget(): Int = synchronized(this) { snap }
+    override fun setSnapTarget(v: Int) = synchronized(this) { snap = v }
 }
 
 /** Desktop is treated as always-online (no Android ConnectivityManager). */

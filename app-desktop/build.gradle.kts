@@ -22,6 +22,10 @@ dependencies {
     implementation(project(":consensus"))
     implementation(project(":myotis-evm"))
     implementation(project(":rpc-backend"))
+    // VerifiedRpcBackend implements jsonrpc-server's MyotisRpcBackend; calling
+    // verifiedHeadAgeMs() forces Kotlin to resolve that supertype, so it must be on the
+    // compile classpath (rpc-backend exposes VerifiedRpcBackend only as `implementation`).
+    implementation(project(":jsonrpc-server"))
     implementation(project(":core"))
 
     implementation(compose.desktop.currentOs)

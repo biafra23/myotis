@@ -21,7 +21,7 @@ import androidx.compose.ui.unit.dp
 
 /**
  * The shared Myotis screen — identical on Android and Desktop. This Step-1 slice renders the
- * Status view for the primary network from {@link NodeController}'s snapshot flow; the Query
+ * Status view for the primary network from [NodeController]'s snapshot flow; the Query
  * / Logs / Settings tabs are ported next (this composable becomes the tab host).
  */
 @Composable
@@ -62,7 +62,9 @@ private fun StatusView(s: NodeSnapshot) {
         StatusRow("Peers", "${s.connectedPeers} (ready ${s.readyPeers}, snap ${s.snapPeers})")
         StatusRow("Discovered", s.discoveredPeers.toString())
         StatusRow("Sync period", "${s.syncCurrentPeriod} / ${s.syncTargetPeriod}")
-        StatusRow("Verified head age", "${s.verifiedHeadAgeMs} ms")
+        // verifiedHeadAgeMs == Long.MAX_VALUE is the "no verified head yet" sentinel — show a
+        // dash instead of the raw ~9.2e18 ms, which would read as a nonsensical age.
+        StatusRow("Verified head age", if (s.verifiedHeadAgeMs == Long.MAX_VALUE) "—" else "${s.verifiedHeadAgeMs} ms")
         StatusRow("Uptime", "${s.uptimeSeconds}s")
     }
 }

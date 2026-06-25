@@ -11,8 +11,8 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 
 /**
- * Android actuals for the shared `:ui` seam: back {@link NodeController}/{@link Settings}
- * with the existing {@link NodeService} + its SharedPreferences statics, so the same
+ * Android actuals for the shared `:ui` seam: back [NodeController]/[Settings]
+ * with the existing [NodeService] + its SharedPreferences statics, so the same
  * Compose `NodeScreen` renders on Android and Desktop. Additive — wired into MainActivity
  * as the Status/other tabs are ported to `:ui`.
  */
@@ -52,7 +52,7 @@ private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
     uptimeSeconds = if (startTimeMs() > 0) (System.currentTimeMillis() - startTimeMs()) / 1000 else 0,
 )
 
-/** Android actual of {@link Settings} over the NodeService SharedPreferences statics. */
+/** Android actual of [Settings] over the NodeService SharedPreferences statics. */
 class AndroidSettings(private val ctx: Context) : Settings {
     override fun enabledNetworks(): List<String> = NodeService.enabledNetworks(ctx)
     override fun primaryNetwork(): String = NodeService.primaryNetwork(ctx)
