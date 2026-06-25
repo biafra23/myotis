@@ -30,7 +30,7 @@ The Android app runs an embedded JSON-RPC server (Ktor, **loopback-only `127.0.0
 
 > **Security:** the server binds **loopback only** by default — the wallet is a same-device client, and the endpoint is unauthenticated with no TLS or rate limiting (and `eth_sendRawTransaction` relays whatever signed bytes it's handed), so it is deliberately not reachable from other devices. Exposing it on a routable interface would require an explicit, opt-in change.
 
-**Connecting MetaMask:** MetaMask runs on the same device as the node. Add a custom network pointing at `http://localhost:8545` (chain id 1 for mainnet). The desktop daemon does **not** serve JSON-RPC — it exposes the same verified operations over its CLI/IPC socket (see *Query commands* below).
+**Connecting MetaMask:** MetaMask runs on the same device as the node. Add a custom network pointing at `http://localhost:8545` (chain id 1 for mainnet). The desktop daemon serves the **same** verified JSON-RPC endpoint on `127.0.0.1:8545` (started automatically — no flag) and additionally exposes the verified operations over its CLI/IPC socket (see *Query commands* below).
 
 ### Implemented (verified) methods
 
@@ -82,7 +82,7 @@ The app runs the node as a foreground `NodeService` (Start/Stop in the UI). Once
 
 ### Desktop daemon
 
-The daemon discovers peers, maintains connections, and listens for CLI commands on a Unix domain socket (`/tmp/ethp2p.sock`); it exposes the verified operations as CLI commands (`get-account`, `get-storage`, `resolve-ens`, …), not JSON-RPC. A **client** invocation sends a single command to the running daemon and exits.
+The daemon discovers peers, maintains connections, serves the verified JSON-RPC endpoint on `127.0.0.1:8545` (per-network: gnosis `8546`, sepolia `8547`), and listens for CLI commands on a Unix domain socket (`/tmp/ethp2p.sock`); it also exposes the verified operations as CLI commands (`get-account`, `get-storage`, `resolve-ens`, …). A **client** invocation sends a single command to the running daemon and exits. As with the Android app, JSON-RPC answers only once the beacon light client reaches `SYNCED`.
 
 ### Start the daemon
 

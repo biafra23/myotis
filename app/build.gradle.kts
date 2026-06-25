@@ -1,3 +1,13 @@
+// Shadow gives us `:app:shadowJar` → a single bundleable fat jar embedders can
+// spawn (e.g. freedom-browser) with `java -jar`, no Gradle on the target host.
+// We deliberately do NOT apply the `application` plugin: it would register its
+// own `run` task and collide with the custom JavaExec `run` below (which wires
+// BLS native lib path, logback config, and -Pnetwork/-Pport/-Pgossipsub args).
+// The main class is set on the shadowJar manifest instead.
+plugins {
+    alias(libs.plugins.shadow)
+}
+
 // The daemon must run the SAME netty as the Android app: the JitPack
 // netty-kotlin fork, not upstream io.netty. jvm-libp2p (via :consensus) and
 // Besu's netty-bom (via :myotis-evm) would otherwise drag upstream io.netty
@@ -43,6 +53,29 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+}
+
+// Bundleable fat jar: `./gradlew :app:shadowJar` → app/build/libs/myotis-<version>-all.jar.
+// Run the daemon from it with `java -jar myotis-<version>-all.jar` (mainnet, JSON-RPC on
+// 127.0.0.1:8545) or `... --network gnosis` / `--port <n>` / `--gossipsub`. The group-wide
+// io.netty exclusion above keeps upstream netty out of the jar (the kotlin fork's classes,
+// republished under io.netty.*, are bundled instead); mergeServiceFiles() concatenates the
+// duplicated META-INF/services entries that several deps (netty, ktor, bouncycastle) ship.
+tasks.shadowJar {
+    archiveBaseName.set("myotis")
+    archiveClassifier.set("all")
+    manifest {
+        attributes["Main-Class"] = "com.jaeckel.ethp2p.app.Main"
+        // log4j-api (pulled in transitively by the ConsenSys discv5 lib + Besu) is a
+        // multi-release jar: its JDK-9+ StackLocator lives under META-INF/versions/9/.
+        // Shadow bundles those versioned classes but does not propagate the
+        // `Multi-Release: true` manifest flag, so without this the JVM runs the base
+        // (JDK-8) StackLocator on JDK 21 — caller-class detection returns null and
+        // log4j's no-arg getLogger() throws ExceptionInInitializerError, which kills
+        // discv5 init (NodeRecordFactory). Re-assert the flag so the versioned class wins.
+        attributes["Multi-Release"] = "true"
+    }
+    mergeServiceFiles()
 }
 
 tasks.register<JavaExec>("run") {

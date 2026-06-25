@@ -39,6 +39,9 @@ kotlin-android      = { id = "org.jetbrains.kotlin.android",         version.ref
 kotlin-jvm          = { id = "org.jetbrains.kotlin.jvm",             version.ref = "kotlin" }
 kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
 compose-compiler    = { id = "org.jetbrains.kotlin.plugin.compose",  version.ref = "kotlin" }
+# Fat-jar packaging for :app (bundleable daemon jar for embedders, e.g. freedom-browser).
+# Pinned to the 8.x line for Gradle 8.12 / JDK 21; 9.x is a breaking rewrite.
+shadow              = { id = "com.gradleup.shadow",                  version = "8.3.9" }
 
 [libraries]
 tuweni-bytes        = { module = "com.github.biafra23.tuweni-kotlin:tuweni-bytes",       version.ref = "tuweni" }
