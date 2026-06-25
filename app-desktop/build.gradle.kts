@@ -20,8 +20,17 @@ kotlin { jvmToolchain(21) }
 // to load the 2.7.2 jar first; jpackage's flattened classpath lets the 2.4.2 one win. Strip
 // io.tmio so only the 2.7.2 fork remains (same packages; Besu already runs against 2.7.2 on
 // the daemon, so 2.4.2 is unneeded) — mirrors the :android-app exclusion.
+//
+// io.netty: the same class of conflict. The JitPack netty-kotlin fork
+// (com.github.biafra23.netty-kotlin, 4.2.x) republishes io.netty.* classes; Besu / vertx /
+// jvm-libp2p drag in upstream io.netty 4.1.115. Both ship e.g. io.netty.channel
+// .SingleThreadEventLoop, and the fork's NioEventLoopGroup calls a 4.2.x constructor the
+// 4.1.115 class lacks → NoSuchMethodError, so the stack fails to start in the flattened
+// jpackage bundle. The :app daemon excludes io.netty group-wide and runs end-to-end on only
+// the fork (reaches SYNCED), so it's safe to do the same here.
 configurations.all {
     exclude(group = "io.tmio")
+    exclude(group = "io.netty")
 }
 
 dependencies {
@@ -75,6 +84,13 @@ compose.desktop {
             targetFormats(TargetFormat.Dmg)
             packageName = "Myotis"
             packageVersion = "1.0.0"  // jpackage/dmg requires MAJOR > 0
+            // Bundle the FULL JDK module graph. jlink otherwise strips the runtime to the
+            // modules it can statically detect, but the backend reaches them reflectively —
+            // DNS (java.naming), JDBC-style lookups, EC TLS (jdk.crypto.ec), XML, etc. — so a
+            // stripped runtime dies at launch with NoClassDefFoundError (first seen:
+            // javax/naming/NamingException). includeAllModules trades a bigger bundle for a
+            // runtime that can actually load Netty / Besu / jvm-libp2p / BouncyCastle.
+            includeAllModules = true
             macOS {
                 bundleID = "io.myotis.desktop"
             }
