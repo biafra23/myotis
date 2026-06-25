@@ -47,6 +47,15 @@ tasks.register<JavaExec>("syncSmoke") {
 compose.desktop {
     application {
         mainClass = "io.myotis.desktop.MainKt"
+        // Pin the runtime jpackage bundles (via jlink) to the Java 21 toolchain. Our bytecode
+        // is class-file 65 (jvmToolchain(21)) and the backend (:networking discv5, :myotis-evm
+        // Besu) ships Java-21 classes that NEED a 21 runtime to load. Without this, jpackage
+        // defaults to whatever JDK runs Gradle — a Java 17 default JAVA_HOME bundles a 17 JRE
+        // that can't load our classes (UnsupportedClassVersionError: class file 65.0 vs 61.0).
+        // CI happened to work only because its JAVA_HOME is already 21.
+        javaHome = javaToolchains.launcherFor {
+            languageVersion.set(JavaLanguageVersion.of(21))
+        }.get().metadata.installationPath.asFile.absolutePath
         nativeDistributions {
             // macOS first (Apple Silicon). The .dmg can only be PRODUCED on macOS (jpackage
             // is host-OS-bound) — build/run on Linux for dev; package the dmg on a macOS CI
