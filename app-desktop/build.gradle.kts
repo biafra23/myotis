@@ -68,6 +68,10 @@ tasks.register<JavaExec>("syncSmoke") {
 compose.desktop {
     application {
         mainClass = "io.myotis.desktop.MainKt"
+        // Use our desktop logback config (rolling, size-capped, ~/.myotis/logs, app level
+        // adjustable via -Dmyotis.log.level) instead of the DEBUG-to-unbounded-file logback.xml
+        // that :app puts on the classpath. Applies to both the packaged app and :app-desktop:run.
+        jvmArgs += listOf("-Dlogback.configurationFile=logback-desktop.xml")
         // Pin the runtime jpackage bundles (via jlink) to the Java 21 toolchain. Our bytecode
         // is class-file 65 (jvmToolchain(21)) and the backend (:networking discv5, :myotis-evm
         // Besu) ships Java-21 classes that NEED a 21 runtime to load. Without this, jpackage
