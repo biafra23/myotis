@@ -19,6 +19,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import java.nio.file.Path
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.io.path.createDirectories
 
 /**
@@ -31,9 +32,13 @@ class DesktopNodeController(private val dataDir: Path) : NodeController {
     private val registry = NodeRegistry()
     // nanoTime, not currentTimeMillis: wall-clock / NTP steps must not skew uptime.
     private val startNs = System.nanoTime()
-    // Serialize lifecycle ops (enable/disable/reboot/shutdown) — they're triggered from the
-    // UI thread but mutate the shared registry; `lock` guards against interleaving.
-    private val lock = Any()
+    // Per-network boot locks keyed by CANONICAL name, mirroring Android's NodeService.bootLocks:
+    // serialize enable/disable for one network without a global lock, so a slow boot of network
+    // A never blocks shutdown or lifecycle ops on B. NodeRegistry is ConcurrentHashMap-backed
+    // (each add/get/remove is already thread-safe), so these locks only guard the per-network
+    // check-then-build so two boots of the same network can't race.
+    private val bootLocks = ConcurrentHashMap<String, Any>()
+    private fun bootLock(canonical: String): Any = bootLocks.computeIfAbsent(canonical) { Any() }
 
     init {
         dataDir.createDirectories()
@@ -45,17 +50,23 @@ class DesktopNodeController(private val dataDir: Path) : NodeController {
         get() = registry.all().any { it.isRunning }
 
     override fun enableNetwork(name: String) {
+        // Resolve the canonical name up front: NetworkConfig.byName aliases (xdai/gbc → gnosis,
+        // case-folds, etc.). Everything below — registry keys, the boot lock, and the key/cache
+        // filenames — must use the canonical form, or an alias would double-boot and leak (the
+        // registry keys stacks by network().name(), so a raw-alias remove() would miss).
+        val network = NetworkConfig.byName(name)
+        val canonical = network.name()
         // All of this (key load/generate, cache init, stack.start()) does blocking disk I/O
-        // and network setup — never run it on the UI thread. Boot on a daemon thread, holding
-        // `lock` so concurrent enable/reboot calls can't double-add or race the registry.
+        // and network setup — never run it on the UI thread. Boot on a daemon thread; the
+        // per-network lock (not a global one) keeps two boots of the SAME network from racing
+        // while leaving shutdown / other networks free to proceed.
         Thread({
-            synchronized(lock) {
-                if (registry.get(name) != null) return@synchronized
-                val network = NetworkConfig.byName(name)
+            synchronized(bootLock(canonical)) {
+                if (registry.get(canonical) != null) return@synchronized
                 val ports = ChainPorts.defaultsFor(network)
-                val keyFile = if (name == "mainnet") "nodekey.hex" else "nodekey-$name.hex"
+                val keyFile = if (canonical == "mainnet") "nodekey.hex" else "nodekey-$canonical.hex"
                 val nodeKey = NodeKey.loadOrGenerate(dataDir.resolve(keyFile))
-                val suffix = if (name == "mainnet") "" else "-$name"
+                val suffix = if (canonical == "mainnet") "" else "-$canonical"
                 val peerCache = PeerCache(dataDir.resolve("peers$suffix.cache"))
                 val clPeerCache = CLPeerCache(dataDir.resolve("cl-peers$suffix.cache"))
                 val stack = ChainStack(
@@ -74,16 +85,17 @@ class DesktopNodeController(private val dataDir: Path) : NodeController {
                 val ok = try {
                     stack.start()
                 } catch (t: Throwable) {
-                    registry.remove(name)
+                    registry.remove(canonical)
                     throw t
                 }
-                if (!ok) registry.remove(name)
+                if (!ok) registry.remove(canonical)
             }
-        }, "desktop-boot-$name").apply { isDaemon = true }.start()
+        }, "desktop-boot-$canonical").apply { isDaemon = true }.start()
     }
 
     override fun disableNetwork(name: String) {
-        synchronized(lock) { registry.remove(name) }
+        val canonical = NetworkConfig.byName(name).name()
+        synchronized(bootLock(canonical)) { registry.remove(canonical) }
     }
 
     override fun rebootNetwork(name: String) {
@@ -92,7 +104,10 @@ class DesktopNodeController(private val dataDir: Path) : NodeController {
     }
 
     override fun shutdown() {
-        synchronized(lock) { registry.shutdownAll() }
+        // No global lock: NodeRegistry and ChainStack.shutdown() are each thread-safe, so window
+        // close tears every stack down promptly without waiting behind an in-progress boot of an
+        // unrelated network.
+        registry.shutdownAll()
     }
 
     override fun setTargetSnapPeers(target: Int) {
