@@ -42,6 +42,8 @@ dependencies {
     implementation(project(":networking"))
     implementation(project(":consensus"))
     implementation(project(":myotis-evm"))
+    // EnsResolutionRoot is referenced directly when calling rpcBackend().resolveEns(...).
+    implementation(project(":myotis-ens"))
     implementation(project(":rpc-backend"))
     // VerifiedRpcBackend implements jsonrpc-server's MyotisRpcBackend; calling
     // verifiedHeadAgeMs() forces Kotlin to resolve that supertype, so it must be on the

@@ -3,12 +3,15 @@ package com.jaeckel.ethp2p.android.cmp
 import android.content.Context
 import com.jaeckel.ethp2p.android.NodeService
 import com.jaeckel.ethp2p.networking.NetworkConfig
+import io.myotis.ui.AccountResult
+import io.myotis.ui.EnsResult
 import io.myotis.ui.NodeController
 import io.myotis.ui.NodeSnapshot
 import io.myotis.ui.Settings
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.future.await
 
 /**
  * Android actuals for the shared `:ui` seam: back [NodeController]/[Settings]
@@ -33,6 +36,21 @@ class AndroidNodeController(private val service: NodeService) : NodeController {
     override fun rebootNetwork(name: String) { service.rebootNetwork(name) }
     override fun shutdown() { service.shutdown() }
     override fun setTargetSnapPeers(target: Int) { service.setTargetSnapPeers(target) }
+
+    override suspend fun requestAccount(network: String, address: String): AccountResult =
+        service.requestAccount(network, address).await().let { r ->
+            AccountResult(
+                r.address(), r.exists(), r.nonce(), r.balanceWei(),
+                r.storageRootHex(), r.codeHashHex(), r.blockNumber(), r.peerStateRootHex(),
+                r.peerProofValid(), r.beaconChainVerified(), r.blsVerified(), r.matchedBeaconSlot(),
+                r.verifyMethod(), r.failReason(),
+            )
+        }
+
+    override suspend fun resolveEns(network: String, name: String): EnsResult =
+        service.resolveEns(network, name).await().let { r ->
+            EnsResult(r.name(), r.addressHex(), r.blockNumber(), r.beaconVerified(), r.error())
+        }
 }
 
 /** Map the Java `NodeService.Snapshot` record into the shared Kotlin model. */
