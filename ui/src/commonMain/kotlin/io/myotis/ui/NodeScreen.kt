@@ -44,10 +44,21 @@ fun NodeScreen(controller: NodeController, settings: Settings) {
             }
 
             Spacer(Modifier.height(16.dp))
+            // A snapshot for `primary` exists only while its stack is registered (running or
+            // mid-boot), so drive button state off it: Start is disabled once the network is
+            // up, Stop only while it is. Stop the primary network specifically (not a global
+            // shutdown) so the pairing reads correctly once more networks are added.
+            val primaryActive = snap != null
             Row {
-                Button(onClick = { controller.enableNetwork(primary) }) { Text("Start $primary") }
+                Button(
+                    onClick = { controller.enableNetwork(primary) },
+                    enabled = !primaryActive,
+                ) { Text("Start $primary") }
                 Spacer(Modifier.width(8.dp))
-                OutlinedButton(onClick = { controller.shutdown() }) { Text("Stop") }
+                OutlinedButton(
+                    onClick = { controller.disableNetwork(primary) },
+                    enabled = primaryActive,
+                ) { Text("Stop") }
             }
         }
     }
