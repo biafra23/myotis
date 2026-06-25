@@ -28,6 +28,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 /**
@@ -115,11 +116,13 @@ private fun StatusView(s: NodeSnapshot) {
 @Composable
 private fun QueryTab(controller: NodeController, network: String) {
     val scope = rememberCoroutineScope()
-    var input by remember { mutableStateOf("") }
-    var loading by remember { mutableStateOf(false) }
-    var account by remember { mutableStateOf<AccountResult?>(null) }
-    var ens by remember { mutableStateOf<EnsResult?>(null) }
-    var error by remember { mutableStateOf<String?>(null) }
+    // Key on `network`: when the active network changes, reset the query input + results so we
+    // never show one network's account/ENS result under another.
+    var input by remember(network) { mutableStateOf("") }
+    var loading by remember(network) { mutableStateOf(false) }
+    var account by remember(network) { mutableStateOf<AccountResult?>(null) }
+    var ens by remember(network) { mutableStateOf<EnsResult?>(null) }
+    var error by remember(network) { mutableStateOf<String?>(null) }
 
     fun submit() {
         val q = input.trim()
@@ -129,6 +132,8 @@ private fun QueryTab(controller: NodeController, network: String) {
             try {
                 if (q.contains('.')) ens = controller.resolveEns(network, q)
                 else account = controller.requestAccount(network, q)
+            } catch (c: CancellationException) {
+                throw c  // let structured cancellation propagate (e.g. composable disposed)
             } catch (t: Throwable) {
                 error = t.message ?: t.toString()
             } finally {
