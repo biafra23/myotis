@@ -12,6 +12,18 @@ plugins {
 
 kotlin { jvmToolchain(21) }
 
+// Besu (via :myotis-evm) drags in the pre-rename tuweni coordinates io.tmio:tuweni-* 2.4.2,
+// whose org.apache.tuweni.bytes.Bytes collides with the JitPack Kotlin fork we use
+// (com.github.biafra23.tuweni-kotlin 2.7.2). A single classloader loads only ONE Bytes for
+// that FQN: tuweni-rlp 2.7.2 (BytesRLPWriter.kt) needs the 2.7.2 Bytes' Kotlin `Companion`,
+// which the 2.4.2 class lacks → NoSuchFieldError at launch. The `gradle run` daemon happens
+// to load the 2.7.2 jar first; jpackage's flattened classpath lets the 2.4.2 one win. Strip
+// io.tmio so only the 2.7.2 fork remains (same packages; Besu already runs against 2.7.2 on
+// the daemon, so 2.4.2 is unneeded) — mirrors the :android-app exclusion.
+configurations.all {
+    exclude(group = "io.tmio")
+}
+
 dependencies {
     implementation(project(":ui"))
 
