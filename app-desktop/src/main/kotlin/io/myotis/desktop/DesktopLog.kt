@@ -53,11 +53,9 @@ class DesktopLogAppender : AppenderBase<ILoggingEvent>() {
             else -> 'I'
         }
         val tp = event.throwableProxy
-        val message = if (tp != null) {
-            event.formattedMessage + "\n" + ThrowableProxyUtil.asString(tp)
-        } else {
-            event.formattedMessage
-        }
+        // formattedMessage can be null in logback; coalesce to "" to keep append non-null.
+        val msg = event.formattedMessage ?: ""
+        val message = if (tp != null) msg + "\n" + ThrowableProxyUtil.asString(tp) else msg
         DesktopLogSource.append(event.timeStamp, level, event.loggerName, message)
     }
 }

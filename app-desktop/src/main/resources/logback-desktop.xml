@@ -30,13 +30,19 @@
          render them. Subject to the same per-logger levels below as console/file. -->
     <appender name="MEMORY" class="io.myotis.desktop.DesktopLogAppender"/>
 
+    <!-- Disk-usage cap for on-disk logs, all tunable at launch (defaults in parens):
+           -Dmyotis.log.totalSizeCap   hard ceiling on ALL log files combined  (50MB)
+           -Dmyotis.log.maxFileSize    roll the active file at this size        (10MB)
+           -Dmyotis.log.maxHistory     max rolled (gzip) files to keep          (7)
+         Once totalSizeCap is reached the OLDEST rolled file is deleted, so the logs can never
+         exceed the cap. E.g. cap everything at 200 MB:  -Dmyotis.log.totalSizeCap=200MB -->
     <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
         <file>${LOG_DIR}/myotis.log</file>
         <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
             <fileNamePattern>${LOG_DIR}/myotis.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
-            <maxFileSize>10MB</maxFileSize>
-            <maxHistory>7</maxHistory>
-            <totalSizeCap>50MB</totalSizeCap>
+            <maxFileSize>${myotis.log.maxFileSize:-10MB}</maxFileSize>
+            <maxHistory>${myotis.log.maxHistory:-7}</maxHistory>
+            <totalSizeCap>${myotis.log.totalSizeCap:-50MB}</totalSizeCap>
         </rollingPolicy>
         <encoder><pattern>${PATTERN}</pattern></encoder>
     </appender>

@@ -40,8 +40,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.datetime.Instant
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
@@ -254,33 +257,44 @@ private fun StatusRow(key: String, value: String, color: Color? = null) {
 private fun LogsTab(logs: LogSource) {
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
+    val tz = remember { TimeZone.currentSystemDefault() }  // resolve once, not per row
     var lines by remember { mutableStateOf<List<LogLine>>(emptyList()) }
+    var shown by remember { mutableStateOf<List<LogLine>>(emptyList()) }
     var lastVersion by remember { mutableStateOf(-1L) }
     var filter by remember { mutableStateOf("") }
 
+    // Poll the cheap version counter; the O(n) snapshot of up to 50k lines runs off the main
+    // thread so it can't jank the UI.
     LaunchedEffect(logs) {
         while (true) {
             val v = logs.version()
             if (v != lastVersion) {
-                lines = logs.snapshot()
+                lines = withContext(Dispatchers.Default) { logs.snapshot() }
                 lastVersion = v
             }
             delay(250)
         }
     }
 
-    val shown = remember(lines, filter) {
+    // Filter off the main thread too, and cooperatively cancel superseded passes (rapid typing).
+    LaunchedEffect(lines, filter) {
         val f = filter.trim().lowercase()
-        if (f.isEmpty()) lines
-        else lines.filter { it.tag.lowercase().contains(f) || it.message.lowercase().contains(f) }
+        shown = if (f.isEmpty()) lines
+        else withContext(Dispatchers.Default) {
+            lines.filter {
+                ensureActive()  // withContext receiver is the CoroutineScope
+                it.tag.lowercase().contains(f) || it.message.lowercase().contains(f)
+            }
+        }
     }
 
     val listState = rememberLazyListState()
-    // Auto-follow: true while the last line is visible (i.e. the user hasn't scrolled up).
-    val atBottom by remember {
+    // Auto-follow: key on `shown` so the derived state re-reads the current list (not a stale
+    // capture); size-2 tolerates the one-frame lag before a freshly-appended item is laid out.
+    val atBottom by remember(shown) {
         derivedStateOf {
             val last = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-            last >= shown.size - 1
+            last >= shown.size - 2
         }
     }
     LaunchedEffect(shown.size) {
@@ -297,14 +311,20 @@ private fun LogsTab(logs: LogSource) {
                 modifier = Modifier.weight(1f),
             )
             Spacer(Modifier.width(8.dp))
-            OutlinedButton(onClick = { clipboard.setText(AnnotatedString(formatLogs(shown))) }) { Text("Copy") }
+            OutlinedButton(onClick = {
+                scope.launch {
+                    // Formatting up to 50k lines also goes off the main thread.
+                    val text = withContext(Dispatchers.Default) { formatLogs(shown, tz) }
+                    clipboard.setText(AnnotatedString(text))
+                }
+            }) { Text("Copy") }
             Spacer(Modifier.width(4.dp))
             OutlinedButton(onClick = { logs.clear() }) { Text("Clear") }
         }
         Spacer(Modifier.height(8.dp))
         Box(Modifier.weight(1f).fillMaxWidth()) {
             LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
-                items(shown, key = { it.sequence }) { LogLineRow(it) }
+                items(shown, key = { it.sequence }) { LogLineRow(it, tz) }
             }
             if (!atBottom && shown.isNotEmpty()) {
                 Button(
@@ -318,7 +338,7 @@ private fun LogsTab(logs: LogSource) {
 }
 
 @Composable
-private fun LogLineRow(line: LogLine) {
+private fun LogLineRow(line: LogLine, tz: TimeZone) {
     val color = when (line.level) {
         'E' -> MaterialTheme.colorScheme.error
         'W' -> Color(0xFFB58900)            // dim amber
@@ -327,23 +347,23 @@ private fun LogLineRow(line: LogLine) {
     }
     val shortTag = line.tag.substringAfterLast('.')
     Text(
-        "${formatLogTime(line.timestampMillis)} ${line.level} $shortTag: ${line.message}",
+        "${formatLogTime(line.timestampMillis, tz)} ${line.level} $shortTag: ${line.message}",
         fontSize = 11.sp,
         fontFamily = FontFamily.Monospace,
         color = color,
     )
 }
 
-private fun formatLogs(lines: List<LogLine>): String = buildString {
+private fun formatLogs(lines: List<LogLine>, tz: TimeZone): String = buildString {
     for (l in lines) {
-        append(formatLogTime(l.timestampMillis)).append(' ').append(l.level)
+        append(formatLogTime(l.timestampMillis, tz)).append(' ').append(l.level)
         append(' ').append(l.tag).append(": ").append(l.message).append('\n')
     }
 }
 
-/** HH:mm:ss.SSS in the local time zone (matches the logback console/file pattern). */
-private fun formatLogTime(ms: Long): String {
-    val dt = Instant.fromEpochMilliseconds(ms).toLocalDateTime(TimeZone.currentSystemDefault())
+/** HH:mm:ss.SSS in [tz] (matches the logback console/file pattern). */
+private fun formatLogTime(ms: Long, tz: TimeZone): String {
+    val dt = Instant.fromEpochMilliseconds(ms).toLocalDateTime(tz)
     fun p2(n: Int) = n.toString().padStart(2, '0')
     fun p3(n: Int) = n.toString().padStart(3, '0')
     return "${p2(dt.hour)}:${p2(dt.minute)}:${p2(dt.second)}.${p3(dt.nanosecond / 1_000_000)}"
