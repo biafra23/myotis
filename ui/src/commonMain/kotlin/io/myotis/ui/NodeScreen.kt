@@ -278,12 +278,14 @@ private fun LogsTab(logs: LogSource) {
 
     // Filter off the main thread too, and cooperatively cancel superseded passes (rapid typing).
     LaunchedEffect(lines, filter) {
-        val f = filter.trim().lowercase()
+        val f = filter.trim()
         shown = if (f.isEmpty()) lines
         else withContext(Dispatchers.Default) {
             lines.filter {
                 ensureActive()  // withContext receiver is the CoroutineScope
-                it.tag.lowercase().contains(f) || it.message.lowercase().contains(f)
+                // contains(ignoreCase = true) avoids allocating a lowercased copy of every
+                // tag/message per keystroke (up to 50k lines).
+                it.tag.contains(f, ignoreCase = true) || it.message.contains(f, ignoreCase = true)
             }
         }
     }
