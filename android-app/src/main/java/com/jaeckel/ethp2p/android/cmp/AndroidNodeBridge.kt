@@ -36,6 +36,8 @@ class AndroidNodeController(private val service: NodeService) : NodeController {
     override fun rebootNetwork(name: String) { service.rebootNetwork(name) }
     override fun shutdown() { service.shutdown() }
     override fun setTargetSnapPeers(target: Int) { service.setTargetSnapPeers(target) }
+    // NodeService is a Context, so it doubles as the arg to the SharedPreferences-backed static.
+    override fun applyBlsBackend() { NodeService.applyBlsBackend(service) }
 
     override suspend fun requestAccount(network: String, address: String): AccountResult =
         service.requestAccount(network, address).await().let { r ->
@@ -81,4 +83,14 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun setRpcPort(network: String, port: Int) = NodeService.setRpcPort(ctx, network, port)
     override fun snapTarget(): Int = NodeService.snapTarget(ctx)
     override fun setSnapTarget(v: Int) = NodeService.setSnapTargetPref(ctx, v)
+
+    override fun displayName(network: String): String = NetworkConfig.byName(network).displayName()
+    override fun defaultRpcPort(network: String): Int = NetworkConfig.byName(network).defaultRpcPort()
+
+    override fun deepPoolThreshold(): Int = NodeService.deepPoolThreshold(ctx)
+    override fun setDeepPool(v: Int) = NodeService.setDeepPoolThreshold(ctx, v)
+    override fun strictStateFreshness(): Boolean = NodeService.strictStateFreshness(ctx)
+    override fun setStrictStateFreshness(v: Boolean) = NodeService.setStrictStateFreshness(ctx, v)
+    override fun nativeBlsEnabled(): Boolean = NodeService.nativeBlsEnabled(ctx)
+    override fun setNativeBlsEnabled(v: Boolean) = NodeService.setNativeBlsEnabled(ctx, v)
 }

@@ -1,5 +1,6 @@
 package io.myotis.ui
 
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -13,11 +14,16 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
@@ -26,6 +32,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -36,6 +43,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -71,6 +79,7 @@ fun NodeScreen(controller: NodeController, settings: Settings, logs: LogSource) 
                 Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Status") })
                 Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Query") })
                 Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("Logs") })
+                Tab(selected = tab == 3, onClick = { tab = 3 }, text = { Text("Settings") })
             }
             Spacer(Modifier.height(16.dp))
 
@@ -78,8 +87,168 @@ fun NodeScreen(controller: NodeController, settings: Settings, logs: LogSource) 
                 0 -> StatusTab(controller, snapshots[primary], primary)
                 1 -> QueryTab(controller, primary)
                 2 -> LogsTab(logs)
+                3 -> SettingsTab(controller, settings, snapshots)
             }
         }
+    }
+}
+
+/**
+ * Settings: enable/disable each network (each runs concurrently as its own node with its own
+ * JSON-RPC port) and tune the shared snap/readiness/BLS/freshness knobs. Toggles that affect
+ * a running stack apply live; RPC-port edits are deferred to Save and reboot only the changed
+ * chain. Mirrors the Android SettingsScreen over the [Settings]/[NodeController] seam.
+ */
+@Composable
+private fun SettingsTab(
+    controller: NodeController,
+    settings: Settings,
+    snapshots: Map<String, NodeSnapshot>,
+) {
+    val networks = remember { settings.allNetworks() }
+    // Per-network enabled toggle + RPC-port text, seeded from persisted settings. Toggling a
+    // switch acts immediately (persists + boots/stops that chain); the RPC port is deferred to Save.
+    val enabled = remember {
+        mutableStateMapOf<String, Boolean>().apply {
+            networks.forEach { put(it, settings.isNetworkEnabled(it)) }
+        }
+    }
+    val rpcPorts = remember {
+        mutableStateMapOf<String, String>().apply {
+            networks.forEach { put(it, settings.rpcPortFor(it).toString()) }
+        }
+    }
+    var snapTarget by remember { mutableStateOf(settings.snapTarget().toString()) }
+    var deepPool by remember { mutableStateOf(settings.deepPoolThreshold().toString()) }
+    var strictFreshness by remember { mutableStateOf(settings.strictStateFreshness()) }
+    var nativeBls by remember { mutableStateOf(settings.nativeBlsEnabled()) }
+
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        Text("Networks", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "Toggle a chain to run it. Each enabled chain runs concurrently as its own node " +
+                "with its own JSON-RPC port — add each port to MetaMask as a separate RPC URL.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        networks.forEach { id ->
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(settings.displayName(id))
+                    Switch(
+                        checked = enabled[id] == true,
+                        onCheckedChange = { on ->
+                            enabled[id] = on
+                            settings.setNetworkEnabled(id, on)
+                            if (on) controller.enableNetwork(id) else controller.disableNetwork(id)
+                        },
+                    )
+                }
+                OutlinedTextField(
+                    value = rpcPorts[id] ?: "",
+                    onValueChange = { rpcPorts[id] = it.filter(Char::isDigit).take(5) },
+                    label = { Text("JSON-RPC port (default ${settings.defaultRpcPort(id)})") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
+
+        HorizontalDivider()
+
+        Text("Node tuning", style = MaterialTheme.typography.titleMedium)
+        OutlinedTextField(
+            value = snapTarget,
+            onValueChange = { snapTarget = it.filter(Char::isDigit).take(3) },
+            label = { Text("Snap-peer target (default 32)") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = deepPool,
+            onValueChange = { deepPool = it.filter(Char::isDigit).take(3) },
+            label = { Text("Readiness \"deep pool\" threshold (default 16)") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+
+        // Strict freshness is the default; the switch exposes the RELAXED (opt-in) state, so the
+        // checked value is the negation. Persisted immediately; applies on the next node restart.
+        SwitchRow(
+            label = "Relaxed state freshness",
+            checked = !strictFreshness,
+            onChange = { relaxed -> strictFreshness = !relaxed; settings.setStrictStateFreshness(!relaxed) },
+        )
+        Text(
+            "Off (default, recommended): strict 2-minute freshness — fee calc / eth_call " +
+                "fast-fail when no fresh servable root exists, and the wallet retries. " +
+                "On (opt-in, experimental): serve a slightly older verified root — but if " +
+                "it isn't fully servable this can HANG the confirm screen for up to 2 min " +
+                "instead of failing fast. Applies on the next node (re)start.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        // Native BLS applies immediately — flips the process-global backend live.
+        SwitchRow(
+            label = "Native BLS acceleration",
+            checked = nativeBls,
+            onChange = { on -> nativeBls = on; settings.setNativeBlsEnabled(on); controller.applyBlsBackend() },
+        )
+        Text(
+            "On (default): use the bundled native blst library for sync-committee BLS " +
+                "verification (much faster than pure-Java). Off: force the pure-Java Milagro path — " +
+                "slower, but useful if the native library fails to load. Applies immediately.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            "An RPC-port change reboots that chain; snap-peer target applies live to every " +
+                "running chain, and the readiness threshold persists for the next check.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Button(
+            onClick = {
+                val snap = snapTarget.toIntOrNull() ?: 32
+                val deep = deepPool.toIntOrNull() ?: 16
+                settings.setSnapTarget(snap)          // persist
+                settings.setDeepPool(deep)            // persist (read at readiness-check time)
+                controller.setTargetSnapPeers(snap)   // live-apply to running stacks
+                networks.forEach { id ->
+                    val port = rpcPorts[id]?.toIntOrNull() ?: settings.defaultRpcPort(id)
+                    val changed = port != settings.rpcPortFor(id)
+                    settings.setRpcPort(id, port)
+                    // Reboot only a RUNNING chain whose port actually changed — rebind that one
+                    // RPC server without disturbing the others or reviving a stopped chain.
+                    if (changed && snapshots[id] != null) controller.rebootNetwork(id)
+                }
+            },
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("Save") }
+    }
+}
+
+/** A label + right-aligned [Switch] row — the repeated toggle layout in [SettingsTab]. */
+@Composable
+private fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().padding(top = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(label)
+        Switch(checked = checked, onCheckedChange = onChange)
     }
 }
 

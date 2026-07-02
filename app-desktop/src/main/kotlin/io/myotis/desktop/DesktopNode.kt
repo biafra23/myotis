@@ -119,6 +119,13 @@ class DesktopNodeController(private val dataDir: Path) : NodeController {
         registry.all().forEach { it.setTargetSnapPeers(target) }
     }
 
+    override fun applyBlsBackend() {
+        // No-op on desktop: there's no bundled native blst library yet (the macOS dylib is a
+        // follow-up — see the CMP plan), so desktop always runs the pure-Java Milagro backend and
+        // the Settings toggle has nothing to swap. Wire this to BlsBackends.set(...) once the
+        // native library ships for desktop.
+    }
+
     override suspend fun requestAccount(network: String, address: String): AccountResult {
         // VerifiedAccountQuery handles a null/!running stack itself (failed future → throws).
         val stack = registry.get(NetworkConfig.byName(network).name())
@@ -190,6 +197,11 @@ class DesktopSettings : Settings {
     private val enabled = linkedSetOf("mainnet")
     private val ports = HashMap<String, Int>()
     private var snap = 32
+    private var deep = 16
+    private var strict = true
+    // Desktop has no bundled native blst yet (Milagro-only), so the honest default is off; the
+    // toggle persists but DesktopNodeController.applyBlsBackend() is a no-op until the dylib ships.
+    private var nativeBls = false
 
     override fun enabledNetworks(): List<String> = synchronized(this) { enabled.toList() }
     override fun primaryNetwork(): String = synchronized(this) { enabled.firstOrNull() ?: "mainnet" }
@@ -208,6 +220,16 @@ class DesktopSettings : Settings {
     }
     override fun snapTarget(): Int = synchronized(this) { snap }
     override fun setSnapTarget(v: Int) = synchronized(this) { snap = v }
+
+    override fun displayName(network: String): String = NetworkConfig.byName(network).displayName()
+    override fun defaultRpcPort(network: String): Int = NetworkConfig.byName(network).defaultRpcPort()
+
+    override fun deepPoolThreshold(): Int = synchronized(this) { deep }
+    override fun setDeepPool(v: Int) = synchronized(this) { deep = v }
+    override fun strictStateFreshness(): Boolean = synchronized(this) { strict }
+    override fun setStrictStateFreshness(v: Boolean) = synchronized(this) { strict = v }
+    override fun nativeBlsEnabled(): Boolean = synchronized(this) { nativeBls }
+    override fun setNativeBlsEnabled(v: Boolean) = synchronized(this) { nativeBls = v }
 }
 
 /** Desktop is treated as always-online (no Android ConnectivityManager). */
