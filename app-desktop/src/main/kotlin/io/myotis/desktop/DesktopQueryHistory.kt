@@ -68,6 +68,8 @@ class DesktopQueryHistory(private val file: Path) : QueryHistory {
 
     private fun rewrite() {
         runCatching {
+            // Ensure the data dir exists — on a first-ever run the app dir may not be created yet.
+            file.parent?.let { Files.createDirectories(it) }
             val sb = StringBuilder()
             entries.forEach {
                 sb.append(it.timestampMillis).append('\t').append(it.input).append('\t').append(it.label).append('\n')

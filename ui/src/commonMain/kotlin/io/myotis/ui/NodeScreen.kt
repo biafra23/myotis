@@ -493,8 +493,10 @@ private fun QueryTab(
     var account by remember(network) { mutableStateOf<AccountResult?>(null) }
     var ens by remember(network) { mutableStateOf<EnsResult?>(null) }
     var error by remember(network) { mutableStateOf<String?>(null) }
-    // History is global (all chains); re-read the local snapshot after each add/clear.
-    var historyList by remember { mutableStateOf(history.entries()) }
+    // History is global (all chains); re-read the local snapshot after each add/clear. Start empty
+    // and load off the main thread (entries() reads a file) so composition never blocks on disk.
+    var historyList by remember(network) { mutableStateOf<List<QueryHistoryEntry>>(emptyList()) }
+    LaunchedEffect(Unit) { historyList = withContext(Dispatchers.Default) { history.entries() } }
 
     // Takes the query string (not the input state) so a tapped history row runs immediately
     // without waiting for the input state write to settle.
@@ -529,9 +531,10 @@ private fun QueryTab(
                 error = t.message ?: t.toString()
             } finally {
                 loading = false
-                // Record for one-tap re-run; label = the resolved address for ENS, else empty.
-                history.add(q, ens?.addressHex ?: "")
-                historyList = history.entries()
+                // Record for one-tap re-run (off the main thread — file write); label = the
+                // resolved address for ENS, else empty.
+                val label = ens?.addressHex ?: ""
+                historyList = withContext(Dispatchers.Default) { history.add(q, label); history.entries() }
             }
         }
     }
@@ -599,7 +602,13 @@ private fun QueryTab(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text("Recent", style = MaterialTheme.typography.titleSmall)
-                TextButton(onClick = { history.clear(); historyList = emptyList() }) { Text("Clear") }
+                TextButton(onClick = {
+                    // clear() deletes a file — off the main thread.
+                    scope.launch {
+                        withContext(Dispatchers.Default) { history.clear() }
+                        historyList = emptyList()
+                    }
+                }) { Text("Clear") }
             }
             historyList.forEach { e -> QueryHistoryRow(e, enabled = !loading, onClick = { run(e.input) }) }
         }
