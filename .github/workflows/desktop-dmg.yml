@@ -38,11 +38,21 @@ jobs:
           submodules: recursive
 
       # Rosetta 2 lets the x86_64 JDK (and the jlink/jpackage it drives) execute on the arm64
-      # runner. Idempotent — a no-op if already present; `|| true` so an "already installed"
-      # non-zero exit doesn't fail the job. Only needed for the cross-built x64 job.
+      # runner. Needed only for the cross-built x64 job. We deliberately do NOT blanket `|| true`:
+      # a genuine "Rosetta unavailable" must fail HERE, loudly — otherwise it surfaces later as a
+      # cryptic "bad CPU type in executable" swallowed by the build retry loop and mis-reported as
+      # a transient dependency blip. Tolerate ONLY the idempotent already-installed case (on a
+      # runner where Rosetta is already present, softwareupdate can exit non-zero with an
+      # "already"/"no updates" message).
       - name: Install Rosetta 2 (x64 cross-build)
         if: matrix.arch == 'x64'
-        run: softwareupdate --install-rosetta --agree-to-license || true
+        run: |
+          set -o pipefail
+          if ! softwareupdate --install-rosetta --agree-to-license 2>&1 | tee /tmp/rosetta.log; then
+            grep -qiE "already|no updates|up.to.date|finished" /tmp/rosetta.log \
+              || { echo "::error::Rosetta 2 install failed"; exit 1; }
+            echo "Rosetta 2 already installed — continuing."
+          fi
 
       # Installs a JDK 21 of the requested architecture and points JAVA_HOME at it. For x64 this
       # is the x86_64 Temurin build (run via Rosetta); for arm64 the native aarch64 build.
@@ -88,6 +98,33 @@ jobs:
           set -e
           dmg=$(ls app-desktop/build/compose/binaries/main/dmg/*.dmg | head -n1)
           mv "$dmg" "app-desktop/build/compose/binaries/main/dmg/Myotis-${{ matrix.arch }}.dmg"
+
+      # Guard against a SILENTLY wrong-arch build. The job otherwise goes green on
+      # "BUILD SUCCESSFUL" alone; any future regression (runner-image change, Gradle re-enabling
+      # JDK auto-detect, setup-java falling back to aarch64, a broken Rosetta) could ship an arm64
+      # binary labelled Myotis-x64.dmg that won't launch on the Intel Macs it targets — failing
+      # only in the field, for exactly the users with no other dmg. Mount the produced dmg and
+      # assert the app launcher's Mach-O architecture matches this job's arch.
+      - name: Verify .dmg architecture
+        run: |
+          set -eu
+          dmg="app-desktop/build/compose/binaries/main/dmg/Myotis-${{ matrix.arch }}.dmg"
+          mnt=$(mktemp -d)
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt"
+          launcher=$(find "$mnt" -type f -path '*/Contents/MacOS/*' | head -n1)
+          jvm=$(find "$mnt" -type f -name 'libjvm.dylib' | head -n1 || true)
+          archs=$(lipo -archs "$launcher")
+          echo "launcher: $launcher -> [$archs]"
+          [ -n "$jvm" ] && echo "bundled libjvm: $jvm -> [$(lipo -archs "$jvm")]" || true
+          hdiutil detach "$mnt" >/dev/null 2>&1 || hdiutil detach "$mnt" -force >/dev/null 2>&1 || true
+          case "${{ matrix.arch }}" in
+            x64)   want=x86_64 ;;
+            arm64) want=arm64  ;;
+          esac
+          # jlink emits a single-arch runtime, so the launcher must be exactly `want`.
+          echo "$archs" | tr ' ' '\n' | grep -qx "$want" \
+            || { echo "::error::arch mismatch: expected $want, got [$archs] for the ${{ matrix.arch }} dmg"; exit 1; }
+          echo "OK: ${{ matrix.arch }} dmg launcher is $want"
 
       - name: Upload DMG
         uses: actions/upload-artifact@v4
