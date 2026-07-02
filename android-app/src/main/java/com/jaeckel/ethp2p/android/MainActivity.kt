@@ -21,6 +21,7 @@ import androidx.compose.ui.Modifier
 import com.jaeckel.ethp2p.android.cmp.AndroidLogSource
 import com.jaeckel.ethp2p.android.cmp.AndroidNetworkStatus
 import com.jaeckel.ethp2p.android.cmp.AndroidNodeController
+import com.jaeckel.ethp2p.android.cmp.AndroidQueryHistoryAdapter
 import com.jaeckel.ethp2p.android.cmp.AndroidSettings
 import io.myotis.ui.NodeScreen
 
@@ -70,9 +71,11 @@ class MainActivity : ComponentActivity() {
             val settings = remember { AndroidSettings(applicationContext) }
             val logs = remember { AndroidLogSource() }
             val netStatus = remember { AndroidNetworkStatus(applicationContext) }
+            // Same filesDir/query-history.tsv the app already used → retains stored queries.
+            val history = remember { AndroidQueryHistoryAdapter(applicationContext) }
             MaterialTheme {
                 Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    NodeScreen(controller, settings, logs, netStatus, ::openWifiSettings)
+                    NodeScreen(controller, settings, logs, netStatus, ::openWifiSettings, history)
                 }
             }
         }
