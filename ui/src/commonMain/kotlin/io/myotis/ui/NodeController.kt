@@ -107,6 +107,8 @@ interface Settings {
     fun displayName(network: String): String
     /** The network's built-in default JSON-RPC port, shown as the field hint. */
     fun defaultRpcPort(network: String): Int
+    /** Whether this network supports ENS resolution (mainnet/Sepolia); Query gates ENS input on it. */
+    fun hasEns(network: String): Boolean
 
     // --- shared node-tuning knobs ---
     fun deepPoolThreshold(): Int
@@ -137,7 +139,8 @@ data class NodeSnapshot(
     val beaconState: String,        // STOPPED / SYNCING / CATCHING_UP / SYNCED
     val connectedPeers: Int,
     val readyPeers: Int,
-    val snapPeers: Int,
+    val snapPeers: Int,             // peers that negotiated snap/1 (capability)
+    val snapServingPeers: Int,      // peers actually in the serving pool now (drives readiness)
     val discoveredPeers: Int,
     val executionBlockNumber: Long,
     val finalizedSlot: Long,

@@ -208,6 +208,8 @@ class DesktopNodeController(private val dataDir: Path, private val settings: Set
             connectedPeers = active.size,
             readyPeers = ready,
             snapPeers = conn?.activeSnapHandlers()?.size ?: 0,
+            // Desktop's connector exposes only the serving handlers, so serving == negotiated here.
+            snapServingPeers = conn?.activeSnapHandlers()?.size ?: 0,
             discoveredPeers = disc4?.table()?.size() ?: 0,
             executionBlockNumber = bss?.executionBlockNumber ?: 0L,
             finalizedSlot = bss?.finalizedSlot ?: 0L,
@@ -258,6 +260,7 @@ class DesktopSettings : Settings {
 
     override fun displayName(network: String): String = NetworkConfig.byName(network).displayName()
     override fun defaultRpcPort(network: String): Int = NetworkConfig.byName(network).defaultRpcPort()
+    override fun hasEns(network: String): Boolean = NetworkConfig.byName(network).hasEns()
 
     override fun deepPoolThreshold(): Int = synchronized(this) { deep }
     override fun setDeepPool(v: Int) = synchronized(this) { deep = v }

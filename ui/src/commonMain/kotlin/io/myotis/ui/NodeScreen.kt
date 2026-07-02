@@ -1,6 +1,7 @@
 package io.myotis.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,6 +21,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -42,6 +44,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
@@ -57,6 +61,10 @@ import kotlinx.coroutines.withContext
 import kotlinx.datetime.Instant
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
+
+// Verified head older than this reads as "warming up" (amber) — wallet calls would -32000 until a
+// fresh servable head exists. Matches the old Android ReadinessStrip threshold.
+private const val READY_HEAD_WARM_MS = 45_000L
 
 /** Default [NetworkStatus] for hosts with no connectivity concept (Desktop): always online. */
 private object AlwaysOnline : NetworkStatus {
@@ -83,12 +91,28 @@ fun NodeScreen(
     val snapshots by snapshotsFlow.collectAsState(initial = emptyMap())
     val onlineFlow = remember(netStatus) { netStatus.online() }
     val online by onlineFlow.collectAsState(initial = true)
-    val primary = settings.primaryNetwork()
     var tab by remember { mutableStateOf(0) }
+
+    // Network selector: chips over the live stacks (or the enabled-set when stopped) drive which
+    // chain Status + Query operate on, so a 2nd enabled chain (e.g. gnosis) is visible/queryable.
+    val chains = snapshots.keys.toList().ifEmpty { settings.enabledNetworks() }
+    var selected by remember { mutableStateOf<String?>(null) }
+    val network = selected?.takeIf { it in chains } ?: chains.firstOrNull() ?: settings.primaryNetwork()
+    val current = snapshots[network]
 
     MaterialTheme {
         Column(Modifier.fillMaxSize().padding(16.dp)) {
-            Text("Myotis", style = MaterialTheme.typography.headlineSmall)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Myotis", style = MaterialTheme.typography.headlineSmall)
+                if (chains.size > 1) {
+                    Spacer(Modifier.width(12.dp))
+                    NetworkChips(chains, network, onSelect = { selected = it })
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            // Readiness traffic-light strip: the wallet's "safe to transact" signal for the
+            // selected chain. Uses the configurable deep-pool threshold from Settings.
+            ReadinessStrip(current, settings.deepPoolThreshold())
             Spacer(Modifier.height(12.dp))
 
             TabRow(selectedTabIndex = tab) {
@@ -100,12 +124,77 @@ fun NodeScreen(
             Spacer(Modifier.height(16.dp))
 
             when (tab) {
-                0 -> StatusTab(controller, snapshots[primary], primary, online, onOpenNetworkSettings)
-                1 -> QueryTab(controller, primary)
+                0 -> StatusTab(controller, current, network, online, onOpenNetworkSettings)
+                1 -> QueryTab(controller, settings, current, network)
                 2 -> LogsTab(logs)
                 3 -> SettingsTab(controller, settings, snapshots)
             }
         }
+    }
+}
+
+/** Horizontally-scrolling chips to pick the chain Status + Query act on (shown when >1 enabled). */
+@Composable
+private fun NetworkChips(chains: List<String>, selected: String, onSelect: (String) -> Unit) {
+    Row(
+        Modifier.horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        chains.forEach { c ->
+            FilterChip(
+                selected = c == selected,
+                onClick = { onSelect(c) },
+                label = { Text(c.replaceFirstChar { it.uppercase() }) },
+            )
+        }
+    }
+}
+
+/**
+ * Readiness traffic-light — the wallet's "safe to transact" signal for the selected chain.
+ * red = not running / not synced; amber = synced but the verified head is still warming (wallet
+ * calls would error -32000); green = ready for simple reads; bright thick green = deep peer pool,
+ * heavy confirm screens will load. The state is exposed via a11y semantics so it isn't conveyed
+ * by color/thickness alone.
+ */
+@Composable
+private fun ReadinessStrip(s: NodeSnapshot?, deepPoolThreshold: Int) {
+    val (color, height, label) = when {
+        s == null || !s.running ->
+            Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not running")
+        s.beaconState != "SYNCED" ->
+            Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not synced")
+        s.verifiedHeadAgeMs > READY_HEAD_WARM_MS ->
+            Triple(Color(0xFFF9A825), 3.dp, "Node readiness: warming up, not ready to transact")
+        s.snapServingPeers >= deepPoolThreshold ->
+            Triple(Color(0xFF00E676), 6.dp,
+                "Node readiness: fully ready — deep peer pool, heavy confirm screens will load")
+        else ->
+            Triple(Color(0xFF2E7D32), 3.dp,
+                "Node readiness: ready for simple reads; peer pool still filling for heavy confirm screens")
+    }
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .height(height)
+            .background(color)
+            .semantics { contentDescription = label },
+    )
+}
+
+/** Query-tab banner: the beacon light client isn't SYNCED, so results are peer-claimed, not verified. */
+@Composable
+private fun ConsensusUnsyncedBanner(beaconState: String) {
+    Column(
+        Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.errorContainer).padding(12.dp),
+    ) {
+        Text(
+            "Consensus not synced (beacon: $beaconState) — balances & nonces are peer-claimed, " +
+                "not cryptographically verified against a beacon-attested state root yet.",
+            fontSize = 13.sp,
+            color = MaterialTheme.colorScheme.onErrorContainer,
+        )
     }
 }
 
@@ -369,18 +458,22 @@ private fun StatusView(s: NodeSnapshot) {
 }
 
 /**
- * Verified account / ENS query over the shared seam. An input that contains a dot is treated
- * as an ENS name (→ [NodeController.resolveEns]); otherwise a hex address (→
- * [NodeController.requestAccount]). Verification status is surfaced prominently — the whole
- * point is that the result is cryptographically anchored, not peer-claimed.
+ * Verified account / ENS query over the shared seam. ENS-looking input (anything that isn't a
+ * bare 0x + 40-hex address) resolves the name first, then — the crucial two-phase step — fetches
+ * AND beacon-verifies the account at the resolved address, so an ENS query still shows a balance.
+ * A plain address goes straight to [NodeController.requestAccount]. Verification status is shown
+ * prominently, and a banner warns when the beacon light client isn't SYNCED (results peer-claimed).
  */
 @Composable
-private fun QueryTab(controller: NodeController, network: String) {
+private fun QueryTab(controller: NodeController, settings: Settings, snap: NodeSnapshot?, network: String) {
     val scope = rememberCoroutineScope()
-    // Key on `network`: when the active network changes, reset the query input + results so we
-    // never show one network's account/ENS result under another.
+    val running = snap?.running == true
+    val ensCapable = remember(network) { settings.hasEns(network) }
+    // Key on `network`: reset input + results when the active chain changes so one chain's result
+    // never shows under another.
     var input by remember(network) { mutableStateOf("") }
     var loading by remember(network) { mutableStateOf(false) }
+    var loadingMsg by remember(network) { mutableStateOf("Querying…") }
     var account by remember(network) { mutableStateOf<AccountResult?>(null) }
     var ens by remember(network) { mutableStateOf<EnsResult?>(null) }
     var error by remember(network) { mutableStateOf<String?>(null) }
@@ -391,8 +484,24 @@ private fun QueryTab(controller: NodeController, network: String) {
         loading = true; error = null; account = null; ens = null
         scope.launch {
             try {
-                if (q.contains('.')) ens = controller.resolveEns(network, q)
-                else account = controller.requestAccount(network, q)
+                if (looksLikeEnsName(q)) {
+                    if (!ensCapable) {
+                        error = "ENS isn't available on ${network.replaceFirstChar { it.uppercase() }} — enter a 0x address."
+                        return@launch
+                    }
+                    loadingMsg = "Resolving…"
+                    val r = controller.resolveEns(network, q)
+                    ens = r
+                    // Phase 2: on a clean resolution, fetch + verify the account at the address.
+                    val addr = r.addressHex
+                    if (r.error == null && addr != null) {
+                        loadingMsg = "Verifying account…"
+                        account = controller.requestAccount(network, addr)
+                    }
+                } else {
+                    loadingMsg = "Verifying account…"
+                    account = controller.requestAccount(network, q)
+                }
             } catch (c: CancellationException) {
                 throw c  // let structured cancellation propagate (e.g. composable disposed)
             } catch (t: Throwable) {
@@ -403,29 +512,71 @@ private fun QueryTab(controller: NodeController, network: String) {
         }
     }
 
-    Column(Modifier.fillMaxWidth()) {
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        if (!running) {
+            Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.errorContainer).padding(12.dp)) {
+                Text(
+                    "Node is not running on ${network.replaceFirstChar { it.uppercase() }}. " +
+                        "Start it from the Status tab before querying.",
+                    fontSize = 13.sp, color = MaterialTheme.colorScheme.onErrorContainer,
+                )
+            }
+            Spacer(Modifier.height(12.dp))
+        } else if (snap?.beaconState != "SYNCED") {
+            ConsensusUnsyncedBanner(snap?.beaconState ?: "STOPPED")
+            Spacer(Modifier.height(12.dp))
+        }
+
         OutlinedTextField(
             value = input,
             onValueChange = { input = it },
-            label = { Text("Address (0x…) or ENS name") },
+            label = { Text(if (ensCapable) "Address (0x…) or ENS name" else "Address (0x…)") },
             singleLine = true,
+            enabled = !loading,
             modifier = Modifier.fillMaxWidth(),
         )
+        if (!ensCapable) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "ENS isn't available on ${network.replaceFirstChar { it.uppercase() }} — enter a 0x " +
+                    "address. Balance & nonce are still beacon-verified.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         Spacer(Modifier.height(8.dp))
-        Button(onClick = { submit() }, enabled = !loading) { Text("Query on $network") }
+        Button(
+            onClick = { submit() },
+            enabled = running && input.isNotBlank() && !loading,
+        ) { Text("Look up") }
         Spacer(Modifier.height(16.dp))
 
+        // The resolved-ENS panel stays visible while the account verifies (and even if it fails).
+        ens?.let {
+            EnsResultView(it)
+            Spacer(Modifier.height(12.dp))
+        }
         when {
             loading -> Row(verticalAlignment = Alignment.CenterVertically) {
                 CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                 Spacer(Modifier.width(8.dp))
-                Text("Querying…")
+                Text(loadingMsg)
             }
             error != null -> Text("Error: $error", color = MaterialTheme.colorScheme.error)
             account != null -> AccountResultView(account!!)
-            ens != null -> EnsResultView(ens!!)
         }
     }
+}
+
+/**
+ * ENS heuristic matching the old NodeService.looksLikeEnsName: a bare 0x + 40-hex string is an
+ * address; anything else (has a dot, wrong length, non-hex chars) is treated as an ENS name.
+ */
+private fun looksLikeEnsName(input: String): Boolean {
+    var s = input.trim()
+    if (s.startsWith("0x") || s.startsWith("0X")) s = s.substring(2)
+    if (s.length != 40) return true
+    return !s.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
 }
 
 @Composable

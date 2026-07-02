@@ -128,6 +128,7 @@ private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
     connectedPeers = connectedPeers(),
     readyPeers = readyPeers(),
     snapPeers = snapPeers(),
+    snapServingPeers = snapServingPeers(),
     discoveredPeers = discoveredPeers(),
     executionBlockNumber = executionBlockNumber(),
     finalizedSlot = finalizedSlot(),
@@ -151,6 +152,7 @@ class AndroidSettings(private val ctx: Context) : Settings {
 
     override fun displayName(network: String): String = NetworkConfig.byName(network).displayName()
     override fun defaultRpcPort(network: String): Int = NetworkConfig.byName(network).defaultRpcPort()
+    override fun hasEns(network: String): Boolean = NetworkConfig.byName(network).hasEns()
 
     override fun deepPoolThreshold(): Int = NodeService.deepPoolThreshold(ctx)
     override fun setDeepPool(v: Int) = NodeService.setDeepPoolThreshold(ctx, v)
