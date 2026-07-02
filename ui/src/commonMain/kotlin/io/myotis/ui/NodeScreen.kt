@@ -226,12 +226,16 @@ private fun SettingsTab(
                 settings.setDeepPool(deep)            // persist (read at readiness-check time)
                 controller.setTargetSnapPeers(snap)   // live-apply to running stacks
                 networks.forEach { id ->
-                    val port = rpcPorts[id]?.toIntOrNull() ?: settings.defaultRpcPort(id)
-                    val changed = port != settings.rpcPortFor(id)
-                    settings.setRpcPort(id, port)
+                    // Compare the EFFECTIVE (post-clamp) persisted port before vs after, not the
+                    // raw typed value: setRpcPort clamps out-of-range input to the network default,
+                    // so an invalid entry on an already-default chain must NOT count as "changed"
+                    // and needlessly reboot a live RPC server. Mirrors the original applyTunables,
+                    // which compared rpcPortFor() before/after the set.
+                    val oldPort = settings.rpcPortFor(id)
+                    settings.setRpcPort(id, rpcPorts[id]?.toIntOrNull() ?: settings.defaultRpcPort(id))
                     // Reboot only a RUNNING chain whose port actually changed — rebind that one
                     // RPC server without disturbing the others or reviving a stopped chain.
-                    if (changed && snapshots[id] != null) controller.rebootNetwork(id)
+                    if (settings.rpcPortFor(id) != oldPort && snapshots[id] != null) controller.rebootNetwork(id)
                 }
             },
             modifier = Modifier.fillMaxWidth(),
