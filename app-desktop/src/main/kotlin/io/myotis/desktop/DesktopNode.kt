@@ -22,6 +22,7 @@ import io.myotis.ui.Settings
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.future.await
 import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
@@ -128,6 +129,27 @@ class DesktopNodeController(private val dataDir: Path, private val settings: Set
         // follow-up — see the CMP plan), so desktop always runs the pure-Java Milagro backend and
         // the Settings toggle has nothing to swap. Wire this to BlsBackends.set(...) once the
         // native library ships for desktop.
+    }
+
+    override fun clearCaches(network: String) {
+        val canonical = NetworkConfig.byName(network).name()
+        // Clear the live stack's backoff/blacklist (fresh discovery slate) when it's up...
+        registry.get(canonical)?.let { it.backoff().clear(); it.blacklistedNodeIds().clear() }
+        // ...and purge the on-disk EL/CL peer caches (mirrors the daemon's purge-cache).
+        val suffix = if (canonical == "mainnet") "" else "-$canonical"
+        PeerCache.purge(dataDir.resolve("peers$suffix.cache"))
+        CLPeerCache.purge(dataDir.resolve("cl-peers$suffix.cache"))
+    }
+
+    override fun resetSyncState(network: String) {
+        val canonical = NetworkConfig.byName(network).name()
+        val suffix = if (canonical == "mainnet") "" else "-$canonical"
+        // Delete the persisted snapshot and any sibling parts (e.g. the ".roots" accumulator) so
+        // the next start re-bootstraps from the embedded checkpoint. A running stack keeps its
+        // in-memory state; this only affects the next start.
+        java.nio.file.Files.newDirectoryStream(dataDir, "sync-state$suffix.snapshot*").use { s ->
+            s.forEach { java.nio.file.Files.deleteIfExists(it) }
+        }
     }
 
     override suspend fun requestAccount(network: String, address: String): AccountResult {
@@ -240,5 +262,5 @@ class DesktopSettings : Settings {
 
 /** Desktop is treated as always-online (no Android ConnectivityManager). */
 object DesktopNetworkStatus : NetworkStatus {
-    override val online: Boolean = true
+    override fun online(): Flow<Boolean> = flowOf(true)
 }

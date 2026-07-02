@@ -1,5 +1,6 @@
 package io.myotis.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -57,16 +58,31 @@ import kotlinx.datetime.Instant
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
 
+/** Default [NetworkStatus] for hosts with no connectivity concept (Desktop): always online. */
+private object AlwaysOnline : NetworkStatus {
+    override fun online(): kotlinx.coroutines.flow.Flow<Boolean> = kotlinx.coroutines.flow.flowOf(true)
+}
+
 /**
  * The shared Myotis screen — identical on Android and Desktop. A tab host over the per-network
- * [NodeController]/[Settings]/[LogSource] seam. Status + Query + Logs are ported; Settings follows.
+ * [NodeController]/[Settings]/[LogSource] seam (Status / Query / Logs / Settings). [netStatus]
+ * drives the offline banner and [onOpenNetworkSettings] opens the platform's network settings;
+ * both default to the always-online / no-op behavior desktop wants.
  */
 @Composable
-fun NodeScreen(controller: NodeController, settings: Settings, logs: LogSource) {
+fun NodeScreen(
+    controller: NodeController,
+    settings: Settings,
+    logs: LogSource,
+    netStatus: NetworkStatus = AlwaysOnline,
+    onOpenNetworkSettings: () -> Unit = {},
+) {
     // remember(controller): snapshots() returns a fresh Flow each call, so collecting it
     // directly would re-subscribe on every recomposition. Retain it across recompositions.
     val snapshotsFlow = remember(controller) { controller.snapshots() }
     val snapshots by snapshotsFlow.collectAsState(initial = emptyMap())
+    val onlineFlow = remember(netStatus) { netStatus.online() }
+    val online by onlineFlow.collectAsState(initial = true)
     val primary = settings.primaryNetwork()
     var tab by remember { mutableStateOf(0) }
 
@@ -84,7 +100,7 @@ fun NodeScreen(controller: NodeController, settings: Settings, logs: LogSource) 
             Spacer(Modifier.height(16.dp))
 
             when (tab) {
-                0 -> StatusTab(controller, snapshots[primary], primary)
+                0 -> StatusTab(controller, snapshots[primary], primary, online, onOpenNetworkSettings)
                 1 -> QueryTab(controller, primary)
                 2 -> LogsTab(logs)
                 3 -> SettingsTab(controller, settings, snapshots)
@@ -257,8 +273,19 @@ private fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Un
 }
 
 @Composable
-private fun StatusTab(controller: NodeController, snap: NodeSnapshot?, primary: String) {
-    Column {
+private fun StatusTab(
+    controller: NodeController,
+    snap: NodeSnapshot?,
+    primary: String,
+    online: Boolean,
+    onOpenNetworkSettings: () -> Unit,
+) {
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        if (!online) {
+            OfflineBanner(onOpenNetworkSettings)
+            Spacer(Modifier.height(16.dp))
+        }
+
         if (snap == null) {
             Text("Node stopped — no data for $primary")
         } else {
@@ -273,13 +300,54 @@ private fun StatusTab(controller: NodeController, snap: NodeSnapshot?, primary: 
         Row {
             Button(
                 onClick = { controller.enableNetwork(primary) },
-                enabled = !primaryActive,
+                // Don't offer Start while offline — discovery can't reach any peer.
+                enabled = !primaryActive && online,
             ) { Text("Start $primary") }
             Spacer(Modifier.width(8.dp))
             OutlinedButton(
                 onClick = { controller.disableNetwork(primary) },
                 enabled = primaryActive,
             ) { Text("Stop") }
+        }
+
+        Spacer(Modifier.height(16.dp))
+        // Maintenance actions (mirrors the old Android Status screen): wipe peer caches to give
+        // discovery a fresh slate, or drop the persisted sync snapshot to re-bootstrap next start.
+        OutlinedButton(
+            onClick = { controller.clearCaches(primary) },
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("Clear peer caches") }
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = { controller.resetSyncState(primary) },
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("Reset sync state") }
+    }
+}
+
+/** Shown at the top of Status when the device has no connectivity. */
+@Composable
+private fun OfflineBanner(onOpenNetworkSettings: () -> Unit) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.errorContainer)
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            "No internet connection",
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.onErrorContainer,
+        )
+        Text(
+            "The node needs internet access to discover and connect to peers. " +
+                "Enable Wi-Fi or mobile data to continue.",
+            fontSize = 13.sp,
+            color = MaterialTheme.colorScheme.onErrorContainer,
+        )
+        Button(onClick = onOpenNetworkSettings, modifier = Modifier.fillMaxWidth()) {
+            Text("Open network settings")
         }
     }
 }
