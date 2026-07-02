@@ -24,6 +24,14 @@ interface NodeController {
     fun setTargetSnapPeers(target: Int)
 
     /**
+     * Re-apply the BLS backend to the process-global selector after [Settings.setNativeBlsEnabled]
+     * flips the preference (Android: native blst ⇄ pure-Java Milagro). Takes effect immediately —
+     * the decompressed-pubkey cache is process-global so the swap is cheap. Desktop currently has
+     * no bundled native library, so its actual is a no-op until the macOS blst dylib ships.
+     */
+    fun applyBlsBackend()
+
+    /**
      * Query an account on [network] and verify the returned proof against the beacon-attested
      * state root (the shared `VerifiedAccountQuery` ladder). Suspends until verification
      * completes. Throws on a bad address or a network that isn't running; verification
@@ -79,6 +87,22 @@ interface Settings {
     fun setRpcPort(network: String, port: Int)
     fun snapTarget(): Int
     fun setSnapTarget(v: Int)
+
+    // --- network metadata (so commonMain need not reference the Java NetworkConfig) ---
+    /** Human-facing name for the Settings row, e.g. "Gnosis Chain". */
+    fun displayName(network: String): String
+    /** The network's built-in default JSON-RPC port, shown as the field hint. */
+    fun defaultRpcPort(network: String): Int
+
+    // --- shared node-tuning knobs ---
+    fun deepPoolThreshold(): Int
+    fun setDeepPool(v: Int)
+    /** true = strict 2-minute state freshness (default); false = relaxed/experimental. */
+    fun strictStateFreshness(): Boolean
+    fun setStrictStateFreshness(v: Boolean)
+    /** true = use bundled native blst (default on Android); false = pure-Java Milagro. */
+    fun nativeBlsEnabled(): Boolean
+    fun setNativeBlsEnabled(v: Boolean)
 }
 
 /** Whether the device currently has network connectivity (Android: ConnectivityManager). */

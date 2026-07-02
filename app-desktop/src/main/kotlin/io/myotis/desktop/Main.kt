@@ -12,8 +12,9 @@ import java.nio.file.Path
  */
 fun main() {
     val dataDir = Path.of(System.getProperty("user.home"), ".myotis")
-    val controller = DesktopNodeController(dataDir)
+    // settings first: the controller reads it at boot (configured RPC port + snap target).
     val settings = DesktopSettings()
+    val controller = DesktopNodeController(dataDir, settings)
     controller.enableNetwork(settings.primaryNetwork())
 
     application {

@@ -12,8 +12,8 @@ import kotlin.system.exitProcess
  */
 fun main() = runBlocking {
     val dataDir = Files.createTempDirectory("myotis-smoke")
-    val controller = DesktopNodeController(dataDir)
     val settings = DesktopSettings()
+    val controller = DesktopNodeController(dataDir, settings)
     val net = settings.primaryNetwork()
     println("[smoke] enabling $net (dataDir=$dataDir)")
     controller.enableNetwork(net)

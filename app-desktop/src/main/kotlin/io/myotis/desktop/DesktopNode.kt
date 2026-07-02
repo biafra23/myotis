@@ -32,7 +32,7 @@ import kotlin.io.path.createDirectories
  * `ChainStack`/`NodeRegistry`) the daemon and Android use, in-process — no Android Service,
  * no IPC. Reuses the daemon's file-backed caches + CCIP gateway from `:app`.
  */
-class DesktopNodeController(private val dataDir: Path) : NodeController {
+class DesktopNodeController(private val dataDir: Path, private val settings: Settings) : NodeController {
 
     private val registry = NodeRegistry()
     // nanoTime, not currentTimeMillis: wall-clock / NTP steps must not skew uptime.
@@ -68,7 +68,10 @@ class DesktopNodeController(private val dataDir: Path) : NodeController {
         Thread({
             synchronized(bootLock(canonical)) {
                 if (registry.get(canonical) != null) return@synchronized
-                val ports = ChainPorts.defaultsFor(network)
+                // Honor the configured JSON-RPC port from Settings (the Settings tab's port field),
+                // falling back to the network default — otherwise editing the port on desktop would
+                // be inert. A reboot (disable+enable) after a port change re-reads this.
+                val ports = ChainPorts.defaultsFor(network).withRpcPort(settings.rpcPortFor(canonical))
                 val keyFile = if (canonical == "mainnet") "nodekey.hex" else "nodekey-$canonical.hex"
                 val nodeKey = NodeKey.loadOrGenerate(dataDir.resolve(keyFile))
                 val suffix = if (canonical == "mainnet") "" else "-$canonical"
@@ -81,7 +84,8 @@ class DesktopNodeController(private val dataDir: Path) : NodeController {
                     dataDir.resolve("sync-state$suffix.snapshot"),
                     false,
                 )
-                stack.configureSnapMaintainer(32, null)  // desktop has system DNS → null provider
+                // Configured snap-peer target (Settings tab), not a hardcoded 32. system DNS → null.
+                stack.configureSnapMaintainer(settings.snapTarget(), null)
                 registry.add(stack)
                 // ChainStack.start() is fault-isolated: it returns false (and closes its own
                 // resources) on failure rather than throwing. Either way — false return or a
@@ -117,6 +121,13 @@ class DesktopNodeController(private val dataDir: Path) : NodeController {
 
     override fun setTargetSnapPeers(target: Int) {
         registry.all().forEach { it.setTargetSnapPeers(target) }
+    }
+
+    override fun applyBlsBackend() {
+        // No-op on desktop: there's no bundled native blst library yet (the macOS dylib is a
+        // follow-up — see the CMP plan), so desktop always runs the pure-Java Milagro backend and
+        // the Settings toggle has nothing to swap. Wire this to BlsBackends.set(...) once the
+        // native library ships for desktop.
     }
 
     override suspend fun requestAccount(network: String, address: String): AccountResult {
@@ -190,6 +201,11 @@ class DesktopSettings : Settings {
     private val enabled = linkedSetOf("mainnet")
     private val ports = HashMap<String, Int>()
     private var snap = 32
+    private var deep = 16
+    private var strict = true
+    // Desktop has no bundled native blst yet (Milagro-only), so the honest default is off; the
+    // toggle persists but DesktopNodeController.applyBlsBackend() is a no-op until the dylib ships.
+    private var nativeBls = false
 
     override fun enabledNetworks(): List<String> = synchronized(this) { enabled.toList() }
     override fun primaryNetwork(): String = synchronized(this) { enabled.firstOrNull() ?: "mainnet" }
@@ -203,11 +219,23 @@ class DesktopSettings : Settings {
         ports[network] ?: NetworkConfig.byName(network).defaultRpcPort()
     }
     override fun setRpcPort(network: String, port: Int) = synchronized(this) {
-        ports[network] = port
+        // Clamp to the valid TCP range, falling back to the network default on out-of-range input
+        // (parity with Android's NodeService.setRpcPort) so we never try to bind an unusable port.
+        ports[network] = if (port in 1024..65535) port else NetworkConfig.byName(network).defaultRpcPort()
         Unit
     }
     override fun snapTarget(): Int = synchronized(this) { snap }
     override fun setSnapTarget(v: Int) = synchronized(this) { snap = v }
+
+    override fun displayName(network: String): String = NetworkConfig.byName(network).displayName()
+    override fun defaultRpcPort(network: String): Int = NetworkConfig.byName(network).defaultRpcPort()
+
+    override fun deepPoolThreshold(): Int = synchronized(this) { deep }
+    override fun setDeepPool(v: Int) = synchronized(this) { deep = v }
+    override fun strictStateFreshness(): Boolean = synchronized(this) { strict }
+    override fun setStrictStateFreshness(v: Boolean) = synchronized(this) { strict = v }
+    override fun nativeBlsEnabled(): Boolean = synchronized(this) { nativeBls }
+    override fun setNativeBlsEnabled(v: Boolean) = synchronized(this) { nativeBls = v }
 }
 
 /** Desktop is treated as always-online (no Android ConnectivityManager). */
