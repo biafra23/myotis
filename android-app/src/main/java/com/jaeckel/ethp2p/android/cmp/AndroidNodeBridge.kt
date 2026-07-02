@@ -12,12 +12,14 @@ import io.myotis.ui.NetworkStatus
 import io.myotis.ui.NodeController
 import io.myotis.ui.NodeSnapshot
 import io.myotis.ui.Settings
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.future.await
 
 /**
@@ -46,13 +48,23 @@ class AndroidNodeController(
             emit(serviceProvider()?.snapshots()?.mapValues { (_, s) -> s.toModel() } ?: emptyMap())
             delay(2000)
         }
-    }
+        // snapshotOf() prunes the backoff map and walks/sorts the live peer list — keep it off the
+        // main/UI dispatcher so the 2s poll can't drop frames.
+    }.flowOn(Dispatchers.Default)
 
     override fun enableNetwork(name: String) {
-        // Bound → boot that stack directly. Not bound yet → start the foreground service, which
-        // boots the whole enabled set (Settings already persisted the enabled flag).
+        // Only boot a stack live on an already-RUNNING bound service. Otherwise (service not
+        // running, or only the BIND_AUTO_CREATE shell is bound) persist the enabled flag and go
+        // through onStartService — which both prompts for POST_NOTIFICATIONS and boots the enabled
+        // set. Gating on isRunning (not just svc != null) is what keeps the notification-permission
+        // prompt reachable, since the shell is bound whenever the UI is visible.
         val svc = serviceProvider()
-        if (svc != null) svc.enableNetwork(name) else onStartService()
+        if (svc != null && NodeService.isRunning()) {
+            svc.enableNetwork(name)
+        } else {
+            NodeService.setNetworkEnabled(appContext, name, true)
+            onStartService()
+        }
     }
     override fun disableNetwork(name: String) { serviceProvider()?.disableNetwork(name) }
     override fun rebootNetwork(name: String) { serviceProvider()?.rebootNetwork(name) }

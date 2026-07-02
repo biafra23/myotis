@@ -133,23 +133,30 @@ class DesktopNodeController(private val dataDir: Path, private val settings: Set
 
     override fun clearCaches(network: String) {
         val canonical = NetworkConfig.byName(network).name()
-        // Clear the live stack's backoff/blacklist (fresh discovery slate) when it's up...
-        registry.get(canonical)?.let { it.backoff().clear(); it.blacklistedNodeIds().clear() }
-        // ...and purge the on-disk EL/CL peer caches (mirrors the daemon's purge-cache).
-        val suffix = if (canonical == "mainnet") "" else "-$canonical"
-        PeerCache.purge(dataDir.resolve("peers$suffix.cache"))
-        CLPeerCache.purge(dataDir.resolve("cl-peers$suffix.cache"))
+        // File deletes are IO — never on the Compose UI thread. Run on a daemon thread (mirrors
+        // Android's NodeService.doClearCaches offloading).
+        Thread({
+            // Clear the live stack's backoff/blacklist (fresh discovery slate) when it's up...
+            registry.get(canonical)?.let { it.backoff().clear(); it.blacklistedNodeIds().clear() }
+            // ...and purge the on-disk EL/CL peer caches (mirrors the daemon's purge-cache).
+            val suffix = if (canonical == "mainnet") "" else "-$canonical"
+            PeerCache.purge(dataDir.resolve("peers$suffix.cache"))
+            CLPeerCache.purge(dataDir.resolve("cl-peers$suffix.cache"))
+        }, "desktop-clear-caches-$canonical").apply { isDaemon = true }.start()
     }
 
     override fun resetSyncState(network: String) {
         val canonical = NetworkConfig.byName(network).name()
-        val suffix = if (canonical == "mainnet") "" else "-$canonical"
-        // Delete the persisted snapshot and any sibling parts (e.g. the ".roots" accumulator) so
-        // the next start re-bootstraps from the embedded checkpoint. A running stack keeps its
-        // in-memory state; this only affects the next start.
-        java.nio.file.Files.newDirectoryStream(dataDir, "sync-state$suffix.snapshot*").use { s ->
-            s.forEach { java.nio.file.Files.deleteIfExists(it) }
-        }
+        // Off the UI thread — directory scan + deletes are blocking IO.
+        Thread({
+            val suffix = if (canonical == "mainnet") "" else "-$canonical"
+            // Delete the persisted snapshot and any sibling parts (e.g. the ".roots" accumulator)
+            // so the next start re-bootstraps from the embedded checkpoint. A running stack keeps
+            // its in-memory state; this only affects the next start.
+            java.nio.file.Files.newDirectoryStream(dataDir, "sync-state$suffix.snapshot*").use { s ->
+                s.forEach { java.nio.file.Files.deleteIfExists(it) }
+            }
+        }, "desktop-reset-sync-$canonical").apply { isDaemon = true }.start()
     }
 
     override suspend fun requestAccount(network: String, address: String): AccountResult {
