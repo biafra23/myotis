@@ -41,15 +41,17 @@ jobs:
       # runner. Needed only for the cross-built x64 job. We deliberately do NOT blanket `|| true`:
       # a genuine "Rosetta unavailable" must fail HERE, loudly — otherwise it surfaces later as a
       # cryptic "bad CPU type in executable" swallowed by the build retry loop and mis-reported as
-      # a transient dependency blip. Tolerate ONLY the idempotent already-installed case (on a
-      # runner where Rosetta is already present, softwareupdate can exit non-zero with an
-      # "already"/"no updates" message).
+      # a transient dependency blip. Tolerate ONLY the idempotent already-installed case: on a
+      # runner where Rosetta is already present, softwareupdate can exit non-zero with a
+      # "Rosetta 2 is already installed" / "already been installed" message. Match those specific
+      # phrases only — a broad token like "finished" could appear in genuine failure output and
+      # mask a real error, defeating the fail-fast intent.
       - name: Install Rosetta 2 (x64 cross-build)
         if: matrix.arch == 'x64'
         run: |
           set -o pipefail
           if ! softwareupdate --install-rosetta --agree-to-license 2>&1 | tee /tmp/rosetta.log; then
-            grep -qiE "already|no updates|up.to.date|finished" /tmp/rosetta.log \
+            grep -qiE "already installed|already been installed" /tmp/rosetta.log \
               || { echo "::error::Rosetta 2 install failed"; exit 1; }
             echo "Rosetta 2 already installed — continuing."
           fi
@@ -110,13 +112,19 @@ jobs:
           set -eu
           dmg="app-desktop/build/compose/binaries/main/dmg/Myotis-${{ matrix.arch }}.dmg"
           mnt=$(mktemp -d)
+          # Detach the image on EVERY exit path (including an early `lipo`/assert failure below),
+          # so a failed check never leaks a mounted volume for the rest of the job.
+          cleanup() { hdiutil detach "$mnt" >/dev/null 2>&1 || hdiutil detach "$mnt" -force >/dev/null 2>&1 || true; rmdir "$mnt" 2>/dev/null || true; }
+          trap cleanup EXIT
           hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt"
           launcher=$(find "$mnt" -type f -path '*/Contents/MacOS/*' | head -n1)
+          # Fail clearly if the bundle layout changed and we found no launcher, rather than letting
+          # `lipo` error on an empty path.
+          [ -n "$launcher" ] || { echo "::error::no app launcher found under $dmg — bundle layout changed?"; exit 1; }
           jvm=$(find "$mnt" -type f -name 'libjvm.dylib' | head -n1 || true)
           archs=$(lipo -archs "$launcher")
           echo "launcher: $launcher -> [$archs]"
           [ -n "$jvm" ] && echo "bundled libjvm: $jvm -> [$(lipo -archs "$jvm")]" || true
-          hdiutil detach "$mnt" >/dev/null 2>&1 || hdiutil detach "$mnt" -force >/dev/null 2>&1 || true
           case "${{ matrix.arch }}" in
             x64)   want=x86_64 ;;
             arm64) want=arm64  ;;
