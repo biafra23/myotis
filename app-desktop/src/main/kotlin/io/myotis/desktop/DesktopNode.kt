@@ -22,6 +22,7 @@ import io.myotis.ui.Settings
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.future.await
 import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
@@ -130,6 +131,34 @@ class DesktopNodeController(private val dataDir: Path, private val settings: Set
         // native library ships for desktop.
     }
 
+    override fun clearCaches(network: String) {
+        val canonical = NetworkConfig.byName(network).name()
+        // File deletes are IO — never on the Compose UI thread. Run on a daemon thread (mirrors
+        // Android's NodeService.doClearCaches offloading).
+        Thread({
+            // Clear the live stack's backoff/blacklist (fresh discovery slate) when it's up...
+            registry.get(canonical)?.let { it.backoff().clear(); it.blacklistedNodeIds().clear() }
+            // ...and purge the on-disk EL/CL peer caches (mirrors the daemon's purge-cache).
+            val suffix = if (canonical == "mainnet") "" else "-$canonical"
+            PeerCache.purge(dataDir.resolve("peers$suffix.cache"))
+            CLPeerCache.purge(dataDir.resolve("cl-peers$suffix.cache"))
+        }, "desktop-clear-caches-$canonical").apply { isDaemon = true }.start()
+    }
+
+    override fun resetSyncState(network: String) {
+        val canonical = NetworkConfig.byName(network).name()
+        // Off the UI thread — directory scan + deletes are blocking IO.
+        Thread({
+            val suffix = if (canonical == "mainnet") "" else "-$canonical"
+            // Delete the persisted snapshot and any sibling parts (e.g. the ".roots" accumulator)
+            // so the next start re-bootstraps from the embedded checkpoint. A running stack keeps
+            // its in-memory state; this only affects the next start.
+            java.nio.file.Files.newDirectoryStream(dataDir, "sync-state$suffix.snapshot*").use { s ->
+                s.forEach { java.nio.file.Files.deleteIfExists(it) }
+            }
+        }, "desktop-reset-sync-$canonical").apply { isDaemon = true }.start()
+    }
+
     override suspend fun requestAccount(network: String, address: String): AccountResult {
         // VerifiedAccountQuery handles a null/!running stack itself (failed future → throws).
         val stack = registry.get(NetworkConfig.byName(network).name())
@@ -179,6 +208,8 @@ class DesktopNodeController(private val dataDir: Path, private val settings: Set
             connectedPeers = active.size,
             readyPeers = ready,
             snapPeers = conn?.activeSnapHandlers()?.size ?: 0,
+            // Desktop's connector exposes only the serving handlers, so serving == negotiated here.
+            snapServingPeers = conn?.activeSnapHandlers()?.size ?: 0,
             discoveredPeers = disc4?.table()?.size() ?: 0,
             executionBlockNumber = bss?.executionBlockNumber ?: 0L,
             finalizedSlot = bss?.finalizedSlot ?: 0L,
@@ -229,6 +260,7 @@ class DesktopSettings : Settings {
 
     override fun displayName(network: String): String = NetworkConfig.byName(network).displayName()
     override fun defaultRpcPort(network: String): Int = NetworkConfig.byName(network).defaultRpcPort()
+    override fun hasEns(network: String): Boolean = NetworkConfig.byName(network).hasEns()
 
     override fun deepPoolThreshold(): Int = synchronized(this) { deep }
     override fun setDeepPool(v: Int) = synchronized(this) { deep = v }
@@ -240,5 +272,5 @@ class DesktopSettings : Settings {
 
 /** Desktop is treated as always-online (no Android ConnectivityManager). */
 object DesktopNetworkStatus : NetworkStatus {
-    override val online: Boolean = true
+    override fun online(): Flow<Boolean> = flowOf(true)
 }

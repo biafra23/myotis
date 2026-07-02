@@ -32,6 +32,20 @@ interface NodeController {
     fun applyBlsBackend()
 
     /**
+     * Wipe a network's peer caches — clear the live stack's backoff/blacklist and delete the
+     * on-disk EL/CL peer cache files — so discovery starts from a fresh slate. Safe whether or
+     * not the network is currently running.
+     */
+    fun clearCaches(network: String)
+
+    /**
+     * Delete a network's persisted sync-committee snapshot so the NEXT start re-bootstraps from
+     * the embedded checkpoint and re-runs catch-up (a debugging aid). A running stack keeps its
+     * in-memory state; this only affects the next start.
+     */
+    fun resetSyncState(network: String)
+
+    /**
      * Query an account on [network] and verify the returned proof against the beacon-attested
      * state root (the shared `VerifiedAccountQuery` ladder). Suspends until verification
      * completes. Throws on a bad address or a network that isn't running; verification
@@ -93,6 +107,8 @@ interface Settings {
     fun displayName(network: String): String
     /** The network's built-in default JSON-RPC port, shown as the field hint. */
     fun defaultRpcPort(network: String): Int
+    /** Whether this network supports ENS resolution (mainnet/Sepolia); Query gates ENS input on it. */
+    fun hasEns(network: String): Boolean
 
     // --- shared node-tuning knobs ---
     fun deepPoolThreshold(): Int
@@ -105,9 +121,11 @@ interface Settings {
     fun setNativeBlsEnabled(v: Boolean)
 }
 
-/** Whether the device currently has network connectivity (Android: ConnectivityManager). */
+/** Device network connectivity, as an observable stream so the UI can react to changes. */
 interface NetworkStatus {
-    val online: Boolean
+    /** Emits the current connectivity and re-emits on change. Android: ConnectivityManager;
+     *  Desktop: a constant `true`. */
+    fun online(): Flow<Boolean>
 }
 
 /**
@@ -121,7 +139,8 @@ data class NodeSnapshot(
     val beaconState: String,        // STOPPED / SYNCING / CATCHING_UP / SYNCED
     val connectedPeers: Int,
     val readyPeers: Int,
-    val snapPeers: Int,
+    val snapPeers: Int,             // peers that negotiated snap/1 (capability)
+    val snapServingPeers: Int,      // peers actually in the serving pool now (drives readiness)
     val discoveredPeers: Int,
     val executionBlockNumber: Long,
     val finalizedSlot: Long,
