@@ -1,6 +1,7 @@
 package com.jaeckel.ethp2p.networking.discv4;
 
 import com.jaeckel.ethp2p.core.crypto.NodeKey;
+import com.jaeckel.ethp2p.networking.ConnectionErrors;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
@@ -201,6 +202,11 @@ public final class DiscV4Handler extends SimpleChannelInboundHandler<DatagramPac
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        log.error("[discv4] Channel error", cause);
+        // Benign transport churn (reset, UDP port-unreachable, …) → one-line DEBUG, no stacktrace.
+        if (ConnectionErrors.isBenignDisconnect(cause)) {
+            log.debug("[discv4] channel closed: {}", ConnectionErrors.describe(cause));
+        } else {
+            log.error("[discv4] Channel error", cause);
+        }
     }
 }

@@ -1,6 +1,7 @@
 package com.jaeckel.ethp2p.networking.rlpx;
 
 import com.jaeckel.ethp2p.core.crypto.NodeKey;
+import com.jaeckel.ethp2p.networking.ConnectionErrors;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
 import io.netty.handler.codec.ByteToMessageDecoder;
@@ -212,7 +213,13 @@ public final class RLPxHandler extends ByteToMessageDecoder {
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        log.error("[rlpx] Exception", cause);
+        // Peer-churn disconnects (connection reset, broken pipe, …) are routine — one-line DEBUG,
+        // no stacktrace. Only genuinely unexpected failures log at ERROR with the full cause.
+        if (ConnectionErrors.isBenignDisconnect(cause)) {
+            log.debug("[rlpx] peer disconnected: {}", ConnectionErrors.describe(cause));
+        } else {
+            log.error("[rlpx] Exception", cause);
+        }
         ctx.close();
     }
 }

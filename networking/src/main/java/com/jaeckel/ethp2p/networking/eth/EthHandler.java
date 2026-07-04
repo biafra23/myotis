@@ -2,6 +2,7 @@ package com.jaeckel.ethp2p.networking.eth;
 
 import com.jaeckel.ethp2p.core.crypto.NodeKey;
 import com.jaeckel.ethp2p.networking.ChainHead;
+import com.jaeckel.ethp2p.networking.ConnectionErrors;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
 import com.jaeckel.ethp2p.networking.eth.messages.*;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxHandler;
@@ -1431,7 +1432,13 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        log.error("[eth] Exception", cause);
+        // Peer-churn disconnects (connection reset, broken pipe, …) are routine — one-line DEBUG,
+        // no stacktrace. Only genuinely unexpected failures log at ERROR with the full cause.
+        if (ConnectionErrors.isBenignDisconnect(cause)) {
+            log.debug("[eth] peer disconnected: {}", ConnectionErrors.describe(cause));
+        } else {
+            log.error("[eth] Exception", cause);
+        }
         ctx.close();
     }
 }
