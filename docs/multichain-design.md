@@ -69,9 +69,9 @@ bolted on.
 The codebase is "one daemon = one network" by construction: a single
 `NetworkConfig` is threaded through every service.
 
-- **`nodekey.hex` is one global identity** (`Main.loadOrGenerate`). Per-network
-  ENRs would want distinct (or per-network-derived) keys so each network
-  advertises its own fork-id.
+- **Node identity is per-network (resolved).** `Main.nodeKeyFile` gives mainnet
+  `nodekey.hex` and every other network `nodekey-<net>.hex`, so each advertises
+  its own fork-id. (Originally a single global `nodekey.hex`.)
 - **discv5 port is hardcoded to 9000** (`Main` → `DiscV5Service.start(9000)`),
   with only an ephemeral fallback. A second network in-process needs its own
   configurable CL port.
