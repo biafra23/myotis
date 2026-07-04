@@ -92,14 +92,16 @@ public final class Main {
     }
 
     /**
-     * Node-identity key file. A single-network daemon keeps the shared {@code nodekey.hex}
-     * (unchanged). When hosting several networks in one process each gets a distinct key
-     * ({@code nodekey-<net>.hex}; mainnet keeps {@code nodekey.hex}) so each advertises its
-     * own ENR/fork-id instead of colliding under one node id in the discovery DHTs.
+     * Node-identity key file, per network — mainnet keeps the legacy {@code nodekey.hex}, every
+     * other network gets {@code nodekey-<net>.hex}. This holds regardless of how many networks the
+     * daemon hosts, so a network always has a stable identity of its own: previously a
+     * single-network run of a non-mainnet chain reused mainnet's {@code nodekey.hex}, meaning
+     * alternating single-network runs advertised the SAME node id on both chains — confusing, and
+     * inconsistent with the Android/desktop hosts, which already key per network unconditionally.
      */
-    static Path nodeKeyFile(String networkName, boolean perNetwork) {
-        if (!perNetwork || "mainnet".equals(networkName)) return Path.of("nodekey.hex");
-        return Path.of("nodekey-" + networkName + ".hex");
+    static Path nodeKeyFile(String networkName) {
+        return "mainnet".equals(networkName) ? Path.of("nodekey.hex")
+                                             : Path.of("nodekey-" + networkName + ".hex");
     }
 
 
@@ -218,13 +220,13 @@ public final class Main {
         for (NetworkConfig network : networks) {
             log.info("IPC socket ({}): {}", network.name(), socketPath(network.name()));
 
-            // Single-network stays byte-identical: legacy --port/30303 + discv5 9000 +
-            // RPC 8545 + shared nodekey.hex. Multi-network uses pinned per-network ports
-            // + per-network identity so the stacks don't collide.
+            // Ports: single-network stays byte-identical (legacy --port/30303 + discv5 9000 +
+            // RPC 8545); multi-network uses pinned per-network ports so the stacks don't collide.
+            // Identity is always per-network (nodeKeyFile below), independent of this.
             ChainPorts ports = multi
                     ? ChainPorts.defaultsFor(network)
                     : new ChainPorts(portOverride, 9000, 8545);
-            NodeKey nodeKey = NodeKey.loadOrGenerate(nodeKeyFile(network.name(), multi));
+            NodeKey nodeKey = NodeKey.loadOrGenerate(nodeKeyFile(network.name()));
 
             PeerCache peerCache = new PeerCache(cacheFile(network.name()));
             CLPeerCache clPeerCache = new CLPeerCache(clCacheFile(network.name()));
