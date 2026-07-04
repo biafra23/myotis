@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import com.jaeckel.ethp2p.android.AndroidQueryHistory
 import com.jaeckel.ethp2p.android.NodeService
 import com.jaeckel.ethp2p.networking.NetworkConfig
 import io.myotis.ui.AccountResult
@@ -11,7 +12,10 @@ import io.myotis.ui.EnsResult
 import io.myotis.ui.NetworkStatus
 import io.myotis.ui.NodeController
 import io.myotis.ui.NodeSnapshot
+import io.myotis.ui.QueryHistory
+import io.myotis.ui.QueryHistoryEntry
 import io.myotis.ui.Settings
+import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
@@ -160,4 +164,17 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun setStrictStateFreshness(v: Boolean) = NodeService.setStrictStateFreshness(ctx, v)
     override fun nativeBlsEnabled(): Boolean = NodeService.nativeBlsEnabled(ctx)
     override fun setNativeBlsEnabled(v: Boolean) = NodeService.setNativeBlsEnabled(ctx, v)
+}
+
+/**
+ * Android actual of [QueryHistory]. Wraps the existing file-backed [AndroidQueryHistory] on the
+ * SAME `filesDir/query-history.tsv` the app already used, so previously stored queries are
+ * retained across the switch to the shared UI.
+ */
+class AndroidQueryHistoryAdapter(ctx: Context) : QueryHistory {
+    private val impl = AndroidQueryHistory(File(ctx.filesDir, "query-history.tsv").toPath())
+    override fun entries(): List<QueryHistoryEntry> =
+        impl.list().map { QueryHistoryEntry(it.input(), it.timestampMs(), it.label()) }
+    override fun add(input: String, label: String) = impl.add(input, label)
+    override fun clear() = impl.clear()
 }

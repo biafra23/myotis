@@ -15,6 +15,7 @@ fun main() {
     // settings first: the controller reads it at boot (configured RPC port + snap target).
     val settings = DesktopSettings()
     val controller = DesktopNodeController(dataDir, settings)
+    val history = DesktopQueryHistory(dataDir.resolve("query-history.tsv"))
     controller.enableNetwork(settings.primaryNetwork())
 
     application {
@@ -24,7 +25,7 @@ fun main() {
             onCloseRequest = { controller.shutdown(); exitApplication() },
             title = "Myotis",
         ) {
-            NodeScreen(controller, settings, DesktopLogSource)
+            NodeScreen(controller, settings, DesktopLogSource, history = history)
         }
     }
 }

@@ -1,6 +1,7 @@
 package io.myotis.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -30,6 +31,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -71,6 +73,13 @@ private object AlwaysOnline : NetworkStatus {
     override fun online(): kotlinx.coroutines.flow.Flow<Boolean> = kotlinx.coroutines.flow.flowOf(true)
 }
 
+/** Fallback when a host doesn't supply persistence — history simply isn't retained. */
+private object NoQueryHistory : QueryHistory {
+    override fun entries(): List<QueryHistoryEntry> = emptyList()
+    override fun add(input: String, label: String) {}
+    override fun clear() {}
+}
+
 /**
  * The shared Myotis screen — identical on Android and Desktop. A tab host over the per-network
  * [NodeController]/[Settings]/[LogSource] seam (Status / Query / Logs / Settings). [netStatus]
@@ -84,6 +93,7 @@ fun NodeScreen(
     logs: LogSource,
     netStatus: NetworkStatus = AlwaysOnline,
     onOpenNetworkSettings: () -> Unit = {},
+    history: QueryHistory = NoQueryHistory,
 ) {
     // remember(controller): snapshots() returns a fresh Flow each call, so collecting it
     // directly would re-subscribe on every recomposition. Retain it across recompositions.
@@ -125,7 +135,7 @@ fun NodeScreen(
 
             when (tab) {
                 0 -> StatusTab(controller, current, network, online, onOpenNetworkSettings)
-                1 -> QueryTab(controller, settings, current, network)
+                1 -> QueryTab(controller, settings, current, network, history)
                 2 -> LogsTab(logs)
                 3 -> SettingsTab(controller, settings, snapshots)
             }
@@ -465,7 +475,13 @@ private fun StatusView(s: NodeSnapshot) {
  * prominently, and a banner warns when the beacon light client isn't SYNCED (results peer-claimed).
  */
 @Composable
-private fun QueryTab(controller: NodeController, settings: Settings, snap: NodeSnapshot?, network: String) {
+private fun QueryTab(
+    controller: NodeController,
+    settings: Settings,
+    snap: NodeSnapshot?,
+    network: String,
+    history: QueryHistory,
+) {
     val scope = rememberCoroutineScope()
     val running = snap?.running == true
     val ensCapable = remember(network) { settings.hasEns(network) }
@@ -477,10 +493,17 @@ private fun QueryTab(controller: NodeController, settings: Settings, snap: NodeS
     var account by remember(network) { mutableStateOf<AccountResult?>(null) }
     var ens by remember(network) { mutableStateOf<EnsResult?>(null) }
     var error by remember(network) { mutableStateOf<String?>(null) }
+    // History is global (all chains); re-read the local snapshot after each add/clear. Start empty
+    // and load off the main thread (entries() reads a file) so composition never blocks on disk.
+    var historyList by remember(network) { mutableStateOf<List<QueryHistoryEntry>>(emptyList()) }
+    LaunchedEffect(Unit) { historyList = withContext(Dispatchers.Default) { history.entries() } }
 
-    fun submit() {
-        val q = input.trim()
+    // Takes the query string (not the input state) so a tapped history row runs immediately
+    // without waiting for the input state write to settle.
+    fun run(raw: String) {
+        val q = raw.trim()
         if (q.isEmpty() || loading) return
+        input = q
         loading = true; error = null; account = null; ens = null
         scope.launch {
             try {
@@ -508,6 +531,10 @@ private fun QueryTab(controller: NodeController, settings: Settings, snap: NodeS
                 error = t.message ?: t.toString()
             } finally {
                 loading = false
+                // Record for one-tap re-run (off the main thread — file write); label = the
+                // resolved address for ENS, else empty.
+                val label = ens?.addressHex ?: ""
+                historyList = withContext(Dispatchers.Default) { history.add(q, label); history.entries() }
             }
         }
     }
@@ -546,7 +573,7 @@ private fun QueryTab(controller: NodeController, settings: Settings, snap: NodeS
         }
         Spacer(Modifier.height(8.dp))
         Button(
-            onClick = { submit() },
+            onClick = { run(input) },
             enabled = running && input.isNotBlank() && !loading,
         ) { Text("Look up") }
         Spacer(Modifier.height(16.dp))
@@ -564,6 +591,51 @@ private fun QueryTab(controller: NodeController, settings: Settings, snap: NodeS
             }
             error != null -> Text("Error: $error", color = MaterialTheme.colorScheme.error)
             account != null -> AccountResultView(account!!)
+        }
+
+        // Recent-query history: tap a row to re-run it (uses the stored input, not the label).
+        if (historyList.isNotEmpty()) {
+            Spacer(Modifier.height(20.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Recent", style = MaterialTheme.typography.titleSmall)
+                TextButton(onClick = {
+                    // clear() deletes a file — off the main thread.
+                    scope.launch {
+                        withContext(Dispatchers.Default) { history.clear() }
+                        historyList = emptyList()
+                    }
+                }) { Text("Clear") }
+            }
+            historyList.forEach { e -> QueryHistoryRow(e, enabled = !loading, onClick = { run(e.input) }) }
+        }
+    }
+}
+
+/** One tappable past-query row: the stored input, with the resolved label beneath when present. */
+@Composable
+private fun QueryHistoryRow(e: QueryHistoryEntry, enabled: Boolean, onClick: () -> Unit) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(vertical = 6.dp),
+    ) {
+        Text(
+            e.input,
+            fontFamily = FontFamily.Monospace, fontSize = 13.sp,
+            maxLines = 1, overflow = TextOverflow.Ellipsis,
+        )
+        if (e.label.isNotEmpty()) {
+            Text(
+                e.label,
+                fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }
