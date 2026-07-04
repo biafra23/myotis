@@ -327,6 +327,24 @@ public final class PeerCache implements Closeable {
         }
     }
 
+    /**
+     * Wipe the in-memory cache and delete the on-disk file, giving discovery a fresh slate. Unlike
+     * the static {@link #purge(Path)}, this clears the LIVE instance's authoritative in-memory maps
+     * too, so a running node can't rewrite the old peers back on the next {@code add}/serve event.
+     */
+    public synchronized void clear() {
+        entries.clear();
+        snapConfirmed.clear();
+        snapDenied.clear();
+        snapFailures.clear();
+        loaded = true;  // memory is now the (empty) authority; don't re-read the file we're deleting
+        submitWrite(() -> {
+            if (!cacheFile.toFile().delete() && cacheFile.toFile().exists()) {
+                log.warn("[cache] failed to delete cache file {}", cacheFile);
+            }
+        });
+    }
+
     /** Delete the cache file (CLI {@code purge-cache}, runs without a daemon). */
     public static void purge(Path cacheFile) {
         try {
