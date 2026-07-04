@@ -31,8 +31,9 @@ public final class ConnectionErrors {
      * error, never a protocol/logic bug.
      */
     public static boolean isBenignDisconnect(Throwable t) {
+        Throwable c = t;
         int depth = 0;
-        for (Throwable c = t; c != null && depth < MAX_CAUSE_DEPTH; c = c.getCause(), depth++) {
+        while (c != null && depth < MAX_CAUSE_DEPTH) {
             if (c instanceof ClosedChannelException) return true;
             if (c instanceof PortUnreachableException) return true;
             if (c instanceof IOException) {   // SocketException / SocketTimeoutException are IOExceptions
@@ -49,6 +50,10 @@ public final class ConnectionErrors {
                     }
                 }
             }
+            Throwable next = c.getCause();
+            if (next == c) break;   // self-referential cause — stop, don't spin to the depth cap
+            c = next;
+            depth++;
         }
         return false;
     }
