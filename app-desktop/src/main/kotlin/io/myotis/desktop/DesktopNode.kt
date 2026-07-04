@@ -44,6 +44,10 @@ class DesktopNodeController(private val dataDir: Path, private val settings: Set
     // (each add/get/remove is already thread-safe), so these locks only guard the per-network
     // check-then-build so two boots of the same network can't race.
     private val bootLocks = ConcurrentHashMap<String, Any>()
+    // Live per-network cache instances (keyed by canonical name), retained so clearCaches can wipe
+    // the authoritative in-memory state — not just the file, which a running stack would rewrite.
+    private val peerCaches = ConcurrentHashMap<String, PeerCache>()
+    private val clPeerCaches = ConcurrentHashMap<String, CLPeerCache>()
     private fun bootLock(canonical: String): Any = bootLocks.computeIfAbsent(canonical) { Any() }
 
     init {
@@ -78,6 +82,9 @@ class DesktopNodeController(private val dataDir: Path, private val settings: Set
                 val suffix = if (canonical == "mainnet") "" else "-$canonical"
                 val peerCache = PeerCache(dataDir.resolve("peers$suffix.cache"))
                 val clPeerCache = CLPeerCache(dataDir.resolve("cl-peers$suffix.cache"))
+                // Retain the live instances so clearCaches can wipe their in-memory state.
+                peerCaches[canonical] = peerCache
+                clPeerCaches[canonical] = clPeerCache
                 val stack = ChainStack(
                     network, ports, nodeKey,
                     PeerCacheAdapter(peerCache), ClPeerCacheAdapter(clPeerCache),
@@ -95,17 +102,24 @@ class DesktopNodeController(private val dataDir: Path, private val settings: Set
                 val ok = try {
                     stack.start()
                 } catch (t: Throwable) {
-                    registry.remove(canonical)
+                    dropStack(canonical)
                     throw t
                 }
-                if (!ok) registry.remove(canonical)
+                if (!ok) dropStack(canonical)
             }
         }, "desktop-boot-$canonical").apply { isDaemon = true }.start()
     }
 
+    /** Drop a network's registry entry and forget its retained cache instances. */
+    private fun dropStack(canonical: String) {
+        registry.remove(canonical)
+        peerCaches.remove(canonical)
+        clPeerCaches.remove(canonical)
+    }
+
     override fun disableNetwork(name: String) {
         val canonical = NetworkConfig.byName(name).name()
-        synchronized(bootLock(canonical)) { registry.remove(canonical) }
+        synchronized(bootLock(canonical)) { dropStack(canonical) }
     }
 
     override fun rebootNetwork(name: String) {
@@ -118,6 +132,10 @@ class DesktopNodeController(private val dataDir: Path, private val settings: Set
         // close tears every stack down promptly without waiting behind an in-progress boot of an
         // unrelated network.
         registry.shutdownAll()
+        // Forget the (now-closed) cache instances so a stray post-shutdown clearCaches takes the
+        // stopped-chain purge path rather than clear()ing a closed instance.
+        peerCaches.clear()
+        clPeerCaches.clear()
     }
 
     override fun setTargetSnapPeers(target: Int) {
@@ -134,14 +152,28 @@ class DesktopNodeController(private val dataDir: Path, private val settings: Set
     override fun clearCaches(network: String) {
         val canonical = NetworkConfig.byName(network).name()
         // File deletes are IO — never on the Compose UI thread. Run on a daemon thread (mirrors
-        // Android's NodeService.doClearCaches offloading).
+        // Android's NodeService.doClearCaches offloading). Serialize with enable/disable via the
+        // per-network boot lock so "is the stack live?" and the clear/purge can't race a teardown.
         Thread({
-            // Clear the live stack's backoff/blacklist (fresh discovery slate) when it's up...
-            registry.get(canonical)?.let { it.backoff().clear(); it.blacklistedNodeIds().clear() }
-            // ...and purge the on-disk EL/CL peer caches (mirrors the daemon's purge-cache).
-            val suffix = if (canonical == "mainnet") "" else "-$canonical"
-            PeerCache.purge(dataDir.resolve("peers$suffix.cache"))
-            CLPeerCache.purge(dataDir.resolve("cl-peers$suffix.cache"))
+            synchronized(bootLock(canonical)) {
+                val suffix = if (canonical == "mainnet") "" else "-$canonical"
+                val stack = registry.get(canonical)
+                if (stack != null) {
+                    // Chain is up: clear the LIVE instances (memory + file) so the running stack
+                    // can't rewrite the old peers back, plus the backoff/blacklist.
+                    stack.backoff().clear(); stack.blacklistedNodeIds().clear()
+                    peerCaches[canonical]?.clear() ?: PeerCache.purge(dataDir.resolve("peers$suffix.cache"))
+                    clPeerCaches[canonical]?.clear() ?: CLPeerCache.purge(dataDir.resolve("cl-peers$suffix.cache"))
+                } else {
+                    // Chain stopped: any retained instance is CLOSED (its diskWriter is shut down, so
+                    // clear() would silently drop the file delete on RejectedExecutionException).
+                    // Forget the stale references and purge the on-disk files directly.
+                    peerCaches.remove(canonical)
+                    clPeerCaches.remove(canonical)
+                    PeerCache.purge(dataDir.resolve("peers$suffix.cache"))
+                    CLPeerCache.purge(dataDir.resolve("cl-peers$suffix.cache"))
+                }
+            }
         }, "desktop-clear-caches-$canonical").apply { isDaemon = true }.start()
     }
 

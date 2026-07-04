@@ -274,6 +274,25 @@ public final class CLPeerCache {
         return result;
     }
 
+    /**
+     * Wipe the in-memory cache and delete the on-disk file, giving CL discovery a fresh slate.
+     * Unlike the static {@link #purge(Path)}, this clears the LIVE instance's authoritative
+     * in-memory sets too, so a running node can't rewrite the old peers back.
+     */
+    public synchronized void clear() {
+        seen.clear();
+        failures.clear();
+        servedRange.clear();
+        bootstrapPeriod.clear();
+        lcConfirmed.clear();
+        lcDenied.clear();
+        try {
+            Files.deleteIfExists(cacheFile);
+        } catch (IOException e) {
+            log.warn("[cl-cache] failed to delete CL cache file {}: {}", cacheFile, e.getMessage());
+        }
+    }
+
     /** Delete the cache file. */
     public static void purge(Path cacheFile) {
         try {

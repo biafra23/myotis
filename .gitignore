@@ -25,12 +25,14 @@ out/
 .DS_Store
 ._*
 
-# Node key (contains private key)
+# Node key (contains private key) — mainnet and per-network (nodekey-<net>.hex)
 nodekey.hex
+nodekey-*.hex
 app/peers.cache
 *.cache
-# Persisted light-client sync snapshots (per-network runtime state)
+# Persisted light-client sync snapshots (per-network runtime state) + their .roots accumulators
 *.snapshot
+*.snapshot.roots
 app/devp2p.log
 app/devlibp2p.log
 .gradle-home/
