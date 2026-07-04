@@ -59,6 +59,7 @@ public final class ConnectionErrors {
      * No stacktrace. The walk is depth-bounded so a cyclic cause chain can't loop forever.
      */
     public static String describe(Throwable t) {
+        if (t == null) return "unknown";
         Throwable root = t;
         int depth = 0;
         while (root.getCause() != null && root.getCause() != root && depth < MAX_CAUSE_DEPTH) {
