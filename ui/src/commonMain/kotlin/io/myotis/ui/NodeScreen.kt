@@ -445,10 +445,13 @@ private fun SyncProgressBar(s: NodeSnapshot) {
     val determinate = s.beaconState == "CATCHING_UP" && start >= 0 && target > start
     Column(Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
         Text(
+            // Label follows the beacon STATE, not the bar's determinacy — a CATCHING_UP node with
+            // an unknown start period still reads "catching up", never "bootstrapping".
             when {
-                !determinate -> "Bootstrapping light client…"
-                current >= target -> "Finishing sync…"
-                else -> "Catching up sync committees — period $current / $target"
+                s.beaconState != "CATCHING_UP" -> "Bootstrapping light client…"
+                determinate && current >= target -> "Finishing sync…"
+                determinate -> "Catching up sync committees — period $current / $target"
+                else -> "Catching up sync committees…"
             },
             style = MaterialTheme.typography.bodySmall,
         )
@@ -515,7 +518,7 @@ private fun StatusView(s: NodeSnapshot) {
         StatusRow("EL block", s.executionBlockNumber.toString())
         StatusRow("Peers", "${s.connectedPeers} (ready ${s.readyPeers}, snap ${s.snapPeers}, serving ${s.snapServingPeers})")
         StatusRow("Discovered", s.discoveredPeers.toString())
-        StatusRow("discv5 peers", s.discv5Peers.toString())
+        StatusRow("Discv5 peers", s.discv5Peers.toString())
         StatusRow("In backoff", s.backedOffPeers.toString())
         StatusRow("Blacklisted", s.blacklistedPeers.toString())
         StatusRow("Sync period", "${s.syncCurrentPeriod} / ${s.syncTargetPeriod}")
