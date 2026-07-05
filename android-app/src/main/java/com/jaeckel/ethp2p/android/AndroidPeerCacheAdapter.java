@@ -1,20 +1,21 @@
 package com.jaeckel.ethp2p.android;
 
-import io.myotis.node.CachedPeer;
-import io.myotis.node.PeerCachePort;
-import io.myotis.node.SnapQuality;
+import io.myotis.api.ports.CachedPeerInfo;
+import io.myotis.api.ports.EnginePeerCache;
+import io.myotis.api.ports.SnapQuality;
 
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Adapts {@link AndroidPeerCache} to the {@link PeerCachePort} that {@code ChainStack}
- * consumes, so {@code node-core} stays independent of the Android module. Pure
- * delegation plus an {@link AndroidPeerCache.SnapQuality} → shared {@link SnapQuality}
- * mapping. Mirrors the daemon's {@code PeerCacheAdapter}.
+ * Adapts {@link AndroidPeerCache} to the engine API's {@link EnginePeerCache} port.
+ * Pure delegation plus the host/port ⇄ InetSocketAddress and
+ * {@link AndroidPeerCache.SnapQuality} → api {@link SnapQuality} mappings. Mirrors the
+ * daemon's {@code PeerCacheAdapter}; addresses are constructed unresolved (the cache
+ * keys by host string, no DNS lookup wanted here).
  */
-public final class AndroidPeerCacheAdapter implements PeerCachePort {
+public final class AndroidPeerCacheAdapter implements EnginePeerCache {
 
     private final AndroidPeerCache delegate;
 
@@ -22,23 +23,25 @@ public final class AndroidPeerCacheAdapter implements PeerCachePort {
         this.delegate = java.util.Objects.requireNonNull(delegate, "delegate");
     }
 
-    @Override public void add(InetSocketAddress address, String publicKeyHex, boolean snap) {
-        delegate.add(address, publicKeyHex, snap);
+    @Override public void add(String host, int port, String publicKeyHex, boolean snap) {
+        delegate.add(InetSocketAddress.createUnresolved(host, port), publicKeyHex, snap);
     }
 
-    @Override public void recordSnapServed(InetSocketAddress address) {
-        delegate.recordSnapServed(address);
+    @Override public void recordSnapServed(String host, int port) {
+        delegate.recordSnapServed(InetSocketAddress.createUnresolved(host, port));
     }
 
-    @Override public void recordSnapFailure(InetSocketAddress address) {
-        delegate.recordSnapFailure(address);
+    @Override public void recordSnapFailure(String host, int port) {
+        delegate.recordSnapFailure(InetSocketAddress.createUnresolved(host, port));
     }
 
-    @Override public List<CachedPeer> load() {
+    @Override public List<CachedPeerInfo> load() {
         List<AndroidPeerCache.CachedPeer> src = delegate.load();
-        List<CachedPeer> out = new ArrayList<>(src.size());
+        List<CachedPeerInfo> out = new ArrayList<>(src.size());
         for (AndroidPeerCache.CachedPeer p : src) {
-            out.add(new CachedPeer(p.address(), p.publicKeyHex(), p.snap(), map(p.snapQuality())));
+            out.add(new CachedPeerInfo(
+                    p.address().getHostString(), p.address().getPort(),
+                    p.publicKeyHex(), p.snap(), map(p.snapQuality())));
         }
         return out;
     }

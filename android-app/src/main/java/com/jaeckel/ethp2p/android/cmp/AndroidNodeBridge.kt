@@ -6,7 +6,6 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import com.jaeckel.ethp2p.android.AndroidQueryHistory
 import com.jaeckel.ethp2p.android.NodeService
-import com.jaeckel.ethp2p.networking.NetworkConfig
 import io.myotis.ui.AccountResult
 import io.myotis.ui.EnsResult
 import io.myotis.ui.NetworkStatus
@@ -152,7 +151,7 @@ private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
 class AndroidSettings(private val ctx: Context) : Settings {
     override fun enabledNetworks(): List<String> = NodeService.enabledNetworks(ctx)
     override fun primaryNetwork(): String = NodeService.primaryNetwork(ctx)
-    override fun allNetworks(): List<String> = NetworkConfig.allNetworks().map { it.name() }
+    override fun allNetworks(): List<String> = NodeService.allNetworkNames()
     override fun isNetworkEnabled(name: String): Boolean = NodeService.isNetworkEnabled(ctx, name)
     override fun setNetworkEnabled(name: String, on: Boolean) = NodeService.setNetworkEnabled(ctx, name, on)
     override fun rpcPortFor(network: String): Int = NodeService.rpcPortFor(ctx, network)
@@ -160,9 +159,9 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun snapTarget(): Int = NodeService.snapTarget(ctx)
     override fun setSnapTarget(v: Int) = NodeService.setSnapTargetPref(ctx, v)
 
-    override fun displayName(network: String): String = NetworkConfig.byName(network).displayName()
-    override fun defaultRpcPort(network: String): Int = NetworkConfig.byName(network).defaultRpcPort()
-    override fun hasEns(network: String): Boolean = NetworkConfig.byName(network).hasEns()
+    override fun displayName(network: String): String = NodeService.displayName(network)
+    override fun defaultRpcPort(network: String): Int = NodeService.defaultRpcPort(network)
+    override fun hasEns(network: String): Boolean = NodeService.hasEns(network)
 
     override fun deepPoolThreshold(): Int = NodeService.deepPoolThreshold(ctx)
     override fun setDeepPool(v: Int) = NodeService.setDeepPoolThreshold(ctx, v)

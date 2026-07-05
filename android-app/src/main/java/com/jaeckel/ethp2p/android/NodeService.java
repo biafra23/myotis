@@ -14,34 +14,30 @@ import android.os.Binder;
 import android.os.IBinder;
 import com.jaeckel.ethp2p.android.log.LogBuffer;
 
-import com.jaeckel.ethp2p.consensus.BeaconLightClient;
-import com.jaeckel.ethp2p.consensus.BeaconSyncState;
-import com.jaeckel.ethp2p.consensus.libp2p.BeaconP2PService;
-import com.jaeckel.ethp2p.consensus.proof.OrderedTrieRoot;
-import com.jaeckel.ethp2p.core.crypto.NodeKey;
-import com.jaeckel.ethp2p.core.types.BlockHeader;
-import com.jaeckel.ethp2p.networking.NetworkConfig;
-import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
-import com.jaeckel.ethp2p.networking.discv5.DiscV5Service;
-import com.jaeckel.ethp2p.networking.eth.messages.BlockBodiesMessage;
-import com.jaeckel.ethp2p.networking.eth.messages.Receipt;
-import com.jaeckel.ethp2p.networking.eth.messages.TxFeeFields;
-import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
-
-import org.apache.tuweni.bytes.Bytes;
-import org.apache.tuweni.crypto.SECP256K1;
+import io.myotis.api.AccountProofResult;
+import io.myotis.api.BeaconState;
+import io.myotis.api.BeaconStatus;
+import io.myotis.api.ChainHandle;
+import io.myotis.api.EngineConfig;
+import io.myotis.api.EnsResolutionResult;
+import io.myotis.api.EnsRoot;
+import io.myotis.api.MyotisEngine;
+import io.myotis.api.NetworkInfo;
+import io.myotis.api.StatusSnapshot;
+import io.myotis.api.ports.EnginePorts;
+import io.myotis.api.ports.NodeKeyStore;
 
 import java.net.InetAddress;
-import java.net.InetSocketAddress;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Comparator;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -127,11 +123,29 @@ public final class NodeService extends Service {
         return c.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE);
     }
     /**
-     * Canonicalize a network name to one {@link NetworkConfig#byName} accepts AND that
-     * the per-network helpers (which test {@code "gnosis".equals(network)}) handle
-     * consistently. Unknown/corrupt/empty values fall back to mainnet so a bad pref can
-     * never crash node startup (byName throws on unknown names) or silently desync the
-     * RPC-port/preset selection from the resolved chain.
+     * The engine, and its static network catalog for the pref helpers below (they're
+     * static — callable from Activities without a bound service). One process-global
+     * engine mirrors the process-global RUNNING flag: service instances come and go,
+     * the hosted-network registry persists across them. The single line naming a
+     * concrete engine class.
+     */
+    private static final MyotisEngine ENGINE = new io.myotis.node.api.JavaMyotisEngine();
+    private static final List<NetworkInfo> NETWORKS = ENGINE.availableNetworks();
+
+    private static NetworkInfo networkInfo(String canonical) {
+        for (NetworkInfo n : NETWORKS) {
+            if (n.name().equals(canonical)) return n;
+        }
+        return NETWORKS.get(0); // mainnet — canonicalNetwork() already fell back
+    }
+
+    /**
+     * Canonicalize a network name to one the engine hosts AND that the per-network
+     * helpers (which test {@code "gnosis".equals(network)}) handle consistently.
+     * Unknown/corrupt/empty values fall back to mainnet so a bad pref can never crash
+     * node startup or silently desync the RPC-port/preset selection from the resolved
+     * chain (which is why this doesn't use {@code ENGINE.canonicalNetworkName} — that
+     * throws on unknown names).
      */
     private static String canonicalNetwork(String n) {
         if (n == null) return "mainnet";
@@ -168,11 +182,11 @@ public final class NodeService extends Service {
     public static void setNetworkEnabled(android.content.Context c, String network, boolean on) {
         prefs(c).edit().putBoolean(enabledKey(canonicalNetwork(network)), on).apply();
     }
-    /** The set of enabled networks (in {@link NetworkConfig#allNetworks} display order). Never
+    /** The set of enabled networks (in the engine catalog's display order). Never
      *  empty — falls back to mainnet so the service always has something to run. */
     public static List<String> enabledNetworks(android.content.Context c) {
         List<String> out = new ArrayList<>();
-        for (NetworkConfig nc : NetworkConfig.allNetworks()) {
+        for (NetworkInfo nc : NETWORKS) {
             if (isNetworkEnabled(c, nc.name())) out.add(nc.name());
         }
         if (out.isEmpty()) out.add("mainnet");
@@ -182,12 +196,26 @@ public final class NodeService extends Service {
     public static String primaryNetwork(android.content.Context c) {
         return enabledNetworks(c).get(0);
     }
-    /** Per-network default RPC port — delegate to {@link NetworkConfig#defaultRpcPort()} so the
-     *  defaults stay collision-free and consistent with {@code ChainPorts.defaultsFor()} (mainnet
-     *  8545, Gnosis 8546, Sepolia 8547). A NodeService-local table would silently put Sepolia on
+    /** Per-network default RPC port — from the engine's catalog so the defaults stay
+     *  collision-free and consistent with the engine's own port defaulting (mainnet 8545,
+     *  Gnosis 8546, Sepolia 8547). A NodeService-local table would silently put Sepolia on
      *  8545 and collide with mainnet's RPC bind when both run. */
     public static int defaultRpcPort(String network) {
-        return NetworkConfig.byName(canonicalNetwork(network)).defaultRpcPort();
+        return networkInfo(canonicalNetwork(network)).defaultRpcPort();
+    }
+    /** All supported networks in display order, from the engine's catalog. */
+    public static List<String> allNetworkNames() {
+        List<String> out = new ArrayList<>(NETWORKS.size());
+        for (NetworkInfo n : NETWORKS) out.add(n.name());
+        return out;
+    }
+    /** Human-facing chain name, from the engine's catalog. */
+    public static String displayName(String network) {
+        return networkInfo(canonicalNetwork(network)).displayName();
+    }
+    /** Whether ENS resolution is available on {@code network}, from the engine's catalog. */
+    public static boolean hasEns(String network) {
+        return networkInfo(canonicalNetwork(network)).hasEns();
     }
     // The RPC port is stored per network so each chain keeps an independent port — a shared key
     // would force the same URL on multiple chains, which MetaMask rejects and which collides on
@@ -279,14 +307,14 @@ public final class NodeService extends Service {
         int c = clampInt(v, 1, 128, DEFAULT_SNAP_TARGET);
         this.targetSnapPeers = c;
         setSnapTargetPref(this, c);
-        for (io.myotis.node.ChainStack s : stacks.values()) s.setTargetSnapPeers(c);
+        for (ChainHandle h : handles.values()) h.setTargetSnapPeers(c);
     }
 
     /** Currently live networks (a chip per entry), in display order. */
     public List<String> liveNetworks() {
         List<String> out = new ArrayList<>();
-        for (NetworkConfig nc : NetworkConfig.allNetworks()) {
-            if (stacks.containsKey(nc.name())) out.add(nc.name());
+        for (NetworkInfo nc : NETWORKS) {
+            if (handles.containsKey(nc.name())) out.add(nc.name());
         }
         return out;
     }
@@ -303,7 +331,7 @@ public final class NodeService extends Service {
             startForegroundService(new Intent(this, NodeService.class));
             return;
         }
-        if (stacks.containsKey(n)) return;
+        if (handles.containsKey(n)) return;
         new Thread(() -> buildAndStart(n), "ethp2p-boot-" + n).start();
     }
 
@@ -314,11 +342,10 @@ public final class NodeService extends Service {
     public void disableNetwork(String name) {
         String n = canonicalNetwork(name);
         setNetworkEnabled(this, n, false);
-        io.myotis.node.ChainStack s = stacks.get(n);
-        forgetStack(n);
+        forgetStack(n);   // drop from the UI's live map immediately
         new Thread(() -> {
             synchronized (bootLock(n)) {
-                if (s != null) { try { s.shutdown(); } catch (Throwable ignored) {} }
+                try { ENGINE.stop(n); } catch (Throwable ignored) {}
             }
             stopIfNoStacksLeft();
         }, "ethp2p-disable-" + n).start();
@@ -332,22 +359,21 @@ public final class NodeService extends Service {
     public void rebootNetwork(String name) {
         String n = canonicalNetwork(name);
         if (!RUNNING.get()) return;
-        io.myotis.node.ChainStack old = stacks.remove(n);
         // Only reboot a chain that's actually live. If it isn't (disabled / not yet built), do
         // nothing — the new port is already persisted and applies on the next enable. Without this,
         // saving settings would start a chain the user has turned off.
-        if (old == null) return;
+        if (handles.remove(n) == null) return;
         new Thread(() -> {
             synchronized (bootLock(n)) {
-                try { old.shutdown(); } catch (Throwable ignored) {}
+                try { ENGINE.stop(n); } catch (Throwable ignored) {}
             }
             buildAndStart(n);   // re-acquires bootLock(n) for its start() — frees ports first
         }, "ethp2p-reboot-" + n).start();
     }
 
-    /** Drop all NodeService-side bookkeeping for a network (the stack itself is shut down separately). */
+    /** Drop all NodeService-side bookkeeping for a network (the engine-side stop happens separately). */
     private void forgetStack(String n) {
-        stacks.remove(n);
+        handles.remove(n);
         cachedElCounts.remove(n);
         cachedClCounts.remove(n);
         elCaches.remove(n);
@@ -356,7 +382,7 @@ public final class NodeService extends Service {
 
     /** True if any network is still enabled (incl. the seeded default). */
     private boolean anyNetworkEnabled() {
-        for (NetworkConfig nc : NetworkConfig.allNetworks()) {
+        for (NetworkInfo nc : NETWORKS) {
             if (isNetworkEnabled(this, nc.name())) return true;
         }
         return false;
@@ -369,7 +395,7 @@ public final class NodeService extends Service {
      * up; without it, disabling one chain mid-boot could wrongly stop the whole service.
      */
     private void stopIfNoStacksLeft() {
-        if (stacks.isEmpty() && !anyNetworkEnabled() && RUNNING.compareAndSet(true, false)) {
+        if (handles.isEmpty() && !anyNetworkEnabled() && RUNNING.compareAndSet(true, false)) {
             LogBuffer.i(TAG, "no networks left enabled; stopping service");
             stopForeground(STOP_FOREGROUND_REMOVE);
             stopSelf();
@@ -385,38 +411,43 @@ public final class NodeService extends Service {
     }
 
 
-    // One per-network node stack (EL + discv4/5 + beacon LC + verified RPC + the snap-peer
-    // maintainer), shared with the :app daemon via :node-core. Step 9: NodeService hosts a
-    // registry of stacks so several chains run concurrently; the UI views one at a time via
-    // a chip selector. The map is the single source of truth for "what's live" — snapshot,
-    // query routing and shutdown all iterate it. Keyed by canonical network name.
-    private final Map<String, io.myotis.node.ChainStack> stacks = new ConcurrentHashMap<>();
+    // One per-network engine handle (EL + discv4/5 + beacon LC + verified RPC + the
+    // snap-peer maintainer), shared with the :app daemon via the engine API. The map is
+    // the UI's source of truth for "what's live" — snapshot, query routing and shutdown
+    // all iterate it; the engine's own registry parallels it (entries are added/removed
+    // together under the per-network bootLock). Keyed by canonical network name.
+    private final Map<String, ChainHandle> handles = new ConcurrentHashMap<>();
     // Per-network "peers loaded from cache at boot" counts, captured when a stack is built
     // (ChainStack owns the live caches via the adapters, so we read the size once here).
     private final Map<String, Integer> cachedElCounts = new ConcurrentHashMap<>();
     private final Map<String, Integer> cachedClCounts = new ConcurrentHashMap<>();
-    // The live cache instances per network (also passed into the ChainStack adapters), kept so
-    // "Clear caches" can wipe the in-memory + on-disk cache of a running chain. Removed on shutdown.
+    // The live cache instances per network (also handed to the engine via the port
+    // adapters), kept so "Clear caches" can wipe the in-memory + on-disk cache of a
+    // running chain. Removed on shutdown.
     private final Map<String, AndroidPeerCache> elCaches = new ConcurrentHashMap<>();
     private final Map<String, AndroidCLPeerCache> clCaches = new ConcurrentHashMap<>();
-    // Per-network lifecycle lock: a network's start() and shutdown() (across DIFFERENT ChainStack
-    // instances) serialize on this, so a fast Stop→Start or disable→enable of the same chain has
-    // the new instance's start() wait for the old instance's shutdown() to free its ports instead
-    // of racing into a BindException. (Per-instance synchronization inside ChainStack can't cover
-    // two different instances — this is the cross-instance equivalent of the old single bootLock.)
-    private final Map<String, Object> bootLocks = new ConcurrentHashMap<>();
-    private Object bootLock(String network) {
-        return bootLocks.computeIfAbsent(canonicalNetwork(network), k -> new Object());
+    // Per-network lifecycle lock: a network's start() and stop() serialize on this, so a
+    // fast Stop→Start or disable→enable of the same chain has the new boot wait for the old
+    // teardown to free its ports AND unregister from the engine (create() throws on a
+    // still-hosted network). STATIC, matching ENGINE and RUNNING: the engine registry
+    // outlives a service instance, so a recreated service's boot must serialize against the
+    // PREVIOUS instance's teardown thread — instance-scoped locks would let them interleave.
+    private static final Map<String, Object> BOOT_LOCKS = new ConcurrentHashMap<>();
+    private static Object bootLock(String network) {
+        return BOOT_LOCKS.computeIfAbsent(canonicalNetwork(network), k -> new Object());
     }
 
     // Service-global uptime stamp (the whole service, not a single chain). Owned by the
     // next start; never cleared in doShutdown — see the PR #82 note there.
     private volatile long startTimeMs;
 
-    // CCIP-Read gateway HTTP is blocking; keep it off the single EVM thread.
-    private final java.util.concurrent.ExecutorService ccipPool =
-            java.util.concurrent.Executors.newCachedThreadPool(r -> {
-                Thread t = new Thread(r, "android-ccip");
+    // Runs the BLOCKING engine-API calls (requestAccount, ens().resolveAddress) off the
+    // caller's thread — the service's public surface stays CompletableFuture-based for
+    // the Kotlin bridge, so the blocking API call is wrapped here. Static daemon pool:
+    // queries may outlive a service instance teardown harmlessly.
+    private static final ExecutorService QUERY_POOL =
+            Executors.newCachedThreadPool(r -> {
+                Thread t = new Thread(r, "android-engine-query");
                 t.setDaemon(true);
                 return t;
             });
@@ -467,7 +498,7 @@ public final class NodeService extends Service {
             // The readiness traffic-light's green gate: a recent head means wallet
             // calls serve instead of hitting "no verified head".
             long verifiedHeadAgeMs,
-            List<RLPxConnector.PeerInfo> readyPeerList,
+            List<io.myotis.api.PeerInfo> readyPeerList,
             String network) {}            // active chain ("mainnet"/"gnosis")
 
     /** Result of a get-account query. Mirrors the JVM daemon's JSON response shape. */
@@ -511,7 +542,7 @@ public final class NodeService extends Service {
      *       trails finalized + a few recent optimistic slots.</li>
      *   <li><b>stateRootMatch</b> (fast-path shortcut) — if the peer's
      *       reported stateRoot happens to be one the BLC has already
-     *       attested ({@link BeaconSyncState#findStateRoot}), skip the
+     *       attested ({@code BeaconSyncState.findStateRoot}), skip the
      *       header fetch entirely. Rare in practice: only fires when the
      *       peer's head briefly aligns with a slot the BLC has just seen.</li>
      * </ul>
@@ -530,12 +561,17 @@ public final class NodeService extends Service {
     }
 
     public CompletableFuture<AccountQueryResult> requestAccount(String network, String hexAddress) {
-        io.myotis.node.ChainStack stack = stacks.get(canonicalNetwork(network));
-        return io.myotis.node.VerifiedAccountQuery.query(stack, hexAddress)
-                .thenApply(NodeService::toAccountQueryResult);
+        ChainHandle handle = handles.get(canonicalNetwork(network));
+        if (handle == null) {
+            return CompletableFuture.failedFuture(new IllegalStateException("Node is not running"));
+        }
+        // The engine call is blocking (snap fetch + verification ladder, internally
+        // timeout-bounded) — run it on the query pool and expose the future the UI expects.
+        return CompletableFuture.supplyAsync(
+                () -> toAccountQueryResult(handle.requestAccount(hexAddress)), QUERY_POOL);
     }
 
-    private static AccountQueryResult toAccountQueryResult(io.myotis.node.VerifiedAccountQuery.Result r) {
+    private static AccountQueryResult toAccountQueryResult(AccountProofResult r) {
         return new AccountQueryResult(
                 r.address(), r.exists(), r.nonce(), r.balanceWei(),
                 r.storageRootHex(), r.codeHashHex(), r.blockNumber(),
@@ -586,19 +622,18 @@ public final class NodeService extends Service {
                                 boolean beaconVerified, String error) {}
 
     /**
-     * Which state ENS resolution runs against. Defaults to the beacon-verified
-     * finalized root so resolved mappings are verified end-to-end; switch to
-     * {@link io.myotis.ens.EnsResolutionRoot#PEER_HEAD} for freshest (unverified)
-     * data. Library consumers can override via {@link #setEnsResolutionRoot}.
+     * Which state ENS resolution runs against. Defaults to AUTO (beacon-verified
+     * finalized root first, peer-head fallback); switch to {@link EnsRoot#PEER_HEAD}
+     * for freshest (unverified) data. Library consumers can override via
+     * {@link #setEnsResolutionRoot}.
      */
-    private volatile io.myotis.ens.EnsResolutionRoot ensResolutionRoot =
-            io.myotis.ens.EnsResolutionRoot.AUTO;
+    private volatile EnsRoot ensResolutionRoot = EnsRoot.AUTO;
 
-    public void setEnsResolutionRoot(io.myotis.ens.EnsResolutionRoot root) {
+    public void setEnsResolutionRoot(EnsRoot root) {
         if (root != null) this.ensResolutionRoot = root;
     }
 
-    public io.myotis.ens.EnsResolutionRoot getEnsResolutionRoot() {
+    public EnsRoot getEnsResolutionRoot() {
         return ensResolutionRoot;
     }
 
@@ -618,30 +653,32 @@ public final class NodeService extends Service {
         return resolveEns(primaryNetwork(this), name);
     }
 
-    @SuppressLint("NewApi") // CompletableFuture.orTimeout — see requestAccount
+    @SuppressLint("NewApi") // CompletableFuture.failedFuture — see requestAccount
     public CompletableFuture<EnsResolution> resolveEns(String network, String name) {
         final String trimmed = name == null ? "" : name.trim();
         final String n = canonicalNetwork(network);
-        // ENS is mainnet/Sepolia-only — Gnosis has no canonical registry (EnsResolver
-        // .forChainId throws for chainId 100). Refuse early so we never run ENS contracts
-        // against a chain that can't have them; the UI also hides the ENS path there.
-        if (!NetworkConfig.byName(n).hasEns()) {
+        // ENS is mainnet/Sepolia-only — refuse early so we never run ENS contracts against
+        // a chain that can't have them; the UI also hides the ENS path there.
+        if (!networkInfo(n).hasEns()) {
             return CompletableFuture.completedFuture(new EnsResolution(
                     trimmed, null, -1, false, "ENS is not available on " + n));
         }
-        // Delegate to the shared backend — the AUTO → FINALIZED → PEER_HEAD policy,
-        // snap-heavy pause, and CCIP handling all live there now (one impl for daemon
-        // + Android). Map its neutral io.myotis.rpc.EnsResolution back to the public
-        // NodeService.EnsResolution the UI (MainActivity) consumes.
-        io.myotis.node.ChainStack stack = stacks.get(n);
-        io.myotis.rpc.VerifiedRpcBackend b = stack != null ? stack.rpcBackend() : null;
-        if (!RUNNING.get() || b == null) {
+        ChainHandle handle = handles.get(n);
+        io.myotis.api.EnsApi ens = handle != null ? handle.ens() : null;
+        if (!RUNNING.get() || ens == null) {
             return CompletableFuture.completedFuture(
                     new EnsResolution(trimmed, null, -1, false, "node not running on " + n));
         }
-        return b.resolveEns(trimmed, ensResolutionRoot)
-                .thenApply(r -> new EnsResolution(
-                        r.name(), r.addressHex(), r.blockNumber(), r.verified(), r.error()));
+        // Delegate to the engine's shared resolution machinery (one AUTO → FINALIZED →
+        // PEER_HEAD policy for daemon + desktop + Android). The engine call is blocking —
+        // run on the query pool; NOTE the API's no-record convention: addressHex==null
+        // with error==null is a successful "name has no record".
+        final EnsRoot root = ensResolutionRoot;
+        return CompletableFuture.supplyAsync(() -> {
+            EnsResolutionResult r = ens.resolveAddress(trimmed, root);
+            return new EnsResolution(r.name(), r.addressHex(), r.blockNumber(),
+                    r.verified(), r.error());
+        }, QUERY_POOL);
     }
 
 
@@ -712,38 +749,25 @@ public final class NodeService extends Service {
     }
 
     /**
-     * Build and start one network's {@link io.myotis.node.ChainStack}, register it in
-     * {@link #stacks}, and capture its boot-time cached-peer counts. ChainStack owns
+     * Build and start one network's engine stack, register its handle in
+     * {@link #handles}, and capture its boot-time cached-peer counts. The engine owns
      * discv4/discv5/beacon/RPC + the snap-peer maintainer and serializes start()/shutdown()
      * internally, so a fast disable→enable (or rebootNetwork) of the same chain waits for
      * its own ports to free. Stops the service only if the very last stack fails to come up.
      */
     private void buildAndStart(String netName) {
         String n = canonicalNetwork(netName);
-        io.myotis.node.ChainStack s = null;
         try {
-            NetworkConfig network = NetworkConfig.byName(n);
             int rpcPort = rpcPortFor(this, n);
-            // VerifiedRpcBackend (built inside ChainStack.start() below) reads its state-read
-            // freshness mode from this process-wide property; mirror the user's Settings choice
-            // into it before the stack builds. Process-global, shared across all stacks.
-            System.setProperty(io.myotis.rpc.VerifiedRpcBackend.STRICT_STATE_FRESHNESS_PROP,
-                    String.valueOf(strictStateFreshness(this)));
             // Mirror the native-BLS toggle into the process-wide BlsBackends selection (set the
             // property + select() the backend). The Settings switch also applies it live on
-            // toggle; re-applying here keeps a freshly (re)started stack consistent.
+            // toggle; re-applying here keeps a freshly (re)started stack consistent. (This is
+            // an internal engine seam, not part of the api — deliberate.)
             String blsChoice = applyBlsBackend(this);
             LogBuffer.i(TAG, "[" + n + "] booting (snap target " + snapTarget(this)
                     + ", rpc port " + rpcPort
                     + ", state-freshness " + (strictStateFreshness(this) ? "strict" : "relaxed")
                     + ", bls " + blsChoice + ")");
-
-            // Identity: legacy mainnet keeps nodekey.hex; other chains get a per-network key
-            // so two chains in one process never share an identity.
-            Path keyFile = new java.io.File(getFilesDir(),
-                    n.equals("mainnet") ? "nodekey.hex" : "nodekey-" + n + ".hex").toPath();
-            NodeKey nodeKey = NodeKey.loadOrGenerate(keyFile);
-            LogBuffer.i(TAG, "[" + n + "] node ID " + nodeKey.nodeId().toHexString());
 
             // Reconstructible network state lives in getCacheDir() so "Clear cache" wipes the
             // peer caches + sync snapshot while identity / query history in getFilesDir() survive.
@@ -754,60 +778,105 @@ public final class NodeService extends Service {
             elCaches.put(n, pc);
             clCaches.put(n, cl);
 
-            // Per-network default EL/discv5 ports (gnosis 30304/9001, sepolia 30305/9002) keep
-            // stacks from colliding; the RPC port is the user-configurable one. ChainStack owns
-            // discv4/discv5/beacon/RPC and the snap-peer maintainer (shared :node-core lifecycle).
-            io.myotis.node.ChainPorts ports =
-                    io.myotis.node.ChainPorts.defaultsFor(network).withRpcPort(rpcPort);
-            s = new io.myotis.node.ChainStack(
-                    network, ports, nodeKey,
+            // EL/discv5 ports use the engine's per-network defaults (0); the RPC port is the
+            // user-configurable one. The snap maintainer keeps snap peers topped up (the
+            // discv4-independent path NAT'd mobile needs); Android supplies the active
+            // network's DNS servers for EIP-1459 resolution.
+            EngineConfig config = new EngineConfig(
+                    n, 0, 0, rpcPort,
+                    netCacheFor(n, "sync-state", ".snapshot").getAbsolutePath(),
+                    /*gossipsub*/ false,
+                    snapTarget(this),
+                    strictStateFreshness(this));
+            EnginePorts ports = new EnginePorts(
+                    // Identity: legacy mainnet keeps nodekey.hex; other chains get a
+                    // per-network key so two chains never share an identity.
+                    new AndroidNodeKeyStore(getFilesDir()),
                     new AndroidPeerCacheAdapter(pc),
                     new AndroidClPeerCacheAdapter(cl),
-                    new com.jaeckel.ethp2p.android.ens.AndroidCcipGateway(ccipPool),
-                    netCacheFor(n, "sync-state", ".snapshot").toPath(),
-                    /*gossipsub*/ false);
-            // Keep snap peers topped up (the discv4-independent path NAT'd mobile needs);
-            // Android supplies the active network's DNS servers for EIP-1459 resolution.
-            s.configureSnapMaintainer(snapTarget(this), this::activeNetworkDnsServers);
-            // Publish into the registry before start() so a concurrent shutdown()/disable can
-            // find and tear it down.
-            stacks.put(n, s);
+                    this::activeNetworkDnsServers,
+                    new com.jaeckel.ethp2p.android.ens.AndroidCcipGateway(),
+                    null, null); // engine default logger/clock
 
-            // Serialize start() against this network's teardown (bootLock) so a Stop→Start /
-            // disable→enable has this new instance's start() wait for the old instance's
-            // shutdown() to free the ports. A whole-service Stop (RUNNING=false) or a per-network
-            // disableNetwork(n) (sets enabled_<n>=false before tearing down) could race this boot,
-            // so bail if either says the chain is no longer wanted — re-checked after start() too,
+            // create() + start() under the per-network bootLock: a Stop→Start / disable→enable
+            // has this boot wait for the old instance's teardown (which holds the same lock) to
+            // free the ports AND unregister from the engine (create() throws on a still-hosted
+            // network). A whole-service Stop or a per-network disable could race this boot, so
+            // bail if either says the chain is no longer wanted — re-checked after start() too,
             // since start() blocks and the race window spans it.
             synchronized (bootLock(n)) {
                 if (!RUNNING.get() || !isNetworkEnabled(this, n)) {
-                    LogBuffer.i(TAG, "[" + n + "] stop/disable raced boot; tearing down constructed stack");
+                    LogBuffer.i(TAG, "[" + n + "] stop/disable raced boot; skipping");
                     forgetStack(n);
-                    s.shutdown();
                     stopIfNoStacksLeft();
                     return;
                 }
-                if (!s.start()) {
+                if (ENGINE.get(n) != null) {
+                    // Already hosted: a genuine double-enable, or a teardown we raced won the
+                    // lock first and hasn't unregistered yet (it holds this lock, so by the
+                    // time we're here it HAS — this branch is then a plain double-enable).
+                    // Log it so an enabled-but-dead chain is diagnosable, and make the UI map
+                    // consistent with the engine either way.
+                    LogBuffer.i(TAG, "[" + n + "] boot skipped: already hosted by the engine");
+                    ChainHandle existing = ENGINE.get(n);
+                    if (existing != null) handles.putIfAbsent(n, existing);
+                    return;
+                }
+                ChainHandle handle = ENGINE.create(config, ports);
+                handles.put(n, handle);
+                if (!handle.start()) {
                     LogBuffer.e(TAG, "[" + n + "] node stack failed to start");
                     forgetStack(n);
+                    try { ENGINE.stop(n); } catch (Throwable ignored) {}
                     stopIfNoStacksLeft();
                     return;
                 }
                 if (!RUNNING.get() || !isNetworkEnabled(this, n)) {
                     LogBuffer.i(TAG, "[" + n + "] stop/disable raced start; tearing down");
                     forgetStack(n);
-                    s.shutdown();
+                    try { ENGINE.stop(n); } catch (Throwable ignored) {}
                     stopIfNoStacksLeft();
                     return;
                 }
             }
-            LogBuffer.i(TAG, "[" + n + "] node stack started (EL " + ports.elPort()
-                    + ", RPC " + ports.rpcPort() + ")");
+            LogBuffer.i(TAG, "[" + n + "] node stack started (RPC " + rpcPort + ")");
         } catch (Exception e) {
             LogBuffer.e(TAG, "[" + n + "] node boot failed", e);
-            if (s != null) { try { s.shutdown(); } catch (Throwable ignored) {} }
             forgetStack(n);
+            try { ENGINE.stop(n); } catch (Throwable ignored) {}
             stopIfNoStacksLeft();
+        }
+    }
+
+    /** Node-identity storage over getFilesDir(): one hex file per network, byte-compatible
+     *  with the files NodeKey.loadOrGenerate has always written (identities carry over). */
+    private static final class AndroidNodeKeyStore implements NodeKeyStore {
+        private final java.io.File filesDir;
+        AndroidNodeKeyStore(java.io.File filesDir) { this.filesDir = filesDir; }
+        private Path fileFor(String network) {
+            return new java.io.File(filesDir,
+                    network.equals("mainnet") ? "nodekey.hex" : "nodekey-" + network + ".hex").toPath();
+        }
+        @Override public byte[] load(String networkName) {
+            Path file = fileFor(networkName);
+            if (!Files.exists(file)) return null;
+            try {
+                String hex = new String(Files.readAllBytes(file),
+                        java.nio.charset.StandardCharsets.UTF_8).strip();
+                if (hex.startsWith("0x") || hex.startsWith("0X")) hex = hex.substring(2);
+                return HexFormat.of().parseHex(hex);
+            } catch (Exception e) {
+                throw new RuntimeException("failed to read node key " + file + ": " + e.getMessage(), e);
+            }
+        }
+        @Override public void store(String networkName, byte[] secret32) {
+            Path file = fileFor(networkName);
+            try {
+                Files.write(file, ("0x" + HexFormat.of().formatHex(secret32))
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            } catch (Exception e) {
+                throw new RuntimeException("failed to write node key " + file + ": " + e.getMessage(), e);
+            }
         }
     }
 
@@ -843,18 +912,17 @@ public final class NodeService extends Service {
      * with bind-in-use.
      */
     private synchronized void doShutdown() {
-        // Shut down and drop every stack. Each ChainStack owns its own close order
-        // (RPC server + backend, beacon LC, connector, discv4/5, peer caches) and
-        // serializes start()/shutdown() internally, so the next start() of the same
-        // chain waits for its ports to free.
-        for (Map.Entry<String, io.myotis.node.ChainStack> e : stacks.entrySet()) {
+        // Stop and drop every network. Iterate the ENGINE's registry (not this instance's
+        // mirror map): with a process-global engine, "stop everything" must be scoped to
+        // what the engine actually hosts, or a handles/engine divergence would leak a stack.
+        for (String n : ENGINE.hostedNetworks()) {
             // Hold the per-network lock so a racing buildAndStart for the same chain can't start a
             // new instance while we're tearing the old one down (would race for the same ports).
-            synchronized (bootLock(e.getKey())) {
-                try { e.getValue().shutdown(); } catch (Throwable ignored) {}
+            synchronized (bootLock(n)) {
+                try { ENGINE.stop(n); } catch (Throwable ignored) {}
             }
         }
-        stacks.clear();
+        handles.clear();
         cachedElCounts.clear();
         cachedClCounts.clear();
         elCaches.clear();
@@ -887,10 +955,10 @@ public final class NodeService extends Service {
     }
 
     private void doClearCaches(String n) {
-        // Backoff/blacklist live in the stack; clear them there so "Clear caches" gives
-        // discovery a fresh slate (the on-disk peer caches are wiped below).
-        io.myotis.node.ChainStack s = stacks.get(n);
-        if (s != null) { s.backoff().clear(); s.blacklistedNodeIds().clear(); }
+        // Backoff/blacklist live in the engine; clear them through the API so "Clear caches"
+        // gives discovery a fresh slate (the on-disk peer caches are wiped below).
+        ChainHandle h = handles.get(n);
+        if (h != null) { try { h.clearPeerState(); } catch (Throwable ignored) {} }
         cachedElCounts.put(n, 0);
         cachedClCounts.put(n, 0);
         // Clear the live cache instance when the chain is up (also wipes the file); when it's
@@ -938,8 +1006,8 @@ public final class NodeService extends Service {
     public Map<String, Snapshot> snapshots() {
         Map<String, Snapshot> out = new java.util.LinkedHashMap<>();
         for (String n : liveNetworks()) {
-            io.myotis.node.ChainStack s = stacks.get(n);
-            if (s != null) out.put(n, snapshotOf(n, s));
+            ChainHandle h = handles.get(n);
+            if (h != null) out.put(n, snapshotOf(n, h));
         }
         return out;
     }
@@ -947,105 +1015,43 @@ public final class NodeService extends Service {
     /** Back-compat: snapshot of the primary enabled network (null when nothing is live). */
     public Snapshot snapshot() {
         String n = primaryNetwork(this);
-        io.myotis.node.ChainStack s = stacks.get(n);
-        return s != null ? snapshotOf(n, s) : null;
+        ChainHandle h = handles.get(n);
+        return h != null ? snapshotOf(n, h) : null;
     }
 
-    /** Build the UI snapshot for one network from its stack's getters. Tolerates a stack
-     *  mid-boot (null connector/discv5/beacon) — those read as zeros / STOPPED. */
-    private Snapshot snapshotOf(String network, io.myotis.node.ChainStack s) {
+    /** Build the UI snapshot for one network from the engine's status surfaces. Tolerates a
+     *  stack mid-boot — the engine reads those as zeros / STARTING (mapped to STOPPED here,
+     *  the string this UI has always shown pre-beacon). */
+    private Snapshot snapshotOf(String network, ChainHandle h) {
         boolean running = RUNNING.get();
-        int attemptedN = s.attemptedCount();
-        // Active backoff count, pruning expired entries as we go — backoff().size() alone would
-        // count stale (expired) entries and let the map grow unbounded over long uptimes, since
-        // the dial path only drops an entry when that peer is re-encountered.
-        int backoffN = s.pruneAndCountActiveBackoff();
-        int blacklistedN = s.blacklistedNodeIds().size();
-        DiscV5Service discV5 = s.discV5();
-        int discv5Live = discV5 != null ? discV5.liveNodeCount() : 0;
+        StatusSnapshot s = h.status();
+        BeaconStatus bs = h.beaconStatus();
         int cachedEl = cachedElCounts.getOrDefault(network, 0);
         int cachedCl = cachedClCounts.getOrDefault(network, 0);
-        BeaconStats bs = beaconStatsSnapshot(s);
-        RLPxConnector connector = s.connector();
-        if (!running || connector == null) {
+        String beaconState = bs.state() == BeaconState.STARTING ? "STOPPED" : bs.state().name();
+        // Catch-up progress: preserve the historical -1-until-known convention (the engine
+        // API defaults these to 0 pre-beacon) for the UI's determinate progress bar.
+        boolean preBeacon = bs.state() == BeaconState.STARTING;
+        long syncCurrent = preBeacon ? -1 : s.syncCurrentPeriod();
+        long syncTarget = preBeacon ? -1 : s.syncTargetPeriod();
+        if (!running || !s.running()) {
             return new Snapshot(running, startTimeMs, 0, 0, 0, 0, /*snapServing*/0,
-                    cachedEl, attemptedN, backoffN,
-                    blacklistedN, discv5Live, 0,
-                    bs.state, bs.bootstrapped, bs.connected, bs.lc,
-                    cachedCl, bs.finalizedSlot, bs.execBlockNum, bs.execBlockHashHex,
-                    bs.syncStartPeriod, bs.syncCurrentPeriod, bs.syncTargetPeriod,
+                    cachedEl, s.attemptedDials(), s.backedOffPeers(),
+                    s.blacklistedPeers(), s.discv5TableSize(), 0,
+                    beaconState, bs.bootstrapped(), bs.connectedPeers(), (int) bs.lightClientPeers(),
+                    cachedCl, bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
+                    s.syncStartPeriod(), syncCurrent, syncTarget,
                     Long.MAX_VALUE, List.of(), network);
         }
-        List<RLPxConnector.PeerInfo> active = connector.getActivePeers();
-        List<RLPxConnector.PeerInfo> ready = new ArrayList<>();
-        int snapCount = 0;
-        for (RLPxConnector.PeerInfo p : active) {
-            if ("READY".equals(p.state())) {
-                ready.add(p);
-                if (p.snapSupported()) snapCount++;
-            }
-        }
-        // snap peers first, then by clientId. Mirrors peers.sh.
-        ready.sort(Comparator
-                .comparing(RLPxConnector.PeerInfo::snapSupported).reversed()
-                .thenComparing(p -> p.clientId() == null ? "" : p.clientId()));
-        DiscV4Service discV4 = s.discV4();
-        int tableSize = discV4 != null ? discV4.table().size() : 0;
-        io.myotis.rpc.VerifiedRpcBackend backend = s.rpcBackend();
-        long headAge = backend != null ? backend.verifiedHeadAgeMs() : Long.MAX_VALUE;
-        // Serving pool = what head builds / heavy confirm screens actually use (filters out
-        // peers benched by snapServingFailed). Distinct from snapCount (negotiated) — surfacing
-        // it makes a serving-pool collapse visible instead of hidden behind the headline count.
-        int snapServing = connector.activeSnapHandlers().size();
-        return new Snapshot(true, startTimeMs, tableSize, active.size(), ready.size(), snapCount, snapServing,
-                cachedEl, attemptedN, backoffN,
-                blacklistedN, discv5Live, 0,
-                bs.state, bs.bootstrapped, bs.connected, bs.lc,
-                cachedCl, bs.finalizedSlot, bs.execBlockNum, bs.execBlockHashHex,
-                bs.syncStartPeriod, bs.syncCurrentPeriod, bs.syncTargetPeriod,
-                headAge, ready, network);
-    }
-
-    /** Per-snapshot beacon view, computed once so the record fields stay consistent. */
-    private record BeaconStats(String state, boolean bootstrapped, int connected, int lc,
-                               long finalizedSlot, long execBlockNum, String execBlockHashHex,
-                               // Sync-committee-period catch-up progress (all -1 until known):
-                               // start = period catch-up began from, current = period the store
-                               // holds now, target = wall-clock period. Lets the UI draw a
-                               // determinate progress bar during CATCHING_UP.
-                               long syncStartPeriod, long syncCurrentPeriod, long syncTargetPeriod) {}
-
-    private BeaconStats beaconStatsSnapshot(io.myotis.node.ChainStack s) {
-        BeaconLightClient blc = s.beaconLightClient();
-        BeaconSyncState bss = s.beaconSyncState();
-        // Genesis time is a constant of the network config (no async publish to race), so the
-        // STARTING guard the single-stack code needed no longer applies; still treat blc/bss
-        // not-yet-wired as STOPPED. Network slot time (Gnosis is 5s, not 12) drives the
-        // wall-clock period; without it the CATCHING_UP/SYNCED classification is wrong.
-        long genesis = s.network().clGenesisTime();
-        int secondsPerSlot = s.network().secondsPerSlot();
-        if (blc == null || bss == null || genesis <= 0L) {
-            return new BeaconStats("STOPPED", false, 0, 0, 0L, 0L, null, -1, -1, -1);
-        }
-        List<BeaconP2PService.PeerInfo> peers = blc.getConnectedPeers();
-        int lc = 0;
-        for (BeaconP2PService.PeerInfo p : peers) {
-            if (p.supportsLightClient()) lc++;
-        }
-        byte[] execHash = bss.getExecutionBlockHash();
-        String execHashHex = execHash == null ? null
-                : org.apache.tuweni.bytes.Bytes.wrap(execHash).toHexString();
-        return new BeaconStats(
-                bss.getSyncState(genesis, secondsPerSlot).name(),
-                blc.isBootstrapped(),
-                peers.size(),
-                lc,
-                bss.getFinalizedSlot(),
-                bss.getExecutionBlockNumber(),
-                execHashHex,
-                bss.getCatchUpStartPeriod(),
-                bss.getCurrentSyncCommitteePeriod(),
-                com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec.currentPeriod(genesis, secondsPerSlot));
+        return new Snapshot(true, startTimeMs,
+                s.discoveredPeers(), s.connectedPeers(), s.readyPeers(),
+                s.snapPeers(), s.snapServingPeers(),
+                cachedEl, s.attemptedDials(), s.backedOffPeers(),
+                s.blacklistedPeers(), s.discv5TableSize(), 0,
+                beaconState, bs.bootstrapped(), bs.connectedPeers(), (int) bs.lightClientPeers(),
+                cachedCl, bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
+                s.syncStartPeriod(), syncCurrent, syncTarget,
+                s.verifiedHeadAgeMs(), s.readyPeerList(), network);
     }
 
     @Override
@@ -1057,7 +1063,6 @@ public final class NodeService extends Service {
         // tears every stack down under each network's bootLock, so a subsequent
         // service start can't race with a half-finished close.
         RUNNING.set(false);
-        ccipPool.shutdownNow();
         new Thread(this::doShutdown, "ethp2p-shutdown").start();
         super.onDestroy();
     }
