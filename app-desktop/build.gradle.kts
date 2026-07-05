@@ -86,10 +86,11 @@ compose.desktop {
             languageVersion.set(JavaLanguageVersion.of(21))
         }.get().metadata.installationPath.asFile.absolutePath
         nativeDistributions {
-            // macOS first (Apple Silicon). The .dmg can only be PRODUCED on macOS (jpackage
-            // is host-OS-bound) — build/run on Linux for dev; package the dmg on a macOS CI
-            // runner. Add Deb/Msi when those hosts exist.
-            targetFormats(TargetFormat.Dmg)
+            // jpackage is host-OS-bound: the .dmg can only be produced on macOS, the .deb only
+            // on Linux. CI builds each on its matching runner (desktop-dmg.yml /
+            // desktop-linux-deb.yml); locally you get the format for your OS. Msi when a
+            // Windows host exists.
+            targetFormats(TargetFormat.Dmg, TargetFormat.Deb)
             packageName = "Myotis"
             packageVersion = "1.0.0"  // jpackage/dmg requires MAJOR > 0
             // Bundle the FULL JDK module graph. jlink otherwise strips the runtime to the
@@ -101,6 +102,12 @@ compose.desktop {
             includeAllModules = true
             macOS {
                 bundleID = "io.myotis.desktop"
+            }
+            linux {
+                // Unlike the dmg (jpackage requires major > 0 on macOS), deb versions may
+                // start at 0 — so Linux carries the app's honest version.
+                packageVersion = "0.1.0"
+                debMaintainer = "dirk@jaeckel.com"
             }
         }
     }
