@@ -142,10 +142,22 @@ data class NodeSnapshot(
     val snapPeers: Int,             // peers that negotiated snap/1 (capability)
     val snapServingPeers: Int,      // peers actually in the serving pool now (drives readiness)
     val discoveredPeers: Int,
+    val backedOffPeers: Int,        // peers in dial backoff right now
+    val blacklistedPeers: Int,      // peers permanently blacklisted this session
+    val discv5Peers: Int,           // live nodes in the discv5 (CL) routing table
     val executionBlockNumber: Long,
     val finalizedSlot: Long,
+    val syncStartPeriod: Long,      // sync-committee catch-up start period (-1 if unknown)
     val syncCurrentPeriod: Long,
     val syncTargetPeriod: Long,
     val verifiedHeadAgeMs: Long,
     val uptimeSeconds: Long,
+    val readyPeerList: List<PeerRow>,  // per-peer detail for the READY peers
+)
+
+/** One connected READY peer, for the Status peer list. */
+data class PeerRow(
+    val remoteAddress: String,
+    val snapSupported: Boolean,
+    val clientId: String?,          // null until the peer sends Hello
 )

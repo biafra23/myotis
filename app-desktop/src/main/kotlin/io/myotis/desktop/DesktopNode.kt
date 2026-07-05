@@ -18,6 +18,7 @@ import io.myotis.ui.EnsResult
 import io.myotis.ui.NetworkStatus
 import io.myotis.ui.NodeController
 import io.myotis.ui.NodeSnapshot
+import io.myotis.ui.PeerRow
 import io.myotis.ui.Settings
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -231,26 +232,35 @@ class DesktopNodeController(private val dataDir: Path, private val settings: Set
         val active = conn?.activePeers ?: emptyList()
         // "ready" = peers past the eth handshake, matching Android's filtered count (the raw
         // active list also includes peers still negotiating Hello/Status).
-        val ready = active.count { "READY" == it.state() }
+        val readyList = active.filter { "READY" == it.state() }
         val backend = stack.rpcBackend()
         return NodeSnapshot(
             running = stack.isRunning,
             network = net.name(),
             beaconState = state,
             connectedPeers = active.size,
-            readyPeers = ready,
+            readyPeers = readyList.size,
             snapPeers = conn?.activeSnapHandlers()?.size ?: 0,
             // Desktop's connector exposes only the serving handlers, so serving == negotiated here.
             snapServingPeers = conn?.activeSnapHandlers()?.size ?: 0,
             discoveredPeers = disc4?.table()?.size() ?: 0,
+            // Prune expired entries before counting (backoff() leaks expired entries until a peer
+            // is re-encountered) — matches Android's NodeService, which uses this same accessor.
+            backedOffPeers = stack.pruneAndCountActiveBackoff(),
+            blacklistedPeers = stack.blacklistedNodeIds().size,
+            discv5Peers = stack.discV5()?.liveNodeCount() ?: 0,
             executionBlockNumber = bss?.executionBlockNumber ?: 0L,
             finalizedSlot = bss?.finalizedSlot ?: 0L,
+            syncStartPeriod = bss?.catchUpStartPeriod ?: -1L,
             syncCurrentPeriod = bss?.currentSyncCommitteePeriod ?: 0L,
             syncTargetPeriod = BeaconChainSpec.currentPeriod(net.clGenesisTime(), net.secondsPerSlot()),
             // Real age of the last verified RPC head, or MAX_VALUE if RPC hasn't built one yet
             // (same sentinel Android's NodeService uses; the UI renders it as "—").
             verifiedHeadAgeMs = backend?.verifiedHeadAgeMs() ?: Long.MAX_VALUE,
             uptimeSeconds = (System.nanoTime() - startNs) / 1_000_000_000L,
+            // snap-capable peers first (matches Android's ordering).
+            readyPeerList = readyList.sortedByDescending { it.snapSupported() }
+                .map { PeerRow(it.remoteAddress(), it.snapSupported(), it.clientId()) },
         )
     }
 }

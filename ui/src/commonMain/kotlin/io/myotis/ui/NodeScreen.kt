@@ -24,6 +24,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -388,6 +389,7 @@ private fun StatusTab(
         if (snap == null) {
             Text("Node stopped — no data for $primary")
         } else {
+            SyncProgressBar(snap)
             StatusView(snap)
         }
 
@@ -421,6 +423,60 @@ private fun StatusTab(
             onClick = { controller.resetSyncState(primary) },
             modifier = Modifier.fillMaxWidth(),
         ) { Text("Reset sync state") }
+
+        // Per-peer detail for the READY peers (address, snap support, client id).
+        if (snap != null && snap.readyPeerList.isNotEmpty()) {
+            Spacer(Modifier.height(16.dp))
+            Text("READY peers (${snap.readyPeerList.size})", style = MaterialTheme.typography.titleSmall)
+            Spacer(Modifier.height(4.dp))
+            snap.readyPeerList.forEach { PeerRowView(it) }
+        }
+    }
+}
+
+/** App-wide beacon sync banner: indeterminate while bootstrapping, determinate as the light
+ *  client catches up sync-committee periods, gone once SYNCED. */
+@Composable
+private fun SyncProgressBar(s: NodeSnapshot) {
+    if (!s.running || s.beaconState == "SYNCED" || s.beaconState == "STOPPED") return
+    val start = s.syncStartPeriod
+    val current = s.syncCurrentPeriod
+    val target = s.syncTargetPeriod
+    val determinate = s.beaconState == "CATCHING_UP" && start >= 0 && target > start
+    Column(Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
+        Text(
+            when {
+                !determinate -> "Bootstrapping light client…"
+                current >= target -> "Finishing sync…"
+                else -> "Catching up sync committees — period $current / $target"
+            },
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Spacer(Modifier.height(4.dp))
+        if (determinate) {
+            val progress = ((current - start).toFloat() / (target - start).toFloat()).coerceIn(0f, 1f)
+            LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+        } else {
+            LinearProgressIndicator(Modifier.fillMaxWidth())
+        }
+    }
+}
+
+/** One tappable-free READY-peer row: address + snap flag, with the client id beneath. */
+@Composable
+private fun PeerRowView(p: PeerRow) {
+    Column(Modifier.padding(vertical = 2.dp)) {
+        Text(
+            "${p.remoteAddress}  snap=${p.snapSupported}",
+            fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+            maxLines = 1, overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            p.clientId ?: "(no clientId)",
+            fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1, overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
@@ -457,8 +513,11 @@ private fun StatusView(s: NodeSnapshot) {
         StatusRow("Network", s.network)
         StatusRow("Beacon", s.beaconState)
         StatusRow("EL block", s.executionBlockNumber.toString())
-        StatusRow("Peers", "${s.connectedPeers} (ready ${s.readyPeers}, snap ${s.snapPeers})")
+        StatusRow("Peers", "${s.connectedPeers} (ready ${s.readyPeers}, snap ${s.snapPeers}, serving ${s.snapServingPeers})")
         StatusRow("Discovered", s.discoveredPeers.toString())
+        StatusRow("discv5 peers", s.discv5Peers.toString())
+        StatusRow("In backoff", s.backedOffPeers.toString())
+        StatusRow("Blacklisted", s.blacklistedPeers.toString())
         StatusRow("Sync period", "${s.syncCurrentPeriod} / ${s.syncTargetPeriod}")
         // verifiedHeadAgeMs == Long.MAX_VALUE is the "no verified head yet" sentinel — show a
         // dash instead of the raw ~9.2e18 ms, which would read as a nonsensical age.
@@ -653,10 +712,23 @@ private fun looksLikeEnsName(input: String): Boolean {
 
 @Composable
 private fun AccountResultView(a: AccountResult) {
+    val clipboard = LocalClipboardManager.current
     Column {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("Result", style = MaterialTheme.typography.titleSmall)
+            // One-tap copy of the FULL result (untruncated hex), for pasting into a block explorer.
+            OutlinedButton(onClick = { clipboard.setText(AnnotatedString(formatAccountResult(a))) }) {
+                Text("Copy")
+            }
+        }
         StatusRow("Address", a.address)
         StatusRow("Exists", a.exists.toString())
         if (a.exists) {
+            StatusRow("Balance (ETH)", formatEth(a.balanceWei))
             StatusRow("Balance (wei)", a.balanceWei ?: "—")
             StatusRow("Nonce", a.nonce.toString())
             StatusRow("Storage root", a.storageRootHex ?: "—")
@@ -682,9 +754,58 @@ private fun AccountResultView(a: AccountResult) {
     }
 }
 
+/** Wei (decimal string) → ETH with 6 dp, truncated toward zero. Pure-Kotlin (commonMain has no
+ *  java.math.BigDecimal): pad to ≥19 digits, split at the 18th from the right. Non-numeric input
+ *  passes through unchanged. */
+private fun formatEth(weiDecimal: String?): String {
+    if (weiDecimal == null) return "—"
+    val neg = weiDecimal.startsWith("-")
+    val digits = weiDecimal.trimStart('-')
+    if (digits.isEmpty() || !digits.all { it in '0'..'9' }) return weiDecimal
+    val padded = digits.padStart(19, '0')
+    val intPart = padded.dropLast(18).trimStart('0').ifEmpty { "0" }
+    val frac = padded.takeLast(18).take(6)
+    return (if (neg) "-" else "") + "$intPart.$frac"
+}
+
+/** Full plaintext dump of an account result for the clipboard (untruncated hex). */
+private fun formatAccountResult(a: AccountResult): String = buildString {
+    appendLine("address: ${a.address}")
+    appendLine("exists: ${a.exists}")
+    if (a.exists) {
+        appendLine("balance (ETH): ${formatEth(a.balanceWei)}")
+        appendLine("balance (wei): ${a.balanceWei ?: "—"}")
+        appendLine("nonce: ${a.nonce}")
+        a.storageRootHex?.let { appendLine("storageRoot: $it") }
+        a.codeHashHex?.let { appendLine("codeHash: $it") }
+    }
+    appendLine("block: ${a.blockNumber}")
+    a.peerStateRootHex?.let { appendLine("peerStateRoot: $it") }
+    appendLine("peerProofValid: ${a.peerProofValid}")
+    appendLine("beaconVerified: ${a.beaconChainVerified}")
+    if (a.beaconChainVerified) {
+        a.verifyMethod?.let { appendLine("method: $it") }
+        appendLine("matchedSlot: ${a.matchedBeaconSlot}")
+        appendLine("blsVerified: ${a.blsVerified}")
+    } else {
+        a.failReason?.let { appendLine("failReason: $it") }
+    }
+}
+
 @Composable
 private fun EnsResultView(e: EnsResult) {
+    val clipboard = LocalClipboardManager.current
     Column {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("ENS", style = MaterialTheme.typography.titleSmall)
+            e.addressHex?.let { addr ->
+                OutlinedButton(onClick = { clipboard.setText(AnnotatedString(addr)) }) { Text("Copy address") }
+            }
+        }
         StatusRow("Name", e.name)
         StatusRow("Address", e.addressHex ?: "—")
         StatusRow("Block", if (e.blockNumber >= 0) e.blockNumber.toString() else "—")
