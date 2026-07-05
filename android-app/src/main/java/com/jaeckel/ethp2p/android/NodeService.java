@@ -107,6 +107,7 @@ public final class NodeService extends Service {
     private static final String K_DEEP_POOL = "deepPoolThreshold";
     private static final String K_STRICT_FRESHNESS = "strictStateFreshness";
     private static final String K_NATIVE_BLS = "nativeBls";
+    private static final String K_RUST_ENGINE = "rustEngine";
     public static final int DEFAULT_RPC_PORT = 8545;
     // Gnosis defaults to a distinct port so both networks can be added to MetaMask
     // at once: MetaMask refuses to save two RPC endpoints that share the same URL
@@ -125,10 +126,11 @@ public final class NodeService extends Service {
      * The engine, and its static network catalog for the pref helpers below (they're
      * static — callable from Activities without a bound service). One process-global
      * engine mirrors the process-global RUNNING flag: service instances come and go,
-     * the hosted-network registry persists across them. The single line naming a
-     * concrete engine class.
+     * the hosted-network registry persists across them. The composition root is the
+     * :myotis-engines selector — `myotis.engine` (the Settings "Rust engine" toggle
+     * via {@link #applyEngineChoice}) picks Java or Rust per network (re)start.
      */
-    private static final MyotisEngine ENGINE = new io.myotis.node.api.JavaMyotisEngine();
+    private static final MyotisEngine ENGINE = io.myotis.engines.Engines.engine();
     private static final List<NetworkInfo> NETWORKS = ENGINE.availableNetworks();
 
     private static NetworkInfo networkInfo(String canonical) {
@@ -300,6 +302,25 @@ public final class NodeService extends Service {
         boolean debuggable = (c.getApplicationInfo().flags
                 & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0;
         return debuggable ? "compare" : "auto";
+    }
+    /** Settings toggle: prefer the (experimental) Rust engine for newly started networks.
+     *  Default off — the Java engine is the proven path. */
+    public static boolean rustEngineEnabled(android.content.Context c) {
+        return prefs(c).getBoolean(K_RUST_ENGINE, false);
+    }
+    public static void setRustEngineEnabled(android.content.Context c, boolean v) {
+        prefs(c).edit().putBoolean(K_RUST_ENGINE, v).apply();
+    }
+    /** Apply the Rust-engine setting to the process-wide {@code Engines} selector. Maps
+     *  enabled → {@code auto} (prefer Rust where it can serve, fall back to Java with a
+     *  log — the Rust engine is catalog-only today), disabled → {@code java}. Unlike the
+     *  BLS toggle this is NOT live: networks keep the engine that created them; the new
+     *  choice applies on the next network (re)start. Returns the applied choice. */
+    public static String applyEngineChoice(android.content.Context c) {
+        String choice = rustEngineEnabled(c) ? "auto" : "java";
+        System.setProperty(io.myotis.engines.Engines.PROP, choice);
+        io.myotis.engines.Engines.select(choice);
+        return choice;
     }
     /** Live-update the snap-peer target (no restart) on every live stack and persist it. */
     public void setTargetSnapPeers(int v) {
@@ -766,10 +787,14 @@ public final class NodeService extends Service {
             // toggle; re-applying here keeps a freshly (re)started stack consistent. (This is
             // an internal engine seam, not part of the api — deliberate.)
             String blsChoice = applyBlsBackend(this);
+            // Same idea for the engine choice: the Settings toggle also applies it on flip,
+            // re-applying here makes a freshly (re)started network honor the current setting.
+            String engineChoice = applyEngineChoice(this);
             LogBuffer.i(TAG, "[" + n + "] booting (snap target " + snapTarget(this)
                     + ", rpc port " + rpcPort
                     + ", state-freshness " + (strictStateFreshness(this) ? "strict" : "relaxed")
-                    + ", bls " + blsChoice + ")");
+                    + ", bls " + blsChoice
+                    + ", engine " + engineChoice + ")");
 
             // create() + start() under the per-network bootLock: a Stop→Start / disable→enable
             // has this boot wait for the old instance's teardown (which holds the same lock) to
@@ -819,7 +844,10 @@ public final class NodeService extends Service {
                         netCacheFor(n, "sync-state", ".snapshot").getAbsolutePath(),
                         /*gossipsub*/ false,
                         snapTarget(this),
-                        strictStateFreshness(this));
+                        strictStateFreshness(this),
+                        // Reconstructible engine-owned state belongs with the other network
+                        // caches so "Clear cache" wipes it too.
+                        getCacheDir().getAbsolutePath());
                 EnginePorts ports = new EnginePorts(
                         // Identity: legacy mainnet keeps nodekey.hex; other chains get a
                         // per-network key so two chains never share an identity.

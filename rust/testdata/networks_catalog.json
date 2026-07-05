@@ -1,0 +1,35 @@
+[
+  {
+    "name": "mainnet",
+    "displayName": "Ethereum Mainnet",
+    "chainId": 1,
+    "hasEns": true,
+    "defaultElPort": 30303,
+    "defaultDiscv5Port": 9000,
+    "defaultRpcPort": 8545,
+    "clGenesisTime": 1606824023,
+    "secondsPerSlot": 12
+  },
+  {
+    "name": "gnosis",
+    "displayName": "Gnosis Chain",
+    "chainId": 100,
+    "hasEns": false,
+    "defaultElPort": 30304,
+    "defaultDiscv5Port": 9001,
+    "defaultRpcPort": 8546,
+    "clGenesisTime": 1638993340,
+    "secondsPerSlot": 5
+  },
+  {
+    "name": "sepolia",
+    "displayName": "Sepolia",
+    "chainId": 11155111,
+    "hasEns": true,
+    "defaultElPort": 30305,
+    "defaultDiscv5Port": 9002,
+    "defaultRpcPort": 8547,
+    "clGenesisTime": 1655733600,
+    "secondsPerSlot": 12
+  }
+]

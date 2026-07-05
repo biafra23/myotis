@@ -25,6 +25,17 @@
   3. only programmer/state errors throw — one type, `EngineException`, which UniFFI
      models as a single flat `Error` enum.
 
+> **Status / decision (phase 1, in progress).** The first Rust-engine PRs bind via
+> **hand-JNI + JSON**, not UniFFI: `:myotis-engines` selects the engine
+> (`Engines.engine()`, `myotis.engine=java|rust|auto`), `RustEngineNative` declares a
+> small set of static natives against `rust/myotis-engine` (cdylib), and compound
+> values cross as JSON strings whose schemas are pinned by golden tests on BOTH sides
+> (`rust/testdata/networks_catalog.json` ⇄ `catalog::tests` ⇄ `NetworksJsonGoldenTest`).
+> Rationale: UniFFI's generated-bindings build step conflicts with the "cargo strictly
+> optional" requirement, and the phase-1 surface is ~a dozen natives. A stale-library
+> guard (`nativeInit()` ABI-version handshake) protects the boundary. The UniFFI
+> mapping below remains the reference for when the surface grows or iOS arrives.
+
 ## 2. Interface → binding map
 
 | `io.myotis.api` | UniFFI construct | Rust shape |

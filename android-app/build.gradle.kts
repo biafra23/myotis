@@ -205,6 +205,9 @@ dependencies {
     // hosts). NodeService builds one ChainStack per enabled network via Android cache
     // adapters, so the per-network EL+CL+RPC lifecycle lives once for both hosts.
     implementation(project(":node-core"))
+    // Engine selector: NodeService.ENGINE is Engines.engine(); the Settings "Rust
+    // engine" toggle drives it via NodeService.applyEngineChoice.
+    implementation(project(":myotis-engines"))
 
     // Shared Compose-Multiplatform UI + the NodeController/Settings seam. The Android
     // actuals (AndroidNodeController/AndroidSettings) back it with NodeService, so the

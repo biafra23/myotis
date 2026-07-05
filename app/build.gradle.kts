@@ -23,6 +23,9 @@ dependencies {
     // file-backed cache adapters + the JVM CCIP gateway and hosts the same stacks
     // the Android app does.
     implementation(project(":node-core"))
+    // The engine selector: Main's composition root is Engines.engine(), routing to
+    // the Java or Rust engine per -Dmyotis.engine.
+    implementation(project(":myotis-engines"))
     // :app source references io.netty.channel.* (via :networking's RLPxConnector
     // API). With io.netty excluded group-wide, the fork must be on :app's compile
     // classpath explicitly (:networking declares it as implementation, so it
@@ -73,6 +76,8 @@ tasks.register<JavaExec>("run") {
     // -Pbls=milagro|native|compare|auto → -Dmyotis.bls.backend (e.g. compare logs a
     // per-verify Milagro-vs-native head-to-head during a live sync).
     (project.findProperty("bls") as String?)?.let { systemProperty("myotis.bls.backend", it) }
+    // -Pengine=java|rust|auto → -Dmyotis.engine (the :myotis-engines selector).
+    (project.findProperty("engine") as String?)?.let { systemProperty("myotis.engine", it) }
     // Pass -Pargs="status" / -Pargs="get-headers 21000000 3" etc. to the JVM main
     // Pass -Pnetwork=sepolia to select a testnet (default: mainnet)
     val appArgs = mutableListOf<String>()

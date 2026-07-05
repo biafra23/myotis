@@ -238,6 +238,7 @@ private fun SettingsTab(
     var deepPool by remember { mutableStateOf(settings.deepPoolThreshold().toString()) }
     var strictFreshness by remember { mutableStateOf(settings.strictStateFreshness()) }
     var nativeBls by remember { mutableStateOf(settings.nativeBlsEnabled()) }
+    var rustEngine by remember { mutableStateOf(settings.rustEngineEnabled()) }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
@@ -325,6 +326,21 @@ private fun SettingsTab(
             "On (default): use the bundled native blst library for sync-committee BLS " +
                 "verification (much faster than pure-Java). Off: force the pure-Java Milagro path — " +
                 "slower, but useful if the native library fails to load. Applies immediately.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        // Engine choice applies per network (re)start — running networks keep their engine.
+        SwitchRow(
+            label = "Rust engine (experimental)",
+            checked = rustEngine,
+            onChange = { on -> rustEngine = on; settings.setRustEngineEnabled(on); controller.applyEngineChoice() },
+        )
+        Text(
+            "Off (default): the proven Java engine runs every network. On: prefer the " +
+                "experimental Rust engine where it can serve — it is being built out and " +
+                "currently falls back to the Java engine for hosting. Applies when a " +
+                "network is (re)started, not to already-running networks.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
