@@ -140,9 +140,10 @@ public final class VerifiedAccountQuery {
      * {@link Verification} verdict WITHOUT building the full {@link Result}. This is the single
      * home of the trust anchor (proof-against-peer-root → beacon stateRootMatch → BLS-attested
      * headerChain): {@link #query} and the JVM daemon's {@code get-account} both call it, so the
-     * verification logic lives in exactly one place. The returned future completes only
-     * exceptionally for a transport error in the header fetch; verification *failures* set
-     * {@link Verification#failReason}.
+     * verification logic lives in exactly one place. The returned future normally completes with
+     * a verdict rather than exceptionally: a transport error in the header fetch is caught and
+     * surfaced as {@code failReason="headerChainError"}, and all other verification *failures*
+     * likewise set {@link Verification#failReason} while completing the future normally.
      */
     public static CompletableFuture<Verification> verify(
             AccountRangeMessage.DecodeResult result,
@@ -250,9 +251,11 @@ public final class VerifiedAccountQuery {
         long nonce = found != null ? found.nonce() : -1;
         String balance = found != null ? found.balance().toString() : null;
         // storageRoot/codeHash come from the proof-verified leaf when we have it, so they're
-        // cryptographically anchored rather than peer-claimed. Fall back to the slim body only
-        // when the proof didn't verify — in which case the result is already flagged
-        // beaconChainVerified=false.
+        // cryptographically anchored rather than peer-claimed. Fall back to the slim (peer-claimed)
+        // body only when the leaf proof didn't verify (v.verifiedAcct == null). Note this is gated
+        // on peerProofValid, NOT beaconChainVerified: the beacon stateRootMatch fast-path can set
+        // beaconChainVerified=true even when the leaf proof didn't verify, so it is not a proxy for
+        // "we have a proof-verified leaf".
         String storageRootHex = v.verifiedAcct != null
                 ? Bytes.wrap(v.verifiedAcct.storageRoot()).toHexString()
                 : (found != null ? found.storageRoot().toHexString() : null);

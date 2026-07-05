@@ -720,6 +720,9 @@ public class CommandHandler {
                 + ",\"proof\":" + proofJson
                 + ",\"verification\":" + verificationJson + "}";
         } catch (Exception e) {
+            // The blocking .get() calls above (requestAccount, verify) can throw
+            // InterruptedException; restore the interrupt status so cancellation propagates.
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
             return jsonError(msg);
