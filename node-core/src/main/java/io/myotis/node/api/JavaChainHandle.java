@@ -1,0 +1,224 @@
+package io.myotis.node.api;
+
+import com.jaeckel.ethp2p.consensus.BeaconSyncState;
+import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
+import com.jaeckel.ethp2p.networking.NetworkConfig;
+import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
+import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
+import io.myotis.api.AccountProofResult;
+import io.myotis.api.BeaconState;
+import io.myotis.api.BlockResult;
+import io.myotis.api.ChainHandle;
+import io.myotis.api.DialResult;
+import io.myotis.api.EngineException;
+import io.myotis.api.EnsApi;
+import io.myotis.api.HeaderInfo;
+import io.myotis.api.HeadersResult;
+import io.myotis.api.PeerInfo;
+import io.myotis.api.StatusSnapshot;
+import io.myotis.api.StorageProofResult;
+import io.myotis.api.VerifiedReads;
+import io.myotis.node.ChainStack;
+import io.myotis.node.VerifiedAccountQuery;
+import org.apache.tuweni.bytes.Bytes;
+import org.apache.tuweni.crypto.SECP256K1;
+
+import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * The JVM implementation of {@link ChainHandle}: wraps one {@link ChainStack} and assembles
+ * the API shapes from the stack's internal accessors. This is the single place the host-facing
+ * status snapshot is built (previously duplicated across the desktop, Android, and daemon
+ * status paths).
+ */
+public final class JavaChainHandle implements ChainHandle {
+
+    private final ChainStack stack;
+    private final boolean strictStateFreshness;
+
+    JavaChainHandle(ChainStack stack, boolean strictStateFreshness) {
+        this.stack = stack;
+        this.strictStateFreshness = strictStateFreshness;
+    }
+
+    @Override public String networkName() { return stack.network().name(); }
+
+    @Override public long chainId() { return stack.network().networkId(); }
+
+    @Override
+    public boolean start() {
+        // The freshness knob is a process-global system property in the reference engine
+        // (VerifiedRpcBackend reads it once, during this start()); set it here — not at
+        // create() — so interleaved create()/start() across networks can't cross-apply.
+        // Per-network divergence within one process is not supported yet.
+        System.setProperty(io.myotis.rpc.VerifiedRpcBackend.STRICT_STATE_FRESHNESS_PROP,
+                String.valueOf(strictStateFreshness));
+        return stack.start();
+    }
+
+    @Override public void stop() { stack.shutdown(); }
+
+    @Override public boolean isRunning() { return stack.isRunning(); }
+
+    @Override public void setTargetSnapPeers(int target) { stack.setTargetSnapPeers(target); }
+
+    @Override
+    public void clearPeerState() {
+        stack.backoff().clear();
+        stack.blacklistedNodeIds().clear();
+    }
+
+    @Override
+    public StatusSnapshot status() {
+        NetworkConfig net = stack.network();
+        RLPxConnector conn = stack.connector();
+        BeaconSyncState bss = stack.beaconSyncState();
+
+        BeaconState beaconState = bss == null
+                ? BeaconState.STARTING
+                : BeaconState.valueOf(bss.getSyncState(net.clGenesisTime(), net.secondsPerSlot()).name());
+
+        List<RLPxConnector.PeerInfo> active = conn != null ? conn.getActivePeers() : List.of();
+        List<RLPxConnector.PeerInfo> ready = new ArrayList<>();
+        for (RLPxConnector.PeerInfo p : active) {
+            // "ready" = past the eth handshake; the raw active list also includes peers
+            // still negotiating Hello/Status.
+            if ("READY".equals(p.state())) ready.add(p);
+        }
+        // Snap-capable peers first (clientId tiebreak), matching the established UI ordering.
+        ready.sort(Comparator.comparing(RLPxConnector.PeerInfo::snapSupported).reversed()
+                .thenComparing(p -> p.clientId() != null ? p.clientId() : ""));
+        List<PeerInfo> readyRows = new ArrayList<>(ready.size());
+        int snapNegotiated = 0;
+        for (RLPxConnector.PeerInfo p : ready) {
+            if (p.snapSupported()) snapNegotiated++;
+            readyRows.add(new PeerInfo(p.remoteAddress(), p.snapSupported(), p.clientId()));
+        }
+
+        // Two DISTINCT counts: peers that negotiated snap/1 vs peers currently in the
+        // serving pool (activeSnapHandlers filters out serving-failed peers). Surfacing
+        // both makes a serving-pool collapse visible — the live operational issue on
+        // peer-scarce chains — so never feed one into the other.
+        int snapServing = conn != null ? conn.activeSnapHandlers().size() : 0;
+        long wallClockPeriod = BeaconChainSpec.currentPeriod(net.clGenesisTime(), net.secondsPerSlot());
+        io.myotis.rpc.VerifiedRpcBackend backend = stack.rpcBackend();
+
+        return new StatusSnapshot(
+                stack.isRunning(),
+                net.name(),
+                beaconState,
+                active.size(),
+                ready.size(),
+                snapNegotiated,
+                snapServing,
+                stack.discV4() != null ? stack.discV4().table().size() : 0,
+                stack.pruneAndCountActiveBackoff(),
+                stack.blacklistedNodeIds().size(),
+                stack.attemptedCount(),
+                stack.discV5() != null ? stack.discV5().liveNodeCount() : 0,
+                bss != null ? bss.getExecutionBlockNumber() : 0L,
+                bss != null ? bss.getOptimisticBlockNumber() : 0L,
+                bss != null ? bss.getFinalizedSlot() : 0L,
+                bss != null ? bss.getFinalizedExecution().blockNumber() : 0L,
+                bss != null ? bss.getCatchUpStartPeriod() : -1L,
+                bss != null ? bss.getCurrentSyncCommitteePeriod() : 0L,
+                wallClockPeriod,
+                bss != null ? bss.getFinalizedPeriod() : 0L,
+                wallClockPeriod,
+                backend != null ? backend.verifiedHeadAgeMs() : Long.MAX_VALUE,
+                readyRows);
+    }
+
+    @Override
+    public VerifiedReads reads() {
+        io.myotis.rpc.VerifiedRpcBackend backend = stack.rpcBackend();
+        return backend == null ? null : new VerifiedReadsAdapter(backend);
+    }
+
+    @Override
+    public EnsApi ens() {
+        if (!stack.network().hasEns()) return null;
+        return new JavaEnsApi(stack);
+    }
+
+    @Override
+    public AccountProofResult requestAccount(String hexAddress) {
+        try {
+            // queryProof internally bounds the header fetch (60 s); the outer bound covers
+            // the snap fetch + verification end to end.
+            return VerifiedAccountQuery.queryProof(stack, hexAddress).get(120, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new EngineException("interrupted while querying account", e);
+        } catch (Exception e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            throw new EngineException(cause.getMessage() != null
+                    ? cause.getMessage() : cause.getClass().getSimpleName(), cause);
+        }
+    }
+
+    @Override
+    public StorageProofResult getStorageProof(String hexAddress, long slot, String holderHexOrNull) {
+        // Wired when the daemon's storage-proof ladder moves into node-core
+        // (plan step PR2: engine-logic motion); nothing calls this until the hosts
+        // are rewired in PR3.
+        throw new EngineException("getStorageProof: not yet wired (lands with the engine-logic motion PR)");
+    }
+
+    @Override
+    public HeadersResult getHeaders(long startBlock, int count) {
+        RLPxConnector conn = stack.connector();
+        if (!stack.isRunning() || conn == null) throw new EngineException("Node is not running");
+        try {
+            List<BlockHeadersMessage.VerifiedHeader> headers =
+                    conn.requestBlockHeaders(startBlock, count).get(30, TimeUnit.SECONDS);
+            List<HeaderInfo> out = new ArrayList<>(headers.size());
+            for (BlockHeadersMessage.VerifiedHeader vh : headers) {
+                var h = vh.header();
+                out.add(new HeaderInfo(
+                        h.number,
+                        vh.hash().toHexString(),
+                        h.parentHash.toHexString(),
+                        h.stateRoot.toHexString(),
+                        h.transactionsRoot.toHexString(),
+                        h.timestamp,
+                        h.gasUsed,
+                        h.gasLimit,
+                        h.baseFeePerGas != null ? h.baseFeePerGas.toString() : null));
+            }
+            return new HeadersResult(out, null);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new HeadersResult(List.of(), "interrupted");
+        } catch (Exception e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            return new HeadersResult(List.of(), cause.getMessage() != null
+                    ? cause.getMessage() : cause.getClass().getSimpleName());
+        }
+    }
+
+    @Override
+    public BlockResult getBlockVerified(long blockNumber) {
+        // Wired when the daemon's block verification moves into node-core (plan step PR2).
+        throw new EngineException("getBlockVerified: not yet wired (lands with the engine-logic motion PR)");
+    }
+
+    @Override
+    public DialResult dialPeer(String host, int port, String pubkeyHex) {
+        RLPxConnector conn = stack.connector();
+        if (!stack.isRunning() || conn == null) throw new EngineException("Node is not running");
+        try {
+            SECP256K1.PublicKey pubKey =
+                    SECP256K1.PublicKey.fromBytes(Bytes.fromHexString(pubkeyHex));
+            conn.connect(new InetSocketAddress(host, port), pubKey);
+            return new DialResult(true, null);
+        } catch (Exception e) {
+            return new DialResult(false, e.getMessage() != null
+                    ? e.getMessage() : e.getClass().getSimpleName());
+        }
+    }
+}
