@@ -209,7 +209,13 @@ tasks.register<Exec>("cargoNdkAndroid") {
     onlyIf { rustAvailable && cargoNdkVersion.isNotEmpty() && androidNdkDir != null }
     workingDir = file("rust")
     androidNdkDir?.let { environment("ANDROID_NDK_HOME", it.absolutePath) }
-    commandLine("./build-android.sh")
+    // Windows can't exec a .sh directly (CreateProcess error=193); route it
+    // through bash there (Git for Windows ships one alongside git itself).
+    if (System.getProperty("os.name").lowercase().contains("win")) {
+        commandLine("bash", "./build-android.sh")
+    } else {
+        commandLine("./build-android.sh")
+    }
     inputs.files(rustSources).withPathSensitivity(PathSensitivity.RELATIVE)
     // Toolchain identity as inputs: switching rustc, cargo-ndk, or the NDK must
     // re-run the build AND its 16 KB alignment check — that check exists to
