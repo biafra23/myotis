@@ -104,12 +104,16 @@ public final class VerifiedAccountQuery {
      * Mutable verification scratchpad. Keeps the two verification methods (headerChain +
      * stateRootMatch) from threading several separate parameters through the async chain.
      */
-    private static final class Verification {
-        boolean beaconChainVerified;
-        boolean blsVerified;
-        long matchedSlot = -1;
-        String verifyMethod;
-        String failReason;
+    public static final class Verification {
+        /** Proof verifies against the peer's own stateRoot (necessary, not sufficient for trust). */
+        public boolean peerProofValid;
+        /** The proof-verified leaf (authoritative storageRoot/codeHash); null when the proof didn't verify. */
+        public MerklePatriciaVerifier.VerifiedAccount verifiedAcct;
+        public boolean beaconChainVerified;
+        public boolean blsVerified;
+        public long matchedSlot = -1;
+        public String verifyMethod;
+        public String failReason;
     }
 
     private static CompletableFuture<Result> buildAccountResult(
@@ -127,27 +131,48 @@ public final class VerifiedAccountQuery {
             }
         }
         final AccountRangeMessage.AccountData foundFinal = found;
+        return verify(result, address, bss, connector)
+                .thenApply(v -> finalizeResult(addr, foundFinal, result, v));
+    }
+
+    /**
+     * Run the proof + beacon verification ladder for a snap AccountRange response, returning the
+     * {@link Verification} verdict WITHOUT building the full {@link Result}. This is the single
+     * home of the trust anchor (proof-against-peer-root → beacon stateRootMatch → BLS-attested
+     * headerChain): {@link #query} and the JVM daemon's {@code get-account} both call it, so the
+     * verification logic lives in exactly one place. The returned future completes only
+     * exceptionally for a transport error in the header fetch; verification *failures* set
+     * {@link Verification#failReason}.
+     */
+    public static CompletableFuture<Verification> verify(
+            AccountRangeMessage.DecodeResult result,
+            Bytes address,
+            BeaconSyncState bss,
+            RLPxConnector connector) {
+        Bytes32 accountHash = Hash.keccak256(address);
+        AccountRangeMessage.AccountData found = null;
+        for (AccountRangeMessage.AccountData a : result.accounts()) {
+            if (a.accountHash().equals(accountHash)) {
+                found = a;
+                break;
+            }
+        }
         long nonce = found != null ? found.nonce() : -1;
         String balance = found != null ? found.balance().toString() : null;
 
-        boolean peerProofValid = false;
-        MerklePatriciaVerifier.VerifiedAccount verifiedAcct = null;
+        Verification v = new Verification();
         if (result.stateRoot() != null && !result.proof().isEmpty()) {
             List<byte[]> proofBytes = new ArrayList<>(result.proof().size());
             for (Bytes b : result.proof()) proofBytes.add(b.toArrayUnsafe());
-            // verifyAndExtractAccount returns the storageRoot/codeHash from the
-            // proof-verified leaf — NOT the peer's slim body — so a peer can't
-            // forge those two fields while keeping nonce/balance honest.
-            verifiedAcct = MerklePatriciaVerifier.verifyAndExtractAccount(
+            // verifyAndExtractAccount returns the storageRoot/codeHash from the proof-verified
+            // leaf — NOT the peer's slim body — so a peer can't forge those two while keeping
+            // nonce/balance honest.
+            v.verifiedAcct = MerklePatriciaVerifier.verifyAndExtractAccount(
                     result.stateRoot().toArrayUnsafe(),
                     address.toArrayUnsafe(),
                     proofBytes, nonce, balance);
-            peerProofValid = (verifiedAcct != null);
+            v.peerProofValid = (v.verifiedAcct != null);
         }
-        final boolean peerProofValidFinal = peerProofValid;
-        final MerklePatriciaVerifier.VerifiedAccount verifiedAcctFinal = verifiedAcct;
-
-        Verification v = new Verification();
 
         // Fast-path shortcut: if the BLC has already attested the peer's exact stateRoot, we're
         // done — no header fetch needed. Rare, but free to check.
@@ -159,8 +184,7 @@ public final class VerifiedAccountQuery {
                 v.matchedSlot = match.slot();
                 v.blsVerified = match.blsVerified();
                 v.verifyMethod = "stateRootMatch";
-                return CompletableFuture.completedFuture(
-                        finalizeResult(addr, foundFinal, result, peerProofValidFinal, verifiedAcctFinal, v));
+                return CompletableFuture.completedFuture(v);
             }
         }
 
@@ -168,7 +192,7 @@ public final class VerifiedAccountQuery {
         // chain verification if every prerequisite holds.
         if (result.stateRoot() == null) {
             v.failReason = "noPeerStateRoot";
-        } else if (!peerProofValid) {
+        } else if (!v.peerProofValid) {
             v.failReason = "peerProofInvalid";
         } else if (bss == null || !bss.isSynced()) {
             v.failReason = "beaconNotSynced";
@@ -211,20 +235,17 @@ public final class VerifiedAccountQuery {
                             } else {
                                 v.failReason = "headerChainInvalid";
                             }
-                            return finalizeResult(addr, foundFinal, result, peerProofValidFinal, verifiedAcctFinal, v);
+                            return v;
                         });
             }
         }
 
-        return CompletableFuture.completedFuture(
-                finalizeResult(addr, foundFinal, result, peerProofValidFinal, verifiedAcctFinal, v));
+        return CompletableFuture.completedFuture(v);
     }
 
     private static Result finalizeResult(String addr,
                                          AccountRangeMessage.AccountData found,
                                          AccountRangeMessage.DecodeResult result,
-                                         boolean peerProofValid,
-                                         MerklePatriciaVerifier.VerifiedAccount verified,
                                          Verification v) {
         long nonce = found != null ? found.nonce() : -1;
         String balance = found != null ? found.balance().toString() : null;
@@ -232,11 +253,11 @@ public final class VerifiedAccountQuery {
         // cryptographically anchored rather than peer-claimed. Fall back to the slim body only
         // when the proof didn't verify — in which case the result is already flagged
         // beaconChainVerified=false.
-        String storageRootHex = verified != null
-                ? Bytes.wrap(verified.storageRoot()).toHexString()
+        String storageRootHex = v.verifiedAcct != null
+                ? Bytes.wrap(v.verifiedAcct.storageRoot()).toHexString()
                 : (found != null ? found.storageRoot().toHexString() : null);
-        String codeHashHex = verified != null
-                ? Bytes.wrap(verified.codeHash()).toHexString()
+        String codeHashHex = v.verifiedAcct != null
+                ? Bytes.wrap(v.verifiedAcct.codeHash()).toHexString()
                 : (found != null ? found.codeHash().toHexString() : null);
         return new Result(
                 addr,
@@ -247,7 +268,7 @@ public final class VerifiedAccountQuery {
                 codeHashHex,
                 result.blockNumber(),
                 result.stateRoot() != null ? result.stateRoot().toHexString() : null,
-                peerProofValid,
+                v.peerProofValid,
                 v.beaconChainVerified,
                 v.blsVerified,
                 v.matchedSlot,

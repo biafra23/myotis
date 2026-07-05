@@ -5,6 +5,7 @@ import com.jaeckel.ethp2p.consensus.BeaconSyncState;
 import com.jaeckel.ethp2p.consensus.libp2p.BeaconP2PService;
 import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
 import com.jaeckel.ethp2p.consensus.proof.MerklePatriciaVerifier;
+import io.myotis.node.VerifiedAccountQuery;
 import com.jaeckel.ethp2p.core.types.BlockHeader;
 import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
 import com.jaeckel.ethp2p.networking.discv4.KademliaTable;
@@ -684,23 +685,19 @@ public class CommandHandler {
             proofSb.append("]");
             String proofJson = proofSb.toString();
 
-            // Verify proof against the peer's state root (should always pass if proof is non-empty)
-            // and against the beacon-verified state root (passes only if roots coincide)
-            String verificationJson = buildVerificationJson(address.toArrayUnsafe(), result.proof(),
-                    found != null ? found.nonce() : -1,
-                    found != null ? found.balance().toString() : null,
-                    result.stateRoot(), result.blockNumber());
+            // Run the SHARED verification ladder (io.myotis.node.VerifiedAccountQuery.verify) —
+            // the single home of the trust anchor — instead of a daemon-local copy. One pass
+            // yields both the beacon verdict AND the proof-verified leaf.
+            VerifiedAccountQuery.Verification v =
+                    VerifiedAccountQuery.verify(result, address, beaconSyncState, connector)
+                            .get(90, TimeUnit.SECONDS);
+            String verificationJson = buildVerificationJson(
+                    v, result.stateRoot(), !result.proof().isEmpty(), result.blockNumber());
 
-            // storageRoot/codeHash from the proof-verified leaf, not the peer's
-            // slim body — a peer can forge those two while keeping nonce/balance
-            // honest, and the slim values would otherwise ride along as "verified".
-            MerklePatriciaVerifier.VerifiedAccount verifiedAcct =
-                    (found != null && result.stateRoot() != null && !result.proof().isEmpty())
-                            ? MerklePatriciaVerifier.verifyAndExtractAccount(
-                                    result.stateRoot().toArrayUnsafe(), address.toArrayUnsafe(),
-                                    result.proof().stream().map(Bytes::toArrayUnsafe).toList(),
-                                    found.nonce(), found.balance().toString())
-                            : null;
+            // storageRoot/codeHash from the proof-verified leaf (v.verifiedAcct), not the peer's
+            // slim body — a peer can forge those two while keeping nonce/balance honest, and the
+            // slim values would otherwise ride along as "verified".
+            MerklePatriciaVerifier.VerifiedAccount verifiedAcct = v.verifiedAcct;
 
             if (found == null) {
                 return "{\"ok\":true,\"exists\":false"
@@ -1682,100 +1679,39 @@ public class CommandHandler {
     // Beacon proof verification helpers
     // -------------------------------------------------------------------------
 
-    private String buildVerificationJson(byte[] address, List<Bytes> proofNodes,
-                                          long nonce, String balance,
-                                          Bytes32 peerStateRoot, long peerBlockNumber) {
-        List<byte[]> proofBytes = proofNodes.stream().map(Bytes::toArrayUnsafe).toList();
+    /**
+     * Serialize the shared {@link VerifiedAccountQuery.Verification} verdict into the daemon's
+     * get-account "verification" JSON, plus the daemon-only diagnostics (finalized / wall-clock
+     * period lag, block numbers). The verification LADDER now lives ONLY in VerifiedAccountQuery;
+     * this method is pure serialization (the daemon used to re-implement the ladder here).
+     */
+    private String buildVerificationJson(VerifiedAccountQuery.Verification v,
+                                          Bytes32 peerStateRoot, boolean proofPresent,
+                                          long peerBlockNumber) {
+        String peerStateRootHex = (peerStateRoot != null && proofPresent) ? peerStateRoot.toHexString() : null;
 
-        // Verify against the peer's state root (the root the proof was actually built for)
-        boolean peerProofValid = false;
-        String peerStateRootHex = null;
-        if (peerStateRoot != null && !proofBytes.isEmpty()) {
-            peerProofValid = MerklePatriciaVerifier.verify(
-                    peerStateRoot.toArrayUnsafe(), address, proofBytes, nonce, balance);
-            peerStateRootHex = peerStateRoot.toHexString();
-        }
-
-        // Check if the peer's state root matches any beacon-attested block.
-        boolean beaconChainVerified = false;
-        boolean blsVerified = false;
-        long matchedSlot = -1;
-        String verifyMethod = null;
-        String failReason = null;
-
-        if (peerStateRoot != null) {
-            BeaconSyncState.SlottedStateRoot match =
-                    beaconSyncState.findStateRoot(peerStateRoot.toArrayUnsafe());
-            if (match != null) {
-                beaconChainVerified = true;
-                matchedSlot = match.slot();
-                blsVerified = match.blsVerified();
-                verifyMethod = "stateRootMatch";
-            }
-        }
-
-        // Atomic snapshot — see note at the get-storage verification path. Block number
-        // and state root must describe the same finalized payload.
-        BeaconSyncState.FinalizedExecution fin = beaconSyncState.getFinalizedExecution();
-        long finalizedBlockNum = fin.blockNumber();
-        byte[] beaconRoot = fin.stateRoot();
+        // Daemon-only diagnostics (not carried by the shared Verification).
+        long finalizedBlockNum = beaconSyncState.getFinalizedExecution().blockNumber();
         long finalizedPeriod = beaconSyncState.getFinalizedPeriod();
         long wallClockPeriod = BeaconChainSpec.currentPeriod(clGenesisTime, secondsPerSlot);
         long periodLag = wallClockPeriod - finalizedPeriod;
 
-        if (!beaconChainVerified) {
-            if (peerStateRoot == null) {
-                failReason = "noPeerStateRoot";
-            } else if (!peerProofValid) {
-                failReason = "peerProofInvalid";
-            } else if (!beaconSyncState.isSynced()) {
-                failReason = "beaconNotSynced";
-            } else if (peerBlockNumber <= 0) {
-                failReason = "noPeerBlockNumber";
-            } else if (finalizedBlockNum <= 0 || beaconRoot == null) {
-                failReason = "beaconBlockUnavailable";
-            } else if (peerBlockNumber <= finalizedBlockNum) {
-                failReason = "peerBlockBehindFinalized";
-            } else if (peerBlockNumber - finalizedBlockNum > MAX_HEADER_CHAIN_GAP) {
-                failReason = "headerChainGapTooLarge";
-            } else {
-                log.info("[verify] headerChain: peerBlock={}, finalizedBlock={}, gap={}",
-                        peerBlockNumber, finalizedBlockNum, peerBlockNumber - finalizedBlockNum);
-                try {
-                    boolean chainValid = verifyHeaderChainBatched(
-                            finalizedBlockNum, peerBlockNumber, beaconRoot,
-                            peerStateRoot.toArrayUnsafe());
-                    if (chainValid) {
-                        beaconChainVerified = true;
-                        matchedSlot = beaconSyncState.getFinalizedSlot();
-                        blsVerified = true;
-                        verifyMethod = "headerChain";
-                    } else {
-                        failReason = "headerChainInvalid";
-                    }
-                } catch (Exception e) {
-                    log.info("[verify] Header chain verification failed: {}", e.getMessage());
-                    failReason = "headerChainError";
-                }
-            }
-        }
-
         StringBuilder sb = new StringBuilder("{");
-        sb.append("\"peerProofValid\":").append(peerProofValid);
+        sb.append("\"peerProofValid\":").append(v.peerProofValid);
         if (peerStateRootHex != null) {
             sb.append(",\"peerStateRoot\":\"").append(peerStateRootHex).append("\"");
         }
         sb.append(",\"beaconSynced\":").append(beaconSyncState.isSynced());
-        sb.append(",\"beaconChainVerified\":").append(beaconChainVerified);
-        if (beaconChainVerified) {
-            sb.append(",\"matchedBeaconSlot\":").append(matchedSlot);
-            sb.append(",\"blsVerified\":").append(blsVerified);
-            if (verifyMethod != null) {
-                sb.append(",\"verifyMethod\":\"").append(verifyMethod).append("\"");
+        sb.append(",\"beaconChainVerified\":").append(v.beaconChainVerified);
+        if (v.beaconChainVerified) {
+            sb.append(",\"matchedBeaconSlot\":").append(v.matchedSlot);
+            sb.append(",\"blsVerified\":").append(v.blsVerified);
+            if (v.verifyMethod != null) {
+                sb.append(",\"verifyMethod\":\"").append(v.verifyMethod).append("\"");
             }
         } else {
-            if (failReason != null) {
-                sb.append(",\"failReason\":\"").append(failReason).append("\"");
+            if (v.failReason != null) {
+                sb.append(",\"failReason\":\"").append(v.failReason).append("\"");
             }
             sb.append(",\"finalizedPeriod\":").append(finalizedPeriod);
             sb.append(",\"wallClockPeriod\":").append(wallClockPeriod);
