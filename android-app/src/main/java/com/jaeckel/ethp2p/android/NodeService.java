@@ -31,7 +31,6 @@ import java.net.InetAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -560,6 +559,8 @@ public final class NodeService extends Service {
         return requestAccount(primaryNetwork(this), hexAddress);
     }
 
+    @SuppressLint("NewApi") // CompletableFuture.failedFuture (API 31) is backported to
+                            // minSdk 29 via desugar_jdk_libs — see the comment block above.
     public CompletableFuture<AccountQueryResult> requestAccount(String network, String hexAddress) {
         ChainHandle handle = handles.get(canonicalNetwork(network));
         if (handle == null) {
@@ -770,35 +771,6 @@ public final class NodeService extends Service {
                     + ", state-freshness " + (strictStateFreshness(this) ? "strict" : "relaxed")
                     + ", bls " + blsChoice + ")");
 
-            // Reconstructible network state lives in getCacheDir() so "Clear cache" wipes the
-            // peer caches + sync snapshot while identity / query history in getFilesDir() survive.
-            AndroidPeerCache pc = new AndroidPeerCache(netCacheFor(n, "peers", ".cache").toPath());
-            AndroidCLPeerCache cl = new AndroidCLPeerCache(netCacheFor(n, "cl-peers", ".cache").toPath());
-            cachedElCounts.put(n, pc.load().size());
-            cachedClCounts.put(n, cl.load().size());
-            elCaches.put(n, pc);
-            clCaches.put(n, cl);
-
-            // EL/discv5 ports use the engine's per-network defaults (0); the RPC port is the
-            // user-configurable one. The snap maintainer keeps snap peers topped up (the
-            // discv4-independent path NAT'd mobile needs); Android supplies the active
-            // network's DNS servers for EIP-1459 resolution.
-            EngineConfig config = new EngineConfig(
-                    n, 0, 0, rpcPort,
-                    netCacheFor(n, "sync-state", ".snapshot").getAbsolutePath(),
-                    /*gossipsub*/ false,
-                    snapTarget(this),
-                    strictStateFreshness(this));
-            EnginePorts ports = new EnginePorts(
-                    // Identity: legacy mainnet keeps nodekey.hex; other chains get a
-                    // per-network key so two chains never share an identity.
-                    new AndroidNodeKeyStore(getFilesDir()),
-                    new AndroidPeerCacheAdapter(pc),
-                    new AndroidClPeerCacheAdapter(cl),
-                    this::activeNetworkDnsServers,
-                    new com.jaeckel.ethp2p.android.ens.AndroidCcipGateway(),
-                    null, null); // engine default logger/clock
-
             // create() + start() under the per-network bootLock: a Stop→Start / disable→enable
             // has this boot wait for the old instance's teardown (which holds the same lock) to
             // free the ports AND unregister from the engine (create() throws on a still-hosted
@@ -823,6 +795,41 @@ public final class NodeService extends Service {
                     if (existing != null) handles.putIfAbsent(n, existing);
                     return;
                 }
+
+                // Build the caches HERE — inside the lock, after every bail check — so an
+                // early bail can never orphan a freshly-started cache writer thread, and the
+                // maps can never be clobbered while a live stack still uses the previous
+                // instances (the engine owns these via the port adapters from create() on).
+                // Reconstructible network state lives in getCacheDir() so "Clear cache" wipes
+                // the peer caches + sync snapshot while identity / query history in
+                // getFilesDir() survive.
+                AndroidPeerCache pc = new AndroidPeerCache(netCacheFor(n, "peers", ".cache").toPath());
+                AndroidCLPeerCache cl = new AndroidCLPeerCache(netCacheFor(n, "cl-peers", ".cache").toPath());
+                cachedElCounts.put(n, pc.load().size());
+                cachedClCounts.put(n, cl.load().size());
+                elCaches.put(n, pc);
+                clCaches.put(n, cl);
+
+                // EL/discv5 ports use the engine's per-network defaults (0); the RPC port is
+                // the user-configurable one. The snap maintainer keeps snap peers topped up
+                // (the discv4-independent path NAT'd mobile needs); Android supplies the
+                // active network's DNS servers for EIP-1459 resolution.
+                EngineConfig config = new EngineConfig(
+                        n, 0, 0, rpcPort,
+                        netCacheFor(n, "sync-state", ".snapshot").getAbsolutePath(),
+                        /*gossipsub*/ false,
+                        snapTarget(this),
+                        strictStateFreshness(this));
+                EnginePorts ports = new EnginePorts(
+                        // Identity: legacy mainnet keeps nodekey.hex; other chains get a
+                        // per-network key so two chains never share an identity.
+                        new AndroidNodeKeyStore(getFilesDir()),
+                        new AndroidPeerCacheAdapter(pc),
+                        new AndroidClPeerCacheAdapter(cl),
+                        this::activeNetworkDnsServers,
+                        new com.jaeckel.ethp2p.android.ens.AndroidCcipGateway(),
+                        null, null); // engine default logger/clock
+
                 ChainHandle handle = ENGINE.create(config, ports);
                 created = handle;
                 handles.put(n, handle);
@@ -876,7 +883,17 @@ public final class NodeService extends Service {
                 String hex = new String(Files.readAllBytes(file),
                         java.nio.charset.StandardCharsets.UTF_8).strip();
                 if (hex.startsWith("0x") || hex.startsWith("0X")) hex = hex.substring(2);
-                return HexFormat.of().parseHex(hex);
+                // Hand-rolled hex: java.util.HexFormat is API 34 and NOT covered by
+                // core-library desugaring, so it would crash at runtime on minSdk 29.
+                if (hex.length() % 2 != 0) throw new IllegalArgumentException("odd-length hex");
+                byte[] out = new byte[hex.length() / 2];
+                for (int i = 0; i < out.length; i++) {
+                    int hi = Character.digit(hex.charAt(i * 2), 16);
+                    int lo = Character.digit(hex.charAt(i * 2 + 1), 16);
+                    if (hi < 0 || lo < 0) throw new IllegalArgumentException("non-hex character");
+                    out[i] = (byte) ((hi << 4) | lo);
+                }
+                return out;
             } catch (Exception e) {
                 throw new RuntimeException("failed to read node key " + file + ": " + e.getMessage(), e);
             }
@@ -884,8 +901,13 @@ public final class NodeService extends Service {
         @Override public void store(String networkName, byte[] secret32) {
             Path file = fileFor(networkName);
             try {
-                Files.write(file, ("0x" + HexFormat.of().formatHex(secret32))
-                        .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                StringBuilder sb = new StringBuilder(2 + secret32.length * 2);
+                sb.append("0x");
+                for (byte b : secret32) {
+                    sb.append(Character.forDigit((b >> 4) & 0xF, 16))
+                      .append(Character.forDigit(b & 0xF, 16));
+                }
+                Files.write(file, sb.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
             } catch (Exception e) {
                 throw new RuntimeException("failed to write node key " + file + ": " + e.getMessage(), e);
             }
