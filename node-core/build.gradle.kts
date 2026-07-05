@@ -15,6 +15,12 @@
 // default yields when a transitive forces 21). AGP 8.7's D8 dexes 21 class files
 // for :android-app.
 
+plugins {
+    // On top of the root `java` plugin: adds the `api` configuration so the
+    // :myotis-api contract types flow transitively to hosts.
+    `java-library`
+}
+
 configurations.all {
     // Mirror :app / :android-app: strip upstream io.netty so the JitPack
     // netty-kotlin fork (republished under the same io.netty.* names, supplied by
@@ -28,6 +34,9 @@ java {
 }
 
 dependencies {
+    // The formal engine boundary this module implements (io.myotis.node.api adapters).
+    // `api` (not `implementation`): hosts consume the interface types transitively.
+    api(project(":myotis-api"))
     implementation(project(":core"))
     implementation(project(":networking"))
     implementation(project(":consensus"))
@@ -53,6 +62,8 @@ dependencies {
 
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)
+    // Tuweni's keccak256 needs the BC provider registered in tests.
+    testImplementation(libs.bouncycastle)
     testRuntimeOnly(libs.logback.classic)
 }
 

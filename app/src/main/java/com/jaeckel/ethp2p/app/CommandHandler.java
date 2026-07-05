@@ -687,17 +687,13 @@ public class CommandHandler {
 
             // Run the SHARED verification ladder (io.myotis.node.VerifiedAccountQuery.verify) —
             // the single home of the trust anchor — instead of a daemon-local copy. One pass
-            // yields both the beacon verdict AND the proof-verified leaf.
+            // yields both the beacon verdict AND the proof-verified leaf. Pass the account we
+            // already located so verify() doesn't re-scan the response.
             VerifiedAccountQuery.Verification v =
-                    VerifiedAccountQuery.verify(result, address, beaconSyncState, connector)
+                    VerifiedAccountQuery.verify(result, address, found, beaconSyncState, connector)
                             .get(90, TimeUnit.SECONDS);
             String verificationJson = buildVerificationJson(
                     v, result.stateRoot(), !result.proof().isEmpty(), result.blockNumber());
-
-            // storageRoot/codeHash from the proof-verified leaf (v.verifiedAcct), not the peer's
-            // slim body — a peer can forge those two while keeping nonce/balance honest, and the
-            // slim values would otherwise ride along as "verified".
-            MerklePatriciaVerifier.VerifiedAccount verifiedAcct = v.verifiedAcct;
 
             if (found == null) {
                 return "{\"ok\":true,\"exists\":false"
@@ -706,16 +702,19 @@ public class CommandHandler {
                     + ",\"proof\":" + proofJson
                     + ",\"verification\":" + verificationJson + "}";
             }
+            // storageRoot/codeHash from the proof-verified leaf when available, not the peer's
+            // slim body — a peer can forge those two while keeping nonce/balance honest, and the
+            // slim values would otherwise ride along as "verified".
             return "{\"ok\":true,\"exists\":true"
                 + ",\"address\":\"" + addr + "\""
                 + ",\"accountHash\":\"" + found.accountHash().toHexString() + "\""
                 + ",\"nonce\":" + found.nonce()
                 + ",\"balance\":\"" + found.balance() + "\""
-                + ",\"storageRoot\":\"" + (verifiedAcct != null
-                        ? Bytes.wrap(verifiedAcct.storageRoot()).toHexString()
+                + ",\"storageRoot\":\"" + (v.verifiedStorageRootHex() != null
+                        ? v.verifiedStorageRootHex()
                         : found.storageRoot().toHexString()) + "\""
-                + ",\"codeHash\":\"" + (verifiedAcct != null
-                        ? Bytes.wrap(verifiedAcct.codeHash()).toHexString()
+                + ",\"codeHash\":\"" + (v.verifiedCodeHashHex() != null
+                        ? v.verifiedCodeHashHex()
                         : found.codeHash().toHexString()) + "\""
                 + ",\"proof\":" + proofJson
                 + ",\"verification\":" + verificationJson + "}";
@@ -1700,21 +1699,21 @@ public class CommandHandler {
         long periodLag = wallClockPeriod - finalizedPeriod;
 
         StringBuilder sb = new StringBuilder("{");
-        sb.append("\"peerProofValid\":").append(v.peerProofValid);
+        sb.append("\"peerProofValid\":").append(v.peerProofValid());
         if (peerStateRootHex != null) {
             sb.append(",\"peerStateRoot\":\"").append(peerStateRootHex).append("\"");
         }
         sb.append(",\"beaconSynced\":").append(beaconSyncState.isSynced());
-        sb.append(",\"beaconChainVerified\":").append(v.beaconChainVerified);
-        if (v.beaconChainVerified) {
-            sb.append(",\"matchedBeaconSlot\":").append(v.matchedSlot);
-            sb.append(",\"blsVerified\":").append(v.blsVerified);
-            if (v.verifyMethod != null) {
-                sb.append(",\"verifyMethod\":\"").append(v.verifyMethod).append("\"");
+        sb.append(",\"beaconChainVerified\":").append(v.beaconChainVerified());
+        if (v.beaconChainVerified()) {
+            sb.append(",\"matchedBeaconSlot\":").append(v.matchedSlot());
+            sb.append(",\"blsVerified\":").append(v.blsVerified());
+            if (v.verifyMethod() != null) {
+                sb.append(",\"verifyMethod\":\"").append(v.verifyMethod()).append("\"");
             }
         } else {
-            if (v.failReason != null) {
-                sb.append(",\"failReason\":\"").append(v.failReason).append("\"");
+            if (v.failReason() != null) {
+                sb.append(",\"failReason\":\"").append(v.failReason()).append("\"");
             }
             sb.append(",\"finalizedPeriod\":").append(finalizedPeriod);
             sb.append(",\"wallClockPeriod\":").append(wallClockPeriod);

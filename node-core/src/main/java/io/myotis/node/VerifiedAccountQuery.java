@@ -101,19 +101,48 @@ public final class VerifiedAccountQuery {
     }
 
     /**
-     * Mutable verification scratchpad. Keeps the two verification methods (headerChain +
-     * stateRootMatch) from threading several separate parameters through the async chain.
+     * The immutable verification verdict. {@code verifiedStorageRootHex}/{@code verifiedCodeHashHex}
+     * come from the proof-verified leaf (authoritative — a peer can't forge them while keeping
+     * nonce/balance honest) and are null when the leaf proof didn't verify; callers needing the
+     * peer-claimed slim values must fall back explicitly.
+     *
+     * @param peerProofValid        proof verifies against the peer's own stateRoot (necessary,
+     *                              not sufficient for trust)
+     * @param verifiedStorageRootHex storage root from the proof-verified leaf, or null
+     * @param verifiedCodeHashHex   code hash from the proof-verified leaf, or null
+     * @param beaconChainVerified   the peer's stateRoot ties to a beacon-attested root
+     * @param blsVerified           the beacon match was BLS-signed
+     * @param matchedSlot           slot of the matching attestation; -1 when none
+     * @param verifyMethod          "stateRootMatch" / "headerChain" / null
+     * @param failReason            null when verified
      */
-    public static final class Verification {
-        /** Proof verifies against the peer's own stateRoot (necessary, not sufficient for trust). */
-        public boolean peerProofValid;
-        /** The proof-verified leaf (authoritative storageRoot/codeHash); null when the proof didn't verify. */
-        public MerklePatriciaVerifier.VerifiedAccount verifiedAcct;
-        public boolean beaconChainVerified;
-        public boolean blsVerified;
-        public long matchedSlot = -1;
-        public String verifyMethod;
-        public String failReason;
+    public record Verification(
+            boolean peerProofValid,
+            String verifiedStorageRootHex,
+            String verifiedCodeHashHex,
+            boolean beaconChainVerified,
+            boolean blsVerified,
+            long matchedSlot,
+            String verifyMethod,
+            String failReason) {}
+
+    /** Mutable scratchpad the async verify chain fills before freezing into a {@link Verification}. */
+    private static final class Scratch {
+        boolean peerProofValid;
+        MerklePatriciaVerifier.VerifiedAccount verifiedAcct;
+        boolean beaconChainVerified;
+        boolean blsVerified;
+        long matchedSlot = -1;
+        String verifyMethod;
+        String failReason;
+
+        Verification freeze() {
+            return new Verification(
+                    peerProofValid,
+                    verifiedAcct != null ? Bytes.wrap(verifiedAcct.storageRoot()).toHexString() : null,
+                    verifiedAcct != null ? Bytes.wrap(verifiedAcct.codeHash()).toHexString() : null,
+                    beaconChainVerified, blsVerified, matchedSlot, verifyMethod, failReason);
+        }
     }
 
     private static CompletableFuture<Result> buildAccountResult(
@@ -131,8 +160,91 @@ public final class VerifiedAccountQuery {
             }
         }
         final AccountRangeMessage.AccountData foundFinal = found;
-        return verify(result, address, bss, connector)
+        return verify(result, address, foundFinal, bss, connector)
                 .thenApply(v -> finalizeResult(addr, foundFinal, result, v));
+    }
+
+    /**
+     * Like {@link #query} but returning the full {@link io.myotis.api.AccountProofResult} —
+     * account data + proof material + verdict + beacon diagnostics — so an IPC/API host can
+     * reproduce its complete response from this record alone. Same validation and the same
+     * single verification ladder.
+     */
+    public static CompletableFuture<io.myotis.api.AccountProofResult> queryProof(
+            ChainStack stack, String hexAddress) {
+        RLPxConnector connector = stack != null ? stack.connector() : null;
+        BeaconSyncState bss = stack != null ? stack.beaconSyncState() : null;
+        if (stack == null || !stack.isRunning() || connector == null) {
+            return CompletableFuture.failedFuture(new IllegalStateException("Node is not running"));
+        }
+        if (hexAddress == null) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException("Address is required"));
+        }
+        String hex = hexAddress.strip();
+        if (hex.startsWith("0x") || hex.startsWith("0X")) hex = hex.substring(2);
+        if (hex.length() != 40) {
+            return CompletableFuture.failedFuture(
+                    new IllegalArgumentException("Address must be 20 bytes (40 hex chars)"));
+        }
+        Bytes address;
+        try {
+            address = Bytes.fromHexString(hex);
+        } catch (Exception e) {
+            return CompletableFuture.failedFuture(
+                    new IllegalArgumentException("Invalid hex address: " + e.getMessage()));
+        }
+        final String addr = "0x" + hex;
+        final Bytes32 accountHash = Hash.keccak256(address);
+        final long clGenesisTime = stack.network().clGenesisTime();
+        final int secondsPerSlot = stack.network().secondsPerSlot();
+        final BeaconSyncState bssFinal = bss;
+        final RLPxConnector conn = connector;
+        return connector.requestAccount(address).thenCompose(result -> {
+            AccountRangeMessage.AccountData found = null;
+            for (AccountRangeMessage.AccountData a : result.accounts()) {
+                if (a.accountHash().equals(accountHash)) { found = a; break; }
+            }
+            final AccountRangeMessage.AccountData foundFinal = found;
+            return verify(result, address, foundFinal, bssFinal, conn).thenApply(v -> {
+                List<String> proofHex = new ArrayList<>(result.proof().size());
+                for (Bytes b : result.proof()) proofHex.add(b.toHexString());
+                String storageRootHex = v.verifiedStorageRootHex() != null
+                        ? v.verifiedStorageRootHex()
+                        : (foundFinal != null ? foundFinal.storageRoot().toHexString() : null);
+                String codeHashHex = v.verifiedCodeHashHex() != null
+                        ? v.verifiedCodeHashHex()
+                        : (foundFinal != null ? foundFinal.codeHash().toHexString() : null);
+                boolean synced = bssFinal != null && bssFinal.isSynced();
+                long finalizedPeriod = bssFinal != null ? bssFinal.getFinalizedPeriod() : 0;
+                long wallClockPeriod = com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec
+                        .currentPeriod(clGenesisTime, secondsPerSlot);
+                long finalizedBlockNumber = bssFinal != null
+                        ? bssFinal.getFinalizedExecution().blockNumber() : 0;
+                long optimisticBlockNumber = bssFinal != null ? bssFinal.getOptimisticBlockNumber() : 0;
+                return new io.myotis.api.AccountProofResult(
+                        addr,
+                        foundFinal != null,
+                        foundFinal != null ? foundFinal.nonce() : -1,
+                        foundFinal != null ? foundFinal.balance().toString() : null,
+                        storageRootHex,
+                        codeHashHex,
+                        result.blockNumber(),
+                        result.stateRoot() != null ? result.stateRoot().toHexString() : null,
+                        v.peerProofValid(),
+                        v.beaconChainVerified(),
+                        v.blsVerified(),
+                        v.matchedSlot(),
+                        v.verifyMethod(),
+                        v.failReason(),
+                        accountHash.toHexString(),
+                        proofHex,
+                        synced,
+                        finalizedPeriod,
+                        wallClockPeriod,
+                        finalizedBlockNumber,
+                        optimisticBlockNumber);
+            });
+        });
     }
 
     /**
@@ -158,10 +270,24 @@ public final class VerifiedAccountQuery {
                 break;
             }
         }
+        return verify(result, address, found, bss, connector);
+    }
+
+    /**
+     * Same as {@link #verify(AccountRangeMessage.DecodeResult, Bytes, BeaconSyncState,
+     * RLPxConnector)} but accepting the already-located {@code found} account, so callers that
+     * scanned {@code result.accounts()} themselves don't pay a second scan.
+     */
+    public static CompletableFuture<Verification> verify(
+            AccountRangeMessage.DecodeResult result,
+            Bytes address,
+            AccountRangeMessage.AccountData found,
+            BeaconSyncState bss,
+            RLPxConnector connector) {
         long nonce = found != null ? found.nonce() : -1;
         String balance = found != null ? found.balance().toString() : null;
 
-        Verification v = new Verification();
+        Scratch v = new Scratch();
         if (result.stateRoot() != null && !result.proof().isEmpty()) {
             List<byte[]> proofBytes = new ArrayList<>(result.proof().size());
             for (Bytes b : result.proof()) proofBytes.add(b.toArrayUnsafe());
@@ -185,7 +311,7 @@ public final class VerifiedAccountQuery {
                 v.matchedSlot = match.slot();
                 v.blsVerified = match.blsVerified();
                 v.verifyMethod = "stateRootMatch";
-                return CompletableFuture.completedFuture(v);
+                return CompletableFuture.completedFuture(v.freeze());
             }
         }
 
@@ -236,12 +362,12 @@ public final class VerifiedAccountQuery {
                             } else {
                                 v.failReason = "headerChainInvalid";
                             }
-                            return v;
+                            return v.freeze();
                         });
             }
         }
 
-        return CompletableFuture.completedFuture(v);
+        return CompletableFuture.completedFuture(v.freeze());
     }
 
     private static Result finalizeResult(String addr,
@@ -252,15 +378,15 @@ public final class VerifiedAccountQuery {
         String balance = found != null ? found.balance().toString() : null;
         // storageRoot/codeHash come from the proof-verified leaf when we have it, so they're
         // cryptographically anchored rather than peer-claimed. Fall back to the slim (peer-claimed)
-        // body only when the leaf proof didn't verify (v.verifiedAcct == null). Note this is gated
-        // on peerProofValid, NOT beaconChainVerified: the beacon stateRootMatch fast-path can set
-        // beaconChainVerified=true even when the leaf proof didn't verify, so it is not a proxy for
-        // "we have a proof-verified leaf".
-        String storageRootHex = v.verifiedAcct != null
-                ? Bytes.wrap(v.verifiedAcct.storageRoot()).toHexString()
+        // body only when the leaf proof didn't verify (verifiedStorageRootHex == null). Note this
+        // is gated on peerProofValid, NOT beaconChainVerified: the beacon stateRootMatch fast-path
+        // can set beaconChainVerified=true even when the leaf proof didn't verify, so it is not a
+        // proxy for "we have a proof-verified leaf".
+        String storageRootHex = v.verifiedStorageRootHex() != null
+                ? v.verifiedStorageRootHex()
                 : (found != null ? found.storageRoot().toHexString() : null);
-        String codeHashHex = v.verifiedAcct != null
-                ? Bytes.wrap(v.verifiedAcct.codeHash()).toHexString()
+        String codeHashHex = v.verifiedCodeHashHex() != null
+                ? v.verifiedCodeHashHex()
                 : (found != null ? found.codeHash().toHexString() : null);
         return new Result(
                 addr,
@@ -271,12 +397,12 @@ public final class VerifiedAccountQuery {
                 codeHashHex,
                 result.blockNumber(),
                 result.stateRoot() != null ? result.stateRoot().toHexString() : null,
-                v.peerProofValid,
-                v.beaconChainVerified,
-                v.blsVerified,
-                v.matchedSlot,
-                v.verifyMethod,
-                v.failReason);
+                v.peerProofValid(),
+                v.beaconChainVerified(),
+                v.blsVerified(),
+                v.matchedSlot(),
+                v.verifyMethod(),
+                v.failReason());
     }
 
     /**
