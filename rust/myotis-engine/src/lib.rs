@@ -54,9 +54,15 @@ mod jni_shim {
         _class: JClass,
         name_or_alias: JString,
     ) -> jstring {
+        // Defensive null check BEFORE get_string: JNI string functions don't accept
+        // null references (undefined behavior — can segfault the JVM, not throw). The
+        // Java wrapper null-checks too, but the native side must not rely on that.
+        if name_or_alias.is_null() {
+            return std::ptr::null_mut();
+        }
         let input: String = match env.get_string(&name_or_alias) {
             Ok(s) => s.into(),
-            Err(_) => return std::ptr::null_mut(), // null String arg → unknown
+            Err(_) => return std::ptr::null_mut(),
         };
         match crate::catalog::canonical_network_name(&input) {
             Some(canonical) => match env.new_string(canonical) {

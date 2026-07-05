@@ -101,31 +101,38 @@ public final class SelectorEngine implements MyotisEngine {
         // failure (or vice versa).
         String choice = Engines.choice();
         MyotisEngine target = resolveFor(choice);
+        // Cross-engine duplicate guard, BEFORE any create attempt: each engine
+        // self-checks only its OWN registry, so without this a choice flip between two
+        // creates could host the same network on both engines — the older stack would
+        // leak, unreachable via get/stop. Checked here (not inside the try) so an
+        // already-hosted error propagates instead of triggering a pointless fallback
+        // that would fail the same way. (Canonical names are parity-tested identical
+        // across engines, so the name survives a fallback target switch.)
+        String canonical = target.canonicalNetworkName(config.networkName());
+        if (get(canonical) != null) {
+            throw new EngineException("network already hosted: " + canonical);
+        }
         if (target != java && "auto".equals(choice)) {
             // auto: a Rust create() failure is a fallback signal, not an error. This
             // double-create is only safe while a failed Rust create() has no side
             // effects — the Rust engine must keep create() all-or-nothing (R0 throws
             // before doing anything; the real implementation must preserve that).
+            // LinkageError too (UnsatisfiedLinkError / stale-.so symbol drift): the
+            // candidate engine must never take hosting down with it. Deliberately NOT
+            // Throwable — OOM/StackOverflow should not be masked as a fallback.
             try {
-                return createOn(target, config, ports);
-            } catch (EngineException e) {
+                return createOn(target, canonical, config, ports);
+            } catch (EngineException | LinkageError e) {
                 log.warn("[engines] auto: Rust engine create({}) failed ({}); "
                         + "falling back to the Java engine", config.networkName(), e.getMessage());
                 target = java;
             }
         }
-        return createOn(target, config, ports);
+        return createOn(target, canonical, config, ports);
     }
 
-    private ChainHandle createOn(MyotisEngine target, EngineConfig config, EnginePorts ports) {
-        String canonical = target.canonicalNetworkName(config.networkName());
-        // Cross-engine duplicate guard: each engine self-checks only its OWN registry,
-        // so without this a choice flip between two creates could host the same network
-        // on both engines — the older stack would leak, unreachable via get/stop.
-        // (Upholds the MyotisEngine.create contract: already hosted anywhere → throw.)
-        if (get(canonical) != null) {
-            throw new EngineException("network already hosted: " + canonical);
-        }
+    private ChainHandle createOn(MyotisEngine target, String canonical,
+                                 EngineConfig config, EnginePorts ports) {
         ChainHandle handle = target.create(config, ports);
         // Record ownership under the canonical name so get/stop (which hosts call with
         // canonical names) route to the right engine.
