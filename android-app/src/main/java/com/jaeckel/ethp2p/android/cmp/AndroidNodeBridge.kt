@@ -75,6 +75,7 @@ class AndroidNodeController(
     override fun shutdown() { serviceProvider()?.shutdown() }
     override fun setTargetSnapPeers(target: Int) { serviceProvider()?.setTargetSnapPeers(target) }
     override fun applyBlsBackend() { NodeService.applyBlsBackend(appContext) }
+    override fun applyEngineChoice() { NodeService.applyEngineChoice(appContext) }
     override fun clearCaches(network: String) { serviceProvider()?.clearCaches(network) }
     override fun resetSyncState(network: String) { serviceProvider()?.resetSyncState(network) }
 
@@ -169,6 +170,8 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun setStrictStateFreshness(v: Boolean) = NodeService.setStrictStateFreshness(ctx, v)
     override fun nativeBlsEnabled(): Boolean = NodeService.nativeBlsEnabled(ctx)
     override fun setNativeBlsEnabled(v: Boolean) = NodeService.setNativeBlsEnabled(ctx, v)
+    override fun rustEngineEnabled(): Boolean = NodeService.rustEngineEnabled(ctx)
+    override fun setRustEngineEnabled(v: Boolean) = NodeService.setRustEngineEnabled(ctx, v)
 }
 
 /**

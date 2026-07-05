@@ -7,8 +7,12 @@ license = "MIT OR Apache-2.0"
 
 [lib]
 # libmyotis_engine.{so,dylib,dll} — loaded by :myotis-engines' RustEngineNative.
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 myotis-consensus = { path = "../myotis-consensus" }
 jni = { version = "0.21", default-features = false }
+# Compound values cross the JNI boundary as JSON (hand-JNI + JSON decision —
+# docs/reimplementation/05). Schemas are pinned by golden tests on both sides.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

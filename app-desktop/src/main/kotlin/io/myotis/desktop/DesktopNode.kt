@@ -12,7 +12,7 @@ import io.myotis.api.EnsRoot
 import io.myotis.api.MyotisEngine
 import io.myotis.api.NetworkInfo
 import io.myotis.api.ports.EnginePorts
-import io.myotis.node.api.JavaMyotisEngine
+import io.myotis.engines.Engines
 import io.myotis.ui.AccountResult
 import io.myotis.ui.EnsResult
 import io.myotis.ui.NetworkStatus
@@ -33,15 +33,15 @@ import kotlin.io.path.createDirectories
 
 /**
  * The Desktop actual of [NodeController]: drives the SAME engine the daemon and Android
- * use — through the engine API ([MyotisEngine]/[ChainHandle]) only. The single concrete
- * engine reference is the [JavaMyotisEngine] default in the constructor; everything else
- * this host touches is `io.myotis.api`. Reuses the daemon's file-backed caches + CCIP
+ * use — through the engine API ([MyotisEngine]/[ChainHandle]) only. The composition-root
+ * default is the [Engines] selector (Java engine unless `myotis.engine`/the Settings
+ * toggle says otherwise); everything else this host touches is `io.myotis.api`. Reuses the daemon's file-backed caches + CCIP
  * gateway from `:app` as its port implementations.
  */
 class DesktopNodeController(
     private val dataDir: Path,
     private val settings: Settings,
-    private val engine: MyotisEngine = JavaMyotisEngine(),
+    private val engine: MyotisEngine = Engines.engine(),
 ) : NodeController {
 
     // nanoTime, not currentTimeMillis: wall-clock / NTP steps must not skew uptime.
@@ -90,6 +90,7 @@ class DesktopNodeController(
                     false,
                     settings.snapTarget(),
                     settings.strictStateFreshness(),
+                    dataDir.toString(),
                 )
                 val ports = EnginePorts(
                     FileNodeKeyStore { n ->
@@ -151,6 +152,14 @@ class DesktopNodeController(
         // No-op on desktop: there's no bundled native blst library yet (the macOS dylib is a
         // follow-up — see the CMP plan), so desktop always runs the pure-Java Milagro backend
         // and the Settings toggle has nothing to swap.
+    }
+
+    override fun applyEngineChoice() {
+        // auto (not rust): the Rust engine is catalog-only for now, so a hard `rust` would
+        // refuse to boot networks; auto prefers Rust where it can serve and falls back to
+        // Java with a log. Applies to networks (re)started afterwards — live ones keep
+        // their engine (reboot the network from Settings to switch it).
+        Engines.select(if (settings.rustEngineEnabled()) "auto" else "java")
     }
 
     override fun clearCaches(network: String) {
@@ -261,7 +270,7 @@ class DesktopNodeController(
  * access is guarded by `synchronized(this)` over the non-thread-safe backing collections.
  */
 class DesktopSettings(
-    private val networks: List<NetworkInfo> = JavaMyotisEngine().availableNetworks(),
+    private val networks: List<NetworkInfo> = Engines.engine().availableNetworks(),
 ) : Settings {
     private val enabled = linkedSetOf("mainnet")
     private val ports = HashMap<String, Int>()
@@ -271,6 +280,8 @@ class DesktopSettings(
     // Desktop has no bundled native blst yet (Milagro-only), so the honest default is off; the
     // toggle persists but DesktopNodeController.applyBlsBackend() is a no-op until the dylib ships.
     private var nativeBls = false
+    // The Rust engine is experimental (catalog-only today) — off by default everywhere.
+    private var rustEngine = false
 
     private fun info(network: String): NetworkInfo? = networks.firstOrNull { it.name() == network }
 
@@ -304,6 +315,8 @@ class DesktopSettings(
     override fun setStrictStateFreshness(v: Boolean) = synchronized(this) { strict = v }
     override fun nativeBlsEnabled(): Boolean = synchronized(this) { nativeBls }
     override fun setNativeBlsEnabled(v: Boolean) = synchronized(this) { nativeBls = v }
+    override fun rustEngineEnabled(): Boolean = synchronized(this) { rustEngine }
+    override fun setRustEngineEnabled(v: Boolean) = synchronized(this) { rustEngine = v }
 }
 
 /** Desktop is treated as always-online (no Android ConnectivityManager). */

@@ -26,15 +26,14 @@ jniLibs="$here/../android-app/src/main/jniLibs"
 # very old 32-bit devices if you still target them.
 cd "$here"
 # Build from the workspace root so the workspace [profile.release] and
-# .cargo/config.toml apply. Only myotis-bls ships in jniLibs for now —
-# myotis-engine is a placeholder until it grows a real JNI surface (add it
-# here with a second -p when that lands). 16 KB-aligned LOAD segments
-# (.cargo/config.toml passes -Wl,-z,max-page-size=16384) so the libs load on
-# Android 15+ devices with 16 KB memory pages.
-cargo ndk -t arm64-v8a -t x86_64 -o "$jniLibs" build --release -p myotis-bls
+# .cargo/config.toml apply. Ships myotis-bls (native BLS) and myotis-engine
+# (the Rust engine behind :myotis-engines' RustEngineNative). 16 KB-aligned
+# LOAD segments (.cargo/config.toml passes -Wl,-z,max-page-size=16384) so the
+# libs load on Android 15+ devices with 16 KB memory pages.
+cargo ndk -t arm64-v8a -t x86_64 -o "$jniLibs" build --release -p myotis-bls -p myotis-engine
 
 echo "built:"
-find "$jniLibs" -name 'libmyotis_bls.so' -exec ls -la {} \;
+find "$jniLibs" -name 'libmyotis_*.so' -exec ls -la {} \;
 
 # Fail loudly if any PT_LOAD segment is <16 KB aligned — a 4 KB-aligned .so is
 # rejected by the dynamic linker on 16 KB-page devices, and the symptom (BLS
@@ -44,7 +43,7 @@ echo "checking 16 KB alignment:"
 python3 - "$jniLibs" <<'PY'
 import struct, sys, glob, os
 bad = []
-for f in glob.glob(os.path.join(sys.argv[1], "*", "libmyotis_bls.so")):
+for f in glob.glob(os.path.join(sys.argv[1], "*", "libmyotis_*.so")):
     with open(f, "rb") as fh:
         d = fh.read()
     if d[:4] != b"\x7fELF":

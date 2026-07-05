@@ -226,6 +226,8 @@ tasks.register<Exec>("cargoNdkAndroid") {
     outputs.files(
         file("android-app/src/main/jniLibs/arm64-v8a/libmyotis_bls.so"),
         file("android-app/src/main/jniLibs/x86_64/libmyotis_bls.so"),
+        file("android-app/src/main/jniLibs/arm64-v8a/libmyotis_engine.so"),
+        file("android-app/src/main/jniLibs/x86_64/libmyotis_engine.so"),
     )
 }
 
