@@ -67,3 +67,67 @@ jobs:
           path: android-app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 30
+
+  # Attach the built APK to the GitHub Release for the pushed tag. Runs ONLY on
+  # `v*` tags (never on branch/PR builds), and reuses the build job's artifact
+  # rather than rebuilding. The desktop-dmg workflow publishes to the SAME
+  # release for the same tag; whichever job runs first creates it and the other
+  # just uploads its asset — the create step below tolerates that race.
+  release:
+    name: Publish APK to release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      # gh release create/upload needs write access to Releases (repo contents).
+      contents: write
+    steps:
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: android-app-debug-${{ github.sha }}
+          path: apk
+
+      - name: Rename APK to a stable, versioned asset name
+        run: |
+          set -eu
+          # Glob into an array and assert exactly one apk — a stray second file
+          # (or zero) should fail here, not silently ship an arbitrary pick.
+          shopt -s nullglob
+          apks=(apk/*.apk)
+          [ "${#apks[@]}" -eq 1 ] \
+            || { echo "::error::expected exactly 1 apk, found ${#apks[@]}: ${apks[*]}"; exit 1; }
+          mv "${apks[0]}" "apk/Myotis-${GITHUB_REF_NAME}-android-debug.apk"
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          # Notes via a quoted heredoc + --notes-file: markdown stays literal
+          # (no shell escaping of backticks/quotes) and renders as intended.
+          notes=$(mktemp)
+          cat > "$notes" <<'NOTES'
+          First public build of the Myotis wallet apps (pre-release).
+
+          **Android (`*-android-debug.apk`)** — unsigned *debug* build. Install via
+          "Install unknown apps". Not a signed release build.
+
+          **Desktop (`Myotis-<arch>.dmg`)** — unsigned; download the dmg matching
+          your Mac (arm64 for Apple Silicon, x64 for Intel). First launch:
+          right-click → Open to get past Gatekeeper (not notarized yet).
+          NOTES
+          # Create the release if it doesn't exist yet. The desktop workflow may
+          # win this race for the same tag: if `create` fails, re-check with
+          # `view` — success there means the other job already created it (fine),
+          # while a genuine failure still surfaces because `view` also fails.
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --prerelease \
+              --title "Myotis $tag" \
+              --notes-file "$notes" \
+              --target "${GITHUB_SHA}" \
+            || gh release view "$tag" >/dev/null 2>&1
+          fi
+          gh release upload "$tag" apk/Myotis-*.apk --clobber
