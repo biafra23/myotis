@@ -15,19 +15,32 @@ const CURRENT_SYNC_COMMITTEE_FIELD_INDEX: u64 = 22;
 const NEXT_SYNC_COMMITTEE_FIELD_INDEX: u64 = 23;
 const FINALIZED_CHECKPOINT_FIELD_INDEX: u64 = 20;
 
+// Depths reaching these helpers come from decode-validated branch lengths (4..=7),
+// but a shift-overflow panic on a wild depth would be a DoS foothold — guard and
+// return gindex 0, which can never satisfy verify_merkle_branch (safe rejection).
+
 /// Generalized index of current_sync_committee for a fork-dependent branch depth.
 pub fn sync_committee_gindex(branch_depth: usize) -> u64 {
+    if branch_depth >= 64 {
+        return 0;
+    }
     (1u64 << branch_depth) + CURRENT_SYNC_COMMITTEE_FIELD_INDEX
 }
 
 /// Generalized index of next_sync_committee for a fork-dependent branch depth.
 pub fn next_sync_committee_gindex(branch_depth: usize) -> u64 {
+    if branch_depth >= 64 {
+        return 0;
+    }
     (1u64 << branch_depth) + NEXT_SYNC_COMMITTEE_FIELD_INDEX
 }
 
 /// Generalized index of finalized_checkpoint.root — the branch depth includes the
 /// extra level into the Checkpoint container (root = field 1).
 pub fn finalized_root_gindex(branch_depth: usize) -> u64 {
+    if branch_depth == 0 || branch_depth >= 64 {
+        return 0;
+    }
     let checkpoint_gindex = (1u64 << (branch_depth - 1)) + FINALIZED_CHECKPOINT_FIELD_INDEX;
     checkpoint_gindex * 2 + 1
 }

@@ -217,6 +217,12 @@ impl ExecutionPayloadHeader {
             return err("ExecutionPayloadHeader: Electra offset but short buffer");
         }
         let fixed = if is_electra { ELECTRA_FIXED_SIZE } else { DENEB_FIXED_SIZE };
+        // Out-of-range extraData offsets fall back to EMPTY, deliberately NOT Err:
+        // this mirrors the Java reference decoder byte-for-byte (same `>= fixed &&
+        // <= len` guard, same empty fallback), and behavioral parity is the contract
+        // the conformance corpus pins. A forged offset can't smuggle anything —
+        // extraData feeds the EPH hash_tree_root, and a wrong root fails the signed
+        // execution-branch check downstream on BOTH engines identically.
         let extra_data = if extra_data_offset >= fixed && extra_data_offset <= ssz_bytes.len() {
             ssz_bytes[extra_data_offset..].to_vec()
         } else {

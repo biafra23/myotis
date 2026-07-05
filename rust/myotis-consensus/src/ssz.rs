@@ -44,11 +44,13 @@ pub fn merkleize_with_limit(chunks: &[Root], limit: usize) -> Root {
     let mut layer: Vec<Root> = Vec::with_capacity(size);
     layer.extend_from_slice(chunks);
     layer.resize(size, zero_hash(0));
-    while layer.len() > 1 {
-        layer = layer
-            .chunks_exact(2)
-            .map(|p| sha256_pair(&p[0], &p[1]))
-            .collect();
+    // In-place pairwise reduction: no per-level reallocation.
+    let mut len = size;
+    while len > 1 {
+        for i in 0..len / 2 {
+            layer[i] = sha256_pair(&layer[2 * i], &layer[2 * i + 1]);
+        }
+        len /= 2;
     }
     layer[0]
 }
@@ -102,17 +104,17 @@ pub fn byte_vector_root(data: &[u8]) -> Root {
 
 /// hash_tree_root of a variable byte list with a chunk limit (extraData).
 pub fn byte_list_root(data: &[u8], chunk_limit: usize) -> Root {
-    let chunks: Vec<Root> = if data.is_empty() {
-        vec![[0u8; 32]]
-    } else {
-        data.chunks(32)
-            .map(|c| {
-                let mut chunk = [0u8; 32];
-                chunk[..c.len()].copy_from_slice(c);
-                chunk
-            })
-            .collect()
-    };
+    // No empty-data special case needed: merkleize_with_limit pads an empty chunk
+    // list with zero leaves up to the limit, which equals the Java one-zero-chunk
+    // path's root exactly.
+    let chunks: Vec<Root> = data
+        .chunks(32)
+        .map(|c| {
+            let mut chunk = [0u8; 32];
+            chunk[..c.len()].copy_from_slice(c);
+            chunk
+        })
+        .collect();
     let root = merkleize_with_limit(&chunks, chunk_limit);
     mix_in_length(&root, data.len() as u64)
 }

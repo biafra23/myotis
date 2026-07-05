@@ -101,7 +101,7 @@ fn replay_reproduces_recorded_verdicts() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.ends_with("-update.ssz")
             && n.len() == "000-update.ssz".len()
-            && n[..3].chars().all(|c| c.is_ascii_digit()))
+            && n.chars().take(3).all(|c| c.is_ascii_digit()))
         .collect();
     update_files.sort();
     actual.insert("updates.count".into(), update_files.len().to_string());
@@ -127,7 +127,7 @@ fn replay_reproduces_recorded_verdicts() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.ends_with("-finality.ssz")
             && n.len() == "000-finality.ssz".len()
-            && n[..3].chars().all(|c| c.is_ascii_digit()))
+            && n.chars().take(3).all(|c| c.is_ascii_digit()))
         .collect();
     finality_files.sort();
     actual.insert("finality.count".into(), finality_files.len().to_string());
