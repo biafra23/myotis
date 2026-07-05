@@ -35,6 +35,14 @@
 > optional" requirement, and the phase-1 surface is ~a dozen natives. A stale-library
 > guard (`nativeInit()` ABI-version handshake) protects the boundary. The UniFFI
 > mapping below remains the reference for when the surface grows or iOS arrives.
+>
+> **Conformance corpus** (plan PR 3): `rust/myotis-bls/tests/conformance.rs` pins the
+> shared BLS fixture files, and `rust/testdata/lc/mainnet/` holds a live-captured
+> light-client corpus (bootstrap → 18-update catch-up chain → finality, plus
+> negatives) whose verdicts `expected.txt` records — replayed and asserted by the
+> Java `LcVectorConformanceTest`, to be reproduced by the Rust LC (PRs 4–6). Capture
+> tooling: `./gradlew :app:run -Plcdump=<dir>`; regenerate verdicts with
+> `-Dmyotis.lc.writeExpected=true`.
 
 ## 2. Interface → binding map
 

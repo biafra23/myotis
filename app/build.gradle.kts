@@ -78,6 +78,9 @@ tasks.register<JavaExec>("run") {
     (project.findProperty("bls") as String?)?.let { systemProperty("myotis.bls.backend", it) }
     // -Pengine=java|rust|auto → -Dmyotis.engine (the :myotis-engines selector).
     (project.findProperty("engine") as String?)?.let { systemProperty("myotis.engine", it) }
+    // -Plcdump=<dir> → -Dmyotis.lc.dumpVectors: capture raw light-client SSZ
+    // (bootstrap/updates/finality) for the rust/testdata conformance corpus.
+    (project.findProperty("lcdump") as String?)?.let { systemProperty("myotis.lc.dumpVectors", it) }
     // Pass -Pargs="status" / -Pargs="get-headers 21000000 3" etc. to the JVM main
     // Pass -Pnetwork=sepolia to select a testnet (default: mainnet)
     val appArgs = mutableListOf<String>()
