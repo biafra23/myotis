@@ -6,18 +6,22 @@ description = "Native BLS12-381 fast-aggregate-verify (blst) behind a JNI shim f
 license = "MIT OR Apache-2.0"
 
 [lib]
-# cdylib → libmyotis_bls.{so,dylib,dll}; the same crate builds for the desktop JVM and,
-# via cargo-ndk, for each Android ABI.
-crate-type = ["cdylib"]
+# cdylib → libmyotis_bls.{so,dylib,dll} for the desktop JVM and (via cargo-ndk) each
+# Android ABI. rlib → in-workspace reuse: myotis-consensus calls the pure verify core
+# directly (feature `jni` off), no dynamic library involved.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# The JNI shim is only wanted in the cdylib the JVM loads; pure-Rust consumers
+# (myotis-consensus) depend with default-features = false.
+default = ["jni"]
+jni = ["dep:jni"]
 
 [dependencies]
 # Supranational blst: the BLS12-381 lib every major Ethereum CL client ships (C + asm).
 blst = "0.3"
-# JNI bindings so the JVM/Android can call in.
-jni = { version = "0.21", default-features = false }
+# JNI bindings so the JVM/Android can call in (optional — see the `jni` feature).
+jni = { version = "0.21", default-features = false, optional = true }
 
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-panic = "abort"
+# NOTE: [profile.release] moved to the workspace root rust/Cargo.toml (crate-level
+# profiles are ignored inside a workspace).

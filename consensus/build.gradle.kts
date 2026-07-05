@@ -38,15 +38,22 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
-    // If the native blst lib (rust/myotis-bls) has been built, put it on java.library.path
-    // so NativeBlsBackend.isAvailable() is true and BlsBackendBenchmark exercises it.
-    // Build with: (cd rust/myotis-bls && cargo build --release)
-    val nativeDir = rootProject.file("rust/myotis-bls/target/release")
-    if (nativeDir.exists()) {
-        val sep = System.getProperty("path.separator")
-        systemProperty(
-            "java.library.path",
-            nativeDir.absolutePath + sep + System.getProperty("java.library.path"),
-        )
+    // Build the Rust workspace first (no-op without cargo) and put its release dir on
+    // java.library.path so NativeBlsBackend.isAvailable() is true and the BLS fixture
+    // tests + BlsBackendBenchmark exercise the native backend. Declared as an INPUT
+    // (not just dependsOn): a rebuilt native lib must re-run these tests — a doFirst
+    // systemProperty alone is invisible to the up-to-date fingerprint. inputs.files
+    // tolerates the outputs not existing on cargo-less machines.
+    inputs.files(rootProject.tasks.named("cargoBuildHost")).withPropertyName("nativeRustLibs")
+    // Resolved in doFirst — the dir only exists AFTER cargoBuildHost has run once.
+    doFirst {
+        val nativeDir = rootProject.file("rust/target/release")
+        if (nativeDir.exists()) {
+            val sep = System.getProperty("path.separator")
+            systemProperty(
+                "java.library.path",
+                nativeDir.absolutePath + sep + System.getProperty("java.library.path"),
+            )
+        }
     }
 }
