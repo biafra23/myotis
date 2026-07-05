@@ -26,6 +26,8 @@ kotlin {
 }
 
 dependencies {
+    // The verified-read contract the router serves (io.myotis.api.VerifiedReads).
+    implementation(project(":myotis-api"))
     // Shared verified-read primitives — the same modules :android-app and :app use.
     implementation(project(":core"))
     implementation(project(":networking"))

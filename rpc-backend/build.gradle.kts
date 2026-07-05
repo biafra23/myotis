@@ -23,7 +23,11 @@ java {
 }
 
 dependencies {
-    // The MyotisRpcBackend interface + RpcRouter/MyotisRpcServer this implements.
+    // The engine API — VerifiedRpcBackend implements io.myotis.api.VerifiedReads.
+    // (node-core, the only consumer that reads it as a VerifiedReads, depends on
+    // :myotis-api directly too, so implementation scope is sufficient.)
+    implementation(project(":myotis-api"))
+    // The Ktor JSON-RPC server this backend is served through.
     implementation(project(":jsonrpc-server"))
 
     // Verified-read primitives, shared with both hosts.
