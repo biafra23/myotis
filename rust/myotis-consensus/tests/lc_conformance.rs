@@ -32,8 +32,14 @@ fn parse_kv(text: &str) -> BTreeMap<String, String> {
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .map(|l| {
+            // expected.txt is the conformance ORACLE: a non-comment line without
+            // '=' means it's corrupted/half-edited — fail loudly, never drop it.
+            let (k, v) = l
+                .split_once('=')
+                .unwrap_or_else(|| panic!("malformed line in expected.txt: {l:?}"));
+            (k.trim().to_string(), v.trim().to_string())
+        })
         .collect()
 }
 
@@ -42,6 +48,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn unhex(s: &str) -> Vec<u8> {
+    assert!(s.len() % 2 == 0, "odd-length hex in expected.txt: {s:?}");
     (0..s.len() / 2)
         .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("bad hex in expected.txt"))
         .collect()
