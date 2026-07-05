@@ -757,6 +757,7 @@ public final class NodeService extends Service {
      */
     private void buildAndStart(String netName) {
         String n = canonicalNetwork(netName);
+        ChainHandle created = null;
         try {
             int rpcPort = rpcPortFor(this, n);
             // Mirror the native-BLS toggle into the process-wide BlsBackends selection (set the
@@ -823,6 +824,7 @@ public final class NodeService extends Service {
                     return;
                 }
                 ChainHandle handle = ENGINE.create(config, ports);
+                created = handle;
                 handles.put(n, handle);
                 if (!handle.start()) {
                     LogBuffer.e(TAG, "[" + n + "] node stack failed to start");
@@ -843,7 +845,17 @@ public final class NodeService extends Service {
         } catch (Exception e) {
             LogBuffer.e(TAG, "[" + n + "] node boot failed", e);
             forgetStack(n);
-            try { ENGINE.stop(n); } catch (Throwable ignored) {}
+            // Tear down only the instance THIS boot created, under the lock, and only
+            // while it is still the registered one — after we dropped the lock a racing
+            // enable may have registered a fresh healthy instance that must not be
+            // stopped by our failure cleanup.
+            if (created != null) {
+                synchronized (bootLock(n)) {
+                    if (ENGINE.get(n) == created) {
+                        try { ENGINE.stop(n); } catch (Throwable ignored) {}
+                    }
+                }
+            }
             stopIfNoStacksLeft();
         }
     }

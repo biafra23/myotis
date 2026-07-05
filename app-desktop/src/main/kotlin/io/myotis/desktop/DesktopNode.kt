@@ -25,6 +25,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
 import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
@@ -215,7 +216,9 @@ class DesktopNodeController(
         return EnsResult(r.name(), r.addressHex(), r.blockNumber(), r.verified(), r.error())
     }
 
-    /** Poll the hosted networks every 2s and emit a per-network snapshot map for the UI. */
+    /** Poll the hosted networks every 2s and emit a per-network snapshot map for the UI.
+     *  flowOn(Default): status() walks/sorts peer lists and prunes the backoff map — keep
+     *  that off the Compose UI thread (parity with Android's bridge, which does the same). */
     override fun snapshots(): Flow<Map<String, NodeSnapshot>> = flow {
         while (true) {
             emit(engine.hostedNetworks().mapNotNull { name ->
@@ -223,7 +226,7 @@ class DesktopNodeController(
             }.toMap())
             delay(2000)
         }
-    }
+    }.flowOn(Dispatchers.Default)
 
     private fun snapshotOf(handle: ChainHandle): NodeSnapshot {
         val s = handle.status()
