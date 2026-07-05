@@ -190,6 +190,19 @@ jobs:
             test -f "dmg/Myotis-${arch}.dmg" \
               || { echo "::error::missing dmg/Myotis-${arch}.dmg"; exit 1; }
           done
+          # Notes via a quoted heredoc + --notes-file: markdown stays literal
+          # (no shell escaping of backticks/quotes) and renders as intended.
+          notes=$(mktemp)
+          cat > "$notes" <<'NOTES'
+          First public build of the Myotis wallet apps (pre-release).
+
+          **Android (`*-android-debug.apk`)** — unsigned *debug* build. Install via
+          "Install unknown apps". Not a signed release build.
+
+          **Desktop (`Myotis-<arch>.dmg`)** — unsigned; download the dmg matching
+          your Mac (arm64 for Apple Silicon, x64 for Intel). First launch:
+          right-click → Open to get past Gatekeeper (not notarized yet).
+          NOTES
           # Create the release if it doesn't exist yet. The android workflow may
           # win this race for the same tag: if `create` fails, re-check with
           # `view` — success there means the other job already created it (fine),
@@ -198,14 +211,7 @@ jobs:
             gh release create "$tag" \
               --prerelease \
               --title "Myotis $tag" \
-              --notes "First public build of the Myotis wallet apps (pre-release).
-
-          **Android (\`*-android-debug.apk\`)** — unsigned *debug* build. Install via
-          \"Install unknown apps\". Not a signed release build.
-
-          **Desktop (\`Myotis-<arch>.dmg\`)** — unsigned; download the dmg matching
-          your Mac (arm64 for Apple Silicon, x64 for Intel). First launch:
-          right-click → Open to get past Gatekeeper (not notarized yet)." \
+              --notes-file "$notes" \
               --target "${GITHUB_SHA}" \
             || gh release view "$tag" >/dev/null 2>&1
           fi
