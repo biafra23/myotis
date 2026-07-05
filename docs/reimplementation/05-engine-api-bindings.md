@@ -57,7 +57,7 @@ Rust side wraps it in `spawn_blocking`, exactly mirroring today's
 - **iOS**: staticlib + UniFFI Swift bindings as an `.xcframework`. The shared Compose
   UI (`:ui` commonMain — already pure Kotlin, no JVM types) gains `iosArm64`/
   `iosSimulatorArm64` targets; an iOS actual of the `NodeController`/`Settings`/
-  `LogSource`/`QueryHistory` seams maps UniFFI types → the ui models (template:
+  `LogSource`/`QueryHistory` seams, mapping UniFFI types → the ui models (template:
   `AndroidNodeBridge.kt`, ~200 lines). iOS-native ports: `NodeKeyStore` → Keychain,
   `HttpGateway` → URLSession/Ktor-Darwin, `DnsServers` → resolver config.
 - **Desktop**: use the crate directly from the JVM via JNI/UniFFI-Kotlin, or ship the

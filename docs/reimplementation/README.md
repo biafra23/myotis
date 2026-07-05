@@ -345,7 +345,7 @@ not-found) / `null`. Wei values are decimal strings; addresses/hashes/calldata a
 |---|---|---|
 | `chainId()` | long | config |
 | `headBlockNumber()` | Long? | beacon optimistic head |
-| `syncState()` | `SYNCING \| CATCHING_UP \| SYNCED` | beacon light client |
+| `syncState()` | `SYNCING` \| `CATCHING_UP` \| `SYNCED` | beacon light client |
 | `getBalance(bytes, block)` | decimal-wei String? | MPT account proof vs anchored stateRoot |
 | `getTransactionCount(bytes, block)` | Long? | MPT account proof (+pending overlay for own txs) |
 | `getCode(bytes, block)` | bytes? | bytecode vs proven `codeHash` |
