@@ -32,6 +32,21 @@ public final class AppSlf4jProvider implements SLF4JServiceProvider {
     /** Must be a prefix of the slf4j-api version on the classpath. */
     public static final String REQUESTED_API_VERSION = "2.0.99";
 
+    /**
+     * Minimum level captured (logcat + {@link LogBuffer}); calls below it are dropped. TRACE is
+     * always suppressed regardless (libp2p floods it). Defaults to DEBUG — capture everything
+     * above trace, matching the historical behavior — and the Logs tab can raise it to quiet the
+     * ring. Volatile: read on every log call, written from the UI thread.
+     */
+    private static volatile Level minLevel = Level.DEBUG;
+
+    /** Set the minimum captured level (from the Logs tab). Ignores null so the volatile can never
+     *  go null and NPE the hot-path read on the next log call. */
+    public static void setMinLevel(Level level) { if (level != null) minLevel = level; }
+
+    /** The current minimum captured level. */
+    public static Level minLevel() { return minLevel; }
+
     private final ILoggerFactory loggerFactory = new AppLoggerFactory();
     private final IMarkerFactory markerFactory = new BasicMarkerFactory();
     private final MDCAdapter mdcAdapter = new BasicMDCAdapter();
@@ -56,14 +71,18 @@ public final class AppSlf4jProvider implements SLF4JServiceProvider {
             this.name = name;
         }
 
-        // We don't filter by level — let consumers (logcat / UI) gate display.
-        // TRACE is suppressed because libp2p is *very* chatty at trace level
-        // and would dominate the ring buffer otherwise.
+        // Level gating is a single process-wide threshold (minLevel), adjustable live from the
+        // Logs tab. TRACE is *always* suppressed because libp2p is very chatty at trace level and
+        // would dominate the ring buffer.
         @Override public boolean isTraceEnabled() { return false; }
-        @Override public boolean isDebugEnabled() { return true; }
-        @Override public boolean isInfoEnabled()  { return true; }
-        @Override public boolean isWarnEnabled()  { return true; }
-        @Override public boolean isErrorEnabled() { return true; }
+        @Override public boolean isDebugEnabled() { return enabled(Level.DEBUG); }
+        @Override public boolean isInfoEnabled()  { return enabled(Level.INFO); }
+        @Override public boolean isWarnEnabled()  { return enabled(Level.WARN); }
+        @Override public boolean isErrorEnabled() { return enabled(Level.ERROR); }
+
+        private static boolean enabled(Level level) {
+            return level != Level.TRACE && level.toInt() >= minLevel.toInt();
+        }
 
         @Override
         protected String getFullyQualifiedCallerName() {
@@ -75,6 +94,9 @@ public final class AppSlf4jProvider implements SLF4JServiceProvider {
                                                    String messagePattern,
                                                    Object[] arguments,
                                                    Throwable throwable) {
+            // Belt-and-suspenders: LegacyAbstractLogger already gates on isXEnabled(), but drop
+            // anything below the threshold (or TRACE) here too so no path bypasses it.
+            if (level == Level.TRACE || level.toInt() < minLevel.toInt()) return;
             String formatted = MessageFormatter.basicArrayFormat(messagePattern, arguments);
 
             // Tee to logcat so `adb logcat` continues to work.
