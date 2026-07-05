@@ -5,6 +5,8 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -17,15 +19,22 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <p>Off by default and effectively free when off (one static null check). Never
  * throws: a capture failure logs and drops the vector — it must not disturb a live
- * sync, which is the source of truth being observed. Note the P2P-bootstrap site
- * runs on a libp2p callback thread, so enabling capture puts one ~26 KB file write
- * on that path — fine for a debug tool, not free.
+ * sync, which is the source of truth being observed. Writes are handed to a
+ * single-threaded background writer: some capture sites run on libp2p callback /
+ * catch-up executor threads, which must not eat disk latency even in debug runs.
+ * The sequence number is taken synchronously, so file order = capture order.
  */
 public final class VectorDump {
 
     private static final Logger log = LoggerFactory.getLogger(VectorDump.class);
     private static final Path DIR;
     private static final AtomicInteger SEQ = new AtomicInteger();
+    /** Daemon thread: capture must never keep a shutting-down JVM alive. */
+    private static final ExecutorService WRITER = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "lc-vector-dump");
+        t.setDaemon(true);
+        return t;
+    });
 
     static {
         String dir = System.getProperty("myotis.lc.dumpVectors");
@@ -54,11 +63,16 @@ public final class VectorDump {
      */
     public static void maybeDump(String kind, byte[] ssz) {
         if (DIR == null || ssz == null) return;
-        try {
-            Path file = DIR.resolve(String.format("%04d-%s.ssz", SEQ.incrementAndGet(), kind));
-            Files.write(file, ssz);
-        } catch (Exception e) {
-            log.warn("[lc-dump] failed to write {} vector: {}", kind, e.getMessage());
-        }
+        // Sequence assigned on the CALLING thread so filename order matches the order
+        // the client actually observed the messages, regardless of writer scheduling.
+        int seq = SEQ.incrementAndGet();
+        byte[] copy = ssz.clone(); // caller may reuse/mutate its buffer after we return
+        WRITER.execute(() -> {
+            try {
+                Files.write(DIR.resolve(String.format("%04d-%s.ssz", seq, kind)), copy);
+            } catch (Exception e) {
+                log.warn("[lc-dump] failed to write {} vector: {}", kind, e.getMessage());
+            }
+        });
     }
 }

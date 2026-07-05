@@ -30,6 +30,7 @@ fn parse_kv(text: &str) -> HashMap<&str, &str> {
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.trim(), v.trim()))
         .collect()
 }
 
