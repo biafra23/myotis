@@ -101,20 +101,26 @@ enabled. `withRpcPort(n)` overrides just the RPC port (hosts may let users pick 
 ### 1.4 Platform ports (the injection seams)
 
 See [README §5.2](README.md#52-platform-ports-iomyotisapiports--implement-per-host) for the
-table. The shapes (re-create as traits/interfaces):
+table. The CANONICAL shapes are the `io.myotis.api.ports` interfaces (re-create as
+traits/callback interfaces exactly as written there):
 
-- `PeerCache`: `add(addr, pubkeyHex, snap)`, `recordSnapServed(addr)`, `recordSnapFailure(addr)`,
-  `load() -> [CachedPeer]`, `close()`.
-- `ClPeerCache`: `load() -> [multiaddr]`, `add`, `markFailure`, `servedRanges() ->
-  map<multiaddr,[low,high]>`, `recordServed`, `bootstrapPeers() -> map<multiaddr,period>`,
-  `recordBootstrap`, `lightClientConfirmed()`, `lightClientDenied()`, `markLightClientBatch`,
-  `close()`. (Method shapes mirror the light client's seed/listener setters so they wire as direct
-  callbacks.)
-- `DnsServerProvider`: `get() -> [dnsServerIp]` (null/empty → resolver's default).
-- `CcipGateway`: `request(method, url, body) -> bytes`.
-- `SnapQualitySink`: `recordSnapServed/Failure(addr)` (persist EL peer quality).
-- `RpcLogger`: `info/warn`. `RpcClock`: `elapsedMillis()` (monotonic).
-- `CachedPeer = (address, publicKeyHex, snap, snapQuality ∈ {CONFIRMED, UNKNOWN, DENIED})`.
+- `NodeKeyStore`: `load(networkName) -> bytes32?`, `store(networkName, bytes32)`.
+- `EnginePeerCache`: `add(host, port, pubkeyHex, snap)`, `recordSnapServed(host, port)`,
+  `recordSnapFailure(host, port)`, `load() -> [CachedPeerInfo]`, `close()`.
+- `EngineClPeerCache`: `load() -> [multiaddr]`, `add`, `markFailure`,
+  `servedRanges() -> [ServedRange(multiaddr, low, high)]`, `recordServed`,
+  `bootstrapPeers() -> [BootstrapPeer(multiaddr, period)]`, `recordBootstrap`,
+  `lightClientConfirmed()/Denied() -> [multiaddr]`, `markLightClientBatch(confirmed, denied)`,
+  `close()`. (Flat record lists, not maps — the engine converts to the light client's
+  seed/listener shapes internally.)
+- `DnsServers`: `dnsServerIps() -> [String]` (null port / empty list → resolver's default).
+- `HttpGateway`: `request(method, url, body?) -> String` — **BLOCKING**, throws on any
+  transport failure; the engine wraps it into its internal async shape and budgets the
+  timeout. (The engine-internal `CcipGateway` future-shape is an implementation detail.)
+- `EngineLogger`: `info/warn/error`. `EngineClock`: `elapsedMillis()` (monotonic).
+- `CachedPeerInfo = (host, port, publicKeyHex, snap, snapQuality ∈ {CONFIRMED, UNKNOWN, DENIED})`.
+- (The old `SnapQualitySink` is engine-internal now — snap-quality persistence rides
+  `EnginePeerCache.recordSnapServed/Failure`.)
 
 ---
 

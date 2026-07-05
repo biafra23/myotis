@@ -307,7 +307,9 @@ hashes/addresses as bytes on the read API and 0x-hex strings in result records.
   `isRunning()`, `setTargetSnapPeers(n)`, `clearPeerState()`, plus the read surfaces
   below and the verified operator queries (`requestAccount`, `getStorageProof`,
   `getHeaders`, `getBlockVerified`, `dialPeer`) returning flat result records whose
-  `failReason`/`error` fields carry verification failures (never exceptions).
+  `failReason`/`error` fields carry verification failures. Verification failures never
+  throw; programmer/state errors (malformed address, network not running) DO throw the
+  API's single `EngineException`.
 - **`EngineConfig`** — `(networkName, elPort, discv5Port, rpcPort [0 = per-network
   default], syncSnapshotPath, gossipsubEnabled, targetSnapPeers [0 = maintainer off],
   strictStateFreshness)`.
