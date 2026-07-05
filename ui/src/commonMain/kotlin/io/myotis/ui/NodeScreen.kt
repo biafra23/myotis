@@ -726,6 +726,7 @@ private fun LogsTab(logs: LogSource) {
     var shown by remember { mutableStateOf<List<LogLine>>(emptyList()) }
     var lastVersion by remember { mutableStateOf(-1L) }
     var filter by remember { mutableStateOf("") }
+    var level by remember { mutableStateOf(logs.level()) }
 
     // Poll the cheap version counter; the O(n) snapshot of up to 50k lines runs off the main
     // thread so it can't jank the UI.
@@ -741,15 +742,19 @@ private fun LogsTab(logs: LogSource) {
     }
 
     // Filter off the main thread too, and cooperatively cancel superseded passes (rapid typing).
-    LaunchedEffect(lines, filter) {
+    // Filters by the selected minimum level AND the text query; `level` also drives capture (via
+    // logs.setLevel), so this display filter mainly hides already-captured lines below `level`.
+    LaunchedEffect(lines, filter, level) {
         val f = filter.trim()
-        shown = if (f.isEmpty()) lines
+        val minRank = level.ordinal
+        shown = if (f.isEmpty() && level == LogLevel.DEBUG) lines
         else withContext(Dispatchers.Default) {
             lines.filter {
                 ensureActive()  // withContext receiver is the CoroutineScope
-                // contains(ignoreCase = true) avoids allocating a lowercased copy of every
-                // tag/message per keystroke (up to 50k lines).
-                it.tag.contains(f, ignoreCase = true) || it.message.contains(f, ignoreCase = true)
+                logLevelRank(it.level) >= minRank &&
+                    // contains(ignoreCase = true) avoids allocating a lowercased copy of every
+                    // tag/message per keystroke (up to 50k lines).
+                    (f.isEmpty() || it.tag.contains(f, ignoreCase = true) || it.message.contains(f, ignoreCase = true))
             }
         }
     }
@@ -787,6 +792,23 @@ private fun LogsTab(logs: LogSource) {
             Spacer(Modifier.width(4.dp))
             OutlinedButton(onClick = { logs.clear() }) { Text("Clear") }
         }
+        Spacer(Modifier.height(4.dp))
+        // Capture level: lower it (e.g. DEBUG) to surface the chatty wire / peer-churn lines,
+        // raise it to quiet the log. Applies to capture (logs.setLevel) AND hides already-captured
+        // lines below the selection.
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text("Level", style = MaterialTheme.typography.labelMedium)
+            LogLevel.entries.forEach { lvl ->
+                FilterChip(
+                    selected = level == lvl,
+                    onClick = { level = lvl; logs.setLevel(lvl) },
+                    label = { Text(lvl.name) },
+                )
+            }
+        }
         Spacer(Modifier.height(8.dp))
         Box(Modifier.weight(1f).fillMaxWidth()) {
             LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
@@ -818,6 +840,15 @@ private fun LogLineRow(line: LogLine, tz: TimeZone) {
         fontFamily = FontFamily.Monospace,
         color = color,
     )
+}
+
+/** Rank a captured line's level char against [LogLevel.ordinal] (DEBUG=0 … ERROR=3). 'V' (TRACE,
+ *  never captured) ranks with DEBUG so a DEBUG selection shows everything. */
+private fun logLevelRank(c: Char): Int = when (c) {
+    'E' -> 3
+    'W' -> 2
+    'I' -> 1
+    else -> 0   // 'D' and 'V'
 }
 
 private fun formatLogs(lines: List<LogLine>, tz: TimeZone): String = buildString {

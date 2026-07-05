@@ -1,11 +1,14 @@
 package io.myotis.desktop
 
 import ch.qos.logback.classic.Level
+import ch.qos.logback.classic.Logger
 import ch.qos.logback.classic.spi.ILoggingEvent
 import ch.qos.logback.classic.spi.ThrowableProxyUtil
 import ch.qos.logback.core.AppenderBase
+import io.myotis.ui.LogLevel
 import io.myotis.ui.LogLine
 import io.myotis.ui.LogSource
+import org.slf4j.LoggerFactory
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -35,6 +38,35 @@ object DesktopLogSource : LogSource {
     override fun clear() {
         synchronized(lock) { buffer.clear() }
         version.incrementAndGet()
+    }
+
+    // The app's own loggers whose level the Logs-tab control drives. Setting the wire logger too
+    // is what lets the control actually reveal the (otherwise ERROR-gated) networking DEBUG lines.
+    private val CONTROLLED_LOGGERS = listOf("com.jaeckel.ethp2p", "io.myotis", "com.jaeckel.ethp2p.networking")
+
+    // Reflects the app-code logger (com.jaeckel.ethp2p). By default the wire logger starts quieter
+    // (ERROR, per logback-desktop.xml) so the chip can read one notch more verbose than the wire is
+    // actually capturing until the user picks a level — at which point setLevel() brings all three
+    // (app, io.myotis, wire) to the selection, so the chip becomes exact.
+    override fun level(): LogLevel =
+        fromLogback((LoggerFactory.getLogger("com.jaeckel.ethp2p") as? Logger)?.effectiveLevel)
+
+    override fun setLevel(level: LogLevel) {
+        val lb = when (level) {
+            LogLevel.DEBUG -> Level.DEBUG
+            LogLevel.INFO -> Level.INFO
+            LogLevel.WARN -> Level.WARN
+            LogLevel.ERROR -> Level.ERROR
+        }
+        CONTROLLED_LOGGERS.forEach { (LoggerFactory.getLogger(it) as? Logger)?.level = lb }
+    }
+
+    private fun fromLogback(lvl: Level?): LogLevel = when {
+        lvl == null -> LogLevel.INFO
+        lvl.toInt() >= Level.ERROR_INT -> LogLevel.ERROR
+        lvl.toInt() >= Level.WARN_INT -> LogLevel.WARN
+        lvl.toInt() >= Level.INFO_INT -> LogLevel.INFO
+        else -> LogLevel.DEBUG
     }
 }
 
