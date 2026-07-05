@@ -203,9 +203,13 @@ jobs:
           **Android (`*-android-debug.apk`)** — unsigned *debug* build. Install via
           "Install unknown apps". Not a signed release build.
 
-          **Desktop (`Myotis-<arch>.dmg`)** — unsigned; download the dmg matching
+          **Desktop macOS (`Myotis-<arch>.dmg`)** — unsigned; download the dmg matching
           your Mac (arm64 for Apple Silicon, x64 for Intel). First launch:
           right-click → Open to get past Gatekeeper (not notarized yet).
+
+          **Desktop Linux (`Myotis-<arch>.deb`)** — install with
+          `sudo apt install ./Myotis-<arch>.deb` (x64 for Intel/AMD, arm64 for
+          Raspberry Pi 5 / ARM machines).
           NOTES
           # Create the release if it doesn't exist yet. The android workflow may
           # win this race for the same tag: if `create` fails, re-check with

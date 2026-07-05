@@ -1,0 +1,208 @@
+name: Desktop DEB (Linux)
+
+on:
+  # Scope push to main + release tags so a branch push that also has an open PR
+  # doesn't build twice (the PR is covered by pull_request below). Tags still
+  # build the release .deb.
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  # pull_request stays unscoped (any base branch) — the double-run is already
+  # killed by narrowing push above, and this keeps CI on PRs that don't target main.
+  pull_request:
+  # Manual publish path: attach debs built from the CURRENT ref to an existing
+  # release (added so Linux builds could join v0.1.0, which was tagged before
+  # this workflow existed, without moving the tag). Note the assets then come
+  # from the dispatched branch tip, not the tag commit.
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: "Existing release tag to upload the debs to (e.g. v0.1.0)"
+        required: true
+        type: string
+
+# Cancel a superseded run when new commits land on the same branch/PR (both
+# arch jobs are cancelled/restarted together).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Linux .deb (${{ matrix.arch }})
+    # jpackage is host-OS-bound (a .deb can only be produced on Linux) and bundles a
+    # single-architecture jlink runtime, so one job per arch on a matching-arch runner:
+    #   x64   → ubuntu-latest (x86_64)
+    #   arm64 → ubuntu-24.04-arm (GitHub's arm64 runner, free for public repos)
+    # No cross-build gymnastics needed here (unlike the macOS x64-under-Rosetta job):
+    # each runner's native JDK matches the target arch.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      # Compose Desktop's packageDeb wraps jpackage (jlink'd JRE + app → .deb).
+      # NON-minified (main, not main-release): the Java backend (Netty / Besu /
+      # BouncyCastle / libp2p) is reflection-heavy and proguard would break it.
+      # Unsigned — installed via `sudo apt install ./Myotis-<arch>.deb` or dpkg -i.
+      # Retry to ride out transient repo-resolution blips.
+      - name: Build Linux .deb (${{ matrix.arch }})
+        run: |
+          for attempt in 1 2 3; do
+            ./gradlew :app-desktop:packageDeb --stacktrace && exit 0
+            echo "::warning::DEB build attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
+            sleep 25
+          done
+          echo "::error::DEB build failed after 3 attempts"
+          exit 1
+
+      # jpackage names the output myotis_<version>_<debarch>.deb; rename to match the
+      # release naming convention (Myotis-<arch> like the dmgs). Assert exactly one deb
+      # — zero or multiple should fail here, not silently ship an arbitrary pick.
+      - name: Tag .deb with architecture
+        run: |
+          set -eu
+          shopt -s nullglob
+          debs=(app-desktop/build/compose/binaries/main/deb/*.deb)
+          [ "${#debs[@]}" -eq 1 ] \
+            || { echo "::error::expected exactly 1 deb, found ${#debs[@]}: ${debs[*]}"; exit 1; }
+          mv "${debs[0]}" "app-desktop/build/compose/binaries/main/deb/Myotis-${{ matrix.arch }}.deb"
+
+      # Guard against a SILENTLY wrong-arch build (parity with the dmg workflow's
+      # verify step): check the declared control-field architecture AND the actual
+      # ELF class of the bundled JVM, so a mislabelled package can't go green.
+      - name: Verify .deb architecture
+        run: |
+          set -eu
+          deb="app-desktop/build/compose/binaries/main/deb/Myotis-${{ matrix.arch }}.deb"
+          case "${{ matrix.arch }}" in
+            x64)   want_deb=amd64; want_elf="x86-64"  ;;
+            arm64) want_deb=arm64; want_elf="aarch64" ;;
+            *) echo "::error::unknown matrix.arch '${{ matrix.arch }}' — update this case block"; exit 1 ;;
+          esac
+          got=$(dpkg-deb --field "$deb" Architecture)
+          # Maintainer is printed as evidence that jpackage composed it as
+          # "vendor <debMaintainer>" — the Debian-policy "Name <email>" shape.
+          echo "control Architecture: $got (version: $(dpkg-deb --field "$deb" Version), maintainer: $(dpkg-deb --field "$deb" Maintainer))"
+          [ "$got" = "$want_deb" ] \
+            || { echo "::error::deb control arch mismatch: expected $want_deb, got $got"; exit 1; }
+          # Extract and inspect the bundled runtime — the control field only states
+          # intent; the ELF class proves what jlink actually emitted.
+          ex=$(mktemp -d)
+          dpkg-deb -x "$deb" "$ex"
+          jvm=$(find "$ex" -type f -name 'libjvm.so' | head -n1)
+          [ -n "$jvm" ] || { echo "::error::no libjvm.so found in the deb — bundle layout changed?"; exit 1; }
+          info=$(file -b "$jvm")
+          echo "bundled libjvm: $info"
+          echo "$info" | grep -q "$want_elf" \
+            || { echo "::error::ELF arch mismatch: expected $want_elf in: $info"; exit 1; }
+          echo "OK: ${{ matrix.arch }} deb is $want_deb/$want_elf"
+
+      - name: Upload DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: myotis-desktop-deb-${{ matrix.arch }}-${{ github.sha }}
+          path: app-desktop/build/compose/binaries/main/deb/*.deb
+          if-no-files-found: error
+          retention-days: 30
+
+  # Attach both arch debs to the GitHub Release. Runs on `v*` tags (same
+  # race-tolerant create as the dmg/apk workflows) and on manual dispatch
+  # (uploads to the given existing tag). Runs ONCE after both matrix jobs.
+  release:
+    name: Publish debs to release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      # gh release create/upload needs write access to Releases (repo contents).
+      contents: write
+    steps:
+      - name: Download deb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: myotis-desktop-deb-*-${{ github.sha }}
+          path: deb
+          merge-multiple: true
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No checkout in this job — gh must be told the repo explicitly or it
+          # dies with "fatal: not a git repository".
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          # Tag ref on push; explicit input on manual dispatch.
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.release-tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          # The dispatch input is free text: validate the shape before passing it
+          # to gh, so a stray value (e.g. leading '-') can't be parsed as a flag.
+          printf '%s' "$tag" | grep -Eq '^v[A-Za-z0-9._-]+$' \
+            || { echo "::error::'$tag' is not a valid release tag (expected v<version>)"; exit 1; }
+          # Fail loudly if either arch deb is missing rather than shipping a
+          # half release (e.g. one matrix job was cancelled).
+          for arch in x64 arm64; do
+            test -f "deb/Myotis-${arch}.deb" \
+              || { echo "::error::missing deb/Myotis-${arch}.deb"; exit 1; }
+          done
+          # Notes via a quoted heredoc + --notes-file: markdown stays literal
+          # (no shell escaping of backticks/quotes) and renders as intended.
+          notes=$(mktemp)
+          cat > "$notes" <<'NOTES'
+          First public build of the Myotis wallet apps (pre-release).
+
+          **Android (`*-android-debug.apk`)** — unsigned *debug* build. Install via
+          "Install unknown apps". Not a signed release build.
+
+          **Desktop macOS (`Myotis-<arch>.dmg`)** — unsigned; download the dmg matching
+          your Mac (arm64 for Apple Silicon, x64 for Intel). First launch:
+          right-click → Open to get past Gatekeeper (not notarized yet).
+
+          **Desktop Linux (`Myotis-<arch>.deb`)** — install with
+          `sudo apt install ./Myotis-<arch>.deb` (x64 for Intel/AMD, arm64 for
+          Raspberry Pi 5 / ARM machines).
+          NOTES
+          # Create the release if it doesn't exist yet. The dmg/apk workflows may
+          # win this race for the same tag: if `create` fails, re-check with
+          # `view` — success there means another job already created it (fine),
+          # while a genuine failure still surfaces because `view` also fails.
+          # (On workflow_dispatch the release for the given tag normally already
+          # exists, so this is view-then-upload.)
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --prerelease \
+              --title "Myotis $tag" \
+              --notes-file "$notes" \
+              --target "${GITHUB_SHA}" \
+            || gh release view "$tag" >/dev/null 2>&1
+          fi
+          gh release upload "$tag" deb/Myotis-x64.deb deb/Myotis-arm64.deb --clobber
