@@ -47,6 +47,15 @@ public interface ChainHandle {
      */
     StatusSnapshot status();
 
+    /** EL discovery's routing-table entries (operator diagnostics). Cheap. */
+    java.util.List<DiscoveredPeer> discoveredPeers();
+
+    /** All EL peers with an open RLPx session, including those still handshaking. Cheap. */
+    java.util.List<ConnectedPeer> connectedPeers();
+
+    /** Deep beacon/CL status including per-peer detail. Cheap. */
+    BeaconStatus beaconStatus();
+
     /**
      * The verified eth_* read surface, or {@code null} while the RPC backend
      * isn't started (e.g. the RPC port was unavailable at {@link #start()}).

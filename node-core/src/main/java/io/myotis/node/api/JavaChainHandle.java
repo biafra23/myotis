@@ -43,6 +43,11 @@ public final class JavaChainHandle implements ChainHandle {
         this.strictStateFreshness = strictStateFreshness;
     }
 
+    /** Package-private: {@link JavaMyotisEngine#debugStack} only. */
+    ChainStack stack() {
+        return stack;
+    }
+
     @Override public String networkName() { return stack.network().name(); }
 
     @Override public long chainId() { return stack.network().networkId(); }
@@ -129,6 +134,72 @@ public final class JavaChainHandle implements ChainHandle {
                 wallClockPeriod,
                 backend != null ? backend.verifiedHeadAgeMs() : Long.MAX_VALUE,
                 readyRows);
+    }
+
+    @Override
+    public java.util.List<io.myotis.api.DiscoveredPeer> discoveredPeers() {
+        var disc = stack.discV4();
+        if (disc == null) return List.of();
+        List<io.myotis.api.DiscoveredPeer> out = new ArrayList<>();
+        for (var e : disc.table().allPeers()) {
+            out.add(new io.myotis.api.DiscoveredPeer(
+                    e.udpAddr().getAddress().getHostAddress(),
+                    e.udpAddr().getPort(),
+                    e.tcpPort(),
+                    e.nodeId().toHexString()));
+        }
+        return out;
+    }
+
+    @Override
+    public java.util.List<io.myotis.api.ConnectedPeer> connectedPeers() {
+        RLPxConnector conn = stack.connector();
+        if (conn == null) return List.of();
+        List<io.myotis.api.ConnectedPeer> out = new ArrayList<>();
+        for (RLPxConnector.PeerInfo p : conn.getActivePeers()) {
+            out.add(new io.myotis.api.ConnectedPeer(
+                    p.remoteAddress(), p.state(), p.snapSupported(), p.clientId()));
+        }
+        return out;
+    }
+
+    @Override
+    public io.myotis.api.BeaconStatus beaconStatus() {
+        NetworkConfig net = stack.network();
+        BeaconSyncState bss = stack.beaconSyncState();
+        var blc = stack.beaconLightClient();
+
+        List<io.myotis.api.ClPeerInfo> peers = new ArrayList<>();
+        int lightClientPeers = 0;
+        if (blc != null) {
+            for (var p : blc.getConnectedPeers()) {
+                boolean lc = p.supportsLightClient();
+                if (lc) lightClientPeers++;
+                peers.add(new io.myotis.api.ClPeerInfo(
+                        p.peerId(), p.remoteAddress(), p.agentVersion(), lc, p.protocols().size()));
+            }
+        }
+        io.myotis.api.BeaconState state = bss == null
+                ? io.myotis.api.BeaconState.STARTING
+                : io.myotis.api.BeaconState.valueOf(
+                        bss.getSyncState(net.clGenesisTime(), net.secondsPerSlot()).name());
+        byte[] stateRoot = bss != null ? bss.getVerifiedExecutionStateRoot() : null;
+        long finalizedSlot = bss != null ? bss.getFinalizedSlot() : 0L;
+        return new io.myotis.api.BeaconStatus(
+                state,
+                bss != null ? bss.getCurrentSyncCommitteePeriod() : 0L,
+                BeaconChainSpec.currentPeriod(net.clGenesisTime(), net.secondsPerSlot()),
+                stack.discV5() != null ? stack.discV5().liveNodeCount() : 0,
+                peers.size(),
+                lightClientPeers,
+                finalizedSlot,
+                bss != null ? bss.getOptimisticSlot() : 0L,
+                finalizedSlot / BeaconChainSpec.SLOTS_PER_SYNC_COMMITTEE_PERIOD,
+                stateRoot != null ? org.apache.tuweni.bytes.Bytes.wrap(stateRoot).toHexString() : null,
+                bss != null ? bss.getExecutionBlockNumber() : 0L,
+                bss != null ? bss.getKnownStateRootCount() : 0,
+                BeaconSyncState.FILL_THRESHOLD,
+                peers);
     }
 
     @Override

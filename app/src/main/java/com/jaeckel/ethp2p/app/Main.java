@@ -1,10 +1,10 @@
 package com.jaeckel.ethp2p.app;
 
-import com.jaeckel.ethp2p.core.crypto.NodeKey;
-import com.jaeckel.ethp2p.networking.NetworkConfig;
-import io.myotis.node.ChainPorts;
-import io.myotis.node.ChainStack;
-import io.myotis.node.NodeRegistry;
+import io.myotis.api.ChainHandle;
+import io.myotis.api.EngineConfig;
+import io.myotis.api.MyotisEngine;
+import io.myotis.api.ports.EnginePorts;
+import io.myotis.node.api.JavaMyotisEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -49,9 +49,11 @@ import java.util.concurrent.CountDownLatch;
  * </ul>
  *
  * <p>Each network's node stack (EL + discv4 + discv5 + beacon light client + verified
- * JSON-RPC) lives in {@link ChainStack} (module {@code :node-core}), shared with the
- * Android app, and is held by a {@link NodeRegistry}. This class owns the daemon shell:
- * the per-network lock files + Unix-socket IPC servers, and the shutdown latch.
+ * JSON-RPC) lives behind the engine API ({@link MyotisEngine}/{@link ChainHandle}) —
+ * {@code new JavaMyotisEngine()} below is the single line naming a concrete engine.
+ * This class owns the daemon shell: the host-implemented ports (file caches, node-key
+ * files, the JVM HTTP CCIP gateway), the per-network lock files + Unix-socket IPC
+ * servers, and the shutdown latch.
  */
 public final class Main {
 
@@ -134,8 +136,17 @@ public final class Main {
         }
         String[] cmdArgs = remaining.toArray(new String[0]);
 
-        // Client commands / purge target a single network — the first listed.
+        MyotisEngine engine = new JavaMyotisEngine();
+
+        // Client commands / purge target a single network — the first listed. Canonicalize
+        // aliases (xdai/gbc → gnosis) so the client targets the SAME socket the daemon
+        // creates; an unknown name keeps the raw form (old behavior: "daemon not running").
         String primary = networkNames.get(0);
+        try {
+            primary = engine.canonicalNetworkName(primary);
+        } catch (io.myotis.api.EngineException ignored) {
+            // keep the raw name; client mode will report the socket as absent
+        }
         Path primarySocket = socketPath(primary);
         Path primaryLock = lockPath(primary);
 
@@ -165,13 +176,16 @@ public final class Main {
         }
 
         // ── Daemon mode (one or more networks in this process) ───────────────
-        List<NetworkConfig> networks = new ArrayList<>();
-        for (String n : networkNames) networks.add(NetworkConfig.byName(n));
-        for (NetworkConfig net : networks) {
-            if (isDaemonRunning(socketPath(net.name()), lockPath(net.name()))) {
-                System.err.println("Daemon already running for " + net.name()
-                        + " (socket: " + socketPath(net.name()) + ")");
-                if (networks.size() == 1) {
+        List<String> canonical = new ArrayList<>();
+        for (String n : networkNames) {
+            String name = engine.canonicalNetworkName(n);
+            if (!canonical.contains(name)) canonical.add(name);
+        }
+        for (String name : canonical) {
+            if (isDaemonRunning(socketPath(name), lockPath(name))) {
+                System.err.println("Daemon already running for " + name
+                        + " (socket: " + socketPath(name) + ")");
+                if (canonical.size() == 1) {
                     System.err.println("Commands:");
                     System.err.println("  ./gradlew :app:run -Pargs=status");
                     System.err.println("  ./gradlew :app:run -Pargs=peers");
@@ -180,29 +194,28 @@ public final class Main {
                 System.exit(1);
             }
         }
-        runDaemon(networks, port, gossipsubEnabled);
+        runDaemon(engine, canonical, port, gossipsubEnabled);
     }
 
     // -------------------------------------------------------------------------
     // Daemon
     // -------------------------------------------------------------------------
 
-    private static void runDaemon(List<NetworkConfig> networks, int portOverride,
+    private static void runDaemon(MyotisEngine engine, List<String> networks, int portOverride,
                                   boolean gossipsubEnabled) throws Exception {
         boolean multi = networks.size() > 1;
-        log.info("=== ethp2p Daemon ({}) ===",
-                String.join(", ", networks.stream().map(NetworkConfig::name).toList()));
+        log.info("=== ethp2p Daemon ({}) ===", String.join(", ", networks));
 
         // 0. Acquire every target network's exclusive lock up front; release all and
         //    abort if any is held (another daemon already owns that network).
         List<FileChannel> lockChannels = new ArrayList<>();
         List<FileLock> fileLocks = new ArrayList<>();
-        for (NetworkConfig network : networks) {
-            FileChannel ch = FileChannel.open(lockPath(network.name()),
+        for (String network : networks) {
+            FileChannel ch = FileChannel.open(lockPath(network),
                     StandardOpenOption.CREATE, StandardOpenOption.WRITE);
             FileLock lk = ch.tryLock();
             if (lk == null) {
-                System.err.println("Daemon already running (lock held: " + lockPath(network.name()) + ")");
+                System.err.println("Daemon already running (lock held: " + lockPath(network) + ")");
                 ch.close();
                 releaseAll(fileLocks, lockChannels);
                 System.exit(1);
@@ -213,57 +226,64 @@ public final class Main {
         }
 
         CountDownLatch stopLatch = new CountDownLatch(1);
-        NodeRegistry registry = new NodeRegistry();
         List<DaemonServer> servers = new ArrayList<>();
 
-        // 1. Build, start, and IPC-wire each network's stack.
-        for (NetworkConfig network : networks) {
-            log.info("IPC socket ({}): {}", network.name(), socketPath(network.name()));
+        // 1. Build, start, and IPC-wire each network's stack — everything through the
+        //    engine API; the host supplies its ports (file caches, key files, HTTP).
+        for (String network : networks) {
+            log.info("IPC socket ({}): {}", network, socketPath(network));
 
             // Ports: single-network stays byte-identical (legacy --port/30303 + discv5 9000 +
-            // RPC 8545); multi-network uses pinned per-network ports so the stacks don't collide.
-            // Identity is always per-network (nodeKeyFile below), independent of this.
-            ChainPorts ports = multi
-                    ? ChainPorts.defaultsFor(network)
-                    : new ChainPorts(portOverride, 9000, 8545);
-            NodeKey nodeKey = NodeKey.loadOrGenerate(nodeKeyFile(network.name()));
-
-            PeerCache peerCache = new PeerCache(cacheFile(network.name()));
-            CLPeerCache clPeerCache = new CLPeerCache(clCacheFile(network.name()));
-            ChainStack stack = new ChainStack(
-                    network, ports, nodeKey,
-                    new PeerCacheAdapter(peerCache),
-                    new ClPeerCacheAdapter(clPeerCache),
+            // RPC 8545); multi-network uses the engine's pinned per-network defaults (0 = default)
+            // so the stacks don't collide. Identity is always per-network (nodeKeyFile).
+            // Strict state freshness keeps honoring the documented operator knob
+            // (-Dmyotis.rpc.strictStateFreshness=false — see OPTIMISATIONS_AND_LIMITATIONS.md).
+            boolean strict = Boolean.parseBoolean(
+                    System.getProperty("myotis.rpc.strictStateFreshness", "true"));
+            EngineConfig config = multi
+                    ? new EngineConfig(network, 0, 0, 0,
+                            syncSnapshotFile(network).toString(), gossipsubEnabled,
+                            SNAP_PEER_TARGET, strict)
+                    : new EngineConfig(network, portOverride, 9000, 8545,
+                            syncSnapshotFile(network).toString(), gossipsubEnabled,
+                            SNAP_PEER_TARGET, strict);
+            // dnsServers=null → resolver's default DNS (the daemon, unlike Android, has
+            // system DNS config). The snap maintainer (SNAP_PEER_TARGET) keeps snap peers
+            // topped up from the cache + a refreshing EIP-1459 DNS pool — helps networks
+            // with scarce snap peers (Gnosis) retain a snap/1 peer for verified reads.
+            EnginePorts ports = new EnginePorts(
+                    new FileNodeKeyStore(Main::nodeKeyFile),
+                    new PeerCacheAdapter(new PeerCache(cacheFile(network))),
+                    new ClPeerCacheAdapter(new CLPeerCache(clCacheFile(network))),
+                    null,
                     new com.jaeckel.ethp2p.app.rpc.JavaHttpCcipGateway(),
-                    syncSnapshotFile(network.name()),
-                    gossipsubEnabled);
-            // Keep snap peers topped up from the cache + a refreshing EIP-1459 DNS pool —
-            // the discv4-independent path. Helps networks with scarce snap peers (Gnosis)
-            // retain a snap/1 peer for verified state reads. dnsServers=null → resolver's
-            // default DNS (the daemon, unlike Android, has system DNS config).
-            stack.configureSnapMaintainer(SNAP_PEER_TARGET, null);
+                    null,
+                    null);
 
-            if (!stack.start()) {
-                System.err.println("Failed to start " + network.name() + " node stack");
-                registry.shutdownAll();
+            ChainHandle handle = engine.create(config, ports);
+            if (!handle.start()) {
+                System.err.println("Failed to start " + network + " node stack");
+                engine.shutdownAll();
                 closeAll(servers);
                 releaseAll(fileLocks, lockChannels);
                 System.exit(1);
                 return;
             }
-            registry.add(stack);
 
-            CommandHandler commandHandler = new CommandHandler(
-                    stack.discV4(), stack.discV5(), stack.connector(), stopLatch,
-                    stack.backoff(), stack.blacklistedNodeIds(),
-                    stack.beaconSyncState(), stack.beaconLightClient(),
-                    network.clGenesisTime(), network.secondsPerSlot());
-            DaemonServer server = new DaemonServer(socketPath(network.name()), commandHandler);
+            // get-transactions (TrueBlocks debug stream) is the documented exemption from
+            // the API boundary — it takes the raw connector via the CONCRETE engine's
+            // debug accessor, wired only here at the composition root.
+            DebugCommands debugCommands = engine instanceof JavaMyotisEngine je
+                    ? new DebugCommands(je.debugStack(network).connector())
+                    : null;
+
+            CommandHandler commandHandler = new CommandHandler(handle, stopLatch, debugCommands);
+            DaemonServer server = new DaemonServer(socketPath(network), commandHandler);
             try {
                 server.start();
             } catch (Exception e) {
-                System.err.println("Failed to start IPC server for " + network.name() + ": " + e.getMessage());
-                registry.shutdownAll();
+                System.err.println("Failed to start IPC server for " + network + ": " + e.getMessage());
+                engine.shutdownAll();
                 closeAll(servers);
                 releaseAll(fileLocks, lockChannels);
                 System.exit(1);
@@ -277,7 +297,7 @@ public final class Main {
         java.util.concurrent.atomic.AtomicBoolean cleaned = new java.util.concurrent.atomic.AtomicBoolean(false);
         Runnable cleanup = () -> {
             if (!cleaned.compareAndSet(false, true)) return;
-            registry.shutdownAll();
+            engine.shutdownAll();
             closeAll(servers);
             releaseAll(fileLocks, lockChannels);
         };

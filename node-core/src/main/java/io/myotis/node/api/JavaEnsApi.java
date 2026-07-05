@@ -42,6 +42,9 @@ final class JavaEnsApi implements EnsApi {
         return backend;
     }
 
+    /** The backend's internal marker for a successful empty forward resolution. */
+    private static final String BACKEND_NO_RECORD = "name does not resolve";
+
     @Override
     public EnsResolutionResult resolveAddress(String name, EnsRoot root) {
         // backend() throws EngineException when not running — the same state-error
@@ -50,8 +53,13 @@ final class JavaEnsApi implements EnsApi {
         try {
             EnsResolution r = backend.resolveEns(name, toEngineRoot(root))
                     .get(RESOLVE_TIMEOUT_SEC, TimeUnit.SECONDS);
+            // Normalize to the API's record convention (same as every EnsApi record
+            // lookup): a successful "no such record" is value==null && error==null.
+            // The backend folds that case into an error string; unfold it HERE so no
+            // consumer ever has to match the magic text.
+            String error = BACKEND_NO_RECORD.equals(r.error()) ? null : r.error();
             return new EnsResolutionResult(r.name(), r.addressHex(), r.blockNumber(),
-                    r.verified(), r.error());
+                    r.verified(), error);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return new EnsResolutionResult(name, null, -1, false, "interrupted");
