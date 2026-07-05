@@ -38,8 +38,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
-Five Gradle modules:
+Key Gradle modules:
 
+- **myotis-api** — THE ENGINE CONTRACT: zero-dependency Java-17 interfaces
+  (`io.myotis.api` + `io.myotis.api.ports`) every host consumes exclusively.
+  FFI-portable types only (byte[], String, long, double[], enums, flat records;
+  blocking methods). Implemented by **node-core**'s `io.myotis.node.api` adapters
+  (`JavaMyotisEngine`/`JavaChainHandle` over `ChainStack`/`NodeRegistry`). Designed so a Rust engine can replace the Java one behind the same
+  surface — see docs/reimplementation/05-engine-api-bindings.md.
 - **core** — Cryptographic identity (`NodeKey`), data types (`BlockHeader`), ENR decoding
 - **networking** — Three protocol layers, all Netty-based:
   - `discv4` — UDP peer discovery using Kademlia DHT (ping/pong/findnode/neighbors)
@@ -66,6 +72,13 @@ Five Gradle modules:
 - Concurrent collections (`ConcurrentHashMap.newKeySet()`) for shared mutable state
 - IPC uses JSON-Lines over Unix domain sockets with Java 21 virtual threads
 - Network configs (genesis hash, fork ID, bootnodes) live in `NetworkConfig`
+- **Hosts talk ONLY to `:myotis-api`** (`MyotisEngine`/`ChainHandle`): host runtime
+  paths in the daemon, desktop, and Android don't import engine internals
+  (node-core/networking/consensus types). Documented exemptions: the single
+  `new JavaMyotisEngine()` at each composition root; the daemon's `get-transactions`
+  debug stream (`DebugCommands` via `JavaMyotisEngine.debugStack`); Android's
+  BLS-backend toggle (`BlsBackends` — an internal engine seam, deliberately not on
+  the API); and `:app`'s `testing/MainnetPeerBootstrap` (an integration-test fixture).
 
 ## Platform & language direction
 

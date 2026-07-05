@@ -1,5 +1,30 @@
 # 04 — The Engine and Its Hosts
 
+> **UPDATE — the engine API is now formalized in code.** Since this document was first
+> written, the engine boundary described here has been extracted into the
+> **`:myotis-api`** module (`io.myotis.api` + `io.myotis.api.ports`): a zero-dependency
+> Java-17 contract that every host consumes exclusively (verified across the daemon,
+> desktop, and Android in PRs #117–#121). Where this document says `ChainStack` /
+> `NodeRegistry` / `MyotisRpcBackend` / `PeerCachePort` etc., the CANONICAL public names
+> are now:
+>
+> | This document (internal) | Canonical API (`io.myotis.api`) |
+> |---|---|
+> | `NodeRegistry` | `MyotisEngine` (catalog + `create`/`get`/`stop`/`shutdownAll`) |
+> | `ChainStack` (ctor + accessors) | `ChainHandle` (+ `EngineConfig`/`EnginePorts` at `create`) |
+> | *host status assembly (was 3× duplicated)* | `status()` → `StatusSnapshot`, `beaconStatus()` → `BeaconStatus`, `discoveredPeers()`, `connectedPeers()` |
+> | `MyotisRpcBackend` (jsonrpc-server SPI, deleted) | `VerifiedReads` (implemented by `VerifiedRpcBackend`) |
+> | `PeerCachePort` / `ClPeerCachePort` / `DnsServerProvider` / `CcipGateway` / `RpcLogger` / `RpcClock` | `ports.EnginePeerCache` / `ports.EngineClPeerCache` / `ports.DnsServers` / `ports.HttpGateway` (blocking) / `ports.EngineLogger` / `ports.EngineClock` (+ `ports.NodeKeyStore`) |
+> | `VerifiedAccountQuery` / storage / block / header queries | `ChainHandle.requestAccount/getStorageProof/getBlockVerified/getHeaders` |
+> | ENS via daemon-local EVM stack (deleted) | `ChainHandle.ens()` → `EnsApi` |
+>
+> The internal machinery this document details (`ChainStack` internals, `RpcCallContext`,
+> caching tiers, the prefetch loop) is still accurate as an implementation guide — it
+> simply now lives BEHIND the API. Re-implementers: match the **`:myotis-api`
+> signatures** (see [README §5](README.md#5-the-engine-api--the-framework-surface-the-deliverable)
+> and [`05-engine-api-bindings.md`](05-engine-api-bindings.md)); use the rest of this
+> document for the wire/verification/concurrency behavior behind them.
+
 > Companion to the [re-implementation spec](README.md). Covers the **reusable engine**
 > (`ChainStack` / `NodeRegistry` + platform ports), the **verified-read backend** (the eth_*
 > pipeline), and the two **host surfaces** — the desktop daemon (Unix-domain-socket IPC) and the
@@ -75,7 +100,7 @@ enabled. `withRpcPort(n)` overrides just the RPC port (hosts may let users pick 
 
 ### 1.4 Platform ports (the injection seams)
 
-See [README §5.2](README.md#52-platform-ports-the-injection-seams--implement-per-host) for the
+See [README §5.2](README.md#52-platform-ports-iomyotisapiports--implement-per-host) for the
 table. The shapes (re-create as traits/interfaces):
 
 - `PeerCache`: `add(addr, pubkeyHex, snap)`, `recordSnapServed(addr)`, `recordSnapFailure(addr)`,
@@ -124,7 +149,7 @@ tighter** (it's what the wallet signs against); block-number tolerances for "nea
 
 ### 2.2 Method catalog
 
-The full list is in [README §5.3](README.md#53-the-verified-read-backend-the-eth_-contract). Notable
+The full list is in [README §5.3](README.md#53-the-verified-read-backend-verifiedreads-the-eth_-contract). Notable
 behaviors to replicate:
 
 - **Null-return contract** (central): a method returns "no verified answer" (host maps to a JSON-RPC

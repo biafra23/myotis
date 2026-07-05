@@ -7,7 +7,7 @@
 This is the **master document**. It gives the whole picture: what Myotis is, its trust
 model, its architecture, the engine API surface to expose, the dependency mapping from
 the JVM reference implementation to Go/Rust, and how to package the result as a
-multi-platform library. Wire-level protocol detail lives in four companion documents:
+multi-platform library. Wire-level protocol detail lives in five companion documents:
 
 | Companion | Covers |
 |---|---|
@@ -15,6 +15,7 @@ multi-platform library. Wire-level protocol detail lives in four companion docum
 | [`02-execution-networking.md`](02-execution-networking.md) | devp2p: discv4, discv5, EIP-1459 DNS discovery, RLPx (ECIES + framing), the `eth` and `snap` sub-protocols |
 | [`03-state-verification-and-evm.md`](03-state-verification-and-evm.md) | Merkle-Patricia proof verification, the SNAP state oracle, the local EVM stack, gas estimation, ABI, CCIP-Read, ENS |
 | [`04-engine-and-hosts.md`](04-engine-and-hosts.md) | The reusable engine (`ChainStack`/`NodeRegistry`), platform ports, the verified backend, IPC + JSON-RPC host surfaces, persistence, concurrency |
+| [`05-engine-api-bindings.md`](05-engine-api-bindings.md) | The formal engine contract (`:myotis-api`) → Rust/UniFFI binding strategy, packaging (Android `.aar` / iOS `.xcframework`), conformance checklist |
 
 > **Scope note.** The request is to re-implement *everything except the Android-specific
 > parts*. Concretely: re-implement the **engine** (all protocols + verification + the
@@ -279,77 +280,100 @@ desktop + Android + iOS.
 
 ## 5. The Engine API — the framework surface (the deliverable)
 
-This is what apps consume. Keep it **library-neutral and FFI-friendly**: bytes, strings,
-integers, enums, and simple records — **no framework-specific async types leaking across
-the boundary** (the reference explicitly forbids leaking `CompletableFuture` into shared
-APIs; for Rust expose `async fn` or blocking + callbacks, for Go expose blocking methods +
-goroutine-safe handles).
+> **This section is now CODE, not prose.** The engine API is formalized as the
+> `:myotis-api` Gradle module (`io.myotis.api` + `io.myotis.api.ports`) — a
+> zero-dependency, Java-17 contract that the JVM reference engine implements and that
+> ALL hosts (JVM daemon, Compose desktop, Android) consume exclusively. **The module's
+> interfaces are the canonical specification**; re-implement to those signatures. This
+> section summarizes the shape; [`05-engine-api-bindings.md`](05-engine-api-bindings.md)
+> maps every interface to a Rust/UniFFI binding strategy.
 
-### 5.1 Lifecycle: `NodeRegistry` + `ChainStack`
+The design rules the module enforces (and a port must keep): **library-neutral and
+FFI-friendly** — `byte[]`, `String`, `long`/`int`/`boolean`, `double[]`, enums, flat records,
+`List`; **no** `CompletableFuture`/`BigInteger`/`Optional`/`InetSocketAddress`/`Path`;
+**all methods blocking** (call from a worker thread; hosts wrap in their own async),
+with callbacks only in the host-implemented ports. Wei crosses as decimal strings;
+hashes/addresses as bytes on the read API and 0x-hex strings in result records.
 
-- **`ChainStack`** — one network's full node on its own ports & identity. Constructed with:
-  `(NetworkConfig, ChainPorts, NodeKey, PeerCache, ClPeerCache, CcipGateway,
-  syncSnapshotPath, gossipsubEnabled)`. Lifecycle: `start() -> bool` (fault-isolated: any
-  failure tears down only this stack and returns false), `shutdown()`. Optional:
-  `configureSnapMaintainer(targetSnapPeers, dnsServerProvider)` (call before `start()`).
-  Accessors expose the live connector, discovery services, beacon sync state/light client,
-  and the verified backend.
-- **`NodeRegistry`** — `Map<networkName, ChainStack>`; `add/get/all/remove/shutdownAll`.
+### 5.1 Lifecycle: `MyotisEngine` + `ChainHandle`
+
+- **`MyotisEngine`** — the root object: `availableNetworks() -> [NetworkInfo]` (the
+  embedded catalog), `canonicalNetworkName(alias)`, `create(EngineConfig, EnginePorts)
+  -> ChainHandle` (registers, does not start), `get/hostedNetworks/stop/shutdownAll`.
   One process hosts mainnet + Gnosis + Sepolia simultaneously, each on its own ports.
-- **`ChainPorts`** — `(elPort, discv5Port, rpcPort)`, defaulted per network so several
-  stacks never collide (see §6).
+  Hosts name a concrete engine exactly once (`new JavaMyotisEngine()` today; the Rust
+  binding's factory later).
+- **`ChainHandle`** — one network: `start() -> bool` (fault-isolated), `stop()`,
+  `isRunning()`, `setTargetSnapPeers(n)`, `clearPeerState()`, plus the read surfaces
+  below and the verified operator queries (`requestAccount`, `getStorageProof`,
+  `getHeaders`, `getBlockVerified`, `dialPeer`) returning flat result records whose
+  `failReason`/`error` fields carry verification failures (never exceptions).
+- **`EngineConfig`** — `(networkName, elPort, discv5Port, rpcPort [0 = per-network
+  default], syncSnapshotPath, gossipsubEnabled, targetSnapPeers [0 = maintainer off],
+  strictStateFreshness)`.
+- **Status**: `status() -> StatusSnapshot` (EL + beacon counts, per-peer rows),
+  `discoveredPeers()`, `connectedPeers()`, `beaconStatus() -> BeaconStatus` (deep CL
+  view incl. per-peer detail, bootstrapped flag, execution block hash).
 
-### 5.2 Platform ports (the injection seams — implement per host)
+### 5.2 Platform ports (`io.myotis.api.ports` — implement per host)
 
-| Port | Purpose | Desktop impl | Mobile impl |
+| Port | Purpose | Desktop/daemon impl | Mobile impl |
 |---|---|---|---|
-| `PeerCache` | EL peer cache: `add(addr, pubkeyHex, snap)`, `recordSnapServed/Failure`, `load() -> [CachedPeer]`, `close()` | file (`peers-<net>.cache`) | app-private file |
-| `ClPeerCache` | CL libp2p peer cache: load/add/markFailure + served-period ranges, bootstrap peers, light-client confirmed/denied verdicts | file (`cl-peers-<net>.cache`) | app-private file |
-| `DnsServerProvider` | DNS server IPs for EIP-1459 TXT lookups (mobile DNS has no system resolver config) | null → system DNS | active-network DNS IPs |
-| `CcipGateway` | CCIP-Read HTTP transport: `request(method, url, body) -> bytes` (GET+POST, ~10–15 s timeouts, bounded response size) | native HTTP client | platform HTTP client |
-| `SnapQualitySink` | persist EL peer snap-serving quality across restarts | file-backed | file-backed |
-| `RpcLogger`, `RpcClock` | logging seam + monotonic clock | stdlib | platform clock/log |
-| key storage | where `NodeKey` (secp256k1) is stored | `nodekey-<net>.hex` | secure storage/keystore |
+| `NodeKeyStore` | 32-byte secp256k1 identity: `load(net) -> bytes?`, `store(net, bytes)` | hex file (`nodekey-<net>.hex`) | app-private file / keystore |
+| `EnginePeerCache` | EL peer cache: `add(host, port, pubkeyHex, snap)`, `recordSnapServed/Failure`, `load() -> [CachedPeerInfo]`, `close()` | file (`peers-<net>.cache`) | app-private file |
+| `EngineClPeerCache` | CL peer cache: multiaddrs + failure counts + `ServedRange`/`BootstrapPeer` records + light-client verdicts | file (`cl-peers-<net>.cache`) | app-private file |
+| `DnsServers` | DNS IPs for EIP-1459 TXT lookups | null → system DNS | active-network DNS IPs |
+| `HttpGateway` | CCIP-Read transport: `request(method, url, body) -> String`, BLOCKING, throw on failure | java.net.http | HttpURLConnection / URLSession |
+| `EngineLogger`, `EngineClock` | log sink + monotonic clock | null → engine defaults | platform log/clock |
 
-`CachedPeer = (address, publicKeyHex, snap: bool, snapQuality: CONFIRMED|UNKNOWN|DENIED)`;
+`CachedPeerInfo = (host, port, publicKeyHex, snap, snapQuality: CONFIRMED|UNKNOWN|DENIED)`;
 quality drives dial priority (CONFIRMED first).
 
-### 5.3 The verified-read backend (the eth_* contract)
+> **Rust-port simplification (recommended):** the peer-cache file formats are pure
+> persistence — a Rust engine should own them internally and shrink both cache ports to
+> plain directory-path strings in `EngineConfig`, leaving hosts only key storage + HTTP
+> + DNS. See [`05-engine-api-bindings.md`](05-engine-api-bindings.md).
 
-The engine's verified surface mirrors the Ethereum JSON-RPC API. This is the single most
-useful API to expose to apps (every method answered **only** from verified data; a method
-returns "absent/unanswerable" rather than guessing — the host maps that to an error):
+### 5.3 The verified-read backend: `VerifiedReads` (the eth_* contract)
+
+`ChainHandle.reads()` (null until the RPC backend is up). Every method answers **only**
+from verified data; `null` = "cannot answer verified right now" (the host maps that to
+an error); JSON-string methods use the tri-state `JSON` / literal `"null"` (verified
+not-found) / `null`. Wei values are decimal strings; addresses/hashes/calldata are bytes.
 
 | Method | Returns | Verification basis |
 |---|---|---|
-| `chainId()` | chain id | config |
-| `headBlockNumber()` | beacon optimistic head, or none | beacon light client |
-| `syncState()` | `SYNCING` \| `CATCHING_UP` \| `SYNCED` | beacon light client |
-| `getBalance(addr, block)` | wei | MPT account proof vs anchored stateRoot |
-| `getTransactionCount(addr, block)` | nonce | MPT account proof (+pending overlay for own txs) |
-| `getCode(addr, block)` | bytecode | bytecode vs proven `codeHash` |
-| `getStorageAt(addr, slot, block)` | 32 bytes | MPT storage proof vs proven `storageRoot` |
-| `call(from, to, data, value, block)` | ABI return bytes | local EVM over proof-served state (threads real `from`/`value` — a zero sender reverts `msg.sender`-gated contracts) |
-| `estimateGas(from, to, data, value)` | gas | local EVM, intrinsic + metered + 15% buffer |
-| `gasPrice()` / `maxPriorityFeePerGas()` / `feeHistory(...)` | fees | base fee from headers, tips from verified bodies |
-| `getBlockByNumber/Hash(...)` | block JSON | beacon-anchored header (no snap needed) |
-| `getTransactionByHash(hash)` | tx JSON | beacon-anchored block vs `transactionsRoot` (+ own sent-tx cache) |
-| `getTransactionReceipt(hash)` | receipt JSON | vs `receiptsRoot` (handles eth/69 bloomless receipts) |
-| `sendRawTransaction(rawTx)` | keccak256(rawTx) | devp2p gossip (engine never signs — relays only) |
+| `chainId()` | long | config |
+| `headBlockNumber()` | Long? | beacon optimistic head |
+| `syncState()` | `SYNCING \| CATCHING_UP \| SYNCED` | beacon light client |
+| `getBalance(bytes, block)` | decimal-wei String? | MPT account proof vs anchored stateRoot |
+| `getTransactionCount(bytes, block)` | Long? | MPT account proof (+pending overlay for own txs) |
+| `getCode(bytes, block)` | bytes? | bytecode vs proven `codeHash` |
+| `getStorageAt(bytes, slot32, block)` | bytes? | MPT storage proof vs proven `storageRoot` |
+| `call(from?, to, data, valueWei?, block)` | bytes? | local EVM over proof-served state |
+| `estimateGas(from?, to, data, valueWei?)` | Long? | local EVM, intrinsic + metered + 15% buffer |
+| `gasPrice()` / `maxPriorityFeePerGas()` | decimal-wei String? | verified headers/bodies |
+| `feeHistory(count, newest, percentiles)` | JSON String? | beacon-verified headers (+bodies) |
+| `getBlockByNumber/Hash(...)` | JSON String? | beacon-anchored header |
+| `getTransactionByHash(bytes32)` | JSON String? | vs `transactionsRoot` (+ own sent-tx cache) |
+| `getTransactionReceipt(bytes32)` | JSON String? | vs `receiptsRoot` (eth/69 bloomless handled) |
+| `sendRawTransaction(bytes)` | bytes? (tx hash) | devp2p gossip (engine never signs) |
 
-Plus **ENS**: `resolve(name)` / `resolveText/Contenthash/MultiCoinAddr/Pubkey/Abi/DnsRecord/
-InterfaceImplementer` and reverse `resolveName(addr)` (with mandatory forward-verification).
+Plus **ENS** via `ChainHandle.ens()` (null on chains without ENS): `resolveAddress(name,
+root)` / `reverseResolve(addr)` (mandatory forward-verification) and the record lookups
+(`text`, `contenthash`, multi-coin, pubkey, ABI, DNS, interface-implementer), each
+returning a flat record with `(value…, blockNumber, verified, error)`. Convention:
+value `null` with error `null` = a *successful* "no such record".
 
 ### 5.4 Host surfaces (pick per platform)
 
-- **Desktop**: a CLI that talks to a long-running daemon over a **Unix-domain socket** with
-  a line-delimited JSON protocol (operator/debug commands incl. proof/verification metadata).
-- **Wallet integration**: an **Ethereum JSON-RPC HTTP server bound to loopback**
-  (`127.0.0.1`), strict mode, so stock wallets work unmodified.
-- **Mobile**: **direct FFI calls** into the engine's verified-read API (no socket needed),
-  or an in-process loopback JSON-RPC server the platform WebView/wallet points at.
+- **Desktop**: a CLI talking to a daemon over a Unix-domain socket, line-delimited JSON
+  (the daemon serializes API records; shapes are host-owned).
+- **Wallet integration**: the Ethereum JSON-RPC HTTP server on loopback, strict mode —
+  the router consumes `VerifiedReads` directly.
+- **Mobile**: direct calls into the engine API (no socket), or the in-process loopback
+  JSON-RPC server the platform wallet points at.
 
----
 
 ## 6. Network Configuration
 
