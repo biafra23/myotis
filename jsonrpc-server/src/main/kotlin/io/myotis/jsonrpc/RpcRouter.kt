@@ -236,9 +236,9 @@ class RpcRouter(
             }
             "eth_getBlockByHash" -> {
                 val p = root.params()
-                // VerifiedReads takes the block hash as 32 bytes; a malformed/non-hash param
-                // falls through (proxy in dev, strict error otherwise) as before.
-                val blockHash = (p?.getOrNull(0))?.asHexBytes() ?: return null
+                // VerifiedReads takes the block hash as EXACTLY 32 bytes; a malformed or
+                // wrong-length param falls through (proxy in dev, strict error otherwise).
+                val blockHash = (p?.getOrNull(0))?.asHexBytes()?.takeIf { it.size == 32 } ?: return null
                 val fullParam = p?.getOrNull(1)
                 val fullTx: Boolean = when {
                     fullParam == null || fullParam is JsonNull -> false

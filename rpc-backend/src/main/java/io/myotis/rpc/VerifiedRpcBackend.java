@@ -837,8 +837,10 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     @Override
     public String getBlockByHash(byte[] blockHash32, boolean fullTransactions) {
         // VerifiedReads passes the hash as bytes (FFI-neutral); the internal lookup keys on
-        // the 0x-hex string form. A null/wrong-length hash can't name a block we verified.
-        if (blockHash32 == null) return null;
+        // the 0x-hex string form. Fast-fail a null/wrong-length hash as "can't answer"
+        // (Java null) rather than a verified "unknown block" (JSON "null") — a malformed
+        // hash names nothing, so no verified verdict about it exists.
+        if (blockHash32 == null || blockHash32.length != 32) return null;
         return rpcGetBlockByHash("0x" + org.apache.tuweni.bytes.Bytes.wrap(blockHash32).toUnprefixedHexString(),
                 fullTransactions);
     }

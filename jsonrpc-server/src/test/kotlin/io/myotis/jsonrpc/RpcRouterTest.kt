@@ -350,6 +350,16 @@ class RpcRouterTest {
         assertNull(b.lastBlockHash)  // backend never called
     }
 
+    @Test fun getBlockByHash_wrongLengthHash_fallsThrough() {
+        // Valid hex but not 32 bytes ("0x1234") must also fall through — the contract's
+        // parameter is exactly 32 bytes; a short hash names nothing verifiable.
+        val b = FakeBackend().apply { blockByHashJson = """{"number":"0x10"}""" }
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":3,"method":"eth_getBlockByHash","params":["0x1234",false]}""")
+        assertTrue(hasError(resp))
+        assertNull(b.lastBlockHash)  // backend never called
+    }
+
     @Test fun getBlockByNumber_futureBlock_returnsNullResult() {
         // backend returns the literal "null" for a non-existent/future block → result: null.
         val resp = route(FakeBackend().apply { blockJson = "null" },
