@@ -103,9 +103,12 @@ jobs:
           case "${{ matrix.arch }}" in
             x64)   want_deb=amd64; want_elf="x86-64"  ;;
             arm64) want_deb=arm64; want_elf="aarch64" ;;
+            *) echo "::error::unknown matrix.arch '${{ matrix.arch }}' — update this case block"; exit 1 ;;
           esac
           got=$(dpkg-deb --field "$deb" Architecture)
-          echo "control Architecture: $got (version: $(dpkg-deb --field "$deb" Version))"
+          # Maintainer is printed as evidence that jpackage composed it as
+          # "vendor <debMaintainer>" — the Debian-policy "Name <email>" shape.
+          echo "control Architecture: $got (version: $(dpkg-deb --field "$deb" Version), maintainer: $(dpkg-deb --field "$deb" Maintainer))"
           [ "$got" = "$want_deb" ] \
             || { echo "::error::deb control arch mismatch: expected $want_deb, got $got"; exit 1; }
           # Extract and inspect the bundled runtime — the control field only states
@@ -161,6 +164,10 @@ jobs:
           else
             tag="${GITHUB_REF_NAME}"
           fi
+          # The dispatch input is free text: validate the shape before passing it
+          # to gh, so a stray value (e.g. leading '-') can't be parsed as a flag.
+          printf '%s' "$tag" | grep -Eq '^v[A-Za-z0-9._-]+$' \
+            || { echo "::error::'$tag' is not a valid release tag (expected v<version>)"; exit 1; }
           # Fail loudly if either arch deb is missing rather than shipping a
           # half release (e.g. one matrix job was cancelled).
           for arch in x64 arm64; do
