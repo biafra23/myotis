@@ -38,6 +38,11 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    // Regeneration knob for the LC conformance corpus (LcVectorConformanceTest):
+    // forward it into the forked test JVM, where -D on the gradlew line doesn't reach.
+    System.getProperty("myotis.lc.writeExpected")?.let {
+        systemProperty("myotis.lc.writeExpected", it)
+    }
     // Build the Rust workspace first (no-op without cargo) and put its release dir on
     // java.library.path so NativeBlsBackend.isAvailable() is true and the BLS fixture
     // tests + BlsBackendBenchmark exercise the native backend. Declared as an INPUT

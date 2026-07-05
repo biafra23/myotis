@@ -22,7 +22,8 @@ pub const SIG_LEN: usize = 96;
 /// A sync committee is 512 pubkeys; this is a generous, safe upper bound.
 pub const MAX_PUBKEYS: usize = 4096;
 
-/// Verify an Ethereum sync-committee aggregate signature.
+/// Verify an Ethereum sync-committee aggregate signature (production path: POP
+/// ciphersuite [`DST`]).
 ///
 /// * `pubkeys` — the committee flattened into one contiguous `48 * n` buffer.
 /// * `n`       — number of participating pubkeys (bounded to [1, 4096]).
@@ -32,6 +33,21 @@ pub const MAX_PUBKEYS: usize = 4096;
 /// Returns `false` (never panics) on any malformed input: bad counts, length
 /// mismatches, decompression failures, subgroup-check failures.
 pub fn fast_aggregate_verify(pubkeys: &[u8], n: usize, message: &[u8], signature: &[u8]) -> bool {
+    fast_aggregate_verify_with_dst(pubkeys, n, message, signature, DST)
+}
+
+/// [`fast_aggregate_verify`] with an explicit DST. Exists for conformance tests
+/// only: the committed BLS fixture corpus (consensus/src/test/resources) was
+/// generated under the NUL ciphersuite, mirroring the Java side's
+/// `BlsVerifier.fastAggregateVerify(pks, msg, sig, DST)` overload. Production
+/// callers use [`fast_aggregate_verify`] (POP) — same as the Java engine.
+pub fn fast_aggregate_verify_with_dst(
+    pubkeys: &[u8],
+    n: usize,
+    message: &[u8],
+    signature: &[u8],
+    dst: &[u8],
+) -> bool {
     // Cap n before any `n * PK_LEN` arithmetic or `Vec::with_capacity(n)`: on 32-bit
     // targets usize is 32-bit, so a huge count could overflow the length check and
     // trigger a massive allocation.
@@ -59,7 +75,7 @@ pub fn fast_aggregate_verify(pubkeys: &[u8], n: usize, message: &[u8], signature
     };
 
     // fast_aggregate_verify: sig_groupcheck=true, all signers over the same message.
-    sig.fast_aggregate_verify(true, message, DST, &pk_refs) == BLST_ERROR::BLST_SUCCESS
+    sig.fast_aggregate_verify(true, message, dst, &pk_refs) == BLST_ERROR::BLST_SUCCESS
 }
 
 #[cfg(feature = "jni")]

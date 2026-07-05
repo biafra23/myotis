@@ -1089,6 +1089,7 @@ public class BeaconLightClient implements AutoCloseable {
             byte[] ssz = response.body();
             log.info("[beacon] HTTP bootstrap received {} bytes", ssz.length);
 
+            com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("bootstrap", ssz);
             LightClientBootstrap bootstrap = LightClientBootstrap.decode(ssz);
 
             try {
@@ -1178,6 +1179,7 @@ public class BeaconLightClient implements AutoCloseable {
                         }
                         log.info("[beacon] Bootstrap response: {} bytes from {}", response.length, peer);
                         try {
+                            com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("bootstrap", response);
                             LightClientBootstrap bootstrap = LightClientBootstrap.decode(response);
 
                             try {
@@ -1542,6 +1544,7 @@ public class BeaconLightClient implements AutoCloseable {
         int applied = 0;
         for (byte[] responseSsz : responses) {
             try {
+                com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("update", responseSsz);
                 LightClientUpdate update = LightClientUpdate.decode(responseSsz);
                 if (processor.processUpdate(update)) {
                     applied++;
@@ -1609,6 +1612,7 @@ public class BeaconLightClient implements AutoCloseable {
                         .get(5, TimeUnit.SECONDS);
                 p2pService.cacheFinalityUpdate(response);
 
+                com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("finality", response);
                 LightClientFinalityUpdate update = LightClientFinalityUpdate.decode(response);
                 LightClientHeader finalizedHeader = update.finalizedHeader();
                 long finalizedSlot = finalizedHeader.beacon().slot();
@@ -1838,6 +1842,7 @@ public class BeaconLightClient implements AutoCloseable {
                 // re-ask upstream.
                 p2pService.cacheFinalityUpdate(response);
 
+                com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("finality", response);
                 LightClientFinalityUpdate update = LightClientFinalityUpdate.decode(response);
 
                 if (store.isInitialized() && processor.processFinalityUpdate(update)) {
