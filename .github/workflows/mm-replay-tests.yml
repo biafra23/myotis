@@ -1,8 +1,19 @@
 name: mm-replay tests
 
 on:
+  # Scope push to main + release tags so a branch push that also has an open PR
+  # doesn't run twice (the PR is covered by pull_request below).
   push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  # pull_request stays unscoped (any base branch) — the double-run is already
+  # killed by narrowing push above, and this keeps CI on PRs that don't target main.
   pull_request:
+
+# Cancel a superseded run when new commits land on the same branch/PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 # Unit tests for the MetaMask replay harness (tools/mm-replay/replay.py) and the
 # golden session fixture. Pure stdlib Python — no Gradle, no external Maven

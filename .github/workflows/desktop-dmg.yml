@@ -1,8 +1,21 @@
 name: Desktop DMG (macOS)
 
 on:
+  # Scope push to main + release tags so a branch push that also has an open PR
+  # doesn't build twice (the PR is covered by pull_request below). Tags still
+  # build the release .dmg.
   push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  # pull_request stays unscoped (any base branch) — the double-run is already
+  # killed by narrowing push above, and this keeps CI on PRs that don't target main.
   pull_request:
+
+# Cancel a superseded run when new commits land on the same branch/PR (each of
+# the two arch jobs is cancelled/restarted together).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
