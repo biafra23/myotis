@@ -184,9 +184,11 @@ public final class JavaChainHandle implements ChainHandle {
                 : io.myotis.api.BeaconState.valueOf(
                         bss.getSyncState(net.clGenesisTime(), net.secondsPerSlot()).name());
         byte[] stateRoot = bss != null ? bss.getVerifiedExecutionStateRoot() : null;
+        byte[] blockHash = bss != null ? bss.getExecutionBlockHash() : null;
         long finalizedSlot = bss != null ? bss.getFinalizedSlot() : 0L;
         return new io.myotis.api.BeaconStatus(
                 state,
+                blc != null && blc.isBootstrapped(),
                 bss != null ? bss.getCurrentSyncCommitteePeriod() : 0L,
                 BeaconChainSpec.currentPeriod(net.clGenesisTime(), net.secondsPerSlot()),
                 stack.discV5() != null ? stack.discV5().liveNodeCount() : 0,
@@ -196,6 +198,7 @@ public final class JavaChainHandle implements ChainHandle {
                 bss != null ? bss.getOptimisticSlot() : 0L,
                 finalizedSlot / BeaconChainSpec.SLOTS_PER_SYNC_COMMITTEE_PERIOD,
                 stateRoot != null ? org.apache.tuweni.bytes.Bytes.wrap(stateRoot).toHexString() : null,
+                blockHash != null ? org.apache.tuweni.bytes.Bytes.wrap(blockHash).toHexString() : null,
                 bss != null ? bss.getExecutionBlockNumber() : 0L,
                 bss != null ? bss.getKnownStateRootCount() : 0,
                 BeaconSyncState.FILL_THRESHOLD,
