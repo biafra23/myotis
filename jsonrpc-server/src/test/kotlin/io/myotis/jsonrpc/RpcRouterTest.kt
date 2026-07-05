@@ -30,7 +30,10 @@ class RpcRouterTest {
         var head: Long? = 0x100,
         var code: ByteArray? = null,
         var storage: ByteArray? = null,
-    ) : MyotisRpcBackend {
+    ) : io.myotis.api.VerifiedReads {
+        // The fake keeps values as BigInteger for the assertions below; VerifiedReads
+        // speaks decimal-string wei and byte[] hashes, so it converts at the boundary
+        // exactly as the real VerifiedRpcBackend does.
         var lastFrom: ByteArray? = null
         var lastTo: ByteArray? = null
         var lastData: ByteArray? = null
@@ -39,13 +42,14 @@ class RpcRouterTest {
         var lastSlot: ByteArray? = null
         override fun chainId() = 1L
         override fun headBlockNumber() = head
-        override fun syncState() = "SYNCED"
+        override fun syncState() = io.myotis.api.SyncState.SYNCED
         override fun call(from: ByteArray?, to: ByteArray, data: ByteArray,
-                          value: BigInteger?, block: String): ByteArray? {
-            lastFrom = from; lastTo = to; lastData = data; lastValue = value; lastBlock = block
+                          valueWei: String?, block: String): ByteArray? {
+            lastFrom = from; lastTo = to; lastData = data
+            lastValue = valueWei?.let { BigInteger(it) }; lastBlock = block
             return callResult
         }
-        override fun getBalance(address: ByteArray, block: String): BigInteger? = balance
+        override fun getBalance(address: ByteArray, block: String): String? = balance?.toString()
         override fun getTransactionCount(address: ByteArray, block: String): Long? = nonce
         override fun getCode(address: ByteArray, block: String): ByteArray? = code
         override fun getStorageAt(address: ByteArray, slot: ByteArray, block: String): ByteArray? {
@@ -61,16 +65,26 @@ class RpcRouterTest {
         override fun getTransactionReceipt(txHash: ByteArray): String? {
             lastReceiptTxHash = txHash; return receiptJson
         }
+        var lastByHashTxHash: ByteArray? = null
+        var txByHashJson: String? = null
+        override fun getTransactionByHash(txHash: ByteArray): String? {
+            lastByHashTxHash = txHash; return txByHashJson
+        }
         var lastBlockTag: String? = null
         var lastFullTx: Boolean? = null
         var blockJson: String? = null
         override fun getBlockByNumber(block: String, fullTransactions: Boolean): String? {
             lastBlockTag = block; lastFullTx = fullTransactions; return blockJson
         }
+        var lastBlockHash: ByteArray? = null
+        var blockByHashJson: String? = null
+        override fun getBlockByHash(blockHash32: ByteArray, fullTransactions: Boolean): String? {
+            lastBlockHash = blockHash32; lastFullTx = fullTransactions; return blockByHashJson
+        }
         var gasPriceWei: BigInteger? = null
-        override fun gasPrice(): BigInteger? = gasPriceWei
+        override fun gasPrice(): String? = gasPriceWei?.toString()
         var tipWei: BigInteger? = null
-        override fun maxPriorityFeePerGas(): BigInteger? = tipWei
+        override fun maxPriorityFeePerGas(): String? = tipWei?.toString()
         var lastFeeBlockCount: Long? = null
         var lastFeeNewest: String? = null
         var lastFeePercentiles: DoubleArray? = null
@@ -85,15 +99,16 @@ class RpcRouterTest {
         var lastEstTo: ByteArray? = null
         var lastEstData: ByteArray? = null
         var lastEstValue: BigInteger? = null
-        var estimateResult: BigInteger? = null
+        var estimateResult: Long? = null
         override fun estimateGas(from: ByteArray?, to: ByteArray?, data: ByteArray?,
-                                 value: BigInteger?): BigInteger? {
-            lastEstFrom = from; lastEstTo = to; lastEstData = data; lastEstValue = value
+                                 valueWei: String?): Long? {
+            lastEstFrom = from; lastEstTo = to; lastEstData = data
+            lastEstValue = valueWei?.let { BigInteger(it) }
             return estimateResult
         }
     }
 
-    private fun route(backend: MyotisRpcBackend?, body: String, proxy: UpstreamProxy? = null): String =
+    private fun route(backend: io.myotis.api.VerifiedReads?, body: String, proxy: UpstreamProxy? = null): String =
         runBlocking { RpcRouter(proxy, MethodLogger(), backend).handle(body) }
 
     private fun result(resp: String): String? =
@@ -311,6 +326,40 @@ class RpcRouterTest {
         assertEquals(false, b.lastFullTx)
     }
 
+    @Test fun getBlockByHash_verified_decodesHashToBytes_andEmbedsBlock() {
+        // VerifiedReads takes the block hash as 32 bytes: the router must decode the 0x-hex
+        // param (case-insensitively) and hand the backend the raw bytes.
+        val b = FakeBackend().apply { blockByHashJson = """{"number":"0x10"}""" }
+        val hash = "0x" + "Ab".repeat(32)  // mixed case
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":3,"method":"eth_getBlockByHash","params":["$hash",false]}""")
+        val obj = json.parseToJsonElement(resp).jsonObject["result"]!!.jsonObject
+        assertEquals("0x10", obj["number"]!!.jsonPrimitive.content)
+        assertEquals(32, b.lastBlockHash!!.size)
+        assertEquals(0xAB.toByte(), b.lastBlockHash!![0])  // decoded, case-folded
+        assertEquals(false, b.lastFullTx)
+    }
+
+    @Test fun getBlockByHash_malformedHash_fallsThrough() {
+        // A non-hex / odd-length hash can't decode to bytes → the router falls through
+        // (strict error) rather than reaching the backend.
+        val b = FakeBackend().apply { blockByHashJson = """{"number":"0x10"}""" }
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":3,"method":"eth_getBlockByHash","params":["0xnothex",false]}""")
+        assertTrue(hasError(resp))
+        assertNull(b.lastBlockHash)  // backend never called
+    }
+
+    @Test fun getBlockByHash_wrongLengthHash_fallsThrough() {
+        // Valid hex but not 32 bytes ("0x1234") must also fall through — the contract's
+        // parameter is exactly 32 bytes; a short hash names nothing verifiable.
+        val b = FakeBackend().apply { blockByHashJson = """{"number":"0x10"}""" }
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":3,"method":"eth_getBlockByHash","params":["0x1234",false]}""")
+        assertTrue(hasError(resp))
+        assertNull(b.lastBlockHash)  // backend never called
+    }
+
     @Test fun getBlockByNumber_futureBlock_returnsNullResult() {
         // backend returns the literal "null" for a non-existent/future block → result: null.
         val resp = route(FakeBackend().apply { blockJson = "null" },
@@ -389,7 +438,7 @@ class RpcRouterTest {
     }
 
     @Test fun estimateGas_decodesCallObject_encodesQuantity() {
-        val b = FakeBackend().apply { estimateResult = BigInteger.valueOf(21000) }
+        val b = FakeBackend().apply { estimateResult = 21000L }
         val resp = route(b,
             """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas",
                "params":[{"from":"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
@@ -403,7 +452,7 @@ class RpcRouterTest {
     }
 
     @Test fun estimateGas_minimalParams_passesNulls() {
-        val b = FakeBackend().apply { estimateResult = BigInteger.valueOf(53000) }
+        val b = FakeBackend().apply { estimateResult = 53000L }
         val resp = route(b,
             """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas",
                "params":[{"to":"0x00000000219ab540356cBB839Cbe05303d7705Fa"}]}""")

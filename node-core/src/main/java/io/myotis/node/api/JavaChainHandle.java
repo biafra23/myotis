@@ -204,8 +204,9 @@ public final class JavaChainHandle implements ChainHandle {
 
     @Override
     public VerifiedReads reads() {
-        io.myotis.rpc.VerifiedRpcBackend backend = stack.rpcBackend();
-        return backend == null ? null : new VerifiedReadsAdapter(backend);
+        // VerifiedRpcBackend implements VerifiedReads directly (since the jsonrpc-server SPI
+        // was retired), so no adapter is needed — return it as the contract type.
+        return stack.rpcBackend();
     }
 
     @Override

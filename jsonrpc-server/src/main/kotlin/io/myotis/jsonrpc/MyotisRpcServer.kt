@@ -36,7 +36,7 @@ class MyotisRpcServer(
     private val port: Int,
     private val upstreamUrl: String? = null,
     private val host: String = "127.0.0.1",
-    private val backend: MyotisRpcBackend? = null,
+    private val backend: io.myotis.api.VerifiedReads? = null,
 ) {
     private val log = LoggerFactory.getLogger(MyotisRpcServer::class.java)
 

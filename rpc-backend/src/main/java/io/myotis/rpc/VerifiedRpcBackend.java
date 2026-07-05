@@ -26,7 +26,7 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * The shared, verified JSON-RPC backend — one implementation of
- * {@link io.myotis.jsonrpc.MyotisRpcBackend} that both the Android app
+ * {@link io.myotis.api.VerifiedReads} that both the Android app
  * ({@code NodeService}) and the {@code :app} CLI daemon construct around their
  * live node components. Ported from {@code NodeService}'s RPC region so the
  * verified-read machinery (head-context anchoring, snap-backed state oracle
@@ -43,7 +43,7 @@ import java.util.concurrent.TimeUnit;
  * (stops every executor this backend owns). The injected components are NOT
  * closed here — the host owns them.
  */
-public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBackend,
+public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         com.jaeckel.ethp2p.networking.eth.TxGossipObserver, AutoCloseable {
 
     // ---------------------------------------------------------------------
@@ -721,9 +721,10 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     }
 
     // ---------------------------------------------------------------------
-    // MyotisRpcBackend — bridges the Kotlin interface to the verified
-    // machinery below (same delegation NodeService's anonymous backend used).
-    // All blocking — called off the router's IO dispatcher.
+    // io.myotis.api.VerifiedReads — bridges the engine-API contract to the
+    // verified machinery below, converting BigInteger ⇄ decimal-String wei and
+    // byte[] ⇄ hex at the boundary. All blocking — called off the router's IO
+    // dispatcher (and from the engine-API host on a worker thread).
     // ---------------------------------------------------------------------
 
     @Override
@@ -738,22 +739,22 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     }
 
     @Override
-    public String syncState() {
-        return beaconSyncState.getSyncState(
+    public io.myotis.api.SyncState syncState() {
+        return io.myotis.api.SyncState.valueOf(beaconSyncState.getSyncState(
                 connector.getNetwork().clGenesisTime(),
-                connector.getNetwork().secondsPerSlot()).name();
+                connector.getNetwork().secondsPerSlot()).name());
     }
 
     @Override
     public byte[] call(byte[] from, byte[] to, byte[] data,
-                       java.math.BigInteger value, String block) {
-        return rpcCall(from, to, data, value, block);
+                       String valueWei, String block) {
+        return rpcCall(from, to, data, parseWei(valueWei), block);
     }
 
     @Override
-    public java.math.BigInteger getBalance(byte[] address, String block) {
+    public String getBalance(byte[] address, String block) {
         io.myotis.evm.world.AccountState a = rpcAccountState(address, block);
-        return a == null ? null : a.balance();
+        return a == null ? null : a.balance().toString();
     }
 
     @Override
@@ -834,18 +835,26 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     }
 
     @Override
-    public String getBlockByHash(String blockHash, boolean fullTransactions) {
-        return rpcGetBlockByHash(blockHash, fullTransactions);
+    public String getBlockByHash(byte[] blockHash32, boolean fullTransactions) {
+        // VerifiedReads passes the hash as bytes (FFI-neutral); the internal lookup keys on
+        // the 0x-hex string form. Fast-fail a null/wrong-length hash as "can't answer"
+        // (Java null) rather than a verified "unknown block" (JSON "null") — a malformed
+        // hash names nothing, so no verified verdict about it exists.
+        if (blockHash32 == null || blockHash32.length != 32) return null;
+        return rpcGetBlockByHash("0x" + org.apache.tuweni.bytes.Bytes.wrap(blockHash32).toUnprefixedHexString(),
+                fullTransactions);
     }
 
     @Override
-    public java.math.BigInteger gasPrice() {
-        return rpcGasPrice();
+    public String gasPrice() {
+        java.math.BigInteger p = rpcGasPrice();
+        return p == null ? null : p.toString();
     }
 
     @Override
-    public java.math.BigInteger maxPriorityFeePerGas() {
-        return rpcMaxPriorityFeePerGas();
+    public String maxPriorityFeePerGas() {
+        java.math.BigInteger p = rpcMaxPriorityFeePerGas();
+        return p == null ? null : p.toString();
     }
 
     @Override
@@ -854,9 +863,15 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     }
 
     @Override
-    public java.math.BigInteger estimateGas(byte[] from, byte[] to, byte[] data,
-                                            java.math.BigInteger value) {
-        return rpcEstimateGas(from, to, data, value);
+    public Long estimateGas(byte[] from, byte[] to, byte[] data, String valueWei) {
+        java.math.BigInteger gas = rpcEstimateGas(from, to, data, parseWei(valueWei));
+        return gas == null ? null : Long.valueOf(gas.longValue());
+    }
+
+    /** Decode a decimal wei string from the {@link io.myotis.api.VerifiedReads} boundary to the
+     *  BigInteger the internal EVM path uses. null → null (the router validated the range). */
+    private static java.math.BigInteger parseWei(String decimal) {
+        return decimal == null ? null : new java.math.BigInteger(decimal);
     }
 
     // ---------------------------------------------------------------------

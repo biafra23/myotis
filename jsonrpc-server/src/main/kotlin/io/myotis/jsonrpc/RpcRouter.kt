@@ -29,7 +29,7 @@ import kotlinx.serialization.json.put
 class RpcRouter(
     private val proxy: UpstreamProxy?,
     private val logger: MethodLogger,
-    private val backend: MyotisRpcBackend? = null,
+    private val backend: io.myotis.api.VerifiedReads? = null,
 ) {
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
@@ -162,7 +162,8 @@ class RpcRouter(
                     parseWeiQuantity(s) ?: return null
                 } else null
                 val block = p.blockTag(1)
-                val out = withContext(Dispatchers.IO) { b.call(from, to, data, value, block) } ?: return null
+                // VerifiedReads takes wei as a decimal string (FFI-neutral boundary).
+                val out = withContext(Dispatchers.IO) { b.call(from, to, data, value?.toString(), block) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexData(out)))
             }
             "eth_getBalance" -> {
@@ -170,7 +171,7 @@ class RpcRouter(
                 val addr = (p?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
                 val block = p.blockTag(1)
                 val bal = withContext(Dispatchers.IO) { b.getBalance(addr, block) } ?: return null
-                resultEnvelope(id, JsonPrimitive(hexQuantity(bal)))
+                resultEnvelope(id, JsonPrimitive(hexQuantityDecimal(bal)))
             }
             "eth_getTransactionCount" -> {
                 val p = root.params()
@@ -235,7 +236,9 @@ class RpcRouter(
             }
             "eth_getBlockByHash" -> {
                 val p = root.params()
-                val blockHash = (p?.getOrNull(0) as? JsonPrimitive)?.content ?: return null
+                // VerifiedReads takes the block hash as EXACTLY 32 bytes; a malformed or
+                // wrong-length param falls through (proxy in dev, strict error otherwise).
+                val blockHash = (p?.getOrNull(0))?.asHexBytes()?.takeIf { it.size == 32 } ?: return null
                 val fullParam = p?.getOrNull(1)
                 val fullTx: Boolean = when {
                     fullParam == null || fullParam is JsonNull -> false
@@ -248,11 +251,11 @@ class RpcRouter(
             }
             "eth_gasPrice" -> {
                 val price = withContext(Dispatchers.IO) { b.gasPrice() } ?: return null
-                resultEnvelope(id, JsonPrimitive(hexQuantity(price)))
+                resultEnvelope(id, JsonPrimitive(hexQuantityDecimal(price)))
             }
             "eth_maxPriorityFeePerGas" -> {
                 val tip = withContext(Dispatchers.IO) { b.maxPriorityFeePerGas() } ?: return null
-                resultEnvelope(id, JsonPrimitive(hexQuantity(tip)))
+                resultEnvelope(id, JsonPrimitive(hexQuantityDecimal(tip)))
             }
             "eth_feeHistory" -> {
                 val p = root.params()
@@ -298,7 +301,7 @@ class RpcRouter(
                     val s = (valueElement as? JsonPrimitive)?.contentOrNull ?: return null
                     parseWeiQuantity(s) ?: return null
                 } else null
-                val gas = withContext(Dispatchers.IO) { b.estimateGas(from, to, data, value) } ?: return null
+                val gas = withContext(Dispatchers.IO) { b.estimateGas(from, to, data, value?.toString()) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexQuantity(gas)))
             }
             else -> null
@@ -345,6 +348,10 @@ class RpcRouter(
     /** Ethereum JSON-RPC QUANTITY encoding: minimal hex, no leading zeros, 0 -> "0x0". */
     private fun hexQuantity(v: Long): String = "0x" + java.lang.Long.toHexString(v)
     private fun hexQuantity(v: java.math.BigInteger): String = "0x" + v.toString(16)
+
+    /** QUANTITY encode a decimal wei string (the FFI-neutral form VerifiedReads returns for
+     *  balances/fees). Parsed to BigInteger, then minimal hex. */
+    private fun hexQuantityDecimal(decimal: String): String = "0x" + java.math.BigInteger(decimal).toString(16)
 
     /** Parse a JSON-RPC QUANTITY (hex `0x…` or decimal) as a wei value, enforcing EVM
      *  semantics: unsigned and <= 256 bits. Returns null for malformed / negative /
