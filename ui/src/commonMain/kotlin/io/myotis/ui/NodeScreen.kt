@@ -726,7 +726,7 @@ private fun LogsTab(logs: LogSource) {
     var shown by remember { mutableStateOf<List<LogLine>>(emptyList()) }
     var lastVersion by remember { mutableStateOf(-1L) }
     var filter by remember { mutableStateOf("") }
-    var level by remember { mutableStateOf(logs.level()) }
+    var level by remember(logs) { mutableStateOf(logs.level()) }
 
     // Poll the cheap version counter; the O(n) snapshot of up to 50k lines runs off the main
     // thread so it can't jank the UI.
@@ -842,8 +842,10 @@ private fun LogLineRow(line: LogLine, tz: TimeZone) {
     )
 }
 
-/** Rank a captured line's level char against [LogLevel.ordinal] (DEBUG=0 … ERROR=3). 'V' (TRACE,
- *  never captured) ranks with DEBUG so a DEBUG selection shows everything. */
+/** Rank a captured line's level char against [LogLevel.ordinal] (DEBUG=0 … ERROR=3). 'V' (TRACE)
+ *  ranks with DEBUG so it shows at the DEBUG selection: TRACE isn't a selectable capture level, but
+ *  a 'V' line can still reach the ring if some logger is independently at TRACE (Desktop's appender
+ *  maps TRACE→'V'). */
 private fun logLevelRank(c: Char): Int = when (c) {
     'E' -> 3
     'W' -> 2

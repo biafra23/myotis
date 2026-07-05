@@ -40,8 +40,9 @@ public final class AppSlf4jProvider implements SLF4JServiceProvider {
      */
     private static volatile Level minLevel = Level.DEBUG;
 
-    /** Set the minimum captured level (from the Logs tab). */
-    public static void setMinLevel(Level level) { minLevel = level; }
+    /** Set the minimum captured level (from the Logs tab). Ignores null so the volatile can never
+     *  go null and NPE the hot-path read on the next log call. */
+    public static void setMinLevel(Level level) { if (level != null) minLevel = level; }
 
     /** The current minimum captured level. */
     public static Level minLevel() { return minLevel; }
