@@ -12,6 +12,7 @@ import io.myotis.ui.EnsResult
 import io.myotis.ui.NetworkStatus
 import io.myotis.ui.NodeController
 import io.myotis.ui.NodeSnapshot
+import io.myotis.ui.PeerRow
 import io.myotis.ui.QueryHistory
 import io.myotis.ui.QueryHistoryEntry
 import io.myotis.ui.Settings
@@ -134,12 +135,17 @@ private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
     snapPeers = snapPeers(),
     snapServingPeers = snapServingPeers(),
     discoveredPeers = discoveredPeers(),
+    backedOffPeers = backedOffPeers(),
+    blacklistedPeers = blacklistedPeers(),
+    discv5Peers = discv5Peers(),
     executionBlockNumber = executionBlockNumber(),
     finalizedSlot = finalizedSlot(),
+    syncStartPeriod = syncStartPeriod(),
     syncCurrentPeriod = syncCurrentPeriod(),
     syncTargetPeriod = syncTargetPeriod(),
     verifiedHeadAgeMs = verifiedHeadAgeMs(),
     uptimeSeconds = if (startTimeMs() > 0) (System.currentTimeMillis() - startTimeMs()) / 1000 else 0,
+    readyPeerList = readyPeerList().map { PeerRow(it.remoteAddress(), it.snapSupported(), it.clientId()) },
 )
 
 /** Android actual of [Settings] over the NodeService SharedPreferences statics. */
