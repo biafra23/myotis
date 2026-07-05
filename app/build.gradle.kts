@@ -39,6 +39,8 @@ dependencies {
 
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)
+    // CommandHandler's static init computes a keccak256 → tests must register the BC provider.
+    testImplementation(libs.bouncycastle)
 }
 
 tasks.test {

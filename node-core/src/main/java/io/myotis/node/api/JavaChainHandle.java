@@ -3,7 +3,6 @@ package io.myotis.node.api;
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
 import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
-import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
 import io.myotis.api.AccountProofResult;
 import io.myotis.api.BeaconState;
@@ -12,7 +11,6 @@ import io.myotis.api.ChainHandle;
 import io.myotis.api.DialResult;
 import io.myotis.api.EngineException;
 import io.myotis.api.EnsApi;
-import io.myotis.api.HeaderInfo;
 import io.myotis.api.HeadersResult;
 import io.myotis.api.PeerInfo;
 import io.myotis.api.StatusSnapshot;
@@ -163,48 +161,33 @@ public final class JavaChainHandle implements ChainHandle {
 
     @Override
     public StorageProofResult getStorageProof(String hexAddress, long slot, String holderHexOrNull) {
-        // Wired when the daemon's storage-proof ladder moves into node-core
-        // (plan step PR2: engine-logic motion); nothing calls this until the hosts
-        // are rewired in PR3.
-        throw new EngineException("getStorageProof: not yet wired (lands with the engine-logic motion PR)");
+        RLPxConnector conn = stack.connector();
+        if (!stack.isRunning() || conn == null) throw new EngineException("Node is not running");
+        try {
+            return io.myotis.node.VerifiedStorageQuery.query(
+                    conn, stack.beaconSyncState(), hexAddress, slot, holderHexOrNull);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new EngineException("interrupted while querying storage", e);
+        } catch (Exception e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            throw new EngineException(cause.getMessage() != null
+                    ? cause.getMessage() : cause.getClass().getSimpleName(), cause);
+        }
     }
 
     @Override
     public HeadersResult getHeaders(long startBlock, int count) {
         RLPxConnector conn = stack.connector();
         if (!stack.isRunning() || conn == null) throw new EngineException("Node is not running");
-        try {
-            List<BlockHeadersMessage.VerifiedHeader> headers =
-                    conn.requestBlockHeaders(startBlock, count).get(30, TimeUnit.SECONDS);
-            List<HeaderInfo> out = new ArrayList<>(headers.size());
-            for (BlockHeadersMessage.VerifiedHeader vh : headers) {
-                var h = vh.header();
-                out.add(new HeaderInfo(
-                        h.number,
-                        vh.hash().toHexString(),
-                        h.parentHash.toHexString(),
-                        h.stateRoot.toHexString(),
-                        h.transactionsRoot.toHexString(),
-                        h.timestamp,
-                        h.gasUsed,
-                        h.gasLimit,
-                        h.baseFeePerGas != null ? h.baseFeePerGas.toString() : null));
-            }
-            return new HeadersResult(out, null);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return new HeadersResult(List.of(), "interrupted");
-        } catch (Exception e) {
-            Throwable cause = e.getCause() != null ? e.getCause() : e;
-            return new HeadersResult(List.of(), cause.getMessage() != null
-                    ? cause.getMessage() : cause.getClass().getSimpleName());
-        }
+        return io.myotis.node.HeaderQuery.fetch(conn, startBlock, count);
     }
 
     @Override
     public BlockResult getBlockVerified(long blockNumber) {
-        // Wired when the daemon's block verification moves into node-core (plan step PR2).
-        throw new EngineException("getBlockVerified: not yet wired (lands with the engine-logic motion PR)");
+        RLPxConnector conn = stack.connector();
+        if (!stack.isRunning() || conn == null) throw new EngineException("Node is not running");
+        return io.myotis.node.VerifiedBlockQuery.query(conn, stack.beaconSyncState(), blockNumber);
     }
 
     @Override

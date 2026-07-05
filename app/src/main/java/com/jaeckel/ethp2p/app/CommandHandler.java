@@ -4,7 +4,6 @@ import com.jaeckel.ethp2p.consensus.BeaconLightClient;
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
 import com.jaeckel.ethp2p.consensus.libp2p.BeaconP2PService;
 import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
-import com.jaeckel.ethp2p.consensus.proof.MerklePatriciaVerifier;
 import io.myotis.node.VerifiedAccountQuery;
 import com.jaeckel.ethp2p.core.types.BlockHeader;
 import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
@@ -14,10 +13,8 @@ import com.jaeckel.ethp2p.networking.eth.messages.BlockBodiesMessage;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
 import com.jaeckel.ethp2p.networking.snap.messages.AccountRangeMessage;
-import com.jaeckel.ethp2p.networking.snap.messages.StorageRangesMessage;
 import org.apache.tuweni.bytes.Bytes;
 import org.apache.tuweni.bytes.Bytes32;
-import org.apache.tuweni.crypto.Hash;
 import org.apache.tuweni.rlp.RLP;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -397,266 +394,82 @@ public class CommandHandler {
     private String handleGetHeaders(String jsonLine) {
         long blockNumber = extractLong(jsonLine, "blockNumber");
         int count = (int) extractLong(jsonLine, "count");
+        // The fetch lives in node-core (io.myotis.node.HeaderQuery, shared with the
+        // engine API); this handler only serializes.
+        io.myotis.api.HeadersResult result = io.myotis.node.HeaderQuery.fetch(connector, blockNumber, count);
+        if (result.error() != null) return jsonError(result.error());
+        return buildHeadersJson(result);
+    }
 
-        try {
-            List<BlockHeadersMessage.VerifiedHeader> headers =
-                    connector.requestBlockHeaders(blockNumber, count)
-                             .get(30, TimeUnit.SECONDS);
-
-            StringBuilder sb = new StringBuilder();
-            sb.append("{\"ok\":true,\"count\":").append(headers.size()).append(",\"headers\":[");
-            boolean first = true;
-            for (BlockHeadersMessage.VerifiedHeader vh : headers) {
-                if (!first) sb.append(",");
-                first = false;
-                BlockHeader h = vh.header();
-                sb.append("{\"number\":").append(h.number)
-                  .append(",\"hash\":\"").append(vh.hash().toHexString()).append("\"")
-                  .append(",\"parentHash\":\"").append(h.parentHash.toHexString()).append("\"")
-                  .append(",\"stateRoot\":\"").append(h.stateRoot.toHexString()).append("\"")
-                  .append(",\"transactionsRoot\":\"").append(h.transactionsRoot.toHexString()).append("\"")
-                  .append(",\"timestamp\":").append(h.timestamp)
-                  .append(",\"gasUsed\":").append(h.gasUsed)
-                  .append(",\"gasLimit\":").append(h.gasLimit);
-                if (h.baseFeePerGas != null) {
-                    sb.append(",\"baseFeePerGas\":\"").append(h.baseFeePerGas).append("\"");
-                }
-                sb.append("}");
+    /** Pure serializer for get-headers (golden-tested); field order matches the historical output. */
+    static String buildHeadersJson(io.myotis.api.HeadersResult result) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"ok\":true,\"count\":").append(result.headers().size()).append(",\"headers\":[");
+        boolean first = true;
+        for (io.myotis.api.HeaderInfo h : result.headers()) {
+            if (!first) sb.append(",");
+            first = false;
+            sb.append("{\"number\":").append(h.number())
+              .append(",\"hash\":\"").append(h.hashHex()).append("\"")
+              .append(",\"parentHash\":\"").append(h.parentHashHex()).append("\"")
+              .append(",\"stateRoot\":\"").append(h.stateRootHex()).append("\"")
+              .append(",\"transactionsRoot\":\"").append(h.transactionsRootHex()).append("\"")
+              .append(",\"timestamp\":").append(h.timestamp())
+              .append(",\"gasUsed\":").append(h.gasUsed())
+              .append(",\"gasLimit\":").append(h.gasLimit());
+            if (h.baseFeePerGasWei() != null) {
+                sb.append(",\"baseFeePerGas\":\"").append(h.baseFeePerGasWei()).append("\"");
             }
-            sb.append("]}");
-            return sb.toString();
-        } catch (Exception e) {
-            Throwable cause = e.getCause() != null ? e.getCause() : e;
-            String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
-            return jsonError(msg);
+            sb.append("}");
         }
+        sb.append("]}");
+        return sb.toString();
     }
 
     private String handleGetBlock(String jsonLine) {
         long blockNumber = extractLong(jsonLine, "blockNumber");
-
-        try {
-            // Step 1: fetch the header (use batched path which retries across peers)
-            List<BlockHeadersMessage.VerifiedHeader> headers =
-                    connector.requestBlockHeadersBatched(blockNumber, 1)
-                             .get(30, TimeUnit.SECONDS);
-            if (headers.isEmpty()) {
-                return jsonError("No header returned for block " + blockNumber);
-            }
-            BlockHeadersMessage.VerifiedHeader vh = headers.get(0);
-            BlockHeader h = vh.header();
-
-            // Step 2: fetch the body using the block hash
-            org.apache.tuweni.bytes.Bytes32 blockHash = vh.hash();
-            List<BlockBodiesMessage.BlockBody> bodies =
-                    connector.requestBlockBodies(blockHash)
-                             .get(30, TimeUnit.SECONDS);
-            if (bodies.isEmpty()) {
-                return jsonError("No body returned for block " + blockNumber);
-            }
-            BlockBodiesMessage.BlockBody body = bodies.get(0);
-
-            // Step 3: verify block against beacon chain
-            String verificationJson = buildBlockVerificationJson(h, blockNumber);
-
-            // Step 4: combine into JSON response
-            StringBuilder sb = new StringBuilder();
-            sb.append("{\"ok\":true,\"block\":{");
-            sb.append("\"number\":").append(h.number);
-            sb.append(",\"hash\":\"").append(vh.hash().toHexString()).append("\"");
-            sb.append(",\"parentHash\":\"").append(h.parentHash.toHexString()).append("\"");
-            sb.append(",\"stateRoot\":\"").append(h.stateRoot.toHexString()).append("\"");
-            sb.append(",\"transactionsRoot\":\"").append(h.transactionsRoot.toHexString()).append("\"");
-            sb.append(",\"receiptsRoot\":\"").append(h.receiptsRoot.toHexString()).append("\"");
-            sb.append(",\"timestamp\":").append(h.timestamp);
-            sb.append(",\"gasUsed\":").append(h.gasUsed);
-            sb.append(",\"gasLimit\":").append(h.gasLimit);
-            if (h.baseFeePerGas != null) {
-                sb.append(",\"baseFeePerGas\":\"").append(h.baseFeePerGas).append("\"");
-            }
-            sb.append(",\"transactionCount\":").append(body.transactions().size());
-            sb.append(",\"uncleCount\":").append(body.uncleCount());
-            sb.append(",\"withdrawalCount\":").append(body.withdrawalCount());
-            sb.append("},\"verification\":").append(verificationJson).append("}");
-            return sb.toString();
-        } catch (Exception e) {
-            Throwable cause = e.getCause() != null ? e.getCause() : e;
-            String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
-            return jsonError(msg);
-        }
+        // The fetch + beacon verification live in node-core (io.myotis.node.VerifiedBlockQuery,
+        // shared with the engine API); this handler only serializes.
+        io.myotis.api.BlockResult r = io.myotis.node.VerifiedBlockQuery.query(
+                connector, beaconSyncState, blockNumber);
+        if (r.error() != null) return jsonError(r.error());
+        return buildBlockJson(r);
     }
 
-    /**
-     * Build beacon chain verification JSON for a block header.
-     *
-     * Verification strategy:
-     * 1. State root match — check if the block's stateRoot matches a beacon-attested root
-     * 2. Header chain anchored to beacon block hash — the beacon chain's ExecutionPayloadHeader
-     *    contains a block_hash field verified by sync committee BLS signatures. We fetch the
-     *    finalized block header from the peer, verify its keccak256(RLP) matches the beacon-
-     *    attested block hash, then walk the parent-hash chain to/from the requested block.
-     *    Each link in the chain is pinned by the previous header's keccak256 hash, so forging
-     *    any header would require a keccak256 preimage attack.
-     */
-    /** The Merge block — first PoS block on mainnet (Sep 15 2022). */
-    private static final long MERGE_BLOCK = 15_537_394L;
-    private static final int MAX_HEADER_CHAIN_GAP = 8192;
-
-    private String buildBlockVerificationJson(BlockHeader header, long blockNumber) {
-        boolean beaconChainVerified = false;
-        boolean blsVerified = false;
-        long matchedSlot = -1;
-        String verifyMethod = null;
-        String failReason = null;
-
-        // Pre-merge blocks cannot be verified via beacon chain
-        if (blockNumber < MERGE_BLOCK) {
-            failReason = "preMergeBlock";
-        } else {
-            // Strategy 1: direct state root match against beacon-attested roots
-            byte[] blockStateRoot = header.stateRoot.toArrayUnsafe();
-            BeaconSyncState.SlottedStateRoot match = beaconSyncState.findStateRoot(blockStateRoot);
-            if (match != null) {
-                beaconChainVerified = true;
-                matchedSlot = match.slot();
-                blsVerified = match.blsVerified();
-                verifyMethod = "stateRootMatch";
-            }
-
-            // Strategy 2: header chain anchored to beacon-attested block hash
-            if (!beaconChainVerified && beaconSyncState.isSynced()) {
-                long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
-                byte[] beaconBlockHash = beaconSyncState.getExecutionBlockHash();
-                long gap = Math.abs(blockNumber - finalizedBlockNum);
-                log.info("[verify-block] headerChain: block={}, finalizedBlock={}, gap={}",
-                        blockNumber, finalizedBlockNum, gap);
-                if (finalizedBlockNum <= 0 || beaconBlockHash == null || beaconBlockHash.length != 32) {
-                    failReason = "beaconBlockHashUnavailable";
-                } else if (gap > MAX_HEADER_CHAIN_GAP && blockNumber != finalizedBlockNum) {
-                    failReason = "headerChainGapTooLarge";
-                } else {
-                    try {
-                        boolean chainValid;
-                        if (blockNumber == finalizedBlockNum) {
-                            chainValid = verifyBlockHashAgainstBeacon(
-                                    finalizedBlockNum, beaconBlockHash, blockStateRoot);
-                        } else if (blockNumber > finalizedBlockNum) {
-                            chainValid = verifyBlockChainFromBeacon(
-                                    finalizedBlockNum, blockNumber, beaconBlockHash);
-                        } else {
-                            chainValid = verifyBlockChainFromBeacon(
-                                    blockNumber, finalizedBlockNum, beaconBlockHash);
-                        }
-                        if (chainValid) {
-                            beaconChainVerified = true;
-                            matchedSlot = beaconSyncState.getFinalizedSlot();
-                            blsVerified = true;
-                            verifyMethod = "headerChain";
-                        } else {
-                            failReason = "headerChainInvalid";
-                        }
-                    } catch (Exception e) {
-                        log.info("[verify-block] Header chain verification failed: {}", e.getMessage());
-                        failReason = "headerChainError";
-                    }
-                }
-            } else if (!beaconChainVerified && !beaconSyncState.isSynced()) {
-                failReason = "beaconNotSynced";
+    /** Pure serializer for get-block (golden-tested); field order matches the historical output. */
+    static String buildBlockJson(io.myotis.api.BlockResult r) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"ok\":true,\"block\":{");
+        sb.append("\"number\":").append(r.number());
+        sb.append(",\"hash\":\"").append(r.hashHex()).append("\"");
+        sb.append(",\"parentHash\":\"").append(r.parentHashHex()).append("\"");
+        sb.append(",\"stateRoot\":\"").append(r.stateRootHex()).append("\"");
+        sb.append(",\"transactionsRoot\":\"").append(r.transactionsRootHex()).append("\"");
+        sb.append(",\"receiptsRoot\":\"").append(r.receiptsRootHex()).append("\"");
+        sb.append(",\"timestamp\":").append(r.timestamp());
+        sb.append(",\"gasUsed\":").append(r.gasUsed());
+        sb.append(",\"gasLimit\":").append(r.gasLimit());
+        if (r.baseFeePerGasWei() != null) {
+            sb.append(",\"baseFeePerGas\":\"").append(r.baseFeePerGasWei()).append("\"");
+        }
+        sb.append(",\"transactionCount\":").append(r.transactionCount());
+        sb.append(",\"uncleCount\":").append(r.uncleCount());
+        sb.append(",\"withdrawalCount\":").append(r.withdrawalCount());
+        sb.append("},\"verification\":{");
+        sb.append("\"beaconSynced\":").append(r.beaconSynced());
+        sb.append(",\"beaconChainVerified\":").append(r.beaconChainVerified());
+        if (r.beaconChainVerified()) {
+            sb.append(",\"matchedBeaconSlot\":").append(r.matchedBeaconSlot());
+            sb.append(",\"blsVerified\":").append(r.blsVerified());
+            if (r.verifyMethod() != null) {
+                sb.append(",\"verifyMethod\":\"").append(r.verifyMethod()).append("\"");
             }
         }
-
-        StringBuilder sb = new StringBuilder("{");
-        sb.append("\"beaconSynced\":").append(beaconSyncState.isSynced());
-        sb.append(",\"beaconChainVerified\":").append(beaconChainVerified);
-        if (beaconChainVerified) {
-            sb.append(",\"matchedBeaconSlot\":").append(matchedSlot);
-            sb.append(",\"blsVerified\":").append(blsVerified);
-            if (verifyMethod != null) {
-                sb.append(",\"verifyMethod\":\"").append(verifyMethod).append("\"");
-            }
+        if (!r.beaconChainVerified() && r.failReason() != null) {
+            sb.append(",\"failReason\":\"").append(r.failReason()).append("\"");
         }
-        if (!beaconChainVerified && failReason != null) {
-            sb.append(",\"failReason\":\"").append(failReason).append("\"");
-        }
-        sb.append("}");
+        sb.append("}}");
         return sb.toString();
-    }
-
-    /**
-     * Verify a single block by checking its hash against the beacon-attested block hash.
-     * Used when the requested block IS the finalized block.
-     */
-    private boolean verifyBlockHashAgainstBeacon(long blockNumber, byte[] beaconBlockHash,
-                                                  byte[] expectedStateRoot) throws Exception {
-        List<BlockHeadersMessage.VerifiedHeader> headers =
-                connector.requestBlockHeaders(blockNumber, 1).get(30, TimeUnit.SECONDS);
-        if (headers.isEmpty()) return false;
-        BlockHeadersMessage.VerifiedHeader vh = headers.get(0);
-        // VerifiedHeader.hash() is keccak256(rawRLP) computed locally — compare to beacon anchor
-        if (!java.util.Arrays.equals(vh.hash().toArrayUnsafe(), beaconBlockHash)) {
-            log.info("[verify-block] Finalized block hash mismatch: peer={} beacon={}",
-                    vh.hash().toShortHexString(), Bytes32.wrap(beaconBlockHash).toShortHexString());
-            return false;
-        }
-        // Also confirm stateRoot matches what the requested block header has
-        return java.util.Arrays.equals(vh.header().stateRoot.toArrayUnsafe(), expectedStateRoot);
-    }
-
-    /**
-     * Verify a chain of blocks anchored to the beacon-attested block hash.
-     *
-     * Fetches headers from startBlock to endBlock. The header at finalizedBlockNum
-     * must have keccak256(RLP) == beaconBlockHash (the sync-committee-verified anchor).
-     * All other headers are verified via parent-hash chaining from that anchor.
-     */
-    private boolean verifyBlockChainFromBeacon(long startBlock, long endBlock,
-                                                byte[] beaconBlockHash) throws Exception {
-        long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
-        int total = (int) (endBlock - startBlock + 1);
-        if (total < 2 || total > MAX_HEADER_CHAIN_GAP) {
-            log.info("[verify-block] Block chain gap {} — out of range [2, {}]", total, MAX_HEADER_CHAIN_GAP);
-            return false;
-        }
-
-        log.info("[verify-block] Fetching {} headers from block #{} to #{}", total, startBlock, endBlock);
-        List<BlockHeadersMessage.VerifiedHeader> allHeaders =
-                connector.requestBlockHeadersBatched(startBlock, total)
-                        .get(120, TimeUnit.SECONDS);
-        if (allHeaders.size() != total) {
-            log.info("[verify-block] Expected {} headers, got {}", total, allHeaders.size());
-            return false;
-        }
-
-        // Find the finalized block within the chain and verify its hash against beacon
-        int anchorIndex = (int) (finalizedBlockNum - startBlock);
-        if (anchorIndex < 0 || anchorIndex >= allHeaders.size()) {
-            log.info("[verify-block] Finalized block #{} not in range [{}, {}]",
-                    finalizedBlockNum, startBlock, endBlock);
-            return false;
-        }
-        BlockHeadersMessage.VerifiedHeader anchorHeader = allHeaders.get(anchorIndex);
-        if (!java.util.Arrays.equals(anchorHeader.hash().toArrayUnsafe(), beaconBlockHash)) {
-            log.info("[verify-block] Anchor block hash mismatch at #{}: peer={} beacon={}",
-                    finalizedBlockNum, anchorHeader.hash().toShortHexString(),
-                    Bytes32.wrap(beaconBlockHash).toShortHexString());
-            return false;
-        }
-
-        // Verify parent-hash chain continuity across all headers
-        for (int i = 0; i < allHeaders.size() - 1; i++) {
-            Bytes32 currentHash = allHeaders.get(i).hash();
-            Bytes32 nextParent = allHeaders.get(i + 1).header().parentHash;
-            if (!currentHash.equals(nextParent)) {
-                log.info("[verify-block] Hash chain break at index {}: block #{} hash={} != block #{} parentHash={}",
-                        i, allHeaders.get(i).header().number, currentHash.toShortHexString(),
-                        allHeaders.get(i + 1).header().number, nextParent.toShortHexString());
-                return false;
-            }
-        }
-
-        log.info("[verify-block] Block chain verified: {} headers anchored at finalized block #{}",
-                total, finalizedBlockNum);
-        return true;
     }
 
     private String handleGetAccount(String jsonLine) {
@@ -665,79 +478,102 @@ public class CommandHandler {
         if (hex.length() != 40) {
             return jsonError("address must be a 20-byte hex string (40 hex chars)");
         }
-        Bytes address = Bytes.fromHexString(hex);
-        Bytes32 accountHash = Hash.keccak256(address);
+        // The fetch + verification ladder + diagnostics live in node-core
+        // (VerifiedAccountQuery.queryProof, shared with the engine API); this handler
+        // only serializes. The raw input is echoed back unchanged (queryProof
+        // normalizes its own copy).
         try {
-            // Use peer's fresh state root to avoid pruning issues —
-            // peers prune state beyond ~128 blocks, so a beacon-finalized root
-            // (6+ min old) is usually too stale for them to serve.
-            AccountRangeMessage.DecodeResult result =
-                connector.requestAccount(address).get(30, TimeUnit.SECONDS);
-            AccountRangeMessage.AccountData found = result.accounts().stream()
-                .filter(a -> a.accountHash().equals(accountHash))
-                .findFirst().orElse(null);
-            // Build proof array
-            StringBuilder proofSb = new StringBuilder("[");
-            for (int i = 0; i < result.proof().size(); i++) {
-                if (i > 0) proofSb.append(",");
-                proofSb.append("\"").append(result.proof().get(i).toHexString()).append("\"");
-            }
-            proofSb.append("]");
-            String proofJson = proofSb.toString();
-
-            // Run the SHARED verification ladder (io.myotis.node.VerifiedAccountQuery.verify) —
-            // the single home of the trust anchor — instead of a daemon-local copy. One pass
-            // yields both the beacon verdict AND the proof-verified leaf. Pass the account we
-            // already located so verify() doesn't re-scan the response.
-            VerifiedAccountQuery.Verification v =
-                    VerifiedAccountQuery.verify(result, address, found, beaconSyncState, connector)
-                            .get(90, TimeUnit.SECONDS);
-            String verificationJson = buildVerificationJson(
-                    v, result.stateRoot(), !result.proof().isEmpty(), result.blockNumber());
-
-            if (found == null) {
-                return "{\"ok\":true,\"exists\":false"
-                    + ",\"address\":\"" + addr + "\""
-                    + ",\"accountHash\":\"" + accountHash.toHexString() + "\""
-                    + ",\"proof\":" + proofJson
-                    + ",\"verification\":" + verificationJson + "}";
-            }
-            // storageRoot/codeHash from the proof-verified leaf when available, not the peer's
-            // slim body — a peer can forge those two while keeping nonce/balance honest, and the
-            // slim values would otherwise ride along as "verified".
-            return "{\"ok\":true,\"exists\":true"
-                + ",\"address\":\"" + addr + "\""
-                + ",\"accountHash\":\"" + found.accountHash().toHexString() + "\""
-                + ",\"nonce\":" + found.nonce()
-                + ",\"balance\":\"" + found.balance() + "\""
-                + ",\"storageRoot\":\"" + (v.verifiedStorageRootHex() != null
-                        ? v.verifiedStorageRootHex()
-                        : found.storageRoot().toHexString()) + "\""
-                + ",\"codeHash\":\"" + (v.verifiedCodeHashHex() != null
-                        ? v.verifiedCodeHashHex()
-                        : found.codeHash().toHexString()) + "\""
-                + ",\"proof\":" + proofJson
-                + ",\"verification\":" + verificationJson + "}";
+            io.myotis.api.AccountProofResult r =
+                    VerifiedAccountQuery.queryProof(connector, beaconSyncState,
+                                    clGenesisTime, secondsPerSlot, addr)
+                            .get(120, TimeUnit.SECONDS);
+            return buildAccountJson(addr, r);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return jsonError("interrupted");
         } catch (Exception e) {
-            // The blocking .get() calls above (requestAccount, verify) can throw
-            // InterruptedException; restore the interrupt status so cancellation propagates.
-            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
             return jsonError(msg);
         }
     }
 
+    /** Pure serializer for get-account (golden-tested); field order and conditional
+     *  emissions match the historical output byte-for-byte. {@code echoAddr} is the raw
+     *  request address, echoed exactly as the daemon always has. */
+    static String buildAccountJson(String echoAddr, io.myotis.api.AccountProofResult r) {
+        StringBuilder proofSb = new StringBuilder("[");
+        for (int i = 0; i < r.proofNodesHex().size(); i++) {
+            if (i > 0) proofSb.append(",");
+            proofSb.append("\"").append(r.proofNodesHex().get(i)).append("\"");
+        }
+        proofSb.append("]");
+
+        // The verification sub-object (formerly buildVerificationJson) — the ladder lives
+        // in VerifiedAccountQuery; this is serialization plus the derived periodLag.
+        StringBuilder v = new StringBuilder("{");
+        v.append("\"peerProofValid\":").append(r.peerProofValid());
+        if (r.peerStateRootHex() != null && !r.proofNodesHex().isEmpty()) {
+            v.append(",\"peerStateRoot\":\"").append(r.peerStateRootHex()).append("\"");
+        }
+        v.append(",\"beaconSynced\":").append(r.beaconSynced());
+        v.append(",\"beaconChainVerified\":").append(r.beaconChainVerified());
+        if (r.beaconChainVerified()) {
+            v.append(",\"matchedBeaconSlot\":").append(r.matchedBeaconSlot());
+            v.append(",\"blsVerified\":").append(r.blsVerified());
+            if (r.verifyMethod() != null) {
+                v.append(",\"verifyMethod\":\"").append(r.verifyMethod()).append("\"");
+            }
+        } else {
+            if (r.failReason() != null) {
+                v.append(",\"failReason\":\"").append(r.failReason()).append("\"");
+            }
+            v.append(",\"finalizedPeriod\":").append(r.finalizedPeriod());
+            v.append(",\"wallClockPeriod\":").append(r.wallClockPeriod());
+            v.append(",\"periodLag\":").append(r.wallClockPeriod() - r.finalizedPeriod());
+            if (r.blockNumber() > 0) {
+                v.append(",\"peerBlockNumber\":").append(r.blockNumber());
+            }
+            if (r.finalizedBlockNumber() > 0) {
+                v.append(",\"finalizedBlockNumber\":").append(r.finalizedBlockNumber());
+            }
+            if (r.optimisticBlockNumber() > 0) {
+                v.append(",\"optimisticBlockNumber\":").append(r.optimisticBlockNumber());
+            }
+        }
+        v.append("}");
+
+        if (!r.exists()) {
+            return "{\"ok\":true,\"exists\":false"
+                + ",\"address\":\"" + echoAddr + "\""
+                + ",\"accountHash\":\"" + r.accountHashHex() + "\""
+                + ",\"proof\":" + proofSb
+                + ",\"verification\":" + v + "}";
+        }
+        return "{\"ok\":true,\"exists\":true"
+            + ",\"address\":\"" + echoAddr + "\""
+            + ",\"accountHash\":\"" + r.accountHashHex() + "\""
+            + ",\"nonce\":" + r.nonce()
+            + ",\"balance\":\"" + r.balanceWei() + "\""
+            + ",\"storageRoot\":\"" + r.storageRootHex() + "\""
+            + ",\"codeHash\":\"" + r.codeHashHex() + "\""
+            + ",\"proof\":" + proofSb
+            + ",\"verification\":" + v + "}";
+    }
+
+
     private String handleGetStorage(String jsonLine) {
         String addr = extractString(jsonLine, "address");
         String slotStr = extractString(jsonLine, "slot");
-        String hex = (addr.startsWith("0x") || addr.startsWith("0X")) ? addr.substring(2) : addr;
-        if (hex.length() != 40) {
+
+        // Validate the address FIRST — historical error precedence: a request with a bad
+        // address and a bad slot reports the address problem.
+        String addrHex = (addr.startsWith("0x") || addr.startsWith("0X")) ? addr.substring(2) : addr;
+        if (addrHex.length() != 40) {
             return jsonError("address must be a 20-byte hex string (40 hex chars)");
         }
-        Bytes contractAddress = Bytes.fromHexString(hex);
 
-        // Parse slot number
+        // Parse slot number (host-side argument parsing; everything after is engine logic).
         long slotNumber;
         try {
             slotNumber = Long.parseLong(slotStr);
@@ -745,245 +581,90 @@ public class CommandHandler {
             return jsonError("slot must be a number");
         }
 
-        // Check if a holder address is provided (for ERC-20 mapping lookups)
+        // Optional holder address (ERC-20 mapping lookups).
         String holderAddr = null;
         try { holderAddr = extractString(jsonLine, "holder"); } catch (Exception ignored) {}
 
-        // Compute the storage key
-        byte[] storageSlotKey;
-        if (holderAddr != null) {
-            // ERC-20 mapping: keccak256(abi.encode(holderAddress, uint256(slot)))
-            String holderHex = (holderAddr.startsWith("0x") || holderAddr.startsWith("0X"))
-                    ? holderAddr.substring(2) : holderAddr;
-            if (holderHex.length() != 40) {
-                return jsonError("holder must be a 20-byte hex string (40 hex chars)");
-            }
-            byte[] holderBytes = Bytes.fromHexString(holderHex).toArrayUnsafe();
-            byte[] encoded = new byte[64];
-            // Left-pad holder address to 32 bytes
-            System.arraycopy(holderBytes, 0, encoded, 12, 20);
-            // uint256(slot) as 32 bytes big-endian
-            encoded[63] = (byte) (slotNumber);
-            encoded[62] = (byte) (slotNumber >>> 8);
-            encoded[61] = (byte) (slotNumber >>> 16);
-            encoded[60] = (byte) (slotNumber >>> 24);
-            encoded[59] = (byte) (slotNumber >>> 32);
-            encoded[58] = (byte) (slotNumber >>> 40);
-            encoded[57] = (byte) (slotNumber >>> 48);
-            encoded[56] = (byte) (slotNumber >>> 56);
-            storageSlotKey = Hash.keccak256(Bytes.wrap(encoded)).toArrayUnsafe();
-        } else {
-            // Direct slot access: key = uint256(slot) as 32 bytes big-endian
-            byte[] slotBytes = new byte[32];
-            slotBytes[31] = (byte) (slotNumber);
-            slotBytes[30] = (byte) (slotNumber >>> 8);
-            slotBytes[29] = (byte) (slotNumber >>> 16);
-            slotBytes[28] = (byte) (slotNumber >>> 24);
-            slotBytes[27] = (byte) (slotNumber >>> 32);
-            slotBytes[26] = (byte) (slotNumber >>> 40);
-            slotBytes[25] = (byte) (slotNumber >>> 48);
-            slotBytes[24] = (byte) (slotNumber >>> 56);
-            storageSlotKey = slotBytes;
-        }
-
-        Bytes32 storageKeyHash = Hash.keccak256(Bytes.wrap(storageSlotKey));
-
+        // The fetch + proof + beacon ladder lives in node-core
+        // (io.myotis.node.VerifiedStorageQuery, shared with the engine API);
+        // this handler only parses arguments and serializes the result.
         try {
-            // Step 1: fetch the account to get storageRoot
-            // Use peer's fresh state root to avoid pruning issues —
-            // peers prune state beyond ~128 blocks, so a beacon-finalized root
-            // (6+ min old) is usually too stale for them to serve.
-            Bytes32 accountHash = Hash.keccak256(contractAddress);
-            AccountRangeMessage.DecodeResult accountResult =
-                connector.requestAccount(contractAddress).get(30, TimeUnit.SECONDS);
-            AccountRangeMessage.AccountData account = accountResult.accounts().stream()
-                .filter(a -> a.accountHash().equals(accountHash))
-                .findFirst().orElse(null);
-            if (account == null) {
-                return jsonError("Contract account not found");
-            }
-
-            // Step 2: fetch storage slot using the same peer state root for consistency
-            Bytes32 snapStateRoot = accountResult.stateRoot();
-
-            // Take storageRoot from the PROOF-VERIFIED account leaf, not the peer's
-            // slim body. Otherwise a peer could forge storageRoot (keeping nonce/
-            // balance honest) plus a matching storage proof and fabricate a
-            // "verified" slot value. snapStateRoot is anchored to the beacon below.
-            List<byte[]> accountProofBytes = accountResult.proof().stream()
-                    .map(Bytes::toArrayUnsafe).toList();
-            MerklePatriciaVerifier.VerifiedAccount verifiedAccount =
-                    snapStateRoot == null ? null
-                            : MerklePatriciaVerifier.verifyAndExtractAccount(
-                                    snapStateRoot.toArrayUnsafe(),
-                                    contractAddress.toArrayUnsafe(), accountProofBytes,
-                                    account.nonce(), account.balance().toString());
-            if (verifiedAccount == null) {
-                return jsonError("Contract account proof did not verify against peer state root");
-            }
-            Bytes32 storageRoot = Bytes32.wrap(verifiedAccount.storageRoot());
-            StorageRangesMessage.DecodeResult storageResult =
-                connector.requestStorage(contractAddress, storageKeyHash, snapStateRoot)
-                    .get(30, TimeUnit.SECONDS);
-
-            // Find matching slot
-            StorageRangesMessage.StorageData found = storageResult.slots().stream()
-                .filter(s -> s.slotHash().equals(storageKeyHash))
-                .findFirst().orElse(null);
-
-            // Build proof array
-            StringBuilder proofSb = new StringBuilder("[");
-            for (int i = 0; i < storageResult.proof().size(); i++) {
-                if (i > 0) proofSb.append(",");
-                proofSb.append("\"").append(storageResult.proof().get(i).toHexString()).append("\"");
-            }
-            proofSb.append("]");
-
-            // Verify storage proof against storageRoot
-            boolean storageProofValid = false;
-            if (!storageResult.proof().isEmpty()) {
-                List<byte[]> proofBytes = storageResult.proof().stream()
-                    .map(Bytes::toArrayUnsafe).toList();
-                byte[] leafValue = MerklePatriciaVerifier.verifyStorageProof(
-                    storageRoot.toArrayUnsafe(), storageSlotKey, proofBytes);
-                storageProofValid = (leafValue != null);
-            }
-
-            // Verify account's state root against beacon state
-            boolean beaconChainVerified = false;
-            boolean blsVerified = false;
-            long matchedSlot = -1;
-            String verifyMethod = null;
-            String failReason = null;
-            Bytes32 usedStateRoot = accountResult.stateRoot();
-            if (usedStateRoot != null) {
-                BeaconSyncState.SlottedStateRoot match =
-                    beaconSyncState.findStateRoot(usedStateRoot.toArrayUnsafe());
-                if (match != null) {
-                    beaconChainVerified = true;
-                    matchedSlot = match.slot();
-                    blsVerified = match.blsVerified();
-                    verifyMethod = "stateRootMatch";
-                }
-            }
-
-            // Header chain verification fallback. Mirror get-account's
-            // buildVerificationJson flow so that a "beaconChainVerified:false"
-            // response always comes with a named failReason — silent nopes
-            // used to turn into a 3-boolean blob that was impossible to debug.
-            long peerBlockNumber = accountResult.blockNumber();
-            if (!beaconChainVerified) {
-                // Atomic snapshot: block number + state root must come from the same
-                // finalized payload, since the header chain is anchored at the block
-                // number and required to terminate at the state root.
-                BeaconSyncState.FinalizedExecution fin = beaconSyncState.getFinalizedExecution();
-                long finalizedBlockNum = fin.blockNumber();
-                byte[] beaconRoot = fin.stateRoot();
-                if (usedStateRoot == null) {
-                    failReason = "noPeerStateRoot";
-                } else if (!storageProofValid) {
-                    failReason = "peerProofInvalid";
-                } else if (!beaconSyncState.isSynced()) {
-                    failReason = "beaconNotSynced";
-                } else if (peerBlockNumber <= 0) {
-                    failReason = "noPeerBlockNumber";
-                } else if (finalizedBlockNum <= 0 || beaconRoot == null) {
-                    failReason = "beaconBlockUnavailable";
-                } else if (peerBlockNumber <= finalizedBlockNum) {
-                    failReason = "peerBlockBehindFinalized";
-                } else if (peerBlockNumber - finalizedBlockNum > MAX_HEADER_CHAIN_GAP) {
-                    failReason = "headerChainGapTooLarge";
-                } else {
-                    log.info("[verify] headerChain: peerBlock={}, finalizedBlock={}, gap={}",
-                            peerBlockNumber, finalizedBlockNum, peerBlockNumber - finalizedBlockNum);
-                    try {
-                        boolean chainValid = verifyHeaderChainBatched(
-                                finalizedBlockNum, peerBlockNumber, beaconRoot,
-                                usedStateRoot.toArrayUnsafe());
-                        if (chainValid) {
-                            beaconChainVerified = true;
-                            matchedSlot = beaconSyncState.getFinalizedSlot();
-                            blsVerified = true;
-                            verifyMethod = "headerChain";
-                        } else {
-                            failReason = "headerChainInvalid";
-                        }
-                    } catch (Exception e) {
-                        log.info("[verify] Header chain verification failed: {}", e.getMessage());
-                        failReason = "headerChainError";
-                    }
-                }
-            }
-
-            String valueHex = found != null ? found.slotValue().toHexString() : null;
-            java.math.BigInteger valueInt = null;
-            if (found != null && !found.slotValue().isEmpty()) {
-                valueInt = new java.math.BigInteger(1, found.slotValue().toArrayUnsafe());
-            }
-
-            StringBuilder sb = new StringBuilder("{\"ok\":true");
-            sb.append(",\"address\":\"").append(addr).append("\"");
-            sb.append(",\"slot\":").append(slotNumber);
-            if (holderAddr != null) {
-                sb.append(",\"holder\":\"").append(holderAddr).append("\"");
-            }
-            sb.append(",\"storageKey\":\"0x").append(bytesToHex(storageSlotKey)).append("\"");
-            sb.append(",\"storageKeyHash\":\"").append(storageKeyHash.toHexString()).append("\"");
-            if (found != null) {
-                sb.append(",\"exists\":true");
-                sb.append(",\"value\":\"").append(valueHex).append("\"");
-                if (valueInt != null) {
-                    sb.append(",\"valueDecimal\":\"").append(valueInt).append("\"");
-                }
-            } else {
-                sb.append(",\"exists\":false");
-                sb.append(",\"slotsReturned\":").append(storageResult.slots().size());
-            }
-            sb.append(",\"storageRoot\":\"").append(storageRoot.toHexString()).append("\"");
-            sb.append(",\"proof\":").append(proofSb);
-            sb.append(",\"verification\":{");
-            sb.append("\"storageProofValid\":").append(storageProofValid);
-            sb.append(",\"beaconSynced\":").append(beaconSyncState.isSynced());
-            sb.append(",\"beaconChainVerified\":").append(beaconChainVerified);
-            if (beaconChainVerified) {
-                sb.append(",\"matchedBeaconSlot\":").append(matchedSlot);
-                sb.append(",\"blsVerified\":").append(blsVerified);
-                if (verifyMethod != null) {
-                    sb.append(",\"verifyMethod\":\"").append(verifyMethod).append("\"");
-                }
-            } else {
-                if (failReason != null) {
-                    sb.append(",\"failReason\":\"").append(failReason).append("\"");
-                }
-                // Always surface the numbers so the operator can see *how far*
-                // off we are, not just that we're off. Emit both finalized and
-                // optimistic anchors — headerChainGapTooLarge is meaningful only
-                // after you see which anchor was considered.
-                long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
-                long finalizedSlot = beaconSyncState.getFinalizedSlot();
-                long optBlockNum = beaconSyncState.getOptimisticBlockNumber();
-                long optSlot = beaconSyncState.getOptimisticSlot();
-                sb.append(",\"peerBlockNumber\":").append(peerBlockNumber);
-                sb.append(",\"finalizedBlockNumber\":").append(finalizedBlockNum);
-                sb.append(",\"optimisticBlockNumber\":").append(optBlockNum);
-                if (peerBlockNumber > 0 && finalizedBlockNum > 0) {
-                    sb.append(",\"blockGap\":").append(peerBlockNumber - finalizedBlockNum);
-                }
-                if (peerBlockNumber > 0 && optBlockNum > 0) {
-                    sb.append(",\"optimisticBlockGap\":").append(peerBlockNumber - optBlockNum);
-                }
-                sb.append(",\"maxHeaderChainGap\":").append(MAX_HEADER_CHAIN_GAP);
-                sb.append(",\"finalizedSlot\":").append(finalizedSlot);
-                sb.append(",\"optimisticSlot\":").append(optSlot);
-            }
-            sb.append("}}");
-            return sb.toString();
+            io.myotis.api.StorageProofResult r = io.myotis.node.VerifiedStorageQuery.query(
+                    connector, beaconSyncState, addr, slotNumber, holderAddr);
+            return buildStorageJson(r);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return jsonError("interrupted");
         } catch (Exception e) {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
             return jsonError(msg);
         }
     }
+
+    /** Pure serializer for get-storage (golden-tested); field order and conditional
+     *  emissions match the historical output byte-for-byte. */
+    static String buildStorageJson(io.myotis.api.StorageProofResult r) {
+        StringBuilder proofSb = new StringBuilder("[");
+        for (int i = 0; i < r.proofNodesHex().size(); i++) {
+            if (i > 0) proofSb.append(",");
+            proofSb.append("\"").append(r.proofNodesHex().get(i)).append("\"");
+        }
+        proofSb.append("]");
+
+        StringBuilder sb = new StringBuilder("{\"ok\":true");
+        sb.append(",\"address\":\"").append(r.addressHex()).append("\"");
+        sb.append(",\"slot\":").append(r.slot());
+        if (r.holderHex() != null) {
+            sb.append(",\"holder\":\"").append(r.holderHex()).append("\"");
+        }
+        sb.append(",\"storageKey\":\"").append(r.storageKeyHex()).append("\"");
+        sb.append(",\"storageKeyHash\":\"").append(r.storageKeyHashHex()).append("\"");
+        if (r.exists()) {
+            sb.append(",\"exists\":true");
+            sb.append(",\"value\":\"").append(r.valueHex()).append("\"");
+            if (r.valueDecimal() != null) {
+                sb.append(",\"valueDecimal\":\"").append(r.valueDecimal()).append("\"");
+            }
+        } else {
+            sb.append(",\"exists\":false");
+            sb.append(",\"slotsReturned\":").append(r.slotsReturned());
+        }
+        sb.append(",\"storageRoot\":\"").append(r.storageRootHex()).append("\"");
+        sb.append(",\"proof\":").append(proofSb);
+        sb.append(",\"verification\":{");
+        sb.append("\"storageProofValid\":").append(r.storageProofValid());
+        sb.append(",\"beaconSynced\":").append(r.beaconSynced());
+        sb.append(",\"beaconChainVerified\":").append(r.beaconChainVerified());
+        if (r.beaconChainVerified()) {
+            sb.append(",\"matchedBeaconSlot\":").append(r.matchedBeaconSlot());
+            sb.append(",\"blsVerified\":").append(r.blsVerified());
+            if (r.verifyMethod() != null) {
+                sb.append(",\"verifyMethod\":\"").append(r.verifyMethod()).append("\"");
+            }
+        } else {
+            if (r.failReason() != null) {
+                sb.append(",\"failReason\":\"").append(r.failReason()).append("\"");
+            }
+            // Always surface the numbers so the operator can see *how far* off we
+            // are, not just that we're off — both finalized and optimistic anchors.
+            sb.append(",\"peerBlockNumber\":").append(r.peerBlockNumber());
+            sb.append(",\"finalizedBlockNumber\":").append(r.finalizedBlockNumber());
+            sb.append(",\"optimisticBlockNumber\":").append(r.optimisticBlockNumber());
+            if (r.peerBlockNumber() > 0 && r.finalizedBlockNumber() > 0) {
+                sb.append(",\"blockGap\":").append(r.peerBlockNumber() - r.finalizedBlockNumber());
+            }
+            if (r.peerBlockNumber() > 0 && r.optimisticBlockNumber() > 0) {
+                sb.append(",\"optimisticBlockGap\":").append(r.peerBlockNumber() - r.optimisticBlockNumber());
+            }
+            sb.append(",\"maxHeaderChainGap\":").append(r.maxHeaderChainGap());
+            sb.append(",\"finalizedSlot\":").append(r.finalizedSlot());
+            sb.append(",\"optimisticSlot\":").append(r.optimisticSlot());
+        }
+        sb.append("}}");
+        return sb.toString();
+    }
+
 
     /**
      * Shared single-thread pool that drives the EVM for the {@code resolve-ens}
@@ -1677,126 +1358,6 @@ public class CommandHandler {
         return "{\"ok\":true,\"message\":\"Daemon shutting down\"}";
     }
 
-    // -------------------------------------------------------------------------
-    // Beacon proof verification helpers
-    // -------------------------------------------------------------------------
-
-    /**
-     * Serialize the shared {@link VerifiedAccountQuery.Verification} verdict into the daemon's
-     * get-account "verification" JSON, plus the daemon-only diagnostics (finalized / wall-clock
-     * period lag, block numbers). The verification LADDER now lives ONLY in VerifiedAccountQuery;
-     * this method is pure serialization (the daemon used to re-implement the ladder here).
-     */
-    private String buildVerificationJson(VerifiedAccountQuery.Verification v,
-                                          Bytes32 peerStateRoot, boolean proofPresent,
-                                          long peerBlockNumber) {
-        String peerStateRootHex = (peerStateRoot != null && proofPresent) ? peerStateRoot.toHexString() : null;
-
-        // Daemon-only diagnostics (not carried by the shared Verification).
-        long finalizedBlockNum = beaconSyncState.getFinalizedExecution().blockNumber();
-        long finalizedPeriod = beaconSyncState.getFinalizedPeriod();
-        long wallClockPeriod = BeaconChainSpec.currentPeriod(clGenesisTime, secondsPerSlot);
-        long periodLag = wallClockPeriod - finalizedPeriod;
-
-        StringBuilder sb = new StringBuilder("{");
-        sb.append("\"peerProofValid\":").append(v.peerProofValid());
-        if (peerStateRootHex != null) {
-            sb.append(",\"peerStateRoot\":\"").append(peerStateRootHex).append("\"");
-        }
-        sb.append(",\"beaconSynced\":").append(beaconSyncState.isSynced());
-        sb.append(",\"beaconChainVerified\":").append(v.beaconChainVerified());
-        if (v.beaconChainVerified()) {
-            sb.append(",\"matchedBeaconSlot\":").append(v.matchedSlot());
-            sb.append(",\"blsVerified\":").append(v.blsVerified());
-            if (v.verifyMethod() != null) {
-                sb.append(",\"verifyMethod\":\"").append(v.verifyMethod()).append("\"");
-            }
-        } else {
-            if (v.failReason() != null) {
-                sb.append(",\"failReason\":\"").append(v.failReason()).append("\"");
-            }
-            sb.append(",\"finalizedPeriod\":").append(finalizedPeriod);
-            sb.append(",\"wallClockPeriod\":").append(wallClockPeriod);
-            sb.append(",\"periodLag\":").append(periodLag);
-            if (peerBlockNumber > 0) {
-                sb.append(",\"peerBlockNumber\":").append(peerBlockNumber);
-            }
-            if (finalizedBlockNum > 0) {
-                sb.append(",\"finalizedBlockNumber\":").append(finalizedBlockNum);
-            }
-            long optBlockNum = beaconSyncState.getOptimisticBlockNumber();
-            if (optBlockNum > 0) {
-                sb.append(",\"optimisticBlockNumber\":").append(optBlockNum);
-            }
-        }
-        sb.append("}");
-        return sb.toString();
-    }
-
-    /**
-     * Verify a chain of consecutive block headers.
-     * Checks that:
-     * 1. The first header's state root matches the beacon-finalized root
-     * 2. Each header's hash equals the next header's parentHash
-     * 3. The last header's state root matches the peer's state root
-     */
-    private static boolean verifyHeaderChain(List<BlockHeadersMessage.VerifiedHeader> headers,
-                                              byte[] expectedFirstStateRoot,
-                                              byte[] expectedLastStateRoot) {
-        if (headers.isEmpty()) return false;
-
-        // Check first header's state root matches beacon-finalized root
-        byte[] firstStateRoot = headers.get(0).header().stateRoot.toArrayUnsafe();
-        if (!java.util.Arrays.equals(firstStateRoot, expectedFirstStateRoot)) return false;
-
-        // Check last header's state root matches peer's state root
-        byte[] lastStateRoot = headers.get(headers.size() - 1).header().stateRoot.toArrayUnsafe();
-        if (!java.util.Arrays.equals(lastStateRoot, expectedLastStateRoot)) return false;
-
-        // Verify hash chain: each header's hash must equal the next header's parentHash
-        for (int i = 0; i < headers.size() - 1; i++) {
-            Bytes32 currentHash = headers.get(i).hash();
-            Bytes32 nextParent = headers.get(i + 1).header().parentHash;
-            if (!currentHash.equals(nextParent)) {
-                log.info("[verify] Hash chain break at index {}: block #{} hash={} != block #{} parentHash={}",
-                        i, headers.get(i).header().number, currentHash.toShortHexString(),
-                        headers.get(i + 1).header().number, nextParent.toShortHexString());
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /**
-     * Fetch headers in batches from a single peer and verify the full chain.
-     * Uses RLPxConnector.requestBlockHeadersBatched to ensure all batches
-     * come from the same peer, preventing cross-peer discontinuities.
-     */
-    private boolean verifyHeaderChainBatched(long finalizedBlock, long peerBlock,
-                                              byte[] beaconStateRoot, byte[] peerStateRoot)
-            throws Exception {
-        int total = (int) (peerBlock - finalizedBlock + 1);
-        if (total < 2 || total > 8192) {
-            log.info("[verify] Header chain gap {} blocks — out of range [2, 8192]", total);
-            return false;
-        }
-
-        log.info("[verify] Fetching {} headers from block #{} to #{}", total, finalizedBlock, peerBlock);
-        List<BlockHeadersMessage.VerifiedHeader> allHeaders =
-                connector.requestBlockHeadersBatched(finalizedBlock, total)
-                        .get(60, TimeUnit.SECONDS);
-
-        boolean valid = verifyHeaderChain(allHeaders, beaconStateRoot, peerStateRoot);
-        log.info("[verify] Full header chain ({} blocks) valid: {}", total, valid);
-        if (!valid && !allHeaders.isEmpty()) {
-            byte[] firstSR = allHeaders.get(0).header().stateRoot.toArrayUnsafe();
-            byte[] lastSR = allHeaders.get(allHeaders.size() - 1).header().stateRoot.toArrayUnsafe();
-            log.info("[verify] firstStateRoot match={}, lastStateRoot match={}",
-                    java.util.Arrays.equals(firstSR, beaconStateRoot),
-                    java.util.Arrays.equals(lastSR, peerStateRoot));
-        }
-        return valid;
-    }
 
     private static String bytesToHex(byte[] bytes) {
         StringBuilder sb = new StringBuilder(bytes.length * 2);

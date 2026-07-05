@@ -984,6 +984,172 @@ public final class VerifiedRpcBackend implements io.myotis.jsonrpc.MyotisRpcBack
     }
 
     // ---------------------------------------------------------------------
+    // ENS record-type lookups (text / contenthash / multi-coin / pubkey / abi /
+    // DNS / interface-implementer / reverse) — the engine home of what the
+    // daemon's IPC handlers used to build ad hoc. Same RpcCallContext machinery,
+    // same AUTO ladder as resolveEns.
+    // ---------------------------------------------------------------------
+
+    /**
+     * One record-type lookup outcome. {@code value == null} with {@code error == null}
+     * is a <em>successful</em> "no such record"; {@code error != null} is a failure.
+     * {@code verified} is true iff the lookup ran against beacon-finalized state.
+     */
+    public record EnsRecord<T>(T value, long blockNumber, boolean verified, String error) {}
+
+    private record RecordAttempt<T>(EnsRecord<T> record, boolean usedOffchain) {}
+
+    /** ENSIP-5 text record. */
+    public CompletableFuture<EnsRecord<String>> resolveEnsText(
+            String name, String key, io.myotis.ens.EnsResolutionRoot mode) {
+        return resolveRecordWithMode("resolveText", mode,
+                (r, ctx) -> r.resolveText(name, key, ctx));
+    }
+
+    /** ENSIP-7 contenthash. */
+    public CompletableFuture<EnsRecord<byte[]>> resolveEnsContenthash(
+            String name, io.myotis.ens.EnsResolutionRoot mode) {
+        return resolveRecordWithMode("resolveContenthash", mode,
+                (r, ctx) -> r.resolveContenthash(name, ctx));
+    }
+
+    /** ENSIP-9 multi-coin address (SLIP-44 coin type). */
+    public CompletableFuture<EnsRecord<byte[]>> resolveEnsMultiCoinAddr(
+            String name, long coinType, io.myotis.ens.EnsResolutionRoot mode) {
+        return resolveRecordWithMode("resolveMultiCoinAddress", mode,
+                (r, ctx) -> r.resolveMultiCoinAddress(name, coinType, ctx));
+    }
+
+    /** Pubkey record (secp256k1 x/y). */
+    public CompletableFuture<EnsRecord<io.myotis.ens.EnsResolver.Pubkey>> resolveEnsPubkey(
+            String name, io.myotis.ens.EnsResolutionRoot mode) {
+        return resolveRecordWithMode("resolvePubkey", mode,
+                (r, ctx) -> r.resolvePubkey(name, ctx));
+    }
+
+    /** ABI record (ENSIP-4); {@code contentTypes} is the accepted-encodings bitmask. */
+    public CompletableFuture<EnsRecord<io.myotis.ens.EnsResolver.AbiRecord>> resolveEnsAbi(
+            String name, long contentTypes, io.myotis.ens.EnsResolutionRoot mode) {
+        return resolveRecordWithMode("resolveAbi", mode,
+                (r, ctx) -> r.resolveAbi(name, contentTypes, ctx));
+    }
+
+    /** DNS record stored in ENS (ENSIP-6); {@code dnsNameWire} is the wire-encoded name. */
+    public CompletableFuture<EnsRecord<byte[]>> resolveEnsDnsRecord(
+            String name, byte[] dnsNameWire, int resource, io.myotis.ens.EnsResolutionRoot mode) {
+        return resolveRecordWithMode("resolveDnsRecord", mode,
+                (r, ctx) -> r.resolveDnsRecord(name, dnsNameWire, resource, ctx));
+    }
+
+    /** ERC-165 interface-implementer record. */
+    public CompletableFuture<EnsRecord<io.myotis.evm.Address>> resolveEnsInterfaceImplementer(
+            String name, byte[] interfaceId4, io.myotis.ens.EnsResolutionRoot mode) {
+        return resolveRecordWithMode("resolveInterfaceImplementer", mode,
+                (r, ctx) -> r.resolveInterfaceImplementer(name, interfaceId4, ctx));
+    }
+
+    /**
+     * Reverse resolution (address → primary name) with the resolver's mandatory ENSIP-3
+     * forward-verification. The returned record's value is the verified name.
+     */
+    public CompletableFuture<EnsRecord<String>> reverseResolveEns(
+            byte[] address20, io.myotis.ens.EnsResolutionRoot mode) {
+        final io.myotis.evm.Address addr;
+        try {
+            addr = io.myotis.evm.Address.of(address20);
+        } catch (RuntimeException e) {
+            // Keep the family's never-throws contract even for a bad-length array.
+            return CompletableFuture.completedFuture(
+                    new EnsRecord<>(null, -1, false, unwrap(e)));
+        }
+        return resolveRecordWithMode("resolveName", mode,
+                (r, ctx) -> r.resolveName(addr, ctx));
+    }
+
+    /**
+     * Shared mode dispatch + snap-heavy guard for the record lookups — mirrors
+     * {@link #resolveEns}: AUTO tries FINALIZED and falls back to PEER_HEAD only when the
+     * record was absent AND no CCIP gateway already determined the answer. Never throws.
+     */
+    private <T> CompletableFuture<EnsRecord<T>> resolveRecordWithMode(
+            String label, io.myotis.ens.EnsResolutionRoot mode,
+            java.util.function.BiFunction<io.myotis.ens.EnsResolver, io.myotis.evm.BlockContext,
+                    CompletableFuture<java.util.Optional<T>>> call) {
+        RLPxConnector conn = connector;
+        if (conn == null) {
+            return CompletableFuture.completedFuture(
+                    new EnsRecord<>(null, -1, false, "node not running"));
+        }
+        final io.myotis.ens.EnsResolutionRoot m =
+                (mode == null) ? io.myotis.ens.EnsResolutionRoot.AUTO : mode;
+        conn.enterSnapHeavy();
+        // Same synchronous-throw guard as resolveEns: supplyAsync can reject before any
+        // future exists; don't leak the snap-heavy state on that path.
+        try {
+            final CompletableFuture<EnsRecord<T>> result;
+            if (m == io.myotis.ens.EnsResolutionRoot.AUTO) {
+                result = attemptResolveRecord(label, io.myotis.ens.EnsResolutionRoot.FINALIZED, call)
+                        .thenCompose(fin -> {
+                            if (fin.record().value() != null || fin.usedOffchain()) {
+                                return CompletableFuture.completedFuture(fin.record());
+                            }
+                            return attemptResolveRecord(label,
+                                    io.myotis.ens.EnsResolutionRoot.PEER_HEAD, call)
+                                    .thenApply(RecordAttempt::record);
+                        });
+            } else {
+                result = attemptResolveRecord(label, m, call).thenApply(RecordAttempt::record);
+            }
+            return result.whenComplete((r, ex) -> conn.exitSnapHeavy());
+        } catch (Throwable t) {
+            conn.exitSnapHeavy();
+            return CompletableFuture.completedFuture(
+                    new EnsRecord<>(null, -1, false, unwrap(t)));
+        }
+    }
+
+    /** One record-lookup attempt against {@code root}. Never throws (mirrors
+     *  {@link #attemptResolveEns}); an absent record is value=null with error=null. */
+    private <T> CompletableFuture<RecordAttempt<T>> attemptResolveRecord(
+            String label, io.myotis.ens.EnsResolutionRoot root,
+            java.util.function.BiFunction<io.myotis.ens.EnsResolver, io.myotis.evm.BlockContext,
+                    CompletableFuture<java.util.Optional<T>>> call) {
+        return CompletableFuture.<RpcCallContext>supplyAsync(() -> {
+            try {
+                return prepareEnsCall(root);
+            } catch (Exception e) {
+                throw new java.util.concurrent.CompletionException(e);
+            }
+        }, evmPool).thenCompose(ctx -> {
+            final boolean verified = ctx.beaconVerified();
+            if (ctx.resolver() == null) {
+                return CompletableFuture.completedFuture(new RecordAttempt<T>(new EnsRecord<>(
+                        null, ctx.blockNumber(), verified,
+                        "ENS not available on chain id " + connector.getNetwork().networkId()),
+                        false));
+            }
+            return call.apply(ctx.resolver(), ctx.blockCtx())
+                    .orTimeout(ENS_TIMEOUT_SEC, TimeUnit.SECONDS)
+                    .handle((opt, ex) -> {
+                        final boolean usedOffchain = ctx.offchainExecutor().usedOffchain();
+                        if (ex != null) {
+                            log.info("[ens] " + label + " failed: " + unwrap(ex));
+                            return new RecordAttempt<T>(new EnsRecord<>(
+                                    null, ctx.blockNumber(), verified, unwrap(ex)), usedOffchain);
+                        }
+                        T value = (opt == null || opt.isEmpty()) ? null : opt.get();
+                        return new RecordAttempt<T>(new EnsRecord<>(
+                                value, ctx.blockNumber(), verified, null), usedOffchain);
+                    });
+        }).exceptionally(ex -> {
+            Throwable cause = (ex instanceof java.util.concurrent.CompletionException
+                    && ex.getCause() != null) ? ex.getCause() : ex;
+            return new RecordAttempt<T>(new EnsRecord<>(null, -1,
+                    root == io.myotis.ens.EnsResolutionRoot.FINALIZED, unwrap(cause)), false);
+        });
+    }
+
+    // ---------------------------------------------------------------------
     // Shared anchored-head context resolution
     // ---------------------------------------------------------------------
 
