@@ -44,7 +44,7 @@ public class BlsBackendBenchmark {
             backends.put("blst (native/rust)", new NativeBlsBackend());
         } else {
             System.out.println("[note] native blst lib not on java.library.path — "
-                    + "build it: (cd rust/myotis-bls && cargo build --release)");
+                    + "build it: (cd rust && cargo build --release)");
         }
 
         System.out.println();

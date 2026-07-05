@@ -15,6 +15,10 @@ all done and verified. Summary first; the original evaluation follows.
 - Android: `rust/build-android.sh` (cargo-ndk) builds `arm64-v8a` + `x86_64`
   `libmyotis_bls.so` into `android-app/src/main/jniLibs` (confirmed packaged in the debug
   APK); `EthP2PApplication` sets `compare` so logcat shows the A/B on-device.
+- `rust/` is a Cargo **workspace** (myotis-bls + the growing Rust engine crates); Gradle
+  drives it via `cargoBuildHost` / `cargoTest` / `cargoNdkAndroid` (root build file), all
+  optional — without cargo on the machine they self-skip and the pure-Java build is
+  untouched. Host artifacts land in `rust/target/release/`.
 
 **Measured — `BlsBackendBenchmark`, real 511-pubkey mainnet aggregate, x86-64 desktop:**
 | backend | cold (ms) | warm (ms/op) |

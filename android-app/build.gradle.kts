@@ -260,3 +260,10 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     debugImplementation(libs.androidx.compose.ui.tooling)
 }
+
+// Rebuild the Rust jniLibs from source when the full toolchain (cargo +
+// cargo-ndk + NDK) is on this machine; cargoNdkAndroid self-skips otherwise
+// and the committed jniLibs ship as-is. Root build.gradle.kts owns the task.
+tasks.matching { it.name == "preBuild" }.configureEach {
+    dependsOn(rootProject.tasks.named("cargoNdkAndroid"))
+}

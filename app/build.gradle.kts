@@ -56,15 +56,19 @@ tasks.register<JavaExec>("run") {
     javaLauncher = javaToolchains.launcherFor {
         languageVersion = JavaLanguageVersion.of(21)
     }
-    // If the native blst lib (rust/myotis-bls) is built, put it on java.library.path so
-    // BlsBackends auto-selects the native backend (~15x faster BLS verify). Falls back to
-    // Milagro if absent. Build: (cd rust/myotis-bls && cargo build --release).
+    // Build the Rust workspace first (no-op without cargo; instant when unchanged) and
+    // put its release dir on java.library.path so BlsBackends auto-selects the native
+    // backend (~15x faster BLS verify). Falls back to Milagro when cargo is absent.
     // Override choice with -Dmyotis.bls.backend=milagro|native|compare.
-    rootProject.file("rust/myotis-bls/target/release").takeIf { it.exists() }?.let {
-        systemProperty(
-            "java.library.path",
-            it.absolutePath + System.getProperty("path.separator") + System.getProperty("java.library.path"),
-        )
+    dependsOn(rootProject.tasks.named("cargoBuildHost"))
+    // Resolved in doFirst — the dir only exists AFTER cargoBuildHost has run once.
+    doFirst {
+        rootProject.file("rust/target/release").takeIf { it.exists() }?.let {
+            systemProperty(
+                "java.library.path",
+                it.absolutePath + System.getProperty("path.separator") + System.getProperty("java.library.path"),
+            )
+        }
     }
     // -Pbls=milagro|native|compare|auto → -Dmyotis.bls.backend (e.g. compare logs a
     // per-verify Milagro-vs-native head-to-head during a live sync).

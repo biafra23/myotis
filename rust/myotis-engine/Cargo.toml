@@ -1,0 +1,14 @@
+[package]
+name = "myotis-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Rust implementation of the io.myotis.api engine contract (JNI cdylib)"
+license = "MIT OR Apache-2.0"
+
+[lib]
+# libmyotis_engine.{so,dylib,dll} — loaded by :myotis-engines' RustEngineNative.
+crate-type = ["cdylib"]
+
+[dependencies]
+myotis-consensus = { path = "../myotis-consensus" }
+jni = { version = "0.21", default-features = false }

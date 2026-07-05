@@ -1,3 +1,4 @@
+import java.io.ByteArrayOutputStream
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -8,6 +9,9 @@ import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
+import java.util.Properties
+import javax.inject.Inject
+import org.gradle.process.ExecOperations
 
 plugins {
     java
@@ -65,6 +69,185 @@ subprojects {
 
     tasks.withType<JavaCompile> {
         options.encoding = "UTF-8"
+    }
+}
+
+// -------------------------------------------------------------------------
+// Optional Rust build (rust/ Cargo workspace — the coming Rust engine plus the
+// native BLS backend). Rust is strictly OPTIONAL: without cargo on the machine
+// every cargo* task self-skips with a single lifecycle note and the pure-Java
+// build is untouched. With cargo installed, Gradle builds both engines:
+//   cargoBuildHost  → rust/target/release/*.{so,dylib,dll}; wired into
+//                     :app run (java.library.path) and :consensus test
+//   cargoTest       → cargo test --workspace; wired into root `check`
+//   cargoNdkAndroid → Android jniLibs via rust/build-android.sh; wired into
+//                     :android-app preBuild. Extra-guarded on cargo-ndk + an
+//                     NDK — the committed jniLibs stay the fallback.
+// -------------------------------------------------------------------------
+
+// Configuration-cache-safe tool probe: `<cmd...>` stdout, or "" when the tool
+// is missing / exits non-zero.
+abstract class ToolProbe : ValueSource<String, ToolProbe.Params> {
+    interface Params : ValueSourceParameters {
+        val command: ListProperty<String>
+        val workingDir: Property<File>
+    }
+
+    @get:Inject abstract val execOperations: ExecOperations
+
+    override fun obtain(): String = try {
+        val out = ByteArrayOutputStream()
+        val result = execOperations.exec {
+            commandLine(parameters.command.get())
+            workingDir = parameters.workingDir.get()
+            standardOutput = out
+            errorOutput = ByteArrayOutputStream()
+            isIgnoreExitValue = true
+        }
+        if (result.exitValue == 0) out.toString(Charsets.UTF_8).trim() else ""
+    } catch (e: Exception) {
+        "" // binary not on PATH
+    }
+}
+
+// Probed from rust/ so rust-toolchain.toml governs which toolchain rustup
+// reports — probing the repo root would measure the rustup DEFAULT toolchain,
+// not the one the builds actually run. (If rustup has no stable installed,
+// the probe exits non-zero → "" → Rust is skipped, not downloaded.)
+fun probeTool(vararg cmd: String): String =
+    providers.of(ToolProbe::class) {
+        parameters.command.set(cmd.toList())
+        parameters.workingDir.set(file("rust"))
+    }.get()
+
+val cargoVersion = probeTool("cargo", "--version") // "cargo 1.96.0 (…)" or ""
+val cargoNdkVersion = if (cargoVersion.isEmpty()) "" else probeTool("cargo", "ndk", "--version")
+
+// Minimum toolchain: headroom for the crates the engine phase pulls in
+// (alloy-primitives / ethereum_ssz MSRVs move quickly). Older toolchains skip
+// the Rust build exactly like a missing cargo — java stays fully functional.
+val minRustMinor = 85
+val rustAvailable = Regex("""cargo (\d+)\.(\d+)""").find(cargoVersion)?.let {
+    val (major, minor) = it.destructured
+    major.toInt() > 1 || (major.toInt() == 1 && minor.toInt() >= minRustMinor)
+} ?: false
+
+// NDK for cargoNdkAndroid: $ANDROID_NDK_HOME, else the newest ndk/<version>
+// under the SDK from local.properties / $ANDROID_HOME / $ANDROID_SDK_ROOT.
+fun findAndroidNdk(): File? {
+    System.getenv("ANDROID_NDK_HOME")?.let { p ->
+        File(p).takeIf { it.isDirectory }?.let { return it }
+    }
+    // java.util.Properties for real unescaping — Windows local.properties
+    // writes sdk.dir=C\:\\Users\\… which a raw line split would mangle.
+    val sdkDir = file("local.properties").takeIf { it.exists() }?.let { f ->
+        Properties().apply { f.inputStream().use { load(it) } }.getProperty("sdk.dir")
+    }
+        ?: System.getenv("ANDROID_HOME")
+        ?: System.getenv("ANDROID_SDK_ROOT")
+        ?: return null
+    val numericVersion = Comparator<File> { a, b ->
+        val pa = a.name.split('.')
+        val pb = b.name.split('.')
+        (0 until maxOf(pa.size, pb.size)).asSequence()
+            .map { i ->
+                (pa.getOrNull(i)?.toLongOrNull() ?: -1L)
+                    .compareTo(pb.getOrNull(i)?.toLongOrNull() ?: -1L)
+            }
+            .firstOrNull { it != 0 } ?: 0
+    }
+    return File(sdkDir, "ndk").listFiles()?.filter { it.isDirectory }?.maxWithOrNull(numericVersion)
+}
+val androidNdkDir = findAndroidNdk()
+
+val rustSources = fileTree("rust") {
+    include(
+        "**/*.rs", "**/Cargo.toml", "Cargo.lock",
+        "rust-toolchain.toml", ".cargo/**", "build-android.sh",
+    )
+    exclude("target/**")
+}
+
+val hostLibNames = run {
+    val os = System.getProperty("os.name").lowercase()
+    listOf("myotis_bls", "myotis_engine").map {
+        when {
+            os.contains("win") -> "$it.dll"
+            os.contains("mac") -> "lib$it.dylib"
+            else -> "lib$it.so"
+        }
+    }
+}
+
+tasks.register<Exec>("cargoBuildHost") {
+    group = "rust"
+    description = "cargo build --release for the host OS (self-skips when cargo is missing)"
+    onlyIf { rustAvailable }
+    workingDir = file("rust")
+    commandLine("cargo", "build", "--release", "--workspace")
+    inputs.files(rustSources).withPathSensitivity(PathSensitivity.RELATIVE)
+    // Toolchain identity is an input: a rustc upgrade with unchanged sources
+    // must rebuild, or stale artifacts survive UP-TO-DATE checks.
+    inputs.property("cargoVersion", cargoVersion)
+    outputs.files(hostLibNames.map { file("rust/target/release/$it") })
+}
+
+val cargoTest = tasks.register<Exec>("cargoTest") {
+    group = "rust"
+    description = "cargo test --workspace (self-skips when cargo is missing)"
+    onlyIf { rustAvailable }
+    workingDir = file("rust")
+    commandLine("cargo", "test", "--workspace")
+    // No declared outputs: cargo's own incrementalism makes a no-change rerun
+    // cheap, and test verdicts aren't files Gradle could fingerprint.
+}
+tasks.named("check") { dependsOn(cargoTest) }
+
+tasks.register<Exec>("cargoNdkAndroid") {
+    group = "rust"
+    description = "Cross-compile the Android jniLibs via rust/build-android.sh (self-skips without cargo + cargo-ndk + NDK; the committed jniLibs are the fallback)"
+    onlyIf { rustAvailable && cargoNdkVersion.isNotEmpty() && androidNdkDir != null }
+    workingDir = file("rust")
+    androidNdkDir?.let { environment("ANDROID_NDK_HOME", it.absolutePath) }
+    // Windows can't exec a .sh directly (CreateProcess error=193); route it
+    // through bash there (Git for Windows ships one alongside git itself).
+    if (System.getProperty("os.name").lowercase().contains("win")) {
+        commandLine("bash", "./build-android.sh")
+    } else {
+        commandLine("./build-android.sh")
+    }
+    inputs.files(rustSources).withPathSensitivity(PathSensitivity.RELATIVE)
+    // Toolchain identity as inputs: switching rustc, cargo-ndk, or the NDK must
+    // re-run the build AND its 16 KB alignment check — that check exists to
+    // catch exactly these toolchain swaps.
+    inputs.property("cargoVersion", cargoVersion)
+    inputs.property("cargoNdkVersion", cargoNdkVersion)
+    inputs.property("ndkDir", androidNdkDir?.absolutePath ?: "")
+    outputs.files(
+        file("android-app/src/main/jniLibs/arm64-v8a/libmyotis_bls.so"),
+        file("android-app/src/main/jniLibs/x86_64/libmyotis_bls.so"),
+    )
+}
+
+// Exactly ONE note when Rust work was requested but is being skipped — enough
+// to explain the SKIPPED tasks without spamming every unrelated invocation.
+// (taskGraph.whenReady isn't configuration-cache-safe; this build doesn't
+// enable the config cache — move the note into the tasks if that changes.)
+val rustSkipNote = when {
+    cargoVersion.isEmpty() ->
+        "[rust] cargo/rustc not found — skipping the Rust build; the pure-Java build is unaffected"
+    !rustAvailable ->
+        "[rust] $cargoVersion is older than 1.$minRustMinor — skipping the Rust build; the pure-Java build is unaffected"
+    else -> null
+}
+gradle.taskGraph.whenReady {
+    if (allTasks.none { it.name.startsWith("cargo") }) return@whenReady
+    if (rustSkipNote != null) {
+        logger.lifecycle(rustSkipNote)
+    } else if (allTasks.any { it.name == "cargoNdkAndroid" } &&
+        (cargoNdkVersion.isEmpty() || androidNdkDir == null)
+    ) {
+        logger.lifecycle("[rust] cargo-ndk or Android NDK not found — Android keeps the committed jniLibs")
     }
 }
 

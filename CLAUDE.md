@@ -34,6 +34,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ./gradlew :app:run -Pargs="get-headers 21000000 3"
 ./gradlew :app:run -Pargs=stop
 ./gradlew :app:run -Pargs=purge-cache
+
+# Rust workspace (rust/ — native BLS + the growing Rust engine). OPTIONAL:
+# without cargo these self-skip with one note; pure-Java build unaffected.
+./gradlew cargoBuildHost   # cargo build --release (auto-runs before :app:run / :consensus:test)
+./gradlew cargoTest        # cargo test --workspace (part of `check`)
+./gradlew cargoNdkAndroid  # Android jniLibs (needs cargo-ndk + NDK; committed jniLibs are the fallback)
 ```
 
 ## Architecture
