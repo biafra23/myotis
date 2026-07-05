@@ -1,14 +1,24 @@
 //! The Myotis sync-committee light client, in Rust.
 //!
-//! Grows through the Rust-engine PR series (see docs/reimplementation/05 and the
-//! phase-1 plan): SSZ types + tree_hash merkleization, checkpoint-pinned bootstrap,
-//! sync-committee verification (over [`myotis_bls::fast_aggregate_verify`]),
-//! catch-up via libp2p req/resp, discv5 CL discovery.
+//! Grown through the Rust-engine PR series (see docs/reimplementation/05 and the
+//! phase-1 plan). This stage (plan PR 4) is the VERIFICATION CORE: SSZ decoding of
+//! the light-client wire containers, hash_tree_root merkleization, Merkle-branch /
+//! gindex checks, and sync-committee signature verification over
+//! [`myotis_bls::fast_aggregate_verify`] — proven equivalent to the Java
+//! implementation by replaying `rust/testdata/lc/mainnet` to the verdicts recorded
+//! in `expected.txt` (see `tests/lc_conformance.rs`). Networking (discv5 + libp2p
+//! req/resp) is the next stage; no I/O lives in this crate yet.
 //!
 //! This is a pure-Rust library crate — no JNI here; the JVM boundary lives in
 //! `myotis-engine`.
 
-/// Placeholder proving the workspace wiring (myotis-bls rlib reuse without JNI).
+pub mod spec;
+pub mod ssz;
+pub mod store;
+pub mod types;
+pub mod verify;
+
+/// The production BLS DST (re-exported for callers that log/compare it).
 pub fn bls_dst() -> &'static [u8] {
     myotis_bls::DST
 }
