@@ -118,6 +118,17 @@ public final class JavaMyotisEngine implements MyotisEngine {
         return handles.get(networkName);
     }
 
+    /**
+     * DEBUG-ONLY escape hatch: the underlying {@link ChainStack} for hosts' documented
+     * exemptions (the daemon's TrueBlocks {@code get-transactions} stream). Deliberately
+     * NOT on the {@link MyotisEngine} interface — a host that wants the engine to stay
+     * replaceable must not build features on this.
+     */
+    public ChainStack debugStack(String networkName) {
+        JavaChainHandle handle = handles.get(networkName);
+        return handle != null ? handle.stack() : null;
+    }
+
     @Override
     public List<String> hostedNetworks() {
         return List.copyOf(handles.keySet());

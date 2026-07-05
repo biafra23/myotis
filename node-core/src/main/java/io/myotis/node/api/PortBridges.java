@@ -30,11 +30,13 @@ import java.util.concurrent.Executor;
  * (InetSocketAddress, Map/Set collections, CompletableFuture). All conversions are
  * mechanical; no behavior lives here.
  */
-final class PortBridges {
+public final class PortBridges {
 
     private PortBridges() {}
 
-    static PeerCachePort toPeerCachePort(EnginePeerCache cache) {
+    /** Public interim: hosts mid-migration (desktop until its engine-API rewiring PR)
+     *  bridge their api-shaped port implementations back to the ChainStack shapes. */
+    public static PeerCachePort toPeerCachePort(EnginePeerCache cache) {
         return new PeerCachePort() {
             @Override public void add(InetSocketAddress address, String publicKeyHex, boolean snap) {
                 cache.add(address.getHostString(), address.getPort(), publicKeyHex, snap);
@@ -60,7 +62,8 @@ final class PortBridges {
         };
     }
 
-    static ClPeerCachePort toClPeerCachePort(EngineClPeerCache cache) {
+    /** Public interim — see {@link #toPeerCachePort}. */
+    public static ClPeerCachePort toClPeerCachePort(EngineClPeerCache cache) {
         return new ClPeerCachePort() {
             @Override public List<String> load() { return cache.load(); }
             @Override public void add(String multiaddr) { cache.add(multiaddr); }
@@ -102,7 +105,7 @@ final class PortBridges {
      * The api gateway is blocking (the FFI-portable shape); the engine's CCIP executor wants a
      * future. Run the blocking call on {@code executor} — never an engine I/O thread.
      */
-    static io.myotis.evm.ccipread.CcipGateway toCcipGateway(HttpGateway gateway, Executor executor) {
+    public static io.myotis.evm.ccipread.CcipGateway toCcipGateway(HttpGateway gateway, Executor executor) {
         return (method, url, body) -> CompletableFuture.supplyAsync(() ->
                 gateway.request(
                         method == io.myotis.evm.ccipread.CcipGateway.Method.GET

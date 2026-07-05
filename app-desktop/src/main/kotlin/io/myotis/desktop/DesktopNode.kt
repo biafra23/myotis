@@ -37,6 +37,12 @@ import kotlin.io.path.createDirectories
 class DesktopNodeController(private val dataDir: Path, private val settings: Settings) : NodeController {
 
     private val registry = NodeRegistry()
+
+    // Runs the blocking HttpGateway port when the CCIP bridge needs a future (interim,
+    // like the PortBridges use below — gone once desktop constructs via MyotisEngine).
+    private val httpGatewayExecutor = java.util.concurrent.Executors.newCachedThreadPool { r ->
+        Thread(r, "desktop-http-gateway").apply { isDaemon = true }
+    }
     // nanoTime, not currentTimeMillis: wall-clock / NTP steps must not skew uptime.
     private val startNs = System.nanoTime()
     // Per-network boot locks keyed by CANONICAL name, mirroring Android's NodeService.bootLocks:
@@ -86,10 +92,15 @@ class DesktopNodeController(private val dataDir: Path, private val settings: Set
                 // Retain the live instances so clearCaches can wipe their in-memory state.
                 peerCaches[canonical] = peerCache
                 clPeerCaches[canonical] = clPeerCache
+                // Interim bridging (removed when desktop constructs via MyotisEngine in the
+                // host-rewiring PR): the daemon's cache adapters + HTTP gateway now implement
+                // the api port shapes; PortBridges maps them back to what ChainStack takes.
                 val stack = ChainStack(
                     network, ports, nodeKey,
-                    PeerCacheAdapter(peerCache), ClPeerCacheAdapter(clPeerCache),
-                    JavaHttpCcipGateway(),
+                    io.myotis.node.api.PortBridges.toPeerCachePort(PeerCacheAdapter(peerCache)),
+                    io.myotis.node.api.PortBridges.toClPeerCachePort(ClPeerCacheAdapter(clPeerCache)),
+                    io.myotis.node.api.PortBridges.toCcipGateway(
+                        JavaHttpCcipGateway(), httpGatewayExecutor),
                     dataDir.resolve("sync-state$suffix.snapshot"),
                     false,
                 )
@@ -133,6 +144,7 @@ class DesktopNodeController(private val dataDir: Path, private val settings: Set
         // close tears every stack down promptly without waiting behind an in-progress boot of an
         // unrelated network.
         registry.shutdownAll()
+        httpGatewayExecutor.shutdown()
         // Forget the (now-closed) cache instances so a stray post-shutdown clearCaches takes the
         // stopped-chain purge path rather than clear()ing a closed instance.
         peerCaches.clear()
