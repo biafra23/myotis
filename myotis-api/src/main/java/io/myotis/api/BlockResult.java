@@ -19,6 +19,7 @@ package io.myotis.api;
  * @param transactionCount    transactions in the body
  * @param uncleCount          uncles in the body
  * @param withdrawalCount     withdrawals in the body
+ * @param beaconSynced        beacon client was SYNCED at query time
  * @param beaconChainVerified the block ties to a beacon-attested root/hash
  * @param blsVerified         the beacon match was BLS-signed
  * @param matchedBeaconSlot   slot of the matching attestation; -1 if none
@@ -41,6 +42,7 @@ public record BlockResult(
         int transactionCount,
         int uncleCount,
         int withdrawalCount,
+        boolean beaconSynced,
         boolean beaconChainVerified,
         boolean blsVerified,
         long matchedBeaconSlot,

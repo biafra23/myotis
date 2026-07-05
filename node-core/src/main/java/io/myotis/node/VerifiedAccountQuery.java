@@ -172,9 +172,21 @@ public final class VerifiedAccountQuery {
      */
     public static CompletableFuture<io.myotis.api.AccountProofResult> queryProof(
             ChainStack stack, String hexAddress) {
-        RLPxConnector connector = stack != null ? stack.connector() : null;
-        BeaconSyncState bss = stack != null ? stack.beaconSyncState() : null;
-        if (stack == null || !stack.isRunning() || connector == null) {
+        if (stack == null || !stack.isRunning()) {
+            return CompletableFuture.failedFuture(new IllegalStateException("Node is not running"));
+        }
+        return queryProof(stack.connector(), stack.beaconSyncState(),
+                stack.network().clGenesisTime(), stack.network().secondsPerSlot(), hexAddress);
+    }
+
+    /**
+     * {@link #queryProof(ChainStack, String)} for callers holding the parts rather than a
+     * stack (the JVM daemon's CommandHandler until the hosts are rewired onto the API).
+     */
+    public static CompletableFuture<io.myotis.api.AccountProofResult> queryProof(
+            RLPxConnector connector, BeaconSyncState bss,
+            long clGenesisTime, int secondsPerSlot, String hexAddress) {
+        if (connector == null) {
             return CompletableFuture.failedFuture(new IllegalStateException("Node is not running"));
         }
         if (hexAddress == null) {
@@ -195,8 +207,6 @@ public final class VerifiedAccountQuery {
         }
         final String addr = "0x" + hex;
         final Bytes32 accountHash = Hash.keccak256(address);
-        final long clGenesisTime = stack.network().clGenesisTime();
-        final int secondsPerSlot = stack.network().secondsPerSlot();
         final BeaconSyncState bssFinal = bss;
         final RLPxConnector conn = connector;
         return connector.requestAccount(address).thenCompose(result -> {
@@ -411,7 +421,9 @@ public final class VerifiedAccountQuery {
      * header's stateRoot equals the peer's reported root, and every header's hash equals the
      * next header's parentHash.
      */
-    private static CompletableFuture<Boolean> verifyHeaderChainBatched(
+    /** Package-private: {@link VerifiedStorageQuery} anchors its account root with the
+     *  same walk, so the headerChain fetch+verify lives once. */
+    static CompletableFuture<Boolean> verifyHeaderChainBatched(
             RLPxConnector connector, long finalizedBlock, long peerBlock,
             byte[] beaconStateRoot, byte[] peerStateRoot) {
         long totalLong = peerBlock - finalizedBlock + 1;
