@@ -93,6 +93,9 @@ compose.desktop {
             targetFormats(TargetFormat.Dmg, TargetFormat.Deb)
             packageName = "Myotis"
             packageVersion = "1.0.0"  // jpackage/dmg requires MAJOR > 0
+            // jpackage builds the deb's Maintainer field as "<vendor> <debMaintainer>",
+            // so the human name lives here and debMaintainer stays a bare email.
+            vendor = "Dirk Jäckel"
             // Bundle the FULL JDK module graph. jlink otherwise strips the runtime to the
             // modules it can statically detect, but the backend reaches them reflectively —
             // DNS (java.naming), JDBC-style lookups, EC TLS (jdk.crypto.ec), XML, etc. — so a
