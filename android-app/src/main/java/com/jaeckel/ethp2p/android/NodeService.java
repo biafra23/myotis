@@ -297,7 +297,8 @@ public final class NodeService extends Service {
      *  (Milagro AND native per verify, as a measurement harness), but on-device that costs
      *  10-16 s of Milagro math per sync-committee update (~500x slower than blst alone) and
      *  froze catch-up/status for minutes — diagnosed on a Pixel 7, 2026-07-06. Compare mode
-     *  remains available where it belongs: the daemon via {@code -Pbls=compare}. */
+     *  is explicit opt-in only, via the {@code myotis.bls.backend=compare} system property
+     *  ({@code -Pbls=compare} on the daemon); no build type defaults to it. */
     public static String blsBackendChoice(android.content.Context c) {
         return nativeBlsEnabled(c) ? "auto" : "milagro";
     }

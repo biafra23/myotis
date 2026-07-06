@@ -60,10 +60,14 @@ public class BeaconLightClient implements AutoCloseable {
      * the UI snapshot poll ({@code isInitialized}) and {@code rpc-head-build}
      * ({@code getFinalizedHeader}) blocked for the entire multi-minute catch-up,
      * because each update's sync-aggregate verify held the monitor for seconds
-     * (10-16 s/update under the Milagro/compare backend). The store's own
-     * synchronized methods keep individual reads/mutations atomic; appliers only
-     * need mutual exclusion among THEMSELVES, and interleaved finality applies
-     * stay safe by monotonicity (updateFinalized/rotation both re-check).
+     * (10-16 s/update under the Milagro/compare backend). Two invariants replace
+     * the old whole-batch store lock: (1) ALL store writers — catch-up appliers
+     * AND the live finality poll — take THIS lock, so verify-then-apply sequences
+     * never interleave (a finality apply slipping between a catch-up verify and
+     * its apply could re-arm a stale next committee); (2) the multi-step
+     * apply-mutations inside {@link LightClientProcessor} hold the store monitor
+     * for just those memory writes, so readers ({@code snapshot()} for
+     * persistence, status getters) never observe a torn state.
      */
     private final Object catchUpApplyLock = new Object();
     private final LightClientProcessor processor;
