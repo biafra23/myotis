@@ -170,6 +170,13 @@ bumped on every surface change.
   `stateRootMatch`, `headerChain`, `beaconNotSynced`, `headerChainGapTooLarge`,
   `preMergeBlock`, … — must match; the daemon's golden JSON tests and the integration greps
   key on them.
+- **Validate every native's inputs at the JNI boundary** before any allocation or
+  arithmetic: numeric parameters are clamped to protocol-sane maxima (e.g.
+  `nativeGetHeadersJson`'s `count` capped at the 1024-headers-per-request batch limit the
+  Java side already uses; negative/overflowing values → error JSON, never
+  `Vec::with_capacity` from raw input — `usize` is 32-bit on some Android targets), and
+  string parameters length/format-checked. Same family as the panic-free rule: a hostile or
+  buggy host argument must produce an `error` field, not an abort.
 
 ## Milestone A — devp2p + verified state queries (PR-by-PR)
 
@@ -284,8 +291,10 @@ Every PR: cut from up-to-date `rust-engine`, no-context review before opening, t
 - **Engine-owned EL peer-cache persistence under `dataDir`** (doc 05 §4 simplification — the
   Rust engine does NOT get an `EnginePeerCache` port): host/port/pubkey/snap + snap-quality
   CONFIRMED/UNKNOWN/DENIED (3 strikes → DENIED, never evicted), loaded into the dial rank at
-  start. Coordinate the on-disk layout with the `rust/persistence` branch's dataDir
-  conventions.
+  start. Write path mirrors the Java cache's discipline (doc 04 §6): in-memory map is
+  authoritative, disk writes are batched/coalesced through a single async writer task —
+  never a synchronous per-item file rewrite on the dial/serve path. Coordinate the on-disk
+  layout with the `rust/persistence` branch's dataDir conventions.
 - Snap-peer maintainer loop (10 s, `activeSnapPeers >= target`, doc 04 §1.1 tunables) wired
   to `nativeSetTargetSnapPeers`; DNS pool as its discv4-independent dial source.
 - `build-android.sh` / jniLibs refresh; `sync_bench.sh` re-run now that `-Pengine=rust`
