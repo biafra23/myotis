@@ -12,9 +12,10 @@ Phase 1 (CL-only Rust engine behind `:myotis-api`) is **done and merged to
 `rust-engine`**: PRs #124 (cargo workspace + Gradle), #127 (`:myotis-engines`
 selector + R0 stub), #128 (conformance seeds), #129 (`myotis-consensus`
 verification core), #130 (`myotis-net`), #131 (`myotis-engine` R1 + benchmark).
-First benchmark numbers: [benchmarks.md](benchmarks.md). The EL phase has **no
-execution plan yet** — it starts only after the user's go decision (see the
-benchmarks bottom line and "EL-phase entry" below).
+First benchmark numbers: [benchmarks.md](benchmarks.md). The EL phase now has an
+execution plan — [07-el-implementation-plan.md](07-el-implementation-plan.md)
+(crate layout, dependencies, conformance corpora, PR-by-PR breakdown); coding
+starts per that plan's entry criteria (see also "EL-phase entry" below).
 
 ## Process conventions (user rulings — follow them)
 
@@ -111,3 +112,11 @@ crate map in [README §7](README.md)) starts only when the user says go, informe
 by: the benchmark numbers, the Pixel re-test of the fixed Java build, and the
 embeddability targets. Before trusting a latency comparison, close gap #1 above
 and re-run `rust/bench/sync_bench.sh` under fresh peer conditions.
+
+**The execution plan for the phase is
+[07-el-implementation-plan.md](07-el-implementation-plan.md)** — milestones
+A (devp2p + MPT + verified account/storage/headers, ending at the CLAUDE.md
+integration gate on `-Pengine=rust`), B (full `VerifiedReads`), C (revm + ENS).
+Design decisions recorded there (user-confirmed 2026-07-06): hand-rolled devp2p
+on small primitive crates (not reth), hand-ported MPT verifier (not alloy-trie),
+new sans-I/O `myotis-core` crate + `el/` modules in `myotis-net`.

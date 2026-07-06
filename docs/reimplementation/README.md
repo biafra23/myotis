@@ -7,7 +7,8 @@
 This is the **master document**. It gives the whole picture: what Myotis is, its trust
 model, its architecture, the engine API surface to expose, the dependency mapping from
 the JVM reference implementation to Go/Rust, and how to package the result as a
-multi-platform library. Wire-level protocol detail lives in five companion documents:
+multi-platform library. Wire-level protocol detail and phase planning live in the companion
+documents:
 
 | Companion | Covers |
 |---|---|
@@ -16,6 +17,8 @@ multi-platform library. Wire-level protocol detail lives in five companion docum
 | [`03-state-verification-and-evm.md`](03-state-verification-and-evm.md) | Merkle-Patricia proof verification, the SNAP state oracle, the local EVM stack, gas estimation, ABI, CCIP-Read, ENS |
 | [`04-engine-and-hosts.md`](04-engine-and-hosts.md) | The reusable engine (`ChainStack`/`NodeRegistry`), platform ports, the verified backend, IPC + JSON-RPC host surfaces, persistence, concurrency |
 | [`05-engine-api-bindings.md`](05-engine-api-bindings.md) | The formal engine contract (`:myotis-api`) → Rust/UniFFI binding strategy, packaging (Android `.aar` / iOS `.xcframework`), conformance checklist |
+| [`06-rust-phase-notes.md`](06-rust-phase-notes.md) | Rust-phase working notes: process rulings, decisions, known gaps |
+| [`07-el-implementation-plan.md`](07-el-implementation-plan.md) | The Rust EL execution plan: crates, dependencies, conformance corpora, PR-by-PR milestones |
 
 > **Scope note.** The request is to re-implement *everything except the Android-specific
 > parts*. Concretely: re-implement the **engine** (all protocols + verification + the
