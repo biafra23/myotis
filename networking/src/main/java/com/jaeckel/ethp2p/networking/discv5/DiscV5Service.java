@@ -259,13 +259,21 @@ public final class DiscV5Service implements AutoCloseable {
         if (!reseedDue(liveNodes)) {
             return;
         }
-        for (NodeRecord bootnode : bootnodeRecords()) {
+        List<NodeRecord> bootnodes = bootnodeRecords();
+        if (bootnodes.isEmpty()) {
+            // Every configured ENR was malformed (each warned once at parse
+            // time): nothing to ping, so don't log a "re-pinged 0" line that
+            // reads as recovery where none is possible (the configured-empty
+            // case is already never-due in reseedDue).
+            return;
+        }
+        for (NodeRecord bootnode : bootnodes) {
             // Fire-and-forget: any one response repopulates a bucket and the
             // next searchForNewPeers() takes it from there.
             system.ping(bootnode).exceptionally(ex -> null);
         }
         log.info("[discv5] live table empty for {} polls — re-pinged {} bootnode(s)",
-                RESEED_EMPTY_POLLS, bootnodeRecords().size());
+                RESEED_EMPTY_POLLS, bootnodes.size());
     }
 
     /** The bootnode ENRs parsed to records, once; malformed entries warn once and drop. */
