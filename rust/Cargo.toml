@@ -4,9 +4,12 @@
 #   myotis-bls       — BLS12-381 fast-aggregate-verify (blst); cdylib for the JVM's
 #                      NativeBlsBackend AND rlib for in-workspace reuse (jni is a
 #                      default feature the pure-Rust consumers turn off).
-#   myotis-consensus — the sync-committee light client (pure Rust lib, no JNI):
-#                      SSZ types, tree_hash merkleization, sync-committee verify,
-#                      discv5 + libp2p req/resp. Grows through the Rust-engine PRs.
+#   myotis-consensus — the sync-committee light client VERIFICATION CORE (pure
+#                      Rust lib, no JNI, sans-I/O — no tokio/sockets/fs/clock):
+#                      SSZ types, tree_hash merkleization, sync-committee verify.
+#   myotis-net       — ALL consensus-layer I/O: discv5 discovery, libp2p eth2
+#                      req/resp, and the sync loop driving myotis-consensus.
+#                      Depends on myotis-consensus; never the other way around.
 #   myotis-engine    — the Rust implementation of the io.myotis.api engine contract,
 #                      exposed to the JVM via hand-JNI (libmyotis_engine).
 #
@@ -15,7 +18,7 @@
 
 [workspace]
 resolver = "2"
-members = ["myotis-bls", "myotis-consensus", "myotis-engine"]
+members = ["myotis-bls", "myotis-consensus", "myotis-engine", "myotis-net"]
 
 # Release profile is workspace-owned (crate-level [profile.*] is ignored in a
 # workspace): same tuning myotis-bls always shipped with.
