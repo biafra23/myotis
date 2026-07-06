@@ -237,6 +237,10 @@ pub struct SyncStatus {
     /// (bootstrap / updates / finality) in the last 60 s — the UI's "CL peers
     /// served N/min" health signal (Java `BeaconStatus.servedPeersLastMinute`).
     pub served_peers_last_min: usize,
+    /// TOTAL entries in the discv5 routing table, including Disconnected
+    /// ones (the UI's "Discv5 peers" row) — deliberately not the connected
+    /// count, which reads a misleading 0 during connectivity blips.
+    pub discv5_table_size: usize,
 }
 
 impl SyncStatus {
@@ -251,6 +255,7 @@ impl SyncStatus {
             period: 0,
             peer_count: 0,
             served_peers_last_min: 0,
+            discv5_table_size: 0,
         }
     }
 }
@@ -352,6 +357,11 @@ struct PeerPool {
     /// stays true of an evicted peer; entries prune inside note_served (the
     /// &mut site), so the map stays bounded by serve activity.
     recent_serves: HashMap<PeerId, Instant>,
+    /// Total discv5 routing-table entry count (incl. Disconnected), written
+    /// by the discovery task each lookup round. Lives here (not a
+    /// publish_status param) because the pool already travels everywhere
+    /// status is published.
+    discv5_table_size: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Consecutive terminal-failure count per peer, for eviction. Reset on any
     /// success. Without eviction the MAX_POOL cap fills with dead peers and
     /// `add` starts rejecting fresh ones — a permanent catch-up wedge.
@@ -389,6 +399,7 @@ impl PeerPool {
             cooldown_until: HashMap::new(),
             fail_counts: HashMap::new(),
             recent_serves: HashMap::new(),
+            discv5_table_size: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             sweep: 0,
         }
     }
@@ -567,12 +578,40 @@ async fn run_sync(
         "sync starting");
 
     // Discovery feeds the pool continuously; failure is non-fatal (Java treats
-    // discv5 the same way). The discovery task self-terminates once this task
-    // is gone: the channel closes and its lookup loop returns, dropping Discv5.
-    let (peer_tx, mut peer_rx) = mpsc::channel::<discovery::DiscoveredPeer>(64);
-    if let Err(e) = discovery::spawn(discovery_cfg, peer_tx).await {
-        tracing::warn!(error = %e, "discv5 unavailable — continuing with static peers");
+    // discv5 the same way). The guard aborts the discovery task the moment
+    // run_sync's future is dropped (SyncHandle::stop): without it the lookup
+    // loop only notices the closed channel at its next 15 s tick, keeping the
+    // UDP port bound and failing a fast stop→start on a fixed discv5_port
+    // (tokio cancellation drops the future's locals without unwinding, so the
+    // guard is panic=abort-safe and Discv5's socket closes immediately).
+    struct DiscoveryGuard(Option<tokio::task::JoinHandle<()>>);
+    impl Drop for DiscoveryGuard {
+        fn drop(&mut self) {
+            if let Some(task) = self.0.as_ref() {
+                task.abort();
+            }
+        }
     }
+    let mut discovery_guard = DiscoveryGuard(None);
+
+    let (peer_tx, mut peer_rx) = mpsc::channel::<discovery::DiscoveredPeer>(64);
+    let mut discovery_up = match discovery::spawn(discovery_cfg.clone(), peer_tx.clone()).await {
+        Ok((task, table_size)) => {
+            pool.discv5_table_size = table_size;
+            discovery_guard.0 = Some(task);
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "discv5 unavailable — will retry (static peers meanwhile)");
+            false
+        }
+    };
+    // Respawn countdown, in outer-loop iterations (~12 s each → retry ~1/min).
+    // A failed spawn is often transient (the predecessor instance's port still
+    // bound during a fast restart) — without the retry, discv5TableSize would
+    // report 0 for the process lifetime, indistinguishable from an empty
+    // table, and the empty-table re-seed could never run at all.
+    let mut discovery_retry_in = 0u32;
 
     let mut processor = LightClientProcessor::new(
         LightClientStore::new(),
@@ -658,6 +697,23 @@ async fn run_sync(
     // behind, finality polling in steady state.
     loop {
         drain_discovered(&mut peer_rx, &mut pool);
+
+        if !discovery_up {
+            if discovery_retry_in == 0 {
+                discovery_retry_in = 5;
+                match discovery::spawn(discovery_cfg.clone(), peer_tx.clone()).await {
+                    Ok((task, table_size)) => {
+                        pool.discv5_table_size = table_size;
+                        discovery_guard.0 = Some(task);
+                        discovery_up = true;
+                        tracing::info!("discv5 recovered on retry");
+                    }
+                    Err(e) => tracing::debug!(error = %e, "discv5 respawn failed — will retry"),
+                }
+            } else {
+                discovery_retry_in -= 1;
+            }
+        }
 
         if !processor.store.is_initialized() {
             let bootstrapped =
@@ -1335,6 +1391,9 @@ async fn publish_status(
         period: store.current_period(),
         peer_count: client.connected_peer_count().await,
         served_peers_last_min: pool.served_last_minute(),
+        discv5_table_size: pool
+            .discv5_table_size
+            .load(std::sync::atomic::Ordering::Relaxed),
     };
     let _ = status_tx.send(status);
 }

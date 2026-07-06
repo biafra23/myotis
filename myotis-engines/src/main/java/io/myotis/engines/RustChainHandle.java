@@ -81,7 +81,8 @@ final class RustChainHandle implements ChainHandle {
             long currentPeriod,
             long targetPeriod,
             long peerCount,
-            int servedPeersLastMinute) {
+            int servedPeersLastMinute,
+            int discv5TableSize) {
 
         static ParsedStatus parse(String json) {
             if (json == null || json.isBlank()) return notRunning();
@@ -97,7 +98,8 @@ final class RustChainHandle implements ChainHandle {
                         o.getLong("currentPeriod", 0L),
                         o.getLong("targetPeriod", 0L),
                         o.getLong("peerCount", 0L),
-                        o.getInt("servedPeersLastMinute", 0));
+                        o.getInt("servedPeersLastMinute", 0),
+                        o.getInt("discv5TableSize", 0));
             } catch (RuntimeException e) {
                 throw new EngineException(
                         "malformed status JSON from the Rust engine: " + e.getMessage(), e);
@@ -105,7 +107,7 @@ final class RustChainHandle implements ChainHandle {
         }
 
         static ParsedStatus notRunning() {
-            return new ParsedStatus(false, BeaconState.STARTING, false, 0L, 0L, 0L, 0L, 0L, 0);
+            return new ParsedStatus(false, BeaconState.STARTING, false, 0L, 0L, 0L, 0L, 0L, 0, 0);
         }
     }
 
@@ -147,7 +149,7 @@ final class RustChainHandle implements ChainHandle {
                 0,              // backedOffPeers
                 0,              // blacklistedPeers
                 0,              // attemptedDials
-                0,              // discv5TableSize
+                s.discv5TableSize(),
                 0L,             // executionBlockNumber
                 0L,             // optimisticBlockNumber
                 s.finalizedSlot(),
@@ -174,7 +176,7 @@ final class RustChainHandle implements ChainHandle {
                 s.currentPeriod(),
                 // Same older-.so fallback as status(): missing key parses as 0.
                 Math.max(s.targetPeriod(), s.currentPeriod()),
-                0,                     // discv5TableSize
+                s.discv5TableSize(),
                 peers,                 // connectedPeers (CL)
                 s.peerCount(),         // lightClientPeers
                 s.servedPeersLastMinute(),
