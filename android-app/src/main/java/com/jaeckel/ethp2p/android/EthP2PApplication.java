@@ -30,16 +30,15 @@ public final class EthP2PApplication extends Application {
         Security.addProvider(new BouncyCastleProvider());
 
         // BLS backend selection (must be set before the light client's first verify).
-        // DEBUGGABLE builds default to "compare": run BOTH the pure-Java Milagro path and
-        // the bundled native blst (jniLibs/<abi>/libmyotis_bls.so) on every sync-committee
-        // verify and log a per-verify head-to-head (tag: ComparingBlsBackend /
-        // "[bls-compare]") so the on-device speedup is directly measurable. RELEASE builds
-        // default to "auto" (native when present, else Milagro) — running Milagro too would
-        // double every verify and, since Milagro is ~30-55s cold on ART, defeat the whole
-        // point of native acceleration. Override anytime with -Dmyotis.bls.backend=
-        // auto|native|milagro|compare.
+        // EVERY build defaults to "auto" (native blst from jniLibs when present, else
+        // Milagro). Debuggable builds USED to default to "compare" (Milagro AND native per
+        // verify, logging a head-to-head) — but on-device that costs 10-16 s of Milagro
+        // math per sync-committee update and, combined with lock contention, froze
+        // catch-up/status for minutes (Pixel 7 diagnosis, 2026-07-06). Compare stays a
+        // deliberate opt-in for measurement runs (-Dmyotis.bls.backend=compare; the daemon
+        // via -Pbls=compare).
         // Seed from the user's "Native BLS acceleration" setting (default ON): OFF forces
-        // Milagro; ON keeps the build-type default (compare on debuggable, auto on release).
+        // Milagro; ON means auto.
         // The Settings toggle applies live via NodeService.applyBlsBackend (and every node
         // start re-applies it) — this just sets the initial value for any pre-start verify.
         if (System.getProperty("myotis.bls.backend") == null) {

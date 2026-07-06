@@ -52,6 +52,20 @@ public class BeaconLightClient implements AutoCloseable {
 
     private final BeaconP2PService p2pService;
     private final LightClientStore store;
+    /**
+     * Serializes CATCH-UP APPLIERS (racing per-peer updates_by_range responses;
+     * first apply-success wins) WITHOUT holding the {@link LightClientStore}
+     * monitor across BLS verification. Diagnosed on-device (Pixel 7, 2026-07-06):
+     * synchronizing the whole batch on {@code store} starved every status reader —
+     * the UI snapshot poll ({@code isInitialized}) and {@code rpc-head-build}
+     * ({@code getFinalizedHeader}) blocked for the entire multi-minute catch-up,
+     * because each update's sync-aggregate verify held the monitor for seconds
+     * (10-16 s/update under the Milagro/compare backend). The store's own
+     * synchronized methods keep individual reads/mutations atomic; appliers only
+     * need mutual exclusion among THEMSELVES, and interleaved finality applies
+     * stay safe by monotonicity (updateFinalized/rotation both re-check).
+     */
+    private final Object catchUpApplyLock = new Object();
     private final LightClientProcessor processor;
     private final BeaconSyncState syncState;
     private final List<String> clPeerMultiaddrs;  // mutable, synchronized
@@ -1224,7 +1238,15 @@ public class BeaconLightClient implements AutoCloseable {
                             // the future so that catchUpSyncCommittee() sees the initialized state.
                             String successPeer = null;
                             synchronized (store) {
-                                if (!winnerFuture.isDone()) {
+                                // isInitialized guard: requestBootstrap has no per-request
+                                // deadline, so a straggler response from an EARLIER bootstrap
+                                // attempt (whose winnerFuture timed out un-completed) can land
+                                // here long after catch-up started. Re-initializing would rewind
+                                // the store to the checkpoint MID catch-up batch and mis-pair the
+                                // committee/period label — a wedge that persists via the snapshot.
+                                // An initialized store is never re-initialized; isInitialized can
+                                // never go false within a store's lifetime, so this is safe.
+                                if (!winnerFuture.isDone() && !store.isInitialized()) {
                                     store.initialize(bootstrap.header(), bootstrap.currentSyncCommittee());
                                     updateSyncState();
                                     winnerFuture.complete(response);
@@ -1477,8 +1499,9 @@ public class BeaconLightClient implements AutoCloseable {
                             }
                             return;
                         }
-                        // Serialize state mutation; first apply-success wins.
-                        synchronized (store) {
+                        // Serialize state mutation among appliers; first apply-success
+                        // wins. Deliberately NOT synchronized(store) — see catchUpApplyLock.
+                        synchronized (catchUpApplyLock) {
                             if (winner.isDone()) return;
                             if (responses == null || responses.isEmpty()) {
                                 emptyCount.incrementAndGet();
@@ -1535,7 +1558,7 @@ public class BeaconLightClient implements AutoCloseable {
 
     /**
      * Decode and process a list of catch-up response SSZ blobs, returning the number applied.
-     * Must be called while holding the {@code store} monitor.
+     * Must be called while holding {@code catchUpApplyLock} (writer serialization).
      */
     private int applyCatchUpResponses(List<byte[]> responses, long currentSlotEstimate,
                                       String peer, long servedFromPeriod) {
@@ -1840,7 +1863,14 @@ public class BeaconLightClient implements AutoCloseable {
 
                 LightClientFinalityUpdate update = LightClientFinalityUpdate.decode(response);
 
-                if (store.isInitialized() && processor.processFinalityUpdate(update)) {
+                final boolean finalityApplied;
+                // Writers serialize on catchUpApplyLock (see its javadoc): without this a
+                // straggler catch-up applier's gate-check→store-next sequence can interleave
+                // with this finality apply's rotation and re-arm a stale next committee.
+                synchronized (catchUpApplyLock) {
+                    finalityApplied = store.isInitialized() && processor.processFinalityUpdate(update);
+                }
+                if (finalityApplied) {
                     updateSyncState();
                     fillChainStateRoots(peer, true);
                     notifyPeerSuccess(peer);
