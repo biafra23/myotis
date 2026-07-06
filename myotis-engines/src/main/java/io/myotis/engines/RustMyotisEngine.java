@@ -90,8 +90,15 @@ public final class RustMyotisEngine implements MyotisEngine {
         return canonical;
     }
 
+    // create/stop/shutdownAll are synchronized so lifecycle transitions are mutually
+    // exclusive: without it, a create() racing shutdownAll() could publish a fresh
+    // native handle AFTER shutdownAll finished iterating, orphaning a running tokio/
+    // libp2p host. The ConcurrentHashMap ops are individually atomic, but the
+    // multi-step create (nativeCreate → putIfAbsent) and teardown are not. These are
+    // cold lifecycle paths, so the coarse lock costs nothing. (synchronized is
+    // reentrant, so shutdownAll → stop() on the same thread is fine.)
     @Override
-    public ChainHandle create(EngineConfig config, EnginePorts ports) {
+    public synchronized ChainHandle create(EngineConfig config, EnginePorts ports) {
         if (config == null) throw new EngineException("engine config is required");
         String canonical = canonicalNetworkName(config.networkName());
         if (!"mainnet".equals(canonical)) {
@@ -128,13 +135,13 @@ public final class RustMyotisEngine implements MyotisEngine {
     }
 
     @Override
-    public void stop(String networkName) {
+    public synchronized void stop(String networkName) {
         RustChainHandle handle = hosted.remove(networkName);
         if (handle != null) handle.stop();
     }
 
     @Override
-    public void shutdownAll() {
+    public synchronized void shutdownAll() {
         for (String name : new ArrayList<>(hosted.keySet())) {
             stop(name);
         }
