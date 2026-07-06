@@ -75,8 +75,11 @@ final class RustEngineNative {
 
     /**
      * Allocate a not-yet-started handle for {@code network} (R1: mainnet only).
-     * Returns the handle id (≥ 1), or -1 for an unknown/unsupported network or a
-     * runtime failure. The Rust side owns the tokio runtime the handle runs on.
+     * Returns the handle id (≥ 1), or a negative sentinel: -1 for an unknown name /
+     * runtime-init failure, -2 for a canonical-but-not-mainnet network. Any value
+     * {@code < 0} is a failure ({@link RustMyotisEngine#create} pre-checks mainnet,
+     * so it only ever observes -1). The Rust side owns the tokio runtime the handle
+     * runs on.
      */
     static native long nativeCreate(String network, String dataDir);
 

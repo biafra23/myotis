@@ -26,11 +26,12 @@ use std::sync::{Mutex, OnceLock};
 
 use myotis_net::{ChainConfig, SyncHandle, SyncState, SyncStatus};
 
-/// R1 hosts mainnet only (Gnosis lands later). Returned by `create` for any
-/// other (still-canonical) network so the Java side can raise a named error.
-const UNSUPPORTED_NETWORK: i64 = -1;
-/// `create` failure (bad name, or the runtime never came up).
+// Distinct negative sentinels from `create` (all `< 0` = failure to the Java side,
+// but distinguishable for tests / future callers):
+/// Unknown network name, or the tokio runtime never came up.
 const CREATE_FAILED: i64 = -1;
+/// A canonical network that R1 does not host yet (anything but mainnet).
+const UNSUPPORTED_NETWORK: i64 = -2;
 
 /// One hosted chain: created-but-not-started, or running.
 enum ChainEntry {
@@ -78,9 +79,9 @@ fn config_for(network_name: &str) -> Option<ChainConfig> {
     }
 }
 
-/// `nativeCreate`: allocate an id for a not-yet-started mainnet chain. Returns
-/// the id, `UNSUPPORTED_NETWORK` for a non-mainnet (but canonical) network, or
-/// `CREATE_FAILED` for an unknown name / unavailable runtime.
+/// `nativeCreate`: allocate an id for a not-yet-started mainnet chain. Returns the
+/// id (`>= 1`), `UNSUPPORTED_NETWORK` (-2) for a canonical-but-not-mainnet network,
+/// or `CREATE_FAILED` (-1) for an unknown name / unavailable runtime.
 pub fn create(network_name: &str, _data_dir: &str) -> i64 {
     let Some(engine) = engine() else {
         return CREATE_FAILED;
@@ -112,23 +113,46 @@ pub fn start(handle: i64) -> bool {
     let Some(engine) = engine() else {
         return false;
     };
-    let mut map = match engine.handles.lock() {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    // Take the config out only if the entry is Created; leave Running untouched.
-    let config = match map.get(&handle) {
-        Some(ChainEntry::Created(c)) => c.clone(),
-        _ => return false,
+    // Take the config under the lock, then RELEASE it before entering the runtime.
+    // Holding the map lock across block_on would serialize every other native
+    // (status/stop/create) behind a potentially-slow start and invites deadlock on
+    // future changes — even though SyncHandle::start is fast today (spawn + return).
+    let config = {
+        let map = match engine.handles.lock() {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        match map.get(&handle) {
+            Some(ChainEntry::Created(c)) => c.clone(),
+            _ => return false, // unknown id, or already running
+        }
     };
     // SyncHandle::start must run inside the tokio runtime (it spawns tasks).
-    let started = engine.rt.block_on(async { SyncHandle::start(config) });
-    match started {
-        Ok(sync) => {
+    let sync = match engine.rt.block_on(async { SyncHandle::start(config) }) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    // Re-lock and publish ONLY if the entry is still the same Created one: a
+    // concurrent stop() may have removed it, or a racing start() may have already
+    // published a Running one, while we were starting. Either way, shut the handle
+    // we just started down rather than orphan its tokio/libp2p host.
+    let mut map = match engine.handles.lock() {
+        Ok(m) => m,
+        Err(_) => {
+            engine.rt.block_on(async { sync.stop().await });
+            return false;
+        }
+    };
+    match map.get(&handle) {
+        Some(ChainEntry::Created(_)) => {
             map.insert(handle, ChainEntry::Running(sync));
             true
         }
-        Err(_) => false,
+        _ => {
+            drop(map);
+            engine.rt.block_on(async { sync.stop().await });
+            false
+        }
     }
 }
 

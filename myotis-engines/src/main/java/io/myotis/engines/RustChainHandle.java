@@ -170,7 +170,10 @@ final class RustChainHandle implements ChainHandle {
                 s.peerCount(),         // lightClientPeers
                 s.finalizedSlot(),
                 s.optimisticSlot(),
-                s.currentPeriod(),     // finalizedPeriod
+                s.finalizedSlot() / 8192L,  // finalizedPeriod = period OF the finalized
+                                            // slot (SLOTS_PER_SYNC_COMMITTEE_PERIOD),
+                                            // consistent with StatusSnapshot — not the
+                                            // committee's currentPeriod.
                 null,                  // executionStateRootHex (EL)
                 null,                  // executionBlockHashHex (EL)
                 0L,                    // executionBlockNumber
@@ -180,6 +183,18 @@ final class RustChainHandle implements ChainHandle {
     }
 
     // ---- CL-only R1 scope: EL / verified-read surface not available yet ----
+    //
+    // reads()/ens() return null — that IS the ChainHandle contract ("or null when
+    // this network has no ENS registry" / "or null ... if the RPC port was
+    // unavailable"), and callers null-check it. The EL QUERY methods below
+    // (requestAccount/getStorageProof/getHeaders/getBlockVerified/dialPeer) throw
+    // EngineException: the contract reserves exceptions for malformed input / not
+    // running, and a CL-only engine asked for an EL proof is a capability-state
+    // error (there is no verification to report a failReason for — the capability
+    // categorically does not exist yet). A failReason record would misrepresent
+    // "we can't" as "we tried and failed". The real fix is EL support (or the
+    // selector routing EL queries to the Java engine while Rust hosts the CL side);
+    // tracked for a later phase.
 
     @Override public VerifiedReads reads() { return null; }
 

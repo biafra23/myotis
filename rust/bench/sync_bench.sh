@@ -33,7 +33,19 @@ now_ms() { date +%s%3N; }
 # Sample RSS (KiB) of a pid tree (the process + children — the JVM spawns none
 # relevant, the daemon is one JVM; the native binary is one process).
 rss_kib() { ps -o rss= -p "$1" 2>/dev/null | awk '{s+=$1} END {print s+0}'; }
-cpu_s()   { ps -o time= -p "$1" 2>/dev/null | awk -F: '{print ($1*3600)+($2*60)+$3}'; }
+# `ps -o time=` prints CPU time as [[DD-]HH:]MM:SS depending on platform/magnitude.
+# Parse all three shapes (DD-HH:MM:SS, HH:MM:SS, MM:SS) to seconds.
+cpu_s() {
+  ps -o time= -p "$1" 2>/dev/null | tr -d ' ' | awk '{
+    n=$0; days=0
+    if (index(n,"-")>0) { split(n,a,"-"); days=a[1]; n=a[2] }
+    c=split(n,t,":")
+    if (c==3)      s=t[1]*3600+t[2]*60+t[3]
+    else if (c==2) s=t[1]*60+t[2]
+    else           s=t[1]
+    print days*86400+s
+  }'
+}
 
 purge_state() {
   ./gradlew :app:run -Pargs=purge-cache >/dev/null 2>&1 || true

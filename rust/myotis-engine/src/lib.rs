@@ -97,8 +97,10 @@ mod jni_shim {
     // ---------------------------------------------------------------------
 
     /// `RustEngineNative.nativeCreate(String network, String dataDir)` — allocate
-    /// a not-yet-started handle id. Returns the id (≥1), or -1 for an unknown /
-    /// unsupported (non-mainnet) network or a runtime failure.
+    /// a not-yet-started handle id. Returns the id (≥ 1), or a negative sentinel:
+    /// -1 (`CREATE_FAILED`) for an unknown name / runtime-init failure, -2
+    /// (`UNSUPPORTED_NETWORK`) for a canonical-but-not-mainnet network. Any `< 0`
+    /// is a failure the Java side turns into a named EngineException.
     #[no_mangle]
     pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeCreate(
         mut env: JNIEnv,
