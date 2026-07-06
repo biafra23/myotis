@@ -62,8 +62,18 @@ shell could reach): peak RSS ≈ 13 MiB.
 
 ## Bottom line for the EL-phase decision
 
+> **Correction (2026-07-06, post phone diagnosis):** the working hypothesis that the
+> Java wallet failed on phones for resource reasons is **disproven**. On a Pixel 7 the
+> Java stack synced fine (PSS 105–283 MiB — ART, not the desktop JVM's 2.1 GiB); the
+> "app looks dead" failure was a lock-contention freeze (compare-BLS debug default ×
+> store monitor held across verification), fixed in PR #133. So "Java can't run on
+> phones" is NOT a valid justification for the port. The Rust case rests on footprint
+> (13 MiB native — extension/iOS embeddings per docs/myotis-rust-engine-guidelines.md),
+> CPU efficiency, and multi-platform reach. See
+> [06-rust-phase-notes.md](06-rust-phase-notes.md).
+
 - **Efficiency: Rust wins clearly** on CPU and (scope-caveated) memory — the mobile /
-  extension case, which is the whole reason for the port, benefits most.
+  extension case benefits most.
 - **Sync latency: not yet a clean win.** The Rust R1 catch-up is slower and
   variance-prone, but the cause is a **known, deferred, fixable gap** (persisted
   peer/proven-server cache — the Java CL peer cache's role), not a fundamental Rust
