@@ -112,6 +112,15 @@ impl ChainConfig {
         )
     }
 
+    /// Wall-clock sync-committee period — the catch-up target the store's period
+    /// climbs to. Public so the engine crate can stamp it into the status JSON at
+    /// read time (deriving it per read keeps it fresh across bootstrap stalls and
+    /// correct for created-but-not-started handles, instead of snapshot-carrying
+    /// a value that goes stale).
+    pub fn wall_clock_period(&self) -> u64 {
+        spec::compute_sync_committee_period(self.current_slot_estimate())
+    }
+
     /// Wall-clock slot estimate — THE clock read of this crate.
     fn current_slot_estimate(&self) -> u64 {
         let now = SystemTime::now()

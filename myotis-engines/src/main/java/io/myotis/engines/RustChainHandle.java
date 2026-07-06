@@ -79,6 +79,7 @@ final class RustChainHandle implements ChainHandle {
             long finalizedSlot,
             long optimisticSlot,
             long currentPeriod,
+            long targetPeriod,
             long peerCount) {
 
         static ParsedStatus parse(String json) {
@@ -93,6 +94,7 @@ final class RustChainHandle implements ChainHandle {
                         o.getLong("finalizedSlot", 0L),
                         o.getLong("optimisticSlot", 0L),
                         o.getLong("currentPeriod", 0L),
+                        o.getLong("targetPeriod", 0L),
                         o.getLong("peerCount", 0L));
             } catch (RuntimeException e) {
                 throw new EngineException(
@@ -101,7 +103,7 @@ final class RustChainHandle implements ChainHandle {
         }
 
         static ParsedStatus notRunning() {
-            return new ParsedStatus(false, BeaconState.STARTING, false, 0L, 0L, 0L, 0L);
+            return new ParsedStatus(false, BeaconState.STARTING, false, 0L, 0L, 0L, 0L, 0L);
         }
     }
 
@@ -125,6 +127,10 @@ final class RustChainHandle implements ChainHandle {
 
     private StatusSnapshot status(ParsedStatus s) {
         int peers = (int) Math.min(s.peerCount(), Integer.MAX_VALUE);
+        // Older natives don't emit "targetPeriod" (parsed as 0): fall back to
+        // currentPeriod — the pre-targetPeriod mirror — so the target >= current
+        // invariant holds against any .so vintage.
+        long targetPeriod = Math.max(s.targetPeriod(), s.currentPeriod());
         // CL-only: EL fields (executionBlockNumber, snapPeers, discv4 table, RPC
         // head age, …) are zero — the Rust engine has no execution layer in R1.
         return new StatusSnapshot(
@@ -146,9 +152,9 @@ final class RustChainHandle implements ChainHandle {
                 0L,             // finalizedBlockNumber
                 -1L,            // syncStartPeriod (unknown)
                 s.currentPeriod(),
-                0L,             // syncTargetPeriod (wall-clock; not surfaced by the native status)
+                targetPeriod,
                 s.finalizedSlot() / 8192L, // finalizedPeriod (SLOTS_PER_SYNC_COMMITTEE_PERIOD)
-                0L,             // wallClockPeriod
+                targetPeriod,   // wallClockPeriod == the catch-up target
                 Long.MAX_VALUE, // verifiedHeadAgeMs (no verified RPC head yet)
                 List.<PeerInfo>of());
     }
@@ -164,7 +170,8 @@ final class RustChainHandle implements ChainHandle {
                 s.beaconState(),
                 s.bootstrapped(),
                 s.currentPeriod(),
-                s.currentPeriod(),     // targetPeriod (wall-clock not surfaced; mirror current)
+                // Same older-.so fallback as status(): missing key parses as 0.
+                Math.max(s.targetPeriod(), s.currentPeriod()),
                 0,                     // discv5TableSize
                 peers,                 // connectedPeers (CL)
                 s.peerCount(),         // lightClientPeers

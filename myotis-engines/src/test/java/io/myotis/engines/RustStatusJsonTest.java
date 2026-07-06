@@ -34,14 +34,14 @@ class RustStatusJsonTest {
     private static final String NOT_STARTED_JSON =
             "{\"running\":false,\"network\":\"mainnet\",\"beaconState\":\"STARTING\","
             + "\"bootstrapped\":false,\"finalizedSlot\":0,\"optimisticSlot\":0,"
-            + "\"currentPeriod\":0,\"peerCount\":0,"
+            + "\"currentPeriod\":0,\"targetPeriod\":0,\"peerCount\":0,"
             + "\"finalizedRootHex\":\"0000000000000000000000000000000000000000000000000000000000000000\"}";
 
     /** A synthetic catching-up shape (real running numbers). */
     private static final String CATCHING_UP_JSON =
             "{\"running\":true,\"network\":\"mainnet\",\"beaconState\":\"CATCHING_UP\","
             + "\"bootstrapped\":true,\"finalizedSlot\":14560000,\"optimisticSlot\":14560032,"
-            + "\"currentPeriod\":1777,\"peerCount\":5,"
+            + "\"currentPeriod\":1777,\"targetPeriod\":1795,\"peerCount\":5,"
             + "\"finalizedRootHex\":\"58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e\"}";
 
     @BeforeAll
@@ -58,6 +58,7 @@ class RustStatusJsonTest {
         assertEquals(0, s.connectedPeers());
         assertEquals(0L, s.finalizedSlot());
         assertEquals(0L, s.syncCurrentPeriod());
+        assertEquals(0L, s.syncTargetPeriod());
         // EL-only fields are zeroed on the CL-only R1 engine.
         assertEquals(0L, s.executionBlockNumber());
         assertEquals(0, s.snapPeers());
@@ -72,6 +73,8 @@ class RustStatusJsonTest {
         assertEquals(5, s.connectedPeers());
         assertEquals(14560000L, s.finalizedSlot());
         assertEquals(1777L, s.syncCurrentPeriod());
+        assertEquals(1795L, s.syncTargetPeriod());
+        assertEquals(1795L, s.wallClockPeriod());
         assertEquals(14560000L / 8192L, s.finalizedPeriod());
     }
 
@@ -81,6 +84,7 @@ class RustStatusJsonTest {
         assertEquals(BeaconState.CATCHING_UP, bs.state());
         assertTrue(bs.bootstrapped());
         assertEquals(1777L, bs.currentPeriod());
+        assertEquals(1795L, bs.targetPeriod());
         assertEquals(14560000L, bs.finalizedSlot());
         assertEquals(14560032L, bs.optimisticSlot());
         assertEquals(5, bs.connectedPeers());
@@ -89,6 +93,27 @@ class RustStatusJsonTest {
         assertNull(bs.executionStateRootHex());
         assertNull(bs.executionBlockHashHex());
         assertEquals(0L, bs.executionBlockNumber());
+    }
+
+    /** The pre-targetPeriod shape an older native library emits (no "targetPeriod"
+     *  key). Kept as a fixture so the missing-key default path stays covered. */
+    private static final String OLD_SHAPE_CATCHING_UP_JSON =
+            "{\"running\":true,\"network\":\"mainnet\",\"beaconState\":\"CATCHING_UP\","
+            + "\"bootstrapped\":true,\"finalizedSlot\":14560000,\"optimisticSlot\":14560032,"
+            + "\"currentPeriod\":1777,\"peerCount\":5,"
+            + "\"finalizedRootHex\":\"58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e\"}";
+
+    @Test
+    void oldShapeWithoutTargetPeriodFallsBackToCurrentPeriod() {
+        // An older .so parses without throwing, and the missing target falls back
+        // to the pre-targetPeriod behavior (mirror currentPeriod), preserving the
+        // target >= current invariant.
+        StatusSnapshot s = RustChainHandle.statusFromJson("mainnet", OLD_SHAPE_CATCHING_UP_JSON);
+        assertEquals(1777L, s.syncCurrentPeriod());
+        assertEquals(1777L, s.syncTargetPeriod());
+        assertEquals(1777L, s.wallClockPeriod());
+        BeaconStatus bs = RustChainHandle.beaconStatusFromJson("mainnet", OLD_SHAPE_CATCHING_UP_JSON);
+        assertEquals(1777L, bs.targetPeriod());
     }
 
     @Test

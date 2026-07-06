@@ -8,7 +8,7 @@
 //!   - `create` allocates an id and stores a `Created(ChainConfig)` entry —
 //!     nothing runs yet.
 //!   - `start` calls `SyncHandle::start` inside the runtime and swaps the entry
-//!     to `Running(SyncHandle)`.
+//!     to `Running(ChainConfig, SyncHandle)`.
 //!   - `status_json` reads the live `SyncStatus` (or the not-started shape).
 //!   - `stop` removes the entry and awaits the handle's shutdown.
 //!
@@ -33,10 +33,11 @@ const CREATE_FAILED: i64 = -1;
 /// A canonical network that R1 does not host yet (anything but mainnet).
 const UNSUPPORTED_NETWORK: i64 = -2;
 
-/// One hosted chain: created-but-not-started, or running.
+/// One hosted chain: created-but-not-started, or running. Running keeps the
+/// config so status reads can derive wall-clock values (targetPeriod) fresh.
 enum ChainEntry {
     Created(ChainConfig),
-    Running(SyncHandle),
+    Running(ChainConfig, SyncHandle),
 }
 
 /// The single legitimate engine singleton. Owns the runtime + the handle map;
@@ -128,7 +129,7 @@ pub fn start(handle: i64) -> bool {
         }
     };
     // SyncHandle::start must run inside the tokio runtime (it spawns tasks).
-    let sync = match engine.rt.block_on(async { SyncHandle::start(config) }) {
+    let sync = match engine.rt.block_on(async { SyncHandle::start(config.clone()) }) {
         Ok(s) => s,
         Err(_) => return false,
     };
@@ -145,7 +146,7 @@ pub fn start(handle: i64) -> bool {
     };
     match map.get(&handle) {
         Some(ChainEntry::Created(_)) => {
-            map.insert(handle, ChainEntry::Running(sync));
+            map.insert(handle, ChainEntry::Running(config, sync));
             true
         }
         _ => {
@@ -167,8 +168,16 @@ pub fn status_json(handle: i64) -> String {
         Err(_) => return "{}".to_string(),
     };
     match map.get(&handle) {
-        Some(ChainEntry::Created(_)) => status_object(false, None),
-        Some(ChainEntry::Running(sync)) => status_object(true, Some(sync.status())),
+        // targetPeriod is derived from the config AT READ TIME (not carried in
+        // the sync snapshot): fresh across bootstrap stalls, and real (not 0)
+        // for a created-but-not-started handle — matching the Java engine's
+        // unconditional wall-clock computation behind the same API.
+        Some(ChainEntry::Created(config)) => {
+            status_object(false, None, config.wall_clock_period())
+        }
+        Some(ChainEntry::Running(config, sync)) => {
+            status_object(true, Some(sync.status()), config.wall_clock_period())
+        }
         None => "{}".to_string(),
     }
 }
@@ -185,7 +194,7 @@ pub fn stop(handle: i64) {
         Ok(mut m) => m.remove(&handle),
         Err(_) => return,
     };
-    if let Some(ChainEntry::Running(sync)) = entry {
+    if let Some(ChainEntry::Running(_, sync)) = entry {
         engine.rt.block_on(async move { sync.stop().await });
     }
 }
@@ -212,7 +221,7 @@ fn hex32(bytes: &[u8; 32]) -> String {
 /// parses (camelCase). `running=false` / `status=None` → the not-started shape.
 /// Built by hand (not serde) so the key set + ordering is the golden contract
 /// both `status_json_shape` tests pin.
-fn status_object(running: bool, status: Option<SyncStatus>) -> String {
+fn status_object(running: bool, status: Option<SyncStatus>, target_period: u64) -> String {
     let s = status.unwrap_or_else(SyncStatus::initial);
     // A not-started handle reports STARTING; a running one maps its live state.
     let beacon = if running {
@@ -230,6 +239,9 @@ fn status_object(running: bool, status: Option<SyncStatus>) -> String {
     obj.insert("finalizedSlot".into(), s.finalized_slot.into());
     obj.insert("optimisticSlot".into(), s.optimistic_slot.into());
     obj.insert("currentPeriod".into(), s.period.into());
+    // Floor at the store's period: a device clock set in the past must not
+    // publish a target below current (the target >= current invariant).
+    obj.insert("targetPeriod".into(), target_period.max(s.period).into());
     obj.insert("peerCount".into(), s.peer_count.into());
     obj.insert("finalizedRootHex".into(), hex32(&s.finalized_root).into());
     // A hand-built object of primitives always serializes; fall back to the
@@ -243,7 +255,7 @@ fn status_object(running: bool, status: Option<SyncStatus>) -> String {
 const NOT_STARTED_FALLBACK: &str = concat!(
     r#"{"running":false,"network":"mainnet","beaconState":"STARTING","#,
     r#""bootstrapped":false,"finalizedSlot":0,"optimisticSlot":0,"#,
-    r#""currentPeriod":0,"peerCount":0,"#,
+    r#""currentPeriod":0,"targetPeriod":0,"peerCount":0,"#,
     r#""finalizedRootHex":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
 );
 
@@ -254,7 +266,7 @@ mod tests {
     #[test]
     fn not_started_status_shape_is_stable() {
         // The golden not-started object (parsed by the Java RustChainHandle test).
-        let json = status_object(false, None);
+        let json = status_object(false, None, 0);
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
         assert_eq!(v["running"], false);
         assert_eq!(v["network"], "mainnet");
@@ -263,6 +275,7 @@ mod tests {
         assert_eq!(v["finalizedSlot"], 0);
         assert_eq!(v["optimisticSlot"], 0);
         assert_eq!(v["currentPeriod"], 0);
+        assert_eq!(v["targetPeriod"], 0);
         assert_eq!(v["peerCount"], 0);
         assert_eq!(
             v["finalizedRootHex"],
@@ -285,13 +298,14 @@ mod tests {
             peer_count: 7,
         };
         let synced: serde_json::Value =
-            serde_json::from_str(&status_object(true, Some(mk(SyncState::Synced)))).unwrap();
+            serde_json::from_str(&status_object(true, Some(mk(SyncState::Synced)), 1795)).unwrap();
         assert_eq!(synced["running"], true);
         assert_eq!(synced["beaconState"], "SYNCED");
         assert_eq!(synced["bootstrapped"], true);
         assert_eq!(synced["finalizedSlot"], 100);
         assert_eq!(synced["optimisticSlot"], 132);
         assert_eq!(synced["currentPeriod"], 1777);
+        assert_eq!(synced["targetPeriod"], 1795);
         assert_eq!(synced["peerCount"], 7);
         assert_eq!(synced["finalizedRootHex"], hex32(&[0xab; 32]));
 
@@ -301,10 +315,28 @@ mod tests {
             (SyncState::CatchingUp, "CATCHING_UP", true),
         ] {
             let v: serde_json::Value =
-                serde_json::from_str(&status_object(true, Some(mk(st)))).unwrap();
+                serde_json::from_str(&status_object(true, Some(mk(st)), 1795)).unwrap();
             assert_eq!(v["beaconState"], expect);
             assert_eq!(v["bootstrapped"], boot);
         }
+    }
+
+    #[test]
+    fn target_period_is_floored_at_current_period() {
+        // A device clock behind the store's committee period (wall period 1770 <
+        // store period 1777) must not publish an inverted target.
+        let s = SyncStatus {
+            state: SyncState::CatchingUp,
+            finalized_slot: 100,
+            finalized_root: [0u8; 32],
+            optimistic_slot: 132,
+            period: 1777,
+            peer_count: 7,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&status_object(true, Some(s), 1770)).unwrap();
+        assert_eq!(v["currentPeriod"], 1777);
+        assert_eq!(v["targetPeriod"], 1777);
     }
 
     #[test]
