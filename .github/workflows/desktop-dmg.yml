@@ -154,3 +154,73 @@ jobs:
           path: app-desktop/build/compose/binaries/main/dmg/*.dmg
           if-no-files-found: error
           retention-days: 30
+
+  # Attach both arch dmgs to the GitHub Release for the pushed tag. Runs ONLY on
+  # `v*` tags, ONCE (not per-arch), after BOTH matrix build jobs finish, and
+  # reuses their artifacts rather than rebuilding. The android-apk workflow
+  # publishes to the SAME release for the same tag; whichever job runs first
+  # creates it and the other just uploads — the create step tolerates that race.
+  release:
+    name: Publish dmgs to release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      # gh release create/upload needs write access to Releases (repo contents).
+      contents: write
+    steps:
+      # Both matrix jobs' artifacts (Myotis-arm64.dmg, Myotis-x64.dmg) land under
+      # dmg/ — they were already arch-tagged and verified in the build job.
+      - name: Download dmg artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: myotis-desktop-dmg-*-${{ github.sha }}
+          path: dmg
+          merge-multiple: true
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No checkout in this job — gh must be told the repo explicitly or it
+          # dies with "fatal: not a git repository" (which sank the first v0.1.0
+          # attempt: every gh release call failed, so no release was created).
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          # Fail loudly if either arch dmg is missing rather than shipping a
+          # half release (e.g. one matrix job was cancelled).
+          for arch in arm64 x64; do
+            test -f "dmg/Myotis-${arch}.dmg" \
+              || { echo "::error::missing dmg/Myotis-${arch}.dmg"; exit 1; }
+          done
+          # Notes via a quoted heredoc + --notes-file: markdown stays literal
+          # (no shell escaping of backticks/quotes) and renders as intended.
+          notes=$(mktemp)
+          cat > "$notes" <<'NOTES'
+          First public build of the Myotis wallet apps (pre-release).
+
+          **Android (`*-android-debug.apk`)** — unsigned *debug* build. Install via
+          "Install unknown apps". Not a signed release build.
+
+          **Desktop macOS (`Myotis-<arch>.dmg`)** — unsigned; download the dmg matching
+          your Mac (arm64 for Apple Silicon, x64 for Intel). First launch:
+          right-click → Open to get past Gatekeeper (not notarized yet).
+
+          **Desktop Linux (`Myotis-<arch>.deb`)** — install with
+          `sudo apt install ./Myotis-<arch>.deb` (x64 for Intel/AMD, arm64 for
+          Raspberry Pi 5 / ARM machines).
+          NOTES
+          # Create the release if it doesn't exist yet. The android workflow may
+          # win this race for the same tag: if `create` fails, re-check with
+          # `view` — success there means the other job already created it (fine),
+          # while a genuine failure still surfaces because `view` also fails.
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --prerelease \
+              --title "Myotis $tag" \
+              --notes-file "$notes" \
+              --target "${GITHUB_SHA}" \
+            || gh release view "$tag" >/dev/null 2>&1
+          fi
+          gh release upload "$tag" dmg/Myotis-arm64.dmg dmg/Myotis-x64.dmg --clobber
