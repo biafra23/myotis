@@ -506,6 +506,10 @@ public final class NodeService extends Service {
             boolean beaconBootstrapped,
             int clPeersConnected,
             int clPeersLightClient,
+            int clPeersServedLastMin, // distinct peers that served a light-client
+                                      // response in the last 60s — CL connections are
+                                      // short-lived, so clPeersConnected is usually 0
+                                      // and THIS is the "are we being fed?" signal
             int clPeersCached,
             long finalizedSlot,
             long executionBlockNumber,
@@ -1107,7 +1111,7 @@ public final class NodeService extends Service {
                     cachedEl, s.attemptedDials(), s.backedOffPeers(),
                     s.blacklistedPeers(), s.discv5TableSize(), 0,
                     beaconState, bs.bootstrapped(), bs.connectedPeers(), (int) bs.lightClientPeers(),
-                    cachedCl, bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
+                    bs.servedPeersLastMinute(), cachedCl, bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
                     s.syncStartPeriod(), syncCurrent, syncTarget,
                     Long.MAX_VALUE, List.of(), network);
         }
@@ -1117,7 +1121,7 @@ public final class NodeService extends Service {
                 cachedEl, s.attemptedDials(), s.backedOffPeers(),
                 s.blacklistedPeers(), s.discv5TableSize(), 0,
                 beaconState, bs.bootstrapped(), bs.connectedPeers(), (int) bs.lightClientPeers(),
-                cachedCl, bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
+                bs.servedPeersLastMinute(), cachedCl, bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
                 s.syncStartPeriod(), syncCurrent, syncTarget,
                 s.verifiedHeadAgeMs(), s.readyPeerList(), network);
     }
