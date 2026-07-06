@@ -34,6 +34,9 @@ pub struct ClPeerCache {
     lc: HashSet<String>,
     nolc: HashSet<String>,
     failures: HashMap<String, u32>,
+    /// Unflushed changes. Mutators only mark; [`Self::flush`] writes — so the
+    /// sync loop batches one write per round instead of one per peer event.
+    dirty: bool,
 }
 
 impl ClPeerCache {
@@ -139,7 +142,7 @@ impl ClPeerCache {
         changed |= self.nolc.remove(addr);
         self.failures.remove(addr); // in-memory streak only — not persisted
         if changed {
-            self.save();
+            self.dirty = true;
         }
     }
 
@@ -160,7 +163,7 @@ impl ClPeerCache {
         }
         self.failures.remove(addr);
         if changed {
-            self.save();
+            self.dirty = true;
         }
     }
 
@@ -175,7 +178,7 @@ impl ClPeerCache {
         let mut changed = self.ensure(addr);
         changed |= self.nolc.insert(addr.to_string());
         if changed {
-            self.save();
+            self.dirty = true;
         }
     }
 
@@ -195,8 +198,21 @@ impl ClPeerCache {
             self.lc.remove(&a);
             self.nolc.remove(&a);
             self.failures.remove(&a);
-            self.save();
+            self.dirty = true;
         }
+    }
+
+    /// Write out unflushed changes, if any. The sync loop calls this once per
+    /// round (post-bootstrap / post-catch-up / post-finality-poll), so a burst
+    /// of per-peer verdicts inside a round costs at most ONE synchronous
+    /// few-KiB write — never one per peer event (review: no blocking I/O
+    /// inside the parallel peer processing loop).
+    pub fn flush(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.save();
+        self.dirty = false;
     }
 
     /// Add the peer if absent; true when it was newly added.
@@ -210,10 +226,8 @@ impl ClPeerCache {
 
     /// Full sorted rewrite via pid-suffixed temp + rename (atomic publish; an
     /// overlapping writer from another process can't tear the temp file).
-    /// Synchronous by design: callers only reach here on a REAL state change
-    /// (new peer / widened range / verdict flip), which is rare after the
-    /// first catch-up — not per round — and the file is a few KiB. Best-effort:
-    /// failures are logged at debug and ignored (performance cache).
+    /// Reached only through [`Self::flush`]. Best-effort: failures are logged
+    /// at debug and ignored (performance cache).
     fn save(&self) {
         let Some(path) = &self.path else { return };
         let mut peers = self.peers.clone();
@@ -276,6 +290,7 @@ mod tests {
 
         // Widen (union), persist, reload: still widened, still tokenized.
         c.record_served("/ip4/1.2.3.4/tcp/9000/p2p/16Uabc", 1760, 1780);
+        c.flush();
         let c2 = ClPeerCache::load(p.clone());
         assert_eq!(c2.served_range("/ip4/1.2.3.4/tcp/9000/p2p/16Uabc"), Some((1760, 1795)));
         let text = std::fs::read_to_string(&p).unwrap();
@@ -300,6 +315,7 @@ mod tests {
         // …the third consecutive failure evicts.
         c.mark_failure("/ip4/1.1.1.1/tcp/9000/p2p/16Uaaa");
         assert!(c.served_range("/ip4/1.1.1.1/tcp/9000/p2p/16Uaaa").is_none());
+        c.flush();
         assert!(ClPeerCache::load(p.clone()).peers.is_empty(), "eviction persisted");
         let _ = std::fs::remove_file(&p);
     }
@@ -315,6 +331,7 @@ mod tests {
         // Uncached full node: the denial IS persisted so restarts skip it.
         c.mark_nolc("/ip4/2.2.2.2/tcp/9000/p2p/16Ubbb");
         assert!(c.is_nolc("/ip4/2.2.2.2/tcp/9000/p2p/16Ubbb"));
+        c.flush();
         let c2 = ClPeerCache::load(p.clone());
         assert!(c2.is_nolc("/ip4/2.2.2.2/tcp/9000/p2p/16Ubbb"), "nolc persisted for new peer");
         assert!(!c2.is_nolc("/ip4/1.1.1.1/tcp/9000/p2p/16Uaaa"));
@@ -328,6 +345,7 @@ mod tests {
         c.record_bootstrap("/ip4/1.1.1.1/tcp/9000/p2p/16Uaaa", 1480);
         c.record_bootstrap("/ip4/1.1.1.1/tcp/9000/p2p/16Uaaa", 1795);
         c.record_bootstrap("/ip4/1.1.1.1/tcp/9000/p2p/16Uaaa", 1600); // ignored: shallower
+        c.flush();
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(text.contains("\tb1795"), "max kept (Java parity): {text}");
         // Load-time merge of duplicate lines also keeps the max.

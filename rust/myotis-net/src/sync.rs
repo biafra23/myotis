@@ -607,7 +607,10 @@ async fn run_sync(
         drain_discovered(&mut peer_rx, &mut pool);
 
         if !processor.store.is_initialized() {
-            if try_bootstrap(&config, &client, &mut pool, &mut processor, &mut clcache).await {
+            let bootstrapped =
+                try_bootstrap(&config, &client, &mut pool, &mut processor, &mut clcache).await;
+            clcache.flush(); // one write per attempt round, win or lose
+            if bootstrapped {
                 persist_snapshot(&config, &processor, &mut last_persisted_period);
                 refresh_local_status(&config, &processor, &local_status);
                 publish_status(&config, &client, &processor, &status_tx).await;
@@ -622,6 +625,10 @@ async fn run_sync(
             let poisoned = catch_up(&config, &client, &mut pool, &mut processor, &status_tx,
                 &mut peer_rx, &mut staged_updates, &mut clcache, &mut resume)
                 .await;
+            // Batch-persist every cache verdict from the catch-up rounds in
+            // one write, OFF the per-peer hot path (review: no blocking I/O
+            // inside the parallel peer loop).
+            clcache.flush();
             if poisoned {
                 // The restored snapshot can't verify anything (corrupt on
                 // disk, framing-valid): discard it and the store, and fall
@@ -660,6 +667,7 @@ async fn run_sync(
             // committee — the snapshot is genuine.
             resume.confirm();
         }
+        clcache.flush(); // batch any finality-round evictions into one write
         // No-op unless the period advanced (force-rotate can move it here too).
         persist_snapshot(&config, &processor, &mut last_persisted_period);
         refresh_local_status(&config, &processor, &local_status);

@@ -97,12 +97,14 @@ pub fn deserialize(data: &[u8], expected_gvr: &[u8; 32]) -> Option<StoreSnapshot
 
 fn write_header(out: &mut Vec<u8>, h: &LightClientHeader) {
     out.extend_from_slice(&h.beacon.encode());
-    for node in &h.execution_branch {
+    // The framing is EXACTLY 4 branch nodes (the reader consumes exactly 4).
+    // A verified header always has 4; tolerate any malformed in-memory value
+    // by clamping — truncate extras, zero-pad missing — rather than emitting
+    // an unreadable file (Java would have thrown on its own writer — we must
+    // never panic and never shift the framing).
+    for node in h.execution_branch.iter().take(4) {
         out.extend_from_slice(node);
     }
-    // A verified header always carries exactly 4 branch nodes; tolerate fewer
-    // by zero-padding rather than producing an unreadable file (Java would
-    // have thrown on its own writer — we must never panic).
     for _ in h.execution_branch.len()..4 {
         out.extend_from_slice(&[0u8; 32]);
     }
