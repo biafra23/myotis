@@ -292,15 +292,15 @@ public final class NodeService extends Service {
         return choice;
     }
     /** The {@code myotis.bls.backend} choice for the current setting: {@code milagro} when
-     *  native BLS is disabled, otherwise the build-type default — {@code compare} on a
-     *  debuggable build (runs Milagro AND native per verify and logs a head-to-head) or
-     *  {@code auto} on release (native when present, else Milagro). Keeping the ON case equal
-     *  to the prior default means enabling native BLS preserves today's behavior exactly. */
+     *  native BLS is disabled, otherwise {@code auto} (native blst when present, else
+     *  Milagro) — on EVERY build type. Debuggable builds used to default to {@code compare}
+     *  (Milagro AND native per verify, as a measurement harness), but on-device that costs
+     *  10-16 s of Milagro math per sync-committee update (~500x slower than blst alone) and
+     *  froze catch-up/status for minutes — diagnosed on a Pixel 7, 2026-07-06. Compare mode
+     *  is explicit opt-in only, via the {@code myotis.bls.backend=compare} system property
+     *  ({@code -Pbls=compare} on the daemon); no build type defaults to it. */
     public static String blsBackendChoice(android.content.Context c) {
-        if (!nativeBlsEnabled(c)) return "milagro";
-        boolean debuggable = (c.getApplicationInfo().flags
-                & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0;
-        return debuggable ? "compare" : "auto";
+        return nativeBlsEnabled(c) ? "auto" : "milagro";
     }
     /** Live-update the snap-peer target (no restart) on every live stack and persist it. */
     public void setTargetSnapPeers(int v) {

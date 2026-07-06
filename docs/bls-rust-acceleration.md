@@ -14,7 +14,7 @@ all done and verified. Summary first; the original evaluation follows.
   native; `-Pbls=compare` runs the head-to-head.
 - Android: `rust/build-android.sh` (cargo-ndk) builds `arm64-v8a` + `x86_64`
   `libmyotis_bls.so` into `android-app/src/main/jniLibs` (confirmed packaged in the debug
-  APK); `EthP2PApplication` sets `compare` so logcat shows the A/B on-device.
+  APK); compare mode is an explicit opt-in (-Dmyotis.bls.backend=compare) — it was briefly the debuggable default, but 10-16 s of Milagro per update froze on-device catch-up (Pixel 7, 2026-07-06).
 
 **Measured — `BlsBackendBenchmark`, real 511-pubkey mainnet aggregate, x86-64 desktop:**
 | backend | cold (ms) | warm (ms/op) |

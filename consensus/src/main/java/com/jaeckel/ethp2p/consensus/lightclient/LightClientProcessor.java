@@ -117,14 +117,22 @@ public class LightClientProcessor {
             return false;
         }
 
-        long oldFinalizedSlot = store.getFinalizedSlot();
-        store.updateFinalized(update.finalizedHeader(), finalizedSlot);
-        store.updateOptimistic(update.attestedHeader(), update.signatureSlot());
-
-        // Rotate sync committee if we crossed a period boundary.
-        // Pass the OLD finalized slot so the period comparison is correct
-        // (updateFinalized may have already advanced this.finalizedSlot).
-        store.applyNextSyncCommitteeWhenPeriodChanges(oldFinalizedSlot, finalizedSlot);
+        // The three store mutations must be one atomic transaction w.r.t. readers:
+        // store.snapshot() (persistence) interleaving between updateFinalized and the
+        // rotation would capture finalizedSlot in the new period with the OLD committee
+        // still current — restored after a restart, that state can't rotate via the
+        // slot-crossing path anymore. Verification above runs without the monitor;
+        // only these fast memory writes hold it.
+        final long oldFinalizedSlot;
+        synchronized (store) {
+            oldFinalizedSlot = store.getFinalizedSlot();
+            store.updateFinalized(update.finalizedHeader(), finalizedSlot);
+            store.updateOptimistic(update.attestedHeader(), update.signatureSlot());
+            // Rotate sync committee if we crossed a period boundary.
+            // Pass the OLD finalized slot so the period comparison is correct
+            // (updateFinalized may have already advanced this.finalizedSlot).
+            store.applyNextSyncCommitteeWhenPeriodChanges(oldFinalizedSlot, finalizedSlot);
+        }
 
         lastAppliedFinalitySig = sig.clone();
         log.debug("[lc-processor] Finality update applied: finalizedSlot {} → {}", oldFinalizedSlot, finalizedSlot);
@@ -240,13 +248,16 @@ public class LightClientProcessor {
             store.updateNextSyncCommittee(nextSyncCommittee);
         }
 
-        long oldFinalizedSlot = store.getFinalizedSlot();
-        store.updateFinalized(update.finalizedHeader(), finalizedSlot);
-        store.updateOptimistic(update.attestedHeader(), update.signatureSlot());
-
-        // Rotate sync committee if we crossed a period boundary.
-        // Pass the OLD finalized slot so the period comparison is correct.
-        store.applyNextSyncCommitteeWhenPeriodChanges(oldFinalizedSlot, finalizedSlot);
+        // Atomic w.r.t. store.snapshot() — see the matching block in
+        // processFinalityUpdate for why a torn snapshot here wedges a restart.
+        synchronized (store) {
+            long oldFinalizedSlot = store.getFinalizedSlot();
+            store.updateFinalized(update.finalizedHeader(), finalizedSlot);
+            store.updateOptimistic(update.attestedHeader(), update.signatureSlot());
+            // Rotate sync committee if we crossed a period boundary.
+            // Pass the OLD finalized slot so the period comparison is correct.
+            store.applyNextSyncCommitteeWhenPeriodChanges(oldFinalizedSlot, finalizedSlot);
+        }
 
         return true;
     }
