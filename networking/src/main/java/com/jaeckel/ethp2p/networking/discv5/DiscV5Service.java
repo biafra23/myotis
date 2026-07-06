@@ -7,6 +7,7 @@ import org.ethereum.beacon.discovery.DiscoverySystemBuilder;
 import org.ethereum.beacon.discovery.crypto.DefaultSigner;
 import org.ethereum.beacon.discovery.schema.NodeRecord;
 import org.ethereum.beacon.discovery.schema.NodeRecordBuilder;
+import org.ethereum.beacon.discovery.schema.NodeRecordFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -43,6 +44,24 @@ public final class DiscV5Service implements AutoCloseable {
     private DiscoverySystem system;
     private ScheduledExecutorService scheduler;
     private final Set<String> seenEnrs = new HashSet<>();
+
+    // Empty-table re-seed: the library pings bootnodes exactly ONCE, inside
+    // start(). If that initial round loses (device network not up yet, transient
+    // UDP loss — both observed on-device), or the table later decays to empty
+    // (mobile NAT liveness churn), searchForNewPeers() has no one to query and
+    // discovery is dead until process restart: live=0 seen-total=0 forever
+    // (Pixel 7, gnosis, 2026-07-06 — 2h wedge, instant recovery on restart).
+    // So: after RESEED_EMPTY_POLLS consecutive empty polls (~1 min at the 15s
+    // cadence), re-ping the bootnodes to refill the K-buckets, and keep doing
+    // that every RESEED_EMPTY_POLLS-th empty poll until the table has nodes.
+    // (DiscV4Service solves the same wedge by re-pinging on EVERY empty
+    // refresh; here the throttle keeps a persistent wedge from pinging the
+    // handful of public CL bootnodes 4x as often for the life of the process.)
+    private static final int RESEED_EMPTY_POLLS = 4;
+    private int consecutiveEmptyPolls;
+    // Bootnode ENRs parsed once, on the first re-seed (malformed entries are
+    // logged once and dropped, not re-swallowed every fire). Poll-thread only.
+    private List<NodeRecord> bootnodeRecords;
 
     public DiscV5Service(NodeKey nodeKey, List<String> bootnodeEnrs,
                          Consumer<Enr> onPeerDiscovered) {
@@ -198,7 +217,9 @@ public final class DiscV5Service implements AutoCloseable {
         try {
             int[] newThisTick = {0};
             int[] withEth2 = {0};
+            int[] live = {0};
             system.streamLiveNodes().forEach(nr -> {
+                live[0]++;
                 String enrStr = nr.asEnr();
                 if (seenEnrs.add(enrStr)) {
                     newThisTick[0]++;
@@ -214,16 +235,75 @@ public final class DiscV5Service implements AutoCloseable {
             // Kick a background search so the table keeps expanding between
             // polls rather than stalling at whatever the bootnodes returned.
             system.searchForNewPeers();
+            reseedIfWedged(live[0]);
             // One INFO line per 15s poll so the daemon log makes it obvious
             // whether the library is making progress. The library itself logs
             // through log4j which our logback pipeline doesn't route — this is
             // the only visibility we have at the slf4j layer.
             log.info("[discv5] poll: live={} seen-total={} new-this-tick={} with-eth2-this-tick={}",
-                    (int) system.streamLiveNodes().count(), seenEnrs.size(),
+                    live[0], seenEnrs.size(),
                     newThisTick[0], withEth2[0]);
         } catch (Exception e) {
             log.warn("[discv5] poll failed: {}", e.getMessage());
         }
+    }
+
+    /**
+     * Re-ping the bootnodes when the live table has been empty for
+     * {@link #RESEED_EMPTY_POLLS} consecutive polls (see the field comment for
+     * why the table can wedge empty). Pings are fire-and-forget: any one
+     * response repopulates a bucket and the next {@code searchForNewPeers()}
+     * takes it from there. Runs on the poll thread; ping() itself is async.
+     */
+    private void reseedIfWedged(int liveNodes) {
+        if (!reseedDue(liveNodes)) {
+            return;
+        }
+        for (NodeRecord bootnode : bootnodeRecords()) {
+            // Fire-and-forget: any one response repopulates a bucket and the
+            // next searchForNewPeers() takes it from there.
+            system.ping(bootnode).exceptionally(ex -> null);
+        }
+        log.info("[discv5] live table empty for {} polls — re-pinged {} bootnode(s)",
+                RESEED_EMPTY_POLLS, bootnodeRecords().size());
+    }
+
+    /** The bootnode ENRs parsed to records, once; malformed entries warn once and drop. */
+    private List<NodeRecord> bootnodeRecords() {
+        if (bootnodeRecords == null) {
+            bootnodeRecords = new java.util.ArrayList<>(bootnodeEnrs.size());
+            for (String enr : bootnodeEnrs) {
+                try {
+                    bootnodeRecords.add(NodeRecordFactory.DEFAULT.fromEnr(enr));
+                } catch (Exception malformed) {
+                    log.warn("[discv5] skipping unparseable bootnode ENR for re-seed: {}",
+                            malformed.getMessage());
+                }
+            }
+        }
+        return bootnodeRecords;
+    }
+
+    /**
+     * The stateful counter step behind {@link #reseedIfWedged} — poll-thread
+     * only (it mutates {@link #consecutiveEmptyPolls}); package-private for
+     * tests. Any live node resets the streak; with no bootnodes configured a
+     * re-seed is never due (nothing to ping — sepolia pins an empty discv5
+     * list, and repeating "re-pinged 0 bootnode(s)" would read as recovery
+     * where none is possible). Otherwise a re-seed is due on every
+     * {@link #RESEED_EMPTY_POLLS}-th consecutive empty poll (the counter
+     * resets when due, so the re-seed repeats while the table stays empty).
+     */
+    boolean reseedDue(int liveNodes) {
+        if (liveNodes > 0 || bootnodeEnrs.isEmpty()) {
+            consecutiveEmptyPolls = 0;
+            return false;
+        }
+        if (++consecutiveEmptyPolls < RESEED_EMPTY_POLLS) {
+            return false;
+        }
+        consecutiveEmptyPolls = 0;
+        return true;
     }
 
     @Override
