@@ -12,6 +12,7 @@ import android.net.LinkProperties;
 import android.net.Network;
 import android.os.Binder;
 import android.os.IBinder;
+import com.jaeckel.ethp2p.android.diag.ProcessHealthDiag;
 import com.jaeckel.ethp2p.android.log.LogBuffer;
 
 import io.myotis.api.AccountProofResult;
@@ -734,6 +735,11 @@ public final class NodeService extends Service {
             return START_NOT_STICKY;
         }
         startTimeMs = System.currentTimeMillis();
+        // Failure forensics: report how the PREVIOUS process died (OOM-kill vs crash
+        // vs clean), then start the health heartbeat. This is what makes an on-device
+        // sync failure diagnosable instead of a silent "it doesn't work".
+        com.jaeckel.ethp2p.android.diag.ProcessHealthDiag.logLastExitReason(this);
+        startHealthHeartbeat();
         // API 34+ requires the foregroundServiceType to be passed here and
         // to match the manifest's <service android:foregroundServiceType="...">
         // declaration. API 29-33 ignore the third arg. minSdk is 29.
@@ -1086,6 +1092,89 @@ public final class NodeService extends Service {
                 cachedCl, bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
                 s.syncStartPeriod(), syncCurrent, syncTarget,
                 s.verifiedHeadAgeMs(), s.readyPeerList(), network);
+    }
+
+    // ---- Failure forensics (see ProcessHealthDiag) ----
+
+    private static final AtomicBoolean HEARTBEAT_STARTED = new AtomicBoolean(false);
+    /** How often the health line is emitted. Cheap; the info is time-series (you want
+     *  the trajectory of memory + sync + snap-peers as it approaches the failure). */
+    private static final long HEARTBEAT_INTERVAL_MS = 20_000;
+
+    /**
+     * Emit one consolidated health line every {@link #HEARTBEAT_INTERVAL_MS}: process
+     * memory, CL sync progress, and EL snap-peer pool state. When the node fails on a
+     * phone, the last few of these + the next launch's prior-exit line pin the mode
+     * (OOM vs CL-wedge vs snap-never-warm). Started once per process; runs until the
+     * process dies (which, for an OOM-kill, is the point — the last line is the clue).
+     */
+    private void startHealthHeartbeat() {
+        // Debuggable builds only: the 20s Debug.getMemoryInfo poll is diagnostic
+        // overhead a shipping user shouldn't pay. The one-shot prior-exit log and the
+        // event-driven onTrimMemory warning stay on in every build (cheap + valuable).
+        boolean debuggable = (getApplicationInfo().flags
+                & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+        if (!debuggable) return;
+        if (!HEARTBEAT_STARTED.compareAndSet(false, true)) return;
+        Thread t = new Thread(() -> {
+            while (true) {
+                try {
+                    LogBuffer.i(ProcessHealthDiag.TAG, buildHealthLine());
+                    Thread.sleep(HEARTBEAT_INTERVAL_MS);
+                } catch (InterruptedException e) {
+                    return;
+                } catch (Throwable ignored) {
+                    // Diagnostics must never take the process down.
+                }
+            }
+        }, "ethp2p-health");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private String buildHealthLine() {
+        long upSec = (System.currentTimeMillis() - startTimeMs) / 1000;
+        String mem = ProcessHealthDiag.memorySummary(this);
+        String cl = "cl: (not running)";
+        String el = "";
+        try {
+            String n = primaryNetwork(this);
+            ChainHandle h = handles.get(n);
+            if (h != null) {
+                StatusSnapshot s = h.status();
+                // CL: is catch-up progressing toward the wall-clock period, and how
+                // stale is the verified head?
+                cl = "cl: period=" + s.syncCurrentPeriod() + "/" + s.wallClockPeriod()
+                        + " fin=" + s.finalizedSlot()
+                        + " headAge=" + headAge(s.verifiedHeadAgeMs());
+                // EL: the snap-peer pool is what gates verified reads. snapServing==0
+                // over time = the "snap peers never warm" failure mode.
+                el = " | el: conn=" + s.connectedPeers()
+                        + " snap=" + s.snapPeers()
+                        + " serving=" + s.snapServingPeers()
+                        + " backoff=" + s.backedOffPeers()
+                        + " blacklist=" + s.blacklistedPeers()
+                        + " discv5=" + s.discv5TableSize()
+                        + " elBlock=" + s.executionBlockNumber();
+            }
+        } catch (Throwable t) {
+            cl = "cl: (status read failed: " + t.getClass().getSimpleName() + ")";
+        }
+        return "up=" + upSec + "s | mem: " + mem + " | " + cl + el;
+    }
+
+    private static String headAge(long ms) {
+        return ms == Long.MAX_VALUE ? "n/a" : (ms / 1000) + "s";
+    }
+
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        // The system sends this under memory pressure; RUNNING_CRITICAL / COMPLETE are
+        // the "you're about to be OOM-killed" warning — the last thing logged before a
+        // silent SIGKILL. Pair with the next launch's prior-exit=LOW_MEMORY line.
+        LogBuffer.w(ProcessHealthDiag.TAG, "onTrimMemory " + ProcessHealthDiag.trimLevelName(level)
+                + " | " + ProcessHealthDiag.memorySummary(this));
     }
 
     @Override
