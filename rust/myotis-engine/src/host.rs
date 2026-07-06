@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use myotis_net::{ChainConfig, SyncHandle, SyncState, SyncStatus};
 
@@ -35,9 +35,12 @@ const UNSUPPORTED_NETWORK: i64 = -2;
 
 /// One hosted chain: created-but-not-started, or running. Running keeps the
 /// config so status reads can derive wall-clock values (targetPeriod) fresh.
+/// `Arc` because the config is cloned out of the map on every such read (and
+/// in `start`) — the deep `ChainConfig` clone happens only once, into
+/// `SyncHandle::start`.
 enum ChainEntry {
-    Created(ChainConfig),
-    Running(ChainConfig, SyncHandle),
+    Created(Arc<ChainConfig>),
+    Running(Arc<ChainConfig>, SyncHandle),
 }
 
 /// The single legitimate engine singleton. Owns the runtime + the handle map;
@@ -99,7 +102,7 @@ pub fn create(network_name: &str, _data_dir: &str) -> i64 {
     let id = engine.next_id.fetch_add(1, Ordering::Relaxed);
     match engine.handles.lock() {
         Ok(mut map) => {
-            map.insert(id, ChainEntry::Created(config));
+            map.insert(id, ChainEntry::Created(Arc::new(config)));
             id
         }
         // A poisoned lock means another native panicked mid-critical-section —
@@ -124,12 +127,13 @@ pub fn start(handle: i64) -> bool {
             Err(_) => return false,
         };
         match map.get(&handle) {
-            Some(ChainEntry::Created(c)) => c.clone(),
+            Some(ChainEntry::Created(c)) => Arc::clone(c),
             _ => return false, // unknown id, or already running
         }
     };
     // SyncHandle::start must run inside the tokio runtime (it spawns tasks).
-    let sync = match engine.rt.block_on(async { SyncHandle::start(config.clone()) }) {
+    // The one deep ChainConfig clone: SyncHandle::start takes it by value.
+    let sync = match engine.rt.block_on(async { SyncHandle::start((*config).clone()) }) {
         Ok(s) => s,
         Err(_) => return false,
     };
