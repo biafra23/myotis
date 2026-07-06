@@ -516,7 +516,7 @@ private fun StatusView(s: NodeSnapshot) {
         StatusRow("Network", s.network)
         StatusRow("Beacon", s.beaconState)
         StatusRow("EL block", s.executionBlockNumber.toString())
-        StatusRow("CL peers", "connected ${s.clConnectedPeers}, updates serving ${s.clLightClientPeers}")
+        StatusRow("CL peers", "con ${s.clConnectedPeers}, serv ${s.clLightClientPeers}")
         StatusRow("EL peers", "ready ${s.readyPeers}, snap ${s.snapPeers}, serving ${s.snapServingPeers}")
         StatusRow("Discovered", s.discoveredPeers.toString())
         StatusRow("Discv5 peers", s.discv5Peers.toString())
