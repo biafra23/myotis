@@ -738,7 +738,7 @@ public final class NodeService extends Service {
         // Failure forensics: report how the PREVIOUS process died (OOM-kill vs crash
         // vs clean), then start the health heartbeat. This is what makes an on-device
         // sync failure diagnosable instead of a silent "it doesn't work".
-        com.jaeckel.ethp2p.android.diag.ProcessHealthDiag.logLastExitReason(this);
+        ProcessHealthDiag.logLastExitReason(this);
         startHealthHeartbeat();
         // API 34+ requires the foregroundServiceType to be passed here and
         // to match the manifest's <service android:foregroundServiceType="...">
@@ -1096,17 +1096,20 @@ public final class NodeService extends Service {
 
     // ---- Failure forensics (see ProcessHealthDiag) ----
 
-    private static final AtomicBoolean HEARTBEAT_STARTED = new AtomicBoolean(false);
     /** How often the health line is emitted. Cheap; the info is time-series (you want
      *  the trajectory of memory + sync + snap-peers as it approaches the failure). */
     private static final long HEARTBEAT_INTERVAL_MS = 20_000;
+    /** The heartbeat thread for THIS service instance, interrupted in {@link #onDestroy}
+     *  so it stops WITH the instance (no NodeService leak) and restarts cleanly on the
+     *  next service start. An OOM-kill is a SIGKILL with no onDestroy, so on that path the
+     *  thread runs until the kill — the last emitted line is the clue we want. */
+    private volatile Thread healthThread;
 
     /**
      * Emit one consolidated health line every {@link #HEARTBEAT_INTERVAL_MS}: process
      * memory, CL sync progress, and EL snap-peer pool state. When the node fails on a
      * phone, the last few of these + the next launch's prior-exit line pin the mode
-     * (OOM vs CL-wedge vs snap-never-warm). Started once per process; runs until the
-     * process dies (which, for an OOM-kill, is the point — the last line is the clue).
+     * (OOM vs CL-wedge vs snap-never-warm).
      */
     private void startHealthHeartbeat() {
         // Debuggable builds only: the 20s Debug.getMemoryInfo poll is diagnostic
@@ -1114,26 +1117,29 @@ public final class NodeService extends Service {
         // event-driven onTrimMemory warning stay on in every build (cheap + valuable).
         boolean debuggable = (getApplicationInfo().flags
                 & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0;
-        if (!debuggable) return;
-        if (!HEARTBEAT_STARTED.compareAndSet(false, true)) return;
+        if (!debuggable || healthThread != null) return;
+        // Monotonic baseline captured here, not read from wall-clock, so an NTP step
+        // can't skew the reported uptime.
+        final long startNano = System.nanoTime();
         Thread t = new Thread(() -> {
-            while (true) {
+            while (!Thread.currentThread().isInterrupted()) {
                 try {
-                    LogBuffer.i(ProcessHealthDiag.TAG, buildHealthLine());
+                    LogBuffer.i(ProcessHealthDiag.TAG, buildHealthLine(startNano));
                     Thread.sleep(HEARTBEAT_INTERVAL_MS);
                 } catch (InterruptedException e) {
-                    return;
+                    return; // onDestroy interrupted us
                 } catch (Throwable ignored) {
                     // Diagnostics must never take the process down.
                 }
             }
         }, "ethp2p-health");
         t.setDaemon(true);
+        healthThread = t;
         t.start();
     }
 
-    private String buildHealthLine() {
-        long upSec = (System.currentTimeMillis() - startTimeMs) / 1000;
+    private String buildHealthLine(long startNano) {
+        long upSec = (System.nanoTime() - startNano) / 1_000_000_000L;
         String mem = ProcessHealthDiag.memorySummary(this);
         String cl = "cl: (not running)";
         String el = "";
@@ -1180,6 +1186,13 @@ public final class NodeService extends Service {
     @Override
     public void onDestroy() {
         LogBuffer.i(TAG, "Stopping node (onDestroy)");
+        // Stop the heartbeat with the instance so it doesn't leak this NodeService and
+        // restarts cleanly on the next start.
+        Thread hb = healthThread;
+        if (hb != null) {
+            hb.interrupt();
+            healthThread = null;
+        }
         // Same fire-and-forget pattern as shutdown(): the system gives us a
         // brief window to return from onDestroy and we don't want to spend
         // it blocking on libp2p host shutdown / Netty graceful drain. doShutdown()
