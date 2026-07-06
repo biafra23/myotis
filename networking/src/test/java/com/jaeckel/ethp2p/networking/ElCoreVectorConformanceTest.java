@@ -251,6 +251,23 @@ class ElCoreVectorConformanceTest {
         writeVector("002-enr-gnosis-bootnode.txt",
                 utf8(NetworkConfig.GNOSIS.clDiscv5Bootnodes().get(0)));
         writeVector("003-enr-el-eth.txt", utf8(syntheticElEnr()));
+        // Non-minimal 3-byte tcp port: rejected as a port on BOTH sides
+        // (reported absent) — pins the strict 1-2-byte rule (geth-parity;
+        // the record itself still decodes).
+        writeVector("004-enr-wide-port.txt", utf8("enr:"
+                + Base64.getUrlEncoder().withoutPadding().encodeToString(
+                        RLP.encodeList(w -> {
+                            w.writeValue(Bytes.wrap(new byte[64])); // dummy signature
+                            w.writeLong(3);                          // seq
+                            w.writeString("id");
+                            w.writeString("v4");
+                            w.writeString("ip");
+                            w.writeValue(Bytes.wrap(new byte[]{(byte) 192, 0, 2, 2}));
+                            w.writeString("tcp");
+                            w.writeValue(Bytes.fromHexString("00751f")); // 3-byte port
+                            w.writeString("udp");
+                            w.writeLong(30303);
+                        }).toArrayUnsafe())));
         writeVector("090-enr-nonlist.txt", utf8("enr:"
                 + Base64.getUrlEncoder().withoutPadding().encodeToString(
                         RLP.encodeValue(utf8("dog")).toArrayUnsafe())));
@@ -395,7 +412,9 @@ class ElCoreVectorConformanceTest {
     }
 
     private static String portString(Bytes port) {
-        if (port == null) return "absent";
+        // 1-2 bytes big-endian, else absent — the Enr.address() / Rust port()
+        // rule (wider-than-u16 encodings are rejected, matching geth).
+        if (port == null || port.size() < 1 || port.size() > 2) return "absent";
         return Integer.toString(port.toInt());
     }
 

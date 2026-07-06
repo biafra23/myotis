@@ -120,6 +120,11 @@ public final class Enr {
         Bytes ipBytes = pairs.get(ipKey);
         Bytes portBytes = pairs.get(portKey);
         if (ipBytes == null || portBytes == null) return Optional.empty();
+        // Ports are 1-2 bytes big-endian (Rust-twin parity, pinned by the
+        // el/core corpus; geth rejects wider too). The old lenient toInt()
+        // also let a 3-4-byte port > 65535 reach new InetSocketAddress(),
+        // which throws an uncaught IllegalArgumentException.
+        if (portBytes.size() < 1 || portBytes.size() > 2) return Optional.empty();
         try {
             InetAddress addr = InetAddress.getByAddress(ipBytes.toArrayUnsafe());
             int port = portBytes.toInt();
