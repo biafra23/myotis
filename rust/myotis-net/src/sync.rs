@@ -218,7 +218,9 @@ pub struct SyncStatus {
 }
 
 impl SyncStatus {
-    fn initial() -> Self {
+    /// The pre-start snapshot (all zero, `Starting`). Public so the engine crate
+    /// can render a not-yet-started handle's status without a live `SyncHandle`.
+    pub fn initial() -> Self {
         Self {
             state: SyncState::Starting,
             finalized_slot: 0,

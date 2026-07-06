@@ -2060,8 +2060,10 @@ version = "0.1.0"
 dependencies = [
  "jni",
  "myotis-consensus",
+ "myotis-net",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

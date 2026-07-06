@@ -23,7 +23,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 1;
+    static final int EXPECTED_ABI_VERSION = 2;
 
     private static final boolean AVAILABLE = load();
 
@@ -70,4 +70,28 @@ final class RustEngineNative {
 
     /** Canonical name for a name/alias, or null when unknown. */
     static native String nativeCanonicalNetworkName(String nameOrAlias);
+
+    // ---- Hosting surface (ABI 2). See RustChainHandle / RustMyotisEngine. ----
+
+    /**
+     * Allocate a not-yet-started handle for {@code network} (R1: mainnet only).
+     * Returns the handle id (≥ 1), or a negative sentinel: -1 for an unknown name /
+     * runtime-init failure, -2 for a canonical-but-not-mainnet network. Any value
+     * {@code < 0} is a failure ({@link RustMyotisEngine#create} pre-checks mainnet,
+     * so it only ever observes -1). The Rust side owns the tokio runtime the handle
+     * runs on.
+     */
+    static native long nativeCreate(String network, String dataDir);
+
+    /** Start the sync loop for a created handle. True on success. */
+    static native boolean nativeStart(long handle);
+
+    /**
+     * One handle's status as a JSON object (camelCase keys — see RustChainHandle),
+     * or {@code "{}"} for an unknown handle. Null only on an OOM-class JNI failure.
+     */
+    static native String nativeStatusJson(long handle);
+
+    /** Remove and shut down a handle's sync loop. No-op for an unknown id. */
+    static native void nativeStop(long handle);
 }

@@ -11,6 +11,12 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 myotis-consensus = { path = "../myotis-consensus" }
+# The consensus-layer I/O + light-client sync loop. The engine OWNS the tokio
+# runtime that drives it (the JNI natives are called from JVM threads with no
+# runtime of their own) — this is the only crate that pulls in tokio/libp2p; the
+# consensus crate stays sans-I/O.
+myotis-net = { path = "../myotis-net" }
+tokio = { version = "=1.52.3", features = ["rt-multi-thread"] }
 jni = { version = "0.21", default-features = false }
 # Compound values cross the JNI boundary as JSON (hand-JNI + JSON decision —
 # docs/reimplementation/05). Schemas are pinned by golden tests on both sides.

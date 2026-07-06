@@ -2,18 +2,23 @@
 //! JVM via hand-JNI (compound records cross as JSON — see the phase-1 plan and
 //! docs/reimplementation/05).
 //!
-//! R0 (this stage): the network CATALOG is answered from Rust — `nativeInit` (ABI
-//! handshake), `nativeAvailableNetworksJson`, `nativeCanonicalNetworkName`. Hosting
-//! (`create`/`start`) stays Java-side until the consensus crate lands (PR 4-6);
-//! `RustMyotisEngine.create()` fails with a named error until then.
+//! R1 (this stage): the network CATALOG is answered from Rust (`nativeInit` ABI
+//! handshake, `nativeAvailableNetworksJson`, `nativeCanonicalNetworkName`) AND the
+//! engine can HOST mainnet — `nativeCreate`/`nativeStart`/`nativeStatusJson`/
+//! `nativeStop` drive a `myotis_net::SyncHandle` (the light-client sync loop) on a
+//! tokio runtime this crate owns (see `host`). R1 is CL-only + mainnet-only; Gnosis
+//! and the EL surface land later.
 
 pub mod catalog;
+mod host;
 
 /// Bumped whenever the JNI surface changes shape. Checked by the Java wrapper's
 /// availability probe (`nativeInit`) before any other native call — a stale .so
 /// on the library path makes the Rust engine report "unavailable" instead of
 /// crashing on a missing/renamed symbol.
-pub const ABI_VERSION: i32 = 1;
+///
+/// v2: added the hosting surface (nativeCreate/Start/StatusJson/Stop).
+pub const ABI_VERSION: i32 = 2;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
@@ -21,8 +26,18 @@ pub use myotis_consensus::bls_dst;
 
 mod jni_shim {
     use jni::objects::{JClass, JString};
-    use jni::sys::{jint, jstring};
+    use jni::sys::{jboolean, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
     use jni::JNIEnv;
+
+    /// Read a JString into a Rust String, or `None` for null / a JNI error.
+    /// Panic-free (the workspace is `panic = "abort"`; a panic here aborts the
+    /// JVM): every failure path returns None instead of unwrapping.
+    fn read_string(env: &mut JNIEnv, s: &JString) -> Option<String> {
+        if s.is_null() {
+            return None;
+        }
+        env.get_string(s).ok().map(Into::into)
+    }
 
     /// `RustEngineNative.nativeInit()` — the availability + ABI handshake.
     #[no_mangle]
@@ -71,5 +86,77 @@ mod jni_shim {
             },
             None => std::ptr::null_mut(),
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Hosting surface (ABI 2). Each native is panic-free by construction: the
+    // workspace builds with `panic = "abort"`, so `catch_unwind` cannot catch a
+    // panic here — a panic would abort the JVM. The `host` module functions
+    // never unwrap/index on runtime state, and these shims only touch JNI values
+    // through fallible `read_string` + sentinel returns.
+    // ---------------------------------------------------------------------
+
+    /// `RustEngineNative.nativeCreate(String network, String dataDir)` — allocate
+    /// a not-yet-started handle id. Returns the id (≥ 1), or a negative sentinel:
+    /// -1 (`CREATE_FAILED`) for an unknown name / runtime-init failure, -2
+    /// (`UNSUPPORTED_NETWORK`) for a canonical-but-not-mainnet network. Any `< 0`
+    /// is a failure the Java side turns into a named EngineException.
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeCreate(
+        mut env: JNIEnv,
+        _class: JClass,
+        network: JString,
+        data_dir: JString,
+    ) -> jlong {
+        let Some(network) = read_string(&mut env, &network) else {
+            return -1;
+        };
+        // dataDir is optional at the native layer (the CL-only R1 sync loop keeps
+        // no on-disk state yet); a null/garbage value must not crash the JVM.
+        let data_dir = read_string(&mut env, &data_dir).unwrap_or_default();
+        crate::host::create(&network, &data_dir)
+    }
+
+    /// `RustEngineNative.nativeStart(long handle)` — start the sync loop. True on
+    /// success; false for an unknown / already-running handle or a start error.
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeStart(
+        _env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+    ) -> jboolean {
+        if crate::host::start(handle) {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
+    }
+
+    /// `RustEngineNative.nativeStatusJson(long handle)` — one handle's status as a
+    /// JSON object (see host::status_object), or `"{}"` for an unknown handle.
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeStatusJson(
+        env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+    ) -> jstring {
+        let json = crate::host::status_json(handle);
+        match env.new_string(json) {
+            Ok(s) => s.into_raw(),
+            // OOM-class failure: null. The Java wrapper treats a null status as a
+            // not-running handle rather than crashing.
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// `RustEngineNative.nativeStop(long handle)` — remove + shut down the sync
+    /// loop. No-op for an unknown id.
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeStop(
+        _env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+    ) {
+        crate::host::stop(handle);
     }
 }

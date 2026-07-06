@@ -1,5 +1,6 @@
 package io.myotis.engines;
 
+import io.myotis.api.EngineConfig;
 import io.myotis.api.EngineException;
 import io.myotis.node.api.JavaMyotisEngine;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
@@ -49,11 +50,21 @@ class RustCatalogParityTest {
     }
 
     @Test
-    void createFailsWithNamedR0Error() {
+    void createRejectsNullConfig() {
         RustMyotisEngine rust = new RustMyotisEngine();
+        assertThrows(EngineException.class, () -> rust.create(null, null));
+    }
+
+    @Test
+    void createRejectsNonMainnet() {
+        // R1 hosts mainnet only; a canonical-but-unsupported network is a named
+        // EngineException (auto mode falls back to Java on it).
+        RustMyotisEngine rust = new RustMyotisEngine();
+        EngineConfig cfg = new EngineConfig(
+                "gnosis", 0, 0, 0, null, false, 0, true, "/tmp/myotis-test");
         EngineException e = assertThrows(EngineException.class,
-                () -> rust.create(null, null));
-        assertEquals(true, e.getMessage().contains("R0"),
+                () -> rust.create(cfg, null));
+        assertEquals(true, e.getMessage().contains("mainnet only"),
                 "unexpected message: " + e.getMessage());
     }
 }
