@@ -2215,12 +2215,14 @@ public class BeaconLightClient implements AutoCloseable {
         }
     }
 
-    /** peerId (or the full multiaddr when it has no /p2p/ component) → time of the
+    /** peerId (or the full multiaddr when it has no /p2p/ component) → nanoTime of the
      *  last successful light-client response. Backs {@link #recentlyServedPeerCount()};
-     *  pruned on read. */
+     *  pruned on both read and write so it stays bounded even when nothing polls status.
+     *  nanoTime, not currentTimeMillis: an NTP step / user clock change must not empty
+     *  or inflate the window. */
     private final java.util.concurrent.ConcurrentHashMap<String, Long> recentServes =
             new java.util.concurrent.ConcurrentHashMap<>();
-    private static final long SERVED_WINDOW_MS = 60_000;
+    private static final long SERVED_WINDOW_NANOS = 60_000_000_000L;
 
     /**
      * Distinct peers that successfully served a light-client response (bootstrap,
@@ -2229,15 +2231,26 @@ public class BeaconLightClient implements AutoCloseable {
      * count — is the "is anyone feeding us updates?" signal status surfaces show.
      */
     public int recentlyServedPeerCount() {
-        long cutoff = System.currentTimeMillis() - SERVED_WINDOW_MS;
-        recentServes.values().removeIf(t -> t < cutoff);
+        pruneRecentServes();
         return recentServes.size();
+    }
+
+    private void pruneRecentServes() {
+        long cutoff = System.nanoTime() - SERVED_WINDOW_NANOS;
+        // Two-arg remove, not values().removeIf: Android's libcore CHM (< API 33) falls
+        // back to iterator removal there, which could drop an entry a concurrent
+        // notifyPeerSuccess just refreshed.
+        for (var e : recentServes.entrySet()) {
+            Long t = e.getValue();
+            if (t - cutoff < 0) recentServes.remove(e.getKey(), t);
+        }
     }
 
     private void notifyPeerSuccess(String peer) {
         if (peer != null) {
             String pid = peerIdOf(peer);
-            recentServes.put(pid != null ? pid : peer, System.currentTimeMillis());
+            recentServes.put(pid != null ? pid : peer, System.nanoTime());
+            pruneRecentServes();
         }
         if (onPeerSuccess != null) {
             try {
