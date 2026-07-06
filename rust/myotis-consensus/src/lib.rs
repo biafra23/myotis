@@ -12,6 +12,7 @@
 //! This is a pure-Rust library crate — no JNI here; the JVM boundary lives in
 //! `myotis-engine`.
 
+pub mod snapshot;
 pub mod spec;
 pub mod ssz;
 pub mod store;

@@ -105,6 +105,36 @@ impl LightClientStore {
     pub fn current_period(&self) -> u64 {
         self.current_sync_committee_period
     }
+
+    /// The persistable verified state, or `None` until the store is initialized
+    /// (mirrors the Java `LightClientStore.snapshot()`). The optimistic header
+    /// falls back to the finalized one so a just-bootstrapped store snapshots.
+    pub fn snapshot(&self) -> Option<crate::snapshot::StoreSnapshot> {
+        let finalized = self.finalized_header.as_ref()?;
+        let current = self.current_sync_committee.as_ref()?;
+        Some(crate::snapshot::StoreSnapshot {
+            finalized_header: finalized.clone(),
+            optimistic_header: self.optimistic_header.as_ref().unwrap_or(finalized).clone(),
+            current_sync_committee: current.clone(),
+            next_sync_committee: self.next_sync_committee.clone(),
+            finalized_slot: self.finalized_slot,
+            optimistic_slot: self.optimistic_slot,
+            current_sync_committee_period: self.current_sync_committee_period,
+        })
+    }
+
+    /// Restore a previously persisted (BLS-verified when written) state —
+    /// the resume path that replaces bootstrap-from-checkpoint. Mirrors the
+    /// Java `LightClientStore.restore(snapshot)`.
+    pub fn restore(&mut self, s: crate::snapshot::StoreSnapshot) {
+        self.finalized_header = Some(s.finalized_header);
+        self.optimistic_header = Some(s.optimistic_header);
+        self.current_sync_committee = Some(s.current_sync_committee);
+        self.next_sync_committee = s.next_sync_committee;
+        self.finalized_slot = s.finalized_slot;
+        self.optimistic_slot = s.optimistic_slot;
+        self.current_sync_committee_period = s.current_sync_committee_period;
+    }
 }
 
 /// Processes updates against a store — Rust twin of `LightClientProcessor` (minus

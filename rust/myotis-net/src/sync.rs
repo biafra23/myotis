@@ -58,6 +58,13 @@ pub struct ChainConfig {
     pub bootstrap_enrs: Vec<String>,
     /// discv5 UDP listen port (0 = OS-assigned; use when running next to a Java daemon).
     pub discv5_port: u16,
+    /// Persisted verified-store snapshot path (`sync-state[-net].snapshot`) —
+    /// the SAME file, SAME format ("LCSS" v1) as the Java engine, so state
+    /// survives restarts and engine switches. None = no persistence.
+    pub snapshot_path: Option<std::path::PathBuf>,
+    /// CL peer cache path (`cl-peers[-net].cache`) — same file/format as the
+    /// Java hosts' caches. None = no persistence.
+    pub cl_peer_cache_path: Option<std::path::PathBuf>,
 }
 
 impl ChainConfig {
@@ -90,6 +97,8 @@ impl ChainConfig {
             static_peers: MAINNET_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: MAINNET_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
+            snapshot_path: None,
+            cl_peer_cache_path: None,
         }
     }
 
@@ -533,6 +542,26 @@ async fn run_sync(
         config.genesis_validators_root,
     );
 
+    // CL peer cache — the SAME file the Java hosts maintain, so proven LC
+    // servers survive restarts and engine switches.
+    let mut clcache = config
+        .cl_peer_cache_path
+        .clone()
+        .map(crate::clcache::ClPeerCache::load)
+        .unwrap_or_else(crate::clcache::ClPeerCache::disabled);
+    for cached in clcache.peers() {
+        if let Some(p) = parse_static_peer(&cached) {
+            let (id, addr) = (p.id, p.addr.clone());
+            pool.add(id, addr);
+            if clcache.is_nolc(&cached) {
+                pool.mark_no_lc_updates(id);
+            }
+            if clcache.served_range(&cached).is_some() {
+                pool.mark_proven(id);
+            }
+        }
+    }
+
     let mut status = SyncStatus::initial();
     status.state = SyncState::Bootstrapping;
     let _ = status_tx.send(status.clone());
@@ -542,26 +571,84 @@ async fn run_sync(
     let mut staged_updates: std::collections::BTreeMap<u64, Vec<u8>> =
         std::collections::BTreeMap::new();
 
-    // Phase 1: bootstrap from the embedded checkpoint.
-    loop {
-        drain_discovered(&mut peer_rx, &mut pool);
-        if try_bootstrap(&config, &client, &mut pool, &mut processor).await {
-            break;
+    // Resume from the persisted snapshot when it is bound to this chain AND
+    // strictly newer than the embedded checkpoint (the snapshot was produced
+    // from our own BLS-verified store, so resuming is strictly less long-range
+    // exposure than re-bootstrapping — same rule as the Java engine, which
+    // reads/writes the identical file). Anything else → fresh bootstrap. A
+    // restored store stays on probation (ResumeGuard) until one update
+    // BLS-verifies against it; see RESUME_REJECTS_MAX.
+    let checkpoint_period = spec::compute_sync_committee_period(config.checkpoint_slot);
+    let mut last_persisted_period = 0u64;
+    let mut resume = ResumeGuard::fresh();
+    if let Some(path) = &config.snapshot_path {
+        if let Ok(bytes) = std::fs::read(path) {
+            match myotis_consensus::snapshot::deserialize(&bytes, &config.genesis_validators_root) {
+                Some(snap) if snap.current_sync_committee_period > checkpoint_period => {
+                    last_persisted_period = snap.current_sync_committee_period;
+                    tracing::info!(period = snap.current_sync_committee_period,
+                        finalized_slot = snap.finalized_slot,
+                        "resumed from persisted snapshot — skipping bootstrap");
+                    processor.store.restore(snap);
+                    resume = ResumeGuard::resumed();
+                }
+                Some(_) => tracing::info!(
+                    "persisted snapshot not newer than the embedded checkpoint — bootstrapping fresh"),
+                None => tracing::warn!(
+                    "persisted snapshot unreadable/foreign — bootstrapping fresh"),
+            }
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
     }
-    refresh_local_status(&config, &processor, &local_status);
-    publish_status(&config, &client, &processor, &status_tx).await;
 
-    // Phase 1b + steady state: catch up when behind, poll finality every slot.
+    // One loop for all phases: bootstrap (when the store isn't initialized —
+    // fresh start OR after a poisoned resume was discarded), catch-up when
+    // behind, finality polling in steady state.
     loop {
         drain_discovered(&mut peer_rx, &mut pool);
+
+        if !processor.store.is_initialized() {
+            let bootstrapped =
+                try_bootstrap(&config, &client, &mut pool, &mut processor, &mut clcache).await;
+            clcache.flush(); // one write per attempt round, win or lose
+            if bootstrapped {
+                persist_snapshot(&config, &processor, &mut last_persisted_period);
+                refresh_local_status(&config, &processor, &local_status);
+                publish_status(&config, &client, &processor, &status_tx).await;
+            } else {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        }
 
         let wall_period = spec::compute_sync_committee_period(config.current_slot_estimate());
         if wall_period > processor.store.current_period() {
-            catch_up(&config, &client, &mut pool, &mut processor, &status_tx, &mut peer_rx,
-                &mut staged_updates)
+            let poisoned = catch_up(&config, &client, &mut pool, &mut processor, &status_tx,
+                &mut peer_rx, &mut staged_updates, &mut clcache, &mut resume)
                 .await;
+            // Batch-persist every cache verdict from the catch-up rounds in
+            // one write, OFF the per-peer hot path (review: no blocking I/O
+            // inside the parallel peer loop).
+            clcache.flush();
+            if poisoned {
+                // The restored snapshot can't verify anything (corrupt on
+                // disk, framing-valid): discard it and the store, and fall
+                // back to the embedded checkpoint — the trust anchor path.
+                tracing::warn!(rejects = RESUME_REJECTS_MAX,
+                    "restored snapshot failed verification repeatedly — discarding; \
+                     re-bootstrapping from the embedded checkpoint");
+                if let Some(path) = &config.snapshot_path {
+                    let _ = std::fs::remove_file(path);
+                }
+                processor.store = LightClientStore::new();
+                staged_updates.clear();
+                last_persisted_period = 0;
+                resume = ResumeGuard::fresh();
+                continue;
+            }
+            // Persist on period advance only (Java parity): the ~50 KiB
+            // committee snapshot is worth rewriting exactly when the committee
+            // moved, not on every finality tick.
+            persist_snapshot(&config, &processor, &mut last_persisted_period);
             refresh_local_status(&config, &processor, &local_status);
             publish_status(&config, &client, &processor, &status_tx).await;
             if spec::compute_sync_committee_period(config.current_slot_estimate())
@@ -575,13 +662,62 @@ async fn run_sync(
             }
         }
 
-        poll_finality(&client, &mut pool, &mut processor).await;
+        if poll_finality(&client, &mut pool, &mut processor, &mut clcache).await {
+            // A finality update verified against the (possibly restored)
+            // committee — the snapshot is genuine.
+            resume.confirm();
+        }
+        clcache.flush(); // batch any finality-round evictions into one write
+        // No-op unless the period advanced (force-rotate can move it here too).
+        persist_snapshot(&config, &processor, &mut last_persisted_period);
         refresh_local_status(&config, &processor, &local_status);
         publish_status(&config, &client, &processor, &status_tx).await;
 
         tokio::time::sleep(Duration::from_secs(config.seconds_per_slot)).await;
     }
     // No code after the loop: the task ends via SyncHandle::stop (abort).
+}
+
+/// Persist the verified store when its committee period advanced past the last
+/// write (Java `persistSnapshot` throttle — so this synchronous ~50 KiB write
+/// runs at most once per ~27 h period, not per poll). Atomic temp+rename with
+/// a pid-suffixed temp name so an overlapping writer from another process
+/// (e.g. an engine switch mid-teardown) can't tear the temp file — renames
+/// stay atomic either way, last writer wins. Best-effort: a failed write
+/// costs a slower next start, never correctness. The Java `.roots` sidecar is
+/// deliberately left in place: stale entries are harmless (the Java client
+/// imports them before updateSyncState and simply ages them out), while a
+/// deleted sidecar would cost Java FILL_THRESHOLD extra finality polls to
+/// reach SYNCED after an engine switch back.
+fn persist_snapshot(
+    config: &ChainConfig,
+    processor: &LightClientProcessor,
+    last_persisted_period: &mut u64,
+) {
+    let Some(path) = &config.snapshot_path else { return };
+    let period = processor.store.current_period();
+    if period <= *last_persisted_period {
+        return;
+    }
+    let Some(snap) = processor.store.snapshot() else { return };
+    let bytes = myotis_consensus::snapshot::serialize(&snap, &config.genesis_validators_root);
+    let tmp = std::path::PathBuf::from(format!(
+        "{}.tmp.{}",
+        path.display(),
+        std::process::id()
+    ));
+    let ok = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, path));
+    match ok {
+        Ok(()) => {
+            tracing::info!(period, bytes = bytes.len(), "persisted sync-state snapshot");
+        }
+        // Give up until the NEXT period advance either way: a failing disk
+        // (full/read-only) would otherwise be retried every ~12 s poll cycle
+        // — repeated blocking I/O plus log spam — for a best-effort cache.
+        Err(e) => tracing::warn!(error = %e,
+            "snapshot write failed — retrying on the next period advance"),
+    }
+    *last_persisted_period = period;
 }
 
 fn drain_discovered(rx: &mut mpsc::Receiver<discovery::DiscoveredPeer>, pool: &mut PeerPool) {
@@ -603,6 +739,7 @@ async fn try_bootstrap(
     client: &ReqRespClient,
     pool: &mut PeerPool,
     processor: &mut LightClientProcessor,
+    clcache: &mut crate::clcache::ClPeerCache,
 ) -> bool {
     if pool.is_empty() {
         tracing::info!("bootstrap: no peers yet (waiting on discovery)");
@@ -675,11 +812,62 @@ async fn try_bootstrap(
             .store
             .initialize(bootstrap.header.clone(), bootstrap.current_sync_committee.clone());
         pool.mark_proven(peer);
+        if let Some(p) = peers.iter().find(|p| p.id == peer) {
+            clcache.record_bootstrap(
+                &format!("{}/p2p/{}", p.addr, p.id),
+                processor.store.current_period(),
+            );
+        }
         tracing::info!(peer = %peer, slot = bootstrap.header.beacon.slot,
             period = processor.store.current_period(), "bootstrap verified and applied");
         return true;
     }
     false
+}
+
+/// Consecutive verify-rejects after a snapshot resume before the restored
+/// state is declared poisoned and the store falls back to the embedded
+/// checkpoint. LCSS has no integrity checksum, so a bit-flipped-but-framing-
+/// valid snapshot (e.g. inside the ~49 KiB committee pubkeys) deserializes
+/// fine and then fails BLS on EVERY update; without this guard that wedges
+/// sync permanently (the period never advances, so the bad file is never
+/// overwritten and every restart re-resumes it). Only catch-up VERIFY rejects
+/// count — well-formed updates that failed BLS/Merkle against the restored
+/// committee (decode failures are excluded: malformed frames indict the peer,
+/// not our store). A bad peer serving valid-but-wrong updates can contribute
+/// rejects too, so the threshold trades a rare unnecessary re-bootstrap
+/// (self-correcting: the checkpoint path re-verifies everything) against a
+/// permanent wedge; any successful apply confirms the resume for good.
+const RESUME_REJECTS_MAX: u32 = 4;
+
+/// Tracks whether a snapshot-restored store has verified anything yet.
+/// Inert (never poisons) when the store bootstrapped fresh.
+struct ResumeGuard {
+    unconfirmed: bool,
+    rejects: u32,
+}
+
+impl ResumeGuard {
+    fn fresh() -> Self {
+        Self { unconfirmed: false, rejects: 0 }
+    }
+    fn resumed() -> Self {
+        Self { unconfirmed: true, rejects: 0 }
+    }
+    /// An update BLS-verified against the restored committee — the snapshot
+    /// is genuine; the guard goes inert.
+    fn confirm(&mut self) {
+        self.unconfirmed = false;
+        self.rejects = 0;
+    }
+    /// Count verify-rejects; true once the restored state is deemed poisoned.
+    fn poisoned(&mut self, rejects: u32) -> bool {
+        if !self.unconfirmed {
+            return false;
+        }
+        self.rejects += rejects;
+        self.rejects >= RESUME_REJECTS_MAX
+    }
 }
 
 /// Periods fetched per catch-up round (≤16 per the plan; the spec request cap
@@ -717,7 +905,9 @@ async fn catch_up(
     // caller so partial pipeline progress survives across catch_up calls.
     // Raw SSZ — everything is BLS/Merkle-verified at apply time, in order.
     staged: &mut std::collections::BTreeMap<u64, Vec<u8>>,
-) {
+    clcache: &mut crate::clcache::ClPeerCache,
+    resume: &mut ResumeGuard,
+) -> bool {
     let mut idle_rounds = 0u32;
     // Exponential pause after fruitless rounds: hammering the whole pool every
     // ~13 s is exactly what CL peer scoring penalizes, and it burns request
@@ -738,7 +928,7 @@ async fn catch_up(
         let committee_period = processor.store.current_period();
         if wall_period <= committee_period {
             tracing::info!(period = committee_period, "sync committee is current");
-            return;
+            return false;
         }
         *staged = staged.split_off(&committee_period); // drop already-passed periods
         let span = (wall_period - committee_period).min(UPDATES_BATCH_MAX);
@@ -749,7 +939,7 @@ async fn catch_up(
         let peers = pool.candidates(CATCHUP_FANOUT, true, true, &lc_servers);
         if peers.is_empty() {
             tracing::warn!("catch-up: no peers available — retrying after discovery");
-            return;
+            return false;
         }
 
         // Every peer gets the SAME (committee_period, span) request — the Java
@@ -797,10 +987,12 @@ async fn catch_up(
                         // Doesn't serve updates_by_range at all — skip in future
                         // batches (Java peersNoLcUpdates). Peer is alive, keep it.
                         pool.mark_no_lc_updates(peer.id);
+                        clcache.mark_nolc(&format!("{}/p2p/{}", peer.addr, peer.id));
                     } else if e != RequestError::Shutdown {
                         // Dial/timeout/connection-closed — count toward eviction
                         // so dead peers stop occupying MAX_POOL slots.
                         pool.note_failure(peer.id);
+                        clcache.mark_failure(&format!("{}/p2p/{}", peer.addr, peer.id));
                     }
                     tracing::debug!(peer = %peer.id, error = %e, "updates_by_range failed");
                     continue;
@@ -837,9 +1029,26 @@ async fn catch_up(
                 // often the only willing server in the pool, and the ~13 s
                 // round cadence sits at Lighthouse's ~1-per-10s quota anyway —
                 // the Java client re-asks its serving peer the same way.
-                applied += apply_staged_prefix(processor, staged, slot_estimate);
-                if applied > 0 {
-            empty_backoff = Duration::from_secs(0);
+                let before_period = processor.store.current_period();
+                let (applied_now, verify_rejects) =
+                    apply_staged_prefix(processor, staged, slot_estimate);
+                if verify_rejects > 0 && resume.poisoned(verify_rejects as u32) {
+                    return true; // restored snapshot can't verify anything — re-bootstrap
+                }
+                if applied_now > 0 {
+                    resume.confirm();
+                    // Only VERIFIED periods reach the shared cross-engine
+                    // cache: this range just BLS-verified and applied, and
+                    // this peer's response is what unblocked it (Java
+                    // applyCatchUpResponses records AFTER processUpdate the
+                    // same way — never before verification).
+                    clcache.record_served(
+                        &format!("{}/p2p/{}", peer.addr, peer.id),
+                        before_period,
+                        before_period + applied_now as u64 - 1,
+                    );
+                    applied += applied_now;
+                    empty_backoff = Duration::from_secs(0);
                     // The fastest serving peer won this round — abandon the
                     // stragglers (identical requests make them redundant) and
                     // start the next round from the advanced period.
@@ -873,7 +1082,7 @@ async fn catch_up(
             if idle_rounds >= CATCHUP_MAX_IDLE_ROUNDS {
                 tracing::warn!(period = processor.store.current_period(), idle_rounds,
                     "catch-up made no progress — returning to the poll loop");
-                return;
+                return false;
             }
             // Grow the pre-round pause 5s → 60s: rapid-fire empty rounds burn
             // server quota and our own peer score; a quiet minute lets rate
@@ -895,12 +1104,18 @@ async fn catch_up(
 /// wall-clock estimate after each — Java `applyCatchUpResponses`). A chunk
 /// that fails decode/verify is dropped from the buffer so the next round
 /// refetches that period from a different peer.
+/// Returns `(applied, verify_rejects)` — verify_rejects counts ONLY updates
+/// that decoded fine but failed BLS/Merkle verification (`process_update` →
+/// false): that is the resume guard's poison signal, since a corrupt restored
+/// committee rejects every well-formed update. Decode failures are NOT
+/// counted — a peer sending malformed frames says nothing about our store.
 fn apply_staged_prefix(
     processor: &mut LightClientProcessor,
     staged: &mut std::collections::BTreeMap<u64, Vec<u8>>,
     slot_estimate: u64,
-) -> usize {
+) -> (usize, usize) {
     let mut applied = 0usize;
+    let mut verify_rejects = 0usize;
     while let Some(chunk) = staged.remove(&processor.store.current_period()) {
         let target_period = processor.store.current_period();
         match LightClientUpdate::decode(&chunk) {
@@ -913,6 +1128,7 @@ fn apply_staged_prefix(
                         period = processor.store.current_period(),
                         "catch-up update applied");
                 } else {
+                    verify_rejects += 1;
                     tracing::debug!(target_period,
                         finalized_slot = update.finalized_header.beacon.slot,
                         "catch-up update rejected");
@@ -925,16 +1141,19 @@ fn apply_staged_prefix(
             }
         }
     }
-    applied
+    (applied, verify_rejects)
 }
 
 /// One finality-poll pass: try peers until one update verifies and applies —
 /// the Java `pollFinalityUpdate` steady-state branch (POLL_FINALITY_PEER_LIMIT=16).
+/// Returns true when an update verified AND applied (the resume guard's
+/// confirmation signal).
 async fn poll_finality(
     client: &ReqRespClient,
     pool: &mut PeerPool,
     processor: &mut LightClientProcessor,
-) {
+    clcache: &mut crate::clcache::ClPeerCache,
+) -> bool {
     let lc_servers = client.lc_update_servers().await;
     let peers = pool.candidates(16, false, false, &lc_servers);
     // Parallel fan-out; first update that verifies AND advances wins.
@@ -959,6 +1178,7 @@ async fn poll_finality(
             Err(e) => {
                 if e != RequestError::Shutdown && e != RequestError::UnsupportedProtocol {
                     pool.note_failure(peer.id);
+                    clcache.mark_failure(&format!("{}/p2p/{}", peer.addr, peer.id));
                 }
                 tracing::debug!(peer = %peer.id, error = %e, "finality_update request failed");
                 continue;
@@ -974,15 +1194,17 @@ async fn poll_finality(
         match LightClientFinalityUpdate::decode(&ssz_payload) {
             Ok(update) => {
                 // Answered a finality request → alive and useful: clear its
-                // failure count so a later blip doesn't drop it prematurely.
+                // failure count so a later blip doesn't drop it prematurely
+                // (cache streak too — Java resets on any successful serve).
                 pool.mark_proven(peer.id);
+                clcache.note_success(&format!("{}/p2p/{}", peer.addr, peer.id));
                 if processor.process_finality_update(&update) {
                     tracing::info!(peer = %peer.id,
                         finalized_slot = processor.store.finalized_slot(),
                         optimistic_slot = processor.store.optimistic_slot(),
                         period = processor.store.current_period(),
                         "finality update applied");
-                    return;
+                    return true;
                 }
                 tracing::debug!(peer = %peer.id,
                     finalized_slot = update.finalized_header.beacon.slot,
@@ -991,6 +1213,7 @@ async fn poll_finality(
             Err(e) => tracing::debug!(peer = %peer.id, error = %e, "finality update decode failed"),
         }
     }
+    false
 }
 
 /// Keep the Status we serve to peers in step with verified store state

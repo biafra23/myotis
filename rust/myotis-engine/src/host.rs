@@ -86,12 +86,12 @@ fn config_for(network_name: &str) -> Option<ChainConfig> {
 /// `nativeCreate`: allocate an id for a not-yet-started mainnet chain. Returns the
 /// id (`>= 1`), `UNSUPPORTED_NETWORK` (-2) for a canonical-but-not-mainnet network,
 /// or `CREATE_FAILED` (-1) for an unknown name / unavailable runtime.
-pub fn create(network_name: &str, _data_dir: &str) -> i64 {
+pub fn create(network_name: &str, data_dir: &str) -> i64 {
     let Some(engine) = engine() else {
         return CREATE_FAILED;
     };
     // Unknown network → CREATE_FAILED; canonical-but-not-mainnet → UNSUPPORTED.
-    let config = match crate::catalog::canonical_network_name(network_name) {
+    let mut config = match crate::catalog::canonical_network_name(network_name) {
         None => return CREATE_FAILED,
         Some("mainnet") => match config_for(network_name) {
             Some(c) => c,
@@ -99,6 +99,20 @@ pub fn create(network_name: &str, _data_dir: &str) -> i64 {
         },
         Some(_) => return UNSUPPORTED_NETWORK,
     };
+    // Persistence lives under the host's dataDir, in the SAME files (names and
+    // formats) the Java hosts/engine maintain — `sync-state[-net].snapshot` and
+    // `cl-peers[-net].cache`, mainnet keeping the bare name — so verified sync
+    // state and proven LC servers survive restarts AND engine switches.
+    if !data_dir.is_empty() {
+        let suffix = if config.name == "mainnet" {
+            String::new()
+        } else {
+            format!("-{}", config.name)
+        };
+        let dir = std::path::Path::new(data_dir);
+        config.snapshot_path = Some(dir.join(format!("sync-state{suffix}.snapshot")));
+        config.cl_peer_cache_path = Some(dir.join(format!("cl-peers{suffix}.cache")));
+    }
     let id = engine.next_id.fetch_add(1, Ordering::Relaxed);
     match engine.handles.lock() {
         Ok(mut map) => {
