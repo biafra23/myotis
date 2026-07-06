@@ -239,6 +239,11 @@ class DesktopNodeController(
 
     private fun snapshotOf(handle: ChainHandle): NodeSnapshot {
         val s = handle.status()
+        // Live counts parsed from the cache FILES (the cross-engine truth; the
+        // Rust engine writes them directly). Memoized on (mtime, size).
+        val suffix = if (s.network() == "mainnet") "" else "-${s.network()}"
+        val clCache = CacheFileStats.cl(dataDir.resolve("cl-peers$suffix.cache"))
+        val elCache = CacheFileStats.el(dataDir.resolve("peers$suffix.cache"))
         // CL peer counts live on the beacon-status surface (parity with Android's
         // NodeService.snapshotOf, which reads both).
         val bs = handle.beaconStatus()
@@ -252,6 +257,12 @@ class DesktopNodeController(
             snapServingPeers = s.snapServingPeers(),
             clConnectedPeers = bs.connectedPeers(),
             clServedPeersLastMin = bs.servedPeersLastMinute(),
+            clCachedPeers = clCache.total,
+            clCachedProven = clCache.proven,
+            clCachedNolc = clCache.nolc,
+            elCachedPeers = elCache.total,
+            elCachedSnapOk = elCache.snapOk,
+            elCachedSnapBad = elCache.snapBad,
             discoveredPeers = s.discoveredPeers(),
             backedOffPeers = s.backedOffPeers(),
             blacklistedPeers = s.blacklistedPeers(),

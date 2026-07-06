@@ -534,6 +534,10 @@ private fun StatusView(s: NodeSnapshot) {
         StatusRow("EL block", s.executionBlockNumber.toString())
         StatusRow("CL peers", "served ${s.clServedPeersLastMin}/min, con ${s.clConnectedPeers}")
         StatusRow("EL peers", "ready ${s.readyPeers}, snap ${s.snapPeers}, serving ${s.snapServingPeers}")
+        // Cache rows: "proven" (CL) / "snap-ok" (EL) predict how fast the NEXT
+        // cold start finds servers — the cache learning is visible live.
+        StatusRow("CL cache", "${s.clCachedPeers} (proven ${s.clCachedProven}, nolc ${s.clCachedNolc})")
+        StatusRow("EL cache", "${s.elCachedPeers} (snap-ok ${s.elCachedSnapOk}, snap-bad ${s.elCachedSnapBad})")
         StatusRow("Discovered", s.discoveredPeers.toString())
         StatusRow("Discv5 peers", s.discv5Peers.toString())
         StatusRow("In backoff", s.backedOffPeers.toString())

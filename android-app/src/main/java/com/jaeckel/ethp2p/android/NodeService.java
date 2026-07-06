@@ -495,7 +495,9 @@ public final class NodeService extends Service {
                                       // this is what head builds / heavy confirm screens use.
                                       // Can be far below snapPeers when peers bench out, which
                                       // is what made "54 snap peers but amber/stuck" so confusing.
-            int cachedPeers,
+            int cachedPeers,           // EL peers in peers[-net].cache (live file count)
+            int elCachedSnapOk,        // …of which snap-serving confirmed (snapok token)
+            int elCachedSnapBad,       // …of which snap-serving denied (snapbad token)
             int attemptedPeers,
             int backedOffPeers,
             int blacklistedPeers,
@@ -510,7 +512,9 @@ public final class NodeService extends Service {
                                       // response in the last 60s — CL connections are
                                       // short-lived, so clPeersConnected is usually 0
                                       // and THIS is the "are we being fed?" signal
-            int clPeersCached,
+            int clPeersCached,         // CL peers in cl-peers[-net].cache (live file count)
+            int clCachedProven,        // …of which proven catch-up servers (served-range token)
+            int clCachedNolc,          // …of which known non-LC (nolc token)
             long finalizedSlot,
             long executionBlockNumber,
             String executionBlockHashHex, // null until first finality update
@@ -1098,8 +1102,11 @@ public final class NodeService extends Service {
         boolean running = RUNNING.get();
         StatusSnapshot s = h.status();
         BeaconStatus bs = h.beaconStatus();
-        int cachedEl = cachedElCounts.getOrDefault(network, 0);
-        int cachedCl = cachedClCounts.getOrDefault(network, 0);
+        // Live counts from the cache FILES (mtime-memoized): the files are the
+        // cross-engine truth — the Rust engine writes them directly, so the
+        // boot-time cachedElCounts/cachedClCounts maps go stale mid-run.
+        CacheFileStats.ElStats elCache = CacheFileStats.el(netCacheFor(network, "peers", ".cache").toPath());
+        CacheFileStats.ClStats clCache = CacheFileStats.cl(netCacheFor(network, "cl-peers", ".cache").toPath());
         String beaconState = bs.state() == BeaconState.STARTING ? "STOPPED" : bs.state().name();
         // Catch-up progress: preserve the historical -1-until-known convention (the engine
         // API defaults these to 0 pre-beacon) for the UI's determinate progress bar.
@@ -1108,20 +1115,22 @@ public final class NodeService extends Service {
         long syncTarget = preBeacon ? -1 : s.syncTargetPeriod();
         if (!running || !s.running()) {
             return new Snapshot(running, startTimeMs, 0, 0, 0, 0, /*snapServing*/0,
-                    cachedEl, s.attemptedDials(), s.backedOffPeers(),
+                    elCache.total(), elCache.snapOk(), elCache.snapBad(), s.attemptedDials(), s.backedOffPeers(),
                     s.blacklistedPeers(), s.discv5TableSize(), 0,
                     beaconState, bs.bootstrapped(), bs.connectedPeers(), (int) bs.lightClientPeers(),
-                    bs.servedPeersLastMinute(), cachedCl, bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
+                    bs.servedPeersLastMinute(), clCache.total(), clCache.proven(), clCache.nolc(),
+                    bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
                     s.syncStartPeriod(), syncCurrent, syncTarget,
                     Long.MAX_VALUE, List.of(), network);
         }
         return new Snapshot(true, startTimeMs,
                 s.discoveredPeers(), s.connectedPeers(), s.readyPeers(),
                 s.snapPeers(), s.snapServingPeers(),
-                cachedEl, s.attemptedDials(), s.backedOffPeers(),
+                elCache.total(), elCache.snapOk(), elCache.snapBad(), s.attemptedDials(), s.backedOffPeers(),
                 s.blacklistedPeers(), s.discv5TableSize(), 0,
                 beaconState, bs.bootstrapped(), bs.connectedPeers(), (int) bs.lightClientPeers(),
-                bs.servedPeersLastMinute(), cachedCl, bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
+                bs.servedPeersLastMinute(), clCache.total(), clCache.proven(), clCache.nolc(),
+                bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
                 s.syncStartPeriod(), syncCurrent, syncTarget,
                 s.verifiedHeadAgeMs(), s.readyPeerList(), network);
     }
