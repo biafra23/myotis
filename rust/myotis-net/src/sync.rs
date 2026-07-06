@@ -349,7 +349,8 @@ struct PeerPool {
     cooldown_until: HashMap<PeerId, Instant>,
     /// Last successful serve per peer, for the served-last-minute health
     /// metric. Deliberately NOT cleared by evict(): "served in the last 60 s"
-    /// stays true of an evicted peer; entries prune inside served_last_minute.
+    /// stays true of an evicted peer; entries prune inside note_served (the
+    /// &mut site), so the map stays bounded by serve activity.
     recent_serves: HashMap<PeerId, Instant>,
     /// Consecutive terminal-failure count per peer, for eviction. Reset on any
     /// success. Without eviction the MAX_POOL cap fills with dead peers and
