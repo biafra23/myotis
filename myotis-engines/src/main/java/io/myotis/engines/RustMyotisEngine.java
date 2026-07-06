@@ -13,17 +13,24 @@ import io.myotis.api.ports.EnginePorts;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * The Rust engine behind the {@link MyotisEngine} contract, via {@link RustEngineNative}.
  *
- * <p>R0 (current stage): the network CATALOG is answered from Rust —
- * {@link #availableNetworks()} and {@link #canonicalNetworkName} are real; hosting is not
- * implemented yet, so {@link #create} fails with a named {@link EngineException} (the
- * selector's {@code auto} mode falls back to the Java engine on that failure). Hosting
- * arrives with the Rust consensus crate (plan PRs 4–6).
+ * <p>R1 (current stage): the network CATALOG is answered from Rust
+ * ({@link #availableNetworks()}, {@link #canonicalNetworkName}) AND the engine can HOST
+ * mainnet — {@link #create} returns a {@link RustChainHandle} driving the Rust
+ * light-client sync loop. R1 is CL-only + mainnet-only: any other (still-canonical)
+ * network is rejected with a named {@link EngineException}, on which the selector's
+ * {@code auto} mode falls back to the Java engine. The EL surface (verified reads,
+ * proofs) lands later.
  */
 public final class RustMyotisEngine implements MyotisEngine {
+
+    /** Networks this engine currently hosts, keyed by canonical name. */
+    private final Map<String, RustChainHandle> hosted = new ConcurrentHashMap<>();
 
     /** True when libmyotis_engine loaded and passed the ABI handshake. */
     public static boolean isAvailable() {
@@ -85,27 +92,51 @@ public final class RustMyotisEngine implements MyotisEngine {
 
     @Override
     public ChainHandle create(EngineConfig config, EnginePorts ports) {
-        throw new EngineException("the Rust engine cannot host networks yet (R0: catalog only)"
-                + " — use myotis.engine=java, or auto to fall back automatically");
+        if (config == null) throw new EngineException("engine config is required");
+        String canonical = canonicalNetworkName(config.networkName());
+        if (!"mainnet".equals(canonical)) {
+            // R1 hosts mainnet only; auto mode falls back to Java on this.
+            throw new EngineException("the R1 Rust engine hosts mainnet only (got: "
+                    + canonical + ")");
+        }
+        long id = RustEngineNative.nativeCreate(canonical, config.dataDir());
+        if (id < 0) {
+            // On this path the network is always mainnet (checked above), so id < 0
+            // means the Rust runtime could not initialize. Named so auto mode falls back.
+            throw new EngineException("the Rust engine could not initialize the runtime for "
+                    + canonical);
+        }
+        RustChainHandle handle = new RustChainHandle(id, canonical, 1L);
+        // Atomic claim (mirrors JavaMyotisEngine.putIfAbsent): reject a re-create rather
+        // than orphaning the previous handle's native entry. On a lost race, release the
+        // native handle we just allocated so it doesn't leak a tokio/libp2p host.
+        if (hosted.putIfAbsent(canonical, handle) != null) {
+            RustEngineNative.nativeStop(id);
+            throw new EngineException("network already hosted: " + canonical);
+        }
+        return handle;
     }
 
     @Override
     public ChainHandle get(String networkName) {
-        return null;
+        return hosted.get(networkName);
     }
 
     @Override
     public List<String> hostedNetworks() {
-        return List.of();
+        return new ArrayList<>(hosted.keySet());
     }
 
     @Override
     public void stop(String networkName) {
-        // nothing hosted in R0
+        RustChainHandle handle = hosted.remove(networkName);
+        if (handle != null) handle.stop();
     }
 
     @Override
     public void shutdownAll() {
-        // nothing hosted in R0
+        for (String name : new ArrayList<>(hosted.keySet())) {
+            stop(name);
+        }
     }
 }
