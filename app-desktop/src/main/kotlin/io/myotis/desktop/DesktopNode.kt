@@ -242,7 +242,7 @@ class DesktopNodeController(
             snapPeers = s.snapPeers(),
             snapServingPeers = s.snapServingPeers(),
             clConnectedPeers = bs.connectedPeers(),
-            clLightClientPeers = bs.lightClientPeers().coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+            clServedPeersLastMin = bs.servedPeersLastMinute(),
             discoveredPeers = s.discoveredPeers(),
             backedOffPeers = s.backedOffPeers(),
             blacklistedPeers = s.blacklistedPeers(),

@@ -194,6 +194,7 @@ public final class JavaChainHandle implements ChainHandle {
                 stack.discV5() != null ? stack.discV5().liveNodeCount() : 0,
                 peers.size(),
                 lightClientPeers,
+                blc != null ? blc.recentlyServedPeerCount() : 0,
                 finalizedSlot,
                 bss != null ? bss.getOptimisticSlot() : 0L,
                 finalizedSlot / BeaconChainSpec.SLOTS_PER_SYNC_COMMITTEE_PERIOD,

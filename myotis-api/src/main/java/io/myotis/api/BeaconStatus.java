@@ -13,6 +13,11 @@ import java.util.List;
  * @param discv5TableSize       live nodes in the CL discv5 routing table
  * @param connectedPeers        connected CL libp2p peers
  * @param lightClientPeers      of those, peers serving the light_client protocols
+ * @param servedPeersLastMinute distinct peers that successfully served a light-client
+ *                              response (bootstrap, updates-by-range, finality update)
+ *                              within the last 60 s — the "is anyone feeding us
+ *                              updates?" signal (CL connections are short-lived, so
+ *                              the instantaneous count above is usually 0)
  * @param finalizedSlot         finalized beacon slot (0 while SYNCING)
  * @param optimisticSlot        optimistic beacon slot (0 while SYNCING)
  * @param finalizedPeriod       period of the finalized slot
@@ -31,6 +36,7 @@ public record BeaconStatus(
         int discv5TableSize,
         int connectedPeers,
         long lightClientPeers,
+        int servedPeersLastMinute,
         long finalizedSlot,
         long optimisticSlot,
         long finalizedPeriod,
