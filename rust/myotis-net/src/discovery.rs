@@ -7,11 +7,23 @@
 
 use std::collections::HashSet;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use discv5::enr::{CombinedKey, CombinedPublicKey, EnrPublicKey, NodeId};
 use discv5::{ConfigBuilder, Discv5, Enr, ListenConfig};
 use libp2p::{Multiaddr, PeerId};
 use tokio::sync::mpsc;
+
+/// Consecutive lookup rounds with zero live table entries before the
+/// bootstrap ENRs are re-added — the Rust twin of the Java DiscV5Service
+/// empty-table re-seed (PR #135): the sigp crate seeds bootnodes exactly once
+/// at spawn; if its bucket maintenance evicts them and the table drains,
+/// find_node has nobody to query and nothing ever re-adds the bootnodes —
+/// a terminal wedge without this. ~60 s at the 15 s lookup cadence, repeating
+/// while the table stays empty (throttled for bootnode politeness, matching
+/// the Java constant).
+const RESEED_EMPTY_ROUNDS: u32 = 4;
 
 /// A dialable CL peer candidate emitted by discovery.
 #[derive(Debug, Clone)]
@@ -21,6 +33,7 @@ pub struct DiscoveredPeer {
     pub addr: Multiaddr,
 }
 
+#[derive(Clone)]
 pub struct DiscoveryConfig {
     pub bootstrap_enrs: Vec<String>,
     /// Accepted `eth2` fork digests: current first, then the prior fork's when
@@ -33,11 +46,14 @@ pub struct DiscoveryConfig {
 /// Spawn the discovery task. Discovered, fork-matched peers stream out on the
 /// returned channel until the task is aborted (drop the `JoinHandle` owner) or
 /// the receiver closes. Failure to start is returned, not panicked — the Java
-/// treats discv5 as non-essential the same way.
+/// treats discv5 as non-essential the same way. The returned counter tracks
+/// the live routing-table size, refreshed each lookup round — the status
+/// surface behind the UI's "Discv5 peers" row (previously hardcoded 0 for
+/// Rust chains).
 pub async fn spawn(
     config: DiscoveryConfig,
     tx: mpsc::Sender<DiscoveredPeer>,
-) -> Result<tokio::task::JoinHandle<()>, String> {
+) -> Result<(tokio::task::JoinHandle<()>, Arc<AtomicUsize>), String> {
     let enr_key = CombinedKey::generate_secp256k1();
     let local_enr = Enr::builder()
         .build(&enr_key)
@@ -48,13 +64,18 @@ pub async fn spawn(
     let mut discv5 = Discv5::new(local_enr, enr_key, discv5_config)
         .map_err(|e| format!("discv5 init failed: {e}"))?;
 
-    let mut seeded = 0usize;
+    // Keep every successfully PARSED bootstrap ENR for the empty-table
+    // re-seed — including ones whose initial add_enr fails (a full bucket at
+    // spawn must not permanently exclude a bootnode from recovery; only
+    // malformed ENRs are dropped, with a warn).
+    let mut bootnodes: Vec<Enr> = Vec::with_capacity(config.bootstrap_enrs.len());
     for enr_str in &config.bootstrap_enrs {
         match enr_str.parse::<Enr>() {
             Ok(enr) => {
-                if discv5.add_enr(enr).is_ok() {
-                    seeded += 1;
+                if let Err(e) = discv5.add_enr(enr.clone()) {
+                    tracing::warn!(error = e, "bootstrap ENR not added to table (kept for re-seed)");
                 }
+                bootnodes.push(enr);
             }
             Err(e) => tracing::warn!(error = %e, "skipping malformed bootstrap ENR"),
         }
@@ -64,17 +85,28 @@ pub async fn spawn(
         .start()
         .await
         .map_err(|e| format!("discv5 start failed: {e}"))?;
-    tracing::info!(bootnodes = seeded, port = config.listen_port, "discv5 started");
+    tracing::info!(bootnodes = bootnodes.len(), port = config.listen_port, "discv5 started");
 
-    Ok(tokio::spawn(run_lookups(discv5, config.accepted_fork_digests, tx)))
+    let table_size = Arc::new(AtomicUsize::new(0));
+    let task = tokio::spawn(run_lookups(
+        discv5,
+        config.accepted_fork_digests,
+        bootnodes,
+        Arc::clone(&table_size),
+        tx,
+    ));
+    Ok((task, table_size))
 }
 
 async fn run_lookups(
     discv5: Discv5,
     accepted_digests: Vec<[u8; 4]>,
+    bootnodes: Vec<Enr>,
+    table_size: Arc<AtomicUsize>,
     tx: mpsc::Sender<DiscoveredPeer>,
 ) {
     let mut seen: HashSet<NodeId> = HashSet::new();
+    let mut empty_rounds = 0u32;
     loop {
         match discv5.find_node(NodeId::random()).await {
             Ok(enrs) => {
@@ -94,6 +126,38 @@ async fn run_lookups(
             }
             Err(e) => tracing::debug!(error = %e, "discv5 lookup failed"),
         }
+
+        // Status metric: TOTAL routing-table entries (never a misleading 0
+        // during a connectivity blip that flips entries Disconnected-in-place).
+        // The re-seed trigger below deliberately uses the stricter
+        // connected_peers() == 0 — the Java twin keys on live==0 the same way.
+        table_size.store(discv5.table_entries_id().len(), Ordering::Relaxed);
+        let live = discv5.connected_peers();
+        if reseed_due(&mut empty_rounds, live, bootnodes.len()) {
+            // add_enr alone is PASSIVE and rejected outright when the target
+            // bucket is full of dead Disconnected entries (sigp only evicts on
+            // a Connected-status insert) — so also PING every bootnode, the
+            // active path the Java re-seed uses: one Pong drives the
+            // Connected insert that evicts a dead entry and refills a bucket.
+            let mut readded = 0usize;
+            for enr in &bootnodes {
+                if discv5.add_enr(enr.clone()).is_ok() {
+                    readded += 1;
+                }
+                let ping = discv5.send_ping(enr.clone());
+                tokio::spawn(async move {
+                    let _ = ping.await; // fire-and-forget; failure is expected noise
+                });
+            }
+            // A recovered table must also REFILL the sync pool: without this,
+            // every re-found peer fails the seen-dedup and is never re-emitted
+            // (emission is once-ever per NodeId), leaving the pool starved
+            // even after a successful re-seed.
+            seen.clear();
+            tracing::info!(pinged = bootnodes.len(), readded, rounds = RESEED_EMPTY_ROUNDS,
+                "discv5 live table empty — pinged bootnodes and cleared the dedup set");
+        }
+
         if tx.is_closed() {
             return;
         }
@@ -103,6 +167,25 @@ async fn run_lookups(
             seen.clear();
         }
     }
+}
+
+/// The stateful counter step behind the empty-table re-seed — the Rust twin
+/// of the Java `DiscV5Service.reseedDue` and pinned by the same test shape:
+/// any live node resets the streak; with no bootnodes a re-seed is never due
+/// (nothing to add); otherwise due on every `RESEED_EMPTY_ROUNDS`-th
+/// consecutive empty round, resetting when due so a persistent wedge keeps
+/// re-seeding instead of firing once.
+fn reseed_due(empty_rounds: &mut u32, live_nodes: usize, bootnode_count: usize) -> bool {
+    if live_nodes > 0 || bootnode_count == 0 {
+        *empty_rounds = 0;
+        return false;
+    }
+    *empty_rounds += 1;
+    if *empty_rounds < RESEED_EMPTY_ROUNDS {
+        return false;
+    }
+    *empty_rounds = 0;
+    true
 }
 
 /// ENR → dial candidate, applying the same gates the Java discv5 callback does:
@@ -186,6 +269,34 @@ mod tests {
         assert!(filter_candidate(&enr, &[[0xDE, 0xAD, 0xBE, 0xEF]]).is_none());
         // Prior-fork fallback position also matches (index 1).
         assert!(filter_candidate(&enr, &[[0; 4], [0x82, 0x4B, 0xE4, 0x31]]).is_some());
+    }
+
+    #[test]
+    fn reseed_counter_mirrors_java_discv5_reseed_test() {
+        let mut c = 0u32;
+        // Due on the 4th consecutive empty round.
+        assert!(!reseed_due(&mut c, 0, 8));
+        assert!(!reseed_due(&mut c, 0, 8));
+        assert!(!reseed_due(&mut c, 0, 8));
+        assert!(reseed_due(&mut c, 0, 8), "4th consecutive empty round must be due");
+        // Repeats while the table stays empty (counter resets when due).
+        for _ in 0..3 {
+            assert!(!reseed_due(&mut c, 0, 8));
+        }
+        assert!(reseed_due(&mut c, 0, 8));
+        // Any live node resets the streak.
+        reseed_due(&mut c, 0, 8);
+        reseed_due(&mut c, 0, 8);
+        assert!(!reseed_due(&mut c, 5, 8), "a live table must reset the streak");
+        for _ in 0..3 {
+            assert!(!reseed_due(&mut c, 0, 8));
+        }
+        assert!(reseed_due(&mut c, 0, 8));
+        // No bootnodes: never due (nothing to add — the sepolia analog).
+        let mut n = 0u32;
+        for i in 0..10 {
+            assert!(!reseed_due(&mut n, 0, 0), "no bootnodes: never due (round {i})");
+        }
     }
 
     #[test]
