@@ -175,6 +175,7 @@ final class RustChainHandle implements ChainHandle {
                 0,                     // discv5TableSize
                 peers,                 // connectedPeers (CL)
                 s.peerCount(),         // lightClientPeers
+                0,                     // servedPeersLastMinute (not surfaced by the native status yet)
                 s.finalizedSlot(),
                 s.optimisticSlot(),
                 s.finalizedSlot() / 8192L,  // finalizedPeriod = period OF the finalized
