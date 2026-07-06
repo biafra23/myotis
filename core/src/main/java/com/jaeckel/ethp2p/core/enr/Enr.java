@@ -44,26 +44,40 @@ public final class Enr {
     /**
      * Decode an ENR from raw RLP bytes (as received in discv4 Neighbors or discv5).
      * Skips signature verification for now.
+     *
+     * <p>Strict about the envelope (Rust-twin parity, pinned by the el/core
+     * conformance corpus): trailing bytes after the record list are rejected,
+     * and a negative signed read of {@code seq} (8-byte high-bit scalar) is
+     * rejected — seq is unsigned on the wire.
      */
     public static Enr decode(Bytes rlpBytes) {
         Map<String, Bytes> pairs = new HashMap<>();
         long[] seqHolder = {0};
-        RLP.decodeList(rlpBytes, reader -> {
-            // First element: signature (skip)
-            reader.skipNext(); // signature
-            // Second element: sequence number
-            seqHolder[0] = reader.readLong();
-            // Remaining: key-value pairs. Most pairs are (string, bytes) — e.g. ip, tcp,
-            // secp256k1 — but modern ENRs carry list-valued pairs too (eth2, attnets,
-            // syncnets, …). Preserve simple bytes values for the fields we consume and
-            // skip list values we don't model.
-            while (!reader.isComplete()) {
-                String key = reader.readString();
-                if (reader.nextIsList()) {
-                    reader.skipNext();
-                } else {
-                    pairs.put(key, reader.readValue());
+        RLP.decode(rlpBytes, outer -> {
+            outer.readList(reader -> {
+                // First element: signature (skip)
+                reader.skipNext(); // signature
+                // Second element: sequence number
+                seqHolder[0] = reader.readLong();
+                if (seqHolder[0] < 0) {
+                    throw new IllegalArgumentException("ENR seq out of range");
                 }
+                // Remaining: key-value pairs. Most pairs are (string, bytes) — e.g. ip, tcp,
+                // secp256k1 — but modern ENRs carry list-valued pairs too (eth2, attnets,
+                // syncnets, …). Preserve simple bytes values for the fields we consume and
+                // skip list values we don't model.
+                while (!reader.isComplete()) {
+                    String key = reader.readString();
+                    if (reader.nextIsList()) {
+                        reader.skipNext();
+                    } else {
+                        pairs.put(key, reader.readValue());
+                    }
+                }
+                return null;
+            });
+            if (!outer.isComplete()) {
+                throw new IllegalArgumentException("Trailing bytes after ENR RLP");
             }
             return null;
         });

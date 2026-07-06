@@ -705,6 +705,7 @@ dependencies = [
  "ff",
  "generic-array",
  "group",
+ "hkdf",
  "pkcs8",
  "rand_core 0.6.4",
  "sec1",
@@ -2052,6 +2053,14 @@ version = "0.1.0"
 dependencies = [
  "myotis-bls",
  "sha2",
+]
+
+[[package]]
+name = "myotis-core"
+version = "0.1.0"
+dependencies = [
+ "k256",
+ "sha3",
 ]
 
 [[package]]

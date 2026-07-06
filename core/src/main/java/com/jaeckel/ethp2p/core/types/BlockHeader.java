@@ -76,46 +76,71 @@ public final class BlockHeader {
     /**
      * Decode a block header from RLP bytes.
      * Handles post-Cancun headers (all fields present).
+     *
+     * <p>Strict about the envelope (Rust-twin parity, pinned by the el/core
+     * conformance corpus): trailing bytes after the header list are rejected
+     * — the header hash is keccak256 of the WHOLE input, so slack bytes
+     * would silently change the hash of what was decoded. Numeric fields
+     * are rejected when the signed read goes negative (an 8-byte high-bit
+     * scalar), which would otherwise collide with the -1 "absent" sentinel
+     * of the EIP-4844 pair.
      */
     public static BlockHeader decode(Bytes rlpBytes) {
-        return RLP.decodeList(rlpBytes, reader -> {
-            Bytes32 parentHash = Bytes32.wrap(reader.readValue());
-            Bytes32 ommersHash = Bytes32.wrap(reader.readValue());
-            Bytes beneficiary = reader.readValue();
-            Bytes32 stateRoot = Bytes32.wrap(reader.readValue());
-            Bytes32 txRoot = Bytes32.wrap(reader.readValue());
-            Bytes32 rcptRoot = Bytes32.wrap(reader.readValue());
-            Bytes logsBloom = reader.readValue();
-            BigInteger difficulty = reader.readBigInteger();
-            long number = reader.readLong();
-            long gasLimit = reader.readLong();
-            long gasUsed = reader.readLong();
-            long timestamp = reader.readLong();
-            Bytes extraData = reader.readValue();
-            Bytes32 mixHash = Bytes32.wrap(reader.readValue());
-            Bytes nonce = reader.readValue();
-
-            // Optional post-London fields
-            BigInteger baseFee = null;
-            Bytes32 withdrawalsRoot = null;
-            long blobGasUsed = -1;
-            long excessBlobGas = -1;
-            Bytes32 parentBeaconRoot = null;
-
-            if (!reader.isComplete()) baseFee = reader.readBigInteger();
-            if (!reader.isComplete()) withdrawalsRoot = Bytes32.wrap(reader.readValue());
-            if (!reader.isComplete()) blobGasUsed = reader.readLong();
-            if (!reader.isComplete()) excessBlobGas = reader.readLong();
-            if (!reader.isComplete()) parentBeaconRoot = Bytes32.wrap(reader.readValue());
-            // EIP-7685 (Prague/Electra): requestsHash — skip if present
-            if (!reader.isComplete()) reader.readValue();
-
-            return new BlockHeader(parentHash, ommersHash, beneficiary,
-                    stateRoot, txRoot, rcptRoot, logsBloom, difficulty,
-                    number, gasLimit, gasUsed, timestamp, extraData,
-                    mixHash, nonce, baseFee, withdrawalsRoot,
-                    blobGasUsed, excessBlobGas, parentBeaconRoot);
+        return RLP.decode(rlpBytes, outer -> {
+            BlockHeader header = outer.readList(BlockHeader::decodeFields);
+            if (!outer.isComplete()) {
+                throw new IllegalArgumentException("Trailing bytes after header RLP");
+            }
+            return header;
         });
+    }
+
+    private static BlockHeader decodeFields(org.apache.tuweni.rlp.RLPReader reader) {
+        Bytes32 parentHash = Bytes32.wrap(reader.readValue());
+        Bytes32 ommersHash = Bytes32.wrap(reader.readValue());
+        Bytes beneficiary = reader.readValue();
+        Bytes32 stateRoot = Bytes32.wrap(reader.readValue());
+        Bytes32 txRoot = Bytes32.wrap(reader.readValue());
+        Bytes32 rcptRoot = Bytes32.wrap(reader.readValue());
+        Bytes logsBloom = reader.readValue();
+        BigInteger difficulty = reader.readBigInteger();
+        long number = readNonNegativeLong(reader, "number");
+        long gasLimit = readNonNegativeLong(reader, "gasLimit");
+        long gasUsed = readNonNegativeLong(reader, "gasUsed");
+        long timestamp = readNonNegativeLong(reader, "timestamp");
+        Bytes extraData = reader.readValue();
+        Bytes32 mixHash = Bytes32.wrap(reader.readValue());
+        Bytes nonce = reader.readValue();
+
+        // Optional post-London fields
+        BigInteger baseFee = null;
+        Bytes32 withdrawalsRoot = null;
+        long blobGasUsed = -1;
+        long excessBlobGas = -1;
+        Bytes32 parentBeaconRoot = null;
+
+        if (!reader.isComplete()) baseFee = reader.readBigInteger();
+        if (!reader.isComplete()) withdrawalsRoot = Bytes32.wrap(reader.readValue());
+        if (!reader.isComplete()) blobGasUsed = readNonNegativeLong(reader, "blobGasUsed");
+        if (!reader.isComplete()) excessBlobGas = readNonNegativeLong(reader, "excessBlobGas");
+        if (!reader.isComplete()) parentBeaconRoot = Bytes32.wrap(reader.readValue());
+        // EIP-7685 (Prague/Electra): requestsHash — skip if present
+        if (!reader.isComplete()) reader.readValue();
+
+        return new BlockHeader(parentHash, ommersHash, beneficiary,
+                stateRoot, txRoot, rcptRoot, logsBloom, difficulty,
+                number, gasLimit, gasUsed, timestamp, extraData,
+                mixHash, nonce, baseFee, withdrawalsRoot,
+                blobGasUsed, excessBlobGas, parentBeaconRoot);
+    }
+
+    /** Tuweni readLong is signed; every header scalar is unsigned on the wire. */
+    private static long readNonNegativeLong(org.apache.tuweni.rlp.RLPReader reader, String name) {
+        long v = reader.readLong();
+        if (v < 0) {
+            throw new IllegalArgumentException("Header field " + name + " out of range");
+        }
+        return v;
     }
 
     /** keccak256 of the RLP-encoded header. Verifiable against trusted block hash. */
