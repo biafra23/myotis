@@ -230,6 +230,9 @@ class DesktopNodeController(
 
     private fun snapshotOf(handle: ChainHandle): NodeSnapshot {
         val s = handle.status()
+        // CL peer counts live on the beacon-status surface (parity with Android's
+        // NodeService.snapshotOf, which reads both).
+        val bs = handle.beaconStatus()
         return NodeSnapshot(
             running = s.running(),
             network = s.network(),
@@ -238,6 +241,8 @@ class DesktopNodeController(
             readyPeers = s.readyPeers(),
             snapPeers = s.snapPeers(),
             snapServingPeers = s.snapServingPeers(),
+            clConnectedPeers = bs.connectedPeers(),
+            clLightClientPeers = bs.lightClientPeers().coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
             discoveredPeers = s.discoveredPeers(),
             backedOffPeers = s.backedOffPeers(),
             blacklistedPeers = s.blacklistedPeers(),
