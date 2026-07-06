@@ -141,8 +141,8 @@ data class NodeSnapshot(
     val readyPeers: Int,
     val snapPeers: Int,             // peers that negotiated snap/1 (capability)
     val snapServingPeers: Int,      // peers actually in the serving pool now (drives readiness)
-    val clConnectedPeers: Int,      // connected CL libp2p peers
-    val clLightClientPeers: Int,    // of those, peers serving the light_client protocols
+    val clConnectedPeers: Int,      // connected CL libp2p peers (usually 0 — connections are short-lived)
+    val clServedPeersLastMin: Int,  // distinct peers that served a light-client response in the last 60s
     val discoveredPeers: Int,
     val backedOffPeers: Int,        // peers in dial backoff right now
     val blacklistedPeers: Int,      // peers permanently blacklisted this session

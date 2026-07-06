@@ -170,7 +170,8 @@ public class CommandHandler {
         String peerStats = "\"uptimeSeconds\":" + uptimeSec
                 + ",\"discoveredPeers\":" + bs.discv5TableSize()
                 + ",\"connectedPeers\":" + bs.connectedPeers()
-                + ",\"lightClientPeers\":" + bs.lightClientPeers();
+                + ",\"lightClientPeers\":" + bs.lightClientPeers()
+                + ",\"servedPeersLastMinute\":" + bs.servedPeersLastMinute();
         String peersJson = buildBeaconPeersJson(bs.peers());
         String periodProgress = "\"currentPeriod\":" + bs.currentPeriod()
                 + ",\"targetPeriod\":" + bs.targetPeriod();

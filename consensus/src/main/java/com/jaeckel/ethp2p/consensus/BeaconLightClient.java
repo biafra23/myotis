@@ -2215,7 +2215,30 @@ public class BeaconLightClient implements AutoCloseable {
         }
     }
 
+    /** peerId (or the full multiaddr when it has no /p2p/ component) → time of the
+     *  last successful light-client response. Backs {@link #recentlyServedPeerCount()};
+     *  pruned on read. */
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> recentServes =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final long SERVED_WINDOW_MS = 60_000;
+
+    /**
+     * Distinct peers that successfully served a light-client response (bootstrap,
+     * updates-by-range, finality update) within the last minute. Connections are
+     * short-lived on the serve path, so this — not the instantaneous connection
+     * count — is the "is anyone feeding us updates?" signal status surfaces show.
+     */
+    public int recentlyServedPeerCount() {
+        long cutoff = System.currentTimeMillis() - SERVED_WINDOW_MS;
+        recentServes.values().removeIf(t -> t < cutoff);
+        return recentServes.size();
+    }
+
     private void notifyPeerSuccess(String peer) {
+        if (peer != null) {
+            String pid = peerIdOf(peer);
+            recentServes.put(pid != null ? pid : peer, System.currentTimeMillis());
+        }
         if (onPeerSuccess != null) {
             try {
                 onPeerSuccess.accept(peer);
