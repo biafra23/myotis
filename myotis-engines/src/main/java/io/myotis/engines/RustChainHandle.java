@@ -80,7 +80,8 @@ final class RustChainHandle implements ChainHandle {
             long optimisticSlot,
             long currentPeriod,
             long targetPeriod,
-            long peerCount) {
+            long peerCount,
+            int servedPeersLastMinute) {
 
         static ParsedStatus parse(String json) {
             if (json == null || json.isBlank()) return notRunning();
@@ -95,7 +96,8 @@ final class RustChainHandle implements ChainHandle {
                         o.getLong("optimisticSlot", 0L),
                         o.getLong("currentPeriod", 0L),
                         o.getLong("targetPeriod", 0L),
-                        o.getLong("peerCount", 0L));
+                        o.getLong("peerCount", 0L),
+                        o.getInt("servedPeersLastMinute", 0));
             } catch (RuntimeException e) {
                 throw new EngineException(
                         "malformed status JSON from the Rust engine: " + e.getMessage(), e);
@@ -103,7 +105,7 @@ final class RustChainHandle implements ChainHandle {
         }
 
         static ParsedStatus notRunning() {
-            return new ParsedStatus(false, BeaconState.STARTING, false, 0L, 0L, 0L, 0L, 0L);
+            return new ParsedStatus(false, BeaconState.STARTING, false, 0L, 0L, 0L, 0L, 0L, 0);
         }
     }
 
@@ -175,7 +177,7 @@ final class RustChainHandle implements ChainHandle {
                 0,                     // discv5TableSize
                 peers,                 // connectedPeers (CL)
                 s.peerCount(),         // lightClientPeers
-                0,                     // servedPeersLastMinute (not surfaced by the native status yet)
+                s.servedPeersLastMinute(),
                 s.finalizedSlot(),
                 s.optimisticSlot(),
                 s.finalizedSlot() / 8192L,  // finalizedPeriod = period OF the finalized

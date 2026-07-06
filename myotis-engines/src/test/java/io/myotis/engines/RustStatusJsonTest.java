@@ -34,14 +34,14 @@ class RustStatusJsonTest {
     private static final String NOT_STARTED_JSON =
             "{\"running\":false,\"network\":\"mainnet\",\"beaconState\":\"STARTING\","
             + "\"bootstrapped\":false,\"finalizedSlot\":0,\"optimisticSlot\":0,"
-            + "\"currentPeriod\":0,\"targetPeriod\":0,\"peerCount\":0,"
+            + "\"currentPeriod\":0,\"targetPeriod\":0,\"peerCount\":0,\"servedPeersLastMinute\":0,"
             + "\"finalizedRootHex\":\"0000000000000000000000000000000000000000000000000000000000000000\"}";
 
     /** A synthetic catching-up shape (real running numbers). */
     private static final String CATCHING_UP_JSON =
             "{\"running\":true,\"network\":\"mainnet\",\"beaconState\":\"CATCHING_UP\","
             + "\"bootstrapped\":true,\"finalizedSlot\":14560000,\"optimisticSlot\":14560032,"
-            + "\"currentPeriod\":1777,\"targetPeriod\":1795,\"peerCount\":5,"
+            + "\"currentPeriod\":1777,\"targetPeriod\":1795,\"peerCount\":5,\"servedPeersLastMinute\":2,"
             + "\"finalizedRootHex\":\"58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e\"}";
 
     @BeforeAll
@@ -85,6 +85,7 @@ class RustStatusJsonTest {
         assertTrue(bs.bootstrapped());
         assertEquals(1777L, bs.currentPeriod());
         assertEquals(1795L, bs.targetPeriod());
+        assertEquals(2, bs.servedPeersLastMinute());
         assertEquals(14560000L, bs.finalizedSlot());
         assertEquals(14560032L, bs.optimisticSlot());
         assertEquals(5, bs.connectedPeers());

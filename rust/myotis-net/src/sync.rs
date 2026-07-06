@@ -233,6 +233,10 @@ pub struct SyncStatus {
     /// Sync-committee period the store currently holds a committee for.
     pub period: u64,
     pub peer_count: usize,
+    /// Distinct peers that successfully served a light-client response
+    /// (bootstrap / updates / finality) in the last 60 s — the UI's "CL peers
+    /// served N/min" health signal (Java `BeaconStatus.servedPeersLastMinute`).
+    pub served_peers_last_min: usize,
 }
 
 impl SyncStatus {
@@ -246,6 +250,7 @@ impl SyncStatus {
             optimistic_slot: 0,
             period: 0,
             peer_count: 0,
+            served_peers_last_min: 0,
         }
     }
 }
@@ -342,6 +347,10 @@ struct PeerPool {
     /// rate-limit that protocol to ~one served update per request window; an
     /// immediate re-ask returns an empty stream, so rotate away for a while.
     cooldown_until: HashMap<PeerId, Instant>,
+    /// Last successful serve per peer, for the served-last-minute health
+    /// metric. Deliberately NOT cleared by evict(): "served in the last 60 s"
+    /// stays true of an evicted peer; entries prune inside served_last_minute.
+    recent_serves: HashMap<PeerId, Instant>,
     /// Consecutive terminal-failure count per peer, for eviction. Reset on any
     /// success. Without eviction the MAX_POOL cap fills with dead peers and
     /// `add` starts rejecting fresh ones — a permanent catch-up wedge.
@@ -366,6 +375,8 @@ const MAX_POOL: usize = 512;
 /// gets slack so one transient blip doesn't drop a scarce LC server.
 const UNPROVEN_EVICT_AT: u32 = 1;
 const PROVEN_EVICT_AT: u32 = 3;
+/// Window for the served-peers health metric (BeaconStatus.servedPeersLastMinute).
+const SERVED_WINDOW: Duration = Duration::from_secs(60);
 
 impl PeerPool {
     fn new() -> Self {
@@ -376,6 +387,7 @@ impl PeerPool {
             proven: HashSet::new(),
             cooldown_until: HashMap::new(),
             fail_counts: HashMap::new(),
+            recent_serves: HashMap::new(),
             sweep: 0,
         }
     }
@@ -383,6 +395,31 @@ impl PeerPool {
     fn mark_proven(&mut self, id: PeerId) {
         self.proven.insert(id);
         self.fail_counts.remove(&id); // a served peer is demonstrably alive
+    }
+
+    /// Stamp a VERIFIED serve (bootstrap applied / catch-up update applied /
+    /// finality update applied) for the served-last-minute health metric.
+    /// Deliberately NOT part of mark_proven: decode-only responses and the
+    /// startup cache warm-load must not read as live serving — the metric
+    /// exists to expose exactly those stalls. Prunes here (the &mut site),
+    /// keeping the map bounded by serve activity.
+    fn note_served(&mut self, id: PeerId) {
+        let now = Instant::now();
+        // checked_sub: within 60 s of device boot the monotonic clock is
+        // younger than the window and a plain subtraction would PANIC
+        // (= abort the app under panic=abort) — keep everything instead.
+        if let Some(cutoff) = now.checked_sub(SERVED_WINDOW) {
+            self.recent_serves.retain(|_, t| *t >= cutoff);
+        }
+        self.recent_serves.insert(id, now);
+    }
+
+    /// Distinct peers with a verified serve within the last 60 s.
+    fn served_last_minute(&self) -> usize {
+        match Instant::now().checked_sub(SERVED_WINDOW) {
+            Some(cutoff) => self.recent_serves.values().filter(|t| **t >= cutoff).count(),
+            None => self.recent_serves.len(), // clock younger than the window
+        }
     }
 
     /// Record a terminal request failure (dial/timeout/connection-closed — NOT
@@ -579,7 +616,15 @@ async fn run_sync(
     // restored store stays on probation (ResumeGuard) until one update
     // BLS-verifies against it; see RESUME_REJECTS_MAX.
     let checkpoint_period = spec::compute_sync_committee_period(config.checkpoint_slot);
-    let mut last_persisted_period = 0u64;
+    // Floor the persist throttle at the CHECKPOINT period: a snapshot at (or
+    // below) the checkpoint period can never be resumed (the strictly-newer
+    // rule rejects it), so writing one could only OVERWRITE a possibly-newer
+    // snapshot on disk with useless bytes — a fresh bootstrap must never
+    // clobber resumable state (this exact overwrite was observed on-device:
+    // a non-resuming boot's bootstrap-persist destroyed a period-1795
+    // snapshot with a dead 1777 one). Only periods verified PAST the
+    // checkpoint are worth writing.
+    let mut last_persisted_period = checkpoint_period;
     let mut resume = ResumeGuard::fresh();
     if let Some(path) = &config.snapshot_path {
         if let Ok(bytes) = std::fs::read(path) {
@@ -591,6 +636,13 @@ async fn run_sync(
                         "resumed from persisted snapshot — skipping bootstrap");
                     processor.store.restore(snap);
                     resume = ResumeGuard::resumed();
+                    // Publish the restored state IMMEDIATELY: without this the
+                    // status watch holds SyncStatus::initial() (period 0 — 
+                    // indistinguishable from a fresh bootstrap) until the first
+                    // catch-up apply, hiding the resume from the UI and from
+                    // on-device forensics.
+                    refresh_local_status(&config, &processor, &local_status);
+                    publish_status(&config, &client, &processor, &pool, &status_tx).await;
                 }
                 Some(_) => tracing::info!(
                     "persisted snapshot not newer than the embedded checkpoint — bootstrapping fresh"),
@@ -613,7 +665,7 @@ async fn run_sync(
             if bootstrapped {
                 persist_snapshot(&config, &processor, &mut last_persisted_period);
                 refresh_local_status(&config, &processor, &local_status);
-                publish_status(&config, &client, &processor, &status_tx).await;
+                publish_status(&config, &client, &processor, &pool, &status_tx).await;
             } else {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
@@ -641,7 +693,7 @@ async fn run_sync(
                 }
                 processor.store = LightClientStore::new();
                 staged_updates.clear();
-                last_persisted_period = 0;
+                last_persisted_period = checkpoint_period; // keep the never-persist-checkpoint floor
                 resume = ResumeGuard::fresh();
                 continue;
             }
@@ -650,7 +702,7 @@ async fn run_sync(
             // moved, not on every finality tick.
             persist_snapshot(&config, &processor, &mut last_persisted_period);
             refresh_local_status(&config, &processor, &local_status);
-            publish_status(&config, &client, &processor, &status_tx).await;
+            publish_status(&config, &client, &processor, &pool, &status_tx).await;
             if spec::compute_sync_committee_period(config.current_slot_estimate())
                 > processor.store.current_period()
             {
@@ -671,7 +723,7 @@ async fn run_sync(
         // No-op unless the period advanced (force-rotate can move it here too).
         persist_snapshot(&config, &processor, &mut last_persisted_period);
         refresh_local_status(&config, &processor, &local_status);
-        publish_status(&config, &client, &processor, &status_tx).await;
+        publish_status(&config, &client, &processor, &pool, &status_tx).await;
 
         tokio::time::sleep(Duration::from_secs(config.seconds_per_slot)).await;
     }
@@ -812,6 +864,7 @@ async fn try_bootstrap(
             .store
             .initialize(bootstrap.header.clone(), bootstrap.current_sync_committee.clone());
         pool.mark_proven(peer);
+        pool.note_served(peer); // verified: checkpoint pin + both branches checked
         if let Some(p) = peers.iter().find(|p| p.id == peer) {
             clcache.record_bootstrap(
                 &format!("{}/p2p/{}", p.addr, p.id),
@@ -1037,6 +1090,7 @@ async fn catch_up(
                 }
                 if applied_now > 0 {
                     resume.confirm();
+                    pool.note_served(peer.id); // BLS-verified and applied
                     // Only VERIFIED periods reach the shared cross-engine
                     // cache: this range just BLS-verified and applied, and
                     // this peer's response is what unblocked it (Java
@@ -1069,7 +1123,7 @@ async fn catch_up(
                 period = processor.store.current_period(),
                 finalized_slot = processor.store.finalized_slot(),
                 "catch-up round applied");
-            publish_status(config, client, processor, status_tx).await;
+            publish_status(config, client, processor, &*pool, status_tx).await;
             idle_rounds = 0;
         } else if staged.len() > staged_before {
             // No prefix advance yet, but the buffer grew — that's progress
@@ -1199,6 +1253,7 @@ async fn poll_finality(
                 pool.mark_proven(peer.id);
                 clcache.note_success(&format!("{}/p2p/{}", peer.addr, peer.id));
                 if processor.process_finality_update(&update) {
+                    pool.note_served(peer.id); // verified against our committee
                     tracing::info!(peer = %peer.id,
                         finalized_slot = processor.store.finalized_slot(),
                         optimistic_slot = processor.store.optimistic_slot(),
@@ -1252,6 +1307,7 @@ async fn publish_status(
     config: &ChainConfig,
     client: &ReqRespClient,
     processor: &LightClientProcessor,
+    pool: &PeerPool,
     status_tx: &watch::Sender<SyncStatus>,
 ) {
     let store = &processor.store;
@@ -1277,6 +1333,7 @@ async fn publish_status(
         optimistic_slot: store.optimistic_slot(),
         period: store.current_period(),
         peer_count: client.connected_peer_count().await,
+        served_peers_last_min: pool.served_last_minute(),
     };
     let _ = status_tx.send(status);
 }

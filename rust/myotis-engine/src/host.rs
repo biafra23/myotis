@@ -261,6 +261,7 @@ fn status_object(running: bool, status: Option<SyncStatus>, target_period: u64) 
     // publish a target below current (the target >= current invariant).
     obj.insert("targetPeriod".into(), target_period.max(s.period).into());
     obj.insert("peerCount".into(), s.peer_count.into());
+    obj.insert("servedPeersLastMinute".into(), s.served_peers_last_min.into());
     obj.insert("finalizedRootHex".into(), hex32(&s.finalized_root).into());
     // A hand-built object of primitives always serializes; fall back to the
     // literal not-started shape rather than panic on the (impossible) error.
@@ -273,7 +274,7 @@ fn status_object(running: bool, status: Option<SyncStatus>, target_period: u64) 
 const NOT_STARTED_FALLBACK: &str = concat!(
     r#"{"running":false,"network":"mainnet","beaconState":"STARTING","#,
     r#""bootstrapped":false,"finalizedSlot":0,"optimisticSlot":0,"#,
-    r#""currentPeriod":0,"targetPeriod":0,"peerCount":0,"#,
+    r#""currentPeriod":0,"targetPeriod":0,"peerCount":0,"servedPeersLastMinute":0,"#,
     r#""finalizedRootHex":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
 );
 
@@ -295,6 +296,7 @@ mod tests {
         assert_eq!(v["currentPeriod"], 0);
         assert_eq!(v["targetPeriod"], 0);
         assert_eq!(v["peerCount"], 0);
+        assert_eq!(v["servedPeersLastMinute"], 0);
         assert_eq!(
             v["finalizedRootHex"],
             "0000000000000000000000000000000000000000000000000000000000000000"
@@ -314,6 +316,7 @@ mod tests {
             optimistic_slot: 132,
             period: 1777,
             peer_count: 7,
+            served_peers_last_min: 3,
         };
         let synced: serde_json::Value =
             serde_json::from_str(&status_object(true, Some(mk(SyncState::Synced)), 1795)).unwrap();
@@ -325,6 +328,7 @@ mod tests {
         assert_eq!(synced["currentPeriod"], 1777);
         assert_eq!(synced["targetPeriod"], 1795);
         assert_eq!(synced["peerCount"], 7);
+        assert_eq!(synced["servedPeersLastMinute"], 3);
         assert_eq!(synced["finalizedRootHex"], hex32(&[0xab; 32]));
 
         for (st, expect, boot) in [
@@ -350,6 +354,7 @@ mod tests {
             optimistic_slot: 132,
             period: 1777,
             peer_count: 7,
+            served_peers_last_min: 3,
         };
         let v: serde_json::Value =
             serde_json::from_str(&status_object(true, Some(s), 1770)).unwrap();
