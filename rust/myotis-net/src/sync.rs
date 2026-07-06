@@ -237,7 +237,9 @@ pub struct SyncStatus {
     /// (bootstrap / updates / finality) in the last 60 s — the UI's "CL peers
     /// served N/min" health signal (Java `BeaconStatus.servedPeersLastMinute`).
     pub served_peers_last_min: usize,
-    /// Live nodes in the discv5 routing table (the UI's "Discv5 peers" row).
+    /// TOTAL entries in the discv5 routing table, including Disconnected
+    /// ones (the UI's "Discv5 peers" row) — deliberately not the connected
+    /// count, which reads a misleading 0 during connectivity blips.
     pub discv5_table_size: usize,
 }
 
@@ -355,9 +357,10 @@ struct PeerPool {
     /// stays true of an evicted peer; entries prune inside note_served (the
     /// &mut site), so the map stays bounded by serve activity.
     recent_serves: HashMap<PeerId, Instant>,
-    /// Live discv5 routing-table size, written by the discovery task each
-    /// lookup round. Lives here (not a publish_status param) because the pool
-    /// already travels everywhere status is published.
+    /// Total discv5 routing-table entry count (incl. Disconnected), written
+    /// by the discovery task each lookup round. Lives here (not a
+    /// publish_status param) because the pool already travels everywhere
+    /// status is published.
     discv5_table_size: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Consecutive terminal-failure count per peer, for eviction. Reset on any
     /// success. Without eviction the MAX_POOL cap fills with dead peers and
@@ -575,12 +578,27 @@ async fn run_sync(
         "sync starting");
 
     // Discovery feeds the pool continuously; failure is non-fatal (Java treats
-    // discv5 the same way). The discovery task self-terminates once this task
-    // is gone: the channel closes and its lookup loop returns, dropping Discv5.
+    // discv5 the same way). The guard aborts the discovery task the moment
+    // run_sync's future is dropped (SyncHandle::stop): without it the lookup
+    // loop only notices the closed channel at its next 15 s tick, keeping the
+    // UDP port bound and failing a fast stop→start on a fixed discv5_port
+    // (tokio cancellation drops the future's locals without unwinding, so the
+    // guard is panic=abort-safe and Discv5's socket closes immediately).
+    struct DiscoveryGuard(Option<tokio::task::JoinHandle<()>>);
+    impl Drop for DiscoveryGuard {
+        fn drop(&mut self) {
+            if let Some(task) = self.0.as_ref() {
+                task.abort();
+            }
+        }
+    }
+    let mut discovery_guard = DiscoveryGuard(None);
+
     let (peer_tx, mut peer_rx) = mpsc::channel::<discovery::DiscoveredPeer>(64);
     let mut discovery_up = match discovery::spawn(discovery_cfg.clone(), peer_tx.clone()).await {
-        Ok((_task, table_size)) => {
+        Ok((task, table_size)) => {
             pool.discv5_table_size = table_size;
+            discovery_guard.0 = Some(task);
             true
         }
         Err(e) => {
@@ -684,8 +702,9 @@ async fn run_sync(
             if discovery_retry_in == 0 {
                 discovery_retry_in = 5;
                 match discovery::spawn(discovery_cfg.clone(), peer_tx.clone()).await {
-                    Ok((_task, table_size)) => {
+                    Ok((task, table_size)) => {
                         pool.discv5_table_size = table_size;
+                        discovery_guard.0 = Some(task);
                         discovery_up = true;
                         tracing::info!("discv5 recovered on retry");
                     }

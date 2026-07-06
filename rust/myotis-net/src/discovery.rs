@@ -44,12 +44,15 @@ pub struct DiscoveryConfig {
 }
 
 /// Spawn the discovery task. Discovered, fork-matched peers stream out on the
-/// returned channel until the task is aborted (drop the `JoinHandle` owner) or
-/// the receiver closes. Failure to start is returned, not panicked — the Java
-/// treats discv5 as non-essential the same way. The returned counter tracks
-/// the live routing-table size, refreshed each lookup round — the status
-/// surface behind the UI's "Discv5 peers" row (previously hardcoded 0 for
-/// Rust chains).
+/// returned channel until the receiver closes or the caller calls
+/// `JoinHandle::abort()` — note that merely DROPPING the handle detaches the
+/// task (it keeps running); the sync loop holds it in an abort-on-drop guard
+/// for prompt UDP-socket release on shutdown. Failure to start is returned,
+/// not panicked — the Java treats discv5 as non-essential the same way. The
+/// returned counter tracks the TOTAL routing-table entry count (including
+/// Disconnected entries), refreshed each lookup round — the status surface
+/// behind the UI's "Discv5 peers" row (previously hardcoded 0 for Rust
+/// chains).
 pub async fn spawn(
     config: DiscoveryConfig,
     tx: mpsc::Sender<DiscoveredPeer>,
