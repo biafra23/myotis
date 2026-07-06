@@ -81,7 +81,9 @@ pub fn deserialize(data: &[u8], expected_gvr: &[u8; 32]) -> Option<StoreSnapshot
     let finalized_header = read_header(&mut r)?;
     let optimistic_header = read_header(&mut r)?;
     let current = read_committee(&mut r)?;
-    let next = if r.u8()? == 1 { Some(read_committee(&mut r)?) } else { None };
+    // Java DataInputStream.readBoolean is `byte != 0` — match it exactly so a
+    // corrupted flag byte can't desynchronize the two readers differently.
+    let next = if r.u8()? != 0 { Some(read_committee(&mut r)?) } else { None };
     Some(StoreSnapshot {
         finalized_header,
         optimistic_header,
@@ -185,7 +187,8 @@ fn read_execution(r: &mut Reader<'_>) -> Option<ExecutionPayloadHeader> {
     let withdrawals_root = r.root()?;
     let blob_gas_used = r.u64()?;
     let excess_blob_gas = r.u64()?;
-    let (deposit, withdrawal, consolidation) = if r.u8()? == 1 {
+    // Boolean framing parity with Java's readBoolean: any non-zero is true.
+    let (deposit, withdrawal, consolidation) = if r.u8()? != 0 {
         (Some(r.root()?), Some(r.root()?), Some(r.root()?))
     } else {
         (None, None, None)

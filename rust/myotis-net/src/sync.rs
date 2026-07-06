@@ -709,11 +709,15 @@ fn persist_snapshot(
     let ok = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, path));
     match ok {
         Ok(()) => {
-            *last_persisted_period = period;
             tracing::info!(period, bytes = bytes.len(), "persisted sync-state snapshot");
         }
-        Err(e) => tracing::warn!(error = %e, "snapshot write failed (will retry next period)"),
+        // Give up until the NEXT period advance either way: a failing disk
+        // (full/read-only) would otherwise be retried every ~12 s poll cycle
+        // — repeated blocking I/O plus log spam — for a best-effort cache.
+        Err(e) => tracing::warn!(error = %e,
+            "snapshot write failed — retrying on the next period advance"),
     }
+    *last_persisted_period = period;
 }
 
 fn drain_discovered(rx: &mut mpsc::Receiver<discovery::DiscoveredPeer>, pool: &mut PeerPool) {
@@ -827,9 +831,13 @@ async fn try_bootstrap(
 /// valid snapshot (e.g. inside the ~49 KiB committee pubkeys) deserializes
 /// fine and then fails BLS on EVERY update; without this guard that wedges
 /// sync permanently (the period never advances, so the bad file is never
-/// overwritten and every restart re-resumes it). Only catch-up rejects count
-/// — they are unambiguous verify failures against the restored committee —
-/// and any successful apply confirms the resume for good.
+/// overwritten and every restart re-resumes it). Only catch-up VERIFY rejects
+/// count — well-formed updates that failed BLS/Merkle against the restored
+/// committee (decode failures are excluded: malformed frames indict the peer,
+/// not our store). A bad peer serving valid-but-wrong updates can contribute
+/// rejects too, so the threshold trades a rare unnecessary re-bootstrap
+/// (self-correcting: the checkpoint path re-verifies everything) against a
+/// permanent wedge; any successful apply confirms the resume for good.
 const RESUME_REJECTS_MAX: u32 = 4;
 
 /// Tracks whether a snapshot-restored store has verified anything yet.
@@ -1022,9 +1030,9 @@ async fn catch_up(
                 // round cadence sits at Lighthouse's ~1-per-10s quota anyway —
                 // the Java client re-asks its serving peer the same way.
                 let before_period = processor.store.current_period();
-                let (applied_now, rejected) =
+                let (applied_now, verify_rejects) =
                     apply_staged_prefix(processor, staged, slot_estimate);
-                if rejected > 0 && resume.poisoned(rejected as u32) {
+                if verify_rejects > 0 && resume.poisoned(verify_rejects as u32) {
                     return true; // restored snapshot can't verify anything — re-bootstrap
                 }
                 if applied_now > 0 {
@@ -1096,16 +1104,18 @@ async fn catch_up(
 /// wall-clock estimate after each — Java `applyCatchUpResponses`). A chunk
 /// that fails decode/verify is dropped from the buffer so the next round
 /// refetches that period from a different peer.
-/// Returns `(applied, rejected)` — rejected counts decode/verify failures, the
-/// resume guard's poison signal (a corrupt restored committee rejects EVERY
-/// update).
+/// Returns `(applied, verify_rejects)` — verify_rejects counts ONLY updates
+/// that decoded fine but failed BLS/Merkle verification (`process_update` →
+/// false): that is the resume guard's poison signal, since a corrupt restored
+/// committee rejects every well-formed update. Decode failures are NOT
+/// counted — a peer sending malformed frames says nothing about our store.
 fn apply_staged_prefix(
     processor: &mut LightClientProcessor,
     staged: &mut std::collections::BTreeMap<u64, Vec<u8>>,
     slot_estimate: u64,
 ) -> (usize, usize) {
     let mut applied = 0usize;
-    let mut rejected = 0usize;
+    let mut verify_rejects = 0usize;
     while let Some(chunk) = staged.remove(&processor.store.current_period()) {
         let target_period = processor.store.current_period();
         match LightClientUpdate::decode(&chunk) {
@@ -1118,7 +1128,7 @@ fn apply_staged_prefix(
                         period = processor.store.current_period(),
                         "catch-up update applied");
                 } else {
-                    rejected += 1;
+                    verify_rejects += 1;
                     tracing::debug!(target_period,
                         finalized_slot = update.finalized_header.beacon.slot,
                         "catch-up update rejected");
@@ -1126,13 +1136,12 @@ fn apply_staged_prefix(
                 }
             }
             Err(e) => {
-                rejected += 1;
                 tracing::debug!(target_period, error = %e, "catch-up update decode failed");
                 break;
             }
         }
     }
-    (applied, rejected)
+    (applied, verify_rejects)
 }
 
 /// One finality-poll pass: try peers until one update verifies and applies —
