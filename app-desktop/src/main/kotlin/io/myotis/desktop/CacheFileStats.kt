@@ -55,10 +55,12 @@ object CacheFileStats {
             val tokens = t.split('\t')
             if (tokens.size < 3) {
                 // The daemon/desktop PeerCache still LOADS the legacy colon form
-                // (ip:port:pubkey[:snap]) and only migrates it on the first full
-                // rewrite — count those lines too or a pre-existing data dir
-                // under-reports until a rewrite happens.
-                if (!t.contains('\t') && t.split(':').size >= 3) total++
+                // (ip:port:pubkey[:snap], IPv4 — first char is a digit) and only
+                // migrates it on the first full rewrite — count those lines too
+                // or a pre-existing data dir under-reports until a rewrite. The
+                // leading-digit gate keeps comment lines with colons out; count
+                // instead of split avoids the substring allocations.
+                if (!t.contains('\t') && t[0] in '0'..'9' && t.count { it == ':' } >= 2) total++
                 continue
             }
             total++
@@ -106,10 +108,11 @@ object CacheFileStats {
     private fun isServedRange(tok: String): Boolean {
         if (tok.isEmpty()) return false
         val dash = tok.indexOf('-')
-        if (dash < 0) return tok.all { it.isDigit() }
+        // ASCII range check — isDigit() accepts any Unicode digit class.
+        if (dash < 0) return tok.all { it in '0'..'9' }
         val low = tok.substring(0, dash)
         val high = tok.substring(dash + 1)
         return low.isNotEmpty() && high.isNotEmpty() &&
-            low.all { it.isDigit() } && high.all { it.isDigit() }
+            low.all { it in '0'..'9' } && high.all { it in '0'..'9' }
     }
 }

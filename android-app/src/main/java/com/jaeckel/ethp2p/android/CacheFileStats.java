@@ -143,7 +143,10 @@ final class CacheFileStats {
     private static boolean allDigits(String s) {
         if (s.isEmpty()) return false;
         for (int i = 0; i < s.length(); i++) {
-            if (!Character.isDigit(s.charAt(i))) return false;
+            char c = s.charAt(i);
+            // ASCII only — Character.isDigit accepts any Unicode digit class,
+            // which the strictly-ASCII cache format never contains.
+            if (c < '0' || c > '9') return false;
         }
         return true;
     }
