@@ -61,6 +61,18 @@ impl BeaconBlockHeader {
             self.body_root,
         ])
     }
+
+    /// SSZ encoding — the exact inverse of [`Self::decode`], and byte-identical
+    /// to the Java `BeaconBlockHeader.encode()` (the snapshot codec embeds it).
+    pub fn encode(&self) -> [u8; Self::ENCODED_SIZE] {
+        let mut out = [0u8; Self::ENCODED_SIZE];
+        out[0..8].copy_from_slice(&self.slot.to_le_bytes());
+        out[8..16].copy_from_slice(&self.proposer_index.to_le_bytes());
+        out[16..48].copy_from_slice(&self.parent_root);
+        out[48..80].copy_from_slice(&self.state_root);
+        out[80..112].copy_from_slice(&self.body_root);
+        out
+    }
 }
 
 // -------------------------------------------------------------------------

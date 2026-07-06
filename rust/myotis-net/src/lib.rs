@@ -21,6 +21,7 @@
 //! Library hygiene: tracing only (no println), no global mutable state — every
 //! [`sync::SyncHandle`] owns its own libp2p host, discv5 service, and store.
 
+pub mod clcache;
 pub mod codec;
 pub mod discovery;
 pub mod protocols;
