@@ -1304,6 +1304,27 @@ public class BeaconLightClient implements AutoCloseable {
     private static final int MAX_CL_PEERS = 1024;
     /** Max 128-period batches per catch-up call. Bounds wall-clock on very old checkpoints. */
     private static final int MAX_CATCHUP_BATCHES = 8;
+    /** LC serve-quota window. Live LC servers (Lighthouse) serve ~one update per
+     *  ~10 s request-quota window; re-asking instantly after a served batch always
+     *  came back empty, wasting the round as "no progress — will retry on next
+     *  sync cycle" (measured on-device with the Rust twin: 20-95 s/period
+     *  collapsed to ~11 s once paced; same value as the Rust engine's
+     *  UPDATES_SERVE_COOLDOWN). The pace is the REMAINDER of this window since
+     *  the last batch request FIRED, not a flat sleep: BLS apply time — minutes
+     *  on-device for big batches — already refills the window (a flat sleep
+     *  would add up to ~77 s of dead time per 8-batch call), and the fire stamp
+     *  lives on an instance field so the NEXT call's batch 0 can't re-ask
+     *  inside the window either (Gnosis's 5 s poll cycle would otherwise do
+     *  exactly that at every batch-cap call boundary). */
+    private static final long CATCHUP_QUOTA_PACE_MS = 11_000;
+    /** nanoTime (monotonic — an NTP step must not skew the pace, same rule as
+     *  the uptime stamps) of the last catch-up batch request fire — the quota
+     *  consumption point (every fan-out consumes serving peers' windows,
+     *  advancing or not). Spans catchUpSyncCommittee calls by design.
+     *  Initialized one window in the past so the first-ever batch never pays
+     *  a pace against nanoTime's arbitrary origin. */
+    private volatile long lastCatchupBatchFireNanos =
+            System.nanoTime() - CATCHUP_QUOTA_PACE_MS * 1_000_000L;
     /** Max peers dialed per catch-up batch. The discovered CL pool runs to thousands of
      *  fork-matched nodes, most of which don't run a light-client server — fanning
      *  updates_by_range at all of them burned minutes of ProtocolNegotiation/Timeout
@@ -1333,6 +1354,25 @@ public class BeaconLightClient implements AutoCloseable {
                     log.info("[beacon] Sync committee is current (period {}), no catch-up needed", committeePeriod);
                 }
                 return;
+            }
+
+            // Pace AFTER the done-check (a finished catch-up must not pay a
+            // pointless pause): sleep only the REMAINDER of the serve-quota
+            // window since the last batch request fired — see the constant's
+            // javadoc for why remainder-based and why the stamp spans calls.
+            long sinceLastFireMs = (System.nanoTime() - lastCatchupBatchFireNanos) / 1_000_000L;
+            long paceMs = CATCHUP_QUOTA_PACE_MS - sinceLastFireMs;
+            if (paceMs > 0) {
+                // Explicit stall marker: this code path's history (#132/#133)
+                // earns making every deliberate pause self-explanatory in logs.
+                log.debug("[beacon] Pacing {} ms for the LC serve quota before the next batch", paceMs);
+                try {
+                    Thread.sleep(paceMs);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                if (!running) return;
             }
 
             long periodsToFetch = currentPeriod - committeePeriod;
@@ -1456,6 +1496,10 @@ public class BeaconLightClient implements AutoCloseable {
             log.warn("[beacon] Catch-up: no capable peers for period {} — retry next cycle", bootstrapPeriod);
             return false;
         }
+        // Quota consumption point: stamp only when a fan-out actually FIRES —
+        // the empty-pool early return above consumed nobody's window, and
+        // pacing after it would delay the next attempt for nothing.
+        lastCatchupBatchFireNanos = System.nanoTime();
         // {@link BeaconP2PService#doReqResp} detects a dying connection and
         // retries with a fresh one, so we no longer pre-emptively disconnect
         // every peer here — that was costing us Lighthouse/Teku connections
