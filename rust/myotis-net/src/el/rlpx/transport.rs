@@ -11,11 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
 use myotis_core::nodekey::NodeKey;
 
-use super::frame::{DecodedFrame, FrameCodec};
+use super::frame::{DecodedFrame, FrameCodec, FrameDecoder, FrameEncoder};
 use super::handshake::Initiator;
 
 /// p2p base message codes (shared prefix below the eth sub-protocol).
@@ -32,6 +33,12 @@ const MAX_ACK_SIZE: usize = 2048;
 /// body buffer. (Waiting on the header itself is a legitimate idle state and is
 /// NOT bounded here.)
 const FRAME_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound a single frame write. A peer that advertises a zero receive window and
+/// stops reading would otherwise block `write_all` forever — and with the split
+/// connection's shared writer, that stalls every other request and the read
+/// loop's Pong. A write timeout means the egress frame stream is in an
+/// indeterminate state, so callers must treat it as a fatal connection error.
+const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A live framed RLPx connection: the TCP stream plus the session's stateful
 /// [`FrameCodec`]. Read/write are serialized through `&mut self` (the codec is
@@ -102,13 +109,22 @@ impl RlpxConnection {
         self.peer_pubkey
     }
 
-    /// Frame and send one message.
+    /// Split into independent read/write halves for the managed-peer's separate
+    /// tasks (the frame codec's egress/ingress state are independent).
+    pub fn split(self) -> (RlpxReader, RlpxWriter, [u8; 64]) {
+        let (read_half, write_half) = self.stream.into_split();
+        let (encoder, decoder) = self.codec.split();
+        (
+            RlpxReader { read_half, decoder },
+            RlpxWriter { write_half, encoder },
+            self.peer_pubkey,
+        )
+    }
+
+    /// Frame and send one message (bounded by [`FRAME_WRITE_TIMEOUT`]).
     pub async fn send(&mut self, message_code: u64, body: &[u8]) -> Result<(), String> {
         let frame = self.codec.encode_frame(message_code, body);
-        self.stream
-            .write_all(&frame)
-            .await
-            .map_err(|e| format!("rlpx write frame: {e}"))
+        write_frame(&mut self.stream, &frame).await
     }
 
     /// Read and decode the next frame. Blocks indefinitely waiting for the next
@@ -143,6 +159,72 @@ impl RlpxConnection {
             .await
             .map(|_| ())
             .map_err(|e| format!("rlpx read: {e}"))
+    }
+}
+
+/// The write half of a split [`RlpxConnection`] — owns the egress cipher/MAC.
+/// Serialize all sends through `&mut self`.
+pub struct RlpxWriter {
+    write_half: OwnedWriteHalf,
+    encoder: FrameEncoder,
+}
+
+impl RlpxWriter {
+    /// Frame and send one message (bounded by [`FRAME_WRITE_TIMEOUT`]).
+    pub async fn send(&mut self, message_code: u64, body: &[u8]) -> Result<(), String> {
+        let frame = self.encoder.encode_frame(message_code, body);
+        write_frame(&mut self.write_half, &frame).await
+    }
+}
+
+/// Write a full frame, bounded by [`FRAME_WRITE_TIMEOUT`]. A timeout leaves the
+/// egress stream mid-frame (the codec's MAC has already advanced), so it is a
+/// fatal error for the connection — the caller must not reuse the writer.
+async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, frame: &[u8]) -> Result<(), String> {
+    tokio::time::timeout(FRAME_WRITE_TIMEOUT, w.write_all(frame))
+        .await
+        .map_err(|_| "rlpx write frame timed out".to_string())?
+        .map_err(|e| format!("rlpx write frame: {e}"))
+}
+
+/// The read half of a split [`RlpxConnection`] — owns the ingress cipher/MAC.
+pub struct RlpxReader {
+    read_half: OwnedReadHalf,
+    decoder: FrameDecoder,
+}
+
+impl RlpxReader {
+    /// Read and decode the next frame. Blocks indefinitely on the header (a
+    /// legitimate idle state); once it arrives the body must follow within
+    /// [`FRAME_BODY_TIMEOUT`].
+    pub async fn recv(&mut self) -> Result<DecodedFrame, String> {
+        let mut header = [0u8; 16];
+        let mut header_mac = [0u8; 16];
+        self.read_half
+            .read_exact(&mut header)
+            .await
+            .map_err(|e| format!("rlpx read: {e}"))?;
+        self.read_half
+            .read_exact(&mut header_mac)
+            .await
+            .map_err(|e| format!("rlpx read: {e}"))?;
+        let body_len = self
+            .decoder
+            .decode_header(&header, &header_mac)
+            .map_err(|e| format!("rlpx header: {}", e.0))?;
+        let padded = (body_len + 15) & !15;
+        let mut enc_body = vec![0u8; padded];
+        let mut body_mac = [0u8; 16];
+        tokio::time::timeout(FRAME_BODY_TIMEOUT, async {
+            self.read_half.read_exact(&mut enc_body).await?;
+            self.read_half.read_exact(&mut body_mac).await
+        })
+        .await
+        .map_err(|_| "rlpx frame body timed out".to_string())?
+        .map_err(|e| format!("rlpx read: {e}"))?;
+        self.decoder
+            .decode_body(&enc_body, &body_mac, body_len)
+            .map_err(|e| format!("rlpx body: {}", e.0))
     }
 }
 

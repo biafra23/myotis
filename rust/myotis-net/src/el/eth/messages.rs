@@ -178,6 +178,17 @@ pub fn encode_get_block_headers_by_hash(
     encode_get_headers(request_id, Item::Bytes(block_hash.to_vec()), max_headers, skip, reverse)
 }
 
+/// `[reqId, []]` — an empty BlockHeaders / BlockBodies / Receipts response, the
+/// answer a passive wallet returns to any inbound eth Get* request (it serves
+/// no chain data). The response code is the request code + 1 (the caller picks
+/// it).
+pub fn encode_empty_response(request_id: u64) -> Vec<u8> {
+    rlp::encode(&Item::List(vec![
+        Item::Bytes(rlp::u64_to_minimal_be(request_id)),
+        Item::List(vec![]),
+    ]))
+}
+
 fn encode_get_headers(request_id: u64, start: Item, max_headers: u64, skip: u64, reverse: bool) -> Vec<u8> {
     let body = Item::List(vec![
         start,

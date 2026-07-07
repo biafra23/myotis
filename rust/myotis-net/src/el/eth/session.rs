@@ -243,6 +243,13 @@ impl EthSession {
         self.conn.peer_pubkey()
     }
 
+    /// Consume the negotiated session, handing the framed connection and the
+    /// negotiated metadata to the [`ManagedPeer`](crate::el::peer::ManagedPeer)
+    /// actor, which drives it from a background read loop.
+    pub fn into_parts(self) -> (RlpxConnection, u64, bool, Status, Hello) {
+        (self.conn, self.eth_version, self.snap, self.peer_status, self.peer_hello)
+    }
+
     // -----------------------------------------------------------------------
     // snap/1 verified state fetch (EL-A6). These share the eth peer's RLPx
     // connection, multiplexed by the dynamic snap message codes.
