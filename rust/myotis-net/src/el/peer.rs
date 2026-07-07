@@ -156,10 +156,10 @@ impl ManagedPeer {
 
         // Send under the writer lock; a write failure leaves the egress frame
         // stream in an indeterminate state (a partial frame may be on the wire),
-        // so mark the peer closed and drop the pending entry.
+        // so fail EVERY in-flight request — not just this one, which would leave
+        // the others hanging until their own timeouts on a dead connection.
         if let Err(e) = self.writer.lock().await.send(send_code, &body).await {
-            self.closed.store(true, Ordering::SeqCst);
-            self.pending.lock().await.remove(&id);
+            fail_all(&self.pending, &self.closed, format!("peer write failure: {e}")).await;
             return Err(e);
         }
 
@@ -350,7 +350,18 @@ impl ManagedPeer {
         finalized_slot: i64,
     ) -> Verdict {
         use crate::el::verify::{header_chain_verdict, ChainHeader, MAX_HEADER_CHAIN_GAP};
-        let total = peer_block - finalized_block + 1;
+        // `ladder_precheck` only reaches here with peer_block > finalized_block,
+        // but guard the subtraction anyway — under panic="abort" an underflow
+        // would kill the process, so fail the verdict closed instead.
+        let total = match peer_block.checked_sub(finalized_block) {
+            Some(diff) => diff + 1,
+            None => {
+                return Verdict {
+                    fail_reason: Some("headerChainInvalid"),
+                    ..Verdict::default()
+                }
+            }
+        };
         // Java's verifyHeaderChainBatched re-guard: total in [2, MAX].
         if total < 2 || total > MAX_HEADER_CHAIN_GAP {
             return Verdict {
@@ -412,9 +423,13 @@ async fn read_loop(
         let code = frame.message_code;
 
         if code == P2P_PING {
-            // Pong body is an empty RLP list. A write failure ends the loop next
-            // iteration; ignore it here.
-            let _ = writer.lock().await.send(P2P_PONG, &[0xc0]).await;
+            // Pong body is an empty RLP list. A write failure (e.g. a half-closed
+            // connection where reads still succeed) means the peer is dead — fail
+            // in-flight requests and stop, rather than spin on a zombie.
+            if let Err(e) = writer.lock().await.send(P2P_PONG, &[0xc0]).await {
+                fail_all(&pending, &closed, format!("peer write failure on Pong: {e}")).await;
+                break;
+            }
             continue;
         }
         if code == P2P_DISCONNECT {
@@ -429,7 +444,11 @@ async fn read_loop(
 
         // An inbound Get* request we answer with an empty response.
         if let Some((resp_code, empty)) = empty_answer(code, &snap_codes, &frame.payload) {
-            let _ = writer.lock().await.send(resp_code, &empty).await;
+            if let Err(e) = writer.lock().await.send(resp_code, &empty).await {
+                fail_all(&pending, &closed, format!("peer write failure on empty response: {e}"))
+                    .await;
+                break;
+            }
             continue;
         }
 
