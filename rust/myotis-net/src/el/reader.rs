@@ -307,6 +307,15 @@ async fn fresh_head(peer: &ManagedPeer) -> Result<([u8; 32], u64), String> {
     let head_hash = peer.peer_status.best_hash;
     let headers = peer.get_block_headers_by_hash(&head_hash, 1).await?;
     let head = headers.into_iter().next().ok_or("peer returned no head header")?;
+    // `head.hash` is OUR keccak of the returned header RLP, so this confirms the
+    // peer actually returned the block we asked for (by hash) — a buggy/hostile
+    // peer returning a different header is caught here with a clear error rather
+    // than surfacing as a confusing header-chain failure downstream. (The state
+    // root is anchored to the beacon chain regardless, so this is robustness,
+    // not the trust gate.)
+    if head.hash != head_hash {
+        return Err("peer returned a header not matching the requested hash".to_string());
+    }
     let state_root = head.header.state_root;
     if state_root == [0u8; 32] {
         return Err("peer head has no state root".to_string());
