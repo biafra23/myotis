@@ -23,7 +23,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 2;
+    static final int EXPECTED_ABI_VERSION = 3; // 3: + nativeDrainLogs
 
     private static final boolean AVAILABLE = load();
 
@@ -94,4 +94,9 @@ final class RustEngineNative {
 
     /** Remove and shut down a handle's sync loop. No-op for an unknown id. */
     static native void nativeStop(long handle);
+
+    /** Up to {@code max} buffered engine tracing lines (oldest first,
+     *  newline-joined; empty when idle). The drainable-ring end of the
+     *  on-device observability seam — see the engine's {@code ringlog}. */
+    static native String nativeDrainLogs(int max);
 }

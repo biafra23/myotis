@@ -91,7 +91,9 @@ Key Gradle modules:
   single `Engines.engine()` line at each composition root; the daemon's
   `get-transactions` debug stream (`DebugCommands` via `SelectorEngine.javaDelegate()
   .debugStack`); the Settings toggles for the BLS backend (`BlsBackends`) and the
-  engine (`Engines`) — internal seams, deliberately not on the API; and `:app`'s
+  engine (`Engines`), and the Rust log drain (`Engines.drainRustLogs` —
+  hosts pump the engine's tracing ring into their log pipeline) — internal
+  seams, deliberately not on the API; and `:app`'s
   `testing/MainnetPeerBootstrap` (an integration-test fixture).
 
 ## Platform & language direction

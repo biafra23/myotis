@@ -31,6 +31,29 @@ public final class Engines {
     private Engines() {}
 
     /**
+     * Drain up to {@code max} buffered Rust-engine tracing lines (oldest first,
+     * newline-joined; empty string when idle or when the Rust engine is not
+     * available). Hosts pump this into their own log pipeline on a short poll
+     * (Android: LogBuffer -> Logs tab + logcat; desktop: slf4j) — an internal
+     * observability seam, deliberately not on the engine API (like the BLS
+     * backend toggle).
+     */
+    public static String drainRustLogs(int max) {
+        // Same lazy-load protection as select(): under the java choice the
+        // native library may never have been loaded — probing availability
+        // would class-load RustEngineNative and map it just to drain a ring
+        // that is empty by construction. rust/auto choices already probed.
+        if ("java".equals(choice)) return "";
+        if (!RustMyotisEngine.isAvailable()) return "";
+        try {
+            String batch = RustEngineNative.nativeDrainLogs(max);
+            return batch != null ? batch : "";
+        } catch (Throwable t) {
+            return ""; // observability must never take the host down
+        }
+    }
+
+    /**
      * The process-wide engine for hosts' composition roots — the single line that used
      * to be {@code new JavaMyotisEngine()}. Always the same {@link SelectorEngine}
      * instance; the underlying choice is consulted per {@code create()} call.

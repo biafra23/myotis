@@ -44,6 +44,8 @@ class DesktopNodeController(
     private val engine: MyotisEngine = Engines.engine(),
 ) : NodeController {
 
+    private val log = org.slf4j.LoggerFactory.getLogger(DesktopNodeController::class.java)
+
     // nanoTime, not currentTimeMillis: wall-clock / NTP steps must not skew uptime.
     private val startNs = System.nanoTime()
     // Per-network boot locks keyed by CANONICAL name, mirroring Android's NodeService.bootLocks:
@@ -236,6 +238,41 @@ class DesktopNodeController(
             delay(2000)
         }
     }.flowOn(Dispatchers.Default)
+
+    init {
+        // Rust log pump on a dedicated daemon thread — NOT inside snapshots():
+        // draining must not stop when the UI stops collecting the flow (window
+        // closed while the node runs) or the ring silently overflows and drops
+        // exactly the incident lines this seam exists to capture. Severity is
+        // preserved (tracing fmt puts the level first). Process-lifetime, like
+        // the controller itself.
+        Thread({
+            while (true) {
+                try {
+                    val batch = Engines.drainRustLogs(500)
+                    if (batch.isNotEmpty()) {
+                        batch.split('\n').forEach {
+                            val t = it.trim()
+                            when {
+                                t.startsWith("ERROR") -> log.error("[rust] {}", it)
+                                t.startsWith("WARN") -> log.warn("[rust] {}", it)
+                                else -> log.info("[rust] {}", it)
+                            }
+                        }
+                    }
+                } catch (e: InterruptedException) {
+                    return@Thread // don't swallow an interrupt raised mid-drain
+                } catch (ignored: Throwable) {
+                    // Observability must never take the host down.
+                }
+                try {
+                    Thread.sleep(5_000)
+                } catch (e: InterruptedException) {
+                    return@Thread
+                }
+            }
+        }, "myotis-rust-logs").apply { isDaemon = true }.start()
+    }
 
     private fun snapshotOf(handle: ChainHandle): NodeSnapshot {
         val s = handle.status()
