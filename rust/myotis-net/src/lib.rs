@@ -24,6 +24,7 @@
 pub mod clcache;
 pub mod codec;
 pub mod discovery;
+pub mod el;
 pub mod protocols;
 pub mod reqresp;
 pub mod status;

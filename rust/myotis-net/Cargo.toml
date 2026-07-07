@@ -11,18 +11,25 @@ license = "MIT OR Apache-2.0"
 # tokio/libp2p/discv5 through any other path) — that's the wasm32 canary's job
 # to enforce (root build.gradle.kts `cargoCheckWasm`).
 myotis-consensus = { path = "../myotis-consensus" }
+# EL primitives (keccak, RLP, NodeKey, ENR) — sans-I/O, same one-way rule.
+myotis-core = { path = "../myotis-core" }
 
 # Exact pins: this crate owns the I/O surface and interop with live CL peers
 # depends on wire-level behavior of these exact versions (noise/yamux framing,
 # discv5 packet format). Cargo.lock would pin them anyway; the `=` makes the
 # intent explicit and survives lockfile regeneration.
-tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net"] }
 libp2p = { version = "=0.56.0", features = ["tokio", "tcp", "noise", "yamux", "identify", "request-response", "secp256k1", "macros"] }
 discv5 = "=0.11.0"
 snap = "=1.1.1"
 tracing = "=0.1.44"
 futures = "=0.3.32"
 async-trait = "=0.1.89"
+# EL discv4 (el::discv4): SO_RCVBUF sizing on the UDP socket (the Android
+# NEIGHBORS-truncation trap — docs/reimplementation/02 §9.10) and entropy for
+# FindNode random targets. Both are I/O-crate concerns by the sans-I/O rules.
+socket2 = "=0.5.10"
+getrandom = "=0.2.17"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -54,10 +54,17 @@ public final class KademliaTable {
         for (Deque<Entry> bucket : buckets) {
             all.addAll(bucket);
         }
-        Bytes32 targetId = target.size() == 32 ? Bytes32.wrap(target) :
-            org.apache.tuweni.crypto.Hash.keccak256(target);
+        Bytes32 targetId = toNodeId(target);
 
-        all.sort(Comparator.comparing(e -> xorDistance(Bytes32.wrap(e.nodeId()), targetId)));
+        // Node IDs are 64-byte pubkeys; hash them to the 32-byte Kademlia id
+        // before XOR (Bytes32.wrap on a 64-byte value throws). Cache the
+        // distance per entry so the keccak+XOR runs once each, not O(N log N)
+        // times inside the comparator. Matches the Rust twin's cached-key sort.
+        Map<Bytes, Bytes32> distanceCache = new HashMap<>(all.size());
+        for (Entry e : all) {
+            distanceCache.put(e.nodeId(), xorDistance(toNodeId(e.nodeId()), targetId));
+        }
+        all.sort(Comparator.comparing(e -> distanceCache.get(e.nodeId())));
         return all.subList(0, Math.min(k, all.size()));
     }
 
@@ -75,10 +82,14 @@ public final class KademliaTable {
     // Internals
     // -------------------------------------------------------------------------
     private int bucketIndex(Bytes nodeId) {
-        Bytes32 id = nodeId.size() == 32 ? Bytes32.wrap(nodeId) :
-            org.apache.tuweni.crypto.Hash.keccak256(nodeId);
-        int lz = leadingZeros(xorDistance(localId, id));
+        int lz = leadingZeros(xorDistance(localId, toNodeId(nodeId)));
         return Math.min(lz, 255);
+    }
+
+    /** A 32-byte node id: a 32-byte value used directly, else keccak256(pubkey). */
+    private static Bytes32 toNodeId(Bytes keyOrId) {
+        return keyOrId.size() == 32 ? Bytes32.wrap(keyOrId)
+                : org.apache.tuweni.crypto.Hash.keccak256(keyOrId);
     }
 
     private static Bytes32 xorDistance(Bytes32 a, Bytes32 b) {
