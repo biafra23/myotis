@@ -1302,14 +1302,23 @@ public class BeaconLightClient implements AutoCloseable {
     private static final int MAX_CL_PEERS = 1024;
     /** Max 128-period batches per catch-up call. Bounds wall-clock on very old checkpoints. */
     private static final int MAX_CATCHUP_BATCHES = 8;
-    /** Pause between ADVANCING catch-up batches. Live LC servers (Lighthouse) serve
-     *  ~one update per ~10 s request-quota window; re-asking instantly after a served
-     *  batch always came back empty, wasting the round as "no progress — will retry
-     *  on next sync cycle" and stretching multi-period catch-ups by a full cycle per
-     *  period. Pacing one quota window keeps the proven server serving every round
-     *  (measured on-device with the Rust twin: 20-95 s/period collapsed to ~11 s).
-     *  Same value as the Rust engine's UPDATES_SERVE_COOLDOWN. */
+    /** LC serve-quota window. Live LC servers (Lighthouse) serve ~one update per
+     *  ~10 s request-quota window; re-asking instantly after a served batch always
+     *  came back empty, wasting the round as "no progress — will retry on next
+     *  sync cycle" (measured on-device with the Rust twin: 20-95 s/period
+     *  collapsed to ~11 s once paced; same value as the Rust engine's
+     *  UPDATES_SERVE_COOLDOWN). The pace is the REMAINDER of this window since
+     *  the last batch request FIRED, not a flat sleep: BLS apply time — minutes
+     *  on-device for big batches — already refills the window (a flat sleep
+     *  would add up to ~77 s of dead time per 8-batch call), and the fire stamp
+     *  lives on an instance field so the NEXT call's batch 0 can't re-ask
+     *  inside the window either (Gnosis's 5 s poll cycle would otherwise do
+     *  exactly that at every batch-cap call boundary). */
     private static final long CATCHUP_QUOTA_PACE_MS = 11_000;
+    /** Wall-clock of the last catch-up batch request fire — the quota
+     *  consumption point (every fan-out consumes serving peers' windows,
+     *  advancing or not). Spans catchUpSyncCommittee calls by design. */
+    private volatile long lastCatchupBatchRequestMs;
     /** Max peers dialed per catch-up batch. The discovered CL pool runs to thousands of
      *  fork-matched nodes, most of which don't run a light-client server — fanning
      *  updates_by_range at all of them burned minutes of ProtocolNegotiation/Timeout
@@ -1342,12 +1351,17 @@ public class BeaconLightClient implements AutoCloseable {
             }
 
             // Pace AFTER the done-check (a finished catch-up must not pay a
-            // pointless pause) and only between advancing batches: batch > 0
-            // means the previous batch applied updates — its server's quota
-            // needs a window to refill before it can serve again.
-            if (batch > 0) {
+            // pointless pause): sleep only the REMAINDER of the serve-quota
+            // window since the last batch request fired — see the constant's
+            // javadoc for why remainder-based and why the stamp spans calls.
+            long sinceLastFire = System.currentTimeMillis() - lastCatchupBatchRequestMs;
+            long paceMs = CATCHUP_QUOTA_PACE_MS - sinceLastFire;
+            if (paceMs > 0) {
+                // Explicit stall marker: this code path's history (#132/#133)
+                // earns making every deliberate pause self-explanatory in logs.
+                log.debug("[beacon] Pacing {} ms for the LC serve quota before the next batch", paceMs);
                 try {
-                    Thread.sleep(CATCHUP_QUOTA_PACE_MS);
+                    Thread.sleep(paceMs);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return;
@@ -1380,6 +1394,8 @@ public class BeaconLightClient implements AutoCloseable {
      * Run one parallel 128-period fetch across all peers; return true if the store advanced.
      */
     private boolean attemptCatchUpBatch(long bootstrapPeriod, long periodsToFetch, long slotEstimate) {
+        // Quota consumption point: stamp before firing (see CATCHUP_QUOTA_PACE_MS).
+        lastCatchupBatchRequestMs = System.currentTimeMillis();
         // Fire requests to all peers in parallel — first peer to deliver a response that
         // actually advances the store wins. Serial iteration with 30s timeouts meant ~9
         // minutes worst case with a list full of dead peers.
