@@ -246,6 +246,12 @@ impl ElPeerCache {
             return;
         }
         let k = addr_key(addr);
+        // Java parity (`if (!entries.containsKey(key)) return;`): only track
+        // failures for peers we actually cached, so the streak map can't grow
+        // for never-added addresses.
+        if !self.entries.contains_key(&k) {
+            return;
+        }
         let count = self.failures.entry(k.clone()).or_insert(0);
         *count += 1;
         if *count >= FAILURE_THRESHOLD {
@@ -455,6 +461,22 @@ mod tests {
         c.record_snap_served("1.2.3.4:30303".parse().unwrap());
         c.flush();
         assert!(c.is_empty());
+    }
+
+    #[test]
+    fn failure_for_unknown_peer_is_ignored() {
+        // Java parity: recording a failure for a peer that was never added is a
+        // no-op (doesn't create an untracked streak entry).
+        let mut c = ElPeerCache::load(std::env::temp_dir().join("myotis-elcache-unknown.cache"));
+        c.record_snap_failure("7.7.7.7:30303".parse().unwrap());
+        c.record_snap_failure("7.7.7.7:30303".parse().unwrap());
+        c.record_snap_failure("7.7.7.7:30303".parse().unwrap());
+        assert!(c.is_empty());
+        // Adding it now starts a fresh streak — one failure must NOT deny it.
+        let a: SocketAddr = "7.7.7.7:30303".parse().unwrap();
+        c.add(a, &pk(1), true);
+        c.record_snap_failure(a);
+        assert_eq!(c.peers()[0].quality, SnapQuality::Unknown);
     }
 
     #[test]
