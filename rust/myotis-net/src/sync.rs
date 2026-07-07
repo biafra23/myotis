@@ -1521,11 +1521,17 @@ fn refresh_local_status(
 /// window. Guarded on a non-zero block hash so a pre-merge / absent execution
 /// header never registers a zero state root as "synced".
 fn update_exec_anchor(store: &LightClientStore, anchor: &ExecAnchor) {
+    // Label each execution payload with ITS block's slot (`beacon.slot`), read
+    // straight from the header — not the store's tracked slots. `finalized_slot`
+    // happens to equal `finalized_header.beacon.slot`, but `optimistic_slot` is
+    // the SIGNATURE slot (~beacon.slot + 1), whereas the optimistic execution
+    // payload belongs to the attested block at `beacon.slot`. Using the block
+    // slot keeps the stateRootMatch window's (slot, root) keys correct.
     if let Some(finalized) = store.finalized_header() {
         let e = &finalized.execution;
         if e.block_hash != [0u8; 32] {
             anchor.update_finalized(
-                store.finalized_slot(),
+                finalized.beacon.slot,
                 e.state_root,
                 e.block_number,
                 e.block_hash,
@@ -1536,7 +1542,7 @@ fn update_exec_anchor(store: &LightClientStore, anchor: &ExecAnchor) {
         let e = &optimistic.execution;
         if e.block_hash != [0u8; 32] {
             anchor.update_optimistic(
-                store.optimistic_slot(),
+                optimistic.beacon.slot,
                 e.block_number,
                 e.block_hash,
                 e.state_root,
@@ -1622,7 +1628,9 @@ mod tests {
         let anchor = ExecAnchor::new();
         let mut store = LightClientStore::new();
         store.update_finalized(&header_with_exec(1000, [0x11; 32], 21_000_000, [0x22; 32]), 1000);
-        store.update_optimistic(&header_with_exec(1002, [0x33; 32], 21_000_002, [0x44; 32]), 1002);
+        // Mirror the processor: the optimistic header is tracked at the SIGNATURE
+        // slot (1003), one past the attested block's beacon.slot (1002).
+        store.update_optimistic(&header_with_exec(1002, [0x33; 32], 21_000_002, [0x44; 32]), 1003);
 
         update_exec_anchor(&store, &anchor);
 
@@ -1635,9 +1643,11 @@ mod tests {
         assert_eq!(anchor.finalized_slot(), 1000);
         assert_eq!(anchor.optimistic_block_number(), 21_000_002);
         assert_eq!(anchor.optimistic_block_hash(), Some([0x44; 32]));
-        // Both roots seed the stateRootMatch window.
-        assert!(anchor.find_state_root(&[0x11; 32]).is_some());
-        assert!(anchor.find_state_root(&[0x33; 32]).is_some());
+        // Both roots seed the stateRootMatch window, each keyed by ITS block's
+        // slot — the optimistic root at the attested block slot 1002, NOT the
+        // store's signature slot 1003.
+        assert_eq!(anchor.find_state_root(&[0x11; 32]).map(|r| r.slot), Some(1000));
+        assert_eq!(anchor.find_state_root(&[0x33; 32]).map(|r| r.slot), Some(1002));
     }
 
     #[test]
