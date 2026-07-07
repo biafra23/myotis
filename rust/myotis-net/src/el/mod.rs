@@ -11,6 +11,7 @@ pub mod discv4;
 pub mod eth;
 pub mod peer;
 pub mod pool;
+pub mod reader;
 pub mod rlpx;
 pub mod snap;
 pub mod verify;
