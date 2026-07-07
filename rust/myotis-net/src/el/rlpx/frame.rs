@@ -40,14 +40,27 @@ pub struct DecodedFrame {
     pub payload: Vec<u8>,
 }
 
+/// The EGRESS half of the frame codec (outbound): AES-256-CTR keystream +
+/// keccak MAC chain. Independent of the ingress half, so the two can live on
+/// separate tokio tasks / socket halves (the managed-peer read/write split).
+pub struct FrameEncoder {
+    encrypt: Aes256Ctr,
+    egress_mac: KeccakMac,
+}
+
+/// The INGRESS half (inbound): AES-256-CTR + keccak MAC chain.
+pub struct FrameDecoder {
+    decrypt: Aes256Ctr,
+    ingress_mac: KeccakMac,
+}
+
 /// Stateful RLPx frame codec — NOT thread-safe (the ciphers and MAC chains are
 /// position-dependent; all sends/receives must be serialized, as on the Java
-/// side). Built from the initiator's [`SessionSecrets`].
+/// side). Composes the two independent halves; [`FrameCodec::split`] hands them
+/// out for the managed-peer read/write tasks.
 pub struct FrameCodec {
-    encrypt: Aes256Ctr,
-    decrypt: Aes256Ctr,
-    egress_mac: KeccakMac,
-    ingress_mac: KeccakMac,
+    encoder: FrameEncoder,
+    decoder: FrameDecoder,
 }
 
 impl FrameCodec {
@@ -55,24 +68,50 @@ impl FrameCodec {
     /// nonce and auth/ack-wire roles swapped — see the handshake tests.)
     pub fn new(secrets: &SessionSecrets) -> FrameCodec {
         let zero_iv = [0u8; 16];
-        let encrypt = Aes256Ctr::new((&secrets.aes_secret).into(), (&zero_iv).into());
-        let decrypt = Aes256Ctr::new((&secrets.aes_secret).into(), (&zero_iv).into());
-
         // egress:  keccak(macSecret XOR ingressNonce ‖ authWire)  [initiator]
         // ingress: keccak(macSecret XOR egressNonce  ‖ ackWire)
         let egress_seed = xor(&secrets.mac_secret, &secrets.ingress_nonce);
-        let egress_mac = KeccakMac::new(&egress_seed, &secrets.mac_secret, &secrets.auth_wire);
         let ingress_seed = xor(&secrets.mac_secret, &secrets.egress_nonce);
-        let ingress_mac = KeccakMac::new(&ingress_seed, &secrets.mac_secret, &secrets.ack_wire);
-
         FrameCodec {
-            encrypt,
-            decrypt,
-            egress_mac,
-            ingress_mac,
+            encoder: FrameEncoder {
+                encrypt: Aes256Ctr::new((&secrets.aes_secret).into(), (&zero_iv).into()),
+                egress_mac: KeccakMac::new(&egress_seed, &secrets.mac_secret, &secrets.auth_wire),
+            },
+            decoder: FrameDecoder {
+                decrypt: Aes256Ctr::new((&secrets.aes_secret).into(), (&zero_iv).into()),
+                ingress_mac: KeccakMac::new(&ingress_seed, &secrets.mac_secret, &secrets.ack_wire),
+            },
         }
     }
 
+    /// Split into the independent egress/ingress halves for the managed peer's
+    /// separate read and write tasks.
+    pub fn split(self) -> (FrameEncoder, FrameDecoder) {
+        (self.encoder, self.decoder)
+    }
+
+    /// Encode one message into a full frame (delegates to the egress half).
+    pub fn encode_frame(&mut self, message_code: u64, body: &[u8]) -> Vec<u8> {
+        self.encoder.encode_frame(message_code, body)
+    }
+
+    /// Verify + decrypt a 16-byte encrypted header (delegates to the ingress half).
+    pub fn decode_header(&mut self, enc_header: &[u8], header_mac: &[u8]) -> Result<usize, CoreError> {
+        self.decoder.decode_header(enc_header, header_mac)
+    }
+
+    /// Verify + decrypt a frame body (delegates to the ingress half).
+    pub fn decode_body(
+        &mut self,
+        enc_body: &[u8],
+        body_mac: &[u8],
+        body_len: usize,
+    ) -> Result<DecodedFrame, CoreError> {
+        self.decoder.decode_body(enc_body, body_mac, body_len)
+    }
+}
+
+impl FrameEncoder {
     /// Encode one message into a full frame (header ‖ header-mac ‖ body ‖ body-mac).
     pub fn encode_frame(&mut self, message_code: u64, body: &[u8]) -> Vec<u8> {
         // Snappy-compress everything except Hello.
@@ -112,7 +151,9 @@ impl FrameCodec {
         frame.extend_from_slice(&body_mac);
         frame
     }
+}
 
+impl FrameDecoder {
     /// Verify + decrypt a 16-byte encrypted header, returning the body length.
     pub fn decode_header(&mut self, enc_header: &[u8], header_mac: &[u8]) -> Result<usize, CoreError> {
         if enc_header.len() != 16 || header_mac.len() != 16 {
@@ -359,10 +400,10 @@ mod tests {
         header[1] = (body_len >> 8) as u8;
         header[2] = body_len as u8;
         header[3] = 0xc0;
-        a.encrypt.apply_keystream(&mut header);
-        let header_mac = a.egress_mac.update_header(&header);
-        a.encrypt.apply_keystream(&mut coded);
-        let body_mac = a.egress_mac.update_body(&coded);
+        a.encoder.encrypt.apply_keystream(&mut header);
+        let header_mac = a.encoder.egress_mac.update_header(&header);
+        a.encoder.encrypt.apply_keystream(&mut coded);
+        let body_mac = a.encoder.egress_mac.update_body(&coded);
 
         let len = b.decode_header(&header, &header_mac).unwrap();
         // The key assertion: this returns (raw fallback) rather than aborting.

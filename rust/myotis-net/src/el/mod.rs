@@ -9,6 +9,7 @@
 pub mod anchor;
 pub mod discv4;
 pub mod eth;
+pub mod peer;
 pub mod rlpx;
 pub mod snap;
 pub mod verify;

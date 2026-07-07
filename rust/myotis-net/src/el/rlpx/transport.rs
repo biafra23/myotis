@@ -11,11 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
 use myotis_core::nodekey::NodeKey;
 
-use super::frame::{DecodedFrame, FrameCodec};
+use super::frame::{DecodedFrame, FrameCodec, FrameDecoder, FrameEncoder};
 use super::handshake::Initiator;
 
 /// p2p base message codes (shared prefix below the eth sub-protocol).
@@ -102,6 +103,18 @@ impl RlpxConnection {
         self.peer_pubkey
     }
 
+    /// Split into independent read/write halves for the managed-peer's separate
+    /// tasks (the frame codec's egress/ingress state are independent).
+    pub fn split(self) -> (RlpxReader, RlpxWriter, [u8; 64]) {
+        let (read_half, write_half) = self.stream.into_split();
+        let (encoder, decoder) = self.codec.split();
+        (
+            RlpxReader { read_half, decoder },
+            RlpxWriter { write_half, encoder },
+            self.peer_pubkey,
+        )
+    }
+
     /// Frame and send one message.
     pub async fn send(&mut self, message_code: u64, body: &[u8]) -> Result<(), String> {
         let frame = self.codec.encode_frame(message_code, body);
@@ -143,6 +156,65 @@ impl RlpxConnection {
             .await
             .map(|_| ())
             .map_err(|e| format!("rlpx read: {e}"))
+    }
+}
+
+/// The write half of a split [`RlpxConnection`] — owns the egress cipher/MAC.
+/// Serialize all sends through `&mut self`.
+pub struct RlpxWriter {
+    write_half: OwnedWriteHalf,
+    encoder: FrameEncoder,
+}
+
+impl RlpxWriter {
+    /// Frame and send one message.
+    pub async fn send(&mut self, message_code: u64, body: &[u8]) -> Result<(), String> {
+        let frame = self.encoder.encode_frame(message_code, body);
+        self.write_half
+            .write_all(&frame)
+            .await
+            .map_err(|e| format!("rlpx write frame: {e}"))
+    }
+}
+
+/// The read half of a split [`RlpxConnection`] — owns the ingress cipher/MAC.
+pub struct RlpxReader {
+    read_half: OwnedReadHalf,
+    decoder: FrameDecoder,
+}
+
+impl RlpxReader {
+    /// Read and decode the next frame. Blocks indefinitely on the header (a
+    /// legitimate idle state); once it arrives the body must follow within
+    /// [`FRAME_BODY_TIMEOUT`].
+    pub async fn recv(&mut self) -> Result<DecodedFrame, String> {
+        let mut header = [0u8; 16];
+        let mut header_mac = [0u8; 16];
+        self.read_half
+            .read_exact(&mut header)
+            .await
+            .map_err(|e| format!("rlpx read: {e}"))?;
+        self.read_half
+            .read_exact(&mut header_mac)
+            .await
+            .map_err(|e| format!("rlpx read: {e}"))?;
+        let body_len = self
+            .decoder
+            .decode_header(&header, &header_mac)
+            .map_err(|e| format!("rlpx header: {}", e.0))?;
+        let padded = (body_len + 15) & !15;
+        let mut enc_body = vec![0u8; padded];
+        let mut body_mac = [0u8; 16];
+        tokio::time::timeout(FRAME_BODY_TIMEOUT, async {
+            self.read_half.read_exact(&mut enc_body).await?;
+            self.read_half.read_exact(&mut body_mac).await
+        })
+        .await
+        .map_err(|_| "rlpx frame body timed out".to_string())?
+        .map_err(|e| format!("rlpx read: {e}"))?;
+        self.decoder
+            .decode_body(&enc_body, &body_mac, body_len)
+            .map_err(|e| format!("rlpx body: {}", e.0))
     }
 }
 

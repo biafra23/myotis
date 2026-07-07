@@ -1,0 +1,544 @@
+//! The managed-peer connection actor (EL-A7b): a negotiated eth/snap peer whose
+//! RLPx connection is driven by a background read loop, so requests correlate
+//! by request id concurrently instead of the single-shot, one-request-at-a-time
+//! [`EthSession`](crate::el::eth::session::EthSession) model.
+//!
+//! Since the RLPx frame codec's egress and ingress state are independent, the
+//! connection splits into a [`RlpxReader`]/[`RlpxWriter`] pair
+//! ([`RlpxConnection::split`]). The read task owns the reader and a clone of the
+//! shared writer; it classifies each inbound frame:
+//!
+//! * p2p **Ping** → **Pong** (keeps the peer from dropping us on idle),
+//! * p2p **Disconnect** / a read error → fail every in-flight request and stop,
+//! * an inbound eth/snap **Get\*** request → an **empty** response (the wallet
+//!   serves no chain data, but a well-behaved empty answer beats a timeout),
+//! * a response → delivered to the waiting request by `(reqId, code)`,
+//! * anything else (gossip, mempool) → ignored.
+//!
+//! Request methods take `&self`: the writer is an `Arc<Mutex<…>>` and the
+//! request-id counter is atomic, so several requests can be outstanding at once.
+//! This is the twin of the Java `EthHandler`'s always-listening channel (its
+//! Netty pipeline answers Ping and unsolicited Get\* the same way).
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::{oneshot, Mutex};
+use tokio::task::JoinHandle;
+
+use myotis_core::rlp;
+use myotis_core::trie::{AccountLeaf, EMPTY_CODE_HASH, EMPTY_TRIE_ROOT};
+
+use crate::el::anchor::ExecAnchor;
+use crate::el::eth::messages::{self, Status, VerifiedHeader};
+use crate::el::eth::session::EthSession;
+use crate::el::rlpx::transport::{
+    Hello, RlpxConnection, RlpxReader, RlpxWriter, P2P_DISCONNECT, P2P_PING, P2P_PONG,
+};
+use crate::el::snap::fetch::{self, AccountOutcome};
+use crate::el::snap::messages as snap;
+use crate::el::verify::Verdict;
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// One in-flight request: the response code it expects and the delivery channel.
+struct Pending {
+    want_code: u64,
+    tx: oneshot::Sender<Result<Vec<u8>, String>>,
+}
+
+type PendingMap = Arc<Mutex<HashMap<u64, Pending>>>;
+
+/// A negotiated eth/snap peer, driven by a background read loop.
+pub struct ManagedPeer {
+    writer: Arc<Mutex<RlpxWriter>>,
+    pending: PendingMap,
+    next_id: AtomicU64,
+    /// Set once the read loop terminates (disconnect / read error); requests
+    /// short-circuit instead of hanging until timeout.
+    closed: Arc<AtomicBool>,
+    reader_task: JoinHandle<()>,
+
+    /// Negotiated eth version (66-69).
+    pub eth_version: u64,
+    /// Whether the peer also advertised snap/1.
+    pub snap: bool,
+    /// The peer's Status (head, fork id).
+    pub peer_status: Status,
+    /// The peer's Hello (client id, capabilities).
+    pub peer_hello: Hello,
+    peer_pubkey: [u8; 64],
+    snap_codes: Option<snap::SnapCodes>,
+}
+
+impl ManagedPeer {
+    /// Take over a handshook [`EthSession`], splitting its connection and
+    /// spawning the background read loop. From here the peer serves concurrent
+    /// requests and answers Ping/Get\* on its own.
+    pub fn spawn(session: EthSession) -> ManagedPeer {
+        let (conn, eth_version, snap, peer_status, peer_hello) = session.into_parts();
+        Self::from_connection(conn, eth_version, snap, peer_status, peer_hello)
+    }
+
+    fn from_connection(
+        conn: RlpxConnection,
+        eth_version: u64,
+        snap: bool,
+        peer_status: Status,
+        peer_hello: Hello,
+    ) -> ManagedPeer {
+        let (reader, writer, peer_pubkey) = conn.split();
+        let snap_codes = snap.then(|| snap::SnapCodes::for_eth_version(eth_version));
+        let writer = Arc::new(Mutex::new(writer));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let closed = Arc::new(AtomicBool::new(false));
+
+        let reader_task = tokio::spawn(read_loop(
+            reader,
+            Arc::clone(&writer),
+            Arc::clone(&pending),
+            Arc::clone(&closed),
+            snap_codes,
+        ));
+
+        ManagedPeer {
+            writer,
+            pending,
+            next_id: AtomicU64::new(1),
+            closed,
+            reader_task,
+            eth_version,
+            snap,
+            peer_status,
+            peer_hello,
+            peer_pubkey,
+            snap_codes,
+        }
+    }
+
+    pub fn peer_pubkey(&self) -> [u8; 64] {
+        self.peer_pubkey
+    }
+
+    /// True once the read loop has stopped (peer disconnect or fatal read
+    /// error); the peer serves no further requests.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Send one request and await its response, correlating by request id. The
+    /// closure receives the allocated id so the encoded body carries it. Fails
+    /// fast if the peer is already closed, on a write error, or on timeout.
+    async fn request(
+        &self,
+        send_code: u64,
+        want_code: u64,
+        encode: impl FnOnce(u64) -> Vec<u8>,
+    ) -> Result<Vec<u8>, String> {
+        if self.is_closed() {
+            return Err("peer connection closed".to_string());
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let body = encode(id);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, Pending { want_code, tx });
+
+        // Send under the writer lock; drop the pending entry if the write fails.
+        if let Err(e) = self.writer.lock().await.send(send_code, &body).await {
+            self.pending.lock().await.remove(&id);
+            return Err(e);
+        }
+
+        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(result)) => result,
+            // The read loop dropped the sender (disconnect drained the map).
+            Ok(Err(_)) => Err("peer connection closed".to_string()),
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                Err(format!("timed out awaiting code 0x{want_code:02x}"))
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // eth requests.
+    // -----------------------------------------------------------------------
+
+    /// Request a batch of headers by starting block number. Verifies nothing
+    /// here — the caller checks hashes against the beacon anchor.
+    pub async fn get_block_headers_by_number(
+        &self,
+        block_number: u64,
+        max_headers: u64,
+        skip: u64,
+        reverse: bool,
+    ) -> Result<Vec<VerifiedHeader>, String> {
+        let payload = self
+            .request(messages::GET_BLOCK_HEADERS, messages::BLOCK_HEADERS, |id| {
+                messages::encode_get_block_headers_by_number(id, block_number, max_headers, skip, reverse)
+            })
+            .await?;
+        let (_rid, headers) = messages::decode_block_headers(&payload)
+            .map_err(|e| format!("BlockHeaders decode: {}", e.0))?;
+        Ok(headers)
+    }
+
+    /// Request headers starting at a block HASH (fetch a peer's fresh head).
+    pub async fn get_block_headers_by_hash(
+        &self,
+        block_hash: &[u8; 32],
+        max_headers: u64,
+    ) -> Result<Vec<VerifiedHeader>, String> {
+        let payload = self
+            .request(messages::GET_BLOCK_HEADERS, messages::BLOCK_HEADERS, |id| {
+                messages::encode_get_block_headers_by_hash(id, block_hash, max_headers, 0, false)
+            })
+            .await?;
+        let (_rid, headers) = messages::decode_block_headers(&payload)
+            .map_err(|e| format!("BlockHeaders decode: {}", e.0))?;
+        Ok(headers)
+    }
+
+    /// Request block bodies by hash.
+    pub async fn get_block_bodies(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> Result<Vec<messages::BlockBody>, String> {
+        let payload = self
+            .request(messages::GET_BLOCK_BODIES, messages::BLOCK_BODIES, |id| {
+                messages::encode_get_block_bodies(id, hashes)
+            })
+            .await?;
+        let (_rid, bodies) = messages::decode_block_bodies(&payload)
+            .map_err(|e| format!("BlockBodies decode: {}", e.0))?;
+        Ok(bodies)
+    }
+
+    // -----------------------------------------------------------------------
+    // snap/1 verified state fetch (shares the eth peer's RLPx connection).
+    // -----------------------------------------------------------------------
+
+    fn snap_codes(&self) -> Option<snap::SnapCodes> {
+        self.snap_codes
+    }
+
+    /// Fetch and verify one account at `state_root` (a FRESH root the peer still
+    /// retains). The returned fields come from the MPT-verified proof leaf,
+    /// never the peer's slim body.
+    pub async fn snap_get_account(
+        &self,
+        state_root: &[u8; 32],
+        address: &[u8; 20],
+    ) -> Result<AccountOutcome, String> {
+        let codes = self.snap_codes().ok_or("peer does not support snap/1")?;
+        let account_hash = myotis_core::keccak::keccak256(address);
+        let payload = self
+            .request(codes.get_account_range, codes.account_range, |id| {
+                snap::encode_get_account(id, state_root, &account_hash, 4096)
+            })
+            .await?;
+        let response = snap::decode_account_range(&payload)
+            .map_err(|e| format!("AccountRange decode: {}", e.0))?;
+        fetch::verify_account(state_root, address, &response).map_err(|e| e.0)
+    }
+
+    /// Fetch and verify one storage slot against the account's proven
+    /// `storage_root` (not the world state root).
+    pub async fn snap_get_storage(
+        &self,
+        state_root: &[u8; 32],
+        address: &[u8; 20],
+        account: &AccountLeaf,
+        slot: &[u8; 32],
+    ) -> Result<Vec<u8>, String> {
+        // No storage trie → every slot is provably zero; skip the round trip.
+        if account.storage_root == EMPTY_TRIE_ROOT {
+            return Ok(Vec::new());
+        }
+        let codes = self.snap_codes().ok_or("peer does not support snap/1")?;
+        let account_hash = myotis_core::keccak::keccak256(address);
+        let slot_hash = myotis_core::keccak::keccak256(slot);
+        let payload = self
+            .request(codes.get_storage_ranges, codes.storage_ranges, |id| {
+                snap::encode_get_storage_slot(id, state_root, &account_hash, &slot_hash, 4096)
+            })
+            .await?;
+        let response = snap::decode_storage_ranges(&payload)
+            .map_err(|e| format!("StorageRanges decode: {}", e.0))?;
+        fetch::verify_storage(account, slot, &response).map_err(|e| e.0)
+    }
+
+    /// Fetch and verify one contract's bytecode by its `code_hash`.
+    pub async fn snap_get_bytecode(&self, code_hash: &[u8; 32]) -> Result<Vec<u8>, String> {
+        // A code-less account (EOAs — the vast majority): no round trip.
+        if code_hash == &EMPTY_CODE_HASH {
+            return Ok(Vec::new());
+        }
+        let codes = self.snap_codes().ok_or("peer does not support snap/1")?;
+        let payload = self
+            .request(codes.get_byte_codes, codes.byte_codes, |id| {
+                snap::encode_get_byte_codes(id, &[*code_hash], 256 * 1024)
+            })
+            .await?;
+        let (_id, codes_returned) =
+            snap::decode_byte_codes(&payload).map_err(|e| format!("ByteCodes decode: {}", e.0))?;
+        fetch::verify_bytecode(code_hash, &codes_returned)
+            .ok_or_else(|| "no returned bytecode matched the requested hash".to_string())
+    }
+
+    // -----------------------------------------------------------------------
+    // Verified-read verdicts (the ladder over the anchored beacon state).
+    // -----------------------------------------------------------------------
+
+    /// Anchor a peer-served `state_root` (for `block_number`) to the beacon
+    /// chain: `stateRootMatch` fast path, else the `headerChain` walk.
+    /// `proof_valid` is the caller's MPT-proof result against `state_root`.
+    pub async fn verified_state_root(
+        &self,
+        anchor: &ExecAnchor,
+        state_root: &[u8; 32],
+        block_number: i64,
+        proof_valid: bool,
+    ) -> Verdict {
+        use crate::el::verify::{ladder_precheck, LadderStep};
+        match ladder_precheck(Some(state_root), proof_valid, block_number, anchor) {
+            LadderStep::Done(verdict) => verdict,
+            LadderStep::NeedHeaderChain {
+                finalized_block,
+                peer_block,
+                beacon_block_hash,
+                finalized_slot,
+            } => {
+                self.header_chain_verdict(
+                    finalized_block,
+                    peer_block,
+                    &beacon_block_hash,
+                    state_root,
+                    finalized_slot,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Fetch `[finalized_block ..= peer_block]` and run the header-chain verdict
+    /// against the beacon-anchored block hash. `headerChainError` on transport
+    /// failure, `headerChainInvalid` on a short/over-long/out-of-range response
+    /// (matching the Java ladder). A single request, so it only spans a gap the
+    /// peer serves in one response — a multi-thousand-block gap truncates and
+    /// fails closed (batched fetch lands in a later A7b sub-PR).
+    async fn header_chain_verdict(
+        &self,
+        finalized_block: u64,
+        peer_block: u64,
+        beacon_block_hash: &[u8; 32],
+        peer_state_root: &[u8; 32],
+        finalized_slot: i64,
+    ) -> Verdict {
+        use crate::el::verify::{header_chain_verdict, ChainHeader, MAX_HEADER_CHAIN_GAP};
+        let total = peer_block - finalized_block + 1;
+        // Java's verifyHeaderChainBatched re-guard: total in [2, MAX].
+        if total < 2 || total > MAX_HEADER_CHAIN_GAP {
+            return Verdict {
+                fail_reason: Some("headerChainInvalid"),
+                ..Verdict::default()
+            };
+        }
+        let headers = match self
+            .get_block_headers_by_number(finalized_block, total, 0, false)
+            .await
+        {
+            Ok(h) => h,
+            Err(_) => {
+                return Verdict {
+                    fail_reason: Some("headerChainError"),
+                    ..Verdict::default()
+                }
+            }
+        };
+        let chain: Vec<ChainHeader> = headers
+            .into_iter()
+            .map(|vh| ChainHeader { hash: vh.hash, header: vh.header })
+            .collect();
+        if chain.len() as u64 != total {
+            return Verdict {
+                fail_reason: Some("headerChainInvalid"),
+                ..Verdict::default()
+            };
+        }
+        header_chain_verdict(&chain, beacon_block_hash, peer_state_root, finalized_slot)
+    }
+}
+
+impl Drop for ManagedPeer {
+    fn drop(&mut self) {
+        // Stop the background read loop when the last handle goes away.
+        self.reader_task.abort();
+    }
+}
+
+/// The background read loop: classify each inbound frame and either answer it
+/// (Ping/Get\*), deliver it to a waiting request, or ignore it. Exits on a read
+/// error or a peer Disconnect, failing every in-flight request on the way out.
+async fn read_loop(
+    mut reader: RlpxReader,
+    writer: Arc<Mutex<RlpxWriter>>,
+    pending: PendingMap,
+    closed: Arc<AtomicBool>,
+    snap_codes: Option<snap::SnapCodes>,
+) {
+    loop {
+        let frame = match reader.recv().await {
+            Ok(f) => f,
+            Err(e) => {
+                fail_all(&pending, format!("peer read loop ended: {e}")).await;
+                break;
+            }
+        };
+        let code = frame.message_code;
+
+        if code == P2P_PING {
+            // Pong body is an empty RLP list. A write failure ends the loop next
+            // iteration; ignore it here.
+            let _ = writer.lock().await.send(P2P_PONG, &[0xc0]).await;
+            continue;
+        }
+        if code == P2P_DISCONNECT {
+            fail_all(&pending, format!("peer disconnected: {}", describe_disconnect(&frame.payload)))
+                .await;
+            break;
+        }
+
+        // An inbound Get* request we answer with an empty response.
+        if let Some((resp_code, empty)) = empty_answer(code, &snap_codes, &frame.payload) {
+            let _ = writer.lock().await.send(resp_code, &empty).await;
+            continue;
+        }
+
+        // Otherwise try to correlate a response by (reqId, code). Anything that
+        // doesn't match a waiting request is gossip/mempool — ignore it.
+        if let Some(id) = leading_request_id(&frame.payload) {
+            let mut map = pending.lock().await;
+            if let Some(entry) = map.get(&id) {
+                if entry.want_code == code {
+                    let entry = map.remove(&id).expect("just checked present");
+                    let _ = entry.tx.send(Ok(frame.payload));
+                }
+            }
+        }
+    }
+    closed.store(true, Ordering::SeqCst);
+}
+
+/// If `code` is an inbound eth/snap Get\* request, return the `(responseCode,
+/// emptyBody)` to answer it with — echoing the request's id. `None` for any
+/// other frame.
+fn empty_answer(
+    code: u64,
+    snap_codes: &Option<snap::SnapCodes>,
+    payload: &[u8],
+) -> Option<(u64, Vec<u8>)> {
+    let id = leading_request_id(payload)?;
+    match code {
+        messages::GET_BLOCK_HEADERS => {
+            Some((messages::BLOCK_HEADERS, messages::encode_empty_response(id)))
+        }
+        messages::GET_BLOCK_BODIES => {
+            Some((messages::BLOCK_BODIES, messages::encode_empty_response(id)))
+        }
+        messages::GET_RECEIPTS => Some((messages::RECEIPTS, messages::encode_empty_response(id))),
+        _ => {
+            let c = snap_codes.as_ref()?;
+            if code == c.get_account_range {
+                Some((c.account_range, snap::encode_empty_range(id)))
+            } else if code == c.get_storage_ranges {
+                Some((c.storage_ranges, snap::encode_empty_range(id)))
+            } else if code == c.get_byte_codes {
+                Some((c.byte_codes, snap::encode_empty_codes(id)))
+            } else if code == c.get_trie_nodes {
+                Some((c.trie_nodes, snap::encode_empty_codes(id)))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Fail every in-flight request with `reason`, draining the pending map.
+async fn fail_all(pending: &PendingMap, reason: String) {
+    let mut map = pending.lock().await;
+    for (_id, entry) in map.drain() {
+        let _ = entry.tx.send(Err(reason.clone()));
+    }
+}
+
+/// The leading request id of an eth/snap request or response (`[reqId, …]`).
+fn leading_request_id(payload: &[u8]) -> Option<u64> {
+    let items = rlp::raw_list_items(payload).ok()?;
+    rlp::decode(items.first()?).ok()?.as_u64().ok()
+}
+
+/// A p2p Disconnect body is `[reason]` (or a bare `reason`); decode it.
+fn describe_disconnect(payload: &[u8]) -> String {
+    let reason = rlp::decode(payload)
+        .ok()
+        .and_then(|it| match it {
+            rlp::Item::List(items) => items.first().and_then(|r| r.as_u64().ok()),
+            rlp::Item::Bytes(_) => it.as_u64().ok(),
+        })
+        .unwrap_or(u64::MAX);
+    format!("reason={reason}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leading_request_id_reads_reqid() {
+        let msg = rlp::encode(&rlp::Item::List(vec![
+            rlp::Item::Bytes(rlp::u64_to_minimal_be(4242)),
+            rlp::Item::List(vec![]),
+        ]));
+        assert_eq!(leading_request_id(&msg), Some(4242));
+        // A bare byte string is not a `[reqId, …]` list.
+        assert_eq!(leading_request_id(&[0x80]), None);
+    }
+
+    #[test]
+    fn empty_answer_maps_eth_get_star() {
+        let req = rlp::encode(&rlp::Item::List(vec![
+            rlp::Item::Bytes(rlp::u64_to_minimal_be(7)),
+            rlp::Item::List(vec![]),
+        ]));
+        let (code, body) = empty_answer(messages::GET_BLOCK_HEADERS, &None, &req).unwrap();
+        assert_eq!(code, messages::BLOCK_HEADERS);
+        assert_eq!(leading_request_id(&body), Some(7));
+
+        let (code, _) = empty_answer(messages::GET_RECEIPTS, &None, &req).unwrap();
+        assert_eq!(code, messages::RECEIPTS);
+
+        // A response code is not an inbound request.
+        assert!(empty_answer(messages::BLOCK_HEADERS, &None, &req).is_none());
+    }
+
+    #[test]
+    fn empty_answer_maps_snap_get_star() {
+        let codes = snap::SnapCodes::for_eth_version(68);
+        let req = rlp::encode(&rlp::Item::List(vec![
+            rlp::Item::Bytes(rlp::u64_to_minimal_be(9)),
+            rlp::Item::List(vec![]),
+        ]));
+        let (code, body) = empty_answer(codes.get_account_range, &Some(codes), &req).unwrap();
+        assert_eq!(code, codes.account_range);
+        assert_eq!(leading_request_id(&body), Some(9));
+
+        let (code, _) = empty_answer(codes.get_byte_codes, &Some(codes), &req).unwrap();
+        assert_eq!(code, codes.byte_codes);
+
+        // Without snap negotiated, snap codes aren't answered.
+        assert!(empty_answer(codes.get_account_range, &None, &req).is_none());
+    }
+}
