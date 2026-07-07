@@ -260,6 +260,8 @@ class DesktopNodeController(
                             }
                         }
                     }
+                } catch (e: InterruptedException) {
+                    return@Thread // don't swallow an interrupt raised mid-drain
                 } catch (ignored: Throwable) {
                     // Observability must never take the host down.
                 }

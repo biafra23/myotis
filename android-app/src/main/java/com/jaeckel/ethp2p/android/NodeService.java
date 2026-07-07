@@ -1166,14 +1166,24 @@ public final class NodeService extends Service {
                     String batch = io.myotis.engines.Engines.drainRustLogs(RUST_LOG_DRAIN_MAX);
                     if (!batch.isEmpty()) {
                         for (String line : batch.split("\n")) {
-                            LogBuffer.i("rust", line);
+                            // Preserve severity: tracing's fmt layer puts the
+                            // level first (time disabled) — "ERROR …"/"WARN …".
+                            String trimmed = line.trim();
+                            if (trimmed.startsWith("ERROR")) LogBuffer.e("rust", line);
+                            else if (trimmed.startsWith("WARN")) LogBuffer.w("rust", line);
+                            else LogBuffer.i("rust", line);
                         }
                     }
+                } catch (Throwable ignored) {
+                    // Observability must never take the process down.
+                }
+                // Sleep OUTSIDE the try above: a persistently-throwing drain
+                // (e.g. a failed Engines static init) must stay a 5 s poll,
+                // never an unthrottled busy loop pinning a core.
+                try {
                     Thread.sleep(RUST_LOG_DRAIN_MS);
                 } catch (InterruptedException e) {
                     return; // onDestroy interrupted us
-                } catch (Throwable ignored) {
-                    // Observability must never take the process down.
                 }
             }
         }, "ethp2p-rust-logs");
