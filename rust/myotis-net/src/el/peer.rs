@@ -137,16 +137,28 @@ impl ManagedPeer {
         want_code: u64,
         encode: impl FnOnce(u64) -> Vec<u8>,
     ) -> Result<Vec<u8>, String> {
-        if self.is_closed() {
-            return Err("peer connection closed".to_string());
-        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let body = encode(id);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, Pending { want_code, tx });
 
-        // Send under the writer lock; drop the pending entry if the write fails.
+        // Insert while holding the pending lock, checking `closed` inside it.
+        // `fail_all` sets `closed` under the SAME lock, so we can't lose the
+        // race where the read loop drains the map (on disconnect) between an
+        // unlocked check and our insert — either we insert before the drain (and
+        // it delivers our Err) or we observe `closed` and bail here.
+        {
+            let mut map = self.pending.lock().await;
+            if self.closed.load(Ordering::SeqCst) {
+                return Err("peer connection closed".to_string());
+            }
+            map.insert(id, Pending { want_code, tx });
+        }
+
+        // Send under the writer lock; a write failure leaves the egress frame
+        // stream in an indeterminate state (a partial frame may be on the wire),
+        // so mark the peer closed and drop the pending entry.
         if let Err(e) = self.writer.lock().await.send(send_code, &body).await {
+            self.closed.store(true, Ordering::SeqCst);
             self.pending.lock().await.remove(&id);
             return Err(e);
         }
@@ -393,7 +405,7 @@ async fn read_loop(
         let frame = match reader.recv().await {
             Ok(f) => f,
             Err(e) => {
-                fail_all(&pending, format!("peer read loop ended: {e}")).await;
+                fail_all(&pending, &closed, format!("peer read loop ended: {e}")).await;
                 break;
             }
         };
@@ -406,8 +418,12 @@ async fn read_loop(
             continue;
         }
         if code == P2P_DISCONNECT {
-            fail_all(&pending, format!("peer disconnected: {}", describe_disconnect(&frame.payload)))
-                .await;
+            fail_all(
+                &pending,
+                &closed,
+                format!("peer disconnected: {}", describe_disconnect(&frame.payload)),
+            )
+            .await;
             break;
         }
 
@@ -429,6 +445,8 @@ async fn read_loop(
             }
         }
     }
+    // Backstop: every break above already set `closed` via `fail_all`, but keep
+    // this so any future exit path can't leave the peer looking open.
     closed.store(true, Ordering::SeqCst);
 }
 
@@ -466,9 +484,13 @@ fn empty_answer(
     }
 }
 
-/// Fail every in-flight request with `reason`, draining the pending map.
-async fn fail_all(pending: &PendingMap, reason: String) {
+/// Fail every in-flight request with `reason`, draining the pending map. Marks
+/// the peer closed under the pending lock (before draining) so a concurrent
+/// [`ManagedPeer::request`] either inserted before the drain — and gets its Err
+/// here — or observes `closed` and bails, never hanging on a dead connection.
+async fn fail_all(pending: &PendingMap, closed: &Arc<AtomicBool>, reason: String) {
     let mut map = pending.lock().await;
+    closed.store(true, Ordering::SeqCst);
     for (_id, entry) in map.drain() {
         let _ = entry.tx.send(Err(reason.clone()));
     }
