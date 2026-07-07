@@ -107,7 +107,10 @@ public final class MerklePatriciaProofVerifier {
     private static Result interpret(Bytes nodeRlp, byte[] path, int idx, Map<Bytes32, Bytes> byHash) {
         List<Bytes> items;
         try {
-            items = RlpItems.split(nodeRlp);
+            // Validated split: the WHOLE node must be structurally well-formed
+            // (embedded lists included, traversed or not), matching the Rust
+            // twin's eager decode.
+            items = RlpItems.splitValidated(nodeRlp);
         } catch (IllegalArgumentException e) {
             return new Result.Invalid("malformed node RLP: " + e.getMessage());
         }
@@ -144,7 +147,14 @@ public final class MerklePatriciaProofVerifier {
     /** Leaf or extension: 2 raw RLP items — encoded-path + (value | next-hash | embedded-list). */
     private static Result interpretShort(List<Bytes> items, byte[] path, int idx, Map<Bytes32, Bytes> byHash) {
         Bytes encodedPath = stripBytesHeader(items.get(0));
-        HexPrefix.Decoded decoded = HexPrefix.decode(encodedPath.toArrayUnsafe());
+        HexPrefix.Decoded decoded;
+        try {
+            decoded = HexPrefix.decode(encodedPath.toArrayUnsafe());
+        } catch (IllegalArgumentException e) {
+            // A bad flag nibble / empty path is a malformed node, not a caller
+            // error — keep the sealed Result contract (Rust-twin parity).
+            return new Result.Invalid("bad hex-prefix path: " + e.getMessage());
+        }
         byte[] nodeNibbles = decoded.nibbles();
 
         // Remaining path must start with the node's nibbles; otherwise the
