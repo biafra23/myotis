@@ -367,7 +367,9 @@ fn snapshot_reader_slots(
 /// returns `None` for any malformed input (JNI callers pass untrusted strings).
 fn parse_address(hex: &str) -> Option<[u8; 20]> {
     let hex = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
-    if hex.len() != 40 {
+    // Require exactly 40 hex digits — reject the sign/whitespace that
+    // `u8::from_str_radix` would otherwise accept (e.g. a "+f" byte-pair).
+    if hex.len() != 40 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 20];
@@ -547,6 +549,7 @@ mod tests {
         assert_eq!(parse_address(&format!("0X{}", "22".repeat(20))), Some([0x22; 20]));
         assert!(parse_address("0x1234").is_none()); // too short
         assert!(parse_address(&"zz".repeat(20)).is_none()); // non-hex
+        assert!(parse_address(&"+f".repeat(20)).is_none()); // sign rejected
         assert!(parse_address("").is_none());
     }
 
