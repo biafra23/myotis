@@ -25,4 +25,5 @@ serde_json = "1"
 # Global tracing subscriber feeding the drainable ring buffer behind
 # nativeDrainLogs — the on-device observability seam (Rust logs were
 # invisible on Android; hosts pump the drain into their own log pipeline).
+tracing = "=0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

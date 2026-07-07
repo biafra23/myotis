@@ -108,6 +108,9 @@ pub struct VerifiedStorage {
     pub slot: u64,
     /// The holder address for an ERC-20 mapping lookup, if any.
     pub holder: Option<[u8; 20]>,
+    /// The 32-byte storage key: the plain padded slot, or the ERC-20 mapping
+    /// slot `keccak256(pad32(holder) ‖ uint256(slot))`.
+    pub storage_key: [u8; 32],
     /// keccak256(storage key) — the slot's trie key.
     pub slot_key_hash: [u8; 32],
     pub found: bool,
@@ -136,6 +139,14 @@ pub struct ElReader {
 }
 
 impl ElReader {
+    /// Start a mainnet reader with a freshly-generated ephemeral node key (the
+    /// CL side generates its libp2p identity per run too; a persistent EL
+    /// identity for peer-cache stability is an EL-A8 concern).
+    pub async fn start_mainnet(anchor: Arc<ExecAnchor>) -> Result<ElReader, String> {
+        let key = generate_node_key()?;
+        ElReader::start(key, anchor, ElConfig::mainnet()).await
+    }
+
     /// Start discovery + the peer pool for `cfg`, reading verified state against
     /// `anchor` (the beacon sync loop's execution anchor).
     pub async fn start(
@@ -238,6 +249,7 @@ impl ElReader {
             address,
             slot,
             holder,
+            storage_key,
             slot_key_hash,
             found: false,
             value: Vec::new(),
@@ -358,6 +370,20 @@ fn storage_key(slot: u64, holder: Option<[u8; 20]>) -> [u8; 32] {
             keccak256(&encoded)
         }
     }
+}
+
+/// Generate a valid secp256k1 node key from OS entropy. Returns `Err` rather
+/// than panicking (the engine host is panic-free by construction); retries the
+/// negligibly-rare out-of-range secret.
+pub fn generate_node_key() -> Result<Arc<NodeKey>, String> {
+    for _ in 0..8 {
+        let mut secret = [0u8; 32];
+        getrandom::getrandom(&mut secret).map_err(|e| format!("OS entropy: {e}"))?;
+        if let Ok(key) = NodeKey::from_secret_bytes(&secret) {
+            return Ok(Arc::new(key));
+        }
+    }
+    Err("could not generate a valid node key from OS entropy".to_string())
 }
 
 /// Decode a fixed 64-char hex CONSTANT. Panics on a malformed literal (a
