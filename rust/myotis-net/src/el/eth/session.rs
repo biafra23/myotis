@@ -18,6 +18,9 @@ use crate::el::rlpx::transport::{
 };
 
 use super::messages::{self, Status};
+use crate::el::snap::fetch::{self, AccountOutcome};
+use crate::el::snap::messages as snap;
+use myotis_core::trie::{AccountLeaf, EMPTY_CODE_HASH, EMPTY_TRIE_ROOT};
 
 /// eth versions we advertise (highest-common wins, floor 66).
 const OUR_ETH_VERSIONS: &[u64] = &[66, 67, 68, 69];
@@ -179,6 +182,22 @@ impl EthSession {
         Ok(headers)
     }
 
+    /// Request headers starting at a block HASH (used to fetch a peer's fresh
+    /// head header for its state root).
+    pub async fn get_block_headers_by_hash(
+        &mut self,
+        block_hash: &[u8; 32],
+        max_headers: u64,
+    ) -> Result<Vec<messages::VerifiedHeader>, String> {
+        let id = self.next_id();
+        let req = messages::encode_get_block_headers_by_hash(id, block_hash, max_headers, 0, false);
+        self.conn.send(messages::GET_BLOCK_HEADERS, &req).await?;
+        let payload = self.await_response(messages::BLOCK_HEADERS, id).await?;
+        let (_rid, headers) = messages::decode_block_headers(&payload)
+            .map_err(|e| format!("BlockHeaders decode: {}", e.0))?;
+        Ok(headers)
+    }
+
     /// Request block bodies by hash.
     pub async fn get_block_bodies(
         &mut self,
@@ -222,6 +241,112 @@ impl EthSession {
 
     pub fn peer_pubkey(&self) -> [u8; 64] {
         self.conn.peer_pubkey()
+    }
+
+    // -----------------------------------------------------------------------
+    // snap/1 verified state fetch (EL-A6). These share the eth peer's RLPx
+    // connection, multiplexed by the dynamic snap message codes.
+    // -----------------------------------------------------------------------
+
+    /// The snap message codes for the negotiated eth version (`None` if the
+    /// peer didn't advertise snap/1).
+    fn snap_codes(&self) -> Option<snap::SnapCodes> {
+        self.snap.then(|| snap::SnapCodes::for_eth_version(self.eth_version))
+    }
+
+    /// Fetch and verify one account at `state_root`. `state_root` must be a
+    /// FRESH root the peer still retains (peers prune beyond ~128 blocks) —
+    /// the caller supplies it (EL-A7 pins it to the beacon anchor / a fresh
+    /// peer head). The returned account fields come from the MPT-verified
+    /// proof leaf, never the peer's slim body.
+    pub async fn snap_get_account(
+        &mut self,
+        state_root: &[u8; 32],
+        address: &[u8; 20],
+    ) -> Result<AccountOutcome, String> {
+        let codes = self.snap_codes().ok_or("peer does not support snap/1")?;
+        let id = self.next_id();
+        let account_hash = myotis_core::keccak::keccak256(address);
+        // Full [origin, 0xff…ff] range + a small responseBytes cap: the peer
+        // returns one account PLUS the complete boundary proof (doc 02 §7.3).
+        let req = snap::encode_get_account(id, state_root, &account_hash, 4096);
+        self.conn.send(codes.get_account_range, &req).await?;
+        let payload = self
+            .await_snap_response(codes.account_range, id)
+            .await?;
+        let response = snap::decode_account_range(&payload)
+            .map_err(|e| format!("AccountRange decode: {}", e.0))?;
+        fetch::verify_account(state_root, address, &response).map_err(|e| e.0)
+    }
+
+    /// Fetch and verify one storage slot. Requires the account (for its
+    /// proven `storage_root`); storage verifies against THAT root, not the
+    /// world state root.
+    pub async fn snap_get_storage(
+        &mut self,
+        state_root: &[u8; 32],
+        address: &[u8; 20],
+        account: &AccountLeaf,
+        slot: &[u8; 32],
+    ) -> Result<Vec<u8>, String> {
+        // An account with no storage trie: every slot is provably zero, so skip
+        // the round trip entirely (EOAs and storage-less contracts).
+        if account.storage_root == EMPTY_TRIE_ROOT {
+            return Ok(Vec::new());
+        }
+        let codes = self.snap_codes().ok_or("peer does not support snap/1")?;
+        let id = self.next_id();
+        let account_hash = myotis_core::keccak::keccak256(address);
+        let slot_hash = myotis_core::keccak::keccak256(slot);
+        let req = snap::encode_get_storage_slot(id, state_root, &account_hash, &slot_hash, 4096);
+        self.conn.send(codes.get_storage_ranges, &req).await?;
+        let payload = self
+            .await_snap_response(codes.storage_ranges, id)
+            .await?;
+        let response = snap::decode_storage_ranges(&payload)
+            .map_err(|e| format!("StorageRanges decode: {}", e.0))?;
+        fetch::verify_storage(account, slot, &response).map_err(|e| e.0)
+    }
+
+    /// Fetch and verify one contract's bytecode by its `code_hash`.
+    pub async fn snap_get_bytecode(&mut self, code_hash: &[u8; 32]) -> Result<Vec<u8>, String> {
+        // A code-less account: no round trip needed (EOAs — the vast majority).
+        if code_hash == &EMPTY_CODE_HASH {
+            return Ok(Vec::new());
+        }
+        let codes = self.snap_codes().ok_or("peer does not support snap/1")?;
+        let id = self.next_id();
+        let req = snap::encode_get_byte_codes(id, &[*code_hash], 256 * 1024);
+        self.conn.send(codes.get_byte_codes, &req).await?;
+        let payload = self.await_snap_response(codes.byte_codes, id).await?;
+        let (_id, codes_returned) =
+            snap::decode_byte_codes(&payload).map_err(|e| format!("ByteCodes decode: {}", e.0))?;
+        fetch::verify_bytecode(code_hash, &codes_returned)
+            .ok_or_else(|| "no returned bytecode matched the requested hash".to_string())
+    }
+
+    /// Like [`await_response`] but matches a snap response id (snap responses
+    /// carry the same leading `[reqId, …]`).
+    async fn await_snap_response(&mut self, want_code: u64, want_id: u64) -> Result<Vec<u8>, String> {
+        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(format!("timed out awaiting snap code 0x{want_code:02x}"));
+            }
+            let frame = tokio::time::timeout(remaining, recv_answering_ping(&mut self.conn))
+                .await
+                .map_err(|_| format!("timed out awaiting snap code 0x{want_code:02x}"))??;
+            if frame.message_code == P2P_DISCONNECT {
+                return Err(format!("peer disconnected: {}", describe_disconnect(&frame.payload)));
+            }
+            if frame.message_code != want_code {
+                continue;
+            }
+            if snap::response_request_id(&frame.payload) == Some(want_id) {
+                return Ok(frame.payload);
+            }
+        }
     }
 }
 

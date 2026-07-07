@@ -9,3 +9,4 @@
 pub mod discv4;
 pub mod eth;
 pub mod rlpx;
+pub mod snap;
