@@ -20,14 +20,11 @@ pub mod ringlog;
 /// crashing on a missing/renamed symbol.
 ///
 /// v2: added the hosting surface (nativeCreate/Start/StatusJson/Stop).
-///
-/// The EL verified-read natives (nativeRequestAccountJson,
-/// nativeGetStorageProofJson) are present as of this build but are DORMANT: the
-/// Java side does not declare or call them yet, so the ABI stays 3 (JNI resolves
-/// only declared natives lazily). The bump to 4 lands atomically with the Java
-/// RustEngineNative declarations + RustChainHandle wiring, so no .so ever reports
-/// an ABI the running Java engine treats as stale.
-pub const ABI_VERSION: i32 = 3;
+/// v4: added the EL verified-read surface (nativeRequestAccountJson,
+///     nativeGetStorageProofJson), wired into the Java RustEngineNative /
+///     RustChainHandle at the same time so no .so ever reports an ABI the
+///     running Java engine treats as stale.
+pub const ABI_VERSION: i32 = 4;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
@@ -189,13 +186,10 @@ mod jni_shim {
     }
 
     // ---------------------------------------------------------------------
-    // EL verified-read surface. DORMANT in this build: ABI_VERSION stays 3 and
-    // the Java side declares neither native yet, so these symbols are present
-    // but unresolved (the bump to 4 lands with the Java wiring — see
-    // ABI_VERSION's doc). Each returns a JSON string: the full AccountProofResult
-    // / StorageProofResult shape on success (verification failures carry a
-    // `failReason`), or `{"error": "..."}` for a transport / not-running /
-    // bad-input failure the Java side raises as an EngineException.
+    // EL verified-read surface (ABI 4). Each returns a JSON string: the full
+    // AccountProofResult / StorageProofResult shape on success (verification
+    // failures carry a `failReason`), or `{"error": "..."}` for a transport /
+    // not-running / bad-input failure the Java side raises as an EngineException.
     // ---------------------------------------------------------------------
 
     /// `RustEngineNative.nativeRequestAccountJson(long handle, String address)`.

@@ -23,7 +23,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 3; // 3: + nativeDrainLogs
+    static final int EXPECTED_ABI_VERSION = 4; // 4: + EL verified-read natives
 
     private static final boolean AVAILABLE = load();
 
@@ -99,4 +99,24 @@ final class RustEngineNative {
      *  newline-joined; empty when idle). The drainable-ring end of the
      *  on-device observability seam — see the engine's {@code ringlog}. */
     static native String nativeDrainLogs(int max);
+
+    // ---- EL verified-read surface (ABI 4). See RustChainHandle. ----
+
+    /**
+     * A verified account query for a running handle, returned as JSON: the full
+     * {@link io.myotis.api.AccountProofResult} shape on success (a verification
+     * failure carries a {@code failReason}), or {@code {"error": "..."}} for a
+     * transport / not-running / bad-input failure (which RustChainHandle raises
+     * as an {@link io.myotis.api.EngineException}). {@code address} is 0x-hex.
+     */
+    static native String nativeRequestAccountJson(long handle, String address);
+
+    /**
+     * A verified storage-slot query for a running handle, as JSON (the
+     * {@link io.myotis.api.StorageProofResult} shape, same error convention as
+     * {@link #nativeRequestAccountJson}). {@code holderOrNull} selects the ERC-20
+     * mapping key {@code keccak256(pad32(holder) ‖ uint256(slot))} when non-null.
+     */
+    static native String nativeGetStorageProofJson(
+            long handle, String address, long slot, String holderOrNull);
 }
