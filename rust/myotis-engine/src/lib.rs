@@ -10,6 +10,7 @@
 //! and the EL surface land later.
 
 pub mod catalog;
+mod eljson;
 mod host;
 pub mod ringlog;
 
@@ -19,6 +20,13 @@ pub mod ringlog;
 /// crashing on a missing/renamed symbol.
 ///
 /// v2: added the hosting surface (nativeCreate/Start/StatusJson/Stop).
+///
+/// The EL verified-read natives (nativeRequestAccountJson,
+/// nativeGetStorageProofJson) are present as of this build but are DORMANT: the
+/// Java side does not declare or call them yet, so the ABI stays 3 (JNI resolves
+/// only declared natives lazily). The bump to 4 lands atomically with the Java
+/// RustEngineNative declarations + RustChainHandle wiring, so no .so ever reports
+/// an ABI the running Java engine treats as stale.
 pub const ABI_VERSION: i32 = 3;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
@@ -178,5 +186,49 @@ mod jni_shim {
         handle: jlong,
     ) {
         crate::host::stop(handle);
+    }
+
+    // ---------------------------------------------------------------------
+    // EL verified-read surface (ABI 4). Each returns a JSON string: the full
+    // AccountProofResult / StorageProofResult shape on success (verification
+    // failures carry a `failReason`), or `{"error": "..."}` for a transport /
+    // not-running / bad-input failure the Java side raises as an EngineException.
+    // ---------------------------------------------------------------------
+
+    /// `RustEngineNative.nativeRequestAccountJson(long handle, String address)`.
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeRequestAccountJson(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        address: JString,
+    ) -> jstring {
+        let address = read_string(&mut env, &address).unwrap_or_default();
+        let json = crate::host::request_account_json(handle, &address);
+        match env.new_string(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// `RustEngineNative.nativeGetStorageProofJson(long handle, String address,
+    /// long slot, String holderOrNull)`.
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeGetStorageProofJson(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        address: JString,
+        slot: jlong,
+        holder: JString,
+    ) -> jstring {
+        let address = read_string(&mut env, &address).unwrap_or_default();
+        // A null/absent holder is the plain-slot lookup.
+        let holder = read_string(&mut env, &holder);
+        let json = crate::host::get_storage_proof_json(handle, &address, slot, holder.as_deref());
+        match env.new_string(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
     }
 }

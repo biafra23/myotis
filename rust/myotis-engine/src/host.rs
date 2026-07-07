@@ -24,7 +24,14 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use myotis_net::el::reader::ElReader;
 use myotis_net::{ChainConfig, SyncHandle, SyncState, SyncStatus};
+
+use crate::eljson;
+
+/// Slots per sync-committee period (for the finalized-slot → period diagnostics
+/// the verified-read results carry).
+const SLOTS_PER_PERIOD: u64 = 8192;
 
 // Distinct negative sentinels from `create` (all `< 0` = failure to the Java side,
 // but distinguishable for tests / future callers):
@@ -40,7 +47,12 @@ const UNSUPPORTED_NETWORK: i64 = -2;
 /// `SyncHandle::start`.
 enum ChainEntry {
     Created(Arc<ChainConfig>),
-    Running(Arc<ChainConfig>, SyncHandle),
+    /// A running chain: the CL sync loop plus (optionally) the EL verified-read
+    /// reader. The reader is `None` if its discovery/pool failed to start — the
+    /// CL still runs, but EL queries report the reader unavailable. `Arc` so a
+    /// query can clone it out and run OUTSIDE the handle-map lock (a verified
+    /// read can take up to ~60 s for a header-chain walk).
+    Running(Arc<ChainConfig>, SyncHandle, Option<Arc<ElReader>>),
 }
 
 /// The single legitimate engine singleton. Owns the runtime + the handle map;
@@ -151,6 +163,20 @@ pub fn start(handle: i64) -> bool {
         Ok(s) => s,
         Err(_) => return false,
     };
+    // Start the EL reader against the sync loop's execution anchor (the CL→EL
+    // bridge). Mainnet-only for now, matching the CL host scope. A failure
+    // (e.g. a discv4 UDP bind error) is non-fatal: the CL still runs and EL
+    // queries report the reader unavailable, rather than failing the whole start.
+    let reader = match engine
+        .rt
+        .block_on(async { ElReader::start_mainnet(sync.exec_anchor()).await })
+    {
+        Ok(r) => Some(Arc::new(r)),
+        Err(e) => {
+            tracing::warn!(handle, error = %e, "EL reader failed to start; CL runs without EL");
+            None
+        }
+    };
     // Re-lock and publish ONLY if the entry is still the same Created one: a
     // concurrent stop() may have removed it, or a racing start() may have already
     // published a Running one, while we were starting. Either way, shut the handle
@@ -158,21 +184,37 @@ pub fn start(handle: i64) -> bool {
     let mut map = match engine.handles.lock() {
         Ok(m) => m,
         Err(_) => {
-            engine.rt.block_on(async { sync.stop().await });
+            shutdown(engine, sync, reader);
             return false;
         }
     };
     match map.get(&handle) {
         Some(ChainEntry::Created(_)) => {
-            map.insert(handle, ChainEntry::Running(config, sync));
+            map.insert(handle, ChainEntry::Running(config, sync, reader));
             true
         }
         _ => {
             drop(map);
-            engine.rt.block_on(async { sync.stop().await });
+            shutdown(engine, sync, reader);
             false
         }
     }
+}
+
+/// Shut down a started-but-not-published sync handle + reader (the lost-race
+/// path). Runs the async stops on the engine runtime.
+fn shutdown(engine: &EngineState, sync: SyncHandle, reader: Option<Arc<ElReader>>) {
+    engine.rt.block_on(async move {
+        sync.stop().await;
+        if let Some(reader) = reader {
+            // Only our just-started reader holds an Arc here, so unwrapping the
+            // Arc to consume `stop(self)` succeeds; if it somehow doesn't, the
+            // reader's Drop still aborts its tasks.
+            if let Ok(reader) = Arc::try_unwrap(reader) {
+                reader.stop().await;
+            }
+        }
+    });
 }
 
 /// `nativeStatusJson`: the status of one handle as a JSON object (see
@@ -193,7 +235,7 @@ pub fn status_json(handle: i64) -> String {
         Some(ChainEntry::Created(config)) => {
             status_object(false, None, config.wall_clock_period())
         }
-        Some(ChainEntry::Running(config, sync)) => {
+        Some(ChainEntry::Running(config, sync, _reader)) => {
             status_object(true, Some(sync.status()), config.wall_clock_period())
         }
         None => "{}".to_string(),
@@ -212,9 +254,127 @@ pub fn stop(handle: i64) {
         Ok(mut m) => m.remove(&handle),
         Err(_) => return,
     };
-    if let Some(ChainEntry::Running(_, sync)) = entry {
-        engine.rt.block_on(async move { sync.stop().await });
+    if let Some(ChainEntry::Running(_, sync, reader)) = entry {
+        engine.rt.block_on(async move {
+            sync.stop().await;
+            if let Some(reader) = reader {
+                if let Ok(reader) = Arc::try_unwrap(reader) {
+                    reader.stop().await;
+                }
+            }
+        });
     }
+}
+
+/// `nativeRequestAccountJson`: run a verified account query for a running
+/// handle, returning the `AccountProofResult` JSON, or `{"error": "..."}` for a
+/// transport / not-running / bad-input failure.
+pub fn request_account_json(handle: i64, address_hex: &str) -> String {
+    let Some(address) = parse_address(address_hex) else {
+        return eljson::error_json("invalid address (expected 20-byte hex)");
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    // Snapshot the reader + the CL status/config under the lock, then release it
+    // before the (potentially slow) query — never hold the map lock across a
+    // verified read.
+    let (reader, finalized_period, wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    match engine.rt.block_on(async { reader.get_account(address).await }) {
+        Ok(account) => eljson::account_json(address_hex, &account, finalized_period, wall_period),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// `nativeGetStorageProofJson`: run a verified storage-slot query for a running
+/// handle. `holder_hex` (if present) selects the ERC-20 mapping key.
+pub fn get_storage_proof_json(
+    handle: i64,
+    address_hex: &str,
+    slot: i64,
+    holder_hex: Option<&str>,
+) -> String {
+    let Some(address) = parse_address(address_hex) else {
+        return eljson::error_json("invalid address (expected 20-byte hex)");
+    };
+    let holder = match holder_hex {
+        Some(h) => match parse_address(h) {
+            Some(a) => Some(a),
+            None => return eljson::error_json("invalid holder (expected 20-byte hex)"),
+        },
+        None => None,
+    };
+    let slot = slot.max(0) as u64;
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, finalized_slot, optimistic_slot) = match snapshot_reader_slots(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    match engine.rt.block_on(async { reader.get_storage(address, slot, holder).await }) {
+        Ok(storage) => eljson::storage_json(
+            address_hex,
+            holder_hex,
+            &storage,
+            finalized_slot,
+            optimistic_slot,
+        ),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// Snapshot `(reader, finalizedPeriod, wallClockPeriod)` for a running handle,
+/// or an error message. Holds the map lock only for the clone.
+fn snapshot_reader(
+    engine: &EngineState,
+    handle: i64,
+) -> Result<(Arc<ElReader>, u64, u64), &'static str> {
+    let map = engine.handles.lock().map_err(|_| "engine lock poisoned")?;
+    match map.get(&handle) {
+        Some(ChainEntry::Running(config, sync, Some(reader))) => Ok((
+            Arc::clone(reader),
+            sync.status().finalized_slot / SLOTS_PER_PERIOD,
+            config.wall_clock_period(),
+        )),
+        Some(ChainEntry::Running(_, _, None)) => Err("EL reader unavailable on this handle"),
+        Some(ChainEntry::Created(_)) => Err("handle not started"),
+        None => Err("unknown handle"),
+    }
+}
+
+/// Snapshot `(reader, finalizedSlot, optimisticSlot)` for a running handle.
+fn snapshot_reader_slots(
+    engine: &EngineState,
+    handle: i64,
+) -> Result<(Arc<ElReader>, u64, u64), &'static str> {
+    let map = engine.handles.lock().map_err(|_| "engine lock poisoned")?;
+    match map.get(&handle) {
+        Some(ChainEntry::Running(_, sync, Some(reader))) => {
+            let s = sync.status();
+            Ok((Arc::clone(reader), s.finalized_slot, s.optimistic_slot))
+        }
+        Some(ChainEntry::Running(_, _, None)) => Err("EL reader unavailable on this handle"),
+        Some(ChainEntry::Created(_)) => Err("handle not started"),
+        None => Err("unknown handle"),
+    }
+}
+
+/// Parse a `0x`-prefixed-or-bare 40-char hex address into 20 bytes. Panic-free:
+/// returns `None` for any malformed input (JNI callers pass untrusted strings).
+fn parse_address(hex: &str) -> Option<[u8; 20]> {
+    let hex = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
+    if hex.len() != 40 {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Map a `SyncState` to the API `beaconState` string.
@@ -378,5 +538,37 @@ mod tests {
         // No engine calls here — just the contract for a missing handle, which
         // status_json returns directly.
         assert_eq!(status_json(i64::MIN), "{}");
+    }
+
+    #[test]
+    fn parse_address_accepts_valid_and_rejects_malformed() {
+        assert_eq!(parse_address(&"11".repeat(20)), Some([0x11; 20]));
+        assert_eq!(parse_address(&format!("0x{}", "22".repeat(20))), Some([0x22; 20]));
+        assert_eq!(parse_address(&format!("0X{}", "22".repeat(20))), Some([0x22; 20]));
+        assert!(parse_address("0x1234").is_none()); // too short
+        assert!(parse_address(&"zz".repeat(20)).is_none()); // non-hex
+        assert!(parse_address("").is_none());
+    }
+
+    #[test]
+    fn account_query_rejects_bad_address_and_unknown_handle() {
+        // Bad address → error before any handle lookup.
+        let v: serde_json::Value =
+            serde_json::from_str(&request_account_json(1, "0xnothex")).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("invalid address"));
+
+        // Valid address, unknown handle → "unknown handle" error.
+        let addr = format!("0x{}", "ab".repeat(20));
+        let v: serde_json::Value =
+            serde_json::from_str(&request_account_json(i64::MIN, &addr)).unwrap();
+        assert_eq!(v["error"], "unknown handle");
+    }
+
+    #[test]
+    fn storage_query_rejects_bad_holder() {
+        let addr = format!("0x{}", "ab".repeat(20));
+        let v: serde_json::Value =
+            serde_json::from_str(&get_storage_proof_json(i64::MIN, &addr, 1, Some("0xbad"))).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("invalid holder"));
     }
 }
