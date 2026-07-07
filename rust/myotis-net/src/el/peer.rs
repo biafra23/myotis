@@ -21,6 +21,7 @@
 //! Netty pipeline answers Ping and unsolicited Get\* the same way).
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,6 +71,9 @@ pub struct ManagedPeer {
     /// The peer's Hello (client id, capabilities).
     pub peer_hello: Hello,
     peer_pubkey: [u8; 64],
+    /// The socket address this peer was dialed at — the key the pool's peer
+    /// cache records snap-serve/failure outcomes under.
+    addr: SocketAddr,
     snap_codes: Option<snap::SnapCodes>,
 }
 
@@ -77,9 +81,9 @@ impl ManagedPeer {
     /// Take over a handshook [`EthSession`], splitting its connection and
     /// spawning the background read loop. From here the peer serves concurrent
     /// requests and answers Ping/Get\* on its own.
-    pub fn spawn(session: EthSession) -> ManagedPeer {
+    pub fn spawn(session: EthSession, addr: SocketAddr) -> ManagedPeer {
         let (conn, eth_version, snap, peer_status, peer_hello) = session.into_parts();
-        Self::from_connection(conn, eth_version, snap, peer_status, peer_hello)
+        Self::from_connection(conn, eth_version, snap, peer_status, peer_hello, addr)
     }
 
     fn from_connection(
@@ -88,6 +92,7 @@ impl ManagedPeer {
         snap: bool,
         peer_status: Status,
         peer_hello: Hello,
+        addr: SocketAddr,
     ) -> ManagedPeer {
         let (reader, writer, peer_pubkey) = conn.split();
         let snap_codes = snap.then(|| snap::SnapCodes::for_eth_version(eth_version));
@@ -114,12 +119,18 @@ impl ManagedPeer {
             peer_status,
             peer_hello,
             peer_pubkey,
+            addr,
             snap_codes,
         }
     }
 
     pub fn peer_pubkey(&self) -> [u8; 64] {
         self.peer_pubkey
+    }
+
+    /// The socket address this peer was dialed at (the peer-cache key).
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
     }
 
     /// True once the read loop has stopped (peer disconnect or fatal read

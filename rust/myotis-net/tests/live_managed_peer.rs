@@ -154,7 +154,7 @@ async fn try_peer(
 
     // Hand the connection to the managed peer — from here a background task
     // reads frames, answers Ping, and correlates responses.
-    let peer = ManagedPeer::spawn(session);
+    let peer = ManagedPeer::spawn(session, addr);
     eprintln!(
         "[live_managed] snap READY with {addr}: eth/{} client={:?}",
         peer.eth_version, peer.peer_hello.client_id
