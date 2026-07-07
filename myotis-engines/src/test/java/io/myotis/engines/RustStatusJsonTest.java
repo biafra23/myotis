@@ -35,7 +35,7 @@ class RustStatusJsonTest {
             "{\"running\":false,\"network\":\"mainnet\",\"beaconState\":\"STARTING\","
             + "\"bootstrapped\":false,\"finalizedSlot\":0,\"optimisticSlot\":0,"
             + "\"currentPeriod\":0,\"targetPeriod\":0,\"peerCount\":0,\"servedPeersLastMinute\":0,"
-            + "\"discv5TableSize\":0,"
+            + "\"discv5TableSize\":0,\"syncStartPeriod\":-1,"
             + "\"finalizedRootHex\":\"0000000000000000000000000000000000000000000000000000000000000000\"}";
 
     /** A synthetic catching-up shape (real running numbers). */
@@ -43,7 +43,7 @@ class RustStatusJsonTest {
             "{\"running\":true,\"network\":\"mainnet\",\"beaconState\":\"CATCHING_UP\","
             + "\"bootstrapped\":true,\"finalizedSlot\":14560000,\"optimisticSlot\":14560032,"
             + "\"currentPeriod\":1777,\"targetPeriod\":1795,\"peerCount\":5,\"servedPeersLastMinute\":2,"
-            + "\"discv5TableSize\":7,"
+            + "\"discv5TableSize\":7,\"syncStartPeriod\":1777,"
             + "\"finalizedRootHex\":\"58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e\"}";
 
     @BeforeAll
@@ -61,6 +61,7 @@ class RustStatusJsonTest {
         assertEquals(0L, s.finalizedSlot());
         assertEquals(0L, s.syncCurrentPeriod());
         assertEquals(0L, s.syncTargetPeriod());
+        assertEquals(-1L, s.syncStartPeriod());
         // EL-only fields are zeroed on the CL-only R1 engine.
         assertEquals(0L, s.executionBlockNumber());
         assertEquals(0, s.snapPeers());
@@ -78,6 +79,7 @@ class RustStatusJsonTest {
         assertEquals(1795L, s.syncTargetPeriod());
         assertEquals(1795L, s.wallClockPeriod());
         assertEquals(7, s.discv5TableSize());
+        assertEquals(1777L, s.syncStartPeriod());
         assertEquals(14560000L / 8192L, s.finalizedPeriod());
     }
 
