@@ -325,6 +325,96 @@ impl EthSession {
             .ok_or_else(|| "no returned bytecode matched the requested hash".to_string())
     }
 
+    /// Fetch the contiguous header range `[finalized_block ..= peer_block]` and
+    /// run the header-chain verdict against the beacon-anchored root. Returns
+    /// `headerChainError` on a transport failure and `headerChainInvalid` on a
+    /// short/over-long/out-of-range response (matching the Java ladder).
+    ///
+    /// **A7b:** this is a SINGLE request, so it only spans a gap the peer serves
+    /// in one response (~1024 headers on geth) — fine for a typical finalized
+    /// gap (~2 epochs, tens–low-hundreds of blocks). A stale-finalized peer with
+    /// a multi-thousand-block gap truncates the response → `chain.len() != total`
+    /// → `headerChainInvalid` (fail-closed, never a partial-chain trust). Batched
+    /// fetching for large gaps lands in the A7b connection layer.
+    async fn header_chain_verdict(
+        &mut self,
+        finalized_block: u64,
+        peer_block: u64,
+        beacon_block_hash: &[u8; 32],
+        peer_state_root: &[u8; 32],
+        finalized_slot: i64,
+    ) -> crate::el::verify::Verdict {
+        use crate::el::verify::{header_chain_verdict, ChainHeader, Verdict, MAX_HEADER_CHAIN_GAP};
+        let total = peer_block - finalized_block + 1;
+        // Match Java's verifyHeaderChainBatched re-guard: total in [2, MAX].
+        // (The precheck admits gap == MAX, i.e. total == MAX+1; Java rejects it
+        // here — keep that exact boundary.)
+        if total < 2 || total > MAX_HEADER_CHAIN_GAP {
+            return Verdict {
+                fail_reason: Some("headerChainInvalid"),
+                ..Verdict::default()
+            };
+        }
+        // Fetch ascending from the finalized block (skip=0, reverse=false).
+        let headers = match self
+            .get_block_headers_by_number(finalized_block, total, 0, false)
+            .await
+        {
+            Ok(h) => h,
+            Err(_) => {
+                return Verdict {
+                    fail_reason: Some("headerChainError"),
+                    ..Verdict::default()
+                }
+            }
+        };
+        let chain: Vec<ChainHeader> = headers
+            .into_iter()
+            .map(|vh| ChainHeader { hash: vh.hash, header: vh.header })
+            .collect();
+        // A short/over-long response can't verify — treat as invalid, not a panic.
+        if chain.len() as u64 != total {
+            return Verdict {
+                fail_reason: Some("headerChainInvalid"),
+                ..Verdict::default()
+            };
+        }
+        header_chain_verdict(&chain, beacon_block_hash, peer_state_root, finalized_slot)
+    }
+
+    /// Anchor a peer-served `state_root` (for `block_number`) to the beacon
+    /// chain, running the full ladder: `stateRootMatch` fast path, else the
+    /// `headerChain` walk. `proof_valid` is the caller's MPT-proof result
+    /// against `state_root`. This is the verdict half of the verified read —
+    /// EL-A7b composes it with the snap account fetch + the JNI surface.
+    pub async fn verified_state_root(
+        &mut self,
+        anchor: &crate::el::anchor::ExecAnchor,
+        state_root: &[u8; 32],
+        block_number: i64,
+        proof_valid: bool,
+    ) -> crate::el::verify::Verdict {
+        use crate::el::verify::{ladder_precheck, LadderStep};
+        match ladder_precheck(Some(state_root), proof_valid, block_number, anchor) {
+            LadderStep::Done(verdict) => verdict,
+            LadderStep::NeedHeaderChain {
+                finalized_block,
+                peer_block,
+                beacon_block_hash,
+                finalized_slot,
+            } => {
+                self.header_chain_verdict(
+                    finalized_block,
+                    peer_block,
+                    &beacon_block_hash,
+                    state_root,
+                    finalized_slot,
+                )
+                .await
+            }
+        }
+    }
+
     /// Like [`await_response`] but matches a snap response id (snap responses
     /// carry the same leading `[reqId, …]`).
     async fn await_snap_response(&mut self, want_code: u64, want_id: u64) -> Result<Vec<u8>, String> {

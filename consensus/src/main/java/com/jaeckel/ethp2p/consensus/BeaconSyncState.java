@@ -139,7 +139,7 @@ public class BeaconSyncState {
      * The finalized execution payload's (block number, state root) read from a single
      * atomic snapshot. {@code stateRoot} is null if not yet synced.
      */
-    public record FinalizedExecution(long blockNumber, byte[] stateRoot) {}
+    public record FinalizedExecution(long blockNumber, byte[] stateRoot, byte[] blockHash) {}
 
     /**
      * Returns the finalized execution block number and state root from one atomic read.
@@ -151,7 +151,8 @@ public class BeaconSyncState {
      */
     public FinalizedExecution getFinalizedExecution() {
         InnerState s = state.get();
-        return new FinalizedExecution(s.executionBlockNumber(), s.executionStateRoot());
+        return new FinalizedExecution(
+                s.executionBlockNumber(), s.executionStateRoot(), s.executionBlockHash());
     }
 
     /**

@@ -340,11 +340,14 @@ public final class VerifiedAccountQuery {
             // finalized payload if an update lands between the calls.
             BeaconSyncState.FinalizedExecution fin = bss.getFinalizedExecution();
             long finalizedBlock = fin.blockNumber();
-            byte[] beaconRoot = fin.stateRoot();
+            // Anchor the header chain on the beacon-finalized BLOCK HASH (pins
+            // the whole first header), NOT its state root (forgeable — see
+            // verifyHeaderChain's javadoc).
+            byte[] beaconBlockHash = fin.blockHash();
 
             if (peerBlockNumber <= 0) {
                 v.failReason = "noPeerBlockNumber";
-            } else if (finalizedBlock <= 0 || beaconRoot == null) {
+            } else if (finalizedBlock <= 0 || beaconBlockHash == null) {
                 v.failReason = "beaconBlockUnavailable";
             } else if (peerBlockNumber <= finalizedBlock) {
                 v.failReason = "peerBlockBehindFinalized";
@@ -358,7 +361,7 @@ public final class VerifiedAccountQuery {
                         peerBlockNumber, finalizedBlock, peerBlockNumber - finalizedBlock);
                 return verifyHeaderChainBatched(
                                 connector, finalizedBlock, peerBlockNumber,
-                                beaconRoot, result.stateRoot().toArrayUnsafe())
+                                beaconBlockHash, result.stateRoot().toArrayUnsafe())
                         .handle((chainValid, ex) -> {
                             if (ex != null) {
                                 log.info("[verify] headerChain error: {}", ex.getMessage());
@@ -425,7 +428,7 @@ public final class VerifiedAccountQuery {
      *  same walk, so the headerChain fetch+verify lives once. */
     static CompletableFuture<Boolean> verifyHeaderChainBatched(
             RLPxConnector connector, long finalizedBlock, long peerBlock,
-            byte[] beaconStateRoot, byte[] peerStateRoot) {
+            byte[] beaconBlockHash, byte[] peerStateRoot) {
         long totalLong = peerBlock - finalizedBlock + 1;
         if (totalLong < 2 || totalLong > MAX_HEADER_CHAIN_GAP) {
             log.info("[verify] headerChain gap {} out of range [2, {}]", totalLong, MAX_HEADER_CHAIN_GAP);
@@ -436,20 +439,31 @@ public final class VerifiedAccountQuery {
         return connector.requestBlockHeadersBatched(finalizedBlock, total)
                 .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
                 .thenApply(headers -> {
-                    boolean valid = verifyHeaderChain(headers, beaconStateRoot, peerStateRoot);
+                    boolean valid = verifyHeaderChain(headers, beaconBlockHash, peerStateRoot);
                     log.info("[verify] Full header chain ({} blocks) valid: {}", headers.size(), valid);
                     return valid;
                 });
     }
 
-    /** Pure verification of a contiguous header range. */
-    private static boolean verifyHeaderChain(List<BlockHeadersMessage.VerifiedHeader> headers,
-                                             byte[] expectedFirstStateRoot,
+    /** Pure verification of a contiguous header range. Package-private so the
+     *  cross-language conformance test (ElVerifyVectorConformanceTest) can pin
+     *  it against the Rust twin (myotis-net el::verify::verify_header_chain).
+     *
+     *  <p>The first header is anchored by its BLOCK HASH, not its state root:
+     *  the block hash is keccak256 of the whole header, so it pins that header
+     *  completely. A state-root-only anchor was exploitable — the finalized
+     *  state root is public, so a peer could copy it into the stateRoot field
+     *  of a fabricated {@code H_0'} (fake everything else), parent-hash-link a
+     *  forged chain to a fake final state root, and have a fake account proof
+     *  verify against it. Anchoring on the beacon-attested block hash defeats
+     *  that (forging a header with a chosen keccak needs a preimage). */
+    static boolean verifyHeaderChain(List<BlockHeadersMessage.VerifiedHeader> headers,
+                                             byte[] expectedFirstBlockHash,
                                              byte[] expectedLastStateRoot) {
         if (headers.isEmpty()) return false;
 
-        byte[] firstStateRoot = headers.get(0).header().stateRoot.toArrayUnsafe();
-        if (!java.util.Arrays.equals(firstStateRoot, expectedFirstStateRoot)) return false;
+        byte[] firstBlockHash = headers.get(0).hash().toArrayUnsafe();
+        if (!java.util.Arrays.equals(firstBlockHash, expectedFirstBlockHash)) return false;
 
         byte[] lastStateRoot = headers.get(headers.size() - 1).header().stateRoot.toArrayUnsafe();
         if (!java.util.Arrays.equals(lastStateRoot, expectedLastStateRoot)) return false;

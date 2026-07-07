@@ -1,0 +1,213 @@
+package io.myotis.node;
+
+import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
+
+import org.apache.tuweni.bytes.Bytes;
+import org.apache.tuweni.bytes.Bytes32;
+import org.apache.tuweni.crypto.Hash;
+import org.apache.tuweni.rlp.RLP;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+
+import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
+
+/**
+ * The EL-A7 verified-read conformance corpus ({@code rust/testdata/el/verify/})
+ * — shared with the Rust {@code myotis-net::el::verify}
+ * ({@code tests/el_verify_conformance.rs}). Pins:
+ *
+ * <ul>
+ *   <li>The load-bearing {@link VerifiedAccountQuery#verifyHeaderChain} crypto:
+ *       committed BlockHeaders messages (valid chain / broken parent link /
+ *       wrong first (beacon) root / wrong last (peer) root) → the boolean
+ *       verdict, which both languages must reproduce from the same bytes.</li>
+ *   <li>The stable ladder token set ({@code stateRootMatch}, {@code headerChain},
+ *       {@code beaconNotSynced}, {@code headerChainGapTooLarge}, …) that the
+ *       operator tooling and integration greps depend on.</li>
+ * </ul>
+ *
+ * <p>Regenerate: {@code ./gradlew :node-core:test --tests
+ * "*ElVerifyVectorConformanceTest*" -Dmyotis.el.writeExpected=true}.
+ */
+class ElVerifyVectorConformanceTest {
+
+    static {
+        if (java.security.Security.getProvider("BC") == null) {
+            java.security.Security.addProvider(
+                    new org.bouncycastle.jce.provider.BouncyCastleProvider());
+        }
+    }
+
+    private static final Path CORPUS = Path.of("..", "rust", "testdata", "el", "verify");
+    private static final boolean WRITE = Boolean.getBoolean("myotis.el.writeExpected");
+
+    // The header-chain trust anchor is the finalized BLOCK HASH (keccak of the
+    // whole first header), NOT its state root. PEER_ROOT is the last header's
+    // state root (the query target).
+    private static final Bytes32 BEACON_STATE_ROOT = tag("beacon-finalized-state-root");
+    private static final Bytes32 GENESIS_PARENT = tag("genesis-parent");
+    private static final Bytes32 PEER_ROOT = tag("peer-head-root");
+
+    /** The canonical finalized block; its hash is the trust anchor. */
+    private static Header finalizedH0() {
+        return header(21_000_000, BEACON_STATE_ROOT, GENESIS_PARENT);
+    }
+
+    private static Map<String, String> expected;
+
+    @BeforeAll
+    static void loadOrPrepare() throws Exception {
+        if (WRITE) {
+            Files.createDirectories(CORPUS);
+            generateVectors();
+            return;
+        }
+        assumeTrue(Files.isDirectory(CORPUS),
+                "el/verify conformance corpus not present at " + CORPUS.toAbsolutePath());
+        expected = new TreeMap<>();
+        Path f = CORPUS.resolve("expected.txt");
+        if (Files.exists(f)) {
+            for (String line : Files.readAllLines(f, StandardCharsets.UTF_8)) {
+                line = line.trim();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                int eq = line.indexOf('=');
+                if (eq > 0) expected.put(line.substring(0, eq), line.substring(eq + 1));
+            }
+        }
+    }
+
+    @Test
+    void replayReproducesRecordedVerdicts() throws Exception {
+        Map<String, String> actual = new TreeMap<>();
+        Bytes32 beaconBlockHash = finalizedH0().hash;
+        actual.put("beaconBlockHash", beaconBlockHash.toUnprefixedHexString());
+        actual.put("peerRoot", PEER_ROOT.toUnprefixedHexString());
+
+        // --- headerChain verification over committed BlockHeaders messages,
+        //     anchored on the finalized BLOCK HASH ---
+        for (Path p : listSorted()) {
+            String base = baseName(p);
+            List<BlockHeadersMessage.VerifiedHeader> headers =
+                    BlockHeadersMessage.decodeWithRequestId(Files.readAllBytes(p)).headers();
+            boolean ok = VerifiedAccountQuery.verifyHeaderChain(
+                    headers, beaconBlockHash.toArray(), PEER_ROOT.toArray());
+            actual.put("chain." + base, Boolean.toString(ok));
+        }
+
+        // --- the stable ladder token set (grepped by operator tooling) ---
+        actual.put("tokens.verifyMethod", "headerChain,stateRootMatch");
+        actual.put("tokens.failReason", String.join(",",
+                "beaconBlockUnavailable", "beaconNotSynced", "headerChainError",
+                "headerChainGapTooLarge", "headerChainInvalid", "noPeerBlockNumber",
+                "noPeerStateRoot", "peerBlockBehindFinalized", "peerProofInvalid"));
+
+        if (WRITE) {
+            StringBuilder sb = new StringBuilder(
+                    "# Recorded verdicts for rust/testdata/el/verify — generated by\n"
+                            + "# ElVerifyVectorConformanceTest with -Dmyotis.el.writeExpected=true.\n");
+            actual.forEach((k, v) -> sb.append(k).append('=').append(v).append('\n'));
+            Files.write(CORPUS.resolve("expected.txt"), sb.toString().getBytes(StandardCharsets.UTF_8));
+            System.out.println("[el-verify-conformance] wrote " + CORPUS.resolve("expected.txt"));
+            return;
+        }
+
+        if (expected.isEmpty()) {
+            org.junit.jupiter.api.Assertions.fail(
+                    "corpus present but expected.txt missing/empty — regenerate with "
+                            + "-Dmyotis.el.writeExpected=true and commit it");
+        }
+        assertEquals(expected, actual, "replay verdicts diverge from the recorded expected.txt");
+    }
+
+    // -------------------------------------------------------------------------
+    // Vector generation: BlockHeaders messages [reqId, [h0, h1, h2]].
+    // -------------------------------------------------------------------------
+
+    private static void generateVectors() throws Exception {
+        Header h0 = finalizedH0();
+        Header h1 = header(21_000_001, tag("mid-root"), h0.hash);
+        Header h2 = header(21_000_002, PEER_ROOT, h1.hash);
+        // Valid: h0.hash == beaconBlockHash, h2.stateRoot == PEER_ROOT, parent-linked.
+        writeMsg("001-chain-valid.rlp", h0, h1, h2);
+
+        // Broken parent link: h2.parentHash != h1.hash.
+        Header h2broken = header(21_000_002, PEER_ROOT, tag("wrong-parent"));
+        writeMsg("002-chain-broken-link.rlp", h0, h1, h2broken);
+
+        // THE ATTACK: a forged first header that COPIES the public beacon state
+        // root into its stateRoot field but has a DIFFERENT block hash (fake
+        // parent) — a state-root-only anchor would accept this; the block-hash
+        // anchor rejects it. Proves the security fix.
+        Header h0forged = header(21_000_000, BEACON_STATE_ROOT, tag("attacker-parent"));
+        Header h1f = header(21_000_001, tag("mid-root"), h0forged.hash);
+        Header h2f = header(21_000_002, PEER_ROOT, h1f.hash);
+        writeMsg("003-chain-forged-first-header.rlp", h0forged, h1f, h2f);
+
+        // Wrong last (peer) root: h2.stateRoot != PEER_ROOT.
+        Header h2w = header(21_000_002, tag("not-peer-root"), h1.hash);
+        writeMsg("004-chain-wrong-last-root.rlp", h0, h1, h2w);
+    }
+
+    private record Header(Bytes rlp, Bytes32 hash) {}
+
+    /** A minimal post-London header with the given number, state root, parent hash. */
+    private static Header header(long number, Bytes32 stateRoot, Bytes32 parentHash) {
+        Bytes rlp = RLP.encodeList(w -> {
+            w.writeValue(parentHash);
+            w.writeValue(Bytes32.fromHexString(
+                    "1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"));
+            w.writeValue(tag("benef").slice(0, 20));
+            w.writeValue(stateRoot);
+            w.writeValue(tag("txroot"));
+            w.writeValue(tag("rcpt"));
+            w.writeValue(Bytes.wrap(new byte[256]));
+            w.writeBigInteger(BigInteger.ZERO);
+            w.writeLong(number);
+            w.writeLong(30_000_000L);
+            w.writeLong(14_838_935L);
+            w.writeLong(1_700_000_000L + number);
+            w.writeValue(Bytes.EMPTY);
+            w.writeValue(tag("mix"));
+            w.writeValue(Bytes.wrap(new byte[8]));
+            w.writeBigInteger(BigInteger.valueOf(1_000_000_000L)); // baseFee
+        });
+        return new Header(rlp, Bytes32.wrap(Hash.keccak256(rlp)));
+    }
+
+    private static void writeMsg(String name, Header... headers) throws Exception {
+        Bytes msg = RLP.encodeList(w -> {
+            w.writeLong(1);
+            w.writeList(hw -> {
+                for (Header h : headers) hw.writeRLP(h.rlp);
+            });
+        });
+        Files.write(CORPUS.resolve(name), msg.toArray());
+    }
+
+    private static List<Path> listSorted() throws Exception {
+        List<Path> out = new java.util.ArrayList<>();
+        try (var s = Files.newDirectoryStream(CORPUS, "[0-9][0-9][0-9]-chain-*.rlp")) {
+            s.forEach(out::add);
+        }
+        out.sort(null);
+        return out;
+    }
+
+    private static String baseName(Path p) {
+        String n = p.getFileName().toString();
+        return n.substring(0, n.lastIndexOf('.'));
+    }
+
+    private static Bytes32 tag(String s) {
+        return Hash.keccak256(Bytes.wrap(("el-verify:" + s).getBytes(StandardCharsets.UTF_8)));
+    }
+}
