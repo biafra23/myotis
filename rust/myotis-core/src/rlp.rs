@@ -111,6 +111,71 @@ pub fn decode_at(data: &[u8], pos: usize) -> Result<(Item, usize), CoreError> {
     decode_item(data, pos, 0)
 }
 
+/// Split an RLP list into the RAW byte sub-slices of its elements (header +
+/// payload each), without copying — the Rust twin of the Java
+/// `core.trie.RlpItems.split`. The eth wire layer needs this to hash a header
+/// or capture a receipt's exact trie-value bytes: for canonical input the
+/// sub-slice IS the canonical encoding, and a non-canonical peer encoding
+/// simply hashes to something that won't match the trusted value (correct
+/// rejection). Structure is validated (each element fully inside the payload);
+/// the list must consume `data` exactly.
+pub fn raw_list_items(data: &[u8]) -> Result<Vec<&[u8]>, CoreError> {
+    let first = *data.first().ok_or_else(|| CoreError("RLP: empty".into()))?;
+    let (payload_start, payload_len) = match first {
+        0xc0..=0xf7 => (1usize, usize::from(first - 0xc0)),
+        0xf8..=0xff => {
+            let (len, header) = read_long_length(data, 0, first - 0xf7)?;
+            (header, len)
+        }
+        _ => return err("RLP: not a list"),
+    };
+    let end = payload_start
+        .checked_add(payload_len)
+        .filter(|&e| e == data.len())
+        .ok_or_else(|| CoreError("RLP: list length does not match input".into()))?;
+    let mut items = Vec::new();
+    let mut pos = payload_start;
+    while pos < end {
+        let (_item, next) = decode_item(data, pos, 0)?;
+        if next > end {
+            return err("RLP: element overruns list payload");
+        }
+        items.push(&data[pos..next]);
+        pos = next;
+    }
+    Ok(items)
+}
+
+/// The payload of a byte-string item (strips the RLP header). For a list item
+/// returns the whole thing unchanged (the caller distinguishes via [`is_list_prefix`]).
+/// Used to unwrap a typed-tx / typed-receipt envelope (`type ‖ rlp(...)`) whose
+/// byte-string CONTENT is the trie value.
+pub fn strip_bytes_header(item: &[u8]) -> Result<&[u8], CoreError> {
+    let first = match item.first() {
+        Some(&b) => b,
+        None => return Ok(item),
+    };
+    match first {
+        0x00..=0x7f => Ok(item),
+        0x80..=0xb7 => {
+            let len = usize::from(first - 0x80);
+            item.get(1..1 + len)
+                .ok_or_else(|| CoreError("RLP: truncated string".into()))
+        }
+        0xb8..=0xbf => {
+            let (len, header) = read_long_length(item, 0, first - 0xb7)?;
+            item.get(header..header + len)
+                .ok_or_else(|| CoreError("RLP: truncated string".into()))
+        }
+        _ => Ok(item), // a list — caller handles
+    }
+}
+
+/// True if the RLP item's first byte marks a list (`0xc0..=0xff`).
+pub fn is_list_prefix(item: &[u8]) -> bool {
+    matches!(item.first(), Some(&b) if b >= 0xc0)
+}
+
 fn decode_item(data: &[u8], pos: usize, depth: usize) -> Result<(Item, usize), CoreError> {
     if depth > MAX_DEPTH {
         return err("RLP: nesting too deep");

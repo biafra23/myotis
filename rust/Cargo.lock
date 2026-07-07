@@ -2095,6 +2095,7 @@ dependencies = [
  "sha3",
  "snap",
  "socket2 0.5.10",
+ "subtle",
  "tokio",
  "tracing",
  "tracing-subscriber",

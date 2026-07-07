@@ -1,0 +1,320 @@
+//! The eth/66-69 session: Hello capability negotiation, the Status handshake
+//! with the network compatibility gate, and request/response correlation over
+//! a FRAMED [`RlpxConnection`] (EL-A5), twin of the Java `EthHandler` state
+//! machine (`AWAITING_HELLO → AWAITING_STATUS → READY`).
+//!
+//! Single-connection, one-request-at-a-time: requests carry a monotonic id and
+//! the receive loop matches responses by id, answering p2p Ping and ignoring
+//! gossip/mempool traffic in between (the wallet never serves those). The full
+//! concurrent futures map is an EL-A7 orchestration concern; this proves the
+//! flow end-to-end.
+
+use std::time::Duration;
+
+use myotis_core::rlp::{self, Item};
+
+use crate::el::rlpx::transport::{
+    decode_hello, encode_hello, Hello, RlpxConnection, P2P_DISCONNECT, P2P_HELLO, P2P_PING, P2P_PONG,
+};
+
+use super::messages::{self, Status};
+
+/// eth versions we advertise (highest-common wins, floor 66).
+const OUR_ETH_VERSIONS: &[u64] = &[66, 67, 68, 69];
+const MIN_ETH_VERSION: u64 = 66;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Parameters for our side of the eth handshake.
+pub struct EthConfig {
+    pub network_id: u64,
+    pub genesis_hash: [u8; 32],
+    pub fork_id_hash: [u8; 4],
+    pub fork_next: u64,
+    /// The block hash/number we advertise as our head (a light client can send
+    /// genesis; peers don't gate on it beyond fork-id).
+    pub head_hash: [u8; 32],
+    pub head_number: u64,
+    pub listen_port: u16,
+}
+
+/// A negotiated, READY eth session over one peer connection.
+pub struct EthSession {
+    conn: RlpxConnection,
+    /// Negotiated eth version (66-69).
+    pub eth_version: u64,
+    /// Whether the peer also advertised snap/1 (drives EL-A6).
+    pub snap: bool,
+    /// The peer's Status (its head, fork id).
+    pub peer_status: Status,
+    /// The peer's Hello (client id, capabilities).
+    pub peer_hello: Hello,
+    next_request_id: u64,
+}
+
+impl EthSession {
+    /// Drive `HANDSHAKE → READY`: exchange Hello, negotiate the eth version,
+    /// exchange Status, and gate on network id + genesis. `local_pubkey` is our
+    /// node id (64-byte). The whole handshake is bounded by a 30 s timeout.
+    pub async fn handshake(
+        mut conn: RlpxConnection,
+        local_pubkey: &[u8; 64],
+        cfg: &EthConfig,
+    ) -> Result<EthSession, String> {
+        let fut = async {
+            // Send our Hello first (Java sends on RLPX_READY).
+            conn.send(P2P_HELLO, &encode_hello(local_pubkey, cfg.listen_port))
+                .await?;
+
+            // The peer's first framed message must be Hello (or Disconnect).
+            let first = conn.recv().await?;
+            if first.message_code == P2P_DISCONNECT {
+                return Err(format!(
+                    "peer disconnected during handshake: {}",
+                    describe_disconnect(&first.payload)
+                ));
+            }
+            if first.message_code != P2P_HELLO {
+                return Err(format!("expected Hello, got code 0x{:02x}", first.message_code));
+            }
+            let peer_hello = decode_hello(&first.payload)?;
+            let (eth_version, snap) = negotiate(&peer_hello)
+                .ok_or_else(|| format!("no common eth version with {:?}", peer_hello.client_id))?;
+
+            // Send our Status in the negotiated version.
+            let status = if eth_version >= 69 {
+                messages::encode_status69(
+                    eth_version,
+                    cfg.network_id,
+                    &cfg.genesis_hash,
+                    &cfg.head_hash,
+                    &cfg.fork_id_hash,
+                    cfg.fork_next,
+                    cfg.head_number,
+                )
+            } else {
+                messages::encode_status(
+                    eth_version,
+                    cfg.network_id,
+                    &cfg.genesis_hash,
+                    &cfg.head_hash,
+                    &cfg.fork_id_hash,
+                    cfg.fork_next,
+                )
+            };
+            conn.send(messages::STATUS, &status).await?;
+
+            // Read the peer's Status (answering Ping in between).
+            let peer_status = loop {
+                let frame = recv_answering_ping(&mut conn).await?;
+                match frame.message_code {
+                    messages::STATUS => {
+                        break messages::decode_status(&frame.payload, eth_version)
+                            .map_err(|e| format!("peer Status decode: {}", e.0))?
+                    }
+                    P2P_DISCONNECT => {
+                        return Err(format!(
+                            "peer disconnected: {}",
+                            describe_disconnect(&frame.payload)
+                        ))
+                    }
+                    other => {
+                        return Err(format!("expected Status, got code 0x{other:02x}"));
+                    }
+                }
+            };
+            if !peer_status.is_compatible(cfg.network_id, &cfg.genesis_hash) {
+                return Err(format!(
+                    "incompatible peer: networkId={} genesis={}",
+                    peer_status.network_id,
+                    hex4(&peer_status.genesis_hash)
+                ));
+            }
+
+            Ok(EthSession {
+                conn,
+                eth_version,
+                snap,
+                peer_status,
+                peer_hello,
+                next_request_id: 1,
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(30), fut)
+            .await
+            .map_err(|_| "eth handshake timed out".to_string())?
+    }
+
+    /// Every eth/66-69 request/response carries a request id. (The eth/69
+    /// changes are the Status shape and bloomless receipts — NOT the request-id
+    /// wrapper: the Java `EthHandler` decodes all versions with the reqId path,
+    /// so the "eth/69 drops reqId" note in doc 02 §6.6 is inaccurate.)
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        id
+    }
+
+    /// Request a batch of headers by starting block number and await the
+    /// matching response. Verifies nothing here — the caller checks hashes
+    /// against the beacon anchor (EL-A7).
+    pub async fn get_block_headers_by_number(
+        &mut self,
+        block_number: u64,
+        max_headers: u64,
+        skip: u64,
+        reverse: bool,
+    ) -> Result<Vec<messages::VerifiedHeader>, String> {
+        let id = self.next_id();
+        let req = messages::encode_get_block_headers_by_number(
+            id,
+            block_number,
+            max_headers,
+            skip,
+            reverse,
+        );
+        self.conn.send(messages::GET_BLOCK_HEADERS, &req).await?;
+        let payload = self.await_response(messages::BLOCK_HEADERS, id).await?;
+        let (_rid, headers) = messages::decode_block_headers(&payload)
+            .map_err(|e| format!("BlockHeaders decode: {}", e.0))?;
+        Ok(headers)
+    }
+
+    /// Request block bodies by hash.
+    pub async fn get_block_bodies(
+        &mut self,
+        hashes: &[[u8; 32]],
+    ) -> Result<Vec<messages::BlockBody>, String> {
+        let id = self.next_id();
+        let req = messages::encode_get_block_bodies(id, hashes);
+        self.conn.send(messages::GET_BLOCK_BODIES, &req).await?;
+        let payload = self.await_response(messages::BLOCK_BODIES, id).await?;
+        let (_rid, bodies) = messages::decode_block_bodies(&payload)
+            .map_err(|e| format!("BlockBodies decode: {}", e.0))?;
+        Ok(bodies)
+    }
+
+    /// Read frames until the expected response code arrives with the matching
+    /// request id, answering Ping and ignoring gossip in between.
+    async fn await_response(&mut self, want_code: u64, want_id: u64) -> Result<Vec<u8>, String> {
+        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(format!("timed out awaiting code 0x{want_code:02x}"));
+            }
+            let frame = tokio::time::timeout(remaining, recv_answering_ping(&mut self.conn))
+                .await
+                .map_err(|_| format!("timed out awaiting code 0x{want_code:02x}"))??;
+
+            if frame.message_code == P2P_DISCONNECT {
+                return Err(format!("peer disconnected: {}", describe_disconnect(&frame.payload)));
+            }
+            if frame.message_code != want_code {
+                // Gossip / mempool / other responses — ignore (wallet is passive).
+                continue;
+            }
+            if response_request_id(&frame.payload) == Some(want_id) {
+                return Ok(frame.payload);
+            }
+            // A stale/mismatched id — keep reading.
+        }
+    }
+
+    pub fn peer_pubkey(&self) -> [u8; 64] {
+        self.conn.peer_pubkey()
+    }
+}
+
+/// Highest common eth version (floor 66) + whether snap/1 is offered.
+fn negotiate(hello: &Hello) -> Option<(u64, bool)> {
+    let mut best: Option<u64> = None;
+    let mut snap = false;
+    for cap in &hello.capabilities {
+        if cap.name == "eth" && OUR_ETH_VERSIONS.contains(&cap.version) && cap.version >= MIN_ETH_VERSION {
+            best = Some(best.map_or(cap.version, |b| b.max(cap.version)));
+        }
+        if cap.name == "snap" && cap.version == 1 {
+            snap = true;
+        }
+    }
+    best.map(|v| (v, snap))
+}
+
+/// Receive the next frame, transparently answering a p2p Ping with a Pong.
+async fn recv_answering_ping(
+    conn: &mut RlpxConnection,
+) -> Result<crate::el::rlpx::frame::DecodedFrame, String> {
+    loop {
+        let frame = conn.recv().await?;
+        if frame.message_code == P2P_PING {
+            // Pong body is an empty RLP list.
+            conn.send(P2P_PONG, &[0xc0]).await?;
+            continue;
+        }
+        return Ok(frame);
+    }
+}
+
+/// The leading request id of an eth/66-68 response (`[reqId, …]`).
+fn response_request_id(payload: &[u8]) -> Option<u64> {
+    let items = rlp::raw_list_items(payload).ok()?;
+    rlp::decode(items.first()?).ok()?.as_u64().ok()
+}
+
+/// A p2p Disconnect body is `[reason]`; decode the reason code for logging.
+fn describe_disconnect(payload: &[u8]) -> String {
+    let reason = rlp::decode(payload)
+        .ok()
+        .and_then(|it| match it {
+            Item::List(items) => items.first().and_then(|r| r.as_u64().ok()),
+            Item::Bytes(_) => it.as_u64().ok(),
+        })
+        .unwrap_or(u64::MAX);
+    format!("reason={reason}")
+}
+
+fn hex4(b: &[u8]) -> String {
+    b.iter().take(4).map(|x| format!("{x:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::el::rlpx::transport::Capability;
+
+    fn hello_with(caps: Vec<(&str, u64)>) -> Hello {
+        Hello {
+            protocol_version: 5,
+            client_id: "Geth/test".into(),
+            capabilities: caps
+                .into_iter()
+                .map(|(n, v)| Capability { name: n.into(), version: v })
+                .collect(),
+            listen_port: 30303,
+            node_id: vec![0u8; 64],
+        }
+    }
+
+    #[test]
+    fn negotiate_highest_common_and_snap() {
+        assert_eq!(
+            negotiate(&hello_with(vec![("eth", 66), ("eth", 68), ("snap", 1)])),
+            Some((68, true))
+        );
+        assert_eq!(negotiate(&hello_with(vec![("eth", 69)])), Some((69, false)));
+        // eth/65 is below the floor; no common version.
+        assert_eq!(negotiate(&hello_with(vec![("eth", 65), ("les", 4)])), None);
+        // Unknown-to-us high version is ignored; falls back to the common one.
+        assert_eq!(negotiate(&hello_with(vec![("eth", 67), ("eth", 99)])), Some((67, false)));
+    }
+
+    #[test]
+    fn response_id_extraction() {
+        let msg = rlp::encode(&Item::List(vec![
+            Item::Bytes(rlp::u64_to_minimal_be(4242)),
+            Item::List(vec![]),
+        ]));
+        assert_eq!(response_request_id(&msg), Some(4242));
+        assert_eq!(response_request_id(&[0x80]), None);
+    }
+}
