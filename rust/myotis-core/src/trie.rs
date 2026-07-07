@@ -70,9 +70,23 @@ pub fn verify_proof(root: &[u8; 32], key: &[u8], proof_nodes: &[Vec<u8>]) -> Pro
 
     // Iterative descent. `pending` is the next node to interpret — either a
     // hash the proof must contain, or an embedded (< 32-byte) child Item.
+    //
+    // Termination bound: one walk can visit each supplied node AT MOST once —
+    // revisiting would require the trie to contain a keccak cycle (a node
+    // whose descendants hash-reference it), which no proof, honest or
+    // hostile, can construct. The explicit counter makes termination
+    // structural instead of resting on that cryptographic argument alone
+    // (embedded in-node descent is separately bounded by the RLP depth cap).
     let mut expected_hash = *root;
     let mut idx = 0usize;
+    let mut lookups = 0usize;
     loop {
+        lookups += 1;
+        if lookups > by_hash.len() {
+            return ProofResult::Invalid(
+                "proof walk exceeded the supplied node count (cycle)".into(),
+            );
+        }
         let node_rlp = match by_hash.get(&expected_hash) {
             Some(n) => *n,
             None => {
