@@ -1101,6 +1101,7 @@ async fn catch_up(
         let wire = codec::encode_request(&ssz_request);
 
         let staged_before = staged.len();
+        let mut poisoned_this_round = false;
         let mut in_flight: FuturesUnordered<_> = peers
             .into_iter()
             .map(|peer| {
@@ -1190,7 +1191,13 @@ async fn catch_up(
                     && verify_rejects > 0
                     && resume.poisoned(verify_rejects as u32)
                 {
-                    return true; // restored snapshot can't verify anything — re-bootstrap
+                    // Defer the verdict to round end: a slower HONEST response
+                    // in this same round can still apply and confirm the
+                    // snapshot — a fast bad peer must not win the race. If an
+                    // apply lands, confirm() resets the guard and the pending
+                    // flag below is ignored.
+                    poisoned_this_round = true;
+                    continue;
                 }
                 if applied_now > 0 {
                     resume.confirm();
@@ -1221,6 +1228,10 @@ async fn catch_up(
             }
         }
         drop(in_flight);
+
+        if poisoned_this_round && applied == 0 {
+            return true; // whole round rejected — restored snapshot can't verify anything
+        }
 
         if applied > 0 {
             tracing::info!(applied, staged = staged.len(),
