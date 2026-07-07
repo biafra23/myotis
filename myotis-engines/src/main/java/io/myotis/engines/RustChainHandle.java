@@ -341,7 +341,9 @@ final class RustChainHandle implements ChainHandle {
         }
         var error = o.get("error");
         if (error != null && !error.isNull()) {
-            throw new EngineException(error.asString());
+            // The Rust side always emits a string error, but tolerate a
+            // structured value rather than throwing a raw library exception.
+            throw new EngineException(error.isString() ? error.asString() : error.toString());
         }
         return o;
     }
@@ -358,7 +360,8 @@ final class RustChainHandle implements ChainHandle {
         if (v == null || !v.isArray()) return List.of();
         List<String> out = new java.util.ArrayList<>();
         v.asArray().forEach(e -> out.add(e.isNull() ? null : e.asString()));
-        return out;
+        // Unmodifiable: these lists live inside immutable result records.
+        return java.util.Collections.unmodifiableList(out);
     }
 
     @Override

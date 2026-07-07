@@ -96,6 +96,13 @@ class RustVerifiedReadJsonTest {
     }
 
     @Test
+    void structuredErrorValueStillBecomesEngineException() {
+        // A non-string error value must not leak a raw library exception.
+        assertThrows(EngineException.class, () -> RustChainHandle.accountFromJson(
+                "0x0", "{\"error\":{\"code\":-32000,\"message\":\"boom\"}}"));
+    }
+
+    @Test
     void nullAndMalformedPayloadsThrow() {
         assertThrows(EngineException.class, () -> RustChainHandle.accountFromJson("0x0", null));
         assertThrows(EngineException.class, () -> RustChainHandle.accountFromJson("0x0", ""));
