@@ -1302,6 +1302,14 @@ public class BeaconLightClient implements AutoCloseable {
     private static final int MAX_CL_PEERS = 1024;
     /** Max 128-period batches per catch-up call. Bounds wall-clock on very old checkpoints. */
     private static final int MAX_CATCHUP_BATCHES = 8;
+    /** Pause between ADVANCING catch-up batches. Live LC servers (Lighthouse) serve
+     *  ~one update per ~10 s request-quota window; re-asking instantly after a served
+     *  batch always came back empty, wasting the round as "no progress — will retry
+     *  on next sync cycle" and stretching multi-period catch-ups by a full cycle per
+     *  period. Pacing one quota window keeps the proven server serving every round
+     *  (measured on-device with the Rust twin: 20-95 s/period collapsed to ~11 s).
+     *  Same value as the Rust engine's UPDATES_SERVE_COOLDOWN. */
+    private static final long CATCHUP_QUOTA_PACE_MS = 11_000;
     /** Max peers dialed per catch-up batch. The discovered CL pool runs to thousands of
      *  fork-matched nodes, most of which don't run a light-client server — fanning
      *  updates_by_range at all of them burned minutes of ProtocolNegotiation/Timeout
@@ -1331,6 +1339,20 @@ public class BeaconLightClient implements AutoCloseable {
                     log.info("[beacon] Sync committee is current (period {}), no catch-up needed", committeePeriod);
                 }
                 return;
+            }
+
+            // Pace AFTER the done-check (a finished catch-up must not pay a
+            // pointless pause) and only between advancing batches: batch > 0
+            // means the previous batch applied updates — its server's quota
+            // needs a window to refill before it can serve again.
+            if (batch > 0) {
+                try {
+                    Thread.sleep(CATCHUP_QUOTA_PACE_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                if (!running) return;
             }
 
             long periodsToFetch = currentPeriod - committeePeriod;
