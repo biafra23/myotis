@@ -130,10 +130,12 @@ fn hex0x(bytes: &[u8; 32]) -> String {
 
 /// Variable-length bytes as `0x`-prefixed lowercase hex.
 fn hex0x_var(bytes: &[u8]) -> String {
+    use std::fmt::Write;
     let mut s = String::with_capacity(2 + bytes.len() * 2);
     s.push_str("0x");
     for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+        // Append directly into the buffer — no per-byte String allocation.
+        let _ = write!(s, "{b:02x}");
     }
     s
 }

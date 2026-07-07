@@ -189,10 +189,13 @@ mod jni_shim {
     }
 
     // ---------------------------------------------------------------------
-    // EL verified-read surface (ABI 4). Each returns a JSON string: the full
-    // AccountProofResult / StorageProofResult shape on success (verification
-    // failures carry a `failReason`), or `{"error": "..."}` for a transport /
-    // not-running / bad-input failure the Java side raises as an EngineException.
+    // EL verified-read surface. DORMANT in this build: ABI_VERSION stays 3 and
+    // the Java side declares neither native yet, so these symbols are present
+    // but unresolved (the bump to 4 lands with the Java wiring — see
+    // ABI_VERSION's doc). Each returns a JSON string: the full AccountProofResult
+    // / StorageProofResult shape on success (verification failures carry a
+    // `failReason`), or `{"error": "..."}` for a transport / not-running /
+    // bad-input failure the Java side raises as an EngineException.
     // ---------------------------------------------------------------------
 
     /// `RustEngineNative.nativeRequestAccountJson(long handle, String address)`.

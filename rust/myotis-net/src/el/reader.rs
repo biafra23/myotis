@@ -372,9 +372,6 @@ fn storage_key(slot: u64, holder: Option<[u8; 20]>) -> [u8; 32] {
     }
 }
 
-/// Decode a fixed 64-char hex CONSTANT. Panics on a malformed literal (a
-/// programming error caught immediately in dev/tests — never runs on peer data),
-/// matching the `sync.rs` convention; it does NOT silently zero-pad bad input.
 /// Generate a valid secp256k1 node key from OS entropy. Returns `Err` rather
 /// than panicking (the engine host is panic-free by construction); retries the
 /// negligibly-rare out-of-range secret.
@@ -389,6 +386,9 @@ pub fn generate_node_key() -> Result<Arc<NodeKey>, String> {
     Err("could not generate a valid node key from OS entropy".to_string())
 }
 
+/// Decode a fixed 64-char hex CONSTANT. Panics on a malformed literal (a
+/// programming error caught immediately in dev/tests — never runs on peer data),
+/// matching the `sync.rs` convention; it does NOT silently zero-pad bad input.
 fn hex32(s: &str) -> [u8; 32] {
     let mut out = [0u8; 32];
     for (i, byte) in out.iter_mut().enumerate() {
