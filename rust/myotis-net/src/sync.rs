@@ -241,6 +241,8 @@ pub struct SyncStatus {
     /// ones (the UI's "Discv5 peers" row) — deliberately not the connected
     /// count, which reads a misleading 0 during connectivity blips.
     pub discv5_table_size: usize,
+    /// Period this run's catch-up started from; -1 until bootstrap/resume.
+    pub sync_start_period: i64,
 }
 
 impl SyncStatus {
@@ -256,6 +258,7 @@ impl SyncStatus {
             peer_count: 0,
             served_peers_last_min: 0,
             discv5_table_size: 0,
+            sync_start_period: -1,
         }
     }
 }
@@ -362,6 +365,12 @@ struct PeerPool {
     /// publish_status param) because the pool already travels everywhere
     /// status is published.
     discv5_table_size: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Period this run's catch-up started from (bootstrap checkpoint or
+    /// resumed snapshot); -1 until known. Drives the UI's determinate
+    /// progress bar ((current-start)/(target-start)) — without it the bar
+    /// spins forever even though current/target are displayed. Same
+    /// travels-with-the-pool rationale as discv5_table_size.
+    sync_start_period: i64,
     /// Consecutive terminal-failure count per peer, for eviction. Reset on any
     /// success. Without eviction the MAX_POOL cap fills with dead peers and
     /// `add` starts rejecting fresh ones — a permanent catch-up wedge.
@@ -400,6 +409,7 @@ impl PeerPool {
             fail_counts: HashMap::new(),
             recent_serves: HashMap::new(),
             discv5_table_size: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            sync_start_period: -1,
             sweep: 0,
         }
     }
@@ -656,6 +666,7 @@ async fn run_sync(
     // restored store stays on probation (ResumeGuard) until one update
     // BLS-verifies against it; see RESUME_REJECTS_MAX.
     let checkpoint_period = spec::compute_sync_committee_period(config.checkpoint_slot);
+    let mut in_catchup = false;
     // Floor the persist throttle at the CHECKPOINT period: a snapshot at (or
     // below) the checkpoint period can never be resumed (the strictly-newer
     // rule rejects it), so writing one could only OVERWRITE a possibly-newer
@@ -731,8 +742,17 @@ async fn run_sync(
 
         let wall_period = spec::compute_sync_committee_period(config.current_slot_estimate());
         if wall_period > processor.store.current_period() {
+            // Baseline the progress bar at every catch-up ENTRY (not just
+            // bootstrap/resume): a process that reached SYNCED and re-enters
+            // catch-up after a doze must start its bar at 0%, not at the
+            // fraction left over from the previous run's baseline.
+            if !in_catchup {
+                in_catchup = true;
+                pool.sync_start_period = processor.store.current_period() as i64;
+            }
             let poisoned = catch_up(&config, &client, &mut pool, &mut processor, &status_tx,
-                &mut peer_rx, &mut staged_updates, &mut clcache, &mut resume)
+                &mut peer_rx, &mut staged_updates, &mut clcache, &mut resume,
+                &mut last_persisted_period)
                 .await;
             // Batch-persist every cache verdict from the catch-up rounds in
             // one write, OFF the per-peer hot path (review: no blocking I/O
@@ -752,11 +772,17 @@ async fn run_sync(
                 staged_updates.clear();
                 last_persisted_period = checkpoint_period; // keep the never-persist-checkpoint floor
                 resume = ResumeGuard::fresh();
+                in_catchup = false;
+                pool.sync_start_period = -1;
+                // Publish the reset immediately: without this the status watch
+                // keeps the DISCARDED snapshot's CATCHING_UP periods frozen on
+                // screen for the whole re-bootstrap.
+                publish_status(&config, &client, &processor, &pool, &status_tx).await;
                 continue;
             }
-            // Persist on period advance only (Java parity): the ~50 KiB
-            // committee snapshot is worth rewriting exactly when the committee
-            // moved, not on every finality tick.
+            // Backstop only: catch_up persists each applied period itself,
+            // so this is a no-op unless a future change makes catch_up return
+            // with an unpersisted advance.
             persist_snapshot(&config, &processor, &mut last_persisted_period);
             refresh_local_status(&config, &processor, &local_status);
             publish_status(&config, &client, &processor, &pool, &status_tx).await;
@@ -771,6 +797,7 @@ async fn run_sync(
             }
         }
 
+        in_catchup = false; // reaching here means the committee is current
         if poll_finality(&client, &mut pool, &mut processor, &mut clcache).await {
             // A finality update verified against the (possibly restored)
             // committee — the snapshot is genuine.
@@ -1054,18 +1081,22 @@ async fn catch_up(
     staged: &mut std::collections::BTreeMap<u64, Vec<u8>>,
     clcache: &mut crate::clcache::ClPeerCache,
     resume: &mut ResumeGuard,
+    last_persisted_period: &mut u64,
 ) -> bool {
     let mut idle_rounds = 0u32;
     // Exponential pause after fruitless rounds: hammering the whole pool every
     // ~13 s is exactly what CL peer scoring penalizes, and it burns request
     // quota on servers that will serve happily a minute later.
     let mut empty_backoff = Duration::from_secs(0);
+    // Pace after a SUCCESSFUL round instead of re-asking instantly: LC servers
+    // (Lighthouse) serve ~one update per ~10 s quota window, so the instant
+    // re-ask always came back empty — which put the just-serving peer on
+    // cooldown, rotated the fan-out to non-servers, and climbed the 5→40 s
+    // empty-round backoff ladder. Observed on-device: 20–95 s per period
+    // where the quota allows ~11 s. Sleeping one quota window keeps the
+    // serving peer in the next round's fan-out with its quota refilled.
+    let mut pace_after_apply = false;
     loop {
-        if !empty_backoff.is_zero() {
-            tracing::info!(backoff_s = empty_backoff.as_secs(),
-                "catch-up: no progress last round — backing off before retrying");
-            tokio::time::sleep(empty_backoff).await;
-        }
         drain_discovered(peer_rx, pool);
         let slot_estimate = config.current_slot_estimate();
         let wall_period = spec::compute_sync_committee_period(slot_estimate);
@@ -1076,6 +1107,19 @@ async fn catch_up(
         if wall_period <= committee_period {
             tracing::info!(period = committee_period, "sync committee is current");
             return false;
+        }
+        // Sleeps AFTER the done-check: the final applied round must not pay
+        // an 11 s pace (or a backoff) just to discover there is no next
+        // request to protect — SYNCED publishes immediately.
+        if pace_after_apply {
+            pace_after_apply = false;
+            tracing::info!(pace_s = UPDATES_SERVE_COOLDOWN.as_secs(),
+                "catch-up: pacing to the LC serve quota before the next round");
+            tokio::time::sleep(UPDATES_SERVE_COOLDOWN).await;
+        } else if !empty_backoff.is_zero() {
+            tracing::info!(backoff_s = empty_backoff.as_secs(),
+                "catch-up: no progress last round — backing off before retrying");
+            tokio::time::sleep(empty_backoff).await;
         }
         *staged = staged.split_off(&committee_period); // drop already-passed periods
         let span = (wall_period - committee_period).min(UPDATES_BATCH_MAX);
@@ -1239,7 +1283,15 @@ async fn catch_up(
                 finalized_slot = processor.store.finalized_slot(),
                 "catch-up round applied");
             publish_status(config, client, processor, &*pool, status_tx).await;
+            // Persist EVERY applied period, not just when catch_up returns:
+            // catch-up loops internally for the whole span, and Android kills
+            // the process freely (reinstalls, OOM, user swipes) — before this,
+            // a kill mid-catch-up lost every verified period since bootstrap
+            // (observed: 4 periods re-verified after a reinstall). ~50 KiB per
+            // ~11 s paced period is negligible next to the BLS work it saves.
+            persist_snapshot(config, processor, last_persisted_period);
             idle_rounds = 0;
+            pace_after_apply = true;
         } else if staged.len() > staged_before {
             // No prefix advance yet, but the buffer grew — that's progress
             // toward unblocking the earliest period; keep going.
@@ -1484,6 +1536,7 @@ async fn publish_status(
         discv5_table_size: pool
             .discv5_table_size
             .load(std::sync::atomic::Ordering::Relaxed),
+        sync_start_period: pool.sync_start_period,
     };
     let _ = status_tx.send(status);
 }

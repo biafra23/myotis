@@ -82,7 +82,8 @@ final class RustChainHandle implements ChainHandle {
             long targetPeriod,
             long peerCount,
             int servedPeersLastMinute,
-            int discv5TableSize) {
+            int discv5TableSize,
+            long syncStartPeriod) {
 
         static ParsedStatus parse(String json) {
             if (json == null || json.isBlank()) return notRunning();
@@ -99,7 +100,8 @@ final class RustChainHandle implements ChainHandle {
                         o.getLong("targetPeriod", 0L),
                         o.getLong("peerCount", 0L),
                         o.getInt("servedPeersLastMinute", 0),
-                        o.getInt("discv5TableSize", 0));
+                        o.getInt("discv5TableSize", 0),
+                        o.getLong("syncStartPeriod", -1L));
             } catch (RuntimeException e) {
                 throw new EngineException(
                         "malformed status JSON from the Rust engine: " + e.getMessage(), e);
@@ -107,7 +109,7 @@ final class RustChainHandle implements ChainHandle {
         }
 
         static ParsedStatus notRunning() {
-            return new ParsedStatus(false, BeaconState.STARTING, false, 0L, 0L, 0L, 0L, 0L, 0, 0);
+            return new ParsedStatus(false, BeaconState.STARTING, false, 0L, 0L, 0L, 0L, 0L, 0, 0, -1L);
         }
     }
 
@@ -154,7 +156,7 @@ final class RustChainHandle implements ChainHandle {
                 0L,             // optimisticBlockNumber
                 s.finalizedSlot(),
                 0L,             // finalizedBlockNumber
-                -1L,            // syncStartPeriod (unknown)
+                s.syncStartPeriod(),
                 s.currentPeriod(),
                 targetPeriod,
                 s.finalizedSlot() / 8192L, // finalizedPeriod (SLOTS_PER_SYNC_COMMITTEE_PERIOD)
