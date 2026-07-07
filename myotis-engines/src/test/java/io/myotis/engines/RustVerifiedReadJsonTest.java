@@ -100,6 +100,17 @@ class RustVerifiedReadJsonTest {
         assertThrows(EngineException.class, () -> RustChainHandle.accountFromJson("0x0", null));
         assertThrows(EngineException.class, () -> RustChainHandle.accountFromJson("0x0", ""));
         assertThrows(EngineException.class, () -> RustChainHandle.accountFromJson("0x0", "not json"));
+        // A non-object payload (e.g. a bare number) → EngineException, not a raw throw.
+        assertThrows(EngineException.class, () -> RustChainHandle.accountFromJson("0x0", "42"));
+    }
+
+    @Test
+    void typeMismatchedFieldBecomesEngineException() {
+        // Rust-side shape drift: a numeric field arrives as a string. The
+        // field-extraction must surface an EngineException, not a raw
+        // UnsupportedOperationException from the JSON library.
+        String json = "{\"exists\":true,\"nonce\":\"not-a-number\",\"proofNodesHex\":[]}";
+        assertThrows(EngineException.class, () -> RustChainHandle.accountFromJson("0x0", json));
     }
 
     /** A headerChain-verified storage slot (mirrors the Rust eljson storage sample). */

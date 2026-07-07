@@ -247,6 +247,7 @@ final class RustChainHandle implements ChainHandle {
     }
 
     private static AccountProofResult accountFromJson(String hexAddress, JsonObject o) {
+        try {
         return new AccountProofResult(
                 o.getString("address", hexAddress),
                 o.getBoolean("exists", false),
@@ -269,6 +270,11 @@ final class RustChainHandle implements ChainHandle {
                 o.getLong("wallClockPeriod", 0L),
                 o.getLong("finalizedBlockNumber", 0L),
                 o.getLong("optimisticBlockNumber", 0L));
+        } catch (RuntimeException e) {
+            // A type-mismatched field (Rust-side shape drift) surfaces as an
+            // EngineException, never a raw UnsupportedOperationException.
+            throw new EngineException("malformed account JSON from the Rust engine: " + e.getMessage(), e);
+        }
     }
 
     @Override
@@ -285,6 +291,7 @@ final class RustChainHandle implements ChainHandle {
     }
 
     private static StorageProofResult storageFromJson(String hexAddress, long slot, JsonObject o) {
+        try {
         return new StorageProofResult(
                 o.getString("addressHex", hexAddress),
                 o.getLong("slot", slot),
@@ -310,6 +317,9 @@ final class RustChainHandle implements ChainHandle {
                 o.getLong("finalizedSlot", 0L),
                 o.getLong("optimisticSlot", 0L),
                 o.getInt("maxHeaderChainGap", 0));
+        } catch (RuntimeException e) {
+            throw new EngineException("malformed storage JSON from the Rust engine: " + e.getMessage(), e);
+        }
     }
 
     /**
