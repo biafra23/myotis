@@ -262,11 +262,16 @@ pub fn decode_multi_chunk_response(
         }
         pos += 4; // fork digest (per-chunk; the payload's own fork sniffing governs decode)
         // A truncated TAIL (the reader's total budget cutting a long paced
-        // response mid-chunk) must not discard the complete chunks before it —
-        // only an undecodable FIRST chunk is a peer-level error.
+        // response mid-chunk) must not discard the complete chunks before it.
+        // Salvage ONLY when the failure is consistent with the buffer simply
+        // ending (bytes ran out) — a decode failure with substantial data
+        // still ahead is mid-response corruption and stays a peer-level
+        // error, so a serves-then-corrupts peer cannot farm proven status.
         let (uncompressed_len, next) = match read_varint(raw, pos) {
             Ok(v) => v,
-            Err(e) if !items.is_empty() => {
+            // 10 bytes is the longest u64 varint — an error with less than
+            // that remaining means the varint itself was cut off.
+            Err(e) if !items.is_empty() && raw.len() - pos < 10 => {
                 tracing::debug!(item = items.len(), raw_len = raw.len(), error = %e,
                     "multi-chunk tail truncated at varint — salvaging prior chunks");
                 break;
@@ -290,7 +295,12 @@ pub fn decode_multi_chunk_response(
         }
         let decompressed = match snappy_decompress(&raw[snappy_start..pos], uncompressed_len) {
             Ok(d) => d,
-            Err(e) if !items.is_empty() => {
+            // Truncation-consistent only: skip_snappy_frames consumes to
+            // data.len() on a cut frame body and leaves < 4 bytes on a cut
+            // frame header. A decompress failure with a full frame's worth of
+            // data still ahead (e.g. a corrupt CRC mid-response with more
+            // chunks after it) is NOT a truncated tail.
+            Err(e) if !items.is_empty() && raw.len() - pos < 4 => {
                 tracing::debug!(item = items.len(), raw_len = raw.len(), error = %e,
                     "multi-chunk tail truncated mid-snappy — salvaging prior chunks");
                 break;
@@ -566,6 +576,24 @@ mod tests {
         assert_eq!(items, payloads);
         // A truncated FIRST chunk stays a peer-level error.
         assert!(decode_multi_chunk_response(&tail[..tail.len() / 2], 5).is_err());
+    }
+
+    #[test]
+    fn multi_chunk_mid_response_corruption_is_not_salvaged() {
+        // A serves-then-corrupts peer must stay a decode error, not earn a
+        // salvaged partial serve: corrupt a chunk's snappy body while MORE
+        // response data follows it — truncation can't look like that. The
+        // payload is incompressible and the flip sits deep in the compressed
+        // data, so frame lengths stay intact and only the content is bad.
+        let good = vec![0x01u8; 500];
+        let noisy: Vec<u8> = (0..25_000u32).map(|i| (i.wrapping_mul(31) >> 3) as u8).collect();
+        let mut corrupt = encode_success_response(&noisy, Some([0; 4]));
+        let flip_at = corrupt.len() - 10;
+        corrupt[flip_at] ^= 0xFF;
+        let mut wire = encode_success_response(&good, Some([0; 4]));
+        wire.extend_from_slice(&corrupt);
+        wire.extend_from_slice(&encode_success_response(&good, Some([0; 4])));
+        assert!(decode_multi_chunk_response(&wire, 5).is_err());
     }
 
     #[test]

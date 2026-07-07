@@ -43,14 +43,18 @@ pub const RESP_TIMEOUT: Duration = Duration::from_secs(10);
 /// peer is charged a failure. A full 128-update batch cannot fit here for a
 /// paced or slow-link server, which is why the codec completes the read at
 /// UPDATES_READ_BUDGET with whatever whole chunks arrived — this timeout only
-/// fires when a peer sent NOTHING for the whole window.
-pub const UPDATES_TIMEOUT: Duration = Duration::from_secs(45);
+/// fires when a peer sent NOTHING for the whole window. Sized so the budget
+/// below can cover a full 128-chunk batch (~3.5 MiB) on a ~65 KB/s link; the
+/// extra 15 s over the old 45 s only lengthens rounds where NO peer serves.
+pub const UPDATES_TIMEOUT: Duration = Duration::from_secs(60);
 /// Total read budget for an updates_by_range response, deliberately under
 /// UPDATES_TIMEOUT: when it expires with data buffered, the read completes and
-/// the complete chunks are used (a paced ~10 s/chunk server yields ~4 periods
+/// the complete chunks are used (a paced ~10 s/chunk server yields ~5 periods
 /// per round instead of a behaviour timeout that loses all of them AND
-/// strike-marks the serving peer toward cache eviction).
-const UPDATES_READ_BUDGET: Duration = Duration::from_secs(40);
+/// strike-marks the serving peer toward cache eviction). The clock starts at
+/// request time, NOT at the first byte — it shadows the behaviour timeout,
+/// so server think time before the first chunk spends the same budget.
+const UPDATES_READ_BUDGET: Duration = Duration::from_secs(55);
 
 /// Complete a response once the stream has gone quiet for this long with data
 /// buffered — the Rust twin of the Java controller's safety/drain timers.
@@ -101,9 +105,13 @@ where
 /// Read to EOF, but once at least one byte is buffered treat `quiet` of
 /// silence as end-of-response; also salvage buffered data when the peer
 /// resets the stream instead of half-closing. `budget`, when set, bounds the
-/// TOTAL read time once data is buffered: a long paced/slow response completes
-/// with what arrived instead of running into the behaviour-level request
-/// timeout, which would discard the buffer and charge the peer a failure.
+/// TOTAL read time measured from entry (mirroring the behaviour timeout it
+/// runs under — pre-first-byte server think time spends it too): when it
+/// expires with data buffered, the read completes with what arrived instead
+/// of running into the behaviour-level request timeout, which would discard
+/// the buffer and charge the peer a failure. With nothing buffered the read
+/// keeps waiting — a wholly unresponsive peer is left to the behaviour
+/// timeout, which is the failure signal eviction accounting keys off.
 async fn read_until_quiet<T>(
     io: &mut T,
     cap: usize,
