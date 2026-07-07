@@ -39,6 +39,9 @@ cipher = "=0.4.4"
 hmac = "=0.12.1"
 sha2 = "=0.10.9"
 sha3 = "=0.10.9"
+# Audited constant-time equality for the ECIES + frame MAC comparisons (a
+# hand-rolled loop risks LLVM lowering it to an early-exit branch).
+subtle = "=2.6.1"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

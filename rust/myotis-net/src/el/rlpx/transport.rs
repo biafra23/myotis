@@ -182,8 +182,8 @@ fn random16() -> [u8; 16] {
 /// EIP-8 padding: 100-300 random bytes (a trailing auth-body list element).
 fn random_padding() -> Vec<u8> {
     let mut len_byte = [0u8; 1];
-    getrandom::getrandom(&mut len_byte).ok();
-    let len = 100 + usize::from(len_byte[0]); // 100..=355
+    getrandom::getrandom(&mut len_byte).expect("OS entropy");
+    let len = 100 + usize::from(len_byte[0]) % 201; // 100..=300, matching the reference
     let mut pad = vec![0u8; len];
     getrandom::getrandom(&mut pad).expect("OS entropy");
     pad

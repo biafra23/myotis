@@ -21,6 +21,7 @@ use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::Aes256;
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use sha3::{Digest, Keccak256};
+use subtle::ConstantTimeEq;
 
 use myotis_core::rlp;
 use myotis_core::CoreError;
@@ -118,7 +119,7 @@ impl FrameCodec {
             return Err(CoreError("RLPx: bad header sizes".into()));
         }
         let expected = self.ingress_mac.update_header(enc_header);
-        if !ct_eq(header_mac, &expected) {
+        if !bool::from(header_mac.ct_eq(&expected)) {
             return Err(CoreError("RLPx: header MAC mismatch".into()));
         }
         let mut header = [0u8; 16];
@@ -146,7 +147,7 @@ impl FrameCodec {
             return Err(CoreError("RLPx: bad body framing".into()));
         }
         let expected = self.ingress_mac.update_body(enc_body);
-        if !ct_eq(body_mac, &expected) {
+        if !bool::from(body_mac.ct_eq(&expected)) {
             return Err(CoreError("RLPx: body MAC mismatch".into()));
         }
         let mut body = enc_body.to_vec();
@@ -208,17 +209,6 @@ fn xor(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
         out[i] = a[i] ^ b[i];
     }
     out
-}
-
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Streaming Keccak-256 MAC chain (go-eth compatible). The AES here is a
@@ -347,24 +337,38 @@ mod tests {
     }
 
     #[test]
-    fn oversized_snappy_declared_length_falls_back_not_allocates() {
-        // A minimal snappy stream whose header declares a ~4 GiB decoded length.
-        // decode_body must NOT try to allocate it (panic="abort" would kill the
-        // process); it falls back to the raw bytes and the upper layer rejects.
+    fn oversized_snappy_declared_length_does_not_allocate_in_decode_body() {
+        // Drive a HOSTILE payload — a snappy header declaring ~4 GiB decoded
+        // length from 6 bytes — all the way through decode_body. It must not
+        // try to allocate 4 GiB (panic="abort" would kill the process); it
+        // falls back to the raw bytes, which the upper RLP layer then rejects.
+        // bomb = varint(0xFFFFFFFF) ‖ 0x00 — a well-formed snappy header.
+        let bomb = vec![0xffu8, 0xff, 0xff, 0xff, 0x0f, 0x00];
+        assert!(snap::raw::decompress_len(&bomb).map_or(false, |n| n > MAX_FRAME_BODY_SIZE));
+
+        // Frame it by hand so the payload region is EXACTLY the bomb (encode_frame
+        // would re-compress it). The initiator MACs it; the responder decodes.
         let (mut a, mut b) = pair();
-        // Build a valid frame carrying that hostile "payload" as msg 0x10.
-        // 0xff,0xff,0xff,0xff,0x0f = varint for 0xFFFFFFFF (~4 GiB), then a byte.
-        let bomb = vec![0xff, 0xff, 0xff, 0xff, 0x0f, 0x00];
-        // Encode as an ALREADY-compressed body by sending it as Hello-style raw
-        // via a non-zero code path: reuse encode_frame which will snappy it, so
-        // instead craft the frame with the bomb as the literal payload region.
-        // Simplest: assert the guard directly on decompress_len.
-        assert!(snap::raw::decompress_len(&bomb).map_or(true, |n| n > MAX_FRAME_BODY_SIZE));
-        // And a normal round-trip still works (guard doesn't reject valid data).
-        let frame = a.encode_frame(0x10, &vec![1u8; 200]);
-        let (h, hm, bod, bm) = split(&frame);
-        let len = b.decode_header(h, hm).unwrap();
-        assert_eq!(b.decode_body(bod, bm, len).unwrap().payload, vec![1u8; 200]);
+        let mut coded = rlp::encode_u64(0x10); // non-Hello code → decompress path
+        coded.extend_from_slice(&bomb);
+        let body_len = coded.len();
+        coded.resize((body_len + 15) & !15, 0);
+
+        let mut header = [0u8; 16];
+        header[0] = (body_len >> 16) as u8;
+        header[1] = (body_len >> 8) as u8;
+        header[2] = body_len as u8;
+        header[3] = 0xc0;
+        a.encrypt.apply_keystream(&mut header);
+        let header_mac = a.egress_mac.update_header(&header);
+        a.encrypt.apply_keystream(&mut coded);
+        let body_mac = a.egress_mac.update_body(&coded);
+
+        let len = b.decode_header(&header, &header_mac).unwrap();
+        // The key assertion: this returns (raw fallback) rather than aborting.
+        let decoded = b.decode_body(&coded, &body_mac, len).unwrap();
+        assert_eq!(decoded.message_code, 0x10);
+        assert_eq!(decoded.payload, bomb); // raw fallback, not a 4 GiB allocation
     }
 
     #[test]

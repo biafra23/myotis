@@ -18,6 +18,7 @@ use aes::Aes128;
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use myotis_core::nodekey::NodeKey;
 use myotis_core::CoreError;
@@ -84,7 +85,7 @@ pub fn decrypt(
     let (enc_key, mac_key) = derive_keys(&shared);
 
     let expected = compute_mac(&mac_key, iv, ciphertext, aad);
-    if !constant_time_eq(mac, &expected) {
+    if !bool::from(mac.ct_eq(&expected)) {
         return Err(CoreError("ECIES: MAC verification failed".into()));
     }
 
@@ -132,17 +133,6 @@ fn compute_mac(mac_key: &[u8; MAC_KEY_SIZE], iv: &[u8], ciphertext: &[u8], aad: 
     let mut out = [0u8; 32];
     out.copy_from_slice(&hmac.finalize().into_bytes());
     out
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 #[cfg(test)]
