@@ -25,6 +25,7 @@ use myotis_consensus::ssz;
 
 use crate::codec;
 use crate::discovery::{self, DiscoveryConfig};
+use crate::el::anchor::ExecAnchor;
 use crate::protocols;
 use crate::reqresp::{self, LocalStatus, ReqRespClient, RequestError};
 use crate::status::{fork_digest, fork_digest_bpo, StatusMessage};
@@ -273,6 +274,9 @@ pub struct SyncHandle {
     status_rx: watch::Receiver<SyncStatus>,
     client: ReqRespClient,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// The CL→EL bridge: the verified beacon loop feeds finalized/optimistic
+    /// execution into this, and the EL verified-read ladder reads it.
+    exec_anchor: Arc<ExecAnchor>,
 }
 
 impl SyncHandle {
@@ -300,15 +304,24 @@ impl SyncHandle {
             listen_port: config.discv5_port,
         };
 
+        let exec_anchor = Arc::new(ExecAnchor::new());
         let sync_task = tokio::spawn(run_sync(
             config,
             client.clone(),
             local_status,
             status_tx,
             discovery_cfg,
+            Arc::clone(&exec_anchor),
         ));
 
-        Ok(SyncHandle { status_rx, client, tasks: vec![sync_task] })
+        Ok(SyncHandle { status_rx, client, tasks: vec![sync_task], exec_anchor })
+    }
+
+    /// The EL execution anchor fed by this beacon sync loop — the CL→EL trust
+    /// bridge the verified-read ladder anchors against (finalized/optimistic
+    /// execution + the BLS-attested state-root window).
+    pub fn exec_anchor(&self) -> Arc<ExecAnchor> {
+        Arc::clone(&self.exec_anchor)
     }
 
     pub fn status(&self) -> SyncStatus {
@@ -575,6 +588,7 @@ async fn run_sync(
     local_status: Arc<LocalStatus>,
     status_tx: watch::Sender<SyncStatus>,
     discovery_cfg: DiscoveryConfig,
+    anchor: Arc<ExecAnchor>,
 ) {
     let mut pool = PeerPool::new();
     for s in &config.static_peers {
@@ -693,7 +707,7 @@ async fn run_sync(
                     // catch-up apply, hiding the resume from the UI and from
                     // on-device forensics.
                     refresh_local_status(&config, &processor, &local_status);
-                    publish_status(&config, &client, &processor, &pool, &status_tx).await;
+                    publish_status(&config, &client, &processor, &pool, &status_tx, &anchor).await;
                 }
                 Some(_) => tracing::info!(
                     "persisted snapshot not newer than the embedded checkpoint — bootstrapping fresh"),
@@ -733,7 +747,7 @@ async fn run_sync(
             if bootstrapped {
                 persist_snapshot(&config, &processor, &mut last_persisted_period);
                 refresh_local_status(&config, &processor, &local_status);
-                publish_status(&config, &client, &processor, &pool, &status_tx).await;
+                publish_status(&config, &client, &processor, &pool, &status_tx, &anchor).await;
             } else {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
@@ -752,7 +766,7 @@ async fn run_sync(
             }
             let poisoned = catch_up(&config, &client, &mut pool, &mut processor, &status_tx,
                 &mut peer_rx, &mut staged_updates, &mut clcache, &mut resume,
-                &mut last_persisted_period)
+                &mut last_persisted_period, &anchor)
                 .await;
             // Batch-persist every cache verdict from the catch-up rounds in
             // one write, OFF the per-peer hot path (review: no blocking I/O
@@ -777,7 +791,7 @@ async fn run_sync(
                 // Publish the reset immediately: without this the status watch
                 // keeps the DISCARDED snapshot's CATCHING_UP periods frozen on
                 // screen for the whole re-bootstrap.
-                publish_status(&config, &client, &processor, &pool, &status_tx).await;
+                publish_status(&config, &client, &processor, &pool, &status_tx, &anchor).await;
                 continue;
             }
             // Backstop only: catch_up persists each applied period itself,
@@ -785,7 +799,7 @@ async fn run_sync(
             // with an unpersisted advance.
             persist_snapshot(&config, &processor, &mut last_persisted_period);
             refresh_local_status(&config, &processor, &local_status);
-            publish_status(&config, &client, &processor, &pool, &status_tx).await;
+            publish_status(&config, &client, &processor, &pool, &status_tx, &anchor).await;
             if spec::compute_sync_committee_period(config.current_slot_estimate())
                 > processor.store.current_period()
             {
@@ -807,7 +821,7 @@ async fn run_sync(
         // No-op unless the period advanced (force-rotate can move it here too).
         persist_snapshot(&config, &processor, &mut last_persisted_period);
         refresh_local_status(&config, &processor, &local_status);
-        publish_status(&config, &client, &processor, &pool, &status_tx).await;
+        publish_status(&config, &client, &processor, &pool, &status_tx, &anchor).await;
 
         tokio::time::sleep(Duration::from_secs(config.seconds_per_slot)).await;
     }
@@ -1082,6 +1096,7 @@ async fn catch_up(
     clcache: &mut crate::clcache::ClPeerCache,
     resume: &mut ResumeGuard,
     last_persisted_period: &mut u64,
+    anchor: &ExecAnchor,
 ) -> bool {
     let mut idle_rounds = 0u32;
     // Exponential pause after fruitless rounds: hammering the whole pool every
@@ -1282,7 +1297,7 @@ async fn catch_up(
                 period = processor.store.current_period(),
                 finalized_slot = processor.store.finalized_slot(),
                 "catch-up round applied");
-            publish_status(config, client, processor, &*pool, status_tx).await;
+            publish_status(config, client, processor, &*pool, status_tx, anchor).await;
             // Persist EVERY applied period, not just when catch_up returns:
             // catch-up loops internally for the whole span, and Android kills
             // the process freely (reinstalls, OOM, user swipes) — before this,
@@ -1498,6 +1513,44 @@ fn refresh_local_status(
     });
 }
 
+/// Feed the EL execution anchor from the verified beacon store — the CL→EL
+/// trust bridge (twin of the Java `BeaconSyncState.updateFinalizedExecution` /
+/// `updateOptimisticExecution`). The finalized payload is what `is_synced()`
+/// derives from and what the header-chain walk anchors against; the optimistic
+/// payload gives the freshest attested head. Both also seed the `stateRootMatch`
+/// window. Guarded on a non-zero block hash so a pre-merge / absent execution
+/// header never registers a zero state root as "synced".
+fn update_exec_anchor(store: &LightClientStore, anchor: &ExecAnchor) {
+    // Label each execution payload with ITS block's slot (`beacon.slot`), read
+    // straight from the header — not the store's tracked slots. `finalized_slot`
+    // happens to equal `finalized_header.beacon.slot`, but `optimistic_slot` is
+    // the SIGNATURE slot (~beacon.slot + 1), whereas the optimistic execution
+    // payload belongs to the attested block at `beacon.slot`. Using the block
+    // slot keeps the stateRootMatch window's (slot, root) keys correct.
+    if let Some(finalized) = store.finalized_header() {
+        let e = &finalized.execution;
+        if e.block_hash != [0u8; 32] {
+            anchor.update_finalized(
+                finalized.beacon.slot,
+                e.state_root,
+                e.block_number,
+                e.block_hash,
+            );
+        }
+    }
+    if let Some(optimistic) = store.optimistic_header() {
+        let e = &optimistic.execution;
+        if e.block_hash != [0u8; 32] {
+            anchor.update_optimistic(
+                optimistic.beacon.slot,
+                e.block_number,
+                e.block_hash,
+                e.state_root,
+            );
+        }
+    }
+}
+
 /// SYNCED gate: committee period current AND the finalized header within ~5
 /// epochs of wall clock (finality itself trails the head by ~2 epochs).
 const SYNCED_SLOT_SLACK_EPOCHS: u64 = 5;
@@ -1508,8 +1561,10 @@ async fn publish_status(
     processor: &LightClientProcessor,
     pool: &PeerPool,
     status_tx: &watch::Sender<SyncStatus>,
+    anchor: &ExecAnchor,
 ) {
     let store = &processor.store;
+    update_exec_anchor(store, anchor);
     let wall_slot = config.current_slot_estimate();
     let wall_period = spec::compute_sync_committee_period(wall_slot);
     let state = if !store.is_initialized() {
@@ -1544,6 +1599,71 @@ async fn publish_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A LightClientHeader with a real (post-merge) execution payload for the
+    /// anchor-wiring tests.
+    fn header_with_exec(
+        slot: u64,
+        state_root: [u8; 32],
+        block_number: u64,
+        block_hash: [u8; 32],
+    ) -> myotis_consensus::types::LightClientHeader {
+        use myotis_consensus::types::{
+            BeaconBlockHeader, ExecutionPayloadHeader, LightClientHeader,
+        };
+        LightClientHeader {
+            beacon: BeaconBlockHeader { slot, ..Default::default() },
+            execution: ExecutionPayloadHeader {
+                state_root,
+                block_number,
+                block_hash,
+                ..Default::default()
+            },
+            execution_branch: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exec_anchor_fed_from_store_headers() {
+        let anchor = ExecAnchor::new();
+        let mut store = LightClientStore::new();
+        store.update_finalized(&header_with_exec(1000, [0x11; 32], 21_000_000, [0x22; 32]), 1000);
+        // Mirror the processor: the optimistic header is tracked at the SIGNATURE
+        // slot (1003), one past the attested block's beacon.slot (1002).
+        store.update_optimistic(&header_with_exec(1002, [0x33; 32], 21_000_002, [0x44; 32]), 1003);
+
+        update_exec_anchor(&store, &anchor);
+
+        // is_synced() derives from the finalized execution state root landing.
+        assert!(anchor.is_synced());
+        let fin = anchor.finalized_execution().expect("finalized execution");
+        assert_eq!(fin.block_number, 21_000_000);
+        assert_eq!(fin.state_root, [0x11; 32]);
+        assert_eq!(fin.block_hash, [0x22; 32]);
+        assert_eq!(anchor.finalized_slot(), 1000);
+        assert_eq!(anchor.optimistic_block_number(), 21_000_002);
+        assert_eq!(anchor.optimistic_block_hash(), Some([0x44; 32]));
+        // Both roots seed the stateRootMatch window, each keyed by ITS block's
+        // slot — the optimistic root at the attested block slot 1002, NOT the
+        // store's signature slot 1003.
+        assert_eq!(anchor.find_state_root(&[0x11; 32]).map(|r| r.slot), Some(1000));
+        assert_eq!(anchor.find_state_root(&[0x33; 32]).map(|r| r.slot), Some(1002));
+    }
+
+    #[test]
+    fn exec_anchor_skips_zero_block_hash() {
+        // A pre-merge / absent execution header (zero block hash) must NOT
+        // register a zero state root as the finalized anchor — that would make
+        // is_synced() true against a bogus root.
+        let anchor = ExecAnchor::new();
+        let mut store = LightClientStore::new();
+        store.update_finalized(&header_with_exec(5, [0u8; 32], 0, [0u8; 32]), 5);
+
+        update_exec_anchor(&store, &anchor);
+
+        assert!(!anchor.is_synced());
+        assert!(anchor.finalized_execution().is_none());
+    }
 
     #[test]
     fn mainnet_config_matches_networkconfig_java() {

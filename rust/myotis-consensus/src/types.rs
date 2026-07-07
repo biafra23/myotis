@@ -24,7 +24,7 @@ fn err<T>(msg: impl Into<String>) -> Result<T, SszError> {
 // BeaconBlockHeader — 112 bytes fixed
 // -------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BeaconBlockHeader {
     pub slot: u64,
     pub proposer_index: u64,
@@ -183,7 +183,7 @@ impl SyncAggregate {
 pub const DENEB_FIXED_SIZE: usize = 584;
 pub const ELECTRA_FIXED_SIZE: usize = 680;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecutionPayloadHeader {
     pub parent_hash: Root,
     pub fee_recipient: [u8; 20],
@@ -294,7 +294,7 @@ impl ExecutionPayloadHeader {
 // LightClientHeader — beacon(112) + execution offset(4) + executionBranch(128)
 // -------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LightClientHeader {
     pub beacon: BeaconBlockHeader,
     pub execution: ExecutionPayloadHeader,
