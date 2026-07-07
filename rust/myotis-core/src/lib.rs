@@ -13,17 +13,23 @@
 //! - [`header`]   ⇄ `core.types.BlockHeader`
 //! - [`enr`]      ⇄ `core.enr.Enr`
 //! - [`forkid`]   ⇄ the pinned EIP-2124 constants in `networking.NetworkConfig`
+//! - [`trie`]     ⇄ `core.trie.MerklePatriciaProofVerifier` + `HexPrefix`
+//! - [`triehash`] ⇄ `consensus.proof.OrderedTrieRoot`
+//! - [`bloom`]    ⇄ the M3:2048 accrual in `networking...ReceiptsMessage`
 //!
 //! Error convention (workspace-wide): `Result<_, CoreError>` with Java-shaped
 //! messages; decoding untrusted bytes never panics (the workspace builds with
 //! `panic = "abort"`, so a panic crossing JNI kills the host process).
 
+pub mod bloom;
 pub mod enr;
 pub mod forkid;
 pub mod header;
 pub mod keccak;
 pub mod nodekey;
 pub mod rlp;
+pub mod trie;
+pub mod triehash;
 
 /// Single error type for this crate, mirroring `SszError(String)` in
 /// `myotis-consensus`: a message, no hierarchy (FFI-flat by design).
