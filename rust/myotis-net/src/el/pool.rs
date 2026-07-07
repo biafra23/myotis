@@ -133,7 +133,7 @@ impl PoolInner {
         let now = Instant::now();
         match result {
             Ok(session) if session.snap => {
-                let peer = Arc::new(ManagedPeer::spawn(session));
+                let peer = Arc::new(ManagedPeer::spawn(session, addr));
                 // Keep `addr` in `attempted` while connected — dropped by
                 // prune_closed when the peer later closes.
                 self.peers.lock().await.push(PooledPeer { addr, peer });
@@ -220,6 +220,23 @@ impl PeerPool {
     /// Node ids blacklisted as wrong-chain this run.
     pub async fn blacklist_count(&self) -> usize {
         self.inner.blacklist.lock().await.len()
+    }
+
+    /// A snap fetch against `addr` returned usable proof material — mark the
+    /// cached peer CONFIRMED (dial-first next run). Persists only on a quality
+    /// transition (dirty-gated flush), so repeated serves don't re-write.
+    pub async fn record_snap_served(&self, addr: SocketAddr) {
+        let mut cache = self.inner.cache.lock().await;
+        cache.record_snap_served(addr);
+        cache.flush();
+    }
+
+    /// A snap fetch against `addr` failed — after the failure threshold the
+    /// cached peer is marked DENIED (deprioritized next run). Dirty-gated flush.
+    pub async fn record_snap_failure(&self, addr: SocketAddr) {
+        let mut cache = self.inner.cache.lock().await;
+        cache.record_snap_failure(addr);
+        cache.flush();
     }
 
     /// Stop the pool: flush the peer cache, abort the dialer, and drop all held
@@ -442,6 +459,52 @@ mod tests {
         pool.stop().await;
         // The cached peer survived load → warm-start → flush-on-stop.
         assert_eq!(ElPeerCache::load(path.clone()).len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn snap_quality_outcomes_persist_to_the_cache() {
+        use crate::el::peercache::SnapQuality;
+        let path =
+            std::env::temp_dir().join(format!("myotis-pool-quality-{}.cache", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let addr: SocketAddr = "192.0.2.5:30303".parse().unwrap();
+        {
+            let mut seed = ElPeerCache::load(path.clone());
+            seed.add(addr, &[7u8; 64], true); // enters as Unknown
+            seed.flush();
+        }
+
+        let key = Arc::new(
+            NodeKey::from_secret_bytes(&myotis_core::keccak::keccak256(b"quality-test")).unwrap(),
+        );
+        let cfg = Arc::new(EthConfig {
+            network_id: 1,
+            genesis_hash: [0u8; 32],
+            fork_id_hash: [0u8; 4],
+            fork_next: 0,
+            head_hash: [0u8; 32],
+            head_number: 0,
+            listen_port: 30303,
+        });
+        let (_tx, rx) = mpsc::channel(4);
+        let pool = PeerPool::start(
+            Arc::clone(&key),
+            key.public_key_bytes(),
+            cfg,
+            PoolConfig::default(),
+            ElPeerCache::load(path.clone()),
+            rx,
+        );
+
+        // A served outcome promotes the cached peer to Confirmed and persists it.
+        pool.record_snap_served(addr).await;
+        assert_eq!(
+            ElPeerCache::load(path.clone()).peers()[0].quality,
+            SnapQuality::Confirmed
+        );
+
+        pool.stop().await;
         let _ = std::fs::remove_file(&path);
     }
 }

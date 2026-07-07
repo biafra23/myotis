@@ -201,8 +201,19 @@ impl ElReader {
         let (state_root, block_number) = fresh_head(&peer).await?;
 
         // Verify-on-fetch: snap_get_account MPT-verifies against state_root and
-        // returns Present/Absent only when the proof holds.
-        let outcome = peer.snap_get_account(&state_root, &address).await?;
+        // returns Present/Absent only when the proof holds. Feed the outcome to
+        // the peer cache so a proven server is dialed first next run and a
+        // hanger is deprioritized.
+        let outcome = match peer.snap_get_account(&state_root, &address).await {
+            Ok(o) => {
+                self.pool.record_snap_served(peer.addr()).await;
+                o
+            }
+            Err(e) => {
+                self.pool.record_snap_failure(peer.addr()).await;
+                return Err(e);
+            }
+        };
         // Anchor the (proof-valid) peer state root to the beacon chain.
         let verdict = peer
             .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
@@ -256,7 +267,13 @@ impl ElReader {
         let slot_key_hash = keccak256(&storage_key);
 
         // Step 1: the proof-verified account gives the trusted storage root.
-        let outcome = peer.snap_get_account(&state_root, &address).await?;
+        let outcome = match peer.snap_get_account(&state_root, &address).await {
+            Ok(o) => o,
+            Err(e) => {
+                self.pool.record_snap_failure(peer.addr()).await;
+                return Err(e);
+            }
+        };
 
         let (fin_num, opt_num, synced) = self.anchor_diagnostics();
         let mut result = VerifiedStorage {
@@ -281,8 +298,10 @@ impl ElReader {
             optimistic_block_number: opt_num,
         };
 
-        // An absent account has no storage: every slot is provably zero.
+        // An absent account has no storage: every slot is provably zero. The
+        // account exclusion proof verified, so the peer served.
         let AccountOutcome::Present(leaf) = outcome else {
+            self.pool.record_snap_served(peer.addr()).await;
             // Still anchor the state root so the verdict reflects the beacon tie.
             let verdict = peer
                 .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
@@ -294,9 +313,19 @@ impl ElReader {
         result.storage_root = leaf.storage_root;
 
         // Step 2: verify the slot against the proof-verified storage root.
-        let value = peer
+        let value = match peer
             .snap_get_storage(&state_root, &address, &leaf, &storage_key)
-            .await?;
+            .await
+        {
+            Ok(v) => {
+                self.pool.record_snap_served(peer.addr()).await;
+                v
+            }
+            Err(e) => {
+                self.pool.record_snap_failure(peer.addr()).await;
+                return Err(e);
+            }
+        };
         result.storage_proof_valid = true;
         // `found` means the slot holds a non-zero value (Java's convention): a
         // zero slot is pruned from the trie and indistinguishable from unset,
