@@ -20,7 +20,7 @@ use crate::el::rlpx::transport::{
 use super::messages::{self, Status};
 use crate::el::snap::fetch::{self, AccountOutcome};
 use crate::el::snap::messages as snap;
-use myotis_core::trie::AccountLeaf;
+use myotis_core::trie::{AccountLeaf, EMPTY_CODE_HASH, EMPTY_TRIE_ROOT};
 
 /// eth versions we advertise (highest-common wins, floor 66).
 const OUR_ETH_VERSIONS: &[u64] = &[66, 67, 68, 69];
@@ -289,6 +289,11 @@ impl EthSession {
         account: &AccountLeaf,
         slot: &[u8; 32],
     ) -> Result<Vec<u8>, String> {
+        // An account with no storage trie: every slot is provably zero, so skip
+        // the round trip entirely (EOAs and storage-less contracts).
+        if account.storage_root == EMPTY_TRIE_ROOT {
+            return Ok(Vec::new());
+        }
         let codes = self.snap_codes().ok_or("peer does not support snap/1")?;
         let id = self.next_id();
         let account_hash = myotis_core::keccak::keccak256(address);
@@ -305,6 +310,10 @@ impl EthSession {
 
     /// Fetch and verify one contract's bytecode by its `code_hash`.
     pub async fn snap_get_bytecode(&mut self, code_hash: &[u8; 32]) -> Result<Vec<u8>, String> {
+        // A code-less account: no round trip needed (EOAs — the vast majority).
+        if code_hash == &EMPTY_CODE_HASH {
+            return Ok(Vec::new());
+        }
         let codes = self.snap_codes().ok_or("peer does not support snap/1")?;
         let id = self.next_id();
         let req = snap::encode_get_byte_codes(id, &[*code_hash], 256 * 1024);
