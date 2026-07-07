@@ -17,7 +17,7 @@
 //! holds `target_snap_peers`, further candidates are ignored until a peer drops.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,8 +81,10 @@ struct PoolInner {
 }
 
 impl PoolInner {
-    /// Drop closed peers, freeing their addresses for a future re-dial.
-    async fn prune_closed(&self) {
+    /// Drop closed peers, freeing their addresses for a future re-dial. Returns
+    /// the number of remaining live peers (so callers avoid a second `peers`
+    /// lock just to read the count).
+    async fn prune_closed(&self) -> usize {
         let mut peers = self.peers.lock().await;
         let mut freed = Vec::new();
         peers.retain(|p| {
@@ -99,10 +101,7 @@ impl PoolInner {
                 attempted.remove(&addr);
             }
         }
-    }
-
-    async fn snap_peer_count(&self) -> usize {
-        self.peers.lock().await.len()
+        peers.len()
     }
 
     /// Record an address backoff. `long` selects the wrong-chain (10 min) vs the
@@ -114,7 +113,7 @@ impl PoolInner {
         // candidate, but an address that never comes back would linger forever.
         // Sweep expired entries when the map grows large so it stays bounded.
         if backoff.len() >= self.pool_cfg.max_attempted {
-            backoff.retain(|_, &mut expiry| expiry > now);
+            backoff.retain(|_, expiry| *expiry > now);
         }
         backoff.insert(addr, now + window);
     }
@@ -199,8 +198,7 @@ impl PeerPool {
 
     /// Count of live snap peers (prunes closed peers first).
     pub async fn snap_peer_count(&self) -> usize {
-        self.inner.prune_closed().await;
-        self.inner.snap_peer_count().await
+        self.inner.prune_closed().await
     }
 
     /// Addresses dialed and not yet failed (in-flight or connected).
@@ -231,11 +229,11 @@ async fn dialer_loop(inner: Arc<PoolInner>, mut rx: mpsc::Receiver<TableEntry>) 
     let dial_slots = Arc::new(Semaphore::new(inner.pool_cfg.max_concurrent_dials));
 
     while let Some(entry) = rx.recv().await {
-        inner.prune_closed().await;
-        if inner.snap_peer_count().await >= inner.pool_cfg.target_snap_peers {
+        // Prune + read the live count in one `peers` lock.
+        if inner.prune_closed().await >= inner.pool_cfg.target_snap_peers {
             continue;
         }
-        let Some(addr) = to_v4(&entry.ip, entry.tcp_port) else { continue };
+        let Some(addr) = to_socket_addr(&entry.ip, entry.tcp_port) else { continue };
         let Some(pubkey) = to_pubkey(&entry.node_id) else { continue };
 
         if inner.blacklist.lock().await.contains(&pubkey) {
@@ -277,24 +275,30 @@ async fn dialer_loop(inner: Arc<PoolInner>, mut rx: mpsc::Receiver<TableEntry>) 
     }
 }
 
-/// A discv4 entry's IPv4 TCP socket, or `None` if the address is unusable.
-fn to_v4(ip: &[u8], tcp_port: u32) -> Option<SocketAddr> {
-    if ip.len() != 4 || tcp_port == 0 || tcp_port > u32::from(u16::MAX) {
+/// A discv4 entry's TCP socket, IPv4 or IPv6, or `None` if the address is
+/// unusable. (discv4 endpoints carry 4- or 16-byte IPs; the pool's bookkeeping
+/// is IP-version-agnostic, so both are dialed.)
+fn to_socket_addr(ip: &[u8], tcp_port: u32) -> Option<SocketAddr> {
+    if tcp_port == 0 || tcp_port > u32::from(u16::MAX) {
         return None;
     }
-    let mut octets = [0u8; 4];
-    octets.copy_from_slice(ip);
-    Some(SocketAddr::from((Ipv4Addr::from(octets), tcp_port as u16)))
+    let port = tcp_port as u16;
+    match ip.len() {
+        4 => {
+            let octets: [u8; 4] = ip.try_into().ok()?;
+            Some(SocketAddr::from((Ipv4Addr::from(octets), port)))
+        }
+        16 => {
+            let octets: [u8; 16] = ip.try_into().ok()?;
+            Some(SocketAddr::from((Ipv6Addr::from(octets), port)))
+        }
+        _ => None,
+    }
 }
 
 /// A discv4 entry's 64-byte node id, or `None` if malformed.
 fn to_pubkey(node_id: &[u8]) -> Option<[u8; 64]> {
-    if node_id.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 64];
-    out.copy_from_slice(node_id);
-    Some(out)
+    node_id.try_into().ok()
 }
 
 #[cfg(test)]
@@ -302,11 +306,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn to_v4_rejects_bad_addresses() {
-        assert!(to_v4(&[1, 2, 3, 4], 30303).is_some());
-        assert!(to_v4(&[1, 2, 3], 30303).is_none()); // wrong length
-        assert!(to_v4(&[1, 2, 3, 4], 0).is_none()); // no TCP port
-        assert!(to_v4(&[1, 2, 3, 4], 70000).is_none()); // port out of range
+    fn to_socket_addr_validation() {
+        assert!(to_socket_addr(&[1, 2, 3, 4], 30303).is_some());
+        assert!(to_socket_addr(&[0; 16], 30303).is_some()); // IPv6
+        assert!(to_socket_addr(&[1, 2, 3], 30303).is_none()); // wrong length
+        assert!(to_socket_addr(&[0; 15], 30303).is_none()); // wrong length
+        assert!(to_socket_addr(&[1, 2, 3, 4], 0).is_none()); // no TCP port
+        assert!(to_socket_addr(&[1, 2, 3, 4], 70000).is_none()); // port out of range
     }
 
     #[test]
