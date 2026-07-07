@@ -970,11 +970,18 @@ async fn try_bootstrap(
 /// overwritten and every restart re-resumes it). Only catch-up VERIFY rejects
 /// count — well-formed updates that failed BLS/Merkle against the restored
 /// committee (decode failures are excluded: malformed frames indict the peer,
-/// not our store). A bad peer serving valid-but-wrong updates can contribute
-/// rejects too, so the threshold trades a rare unnecessary re-bootstrap
-/// (self-correcting: the checkpoint path re-verifies everything) against a
-/// permanent wedge; any successful apply confirms the resume for good.
-const RESUME_REJECTS_MAX: u32 = 4;
+/// not our store), and ONLY from batches with zero applies: an apply in the
+/// same batch proves the restored committee, so confirm() wins over poison
+/// accounting. A lone bad peer replaying unverifiable updates can still trip
+/// this before any honest serve — ACCEPTED: the outcome is a self-correcting
+/// re-bootstrap from the embedded checkpoint (a cold-start cost, ~15 min),
+/// which strictly beats the alternatives — any distinct-peer requirement is
+/// Sybil-cheap (peer identities are free; counts are not cryptographic
+/// evidence, per the repo trust rule) AND permanently wedges the genuinely-
+/// corrupt-snapshot case when only one server answers (the scarce-server
+/// reality). The threshold is 8 (~2 min of reject rounds) to make the
+/// false positive rare while keeping the corrupt-snapshot escape prompt.
+const RESUME_REJECTS_MAX: u32 = 8;
 
 /// Tracks whether a snapshot-restored store has verified anything yet.
 /// Inert (never poisons) when the store bootstrapped fresh.
@@ -997,6 +1004,10 @@ impl ResumeGuard {
         self.rejects = 0;
     }
     /// Count verify-rejects; true once the restored state is deemed poisoned.
+    /// Callers must only report rejects from batches WITHOUT an apply — an
+    /// apply proves the snapshot and confirm() takes precedence (rejects in
+    /// such a batch are stale/bad chunks from other peers, not evidence
+    /// against the restored committee).
     fn poisoned(&mut self, rejects: u32) -> bool {
         if !self.unconfirmed {
             return false;
@@ -1168,7 +1179,17 @@ async fn catch_up(
                 let before_period = processor.store.current_period();
                 let (applied_now, verify_rejects) =
                     apply_staged_prefix(processor, staged, slot_estimate);
-                if verify_rejects > 0 && resume.poisoned(verify_rejects as u32) {
+                // ORDER MATTERS: an apply in this batch BLS-verified against
+                // the restored committee and proves the snapshot genuine —
+                // confirm() must win over poison accounting (a reject in the
+                // same batch is a stale/bad chunk another peer staged, not
+                // evidence against the snapshot; counting it first was
+                // exactly how one bad peer could get a good snapshot
+                // deleted despite an honest serve landing in the same round).
+                if applied_now == 0
+                    && verify_rejects > 0
+                    && resume.poisoned(verify_rejects as u32)
+                {
                     return true; // restored snapshot can't verify anything — re-bootstrap
                 }
                 if applied_now > 0 {
