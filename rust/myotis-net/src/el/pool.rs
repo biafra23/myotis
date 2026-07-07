@@ -253,7 +253,9 @@ async fn dialer_loop(inner: Arc<PoolInner>, mut rx: mpsc::Receiver<TableEntry>) 
         if inner.prune_closed().await >= inner.pool_cfg.target_snap_peers {
             break;
         }
-        try_dial(&inner, &dial_slots, c.addr, c.pubkey).await;
+        if !try_dial(&inner, &dial_slots, c.addr, c.pubkey).await {
+            return; // pool shutting down (dial semaphore closed)
+        }
     }
 
     // Then top up from live discovery.
@@ -263,21 +265,25 @@ async fn dialer_loop(inner: Arc<PoolInner>, mut rx: mpsc::Receiver<TableEntry>) 
         }
         let Some(addr) = to_socket_addr(&entry.ip, entry.tcp_port) else { continue };
         let Some(pubkey) = to_pubkey(&entry.node_id) else { continue };
-        try_dial(&inner, &dial_slots, addr, pubkey).await;
+        if !try_dial(&inner, &dial_slots, addr, pubkey).await {
+            return; // pool shutting down (dial semaphore closed)
+        }
     }
 }
 
-/// Eligibility-check a candidate and, if it passes, dial it in a
-/// permit-bounded task. Skips (silently) a blacklisted node id, an address in
-/// backoff, one already attempted/connected, or when the attempted cap is hit.
+/// Eligibility-check a candidate and, if it passes, dial it in a permit-bounded
+/// task. Silently skips a blacklisted node id, an address in backoff, one
+/// already attempted/connected, or the attempted cap. Returns `false` only when
+/// the dial semaphore is closed (the pool is shutting down) so the caller can
+/// stop iterating; `true` otherwise (skipped or dialed).
 async fn try_dial(
     inner: &Arc<PoolInner>,
     dial_slots: &Arc<Semaphore>,
     addr: SocketAddr,
     pubkey: [u8; 64],
-) {
+) -> bool {
     if inner.blacklist.lock().await.contains(&pubkey) {
-        return;
+        return true;
     }
     // Backoff: skip while cooling off; drop the entry once expired so the map
     // doesn't grow unbounded.
@@ -285,7 +291,7 @@ async fn try_dial(
         let mut backoff = inner.backoff.lock().await;
         if let Some(&expiry) = backoff.get(&addr) {
             if Instant::now() < expiry {
-                return;
+                return true;
             }
             backoff.remove(&addr);
         }
@@ -294,20 +300,21 @@ async fn try_dial(
     {
         let mut attempted = inner.attempted.lock().await;
         if attempted.len() >= inner.pool_cfg.max_attempted || !attempted.insert(addr) {
-            return;
+            return true;
         }
     }
     // Bound concurrency: acquire a dial permit (waits when saturated), then dial
     // in a task that releases it when done.
     let Ok(permit) = Arc::clone(dial_slots).acquire_owned().await else {
         inner.attempted.lock().await.remove(&addr);
-        return;
+        return false;
     };
     let inner2 = Arc::clone(inner);
     tokio::spawn(async move {
         inner2.dial_one(addr, pubkey).await;
         drop(permit);
     });
+    true
 }
 
 /// A discv4 entry's TCP socket, IPv4 or IPv6, or `None` if the address is
