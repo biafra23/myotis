@@ -117,10 +117,13 @@ impl ClPeerCache {
         let mut out: Vec<String> = self.peers.clone();
         out.sort_by_key(|a| {
             match self.served.get(a) {
-                // Tier 0, widest range first (Reverse, not i64 negation — a
-                // corrupt cache line can parse to a width ≥ 2^63, where the
-                // cast negation panics under overflow checks).
-                Some((lo, hi)) => (0, Reverse(hi - lo)),
+                // Tier 0, widest range first. checked_sub, not `hi - lo`: the
+                // stored order is normally lo ≤ hi, but a corrupt/hand-edited
+                // cache line could reverse it, and a bare subtraction would
+                // underflow-panic under overflow-checks — fatal with
+                // panic="abort". (Reverse, not i64 negation, likewise avoids
+                // the ≥ 2^63 negation-overflow panic.)
+                Some(&(lo, hi)) => (0, Reverse(hi.checked_sub(lo).unwrap_or(0))),
                 None if self.bootstrap.contains_key(a) || self.lc.contains(a) => (1, Reverse(0)),
                 None => (2, Reverse(0)),
             }
