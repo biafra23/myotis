@@ -35,8 +35,13 @@ pub fn account_json(
     let mut obj = serde_json::Map::new();
     obj.insert("address".into(), address_echo.into());
     obj.insert("exists".into(), a.exists.into());
-    // Java convention: nonce -1 and balance null when the account is absent.
-    obj.insert("nonce".into(), if a.exists { json_i64(a.nonce as i64) } else { json_i64(-1) });
+    // Java convention: nonce -1 and balance null when the account is absent. On
+    // the (unrealistic) chance a nonce exceeds i64::MAX, saturate rather than
+    // wrap — a wrap to -1 would collide with the absent sentinel.
+    obj.insert(
+        "nonce".into(),
+        if a.exists { json_i64(i64::try_from(a.nonce).unwrap_or(i64::MAX)) } else { json_i64(-1) },
+    );
     obj.insert(
         "balanceWei".into(),
         if a.exists { be_to_decimal(&a.balance).into() } else { serde_json::Value::Null },

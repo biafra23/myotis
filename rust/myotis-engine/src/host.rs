@@ -307,7 +307,10 @@ pub fn get_storage_proof_json(
         },
         None => None,
     };
-    let slot = slot.max(0) as u64;
+    // Preserve the bit pattern: a slot index >= 2^63 arrives as a negative
+    // Java long; `as u64` recovers the intended unsigned slot (clamping to 0
+    // would silently query slot 0 instead).
+    let slot = slot as u64;
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
     };
