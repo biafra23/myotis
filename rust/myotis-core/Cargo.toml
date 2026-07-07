@@ -1,0 +1,21 @@
+[package]
+name = "myotis-core"
+version = "0.1.0"
+edition = "2021"
+description = "Myotis execution-layer primitives: keccak-256, RLP, secp256k1 identity, BlockHeader, ENR (sans-I/O; grows through the EL-phase PRs)"
+license = "MIT OR Apache-2.0"
+
+# Sans-I/O like myotis-consensus: no tokio/sockets/fs/clock/entropy. Key
+# GENERATION therefore lives in the I/O crates (they own OS entropy); this
+# crate only ever derives from caller-supplied secret bytes. Enforced by the
+# wasm32 canary (root `cargoCheckWasm` checks this crate too).
+[dependencies]
+# keccak-256 (EL hashing — never mix with the CL's SHA-256, see docs/reimplementation README §11.6)
+sha3 = "=0.10.9"
+# secp256k1: sign-prehashed/recover (discv4 packets, RLPx auth) + ECDH (ECIES).
+# Pure Rust (RustCrypto) — no C build, cargo-ndk/wasm32-clean. `precomputed-tables`
+# deliberately off (binary size; mobile targets). NO `std` feature: k256/std →
+# elliptic-curve/std → rand_core/std → getrandom, which doesn't build for plain
+# wasm32-unknown-unknown and would kill the sans-I/O canary (this crate needs no
+# entropy — key GENERATION lives in the I/O crates).
+k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa", "ecdh"] }

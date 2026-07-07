@@ -203,22 +203,26 @@ val cargoTest = tasks.register<Exec>("cargoTest") {
 }
 tasks.named("check") { dependsOn(cargoTest) }
 
-// wasm32 canary: `cargo check --target wasm32-unknown-unknown -p myotis-consensus`
-// PROVES the verification core stayed sans-I/O — tokio/libp2p/discv5 (and any
-// sockets/fs dependency someone accidentally adds) don't build for plain wasm32,
-// so the check failing is the tripwire. Needs BOTH the rustup target installed
-// AND clang on PATH (blst compiles its C sources with clang for wasm); self-skips
-// otherwise with one lifecycle note, like every other cargo* task.
+// wasm32 canary: `cargo check --target wasm32-unknown-unknown` for the sans-I/O
+// crates (myotis-consensus, and myotis-core since the EL phase). PROVES they
+// stayed sans-I/O — tokio/libp2p/discv5 (and any sockets/fs dependency someone
+// accidentally adds) don't build for plain wasm32, so the check failing is the
+// tripwire. Needs BOTH the rustup target installed AND clang on PATH (blst
+// compiles its C sources with clang for wasm); self-skips otherwise with one
+// lifecycle note, like every other cargo* task.
 val wasmTargetInstalled = rustAvailable &&
     probeTool("rustup", "target", "list", "--installed")
         .lineSequence().any { it.trim() == "wasm32-unknown-unknown" }
 val clangAvailable = rustAvailable && probeTool("clang", "--version").isNotEmpty()
 val cargoCheckWasm = tasks.register<Exec>("cargoCheckWasm") {
     group = "rust"
-    description = "cargo check -p myotis-consensus for wasm32-unknown-unknown — the sans-I/O canary (self-skips without cargo + the rustup wasm32 target + clang)"
+    description = "cargo check -p myotis-consensus -p myotis-core for wasm32-unknown-unknown — the sans-I/O canary (self-skips without cargo + the rustup wasm32 target + clang)"
     onlyIf { rustAvailable && wasmTargetInstalled && clangAvailable }
     workingDir = file("rust")
-    commandLine("cargo", "check", "--target", "wasm32-unknown-unknown", "-p", "myotis-consensus")
+    commandLine(
+        "cargo", "check", "--target", "wasm32-unknown-unknown",
+        "-p", "myotis-consensus", "-p", "myotis-core",
+    )
     // No declared outputs, same rationale as cargoTest: cargo's own
     // incrementalism makes a no-change rerun cheap.
 }

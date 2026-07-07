@@ -7,6 +7,10 @@
 #   myotis-consensus — the sync-committee light client VERIFICATION CORE (pure
 #                      Rust lib, no JNI, sans-I/O — no tokio/sockets/fs/clock):
 #                      SSZ types, tree_hash merkleization, sync-committee verify.
+#   myotis-core      — EXECUTION-layer primitives (pure Rust lib, sans-I/O like
+#                      myotis-consensus): keccak-256, RLP, secp256k1 identity,
+#                      BlockHeader, ENR, pinned fork-ids. Grows through the
+#                      EL-phase PRs (docs/reimplementation/07).
 #   myotis-net       — ALL consensus-layer I/O: discv5 discovery, libp2p eth2
 #                      req/resp, and the sync loop driving myotis-consensus.
 #                      Depends on myotis-consensus; never the other way around.
@@ -18,7 +22,7 @@
 
 [workspace]
 resolver = "2"
-members = ["myotis-bls", "myotis-consensus", "myotis-engine", "myotis-net"]
+members = ["myotis-bls", "myotis-consensus", "myotis-core", "myotis-engine", "myotis-net"]
 
 # Release profile is workspace-owned (crate-level [profile.*] is ignored in a
 # workspace): same tuning myotis-bls always shipped with.
