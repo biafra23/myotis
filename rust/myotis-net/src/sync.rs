@@ -871,10 +871,28 @@ async fn try_bootstrap(
     }
     let results = futures::future::join_all(futures).await;
 
+    // Same round-scoped cache accounting as poll_finality: strikes are
+    // buffered and applied ONLY when the whole round fails — a round with a
+    // verified winner spares its speculative losers, while a fully-failed
+    // round strikes each failed peer once. Without any bootstrap-side strikes
+    // (the previous state), dead proven servers could accumulate in the shared
+    // cache unboundedly and — once they filled the 8-candidate proven tier —
+    // wedge a fresh bootstrap forever on the same dead dials every round.
+    let mut round_failures: Vec<String> = Vec::new();
+    let mut fail = |pool: &mut PeerPool, buf: &mut Vec<String>, id: PeerId| {
+        pool.note_failure(id);
+        if let Some(p) = peers.iter().find(|p| p.id == id) {
+            buf.push(format!("{}/p2p/{}", p.addr, p.id));
+        }
+    };
+
     for (peer, res) in results {
         let raw = match res {
             Ok(raw) => raw,
             Err(e) => {
+                if e != RequestError::Shutdown && e != RequestError::UnsupportedProtocol {
+                    fail(pool, &mut round_failures, peer);
+                }
                 tracing::debug!(peer = %peer, error = %e, "bootstrap request failed");
                 continue;
             }
@@ -882,6 +900,7 @@ async fn try_bootstrap(
         let ssz_payload = match codec::decode_response(&raw, true) {
             Ok(d) => d.ssz_payload,
             Err(e) => {
+                fail(pool, &mut round_failures, peer);
                 tracing::debug!(peer = %peer, error = %e, "bootstrap frame invalid");
                 continue;
             }
@@ -889,6 +908,7 @@ async fn try_bootstrap(
         let bootstrap = match LightClientBootstrap::decode(&ssz_payload) {
             Ok(b) => b,
             Err(e) => {
+                fail(pool, &mut round_failures, peer);
                 tracing::debug!(peer = %peer, error = %e, "bootstrap decode failed");
                 continue;
             }
@@ -897,6 +917,7 @@ async fn try_bootstrap(
         // Checkpoint pin: the peer chose the payload, WE chose the root.
         let header_root = bootstrap.header.beacon.hash_tree_root();
         if header_root != config.checkpoint_root {
+            fail(pool, &mut round_failures, peer);
             tracing::warn!(peer = %peer, got = %hex_str(&header_root),
                 "bootstrap rejected: header root does not match checkpoint");
             continue;
@@ -909,10 +930,12 @@ async fn try_bootstrap(
             spec::sync_committee_gindex(depth),
             &bootstrap.header.beacon.state_root,
         ) {
+            fail(pool, &mut round_failures, peer);
             tracing::warn!(peer = %peer, depth, "bootstrap rejected: sync committee branch invalid");
             continue;
         }
         if !LightClientProcessor::verify_execution_branch(&bootstrap.header) {
+            fail(pool, &mut round_failures, peer);
             tracing::warn!(peer = %peer, "bootstrap rejected: execution branch invalid");
             continue;
         }
@@ -930,7 +953,10 @@ async fn try_bootstrap(
         }
         tracing::info!(peer = %peer, slot = bootstrap.header.beacon.slot,
             period = processor.store.current_period(), "bootstrap verified and applied");
-        return true;
+        return true; // round has a winner — buffered strikes are discarded
+    }
+    for addr in &round_failures {
+        clcache.mark_failure(addr);
     }
     false
 }
@@ -1283,13 +1309,30 @@ async fn poll_finality(
             }
         })
         .collect();
+    // Round-scoped cache accounting. The Java poll is SEQUENTIAL, proven-first,
+    // stop-at-first-success: live proven servers usually answer first try, so
+    // peers behind the winner are never dialed and accrue no strikes, while a
+    // DEAD tier-0 peer is tried at the head of every poll and evicted from the
+    // persistent cache after 3 polls. This parallel fan-out must reproduce
+    // those OUTCOMES, not the per-dial mechanics: dialing 16 at once mints up
+    // to 15 speculative losses per 12 s round, and feeding each into the
+    // cache's 3-strike eviction emptied it of every proven server on-device
+    // (peers=209, catch_up_servers=0). So: failures are buffered per round;
+    // a round WITH a winner discards them (the losers raced a success — the
+    // Java analog was never dialed); a fully-failed round strikes every failed
+    // peer once (the Java analog dialed the whole list and struck each). Dead
+    // proven servers thus still evict in ~3 fully-failed encounters, and the
+    // cache can't accumulate them unboundedly. Session-pool note_failure stays
+    // per-dial: it exists precisely to rotate the live fan-out.
+    let mut round_failures: Vec<String> = Vec::new();
+    let mut applied = false;
     while let Some((peer, res)) = in_flight.next().await {
         let raw = match res {
             Ok(raw) => raw,
             Err(e) => {
                 if e != RequestError::Shutdown && e != RequestError::UnsupportedProtocol {
                     pool.note_failure(peer.id);
-                    clcache.mark_failure(&format!("{}/p2p/{}", peer.addr, peer.id));
+                    round_failures.push(format!("{}/p2p/{}", peer.addr, peer.id));
                 }
                 tracing::debug!(peer = %peer.id, error = %e, "finality_update request failed");
                 continue;
@@ -1298,34 +1341,49 @@ async fn poll_finality(
         let ssz_payload = match codec::decode_response(&raw, true) {
             Ok(d) => d.ssz_payload,
             Err(e) => {
+                // Garbage frames are failures too (bootstrap-round parity):
+                // strikable when the whole round fails, spared by a winner.
+                pool.note_failure(peer.id);
+                round_failures.push(format!("{}/p2p/{}", peer.addr, peer.id));
                 tracing::debug!(peer = %peer.id, error = %e, "finality_update frame invalid");
                 continue;
             }
         };
         match LightClientFinalityUpdate::decode(&ssz_payload) {
             Ok(update) => {
-                // Answered a finality request → alive and useful: clear its
-                // failure count so a later blip doesn't drop it prematurely
-                // (cache streak too — Java resets on any successful serve).
-                pool.mark_proven(peer.id);
-                clcache.note_success(&format!("{}/p2p/{}", peer.addr, peer.id));
                 if processor.process_finality_update(&update) {
-                    pool.note_served(peer.id); // verified against our committee
+                    // Success is a VERIFIED apply (Java notifies its cache
+                    // only after processUpdate succeeds, never on mere decode
+                    // — a peer serving decodable-but-unverifiable updates
+                    // must not earn tier-1 status or cache streak resets).
+                    pool.mark_proven(peer.id);
+                    pool.note_served(peer.id);
+                    clcache.note_success(&format!("{}/p2p/{}", peer.addr, peer.id));
                     tracing::info!(peer = %peer.id,
                         finalized_slot = processor.store.finalized_slot(),
                         optimistic_slot = processor.store.optimistic_slot(),
                         period = processor.store.current_period(),
                         "finality update applied");
-                    return true;
+                    applied = true;
+                    break; // stragglers are speculative losers — spare them
                 }
                 tracing::debug!(peer = %peer.id,
                     finalized_slot = update.finalized_header.beacon.slot,
                     "finality update did not advance state");
             }
-            Err(e) => tracing::debug!(peer = %peer.id, error = %e, "finality update decode failed"),
+            Err(e) => {
+                pool.note_failure(peer.id);
+                round_failures.push(format!("{}/p2p/{}", peer.addr, peer.id));
+                tracing::debug!(peer = %peer.id, error = %e, "finality update decode failed");
+            }
         }
     }
-    false
+    if !applied {
+        for addr in &round_failures {
+            clcache.mark_failure(addr);
+        }
+    }
+    applied
 }
 
 /// Keep the Status we serve to peers in step with verified store state
