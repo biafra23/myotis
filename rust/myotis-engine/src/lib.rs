@@ -11,6 +11,7 @@
 
 pub mod catalog;
 mod host;
+pub mod ringlog;
 
 /// Bumped whenever the JNI surface changes shape. Checked by the Java wrapper's
 /// availability probe (`nativeInit`) before any other native call — a stale .so
@@ -18,7 +19,7 @@ mod host;
 /// crashing on a missing/renamed symbol.
 ///
 /// v2: added the hosting surface (nativeCreate/Start/StatusJson/Stop).
-pub const ABI_VERSION: i32 = 2;
+pub const ABI_VERSION: i32 = 3;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
@@ -40,12 +41,31 @@ mod jni_shim {
     }
 
     /// `RustEngineNative.nativeInit()` — the availability + ABI handshake.
+    /// Also installs the global tracing subscriber feeding the drainable ring
+    /// (idempotent), so every line the engine logs from here on is observable.
     #[no_mangle]
     pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeInit(
         _env: JNIEnv,
         _class: JClass,
     ) -> jint {
+        crate::ringlog::init();
         crate::ABI_VERSION
+    }
+
+    /// `RustEngineNative.nativeDrainLogs(int)` — up to `max` buffered tracing
+    /// lines, oldest first, newline-joined; empty string when idle. Hosts pump
+    /// this into their own log pipeline (Android LogBuffer → Logs tab/logcat).
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeDrainLogs(
+        env: JNIEnv,
+        _class: JClass,
+        max: jint,
+    ) -> jstring {
+        let batch = crate::ringlog::drain(max.max(0) as usize);
+        match env.new_string(batch) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
     }
 
     /// `RustEngineNative.nativeAvailableNetworksJson()` — the embedded catalog as a

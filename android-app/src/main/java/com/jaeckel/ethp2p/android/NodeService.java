@@ -769,6 +769,7 @@ public final class NodeService extends Service {
         // sync failure diagnosable instead of a silent "it doesn't work".
         ProcessHealthDiag.logLastExitReason(this);
         startHealthHeartbeat();
+        startRustLogPump();
         // API 34+ requires the foregroundServiceType to be passed here and
         // to match the manifest's <service android:foregroundServiceType="...">
         // declaration. API 29-33 ignore the third arg. minSdk is 29.
@@ -1146,6 +1147,41 @@ public final class NodeService extends Service {
      *  thread runs until the kill — the last emitted line is the clue we want. */
     private volatile Thread healthThread;
 
+    /** Rust-engine log pump for THIS service instance — same lifecycle contract
+     *  as {@link #healthThread}. Pumps the engine's drainable tracing ring into
+     *  {@link LogBuffer} (Logs tab + logcat) every 5 s; before this seam every
+     *  Rust-side incident on a phone had to be diagnosed blind. Runs on EVERY
+     *  build type (unlike the heartbeat): a 5 s poll of an in-memory ring is
+     *  nearly free, and the ring is empty unless the Rust engine is active. */
+    private volatile Thread rustLogThread;
+
+    private static final long RUST_LOG_DRAIN_MS = 5_000;
+    private static final int RUST_LOG_DRAIN_MAX = 500;
+
+    private void startRustLogPump() {
+        if (rustLogThread != null) return;
+        Thread t = new Thread(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    String batch = io.myotis.engines.Engines.drainRustLogs(RUST_LOG_DRAIN_MAX);
+                    if (!batch.isEmpty()) {
+                        for (String line : batch.split("\n")) {
+                            LogBuffer.i("rust", line);
+                        }
+                    }
+                    Thread.sleep(RUST_LOG_DRAIN_MS);
+                } catch (InterruptedException e) {
+                    return; // onDestroy interrupted us
+                } catch (Throwable ignored) {
+                    // Observability must never take the process down.
+                }
+            }
+        }, "ethp2p-rust-logs");
+        t.setDaemon(true);
+        rustLogThread = t;
+        t.start();
+    }
+
     /**
      * Emit one consolidated health line every {@link #HEARTBEAT_INTERVAL_MS}: process
      * memory, CL sync progress, and EL snap-peer pool state. When the node fails on a
@@ -1233,6 +1269,11 @@ public final class NodeService extends Service {
         if (hb != null) {
             hb.interrupt();
             healthThread = null;
+        }
+        Thread rl = rustLogThread;
+        if (rl != null) {
+            rl.interrupt();
+            rustLogThread = null;
         }
         // Same fire-and-forget pattern as shutdown(): the system gives us a
         // brief window to return from onDestroy and we don't want to spend
