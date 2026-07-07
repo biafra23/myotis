@@ -1341,6 +1341,10 @@ async fn poll_finality(
         let ssz_payload = match codec::decode_response(&raw, true) {
             Ok(d) => d.ssz_payload,
             Err(e) => {
+                // Garbage frames are failures too (bootstrap-round parity):
+                // strikable when the whole round fails, spared by a winner.
+                pool.note_failure(peer.id);
+                round_failures.push(format!("{}/p2p/{}", peer.addr, peer.id));
                 tracing::debug!(peer = %peer.id, error = %e, "finality_update frame invalid");
                 continue;
             }
@@ -1367,7 +1371,11 @@ async fn poll_finality(
                     finalized_slot = update.finalized_header.beacon.slot,
                     "finality update did not advance state");
             }
-            Err(e) => tracing::debug!(peer = %peer.id, error = %e, "finality update decode failed"),
+            Err(e) => {
+                pool.note_failure(peer.id);
+                round_failures.push(format!("{}/p2p/{}", peer.addr, peer.id));
+                tracing::debug!(peer = %peer.id, error = %e, "finality update decode failed");
+            }
         }
     }
     if !applied {
