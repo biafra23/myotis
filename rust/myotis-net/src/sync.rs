@@ -1058,9 +1058,18 @@ impl ResumeGuard {
     }
 }
 
-/// Periods fetched per catch-up round (≤16 per the plan; the spec request cap
-/// is 128).
-const UPDATES_BATCH_MAX: u64 = 16;
+/// Periods requested per catch-up round — the full spec cap, matching the
+/// Java client's `min(periodsToFetch, 128)`. This is THE cold-sync lever:
+/// "generous" servers exist that stream the whole requested range back-to-back
+/// (measured on the same Pixel 7 with the same cached peers: Java engine
+/// synced 19 periods in 140 s off one such server, while this engine's old
+/// 16-cap plus per-round costs — serve latency, the 12 s quiet window, the
+/// 11 s pace, backoff on empty rounds — took 972 s at ~1 period per round
+/// from quota-truncating servers). One generous response now covers the whole
+/// catch-up in a single staged apply; truncating (Lighthouse-style) servers
+/// still return 1 chunk per round exactly as before. Wire-size check: 128
+/// chunks × ~27 KiB ≈ 3.5 MiB, well under the 16 MiB response cap.
+const UPDATES_BATCH_MAX: u64 = 128;
 /// Peer candidates asked per round — all in parallel, first useful response
 /// wins (Java CATCHUP_FANOUT_MAX is 48; the discovered pool is failure-heavy,
 /// so a wide fan-out is what makes rounds land).
@@ -1320,13 +1329,17 @@ async fn catch_up(
                     "catch-up made no progress — returning to the poll loop");
                 return false;
             }
-            // Grow the pre-round pause 5s → 60s: rapid-fire empty rounds burn
-            // server quota and our own peer score; a quiet minute lets rate
-            // limiters refill and discovery deliver fresh candidates.
+            // Grow the pre-round pause 5s → 25s: rapid-fire empty rounds burn
+            // server quota and our own peer score, but with the post-apply
+            // pacing preventing self-inflicted empties, the rounds that reach
+            // here are genuine server droughts — and a 60 s ceiling meant up
+            // to a minute of blindness after a server RETURNED (droughts
+            // dominated measured cold syncs). 25 s samples recovery twice as
+            // fast at negligible quota cost.
             empty_backoff = if empty_backoff.is_zero() {
                 Duration::from_secs(5)
             } else {
-                (empty_backoff * 2).min(Duration::from_secs(60))
+                (empty_backoff * 2).min(Duration::from_secs(25))
             };
             tracing::debug!(period = processor.store.current_period(), idle_rounds,
                 "catch-up round made no progress — retrying after backoff");
