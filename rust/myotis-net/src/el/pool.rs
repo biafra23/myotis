@@ -109,7 +109,14 @@ impl PoolInner {
     /// transient (30 s) window.
     async fn record_backoff(&self, addr: SocketAddr, long: bool, now: Instant) {
         let window = if long { BACKOFF_INCOMPATIBLE } else { BACKOFF_TRANSIENT };
-        self.backoff.lock().await.insert(addr, now + window);
+        let mut backoff = self.backoff.lock().await;
+        // Entries are normally dropped when their address resurfaces as a
+        // candidate, but an address that never comes back would linger forever.
+        // Sweep expired entries when the map grows large so it stays bounded.
+        if backoff.len() >= self.pool_cfg.max_attempted {
+            backoff.retain(|_, &mut expiry| expiry > now);
+        }
+        backoff.insert(addr, now + window);
     }
 
     /// Dial one candidate through the full eth+snap handshake, updating the
@@ -136,7 +143,11 @@ impl PoolInner {
                 self.attempted.lock().await.remove(&addr);
             }
             Err(e) => {
-                let incompatible = e.contains("incompatible peer");
+                // Only the network-id/genesis mismatch error starts with this
+                // prefix (see EthSession::handshake). Match the PREFIX, not a
+                // substring: a peer's client id is echoed into other error
+                // strings, so `contains` could be steered by a hostile peer.
+                let incompatible = e.starts_with("incompatible peer");
                 if incompatible {
                     self.blacklist.lock().await.insert(pubkey);
                 }
