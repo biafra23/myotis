@@ -261,7 +261,18 @@ pub fn decode_multi_chunk_response(
             break;
         }
         pos += 4; // fork digest (per-chunk; the payload's own fork sniffing governs decode)
-        let (uncompressed_len, next) = read_varint(raw, pos)?;
+        // A truncated TAIL (the reader's total budget cutting a long paced
+        // response mid-chunk) must not discard the complete chunks before it —
+        // only an undecodable FIRST chunk is a peer-level error.
+        let (uncompressed_len, next) = match read_varint(raw, pos) {
+            Ok(v) => v,
+            Err(e) if !items.is_empty() => {
+                tracing::debug!(item = items.len(), raw_len = raw.len(), error = %e,
+                    "multi-chunk tail truncated at varint — salvaging prior chunks");
+                break;
+            }
+            Err(e) => return Err(e),
+        };
         pos = next;
         let uncompressed_len = uncompressed_len as usize;
         if uncompressed_len == 0 {
@@ -277,7 +288,15 @@ pub fn decode_multi_chunk_response(
                 "multi-chunk skip_snappy_frames returned empty span");
             break;
         }
-        let decompressed = snappy_decompress(&raw[snappy_start..pos], uncompressed_len)?;
+        let decompressed = match snappy_decompress(&raw[snappy_start..pos], uncompressed_len) {
+            Ok(d) => d,
+            Err(e) if !items.is_empty() => {
+                tracing::debug!(item = items.len(), raw_len = raw.len(), error = %e,
+                    "multi-chunk tail truncated mid-snappy — salvaging prior chunks");
+                break;
+            }
+            Err(e) => return Err(e),
+        };
         if decompressed.is_empty() {
             tracing::info!(
                 item = items.len(),
@@ -529,6 +548,24 @@ mod tests {
         wire.extend_from_slice(&encode_error_response(RESULT_RESOURCE_UNAVAILABLE, "no more"));
         let items = decode_multi_chunk_response(&wire, 5).unwrap();
         assert_eq!(items, vec![good]);
+    }
+
+    #[test]
+    fn multi_chunk_salvages_complete_chunks_before_truncated_tail() {
+        // The reader's total budget can cut a long paced response mid-chunk:
+        // the complete chunks before the cut must survive, not error out.
+        let payloads: Vec<Vec<u8>> = vec![vec![0x01; 500], vec![0x02; 25_000]];
+        let mut wire = Vec::new();
+        for p in &payloads {
+            wire.extend_from_slice(&encode_success_response(p, Some([0; 4])));
+        }
+        let tail = encode_success_response(&[0x03u8; 25_000], Some([0; 4]));
+        // Cut inside the tail's snappy body (past result byte + digest + varint).
+        wire.extend_from_slice(&tail[..tail.len() / 2]);
+        let items = decode_multi_chunk_response(&wire, 5).unwrap();
+        assert_eq!(items, payloads);
+        // A truncated FIRST chunk stays a peer-level error.
+        assert!(decode_multi_chunk_response(&tail[..tail.len() / 2], 5).is_err());
     }
 
     #[test]

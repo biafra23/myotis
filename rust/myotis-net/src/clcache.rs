@@ -103,20 +103,26 @@ impl ClPeerCache {
     }
 
     /// All cached peers, best first: proven catch-up servers (WIDEST served
-    /// range first — a wide range marks a "generous" server that streams many
-    /// periods per response instead of quota-truncating to one; those are the
-    /// servers that turn a 19-round catch-up into a 1-round one), then
-    /// bootstrap servers / lc-confirmed, then the rest. `nolc` peers are still
-    /// returned (the pool tracks them separately) — the caller seeds its own
-    /// sets. The pool preserves this seeding order within its tiers.
+    /// range first), then bootstrap servers / lc-confirmed, then the rest.
+    /// The served range is the accumulated UNION across responses, so width
+    /// does NOT single out "generous" multi-chunk servers — a truncating
+    /// server that stuck around for a whole catch-up carries a wide range too.
+    /// What it does mark is the peers that demonstrably carried the most
+    /// verified periods, which is the best available dial-first signal until
+    /// per-response serve size is recorded. `nolc` peers are still returned
+    /// (the pool tracks them separately) — the caller seeds its own sets. The
+    /// pool preserves this seeding order within its tiers.
     pub fn peers(&self) -> Vec<String> {
+        use std::cmp::Reverse;
         let mut out: Vec<String> = self.peers.clone();
         out.sort_by_key(|a| {
             match self.served.get(a) {
-                // Tier 0, sub-ordered by descending width (i64: wider = smaller key).
-                Some((lo, hi)) => (0, -((hi - lo) as i64)),
-                None if self.bootstrap.contains_key(a) || self.lc.contains(a) => (1, 0),
-                None => (2, 0),
+                // Tier 0, widest range first (Reverse, not i64 negation — a
+                // corrupt cache line can parse to a width ≥ 2^63, where the
+                // cast negation panics under overflow checks).
+                Some((lo, hi)) => (0, Reverse(hi - lo)),
+                None if self.bootstrap.contains_key(a) || self.lc.contains(a) => (1, Reverse(0)),
+                None => (2, Reverse(0)),
             }
         });
         out
