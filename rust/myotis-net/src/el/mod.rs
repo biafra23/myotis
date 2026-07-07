@@ -7,3 +7,4 @@
 //! against Java-generated conformance corpora under `rust/testdata/el/`.
 
 pub mod discv4;
+pub mod rlpx;
