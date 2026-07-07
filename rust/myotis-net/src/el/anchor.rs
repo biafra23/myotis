@@ -26,13 +26,18 @@ pub struct SlottedStateRoot {
     pub bls_verified: bool,
 }
 
-/// The finalized execution anchor: the block number + its beacon-verified
-/// execution state root, read together so a query never pairs a number with a
-/// root from a different finalized payload.
+/// The finalized execution anchor: the block number, its beacon-verified
+/// execution state root, AND its block hash — read together so a query never
+/// pairs fields from different finalized payloads. The `block_hash` is THE
+/// trust anchor for the header-chain walk: it is the keccak of the whole
+/// finalized header, so it pins that header completely (a peer can copy the
+/// public `state_root` into a fabricated header, but cannot forge one whose
+/// keccak equals `block_hash`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FinalizedExecution {
     pub block_number: u64,
     pub state_root: [u8; 32],
+    pub block_hash: [u8; 32],
 }
 
 #[derive(Default)]
@@ -121,14 +126,19 @@ impl ExecAnchor {
             .is_some()
     }
 
-    /// The finalized execution `(block_number, state_root)` read atomically.
-    /// `None` until the first finalized update lands.
+    /// The finalized execution `(block_number, state_root, block_hash)` read
+    /// atomically. `None` until the first finalized update lands (root AND hash
+    /// are set together by [`Self::update_finalized`]).
     pub fn finalized_execution(&self) -> Option<FinalizedExecution> {
         let inner = self.inner.lock().expect("anchor mutex");
-        inner.execution_state_root.map(|state_root| FinalizedExecution {
-            block_number: inner.execution_block_number,
-            state_root,
-        })
+        match (inner.execution_state_root, inner.execution_block_hash) {
+            (Some(state_root), Some(block_hash)) => Some(FinalizedExecution {
+                block_number: inner.execution_block_number,
+                state_root,
+                block_hash,
+            }),
+            _ => None,
+        }
     }
 
     pub fn finalized_slot(&self) -> u64 {

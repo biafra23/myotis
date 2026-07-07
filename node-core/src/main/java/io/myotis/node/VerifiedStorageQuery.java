@@ -151,7 +151,9 @@ public final class VerifiedStorageQuery {
             // the root.
             BeaconSyncState.FinalizedExecution fin = beaconSyncState.getFinalizedExecution();
             long finalizedBlockNum = fin.blockNumber();
-            byte[] beaconRoot = fin.stateRoot();
+            // Anchor on the beacon-finalized BLOCK HASH, not the (forgeable)
+            // state root — see VerifiedAccountQuery.verifyHeaderChain's javadoc.
+            byte[] beaconBlockHash = fin.blockHash();
             if (usedStateRoot == null) {
                 failReason = "noPeerStateRoot";
             } else if (!storageProofValid) {
@@ -160,7 +162,7 @@ public final class VerifiedStorageQuery {
                 failReason = "beaconNotSynced";
             } else if (peerBlockNumber <= 0) {
                 failReason = "noPeerBlockNumber";
-            } else if (finalizedBlockNum <= 0 || beaconRoot == null) {
+            } else if (finalizedBlockNum <= 0 || beaconBlockHash == null) {
                 failReason = "beaconBlockUnavailable";
             } else if (peerBlockNumber <= finalizedBlockNum) {
                 failReason = "peerBlockBehindFinalized";
@@ -172,7 +174,7 @@ public final class VerifiedStorageQuery {
                 try {
                     boolean chainValid = VerifiedAccountQuery.verifyHeaderChainBatched(
                                     connector, finalizedBlockNum, peerBlockNumber,
-                                    beaconRoot, usedStateRoot.toArrayUnsafe())
+                                    beaconBlockHash, usedStateRoot.toArrayUnsafe())
                             .get(VerifiedAccountQuery.HEADER_CHAIN_TIMEOUT_SEC + 10, TimeUnit.SECONDS);
                     if (chainValid) {
                         beaconChainVerified = true;

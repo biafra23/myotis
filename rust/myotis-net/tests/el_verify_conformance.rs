@@ -33,20 +33,21 @@ fn replay_reproduces_recorded_verdicts() {
         "corpus present but expected.txt missing/empty — regenerate on the Java side"
     );
 
-    let beacon_root = hex32(&expected["beaconRoot"]);
+    let beacon_block_hash = hex32(&expected["beaconBlockHash"]);
     let peer_root = hex32(&expected["peerRoot"]);
     let mut actual: BTreeMap<String, String> = BTreeMap::new();
-    actual.insert("beaconRoot".into(), hex(&beacon_root));
+    actual.insert("beaconBlockHash".into(), hex(&beacon_block_hash));
     actual.insert("peerRoot".into(), hex(&peer_root));
 
-    // --- headerChain verification over Java's committed BlockHeaders messages ---
+    // --- headerChain verification over Java's committed BlockHeaders messages,
+    //     anchored on the finalized BLOCK HASH ---
     for (base, bytes) in chain_vectors(&corpus) {
         let (_id, headers) = decode_block_headers(&bytes).unwrap();
         let chain: Vec<ChainHeader> = headers
             .into_iter()
             .map(|vh| ChainHeader { hash: vh.hash, header: vh.header })
             .collect();
-        let ok = verify_header_chain(&chain, &beacon_root, &peer_root);
+        let ok = verify_header_chain(&chain, &beacon_block_hash, &peer_root);
         actual.insert(format!("chain.{base}"), ok.to_string());
     }
 

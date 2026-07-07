@@ -340,7 +340,7 @@ impl EthSession {
         &mut self,
         finalized_block: u64,
         peer_block: u64,
-        beacon_state_root: &[u8; 32],
+        beacon_block_hash: &[u8; 32],
         peer_state_root: &[u8; 32],
         finalized_slot: i64,
     ) -> crate::el::verify::Verdict {
@@ -379,7 +379,7 @@ impl EthSession {
                 ..Verdict::default()
             };
         }
-        header_chain_verdict(&chain, beacon_state_root, peer_state_root, finalized_slot)
+        header_chain_verdict(&chain, beacon_block_hash, peer_state_root, finalized_slot)
     }
 
     /// Anchor a peer-served `state_root` (for `block_number`) to the beacon
@@ -400,13 +400,13 @@ impl EthSession {
             LadderStep::NeedHeaderChain {
                 finalized_block,
                 peer_block,
-                beacon_state_root,
+                beacon_block_hash,
                 finalized_slot,
             } => {
                 self.header_chain_verdict(
                     finalized_block,
                     peer_block,
-                    &beacon_state_root,
+                    &beacon_block_hash,
                     state_root,
                     finalized_slot,
                 )

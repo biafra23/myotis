@@ -50,8 +50,17 @@ class ElVerifyVectorConformanceTest {
     private static final Path CORPUS = Path.of("..", "rust", "testdata", "el", "verify");
     private static final boolean WRITE = Boolean.getBoolean("myotis.el.writeExpected");
 
-    private static final Bytes32 BEACON_ROOT = tag("beacon-finalized-root");
+    // The header-chain trust anchor is the finalized BLOCK HASH (keccak of the
+    // whole first header), NOT its state root. PEER_ROOT is the last header's
+    // state root (the query target).
+    private static final Bytes32 BEACON_STATE_ROOT = tag("beacon-finalized-state-root");
+    private static final Bytes32 GENESIS_PARENT = tag("genesis-parent");
     private static final Bytes32 PEER_ROOT = tag("peer-head-root");
+
+    /** The canonical finalized block; its hash is the trust anchor. */
+    private static Header finalizedH0() {
+        return header(21_000_000, BEACON_STATE_ROOT, GENESIS_PARENT);
+    }
 
     private static Map<String, String> expected;
 
@@ -79,16 +88,18 @@ class ElVerifyVectorConformanceTest {
     @Test
     void replayReproducesRecordedVerdicts() throws Exception {
         Map<String, String> actual = new TreeMap<>();
-        actual.put("beaconRoot", BEACON_ROOT.toUnprefixedHexString());
+        Bytes32 beaconBlockHash = finalizedH0().hash;
+        actual.put("beaconBlockHash", beaconBlockHash.toUnprefixedHexString());
         actual.put("peerRoot", PEER_ROOT.toUnprefixedHexString());
 
-        // --- headerChain verification over committed BlockHeaders messages ---
+        // --- headerChain verification over committed BlockHeaders messages,
+        //     anchored on the finalized BLOCK HASH ---
         for (Path p : listSorted()) {
             String base = baseName(p);
             List<BlockHeadersMessage.VerifiedHeader> headers =
                     BlockHeadersMessage.decodeWithRequestId(Files.readAllBytes(p)).headers();
             boolean ok = VerifiedAccountQuery.verifyHeaderChain(
-                    headers, BEACON_ROOT.toArray(), PEER_ROOT.toArray());
+                    headers, beaconBlockHash.toArray(), PEER_ROOT.toArray());
             actual.put("chain." + base, Boolean.toString(ok));
         }
 
@@ -122,22 +133,24 @@ class ElVerifyVectorConformanceTest {
     // -------------------------------------------------------------------------
 
     private static void generateVectors() throws Exception {
-        // A valid 3-header chain: h0.stateRoot == BEACON_ROOT, h2.stateRoot == PEER_ROOT,
-        // parent-linked h0 <- h1 <- h2.
-        Header h0 = header(21_000_000, BEACON_ROOT, tag("genesis-parent"));
+        Header h0 = finalizedH0();
         Header h1 = header(21_000_001, tag("mid-root"), h0.hash);
         Header h2 = header(21_000_002, PEER_ROOT, h1.hash);
+        // Valid: h0.hash == beaconBlockHash, h2.stateRoot == PEER_ROOT, parent-linked.
         writeMsg("001-chain-valid.rlp", h0, h1, h2);
 
         // Broken parent link: h2.parentHash != h1.hash.
         Header h2broken = header(21_000_002, PEER_ROOT, tag("wrong-parent"));
         writeMsg("002-chain-broken-link.rlp", h0, h1, h2broken);
 
-        // Wrong first (beacon) root: h0.stateRoot != BEACON_ROOT.
-        Header h0wrong = header(21_000_000, tag("not-beacon-root"), tag("genesis-parent"));
-        Header h1b = header(21_000_001, tag("mid-root"), h0wrong.hash);
-        Header h2b = header(21_000_002, PEER_ROOT, h1b.hash);
-        writeMsg("003-chain-wrong-first-root.rlp", h0wrong, h1b, h2b);
+        // THE ATTACK: a forged first header that COPIES the public beacon state
+        // root into its stateRoot field but has a DIFFERENT block hash (fake
+        // parent) — a state-root-only anchor would accept this; the block-hash
+        // anchor rejects it. Proves the security fix.
+        Header h0forged = header(21_000_000, BEACON_STATE_ROOT, tag("attacker-parent"));
+        Header h1f = header(21_000_001, tag("mid-root"), h0forged.hash);
+        Header h2f = header(21_000_002, PEER_ROOT, h1f.hash);
+        writeMsg("003-chain-forged-first-header.rlp", h0forged, h1f, h2f);
 
         // Wrong last (peer) root: h2.stateRoot != PEER_ROOT.
         Header h2w = header(21_000_002, tag("not-peer-root"), h1.hash);

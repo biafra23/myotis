@@ -62,7 +62,9 @@ pub enum LadderStep {
     NeedHeaderChain {
         finalized_block: u64,
         peer_block: u64,
-        beacon_state_root: [u8; 32],
+        /// The beacon-finalized BLOCK HASH — the trust anchor the first fetched
+        /// header must hash to.
+        beacon_block_hash: [u8; 32],
         finalized_slot: i64,
     },
 }
@@ -120,7 +122,7 @@ pub fn ladder_precheck(
     LadderStep::NeedHeaderChain {
         finalized_block: fin.block_number,
         peer_block,
-        beacon_state_root: fin.state_root,
+        beacon_block_hash: fin.block_hash,
         finalized_slot: anchor.finalized_slot() as i64,
     }
 }
@@ -134,16 +136,17 @@ pub struct ChainHeader {
 }
 
 /// Verdict for the header-chain branch: verify the fetched range end-to-end and
-/// return `headerChain` / `headerChainInvalid`. `beacon_state_root` is the
-/// finalized root (must equal the FIRST header's state root); `peer_state_root`
-/// is what the snap query used (must equal the LAST header's state root).
+/// return `headerChain` / `headerChainInvalid`. `beacon_block_hash` is the
+/// finalized block HASH (must equal the FIRST header's keccak — the trust
+/// anchor); `peer_state_root` is what the snap query used (must equal the LAST
+/// header's state root).
 pub fn header_chain_verdict(
     headers: &[ChainHeader],
-    beacon_state_root: &[u8; 32],
+    beacon_block_hash: &[u8; 32],
     peer_state_root: &[u8; 32],
     finalized_slot: i64,
 ) -> Verdict {
-    if verify_header_chain(headers, beacon_state_root, peer_state_root) {
+    if verify_header_chain(headers, beacon_block_hash, peer_state_root) {
         Verdict::verified("headerChain", finalized_slot, true)
     } else {
         Verdict::failed("headerChainInvalid")
@@ -152,19 +155,23 @@ pub fn header_chain_verdict(
 
 /// Pure verification of a contiguous header range (twin of
 /// `VerifiedAccountQuery.verifyHeaderChain`):
-/// 1. the FIRST header's state root == the beacon-finalized root (trust anchor);
-/// 2. the LAST header's state root == the peer-reported root (query target);
+/// 1. the FIRST header's HASH == the beacon-finalized block hash — THE trust
+///    anchor. Must be the block HASH, not just the state root: the block hash
+///    is `keccak256` of the whole header, so it pins the header completely,
+///    whereas a state-root-only check lets a peer copy the PUBLIC finalized
+///    state root into a fabricated `H_0'` and forge a chain to a fake root.
+/// 2. the LAST header's state root == the peer-reported root (the query target);
 /// 3. every consecutive pair links: `header[i].hash == header[i+1].parentHash`
 ///    (each hash being `keccak256(RLP)`, so the chain is peer-unforgeable).
 pub fn verify_header_chain(
     headers: &[ChainHeader],
-    expected_first_state_root: &[u8; 32],
+    expected_first_block_hash: &[u8; 32],
     expected_last_state_root: &[u8; 32],
 ) -> bool {
     if headers.is_empty() {
         return false;
     }
-    if &headers[0].header.state_root != expected_first_state_root {
+    if &headers[0].hash != expected_first_block_hash {
         return false;
     }
     if &headers[headers.len() - 1].header.state_root != expected_last_state_root {
@@ -222,19 +229,37 @@ mod tests {
         let h0 = header(100, root(0xa0), root(0xff)); // finalized
         let h1 = header(101, root(0xa1), h0.hash);
         let h2 = header(102, root(0xa2), h1.hash); // peer head
+        let h0_hash = h0.hash;
         let chain = [h0, h1, h2];
-        assert!(verify_header_chain(&chain, &root(0xa0), &root(0xa2)));
-        // Wrong first (beacon) root, wrong last (peer) root, both rejected.
+        // Anchored by the FIRST header's block HASH, ending at the peer state root.
+        assert!(verify_header_chain(&chain, &h0_hash, &root(0xa2)));
+        // Wrong first (beacon) block hash, wrong last (peer) root, both rejected.
         assert!(!verify_header_chain(&chain, &root(0xbb), &root(0xa2)));
-        assert!(!verify_header_chain(&chain, &root(0xa0), &root(0xbb)));
+        assert!(!verify_header_chain(&chain, &h0_hash, &root(0xbb)));
+    }
+
+    #[test]
+    fn forged_first_header_with_correct_state_root_is_rejected() {
+        // THE attack: a fabricated H_0' that copies the public finalized state
+        // root into its stateRoot field but is otherwise fake — its block HASH
+        // differs from the trusted finalized block hash, so anchoring on the
+        // hash rejects it (a state-root-only anchor would have accepted it).
+        let real_h0 = header(100, root(0xa0), root(0xff));
+        let forged_h0 = header(100, root(0xa0), root(0xde)); // same stateRoot, different parent → different hash
+        assert_ne!(real_h0.hash, forged_h0.hash);
+        let h1 = header(101, root(0xa1), forged_h0.hash);
+        let chain = [forged_h0, h1];
+        // Anchored on the REAL finalized block hash → the forged chain is rejected.
+        assert!(!verify_header_chain(&chain, &real_h0.hash, &root(0xa1)));
     }
 
     #[test]
     fn broken_parent_link_rejected() {
         let h0 = header(100, root(0xa0), root(0xff));
         let h1 = header(101, root(0xa1), root(0xde)); // parent != h0.hash
+        let h0_hash = h0.hash;
         let chain = [h0, h1];
-        assert!(!verify_header_chain(&chain, &root(0xa0), &root(0xa1)));
+        assert!(!verify_header_chain(&chain, &h0_hash, &root(0xa1)));
     }
 
     #[test]
@@ -284,12 +309,12 @@ mod tests {
             fail(ladder_precheck(Some(&root(1)), true, 21_000_000 + 8193, &anchor)),
             Some("headerChainGapTooLarge")
         );
-        // in range → NeedHeaderChain.
+        // in range → NeedHeaderChain, carrying the finalized BLOCK HASH.
         match ladder_precheck(Some(&root(1)), true, 21_000_100, &anchor) {
-            LadderStep::NeedHeaderChain { finalized_block, peer_block, beacon_state_root, .. } => {
+            LadderStep::NeedHeaderChain { finalized_block, peer_block, beacon_block_hash, .. } => {
                 assert_eq!(finalized_block, 21_000_000);
                 assert_eq!(peer_block, 21_000_100);
-                assert_eq!(beacon_state_root, root(0xf0));
+                assert_eq!(beacon_block_hash, root(0xf1)); // the finalized block hash
             }
             _ => panic!("expected NeedHeaderChain"),
         }
