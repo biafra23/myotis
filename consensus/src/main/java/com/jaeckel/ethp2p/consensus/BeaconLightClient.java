@@ -1398,8 +1398,6 @@ public class BeaconLightClient implements AutoCloseable {
      * Run one parallel 128-period fetch across all peers; return true if the store advanced.
      */
     private boolean attemptCatchUpBatch(long bootstrapPeriod, long periodsToFetch, long slotEstimate) {
-        // Quota consumption point: stamp before firing (see CATCHUP_QUOTA_PACE_MS).
-        lastCatchupBatchFireNanos = System.nanoTime();
         // Fire requests to all peers in parallel — first peer to deliver a response that
         // actually advances the store wins. Serial iteration with 30s timeouts meant ~9
         // minutes worst case with a list full of dead peers.
@@ -1496,6 +1494,10 @@ public class BeaconLightClient implements AutoCloseable {
             log.warn("[beacon] Catch-up: no capable peers for period {} — retry next cycle", bootstrapPeriod);
             return false;
         }
+        // Quota consumption point: stamp only when a fan-out actually FIRES —
+        // the empty-pool early return above consumed nobody's window, and
+        // pacing after it would delay the next attempt for nothing.
+        lastCatchupBatchFireNanos = System.nanoTime();
         // {@link BeaconP2PService#doReqResp} detects a dying connection and
         // retries with a fresh one, so we no longer pre-emptively disconnect
         // every peer here — that was costing us Lighthouse/Teku connections
