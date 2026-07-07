@@ -110,24 +110,19 @@ pub fn decode_status(rlp_bytes: &[u8], eth_version: u64) -> Result<Status, CoreE
             latest_block: Some(items[5].as_u64()?),
         })
     } else {
-        // [version, networkId, td, bestHash, genesis, forkId]
-        if items.len() < 5 {
+        // [version, networkId, td, bestHash, genesis, forkId]. forkId is
+        // MANDATORY for eth/66+ (EIP-2124), so require all 6 fields.
+        if items.len() < 6 {
             return err_status(items.len());
         }
-        let (fork_hash, fork_next) = match items.get(5) {
-            Some(f) => {
-                let fork = f.as_list()?;
-                (fork_id_hash(fork)?, fork.get(1).map_or(Ok(0), Item::as_u64)?)
-            }
-            None => ([0u8; 4], 0),
-        };
+        let fork = items[5].as_list()?;
         Ok(Status {
             protocol_version: items[0].as_u64()?,
             network_id: items[1].as_u64()?,
             genesis_hash: fixed32(&items[4])?,
             best_hash: fixed32(&items[3])?,
-            fork_id_hash: fork_hash,
-            fork_next,
+            fork_id_hash: fork_id_hash(fork)?,
+            fork_next: fork.get(1).map_or(Ok(0), Item::as_u64)?,
             latest_block: None,
         })
     }
@@ -145,14 +140,13 @@ fn err_status<T>(n: usize) -> Result<T, CoreError> {
 }
 
 fn fork_id_hash(fork: &[Item]) -> Result<[u8; 4], CoreError> {
+    // EIP-2124: the fork hash is EXACTLY 4 bytes (CRC32). Reject anything else.
     let bytes = fork
         .first()
         .ok_or_else(|| CoreError("Status: empty forkId".into()))?
-        .as_bytes()?;
+        .as_fixed_bytes(4)?;
     let mut out = [0u8; 4];
-    if bytes.len() >= 4 {
-        out.copy_from_slice(&bytes[..4]);
-    }
+    out.copy_from_slice(bytes);
     Ok(out)
 }
 
@@ -245,11 +239,16 @@ pub fn decode_block_bodies(rlp_bytes: &[u8]) -> Result<(u64, Vec<BlockBody>), Co
     let (request_id, bodies_rlp) = strip_request_id(rlp_bytes)?;
     let mut bodies = Vec::new();
     for body_raw in rlp::raw_list_items(bodies_rlp)? {
-        // body = [transactions, uncles, withdrawals?]
+        // body = [transactions, uncles, withdrawals?] — transactions AND uncles
+        // are mandatory (withdrawals only post-Shanghai).
         let fields = rlp::raw_list_items(body_raw)?;
-        let txs_raw = *fields
-            .first()
-            .ok_or_else(|| CoreError("BlockBody: missing transactions".into()))?;
+        if fields.len() < 2 {
+            return Err(CoreError(format!(
+                "BlockBody: expected >= 2 fields, got {}",
+                fields.len()
+            )));
+        }
+        let txs_raw = fields[0];
         let mut transactions = Vec::new();
         for tx in rlp::raw_list_items(txs_raw)? {
             // Legacy tx = RLP list (kept as-is, it's canonical); typed tx =
@@ -332,8 +331,14 @@ fn canonicalize_eth69_receipt(wire: &[u8]) -> Result<Vec<u8>, CoreError> {
     if fields.len() < 4 {
         return Err(CoreError("eth/69 receipt: too few fields".into()));
     }
-    let tx_type = fields[0].as_bytes()?;
-    let ty = tx_type.last().copied().unwrap_or(0);
+    // The receipt tx-type is a single byte in `0x00..=0x7f` (0 = legacy). Keep
+    // the Java last-byte extraction for the valid single-byte case, but reject
+    // multi-byte / out-of-range encodings rather than silently truncating.
+    let ty = match fields[0].as_bytes()? {
+        [] => 0u8,
+        &[b] if b <= 0x7f => b,
+        _ => return Err(CoreError("eth/69 receipt: invalid tx type".into())),
+    };
     let status_or_state = fields[1].as_bytes()?;
     let cum_gas = fields[2].as_bytes()?;
     let logs = fields[3].as_list()?;
@@ -346,11 +351,12 @@ fn canonicalize_eth69_receipt(wire: &[u8]) -> Result<Vec<u8>, CoreError> {
         if lf.len() < 3 {
             return Err(CoreError("eth/69 receipt: malformed log".into()));
         }
-        let address = lf[0].as_bytes()?;
+        // Consensus rules: a log address is exactly 20 bytes, each topic 32.
+        let address = lf[0].as_fixed_bytes(20)?;
         accrue(&mut bloom, address);
         let topics = lf[1].as_list()?;
         for t in topics {
-            accrue(&mut bloom, t.as_bytes()?);
+            accrue(&mut bloom, t.as_fixed_bytes(32)?);
         }
         log_items.push(log.clone());
     }
