@@ -57,9 +57,14 @@ public final class KademliaTable {
         Bytes32 targetId = toNodeId(target);
 
         // Node IDs are 64-byte pubkeys; hash them to the 32-byte Kademlia id
-        // before XOR (Bytes32.wrap on a 64-byte value throws). Matches the
-        // Rust twin's to_node_id().
-        all.sort(Comparator.comparing(e -> xorDistance(toNodeId(e.nodeId()), targetId)));
+        // before XOR (Bytes32.wrap on a 64-byte value throws). Cache the
+        // distance per entry so the keccak+XOR runs once each, not O(N log N)
+        // times inside the comparator. Matches the Rust twin's cached-key sort.
+        Map<Bytes, Bytes32> distanceCache = new HashMap<>(all.size());
+        for (Entry e : all) {
+            distanceCache.put(e.nodeId(), xorDistance(toNodeId(e.nodeId()), targetId));
+        }
+        all.sort(Comparator.comparing(e -> distanceCache.get(e.nodeId())));
         return all.subList(0, Math.min(k, all.size()));
     }
 

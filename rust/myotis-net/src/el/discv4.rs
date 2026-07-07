@@ -280,10 +280,9 @@ impl KademliaTable {
     pub fn closest_peers(&self, target: &[u8], k: usize) -> Vec<TableEntry> {
         let target_id = to_node_id(target);
         let mut all: Vec<&TableEntry> = self.buckets.iter().flatten().collect();
-        all.sort_by(|a, b| {
-            xor_distance(&to_node_id(&a.node_id), &target_id)
-                .cmp(&xor_distance(&to_node_id(&b.node_id), &target_id))
-        });
+        // Cached-key sort: to_node_id (a keccak over the 64-byte pubkey) runs
+        // once per entry, not O(N log N) times inside the comparator.
+        all.sort_by_cached_key(|e| xor_distance(&to_node_id(&e.node_id), &target_id));
         all.into_iter().take(k).cloned().collect()
     }
 
@@ -479,7 +478,7 @@ fn bind_udp(port: u16) -> std::io::Result<(tokio::net::UdpSocket, bool)> {
             Some(socket2::Protocol::UDP),
         )?;
         socket.set_only_v6(false)?;
-        socket.set_recv_buffer_size(1 << 20)?;
+        set_recv_buffer_best_effort(&socket);
         socket.set_nonblocking(true)?;
         socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
         tokio::net::UdpSocket::from_std(socket.into())
@@ -492,11 +491,21 @@ fn bind_udp(port: u16) -> std::io::Result<(tokio::net::UdpSocket, bool)> {
                 socket2::Type::DGRAM,
                 Some(socket2::Protocol::UDP),
             )?;
-            socket.set_recv_buffer_size(1 << 20)?;
+            set_recv_buffer_best_effort(&socket);
             socket.set_nonblocking(true)?;
             socket.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())?;
             Ok((tokio::net::UdpSocket::from_std(socket.into())?, false))
         }
+    }
+}
+
+/// Enlarge SO_RCVBUF to 1 MiB, but don't fail the bind if the platform
+/// refuses (strict `net.core.rmem_max`, containers): the fixed 4096-byte read
+/// buffer already prevents NEIGHBORS truncation; the larger kernel buffer only
+/// absorbs reply bursts, so the default is a fine fallback.
+fn set_recv_buffer_best_effort(socket: &socket2::Socket) {
+    if let Err(e) = socket.set_recv_buffer_size(1 << 20) {
+        tracing::debug!("discv4 SO_RCVBUF 1 MiB not granted, using default: {e}");
     }
 }
 
@@ -526,6 +535,9 @@ impl ServiceLoop {
             tokio::time::Instant::now() + std::time::Duration::from_secs(10),
             std::time::Duration::from_secs(15),
         );
+        // After a stall/sleep, catch up with ONE tick, not a burst of them —
+        // otherwise we'd flood peers with a storm of FindNodes on wakeup.
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut buf = vec![0u8; RECV_BUF];
         loop {
             tokio::select! {
@@ -779,20 +791,20 @@ fn to_socket_addr(ip: &[u8], port: u16) -> Option<SocketAddr> {
     }
 }
 
-/// Up to `k` distinct random picks (Fisher-Yates over indices, getrandom-fed).
+/// Up to `k` distinct random picks (PARTIAL Fisher-Yates — only the first
+/// `min(k, n)` positions are resolved, so at most `k` entropy draws rather
+/// than one per table entry; the table can hold thousands).
 fn sample(peers: &[TableEntry], k: usize) -> Vec<TableEntry> {
-    let mut indices: Vec<usize> = (0..peers.len()).collect();
+    let n = peers.len();
+    let take = k.min(n);
+    let mut indices: Vec<usize> = (0..n).collect();
     let mut rnd = [0u8; 8];
-    for i in (1..indices.len()).rev() {
+    for i in 0..take {
         let _ = getrandom::getrandom(&mut rnd);
-        let j = (u64::from_le_bytes(rnd) as usize) % (i + 1);
+        let j = i + (u64::from_le_bytes(rnd) as usize) % (n - i);
         indices.swap(i, j);
     }
-    indices
-        .into_iter()
-        .take(k)
-        .map(|i| peers[i].clone())
-        .collect()
+    indices[..take].iter().map(|&i| peers[i].clone()).collect()
 }
 
 #[cfg(test)]
