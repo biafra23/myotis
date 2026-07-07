@@ -30,11 +30,14 @@ import java.util.List;
  * {@link RustEngineNative}; compound status is a JSON object (the hand-JNI + JSON
  * decision, pinned by golden tests on both sides).
  *
- * <p>R1 scope is CL-only + mainnet-only: the beacon fields of the status snapshot
- * are real (finalized slot, sync period, peer count, beacon state); the EL-side
- * fields (execution block number, snap peers, RPC head age, …) are zero because
- * this engine has no execution layer yet. The verified-read / proof / header
- * queries throw {@link EngineException} until the EL surface lands.
+ * <p>Mainnet-only. The beacon fields of the status snapshot are real (finalized
+ * slot, sync period, peer count, beacon state); some EL-side status fields
+ * (snap-peer counts, RPC head age) are still zero. The verified-read
+ * {@link #requestAccount}/{@link #getStorageProof} queries ARE live — they cross
+ * to the Rust {@code ElReader} (discovery + peer pool + the CL-fed execution
+ * anchor) and return the same proof/verdict records as the Java engine. The
+ * remaining EL queries ({@link #getHeaders}/{@link #getBlockVerified}/
+ * {@link #dialPeer}) throw {@link EngineException} until those surfaces land.
  */
 final class RustChainHandle implements ChainHandle {
 
@@ -233,12 +236,139 @@ final class RustChainHandle implements ChainHandle {
 
     @Override
     public AccountProofResult requestAccount(String hexAddress) {
-        throw new EngineException(NOT_AVAILABLE);
+        JsonObject o = parseResultOrThrow(
+                RustEngineNative.nativeRequestAccountJson(handle, hexAddress), "account");
+        return accountFromJson(hexAddress, o);
+    }
+
+    /** Package-private test seam: JSON → {@link AccountProofResult} without JNI. */
+    static AccountProofResult accountFromJson(String hexAddress, String json) {
+        return accountFromJson(hexAddress, parseResultOrThrow(json, "account"));
+    }
+
+    private static AccountProofResult accountFromJson(String hexAddress, JsonObject o) {
+        try {
+        return new AccountProofResult(
+                o.getString("address", hexAddress),
+                o.getBoolean("exists", false),
+                o.getLong("nonce", -1L),
+                stringOrNull(o, "balanceWei"),
+                stringOrNull(o, "storageRootHex"),
+                stringOrNull(o, "codeHashHex"),
+                o.getLong("blockNumber", 0L),
+                stringOrNull(o, "peerStateRootHex"),
+                o.getBoolean("peerProofValid", false),
+                o.getBoolean("beaconChainVerified", false),
+                o.getBoolean("blsVerified", false),
+                o.getLong("matchedBeaconSlot", -1L),
+                stringOrNull(o, "verifyMethod"),
+                stringOrNull(o, "failReason"),
+                stringOrNull(o, "accountHashHex"),
+                stringList(o, "proofNodesHex"),
+                o.getBoolean("beaconSynced", false),
+                o.getLong("finalizedPeriod", 0L),
+                o.getLong("wallClockPeriod", 0L),
+                o.getLong("finalizedBlockNumber", 0L),
+                o.getLong("optimisticBlockNumber", 0L));
+        } catch (RuntimeException e) {
+            // A type-mismatched field (Rust-side shape drift) surfaces as an
+            // EngineException, never a raw UnsupportedOperationException.
+            throw new EngineException("malformed account JSON from the Rust engine: " + e.getMessage(), e);
+        }
     }
 
     @Override
     public StorageProofResult getStorageProof(String hexAddress, long slot, String holderHexOrNull) {
-        throw new EngineException(NOT_AVAILABLE);
+        JsonObject o = parseResultOrThrow(
+                RustEngineNative.nativeGetStorageProofJson(handle, hexAddress, slot, holderHexOrNull),
+                "storage");
+        return storageFromJson(hexAddress, slot, o);
+    }
+
+    /** Package-private test seam: JSON → {@link StorageProofResult} without JNI. */
+    static StorageProofResult storageFromJson(String hexAddress, long slot, String json) {
+        return storageFromJson(hexAddress, slot, parseResultOrThrow(json, "storage"));
+    }
+
+    private static StorageProofResult storageFromJson(String hexAddress, long slot, JsonObject o) {
+        try {
+        return new StorageProofResult(
+                o.getString("addressHex", hexAddress),
+                o.getLong("slot", slot),
+                stringOrNull(o, "holderHex"),
+                stringOrNull(o, "storageKeyHex"),
+                stringOrNull(o, "storageKeyHashHex"),
+                o.getBoolean("exists", false),
+                stringOrNull(o, "valueHex"),
+                stringOrNull(o, "valueDecimal"),
+                o.getInt("slotsReturned", 0),
+                stringOrNull(o, "storageRootHex"),
+                stringList(o, "proofNodesHex"),
+                o.getBoolean("storageProofValid", false),
+                o.getBoolean("beaconSynced", false),
+                o.getBoolean("beaconChainVerified", false),
+                o.getBoolean("blsVerified", false),
+                o.getLong("matchedBeaconSlot", -1L),
+                stringOrNull(o, "verifyMethod"),
+                stringOrNull(o, "failReason"),
+                o.getLong("peerBlockNumber", 0L),
+                o.getLong("finalizedBlockNumber", 0L),
+                o.getLong("optimisticBlockNumber", 0L),
+                o.getLong("finalizedSlot", 0L),
+                o.getLong("optimisticSlot", 0L),
+                o.getInt("maxHeaderChainGap", 0));
+        } catch (RuntimeException e) {
+            throw new EngineException("malformed storage JSON from the Rust engine: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Parse a native verified-read payload. A {@code {"error": "..."}} object (a
+     * transport / not-running / bad-input failure) becomes an {@link EngineException};
+     * a null/blank/malformed payload likewise. A verification FAILURE is NOT an error —
+     * it is a full result whose {@code failReason} is set, and is returned normally.
+     */
+    private static JsonObject parseResultOrThrow(String json, String what) {
+        if (json == null || json.isBlank()) {
+            throw new EngineException((json == null ? "null" : "blank") + " " + what
+                    + " JSON from the Rust engine (native failure?)");
+        }
+        JsonObject o;
+        try {
+            o = Json.parse(json).asObject();
+        } catch (RuntimeException e) {
+            throw new EngineException(
+                    "malformed " + what + " JSON from the Rust engine: " + e.getMessage(), e);
+        }
+        var error = o.get("error");
+        if (error != null && !error.isNull()) {
+            // The Rust side always emits a string error, but tolerate a
+            // structured value rather than throwing a raw library exception.
+            throw new EngineException(error.isString() ? error.asString() : error.toString());
+        }
+        return o;
+    }
+
+    /** A JSON string field, or null when absent/JSON-null. */
+    private static String stringOrNull(JsonObject o, String key) {
+        var v = o.get(key);
+        return (v == null || v.isNull()) ? null : v.asString();
+    }
+
+    /**
+     * A JSON string-array field as an unmodifiable List. An ABSENT field yields
+     * an empty list (forward-compat with an older native that omits it), but a
+     * PRESENT field that isn't a string array throws (via {@code asArray()} /
+     * {@code asString()}) — caught by the field-mapping try/catch as an
+     * {@link EngineException}, failing closed on Rust-side shape drift.
+     */
+    private static List<String> stringList(JsonObject o, String key) {
+        var v = o.get(key);
+        if (v == null || v.isNull()) return List.of();
+        List<String> out = new java.util.ArrayList<>();
+        v.asArray().forEach(e -> out.add(e.asString()));
+        // Unmodifiable: these lists live inside immutable result records.
+        return java.util.Collections.unmodifiableList(out);
     }
 
     @Override
