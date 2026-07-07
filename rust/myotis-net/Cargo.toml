@@ -18,7 +18,7 @@ myotis-core = { path = "../myotis-core" }
 # depends on wire-level behavior of these exact versions (noise/yamux framing,
 # discv5 packet format). Cargo.lock would pin them anyway; the `=` makes the
 # intent explicit and survives lockfile regeneration.
-tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net"] }
+tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net", "io-util"] }
 libp2p = { version = "=0.56.0", features = ["tokio", "tcp", "noise", "yamux", "identify", "request-response", "secp256k1", "macros"] }
 discv5 = "=0.11.0"
 snap = "=1.1.1"
@@ -30,6 +30,18 @@ async-trait = "=0.1.89"
 # FindNode random targets. Both are I/O-crate concerns by the sans-I/O rules.
 socket2 = "=0.5.10"
 getrandom = "=0.2.17"
+# RLPx (el::rlpx): ECIES (AES-128-CTR + HMAC-SHA256 + concat-KDF over SHA-256)
+# and the framed transport (AES-256-CTR + AES-256-ECB MAC + streaming Keccak-256).
+# All RustCrypto, pure Rust, cargo-ndk-clean. snap (snappy) is already in-tree.
+aes = "=0.8.4"
+ctr = "=0.9.2"
+cipher = "=0.4.4"
+hmac = "=0.12.1"
+sha2 = "=0.10.9"
+sha3 = "=0.10.9"
+# Audited constant-time equality for the ECIES + frame MAC comparisons (a
+# hand-rolled loop risks LLVM lowering it to an early-exit branch).
+subtle = "=2.6.1"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
