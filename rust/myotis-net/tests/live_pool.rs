@@ -70,6 +70,7 @@ async fn pool_dials_from_discovery_and_serves_a_verified_account() {
         key.public_key_bytes(),
         cfg,
         PoolConfig::default(),
+        myotis_net::el::peercache::ElPeerCache::disabled(),
         rx,
     );
 

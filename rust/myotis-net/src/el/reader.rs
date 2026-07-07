@@ -47,6 +47,9 @@ pub struct ElConfig {
     /// The TCP port we advertise in Hello (informational for a dialer).
     pub listen_port: u16,
     pub pool_config: PoolConfig,
+    /// Path to the EL peer cache (`dataDir/peers.cache`) for warm-start; `None`
+    /// runs without persistence.
+    pub cache_path: Option<std::path::PathBuf>,
 }
 
 impl ElConfig {
@@ -69,6 +72,7 @@ impl ElConfig {
             discv4_port: 0,
             listen_port: 30303,
             pool_config: PoolConfig::default(),
+            cache_path: None,
         }
     }
 }
@@ -141,10 +145,15 @@ pub struct ElReader {
 impl ElReader {
     /// Start a mainnet reader with a freshly-generated ephemeral node key (the
     /// CL side generates its libp2p identity per run too; a persistent EL
-    /// identity for peer-cache stability is an EL-A8 concern).
-    pub async fn start_mainnet(anchor: Arc<ExecAnchor>) -> Result<ElReader, String> {
+    /// identity is an EL-A8 concern). `cache_path` is the EL peer cache for
+    /// warm-start (`dataDir/peers.cache`), or `None` to run without persistence.
+    pub async fn start_mainnet(
+        anchor: Arc<ExecAnchor>,
+        cache_path: Option<std::path::PathBuf>,
+    ) -> Result<ElReader, String> {
         let key = generate_node_key()?;
-        ElReader::start(key, anchor, ElConfig::mainnet()).await
+        let cfg = ElConfig { cache_path, ..ElConfig::mainnet() };
+        ElReader::start(key, anchor, cfg).await
     }
 
     /// Start discovery + the peer pool for `cfg`, reading verified state against
@@ -171,8 +180,13 @@ impl ElReader {
             head_number: 0,
             listen_port: cfg.listen_port,
         });
+        // Load the EL peer cache for warm-start (disabled if no path).
+        let cache = match &cfg.cache_path {
+            Some(path) => crate::el::peercache::ElPeerCache::load(path.clone()),
+            None => crate::el::peercache::ElPeerCache::disabled(),
+        };
         let local_pubkey = key.public_key_bytes();
-        let pool = PeerPool::start(key, local_pubkey, eth_cfg, cfg.pool_config, rx);
+        let pool = PeerPool::start(key, local_pubkey, eth_cfg, cfg.pool_config, cache, rx);
         Ok(ElReader { discovery, pool, anchor })
     }
 
