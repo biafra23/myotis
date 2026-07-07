@@ -30,6 +30,7 @@ use myotis_core::nodekey::NodeKey;
 use crate::el::discv4::TableEntry;
 use crate::el::eth::session::{EthConfig, EthSession};
 use crate::el::peer::ManagedPeer;
+use crate::el::peercache::ElPeerCache;
 use crate::el::rlpx::transport::RlpxConnection;
 
 /// Wrong-chain peers: don't retry the address for a long while (Java's
@@ -78,6 +79,8 @@ struct PoolInner {
     backoff: Mutex<HashMap<SocketAddr, Instant>>,
     /// Node ids of wrong-chain peers, never dialed again this run.
     blacklist: Mutex<HashSet<[u8; 64]>>,
+    /// Proven snap-capable peers, persisted for warm-start on the next run.
+    cache: Mutex<ElPeerCache>,
 }
 
 impl PoolInner {
@@ -134,6 +137,12 @@ impl PoolInner {
                 // Keep `addr` in `attempted` while connected — dropped by
                 // prune_closed when the peer later closes.
                 self.peers.lock().await.push(PooledPeer { addr, peer });
+                // Persist this proven snap-capable peer for warm-start next run.
+                // `add` only marks the cache dirty for a genuinely new peer, so
+                // `flush` no-ops on a re-connect.
+                let mut cache = self.cache.lock().await;
+                cache.add(addr, &pubkey, true);
+                cache.flush();
             }
             Ok(_) => {
                 // Compatible but no snap/1 — useless for verified reads. Cool the
@@ -172,6 +181,7 @@ impl PeerPool {
         local_pubkey: [u8; 64],
         cfg: Arc<EthConfig>,
         pool_cfg: PoolConfig,
+        cache: ElPeerCache,
         rx: mpsc::Receiver<TableEntry>,
     ) -> PeerPool {
         let inner = Arc::new(PoolInner {
@@ -183,6 +193,7 @@ impl PeerPool {
             attempted: Mutex::new(HashSet::new()),
             backoff: Mutex::new(HashMap::new()),
             blacklist: Mutex::new(HashSet::new()),
+            cache: Mutex::new(cache),
         });
         let dialer_task = tokio::spawn(dialer_loop(Arc::clone(&inner), rx));
         PeerPool { inner, dialer_task }
@@ -211,8 +222,10 @@ impl PeerPool {
         self.inner.blacklist.lock().await.len()
     }
 
-    /// Stop the pool: abort the dialer and drop all held peers (closing them).
+    /// Stop the pool: flush the peer cache, abort the dialer, and drop all held
+    /// peers (closing them).
     pub async fn stop(self) {
+        self.inner.cache.lock().await.flush();
         self.dialer_task.abort();
         self.inner.peers.lock().await.clear();
     }
@@ -224,55 +237,77 @@ impl Drop for PeerPool {
     }
 }
 
-/// Consume the candidate stream, dialing eligible peers under a concurrency cap.
+/// Dial cached snap peers first (warm start), then consume the discv4 candidate
+/// stream — both through the same eligibility + concurrency-capped dial path.
 async fn dialer_loop(inner: Arc<PoolInner>, mut rx: mpsc::Receiver<TableEntry>) {
     let dial_slots = Arc::new(Semaphore::new(inner.pool_cfg.max_concurrent_dials));
 
+    // Warm start: re-dial proven snap peers from the cache, snap-quality first
+    // (Confirmed → Unknown → Denied). Snapshot the list so the cache lock isn't
+    // held across the dials.
+    let cached = inner.cache.lock().await.peers();
+    if !cached.is_empty() {
+        tracing::info!(count = cached.len(), "EL pool warm-starting from peer cache");
+    }
+    for c in cached {
+        if inner.prune_closed().await >= inner.pool_cfg.target_snap_peers {
+            break;
+        }
+        try_dial(&inner, &dial_slots, c.addr, c.pubkey).await;
+    }
+
+    // Then top up from live discovery.
     while let Some(entry) = rx.recv().await {
-        // Prune + read the live count in one `peers` lock.
         if inner.prune_closed().await >= inner.pool_cfg.target_snap_peers {
             continue;
         }
         let Some(addr) = to_socket_addr(&entry.ip, entry.tcp_port) else { continue };
         let Some(pubkey) = to_pubkey(&entry.node_id) else { continue };
-
-        if inner.blacklist.lock().await.contains(&pubkey) {
-            continue;
-        }
-
-        // Backoff: skip while cooling off; drop the entry once it has expired so
-        // the map doesn't grow unbounded.
-        {
-            let mut backoff = inner.backoff.lock().await;
-            if let Some(&expiry) = backoff.get(&addr) {
-                if Instant::now() < expiry {
-                    continue;
-                }
-                backoff.remove(&addr);
-            }
-        }
-
-        // Claim the address (bounded), or skip if in-flight/connected already.
-        {
-            let mut attempted = inner.attempted.lock().await;
-            if attempted.len() >= inner.pool_cfg.max_attempted || !attempted.insert(addr) {
-                continue;
-            }
-        }
-
-        // Bound concurrency: acquire a dial permit (waits when saturated), then
-        // dial in a task that releases it when done.
-        let Ok(permit) = Arc::clone(&dial_slots).acquire_owned().await else {
-            // Semaphore closed — pool shutting down.
-            inner.attempted.lock().await.remove(&addr);
-            break;
-        };
-        let inner2 = Arc::clone(&inner);
-        tokio::spawn(async move {
-            inner2.dial_one(addr, pubkey).await;
-            drop(permit);
-        });
+        try_dial(&inner, &dial_slots, addr, pubkey).await;
     }
+}
+
+/// Eligibility-check a candidate and, if it passes, dial it in a
+/// permit-bounded task. Skips (silently) a blacklisted node id, an address in
+/// backoff, one already attempted/connected, or when the attempted cap is hit.
+async fn try_dial(
+    inner: &Arc<PoolInner>,
+    dial_slots: &Arc<Semaphore>,
+    addr: SocketAddr,
+    pubkey: [u8; 64],
+) {
+    if inner.blacklist.lock().await.contains(&pubkey) {
+        return;
+    }
+    // Backoff: skip while cooling off; drop the entry once expired so the map
+    // doesn't grow unbounded.
+    {
+        let mut backoff = inner.backoff.lock().await;
+        if let Some(&expiry) = backoff.get(&addr) {
+            if Instant::now() < expiry {
+                return;
+            }
+            backoff.remove(&addr);
+        }
+    }
+    // Claim the address (bounded), or skip if in-flight/connected already.
+    {
+        let mut attempted = inner.attempted.lock().await;
+        if attempted.len() >= inner.pool_cfg.max_attempted || !attempted.insert(addr) {
+            return;
+        }
+    }
+    // Bound concurrency: acquire a dial permit (waits when saturated), then dial
+    // in a task that releases it when done.
+    let Ok(permit) = Arc::clone(dial_slots).acquire_owned().await else {
+        inner.attempted.lock().await.remove(&addr);
+        return;
+    };
+    let inner2 = Arc::clone(inner);
+    tokio::spawn(async move {
+        inner2.dial_one(addr, pubkey).await;
+        drop(permit);
+    });
 }
 
 /// A discv4 entry's TCP socket, IPv4 or IPv6, or `None` if the address is
@@ -342,11 +377,64 @@ mod tests {
             key.public_key_bytes(),
             cfg,
             PoolConfig::default(),
+            ElPeerCache::disabled(),
             rx,
         );
         assert_eq!(pool.snap_peer_count().await, 0);
         assert!(pool.snap_peer().await.is_none());
         assert_eq!(pool.attempted_count().await, 0);
         pool.stop().await;
+    }
+
+    #[tokio::test]
+    async fn warm_start_dials_cached_peers_and_survives_a_flush() {
+        // Seed the cache with a snap peer at a blackhole address (RFC 5737
+        // TEST-NET-1 — the dial never completes, which is fine: we assert the
+        // warm-start CLAIMED it, and that the cache survives the load→flush).
+        let path = std::env::temp_dir().join(format!("myotis-pool-warm-{}.cache", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut seed = ElPeerCache::load(path.clone());
+            seed.add("192.0.2.1:30303".parse().unwrap(), &[9u8; 64], true);
+            seed.flush();
+        }
+
+        let key = Arc::new(
+            NodeKey::from_secret_bytes(&myotis_core::keccak::keccak256(b"warm-test")).unwrap(),
+        );
+        let cfg = Arc::new(EthConfig {
+            network_id: 1,
+            genesis_hash: [0u8; 32],
+            fork_id_hash: [0u8; 4],
+            fork_next: 0,
+            head_hash: [0u8; 32],
+            head_number: 0,
+            listen_port: 30303,
+        });
+        let (_tx, rx) = mpsc::channel(4);
+        let pool = PeerPool::start(
+            Arc::clone(&key),
+            key.public_key_bytes(),
+            cfg,
+            PoolConfig::default(),
+            ElPeerCache::load(path.clone()),
+            rx,
+        );
+        // The warm-start branch dials the cached peer, claiming its address.
+        // Poll briefly (the blackhole dial hangs on connect, so it stays claimed).
+        let mut attempted = 0;
+        for _ in 0..40 {
+            attempted = pool.attempted_count().await;
+            if attempted >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(attempted, 1, "warm start should have dialed the cached peer");
+
+        pool.stop().await;
+        // The cached peer survived load → warm-start → flush-on-stop.
+        assert_eq!(ElPeerCache::load(path.clone()).len(), 1);
+        let _ = std::fs::remove_file(&path);
     }
 }

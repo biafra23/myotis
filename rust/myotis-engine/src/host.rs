@@ -167,9 +167,17 @@ pub fn start(handle: i64) -> bool {
     // bridge). Mainnet-only for now, matching the CL host scope. A failure
     // (e.g. a discv4 UDP bind error) is non-fatal: the CL still runs and EL
     // queries report the reader unavailable, rather than failing the whole start.
+    // The EL peer cache sits alongside the CL snapshot under the host's dataDir
+    // (`peers.cache`, the same file the Java daemon writes), so verified snap
+    // peers warm-start across restarts and engine switches.
+    let el_cache_path = config
+        .snapshot_path
+        .as_deref()
+        .and_then(|p| p.parent())
+        .map(|dir| dir.join("peers.cache"));
     let reader = match engine
         .rt
-        .block_on(async { ElReader::start_mainnet(sync.exec_anchor()).await })
+        .block_on(async { ElReader::start_mainnet(sync.exec_anchor(), el_cache_path).await })
     {
         Ok(r) => Some(Arc::new(r)),
         Err(e) => {
