@@ -1315,10 +1315,14 @@ public class BeaconLightClient implements AutoCloseable {
      *  inside the window either (Gnosis's 5 s poll cycle would otherwise do
      *  exactly that at every batch-cap call boundary). */
     private static final long CATCHUP_QUOTA_PACE_MS = 11_000;
-    /** Wall-clock of the last catch-up batch request fire — the quota
+    /** nanoTime (monotonic — an NTP step must not skew the pace, same rule as
+     *  the uptime stamps) of the last catch-up batch request fire — the quota
      *  consumption point (every fan-out consumes serving peers' windows,
-     *  advancing or not). Spans catchUpSyncCommittee calls by design. */
-    private volatile long lastCatchupBatchRequestMs;
+     *  advancing or not). Spans catchUpSyncCommittee calls by design.
+     *  Initialized one window in the past so the first-ever batch never pays
+     *  a pace against nanoTime's arbitrary origin. */
+    private volatile long lastCatchupBatchFireNanos =
+            System.nanoTime() - CATCHUP_QUOTA_PACE_MS * 1_000_000L;
     /** Max peers dialed per catch-up batch. The discovered CL pool runs to thousands of
      *  fork-matched nodes, most of which don't run a light-client server — fanning
      *  updates_by_range at all of them burned minutes of ProtocolNegotiation/Timeout
@@ -1354,8 +1358,8 @@ public class BeaconLightClient implements AutoCloseable {
             // pointless pause): sleep only the REMAINDER of the serve-quota
             // window since the last batch request fired — see the constant's
             // javadoc for why remainder-based and why the stamp spans calls.
-            long sinceLastFire = System.currentTimeMillis() - lastCatchupBatchRequestMs;
-            long paceMs = CATCHUP_QUOTA_PACE_MS - sinceLastFire;
+            long sinceLastFireMs = (System.nanoTime() - lastCatchupBatchFireNanos) / 1_000_000L;
+            long paceMs = CATCHUP_QUOTA_PACE_MS - sinceLastFireMs;
             if (paceMs > 0) {
                 // Explicit stall marker: this code path's history (#132/#133)
                 // earns making every deliberate pause self-explanatory in logs.
@@ -1395,7 +1399,7 @@ public class BeaconLightClient implements AutoCloseable {
      */
     private boolean attemptCatchUpBatch(long bootstrapPeriod, long periodsToFetch, long slotEstimate) {
         // Quota consumption point: stamp before firing (see CATCHUP_QUOTA_PACE_MS).
-        lastCatchupBatchRequestMs = System.currentTimeMillis();
+        lastCatchupBatchFireNanos = System.nanoTime();
         // Fire requests to all peers in parallel — first peer to deliver a response that
         // actually advances the store wins. Serial iteration with 30s timeouts meant ~9
         // minutes worst case with a list full of dead peers.
