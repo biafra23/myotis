@@ -112,6 +112,14 @@ class RustVerifiedReadJsonTest {
     }
 
     @Test
+    void driftedArrayFieldFailsClosed() {
+        // proofNodesHex present but not an array → EngineException (fail closed),
+        // NOT a silently-swallowed empty list.
+        String json = "{\"exists\":true,\"nonce\":0,\"proofNodesHex\":{\"unexpected\":true}}";
+        assertThrows(EngineException.class, () -> RustChainHandle.accountFromJson("0x0", json));
+    }
+
+    @Test
     void typeMismatchedFieldBecomesEngineException() {
         // Rust-side shape drift: a numeric field arrives as a string. The
         // field-extraction must surface an EngineException, not a raw

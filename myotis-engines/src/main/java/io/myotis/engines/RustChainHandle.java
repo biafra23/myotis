@@ -330,7 +330,8 @@ final class RustChainHandle implements ChainHandle {
      */
     private static JsonObject parseResultOrThrow(String json, String what) {
         if (json == null || json.isBlank()) {
-            throw new EngineException("null " + what + " JSON from the Rust engine (native failure?)");
+            throw new EngineException((json == null ? "null" : "blank") + " " + what
+                    + " JSON from the Rust engine (native failure?)");
         }
         JsonObject o;
         try {
@@ -354,12 +355,18 @@ final class RustChainHandle implements ChainHandle {
         return (v == null || v.isNull()) ? null : v.asString();
     }
 
-    /** A JSON string-array field as a List, or empty when absent/not an array. */
+    /**
+     * A JSON string-array field as an unmodifiable List. An ABSENT field yields
+     * an empty list (forward-compat with an older native that omits it), but a
+     * PRESENT field that isn't a string array throws (via {@code asArray()} /
+     * {@code asString()}) — caught by the field-mapping try/catch as an
+     * {@link EngineException}, failing closed on Rust-side shape drift.
+     */
     private static List<String> stringList(JsonObject o, String key) {
         var v = o.get(key);
-        if (v == null || !v.isArray()) return List.of();
+        if (v == null || v.isNull()) return List.of();
         List<String> out = new java.util.ArrayList<>();
-        v.asArray().forEach(e -> out.add(e.isNull() ? null : e.asString()));
+        v.asArray().forEach(e -> out.add(e.asString()));
         // Unmodifiable: these lists live inside immutable result records.
         return java.util.Collections.unmodifiableList(out);
     }
