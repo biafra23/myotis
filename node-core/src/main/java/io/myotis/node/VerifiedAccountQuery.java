@@ -442,8 +442,10 @@ public final class VerifiedAccountQuery {
                 });
     }
 
-    /** Pure verification of a contiguous header range. */
-    private static boolean verifyHeaderChain(List<BlockHeadersMessage.VerifiedHeader> headers,
+    /** Pure verification of a contiguous header range. Package-private so the
+     *  cross-language conformance test (ElVerifyVectorConformanceTest) can pin
+     *  it against the Rust twin (myotis-net el::verify::verify_header_chain). */
+    static boolean verifyHeaderChain(List<BlockHeadersMessage.VerifiedHeader> headers,
                                              byte[] expectedFirstStateRoot,
                                              byte[] expectedLastStateRoot) {
         if (headers.isEmpty()) return false;

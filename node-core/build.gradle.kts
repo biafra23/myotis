@@ -69,4 +69,9 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    // Regeneration knob for the EL conformance corpora (ElVerifyVectorConformanceTest):
+    // forward it into the forked test JVM, as :consensus and :networking do.
+    System.getProperty("myotis.el.writeExpected")?.let {
+        systemProperty("myotis.el.writeExpected", it)
+    }
 }
