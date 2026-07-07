@@ -256,13 +256,21 @@ Every PR: cut from up-to-date `rust-engine`, no-context review before opening, t
   **full `[origin, 0xff…ff]` range + small responseBytes** pattern (complete boundary proof,
   tiny discarded page — doc 02 §7.3); slim-body defaults; double-RLP-wrapped slot values;
   `GetTrieNodes` wired at the codec layer but unused by the oracle (doc 02 §7).
-- Fresh per-peer root flow: fetch the peer's current head header by its best-block hash,
-  reject stale heads (`minSensibleHeadBlock` floor), use THAT `stateRoot`; verify-on-fetch
-  through the EL-A2 verifier (account vs state root; storage vs the proven `storageRoot`;
-  bytecode by `keccak256 == codeHash`); rotate peers on failure + mark root-unavailable.
-- Empty responders for inbound snap requests.
-- Exit: `el/snap/` vectors green both sides; live `#[ignore]`: verified account + storage
-  fetch for a known mainnet account against a fresh root.
+- Fresh per-peer root flow: the caller supplies the `stateRoot`; verify-on-fetch through the
+  EL-A2 verifier (account vs state root; storage vs the proven `storageRoot`; bytecode by
+  `keccak256 == codeHash`).
+- Exit: `el/snap/` vectors green both sides; live `#[ignore]`: verified account fetch for a
+  known mainnet account against a fresh root.
+- **DEFERRED to EL-A7** (the managed-peer connection layer — the single-shot request model in
+  A6 has no place for them): the stale-head floor (`minSensibleHeadBlock`); peer rotation on
+  `Invalid`/timeout + root-unavailable marking; and answering inbound snap `Get*` (and eth
+  `Get*`) with empty responses (needs a background read loop). The empty-response ENCODERS
+  ship in A6; A7 wires them.
+
+> **STATUS (delivered by EL-A6, PR #NNN):** the pure codecs, verify-on-fetch, and the
+> single-shot `EthSession::snap_get_account/storage/bytecode` are done and cross-language
+> conformance-pinned; a live run fetched a verified mainnet account. The deferred items above
+> move to EL-A7.
 
 ### EL-A7 — orchestration, verified queries, JNI (the gate PR)
 
@@ -270,6 +278,10 @@ Every PR: cut from up-to-date `rust-engine`, no-context review before opening, t
   30 s transient), session nodeId blacklist, snap-first dial rank (proven → snap-capable →
   denied → plain), static-enode dials (Gnosis-style) and cached-peer dials wired for when the
   cache lands (EL-A8).
+- **Carried from EL-A6** (the managed-peer connection layer): a background per-connection read
+  loop that answers inbound eth/snap `Get*` with empty responses (encoders shipped in A5/A6),
+  the stale-head floor (`minSensibleHeadBlock`) before a snap query, and peer rotation on
+  `Invalid`/timeout + root-unavailable marking across the connector's active peers.
 - `ExecAnchor` (above) fed from `sync.rs`; verified query ladders ported from
   `VerifiedAccountQuery`/`VerifiedStorageQuery`/`HeaderQuery`: proof-vs-peer-root →
   `stateRootMatch` (window lookup) → `headerChain` (walk `[finalized … peer head]`, every
