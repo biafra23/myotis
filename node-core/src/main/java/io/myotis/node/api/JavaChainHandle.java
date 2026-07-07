@@ -12,6 +12,7 @@ import io.myotis.api.DialResult;
 import io.myotis.api.EngineException;
 import io.myotis.api.EnsApi;
 import io.myotis.api.HeadersResult;
+import io.myotis.api.LifecycleState;
 import io.myotis.api.PeerInfo;
 import io.myotis.api.StatusSnapshot;
 import io.myotis.api.StorageProofResult;
@@ -67,6 +68,28 @@ public final class JavaChainHandle implements ChainHandle {
 
     @Override public boolean isRunning() { return stack.isRunning(); }
 
+    @Override public boolean pause() { return stack.pause(); }
+
+    @Override public boolean resume() { return stack.resume(); }
+
+    @Override public LifecycleState lifecycle() { return stack.lifecycle(); }
+
+    @Override public long lastActivityEpochMillis() { return stack.lastActivityMs(); }
+
+    /**
+     * Wake-and-wait shared by the verified operator queries: a query on a paused
+     * stack triggers resume and holds here until the node is ready. On a
+     * PAUSED-at-deadline timeout (resume kept failing) this throws; a STOPPED
+     * stack falls through to each query's existing "Node is not running" guard.
+     */
+    private void awaitWake() {
+        stack.awaitReadyForReads(ChainStack.WAKE_WAIT_CAP_MS);
+        if (stack.lifecycle() == LifecycleState.PAUSED) {
+            throw new EngineException("node did not become ready within "
+                    + (ChainStack.WAKE_WAIT_CAP_MS / 1000) + "s (paused; resume failing)");
+        }
+    }
+
     @Override public void setTargetSnapPeers(int target) { stack.setTargetSnapPeers(target); }
 
     @Override
@@ -112,6 +135,7 @@ public final class JavaChainHandle implements ChainHandle {
 
         return new StatusSnapshot(
                 stack.isRunning(),
+                stack.lifecycle(),
                 net.name(),
                 beaconState,
                 active.size(),
@@ -208,9 +232,10 @@ public final class JavaChainHandle implements ChainHandle {
 
     @Override
     public VerifiedReads reads() {
-        // VerifiedRpcBackend implements VerifiedReads directly (since the jsonrpc-server SPI
-        // was retired), so no adapter is needed — return it as the contract type.
-        return stack.rpcBackend();
+        // The gate, not the raw backend: it stays valid across pause/resume cycles
+        // (the backend is torn down on pause and rebuilt on resume) and a read on a
+        // paused stack wakes it. Null only when the RPC pipeline never came up.
+        return stack.verifiedReads();
     }
 
     @Override
@@ -221,6 +246,7 @@ public final class JavaChainHandle implements ChainHandle {
 
     @Override
     public AccountProofResult requestAccount(String hexAddress) {
+        awaitWake();
         try {
             // queryProof internally bounds the header fetch (60 s); the outer bound covers
             // the snap fetch + verification end to end.
@@ -237,6 +263,7 @@ public final class JavaChainHandle implements ChainHandle {
 
     @Override
     public StorageProofResult getStorageProof(String hexAddress, long slot, String holderHexOrNull) {
+        awaitWake();
         RLPxConnector conn = stack.connector();
         if (!stack.isRunning() || conn == null) throw new EngineException("Node is not running");
         try {
@@ -254,6 +281,7 @@ public final class JavaChainHandle implements ChainHandle {
 
     @Override
     public HeadersResult getHeaders(long startBlock, int count) {
+        awaitWake();
         RLPxConnector conn = stack.connector();
         if (!stack.isRunning() || conn == null) throw new EngineException("Node is not running");
         return io.myotis.node.HeaderQuery.fetch(conn, startBlock, count);
@@ -261,6 +289,7 @@ public final class JavaChainHandle implements ChainHandle {
 
     @Override
     public BlockResult getBlockVerified(long blockNumber) {
+        awaitWake();
         RLPxConnector conn = stack.connector();
         if (!stack.isRunning() || conn == null) throw new EngineException("Node is not running");
         return io.myotis.node.VerifiedBlockQuery.query(conn, stack.beaconSyncState(), blockNumber);
@@ -268,6 +297,7 @@ public final class JavaChainHandle implements ChainHandle {
 
     @Override
     public DialResult dialPeer(String host, int port, String pubkeyHex) {
+        awaitWake();
         RLPxConnector conn = stack.connector();
         if (!stack.isRunning() || conn == null) throw new EngineException("Node is not running");
         try {

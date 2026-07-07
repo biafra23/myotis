@@ -172,6 +172,8 @@ private fun NetworkChips(chains: List<String>, selected: String, onSelect: (Stri
 @Composable
 private fun ReadinessStrip(s: NodeSnapshot?, deepPoolThreshold: Int) {
     val (color, height, label) = when {
+        s != null && s.lifecycle == "PAUSED" ->
+            Triple(Color(0xFF78909C), 3.dp, "Node readiness: sleeping — a request wakes it")
         s == null || !s.running ->
             Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not running")
         s.beaconState != "SYNCED" ->
@@ -236,6 +238,7 @@ private fun SettingsTab(
     }
     var snapTarget by remember { mutableStateOf(settings.snapTarget().toString()) }
     var deepPool by remember { mutableStateOf(settings.deepPoolThreshold().toString()) }
+    var idlePause by remember { mutableStateOf(settings.idlePauseMinutes().toString()) }
     var strictFreshness by remember { mutableStateOf(settings.strictStateFreshness()) }
     var nativeBls by remember { mutableStateOf(settings.nativeBlsEnabled()) }
 
@@ -297,6 +300,21 @@ private fun SettingsTab(
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             modifier = Modifier.fillMaxWidth(),
         )
+        OutlinedTextField(
+            value = idlePause,
+            onValueChange = { idlePause = it.filter(Char::isDigit).take(3) },
+            label = { Text("Idle sleep after (minutes, 0 = never)") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Text(
+            "After this many minutes without a wallet request or query, the node goes to " +
+                "sleep: all P2P networking stops (saving battery) while the JSON-RPC port keeps " +
+                "listening. The first request wakes it — expect that call to take a little longer.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
 
         // Strict freshness is the default; the switch exposes the RELAXED (opt-in) state, so the
         // checked value is the negation. Persisted immediately; applies on the next node restart.
@@ -340,6 +358,8 @@ private fun SettingsTab(
                 val deep = deepPool.toIntOrNull() ?: 16
                 settings.setSnapTarget(snap)          // persist
                 settings.setDeepPool(deep)            // persist (read at readiness-check time)
+                // Idle sleep: persisted; the controller reads it on every tick, so it applies live.
+                settings.setIdlePauseMinutes(idlePause.toIntOrNull() ?: 5)
                 controller.setTargetSnapPeers(snap)   // live-apply to running stacks
                 networks.forEach { id ->
                     // Compare the EFFECTIVE (post-clamp) persisted port before vs after, not the
@@ -514,6 +534,11 @@ private fun OfflineBanner(onOpenNetworkSettings: () -> Unit) {
 private fun StatusView(s: NodeSnapshot) {
     Column {
         StatusRow("Network", s.network)
+        StatusRow("State", when (s.lifecycle) {
+            "PAUSED" -> "Sleeping (wakes on request)"
+            "RUNNING" -> "Running"
+            else -> "Stopped"
+        })
         StatusRow("Beacon", s.beaconState)
         StatusRow("EL block", s.executionBlockNumber.toString())
         StatusRow("CL peers", "served ${s.clServedPeersLastMin}/min, con ${s.clConnectedPeers}")

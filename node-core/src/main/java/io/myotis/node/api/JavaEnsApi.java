@@ -37,7 +37,10 @@ final class JavaEnsApi implements EnsApi {
     }
 
     private VerifiedRpcBackend backend() {
-        VerifiedRpcBackend backend = stack.rpcBackend();
+        // Wake-and-wait: ENS resolution on a paused stack triggers resume and holds
+        // here (bounded) exactly like the JSON-RPC path; the returned backend is the
+        // live post-resume one.
+        VerifiedRpcBackend backend = stack.awaitReadyForReads(ChainStack.WAKE_WAIT_CAP_MS);
         if (backend == null) throw new EngineException("node not running (RPC backend not started)");
         return backend;
     }

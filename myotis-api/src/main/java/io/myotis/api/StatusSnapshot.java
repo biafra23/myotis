@@ -7,7 +7,8 @@ import java.util.List;
  * hosts' status surfaces render (UI status tabs, the daemon's {@code status} /
  * {@code beacon-status} / {@code peers} IPC commands).
  *
- * @param running               whether the stack is running
+ * @param running               whether the stack is running ({@code lifecycle == RUNNING})
+ * @param lifecycle             coarse lifecycle state (paused ⇒ {@code running=false})
  * @param network               canonical network name
  * @param beaconState           beacon light-client state (STARTING before first state)
  * @param connectedPeers        EL peers with an open RLPx session (incl. still handshaking)
@@ -35,6 +36,7 @@ import java.util.List;
  */
 public record StatusSnapshot(
         boolean running,
+        LifecycleState lifecycle,
         String network,
         BeaconState beaconState,
         int connectedPeers,

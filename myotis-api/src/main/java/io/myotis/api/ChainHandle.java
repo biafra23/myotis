@@ -31,6 +31,37 @@ public interface ChainHandle {
 
     boolean isRunning();
 
+    /**
+     * Suspend all networking (zero sockets, zero periodic timers) while keeping
+     * the stack instance and its warm verified state — beacon light-client
+     * store, sync state, peer knowledge — in memory. The JSON-RPC server keeps
+     * listening; a verified read arriving while paused triggers {@link #resume()}
+     * and is held until the node can answer (bounded, ~90 s). Blocking (a few
+     * seconds). Idempotent; a no-op unless {@code RUNNING}.
+     *
+     * @return {@code true} when the stack is {@code PAUSED} on return
+     */
+    boolean pause();
+
+    /**
+     * Rebuild networking after {@link #pause()}. Blocking (seconds; skips the
+     * cold DNS walk). Fault-isolated like {@link #start()}: on failure returns
+     * {@code false} and the stack stays {@code PAUSED} (retryable). A no-op
+     * returning {@code true} when already {@code RUNNING}.
+     */
+    boolean resume();
+
+    /** Coarse lifecycle state; {@link #isRunning()} == {@code lifecycle() == RUNNING}. */
+    LifecycleState lifecycle();
+
+    /**
+     * Epoch millis of the last host-relevant activity: any gated verified read
+     * (JSON-RPC / ENS) or verified operator query. {@code 0} if none since
+     * start. Hosts poll this for their idle-sleep timer — deliberately a getter
+     * rather than a callback so the engine surface stays FFI-portable.
+     */
+    long lastActivityEpochMillis();
+
     /** Live-update the snap-peer maintainer target (no restart). */
     void setTargetSnapPeers(int target);
 

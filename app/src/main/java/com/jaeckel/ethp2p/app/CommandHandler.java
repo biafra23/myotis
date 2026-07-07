@@ -75,6 +75,8 @@ public class CommandHandler {
                 case "resolve-ens-dns"         -> handleResolveEnsDns(jsonLine);
                 case "resolve-ens-interface"   -> handleResolveEnsInterface(jsonLine);
                 case "dial"                    -> handleDial(jsonLine);
+                case "pause"                   -> handlePause();
+                case "resume"                  -> handleResume();
                 case "stop"                    -> handleStop();
                 case "beacon-status"           -> handleBeaconStatus();
                 default                        -> jsonError("Unknown command: " + cmd);
@@ -118,10 +120,26 @@ public class CommandHandler {
     // Status / peers
     // -------------------------------------------------------------------------
 
+    /** Pause the stack into idle sleep: networking off, RPC listening, first request wakes it. */
+    private String handlePause() {
+        log.info("[ipc] Pause command received");
+        return handle.pause()
+                ? "{\"ok\":true,\"lifecycle\":\"PAUSED\"}"
+                : jsonError("pause failed (lifecycle: " + handle.lifecycle() + ")");
+    }
+
+    /** Resume a paused stack (also happens automatically on the first verified read). */
+    private String handleResume() {
+        log.info("[ipc] Resume command received");
+        return handle.resume()
+                ? "{\"ok\":true,\"lifecycle\":\"RUNNING\"}"
+                : jsonError("resume failed (lifecycle: " + handle.lifecycle() + ")");
+    }
+
     private String handleStatus() {
         long uptimeSec = (System.currentTimeMillis() - startTimeMs) / 1000;
         StatusSnapshot s = handle.status();
-        return "{\"ok\":true,\"state\":\"RUNNING\",\"uptimeSeconds\":" + uptimeSec
+        return "{\"ok\":true,\"state\":\"" + handle.lifecycle() + "\",\"uptimeSeconds\":" + uptimeSec
                 + ",\"discoveredPeers\":" + s.discoveredPeers()
                 + ",\"connectedPeers\":" + s.connectedPeers()
                 + ",\"readyPeers\":" + s.readyPeers()

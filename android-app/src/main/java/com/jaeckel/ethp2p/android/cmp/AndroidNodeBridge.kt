@@ -127,6 +127,7 @@ class AndroidNetworkStatus(private val ctx: Context) : NetworkStatus {
 /** Map the Java `NodeService.Snapshot` record into the shared Kotlin model. */
 private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
     running = running(),
+    lifecycle = lifecycle(),
     network = network(),
     beaconState = beaconState(),
     connectedPeers = connectedPeers(),
@@ -171,6 +172,9 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun setStrictStateFreshness(v: Boolean) = NodeService.setStrictStateFreshness(ctx, v)
     override fun nativeBlsEnabled(): Boolean = NodeService.nativeBlsEnabled(ctx)
     override fun setNativeBlsEnabled(v: Boolean) = NodeService.setNativeBlsEnabled(ctx, v)
+
+    override fun idlePauseMinutes(): Int = NodeService.idlePauseMinutes(ctx)
+    override fun setIdlePauseMinutes(v: Int) = NodeService.setIdlePauseMinutes(ctx, v)
 }
 
 /**

@@ -119,6 +119,14 @@ interface Settings {
     /** true = use bundled native blst (default on Android); false = pure-Java Milagro. */
     fun nativeBlsEnabled(): Boolean
     fun setNativeBlsEnabled(v: Boolean)
+
+    /**
+     * Minutes of no RPC/UI activity before a running stack is paused into idle sleep
+     * (networking off, RPC listening, first request wakes it). 0 disables auto-pause.
+     * Defaults keep hosts without an idle controller (desktop) compiling: auto-pause off.
+     */
+    fun idlePauseMinutes(): Int = 0
+    fun setIdlePauseMinutes(v: Int) {}
 }
 
 /** Device network connectivity, as an observable stream so the UI can react to changes. */
@@ -135,6 +143,8 @@ interface NetworkStatus {
  */
 data class NodeSnapshot(
     val running: Boolean,
+    val lifecycle: String,          // RUNNING / PAUSED / STOPPED — PAUSED = idle sleep
+                                    // (networking off, RPC listening, wakes on request)
     val network: String,
     val beaconState: String,        // STOPPED / SYNCING / CATCHING_UP / SYNCED
     val connectedPeers: Int,

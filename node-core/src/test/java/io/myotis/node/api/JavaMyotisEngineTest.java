@@ -89,6 +89,29 @@ class JavaMyotisEngineTest {
     }
 
     @Test
+    void lifecycleSurfaceOnNeverStartedHandle() {
+        JavaMyotisEngine engine = new JavaMyotisEngine();
+        EngineConfig config = new EngineConfig("gnosis", 0, 0, 0, null, false, 0, true);
+        ChainHandle handle = engine.create(config, testPorts(new MemoryKeyStore()));
+
+        assertEquals(io.myotis.api.LifecycleState.STOPPED, handle.lifecycle());
+        assertFalse(handle.isRunning());
+        assertEquals(0L, handle.lastActivityEpochMillis());
+
+        // pause()/resume() on a never-started stack are safe no-ops: STOPPED is
+        // terminal, so neither transitions and both report failure.
+        assertFalse(handle.pause());
+        assertFalse(handle.resume());
+        assertEquals(io.myotis.api.LifecycleState.STOPPED, handle.lifecycle());
+
+        // status() reflects the lifecycle without a running stack.
+        assertEquals(io.myotis.api.LifecycleState.STOPPED, handle.status().lifecycle());
+        assertFalse(handle.status().running());
+
+        engine.stop("gnosis");
+    }
+
+    @Test
     void createReusesStoredKey() {
         JavaMyotisEngine engine = new JavaMyotisEngine();
         MemoryKeyStore keyStore = new MemoryKeyStore();

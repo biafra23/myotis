@@ -235,6 +235,7 @@ class DesktopNodeController(
         val bs = handle.beaconStatus()
         return NodeSnapshot(
             running = s.running(),
+            lifecycle = s.lifecycle().name,
             network = s.network(),
             beaconState = s.beaconState().name,
             connectedPeers = s.connectedPeers(),
