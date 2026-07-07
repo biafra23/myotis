@@ -180,7 +180,7 @@ impl ElReader {
         let outcome = peer.snap_get_account(&state_root, &address).await?;
         // Anchor the (proof-valid) peer state root to the beacon chain.
         let verdict = peer
-            .verified_state_root(&self.anchor, &state_root, block_number as i64, true)
+            .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
             .await;
         let (fin_num, opt_num, synced) = self.anchor_diagnostics();
 
@@ -259,7 +259,7 @@ impl ElReader {
         let AccountOutcome::Present(leaf) = outcome else {
             // Still anchor the state root so the verdict reflects the beacon tie.
             let verdict = peer
-                .verified_state_root(&self.anchor, &state_root, block_number as i64, true)
+                .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
                 .await;
             result.storage_proof_valid = true; // exclusion proof held
             apply_verdict(&mut result, &verdict);
@@ -283,7 +283,7 @@ impl ElReader {
 
         // Step 3: anchor the account's state root to the beacon chain.
         let verdict = peer
-            .verified_state_root(&self.anchor, &state_root, block_number as i64, true)
+            .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
             .await;
         apply_verdict(&mut result, &verdict);
         Ok(result)
@@ -360,17 +360,23 @@ fn storage_key(slot: u64, holder: Option<[u8; 20]>) -> [u8; 32] {
     }
 }
 
+/// Decode a fixed 64-char hex CONSTANT. Panics on a malformed literal (a
+/// programming error caught immediately in dev/tests — never runs on peer data),
+/// matching the `sync.rs` convention; it does NOT silently zero-pad bad input.
 fn hex32(s: &str) -> [u8; 32] {
     let mut out = [0u8; 32];
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < 32 && (i * 2 + 1) < bytes.len() {
-        let hi = (bytes[i * 2] as char).to_digit(16).unwrap_or(0) as u8;
-        let lo = (bytes[i * 2 + 1] as char).to_digit(16).unwrap_or(0) as u8;
-        out[i] = (hi << 4) | lo;
-        i += 1;
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("valid 64-char hex constant");
     }
     out
+}
+
+/// Convert a peer-reported block number to the `i64` the verify ladder takes.
+/// A realistic block number always fits; an out-of-range value (a hostile peer
+/// claiming >= 2^63) maps to a negative sentinel, which the ladder rejects as
+/// `noPeerBlockNumber` — fail-closed and explicit, no wrapping cast.
+fn to_ladder_block(block_number: u64) -> i64 {
+    i64::try_from(block_number).unwrap_or(-1)
 }
 
 #[cfg(test)]
