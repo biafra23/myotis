@@ -2,24 +2,13 @@
      in the :app `run` task (only when no -Pargs, i.e. the long-running service),
      so it wins over the logback.xml that trueblocks-kotlin bundles on the classpath.
 
-     Writes to a STABLE file (${user.dir}/devp2p.log — the project's canonical daemon
-     log, see CLAUDE.md) and TRUNCATES it on each start (<append>false</append>) so a
-     `tail -F devp2p.log` always follows the current run, not a months-long pile-up.
-     Client commands (./gradlew :app:run -Pargs=...) use logback-client.xml instead,
-     which is console-only and never touches this file. -->
+     Console-only: the daemon logs to STDOUT (follow it in the terminal, or via the
+     launcher's own redirect). The Rust engine's own tracing is drained to the
+     `rust` logger on a short poll (Main.startRustLogPump), so `-Pengine=rust`
+     activity shows up here too — set RUST_LOG for more verbosity. Client commands
+     (./gradlew :app:run -Pargs=...) use logback-client.xml, also console-only. -->
 <configuration>
     <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
-        <encoder>
-            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
-        </encoder>
-    </appender>
-
-    <appender name="FILE" class="ch.qos.logback.core.FileAppender">
-        <!-- Path set by the :app run task (myotis.logfile = <repo-root>/devp2p.log),
-             so it's the same file no matter the JVM working dir; falls back to the
-             working dir for a bare `java -jar` launch. -->
-        <file>${myotis.logfile:-${user.dir}/devp2p.log}</file>
-        <append>false</append>
         <encoder>
             <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
         </encoder>
@@ -35,6 +24,5 @@
 
     <root level="INFO">
         <appender-ref ref="CONSOLE"/>
-        <appender-ref ref="FILE"/>
     </root>
 </configuration>
