@@ -198,7 +198,7 @@ impl ElReader {
             peer_proof_valid: true,
             beacon_chain_verified: verdict.beacon_chain_verified,
             bls_verified: verdict.bls_verified,
-            matched_beacon_slot: verdict.matched_slot,
+            matched_beacon_slot: matched_slot(&verdict),
             verify_method: verdict.verify_method,
             fail_reason: verdict.fail_reason,
             beacon_synced: synced,
@@ -272,12 +272,13 @@ impl ElReader {
             .snap_get_storage(&state_root, &address, &leaf, &storage_key)
             .await?;
         result.storage_proof_valid = true;
+        // `found` means the slot holds a non-zero value (Java's convention): a
+        // zero slot is pruned from the trie and indistinguishable from unset,
+        // whether the account's storage trie is empty or the slot has a verified
+        // exclusion proof. Both report found=false, value=zero (empty bytes).
         if !value.is_empty() {
             result.found = true;
             result.value = value;
-        } else if leaf.storage_root == EMPTY_TRIE_ROOT {
-            // Storage-less account: the slot is provably zero (found, value 0).
-            result.found = true;
         }
 
         // Step 3: anchor the account's state root to the beacon chain.
@@ -317,9 +318,19 @@ async fn fresh_head(peer: &ManagedPeer) -> Result<([u8; 32], u64), String> {
 fn apply_verdict(result: &mut VerifiedStorage, verdict: &crate::el::verify::Verdict) {
     result.beacon_chain_verified = verdict.beacon_chain_verified;
     result.bls_verified = verdict.bls_verified;
-    result.matched_beacon_slot = verdict.matched_slot;
+    result.matched_beacon_slot = matched_slot(verdict);
     result.verify_method = verdict.verify_method;
     result.fail_reason = verdict.fail_reason;
+}
+
+/// The matched beacon slot for a result, using the Java `-1`-when-none
+/// convention (the `Verdict` default is a bare `0`, which would read as slot 0).
+fn matched_slot(verdict: &crate::el::verify::Verdict) -> i64 {
+    if verdict.beacon_chain_verified {
+        verdict.matched_slot
+    } else {
+        -1
+    }
 }
 
 /// The 32-byte storage key: plain `uint256(slot)`, or the ERC-20 mapping key
