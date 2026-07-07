@@ -130,7 +130,13 @@ impl ElPeerCache {
             self.parse_legacy_line(line);
             return;
         }
-        let ip = parts[0];
+        // Canonicalize the IP so the key matches the one `addr_key` computes on
+        // a later mutate — otherwise a non-canonical literal in the file (e.g.
+        // uppercase/expanded IPv6) would make quality updates miss and `add`
+        // duplicate the entry. An unparseable IP drops the line.
+        let Ok(ip) = parts[0].parse::<std::net::IpAddr>() else {
+            return;
+        };
         let Ok(port) = parts[1].parse::<u16>() else {
             return;
         };
@@ -148,7 +154,7 @@ impl ElPeerCache {
             }
         }
         self.entries.insert(
-            key(ip, port),
+            key(&ip.to_string(), port),
             Entry { pubkey_hex: pubkey_hex.to_string(), snap, quality },
         );
     }
@@ -159,7 +165,9 @@ impl ElPeerCache {
         let Some(first) = line.find(':') else { return };
         let Some(second_rel) = line[first + 1..].find(':') else { return };
         let second = first + 1 + second_rel;
-        let ip = &line[..first];
+        let Ok(ip) = line[..first].parse::<std::net::IpAddr>() else {
+            return;
+        };
         let Ok(port) = line[first + 1..second].parse::<u16>() else {
             return;
         };
@@ -174,7 +182,7 @@ impl ElPeerCache {
             return;
         }
         self.entries.insert(
-            key(ip, port),
+            key(&ip.to_string(), port),
             Entry { pubkey_hex: pubkey_hex.to_string(), snap, quality: SnapQuality::Unknown },
         );
     }
@@ -461,6 +469,27 @@ mod tests {
         c.record_snap_served("1.2.3.4:30303".parse().unwrap());
         c.flush();
         assert!(c.is_empty());
+    }
+
+    #[test]
+    fn non_canonical_ip_is_matched_after_canonicalization() {
+        // A non-canonical IPv6 literal in the file (uppercase + expanded) must
+        // load under the SAME key a later mutate computes, so quality updates
+        // land and `add` doesn't duplicate.
+        let hex = format!("0x{}", "ab".repeat(64));
+        let text = format!("2001:0DB8:0000:0000:0000:0000:0000:0001\t30303\t{hex}\t1\n");
+        let path = std::env::temp_dir().join("myotis-elcache-canon.cache");
+        fs::write(&path, text).unwrap();
+        let mut c = ElPeerCache::load(path.clone());
+        assert_eq!(c.len(), 1);
+        // The canonical form of that address.
+        let canonical: SocketAddr = "[2001:db8::1]:30303".parse().unwrap();
+        c.record_snap_served(canonical);
+        assert_eq!(c.peers()[0].quality, SnapQuality::Confirmed);
+        // Re-adding the canonical address must NOT create a duplicate.
+        c.add(canonical, &pk(0xab), true);
+        assert_eq!(c.len(), 1);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
