@@ -109,6 +109,7 @@ public final class NodeService extends Service {
     private static final String K_STRICT_FRESHNESS = "strictStateFreshness";
     private static final String K_NATIVE_BLS = "nativeBls";
     private static final String K_IDLE_PAUSE_MIN = "idlePauseMinutes";
+    private static final String K_STAY_AWAKE_CHARGING = "stayAwakeWhileCharging";
     public static final int DEFAULT_IDLE_PAUSE_MIN = 5;
     public static final int DEFAULT_RPC_PORT = 8545;
     // Gnosis defaults to a distinct port so both networks can be added to MetaMask
@@ -265,6 +266,15 @@ public final class NodeService extends Service {
     public static void setIdlePauseMinutes(android.content.Context c, int v) {
         prefs(c).edit().putInt(K_IDLE_PAUSE_MIN, clampInt(v, 0, 240, DEFAULT_IDLE_PAUSE_MIN)).apply();
     }
+    /** When true (default), the idle controller skips auto-pause while the device is charging
+     *  — plugged in, battery isn't a concern, so the node stays awake and synced. The emergency
+     *  low-memory pause ({@link #onTrimMemory}) ignores this. Read live by the idle tick. */
+    public static boolean stayAwakeWhileCharging(android.content.Context c) {
+        return prefs(c).getBoolean(K_STAY_AWAKE_CHARGING, true);
+    }
+    public static void setStayAwakeWhileCharging(android.content.Context c, boolean v) {
+        prefs(c).edit().putBoolean(K_STAY_AWAKE_CHARGING, v).apply();
+    }
     /** Whether RPC state reads use the strict 2-min head-staleness bound. Default true
      *  (strict). Relaxing it (toggle OFF strict / ON "relaxed") lets eth_call / balance /
      *  estimateGas serve an older root — but that *backfired* into 120-s confirm-screen
@@ -392,6 +402,7 @@ public final class NodeService extends Service {
         clCaches.remove(n);
         stackStartMs.remove(n);
         lastResumeMs.remove(n);
+        reachedSynced.remove(n);   // a re-enable cold-starts the SYNCED-once gate again
     }
 
     /** True if any network is still enabled (incl. the seeded default). */
@@ -477,6 +488,21 @@ public final class NodeService extends Service {
      *  STATIC so the {@link #dailyCatchUp} worker (no service binder) can hold the grace
      *  stamp while it catches up, keeping the instance idle ticker from pausing it mid-pass. */
     private static final Map<String, Long> lastResumeMs = new ConcurrentHashMap<>();
+    /** Per-network flag: the stack has reached SYNCED (with a warm verified head) at least once
+     *  since it (re)started. A fresh start must run through to SYNCED before the idle controller
+     *  is allowed to pause it — pausing mid-initial-sync just makes the next wake redo the work.
+     *  STATIC (like the stamps above): survives a service instance. Set true when first observed
+     *  SYNCED and cleared when the network is torn down (so a disable→re-enable cold-starts the
+     *  gate again); a stack that briefly falls out of sync after its first SYNCED still pauses on
+     *  the normal idle rules. */
+    private static final java.util.Set<String> reachedSynced = ConcurrentHashMap.newKeySet();
+    /** Backstop for the SYNCED-once gate: if a fresh stack has been trying to reach SYNCED for
+     *  this long (measured from its boot stamp) without success — no peers, a wedged sync, a
+     *  perpetually-throwing status() — stop keeping it awake and let the idle controller pause it.
+     *  Otherwise "run until synced" could drain the battery indefinitely on a node that never
+     *  syncs, the exact thing the feature fights. Generous so a slow-but-progressing initial sync
+     *  on a poor network still completes first. */
+    private static final long SYNC_RUN_CEILING_MS = 30 * 60_000L;
     private volatile java.util.concurrent.ScheduledExecutorService idleTicker;
     /** What the notification currently shows, to notify() only on transitions. */
     private volatile Boolean notifiedSleeping;
@@ -542,9 +568,30 @@ public final class NodeService extends Service {
      * is older than {@code idleMs}, then reconcile the notification. Guarded:
      * an uncaught throw would silently stop all future scheduled runs.
      */
-    private void idleTick(long idleMs) {
+    private void idleTick(long idleMs) { idleTick(idleMs, true); }
+
+    /**
+     * @param routine {@code true} for the scheduled idle ticker — applies the battery-saving
+     *   gates below. {@code false} for the emergency {@link #onTrimMemory} pause, which must go
+     *   through regardless (a pre-sync node under memory pressure is better paused than
+     *   OOM-killed and cold-started).
+     *
+     * <p>Routine gates, all skipped when {@code routine} is false:
+     * <ul>
+     *   <li><b>SYNCED-once</b> — never pause a stack that hasn't yet reached SYNCED (+ warm head)
+     *       this run, so a fresh start finishes initial sync before its first sleep. Exception:
+     *       if no network is available it can't sync anyway, so allow the pause rather than keep
+     *       the radio scanning.</li>
+     *   <li><b>Charging</b> — when {@link #stayAwakeWhileCharging} is on (default) and the device
+     *       is plugged in, skip auto-pause entirely: battery isn't a concern, stay synced.</li>
+     * </ul>
+     */
+    private void idleTick(long idleMs, boolean routine) {
         try {
             long now = System.currentTimeMillis();
+            // Process-global conditions, evaluated once per pass rather than per stack.
+            boolean skipWhileCharging = routine && stayAwakeWhileCharging(this) && isCharging();
+            boolean netUp = networkAvailable();
             for (Map.Entry<String, ChainHandle> e : handles.entrySet()) {
                 String n = e.getKey();
                 ChainHandle h = e.getValue();
@@ -557,6 +604,24 @@ public final class NodeService extends Service {
                         Math.max(lastResumeMs.getOrDefault(n, 0L),
                                  stackStartMs.getOrDefault(n, 0L)));
                 if (now - lastActivity <= idleMs) continue;
+                if (skipWhileCharging) continue; // plugged in: keep awake and synced
+                // SYNCED-once gate: don't pause a stack still doing its initial sync — unless
+                // there's no network to sync over, in which case sleeping saves battery.
+                if (routine && !reachedSynced.contains(n)) {
+                    if (isSyncedWarm(h)) {
+                        reachedSynced.add(n); // first SYNCED reached; fall through to the pause
+                        LogBuffer.i(TAG, "[" + n + "] reached SYNCED; idle-pause now eligible");
+                    } else if (netUp
+                            && now - stackStartMs.getOrDefault(n, 0L) < SYNC_RUN_CEILING_MS) {
+                        continue; // still catching up with a network available — keep networking on
+                    } else if (netUp) {
+                        // Online but still not synced after the ceiling — stop draining battery
+                        // on a stack that can't sync; let it pause and wake/retry later.
+                        LogBuffer.i(TAG, "[" + n + "] not SYNCED after "
+                                + (SYNC_RUN_CEILING_MS / 60_000L) + "m; allowing idle pause");
+                    }
+                    // else: not synced and offline → allow the pause below
+                }
                 long idleForSec = (now - lastActivity) / 1000;
                 new Thread(() -> {
                     synchronized (bootLock(n)) {
@@ -577,6 +642,59 @@ public final class NodeService extends Service {
             updateNotification();
         } catch (Throwable t) {
             LogBuffer.w(TAG, "idle tick error: " + t);
+        }
+    }
+
+    /** The stack has a fresh verified head from a SYNCED beacon light client — the same
+     *  "synced + warm head" bar the daily catch-up waits for before pausing again. */
+    private static boolean isSyncedWarm(ChainHandle h) {
+        try {
+            StatusSnapshot s = h.status();
+            return s.beaconState() == BeaconState.SYNCED
+                    && s.verifiedHeadAgeMs() != Long.MAX_VALUE;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** True when a network with Internet capability is active. Fail-open (true) if the state
+     *  can't be read, so a transient query error doesn't wrongly let the idle tick pause a
+     *  still-syncing stack. */
+    private boolean networkAvailable() {
+        try {
+            ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+            if (cm == null) return true;
+            Network net = cm.getActiveNetwork();
+            if (net == null) return false;
+            android.net.NetworkCapabilities caps = cm.getNetworkCapabilities(net);
+            return caps != null
+                    && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET);
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    /** True when the device is plugged in (AC / USB / wireless) or actively charging — i.e.
+     *  battery isn't a concern. Plug-state is read first (via the sticky ACTION_BATTERY_CHANGED
+     *  intent) because {@code BatteryManager.isCharging()} reports charge state, which is false
+     *  when plugged in but momentarily discharging under load. Fail-safe to false so a read error
+     *  never blocks a pause. */
+    private boolean isCharging() {
+        try {
+            android.content.Intent i = registerReceiver(null,
+                    new android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED));
+            if (i != null
+                    && i.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) != 0) {
+                return true; // plugged into AC / USB / wireless
+            }
+        } catch (Throwable ignored) {
+            // fall through to the charge-state check
+        }
+        try {
+            android.os.BatteryManager bm = getSystemService(android.os.BatteryManager.class);
+            return bm != null && bm.isCharging();
+        } catch (Throwable t) {
+            return false;
         }
     }
 
@@ -1226,6 +1344,9 @@ public final class NodeService extends Service {
         cachedClCounts.clear();
         elCaches.clear();
         clCaches.clear();
+        // Safe to clear (unlike startTimeMs below): a Stop->Start just re-runs the SYNCED-once
+        // gate until the restarted stack re-observes SYNCED — fast off the warm store, no freeze.
+        reachedSynced.clear();
         // NB: do NOT clear startTimeMs here. doShutdown() runs on a worker thread and its
         // teardown takes seconds; a quick Stop -> Start has onStartCommand() flip RUNNING back
         // to true and stamp a fresh startTimeMs while we're still mid-teardown (buildAndStart's
@@ -1451,7 +1572,9 @@ public final class NodeService extends Service {
         // A pause frees the big consumers (Netty buffers, evm pools, libp2p) while
         // keeping the warm beacon store — far better than dying and cold-starting.
         if (level >= TRIM_MEMORY_RUNNING_CRITICAL && RUNNING.get()) {
-            idleTick(60_000L);
+            // Emergency pass: bypass the SYNCED-once / charging gates. Freeing the big consumers
+            // beats getting OOM-killed and cold-starting, even mid-initial-sync or while charging.
+            idleTick(60_000L, false);
         }
     }
 

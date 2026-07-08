@@ -129,6 +129,14 @@ interface Settings {
     fun setIdlePauseMinutes(v: Int) {}
 
     /**
+     * When true (default), the idle controller does NOT auto-pause while the device is
+     * charging — plugged in, battery isn't a concern, so the node stays awake and synced.
+     * Emergency memory-pressure pauses ignore this. Default true keeps desktop compiling.
+     */
+    fun stayAwakeWhileCharging(): Boolean = true
+    fun setStayAwakeWhileCharging(v: Boolean) {}
+
+    /**
      * Whether this host actually has an idle-sleep controller (Android). The idle-sleep
      * Settings row is shown only when true — desktop has no controller, so surfacing a
      * battery-saving toggle there would imply a feature that can't take effect. Default false.
