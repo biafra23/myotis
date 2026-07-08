@@ -135,6 +135,28 @@ pub struct VerifiedStorage {
     pub optimistic_block_number: u64,
 }
 
+/// A verified contract-code query result (for `eth_getCode`). The bytecode is
+/// content-addressed: `snap_get_bytecode` checks `keccak256(code) == code_hash`,
+/// and `code_hash` itself comes from the beacon-anchored, proof-verified account,
+/// so `verify_method`/`fail_reason` are inherited from that account query.
+#[derive(Debug, Clone)]
+pub struct VerifiedCode {
+    pub address: [u8; 20],
+    pub exists: bool,
+    /// The contract bytecode (empty for an EOA / empty-code account / unverified).
+    pub code: Vec<u8>,
+    pub code_hash: [u8; 32],
+    pub block_number: u64,
+    pub beacon_chain_verified: bool,
+    pub bls_verified: bool,
+    pub matched_beacon_slot: i64,
+    pub verify_method: Option<&'static str>,
+    pub fail_reason: Option<&'static str>,
+    pub beacon_synced: bool,
+    pub finalized_block_number: u64,
+    pub optimistic_block_number: u64,
+}
+
 /// A running EL reader: owns discv4 + the peer pool, borrows the beacon anchor.
 pub struct ElReader {
     discovery: Discv4Service,
@@ -312,6 +334,32 @@ impl ElReader {
         slot: u64,
         holder: Option<[u8; 20]>,
     ) -> Result<VerifiedStorage, String> {
+        self.get_storage_keyed(address, slot, holder, storage_key(slot, holder)).await
+    }
+
+    /// Fetch + verify a RAW 32-byte storage position (`eth_getStorageAt`): the
+    /// storage key IS the position — no `uint256(slot)` padding, no ERC-20 mapping.
+    /// `slot`/`holder` are labels only (0 / none): a full 32-byte position has no
+    /// meaningful u64 index.
+    pub async fn get_storage_at(
+        &self,
+        address: [u8; 20],
+        position: [u8; 32],
+    ) -> Result<VerifiedStorage, String> {
+        self.get_storage_keyed(address, 0, None, position).await
+    }
+
+    /// The cross-peer retry loop shared by `get_storage` / `get_storage_at`, keyed
+    /// on the precomputed 32-byte storage key. Verification-aware: returns on the
+    /// first peer that produces a verdict (or a global failure); a per-peer failure
+    /// (stale head / bad proof) moves to the next peer, keeping the best as fallback.
+    async fn get_storage_keyed(
+        &self,
+        address: [u8; 20],
+        slot: u64,
+        holder: Option<[u8; 20]>,
+        storage_key: [u8; 32],
+    ) -> Result<VerifiedStorage, String> {
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
@@ -320,7 +368,7 @@ impl ElReader {
         let mut fallback: Option<VerifiedStorage> = None;
         let mut last_err = String::new();
         for peer in &peers {
-            match self.get_storage_from(peer, address, slot, holder).await {
+            match self.get_storage_from(peer, address, slot, holder, storage_key).await {
                 Ok(result) => {
                     if result.verify_method.is_some() || is_global_fail(result.fail_reason) {
                         self.pool.record_snap_served(peer.addr()).await;
@@ -348,10 +396,10 @@ impl ElReader {
         address: [u8; 20],
         slot: u64,
         holder: Option<[u8; 20]>,
+        storage_key: [u8; 32],
     ) -> Result<VerifiedStorage, String> {
         let (state_root, block_number) = fresh_head(peer).await?;
 
-        let storage_key = storage_key(slot, holder);
         let slot_key_hash = keccak256(&storage_key);
 
         // Step 1: the proof-verified account gives the trusted storage root.
@@ -416,6 +464,68 @@ impl ElReader {
             .await;
         apply_verdict(&mut result, &verdict);
         Ok(result)
+    }
+
+    /// Fetch + verify a contract's bytecode (`eth_getCode`). The account query is
+    /// the trust anchor: it yields a beacon-anchored, proof-verified `code_hash`
+    /// and verdict. The bytecode itself is then content-addressed — any snap peer's
+    /// bytes are trusted iff `keccak256(code) == code_hash` — so the verdict is
+    /// inherited from the account. A verified EOA / empty-code / absent account has
+    /// provably empty code (no round trip). An unverified account returns empty code
+    /// with `verify_method: None` (the caller surfaces that as "can't answer").
+    pub async fn get_code(&self, address: [u8; 20]) -> Result<VerifiedCode, String> {
+        let account = self.get_account(address).await?;
+        let mut result = VerifiedCode {
+            address,
+            exists: account.exists,
+            code: Vec::new(),
+            code_hash: account.code_hash,
+            block_number: account.block_number,
+            beacon_chain_verified: account.beacon_chain_verified,
+            bls_verified: account.bls_verified,
+            matched_beacon_slot: account.matched_beacon_slot,
+            verify_method: account.verify_method,
+            fail_reason: account.fail_reason,
+            beacon_synced: account.beacon_synced,
+            finalized_block_number: account.finalized_block_number,
+            optimistic_block_number: account.optimistic_block_number,
+        };
+        // No bytecode to fetch when the answer isn't verified, the account is
+        // absent, or the code hash is empty (an EOA / empty-code contract): a
+        // verified account with EMPTY_CODE_HASH has provably empty code.
+        if account.verify_method.is_none()
+            || !account.exists
+            || account.code_hash == EMPTY_CODE_HASH
+        {
+            return Ok(result);
+        }
+        result.code = self.fetch_bytecode(&account.code_hash).await?;
+        Ok(result)
+    }
+
+    /// Fetch bytecode for a verified `code_hash`, trying snap peers until one
+    /// serves bytes that hash to it (`snap_get_bytecode` verifies the hash, so no
+    /// per-peer verdict is needed — the code is content-addressed).
+    async fn fetch_bytecode(&self, code_hash: &[u8; 32]) -> Result<Vec<u8>, String> {
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err("no snap peer available".to_string());
+        }
+        let total = peers.len();
+        let mut last_err = String::new();
+        for peer in &peers {
+            match peer.snap_get_bytecode(code_hash).await {
+                Ok(code) => {
+                    self.pool.record_snap_served(peer.addr()).await;
+                    return Ok(code);
+                }
+                Err(e) => {
+                    self.pool.record_snap_failure(peer.addr()).await;
+                    last_err = e;
+                }
+            }
+        }
+        Err(format!("all {total} snap peer(s) failed to serve verifiable bytecode: {last_err}"))
     }
 
     /// `(finalized_block_number, optimistic_block_number, is_synced)` snapshot.

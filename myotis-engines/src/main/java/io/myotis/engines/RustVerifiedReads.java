@@ -109,11 +109,36 @@ final class RustVerifiedReads implements VerifiedReads {
         return r.exists() ? r.nonce() : 0L;
     }
 
+    @Override
+    public byte[] getCode(byte[] address, String block) {
+        if (!isHeadSelector(block)) return null;
+        if (address == null || address.length != 20) return null;
+        try {
+            return handle.codeVerified(toHex(address));
+        } catch (RuntimeException e) {
+            log.debug("[engines] verified code read unavailable: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    @Override
+    public byte[] getStorageAt(byte[] address, byte[] slot32, String block) {
+        if (!isHeadSelector(block)) return null;
+        if (address == null || address.length != 20) return null;
+        // The router pads the position to a full 32-byte word (asWord32) before the
+        // call; reject anything else defensively.
+        if (slot32 == null || slot32.length != 32) return null;
+        try {
+            return handle.storageAtVerified(toHex(address), toHex(slot32));
+        } catch (RuntimeException e) {
+            log.debug("[engines] verified storage read unavailable: {}", e.getMessage());
+            return null;
+        }
+    }
+
     // ---- not yet served verified on the Rust engine (later EL-B / EL-C slices) ----
 
     @Override public byte[] call(byte[] from, byte[] to, byte[] data, String valueWei, String block) { return null; }
-    @Override public byte[] getCode(byte[] address, String block) { return null; }
-    @Override public byte[] getStorageAt(byte[] address, byte[] slot32, String block) { return null; }
     @Override public byte[] sendRawTransaction(byte[] rawTx) { return null; }
     @Override public String getTransactionReceipt(byte[] txHash) { return null; }
     @Override public String getTransactionByHash(byte[] txHash) { return null; }
@@ -156,11 +181,12 @@ final class RustVerifiedReads implements VerifiedReads {
         return b.equalsIgnoreCase("latest") || b.equalsIgnoreCase("pending");
     }
 
-    /** 20-byte address → lowercase 0x-hex (the form {@code requestAccount} expects). */
-    private static String toHex(byte[] address) {
-        if (address == null) throw new EngineException("address is required");
+    /** Fixed-width bytes → lowercase 0x-hex (a 20-byte address or a 32-byte
+     *  storage position — the forms the natives expect). */
+    private static String toHex(byte[] bytes) {
+        if (bytes == null) throw new EngineException("byte input is required");
         // HexFormat is desugared for Android here (desugar_jdk_libs 2.1.x) — the same
         // API node-core (ChainStack) and myotis-ens already rely on in main code.
-        return "0x" + java.util.HexFormat.of().formatHex(address);
+        return "0x" + java.util.HexFormat.of().formatHex(bytes);
     }
 }

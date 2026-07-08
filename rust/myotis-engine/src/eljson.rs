@@ -8,7 +8,7 @@
 //! serializes `{"error": "..."}`, which the Java side raises as an
 //! `EngineException`.
 
-use myotis_net::el::reader::{VerifiedAccount, VerifiedStorage};
+use myotis_net::el::reader::{VerifiedAccount, VerifiedCode, VerifiedStorage};
 
 /// The header-chain gap cap the ladder enforces (mirrors the Java
 /// `VerifiedAccountQuery.MAX_HEADER_CHAIN_GAP`), echoed in the storage result's
@@ -111,6 +111,34 @@ pub fn storage_json(
     serde_json::Value::Object(obj).to_string()
 }
 
+/// Serialize a verified contract-code result (`eth_getCode`). `codeHex` is the
+/// full bytecode (0x-hex, `0x` for empty); the Java side reads it plus
+/// `verifyMethod` — data only when a verdict is present.
+pub fn code_json(
+    address_echo: &str,
+    c: &VerifiedCode,
+    finalized_period: u64,
+    wall_clock_period: u64,
+) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert("address".into(), address_echo.into());
+    obj.insert("exists".into(), c.exists.into());
+    obj.insert("codeHex".into(), hex0x_var(&c.code).into());
+    obj.insert("codeHashHex".into(), hex0x(&c.code_hash).into());
+    obj.insert("blockNumber".into(), json_u64(c.block_number));
+    obj.insert("beaconChainVerified".into(), c.beacon_chain_verified.into());
+    obj.insert("blsVerified".into(), c.bls_verified.into());
+    obj.insert("matchedBeaconSlot".into(), json_i64(c.matched_beacon_slot));
+    obj.insert("verifyMethod".into(), opt_str(c.verify_method));
+    obj.insert("failReason".into(), opt_str(c.fail_reason));
+    obj.insert("beaconSynced".into(), c.beacon_synced.into());
+    obj.insert("finalizedPeriod".into(), json_u64(finalized_period));
+    obj.insert("wallClockPeriod".into(), json_u64(wall_clock_period));
+    obj.insert("finalizedBlockNumber".into(), json_u64(c.finalized_block_number));
+    obj.insert("optimisticBlockNumber".into(), json_u64(c.optimistic_block_number));
+    serde_json::Value::Object(obj).to_string()
+}
+
 fn opt_str(v: Option<&'static str>) -> serde_json::Value {
     v.map(Into::into).unwrap_or(serde_json::Value::Null)
 }
@@ -167,7 +195,7 @@ fn be_to_decimal(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myotis_net::el::reader::{VerifiedAccount, VerifiedStorage};
+    use myotis_net::el::reader::{VerifiedAccount, VerifiedCode, VerifiedStorage};
 
     fn sample_account() -> VerifiedAccount {
         VerifiedAccount {
@@ -296,6 +324,57 @@ mod tests {
     fn error_json_shape() {
         let v: serde_json::Value = serde_json::from_str(&error_json("no snap peer")).unwrap();
         assert_eq!(v["error"], "no snap peer");
+    }
+
+    fn sample_code() -> VerifiedCode {
+        VerifiedCode {
+            address: [0x11; 20],
+            exists: true,
+            code: vec![0x60, 0x80, 0x60, 0x40], // a snippet of contract bytecode
+            code_hash: [0x44; 32],
+            block_number: 21_000_000,
+            beacon_chain_verified: true,
+            bls_verified: true,
+            matched_beacon_slot: 7_000_000,
+            verify_method: Some("headerChain"),
+            fail_reason: None,
+            beacon_synced: true,
+            finalized_block_number: 20_999_000,
+            optimistic_block_number: 21_000_010,
+        }
+    }
+
+    #[test]
+    fn code_json_shape_and_values() {
+        let json = code_json("0xabc", &sample_code(), 1777, 1795);
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(v["address"], "0xabc");
+        assert_eq!(v["exists"], true);
+        assert_eq!(v["codeHex"], "0x60806040");
+        assert_eq!(v["codeHashHex"], hex0x(&[0x44; 32]));
+        assert_eq!(v["blockNumber"], 21_000_000);
+        assert_eq!(v["beaconChainVerified"], true);
+        assert_eq!(v["blsVerified"], true);
+        assert_eq!(v["matchedBeaconSlot"], 7_000_000);
+        assert_eq!(v["verifyMethod"], "headerChain");
+        assert_eq!(v["failReason"], serde_json::Value::Null);
+        assert_eq!(v["beaconSynced"], true);
+        assert_eq!(v["finalizedPeriod"], 1777);
+        assert_eq!(v["wallClockPeriod"], 1795);
+        assert_eq!(v["finalizedBlockNumber"], 20_999_000);
+        assert_eq!(v["optimisticBlockNumber"], 21_000_010);
+    }
+
+    #[test]
+    fn empty_code_serializes_as_0x() {
+        // An EOA / empty-code account: verified, but no bytecode → "0x".
+        let mut c = sample_code();
+        c.code = Vec::new();
+        c.exists = false;
+        let v: serde_json::Value = serde_json::from_str(&code_json("0x0", &c, 1, 1)).unwrap();
+        assert_eq!(v["codeHex"], "0x");
+        assert_eq!(v["exists"], false);
+        assert_eq!(v["verifyMethod"], "headerChain");
     }
 
     #[test]

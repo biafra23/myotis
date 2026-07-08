@@ -374,6 +374,52 @@ pub fn get_storage_proof_json(
     }
 }
 
+/// `nativeGetCodeJson`: run a verified contract-code query (`eth_getCode`) for a
+/// running handle, returning the code result JSON, or `{"error": "..."}` for a
+/// transport / not-running / bad-input failure.
+pub fn get_code_json(handle: i64, address_hex: &str) -> String {
+    let Some(address) = parse_address(address_hex) else {
+        return eljson::error_json("invalid address (expected 20-byte hex)");
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, finalized_period, wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    match engine.rt.block_on(async { reader.get_code(address).await }) {
+        Ok(code) => eljson::code_json(address_hex, &code, finalized_period, wall_period),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// `nativeGetStorageAtJson`: run a verified RAW-32-byte-position storage query
+/// (`eth_getStorageAt`) for a running handle. `position_hex` is the 32-byte
+/// storage position (0x-hex); the trie key is that position itself — no ERC-20
+/// mapping, unlike `get_storage_proof_json`'s `(slot, holder)`.
+pub fn get_storage_at_json(handle: i64, address_hex: &str, position_hex: &str) -> String {
+    let Some(address) = parse_address(address_hex) else {
+        return eljson::error_json("invalid address (expected 20-byte hex)");
+    };
+    let Some(position) = parse_word32(position_hex) else {
+        return eljson::error_json("invalid storage position (expected 32-byte hex)");
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, finalized_slot, optimistic_slot) = match snapshot_reader_slots(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    match engine.rt.block_on(async { reader.get_storage_at(address, position).await }) {
+        Ok(storage) => {
+            eljson::storage_json(address_hex, None, &storage, finalized_slot, optimistic_slot)
+        }
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
 /// Snapshot `(reader, finalizedPeriod, wallClockPeriod)` for a running handle,
 /// or an error message. Holds the map lock only for the clone.
 fn snapshot_reader(
@@ -420,6 +466,21 @@ fn parse_address(hex: &str) -> Option<[u8; 20]> {
         return None;
     }
     let mut out = [0u8; 20];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Parse a 32-byte storage position (`eth_getStorageAt`) from 0x-hex. The Java
+/// side normalizes to a full 64-hex-digit word before the call, so require
+/// exactly that — same strictness as `parse_address`.
+fn parse_word32(hex: &str) -> Option<[u8; 32]> {
+    let hex = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
     for (i, byte) in out.iter_mut().enumerate() {
         *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
     }
