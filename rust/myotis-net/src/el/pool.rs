@@ -229,6 +229,17 @@ impl PeerPool {
         self.inner.blacklist.lock().await.len()
     }
 
+    /// Count of ACTIVE (non-expired) backoffs, pruning expired entries as a
+    /// side effect — matching the `StatusSnapshot.backedOffPeers` "active,
+    /// pruned on read" semantics (and the Java `activeBackoffCount`). Pruning
+    /// here also keeps the map from lingering with dead entries.
+    pub async fn backoff_count(&self) -> usize {
+        let now = Instant::now();
+        let mut backoff = self.inner.backoff.lock().await;
+        backoff.retain(|_, expiry| *expiry > now);
+        backoff.len()
+    }
+
     /// A snap fetch against `addr` returned usable proof material — mark the
     /// cached peer CONFIRMED (dial-first next run). Persists only on a quality
     /// transition (dirty-gated flush), so repeated serves don't re-write.

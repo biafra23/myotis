@@ -231,23 +231,59 @@ pub fn status_json(handle: i64) -> String {
     let Some(engine) = engine() else {
         return "{}".to_string();
     };
-    let map = match engine.handles.lock() {
-        Ok(m) => m,
-        Err(_) => return "{}".to_string(),
-    };
-    match map.get(&handle) {
+    // Snapshot what we need under the map lock — the EL count reads are async
+    // and must not run while the lock is held.
+    enum Snap {
         // targetPeriod is derived from the config AT READ TIME (not carried in
         // the sync snapshot): fresh across bootstrap stalls, and real (not 0)
-        // for a created-but-not-started handle — matching the Java engine's
-        // unconditional wall-clock computation behind the same API.
-        Some(ChainEntry::Created(config)) => {
-            status_object(false, None, config.wall_clock_period())
-        }
-        Some(ChainEntry::Running(config, sync, _reader)) => {
-            status_object(true, Some(sync.status()), config.wall_clock_period())
-        }
-        None => "{}".to_string(),
+        // for a created-but-not-started handle — matching the Java engine.
+        Created(u64),
+        Running(SyncStatus, u64, Option<Arc<ElReader>>),
+        Unknown,
     }
+    let snap = {
+        let map = match engine.handles.lock() {
+            Ok(m) => m,
+            Err(_) => return "{}".to_string(),
+        };
+        match map.get(&handle) {
+            Some(ChainEntry::Created(config)) => Snap::Created(config.wall_clock_period()),
+            Some(ChainEntry::Running(config, sync, reader)) => {
+                Snap::Running(sync.status(), config.wall_clock_period(), reader.clone())
+            }
+            None => Snap::Unknown,
+        }
+    };
+    match snap {
+        Snap::Created(wall) => status_object(false, None, wall, ElCounts::default()),
+        Snap::Running(status, wall, reader) => {
+            let el = match reader {
+                Some(r) => engine.rt.block_on(async {
+                    ElCounts {
+                        snap_peers: r.snap_peer_count().await,
+                        discovered: r.discovered_count(),
+                        attempted: r.attempted_count().await,
+                        backed_off: r.backoff_count().await,
+                        blacklisted: r.blacklist_count().await,
+                    }
+                }),
+                None => ElCounts::default(),
+            };
+            status_object(true, Some(status), wall, el)
+        }
+        Snap::Unknown => "{}".to_string(),
+    }
+}
+
+/// EL pool/discovery counts for the status snapshot (all zero for a
+/// not-started handle or when the EL reader failed to start).
+#[derive(Default)]
+struct ElCounts {
+    snap_peers: usize,
+    discovered: usize,
+    attempted: usize,
+    backed_off: usize,
+    blacklisted: usize,
 }
 
 /// `nativeStop`: remove + shut down a handle's sync loop. No-op for unknown id.
@@ -412,7 +448,12 @@ fn hex32(bytes: &[u8; 32]) -> String {
 /// parses (camelCase). `running=false` / `status=None` → the not-started shape.
 /// Built by hand (not serde) so the key set + ordering is the golden contract
 /// both `status_json_shape` tests pin.
-fn status_object(running: bool, status: Option<SyncStatus>, target_period: u64) -> String {
+fn status_object(
+    running: bool,
+    status: Option<SyncStatus>,
+    target_period: u64,
+    el: ElCounts,
+) -> String {
     let s = status.unwrap_or_else(SyncStatus::initial);
     // A not-started handle reports STARTING; a running one maps its live state.
     let beacon = if running {
@@ -438,6 +479,14 @@ fn status_object(running: bool, status: Option<SyncStatus>, target_period: u64) 
     obj.insert("discv5TableSize".into(), s.discv5_table_size.into());
     obj.insert("syncStartPeriod".into(), s.sync_start_period.into());
     obj.insert("finalizedRootHex".into(), hex32(&s.finalized_root).into());
+    // EL pool/discovery counts (the Rust engine's execution-layer side). The
+    // pool keeps only snap-capable READY peers, so readyPeers == snapPeers.
+    obj.insert("snapPeers".into(), el.snap_peers.into());
+    obj.insert("readyPeers".into(), el.snap_peers.into());
+    obj.insert("discoveredPeers".into(), el.discovered.into());
+    obj.insert("attemptedDials".into(), el.attempted.into());
+    obj.insert("backedOffPeers".into(), el.backed_off.into());
+    obj.insert("blacklistedPeers".into(), el.blacklisted.into());
     // A hand-built object of primitives always serializes; fall back to the
     // literal not-started shape rather than panic on the (impossible) error.
     serde_json::to_string(&serde_json::Value::Object(obj))
@@ -451,7 +500,9 @@ const NOT_STARTED_FALLBACK: &str = concat!(
     r#""bootstrapped":false,"finalizedSlot":0,"optimisticSlot":0,"#,
     r#""currentPeriod":0,"targetPeriod":0,"peerCount":0,"servedPeersLastMinute":0,"#,
     r#""discv5TableSize":0,"syncStartPeriod":-1,"#,
-    r#""finalizedRootHex":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
+    r#""finalizedRootHex":"0000000000000000000000000000000000000000000000000000000000000000","#,
+    r#""snapPeers":0,"readyPeers":0,"discoveredPeers":0,"attemptedDials":0,"#,
+    r#""backedOffPeers":0,"blacklistedPeers":0}"#,
 );
 
 #[cfg(test)]
@@ -461,7 +512,7 @@ mod tests {
     #[test]
     fn not_started_status_shape_is_stable() {
         // The golden not-started object (parsed by the Java RustChainHandle test).
-        let json = status_object(false, None, 0);
+        let json = status_object(false, None, 0, ElCounts::default());
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
         assert_eq!(v["running"], false);
         assert_eq!(v["network"], "mainnet");
@@ -479,6 +530,11 @@ mod tests {
             v["finalizedRootHex"],
             "0000000000000000000000000000000000000000000000000000000000000000"
         );
+        // EL counts are zero for a not-started handle.
+        for k in ["snapPeers", "readyPeers", "discoveredPeers", "attemptedDials",
+                  "backedOffPeers", "blacklistedPeers"] {
+            assert_eq!(v[k], 0, "{k} should be 0 when not started");
+        }
         // Round-trips through the fallback constant too.
         let fb: serde_json::Value =
             serde_json::from_str(NOT_STARTED_FALLBACK).expect("fallback valid json");
@@ -498,8 +554,9 @@ mod tests {
             discv5_table_size: 12,
             sync_start_period: 1777,
         };
+        let el = ElCounts { snap_peers: 5, discovered: 240, attempted: 14, backed_off: 30, blacklisted: 66 };
         let synced: serde_json::Value =
-            serde_json::from_str(&status_object(true, Some(mk(SyncState::Synced)), 1795)).unwrap();
+            serde_json::from_str(&status_object(true, Some(mk(SyncState::Synced)), 1795, el)).unwrap();
         assert_eq!(synced["running"], true);
         assert_eq!(synced["beaconState"], "SYNCED");
         assert_eq!(synced["bootstrapped"], true);
@@ -512,6 +569,14 @@ mod tests {
         assert_eq!(synced["discv5TableSize"], 12);
         assert_eq!(synced["syncStartPeriod"], 1777);
         assert_eq!(synced["finalizedRootHex"], hex32(&[0xab; 32]));
+        // EL counts reflect the pool/discovery snapshot (snapPeers drives
+        // readyPeers, since the pool holds only snap-capable READY peers).
+        assert_eq!(synced["snapPeers"], 5);
+        assert_eq!(synced["readyPeers"], 5);
+        assert_eq!(synced["discoveredPeers"], 240);
+        assert_eq!(synced["attemptedDials"], 14);
+        assert_eq!(synced["backedOffPeers"], 30);
+        assert_eq!(synced["blacklistedPeers"], 66);
 
         for (st, expect, boot) in [
             (SyncState::Starting, "SYNCING", false),
@@ -519,7 +584,7 @@ mod tests {
             (SyncState::CatchingUp, "CATCHING_UP", true),
         ] {
             let v: serde_json::Value =
-                serde_json::from_str(&status_object(true, Some(mk(st)), 1795)).unwrap();
+                serde_json::from_str(&status_object(true, Some(mk(st)), 1795, ElCounts::default())).unwrap();
             assert_eq!(v["beaconState"], expect);
             assert_eq!(v["bootstrapped"], boot);
         }
@@ -541,7 +606,7 @@ mod tests {
             sync_start_period: 1777,
         };
         let v: serde_json::Value =
-            serde_json::from_str(&status_object(true, Some(s), 1770)).unwrap();
+            serde_json::from_str(&status_object(true, Some(s), 1770, ElCounts::default())).unwrap();
         assert_eq!(v["currentPeriod"], 1777);
         assert_eq!(v["targetPeriod"], 1777);
     }

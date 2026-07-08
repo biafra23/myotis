@@ -74,7 +74,8 @@ final class RustChainHandle implements ChainHandle {
         return ParsedStatus.parse(json);
     }
 
-    /** The parsed native status object — CL fields only (see the class javadoc). */
+    /** The parsed native status object — CL fields plus the EL pool/discovery
+     *  counts. Older natives omit the EL keys → they default to 0. */
     private record ParsedStatus(
             boolean running,
             BeaconState beaconState,
@@ -86,7 +87,12 @@ final class RustChainHandle implements ChainHandle {
             long peerCount,
             int servedPeersLastMinute,
             int discv5TableSize,
-            long syncStartPeriod) {
+            long syncStartPeriod,
+            int snapPeers,
+            int discoveredPeers,
+            int attemptedDials,
+            int backedOffPeers,
+            int blacklistedPeers) {
 
         static ParsedStatus parse(String json) {
             if (json == null || json.isBlank()) return notRunning();
@@ -104,7 +110,12 @@ final class RustChainHandle implements ChainHandle {
                         o.getLong("peerCount", 0L),
                         o.getInt("servedPeersLastMinute", 0),
                         o.getInt("discv5TableSize", 0),
-                        o.getLong("syncStartPeriod", -1L));
+                        o.getLong("syncStartPeriod", -1L),
+                        o.getInt("snapPeers", 0),
+                        o.getInt("discoveredPeers", 0),
+                        o.getInt("attemptedDials", 0),
+                        o.getInt("backedOffPeers", 0),
+                        o.getInt("blacklistedPeers", 0));
             } catch (RuntimeException e) {
                 throw new EngineException(
                         "malformed status JSON from the Rust engine: " + e.getMessage(), e);
@@ -112,7 +123,8 @@ final class RustChainHandle implements ChainHandle {
         }
 
         static ParsedStatus notRunning() {
-            return new ParsedStatus(false, BeaconState.STARTING, false, 0L, 0L, 0L, 0L, 0L, 0, 0, -1L);
+            return new ParsedStatus(false, BeaconState.STARTING, false, 0L, 0L, 0L, 0L, 0L, 0, 0, -1L,
+                    0, 0, 0, 0, 0);
         }
     }
 
@@ -140,20 +152,22 @@ final class RustChainHandle implements ChainHandle {
         // currentPeriod — the pre-targetPeriod mirror — so the target >= current
         // invariant holds against any .so vintage.
         long targetPeriod = Math.max(s.targetPeriod(), s.currentPeriod());
-        // CL-only: EL fields (executionBlockNumber, snapPeers, discv4 table, RPC
-        // head age, …) are zero — the Rust engine has no execution layer in R1.
+        // EL pool/discovery counts now come from the Rust status JSON. The pool
+        // keeps only snap-capable READY peers, so readyPeers == snapPeers (and
+        // snapServingPeers is approximated by the same). Execution-block /
+        // verified-head fields are still zero (a later follow-up).
         return new StatusSnapshot(
                 s.running(),
                 networkName,
                 s.beaconState(),
-                peers,          // connectedPeers (CL libp2p peers)
-                0,              // readyPeers (EL)
-                0,              // snapPeers
-                0,              // snapServingPeers
-                0,              // discoveredPeers (discv4)
-                0,              // backedOffPeers
-                0,              // blacklistedPeers
-                0,              // attemptedDials
+                peers,                 // connectedPeers (CL libp2p peers)
+                s.snapPeers(),         // readyPeers (EL — pool holds only snap-ready)
+                s.snapPeers(),         // snapPeers
+                s.snapPeers(),         // snapServingPeers (approx)
+                s.discoveredPeers(),   // discoveredPeers (discv4)
+                s.backedOffPeers(),    // backedOffPeers
+                s.blacklistedPeers(),  // blacklistedPeers
+                s.attemptedDials(),    // attemptedDials
                 s.discv5TableSize(),
                 0L,             // executionBlockNumber
                 0L,             // optimisticBlockNumber

@@ -36,15 +36,19 @@ class RustStatusJsonTest {
             + "\"bootstrapped\":false,\"finalizedSlot\":0,\"optimisticSlot\":0,"
             + "\"currentPeriod\":0,\"targetPeriod\":0,\"peerCount\":0,\"servedPeersLastMinute\":0,"
             + "\"discv5TableSize\":0,\"syncStartPeriod\":-1,"
-            + "\"finalizedRootHex\":\"0000000000000000000000000000000000000000000000000000000000000000\"}";
+            + "\"finalizedRootHex\":\"0000000000000000000000000000000000000000000000000000000000000000\","
+            + "\"snapPeers\":0,\"readyPeers\":0,\"discoveredPeers\":0,\"attemptedDials\":0,"
+            + "\"backedOffPeers\":0,\"blacklistedPeers\":0}";
 
-    /** A synthetic catching-up shape (real running numbers). */
+    /** A synthetic catching-up shape (real running numbers, incl. EL counts). */
     private static final String CATCHING_UP_JSON =
             "{\"running\":true,\"network\":\"mainnet\",\"beaconState\":\"CATCHING_UP\","
             + "\"bootstrapped\":true,\"finalizedSlot\":14560000,\"optimisticSlot\":14560032,"
             + "\"currentPeriod\":1777,\"targetPeriod\":1795,\"peerCount\":5,\"servedPeersLastMinute\":2,"
             + "\"discv5TableSize\":7,\"syncStartPeriod\":1777,"
-            + "\"finalizedRootHex\":\"58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e\"}";
+            + "\"finalizedRootHex\":\"58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e\","
+            + "\"snapPeers\":6,\"readyPeers\":6,\"discoveredPeers\":240,\"attemptedDials\":14,"
+            + "\"backedOffPeers\":30,\"blacklistedPeers\":66}";
 
     @BeforeAll
     static void setup() {
@@ -81,6 +85,14 @@ class RustStatusJsonTest {
         assertEquals(7, s.discv5TableSize());
         assertEquals(1777L, s.syncStartPeriod());
         assertEquals(14560000L / 8192L, s.finalizedPeriod());
+        // EL pool/discovery counts now flow through (not hardcoded 0). The pool
+        // holds only snap-capable READY peers, so readyPeers == snapPeers.
+        assertEquals(6, s.snapPeers());
+        assertEquals(6, s.readyPeers());
+        assertEquals(240, s.discoveredPeers());
+        assertEquals(14, s.attemptedDials());
+        assertEquals(30, s.backedOffPeers());
+        assertEquals(66, s.blacklistedPeers());
     }
 
     @Test
