@@ -265,6 +265,8 @@ pub fn status_json(handle: i64) -> String {
                         attempted: r.attempted_count().await,
                         backed_off: r.backoff_count().await,
                         blacklisted: r.blacklist_count().await,
+                        optimistic_block: r.optimistic_block_number(),
+                        finalized_block: r.finalized_block_number(),
                     }
                 }),
                 None => ElCounts::default(),
@@ -284,6 +286,10 @@ struct ElCounts {
     attempted: usize,
     backed_off: usize,
     blacklisted: usize,
+    /// Beacon optimistic-head execution block number (0 before the anchor has one).
+    optimistic_block: u64,
+    /// Finalized execution block number (0 before the anchor has one).
+    finalized_block: u64,
 }
 
 /// `nativeStop`: remove + shut down a handle's sync loop. No-op for unknown id.
@@ -548,6 +554,12 @@ fn status_object(
     obj.insert("attemptedDials".into(), el.attempted.into());
     obj.insert("backedOffPeers".into(), el.backed_off.into());
     obj.insert("blacklistedPeers".into(), el.blacklisted.into());
+    // Execution head/finalized block numbers from the beacon anchor. optimistic
+    // drives eth_blockNumber; executionBlockNumber == finalized (the finalized
+    // payload's block), matching the StatusSnapshot field semantics.
+    obj.insert("optimisticBlockNumber".into(), el.optimistic_block.into());
+    obj.insert("finalizedBlockNumber".into(), el.finalized_block.into());
+    obj.insert("executionBlockNumber".into(), el.finalized_block.into());
     // A hand-built object of primitives always serializes; fall back to the
     // literal not-started shape rather than panic on the (impossible) error.
     serde_json::to_string(&serde_json::Value::Object(obj))
@@ -563,7 +575,8 @@ const NOT_STARTED_FALLBACK: &str = concat!(
     r#""discv5TableSize":0,"syncStartPeriod":-1,"#,
     r#""finalizedRootHex":"0000000000000000000000000000000000000000000000000000000000000000","#,
     r#""snapPeers":0,"readyPeers":0,"discoveredPeers":0,"attemptedDials":0,"#,
-    r#""backedOffPeers":0,"blacklistedPeers":0}"#,
+    r#""backedOffPeers":0,"blacklistedPeers":0,"optimisticBlockNumber":0,"#,
+    r#""finalizedBlockNumber":0,"executionBlockNumber":0}"#,
 );
 
 #[cfg(test)]
@@ -593,7 +606,8 @@ mod tests {
         );
         // EL counts are zero for a not-started handle.
         for k in ["snapPeers", "readyPeers", "discoveredPeers", "attemptedDials",
-                  "backedOffPeers", "blacklistedPeers"] {
+                  "backedOffPeers", "blacklistedPeers", "optimisticBlockNumber",
+                  "finalizedBlockNumber", "executionBlockNumber"] {
             assert_eq!(v[k], 0, "{k} should be 0 when not started");
         }
         // Round-trips through the fallback constant too.
@@ -615,7 +629,15 @@ mod tests {
             discv5_table_size: 12,
             sync_start_period: 1777,
         };
-        let el = ElCounts { snap_peers: 5, discovered: 240, attempted: 14, backed_off: 30, blacklisted: 66 };
+        let el = ElCounts {
+            snap_peers: 5,
+            discovered: 240,
+            attempted: 14,
+            backed_off: 30,
+            blacklisted: 66,
+            optimistic_block: 21_000_010,
+            finalized_block: 20_999_000,
+        };
         let synced: serde_json::Value =
             serde_json::from_str(&status_object(true, Some(mk(SyncState::Synced)), 1795, el)).unwrap();
         assert_eq!(synced["running"], true);
@@ -638,6 +660,9 @@ mod tests {
         assert_eq!(synced["attemptedDials"], 14);
         assert_eq!(synced["backedOffPeers"], 30);
         assert_eq!(synced["blacklistedPeers"], 66);
+        assert_eq!(synced["optimisticBlockNumber"], 21_000_010);
+        assert_eq!(synced["finalizedBlockNumber"], 20_999_000);
+        assert_eq!(synced["executionBlockNumber"], 20_999_000);
 
         for (st, expect, boot) in [
             (SyncState::Starting, "SYNCING", false),

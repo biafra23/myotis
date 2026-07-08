@@ -235,6 +235,18 @@ impl ElReader {
         self.discovery.table_size()
     }
 
+    /// The beacon optimistic-head execution block number (`eth_blockNumber`), or 0
+    /// before the anchor has a head. This is the verified canonical head the
+    /// account/storage reads' peer tips are checked to chain to.
+    pub fn optimistic_block_number(&self) -> u64 {
+        self.anchor.optimistic_block_number()
+    }
+
+    /// The finalized execution block number, or 0 before the anchor has one.
+    pub fn finalized_block_number(&self) -> u64 {
+        self.anchor.finalized_execution().map(|f| f.block_number).unwrap_or(0)
+    }
+
     /// Fetch + verify one account, running the full beacon-anchor ladder.
     ///
     /// Tries each live snap peer in turn (newest first) and returns the first
