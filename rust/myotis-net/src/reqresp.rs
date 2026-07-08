@@ -334,11 +334,11 @@ enum Command {
     LcServers {
         reply: oneshot::Sender<HashSet<PeerId>>,
     },
-    /// `earliest_available_slot` per peer, learned from the auto-Status
-    /// exchange — a peer whose earliest slot is past the period we need can't
-    /// serve it, so catch-up skips it (Java `earliestAvailableSlot`).
-    PeerEarliest {
-        reply: oneshot::Sender<HashMap<PeerId, u64>>,
+    /// One snapshot of both catch-up peer-selection inputs — the LC-server set
+    /// and the per-peer `earliest_available_slot` map — so a round fetches them
+    /// in a single swarm round-trip instead of two.
+    CatchupMeta {
+        reply: oneshot::Sender<(HashSet<PeerId>, HashMap<PeerId, u64>)>,
     },
     Shutdown,
 }
@@ -386,13 +386,15 @@ impl ReqRespClient {
         rx.await.unwrap_or_default()
     }
 
-    /// `earliest_available_slot` per peer, from the auto-Status exchange. Peers
-    /// absent from the map haven't completed Status yet (treat as unknown —
-    /// never skipped); a v1 peer reports 0 (has history from genesis).
-    pub async fn peer_earliest_slots(&self) -> HashMap<PeerId, u64> {
+    /// Both catch-up peer-selection inputs in one round-trip: the set of
+    /// Identify-confirmed LC servers, and `earliest_available_slot` per peer
+    /// (from the auto-Status exchange). Peers absent from the earliest map
+    /// haven't completed Status yet (unknown — never skipped); a v1 peer
+    /// reports 0 (history from genesis).
+    pub async fn catchup_peer_meta(&self) -> (HashSet<PeerId>, HashMap<PeerId, u64>) {
         let (reply, rx) = oneshot::channel();
-        if self.tx.send(Command::PeerEarliest { reply }).await.is_err() {
-            return HashMap::new();
+        if self.tx.send(Command::CatchupMeta { reply }).await.is_err() {
+            return (HashSet::new(), HashMap::new());
         }
         rx.await.unwrap_or_default()
     }
@@ -525,8 +527,8 @@ async fn run_swarm(
                 Some(Command::LcServers { reply }) => {
                     let _ = reply.send(ctx.lc_servers.clone());
                 }
-                Some(Command::PeerEarliest { reply }) => {
-                    let _ = reply.send(ctx.peer_earliest.clone());
+                Some(Command::CatchupMeta { reply }) => {
+                    let _ = reply.send((ctx.lc_servers.clone(), ctx.peer_earliest.clone()));
                 }
             },
             event = swarm.select_next_some() => handle_swarm_event(&mut swarm, &mut ctx, event),
@@ -633,8 +635,13 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
         SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
             if num_established == 0 {
                 ctx.connected.remove(&peer_id);
-                // Next connection must redo the Status handshake.
+                // Next connection must redo the Status handshake — and drop the
+                // per-peer metadata it produced so these maps stay bounded by
+                // the CONNECTED set, not by every peer ever seen (a reconnect
+                // re-runs Identify + auto-Status and repopulates both).
                 ctx.status_done.remove(&peer_id);
+                ctx.lc_servers.remove(&peer_id);
+                ctx.peer_earliest.remove(&peer_id);
                 fail_queued(ctx, &peer_id, RequestError::ConnectionClosed);
                 tracing::debug!(peer = %peer_id, "connection closed");
             }

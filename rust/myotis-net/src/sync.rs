@@ -559,8 +559,19 @@ impl PeerPool {
             out.push(p.clone());
         }
         if out.is_empty() {
-            // Never starve the batch (Java: `if (capable.isEmpty()) capable = peers`).
-            out.extend(self.peers.iter().take(n).cloned());
+            // Never starve the batch on the SOFT filters (Java: `if
+            // (capable.isEmpty()) capable = peers`) — a no-lc/cooled peer may
+            // still serve. But keep honoring `skip`: those peers are provably
+            // incapable of the needed period, so asking them wastes a whole
+            // round and ratchets the empty-round backoff. If skip leaves
+            // nothing, return [] and let catch_up bounce to rediscovery.
+            out.extend(
+                self.peers
+                    .iter()
+                    .filter(|p| !skip.contains(&p.id))
+                    .take(n)
+                    .cloned(),
+            );
         }
         out
     }
@@ -1165,20 +1176,23 @@ async fn catch_up(
         tracing::info!(from_period = committee_period, wall_period, span,
             staged = staged.len(), "catch-up: requesting updates_by_range");
 
-        let lc_servers = client.lc_update_servers().await;
-        // Skip peers whose advertised earliest_available_slot proves they can't
-        // hold the period we need — their light-client history starts later, so
+        let (lc_servers, earliest_slots) = client.catchup_peer_meta().await;
+        // Skip peers whose advertised earliest_available_slot proves their
+        // light-client history begins in a LATER period than the one we need —
         // they'd only return far-future updates the period gate discards (Java
-        // attemptCatchUpBatch's earliestAvailableSlot filter). Peers we haven't
+        // attemptCatchUpBatch's earliestAvailableSlot filter). Compare at
+        // PERIOD granularity: a peer whose earliest slot lands anywhere inside
+        // committee_period can still serve that period's update, so only skip
+        // when its earliest period is strictly greater. Peers not yet
         // status-exchanged (absent from the map) are unknown and kept; v1 peers
-        // report 0 (genesis history) and are never skipped. candidates() falls
-        // back to the whole pool if this empties it, so we never starve.
-        let needed_slot = committee_period * spec::SLOTS_PER_SYNC_COMMITTEE_PERIOD;
-        let too_shallow: HashSet<PeerId> = client
-            .peer_earliest_slots()
-            .await
+        // report 0 (genesis history) and are never skipped. candidates() still
+        // returns [] rather than a too-shallow-only batch, so an all-shallow
+        // pool bounces to the outer loop for rediscovery instead of thrashing.
+        let too_shallow: HashSet<PeerId> = earliest_slots
             .into_iter()
-            .filter(|&(_, earliest)| earliest > needed_slot)
+            .filter(|&(_, earliest)| {
+                spec::compute_sync_committee_period(earliest) > committee_period
+            })
             .map(|(id, _)| id)
             .collect();
         let peers = pool.candidates(CATCHUP_FANOUT, true, true, &lc_servers, &too_shallow);
@@ -1828,11 +1842,18 @@ mod tests {
         let c = pool.candidates(4, false, false, &prefer, &skip);
         assert!(c.iter().all(|p| p.id != ids[3]));
 
-        // Never starve: everything marked no-lc still returns candidates.
+        // Never starve on the SOFT filters: everything marked no-lc still
+        // returns candidates (a no-lc peer may serve; better than nobody).
         for id in &ids {
             pool.mark_no_lc_updates(*id);
         }
         assert!(!pool.candidates(2, true, false, &HashSet::new(), &HashSet::new()).is_empty());
+
+        // But the HARD skip is honored even by the never-starve fallback:
+        // a fully-skipped pool returns [] (provably-incapable peers are worse
+        // than none — catch_up bounces to rediscovery instead of thrashing).
+        let all_skip: HashSet<PeerId> = ids.iter().copied().collect();
+        assert!(pool.candidates(4, true, false, &HashSet::new(), &all_skip).is_empty());
     }
 
     #[test]
