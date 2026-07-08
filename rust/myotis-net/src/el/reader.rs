@@ -380,8 +380,11 @@ impl ElReader {
             optimistic_block_number: opt_num,
         };
 
-        // An absent account has no storage: every slot is provably zero. The
-        // account exclusion proof verified, so this counts as served.
+        // An absent account has no storage: every slot is provably zero, and the
+        // account exclusion proof verified. Anchor the state root so the result
+        // carries the beacon verdict, then return it; this per-peer helper does no
+        // cache bookkeeping — the outer retry loop records served/failure from the
+        // verdict.
         let AccountOutcome::Present(leaf) = outcome else {
             // Still anchor the state root so the verdict reflects the beacon tie.
             let verdict = peer
@@ -519,10 +522,6 @@ fn hex32(s: &str) -> [u8; 32] {
     out
 }
 
-/// Convert a peer-reported block number to the `i64` the verify ladder takes.
-/// A realistic block number always fits; an out-of-range value (a hostile peer
-/// claiming >= 2^63) maps to a negative sentinel, which the ladder rejects as
-/// `noPeerBlockNumber` — fail-closed and explicit, no wrapping cast.
 /// Whether a ladder `fail_reason` is GLOBAL — determined by the beacon anchor's
 /// state, identical for every peer — vs PER-PEER (a stale/behind head, an
 /// invalid proof: another peer can still verify). A global failure short-circuits
@@ -531,6 +530,10 @@ fn is_global_fail(reason: Option<&'static str>) -> bool {
     matches!(reason, Some("beaconNotSynced") | Some("beaconBlockUnavailable"))
 }
 
+/// Convert a peer-reported block number to the `i64` the verify ladder takes.
+/// A realistic block number always fits; an out-of-range value (a hostile peer
+/// claiming >= 2^63) maps to a negative sentinel, which the ladder rejects as
+/// `noPeerBlockNumber` — fail-closed and explicit, no wrapping cast.
 fn to_ladder_block(block_number: u64) -> i64 {
     i64::try_from(block_number).unwrap_or(-1)
 }
