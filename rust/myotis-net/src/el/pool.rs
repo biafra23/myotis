@@ -133,6 +133,11 @@ impl PoolInner {
         let now = Instant::now();
         match result {
             Ok(session) if session.snap => {
+                // INFO: the operator-visible signal that the EL found a usable
+                // snap peer (bounded to ~target occurrences per run). Per-peer
+                // failures/non-snap stay at debug to avoid the discv4 cross-chain
+                // noise (most discovered peers are other networks or full).
+                tracing::info!(%addr, eth = session.eth_version, "el dial: snap peer connected");
                 let peer = Arc::new(ManagedPeer::spawn(session, addr));
                 // Keep `addr` in `attempted` while connected — dropped by
                 // prune_closed when the peer later closes.
@@ -144,9 +149,10 @@ impl PoolInner {
                 cache.add(addr, &pubkey, true);
                 cache.flush();
             }
-            Ok(_) => {
+            Ok(session) => {
                 // Compatible but no snap/1 — useless for verified reads. Cool the
                 // address off and free it from `attempted`.
+                tracing::debug!(%addr, eth = session.eth_version, "el dial: connected but no snap/1");
                 self.record_backoff(addr, false, now).await;
                 self.attempted.lock().await.remove(&addr);
             }
@@ -156,6 +162,7 @@ impl PoolInner {
                 // substring: a peer's client id is echoed into other error
                 // strings, so `contains` could be steered by a hostile peer.
                 let incompatible = e.starts_with("incompatible peer");
+                tracing::debug!(%addr, incompatible, error = %e, "el dial: failed");
                 if incompatible {
                     self.blacklist.lock().await.insert(pubkey);
                 }
