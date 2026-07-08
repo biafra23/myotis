@@ -408,7 +408,11 @@ async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
             "EL pool below target — maintainer re-dialing cached snap peers"
         );
         for c in cached {
-            if inner.prune_closed().await >= inner.pool_cfg.target_snap_peers {
+            // Cheap live-count check: the guard above already pruned, and this
+            // tight loop rarely spans a peer closing, so read `peers` length
+            // directly (freshly-connected dials show up here) rather than
+            // re-pruning both maps every iteration.
+            if inner.peers.lock().await.len() >= inner.pool_cfg.target_snap_peers {
                 break;
             }
             if !try_dial(&inner, &dial_slots, c.addr, c.pubkey).await {
