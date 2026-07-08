@@ -39,6 +39,9 @@ const BACKOFF_INCOMPATIBLE: Duration = Duration::from_secs(10 * 60);
 /// Transient failures / not-snap peers: a short cool-off (Java's
 /// `BACKOFF_TRANSIENT_MS`).
 const BACKOFF_TRANSIENT: Duration = Duration::from_secs(30);
+/// How often the maintainer checks the pool and tops it back up to target
+/// (Java's `maintainSnapPeers` fixed delay).
+const MAINTAINER_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Pool tunables.
 #[derive(Debug, Clone, Copy)]
@@ -178,6 +181,9 @@ impl PoolInner {
 pub struct PeerPool {
     inner: Arc<PoolInner>,
     dialer_task: JoinHandle<()>,
+    /// Keeps the live snap-peer count at target by re-dialing cached peers when
+    /// they die (twin of the Java `ChainStack.maintainSnapPeers` loop).
+    maintainer_task: JoinHandle<()>,
 }
 
 impl PeerPool {
@@ -202,8 +208,12 @@ impl PeerPool {
             blacklist: Mutex::new(HashSet::new()),
             cache: Mutex::new(cache),
         });
-        let dialer_task = tokio::spawn(dialer_loop(Arc::clone(&inner), rx));
-        PeerPool { inner, dialer_task }
+        // Both the discv4 dialer and the maintainer dial through one shared
+        // concurrency budget.
+        let dial_slots = Arc::new(Semaphore::new(inner.pool_cfg.max_concurrent_dials));
+        let dialer_task = tokio::spawn(dialer_loop(Arc::clone(&inner), rx, Arc::clone(&dial_slots)));
+        let maintainer_task = tokio::spawn(maintainer_loop(Arc::clone(&inner), dial_slots));
+        PeerPool { inner, dialer_task, maintainer_task }
     }
 
     /// A live snap-capable peer for a verified read, or `None` if the pool has
@@ -212,6 +222,22 @@ impl PeerPool {
     pub async fn snap_peer(&self) -> Option<Arc<ManagedPeer>> {
         self.inner.prune_closed().await;
         self.inner.peers.lock().await.last().map(|p| Arc::clone(&p.peer))
+    }
+
+    /// All live snap peers, NEWEST first (freshest head → most likely to still
+    /// retain the state a query needs). The verified-read ladder tries them in
+    /// order, moving to the next on a failure — twin of the Java
+    /// `RLPxConnector.trySnapPeer` retry loop. Prunes closed peers first.
+    pub async fn snap_peers(&self) -> Vec<Arc<ManagedPeer>> {
+        self.inner.prune_closed().await;
+        self.inner
+            .peers
+            .lock()
+            .await
+            .iter()
+            .rev()
+            .map(|p| Arc::clone(&p.peer))
+            .collect()
     }
 
     /// Count of live snap peers (prunes closed peers first).
@@ -257,11 +283,12 @@ impl PeerPool {
         cache.flush();
     }
 
-    /// Stop the pool: flush the peer cache, abort the dialer, and drop all held
-    /// peers (closing them).
+    /// Stop the pool: flush the peer cache, abort the background tasks, and drop
+    /// all held peers (closing them).
     pub async fn stop(self) {
         self.inner.cache.lock().await.flush();
         self.dialer_task.abort();
+        self.maintainer_task.abort();
         self.inner.peers.lock().await.clear();
     }
 }
@@ -269,14 +296,17 @@ impl PeerPool {
 impl Drop for PeerPool {
     fn drop(&mut self) {
         self.dialer_task.abort();
+        self.maintainer_task.abort();
     }
 }
 
 /// Dial cached snap peers first (warm start), then consume the discv4 candidate
 /// stream — both through the same eligibility + concurrency-capped dial path.
-async fn dialer_loop(inner: Arc<PoolInner>, mut rx: mpsc::Receiver<TableEntry>) {
-    let dial_slots = Arc::new(Semaphore::new(inner.pool_cfg.max_concurrent_dials));
-
+async fn dialer_loop(
+    inner: Arc<PoolInner>,
+    mut rx: mpsc::Receiver<TableEntry>,
+    dial_slots: Arc<Semaphore>,
+) {
     // Warm start: re-dial proven snap peers from the cache, snap-quality first
     // (Confirmed → Unknown → Denied). Snapshot the list so the cache lock isn't
     // held across the dials.
@@ -350,6 +380,42 @@ async fn try_dial(
         drop(permit);
     });
     true
+}
+
+/// The snap-peer maintainer: on a timer, if the live snap count has dropped
+/// below `target_snap_peers`, re-dial cached snap peers (snap-quality first) to
+/// top back up. Twin of the Java `ChainStack.maintainSnapPeers` loop — the
+/// discv4 dialer alone can starve on a long-running daemon once its stream goes
+/// quiet and pooled peers die, so this keeps the pool healed from the cache.
+async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
+    loop {
+        tokio::time::sleep(MAINTAINER_INTERVAL).await;
+        // prune_closed frees dead peers' addresses so try_dial can re-dial them.
+        let live = inner.prune_closed().await;
+        if live >= inner.pool_cfg.target_snap_peers {
+            continue;
+        }
+        // Snapshot the cache (snap-quality-sorted) without holding its lock
+        // across the dials.
+        let cached = inner.cache.lock().await.peers();
+        if cached.is_empty() {
+            continue;
+        }
+        tracing::debug!(
+            live,
+            target = inner.pool_cfg.target_snap_peers,
+            cached = cached.len(),
+            "EL pool below target — maintainer re-dialing cached snap peers"
+        );
+        for c in cached {
+            if inner.prune_closed().await >= inner.pool_cfg.target_snap_peers {
+                break;
+            }
+            if !try_dial(&inner, &dial_slots, c.addr, c.pubkey).await {
+                return; // pool shutting down
+            }
+        }
+    }
 }
 
 /// A discv4 entry's TCP socket, IPv4 or IPv6, or `None` if the address is

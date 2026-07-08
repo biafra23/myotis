@@ -214,24 +214,45 @@ impl ElReader {
     }
 
     /// Fetch + verify one account, running the full beacon-anchor ladder.
+    ///
+    /// Tries each live snap peer in turn (newest first) and returns the first
+    /// that serves — twin of the Java `RLPxConnector.trySnapPeer` retry loop, so
+    /// a single hung/dead peer doesn't fail the query. A serving peer is marked
+    /// CONFIRMED in the cache, a failing one records a strike (→ deprioritized).
     pub async fn get_account(&self, address: [u8; 20]) -> Result<VerifiedAccount, String> {
-        let peer = self.pool.snap_peer().await.ok_or("no snap peer available")?;
-        let (state_root, block_number) = fresh_head(&peer).await?;
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err("no snap peer available".to_string());
+        }
+        let total = peers.len();
+        let mut last_err = String::new();
+        for peer in &peers {
+            match self.get_account_from(peer, address).await {
+                Ok(result) => {
+                    self.pool.record_snap_served(peer.addr()).await;
+                    return Ok(result);
+                }
+                Err(e) => {
+                    self.pool.record_snap_failure(peer.addr()).await;
+                    last_err = e;
+                }
+            }
+        }
+        Err(format!("all {total} snap peer(s) failed to serve account: {last_err}"))
+    }
 
+    /// One account fetch + verdict against a single peer (no retry, no cache
+    /// bookkeeping — the caller loop owns those). Any transport/proof error
+    /// propagates so the loop can move to the next peer.
+    async fn get_account_from(
+        &self,
+        peer: &ManagedPeer,
+        address: [u8; 20],
+    ) -> Result<VerifiedAccount, String> {
+        let (state_root, block_number) = fresh_head(peer).await?;
         // Verify-on-fetch: snap_get_account MPT-verifies against state_root and
-        // returns Present/Absent only when the proof holds. Feed the outcome to
-        // the peer cache so a proven server is dialed first next run and a
-        // hanger is deprioritized.
-        let outcome = match peer.snap_get_account(&state_root, &address).await {
-            Ok(o) => {
-                self.pool.record_snap_served(peer.addr()).await;
-                o
-            }
-            Err(e) => {
-                self.pool.record_snap_failure(peer.addr()).await;
-                return Err(e);
-            }
-        };
+        // returns Present/Absent only when the proof holds.
+        let outcome = peer.snap_get_account(&state_root, &address).await?;
         // Anchor the (proof-valid) peer state root to the beacon chain.
         let verdict = peer
             .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
@@ -278,20 +299,43 @@ impl ElReader {
         slot: u64,
         holder: Option<[u8; 20]>,
     ) -> Result<VerifiedStorage, String> {
-        let peer = self.pool.snap_peer().await.ok_or("no snap peer available")?;
-        let (state_root, block_number) = fresh_head(&peer).await?;
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err("no snap peer available".to_string());
+        }
+        let total = peers.len();
+        let mut last_err = String::new();
+        for peer in &peers {
+            match self.get_storage_from(peer, address, slot, holder).await {
+                Ok(result) => {
+                    self.pool.record_snap_served(peer.addr()).await;
+                    return Ok(result);
+                }
+                Err(e) => {
+                    self.pool.record_snap_failure(peer.addr()).await;
+                    last_err = e;
+                }
+            }
+        }
+        Err(format!("all {total} snap peer(s) failed to serve storage: {last_err}"))
+    }
+
+    /// One storage-slot fetch + verdict against a single peer (no retry / cache
+    /// bookkeeping — the caller loop owns those). Errors propagate for retry.
+    async fn get_storage_from(
+        &self,
+        peer: &ManagedPeer,
+        address: [u8; 20],
+        slot: u64,
+        holder: Option<[u8; 20]>,
+    ) -> Result<VerifiedStorage, String> {
+        let (state_root, block_number) = fresh_head(peer).await?;
 
         let storage_key = storage_key(slot, holder);
         let slot_key_hash = keccak256(&storage_key);
 
         // Step 1: the proof-verified account gives the trusted storage root.
-        let outcome = match peer.snap_get_account(&state_root, &address).await {
-            Ok(o) => o,
-            Err(e) => {
-                self.pool.record_snap_failure(peer.addr()).await;
-                return Err(e);
-            }
-        };
+        let outcome = peer.snap_get_account(&state_root, &address).await?;
 
         let (fin_num, opt_num, synced) = self.anchor_diagnostics();
         let mut result = VerifiedStorage {
@@ -317,9 +361,8 @@ impl ElReader {
         };
 
         // An absent account has no storage: every slot is provably zero. The
-        // account exclusion proof verified, so the peer served.
+        // account exclusion proof verified, so this counts as served.
         let AccountOutcome::Present(leaf) = outcome else {
-            self.pool.record_snap_served(peer.addr()).await;
             // Still anchor the state root so the verdict reflects the beacon tie.
             let verdict = peer
                 .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
@@ -331,19 +374,9 @@ impl ElReader {
         result.storage_root = leaf.storage_root;
 
         // Step 2: verify the slot against the proof-verified storage root.
-        let value = match peer
+        let value = peer
             .snap_get_storage(&state_root, &address, &leaf, &storage_key)
-            .await
-        {
-            Ok(v) => {
-                self.pool.record_snap_served(peer.addr()).await;
-                v
-            }
-            Err(e) => {
-                self.pool.record_snap_failure(peer.addr()).await;
-                return Err(e);
-            }
-        };
+            .await?;
         result.storage_proof_valid = true;
         // `found` means the slot holds a non-zero value (Java's convention): a
         // zero slot is pruned from the trie and indistinguishable from unset,
