@@ -54,6 +54,12 @@
          -Dmyotis.log.wire.level=INFO (or DEBUG) to watch the wire during diagnosis. -->
     <logger name="com.jaeckel.ethp2p.networking" level="${WIRE_LEVEL}"/>
 
+    <!-- RPC access log: one concise INFO line per JSON-RPC call the server answers
+         (method/id/outcome/latency), incl. parse/batch errors. Falls under io.myotis
+         already; pinned here so it's discoverable and can go to DEBUG (full req/resp
+         bodies) independently of the app/wire levels. In the Logs tab, filter on "rpc". -->
+    <logger name="io.myotis.jsonrpc.access" level="INFO"/>
+
     <!-- Third-party noise stays pinned regardless of APP_LEVEL. -->
     <logger name="io.netty" level="WARN"/>
     <logger name="org.apache.tuweni" level="WARN"/>

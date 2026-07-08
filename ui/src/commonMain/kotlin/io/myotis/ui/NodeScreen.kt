@@ -172,6 +172,8 @@ private fun NetworkChips(chains: List<String>, selected: String, onSelect: (Stri
 @Composable
 private fun ReadinessStrip(s: NodeSnapshot?, deepPoolThreshold: Int) {
     val (color, height, label) = when {
+        s != null && s.lifecycle == "PAUSED" ->
+            Triple(Color(0xFF78909C), 3.dp, "Node readiness: sleeping — a request wakes it")
         s == null || !s.running ->
             Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not running")
         s.beaconState != "SYNCED" ->
@@ -236,6 +238,7 @@ private fun SettingsTab(
     }
     var snapTarget by remember { mutableStateOf(settings.snapTarget().toString()) }
     var deepPool by remember { mutableStateOf(settings.deepPoolThreshold().toString()) }
+    var idlePause by remember { mutableStateOf(settings.idlePauseMinutes().toString()) }
     var strictFreshness by remember { mutableStateOf(settings.strictStateFreshness()) }
     var nativeBls by remember { mutableStateOf(settings.nativeBlsEnabled()) }
 
@@ -297,6 +300,26 @@ private fun SettingsTab(
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             modifier = Modifier.fillMaxWidth(),
         )
+        // Idle-sleep is only meaningful on a host that actually runs the idle controller
+        // (Android). On desktop (no controller) the setting is a no-op, so don't surface a
+        // battery-saving toggle that can't take effect.
+        if (settings.supportsIdleSleep()) {
+            OutlinedTextField(
+                value = idlePause,
+                onValueChange = { idlePause = it.filter(Char::isDigit).take(3) },
+                label = { Text("Idle sleep after (minutes, 0 = never)") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                "After this many minutes without a wallet request or query, the node goes to " +
+                    "sleep: all P2P networking stops (saving battery) while the JSON-RPC port keeps " +
+                    "listening. The first request wakes it — expect that call to take a little longer.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
 
         // Strict freshness is the default; the switch exposes the RELAXED (opt-in) state, so the
         // checked value is the negation. Persisted immediately; applies on the next node restart.
@@ -340,6 +363,12 @@ private fun SettingsTab(
                 val deep = deepPool.toIntOrNull() ?: 16
                 settings.setSnapTarget(snap)          // persist
                 settings.setDeepPool(deep)            // persist (read at readiness-check time)
+                // Idle sleep: persisted only on hosts that run the controller; the tick reads it
+                // live. Blank/invalid input keeps the CURRENT value rather than silently enabling
+                // sleep (the label says "0 = never"), so a stray edit can't turn it on by accident.
+                if (settings.supportsIdleSleep()) {
+                    settings.setIdlePauseMinutes(idlePause.toIntOrNull() ?: settings.idlePauseMinutes())
+                }
                 controller.setTargetSnapPeers(snap)   // live-apply to running stacks
                 networks.forEach { id ->
                     // Compare the EFFECTIVE (post-clamp) persisted port before vs after, not the
@@ -512,8 +541,14 @@ private fun OfflineBanner(onOpenNetworkSettings: () -> Unit) {
 
 @Composable
 private fun StatusView(s: NodeSnapshot) {
+    val tz = remember { TimeZone.currentSystemDefault() }
     Column {
         StatusRow("Network", s.network)
+        StatusRow("State", when (s.lifecycle) {
+            "PAUSED" -> "Sleeping (wakes on request)"
+            "RUNNING" -> "Running"
+            else -> "Stopped"
+        })
         StatusRow("Beacon", s.beaconState)
         StatusRow("EL block", s.executionBlockNumber.toString())
         StatusRow("CL peers", "served ${s.clServedPeersLastMin}/min, con ${s.clConnectedPeers}")
@@ -527,6 +562,19 @@ private fun StatusView(s: NodeSnapshot) {
         // dash instead of the raw ~9.2e18 ms, which would read as a nonsensical age.
         StatusRow("Verified head age", if (s.verifiedHeadAgeMs == Long.MAX_VALUE) "—" else "${s.verifiedHeadAgeMs} ms")
         StatusRow("Uptime", "${s.uptimeSeconds}s")
+        // Pseudo-sleep observability: how much the node has idle-slept, and when/why it
+        // last woke. Foreground (opening the app) is excluded from the "last woke" reason,
+        // so this keeps showing the last real request/catch-up wake even as you view it.
+        StatusRow(
+            "Sleep",
+            if (s.pauseCount == 0) "never slept"
+            else "${formatDuration(s.totalPausedMs)} over ${s.pauseCount} " +
+                if (s.pauseCount == 1) "pause" else "pauses",
+        )
+        if (s.lastResumeEpochMs > 0) {
+            val slept = if (s.lastPauseEpochMs > 0) " · slept ${formatLogTime(s.lastPauseEpochMs, tz)}" else ""
+            StatusRow("Last woke", "${formatLogTime(s.lastResumeEpochMs, tz)} (${s.lastWakeReason ?: "?"})$slept")
+        }
     }
 }
 
@@ -982,6 +1030,19 @@ private fun formatLogs(lines: List<LogLine>, tz: TimeZone): String = buildString
     for (l in lines) {
         append(formatLogTime(l.timestampMillis, tz)).append(' ').append(l.level)
         append(' ').append(l.tag).append(": ").append(l.message).append('\n')
+    }
+}
+
+/** Compact elapsed duration: "45s" / "3m 12s" / "1h 3m". */
+private fun formatDuration(ms: Long): String {
+    val totalSec = ms / 1000
+    val h = totalSec / 3600
+    val m = (totalSec % 3600) / 60
+    val sec = totalSec % 60
+    return when {
+        h > 0 -> "${h}h ${m}m"
+        m > 0 -> "${m}m ${sec}s"
+        else -> "${sec}s"
     }
 }
 

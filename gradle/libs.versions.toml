@@ -89,6 +89,8 @@ androidx-compose-ui-graphics      = { module = "androidx.compose.ui:ui-graphics"
 androidx-compose-ui-tooling       = { module = "androidx.compose.ui:ui-tooling" }
 androidx-compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
 androidx-compose-material3        = { module = "androidx.compose.material3:material3" }
+# Java-only Worker (no -ktx needed): the daily beacon catch-up job while the node sleeps.
+androidx-work-runtime             = { module = "androidx.work:work-runtime", version = "2.9.1" }
 
 # JSON-RPC server (:jsonrpc-server) — all Android-safe (no java.net.http).
 ktor-server-core           = { module = "io.ktor:ktor-server-core",  version.ref = "ktor" }

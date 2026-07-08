@@ -127,6 +127,7 @@ class AndroidNetworkStatus(private val ctx: Context) : NetworkStatus {
 /** Map the Java `NodeService.Snapshot` record into the shared Kotlin model. */
 private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
     running = running(),
+    lifecycle = lifecycle(),
     network = network(),
     beaconState = beaconState(),
     connectedPeers = connectedPeers(),
@@ -147,6 +148,11 @@ private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
     verifiedHeadAgeMs = verifiedHeadAgeMs(),
     uptimeSeconds = if (startTimeMs() > 0) (System.currentTimeMillis() - startTimeMs()) / 1000 else 0,
     readyPeerList = readyPeerList().map { PeerRow(it.remoteAddress(), it.snapSupported(), it.clientId()) },
+    pauseCount = pauseCount(),
+    totalPausedMs = totalPausedMs(),
+    lastPauseEpochMs = lastPauseEpochMs(),
+    lastResumeEpochMs = lastResumeEpochMs(),
+    lastWakeReason = lastWakeReason(),
 )
 
 /** Android actual of [Settings] over the NodeService SharedPreferences statics. */
@@ -171,6 +177,10 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun setStrictStateFreshness(v: Boolean) = NodeService.setStrictStateFreshness(ctx, v)
     override fun nativeBlsEnabled(): Boolean = NodeService.nativeBlsEnabled(ctx)
     override fun setNativeBlsEnabled(v: Boolean) = NodeService.setNativeBlsEnabled(ctx, v)
+
+    override fun idlePauseMinutes(): Int = NodeService.idlePauseMinutes(ctx)
+    override fun setIdlePauseMinutes(v: Int) = NodeService.setIdlePauseMinutes(ctx, v)
+    override fun supportsIdleSleep(): Boolean = true   // NodeService runs the idle controller
 }
 
 /**

@@ -418,9 +418,17 @@ public class BeaconP2PService implements AutoCloseable {
             keepaliveExecutor = null;
         }
         Host h = host;
+        // Null the reference so a close→start cycle (BeaconLightClient pause/resume)
+        // gets a fresh host, double-close is a no-op, and doReqResp/getConnectedPeers
+        // fail fast between pause and resume instead of touching a stopped host.
+        host = null;
         if (h != null) {
-            h.stop().join();
-            log.info("[beacon-p2p] libp2p host stopped");
+            try {
+                h.stop().join();
+                log.info("[beacon-p2p] libp2p host stopped");
+            } catch (Throwable e) {
+                log.warn("[beacon-p2p] host stop: {}", e.toString());
+            }
         }
     }
 

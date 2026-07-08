@@ -45,7 +45,11 @@ class MainActivity : ComponentActivity() {
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-            boundServiceState.value = (service as NodeService.LocalBinder).service()
+            val svc = (service as NodeService.LocalBinder).service()
+            boundServiceState.value = svc
+            // Fresh bind = the app just came to the foreground: count it as activity and
+            // proactively wake any idle-paused stack so the UI shows live data.
+            svc.onAppForeground()
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -102,6 +106,9 @@ class MainActivity : ComponentActivity() {
         // (which actually boots the node) is NOT called by binding alone, so this does not
         // auto-start peer discovery.
         bindService(Intent(this, NodeService::class.java), connection, Context.BIND_AUTO_CREATE)
+        // Already bound (rebind is async and may not fire onServiceConnected again): treat
+        // foregrounding as activity and wake idle-paused stacks now.
+        boundServiceState.value?.onAppForeground()
     }
 
     override fun onStop() {

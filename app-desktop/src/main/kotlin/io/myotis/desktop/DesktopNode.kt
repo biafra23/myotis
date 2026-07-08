@@ -235,6 +235,7 @@ class DesktopNodeController(
         val bs = handle.beaconStatus()
         return NodeSnapshot(
             running = s.running(),
+            lifecycle = s.lifecycle().name,
             network = s.network(),
             beaconState = s.beaconState().name,
             connectedPeers = s.connectedPeers(),
@@ -255,6 +256,11 @@ class DesktopNodeController(
             verifiedHeadAgeMs = s.verifiedHeadAgeMs(),
             uptimeSeconds = (System.nanoTime() - startNs) / 1_000_000_000L,
             readyPeerList = s.readyPeerList().map { PeerRow(it.remoteAddress(), it.snapSupported(), it.clientId()) },
+            pauseCount = s.pauseCount(),
+            totalPausedMs = s.totalPausedMs(),
+            lastPauseEpochMs = s.lastPauseEpochMs(),
+            lastResumeEpochMs = s.lastResumeEpochMs(),
+            lastWakeReason = s.lastWakeReason(),
         )
     }
 }

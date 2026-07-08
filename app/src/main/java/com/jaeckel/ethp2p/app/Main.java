@@ -189,6 +189,8 @@ public final class Main {
                     System.err.println("Commands:");
                     System.err.println("  ./gradlew :app:run -Pargs=status");
                     System.err.println("  ./gradlew :app:run -Pargs=peers");
+                    System.err.println("  ./gradlew :app:run -Pargs=pause");
+                    System.err.println("  ./gradlew :app:run -Pargs=resume");
                     System.err.println("  ./gradlew :app:run -Pargs=stop");
                 }
                 System.exit(1);

@@ -44,5 +44,19 @@ public final class EthP2PApplication extends Application {
         if (System.getProperty("myotis.bls.backend") == null) {
             System.setProperty("myotis.bls.backend", NodeService.blsBackendChoice(this));
         }
+
+        // Daily beacon catch-up while the node sleeps (see CatchUpWorker): resume →
+        // sync-committee catch-up → persist snapshot → pause. Network-constrained;
+        // KEEP preserves the existing schedule across app restarts. A sync-committee
+        // period is ~27 h, so a daily pass keeps wakes at zero BLS catch-up.
+        androidx.work.WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+                "myotis-daily-catchup",
+                androidx.work.ExistingPeriodicWorkPolicy.KEEP,
+                new androidx.work.PeriodicWorkRequest.Builder(
+                        CatchUpWorker.class, 24, java.util.concurrent.TimeUnit.HOURS)
+                        .setConstraints(new androidx.work.Constraints.Builder()
+                                .setRequiredNetworkType(androidx.work.NetworkType.CONNECTED)
+                                .build())
+                        .build());
     }
 }

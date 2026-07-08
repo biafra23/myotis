@@ -50,7 +50,9 @@ dependencies {
 
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)
-    testRuntimeOnly(libs.logback.classic)
+    // logback on the test COMPILE classpath (not just runtime): RpcAccessLogTest attaches a
+    // ListAppender to the io.myotis.jsonrpc.access logger to assert the access-log lines.
+    testImplementation(libs.logback.classic)
 }
 
 tasks.test {
