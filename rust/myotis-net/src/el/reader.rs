@@ -195,6 +195,24 @@ impl ElReader {
         self.pool.snap_peer_count().await
     }
 
+    /// EL pool/discovery counts for the host status snapshot.
+    pub async fn attempted_count(&self) -> usize {
+        self.pool.attempted_count().await
+    }
+
+    pub async fn blacklist_count(&self) -> usize {
+        self.pool.blacklist_count().await
+    }
+
+    pub async fn backoff_count(&self) -> usize {
+        self.pool.backoff_count().await
+    }
+
+    /// discv4 routing-table size (peers discovered/known).
+    pub fn discovered_count(&self) -> usize {
+        self.discovery.table_size()
+    }
+
     /// Fetch + verify one account, running the full beacon-anchor ladder.
     pub async fn get_account(&self, address: [u8; 20]) -> Result<VerifiedAccount, String> {
         let peer = self.pool.snap_peer().await.ok_or("no snap peer available")?;

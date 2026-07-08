@@ -229,6 +229,12 @@ impl PeerPool {
         self.inner.blacklist.lock().await.len()
     }
 
+    /// Addresses currently cooling off in backoff (may include not-yet-swept
+    /// expired entries; a status-line approximation).
+    pub async fn backoff_count(&self) -> usize {
+        self.inner.backoff.lock().await.len()
+    }
+
     /// A snap fetch against `addr` returned usable proof material — mark the
     /// cached peer CONFIRMED (dial-first next run). Persists only on a quality
     /// transition (dirty-gated flush), so repeated serves don't re-write.
