@@ -118,8 +118,14 @@ public final class Main {
                             else rustLog.info("{}", line);
                         }
                     }
-                } catch (Throwable ignored) {
-                    // Never let log draining take the daemon down.
+                } catch (Throwable t) {
+                    // Never let log draining take the daemon down — but don't
+                    // swallow an interrupt: restore the flag and stop.
+                    if (t instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    // Any other error is dropped; keep pumping.
                 }
                 try {
                     // Short poll → near-real-time without a busy spin. The ring
