@@ -426,6 +426,49 @@ pub fn get_storage_at_json(handle: i64, address_hex: &str, position_hex: &str) -
     }
 }
 
+/// `nativeGetBlockByNumberJson`: verified `eth_getBlockByNumber` (transactions as
+/// hashes) for a running handle. Returns the block JSON when found+verified, the
+/// literal `"null"` for a future/unknown block (eth's null), or `{"error": "..."}`
+/// when it can't verify right now (which the Java side maps to a null → -32000).
+/// `fullTransactions=true` is handled on the Java side (returns null before this
+/// native runs), so this always serves the hashes-only shape.
+pub fn get_block_by_number_json(handle: i64, block_tag: &str) -> String {
+    let target = match parse_block_target(block_tag) {
+        Ok(t) => t,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    match engine.rt.block_on(async { reader.get_block_by_number(target).await }) {
+        Ok(Some(block)) => eljson::block_json(&block),
+        Ok(None) => "null".to_string(), // verified future/unknown block → eth null
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// Parse an eth block selector to a target number: `None` = latest (the head).
+/// Mirrors the Java backend — latest/pending/safe/finalized all resolve to the
+/// optimistic head; earliest (genesis) and malformed/negative are not served
+/// verified (`Err`, surfaced as an error the router turns into -32000).
+fn parse_block_target(tag: &str) -> Result<Option<u64>, &'static str> {
+    match tag {
+        "latest" | "pending" | "safe" | "finalized" => Ok(None),
+        "earliest" => Err("earliest (genesis) is not served verified"),
+        hex => {
+            let h = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
+            if h.is_empty() || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("invalid block number");
+            }
+            u64::from_str_radix(h, 16).map(Some).map_err(|_| "block number out of range")
+        }
+    }
+}
+
 /// Snapshot `(reader, finalizedPeriod, wallClockPeriod)` for a running handle,
 /// or an error message. Holds the map lock only for the clone.
 fn snapshot_reader(

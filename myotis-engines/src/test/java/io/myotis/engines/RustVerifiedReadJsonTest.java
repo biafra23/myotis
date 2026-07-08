@@ -229,4 +229,32 @@ class RustVerifiedReadJsonTest {
         String json = "{\"valueHex\":\"0x2a\",\"verifyMethod\":null,\"failReason\":\"beaconNotSynced\"}";
         assertNull(RustChainHandle.storageValueFromJson(json));
     }
+
+    // ---- eth_getBlockByNumber (blockJsonOrThrow) ----
+
+    @Test
+    void blockJsonPassesThroughObject() {
+        String block = "{\"number\":\"0x1406f40\",\"hash\":\"0x99\",\"transactions\":[],\"uncles\":[]}";
+        assertEquals(block, RustChainHandle.blockJsonOrThrow(block));
+    }
+
+    @Test
+    void blockNullLiteralIsVerifiedNotFound() {
+        // "null" (a verified future/unknown block) is returned as-is → the router
+        // emits a JSON null result (eth's unknown-block convention), not an error.
+        assertEquals("null", RustChainHandle.blockJsonOrThrow("null"));
+    }
+
+    @Test
+    void blockErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.blockJsonOrThrow("{\"error\":\"beacon not synced\"}"));
+    }
+
+    @Test
+    void blockBlankOrMalformedPayloadThrows() {
+        assertThrows(EngineException.class, () -> RustChainHandle.blockJsonOrThrow(null));
+        assertThrows(EngineException.class, () -> RustChainHandle.blockJsonOrThrow(""));
+        assertThrows(EngineException.class, () -> RustChainHandle.blockJsonOrThrow("not json"));
+    }
 }

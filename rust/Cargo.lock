@@ -2069,6 +2069,7 @@ version = "0.1.0"
 dependencies = [
  "jni",
  "myotis-consensus",
+ "myotis-core",
  "myotis-net",
  "serde",
  "serde_json",
