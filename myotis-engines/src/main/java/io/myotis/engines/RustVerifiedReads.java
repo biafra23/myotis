@@ -56,6 +56,12 @@ final class RustVerifiedReads implements VerifiedReads {
         // The beacon optimistic-head execution block number (eth_blockNumber), from
         // the anchor via the status JSON. 0 == the anchor has no head yet (not
         // synced enough) → null, per the contract.
+        //
+        // Head/state skew: this is the beacon optimistic head N, whereas getBalance/
+        // getCode/getStorageAt("latest") are served against a peer's fresh tip, which
+        // is typically a few blocks AHEAD of N. Both are beacon-verified, so a read
+        // at a block > N is not a trust violation — just the standard light-client
+        // skew that wallets (MetaMask) tolerate.
         try {
             long head = handle.status().optimisticBlockNumber();
             return head > 0 ? head : null;
