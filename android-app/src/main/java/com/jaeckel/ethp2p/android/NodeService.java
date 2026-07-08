@@ -109,6 +109,9 @@ public final class NodeService extends Service {
     private static final String K_STRICT_FRESHNESS = "strictStateFreshness";
     private static final String K_NATIVE_BLS = "nativeBls";
     private static final String K_RUST_ENGINE = "rustEngine";
+    private static final String K_IDLE_PAUSE_MIN = "idlePauseMinutes";
+    private static final String K_STAY_AWAKE_CHARGING = "stayAwakeWhileCharging";
+    public static final int DEFAULT_IDLE_PAUSE_MIN = 5;
     public static final int DEFAULT_RPC_PORT = 8545;
     // Gnosis defaults to a distinct port so both networks can be added to MetaMask
     // at once: MetaMask refuses to save two RPC endpoints that share the same URL
@@ -256,6 +259,25 @@ public final class NodeService extends Service {
     public static void setDeepPoolThreshold(android.content.Context c, int v) {
         prefs(c).edit().putInt(K_DEEP_POOL, clampInt(v, 1, 128, DEFAULT_DEEP_POOL)).apply();
     }
+    /** Minutes of no RPC/UI activity before a running stack is paused (networking off,
+     *  RPC keeps listening; the first request wakes it). 0 disables auto-pause. */
+    public static int idlePauseMinutes(android.content.Context c) {
+        return clampInt(prefs(c).getInt(K_IDLE_PAUSE_MIN, DEFAULT_IDLE_PAUSE_MIN),
+                0, 240, DEFAULT_IDLE_PAUSE_MIN);
+    }
+    public static void setIdlePauseMinutes(android.content.Context c, int v) {
+        prefs(c).edit().putInt(K_IDLE_PAUSE_MIN, clampInt(v, 0, 240, DEFAULT_IDLE_PAUSE_MIN)).apply();
+    }
+    /** When true (default), the idle controller skips auto-pause while the device is charging and
+     *  online — plugged in with a network, battery isn't a concern, so the node stays awake and
+     *  synced. Plugged in but offline still pauses (nothing to sync). The emergency low-memory
+     *  pause ({@link #onTrimMemory}) ignores this. Read live by the idle tick. */
+    public static boolean stayAwakeWhileCharging(android.content.Context c) {
+        return prefs(c).getBoolean(K_STAY_AWAKE_CHARGING, true);
+    }
+    public static void setStayAwakeWhileCharging(android.content.Context c, boolean v) {
+        prefs(c).edit().putBoolean(K_STAY_AWAKE_CHARGING, v).apply();
+    }
     /** Whether RPC state reads use the strict 2-min head-staleness bound. Default true
      *  (strict). Relaxing it (toggle OFF strict / ON "relaxed") lets eth_call / balance /
      *  estimateGas serve an older root — but that *backfired* into 120-s confirm-screen
@@ -346,6 +368,7 @@ public final class NodeService extends Service {
      * and start just this stack on a worker. No-op if it's already live.
      */
     public void enableNetwork(String name) {
+        noteUiActivity();
         String n = canonicalNetwork(name);
         setNetworkEnabled(this, n, true);
         if (!RUNNING.get()) {
@@ -384,6 +407,10 @@ public final class NodeService extends Service {
         // nothing — the new port is already persisted and applies on the next enable. Without this,
         // saving settings would start a chain the user has turned off.
         if (handles.remove(n) == null) return;
+        // A reboot is a cold restart of this stack: clear the SYNCED-once flag so it runs through
+        // to SYNCED again before the idle controller may pause it. buildAndStart re-stamps the
+        // start clocks. (rebootNetwork doesn't go through forgetStack, so clear it explicitly here.)
+        reachedSynced.remove(n);
         new Thread(() -> {
             synchronized (bootLock(n)) {
                 try { ENGINE.stop(n); } catch (Throwable ignored) {}
@@ -399,6 +426,10 @@ public final class NodeService extends Service {
         cachedClCounts.remove(n);
         elCaches.remove(n);
         clCaches.remove(n);
+        stackStartMs.remove(n);
+        stackStartNano.remove(n);
+        lastResumeMs.remove(n);
+        reachedSynced.remove(n);   // a re-enable cold-starts the SYNCED-once gate again
     }
 
     /** True if any network is still enabled (incl. the seeded default). */
@@ -462,6 +493,362 @@ public final class NodeService extends Service {
     // next start; never cleared in doShutdown — see the PR #82 note there.
     private volatile long startTimeMs;
 
+    // ---------------------------------------------------------------------
+    // Idle sleep controller: pause a stack's networking after idlePauseMinutes
+    // of no RPC / UI activity. The engine self-wakes on an incoming JSON-RPC
+    // request (the wake gate holds it until ready), so the controller only has
+    // to decide when to go BACK to sleep — and to reconcile the notification
+    // with wakes it didn't perform.
+    // ---------------------------------------------------------------------
+
+    /** How often the idle controller checks activity and reconciles the notification. */
+    private static final long IDLE_TICK_MS = 30_000;
+    /** Last UI-originated activity (query tab, ENS lookup, enable, app foreground). */
+    private volatile long uiActivityMs;
+    /** Per-network boot stamp: a freshly-started stack gets a full idle window.
+     *  STATIC (matching ENGINE / RUNNING / BOOT_LOCKS): this is per-network-stack state that
+     *  outlives a service instance, and the static {@link #dailyCatchUp} worker path reads/writes it. */
+    private static final Map<String, Long> stackStartMs = new ConcurrentHashMap<>();
+    /** Per-network stack-start stamp in monotonic {@link System#nanoTime} for the SYNCED-once
+     *  ceiling only. Separate from {@link #stackStartMs} (wall-clock, used for idle-window display
+     *  and the pause decision) so a wall-clock/NTP step can't prematurely expire or indefinitely
+     *  extend the 30-minute run-until-synced backstop. Stamped alongside stackStartMs at boot,
+     *  cleared on teardown. */
+    private static final Map<String, Long> stackStartNano = new ConcurrentHashMap<>();
+    /** Per-network HOST-side resume stamp (foreground resume, daily catch-up): gives
+     *  the resumed stack a full idle window even though no request bumped the engine's
+     *  activity clock. Engine-side wakes need no stamp — the waking request did it.
+     *  STATIC so the {@link #dailyCatchUp} worker (no service binder) can hold the grace
+     *  stamp while it catches up, keeping the instance idle ticker from pausing it mid-pass. */
+    private static final Map<String, Long> lastResumeMs = new ConcurrentHashMap<>();
+    /** Per-network flag: the stack has reached SYNCED (with a warm verified head) at least once
+     *  since it (re)started. A fresh start must run through to SYNCED before the idle controller
+     *  is allowed to pause it — pausing mid-initial-sync just makes the next wake redo the work.
+     *  STATIC (like the stamps above): survives a service instance. Set true when first observed
+     *  SYNCED and cleared when the network is torn down (so a disable→re-enable cold-starts the
+     *  gate again); a stack that briefly falls out of sync after its first SYNCED still pauses on
+     *  the normal idle rules. */
+    private static final java.util.Set<String> reachedSynced = ConcurrentHashMap.newKeySet();
+    /** Backstop for the SYNCED-once gate: if a fresh stack has been trying to reach SYNCED for
+     *  this long (measured from its boot stamp) without success — no peers, a wedged sync, a
+     *  perpetually-throwing status() — stop keeping it awake and let the idle controller pause it.
+     *  Otherwise "run until synced" could drain the battery indefinitely on a node that never
+     *  syncs, the exact thing the feature fights. Generous so a slow-but-progressing initial sync
+     *  on a poor network still completes first. */
+    private static final long SYNC_RUN_CEILING_MS = 30 * 60_000L;
+    private volatile java.util.concurrent.ScheduledExecutorService idleTicker;
+    /** What the notification currently shows, to notify() only on transitions. */
+    private volatile Boolean notifiedSleeping;
+
+    /** Note UI-originated activity so the idle controller keeps the node awake. */
+    public void noteUiActivity() {
+        uiActivityMs = System.currentTimeMillis();
+    }
+
+    /**
+     * The app came to the foreground: count it as activity and proactively resume
+     * every paused stack so the UI shows live data without waiting for a query.
+     */
+    public void onAppForeground() {
+        noteUiActivity();
+        for (Map.Entry<String, ChainHandle> e : handles.entrySet()) {
+            String n = e.getKey();
+            ChainHandle h = e.getValue();
+            if (h.lifecycle() != io.myotis.api.LifecycleState.PAUSED) continue;
+            lastResumeMs.put(n, System.currentTimeMillis());
+            new Thread(() -> {
+                synchronized (bootLock(n)) {
+                    ChainHandle cur = handles.get(n);
+                    if (cur != null && RUNNING.get()) {
+                        LogBuffer.i(TAG, "[" + n + "] resuming (app foreground)");
+                        // FOREGROUND is an observation wake: counts toward the pause total but
+                        // must not overwrite the last-wake reason, or opening the app to view
+                        // the status page would hide the request/catch-up wake being debugged.
+                        try { cur.resume(io.myotis.api.WakeReason.FOREGROUND); } catch (Throwable t) {
+                            LogBuffer.w(TAG, "[" + n + "] foreground resume failed: " + t);
+                        }
+                    }
+                }
+                updateNotification();
+            }, "ethp2p-fg-resume-" + n).start();
+        }
+    }
+
+    private void startIdleTicker() {
+        if (idleTicker != null) return;
+        java.util.concurrent.ScheduledExecutorService ex =
+                Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "ethp2p-idle");
+                    t.setDaemon(true);
+                    return t;
+                });
+        ex.scheduleWithFixedDelay(() -> idleTick(idlePauseMinutes(this) * 60_000L),
+                IDLE_TICK_MS, IDLE_TICK_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        idleTicker = ex;
+    }
+
+    private void stopIdleTicker() {
+        java.util.concurrent.ScheduledExecutorService ex = idleTicker;
+        if (ex != null) {
+            ex.shutdownNow();
+            idleTicker = null;
+        }
+    }
+
+    /**
+     * One idle-controller pass: pause every RUNNING stack whose last activity —
+     * engine-side (gated RPC/ENS/query), UI-side, or a host resume/boot stamp —
+     * is older than {@code idleMs}, then reconcile the notification. Guarded:
+     * an uncaught throw would silently stop all future scheduled runs.
+     */
+    private void idleTick(long idleMs) { idleTick(idleMs, true); }
+
+    /**
+     * @param routine {@code true} for the scheduled idle ticker — applies the battery-saving
+     *   gates below. {@code false} for the emergency {@link #onTrimMemory} pause, which must go
+     *   through regardless (a pre-sync node under memory pressure is better paused than
+     *   OOM-killed and cold-started).
+     *
+     * <p>Routine gates, all skipped when {@code routine} is false:
+     * <ul>
+     *   <li><b>SYNCED-once</b> — never pause a stack that hasn't yet reached SYNCED (+ warm head)
+     *       this run, so a fresh start finishes initial sync before its first sleep. Exception:
+     *       if no network is available it can't sync anyway, so allow the pause rather than keep
+     *       the radio scanning.</li>
+     *   <li><b>Charging</b> — when {@link #stayAwakeWhileCharging} is on (default), the device is
+     *       plugged in, <em>and</em> a network is available, skip auto-pause: battery isn't a
+     *       concern, stay synced. Plugged in but offline still pauses (nothing to sync).</li>
+     * </ul>
+     */
+    private void idleTick(long idleMs, boolean routine) {
+        // Bail if the service is being torn down: doShutdown() runs on a worker thread, so a
+        // scheduled tick (or the onTrimMemory pass) could otherwise spawn pause threads or mutate
+        // reachedSynced after Stop. The per-stack pause thread re-checks RUNNING under bootLock too.
+        if (!RUNNING.get()) return;
+        try {
+            long now = System.currentTimeMillis();
+            // Process-global conditions, evaluated once per pass rather than per stack.
+            boolean netUp = networkAvailable();
+            // Stay awake while charging only when there's actually a network to stay synced over.
+            // Plugged in but offline there's nothing to do, so let the stack pause rather than keep
+            // the radio scanning — the same "no network -> pause anyway" rule the SYNCED gate uses.
+            boolean skipWhileCharging =
+                    routine && stayAwakeWhileCharging(this) && isCharging() && netUp;
+            for (Map.Entry<String, ChainHandle> e : handles.entrySet()) {
+                String n = e.getKey();
+                ChainHandle h = e.getValue();
+                if (idleMs <= 0) break; // auto-pause disabled
+                io.myotis.api.LifecycleState ls;
+                try { ls = h.lifecycle(); } catch (Throwable t) { continue; }
+                if (ls != io.myotis.api.LifecycleState.RUNNING) continue;
+                long lastActivity = Math.max(
+                        Math.max(h.lastActivityEpochMillis(), uiActivityMs),
+                        Math.max(lastResumeMs.getOrDefault(n, 0L),
+                                 stackStartMs.getOrDefault(n, 0L)));
+                if (now - lastActivity <= idleMs) continue;
+                if (skipWhileCharging) continue; // plugged in: keep awake and synced
+                // SYNCED-once gate: don't pause a stack still doing its initial sync — unless
+                // there's no network to sync over, in which case sleeping saves battery.
+                if (routine && !reachedSynced.contains(n)) {
+                    if (isSyncedWarm(h)) {
+                        reachedSynced.add(n); // first SYNCED reached; fall through to the pause
+                        LogBuffer.i(TAG, "[" + n + "] reached SYNCED; idle-pause now eligible");
+                    } else if (netUp && !syncRunCeilingReached(n)) {
+                        continue; // still catching up with a network available — keep networking on
+                    } else if (netUp) {
+                        // Online but still not synced after the ceiling — stop draining battery
+                        // on a stack that can't sync; let it pause and wake/retry later.
+                        LogBuffer.i(TAG, "[" + n + "] not SYNCED after "
+                                + (SYNC_RUN_CEILING_MS / 60_000L) + "m; allowing idle pause");
+                    }
+                    // else: not synced and offline → allow the pause below
+                }
+                long idleForSec = (now - lastActivity) / 1000;
+                new Thread(() -> {
+                    synchronized (bootLock(n)) {
+                        // Re-check under the lock: a disable/reboot/stop may have raced us,
+                        // and pause() on a stack that lost that race is a no-op anyway.
+                        ChainHandle cur = handles.get(n);
+                        if (cur != null && RUNNING.get() && isNetworkEnabled(this, n)) {
+                            LogBuffer.i(TAG, "[" + n + "] idle " + idleForSec
+                                    + "s; pausing networking (RPC keeps listening)");
+                            try { cur.pause(); } catch (Throwable t) {
+                                LogBuffer.w(TAG, "[" + n + "] pause failed: " + t);
+                            }
+                        }
+                    }
+                    updateNotification();
+                }, "ethp2p-pause-" + n).start();
+            }
+            updateNotification();
+        } catch (Throwable t) {
+            LogBuffer.w(TAG, "idle tick error: " + t);
+        }
+    }
+
+    /** The stack has a fresh verified head from a SYNCED beacon light client — the same
+     *  "synced + warm head" bar the daily catch-up waits for before pausing again. */
+    private static boolean isSyncedWarm(ChainHandle h) {
+        try {
+            StatusSnapshot s = h.status();
+            return s.beaconState() == BeaconState.SYNCED
+                    && s.verifiedHeadAgeMs() != Long.MAX_VALUE;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** True once a still-unsynced stack has been running past {@link #SYNC_RUN_CEILING_MS}, measured
+     *  on the monotonic clock so a wall-clock/NTP step can't skew it. This is the backstop that stops
+     *  "run until synced" from keeping networking on (and draining the battery) forever on a stack
+     *  that never syncs. An absent stamp (shouldn't happen — set at boot) is treated as reached, so
+     *  the SYNCED-once gate can't wedge a stack awake indefinitely. */
+    private static boolean syncRunCeilingReached(String n) {
+        Long startNano = stackStartNano.get(n);
+        if (startNano == null) return true;
+        return System.nanoTime() - startNano >= SYNC_RUN_CEILING_MS * 1_000_000L;
+    }
+
+    /** True when a network with Internet capability is active. Fail-open (true) if the state
+     *  can't be read, so a transient query error doesn't wrongly let the idle tick pause a
+     *  still-syncing stack. */
+    private boolean networkAvailable() {
+        try {
+            ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+            if (cm == null) return true;
+            Network net = cm.getActiveNetwork();
+            if (net == null) return false;
+            android.net.NetworkCapabilities caps = cm.getNetworkCapabilities(net);
+            return caps != null
+                    && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET);
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    /** True when the device is plugged in (AC / USB / wireless) or actively charging — i.e.
+     *  battery isn't a concern. Plug-state is read first (via the sticky ACTION_BATTERY_CHANGED
+     *  intent) because {@code BatteryManager.isCharging()} reports charge state, which is false
+     *  when plugged in but momentarily discharging under load. Fail-safe to false so a read error
+     *  never blocks a pause. */
+    private boolean isCharging() {
+        try {
+            android.content.Intent i = registerReceiver(null,
+                    new android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED));
+            if (i != null
+                    && i.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) != 0) {
+                return true; // plugged into AC / USB / wireless
+            }
+        } catch (Throwable ignored) {
+            // fall through to the charge-state check
+        }
+        try {
+            android.os.BatteryManager bm = getSystemService(android.os.BatteryManager.class);
+            return bm != null && bm.isCharging();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** True when the service runs at least one stack and every live stack is paused. */
+    private boolean allStacksPaused() {
+        boolean any = false;
+        for (ChainHandle h : handles.values()) {
+            any = true;
+            try {
+                if (h.lifecycle() != io.myotis.api.LifecycleState.PAUSED) return false;
+            } catch (Throwable t) {
+                return false;
+            }
+        }
+        return any;
+    }
+
+    /**
+     * The daily maintenance pass ({@link CatchUpWorker}): for each idle-PAUSED stack,
+     * resume, wait until the beacon client is SYNCED and the verified head is warm (or
+     * the per-network budget slice runs out), and pause again — but only if no real
+     * activity arrived meanwhile (then the idle controller owns the stack again).
+     *
+     * <p>Two distinct clocks, deliberately: the worker never touches the ENGINE's
+     * activity clock ({@code lastActivityEpochMillis}), so the "did real activity
+     * arrive?" check at the end stays honest. It DOES hold the host-side
+     * {@link #lastResumeMs} grace stamp (refreshed each loop) while it runs, so the
+     * instance idle ticker — which also considers {@code lastResumeMs} — won't pause
+     * the just-resumed stack out from under the catch-up before it reaches SYNCED.
+     * Snapshot persistence is free: the engine persists on every pause.
+     *
+     * <p>Static: the Worker has no binder; ENGINE / BOOT_LOCKS / the idle stamps are
+     * all process-global.
+     */
+    public static void dailyCatchUp(long budgetMs) {
+        List<String> hosted = ENGINE.hostedNetworks();
+        if (hosted.isEmpty()) return;
+        long sliceMs = Math.max(30_000L, budgetMs / hosted.size());
+        for (String n : hosted) {
+            ChainHandle h = ENGINE.get(n);
+            if (h == null || h.lifecycle() != io.myotis.api.LifecycleState.PAUSED) continue;
+            long activityBefore = h.lastActivityEpochMillis();
+            LogBuffer.i(TAG, "[" + n + "] daily catch-up: resuming");
+            boolean resumed;
+            synchronized (bootLock(n)) {
+                // Hold the grace stamp BEFORE resume returns RUNNING, so the idle ticker
+                // can't pause the stack in the window between resume() and the loop.
+                lastResumeMs.put(n, System.currentTimeMillis());
+                resumed = h.resume(io.myotis.api.WakeReason.CATCH_UP);
+            }
+            if (!resumed) continue; // stays paused; next daily run retries
+            // Monotonic deadline (nanoTime, overflow-safe compare) so an NTP/wall-clock
+            // step can't cut the pass short or hang it.
+            long deadlineNano = System.nanoTime() + sliceMs * 1_000_000L;
+            while (System.nanoTime() - deadlineNano < 0) {
+                // Refresh the grace stamp each iteration: keeps now-lastResumeMs well under
+                // any idle window (min 60s) so the 30s idle ticker never pauses us mid-pass.
+                lastResumeMs.put(n, System.currentTimeMillis());
+                try {
+                    StatusSnapshot s = h.status();
+                    if (s.beaconState() == BeaconState.SYNCED
+                            && s.verifiedHeadAgeMs() != Long.MAX_VALUE) {
+                        break;
+                    }
+                    Thread.sleep(5_000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Throwable ignored) {
+                    break;
+                }
+            }
+            // Real user/RPC activity arrived mid-catch-up → leave the stack to the
+            // idle controller; otherwise go straight back to sleep (pause persists
+            // the freshly-caught-up snapshot).
+            if (h.lastActivityEpochMillis() == activityBefore) {
+                synchronized (bootLock(n)) {
+                    try { h.pause(); } catch (Throwable ignored) {}
+                }
+                LogBuffer.i(TAG, "[" + n + "] daily catch-up done; paused again");
+            } else {
+                LogBuffer.i(TAG, "[" + n + "] daily catch-up: activity arrived; staying awake");
+            }
+        }
+    }
+
+    /** Re-issue the foreground notification when the sleeping/active state changed —
+     *  including engine-initiated wakes (an RPC request resumed a paused stack). */
+    private void updateNotification() {
+        if (!RUNNING.get()) return;
+        boolean sleeping = allStacksPaused();
+        Boolean shown = notifiedSleeping;
+        if (shown != null && shown == sleeping) return;
+        notifiedSleeping = sleeping;
+        try {
+            NotificationManager nm = getSystemService(NotificationManager.class);
+            if (nm != null) nm.notify(NOTIFICATION_ID, buildNotification(sleeping));
+        } catch (Throwable t) {
+            LogBuffer.w(TAG, "notification update failed: " + t);
+        }
+    }
+
     // Runs the BLOCKING engine-API calls (requestAccount, ens().resolveAddress) off the
     // caller's thread — the service's public surface stays CompletableFuture-based for
     // the Kotlin bridge, so the blocking API call is wrapped here. Static daemon pool:
@@ -485,6 +872,9 @@ public final class NodeService extends Service {
 
     public record Snapshot(
             boolean running,
+            String lifecycle,         // "RUNNING" | "PAUSED" | "STOPPED" — PAUSED is the
+                                      // idle sleep state: networking off, RPC listening,
+                                      // warm state retained, first request wakes it
             long startTimeMs,
             int discoveredPeers,
             int connectedPeers,
@@ -528,7 +918,13 @@ public final class NodeService extends Service {
             // calls serve instead of hitting "no verified head".
             long verifiedHeadAgeMs,
             List<io.myotis.api.PeerInfo> readyPeerList,
-            String network) {}            // active chain ("mainnet"/"gnosis")
+            String network,               // active chain ("mainnet"/"gnosis")
+            // Idle-sleep metrics (see WakeReason / SleepMetrics) — for the Status screen.
+            int pauseCount,               // times this stack entered idle sleep since start
+            long totalPausedMs,           // cumulative time paused (ms)
+            long lastPauseEpochMs,        // wall-clock ms of the last pause; 0 if never
+            long lastResumeEpochMs,       // wall-clock ms of the last DEMAND wake; 0 if none
+            String lastWakeReason) {}     // reason tag of the last demand wake; null if none
 
     /** Result of a get-account query. Mirrors the JVM daemon's JSON response shape. */
     public record AccountQueryResult(
@@ -592,6 +988,7 @@ public final class NodeService extends Service {
     @SuppressLint("NewApi") // CompletableFuture.failedFuture (API 31) is backported to
                             // minSdk 29 via desugar_jdk_libs — see the comment block above.
     public CompletableFuture<AccountQueryResult> requestAccount(String network, String hexAddress) {
+        noteUiActivity();
         ChainHandle handle = handles.get(canonicalNetwork(network));
         if (handle == null) {
             return CompletableFuture.failedFuture(new IllegalStateException("Node is not running"));
@@ -686,6 +1083,7 @@ public final class NodeService extends Service {
 
     @SuppressLint("NewApi") // CompletableFuture.failedFuture — see requestAccount
     public CompletableFuture<EnsResolution> resolveEns(String network, String name) {
+        noteUiActivity();
         final String trimmed = name == null ? "" : name.trim();
         final String n = canonicalNetwork(network);
         // ENS is mainnet/Sepolia-only — refuse early so we never run ENS contracts against
@@ -773,8 +1171,10 @@ public final class NodeService extends Service {
         // API 34+ requires the foregroundServiceType to be passed here and
         // to match the manifest's <service android:foregroundServiceType="...">
         // declaration. API 29-33 ignore the third arg. minSdk is 29.
-        startForeground(NOTIFICATION_ID, buildNotification(),
+        notifiedSleeping = false;
+        startForeground(NOTIFICATION_ID, buildNotification(false),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+        startIdleTicker();
 
         // Boot every enabled network as its own stack (Step 9). Each Netty/libp2p boot is
         // blocking-ish, so build + start each on its own worker; they bind distinct ports
@@ -891,6 +1291,11 @@ public final class NodeService extends Service {
                     return;
                 }
             }
+            // A freshly-booted stack gets a full idle window before the controller
+            // may pause it (its engine activity clock starts at 0).
+            stackStartMs.put(n, System.currentTimeMillis());
+            stackStartNano.put(n, System.nanoTime());   // monotonic clock for the sync-run ceiling
+            updateNotification();
             LogBuffer.i(TAG, "[" + n + "] node stack started (RPC " + rpcPort + ")");
         } catch (Exception e) {
             LogBuffer.e(TAG, "[" + n + "] node boot failed", e);
@@ -1004,6 +1409,9 @@ public final class NodeService extends Service {
         cachedClCounts.clear();
         elCaches.clear();
         clCaches.clear();
+        // Safe to clear (unlike startTimeMs below): a Stop->Start just re-runs the SYNCED-once
+        // gate until the restarted stack re-observes SYNCED — fast off the warm store, no freeze.
+        reachedSynced.clear();
         // NB: do NOT clear startTimeMs here. doShutdown() runs on a worker thread and its
         // teardown takes seconds; a quick Stop -> Start has onStartCommand() flip RUNNING back
         // to true and stamp a fresh startTimeMs while we're still mid-teardown (buildAndStart's
@@ -1114,17 +1522,22 @@ public final class NodeService extends Service {
         boolean preBeacon = bs.state() == BeaconState.STARTING;
         long syncCurrent = preBeacon ? -1 : s.syncCurrentPeriod();
         long syncTarget = preBeacon ? -1 : s.syncTargetPeriod();
+        String lifecycle = s.lifecycle() != null ? s.lifecycle().name() : "STOPPED";
         if (!running || !s.running()) {
-            return new Snapshot(running, startTimeMs, 0, 0, 0, 0, /*snapServing*/0,
+            // Covers both a stopped stack and a PAUSED one (running=false, warm state
+            // retained) — the lifecycle string lets the UI tell them apart.
+            return new Snapshot(running, lifecycle, startTimeMs, 0, 0, 0, 0, /*snapServing*/0,
                     elCache.total(), elCache.snapOk(), elCache.snapBad(), s.attemptedDials(), s.backedOffPeers(),
                     s.blacklistedPeers(), s.discv5TableSize(), 0,
                     beaconState, bs.bootstrapped(), bs.connectedPeers(), (int) bs.lightClientPeers(),
                     bs.servedPeersLastMinute(), clCache.total(), clCache.proven(), clCache.nolc(),
                     bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
                     s.syncStartPeriod(), syncCurrent, syncTarget,
-                    Long.MAX_VALUE, List.of(), network);
+                    Long.MAX_VALUE, List.of(), network,
+                    s.pauseCount(), s.totalPausedMs(), s.lastPauseEpochMs(),
+                    s.lastResumeEpochMs(), s.lastWakeReason());
         }
-        return new Snapshot(true, startTimeMs,
+        return new Snapshot(true, lifecycle, startTimeMs,
                 s.discoveredPeers(), s.connectedPeers(), s.readyPeers(),
                 s.snapPeers(), s.snapServingPeers(),
                 elCache.total(), elCache.snapOk(), elCache.snapBad(), s.attemptedDials(), s.backedOffPeers(),
@@ -1133,7 +1546,9 @@ public final class NodeService extends Service {
                 bs.servedPeersLastMinute(), clCache.total(), clCache.proven(), clCache.nolc(),
                 bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
                 s.syncStartPeriod(), syncCurrent, syncTarget,
-                s.verifiedHeadAgeMs(), s.readyPeerList(), network);
+                s.verifiedHeadAgeMs(), s.readyPeerList(), network,
+                s.pauseCount(), s.totalPausedMs(), s.lastPauseEpochMs(),
+                s.lastResumeEpochMs(), s.lastWakeReason());
     }
 
     // ---- Failure forensics (see ProcessHealthDiag) ----
@@ -1268,6 +1683,14 @@ public final class NodeService extends Service {
         // silent SIGKILL. Pair with the next launch's prior-exit=LOW_MEMORY line.
         LogBuffer.w(ProcessHealthDiag.TAG, "onTrimMemory " + ProcessHealthDiag.trimLevelName(level)
                 + " | " + ProcessHealthDiag.memorySummary(this));
+        // About to be OOM-killed: pause any stack that's been idle even briefly.
+        // A pause frees the big consumers (Netty buffers, evm pools, libp2p) while
+        // keeping the warm beacon store — far better than dying and cold-starting.
+        if (level >= TRIM_MEMORY_RUNNING_CRITICAL && RUNNING.get()) {
+            // Emergency pass: bypass the SYNCED-once / charging gates. Freeing the big consumers
+            // beats getting OOM-killed and cold-starting, even mid-initial-sync or while charging.
+            idleTick(60_000L, false);
+        }
     }
 
     @Override
@@ -1285,6 +1708,7 @@ public final class NodeService extends Service {
             rl.interrupt();
             rustLogThread = null;
         }
+        stopIdleTicker();
         // Same fire-and-forget pattern as shutdown(): the system gives us a
         // brief window to return from onDestroy and we don't want to spend
         // it blocking on libp2p host shutdown / Netty graceful drain. doShutdown()
@@ -1295,14 +1719,17 @@ public final class NodeService extends Service {
         super.onDestroy();
     }
 
-    private Notification buildNotification() {
+    private Notification buildNotification(boolean sleeping) {
         NotificationManager nm = getSystemService(NotificationManager.class);
         NotificationChannel channel = new NotificationChannel(
                 CHANNEL_ID, "ethp2p node",
                 NotificationManager.IMPORTANCE_LOW);
         nm.createNotificationChannel(channel);
         return new Notification.Builder(this, CHANNEL_ID)
-                .setContentTitle("ethp2p node running")
+                .setContentTitle(sleeping ? "ethp2p node sleeping" : "ethp2p node running")
+                .setContentText(sleeping
+                        ? "Networking off — a wallet request wakes it"
+                        : null)
                 .setSmallIcon(android.R.drawable.stat_sys_download)
                 .setOngoing(true)
                 .build();

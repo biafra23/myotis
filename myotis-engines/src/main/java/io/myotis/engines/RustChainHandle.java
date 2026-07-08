@@ -14,6 +14,7 @@ import io.myotis.api.DiscoveredPeer;
 import io.myotis.api.EngineException;
 import io.myotis.api.EnsApi;
 import io.myotis.api.HeadersResult;
+import io.myotis.api.LifecycleState;
 import io.myotis.api.PeerInfo;
 import io.myotis.api.StatusSnapshot;
 import io.myotis.api.StorageProofResult;
@@ -89,6 +90,45 @@ final class RustChainHandle implements ChainHandle {
             this.rpcServer = null;
         }
         RustEngineNative.nativeStop(handle);
+    }
+
+    // ---- idle-sleep lifecycle: NO-OP on the Rust engine (see class javadoc) ----
+    //
+    // The Java engine idle-pauses by tearing down + rebuilding its networking
+    // (ChainStack.pause/resume via WakeGate). The Rust engine owns a tokio/libp2p
+    // stack it can't cheaply suspend yet, so it implements the contract as a no-op:
+    // it simply never idle-sleeps. pause() reports it did NOT pause (stays RUNNING);
+    // resume() is a no-op success; lifecycle() is RUNNING/STOPPED (never PAUSED); and
+    // lastActivityEpochMillis() reports "now" so a host idle controller sees constant
+    // activity and never attempts a pause. Real Rust pause/resume is a later follow-up.
+
+    @Override
+    public boolean pause() {
+        // Did not enter PAUSED — the Rust engine keeps RUNNING.
+        return false;
+    }
+
+    @Override
+    public boolean resume() {
+        // Always RUNNING → resume is a no-op success (mirrors the "already RUNNING" case).
+        return isRunning();
+    }
+
+    @Override
+    public boolean resume(String reason) {
+        return resume();
+    }
+
+    @Override
+    public LifecycleState lifecycle() {
+        return isRunning() ? LifecycleState.RUNNING : LifecycleState.STOPPED;
+    }
+
+    @Override
+    public long lastActivityEpochMillis() {
+        // No activity tracking; report "now" so a host idle timer never elapses and
+        // never tries to pause (which would be a no-op returning false anyway).
+        return System.currentTimeMillis();
     }
 
     /**
@@ -222,6 +262,7 @@ final class RustChainHandle implements ChainHandle {
         // status JSON; only verifiedHeadAgeMs remains a later follow-up.
         return new StatusSnapshot(
                 s.running(),
+                s.running() ? LifecycleState.RUNNING : LifecycleState.STOPPED,
                 networkName,
                 s.beaconState(),
                 peers,                 // connectedPeers (CL libp2p peers)
@@ -243,7 +284,14 @@ final class RustChainHandle implements ChainHandle {
                 s.finalizedSlot() / 8192L, // finalizedPeriod (SLOTS_PER_SYNC_COMMITTEE_PERIOD)
                 targetPeriod,   // wallClockPeriod == the catch-up target
                 Long.MAX_VALUE, // verifiedHeadAgeMs (no verified RPC head yet)
-                List.<PeerInfo>of());
+                List.<PeerInfo>of(),
+                // Idle-sleep metrics: the Rust engine does not idle-pause yet (pause()
+                // is a no-op — see below), so it never accrues pause stats.
+                0,      // pauseCount
+                0L,     // totalPausedMs
+                0L,     // lastPauseEpochMs
+                0L,     // lastResumeEpochMs
+                null);  // lastWakeReason
     }
 
     @Override

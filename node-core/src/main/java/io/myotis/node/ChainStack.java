@@ -10,6 +10,7 @@ import com.jaeckel.ethp2p.networking.discv4.KademliaTable;
 import com.jaeckel.ethp2p.networking.discv5.DiscV5Service;
 import com.jaeckel.ethp2p.networking.dns.DnsEnrResolver;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
+import io.myotis.api.LifecycleState;
 import org.apache.tuweni.bytes.Bytes;
 import org.apache.tuweni.crypto.SECP256K1;
 import org.slf4j.Logger;
@@ -35,6 +36,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+
+import static io.myotis.api.LifecycleState.PAUSED;
+import static io.myotis.api.LifecycleState.RUNNING;
+import static io.myotis.api.LifecycleState.STOPPED;
 
 /**
  * One Ethereum network's full node stack — RLPx (EL) + discv4 + discv5 (CL discovery)
@@ -64,6 +69,10 @@ public final class ChainStack {
     private static final int DNS_DIALS_PER_MIN = 60;         // rolling-minute rate cap
     private static final int DNS_POOL_MAX = 600;             // candidate-pool size cap
     private static final long DNS_REFRESH_INTERVAL_MS = 4 * 60 * 1000L;
+    /** Max time a verified read arriving on a paused stack is held while the wake completes. */
+    public static final long WAKE_WAIT_CAP_MS = 90_000L;
+    /** Wake-wait poll interval. */
+    private static final long WAKE_POLL_MS = 250L;
 
     // -- injected configuration ------------------------------------------------
     private final NetworkConfig network;
@@ -79,7 +88,13 @@ public final class ChainStack {
     private final Set<String> attempted = ConcurrentHashMap.newKeySet();
     private final Map<String, Long> backoff = new ConcurrentHashMap<>();
     private final Set<String> blacklistedNodeIds = ConcurrentHashMap.newKeySet();
-    private final AtomicBoolean running = new AtomicBoolean(false);
+    private final AtomicReference<LifecycleState> phase = new AtomicReference<>(STOPPED);
+    /** Wake-on-request: activity stamping + single-flight resume + bounded request hold. */
+    private final WakeGate wakeGate;
+    /** The stable VerifiedReads the RPC server holds across pause/resume cycles. */
+    private final GatedVerifiedReads gatedReads;
+    /** Idle-sleep bookkeeping (pause count / total paused / last wake) for the status screens. */
+    private final SleepMetrics sleepMetrics = new SleepMetrics();
 
     // -- snap-peer maintainer (optional; enabled via configureSnapMaintainer) --
     private volatile boolean maintainerEnabled = false;
@@ -117,6 +132,10 @@ public final class ChainStack {
         this.ccipGateway = ccipGateway;
         this.syncSnapshotFile = syncSnapshotFile;
         this.gossipsubEnabled = gossipsubEnabled;
+        this.wakeGate = new WakeGate(phase::get, this::readyForReads,
+                () -> resume(io.myotis.api.WakeReason.REQUEST),
+                System::currentTimeMillis, WAKE_POLL_MS, "wake-resume-" + network.name());
+        this.gatedReads = new GatedVerifiedReads(this);
     }
 
     /**
@@ -130,7 +149,7 @@ public final class ChainStack {
      * any host wanting aggressive snap-peer retention) turns it on.
      */
     public void configureSnapMaintainer(int targetSnapPeers, DnsServerProvider dnsServers) {
-        if (running.get()) {
+        if (phase.get() != STOPPED) {
             throw new IllegalStateException("configureSnapMaintainer must be called before start()");
         }
         this.maintainerEnabled = true;
@@ -158,7 +177,7 @@ public final class ChainStack {
      * flipping {@code running} mid-build and leaking the components started afterward.
      */
     public synchronized boolean start() {
-        if (!running.compareAndSet(false, true)) return true; // already started
+        if (!phase.compareAndSet(STOPPED, RUNNING)) return true; // already started
         try {
             log.info("[{}] Node ID: {}", network.name(), nodeKey.nodeId().toHexString());
 
@@ -180,27 +199,17 @@ public final class ChainStack {
             List<Enr> dnsClEnrs = clFuture.join();
             this.dnsElPool = dnsElEnrs;  // seed the maintainer's candidate pool
 
-            List<InetSocketAddress> mergedBootnodes = mergeBootnodes(dnsElEnrs);
-
             // 2. RLPx connector + immediate cached / DNS-direct dials.
             this.connector = buildConnector();
-            dialCachedPeers();
-            directDialDnsEnodes(dnsElEnrs);
-            directDialStaticEnodes();   // enrtree substitute for chains without one (Gnosis)
+            dialInitialPeers(dnsElEnrs);
 
             // 3. discv4.
-            this.discV4 = buildDiscV4(mergedBootnodes);
-            try {
-                discV4.start(ports.elPort());
-            } catch (Exception e) {
-                log.error("[{}] discv4 failed to bind UDP {}: {}", network.name(), ports.elPort(), e.toString());
-                throw e; // EL is essential — fail this stack
-            }
-            log.info("[{}] discv4 started on UDP port {}", network.name(), ports.elPort());
+            startDiscV4(dnsElEnrs);
 
             // 4. Beacon: sync-state + discv5 (CL discovery) + light client.
             this.beaconSyncState = new BeaconSyncState();
-            startDiscV5AndBeacon(dnsClEnrs);
+            startDiscV5();
+            buildAndStartBeacon(dnsClEnrs);
 
             // 5. Verified JSON-RPC (best-effort; a bind failure here does not fail the stack).
             startRpc();
@@ -217,9 +226,118 @@ public final class ChainStack {
         }
     }
 
-    /** Tear down this stack's components (reverse order) and release its caches. */
+    /**
+     * Suspend all networking — every socket and every periodic timer — while keeping
+     * the stack instance and its warm verified state in memory: the beacon light
+     * client's store, {@code beaconSyncState}'s roots window, the peer caches (NOT
+     * closed, unlike {@link #shutdown()}), the DNS candidate pool, and the dial
+     * backoff/blacklist. The JSON-RPC server keeps LISTENING (an idle loopback
+     * socket holds no radio); a verified read arriving while paused goes through
+     * {@link #awaitReadyForReads}, which triggers {@link #resume()} and holds the
+     * request until the node can answer.
+     *
+     * @return {@code true} when the stack is {@code PAUSED} on return
+     */
+    public synchronized boolean pause() {
+        if (!phase.compareAndSet(RUNNING, PAUSED)) return phase.get() == PAUSED;
+        sleepMetrics.onPause(System.currentTimeMillis(), System.nanoTime());
+        log.info("[{}] pausing: quiescing networking (RPC keeps listening)", network.name());
+        closeNetworkingComponents();
+        log.info("[{}] paused", network.name());
+        return true;
+    }
+
+    /**
+     * Rebuild networking after {@link #pause()}. Skips the cold-start DNS tree walk
+     * (the retained {@code dnsElPool} seeds the dials) and re-anchors the beacon
+     * light client from its warm in-memory store. Fault-isolated like
+     * {@link #start()}: on failure whatever was rebuilt is closed again and the
+     * stack stays {@code PAUSED} (retryable).
+     */
+    public synchronized boolean resume() {
+        return resume(io.myotis.api.WakeReason.MANUAL);
+    }
+
+    /**
+     * As {@link #resume()}, recording {@code reason} as the wake cause for the status
+     * screens. {@link io.myotis.api.WakeReason#FOREGROUND} is an observation wake: it
+     * still counts toward the pause total but does not overwrite the last-wake reason.
+     */
+    public synchronized boolean resume(String reason) {
+        LifecycleState p = phase.get();
+        if (p == RUNNING) return true;
+        if (p != PAUSED) return false; // STOPPED is terminal
+        log.info("[{}] resuming from pause ({})", network.name(), reason);
+        try {
+            this.connector = buildConnector();
+            dialInitialPeers(dnsElPool);
+            startDiscV4(dnsElPool);          // essential — throws on bind failure
+            startDiscV5();                   // non-essential, warn-and-continue
+            BeaconLightClient blc = beaconLightClient;
+            if (blc != null) blc.resume();
+            if (rpcServer != null) {
+                // The listener survived the pause; swap a fresh backend in behind
+                // the gate (the old one died with the previous connector).
+                io.myotis.rpc.VerifiedRpcBackend backend = buildAndStartBackend();
+                this.rpcBackend = backend;
+            } else {
+                startRpc(); // first start's bind failed — retry best-effort
+            }
+            if (maintainerEnabled) startPeerMaintainer();
+            phase.set(RUNNING);
+            // Foreground (observation) wakes count toward the total but must not overwrite
+            // the last-wake reason — see WakeReason / SleepMetrics.
+            sleepMetrics.onResume(System.currentTimeMillis(), System.nanoTime(), reason,
+                    !io.myotis.api.WakeReason.FOREGROUND.equals(reason));
+            log.info("[{}] resumed ({})", network.name(), reason);
+            return true;
+        } catch (Throwable t) {
+            log.error("[{}] resume failed (staying paused): {}", network.name(), t.toString());
+            closeNetworkingComponents();
+            return false;
+        }
+    }
+
+    /**
+     * The teardown shared by {@link #pause()} and a failed {@link #resume()}'s
+     * cleanup: stop every timer and socket, keep the RPC listener and all warm
+     * state. {@code attempted} is cleared because its entries are normally freed
+     * by connect-future listeners that die with the connector — leaving them
+     * would block re-dials on resume.
+     */
+    private void closeNetworkingComponents() {
+        ScheduledExecutorService pm = peerMaintainer;
+        if (pm != null) { pm.shutdownNow(); peerMaintainer = null; }
+        io.myotis.rpc.VerifiedRpcBackend backend = rpcBackend;
+        if (backend != null) {
+            rpcBackend = null; // gate re-reads this; null → requests hold instead of hitting a closed backend
+            try { backend.close(); } catch (Throwable ignored) {}
+        }
+        BeaconLightClient blc = beaconLightClient;
+        if (blc != null) {
+            try { blc.pause(); } catch (Throwable e) {
+                log.warn("[{}] beacon pause: {}", network.name(), e.toString());
+            }
+        }
+        RLPxConnector conn = connector;
+        if (conn != null) { connector = null; try { conn.close(); } catch (Throwable ignored) {} }
+        DiscV5Service d5 = discV5;
+        if (d5 != null) { discV5 = null; try { d5.close(); } catch (Throwable ignored) {} }
+        DiscV4Service d4 = discV4;
+        if (d4 != null) { discV4 = null; try { d4.close(); } catch (Throwable ignored) {} }
+        attempted.clear();
+    }
+
+    /**
+     * Tear down this stack's components (reverse order) and release its caches.
+     * Valid from any phase — a paused stack's components are already null and the
+     * closes are null-guarded; {@code BeaconLightClient.close()} after a pause is
+     * safe. Setting the phase to {@code STOPPED} first also releases any request
+     * threads parked in {@link #awaitReadyForReads} (they observe STOPPED on
+     * their next poll and return null).
+     */
     public synchronized void shutdown() {
-        running.set(false);
+        phase.set(STOPPED);
         ScheduledExecutorService pm = peerMaintainer;
         if (pm != null) { pm.shutdownNow(); peerMaintainer = null; }
         if (rpcServer != null) { try { rpcServer.stop(); } catch (Throwable ignored) {} }
@@ -236,12 +354,81 @@ public final class ChainStack {
     }
 
     // -------------------------------------------------------------------------
+    // Wake-on-request gate
+    // -------------------------------------------------------------------------
+
+    /**
+     * The wake-on-request choke point every verified read goes through: notes
+     * host-visible activity, triggers a single-flight async {@link #resume()}
+     * when paused, and blocks until reads are answerable or {@code capMs}
+     * elapses.
+     *
+     * @return the live backend to query, or {@code null} when no verified answer
+     *         is possible (stack stopped, RPC never started / failed to bind, or
+     *         still paused at the deadline). A stack that is RUNNING but still cold
+     *         at the deadline returns the backend anyway — it produces its own
+     *         precise bounded errors.
+     */
+    public io.myotis.rpc.VerifiedRpcBackend awaitReadyForReads(long capMs) {
+        // RUNNING with no backend means the JSON-RPC bind failed at start (the failure
+        // is swallowed and the phase stays RUNNING). No amount of waiting will produce a
+        // backend without a pause→resume, so fast-fail instead of holding the full cap —
+        // otherwise ENS / operator queries would hang ~90s and still fail. (PAUSED with a
+        // null backend is the normal sleep state and falls through to await(), which
+        // triggers the wake.)
+        if (phase.get() == RUNNING && rpcBackend == null) return null;
+        return wakeGate.await(capMs) ? rpcBackend : null;
+    }
+
+    /** Note activity and kick a wake if paused, without blocking (status probes). */
+    public void noteActivityAndWake() {
+        wakeGate.poke();
+    }
+
+    /**
+     * Requests currently being served (gated JSON-RPC reads + operator queries). While
+     * non-zero, {@link #lastActivityMs()} reports "now" so the host idle timer never
+     * pauses the stack mid-request — pausing would close the backend/connector under a
+     * slow in-flight call (e.g. a multi-second confirm-screen sweep). Balanced with
+     * {@link #beginRequest()}/{@link #endRequest()}.
+     */
+    private final AtomicInteger inFlight = new AtomicInteger();
+
+    public void beginRequest() { inFlight.incrementAndGet(); }
+    public void endRequest() { inFlight.decrementAndGet(); }
+
+    /** Epoch millis of the last gated verified read / operator query; 0 if none. While a
+     *  request is in flight this returns the current time, so the idle timer holds off. */
+    public long lastActivityMs() {
+        return inFlight.get() > 0 ? System.currentTimeMillis() : wakeGate.lastActivityMs();
+    }
+
+    // -- idle-sleep metrics (for status snapshots) --
+    public int pauseCount() { return sleepMetrics.pauseCount(); }
+    public long totalPausedMs() { return sleepMetrics.totalPausedMs(); }
+    public long lastPauseEpochMs() { return sleepMetrics.lastPauseEpochMs(); }
+    public long lastResumeEpochMs() { return sleepMetrics.lastResumeEpochMs(); }
+    public String lastWakeReason() { return sleepMetrics.lastWakeReason(); }
+
+    /** Readiness for verified reads: beacon SYNCED and the head warmer has an anchored head. */
+    private boolean readyForReads() {
+        if (phase.get() != RUNNING) return false;
+        BeaconSyncState bss = beaconSyncState;
+        io.myotis.rpc.VerifiedRpcBackend b = rpcBackend;
+        return bss != null && b != null
+                && bss.getSyncState(network.clGenesisTime(), network.secondsPerSlot())
+                        == BeaconSyncState.State.SYNCED
+                && b.verifiedHeadAgeMs() != Long.MAX_VALUE;
+    }
+
+    // -------------------------------------------------------------------------
     // Accessors (for the host's IPC / UI layer)
     // -------------------------------------------------------------------------
 
     public NetworkConfig network() { return network; }
     public ChainPorts ports() { return ports; }
-    public boolean isRunning() { return running.get(); }
+    public boolean isRunning() { return phase.get() == RUNNING; }
+    public LifecycleState lifecycle() { return phase.get(); }
     public RLPxConnector connector() { return connector; }
     public DiscV4Service discV4() { return discV4; }
     public DiscV5Service discV5() { return discV5; }
@@ -249,6 +436,17 @@ public final class ChainStack {
     public BeaconLightClient beaconLightClient() { return beaconLightClient; }
     /** The verified backend (for ENS resolution / verified reads), or null if RPC didn't start. */
     public io.myotis.rpc.VerifiedRpcBackend rpcBackend() { return rpcBackend; }
+
+    /**
+     * The pause-stable verified read surface hosts should hold: routes every read
+     * through the wake gate, so it stays valid across pause/resume cycles while
+     * the backend underneath is rebuilt. Null when the RPC pipeline never came up
+     * (bind failure at start and no successful resume since) and the stack has no
+     * backend — matching the old "reads unavailable" contract.
+     */
+    public io.myotis.api.VerifiedReads verifiedReads() {
+        return (rpcServer != null || rpcBackend != null) ? gatedReads : null;
+    }
     public Map<String, Long> backoff() { return backoff; }
     public Set<String> blacklistedNodeIds() { return blacklistedNodeIds; }
     /** Count of in-flight / recently-attempted dials (for host status snapshots). */
@@ -359,6 +557,28 @@ public final class ChainStack {
         }
     }
 
+    /** The immediate dial burst after a connector is (re)built: cached peers first,
+     *  then DNS-resolved enodes, then the static enode list (Gnosis's enrtree substitute). */
+    private void dialInitialPeers(List<Enr> dnsElEnrs) {
+        dialCachedPeers();
+        directDialDnsEnodes(dnsElEnrs);
+        directDialStaticEnodes();
+    }
+
+    /** Build and bind discv4 (EL discovery). Essential: a bind failure throws and
+     *  fails the start/resume that called this. */
+    private void startDiscV4(List<Enr> dnsElEnrs) throws Exception {
+        List<InetSocketAddress> mergedBootnodes = mergeBootnodes(dnsElEnrs);
+        this.discV4 = buildDiscV4(mergedBootnodes);
+        try {
+            discV4.start(ports.elPort());
+        } catch (Exception e) {
+            log.error("[{}] discv4 failed to bind UDP {}: {}", network.name(), ports.elPort(), e.toString());
+            throw e; // EL is essential — fail this stack
+        }
+        log.info("[{}] discv4 started on UDP port {}", network.name(), ports.elPort());
+    }
+
     private RLPxConnector buildConnector() {
         return new RLPxConnector(nodeKey, ports.elPort(), network, headers -> {
             if (!headers.isEmpty()) {
@@ -443,10 +663,14 @@ public final class ChainStack {
         });
     }
 
-    private void startDiscV5AndBeacon(List<Enr> dnsClEnrs) {
+    /** Build and bind discv5 (CL discovery). Non-essential: a failure is logged and
+     *  swallowed — EL keeps working and CL falls back to cache + seed list. The
+     *  found-peer callback reads the volatile {@code beaconLightClient} field: null
+     *  during the first start's brief pre-BLC window (peers land in the cache and
+     *  are picked up moments later), already-set on resume. */
+    private void startDiscV5() {
         List<byte[]> acceptedForkDigests = network.acceptedForkDigests();
         AtomicInteger mismatchesLogged = new AtomicInteger();
-        AtomicReference<BeaconLightClient> blcRef = new AtomicReference<>();
 
         this.discV5 = new DiscV5Service(nodeKey, network.clDiscv5Bootnodes(), enr -> {
             var eth2 = enr.eth2();
@@ -468,7 +692,7 @@ public final class ChainStack {
             final int mi = matchIdx;
             enr.toLibp2pMultiaddr().ifPresent(ma -> {
                 clPeerCache.add(ma);
-                BeaconLightClient blc = blcRef.get();
+                BeaconLightClient blc = beaconLightClient;
                 boolean liveAdded = blc != null && blc.addPeer(ma);
                 log.info("[{}][discv5] CL peer {} ({} match){}", network.name(), ma,
                         mi == 0 ? "current" : "prior", liveAdded ? " → live pool" : "");
@@ -481,8 +705,11 @@ public final class ChainStack {
             log.warn("[{}][discv5] failed to start on UDP {}, continuing without CL discovery: {}",
                     network.name(), ports.discv5Port(), t.toString());
         }
+    }
 
-        // Beacon light client.
+    /** Construct and start the beacon light client (first start only — a resume
+     *  reuses the retained instance via {@code BeaconLightClient.resume()}). */
+    private void buildAndStartBeacon(List<Enr> dnsClEnrs) {
         List<String> clPeers = new ArrayList<>(clPeerCache.load());
         for (String peer : network.clPeerMultiaddrs()) {
             if (!clPeers.contains(peer)) clPeers.add(peer);
@@ -506,10 +733,28 @@ public final class ChainStack {
         blc.setOnLightClientVerdict(clPeerCache::markLightClientBatch);
         blc.setSnapshotFile(syncSnapshotFile);
         blc.setGossipsubEnabled(gossipsubEnabled);
-        blcRef.set(blc);
         blc.start();
         this.beaconLightClient = blc;
         log.info("[{}] Beacon light client started with {} CL peer(s)", network.name(), clPeers.size());
+    }
+
+    /** Build and start a fresh verified backend over the CURRENT connector/light
+     *  client. One-shot like the components it binds to — pause closes it and
+     *  resume calls this again. */
+    private io.myotis.rpc.VerifiedRpcBackend buildAndStartBackend() {
+        io.myotis.rpc.SnapQualitySink snapQualitySink = new io.myotis.rpc.SnapQualitySink() {
+            @Override public void recordSnapServed(InetSocketAddress address) { peerCache.recordSnapServed(address); }
+            @Override public void recordSnapFailure(InetSocketAddress address) { peerCache.recordSnapFailure(address); }
+        };
+        io.myotis.rpc.RpcLogger rpcLogger = new io.myotis.rpc.RpcLogger() {
+            @Override public void info(String message) { log.info(message); }
+            @Override public void warn(String message) { log.warn(message); }
+        };
+        io.myotis.rpc.VerifiedRpcBackend backend = new io.myotis.rpc.VerifiedRpcBackend(
+                connector, beaconLightClient, beaconSyncState, ccipGateway,
+                rpcLogger, io.myotis.rpc.RpcClock.monotonic(), snapQualitySink);
+        backend.start();
+        return backend;
     }
 
     private void startRpc() {
@@ -521,21 +766,13 @@ public final class ChainStack {
                 probe.setReuseAddress(true);
                 probe.bind(new InetSocketAddress("127.0.0.1", rpcPort));
             }
-            io.myotis.rpc.SnapQualitySink snapQualitySink = new io.myotis.rpc.SnapQualitySink() {
-                @Override public void recordSnapServed(InetSocketAddress address) { peerCache.recordSnapServed(address); }
-                @Override public void recordSnapFailure(InetSocketAddress address) { peerCache.recordSnapFailure(address); }
-            };
-            io.myotis.rpc.RpcLogger rpcLogger = new io.myotis.rpc.RpcLogger() {
-                @Override public void info(String message) { log.info(message); }
-                @Override public void warn(String message) { log.warn(message); }
-            };
-            io.myotis.rpc.VerifiedRpcBackend backend = new io.myotis.rpc.VerifiedRpcBackend(
-                    connector, beaconLightClient, beaconSyncState, ccipGateway,
-                    rpcLogger, io.myotis.rpc.RpcClock.monotonic(), snapQualitySink);
+            io.myotis.rpc.VerifiedRpcBackend backend = buildAndStartBackend();
             try {
-                backend.start();
+                // The server is constructed over the GATE, never the raw backend:
+                // it survives pause() (keeps listening) while the backend underneath
+                // is torn down and rebuilt, and a request on a paused stack wakes it.
                 io.myotis.jsonrpc.MyotisRpcServer server =
-                        new io.myotis.jsonrpc.MyotisRpcServer(rpcPort, null, "127.0.0.1", backend);
+                        new io.myotis.jsonrpc.MyotisRpcServer(rpcPort, null, "127.0.0.1", gatedReads);
                 server.start();
                 this.rpcServer = server;
                 this.rpcBackend = backend;
@@ -605,7 +842,7 @@ public final class ChainStack {
     /** Keep {@code activeSnapHandlers() >= targetSnapPeers}: re-dial cached snap peers,
      *  then top up from the DNS ENR pool (rate-capped), then refresh the pool if still low. */
     private void maintainSnapPeers() {
-        if (!running.get()) return;
+        if (phase.get() != RUNNING) return;
         // Guard the whole body: an uncaught throw would make scheduleWithFixedDelay
         // silently stop all future runs.
         try {
@@ -677,9 +914,9 @@ public final class ChainStack {
             }
             List<Enr> resolved = resolver.resolveAllFromStrings(
                     network.elEnrTreeUrls(), Duration.ofSeconds(25));
-            // The resolve can take ~25s; if the stack was shut down meanwhile, drop the
-            // result instead of merging into / writing the pool of a dead stack.
-            if (!running.get()) return;
+            // The resolve can take ~25s; if the stack was shut down or paused meanwhile,
+            // drop the result instead of merging into / writing the pool of a dead stack.
+            if (phase.get() != RUNNING) return;
             lastDnsResolveMs = System.currentTimeMillis();
 
             byte[] ourFork = network.forkIdHash();

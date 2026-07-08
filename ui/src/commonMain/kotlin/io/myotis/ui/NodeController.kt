@@ -132,6 +132,29 @@ interface Settings {
     /** true = prefer the (experimental) Rust engine for newly started networks; default false. */
     fun rustEngineEnabled(): Boolean
     fun setRustEngineEnabled(v: Boolean)
+
+    /**
+     * Minutes of no RPC/UI activity before a running stack is paused into idle sleep
+     * (networking off, RPC listening, first request wakes it). 0 disables auto-pause.
+     * Defaults keep hosts without an idle controller (desktop) compiling: auto-pause off.
+     */
+    fun idlePauseMinutes(): Int = 0
+    fun setIdlePauseMinutes(v: Int) {}
+
+    /**
+     * When true (default), the idle controller does NOT auto-pause while the device is
+     * charging — plugged in, battery isn't a concern, so the node stays awake and synced.
+     * Emergency memory-pressure pauses ignore this. Default true keeps desktop compiling.
+     */
+    fun stayAwakeWhileCharging(): Boolean = true
+    fun setStayAwakeWhileCharging(v: Boolean) {}
+
+    /**
+     * Whether this host actually has an idle-sleep controller (Android). The idle-sleep
+     * Settings row is shown only when true — desktop has no controller, so surfacing a
+     * battery-saving toggle there would imply a feature that can't take effect. Default false.
+     */
+    fun supportsIdleSleep(): Boolean = false
 }
 
 /** Device network connectivity, as an observable stream so the UI can react to changes. */
@@ -148,6 +171,8 @@ interface NetworkStatus {
  */
 data class NodeSnapshot(
     val running: Boolean,
+    val lifecycle: String,          // RUNNING / PAUSED / STOPPED — PAUSED = idle sleep
+                                    // (networking off, RPC listening, wakes on request)
     val network: String,
     val beaconState: String,        // STOPPED / SYNCING / CATCHING_UP / SYNCED
     val connectedPeers: Int,
@@ -174,6 +199,12 @@ data class NodeSnapshot(
     val verifiedHeadAgeMs: Long,
     val uptimeSeconds: Long,
     val readyPeerList: List<PeerRow>,  // per-peer detail for the READY peers
+    // Idle-sleep metrics (pseudo-sleep observability). See WakeReason.
+    val pauseCount: Int,               // times the stack idle-slept since start
+    val totalPausedMs: Long,           // cumulative time paused
+    val lastPauseEpochMs: Long,        // wall-clock ms of the last pause; 0 if never
+    val lastResumeEpochMs: Long,       // wall-clock ms of the last DEMAND wake; 0 if none
+    val lastWakeReason: String?,       // reason of the last demand wake; null if none
 )
 
 /** One connected READY peer, for the Status peer list. */

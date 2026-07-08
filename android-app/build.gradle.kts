@@ -263,6 +263,11 @@ dependencies {
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.compose.ui.tooling.preview)
     debugImplementation(libs.androidx.compose.ui.tooling)
+
+    // WorkManager: the ~daily beacon catch-up while the node is idle-paused
+    // (resume → sync → persist snapshot → pause), so wakes stay fast after
+    // days of sleep. Java-only Worker — no ktx/coroutines artifact needed.
+    implementation(libs.androidx.work.runtime)
 }
 
 // Rebuild the Rust jniLibs from source when the full toolchain (cargo +
