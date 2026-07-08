@@ -95,6 +95,53 @@ public final class Main {
     }
 
     /**
+     * Drain the Rust engine's tracing ring to the {@code rust} logger (→ stdout)
+     * on a short poll, so its own logs surface near-real-time under
+     * {@code -Pengine=rust}. A daemon thread for the process lifetime; the ring
+     * is process-global (all networks) and drainRustLogs is a no-op under the
+     * Java engine. Observability must never take the daemon down, so every
+     * failure is swallowed. Mirrors the desktop/Android hosts' pump.
+     */
+    private static void startRustLogPump() {
+        Logger rustLog = LoggerFactory.getLogger("rust");
+        Thread pump = new Thread(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    String batch = Engines.drainRustLogs(1000);
+                    if (!batch.isEmpty()) {
+                        for (String line : batch.split("\n")) {
+                            if (line.isBlank()) continue;
+                            String s = line.strip();
+                            // The Rust fmt layer puts the level first; preserve it.
+                            if (s.startsWith("ERROR")) rustLog.error("{}", line);
+                            else if (s.startsWith("WARN")) rustLog.warn("{}", line);
+                            else rustLog.info("{}", line);
+                        }
+                    }
+                } catch (Throwable t) {
+                    // Never let log draining take the daemon down — but don't
+                    // swallow an interrupt: restore the flag and stop.
+                    if (t instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    // Any other error is dropped; keep pumping.
+                }
+                try {
+                    // Short poll → near-real-time without a busy spin. The ring
+                    // buffers between drains, so nothing is lost at this cadence.
+                    Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }, "myotis-rust-logs");
+        pump.setDaemon(true);
+        pump.start();
+    }
+
+    /**
      * Node-identity key file, per network — mainnet keeps the legacy {@code nodekey.hex}, every
      * other network gets {@code nodekey-<net>.hex}. This holds regardless of how many networks the
      * daemon hosts, so a network always has a stable identity of its own: previously a
@@ -303,6 +350,12 @@ public final class Main {
             }
             servers.add(server);
         }
+
+        // Relay the Rust engine's own tracing to stdout (via the `rust` logger)
+        // so `-Pengine=rust` sync/EL activity is visible in the daemon log. The
+        // ring is process-global, so one pump covers every network; it is a
+        // no-op under the Java engine. Daemon-only path (client commands exit).
+        startRustLogPump();
 
         // 2. Run cleanup exactly once, whether reached via the await() below or the
         //    shutdown hook (Ctrl-C / SIGTERM, or normal exit after await returns).
