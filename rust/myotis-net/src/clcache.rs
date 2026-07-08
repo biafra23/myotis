@@ -102,18 +102,30 @@ impl ClPeerCache {
             .or_insert((low, high));
     }
 
-    /// All cached peers, best first: proven catch-up servers, then bootstrap
-    /// servers / lc-confirmed, then the rest. `nolc` peers are still returned
-    /// (the pool tracks them separately) — the caller seeds its own sets.
+    /// All cached peers, best first: proven catch-up servers (WIDEST served
+    /// range first), then bootstrap servers / lc-confirmed, then the rest.
+    /// The served range is the accumulated UNION across responses, so width
+    /// does NOT single out "generous" multi-chunk servers — a truncating
+    /// server that stuck around for a whole catch-up carries a wide range too.
+    /// What it does mark is the peers that demonstrably carried the most
+    /// verified periods, which is the best available dial-first signal until
+    /// per-response serve size is recorded. `nolc` peers are still returned
+    /// (the pool tracks them separately) — the caller seeds its own sets. The
+    /// pool preserves this seeding order within its tiers.
     pub fn peers(&self) -> Vec<String> {
+        use std::cmp::Reverse;
         let mut out: Vec<String> = self.peers.clone();
         out.sort_by_key(|a| {
-            if self.served.contains_key(a) {
-                0
-            } else if self.bootstrap.contains_key(a) || self.lc.contains(a) {
-                1
-            } else {
-                2
+            match self.served.get(a) {
+                // Tier 0, widest range first. checked_sub, not `hi - lo`: the
+                // stored order is normally lo ≤ hi, but a corrupt/hand-edited
+                // cache line could reverse it, and a bare subtraction would
+                // underflow-panic under overflow-checks — fatal with
+                // panic="abort". (Reverse, not i64 negation, likewise avoids
+                // the ≥ 2^63 negation-overflow panic.)
+                Some(&(lo, hi)) => (0, Reverse(hi.checked_sub(lo).unwrap_or(0))),
+                None if self.bootstrap.contains_key(a) || self.lc.contains(a) => (1, Reverse(0)),
+                None => (2, Reverse(0)),
             }
         });
         out
@@ -362,13 +374,17 @@ mod tests {
             &p,
             "/ip4/3.3.3.3/tcp/9000/p2p/16Uc\n\
              /ip4/2.2.2.2/tcp/9000/p2p/16Ub\tb1480\n\
-             /ip4/1.1.1.1/tcp/9000/p2p/16Ua\t1770-1795\tlc\n",
+             /ip4/1.1.1.1/tcp/9000/p2p/16Ua\t1794-1795\tlc\n\
+             /ip4/4.4.4.4/tcp/9000/p2p/16Ud\t1777-1795\tlc\n",
         )
         .unwrap();
         let c = ClPeerCache::load(p.clone());
         let order = c.peers();
-        assert!(order[0].contains("1.1.1.1"), "proven first: {order:?}");
-        assert!(order[1].contains("2.2.2.2"), "bootstrap second: {order:?}");
+        // Within the proven tier, the WIDEST served range leads — that's the
+        // generous multi-chunk server that can cover a catch-up in one round.
+        assert!(order[0].contains("4.4.4.4"), "widest proven first: {order:?}");
+        assert!(order[1].contains("1.1.1.1"), "narrow proven second: {order:?}");
+        assert!(order[2].contains("2.2.2.2"), "bootstrap third: {order:?}");
         let _ = std::fs::remove_file(&p);
     }
 }

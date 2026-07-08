@@ -669,7 +669,7 @@ async fn run_sync(
 
     // Catch-up pipeline buffer (see catch_up) — lives here so staged periods
     // survive catch_up returning empty-handed between poll cycles.
-    let mut staged_updates: std::collections::BTreeMap<u64, Vec<u8>> =
+    let mut staged_updates: std::collections::BTreeMap<u64, StagedChunk> =
         std::collections::BTreeMap::new();
 
     // Resume from the persisted snapshot when it is bound to this chain AND
@@ -1058,9 +1058,31 @@ impl ResumeGuard {
     }
 }
 
-/// Periods fetched per catch-up round (≤16 per the plan; the spec request cap
-/// is 128).
-const UPDATES_BATCH_MAX: u64 = 16;
+/// A fetched-but-unapplied catch-up update plus the shared-cache key
+/// (`multiaddr/p2p/peerid`) of the peer whose response staged it — the apply
+/// path credits `record_served` to the actual stager, which is not always the
+/// round's responding peer (chunks linger across rounds and responses).
+struct StagedChunk {
+    ssz: Vec<u8>,
+    from: String,
+}
+
+/// Periods requested per catch-up round — the full spec cap, matching the
+/// Java client's `min(periodsToFetch, 128)`. This is THE cold-sync lever:
+/// "generous" servers exist that stream the whole requested range back-to-back
+/// (measured on the same Pixel 7 with the same cached peers: Java engine
+/// synced 19 periods in 140 s off one such server, while this engine's old
+/// 16-cap plus per-round costs — serve latency, the 12 s quiet window, the
+/// 11 s pace, backoff on empty rounds — took 972 s at ~1 period per round
+/// from quota-truncating servers). One generous response now covers the whole
+/// catch-up in a single staged apply; truncating (Lighthouse-style) servers
+/// still return 1 chunk per round exactly as before. Wire-size check: 128
+/// chunks × ~27 KiB ≈ 3.5 MiB, well under the 16 MiB response cap. Time
+/// check: a paced or slow-link server can't stream 128 chunks inside the
+/// 45 s request timeout — the codec's UPDATES_READ_BUDGET completes such a
+/// read early with the chunks that DID arrive, so a partial batch applies
+/// instead of timing out and strike-marking the server.
+const UPDATES_BATCH_MAX: u64 = 128;
 /// Peer candidates asked per round — all in parallel, first useful response
 /// wins (Java CATCHUP_FANOUT_MAX is 48; the discovered pool is failure-heavy,
 /// so a wide fan-out is what makes rounds land).
@@ -1075,7 +1097,7 @@ const CATCHUP_MAX_IDLE_ROUNDS: u32 = 6;
 /// Catch the store's committee period up to wall clock — the behavioral twin
 /// of the Java `catchUpSyncCommittee`/`attemptCatchUpBatch`/
 /// `applyCatchUpResponses`: every fan-out peer gets the SAME
-/// `(current_period, count ≤ 16)` range request in parallel, so any single
+/// `(current_period, count ≤ 128)` range request in parallel, so any single
 /// successful response starts with the EARLIEST missing period (the whole
 /// pipeline's bottleneck — the committee chain admits no gaps). Response
 /// chunks are staged at consecutive periods (a mislabeled chunk just fails
@@ -1092,7 +1114,7 @@ async fn catch_up(
     // Fetched-but-not-yet-applied updates keyed by target period, owned by the
     // caller so partial pipeline progress survives across catch_up calls.
     // Raw SSZ — everything is BLS/Merkle-verified at apply time, in order.
-    staged: &mut std::collections::BTreeMap<u64, Vec<u8>>,
+    staged: &mut std::collections::BTreeMap<u64, StagedChunk>,
     clcache: &mut crate::clcache::ClPeerCache,
     resume: &mut ResumeGuard,
     last_persisted_period: &mut u64,
@@ -1212,9 +1234,17 @@ async fn catch_up(
                     hex = %raw.iter().map(|b| format!("{b:02x}")).collect::<String>(),
                     "small updates_by_range frame");
             }
+            let peer_key = format!("{}/p2p/{}", peer.addr, peer.id);
             let chunks = match codec::decode_multi_chunk_response(&raw, sub_count as usize) {
                 Ok(c) => c,
                 Err(e) => {
+                    // Undecodable response — with the codec's read budget this
+                    // is also where a byte-dribbling peer lands (it used to hit
+                    // the behaviour timeout instead). Charge it the same way so
+                    // 3-strike eviction still prunes peers that never produce
+                    // a usable chunk.
+                    pool.note_failure(peer.id);
+                    clcache.mark_failure(&peer_key);
                     tracing::debug!(peer = %peer.id, raw_len = raw.len(), error = %e,
                         "updates_by_range frame invalid");
                     continue;
@@ -1226,7 +1256,10 @@ async fn catch_up(
                     break; // truncated/empty chunk — nothing after it is trustworthy
                 }
                 served += 1;
-                staged.entry(sub_from + i as u64).or_insert(chunk);
+                staged.entry(sub_from + i as u64).or_insert_with(|| StagedChunk {
+                    ssz: chunk,
+                    from: peer_key.clone(),
+                });
             }
             if served > 0 {
                 tracing::info!(peer = %peer.id, sub_from, sub_count, served,
@@ -1236,9 +1269,15 @@ async fn catch_up(
                 // often the only willing server in the pool, and the ~13 s
                 // round cadence sits at Lighthouse's ~1-per-10s quota anyway —
                 // the Java client re-asks its serving peer the same way.
+                // Apply at most ONE staged update here — just enough BLS to
+                // decide this response is the round's winner. The rest of the
+                // staged prefix (up to 128 periods from a generous server) is
+                // drained AFTER the fan-out is dropped, so the stragglers'
+                // redundant multi-MiB streams are cancelled behind one
+                // signature verification instead of a full batch of them.
                 let before_period = processor.store.current_period();
-                let (applied_now, verify_rejects) =
-                    apply_staged_prefix(processor, staged, slot_estimate);
+                let (applied_now, verify_rejects, applied_from) =
+                    apply_staged_step(processor, staged, slot_estimate);
                 // ORDER MATTERS: an apply in this batch BLS-verified against
                 // the restored committee and proves the snapshot genuine —
                 // confirm() must win over poison accounting (a reject in the
@@ -1262,15 +1301,14 @@ async fn catch_up(
                     resume.confirm();
                     pool.note_served(peer.id); // BLS-verified and applied
                     // Only VERIFIED periods reach the shared cross-engine
-                    // cache: this range just BLS-verified and applied, and
-                    // this peer's response is what unblocked it (Java
-                    // applyCatchUpResponses records AFTER processUpdate the
-                    // same way — never before verification).
-                    clcache.record_served(
-                        &format!("{}/p2p/{}", peer.addr, peer.id),
-                        before_period,
-                        before_period + applied_now as u64 - 1,
-                    );
+                    // cache, credited to the peer whose response STAGED the
+                    // applied chunk — usually this responder, but a chunk
+                    // lingering from an earlier response can be the one that
+                    // applies (Java applyCatchUpResponses records AFTER
+                    // processUpdate the same way — never before verification).
+                    if let Some(key) = applied_from {
+                        clcache.record_served(&key, before_period, before_period);
+                    }
                     applied += applied_now;
                     empty_backoff = Duration::from_secs(0);
                     // The fastest serving peer won this round — abandon the
@@ -1293,18 +1331,49 @@ async fn catch_up(
         }
 
         if applied > 0 {
+            // Drain the rest of the contiguous staged prefix — a generous
+            // response stages up to the whole remaining span. One update per
+            // iteration: persist after EVERY period so an Android kill
+            // mid-drain loses at most one period's BLS work, not the whole
+            // batch (the ~50 KiB write+rename is milliseconds next to the
+            // ~100 ms BLS verify it checkpoints), publish so the progress bar
+            // tracks the drain instead of jumping at round end, and yield so
+            // back-to-back BLS verifications don't pin this worker while the
+            // swarm task needs it. A verify-reject here is a stale chunk some
+            // other peer staged earlier — the winner already confirmed the
+            // store, so it is dropped for refetch without poison accounting.
+            // Each period is credited to the peer whose response staged it.
+            let mut drained = 0usize;
+            loop {
+                let before_period = processor.store.current_period();
+                let (applied_now, _verify_rejects, applied_from) =
+                    apply_staged_step(processor, staged, slot_estimate);
+                if applied_now == 0 {
+                    break;
+                }
+                applied += applied_now;
+                drained += 1;
+                if let Some(key) = applied_from {
+                    clcache.record_served(&key, before_period, before_period);
+                }
+                persist_snapshot(config, processor, last_persisted_period);
+                publish_status(config, client, processor, &*pool, status_tx, anchor).await;
+                tokio::task::yield_now().await;
+            }
             tracing::info!(applied, staged = staged.len(),
                 period = processor.store.current_period(),
                 finalized_slot = processor.store.finalized_slot(),
                 "catch-up round applied");
-            publish_status(config, client, processor, &*pool, status_tx, anchor).await;
-            // Persist EVERY applied period, not just when catch_up returns:
-            // catch-up loops internally for the whole span, and Android kills
-            // the process freely (reinstalls, OOM, user swipes) — before this,
-            // a kill mid-catch-up lost every verified period since bootstrap
-            // (observed: 4 periods re-verified after a reinstall). ~50 KiB per
-            // ~11 s paced period is negligible next to the BLS work it saves.
-            persist_snapshot(config, processor, last_persisted_period);
+            if drained == 0 {
+                // Single-period round (truncating server): the drain didn't
+                // run, so this is the round's one publish+persist. Persisting
+                // every applied period — not just when catch_up returns —
+                // is what keeps an Android kill (reinstall, OOM, user swipe)
+                // from losing every verified period since bootstrap
+                // (observed: 4 periods re-verified after a reinstall).
+                publish_status(config, client, processor, &*pool, status_tx, anchor).await;
+                persist_snapshot(config, processor, last_persisted_period);
+            }
             idle_rounds = 0;
             pace_after_apply = true;
         } else if staged.len() > staged_before {
@@ -1320,13 +1389,20 @@ async fn catch_up(
                     "catch-up made no progress — returning to the poll loop");
                 return false;
             }
-            // Grow the pre-round pause 5s → 60s: rapid-fire empty rounds burn
-            // server quota and our own peer score; a quiet minute lets rate
-            // limiters refill and discovery deliver fresh candidates.
+            // Grow the pre-round pause 5s → 25s: rapid-fire empty rounds burn
+            // server quota and our own peer score, but with the post-apply
+            // pacing preventing self-inflicted empties, the rounds that reach
+            // here are genuine server droughts — and a 60 s ceiling meant up
+            // to a minute of blindness after a server RETURNED (droughts
+            // dominated measured cold syncs). 25 s samples recovery twice as
+            // fast at bounded quota cost: CATCHUP_MAX_IDLE_ROUNDS exits to
+            // the outer poll loop after 6 fruitless rounds either way, so a
+            // sustained drought cycles at most ~35% more request bursts than
+            // the 60 s ceiling did — it cannot hammer indefinitely faster.
             empty_backoff = if empty_backoff.is_zero() {
                 Duration::from_secs(5)
             } else {
-                (empty_backoff * 2).min(Duration::from_secs(60))
+                (empty_backoff * 2).min(Duration::from_secs(25))
             };
             tracing::debug!(period = processor.store.current_period(), idle_rounds,
                 "catch-up round made no progress — retrying after backoff");
@@ -1334,50 +1410,52 @@ async fn catch_up(
     }
 }
 
-/// Verify+apply the contiguous staged prefix: each staged update is decoded
-/// and processed in period order, advancing the store's committee period by
-/// one per applied update (`force_rotate_if_past_period` on the recorded
-/// wall-clock estimate after each — Java `applyCatchUpResponses`). A chunk
-/// that fails decode/verify is dropped from the buffer so the next round
-/// refetches that period from a different peer.
-/// Returns `(applied, verify_rejects)` — verify_rejects counts ONLY updates
-/// that decoded fine but failed BLS/Merkle verification (`process_update` →
-/// false): that is the resume guard's poison signal, since a corrupt restored
-/// committee rejects every well-formed update. Decode failures are NOT
-/// counted — a peer sending malformed frames says nothing about our store.
-fn apply_staged_prefix(
+/// Verify+apply AT MOST ONE staged update — the one at the store's current
+/// period (the contiguous prefix advances one period per call; callers loop:
+/// the fan-out handler calls once to pick a winner, the post-fan-out drain
+/// loops with a persist+yield between calls). The update is decoded and
+/// processed, advancing the committee period on success
+/// (`force_rotate_if_past_period` on the recorded wall-clock estimate — Java
+/// `applyCatchUpResponses`). A chunk that fails decode/verify is dropped from
+/// the buffer so the next round refetches that period from a different peer.
+/// Returns `(applied, verify_rejects, applied_from)` — applied and
+/// verify_rejects are each 0 or 1, and applied_from is the shared-cache key
+/// of the peer whose response staged the applied chunk (None unless applied).
+/// verify_rejects counts ONLY an update that decoded fine but failed
+/// BLS/Merkle verification (`process_update` → false): that is the resume
+/// guard's poison signal, since a corrupt restored committee rejects every
+/// well-formed update. Decode failures are NOT counted — a peer sending
+/// malformed frames says nothing about our store.
+fn apply_staged_step(
     processor: &mut LightClientProcessor,
-    staged: &mut std::collections::BTreeMap<u64, Vec<u8>>,
+    staged: &mut std::collections::BTreeMap<u64, StagedChunk>,
     slot_estimate: u64,
-) -> (usize, usize) {
-    let mut applied = 0usize;
-    let mut verify_rejects = 0usize;
-    while let Some(chunk) = staged.remove(&processor.store.current_period()) {
-        let target_period = processor.store.current_period();
-        match LightClientUpdate::decode(&chunk) {
-            Ok(update) => {
-                if processor.process_update(&update) {
-                    applied += 1;
-                    processor.store.force_rotate_if_past_period(slot_estimate);
-                    tracing::debug!(target_period,
-                        finalized_slot = update.finalized_header.beacon.slot,
-                        period = processor.store.current_period(),
-                        "catch-up update applied");
-                } else {
-                    verify_rejects += 1;
-                    tracing::debug!(target_period,
-                        finalized_slot = update.finalized_header.beacon.slot,
-                        "catch-up update rejected");
-                    break;
-                }
-            }
-            Err(e) => {
-                tracing::debug!(target_period, error = %e, "catch-up update decode failed");
-                break;
+) -> (usize, usize, Option<String>) {
+    let target_period = processor.store.current_period();
+    let Some(chunk) = staged.remove(&target_period) else {
+        return (0, 0, None);
+    };
+    match LightClientUpdate::decode(&chunk.ssz) {
+        Ok(update) => {
+            if processor.process_update(&update) {
+                processor.store.force_rotate_if_past_period(slot_estimate);
+                tracing::debug!(target_period,
+                    finalized_slot = update.finalized_header.beacon.slot,
+                    period = processor.store.current_period(),
+                    "catch-up update applied");
+                (1, 0, Some(chunk.from))
+            } else {
+                tracing::debug!(target_period,
+                    finalized_slot = update.finalized_header.beacon.slot,
+                    "catch-up update rejected");
+                (0, 1, None)
             }
         }
+        Err(e) => {
+            tracing::debug!(target_period, error = %e, "catch-up update decode failed");
+            (0, 0, None)
+        }
     }
-    (applied, verify_rejects)
 }
 
 /// One finality-poll pass: try peers until one update verifies and applies —

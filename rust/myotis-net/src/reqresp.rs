@@ -38,8 +38,23 @@ use crate::status::{self, StatusMessage};
 pub const RESP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Live servers PACE multi-chunk responses (observed: single chunks arriving
 /// ~10 s apart under Lighthouse's rate limiter) — a short deadline turns a
-/// 16-chunk response into a 1-chunk one. Budget for a paced full batch.
-pub const UPDATES_TIMEOUT: Duration = Duration::from_secs(45);
+/// multi-chunk response into a 1-chunk one. This is the libp2p behaviour-level
+/// deadline: when IT fires, everything the codec buffered is dropped and the
+/// peer is charged a failure. A full 128-update batch cannot fit here for a
+/// paced or slow-link server, which is why the codec completes the read at
+/// UPDATES_READ_BUDGET with whatever whole chunks arrived — this timeout only
+/// fires when a peer sent NOTHING for the whole window. Sized so the budget
+/// below can cover a full 128-chunk batch (~3.5 MiB) on a ~65 KB/s link; the
+/// extra 15 s over the old 45 s only lengthens rounds where NO peer serves.
+pub const UPDATES_TIMEOUT: Duration = Duration::from_secs(60);
+/// Total read budget for an updates_by_range response, deliberately under
+/// UPDATES_TIMEOUT: when it expires with data buffered, the read completes and
+/// the complete chunks are used (a paced ~10 s/chunk server yields ~5 periods
+/// per round instead of a behaviour timeout that loses all of them AND
+/// strike-marks the serving peer toward cache eviction). The clock starts at
+/// request time, NOT at the first byte — it shadows the behaviour timeout,
+/// so server think time before the first chunk spends the same budget.
+const UPDATES_READ_BUDGET: Duration = Duration::from_secs(55);
 
 /// Complete a response once the stream has gone quiet for this long with data
 /// buffered — the Rust twin of the Java controller's safety/drain timers.
@@ -55,8 +70,8 @@ const RESPONSE_QUIET_WINDOW: Duration = Duration::from_secs(3);
 const UPDATES_QUIET_WINDOW: Duration = Duration::from_secs(12);
 
 const MAX_REQUEST_WIRE_BYTES: usize = 1024;
-/// A 16-update batch decompresses to ~16 x ~60 KB SSZ; the compressed wire is
-/// smaller. 16 MiB is a generous DoS ceiling, not a target.
+/// A full 128-update batch is ~3.5 MiB on the wire (~128 x ~60 KB SSZ
+/// uncompressed). 16 MiB is a generous DoS ceiling, not a target.
 const MAX_RESPONSE_WIRE_BYTES: usize = 16 * 1024 * 1024;
 
 // -------------------------------------------------------------------------
@@ -89,11 +104,24 @@ where
 
 /// Read to EOF, but once at least one byte is buffered treat `quiet` of
 /// silence as end-of-response; also salvage buffered data when the peer
-/// resets the stream instead of half-closing.
-async fn read_until_quiet<T>(io: &mut T, cap: usize, quiet: Duration) -> io::Result<Vec<u8>>
+/// resets the stream instead of half-closing. `budget`, when set, bounds the
+/// TOTAL read time measured from entry (mirroring the behaviour timeout it
+/// runs under — pre-first-byte server think time spends it too): when it
+/// expires with data buffered, the read completes with what arrived instead
+/// of running into the behaviour-level request timeout, which would discard
+/// the buffer and charge the peer a failure. With nothing buffered the read
+/// keeps waiting — a wholly unresponsive peer is left to the behaviour
+/// timeout, which is the failure signal eviction accounting keys off.
+async fn read_until_quiet<T>(
+    io: &mut T,
+    cap: usize,
+    quiet: Duration,
+    budget: Option<Duration>,
+) -> io::Result<Vec<u8>>
 where
     T: AsyncRead + Unpin + Send,
 {
+    let deadline = budget.map(|b| tokio::time::Instant::now() + b);
     let mut buf = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
     loop {
@@ -105,9 +133,14 @@ where
         let read = if buf.is_empty() {
             io.read(&mut chunk).await.map(Some)
         } else {
-            match tokio::time::timeout(quiet, io.read(&mut chunk)).await {
+            let mut wake_at = tokio::time::Instant::now() + quiet;
+            if let Some(d) = deadline {
+                wake_at = wake_at.min(d);
+            }
+            match tokio::time::timeout_at(wake_at, io.read(&mut chunk)).await {
                 Ok(r) => r.map(Some),
-                Err(_elapsed) => Ok(None), // quiet with data buffered → complete
+                // Quiet with data buffered — or total budget spent — → complete.
+                Err(_elapsed) => Ok(None),
             }
         };
         match read {
@@ -158,12 +191,16 @@ impl request_response::Codec for Eth2Codec {
         // mirroring the Java controller's drain timers (and salvaging complete
         // chunks when a peer resets instead of closing; the codec validates
         // everything downstream).
-        let quiet = if p.as_ref() == protocols::UPDATES_BY_RANGE {
-            UPDATES_QUIET_WINDOW
+        let (quiet, budget) = if p.as_ref() == protocols::UPDATES_BY_RANGE {
+            // Budgeted: a full 128-update batch from a paced or slow-link
+            // server can outlast UPDATES_TIMEOUT; completing at the budget
+            // keeps the chunks that DID arrive (single-chunk protocols fit
+            // their behaviour timeout trivially and need no budget).
+            (UPDATES_QUIET_WINDOW, Some(UPDATES_READ_BUDGET))
         } else {
-            RESPONSE_QUIET_WINDOW
+            (RESPONSE_QUIET_WINDOW, None)
         };
-        read_until_quiet(io, MAX_RESPONSE_WIRE_BYTES, quiet).await
+        read_until_quiet(io, MAX_RESPONSE_WIRE_BYTES, quiet, budget).await
     }
 
     async fn write_request<T>(&mut self, _p: &Eth2Protocol, io: &mut T, req: Vec<u8>) -> io::Result<()>
