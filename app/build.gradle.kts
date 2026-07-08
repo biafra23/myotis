@@ -77,7 +77,17 @@ tasks.register<JavaExec>("run") {
     // per-verify Milagro-vs-native head-to-head during a live sync).
     (project.findProperty("bls") as String?)?.let { systemProperty("myotis.bls.backend", it) }
     // -Pengine=java|rust|auto → -Dmyotis.engine (the :myotis-engines selector).
-    (project.findProperty("engine") as String?)?.let { systemProperty("myotis.engine", it) }
+    // Fail fast on a typo: an unrecognized value would otherwise silently fall
+    // back to the Java engine (Engines.normalize warns + yields java), so a
+    // `-Pengine=rust.` runs Java without it being obvious. Blank → unset (default
+    // java).
+    (project.findProperty("engine") as? String)?.takeIf { it.isNotBlank() }?.let { raw ->
+        val v = raw.trim().lowercase()
+        if (v !in listOf("java", "rust", "auto")) {
+            throw GradleException("-Pengine must be one of java|rust|auto (got '$raw')")
+        }
+        systemProperty("myotis.engine", v)
+    }
     // -Prustlog=<filter> → RUST_LOG for the Rust engine's tracing (drained to
     // stdout via the `rust` logger). Gradle's run task doesn't forward the
     // shell's RUST_LOG to the forked JVM, so set it explicitly. Accepts the full
