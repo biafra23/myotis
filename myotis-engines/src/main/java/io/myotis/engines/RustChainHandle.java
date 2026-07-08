@@ -38,6 +38,11 @@ import java.util.List;
  * anchor) and return the same proof/verdict records as the Java engine. The
  * remaining EL queries ({@link #getHeaders}/{@link #getBlockVerified}/
  * {@link #dialPeer}) throw {@link EngineException} until those surfaces land.
+ *
+ * <p>{@link #reads()} now serves the verified JSON-RPC endpoint (EL-B): on
+ * {@link #start()} this handle self-starts the shared {@code jsonrpc-server} on
+ * {@code 127.0.0.1:rpcPort} backed by {@link RustVerifiedReads}, mirroring how the
+ * Java engine self-starts it inside {@code ChainStack}.
  */
 final class RustChainHandle implements ChainHandle {
 
@@ -49,20 +54,73 @@ final class RustChainHandle implements ChainHandle {
     private final long handle;
     private final String networkName;
     private final long chainId;
+    /** Loopback JSON-RPC port; {@code <= 0} disables the server (e.g. the JSON test seams). */
+    private final int rpcPort;
+    /** The verified read surface the JSON-RPC server serves; never null. */
+    private final RustVerifiedReads verifiedReads = new RustVerifiedReads(this);
+    /** The running JSON-RPC server, or null when disabled / not started. */
+    private volatile io.myotis.jsonrpc.MyotisRpcServer rpcServer;
 
-    RustChainHandle(long handle, String networkName, long chainId) {
+    RustChainHandle(long handle, String networkName, long chainId, int rpcPort) {
         this.handle = handle;
         this.networkName = networkName;
         this.chainId = chainId;
+        this.rpcPort = rpcPort;
     }
 
     @Override public String networkName() { return networkName; }
 
     @Override public long chainId() { return chainId; }
 
-    @Override public boolean start() { return RustEngineNative.nativeStart(handle); }
+    @Override
+    public boolean start() {
+        boolean ok = RustEngineNative.nativeStart(handle);
+        // Only expose the verified JSON-RPC endpoint once the native stack is up.
+        if (ok) startRpc();
+        return ok;
+    }
 
-    @Override public void stop() { RustEngineNative.nativeStop(handle); }
+    @Override
+    public void stop() {
+        // Stop serving before tearing down the native stack the reads depend on.
+        io.myotis.jsonrpc.MyotisRpcServer server = this.rpcServer;
+        if (server != null) {
+            try { server.stop(); } catch (Throwable ignored) {}
+            this.rpcServer = null;
+        }
+        RustEngineNative.nativeStop(handle);
+    }
+
+    /**
+     * Start the shared {@code jsonrpc-server} on {@code 127.0.0.1:rpcPort}, backed by
+     * {@link RustVerifiedReads} — the Rust-engine counterpart to
+     * {@code ChainStack.startRpc()}. Loopback only, strict (no upstream proxy). A
+     * bind failure is logged and the stack continues without JSON-RPC (mirrors the
+     * Java engine): the IPC socket still serves the same verified primitives.
+     */
+    private void startRpc() {
+        if (rpcPort <= 0) return; // RPC disabled (test seam / explicit opt-out)
+        try {
+            // Deterministic up-front bind probe: Ktor's CIO engine surfaces bind
+            // failures asynchronously, which a try/catch around start() can miss.
+            try (java.net.ServerSocket probe = new java.net.ServerSocket()) {
+                probe.setReuseAddress(true);
+                probe.bind(new java.net.InetSocketAddress("127.0.0.1", rpcPort));
+            }
+            io.myotis.jsonrpc.MyotisRpcServer server =
+                    new io.myotis.jsonrpc.MyotisRpcServer(rpcPort, null, "127.0.0.1", verifiedReads);
+            server.start();
+            this.rpcServer = server;
+            log.info("[{}] JSON-RPC listening on http://127.0.0.1:{} (verified, strict)",
+                    networkName, rpcPort);
+        } catch (java.io.IOException bindEx) {
+            log.warn("[{}][rpc] port {} unavailable ({}); continuing without JSON-RPC",
+                    networkName, rpcPort, bindEx.getMessage());
+        } catch (Throwable t) {
+            log.warn("[{}][rpc] failed to start JSON-RPC; continuing without it: {}",
+                    networkName, t.toString());
+        }
+    }
 
     @Override public boolean isRunning() { return readStatus().running(); }
 
@@ -138,12 +196,12 @@ final class RustChainHandle implements ChainHandle {
      * Package-private test seam: exercises the JSON→snapshot mapping without JNI.
      */
     static StatusSnapshot statusFromJson(String network, String json) {
-        return new RustChainHandle(0L, network, 1L).status(ParsedStatus.parse(json));
+        return new RustChainHandle(0L, network, 1L, 0).status(ParsedStatus.parse(json));
     }
 
     /** Package-private test seam: JSON→{@link BeaconStatus} without JNI. */
     static BeaconStatus beaconStatusFromJson(String network, String json) {
-        return new RustChainHandle(0L, network, 1L).beaconStatus(ParsedStatus.parse(json));
+        return new RustChainHandle(0L, network, 1L, 0).beaconStatus(ParsedStatus.parse(json));
     }
 
     private StatusSnapshot status(ParsedStatus s) {
@@ -213,21 +271,24 @@ final class RustChainHandle implements ChainHandle {
                 List.<ClPeerInfo>of());
     }
 
-    // ---- CL-only R1 scope: EL / verified-read surface not available yet ----
+    // ---- verified-read surface (EL-B) ----
     //
-    // reads()/ens() return null — that IS the ChainHandle contract ("or null when
-    // this network has no ENS registry" / "or null ... if the RPC port was
-    // unavailable"), and callers null-check it. The EL QUERY methods below
-    // (requestAccount/getStorageProof/getHeaders/getBlockVerified/dialPeer) throw
-    // EngineException: the contract reserves exceptions for malformed input / not
-    // running, and a CL-only engine asked for an EL proof is a capability-state
-    // error (there is no verification to report a failReason for — the capability
-    // categorically does not exist yet). A failReason record would misrepresent
-    // "we can't" as "we tried and failed". The real fix is EL support (or the
-    // selector routing EL queries to the Java engine while Rust hosts the CL side);
-    // tracked for a later phase.
+    // reads() returns the RustVerifiedReads adapter — the JSON-RPC read surface the
+    // shared jsonrpc-server serves on 127.0.0.1:rpcPort (started in startRpc()). It
+    // answers the beacon-anchored reads a wallet needs to build a plain-ETH send
+    // (chainId/getBalance/getTransactionCount/syncState) from the same proof-verified
+    // account query as requestAccount below; the rest of VerifiedReads returns null
+    // ("can't answer verified") until later EL-B / EL-C slices land.
+    //
+    // ens() still returns null (no ENS registry served yet) — that IS the ChainHandle
+    // contract ("or null when this network has no ENS registry"), and callers
+    // null-check it. The EL QUERY methods further down (getHeaders/getBlockVerified/
+    // dialPeer) still throw EngineException: the contract reserves exceptions for
+    // malformed input / not running, and an unimplemented EL surface is a capability
+    // error (no verification to report a failReason for) — a failReason record would
+    // misrepresent "we can't" as "we tried and failed".
 
-    @Override public VerifiedReads reads() { return null; }
+    @Override public VerifiedReads reads() { return verifiedReads; }
 
     @Override public EnsApi ens() { return null; }
 
