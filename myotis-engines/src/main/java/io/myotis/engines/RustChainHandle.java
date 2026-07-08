@@ -374,6 +374,73 @@ final class RustChainHandle implements ChainHandle {
         return storageFromJson(hexAddress, slot, parseResultOrThrow(json, "storage"));
     }
 
+    // ---- VerifiedReads helpers (used by RustVerifiedReads; not ChainHandle API) ----
+
+    /**
+     * Verified contract bytecode for {@code hexAddress} (eth_getCode), or null when
+     * the query produced no verdict (can't answer verified). A verified EOA /
+     * empty-code account yields an empty array. Throws {@link EngineException} on a
+     * transport / not-running failure (the adapter maps that to null).
+     */
+    byte[] codeVerified(String hexAddress) {
+        return codeFromJson(RustEngineNative.nativeGetCodeJson(handle, hexAddress));
+    }
+
+    /** Package-private test seam: code JSON → verified bytecode (or null) without JNI. */
+    static byte[] codeFromJson(String json) {
+        JsonObject o = parseResultOrThrow(json, "code");
+        try {
+            if (stringOrNull(o, "verifyMethod") == null) return null; // unverified → can't answer
+            return hexToBytes(stringOrNull(o, "codeHex")); // 0x / empty → empty bytecode
+        } catch (RuntimeException e) {
+            throw new EngineException("malformed code JSON from the Rust engine: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * One verified 32-byte storage word at a RAW position (eth_getStorageAt), or
+     * null when unverified. The value is left-padded to a full 32-byte word (a
+     * zero/unset slot → 32 zero bytes). {@code position32Hex} is the 0x-hex 32-byte
+     * position. Throws {@link EngineException} on a transport / not-running failure.
+     */
+    byte[] storageAtVerified(String hexAddress, String position32Hex) {
+        return storageValueFromJson(
+                RustEngineNative.nativeGetStorageAtJson(handle, hexAddress, position32Hex));
+    }
+
+    /** Package-private test seam: storage-at JSON → verified 32-byte word (or null). */
+    static byte[] storageValueFromJson(String json) {
+        JsonObject o = parseResultOrThrow(json, "storage");
+        try {
+            if (stringOrNull(o, "verifyMethod") == null) return null; // unverified → can't answer
+            // valueHex is the big-endian value (leading zeros stripped) or null when the
+            // slot is zero/unset; eth_getStorageAt returns a full 32-byte word.
+            return leftPad32(hexToBytes(stringOrNull(o, "valueHex")));
+        } catch (RuntimeException e) {
+            throw new EngineException("malformed storage JSON from the Rust engine: " + e.getMessage(), e);
+        }
+    }
+
+    /** 0x-hex (or null/"0x"/empty) → bytes; null/empty → an empty array. */
+    private static byte[] hexToBytes(String hexOrNull) {
+        if (hexOrNull == null) return new byte[0];
+        String h = (hexOrNull.startsWith("0x") || hexOrNull.startsWith("0X"))
+                ? hexOrNull.substring(2) : hexOrNull;
+        if (h.isEmpty()) return new byte[0];
+        return java.util.HexFormat.of().parseHex(h);
+    }
+
+    /** Left-pad a big-endian value to a 32-byte word (a storage value is ≤ 32 bytes). */
+    private static byte[] leftPad32(byte[] v) {
+        if (v.length == 32) return v;
+        if (v.length > 32) {
+            throw new EngineException("storage value exceeds 32 bytes: " + v.length);
+        }
+        byte[] out = new byte[32];
+        System.arraycopy(v, 0, out, 32 - v.length, v.length);
+        return out;
+    }
+
     private static StorageProofResult storageFromJson(String hexAddress, long slot, JsonObject o) {
         try {
         return new StorageProofResult(

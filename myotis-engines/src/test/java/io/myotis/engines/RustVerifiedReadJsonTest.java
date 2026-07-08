@@ -5,6 +5,7 @@ import io.myotis.api.EngineException;
 import io.myotis.api.StorageProofResult;
 import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -165,5 +166,67 @@ class RustVerifiedReadJsonTest {
     void storageErrorObjectBecomesEngineException() {
         assertThrows(EngineException.class,
                 () -> RustChainHandle.storageFromJson("0x0", 1, "{\"error\":\"handle not started\"}"));
+    }
+
+    // ---- eth_getCode (codeFromJson) ----
+
+    /** A headerChain-verified contract (mirrors the Rust eljson code sample). */
+    private static final String CODE_JSON =
+            "{\"address\":\"0xC0\",\"exists\":true,\"codeHex\":\"0x60806040\","
+            + "\"codeHashHex\":\"0x4444444444444444444444444444444444444444444444444444444444444444\","
+            + "\"blockNumber\":21000000,\"beaconChainVerified\":true,\"blsVerified\":true,"
+            + "\"matchedBeaconSlot\":7000000,\"verifyMethod\":\"headerChain\",\"failReason\":null,"
+            + "\"beaconSynced\":true,\"finalizedPeriod\":1777,\"wallClockPeriod\":1795,"
+            + "\"finalizedBlockNumber\":20999000,\"optimisticBlockNumber\":21000010}";
+
+    @Test
+    void codeJsonMapsToVerifiedBytecode() {
+        assertArrayEquals(new byte[] {0x60, (byte) 0x80, 0x60, 0x40},
+                RustChainHandle.codeFromJson(CODE_JSON));
+    }
+
+    @Test
+    void emptyVerifiedCodeIsEmptyArray() {
+        // A verified EOA / empty-code account: codeHex "0x" → empty bytecode (not null).
+        String json = "{\"exists\":false,\"codeHex\":\"0x\",\"verifyMethod\":\"headerChain\"}";
+        assertArrayEquals(new byte[0], RustChainHandle.codeFromJson(json));
+    }
+
+    @Test
+    void unverifiedCodeIsNull() {
+        // No verdict (verifyMethod null) → can't answer verified → null (router -32000).
+        String json = "{\"exists\":true,\"codeHex\":\"0x6080\",\"verifyMethod\":null,"
+                + "\"failReason\":\"beaconNotSynced\"}";
+        assertNull(RustChainHandle.codeFromJson(json));
+    }
+
+    @Test
+    void codeErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.codeFromJson("{\"error\":\"no snap peer available\"}"));
+    }
+
+    // ---- eth_getStorageAt (storageValueFromJson) ----
+
+    @Test
+    void storageValueLeftPadsToWord() {
+        // valueHex is the big-endian value (0x2a in STORAGE_JSON) → a full 32-byte word.
+        byte[] word = RustChainHandle.storageValueFromJson(STORAGE_JSON);
+        byte[] expected = new byte[32];
+        expected[31] = 0x2a;
+        assertArrayEquals(expected, word);
+    }
+
+    @Test
+    void unsetStorageSlotIsZeroWord() {
+        // A verified zero/unset slot: valueHex null → 32 zero bytes (eth_getStorageAt 0x0…0).
+        String json = "{\"exists\":false,\"valueHex\":null,\"verifyMethod\":\"headerChain\"}";
+        assertArrayEquals(new byte[32], RustChainHandle.storageValueFromJson(json));
+    }
+
+    @Test
+    void unverifiedStorageValueIsNull() {
+        String json = "{\"valueHex\":\"0x2a\",\"verifyMethod\":null,\"failReason\":\"beaconNotSynced\"}";
+        assertNull(RustChainHandle.storageValueFromJson(json));
     }
 }

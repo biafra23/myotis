@@ -23,7 +23,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 4; // 4: + EL verified-read natives
+    static final int EXPECTED_ABI_VERSION = 5; // 5: + nativeGetCodeJson / nativeGetStorageAtJson
 
     private static final boolean AVAILABLE = load();
 
@@ -119,4 +119,23 @@ final class RustEngineNative {
      */
     static native String nativeGetStorageProofJson(
             long handle, String address, long slot, String holderOrNull);
+
+    /**
+     * A verified contract-code query (`eth_getCode`) for a running handle, as
+     * JSON: {@code {codeHex, codeHashHex, verifyMethod, failReason, ...}} on
+     * success (empty {@code codeHex} for an EOA / empty-code / unverified account),
+     * or {@code {"error": "..."}} for a transport / not-running / bad-input failure.
+     * {@code address} is 0x-hex.
+     */
+    static native String nativeGetCodeJson(long handle, String address);
+
+    /**
+     * A verified RAW-32-byte-position storage query (`eth_getStorageAt`) for a
+     * running handle, as JSON (the {@link io.myotis.api.StorageProofResult} shape,
+     * same error convention as {@link #nativeRequestAccountJson}). {@code position}
+     * is the 32-byte storage position as 0x-hex — the trie key IS that position,
+     * distinct from {@link #nativeGetStorageProofJson}'s {@code (slot, holder)}
+     * ERC-20 mapping form.
+     */
+    static native String nativeGetStorageAtJson(long handle, String address, String position);
 }
