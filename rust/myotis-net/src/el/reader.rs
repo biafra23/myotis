@@ -589,6 +589,10 @@ impl ElReader {
                 "block {target_num} is {back} behind the head — beyond the {BLOCK_LOOKBACK_MAX}-block verify window"
             ));
         }
+        // Serve over the snap pool (the peer set the reader maintains); a block
+        // serve is eth-only (headers + bodies), so this is a superset of what's
+        // needed. If eth peers exist but none negotiated snap, this fails closed
+        // (Err → -32000), never a false "null". Reputation reuses the snap sinks.
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
@@ -622,7 +626,13 @@ impl ElReader {
         back: u64,
         head_hash: &[u8; 32],
     ) -> Result<VerifiedBlock, String> {
-        // The contiguous forward window [target .. head] (back + 1 headers).
+        // The contiguous forward window [target .. head] (back + 1 headers), in one
+        // request. back < BLOCK_LOOKBACK_MAX (256) bounds this to ~150 KB, within the
+        // eth response soft limit; a peer that caps its response below back+1 fails
+        // the length check below and is skipped (fails closed — the caller tries the
+        // next peer), so deep pins carry a slightly higher liveness risk than a
+        // batched fetch would. The common case (latest / a few blocks back) is one
+        // small response.
         let window = peer.get_block_headers_by_number(target_num, back + 1, 0, false).await?;
         if window.len() as u64 != back + 1 {
             return Err(format!("peer returned {} headers, expected {}", window.len(), back + 1));
