@@ -266,9 +266,10 @@ public final class NodeService extends Service {
     public static void setIdlePauseMinutes(android.content.Context c, int v) {
         prefs(c).edit().putInt(K_IDLE_PAUSE_MIN, clampInt(v, 0, 240, DEFAULT_IDLE_PAUSE_MIN)).apply();
     }
-    /** When true (default), the idle controller skips auto-pause while the device is charging
-     *  — plugged in, battery isn't a concern, so the node stays awake and synced. The emergency
-     *  low-memory pause ({@link #onTrimMemory}) ignores this. Read live by the idle tick. */
+    /** When true (default), the idle controller skips auto-pause while the device is charging and
+     *  online — plugged in with a network, battery isn't a concern, so the node stays awake and
+     *  synced. Plugged in but offline still pauses (nothing to sync). The emergency low-memory
+     *  pause ({@link #onTrimMemory}) ignores this. Read live by the idle tick. */
     public static boolean stayAwakeWhileCharging(android.content.Context c) {
         return prefs(c).getBoolean(K_STAY_AWAKE_CHARGING, true);
     }
@@ -593,8 +594,9 @@ public final class NodeService extends Service {
      *       this run, so a fresh start finishes initial sync before its first sleep. Exception:
      *       if no network is available it can't sync anyway, so allow the pause rather than keep
      *       the radio scanning.</li>
-     *   <li><b>Charging</b> — when {@link #stayAwakeWhileCharging} is on (default) and the device
-     *       is plugged in, skip auto-pause entirely: battery isn't a concern, stay synced.</li>
+     *   <li><b>Charging</b> — when {@link #stayAwakeWhileCharging} is on (default), the device is
+     *       plugged in, <em>and</em> a network is available, skip auto-pause: battery isn't a
+     *       concern, stay synced. Plugged in but offline still pauses (nothing to sync).</li>
      * </ul>
      */
     private void idleTick(long idleMs, boolean routine) {
@@ -605,8 +607,12 @@ public final class NodeService extends Service {
         try {
             long now = System.currentTimeMillis();
             // Process-global conditions, evaluated once per pass rather than per stack.
-            boolean skipWhileCharging = routine && stayAwakeWhileCharging(this) && isCharging();
             boolean netUp = networkAvailable();
+            // Stay awake while charging only when there's actually a network to stay synced over.
+            // Plugged in but offline there's nothing to do, so let the stack pause rather than keep
+            // the radio scanning — the same "no network -> pause anyway" rule the SYNCED gate uses.
+            boolean skipWhileCharging =
+                    routine && stayAwakeWhileCharging(this) && isCharging() && netUp;
             for (Map.Entry<String, ChainHandle> e : handles.entrySet()) {
                 String n = e.getKey();
                 ChainHandle h = e.getValue();

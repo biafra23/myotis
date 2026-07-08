@@ -317,7 +317,8 @@ private fun SettingsTab(
                 "After this many minutes without a wallet request or query, the node goes to " +
                     "sleep: all P2P networking stops (saving battery) while the JSON-RPC port keeps " +
                     "listening. The first request wakes it — expect that call to take a little longer. " +
-                    "A fresh start always runs through to SYNCED before the first sleep.",
+                    "On a fresh start it runs through to SYNCED before the first sleep, as long as it " +
+                    "has a network to sync over.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
