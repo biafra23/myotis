@@ -492,6 +492,46 @@ final class RustChainHandle implements ChainHandle {
         return json; // the verified block object
     }
 
+    /** A verified fee suggestion — both values decimal-wei strings. */
+    record FeeEstimate(String gasPriceWei, String maxPriorityFeePerGasWei) {}
+
+    /** How long a fee estimate is reused so a paired gasPrice+maxPriorityFee poll
+     *  shares one native compute (each is a 3-block verified fetch). */
+    private static final long FEE_CACHE_TTL_MS = 3_000;
+    private volatile FeeEstimate cachedFee;
+    private volatile long cachedFeeAtMs;
+
+    /**
+     * Verified fee suggestion, cached for {@link #FEE_CACHE_TTL_MS}. Throws
+     * {@link EngineException} when it can't verify (transport / not-running) — the
+     * error is never cached, so the next call retries.
+     */
+    FeeEstimate feeEstimate() {
+        FeeEstimate c = cachedFee;
+        if (c != null && System.currentTimeMillis() - cachedFeeAtMs < FEE_CACHE_TTL_MS) {
+            return c;
+        }
+        FeeEstimate est = feeFromJson(RustEngineNative.nativeFeeEstimateJson(handle));
+        cachedFee = est;
+        cachedFeeAtMs = System.currentTimeMillis();
+        return est;
+    }
+
+    /** Package-private test seam: fee JSON → {@link FeeEstimate} without JNI. */
+    static FeeEstimate feeFromJson(String json) {
+        JsonObject o = parseResultOrThrow(json, "fee");
+        try {
+            String gas = stringOrNull(o, "gasPriceWei");
+            String tip = stringOrNull(o, "maxPriorityFeePerGasWei");
+            if (gas == null || tip == null) {
+                throw new EngineException("fee JSON missing gasPriceWei/maxPriorityFeePerGasWei");
+            }
+            return new FeeEstimate(gas, tip);
+        } catch (RuntimeException e) {
+            throw new EngineException("malformed fee JSON from the Rust engine: " + e.getMessage(), e);
+        }
+    }
+
     /** Package-private test seam: storage-at JSON → verified 32-byte word (or null). */
     static byte[] storageValueFromJson(String json) {
         JsonObject o = parseResultOrThrow(json, "storage");

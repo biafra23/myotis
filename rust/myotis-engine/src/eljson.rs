@@ -8,7 +8,9 @@
 //! serializes `{"error": "..."}`, which the Java side raises as an
 //! `EngineException`.
 
-use myotis_net::el::reader::{VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedStorage};
+use myotis_net::el::reader::{
+    FeeEstimate, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedStorage,
+};
 
 /// The header-chain gap cap the ladder enforces (mirrors the Java
 /// `VerifiedAccountQuery.MAX_HEADER_CHAIN_GAP`), echoed in the storage result's
@@ -219,6 +221,16 @@ pub fn block_json(b: &VerifiedBlock) -> String {
     s
 }
 
+/// Serialize a verified fee suggestion. Both values are decimal-wei strings (the
+/// FFI-neutral form the Java `VerifiedReads.gasPrice()/maxPriorityFeePerGas()`
+/// return); the Java side re-encodes to 0x-QUANTITY at the JSON-RPC boundary.
+pub fn fee_json(f: &FeeEstimate) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert("gasPriceWei".into(), f.gas_price_wei.to_string().into());
+    obj.insert("maxPriorityFeePerGasWei".into(), f.max_priority_fee_wei.to_string().into());
+    serde_json::Value::Object(obj).to_string()
+}
+
 /// A u64 as a minimal-hex QUANTITY (`0x0` for zero).
 fn hex_quantity(v: u64) -> String {
     format!("0x{v:x}")
@@ -298,7 +310,9 @@ fn be_to_decimal(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myotis_net::el::reader::{VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedStorage};
+    use myotis_net::el::reader::{
+    FeeEstimate, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedStorage,
+};
 
     fn sample_account() -> VerifiedAccount {
         VerifiedAccount {
@@ -550,6 +564,14 @@ mod tests {
         assert!(v.get("blobGasUsed").is_none());
         assert!(v.get("excessBlobGas").is_none());
         assert!(v.get("parentBeaconBlockRoot").is_none());
+    }
+
+    #[test]
+    fn fee_json_shape() {
+        let f = FeeEstimate { max_priority_fee_wei: 1_500_000_000, gas_price_wei: 12_345_678_900 };
+        let v: serde_json::Value = serde_json::from_str(&fee_json(&f)).expect("valid json");
+        assert_eq!(v["gasPriceWei"], "12345678900");
+        assert_eq!(v["maxPriorityFeePerGasWei"], "1500000000");
     }
 
     #[test]

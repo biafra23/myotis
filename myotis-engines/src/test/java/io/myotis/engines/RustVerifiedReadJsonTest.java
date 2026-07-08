@@ -257,4 +257,26 @@ class RustVerifiedReadJsonTest {
         assertThrows(EngineException.class, () -> RustChainHandle.blockJsonOrThrow(""));
         assertThrows(EngineException.class, () -> RustChainHandle.blockJsonOrThrow("not json"));
     }
+
+    // ---- eth_gasPrice / eth_maxPriorityFeePerGas (feeFromJson) ----
+
+    @Test
+    void feeJsonMapsToEstimate() {
+        RustChainHandle.FeeEstimate est = RustChainHandle.feeFromJson(
+                "{\"gasPriceWei\":\"12345678900\",\"maxPriorityFeePerGasWei\":\"1500000000\"}");
+        assertEquals("12345678900", est.gasPriceWei());
+        assertEquals("1500000000", est.maxPriorityFeePerGasWei());
+    }
+
+    @Test
+    void feeErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.feeFromJson("{\"error\":\"beacon not synced\"}"));
+    }
+
+    @Test
+    void feeMissingFieldThrows() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.feeFromJson("{\"gasPriceWei\":\"100\"}"));
+    }
 }

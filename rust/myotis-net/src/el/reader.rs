@@ -33,6 +33,7 @@ use crate::el::eth::session::EthConfig;
 use crate::el::peer::ManagedPeer;
 use crate::el::pool::{PeerPool, PoolConfig};
 use crate::el::snap::fetch::AccountOutcome;
+use crate::el::tx;
 
 /// EL network parameters for the reader's discv4 + eth handshake.
 #[derive(Debug, Clone)]
@@ -176,6 +177,25 @@ pub struct VerifiedBlock {
 /// (mirrors the Java `VerifiedRpcBackend.BLOCK_LOOKBACK_MAX`): the header window
 /// [target..head] is fetched in one request, so this bounds its size.
 const BLOCK_LOOKBACK_MAX: u64 = 256;
+
+/// Recent blocks sampled for the `eth_maxPriorityFeePerGas` tip suggestion
+/// (mirrors the Java `TIP_SUGGEST_BLOCKS`).
+const TIP_SUGGEST_BLOCKS: u64 = 3;
+
+/// Mainnet floor for the suggested tip: 0.1 gwei (mirrors the Java `MIN_SUGGESTED_TIP`).
+/// The Rust engine is mainnet-only, so this is a constant here rather than the
+/// network-aware `minSuggestedTipWei`.
+const MIN_SUGGESTED_TIP_WEI: u128 = 100_000_000;
+
+/// A verified fee suggestion (`eth_gasPrice` + `eth_maxPriorityFeePerGas`), both
+/// in wei. The tip is the median effective priority fee over the last
+/// `TIP_SUGGEST_BLOCKS` verified blocks (floored); the gas price is the next
+/// block's base fee plus that tip.
+#[derive(Debug, Clone, Copy)]
+pub struct FeeEstimate {
+    pub max_priority_fee_wei: u128,
+    pub gas_price_wei: u128,
+}
 
 /// A running EL reader: owns discv4 + the peer pool, borrows the beacon anchor.
 pub struct ElReader {
@@ -662,6 +682,97 @@ impl ElReader {
         Ok(VerifiedBlock { hash: vh.hash, header: vh.header.clone(), tx_hashes })
     }
 
+    /// Verified fee suggestion (`eth_gasPrice` + `eth_maxPriorityFeePerGas`). Samples
+    /// the last `TIP_SUGGEST_BLOCKS` beacon-anchored blocks: median per-tx effective
+    /// tip (floored at `MIN_SUGGESTED_TIP_WEI`) as the priority fee, and next-block
+    /// base fee + that tip as the legacy gas price. `Err` when it can't verify.
+    pub async fn fee_estimate(&self) -> Result<FeeEstimate, String> {
+        let head_num = self.anchor.optimistic_block_number();
+        let Some(head_hash) = self.anchor.optimistic_block_hash() else {
+            return Err("no beacon-anchored head yet".to_string());
+        };
+        if head_num == 0 {
+            return Err("beacon not synced".to_string());
+        }
+        // Sample [start..head]; never below genesis.
+        let count = TIP_SUGGEST_BLOCKS.min(head_num + 1);
+        let start = head_num + 1 - count;
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err("no snap peer available".to_string());
+        }
+        let total = peers.len();
+        let mut last_err = String::new();
+        for peer in &peers {
+            match self.fee_estimate_from(peer, start, count, &head_hash).await {
+                Ok(est) => {
+                    self.pool.record_snap_served(peer.addr()).await;
+                    return Ok(est);
+                }
+                Err(e) => {
+                    self.pool.record_snap_failure(peer.addr()).await;
+                    last_err = e;
+                }
+            }
+        }
+        Err(format!("all {total} snap peer(s) failed to serve a verifiable fee estimate: {last_err}"))
+    }
+
+    /// Compute the fee estimate against a single peer: fetch the header window
+    /// [start..head] (anchored + hash-linked to the beacon head), fetch all bodies
+    /// in one request, verify each against its header's `transactions_root`, then
+    /// take the median per-tx effective tip and the next-block base fee.
+    async fn fee_estimate_from(
+        &self,
+        peer: &ManagedPeer,
+        start: u64,
+        count: u64,
+        head_hash: &[u8; 32],
+    ) -> Result<FeeEstimate, String> {
+        let window = peer.get_block_headers_by_number(start, count, 0, false).await?;
+        if window.len() as u64 != count {
+            return Err(format!("peer returned {} headers, expected {}", window.len(), count));
+        }
+        if &window[window.len() - 1].hash != head_hash {
+            return Err("window head does not match the beacon-anchored head hash".to_string());
+        }
+        for i in 0..window.len() - 1 {
+            if window[i + 1].header.parent_hash != window[i].hash {
+                return Err("header window is not hash-linked".to_string());
+            }
+        }
+        let hashes: Vec<[u8; 32]> = window.iter().map(|vh| vh.hash).collect();
+        let bodies = peer.get_block_bodies(&hashes).await?;
+        if bodies.len() != window.len() {
+            return Err(format!("peer returned {} bodies, expected {}", bodies.len(), window.len()));
+        }
+        let mut tips: Vec<u128> = Vec::new();
+        for (vh, body) in window.iter().zip(bodies.iter()) {
+            // Verify each body against its (chain-verified) header, then decode tips
+            // at THAT block's base fee. A pairing error here fails the whole estimate
+            // (fail closed → next peer) rather than skewing the median with bad data.
+            if !triehash::verify(&body.transactions, &vh.header.transactions_root) {
+                return Err("block body transactions do not match the header transactionsRoot".to_string());
+            }
+            let base = header_base_fee(&vh.header);
+            for raw in &body.transactions {
+                if let Some(t) = tx::effective_tip(raw, base) {
+                    tips.push(t);
+                }
+            }
+        }
+        let tip = if tips.is_empty() {
+            MIN_SUGGESTED_TIP_WEI
+        } else {
+            tips.sort_unstable();
+            tips[tips.len() / 2].max(MIN_SUGGESTED_TIP_WEI)
+        };
+        // Gas price = the NEXT block's base fee (from the head header) + the tip.
+        let head_header = &window[window.len() - 1].header;
+        let gas_price = next_base_fee(head_header).saturating_add(tip);
+        Ok(FeeEstimate { max_priority_fee_wei: tip, gas_price_wei: gas_price })
+    }
+
     /// `(finalized_block_number, optimistic_block_number, is_synced)` snapshot.
     fn anchor_diagnostics(&self) -> (u64, u64, bool) {
         let fin = self.anchor.finalized_execution().map(|f| f.block_number).unwrap_or(0);
@@ -780,6 +891,38 @@ fn is_global_fail(reason: Option<&'static str>) -> bool {
 /// `noPeerBlockNumber` — fail-closed and explicit, no wrapping cast.
 fn to_ladder_block(block_number: u64) -> i64 {
     i64::try_from(block_number).unwrap_or(-1)
+}
+
+/// A header's `base_fee_per_gas` (minimal big-endian scalar) as `u128`; 0 when
+/// absent (pre-London — not mainnet today) or implausibly wide (> 16 bytes).
+fn header_base_fee(h: &BlockHeader) -> u128 {
+    match &h.base_fee_per_gas {
+        Some(b) if b.len() <= 16 => b.iter().fold(0u128, |acc, &x| (acc << 8) | x as u128),
+        _ => 0,
+    }
+}
+
+/// The EIP-1559 next-block base fee from `h` (mirrors the Java
+/// `VerifiedRpcBackend.nextBaseFee`): ±1/8 of the parent base fee scaled by how far
+/// gasUsed is from the gasTarget (gasLimit/2), with the +1 minimum-bump rule.
+fn next_base_fee(h: &BlockHeader) -> u128 {
+    let base = header_base_fee(h);
+    if base == 0 {
+        return 0;
+    }
+    let gas_target = h.gas_limit / 2;
+    if gas_target == 0 || h.gas_used == gas_target {
+        return base;
+    }
+    let target = gas_target as u128;
+    if h.gas_used > gas_target {
+        let delta =
+            (base.saturating_mul((h.gas_used - gas_target) as u128) / target / 8).max(1);
+        base.saturating_add(delta)
+    } else {
+        let delta = base.saturating_mul((gas_target - h.gas_used) as u128) / target / 8;
+        base.saturating_sub(delta)
+    }
 }
 
 #[cfg(test)]

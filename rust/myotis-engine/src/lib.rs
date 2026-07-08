@@ -24,7 +24,7 @@ pub mod ringlog;
 ///     nativeGetStorageProofJson), wired into the Java RustEngineNative /
 ///     RustChainHandle at the same time so no .so ever reports an ABI the
 ///     running Java engine treats as stale.
-pub const ABI_VERSION: i32 = 6;
+pub const ABI_VERSION: i32 = 7;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
@@ -277,6 +277,22 @@ mod jni_shim {
     ) -> jstring {
         let block_tag = read_string(&mut env, &block_tag).unwrap_or_default();
         let json = crate::host::get_block_by_number_json(handle, &block_tag);
+        match env.new_string(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// `RustEngineNative.nativeFeeEstimateJson(long handle)` — verified
+    /// `eth_gasPrice` + `eth_maxPriorityFeePerGas`. Returns
+    /// `{"gasPriceWei","maxPriorityFeePerGasWei"}` or `{"error": "..."}`.
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeFeeEstimateJson(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+    ) -> jstring {
+        let json = crate::host::fee_estimate_json(handle);
         match env.new_string(json) {
             Ok(s) => s.into_raw(),
             Err(_) => std::ptr::null_mut(),
