@@ -281,6 +281,14 @@ final class RustChainHandle implements ChainHandle {
     // account query as requestAccount below; the rest of VerifiedReads returns null
     // ("can't answer verified") until later EL-B / EL-C slices land.
     //
+    // Per the ChainHandle contract, reads() is null "while the RPC backend isn't
+    // started (e.g. the RPC port was unavailable at start())". The adapter is itself
+    // transport-independent (it queries the native directly), but reads() gates on
+    // rpcServer so it means the same thing on both engines: the Java engine's
+    // rpcBackend is null until startRpc() succeeds, and hosts null-check reads()
+    // to decide whether verified RPC is available. So: null before start(), when
+    // rpcPort<=0, or on a bind failure; non-null once serving.
+    //
     // ens() still returns null (no ENS registry served yet) — that IS the ChainHandle
     // contract ("or null when this network has no ENS registry"), and callers
     // null-check it. The EL QUERY methods further down (getHeaders/getBlockVerified/
@@ -289,7 +297,7 @@ final class RustChainHandle implements ChainHandle {
     // error (no verification to report a failReason for) — a failReason record would
     // misrepresent "we can't" as "we tried and failed".
 
-    @Override public VerifiedReads reads() { return verifiedReads; }
+    @Override public VerifiedReads reads() { return rpcServer != null ? verifiedReads : null; }
 
     @Override public EnsApi ens() { return null; }
 

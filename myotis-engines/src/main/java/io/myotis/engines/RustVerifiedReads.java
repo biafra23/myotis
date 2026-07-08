@@ -128,6 +128,10 @@ final class RustVerifiedReads implements VerifiedReads {
 
     /** Run the verified account query, mapping a transport/not-running failure to null. */
     private AccountProofResult queryAccount(byte[] address) {
+        // An eth address is exactly 20 bytes. Reject any other length (incl. null) up
+        // front — "can't answer" (null) rather than round-tripping a bogus key through
+        // the native query — so a malformed address never crosses the JNI boundary.
+        if (address == null || address.length != 20) return null;
         try {
             return handle.requestAccount(toHex(address));
         } catch (RuntimeException e) {
