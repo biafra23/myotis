@@ -497,24 +497,25 @@ final class RustChainHandle implements ChainHandle {
 
     /** How long a fee estimate is reused so a paired gasPrice+maxPriorityFee poll
      *  shares one native compute (each is a 3-block verified fetch). */
-    private static final long FEE_CACHE_TTL_MS = 3_000;
+    private static final long FEE_CACHE_TTL_NANOS = 3_000_000_000L; // 3s
     /** Value+timestamp in one volatile so a reader can't pair a fresh estimate with
-     *  a stale stamp (or vice versa). */
-    private record CachedFee(FeeEstimate est, long atMs) {}
+     *  a stale stamp (or vice versa). Monotonic nanoTime — immune to wall-clock/NTP
+     *  jumps that could otherwise expire the cache early or serve it too long. */
+    private record CachedFee(FeeEstimate est, long atNanos) {}
     private volatile CachedFee cachedFee;
 
     /**
-     * Verified fee suggestion, cached for {@link #FEE_CACHE_TTL_MS}. Throws
+     * Verified fee suggestion, cached for {@link #FEE_CACHE_TTL_NANOS}. Throws
      * {@link EngineException} when it can't verify (transport / not-running) — the
      * error is never cached, so the next call retries.
      */
     FeeEstimate feeEstimate() {
         CachedFee c = cachedFee;
-        if (c != null && System.currentTimeMillis() - c.atMs() < FEE_CACHE_TTL_MS) {
+        if (c != null && System.nanoTime() - c.atNanos() < FEE_CACHE_TTL_NANOS) {
             return c.est();
         }
         FeeEstimate est = feeFromJson(RustEngineNative.nativeFeeEstimateJson(handle));
-        cachedFee = new CachedFee(est, System.currentTimeMillis());
+        cachedFee = new CachedFee(est, System.nanoTime());
         return est;
     }
 
