@@ -23,7 +23,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 5; // 5: + nativeGetCodeJson / nativeGetStorageAtJson
+    static final int EXPECTED_ABI_VERSION = 6; // 6: + nativeGetBlockByNumberJson
 
     private static final boolean AVAILABLE = load();
 
@@ -105,7 +105,7 @@ final class RustEngineNative {
     /**
      * A verified account query for a running handle, returned as JSON: the full
      * {@link io.myotis.api.AccountProofResult} shape on success (a verification
-     * failure carries a {@code failReason}), or {@code {"error": "..."}} for a
+     * failure carries a {@code failReason}), or an {@code "error"} object for a
      * transport / not-running / bad-input failure (which RustChainHandle raises
      * as an {@link io.myotis.api.EngineException}). {@code address} is 0x-hex.
      */
@@ -122,9 +122,9 @@ final class RustEngineNative {
 
     /**
      * A verified contract-code query (`eth_getCode`) for a running handle, as
-     * JSON: {@code {codeHex, codeHashHex, verifyMethod, failReason, ...}} on
-     * success (empty {@code codeHex} for an EOA / empty-code / unverified account),
-     * or {@code {"error": "..."}} for a transport / not-running / bad-input failure.
+     * JSON: a <code>{codeHex, codeHashHex, verifyMethod, failReason, …}</code>
+     * object on success (empty {@code codeHex} for an EOA / empty-code / unverified
+     * account), or an {@code "error"} object for a transport / not-running / bad-input failure.
      * {@code address} is 0x-hex.
      */
     static native String nativeGetCodeJson(long handle, String address);
@@ -138,4 +138,14 @@ final class RustEngineNative {
      * ERC-20 mapping form.
      */
     static native String nativeGetStorageAtJson(long handle, String address, String position);
+
+    /**
+     * Verified {@code eth_getBlockByNumber} (transactions as hashes) for a running
+     * handle. {@code blockTag} is an eth block selector ({@code "latest"} / a
+     * 0x-hex number / …). Returns the block JSON object, the literal {@code "null"}
+     * for a future/unknown block (eth's null), or an {@code "error"} object for a
+     * transport / not-running / can't-verify failure. {@code fullTransactions} is
+     * handled Java-side (returns null before this native runs).
+     */
+    static native String nativeGetBlockByNumberJson(long handle, String blockTag);
 }

@@ -154,7 +154,23 @@ final class RustVerifiedReads implements VerifiedReads {
     @Override public byte[] sendRawTransaction(byte[] rawTx) { return null; }
     @Override public String getTransactionReceipt(byte[] txHash) { return null; }
     @Override public String getTransactionByHash(byte[] txHash) { return null; }
-    @Override public String getBlockByNumber(String block, boolean fullTransactions) { return null; }
+
+    @Override
+    public String getBlockByNumber(String block, boolean fullTransactions) {
+        // Full tx objects need tx decode + sender recovery — not served verified yet
+        // (mirrors the Java engine); null → strict -32000.
+        if (fullTransactions) return null;
+        String tag = (block == null || block.isBlank()) ? "latest" : block;
+        try {
+            // Returns the block JSON, the "null" literal (verified future/unknown
+            // block), or throws when it can't verify (→ null → -32000).
+            return handle.blockByNumberJson(tag);
+        } catch (RuntimeException e) {
+            log.debug("[engines] verified block read unavailable: {}", e.getMessage());
+            return null;
+        }
+    }
+
     @Override public String getBlockByHash(byte[] blockHash32, boolean fullTransactions) { return null; }
     @Override public String gasPrice() { return null; }
     @Override public String maxPriorityFeePerGas() { return null; }

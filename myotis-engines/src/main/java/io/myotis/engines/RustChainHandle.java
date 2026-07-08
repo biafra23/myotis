@@ -413,6 +413,37 @@ final class RustChainHandle implements ChainHandle {
                 RustEngineNative.nativeGetStorageAtJson(handle, hexAddress, position32Hex));
     }
 
+    /**
+     * Verified eth_getBlockByNumber (transactions as hashes): the block JSON object,
+     * the literal {@code "null"} (a verified future/unknown block → eth null), or
+     * throws {@link EngineException} when it can't verify (transport / not-running).
+     * {@code blockTag} is an eth block selector ({@code "latest"} / 0x-hex number).
+     */
+    String blockByNumberJson(String blockTag) {
+        return blockJsonOrThrow(RustEngineNative.nativeGetBlockByNumberJson(handle, blockTag));
+    }
+
+    /** Package-private test seam: native block payload → block JSON | "null" | throw. */
+    static String blockJsonOrThrow(String json) {
+        if (json == null || json.isBlank()) {
+            throw new EngineException("blank block JSON from the Rust engine (native failure?)");
+        }
+        // The eth-null literal (verified future/unknown block) is not a JSON object;
+        // return it before parsing so the router can emit a JSON null result.
+        if (json.equals("null")) return "null";
+        JsonObject o;
+        try {
+            o = Json.parse(json).asObject();
+        } catch (RuntimeException e) {
+            throw new EngineException("malformed block JSON from the Rust engine: " + e.getMessage(), e);
+        }
+        var error = o.get("error");
+        if (error != null && !error.isNull()) {
+            throw new EngineException(error.isString() ? error.asString() : error.toString());
+        }
+        return json; // the verified block object
+    }
+
     /** Package-private test seam: storage-at JSON → verified 32-byte word (or null). */
     static byte[] storageValueFromJson(String json) {
         JsonObject o = parseResultOrThrow(json, "storage");

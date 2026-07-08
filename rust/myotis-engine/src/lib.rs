@@ -24,7 +24,7 @@ pub mod ringlog;
 ///     nativeGetStorageProofJson), wired into the Java RustEngineNative /
 ///     RustChainHandle at the same time so no .so ever reports an ABI the
 ///     running Java engine treats as stale.
-pub const ABI_VERSION: i32 = 5;
+pub const ABI_VERSION: i32 = 6;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
@@ -259,6 +259,24 @@ mod jni_shim {
         let address = read_string(&mut env, &address).unwrap_or_default();
         let position = read_string(&mut env, &position).unwrap_or_default();
         let json = crate::host::get_storage_at_json(handle, &address, &position);
+        match env.new_string(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// `RustEngineNative.nativeGetBlockByNumberJson(long handle, String blockTag)`
+    /// — verified `eth_getBlockByNumber` (transactions as hashes). Returns the block
+    /// JSON, the literal `"null"`, or `{"error": "..."}`.
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeGetBlockByNumberJson(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        block_tag: JString,
+    ) -> jstring {
+        let block_tag = read_string(&mut env, &block_tag).unwrap_or_default();
+        let json = crate::host::get_block_by_number_json(handle, &block_tag);
         match env.new_string(json) {
             Ok(s) => s.into_raw(),
             Err(_) => std::ptr::null_mut(),

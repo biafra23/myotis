@@ -426,6 +426,55 @@ pub fn get_storage_at_json(handle: i64, address_hex: &str, position_hex: &str) -
     }
 }
 
+/// `nativeGetBlockByNumberJson`: verified `eth_getBlockByNumber` (transactions as
+/// hashes) for a running handle. Returns the block JSON when found+verified, the
+/// literal `"null"` for a future/unknown block (eth's null), or `{"error": "..."}`
+/// when it can't verify right now (which the Java side maps to a null → -32000).
+/// `fullTransactions=true` is handled on the Java side (returns null before this
+/// native runs), so this always serves the hashes-only shape.
+pub fn get_block_by_number_json(handle: i64, block_tag: &str) -> String {
+    let target = match parse_block_target(block_tag) {
+        Ok(t) => t,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    match engine.rt.block_on(async { reader.get_block_by_number(target).await }) {
+        Ok(Some(block)) => eljson::block_json(&block),
+        Ok(None) => "null".to_string(), // verified future/unknown block → eth null
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// Parse an eth block selector to a target number: `None` = latest (the head).
+/// Mirrors the Java backend — latest/pending/safe/finalized all resolve to the
+/// optimistic head; earliest (genesis) and malformed/negative are not served
+/// verified (`Err`, surfaced as an error the router turns into -32000).
+fn parse_block_target(tag: &str) -> Result<Option<u64>, &'static str> {
+    match tag {
+        "latest" | "pending" | "safe" | "finalized" => Ok(None),
+        "earliest" => Err("earliest (genesis) is not served verified"),
+        hex => {
+            let h = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
+            if h.is_empty() || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("invalid block number");
+            }
+            match u64::from_str_radix(h, 16) {
+                // Block 0 (any hex form) is genesis — reject it up front, same as the
+                // "earliest" tag, rather than letting it fail deep in the lookback cap.
+                Ok(0) => Err("earliest (genesis) is not served verified"),
+                Ok(n) => Ok(Some(n)),
+                Err(_) => Err("block number out of range"),
+            }
+        }
+    }
+}
+
 /// Snapshot `(reader, finalizedPeriod, wallClockPeriod)` for a running handle,
 /// or an error message. Holds the map lock only for the clone.
 fn snapshot_reader(
@@ -702,6 +751,22 @@ mod tests {
         // No engine calls here — just the contract for a missing handle, which
         // status_json returns directly.
         assert_eq!(status_json(i64::MIN), "{}");
+    }
+
+    #[test]
+    fn parse_block_target_cases() {
+        assert_eq!(parse_block_target("latest"), Ok(None));
+        assert_eq!(parse_block_target("pending"), Ok(None));
+        assert_eq!(parse_block_target("finalized"), Ok(None));
+        assert_eq!(parse_block_target("0x1406f40"), Ok(Some(21_000_000)));
+        assert!(parse_block_target("earliest").is_err());
+        // Block 0 (genesis) is rejected up front in any hex form, like "earliest".
+        assert!(parse_block_target("0x0").is_err());
+        assert!(parse_block_target("0x00").is_err());
+        assert!(parse_block_target("0").is_err());
+        // Malformed selectors.
+        assert!(parse_block_target("0xzz").is_err());
+        assert!(parse_block_target("0x").is_err());
     }
 
     #[test]

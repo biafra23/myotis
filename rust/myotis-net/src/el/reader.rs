@@ -21,9 +21,11 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
+use myotis_core::header::BlockHeader;
 use myotis_core::keccak::keccak256;
 use myotis_core::nodekey::NodeKey;
 use myotis_core::trie::{EMPTY_CODE_HASH, EMPTY_TRIE_ROOT};
+use myotis_core::triehash;
 
 use crate::el::anchor::ExecAnchor;
 use crate::el::discv4::{Discv4Config, Discv4Service};
@@ -156,6 +158,24 @@ pub struct VerifiedCode {
     pub finalized_block_number: u64,
     pub optimistic_block_number: u64,
 }
+
+/// A verified block result (`eth_getBlockByNumber`, transactions as hashes). The
+/// header is anchored to the beacon optimistic head via a hash-linked header
+/// window, and the body's transactions verify against the header's
+/// `transactions_root` — so returning it at all IS the verification (the eth block
+/// object carries no verdict field).
+#[derive(Debug, Clone)]
+pub struct VerifiedBlock {
+    pub hash: [u8; 32],
+    pub header: BlockHeader,
+    /// keccak256 of each transaction's raw bytes, in block order.
+    pub tx_hashes: Vec<[u8; 32]>,
+}
+
+/// How far below the beacon head a block pin may be and still verify cheaply
+/// (mirrors the Java `VerifiedRpcBackend.BLOCK_LOOKBACK_MAX`): the header window
+/// [target..head] is fetched in one request, so this bounds its size.
+const BLOCK_LOOKBACK_MAX: u64 = 256;
 
 /// A running EL reader: owns discv4 + the peer pool, borrows the beacon anchor.
 pub struct ElReader {
@@ -538,6 +558,108 @@ impl ElReader {
             }
         }
         Err(format!("all {total} snap peer(s) failed to serve verifiable bytecode: {last_err}"))
+    }
+
+    /// Verified `eth_getBlockByNumber` (transactions as hashes). `target` is the
+    /// block number, or `None` for the latest (the beacon optimistic head).
+    ///
+    /// Returns `Ok(Some(block))` when a block is fetched and verified; `Ok(None)`
+    /// for a number ABOVE the verified head (a future/unknown block → eth `null`);
+    /// and `Err` when it can't verify right now (no anchor, too far back, or every
+    /// peer failed → the host maps this to an error the router surfaces as -32000).
+    pub async fn get_block_by_number(
+        &self,
+        target: Option<u64>,
+    ) -> Result<Option<VerifiedBlock>, String> {
+        let head_num = self.anchor.optimistic_block_number();
+        let Some(head_hash) = self.anchor.optimistic_block_hash() else {
+            return Err("no beacon-anchored head yet".to_string());
+        };
+        if head_num == 0 {
+            return Err("beacon not synced".to_string());
+        }
+        let target_num = target.unwrap_or(head_num);
+        // A pin above the verified head is future/unknown, not an error.
+        if target_num > head_num {
+            return Ok(None);
+        }
+        let back = head_num - target_num;
+        if back >= BLOCK_LOOKBACK_MAX {
+            return Err(format!(
+                "block {target_num} is {back} behind the head — beyond the {BLOCK_LOOKBACK_MAX}-block verify window"
+            ));
+        }
+        // Serve over the snap pool (the peer set the reader maintains); a block
+        // serve is eth-only (headers + bodies), so this is a superset of what's
+        // needed. If eth peers exist but none negotiated snap, this fails closed
+        // (Err → -32000), never a false "null". Reputation reuses the snap sinks.
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err("no snap peer available".to_string());
+        }
+        let total = peers.len();
+        let mut last_err = String::new();
+        for peer in &peers {
+            match self.get_block_from(peer, target_num, back, &head_hash).await {
+                Ok(block) => {
+                    self.pool.record_snap_served(peer.addr()).await;
+                    return Ok(Some(block));
+                }
+                Err(e) => {
+                    self.pool.record_snap_failure(peer.addr()).await;
+                    last_err = e;
+                }
+            }
+        }
+        Err(format!("all {total} snap peer(s) failed to serve a verifiable block: {last_err}"))
+    }
+
+    /// Fetch + verify one block against a single peer. Fetches the header window
+    /// [target..head], checks it hash-links up to the beacon-anchored head hash,
+    /// then fetches the target's body and verifies its transactions against the
+    /// header's `transactions_root`. Any mismatch/transport error propagates for
+    /// the caller loop to try the next peer.
+    async fn get_block_from(
+        &self,
+        peer: &ManagedPeer,
+        target_num: u64,
+        back: u64,
+        head_hash: &[u8; 32],
+    ) -> Result<VerifiedBlock, String> {
+        // The contiguous forward window [target .. head] (back + 1 headers), in one
+        // request. back < BLOCK_LOOKBACK_MAX (256) bounds this to ~150 KB, within the
+        // eth response soft limit; a peer that caps its response below back+1 fails
+        // the length check below and is skipped (fails closed — the caller tries the
+        // next peer), so deep pins carry a slightly higher liveness risk than a
+        // batched fetch would. The common case (latest / a few blocks back) is one
+        // small response.
+        let window = peer.get_block_headers_by_number(target_num, back + 1, 0, false).await?;
+        if window.len() as u64 != back + 1 {
+            return Err(format!("peer returned {} headers, expected {}", window.len(), back + 1));
+        }
+        // The window's head must BE the beacon-anchored head, and each header must
+        // hash-link to the next — proving the target header chains to the verified
+        // head (the trust gate: head_hash is the light-client-attested exec hash).
+        if &window[window.len() - 1].hash != head_hash {
+            return Err("window head does not match the beacon-anchored head hash".to_string());
+        }
+        for i in 0..window.len() - 1 {
+            if window[i + 1].header.parent_hash != window[i].hash {
+                return Err("header window is not hash-linked".to_string());
+            }
+        }
+        let vh = &window[0];
+        if vh.header.number != target_num {
+            return Err("peer returned the wrong target block number".to_string());
+        }
+        // Body: verify its transactions against the (now trusted) transactions_root.
+        let bodies = peer.get_block_bodies(&[vh.hash]).await?;
+        let body = bodies.into_iter().next().ok_or("peer returned no block body")?;
+        if !triehash::verify(&body.transactions, &vh.header.transactions_root) {
+            return Err("block body transactions do not match the header transactionsRoot".to_string());
+        }
+        let tx_hashes = body.transactions.iter().map(|t| keccak256(t)).collect();
+        Ok(VerifiedBlock { hash: vh.hash, header: vh.header.clone(), tx_hashes })
     }
 
     /// `(finalized_block_number, optimistic_block_number, is_synced)` snapshot.

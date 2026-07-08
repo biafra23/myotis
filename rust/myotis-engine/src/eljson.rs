@@ -8,7 +8,7 @@
 //! serializes `{"error": "..."}`, which the Java side raises as an
 //! `EngineException`.
 
-use myotis_net::el::reader::{VerifiedAccount, VerifiedCode, VerifiedStorage};
+use myotis_net::el::reader::{VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedStorage};
 
 /// The header-chain gap cap the ladder enforces (mirrors the Java
 /// `VerifiedAccountQuery.MAX_HEADER_CHAIN_GAP`), echoed in the storage result's
@@ -139,6 +139,109 @@ pub fn code_json(
     serde_json::Value::Object(obj).to_string()
 }
 
+/// Serialize a verified block to the `eth_getBlockByNumber` JSON — transactions as
+/// hashes, `uncles` always empty (a verified header serve). Mirrors the Java
+/// `VerifiedRpcBackend.buildBlockJson` field set and QUANTITY encoding exactly.
+/// Hand-built (not serde) so the shape is the pinned cross-language contract.
+pub fn block_json(b: &VerifiedBlock) -> String {
+    let h = &b.header;
+    let mut s = String::with_capacity(1024);
+    s.push_str("{\"number\":\"");
+    s.push_str(&hex_quantity(h.number));
+    s.push_str("\",\"hash\":\"");
+    s.push_str(&hex0x(&b.hash));
+    s.push_str("\",\"parentHash\":\"");
+    s.push_str(&hex0x(&h.parent_hash));
+    s.push_str("\",\"nonce\":\"");
+    s.push_str(&hex0x_var(&h.nonce));
+    s.push_str("\",\"sha3Uncles\":\"");
+    s.push_str(&hex0x(&h.ommers_hash));
+    s.push_str("\",\"logsBloom\":\"");
+    s.push_str(&hex0x_var(&h.logs_bloom));
+    s.push_str("\",\"transactionsRoot\":\"");
+    s.push_str(&hex0x(&h.transactions_root));
+    s.push_str("\",\"stateRoot\":\"");
+    s.push_str(&hex0x(&h.state_root));
+    s.push_str("\",\"receiptsRoot\":\"");
+    s.push_str(&hex0x(&h.receipts_root));
+    s.push_str("\",\"miner\":\"");
+    s.push_str(&hex0x_var(&h.beneficiary));
+    s.push_str("\",\"difficulty\":\"");
+    s.push_str(&hex_quantity_scalar(&h.difficulty));
+    s.push_str("\",\"extraData\":\"");
+    s.push_str(&hex0x_var(&h.extra_data));
+    s.push_str("\",\"gasLimit\":\"");
+    s.push_str(&hex_quantity(h.gas_limit));
+    s.push_str("\",\"gasUsed\":\"");
+    s.push_str(&hex_quantity(h.gas_used));
+    s.push_str("\",\"timestamp\":\"");
+    s.push_str(&hex_quantity(h.timestamp));
+    s.push_str("\",\"mixHash\":\"");
+    s.push_str(&hex0x(&h.mix_hash_or_prev_randao));
+    s.push('"');
+    // Optional post-fork fields — emitted only when present (fork-gated), exactly
+    // like the Java serializer.
+    if let Some(bf) = &h.base_fee_per_gas {
+        s.push_str(",\"baseFeePerGas\":\"");
+        s.push_str(&hex_quantity_scalar(bf));
+        s.push('"');
+    }
+    if let Some(wr) = &h.withdrawals_root {
+        s.push_str(",\"withdrawalsRoot\":\"");
+        s.push_str(&hex0x(wr));
+        s.push('"');
+    }
+    if let Some(bg) = h.blob_gas_used {
+        s.push_str(",\"blobGasUsed\":\"");
+        s.push_str(&hex_quantity(bg));
+        s.push('"');
+    }
+    if let Some(eg) = h.excess_blob_gas {
+        s.push_str(",\"excessBlobGas\":\"");
+        s.push_str(&hex_quantity(eg));
+        s.push('"');
+    }
+    if let Some(pr) = &h.parent_beacon_block_root {
+        s.push_str(",\"parentBeaconBlockRoot\":\"");
+        s.push_str(&hex0x(pr));
+        s.push('"');
+    }
+    s.push_str(",\"transactions\":[");
+    for (i, txh) in b.tx_hashes.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('"');
+        s.push_str(&hex0x(txh));
+        s.push('"');
+    }
+    s.push_str("],\"uncles\":[]}");
+    s
+}
+
+/// A u64 as a minimal-hex QUANTITY (`0x0` for zero).
+fn hex_quantity(v: u64) -> String {
+    format!("0x{v:x}")
+}
+
+/// A minimal big-endian scalar (header difficulty / baseFee) as a QUANTITY:
+/// empty/all-zero → `0x0`; else `0x` + hex with leading zero bytes/nibble stripped.
+fn hex_quantity_scalar(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    match bytes.iter().position(|&b| b != 0) {
+        None => "0x0".to_string(),
+        Some(i) => {
+            let mut s = String::with_capacity(2 + (bytes.len() - i) * 2);
+            s.push_str("0x");
+            let _ = write!(s, "{:x}", bytes[i]); // first non-zero byte: no leading-zero nibble
+            for b in &bytes[i + 1..] {
+                let _ = write!(s, "{b:02x}");
+            }
+            s
+        }
+    }
+}
+
 fn opt_str(v: Option<&'static str>) -> serde_json::Value {
     v.map(Into::into).unwrap_or(serde_json::Value::Null)
 }
@@ -195,7 +298,7 @@ fn be_to_decimal(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myotis_net::el::reader::{VerifiedAccount, VerifiedCode, VerifiedStorage};
+    use myotis_net::el::reader::{VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedStorage};
 
     fn sample_account() -> VerifiedAccount {
         VerifiedAccount {
@@ -375,6 +478,78 @@ mod tests {
         assert_eq!(v["codeHex"], "0x");
         assert_eq!(v["exists"], false);
         assert_eq!(v["verifyMethod"], "headerChain");
+    }
+
+    fn sample_block() -> VerifiedBlock {
+        use myotis_net::el::reader::VerifiedBlock as VB;
+        let header = myotis_core::header::BlockHeader {
+            parent_hash: [0x11; 32],
+            ommers_hash: [0x22; 32],
+            beneficiary: vec![0xaa; 20],
+            state_root: [0x33; 32],
+            transactions_root: [0x44; 32],
+            receipts_root: [0x55; 32],
+            logs_bloom: vec![0x00; 256],
+            difficulty: Vec::new(), // post-Merge: 0 -> "0x0"
+            number: 21_000_000,
+            gas_limit: 30_000_000,
+            gas_used: 15_000_000,
+            timestamp: 1_700_000_000,
+            extra_data: vec![0xde, 0xad],
+            mix_hash_or_prev_randao: [0x66; 32],
+            nonce: vec![0x00; 8],
+            base_fee_per_gas: Some(vec![0x07, 0x5b, 0xcd, 0x15]), // 123_456_789
+            withdrawals_root: Some([0x77; 32]),
+            blob_gas_used: Some(131_072),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some([0x88; 32]),
+        };
+        VB { hash: [0x99; 32], header, tx_hashes: vec![[0xa1; 32], [0xb2; 32]] }
+    }
+
+    #[test]
+    fn block_json_shape_and_values() {
+        let v: serde_json::Value =
+            serde_json::from_str(&block_json(&sample_block())).expect("valid json");
+        assert_eq!(v["number"], "0x1406f40"); // 21_000_000
+        assert_eq!(v["hash"], hex0x(&[0x99; 32]));
+        assert_eq!(v["parentHash"], hex0x(&[0x11; 32]));
+        assert_eq!(v["nonce"], hex0x_var(&[0u8; 8]));
+        assert_eq!(v["sha3Uncles"], hex0x(&[0x22; 32]));
+        assert_eq!(v["transactionsRoot"], hex0x(&[0x44; 32]));
+        assert_eq!(v["stateRoot"], hex0x(&[0x33; 32]));
+        assert_eq!(v["receiptsRoot"], hex0x(&[0x55; 32]));
+        assert_eq!(v["miner"], hex0x_var(&[0xaau8; 20]));
+        assert_eq!(v["difficulty"], "0x0"); // post-Merge
+        assert_eq!(v["extraData"], "0xdead");
+        assert_eq!(v["gasLimit"], "0x1c9c380"); // 30_000_000
+        assert_eq!(v["gasUsed"], "0xe4e1c0"); // 15_000_000
+        assert_eq!(v["timestamp"], "0x6553f100"); // 1_700_000_000
+        assert_eq!(v["mixHash"], hex0x(&[0x66; 32]));
+        assert_eq!(v["baseFeePerGas"], "0x75bcd15"); // 123_456_789
+        assert_eq!(v["withdrawalsRoot"], hex0x(&[0x77; 32]));
+        assert_eq!(v["blobGasUsed"], "0x20000"); // 131_072
+        assert_eq!(v["excessBlobGas"], "0x0");
+        assert_eq!(v["parentBeaconBlockRoot"], hex0x(&[0x88; 32]));
+        assert_eq!(v["transactions"][0], hex0x(&[0xa1; 32]));
+        assert_eq!(v["transactions"][1], hex0x(&[0xb2; 32]));
+        assert!(v["uncles"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pre_london_block_omits_optional_fields() {
+        let mut b = sample_block();
+        b.header.base_fee_per_gas = None;
+        b.header.withdrawals_root = None;
+        b.header.blob_gas_used = None;
+        b.header.excess_blob_gas = None;
+        b.header.parent_beacon_block_root = None;
+        let v: serde_json::Value = serde_json::from_str(&block_json(&b)).unwrap();
+        assert!(v.get("baseFeePerGas").is_none());
+        assert!(v.get("withdrawalsRoot").is_none());
+        assert!(v.get("blobGasUsed").is_none());
+        assert!(v.get("excessBlobGas").is_none());
+        assert!(v.get("parentBeaconBlockRoot").is_none());
     }
 
     #[test]
