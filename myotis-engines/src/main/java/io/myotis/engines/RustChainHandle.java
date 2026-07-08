@@ -151,7 +151,9 @@ final class RustChainHandle implements ChainHandle {
             int discoveredPeers,
             int attemptedDials,
             int backedOffPeers,
-            int blacklistedPeers) {
+            int blacklistedPeers,
+            long optimisticBlockNumber,
+            long finalizedBlockNumber) {
 
         static ParsedStatus parse(String json) {
             if (json == null || json.isBlank()) return notRunning();
@@ -174,7 +176,9 @@ final class RustChainHandle implements ChainHandle {
                         o.getInt("discoveredPeers", 0),
                         o.getInt("attemptedDials", 0),
                         o.getInt("backedOffPeers", 0),
-                        o.getInt("blacklistedPeers", 0));
+                        o.getInt("blacklistedPeers", 0),
+                        o.getLong("optimisticBlockNumber", 0L),
+                        o.getLong("finalizedBlockNumber", 0L));
             } catch (RuntimeException e) {
                 throw new EngineException(
                         "malformed status JSON from the Rust engine: " + e.getMessage(), e);
@@ -183,7 +187,7 @@ final class RustChainHandle implements ChainHandle {
 
         static ParsedStatus notRunning() {
             return new ParsedStatus(false, BeaconState.STARTING, false, 0L, 0L, 0L, 0L, 0L, 0, 0, -1L,
-                    0, 0, 0, 0, 0);
+                    0, 0, 0, 0, 0, 0L, 0L);
         }
     }
 
@@ -213,8 +217,9 @@ final class RustChainHandle implements ChainHandle {
         long targetPeriod = Math.max(s.targetPeriod(), s.currentPeriod());
         // EL pool/discovery counts now come from the Rust status JSON. The pool
         // keeps only snap-capable READY peers, so readyPeers == snapPeers (and
-        // snapServingPeers is approximated by the same). Execution-block /
-        // verified-head fields are still zero (a later follow-up).
+        // snapServingPeers is approximated by the same). Execution block numbers
+        // (optimistic head + finalized) now come from the beacon anchor via the
+        // status JSON; only verifiedHeadAgeMs remains a later follow-up.
         return new StatusSnapshot(
                 s.running(),
                 networkName,
@@ -228,10 +233,10 @@ final class RustChainHandle implements ChainHandle {
                 s.blacklistedPeers(),  // blacklistedPeers
                 s.attemptedDials(),    // attemptedDials
                 s.discv5TableSize(),
-                0L,             // executionBlockNumber
-                0L,             // optimisticBlockNumber
+                s.finalizedBlockNumber(),   // executionBlockNumber (== finalized payload's block)
+                s.optimisticBlockNumber(),  // optimisticBlockNumber (the eth_blockNumber head)
                 s.finalizedSlot(),
-                0L,             // finalizedBlockNumber
+                s.finalizedBlockNumber(),   // finalizedBlockNumber
                 s.syncStartPeriod(),
                 s.currentPeriod(),
                 targetPeriod,

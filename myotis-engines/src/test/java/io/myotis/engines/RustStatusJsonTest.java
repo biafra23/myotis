@@ -48,7 +48,9 @@ class RustStatusJsonTest {
             + "\"discv5TableSize\":7,\"syncStartPeriod\":1777,"
             + "\"finalizedRootHex\":\"58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e\","
             + "\"snapPeers\":6,\"readyPeers\":6,\"discoveredPeers\":240,\"attemptedDials\":14,"
-            + "\"backedOffPeers\":30,\"blacklistedPeers\":66}";
+            + "\"backedOffPeers\":30,\"blacklistedPeers\":66,"
+            + "\"optimisticBlockNumber\":21000010,\"finalizedBlockNumber\":20999000,"
+            + "\"executionBlockNumber\":20999000}";
 
     @BeforeAll
     static void setup() {
@@ -66,8 +68,9 @@ class RustStatusJsonTest {
         assertEquals(0L, s.syncCurrentPeriod());
         assertEquals(0L, s.syncTargetPeriod());
         assertEquals(-1L, s.syncStartPeriod());
-        // EL-only fields are zeroed on the CL-only R1 engine.
+        // EL block/peer fields are 0 for a not-started handle (no anchor head yet).
         assertEquals(0L, s.executionBlockNumber());
+        assertEquals(0L, s.optimisticBlockNumber());
         assertEquals(0, s.snapPeers());
         assertEquals(Long.MAX_VALUE, s.verifiedHeadAgeMs());
     }
@@ -93,6 +96,11 @@ class RustStatusJsonTest {
         assertEquals(14, s.attemptedDials());
         assertEquals(30, s.backedOffPeers());
         assertEquals(66, s.blacklistedPeers());
+        // Execution block numbers now flow from the beacon anchor (not hardcoded 0):
+        // optimistic head drives eth_blockNumber; executionBlockNumber == finalized.
+        assertEquals(21000010L, s.optimisticBlockNumber());
+        assertEquals(20999000L, s.finalizedBlockNumber());
+        assertEquals(20999000L, s.executionBlockNumber());
     }
 
     @Test

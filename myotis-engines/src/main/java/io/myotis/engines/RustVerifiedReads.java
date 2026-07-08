@@ -53,10 +53,16 @@ final class RustVerifiedReads implements VerifiedReads {
 
     @Override
     public Long headBlockNumber() {
-        // The Rust status JSON does not yet carry the anchored execution block
-        // number (a later EL-B slice wires the ExecAnchor head into status), so
-        // eth_blockNumber cannot be answered verified until then.
-        return null;
+        // The beacon optimistic-head execution block number (eth_blockNumber), from
+        // the anchor via the status JSON. 0 == the anchor has no head yet (not
+        // synced enough) → null, per the contract.
+        try {
+            long head = handle.status().optimisticBlockNumber();
+            return head > 0 ? head : null;
+        } catch (RuntimeException e) {
+            log.debug("[engines] headBlockNumber unavailable: {}", e.getMessage());
+            return null;
+        }
     }
 
     @Override
