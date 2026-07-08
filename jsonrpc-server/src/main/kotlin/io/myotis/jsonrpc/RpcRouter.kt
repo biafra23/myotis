@@ -49,9 +49,13 @@ class RpcRouter(
     }
 
     suspend fun handle(body: String): String {
+        val t0 = System.nanoTime()
         val root = try {
             json.parseToJsonElement(body)
         } catch (e: Exception) {
+            // Log the parse failure too — otherwise a malformed request the server DID
+            // respond to (with -32700) would be invisible in the access log.
+            logger.record("<parse-error>", "null", "ERROR", elapsedMs(t0), -32700)
             return errorEnvelope(JsonNull, -32700, "Parse error")
         }
         return when (root) {
@@ -60,15 +64,33 @@ class RpcRouter(
                 // JSON-RPC 2.0 batch: each request gets its own response/error object so
                 // a wallet (MetaMask batches heavily) can match them by id — not a single
                 // error envelope. Elements are handled independently.
-                if (root.isEmpty()) return errorEnvelope(JsonNull, -32600, "Invalid Request")
+                if (root.isEmpty()) {
+                    logger.record("<empty-batch>", "null", "ERROR", elapsedMs(t0), -32600)
+                    return errorEnvelope(JsonNull, -32600, "Invalid Request")
+                }
                 val responses = root.map { el ->
                     (el as? JsonObject)?.let { handleOne(it, null) }
-                        ?: errorEnvelope(JsonNull, -32600, "Invalid Request")
+                        ?: run {
+                            logger.record("<invalid>", "null", "ERROR", 0, -32600)
+                            errorEnvelope(JsonNull, -32600, "Invalid Request")
+                        }
                 }
                 "[" + responses.joinToString(",") + "]"
             }
-            else -> errorEnvelope(JsonNull, -32600, "Invalid Request")
+            else -> {
+                logger.record("<invalid>", "null", "ERROR", elapsedMs(t0), -32600)
+                errorEnvelope(JsonNull, -32600, "Invalid Request")
+            }
         }
+    }
+
+    private fun elapsedMs(t0: Long): Long = (System.nanoTime() - t0) / 1_000_000
+
+    /** The request id rendered for the access log ({@code 42} / {@code "abc"} / {@code null}),
+     *  bounded so a pathological id can't produce a giant log line. */
+    private fun idString(id: JsonElement): String {
+        val s = id.toString()
+        return if (s.length > 64) s.substring(0, 64) + "…" else s
     }
 
     /**
@@ -79,14 +101,15 @@ class RpcRouter(
     private suspend fun handleOne(root: JsonObject, wholeBody: String?): String {
         val method = root["method"]?.jsonPrimitive?.contentOrNull
         val id = root["id"] ?: JsonNull
+        val idStr = idString(id)
         if (method == "myotis_rpcCoverage") {
-            logger.record(method, "LOCAL", 0)
+            logger.record(method, idStr, "LOCAL", 0)
             return resultEnvelope(id, logger.coverage())
         }
         val t0 = System.nanoTime()
         val verified = tryVerified(method, id, root)
         if (verified != null) {
-            logger.record(method!!, "VERIFIED", (System.nanoTime() - t0) / 1_000_000)
+            logger.record(method!!, idStr, "VERIFIED", elapsedMs(t0))
             return verified
         }
         val m = method ?: "request"
@@ -96,7 +119,8 @@ class RpcRouter(
             // rejected method, so myotis_rpcCoverage keeps mapping what the wallet needs.
             // -32601 = we don't implement it verified (wallet can stop asking); -32000 =
             // implemented but can't answer right now — no peer / not synced (retryable).
-            logger.record(m, "ERROR", 0)
+            val code = if (m in VERIFIED_METHODS) -32000 else -32601
+            logger.record(m, idStr, "ERROR", elapsedMs(t0), code)
             return if (m in VERIFIED_METHODS) {
                 errorEnvelope(id, -32000, "method '$m' cannot be served verified right now (no peer / not synced)")
             } else {
@@ -108,11 +132,11 @@ class RpcRouter(
         val forwardBody = wholeBody ?: json.encodeToString(JsonObject.serializer(), root)
         return try {
             val response = proxy.forward(forwardBody)
-            logger.record(m, "PROXY", (System.nanoTime() - pt0) / 1_000_000)
+            logger.record(m, idStr, "PROXY", elapsedMs(pt0))
             response
         } catch (e: Exception) {
             // Upstream down/timeout: JSON-RPC error, not a raw HTTP 500, so the wallet copes.
-            logger.record(m, "ERROR", (System.nanoTime() - pt0) / 1_000_000)
+            logger.record(m, idStr, "ERROR", elapsedMs(pt0), -32603)
             errorEnvelope(id, -32603, "upstream proxy error: ${e.message}")
         }
     }
