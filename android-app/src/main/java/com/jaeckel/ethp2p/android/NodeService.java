@@ -385,6 +385,10 @@ public final class NodeService extends Service {
         // nothing — the new port is already persisted and applies on the next enable. Without this,
         // saving settings would start a chain the user has turned off.
         if (handles.remove(n) == null) return;
+        // A reboot is a cold restart of this stack: clear the SYNCED-once flag so it runs through
+        // to SYNCED again before the idle controller may pause it. buildAndStart re-stamps the
+        // start clocks. (rebootNetwork doesn't go through forgetStack, so clear it explicitly here.)
+        reachedSynced.remove(n);
         new Thread(() -> {
             synchronized (bootLock(n)) {
                 try { ENGINE.stop(n); } catch (Throwable ignored) {}
@@ -401,6 +405,7 @@ public final class NodeService extends Service {
         elCaches.remove(n);
         clCaches.remove(n);
         stackStartMs.remove(n);
+        stackStartNano.remove(n);
         lastResumeMs.remove(n);
         reachedSynced.remove(n);   // a re-enable cold-starts the SYNCED-once gate again
     }
@@ -482,6 +487,12 @@ public final class NodeService extends Service {
      *  STATIC (matching ENGINE / RUNNING / BOOT_LOCKS): this is per-network-stack state that
      *  outlives a service instance, and the static {@link #dailyCatchUp} worker path reads/writes it. */
     private static final Map<String, Long> stackStartMs = new ConcurrentHashMap<>();
+    /** Per-network stack-start stamp in monotonic {@link System#nanoTime} for the SYNCED-once
+     *  ceiling only. Separate from {@link #stackStartMs} (wall-clock, used for idle-window display
+     *  and the pause decision) so a wall-clock/NTP step can't prematurely expire or indefinitely
+     *  extend the 30-minute run-until-synced backstop. Stamped alongside stackStartMs at boot,
+     *  cleared on teardown. */
+    private static final Map<String, Long> stackStartNano = new ConcurrentHashMap<>();
     /** Per-network HOST-side resume stamp (foreground resume, daily catch-up): gives
      *  the resumed stack a full idle window even though no request bumped the engine's
      *  activity clock. Engine-side wakes need no stamp — the waking request did it.
@@ -587,6 +598,10 @@ public final class NodeService extends Service {
      * </ul>
      */
     private void idleTick(long idleMs, boolean routine) {
+        // Bail if the service is being torn down: doShutdown() runs on a worker thread, so a
+        // scheduled tick (or the onTrimMemory pass) could otherwise spawn pause threads or mutate
+        // reachedSynced after Stop. The per-stack pause thread re-checks RUNNING under bootLock too.
+        if (!RUNNING.get()) return;
         try {
             long now = System.currentTimeMillis();
             // Process-global conditions, evaluated once per pass rather than per stack.
@@ -611,8 +626,7 @@ public final class NodeService extends Service {
                     if (isSyncedWarm(h)) {
                         reachedSynced.add(n); // first SYNCED reached; fall through to the pause
                         LogBuffer.i(TAG, "[" + n + "] reached SYNCED; idle-pause now eligible");
-                    } else if (netUp
-                            && now - stackStartMs.getOrDefault(n, 0L) < SYNC_RUN_CEILING_MS) {
+                    } else if (netUp && !syncRunCeilingReached(n)) {
                         continue; // still catching up with a network available — keep networking on
                     } else if (netUp) {
                         // Online but still not synced after the ceiling — stop draining battery
@@ -655,6 +669,17 @@ public final class NodeService extends Service {
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    /** True once a still-unsynced stack has been running past {@link #SYNC_RUN_CEILING_MS}, measured
+     *  on the monotonic clock so a wall-clock/NTP step can't skew it. This is the backstop that stops
+     *  "run until synced" from keeping networking on (and draining the battery) forever on a stack
+     *  that never syncs. An absent stamp (shouldn't happen — set at boot) is treated as reached, so
+     *  the SYNCED-once gate can't wedge a stack awake indefinitely. */
+    private static boolean syncRunCeilingReached(String n) {
+        Long startNano = stackStartNano.get(n);
+        if (startNano == null) return true;
+        return System.nanoTime() - startNano >= SYNC_RUN_CEILING_MS * 1_000_000L;
     }
 
     /** True when a network with Internet capability is active. Fail-open (true) if the state
@@ -1230,6 +1255,7 @@ public final class NodeService extends Service {
             // A freshly-booted stack gets a full idle window before the controller
             // may pause it (its engine activity clock starts at 0).
             stackStartMs.put(n, System.currentTimeMillis());
+            stackStartNano.put(n, System.nanoTime());   // monotonic clock for the sync-run ceiling
             updateNotification();
             LogBuffer.i(TAG, "[" + n + "] node stack started (RPC " + rpcPort + ")");
         } catch (Exception e) {
