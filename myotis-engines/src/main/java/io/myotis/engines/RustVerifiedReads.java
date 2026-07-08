@@ -67,9 +67,12 @@ final class RustVerifiedReads implements VerifiedReads {
                 case CATCHING_UP -> SyncState.CATCHING_UP;
                 case STARTING, SYNCING -> SyncState.SYNCING;
             };
-        } catch (EngineException e) {
+        } catch (RuntimeException e) {
             // Never throw from the read surface: an unreadable status reads as
-            // "not synced yet" rather than crashing the eth_syncing request.
+            // "not synced yet" rather than crashing the eth_syncing request. Catch
+            // the broad RuntimeException (not just EngineException) so any unchecked
+            // failure from the native status path stays contained (the router's
+            // tryVerified dispatch is not exception-guarded).
             log.debug("[engines] syncState fell back to SYNCING: {}", e.getMessage());
             return SyncState.SYNCING;
         }
@@ -93,6 +96,16 @@ final class RustVerifiedReads implements VerifiedReads {
         // Verified-absent → nonce 0 (r.nonce() is -1 when !exists). No pending
         // overlay yet: "pending" resolves to the verified head nonce, which is
         // correct for a wallet sending its first not-yet-mined tx.
+        //
+        // Nonce freshness: the Java backend (VerifiedRpcBackend) gates nonce
+        // serving on a TIGHTER staleness bound than balance, because a stale nonce
+        // is uniquely dangerous — the wallet signs against it and the tx bounces
+        // ("nonce too low") or silently replaces a pending one. This adapter has no
+        // separate bound: the Rust verified read only sets verifyMethod against a
+        // beacon-anchored head that is not behind finalized (a stale-behind peer
+        // fails verification → null), so staleness is bounded to the peer's current
+        // tip (slot-scale seconds). Replicating the Java engine's explicit tighter
+        // nonce gate is a follow-up, pending a head-age field in the Rust status.
         return r.exists() ? r.nonce() : 0L;
     }
 
@@ -117,7 +130,11 @@ final class RustVerifiedReads implements VerifiedReads {
     private AccountProofResult queryAccount(byte[] address) {
         try {
             return handle.requestAccount(toHex(address));
-        } catch (EngineException e) {
+        } catch (RuntimeException e) {
+            // Contain any unchecked failure (transport/not-running EngineException,
+            // or a raw unchecked throwable off the native path) as "can't answer
+            // verified right now" — the router's tryVerified dispatch is not
+            // exception-guarded, so nothing may escape this adapter.
             log.debug("[engines] verified account read unavailable: {}", e.getMessage());
             return null;
         }
