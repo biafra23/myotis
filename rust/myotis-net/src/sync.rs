@@ -565,13 +565,19 @@ impl PeerPool {
             // incapable of the needed period, so asking them wastes a whole
             // round and ratchets the empty-round backoff. If skip leaves
             // nothing, return [] and let catch_up bounce to rediscovery.
-            out.extend(
-                self.peers
-                    .iter()
-                    .filter(|p| !skip.contains(&p.id))
-                    .take(n)
-                    .cloned(),
-            );
+            // Sweep the fallback too, so consecutive drought rounds spread the
+            // retries across the pool instead of re-hammering the first few.
+            let start = self.sweep % self.peers.len();
+            self.sweep = self.sweep.wrapping_add(n);
+            for i in 0..self.peers.len() {
+                if out.len() >= n {
+                    break;
+                }
+                let p = &self.peers[(start + i) % self.peers.len()];
+                if !skip.contains(&p.id) {
+                    out.push(p.clone());
+                }
+            }
         }
         out
     }
