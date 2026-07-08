@@ -72,6 +72,8 @@ public final class JavaChainHandle implements ChainHandle {
 
     @Override public boolean resume() { return stack.resume(); }
 
+    @Override public boolean resume(String reason) { return stack.resume(reason); }
+
     @Override public LifecycleState lifecycle() { return stack.lifecycle(); }
 
     @Override public long lastActivityEpochMillis() { return stack.lastActivityMs(); }
@@ -157,7 +159,12 @@ public final class JavaChainHandle implements ChainHandle {
                 bss != null ? bss.getFinalizedPeriod() : 0L,
                 wallClockPeriod,
                 backend != null ? backend.verifiedHeadAgeMs() : Long.MAX_VALUE,
-                readyRows);
+                readyRows,
+                stack.pauseCount(),
+                stack.totalPausedMs(),
+                stack.lastPauseEpochMs(),
+                stack.lastResumeEpochMs(),
+                stack.lastWakeReason());
     }
 
     @Override

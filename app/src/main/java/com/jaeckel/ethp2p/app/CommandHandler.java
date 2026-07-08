@@ -131,7 +131,7 @@ public class CommandHandler {
     /** Resume a paused stack (also happens automatically on the first verified read). */
     private String handleResume() {
         log.info("[ipc] Resume command received");
-        return handle.resume()
+        return handle.resume(io.myotis.api.WakeReason.IPC)
                 ? "{\"ok\":true,\"lifecycle\":\"RUNNING\"}"
                 : jsonError("resume failed (lifecycle: " + handle.lifecycle() + ")");
     }
@@ -139,13 +139,19 @@ public class CommandHandler {
     private String handleStatus() {
         long uptimeSec = (System.currentTimeMillis() - startTimeMs) / 1000;
         StatusSnapshot s = handle.status();
+        String wakeReason = s.lastWakeReason() == null ? "null" : "\"" + s.lastWakeReason() + "\"";
         return "{\"ok\":true,\"state\":\"" + handle.lifecycle() + "\",\"uptimeSeconds\":" + uptimeSec
                 + ",\"discoveredPeers\":" + s.discoveredPeers()
                 + ",\"connectedPeers\":" + s.connectedPeers()
                 + ",\"readyPeers\":" + s.readyPeers()
                 + ",\"snapPeers\":" + s.snapPeers()
                 + ",\"backedOffPeers\":" + s.backedOffPeers()
-                + ",\"blacklistedPeers\":" + s.blacklistedPeers() + "}";
+                + ",\"blacklistedPeers\":" + s.blacklistedPeers()
+                + ",\"pauseCount\":" + s.pauseCount()
+                + ",\"totalPausedMs\":" + s.totalPausedMs()
+                + ",\"lastPauseEpochMs\":" + s.lastPauseEpochMs()
+                + ",\"lastResumeEpochMs\":" + s.lastResumeEpochMs()
+                + ",\"lastWakeReason\":" + wakeReason + "}";
     }
 
     private String handlePeers() {

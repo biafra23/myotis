@@ -108,6 +108,17 @@ class JavaMyotisEngineTest {
         assertEquals(io.myotis.api.LifecycleState.STOPPED, handle.status().lifecycle());
         assertFalse(handle.status().running());
 
+        // Sleep metrics are zeroed on a never-started stack.
+        io.myotis.api.StatusSnapshot snap = handle.status();
+        assertEquals(0, snap.pauseCount());
+        assertEquals(0L, snap.totalPausedMs());
+        assertEquals(0L, snap.lastResumeEpochMs());
+        assertNull(snap.lastWakeReason());
+
+        // resume(reason) is a safe no-op on STOPPED (same as resume()).
+        assertFalse(handle.resume(io.myotis.api.WakeReason.CATCH_UP));
+        assertEquals(io.myotis.api.LifecycleState.STOPPED, handle.lifecycle());
+
         engine.stop("gnosis");
     }
 

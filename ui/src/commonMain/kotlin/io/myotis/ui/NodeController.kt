@@ -172,6 +172,12 @@ data class NodeSnapshot(
     val verifiedHeadAgeMs: Long,
     val uptimeSeconds: Long,
     val readyPeerList: List<PeerRow>,  // per-peer detail for the READY peers
+    // Idle-sleep metrics (pseudo-sleep observability). See WakeReason.
+    val pauseCount: Int,               // times the stack idle-slept since start
+    val totalPausedMs: Long,           // cumulative time paused
+    val lastPauseEpochMs: Long,        // wall-clock ms of the last pause; 0 if never
+    val lastResumeEpochMs: Long,       // wall-clock ms of the last DEMAND wake; 0 if none
+    val lastWakeReason: String?,       // reason of the last demand wake; null if none
 )
 
 /** One connected READY peer, for the Status peer list. */

@@ -541,6 +541,7 @@ private fun OfflineBanner(onOpenNetworkSettings: () -> Unit) {
 
 @Composable
 private fun StatusView(s: NodeSnapshot) {
+    val tz = remember { TimeZone.currentSystemDefault() }
     Column {
         StatusRow("Network", s.network)
         StatusRow("State", when (s.lifecycle) {
@@ -561,6 +562,19 @@ private fun StatusView(s: NodeSnapshot) {
         // dash instead of the raw ~9.2e18 ms, which would read as a nonsensical age.
         StatusRow("Verified head age", if (s.verifiedHeadAgeMs == Long.MAX_VALUE) "—" else "${s.verifiedHeadAgeMs} ms")
         StatusRow("Uptime", "${s.uptimeSeconds}s")
+        // Pseudo-sleep observability: how much the node has idle-slept, and when/why it
+        // last woke. Foreground (opening the app) is excluded from the "last woke" reason,
+        // so this keeps showing the last real request/catch-up wake even as you view it.
+        StatusRow(
+            "Sleep",
+            if (s.pauseCount == 0) "never slept"
+            else "${formatDuration(s.totalPausedMs)} over ${s.pauseCount} " +
+                if (s.pauseCount == 1) "pause" else "pauses",
+        )
+        if (s.lastResumeEpochMs > 0) {
+            val slept = if (s.lastPauseEpochMs > 0) " · slept ${formatLogTime(s.lastPauseEpochMs, tz)}" else ""
+            StatusRow("Last woke", "${formatLogTime(s.lastResumeEpochMs, tz)} (${s.lastWakeReason ?: "?"})$slept")
+        }
     }
 }
 
@@ -1016,6 +1030,19 @@ private fun formatLogs(lines: List<LogLine>, tz: TimeZone): String = buildString
     for (l in lines) {
         append(formatLogTime(l.timestampMillis, tz)).append(' ').append(l.level)
         append(' ').append(l.tag).append(": ").append(l.message).append('\n')
+    }
+}
+
+/** Compact elapsed duration: "45s" / "3m 12s" / "1h 3m". */
+private fun formatDuration(ms: Long): String {
+    val totalSec = ms / 1000
+    val h = totalSec / 3600
+    val m = (totalSec % 3600) / 60
+    val sec = totalSec % 60
+    return when {
+        h > 0 -> "${h}h ${m}m"
+        m > 0 -> "${m}m ${sec}s"
+        else -> "${sec}s"
     }
 }
 

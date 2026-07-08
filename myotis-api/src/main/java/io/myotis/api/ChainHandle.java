@@ -51,6 +51,13 @@ public interface ChainHandle {
      */
     boolean resume();
 
+    /**
+     * As {@link #resume()}, but records {@code reason} (a {@link WakeReason} tag) as
+     * the wake cause for the status screens' "last wake" line. {@link WakeReason#FOREGROUND}
+     * is treated as an observation and does not overwrite the recorded last-wake reason.
+     */
+    boolean resume(String reason);
+
     /** Coarse lifecycle state; {@link #isRunning()} == {@code lifecycle() == RUNNING}. */
     LifecycleState lifecycle();
 

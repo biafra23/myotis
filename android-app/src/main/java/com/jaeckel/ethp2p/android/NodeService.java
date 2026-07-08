@@ -502,7 +502,10 @@ public final class NodeService extends Service {
                     ChainHandle cur = handles.get(n);
                     if (cur != null && RUNNING.get()) {
                         LogBuffer.i(TAG, "[" + n + "] resuming (app foreground)");
-                        try { cur.resume(); } catch (Throwable t) {
+                        // FOREGROUND is an observation wake: counts toward the pause total but
+                        // must not overwrite the last-wake reason, or opening the app to view
+                        // the status page would hide the request/catch-up wake being debugged.
+                        try { cur.resume(io.myotis.api.WakeReason.FOREGROUND); } catch (Throwable t) {
                             LogBuffer.w(TAG, "[" + n + "] foreground resume failed: " + t);
                         }
                     }
@@ -622,7 +625,7 @@ public final class NodeService extends Service {
                 // Hold the grace stamp BEFORE resume returns RUNNING, so the idle ticker
                 // can't pause the stack in the window between resume() and the loop.
                 lastResumeMs.put(n, System.currentTimeMillis());
-                resumed = h.resume();
+                resumed = h.resume(io.myotis.api.WakeReason.CATCH_UP);
             }
             if (!resumed) continue; // stays paused; next daily run retries
             // Monotonic deadline (nanoTime, overflow-safe compare) so an NTP/wall-clock
@@ -741,7 +744,13 @@ public final class NodeService extends Service {
             // calls serve instead of hitting "no verified head".
             long verifiedHeadAgeMs,
             List<io.myotis.api.PeerInfo> readyPeerList,
-            String network) {}            // active chain ("mainnet"/"gnosis")
+            String network,               // active chain ("mainnet"/"gnosis")
+            // Idle-sleep metrics (see WakeReason / SleepMetrics) — for the Status screen.
+            int pauseCount,               // times this stack entered idle sleep since start
+            long totalPausedMs,           // cumulative time paused (ms)
+            long lastPauseEpochMs,        // wall-clock ms of the last pause; 0 if never
+            long lastResumeEpochMs,       // wall-clock ms of the last DEMAND wake; 0 if none
+            String lastWakeReason) {}     // reason tag of the last demand wake; null if none
 
     /** Result of a get-account query. Mirrors the JVM daemon's JSON response shape. */
     public record AccountQueryResult(
@@ -1334,7 +1343,9 @@ public final class NodeService extends Service {
                     beaconState, bs.bootstrapped(), bs.connectedPeers(), (int) bs.lightClientPeers(),
                     bs.servedPeersLastMinute(), cachedCl, bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
                     s.syncStartPeriod(), syncCurrent, syncTarget,
-                    Long.MAX_VALUE, List.of(), network);
+                    Long.MAX_VALUE, List.of(), network,
+                    s.pauseCount(), s.totalPausedMs(), s.lastPauseEpochMs(),
+                    s.lastResumeEpochMs(), s.lastWakeReason());
         }
         return new Snapshot(true, lifecycle, startTimeMs,
                 s.discoveredPeers(), s.connectedPeers(), s.readyPeers(),
@@ -1344,7 +1355,9 @@ public final class NodeService extends Service {
                 beaconState, bs.bootstrapped(), bs.connectedPeers(), (int) bs.lightClientPeers(),
                 bs.servedPeersLastMinute(), cachedCl, bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
                 s.syncStartPeriod(), syncCurrent, syncTarget,
-                s.verifiedHeadAgeMs(), s.readyPeerList(), network);
+                s.verifiedHeadAgeMs(), s.readyPeerList(), network,
+                s.pauseCount(), s.totalPausedMs(), s.lastPauseEpochMs(),
+                s.lastResumeEpochMs(), s.lastWakeReason());
     }
 
     // ---- Failure forensics (see ProcessHealthDiag) ----

@@ -33,6 +33,12 @@ import java.util.List;
  * @param verifiedHeadAgeMs     age of the last verified RPC head context;
  *                              {@code Long.MAX_VALUE} = none built yet
  * @param readyPeerList         per-peer detail for the READY peers, snap-capable first
+ * @param pauseCount            times this stack entered idle sleep since start
+ * @param totalPausedMs         cumulative time spent paused (ms), across all pauses
+ * @param lastPauseEpochMs      wall-clock ms of the most recent pause; 0 if never paused
+ * @param lastResumeEpochMs     wall-clock ms of the most recent DEMAND wake; 0 if none
+ *                              (a foreground/observation wake does not update this)
+ * @param lastWakeReason        {@link WakeReason} tag of the most recent demand wake; null if none
  */
 public record StatusSnapshot(
         boolean running,
@@ -58,5 +64,10 @@ public record StatusSnapshot(
         long finalizedPeriod,
         long wallClockPeriod,
         long verifiedHeadAgeMs,
-        List<PeerInfo> readyPeerList) {
+        List<PeerInfo> readyPeerList,
+        int pauseCount,
+        long totalPausedMs,
+        long lastPauseEpochMs,
+        long lastResumeEpochMs,
+        String lastWakeReason) {
 }

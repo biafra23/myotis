@@ -148,6 +148,11 @@ private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
     verifiedHeadAgeMs = verifiedHeadAgeMs(),
     uptimeSeconds = if (startTimeMs() > 0) (System.currentTimeMillis() - startTimeMs()) / 1000 else 0,
     readyPeerList = readyPeerList().map { PeerRow(it.remoteAddress(), it.snapSupported(), it.clientId()) },
+    pauseCount = pauseCount(),
+    totalPausedMs = totalPausedMs(),
+    lastPauseEpochMs = lastPauseEpochMs(),
+    lastResumeEpochMs = lastResumeEpochMs(),
+    lastWakeReason = lastWakeReason(),
 )
 
 /** Android actual of [Settings] over the NodeService SharedPreferences statics. */

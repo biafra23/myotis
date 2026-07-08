@@ -93,6 +93,8 @@ public final class ChainStack {
     private final WakeGate wakeGate;
     /** The stable VerifiedReads the RPC server holds across pause/resume cycles. */
     private final GatedVerifiedReads gatedReads;
+    /** Idle-sleep bookkeeping (pause count / total paused / last wake) for the status screens. */
+    private final SleepMetrics sleepMetrics = new SleepMetrics();
 
     // -- snap-peer maintainer (optional; enabled via configureSnapMaintainer) --
     private volatile boolean maintainerEnabled = false;
@@ -130,7 +132,8 @@ public final class ChainStack {
         this.ccipGateway = ccipGateway;
         this.syncSnapshotFile = syncSnapshotFile;
         this.gossipsubEnabled = gossipsubEnabled;
-        this.wakeGate = new WakeGate(phase::get, this::readyForReads, this::resume,
+        this.wakeGate = new WakeGate(phase::get, this::readyForReads,
+                () -> resume(io.myotis.api.WakeReason.REQUEST),
                 System::currentTimeMillis, WAKE_POLL_MS, "wake-resume-" + network.name());
         this.gatedReads = new GatedVerifiedReads(this);
     }
@@ -237,6 +240,7 @@ public final class ChainStack {
      */
     public synchronized boolean pause() {
         if (!phase.compareAndSet(RUNNING, PAUSED)) return phase.get() == PAUSED;
+        sleepMetrics.onPause(System.currentTimeMillis(), System.nanoTime());
         log.info("[{}] pausing: quiescing networking (RPC keeps listening)", network.name());
         closeNetworkingComponents();
         log.info("[{}] paused", network.name());
@@ -251,10 +255,19 @@ public final class ChainStack {
      * stack stays {@code PAUSED} (retryable).
      */
     public synchronized boolean resume() {
+        return resume(io.myotis.api.WakeReason.MANUAL);
+    }
+
+    /**
+     * As {@link #resume()}, recording {@code reason} as the wake cause for the status
+     * screens. {@link io.myotis.api.WakeReason#FOREGROUND} is an observation wake: it
+     * still counts toward the pause total but does not overwrite the last-wake reason.
+     */
+    public synchronized boolean resume(String reason) {
         LifecycleState p = phase.get();
         if (p == RUNNING) return true;
         if (p != PAUSED) return false; // STOPPED is terminal
-        log.info("[{}] resuming from pause", network.name());
+        log.info("[{}] resuming from pause ({})", network.name(), reason);
         try {
             this.connector = buildConnector();
             dialInitialPeers(dnsElPool);
@@ -272,7 +285,11 @@ public final class ChainStack {
             }
             if (maintainerEnabled) startPeerMaintainer();
             phase.set(RUNNING);
-            log.info("[{}] resumed", network.name());
+            // Foreground (observation) wakes count toward the total but must not overwrite
+            // the last-wake reason — see WakeReason / SleepMetrics.
+            sleepMetrics.onResume(System.currentTimeMillis(), System.nanoTime(), reason,
+                    !io.myotis.api.WakeReason.FOREGROUND.equals(reason));
+            log.info("[{}] resumed ({})", network.name(), reason);
             return true;
         } catch (Throwable t) {
             log.error("[{}] resume failed (staying paused): {}", network.name(), t.toString());
@@ -365,6 +382,13 @@ public final class ChainStack {
     public long lastActivityMs() {
         return wakeGate.lastActivityMs();
     }
+
+    // -- idle-sleep metrics (for status snapshots) --
+    public int pauseCount() { return sleepMetrics.pauseCount(); }
+    public long totalPausedMs() { return sleepMetrics.totalPausedMs(); }
+    public long lastPauseEpochMs() { return sleepMetrics.lastPauseEpochMs(); }
+    public long lastResumeEpochMs() { return sleepMetrics.lastResumeEpochMs(); }
+    public String lastWakeReason() { return sleepMetrics.lastWakeReason(); }
 
     /** Readiness for verified reads: beacon SYNCED and the head warmer has an anchored head. */
     private boolean readyForReads() {
