@@ -334,6 +334,12 @@ enum Command {
     LcServers {
         reply: oneshot::Sender<HashSet<PeerId>>,
     },
+    /// One snapshot of both catch-up peer-selection inputs — the LC-server set
+    /// and the per-peer `earliest_available_slot` map — so a round fetches them
+    /// in a single swarm round-trip instead of two.
+    CatchupMeta {
+        reply: oneshot::Sender<(HashSet<PeerId>, HashMap<PeerId, u64>)>,
+    },
     Shutdown,
 }
 
@@ -376,6 +382,19 @@ impl ReqRespClient {
         let (reply, rx) = oneshot::channel();
         if self.tx.send(Command::LcServers { reply }).await.is_err() {
             return HashSet::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// Both catch-up peer-selection inputs in one round-trip: the set of
+    /// Identify-confirmed LC servers, and `earliest_available_slot` per peer
+    /// (from the auto-Status exchange). Peers absent from the earliest map
+    /// haven't completed Status yet (unknown — never skipped); a v1 peer
+    /// reports 0 (history from genesis).
+    pub async fn catchup_peer_meta(&self) -> (HashSet<PeerId>, HashMap<PeerId, u64>) {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::CatchupMeta { reply }).await.is_err() {
+            return (HashSet::new(), HashMap::new());
         }
         rx.await.unwrap_or_default()
     }
@@ -463,6 +482,8 @@ struct SwarmCtx {
     status_done: HashSet<PeerId>,
     queued: HashMap<PeerId, Vec<QueuedRequest>>,
     lc_servers: HashSet<PeerId>,
+    /// `earliest_available_slot` learned from each peer's auto-Status reply.
+    peer_earliest: HashMap<PeerId, u64>,
     local_status: Arc<LocalStatus>,
 }
 
@@ -477,6 +498,7 @@ async fn run_swarm(
         status_done: HashSet::new(),
         queued: HashMap::new(),
         lc_servers: HashSet::new(),
+        peer_earliest: HashMap::new(),
         local_status,
     };
     loop {
@@ -504,6 +526,9 @@ async fn run_swarm(
                 }
                 Some(Command::LcServers { reply }) => {
                     let _ = reply.send(ctx.lc_servers.clone());
+                }
+                Some(Command::CatchupMeta { reply }) => {
+                    let _ = reply.send((ctx.lc_servers.clone(), ctx.peer_earliest.clone()));
                 }
             },
             event = swarm.select_next_some() => handle_swarm_event(&mut swarm, &mut ctx, event),
@@ -610,8 +635,13 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
         SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
             if num_established == 0 {
                 ctx.connected.remove(&peer_id);
-                // Next connection must redo the Status handshake.
+                // Next connection must redo the Status handshake — and drop the
+                // per-peer metadata it produced so these maps stay bounded by
+                // the CONNECTED set, not by every peer ever seen (a reconnect
+                // re-runs Identify + auto-Status and repopulates both).
                 ctx.status_done.remove(&peer_id);
+                ctx.lc_servers.remove(&peer_id);
+                ctx.peer_earliest.remove(&peer_id);
                 fail_queued(ctx, &peer_id, RequestError::ConnectionClosed);
                 tracing::debug!(peer = %peer_id, "connection closed");
             }
@@ -717,7 +747,9 @@ fn complete(
         }
         Some(Pending::AutoStatusV2(peer_id)) => match result {
             Ok(raw) => {
-                log_peer_status("v2", peer_id, &raw);
+                if let Some(earliest) = log_peer_status("v2", peer_id, &raw) {
+                    ctx.peer_earliest.insert(peer_id, earliest);
+                }
                 mark_status_done(swarm, ctx, peer_id);
             }
             Err(RequestError::UnsupportedProtocol) => {
@@ -736,7 +768,11 @@ fn complete(
         },
         Some(Pending::AutoStatusV1(peer_id)) => {
             match result {
-                Ok(raw) => log_peer_status("v1", peer_id, &raw),
+                Ok(raw) => {
+                    if let Some(earliest) = log_peer_status("v1", peer_id, &raw) {
+                        ctx.peer_earliest.insert(peer_id, earliest);
+                    }
+                }
                 Err(e) => tracing::debug!(peer = %peer_id, error = %e, "auto-status v1 failed"),
             }
             mark_status_done(swarm, ctx, peer_id);
@@ -745,7 +781,9 @@ fn complete(
     }
 }
 
-fn log_peer_status(version: &str, peer: PeerId, raw: &[u8]) {
+/// Logs a peer's auto-Status reply and returns its `earliest_available_slot`
+/// (None on a decode/frame error). v1 peers report 0 — genesis history.
+fn log_peer_status(version: &str, peer: PeerId, raw: &[u8]) -> Option<u64> {
     match codec::decode_response(raw, false) {
         Ok(d) => {
             let decoded = if version == "v2" {
@@ -754,15 +792,24 @@ fn log_peer_status(version: &str, peer: PeerId, raw: &[u8]) {
                 StatusMessage::decode_v1(&d.ssz_payload)
             };
             match decoded {
-                Ok(s) => tracing::debug!(peer = %peer, version,
-                    fork_digest = %hex4(&s.fork_digest),
-                    finalized_epoch = s.finalized_epoch, head_slot = s.head_slot,
-                    earliest = s.earliest_available_slot, "auto-status ok"),
-                Err(e) => tracing::debug!(peer = %peer, version, error = %e,
-                    "auto-status decode failed"),
+                Ok(s) => {
+                    tracing::debug!(peer = %peer, version,
+                        fork_digest = %hex4(&s.fork_digest),
+                        finalized_epoch = s.finalized_epoch, head_slot = s.head_slot,
+                        earliest = s.earliest_available_slot, "auto-status ok");
+                    Some(s.earliest_available_slot)
+                }
+                Err(e) => {
+                    tracing::debug!(peer = %peer, version, error = %e,
+                        "auto-status decode failed");
+                    None
+                }
             }
         }
-        Err(e) => tracing::debug!(peer = %peer, version, error = %e, "auto-status frame invalid"),
+        Err(e) => {
+            tracing::debug!(peer = %peer, version, error = %e, "auto-status frame invalid");
+            None
+        }
     }
 }
 

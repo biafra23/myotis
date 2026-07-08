@@ -522,12 +522,14 @@ impl PeerPool {
         skip_no_lc: bool,
         respect_cooldown: bool,
         prefer: &HashSet<PeerId>,
+        skip: &HashSet<PeerId>,
     ) -> Vec<Peer> {
         if self.peers.is_empty() {
             return Vec::new();
         }
         let ok = |pool: &Self, id: &PeerId| {
-            (!skip_no_lc || !pool.no_lc_updates.contains(id))
+            !skip.contains(id)
+                && (!skip_no_lc || !pool.no_lc_updates.contains(id))
                 && (!respect_cooldown || pool.cooled_down(id))
         };
         let mut out: Vec<Peer> = Vec::with_capacity(n);
@@ -557,8 +559,25 @@ impl PeerPool {
             out.push(p.clone());
         }
         if out.is_empty() {
-            // Never starve the batch (Java: `if (capable.isEmpty()) capable = peers`).
-            out.extend(self.peers.iter().take(n).cloned());
+            // Never starve the batch on the SOFT filters (Java: `if
+            // (capable.isEmpty()) capable = peers`) — a no-lc/cooled peer may
+            // still serve. But keep honoring `skip`: those peers are provably
+            // incapable of the needed period, so asking them wastes a whole
+            // round and ratchets the empty-round backoff. If skip leaves
+            // nothing, return [] and let catch_up bounce to rediscovery.
+            // Sweep the fallback too, so consecutive drought rounds spread the
+            // retries across the pool instead of re-hammering the first few.
+            let start = self.sweep % self.peers.len();
+            self.sweep = self.sweep.wrapping_add(n);
+            for i in 0..self.peers.len() {
+                if out.len() >= n {
+                    break;
+                }
+                let p = &self.peers[(start + i) % self.peers.len()];
+                if !skip.contains(&p.id) {
+                    out.push(p.clone());
+                }
+            }
         }
         out
     }
@@ -895,7 +914,7 @@ async fn try_bootstrap(
         tracing::info!("bootstrap: no peers yet (waiting on discovery)");
         return false;
     }
-    let peers = pool.candidates(8, false, false, &HashSet::new());
+    let peers = pool.candidates(8, false, false, &HashSet::new(), &HashSet::new());
     tracing::info!(peers = peers.len(), root = %hex_str(&config.checkpoint_root),
         slot = config.checkpoint_slot, "bootstrap: requesting by checkpoint root");
 
@@ -1163,8 +1182,26 @@ async fn catch_up(
         tracing::info!(from_period = committee_period, wall_period, span,
             staged = staged.len(), "catch-up: requesting updates_by_range");
 
-        let lc_servers = client.lc_update_servers().await;
-        let peers = pool.candidates(CATCHUP_FANOUT, true, true, &lc_servers);
+        let (lc_servers, earliest_slots) = client.catchup_peer_meta().await;
+        // Skip peers whose advertised earliest_available_slot proves their
+        // light-client history begins in a LATER period than the one we need —
+        // they'd only return far-future updates the period gate discards (Java
+        // attemptCatchUpBatch's earliestAvailableSlot filter). Compare at
+        // PERIOD granularity: a peer whose earliest slot lands anywhere inside
+        // committee_period can still serve that period's update, so only skip
+        // when its earliest period is strictly greater. Peers not yet
+        // status-exchanged (absent from the map) are unknown and kept; v1 peers
+        // report 0 (genesis history) and are never skipped. candidates() still
+        // returns [] rather than a too-shallow-only batch, so an all-shallow
+        // pool bounces to the outer loop for rediscovery instead of thrashing.
+        let too_shallow: HashSet<PeerId> = earliest_slots
+            .into_iter()
+            .filter(|&(_, earliest)| {
+                spec::compute_sync_committee_period(earliest) > committee_period
+            })
+            .map(|(id, _)| id)
+            .collect();
+        let peers = pool.candidates(CATCHUP_FANOUT, true, true, &lc_servers, &too_shallow);
         if peers.is_empty() {
             tracing::warn!("catch-up: no peers available — retrying after discovery");
             return false;
@@ -1469,7 +1506,9 @@ async fn poll_finality(
     clcache: &mut crate::clcache::ClPeerCache,
 ) -> bool {
     let lc_servers = client.lc_update_servers().await;
-    let peers = pool.candidates(16, false, false, &lc_servers);
+    // No earliest-slot skip here: finality polling asks for the LATEST update,
+    // which every synced peer holds regardless of how far its history is pruned.
+    let peers = pool.candidates(16, false, false, &lc_servers, &HashSet::new());
     // Parallel fan-out; first update that verifies AND advances wins.
     let mut in_flight: FuturesUnordered<_> = peers
         .into_iter()
@@ -1793,21 +1832,34 @@ mod tests {
         assert_eq!(pool.len(), 4);
 
         pool.mark_no_lc_updates(ids[1]);
-        let c = pool.candidates(4, true, false, &HashSet::new());
+        let c = pool.candidates(4, true, false, &HashSet::new(), &HashSet::new());
         assert_eq!(c.len(), 3);
         assert!(c.iter().all(|p| p.id != ids[1]));
 
         // Preferred peers come first.
         let mut prefer = HashSet::new();
         prefer.insert(ids[3]);
-        let c = pool.candidates(2, false, false, &prefer);
+        let c = pool.candidates(2, false, false, &prefer, &HashSet::new());
         assert_eq!(c[0].id, ids[3]);
 
-        // Never starve: everything marked no-lc still returns candidates.
+        // A skipped (too-shallow) peer is excluded even when preferred.
+        let mut skip = HashSet::new();
+        skip.insert(ids[3]);
+        let c = pool.candidates(4, false, false, &prefer, &skip);
+        assert!(c.iter().all(|p| p.id != ids[3]));
+
+        // Never starve on the SOFT filters: everything marked no-lc still
+        // returns candidates (a no-lc peer may serve; better than nobody).
         for id in &ids {
             pool.mark_no_lc_updates(*id);
         }
-        assert!(!pool.candidates(2, true, false, &HashSet::new()).is_empty());
+        assert!(!pool.candidates(2, true, false, &HashSet::new(), &HashSet::new()).is_empty());
+
+        // But the HARD skip is honored even by the never-starve fallback:
+        // a fully-skipped pool returns [] (provably-incapable peers are worse
+        // than none — catch_up bounces to rediscovery instead of thrashing).
+        let all_skip: HashSet<PeerId> = ids.iter().copied().collect();
+        assert!(pool.candidates(4, true, false, &HashSet::new(), &all_skip).is_empty());
     }
 
     #[test]
