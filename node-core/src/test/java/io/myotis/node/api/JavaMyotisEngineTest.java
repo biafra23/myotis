@@ -91,7 +91,7 @@ class JavaMyotisEngineTest {
     @Test
     void lifecycleSurfaceOnNeverStartedHandle() {
         JavaMyotisEngine engine = new JavaMyotisEngine();
-        EngineConfig config = new EngineConfig("gnosis", 0, 0, 0, null, false, 0, true);
+        EngineConfig config = new EngineConfig("gnosis", 0, 0, 0, null, false, 0, true, null);
         ChainHandle handle = engine.create(config, testPorts(new MemoryKeyStore()));
 
         assertEquals(io.myotis.api.LifecycleState.STOPPED, handle.lifecycle());
