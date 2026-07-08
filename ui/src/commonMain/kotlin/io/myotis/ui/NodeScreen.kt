@@ -239,6 +239,7 @@ private fun SettingsTab(
     var snapTarget by remember { mutableStateOf(settings.snapTarget().toString()) }
     var deepPool by remember { mutableStateOf(settings.deepPoolThreshold().toString()) }
     var idlePause by remember { mutableStateOf(settings.idlePauseMinutes().toString()) }
+    var stayAwakeCharging by remember { mutableStateOf(settings.stayAwakeWhileCharging()) }
     var strictFreshness by remember { mutableStateOf(settings.strictStateFreshness()) }
     var nativeBls by remember { mutableStateOf(settings.nativeBlsEnabled()) }
 
@@ -315,7 +316,22 @@ private fun SettingsTab(
             Text(
                 "After this many minutes without a wallet request or query, the node goes to " +
                     "sleep: all P2P networking stops (saving battery) while the JSON-RPC port keeps " +
-                    "listening. The first request wakes it — expect that call to take a little longer.",
+                    "listening. The first request wakes it — expect that call to take a little longer. " +
+                    "On a fresh start it runs through to SYNCED before the first sleep, as long as it " +
+                    "has a network to sync over.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            // Applies live — the idle tick reads it each pass.
+            SwitchRow(
+                label = "Stay awake while charging",
+                checked = stayAwakeCharging,
+                onChange = { on -> stayAwakeCharging = on; settings.setStayAwakeWhileCharging(on) },
+            )
+            Text(
+                "On (default): while the phone is plugged in, skip idle sleep and keep the node " +
+                    "awake and synced (battery isn't a concern). Off: sleep on the same idle timer " +
+                    "whether charging or not. Emergency low-memory pauses happen either way.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

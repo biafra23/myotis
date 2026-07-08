@@ -180,6 +180,8 @@ class AndroidSettings(private val ctx: Context) : Settings {
 
     override fun idlePauseMinutes(): Int = NodeService.idlePauseMinutes(ctx)
     override fun setIdlePauseMinutes(v: Int) = NodeService.setIdlePauseMinutes(ctx, v)
+    override fun stayAwakeWhileCharging(): Boolean = NodeService.stayAwakeWhileCharging(ctx)
+    override fun setStayAwakeWhileCharging(v: Boolean) = NodeService.setStayAwakeWhileCharging(ctx, v)
     override fun supportsIdleSleep(): Boolean = true   // NodeService runs the idle controller
 }
 
