@@ -80,9 +80,10 @@ public final class JavaChainHandle implements ChainHandle {
 
     /**
      * Wake-and-wait shared by the verified operator queries: a query on a paused
-     * stack triggers resume and holds here until the node is ready. On a
-     * PAUSED-at-deadline timeout (resume kept failing) this throws; a STOPPED
-     * stack falls through to each query's existing "Node is not running" guard.
+     * stack triggers resume and waits up to the cap for readiness. A RUNNING-but-cold
+     * stack does NOT block to full readiness — it proceeds and the query/backend emits
+     * its own bounded errors. Only a PAUSED-at-deadline (resume kept failing) throws;
+     * a STOPPED stack falls through to each query's existing "Node is not running" guard.
      */
     private void awaitWake() {
         stack.awaitReadyForReads(ChainStack.WAKE_WAIT_CAP_MS);
@@ -254,6 +255,7 @@ public final class JavaChainHandle implements ChainHandle {
     @Override
     public AccountProofResult requestAccount(String hexAddress) {
         awaitWake();
+        stack.beginRequest();   // hold off the idle timer while this (slow) query runs
         try {
             // queryProof internally bounds the header fetch (60 s); the outer bound covers
             // the snap fetch + verification end to end.
@@ -265,6 +267,8 @@ public final class JavaChainHandle implements ChainHandle {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             throw new EngineException(cause.getMessage() != null
                     ? cause.getMessage() : cause.getClass().getSimpleName(), cause);
+        } finally {
+            stack.endRequest();
         }
     }
 
@@ -273,6 +277,7 @@ public final class JavaChainHandle implements ChainHandle {
         awaitWake();
         RLPxConnector conn = stack.connector();
         if (!stack.isRunning() || conn == null) throw new EngineException("Node is not running");
+        stack.beginRequest();
         try {
             return io.myotis.node.VerifiedStorageQuery.query(
                     conn, stack.beaconSyncState(), hexAddress, slot, holderHexOrNull);
@@ -283,6 +288,8 @@ public final class JavaChainHandle implements ChainHandle {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             throw new EngineException(cause.getMessage() != null
                     ? cause.getMessage() : cause.getClass().getSimpleName(), cause);
+        } finally {
+            stack.endRequest();
         }
     }
 
@@ -291,7 +298,12 @@ public final class JavaChainHandle implements ChainHandle {
         awaitWake();
         RLPxConnector conn = stack.connector();
         if (!stack.isRunning() || conn == null) throw new EngineException("Node is not running");
-        return io.myotis.node.HeaderQuery.fetch(conn, startBlock, count);
+        stack.beginRequest();
+        try {
+            return io.myotis.node.HeaderQuery.fetch(conn, startBlock, count);
+        } finally {
+            stack.endRequest();
+        }
     }
 
     @Override
@@ -299,7 +311,12 @@ public final class JavaChainHandle implements ChainHandle {
         awaitWake();
         RLPxConnector conn = stack.connector();
         if (!stack.isRunning() || conn == null) throw new EngineException("Node is not running");
-        return io.myotis.node.VerifiedBlockQuery.query(conn, stack.beaconSyncState(), blockNumber);
+        stack.beginRequest();
+        try {
+            return io.myotis.node.VerifiedBlockQuery.query(conn, stack.beaconSyncState(), blockNumber);
+        } finally {
+            stack.endRequest();
+        }
     }
 
     @Override

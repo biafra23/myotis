@@ -364,12 +364,19 @@ public final class ChainStack {
      * elapses.
      *
      * @return the live backend to query, or {@code null} when no verified answer
-     *         is possible (stack stopped, RPC never started, or still paused at
-     *         the deadline). A stack that is RUNNING but still cold at the
-     *         deadline returns the backend anyway — it produces its own precise
-     *         bounded errors.
+     *         is possible (stack stopped, RPC never started / failed to bind, or
+     *         still paused at the deadline). A stack that is RUNNING but still cold
+     *         at the deadline returns the backend anyway — it produces its own
+     *         precise bounded errors.
      */
     public io.myotis.rpc.VerifiedRpcBackend awaitReadyForReads(long capMs) {
+        // RUNNING with no backend means the JSON-RPC bind failed at start (the failure
+        // is swallowed and the phase stays RUNNING). No amount of waiting will produce a
+        // backend without a pause→resume, so fast-fail instead of holding the full cap —
+        // otherwise ENS / operator queries would hang ~90s and still fail. (PAUSED with a
+        // null backend is the normal sleep state and falls through to await(), which
+        // triggers the wake.)
+        if (phase.get() == RUNNING && rpcBackend == null) return null;
         return wakeGate.await(capMs) ? rpcBackend : null;
     }
 
@@ -378,9 +385,22 @@ public final class ChainStack {
         wakeGate.poke();
     }
 
-    /** Epoch millis of the last gated verified read / operator query; 0 if none. */
+    /**
+     * Requests currently being served (gated JSON-RPC reads + operator queries). While
+     * non-zero, {@link #lastActivityMs()} reports "now" so the host idle timer never
+     * pauses the stack mid-request — pausing would close the backend/connector under a
+     * slow in-flight call (e.g. a multi-second confirm-screen sweep). Balanced with
+     * {@link #beginRequest()}/{@link #endRequest()}.
+     */
+    private final AtomicInteger inFlight = new AtomicInteger();
+
+    public void beginRequest() { inFlight.incrementAndGet(); }
+    public void endRequest() { inFlight.decrementAndGet(); }
+
+    /** Epoch millis of the last gated verified read / operator query; 0 if none. While a
+     *  request is in flight this returns the current time, so the idle timer holds off. */
     public long lastActivityMs() {
-        return wakeGate.lastActivityMs();
+        return inFlight.get() > 0 ? System.currentTimeMillis() : wakeGate.lastActivityMs();
     }
 
     // -- idle-sleep metrics (for status snapshots) --

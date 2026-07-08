@@ -34,7 +34,8 @@ final class WakeGate {
      * @param phase          live lifecycle state of the guarded stack
      * @param ready          true when verified reads are answerable (only consulted while RUNNING)
      * @param resume         the blocking resume action; run on a fresh daemon thread, single-flight
-     * @param clock          epoch-millis source (injected for tests)
+     * @param clock          wall-clock epoch-millis source for activity stamping (injected for
+     *                       tests); the wait DEADLINE uses monotonic {@code System.nanoTime}
      * @param pollMs         wait-loop poll interval
      * @param wakeThreadName name for the spawned resume thread
      */
@@ -60,13 +61,17 @@ final class WakeGate {
      */
     boolean await(long capMs) {
         noteActivity();
-        long deadline = clock.getAsLong() + capMs;
+        // Monotonic deadline (nanoTime, overflow-safe compare): capMs is a DURATION, so an
+        // NTP / manual wall-clock step must not extend or prematurely expire the hold. The
+        // injected wall-clock `clock` is used only for activity stamping (noteActivity),
+        // which the host idle timer compares against its own wall clock.
+        long deadlineNanos = System.nanoTime() + capMs * 1_000_000L;
         while (true) {
             LifecycleState p = phase.get();
             if (p == LifecycleState.STOPPED) return false;
             if (p == LifecycleState.PAUSED) triggerWake();
             if (p == LifecycleState.RUNNING && ready.getAsBoolean()) return true;
-            if (clock.getAsLong() >= deadline) return p == LifecycleState.RUNNING;
+            if (System.nanoTime() - deadlineNanos >= 0) return p == LifecycleState.RUNNING;
             try {
                 Thread.sleep(pollMs);
             } catch (InterruptedException e) {

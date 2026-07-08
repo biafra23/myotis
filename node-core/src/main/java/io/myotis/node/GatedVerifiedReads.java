@@ -33,13 +33,22 @@ final class GatedVerifiedReads implements VerifiedReads {
     }
 
     /**
-     * Wake-and-wait, then return the live backend — or null (unanswerable). The
-     * backend reference is re-read from the stack after the wait, so a resume's
-     * freshly-built backend is picked up and a paused stack's torn-down one is
-     * never touched.
+     * Wake-and-wait, then run {@code call} against the live backend under an in-flight
+     * guard; returns null (unanswerable) without calling when no backend is available.
+     * The backend is re-read from the stack after the wait, so a resume's freshly-built
+     * backend is picked up and a paused stack's torn-down one is never touched. The
+     * {@code beginRequest}/{@code endRequest} pair marks the stack busy so the host idle
+     * timer can't pause it mid-call (which would close the backend under the request).
      */
-    private VerifiedReads awaitReady() {
-        return stack.awaitReadyForReads(ChainStack.WAKE_WAIT_CAP_MS);
+    private <T> T guarded(java.util.function.Function<VerifiedReads, T> call) {
+        VerifiedReads d = stack.awaitReadyForReads(ChainStack.WAKE_WAIT_CAP_MS);
+        if (d == null) return null;
+        stack.beginRequest();
+        try {
+            return call.apply(d);
+        } finally {
+            stack.endRequest();
+        }
     }
 
     @Override
@@ -58,91 +67,76 @@ final class GatedVerifiedReads implements VerifiedReads {
 
     @Override
     public Long headBlockNumber() {
-        VerifiedReads d = awaitReady();
-        return d == null ? null : d.headBlockNumber();
+        return guarded(d -> d.headBlockNumber());
     }
 
     @Override
     public byte[] call(byte[] from, byte[] to, byte[] data, String valueWei, String block) {
-        VerifiedReads d = awaitReady();
-        return d == null ? null : d.call(from, to, data, valueWei, block);
+        return guarded(d -> d.call(from, to, data, valueWei, block));
     }
 
     @Override
     public String getBalance(byte[] address, String block) {
-        VerifiedReads d = awaitReady();
-        return d == null ? null : d.getBalance(address, block);
+        return guarded(d -> d.getBalance(address, block));
     }
 
     @Override
     public Long getTransactionCount(byte[] address, String block) {
-        VerifiedReads d = awaitReady();
-        return d == null ? null : d.getTransactionCount(address, block);
+        return guarded(d -> d.getTransactionCount(address, block));
     }
 
     @Override
     public byte[] getCode(byte[] address, String block) {
-        VerifiedReads d = awaitReady();
-        return d == null ? null : d.getCode(address, block);
+        return guarded(d -> d.getCode(address, block));
     }
 
     @Override
     public byte[] getStorageAt(byte[] address, byte[] slot32, String block) {
-        VerifiedReads d = awaitReady();
-        return d == null ? null : d.getStorageAt(address, slot32, block);
+        return guarded(d -> d.getStorageAt(address, slot32, block));
     }
 
     @Override
     public byte[] sendRawTransaction(byte[] rawTx) {
-        VerifiedReads d = awaitReady();
-        return d == null ? null : d.sendRawTransaction(rawTx);
+        return guarded(d -> d.sendRawTransaction(rawTx));
     }
 
     @Override
     public String getTransactionReceipt(byte[] txHash) {
-        VerifiedReads d = awaitReady();
-        return d == null ? null : d.getTransactionReceipt(txHash);
+        return guarded(d -> d.getTransactionReceipt(txHash));
     }
 
     @Override
     public String getTransactionByHash(byte[] txHash) {
-        VerifiedReads d = awaitReady();
-        return d == null ? null : d.getTransactionByHash(txHash);
+        return guarded(d -> d.getTransactionByHash(txHash));
     }
 
     @Override
     public String getBlockByNumber(String block, boolean fullTransactions) {
-        VerifiedReads d = awaitReady();
-        return d == null ? null : d.getBlockByNumber(block, fullTransactions);
+        return guarded(d -> d.getBlockByNumber(block, fullTransactions));
     }
 
     @Override
     public String getBlockByHash(byte[] blockHash32, boolean fullTransactions) {
-        VerifiedReads d = awaitReady();
-        return d == null ? null : d.getBlockByHash(blockHash32, fullTransactions);
+        return guarded(d -> d.getBlockByHash(blockHash32, fullTransactions));
     }
 
     @Override
     public String gasPrice() {
-        VerifiedReads d = awaitReady();
-        return d == null ? null : d.gasPrice();
+        return guarded(VerifiedReads::gasPrice);
     }
 
     @Override
     public String maxPriorityFeePerGas() {
-        VerifiedReads d = awaitReady();
-        return d == null ? null : d.maxPriorityFeePerGas();
+        return guarded(VerifiedReads::maxPriorityFeePerGas);
     }
 
     @Override
     public String feeHistory(long blockCount, String newestBlock, double[] rewardPercentiles) {
-        VerifiedReads d = awaitReady();
-        return d == null ? null : d.feeHistory(blockCount, newestBlock, rewardPercentiles);
+        return guarded(d -> d.feeHistory(blockCount, newestBlock, rewardPercentiles));
     }
 
     @Override
     public Long estimateGas(byte[] from, byte[] to, byte[] data, String valueWei) {
-        VerifiedReads d = awaitReady();
-        return d == null ? null : d.estimateGas(from, to, data, valueWei);
+        return guarded(d -> d.estimateGas(from, to, data, valueWei));
     }
 }
