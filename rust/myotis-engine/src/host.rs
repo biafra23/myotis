@@ -464,7 +464,13 @@ fn parse_block_target(tag: &str) -> Result<Option<u64>, &'static str> {
             if h.is_empty() || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err("invalid block number");
             }
-            u64::from_str_radix(h, 16).map(Some).map_err(|_| "block number out of range")
+            match u64::from_str_radix(h, 16) {
+                // Block 0 (any hex form) is genesis — reject it up front, same as the
+                // "earliest" tag, rather than letting it fail deep in the lookback cap.
+                Ok(0) => Err("earliest (genesis) is not served verified"),
+                Ok(n) => Ok(Some(n)),
+                Err(_) => Err("block number out of range"),
+            }
         }
     }
 }
@@ -745,6 +751,22 @@ mod tests {
         // No engine calls here — just the contract for a missing handle, which
         // status_json returns directly.
         assert_eq!(status_json(i64::MIN), "{}");
+    }
+
+    #[test]
+    fn parse_block_target_cases() {
+        assert_eq!(parse_block_target("latest"), Ok(None));
+        assert_eq!(parse_block_target("pending"), Ok(None));
+        assert_eq!(parse_block_target("finalized"), Ok(None));
+        assert_eq!(parse_block_target("0x1406f40"), Ok(Some(21_000_000)));
+        assert!(parse_block_target("earliest").is_err());
+        // Block 0 (genesis) is rejected up front in any hex form, like "earliest".
+        assert!(parse_block_target("0x0").is_err());
+        assert!(parse_block_target("0x00").is_err());
+        assert!(parse_block_target("0").is_err());
+        // Malformed selectors.
+        assert!(parse_block_target("0xzz").is_err());
+        assert!(parse_block_target("0x").is_err());
     }
 
     #[test]
