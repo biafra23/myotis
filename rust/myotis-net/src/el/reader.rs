@@ -225,12 +225,22 @@ impl ElReader {
             return Err("no snap peer available".to_string());
         }
         let total = peers.len();
+        let mut fallback: Option<VerifiedAccount> = None;
         let mut last_err = String::new();
         for peer in &peers {
             match self.get_account_from(peer, address).await {
                 Ok(result) => {
-                    self.pool.record_snap_served(peer.addr()).await;
-                    return Ok(result);
+                    // Verified, or a GLOBAL verdict failure (beacon not ready —
+                    // identical for every peer): this is the answer.
+                    if result.verify_method.is_some() || is_global_fail(result.fail_reason) {
+                        self.pool.record_snap_served(peer.addr()).await;
+                        return Ok(result);
+                    }
+                    // A PER-PEER verdict failure (a stale/behind head or a bad
+                    // proof — a different peer can still verify): keep it as a
+                    // fallback and try the next peer.
+                    self.pool.record_snap_failure(peer.addr()).await;
+                    fallback.get_or_insert(result);
                 }
                 Err(e) => {
                     self.pool.record_snap_failure(peer.addr()).await;
@@ -238,7 +248,10 @@ impl ElReader {
                 }
             }
         }
-        Err(format!("all {total} snap peer(s) failed to serve account: {last_err}"))
+        // No peer verified; return the best per-peer result if we got one.
+        fallback.map(Ok).unwrap_or_else(|| {
+            Err(format!("all {total} snap peer(s) failed to serve a verifiable account: {last_err}"))
+        })
     }
 
     /// One account fetch + verdict against a single peer (no retry, no cache
@@ -304,12 +317,17 @@ impl ElReader {
             return Err("no snap peer available".to_string());
         }
         let total = peers.len();
+        let mut fallback: Option<VerifiedStorage> = None;
         let mut last_err = String::new();
         for peer in &peers {
             match self.get_storage_from(peer, address, slot, holder).await {
                 Ok(result) => {
-                    self.pool.record_snap_served(peer.addr()).await;
-                    return Ok(result);
+                    if result.verify_method.is_some() || is_global_fail(result.fail_reason) {
+                        self.pool.record_snap_served(peer.addr()).await;
+                        return Ok(result);
+                    }
+                    self.pool.record_snap_failure(peer.addr()).await;
+                    fallback.get_or_insert(result);
                 }
                 Err(e) => {
                     self.pool.record_snap_failure(peer.addr()).await;
@@ -317,7 +335,9 @@ impl ElReader {
                 }
             }
         }
-        Err(format!("all {total} snap peer(s) failed to serve storage: {last_err}"))
+        fallback.map(Ok).unwrap_or_else(|| {
+            Err(format!("all {total} snap peer(s) failed to serve verifiable storage: {last_err}"))
+        })
     }
 
     /// One storage-slot fetch + verdict against a single peer (no retry / cache
@@ -422,6 +442,14 @@ async fn fresh_head(peer: &ManagedPeer) -> Result<([u8; 32], u64), String> {
     if head.hash != head_hash {
         return Err("peer returned a header not matching the requested hash".to_string());
     }
+    // A peer advertising a genesis head (block 0) can't serve current state —
+    // vitalik.eth would verify as ABSENT at the genesis root, and the ladder
+    // rejects it as noPeerBlockNumber. Treat it as a failure so the retry loop
+    // moves to a peer with a real head (junk/light-client nodes can negotiate
+    // snap/1 yet still advertise genesis).
+    if head.header.number == 0 {
+        return Err("peer advertises a genesis head (block 0 — no current state)".to_string());
+    }
     let state_root = head.header.state_root;
     if state_root == [0u8; 32] {
         return Err("peer head has no state root".to_string());
@@ -495,6 +523,14 @@ fn hex32(s: &str) -> [u8; 32] {
 /// A realistic block number always fits; an out-of-range value (a hostile peer
 /// claiming >= 2^63) maps to a negative sentinel, which the ladder rejects as
 /// `noPeerBlockNumber` — fail-closed and explicit, no wrapping cast.
+/// Whether a ladder `fail_reason` is GLOBAL — determined by the beacon anchor's
+/// state, identical for every peer — vs PER-PEER (a stale/behind head, an
+/// invalid proof: another peer can still verify). A global failure short-circuits
+/// the cross-peer retry (no point re-asking); a per-peer failure moves on.
+fn is_global_fail(reason: Option<&'static str>) -> bool {
+    matches!(reason, Some("beaconNotSynced") | Some("beaconBlockUnavailable"))
+}
+
 fn to_ladder_block(block_number: u64) -> i64 {
     i64::try_from(block_number).unwrap_or(-1)
 }
