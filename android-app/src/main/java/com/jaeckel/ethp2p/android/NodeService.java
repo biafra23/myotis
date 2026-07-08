@@ -467,12 +467,16 @@ public final class NodeService extends Service {
     private static final long IDLE_TICK_MS = 30_000;
     /** Last UI-originated activity (query tab, ENS lookup, enable, app foreground). */
     private volatile long uiActivityMs;
-    /** Per-network boot stamp: a freshly-started stack gets a full idle window. */
-    private final Map<String, Long> stackStartMs = new ConcurrentHashMap<>();
+    /** Per-network boot stamp: a freshly-started stack gets a full idle window.
+     *  STATIC (matching ENGINE / RUNNING / BOOT_LOCKS): this is per-network-stack state that
+     *  outlives a service instance, and the static {@link #dailyCatchUp} worker path reads/writes it. */
+    private static final Map<String, Long> stackStartMs = new ConcurrentHashMap<>();
     /** Per-network HOST-side resume stamp (foreground resume, daily catch-up): gives
      *  the resumed stack a full idle window even though no request bumped the engine's
-     *  activity clock. Engine-side wakes need no stamp — the waking request did it. */
-    private final Map<String, Long> lastResumeMs = new ConcurrentHashMap<>();
+     *  activity clock. Engine-side wakes need no stamp — the waking request did it.
+     *  STATIC so the {@link #dailyCatchUp} worker (no service binder) can hold the grace
+     *  stamp while it catches up, keeping the instance idle ticker from pausing it mid-pass. */
+    private static final Map<String, Long> lastResumeMs = new ConcurrentHashMap<>();
     private volatile java.util.concurrent.ScheduledExecutorService idleTicker;
     /** What the notification currently shows, to notify() only on transitions. */
     private volatile Boolean notifiedSleeping;
@@ -592,11 +596,17 @@ public final class NodeService extends Service {
      * resume, wait until the beacon client is SYNCED and the verified head is warm (or
      * the per-network budget slice runs out), and pause again — but only if no real
      * activity arrived meanwhile (then the idle controller owns the stack again).
-     * Deliberately does NOT count as activity: resume()/catch-up never bump the
-     * engine's activity clock (only gated requests do), so the worker can't fight the
-     * idle policy. Snapshot persistence is free — the engine persists on every pause.
      *
-     * <p>Static: the Worker has no binder, and ENGINE/BOOT_LOCKS are process-global.
+     * <p>Two distinct clocks, deliberately: the worker never touches the ENGINE's
+     * activity clock ({@code lastActivityEpochMillis}), so the "did real activity
+     * arrive?" check at the end stays honest. It DOES hold the host-side
+     * {@link #lastResumeMs} grace stamp (refreshed each loop) while it runs, so the
+     * instance idle ticker — which also considers {@code lastResumeMs} — won't pause
+     * the just-resumed stack out from under the catch-up before it reaches SYNCED.
+     * Snapshot persistence is free: the engine persists on every pause.
+     *
+     * <p>Static: the Worker has no binder; ENGINE / BOOT_LOCKS / the idle stamps are
+     * all process-global.
      */
     public static void dailyCatchUp(long budgetMs) {
         List<String> hosted = ENGINE.hostedNetworks();
@@ -609,11 +619,19 @@ public final class NodeService extends Service {
             LogBuffer.i(TAG, "[" + n + "] daily catch-up: resuming");
             boolean resumed;
             synchronized (bootLock(n)) {
+                // Hold the grace stamp BEFORE resume returns RUNNING, so the idle ticker
+                // can't pause the stack in the window between resume() and the loop.
+                lastResumeMs.put(n, System.currentTimeMillis());
                 resumed = h.resume();
             }
             if (!resumed) continue; // stays paused; next daily run retries
-            long deadline = System.currentTimeMillis() + sliceMs;
-            while (System.currentTimeMillis() < deadline) {
+            // Monotonic deadline (nanoTime, overflow-safe compare) so an NTP/wall-clock
+            // step can't cut the pass short or hang it.
+            long deadlineNano = System.nanoTime() + sliceMs * 1_000_000L;
+            while (System.nanoTime() - deadlineNano < 0) {
+                // Refresh the grace stamp each iteration: keeps now-lastResumeMs well under
+                // any idle window (min 60s) so the 30s idle ticker never pauses us mid-pass.
+                lastResumeMs.put(n, System.currentTimeMillis());
                 try {
                     StatusSnapshot s = h.status();
                     if (s.beaconState() == BeaconState.SYNCED

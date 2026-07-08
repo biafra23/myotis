@@ -127,6 +127,13 @@ interface Settings {
      */
     fun idlePauseMinutes(): Int = 0
     fun setIdlePauseMinutes(v: Int) {}
+
+    /**
+     * Whether this host actually has an idle-sleep controller (Android). The idle-sleep
+     * Settings row is shown only when true — desktop has no controller, so surfacing a
+     * battery-saving toggle there would imply a feature that can't take effect. Default false.
+     */
+    fun supportsIdleSleep(): Boolean = false
 }
 
 /** Device network connectivity, as an observable stream so the UI can react to changes. */

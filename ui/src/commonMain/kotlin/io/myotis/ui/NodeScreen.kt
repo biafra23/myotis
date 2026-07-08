@@ -300,21 +300,26 @@ private fun SettingsTab(
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             modifier = Modifier.fillMaxWidth(),
         )
-        OutlinedTextField(
-            value = idlePause,
-            onValueChange = { idlePause = it.filter(Char::isDigit).take(3) },
-            label = { Text("Idle sleep after (minutes, 0 = never)") },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        Text(
-            "After this many minutes without a wallet request or query, the node goes to " +
-                "sleep: all P2P networking stops (saving battery) while the JSON-RPC port keeps " +
-                "listening. The first request wakes it — expect that call to take a little longer.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        // Idle-sleep is only meaningful on a host that actually runs the idle controller
+        // (Android). On desktop (no controller) the setting is a no-op, so don't surface a
+        // battery-saving toggle that can't take effect.
+        if (settings.supportsIdleSleep()) {
+            OutlinedTextField(
+                value = idlePause,
+                onValueChange = { idlePause = it.filter(Char::isDigit).take(3) },
+                label = { Text("Idle sleep after (minutes, 0 = never)") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                "After this many minutes without a wallet request or query, the node goes to " +
+                    "sleep: all P2P networking stops (saving battery) while the JSON-RPC port keeps " +
+                    "listening. The first request wakes it — expect that call to take a little longer.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
 
         // Strict freshness is the default; the switch exposes the RELAXED (opt-in) state, so the
         // checked value is the negation. Persisted immediately; applies on the next node restart.
@@ -358,8 +363,12 @@ private fun SettingsTab(
                 val deep = deepPool.toIntOrNull() ?: 16
                 settings.setSnapTarget(snap)          // persist
                 settings.setDeepPool(deep)            // persist (read at readiness-check time)
-                // Idle sleep: persisted; the controller reads it on every tick, so it applies live.
-                settings.setIdlePauseMinutes(idlePause.toIntOrNull() ?: 5)
+                // Idle sleep: persisted only on hosts that run the controller; the tick reads it
+                // live. Blank/invalid input keeps the CURRENT value rather than silently enabling
+                // sleep (the label says "0 = never"), so a stray edit can't turn it on by accident.
+                if (settings.supportsIdleSleep()) {
+                    settings.setIdlePauseMinutes(idlePause.toIntOrNull() ?: settings.idlePauseMinutes())
+                }
                 controller.setTargetSnapPeers(snap)   // live-apply to running stacks
                 networks.forEach { id ->
                     // Compare the EFFECTIVE (post-clamp) persisted port before vs after, not the
