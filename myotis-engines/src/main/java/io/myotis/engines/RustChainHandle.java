@@ -498,8 +498,10 @@ final class RustChainHandle implements ChainHandle {
     /** How long a fee estimate is reused so a paired gasPrice+maxPriorityFee poll
      *  shares one native compute (each is a 3-block verified fetch). */
     private static final long FEE_CACHE_TTL_MS = 3_000;
-    private volatile FeeEstimate cachedFee;
-    private volatile long cachedFeeAtMs;
+    /** Value+timestamp in one volatile so a reader can't pair a fresh estimate with
+     *  a stale stamp (or vice versa). */
+    private record CachedFee(FeeEstimate est, long atMs) {}
+    private volatile CachedFee cachedFee;
 
     /**
      * Verified fee suggestion, cached for {@link #FEE_CACHE_TTL_MS}. Throws
@@ -507,13 +509,12 @@ final class RustChainHandle implements ChainHandle {
      * error is never cached, so the next call retries.
      */
     FeeEstimate feeEstimate() {
-        FeeEstimate c = cachedFee;
-        if (c != null && System.currentTimeMillis() - cachedFeeAtMs < FEE_CACHE_TTL_MS) {
-            return c;
+        CachedFee c = cachedFee;
+        if (c != null && System.currentTimeMillis() - c.atMs() < FEE_CACHE_TTL_MS) {
+            return c.est();
         }
         FeeEstimate est = feeFromJson(RustEngineNative.nativeFeeEstimateJson(handle));
-        cachedFee = est;
-        cachedFeeAtMs = System.currentTimeMillis();
+        cachedFee = new CachedFee(est, System.currentTimeMillis());
         return est;
     }
 

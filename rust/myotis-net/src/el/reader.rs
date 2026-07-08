@@ -749,13 +749,19 @@ impl ElReader {
         let mut tips: Vec<u128> = Vec::new();
         for (vh, body) in window.iter().zip(bodies.iter()) {
             // Verify each body against its (chain-verified) header, then decode tips
-            // at THAT block's base fee. A pairing error here fails the whole estimate
-            // (fail closed → next peer) rather than skewing the median with bad data.
+            // at THAT block's base fee. A body that fails its transactionsRoot fails
+            // the WHOLE estimate (→ next peer): stricter than the Java cold path,
+            // which would median over the remaining good blocks — safer here, at a
+            // small availability cost. (A wrong header/body pairing from an out-of-
+            // order peer response is caught the same way.)
             if !triehash::verify(&body.transactions, &vh.header.transactions_root) {
                 return Err("block body transactions do not match the header transactionsRoot".to_string());
             }
             let base = header_base_fee(&vh.header);
             for raw in &body.transactions {
+                // A tx the minimal fee decoder can't read is skipped (not dropped
+                // with its whole block, as Java does) — no real-world divergence
+                // since every current mainnet tx type decodes.
                 if let Some(t) = tx::effective_tip(raw, base) {
                     tips.push(t);
                 }
