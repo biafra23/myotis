@@ -81,10 +81,10 @@ tasks.register<JavaExec>("run") {
     // back to the Java engine (Engines.normalize warns + yields java), so a
     // `-Pengine=rust.` runs Java without it being obvious. Blank → unset (default
     // java).
-    (project.findProperty("engine") as? String)?.takeIf { it.isNotBlank() }?.let {
-        val v = it.trim().lowercase()
-        require(v in listOf("java", "rust", "auto")) {
-            "-Pengine must be one of java|rust|auto (got '$it')"
+    (project.findProperty("engine") as? String)?.takeIf { it.isNotBlank() }?.let { raw ->
+        val v = raw.trim().lowercase()
+        if (v !in listOf("java", "rust", "auto")) {
+            throw GradleException("-Pengine must be one of java|rust|auto (got '$raw')")
         }
         systemProperty("myotis.engine", v)
     }
