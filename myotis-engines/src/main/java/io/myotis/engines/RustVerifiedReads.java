@@ -155,11 +155,8 @@ final class RustVerifiedReads implements VerifiedReads {
     /** 20-byte address → lowercase 0x-hex (the form {@code requestAccount} expects). */
     private static String toHex(byte[] address) {
         if (address == null) throw new EngineException("address is required");
-        StringBuilder sb = new StringBuilder(2 + address.length * 2).append("0x");
-        for (byte b : address) {
-            sb.append(Character.forDigit((b >> 4) & 0xF, 16));
-            sb.append(Character.forDigit(b & 0xF, 16));
-        }
-        return sb.toString();
+        // HexFormat is desugared for Android here (desugar_jdk_libs 2.1.x) — the same
+        // API node-core (ChainStack) and myotis-ens already rely on in main code.
+        return "0x" + java.util.HexFormat.of().formatHex(address);
     }
 }

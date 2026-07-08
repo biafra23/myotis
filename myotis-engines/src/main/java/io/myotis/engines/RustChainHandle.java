@@ -73,7 +73,7 @@ final class RustChainHandle implements ChainHandle {
     @Override public long chainId() { return chainId; }
 
     @Override
-    public boolean start() {
+    public synchronized boolean start() {
         boolean ok = RustEngineNative.nativeStart(handle);
         // Only expose the verified JSON-RPC endpoint once the native stack is up.
         if (ok) startRpc();
@@ -81,7 +81,7 @@ final class RustChainHandle implements ChainHandle {
     }
 
     @Override
-    public void stop() {
+    public synchronized void stop() {
         // Stop serving before tearing down the native stack the reads depend on.
         io.myotis.jsonrpc.MyotisRpcServer server = this.rpcServer;
         if (server != null) {
@@ -99,7 +99,8 @@ final class RustChainHandle implements ChainHandle {
      * Java engine): the IPC socket still serves the same verified primitives.
      */
     private void startRpc() {
-        if (rpcPort <= 0) return; // RPC disabled (test seam / explicit opt-out)
+        if (rpcPort <= 0) return;        // RPC disabled (test seam / explicit opt-out)
+        if (rpcServer != null) return;   // already started — avoid a re-bind / server leak
         try {
             // Deterministic up-front bind probe: Ktor's CIO engine surfaces bind
             // failures asynchronously, which a try/catch around start() can miss.
