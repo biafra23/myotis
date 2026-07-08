@@ -615,6 +615,52 @@ public class BeaconLightClient implements AutoCloseable {
         log.info("[beacon] Light client started with {} peer(s)", clPeerMultiaddrs.size());
     }
 
+    /**
+     * Stop the sync thread and the libp2p host but KEEP the verified store, the
+     * catch-up executor, and the peer-knowledge maps warm for {@link #resume()}.
+     * Persists the snapshot so a process kill while asleep loses nothing.
+     * Idempotent; a no-op unless running.
+     */
+    public synchronized void pause() {
+        if (!running) return;
+        running = false;
+        Thread t = syncThread;
+        if (t != null) {
+            t.interrupt();
+            try {
+                t.join(2_000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        syncThread = null;
+        persistSnapshot();
+        try {
+            p2pService.close();
+        } catch (Throwable e) {
+            log.warn("[beacon] p2p close on pause: {}", e.toString());
+        }
+        log.info("[beacon] Light client paused (store retained, period {})",
+                store.isInitialized() ? store.getCurrentSyncCommitteePeriod() : -1);
+    }
+
+    /**
+     * Restart the libp2p host and sync loop after {@link #pause()}. The warm
+     * in-memory store makes {@code syncLoop} skip snapshot-restore and bootstrap
+     * and go straight to Identify + committee catch-up (which covers any periods
+     * missed while asleep). Idempotent; a no-op when already running.
+     */
+    public synchronized void resume() {
+        if (running) return;
+        p2pService.start();
+        warmBlsPubkeyCache();
+        running = true;
+        syncThread = new Thread(this::syncLoop, "beacon-sync");
+        syncThread.setDaemon(true);
+        syncThread.start();
+        log.info("[beacon] Light client resumed with {} peer(s)", clPeerMultiaddrs.size());
+    }
+
     // -------------------------------------------------------------------------
     // Sync loop
     // -------------------------------------------------------------------------
@@ -631,7 +677,10 @@ public class BeaconLightClient implements AutoCloseable {
         // Runs BEFORE the network pre-connect: it's disk-only, and it kicks off the
         // background BLS pubkey-cache warm so decompression overlaps the Identify
         // round instead of stalling the first finality verify after it.
-        boolean resumed = tryResumeFromSnapshot();
+        // An already-initialized store means this loop is re-entered by resume()
+        // after a pause: the live in-memory state is strictly newer than (or equal
+        // to) the snapshot pause() just wrote — restoring over it would go backward.
+        boolean resumed = store.isInitialized() || tryResumeFromSnapshot();
 
         // Pre-connect to peers and query Identify to learn protocol support.
         // This lets bootstrap() prioritize peers advertising light_client protocols.
@@ -2359,7 +2408,12 @@ public class BeaconLightClient implements AutoCloseable {
         }
         // Persist final verified state so the next launch resumes from here.
         persistSnapshot();
-        p2pService.close();
+        try {
+            p2pService.close();
+        } catch (Throwable e) {
+            // close-after-pause: the libp2p host is already stopped — not fatal.
+            log.warn("[beacon] p2p close: {}", e.toString());
+        }
         catchUpExecutor.shutdownNow();
         log.info("[beacon] Light client stopped");
     }

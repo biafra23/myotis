@@ -89,6 +89,40 @@ class JavaMyotisEngineTest {
     }
 
     @Test
+    void lifecycleSurfaceOnNeverStartedHandle() {
+        JavaMyotisEngine engine = new JavaMyotisEngine();
+        EngineConfig config = new EngineConfig("gnosis", 0, 0, 0, null, false, 0, true, null);
+        ChainHandle handle = engine.create(config, testPorts(new MemoryKeyStore()));
+
+        assertEquals(io.myotis.api.LifecycleState.STOPPED, handle.lifecycle());
+        assertFalse(handle.isRunning());
+        assertEquals(0L, handle.lastActivityEpochMillis());
+
+        // pause()/resume() on a never-started stack are safe no-ops: STOPPED is
+        // terminal, so neither transitions and both report failure.
+        assertFalse(handle.pause());
+        assertFalse(handle.resume());
+        assertEquals(io.myotis.api.LifecycleState.STOPPED, handle.lifecycle());
+
+        // status() reflects the lifecycle without a running stack.
+        assertEquals(io.myotis.api.LifecycleState.STOPPED, handle.status().lifecycle());
+        assertFalse(handle.status().running());
+
+        // Sleep metrics are zeroed on a never-started stack.
+        io.myotis.api.StatusSnapshot snap = handle.status();
+        assertEquals(0, snap.pauseCount());
+        assertEquals(0L, snap.totalPausedMs());
+        assertEquals(0L, snap.lastResumeEpochMs());
+        assertNull(snap.lastWakeReason());
+
+        // resume(reason) is a safe no-op on STOPPED (same as resume()).
+        assertFalse(handle.resume(io.myotis.api.WakeReason.CATCH_UP));
+        assertEquals(io.myotis.api.LifecycleState.STOPPED, handle.lifecycle());
+
+        engine.stop("gnosis");
+    }
+
+    @Test
     void createReusesStoredKey() {
         JavaMyotisEngine engine = new JavaMyotisEngine();
         MemoryKeyStore keyStore = new MemoryKeyStore();

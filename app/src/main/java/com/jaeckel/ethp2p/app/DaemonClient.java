@@ -81,7 +81,7 @@ public class DaemonClient {
         if (args.length == 0) throw new IllegalArgumentException("No command specified");
         String cmd = args[0];
         return switch (cmd) {
-            case "status", "peers", "stop" -> "{\"cmd\":\"" + esc(cmd) + "\"}";
+            case "status", "peers", "stop", "pause", "resume" -> "{\"cmd\":\"" + esc(cmd) + "\"}";
             case "get-headers" -> {
                 long blockNumber = args.length > 1 ? Long.parseLong(args[1]) : 21_000_000L;
                 int count       = args.length > 2 ? Integer.parseInt(args[2]) : 3;

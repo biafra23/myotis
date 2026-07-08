@@ -40,6 +40,11 @@ class MyotisRpcServer(
 ) {
     private val log = LoggerFactory.getLogger(MyotisRpcServer::class.java)
 
+    /** RPC access log (shared with [MethodLogger]): concise per-call lines land here at INFO;
+     *  this server adds the full request+response body at DEBUG. Filter the Logs tab on "rpc",
+     *  or `grep 'jsonrpc.access'` the daemon log; drop the level to DEBUG for full bodies. */
+    private val accessLog = LoggerFactory.getLogger(MethodLogger.ACCESS_LOGGER)
+
     private val proxy: UpstreamProxy? = upstreamUrl?.takeIf { it.isNotBlank() }?.let { UpstreamProxy(it) }
     private val logger = MethodLogger()
     private val router = RpcRouter(proxy, logger, backend)
@@ -73,11 +78,24 @@ class MyotisRpcServer(
         }
     }
 
+    /** Bound a body for the DEBUG access log: trim whitespace, cap length, and collapse
+     *  newlines so one exchange stays one grep-able line. */
+    private fun cap(s: String): String {
+        val t = s.trim().replace('\n', ' ').replace('\r', ' ')
+        return if (t.length > MAX_BODY_LOG_CHARS) {
+            t.substring(0, MAX_BODY_LOG_CHARS) + "…(" + (t.length - MAX_BODY_LOG_CHARS) + " more)"
+        } else t
+    }
+
     private companion object {
         /** How often to trickle a keep-alive whitespace byte while a response is still
          *  being computed. Short enough to reset any sane per-read socket timeout
          *  (OkHttp defaults to 10s), long enough to stay invisible for normal calls. */
         const val HEARTBEAT_INTERVAL_MS = 5_000L
+
+        /** Per-body cap for the DEBUG access log — keeps a large eth_call / batch from
+         *  blowing the Android 50k-line ring or producing one enormous line. */
+        const val MAX_BODY_LOG_CHARS = 4_096
     }
 
     @Volatile
@@ -128,6 +146,13 @@ class MyotisRpcServer(
                                 }
                             }
                             write(response)
+                            // Full request+response at DEBUG (concise per-call INFO lines come
+                            // from MethodLogger). One record for the whole exchange, incl. batches
+                            // and parse errors; bodies capped so a big eth_call / batch can't blow
+                            // the Android log ring or produce one enormous line.
+                            if (accessLog.isDebugEnabled) {
+                                accessLog.debug("[rpc] req={} resp={}", cap(body), cap(response))
+                            }
                             capture(body, response)
                         }
                     }

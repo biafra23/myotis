@@ -15,6 +15,11 @@
     </appender>
 
     <logger name="com.jaeckel.ethp2p" level="DEBUG"/>
+    <!-- RPC access log: one concise INFO line per JSON-RPC call the server answers
+         (method/id/outcome/latency), incl. parse/batch errors. Isolate it above the
+         com.jaeckel.ethp2p=DEBUG wire flood with `grep 'jsonrpc.access' devp2p.log`.
+         Bump to DEBUG to also log the full request+response bodies. -->
+    <logger name="io.myotis.jsonrpc.access" level="INFO"/>
     <logger name="io.netty" level="WARN"/>
     <logger name="org.apache.tuweni" level="WARN"/>
     <logger name="io.libp2p" level="WARN"/>
