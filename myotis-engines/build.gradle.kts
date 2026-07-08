@@ -18,6 +18,10 @@ dependencies {
     api(project(":myotis-api"))
     // The Java engine (JavaMyotisEngine) — one of the two selectable engines.
     implementation(project(":node-core"))
+    // The shared JSON-RPC server (MyotisRpcServer/RpcRouter): the Rust engine self-
+    // starts it over RustVerifiedReads, mirroring how the Java engine (node-core)
+    // self-starts it internally. Consumers already ship it transitively via node-core.
+    implementation(project(":jsonrpc-server"))
     implementation(libs.minimal.json)
     implementation(libs.slf4j.api)
 

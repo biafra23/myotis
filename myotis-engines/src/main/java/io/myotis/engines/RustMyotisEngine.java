@@ -113,7 +113,11 @@ public final class RustMyotisEngine implements MyotisEngine {
             throw new EngineException("the Rust engine could not initialize the runtime for "
                     + canonical);
         }
-        RustChainHandle handle = new RustChainHandle(id, canonical, 1L);
+        // Mirror JavaMyotisEngine: honour a host-supplied RPC port, else the
+        // mainnet default (8545). The Rust engine hosts mainnet only, so the
+        // per-network default is a constant here.
+        int rpcPort = config.rpcPort() > 0 ? config.rpcPort() : 8545;
+        RustChainHandle handle = new RustChainHandle(id, canonical, 1L, rpcPort);
         // Atomic claim (mirrors JavaMyotisEngine.putIfAbsent): reject a re-create rather
         // than orphaning the previous handle's native entry. On a lost race, release the
         // native handle we just allocated so it doesn't leak a tokio/libp2p host.
