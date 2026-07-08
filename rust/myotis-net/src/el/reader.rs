@@ -912,21 +912,25 @@ fn header_base_fee(h: &BlockHeader) -> u128 {
 /// `VerifiedRpcBackend.nextBaseFee`): ±1/8 of the parent base fee scaled by how far
 /// gasUsed is from the gasTarget (gasLimit/2), with the +1 minimum-bump rule.
 fn next_base_fee(h: &BlockHeader) -> u128 {
-    let base = header_base_fee(h);
+    next_base_fee_calc(header_base_fee(h), h.gas_limit, h.gas_used)
+}
+
+/// Pure EIP-1559 next-base-fee arithmetic (extracted from `next_base_fee` for unit
+/// testing). `base == 0` (pre-London) → 0.
+fn next_base_fee_calc(base: u128, gas_limit: u64, gas_used: u64) -> u128 {
     if base == 0 {
         return 0;
     }
-    let gas_target = h.gas_limit / 2;
-    if gas_target == 0 || h.gas_used == gas_target {
+    let gas_target = gas_limit / 2;
+    if gas_target == 0 || gas_used == gas_target {
         return base;
     }
     let target = gas_target as u128;
-    if h.gas_used > gas_target {
-        let delta =
-            (base.saturating_mul((h.gas_used - gas_target) as u128) / target / 8).max(1);
+    if gas_used > gas_target {
+        let delta = (base.saturating_mul((gas_used - gas_target) as u128) / target / 8).max(1);
         base.saturating_add(delta)
     } else {
-        let delta = base.saturating_mul((gas_target - h.gas_used) as u128) / target / 8;
+        let delta = base.saturating_mul((gas_target - gas_used) as u128) / target / 8;
         base.saturating_sub(delta)
     }
 }
@@ -934,6 +938,43 @@ fn next_base_fee(h: &BlockHeader) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_base_fee_at_target_is_unchanged() {
+        // gasUsed == gasTarget (gasLimit/2) → base fee holds.
+        assert_eq!(next_base_fee_calc(1_000_000_000, 30_000_000, 15_000_000), 1_000_000_000);
+    }
+
+    #[test]
+    fn next_base_fee_full_block_rises_one_eighth() {
+        // gasUsed == gasLimit (2× target) → +1/8: delta = base*target/target/8 = base/8.
+        assert_eq!(
+            next_base_fee_calc(1_000_000_000, 30_000_000, 30_000_000),
+            1_000_000_000 + 125_000_000
+        );
+    }
+
+    #[test]
+    fn next_base_fee_empty_block_falls_one_eighth() {
+        // gasUsed == 0 → -1/8: delta = base*target/target/8 = base/8.
+        assert_eq!(
+            next_base_fee_calc(1_000_000_000, 30_000_000, 0),
+            1_000_000_000 - 125_000_000
+        );
+    }
+
+    #[test]
+    fn next_base_fee_min_bump_is_one_wei() {
+        // Barely over target with a tiny base: the up-delta rounds to 0 but is
+        // floored to +1 wei (the EIP-1559 minimum bump); the down side has no floor.
+        assert_eq!(next_base_fee_calc(1, 30_000_000, 15_000_001), 2);
+        assert_eq!(next_base_fee_calc(1, 30_000_000, 14_999_999), 1);
+    }
+
+    #[test]
+    fn next_base_fee_pre_london_is_zero() {
+        assert_eq!(next_base_fee_calc(0, 30_000_000, 15_000_000), 0);
+    }
 
     #[test]
     fn plain_storage_key_is_padded_slot() {

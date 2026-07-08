@@ -137,4 +137,41 @@ mod tests {
         assert_eq!(effective_tip(&[], 1), None);
         assert_eq!(effective_tip(&[0x7f, 0xc0], 1), None); // reserved type byte
     }
+
+    /// EIP-2930 (type 0x01): [chainId, nonce, gasPrice, …] — gasPrice at index 2.
+    fn eip2930_tx(gas_price: u128) -> Vec<u8> {
+        let mut out = vec![0x01];
+        out.extend_from_slice(&encode(&Item::List(vec![
+            Item::Bytes(be(1)),          // chainId
+            Item::Bytes(be(1)),          // nonce
+            Item::Bytes(be(gas_price)),  // gasPrice
+            Item::Bytes(be(21000)),      // gasLimit
+            Item::Bytes(vec![0x11; 20]), // to
+            Item::Bytes(be(0)),          // value
+            Item::Bytes(Vec::new()),     // data
+            Item::List(Vec::new()),      // accessList
+            Item::Bytes(be(0)),          // yParity
+            Item::Bytes(vec![0x22; 32]), // r
+            Item::Bytes(vec![0x33; 32]), // s
+        ])));
+        out
+    }
+
+    #[test]
+    fn eip2930_tip_reads_gas_price_at_index_2() {
+        // gasPrice 30 gwei, base 10 gwei → tip 20 gwei (a wrong index would misread).
+        let tx = eip2930_tx(30_000_000_000);
+        assert_eq!(effective_tip(&tx, 10_000_000_000), Some(20_000_000_000));
+    }
+
+    #[test]
+    fn typed_4844_and_7702_share_the_1559_fee_layout() {
+        // 0x03 (blob) and 0x04 (7702) read maxPriorityFee@2 / maxFee@3 like 0x02;
+        // the decoder ignores their trailing fields, so a 1559-shaped list suffices.
+        for ty in [0x03u8, 0x04] {
+            let mut tx = eip1559_tx(2_000_000_000, 100_000_000_000);
+            tx[0] = ty;
+            assert_eq!(effective_tip(&tx, 10_000_000_000), Some(2_000_000_000), "type {ty:#x}");
+        }
+    }
 }

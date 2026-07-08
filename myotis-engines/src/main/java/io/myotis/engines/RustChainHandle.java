@@ -522,16 +522,22 @@ final class RustChainHandle implements ChainHandle {
     /** Package-private test seam: fee JSON → {@link FeeEstimate} without JNI. */
     static FeeEstimate feeFromJson(String json) {
         JsonObject o = parseResultOrThrow(json, "fee");
+        String gas;
+        String tip;
         try {
-            String gas = stringOrNull(o, "gasPriceWei");
-            String tip = stringOrNull(o, "maxPriorityFeePerGasWei");
-            if (gas == null || tip == null) {
-                throw new EngineException("fee JSON missing gasPriceWei/maxPriorityFeePerGasWei");
-            }
-            return new FeeEstimate(gas, tip);
+            // Field extraction only — a type-mismatched value (asString on a non-
+            // string) is Rust-side shape drift → "malformed".
+            gas = stringOrNull(o, "gasPriceWei");
+            tip = stringOrNull(o, "maxPriorityFeePerGasWei");
         } catch (RuntimeException e) {
             throw new EngineException("malformed fee JSON from the Rust engine: " + e.getMessage(), e);
         }
+        // Missing-field check OUTSIDE the try so its message isn't re-wrapped as
+        // "malformed" by the catch (EngineException is a RuntimeException).
+        if (gas == null || tip == null) {
+            throw new EngineException("fee JSON missing gasPriceWei/maxPriorityFeePerGasWei");
+        }
+        return new FeeEstimate(gas, tip);
     }
 
     /** Package-private test seam: storage-at JSON → verified 32-byte word (or null). */

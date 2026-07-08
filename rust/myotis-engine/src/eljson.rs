@@ -311,8 +311,8 @@ fn be_to_decimal(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use myotis_net::el::reader::{
-    FeeEstimate, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedStorage,
-};
+        FeeEstimate, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedStorage,
+    };
 
     fn sample_account() -> VerifiedAccount {
         VerifiedAccount {
