@@ -84,7 +84,11 @@ tasks.register<JavaExec>("run") {
     // env_logger/tracing syntax: `-Prustlog=debug` for everything, or a targeted
     // filter like `-Prustlog=myotis_net=debug,info` (default when unset:
     // info with the noisy deps at warn).
-    (project.findProperty("rustlog") as String?)?.let { environment("RUST_LOG", it) }
+    // Guard against a blank value: `-Prustlog=` would set RUST_LOG="" and
+    // OVERRIDE the engine's default filter with an empty one (silencing the Rust
+    // logs) — treat blank as unset so the default stands.
+    (project.findProperty("rustlog") as? String)?.takeIf { it.isNotBlank() }
+        ?.let { environment("RUST_LOG", it) }
     // -Plcdump=<dir> → -Dmyotis.lc.dumpVectors: capture raw light-client SSZ
     // (bootstrap/updates/finality) for the rust/testdata conformance corpus.
     (project.findProperty("lcdump") as String?)?.let { systemProperty("myotis.lc.dumpVectors", it) }
