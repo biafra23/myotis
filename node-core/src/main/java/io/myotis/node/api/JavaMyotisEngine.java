@@ -104,6 +104,9 @@ public final class JavaMyotisEngine implements MyotisEngine {
         }
 
         JavaChainHandle handle = new JavaChainHandle(stack, config.strictStateFreshness());
+        // Late-bind the JSON-RPC status source (resolves the stack↔handle cycle): the
+        // handle is the NodeStatusReads, and startRpc() runs later inside handle.start().
+        stack.setStatusReads(handle);
         // Atomic claim: two concurrent create()s for the same network must not both
         // register (the check above is only a fast fail).
         if (handles.putIfAbsent(name, handle) != null) {

@@ -116,6 +116,12 @@ public final class ChainStack {
     private volatile io.myotis.rpc.VerifiedRpcBackend rpcBackend;
     private volatile io.myotis.jsonrpc.MyotisRpcServer rpcServer;
 
+    /** Status source for the JSON-RPC myotis_status / myotis_beaconStatus methods; the
+     *  wrapping handle late-binds it (see {@link #setStatusReads}) before start(). */
+    private volatile io.myotis.api.NodeStatusReads statusReads;
+    /** Epoch ms of the first successful start; 0 until then. Drives {@link #uptimeSeconds()}. */
+    private volatile long startedAtMs;
+
     public ChainStack(NetworkConfig network,
                       ChainPorts ports,
                       NodeKey nodeKey,
@@ -178,6 +184,7 @@ public final class ChainStack {
      */
     public synchronized boolean start() {
         if (!phase.compareAndSet(STOPPED, RUNNING)) return true; // already started
+        if (startedAtMs == 0L) startedAtMs = System.currentTimeMillis();
         try {
             log.info("[{}] Node ID: {}", network.name(), nodeKey.nodeId().toHexString());
 
@@ -404,6 +411,15 @@ public final class ChainStack {
     }
 
     // -- idle-sleep metrics (for status snapshots) --
+    /** Late-bind the JSON-RPC status source (the wrapping handle), before {@link #start()}. */
+    public void setStatusReads(io.myotis.api.NodeStatusReads statusReads) { this.statusReads = statusReads; }
+
+    /** Node uptime in seconds since the first successful start; 0 before then. */
+    public long uptimeSeconds() {
+        long s = startedAtMs;
+        return s == 0L ? 0L : (System.currentTimeMillis() - s) / 1000L;
+    }
+
     public int pauseCount() { return sleepMetrics.pauseCount(); }
     public long totalPausedMs() { return sleepMetrics.totalPausedMs(); }
     public long lastPauseEpochMs() { return sleepMetrics.lastPauseEpochMs(); }
@@ -772,7 +788,7 @@ public final class ChainStack {
                 // it survives pause() (keeps listening) while the backend underneath
                 // is torn down and rebuilt, and a request on a paused stack wakes it.
                 io.myotis.jsonrpc.MyotisRpcServer server =
-                        new io.myotis.jsonrpc.MyotisRpcServer(rpcPort, null, "127.0.0.1", gatedReads);
+                        new io.myotis.jsonrpc.MyotisRpcServer(rpcPort, null, "127.0.0.1", gatedReads, statusReads);
                 server.start();
                 this.rpcServer = server;
                 this.rpcBackend = backend;

@@ -13,6 +13,7 @@ import io.myotis.api.EngineException;
 import io.myotis.api.EnsApi;
 import io.myotis.api.HeadersResult;
 import io.myotis.api.LifecycleState;
+import io.myotis.api.NodeStatusReads;
 import io.myotis.api.PeerInfo;
 import io.myotis.api.StatusSnapshot;
 import io.myotis.api.StorageProofResult;
@@ -34,7 +35,7 @@ import java.util.concurrent.TimeUnit;
  * status snapshot is built (previously duplicated across the desktop, Android, and daemon
  * status paths).
  */
-public final class JavaChainHandle implements ChainHandle {
+public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
 
     private final ChainStack stack;
     private final boolean strictStateFreshness;
@@ -167,6 +168,10 @@ public final class JavaChainHandle implements ChainHandle {
                 stack.lastResumeEpochMs(),
                 stack.lastWakeReason());
     }
+
+    /** {@link NodeStatusReads}: node uptime for the JSON-RPC status result's {@code uptimeSeconds}. */
+    @Override
+    public long uptimeSeconds() { return stack.uptimeSeconds(); }
 
     @Override
     public java.util.List<io.myotis.api.DiscoveredPeer> discoveredPeers() {

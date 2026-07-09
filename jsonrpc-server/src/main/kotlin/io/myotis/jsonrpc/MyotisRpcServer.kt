@@ -37,6 +37,7 @@ class MyotisRpcServer(
     private val upstreamUrl: String? = null,
     private val host: String = "127.0.0.1",
     private val backend: io.myotis.api.VerifiedReads? = null,
+    private val statusReads: io.myotis.api.NodeStatusReads? = null,
 ) {
     private val log = LoggerFactory.getLogger(MyotisRpcServer::class.java)
 
@@ -47,7 +48,7 @@ class MyotisRpcServer(
 
     private val proxy: UpstreamProxy? = upstreamUrl?.takeIf { it.isNotBlank() }?.let { UpstreamProxy(it) }
     private val logger = MethodLogger()
-    private val router = RpcRouter(proxy, logger, backend)
+    private val router = RpcRouter(proxy, logger, backend, statusReads)
 
     /**
      * Optional request/response capture for debugging + replay. Off unless the
