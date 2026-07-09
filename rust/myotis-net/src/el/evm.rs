@@ -60,6 +60,22 @@ pub enum GasOutcome {
     Unavailable(String),
 }
 
+/// The outcome of an ENS forward resolution. `block_number` is the verified head
+/// the resolution ran against. A hard failure (state unavailable, invalid name)
+/// travels the `Err(String)` channel instead, like the other reads.
+#[derive(Debug, Clone)]
+pub enum EnsOutcome {
+    /// The name resolved to this address record.
+    Resolved { address: [u8; 20], block_number: u64 },
+    /// Successfully determined that the name has NO address record (absent name,
+    /// zero-address record, or a non-wildcard ancestor resolver).
+    NoRecord { block_number: u64 },
+    /// The name resolves OFFCHAIN (ERC-3668 `OffchainLookup`) — the record exists
+    /// but needs a CCIP-Read gateway, which this engine doesn't drive yet
+    /// (EL-C-5-3). Distinguishable from `NoRecord` by design.
+    Offchain { block_number: u64 },
+}
+
 /// Build a [`BlockContext`] from a verified head header. `chain_id` comes from the
 /// chain config (the header carries no chain id).
 pub fn block_context(header: &BlockHeader, chain_id: u64) -> Result<BlockContext, String> {

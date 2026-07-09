@@ -13,6 +13,7 @@ import io.myotis.api.DialResult;
 import io.myotis.api.DiscoveredPeer;
 import io.myotis.api.EngineException;
 import io.myotis.api.EnsApi;
+import io.myotis.api.EnsResolutionResult;
 import io.myotis.api.HeadersResult;
 import io.myotis.api.LifecycleState;
 import io.myotis.api.NodeStatusReads;
@@ -407,17 +408,21 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     // to decide whether verified RPC is available. So: null before start(), when
     // rpcPort<=0, or on a bind failure; non-null once serving.
     //
-    // ens() still returns null (no ENS registry served yet) — that IS the ChainHandle
-    // contract ("or null when this network has no ENS registry"), and callers
-    // null-check it. The EL QUERY methods further down (getHeaders/getBlockVerified/
-    // dialPeer) still throw EngineException: the contract reserves exceptions for
-    // malformed input / not running, and an unimplemented EL surface is a capability
-    // error (no verification to report a failReason for) — a failReason record would
-    // misrepresent "we can't" as "we tried and failed".
+    // ens() serves forward resolution via the native resolver (EL-C-5-1); the
+    // Rust engine is mainnet-only and mainnet has ENS, so it is always non-null.
+    // Unimplemented record types report a graceful error RESULT per the EnsApi
+    // contract (see RustEnsApi). The EL QUERY methods further down
+    // (getHeaders/getBlockVerified/dialPeer) still throw EngineException: the
+    // contract reserves exceptions for malformed input / not running, and an
+    // unimplemented EL surface is a capability error (no verification to report
+    // a failReason for) — a failReason record would misrepresent "we can't" as
+    // "we tried and failed".
 
     @Override public VerifiedReads reads() { return rpcServer != null ? verifiedReads : null; }
 
-    @Override public EnsApi ens() { return null; }
+    private final EnsApi ensApi = new RustEnsApi(this);
+
+    @Override public EnsApi ens() { return ensApi; }
 
     @Override
     public List<DiscoveredPeer> discoveredPeers() { return List.of(); }
@@ -540,6 +545,44 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
             return null;
         } catch (RuntimeException e) {
             throw new EngineException("malformed call JSON from the Rust engine: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * One verified ENS forward resolution: {@code name} → its
+     * {@link EnsResolutionResult}. Throws {@link EngineException} on a transport /
+     * not-running failure (the RustEnsApi adapter maps that to an error result).
+     */
+    EnsResolutionResult resolveEnsVerified(String name) {
+        return ensResolutionFromJson(name, RustEngineNative.nativeResolveEnsJson(handle, name));
+    }
+
+    /** Package-private test seam: ENS JSON → {@link EnsResolutionResult} without JNI. */
+    static EnsResolutionResult ensResolutionFromJson(String name, String json) {
+        JsonObject o = parseResultOrThrow(json, "resolve-ens");
+        try {
+            String status = stringOrNull(o, "status");
+            long block = o.getLong("blockNumber", -1L);
+            // verified=false: the resolution IS proof-verified against the
+            // beacon-anchored optimistic head, but "verified" in this API means a
+            // beacon-FINALIZED root (see RustEnsApi) — don't overclaim.
+            return switch (status == null ? "" : status) {
+                case "ok" -> new EnsResolutionResult(
+                        name, stringOrNull(o, "addressHex"), block, false, null);
+                // API convention: addressHex==null && error==null is a SUCCESSFUL
+                // "name has no record".
+                case "noRecord" -> new EnsResolutionResult(name, null, block, false, null);
+                case "offchain" -> new EnsResolutionResult(name, null, block, false,
+                        "name resolves offchain (ERC-3668); CCIP-Read not yet supported"
+                        + " on the rust engine");
+                default -> throw new EngineException(
+                        "resolve-ens JSON: unknown status '" + status + "'");
+            };
+        } catch (EngineException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            throw new EngineException(
+                    "malformed resolve-ens JSON from the Rust engine: " + e.getMessage(), e);
         }
     }
 
