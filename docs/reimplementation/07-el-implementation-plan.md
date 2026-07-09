@@ -348,6 +348,27 @@ Spec: doc 03 §§3–7, doc 04 §3. New crate `myotis-evm` (sans-I/O; revm gated
    `Database` adapter; three cache tiers (per-call view / in-flight dedup / cross-call
    `StateProofCache` keyed by stateRoot — cryptographic facts, safe to share); `BytecodeCache`
    forever-valid; sync↔async bridge off I/O threads.
+   - **Landed (EL-C-1).** `myotis-evm` crate: sync `SnapStateOracle` trait (`fetch_account`/
+     `fetch_storage`/`fetch_bytecode`) + `OracleAccount` + closed `OracleError`
+     (`StateUnavailable`/`BytecodeUnavailable`/`InvalidProof`/`BlockHashUnsupported`) +
+     `FixtureSnapStateOracle`; `OracleDatabase` implementing revm `DatabaseRef` (three-tier
+     read: per-call view → cross-call `StateProofCache` → oracle); `StateProofCache`
+     (Noop + bounded-LRU `InMemory`) and `BytecodeCache` (Noop + forever `InMemory`), both
+     SPIs. Validated by a real revm `transact` of an SLOAD-return contract through the adapter.
+     Decisions: **revm `=41.0.0`, `default-features=false, features=["std"]`** — drops the
+     C precompile backends (c-kzg/libsecp256k1/blst) for revm's pure-Rust fallbacks, so
+     `cargo tree -p myotis-evm` COMPILES only k256 for crypto (`cargo tree -i c-kzg` /
+     `-i secp256k1-sys` print "nothing to print" — no C toolchain invoked, cargo-ndk/
+     mobile-clean). `c-kzg`/`secp256k1-sys` remain as unbuilt *entries* in the workspace
+     `Cargo.lock` (optional deps of `revm-precompile` that Cargo pins but our features never
+     enable). revm's 1.91 MSRV is met by the workspace `stable` toolchain. The oracle trait is **synchronous** (the
+     async→sync bridge belongs in the I/O impl that wraps `ElReader`, not this sans-I/O
+     crate); the **in-flight-dedup** tier is deferred to the async prefetch slice (a single
+     synchronous `transact` reads serially, so the per-call view cache already dedups). Not
+     on the wasm32 canary (revm pulls `std`). *Carried to EL-C-2:* the latest spec caps per-tx
+     gas at 2²⁴ (EIP-7825), so the 30 M `eth_call` ceiling needs the fork/`CfgEnv` selection
+     that C-2 owns; and precompile completeness under the pure-Rust backends (ecrecover via
+     k256, KZG via kzg-rs) must be verified when the EVM actually executes.
 2. **View calls + fork table.** Frame setup verbatim (zero-sender anonymous vs sender/value
    `eth_call` overload, `isStatic`, 30 M gas, EIP-7702 one-hop, BLOCKHASH unsupported →
    fail fast); mainnet fork schedule (throws below London; Shanghai keeps Istanbul
