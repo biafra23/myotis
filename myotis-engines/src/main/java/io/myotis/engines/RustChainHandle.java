@@ -62,6 +62,13 @@ final class RustChainHandle implements ChainHandle {
     /** The running JSON-RPC server, or null when disabled / not started. */
     private volatile io.myotis.jsonrpc.MyotisRpcServer rpcServer;
 
+    /** Head-freshness tracking for verifiedHeadAgeMs: the last optimistic-head block
+     *  number seen, and the monotonic time it was first seen. The reported age is the
+     *  elapsed time since the head last ADVANCED — a real age (0 → ~12 s per block,
+     *  growing if the head stalls), not a constant. */
+    private volatile long lastHeadBlock = -1L;
+    private volatile long lastHeadAdvanceNanos;
+
     RustChainHandle(long handle, String networkName, long chainId, int rpcPort) {
         this.handle = handle;
         this.networkName = networkName;
@@ -249,6 +256,12 @@ final class RustChainHandle implements ChainHandle {
         return new RustChainHandle(0L, network, 1L, 0).beaconStatus(ParsedStatus.parse(json));
     }
 
+    /** Package-private test seam: map a status JSON on THIS handle (so head-age
+     *  tracking persists across calls). Lets a test observe verifiedHeadAgeMs grow. */
+    StatusSnapshot statusFromJsonOnThisHandle(String json) {
+        return status(ParsedStatus.parse(json));
+    }
+
     private StatusSnapshot status(ParsedStatus s) {
         int peers = (int) Math.min(s.peerCount(), Integer.MAX_VALUE);
         // Older natives don't emit "targetPeriod" (parsed as 0): fall back to
@@ -261,14 +274,22 @@ final class RustChainHandle implements ChainHandle {
         // (optimistic head + finalized) come from the beacon anchor via the status.
         //
         // verifiedHeadAgeMs drives the host's readiness dot (< 45 s = ready/green).
-        // The Rust reader anchors every query to the peer's fresh head, so there is
-        // no separate head context to age: report 0 (fresh) exactly when a verified
-        // read CAN be served — SYNCED, with an anchored head and snap peers — else
-        // the Long.MAX_VALUE "no verified head yet" sentinel. This makes the dot
-        // match the engine's actual read capability (it was stuck amber before).
+        // The Rust reader anchors every query to the peer's fresh head; there's no
+        // separate head context to age, so age it by how long since the optimistic
+        // head last ADVANCED (a new block ~every 12 s resets it) — a REAL, changing
+        // age, not a constant. Reported only when a verified read CAN be served
+        // (SYNCED, an anchored head, snap peers); else the Long.MAX_VALUE "no
+        // verified head yet" sentinel. Monotonic nanoTime — a wall-clock/NTP jump
+        // must not distort the age.
+        long optHead = s.optimisticBlockNumber();
+        long nowNanos = System.nanoTime();
+        if (optHead != lastHeadBlock) {
+            lastHeadBlock = optHead;
+            lastHeadAdvanceNanos = nowNanos;
+        }
         long verifiedHeadAgeMs = (s.beaconState() == BeaconState.SYNCED
-                && s.optimisticBlockNumber() > 0 && s.snapPeers() > 0)
-                ? 0L
+                && optHead > 0 && s.snapPeers() > 0)
+                ? Math.max(0L, (nowNanos - lastHeadAdvanceNanos) / 1_000_000L)
                 : Long.MAX_VALUE;
         return new StatusSnapshot(
                 s.running(),

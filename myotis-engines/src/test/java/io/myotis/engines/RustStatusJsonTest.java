@@ -125,6 +125,22 @@ class RustStatusJsonTest {
     }
 
     @Test
+    void verifiedHeadAgeGrowsBetweenBlocksAndResetsOnAdvance() throws InterruptedException {
+        // One persistent handle polled repeatedly — the real on-device behavior.
+        RustChainHandle h = new RustChainHandle(0L, "mainnet", 1L, 0);
+        String synced = CATCHING_UP_JSON.replace("CATCHING_UP", "SYNCED"); // optimisticBlockNumber 21000010
+        long age1 = h.statusFromJsonOnThisHandle(synced).verifiedHeadAgeMs();
+        assertEquals(0L, age1);                       // just observed the head
+        Thread.sleep(20);
+        long age2 = h.statusFromJsonOnThisHandle(synced).verifiedHeadAgeMs();
+        assertTrue(age2 >= 15, "age must GROW at the same head, was " + age2); // not a constant
+        // A new block resets the age back toward 0.
+        String advanced = synced.replace("21000010", "21000011");
+        long age3 = h.statusFromJsonOnThisHandle(advanced).verifiedHeadAgeMs();
+        assertTrue(age3 < age2, "a new head must reset the age, was " + age3);
+    }
+
+    @Test
     void beaconStatusMapping() {
         BeaconStatus bs = RustChainHandle.beaconStatusFromJson("mainnet", CATCHING_UP_JSON);
         assertEquals(BeaconState.CATCHING_UP, bs.state());
