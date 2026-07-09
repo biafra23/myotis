@@ -49,6 +49,17 @@ pub enum CallOutcome {
     Unavailable(String),
 }
 
+/// The outcome of an `estimateGas`. `estimateGas` has no number for a revert or a
+/// failed/unverifiable run — the host maps `Unavailable` to a JSON-RPC null, like
+/// the Java engine.
+#[derive(Debug, Clone)]
+pub enum GasOutcome {
+    /// The gas-limit estimate (already buffered by the executor).
+    Estimate(u64),
+    /// No estimate (revert / halt / state unavailable). The string is diagnostic.
+    Unavailable(String),
+}
+
 /// Build a [`BlockContext`] from a verified head header. `chain_id` comes from the
 /// chain config (the header carries no chain id).
 pub fn block_context(header: &BlockHeader, chain_id: u64) -> Result<BlockContext, String> {

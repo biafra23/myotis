@@ -544,6 +544,32 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     }
 
     /**
+     * One verified {@code eth_estimateGas}: the gas-limit estimate, or null. {@code
+     * from} empty for an anonymous sender; {@code valueDecimal} is wei as a decimal
+     * string. Throws {@link EngineException} on a transport / not-running failure.
+     */
+    Long estimateGasVerified(String fromHex, String toHex, String dataHex, String valueDecimal) {
+        return estimateGasFromJson(
+                RustEngineNative.nativeEstimateGasJson(handle, fromHex, toHex, dataHex, valueDecimal));
+    }
+
+    /** Package-private test seam: estimateGas JSON → gas estimate (or null) without JNI. */
+    static Long estimateGasFromJson(String json) {
+        JsonObject o = parseResultOrThrow(json, "estimateGas");
+        try {
+            // Only "ok" carries a number; a revert / unavailable run has no estimate → null.
+            var gas = o.get("gas");
+            if ("ok".equals(stringOrNull(o, "status")) && gas != null && !gas.isNull()) {
+                return gas.asLong();
+            }
+            return null;
+        } catch (RuntimeException e) {
+            throw new EngineException(
+                    "malformed estimateGas JSON from the Rust engine: " + e.getMessage(), e);
+        }
+    }
+
+    /**
      * One verified 32-byte storage word at a RAW position (eth_getStorageAt), or
      * null when unverified. The value is left-padded to a full 32-byte word (a
      * zero/unset slot → 32 zero bytes). {@code position32Hex} is the 0x-hex 32-byte

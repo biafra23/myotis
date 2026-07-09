@@ -8,7 +8,7 @@
 //! serializes `{"error": "..."}`, which the Java side raises as an
 //! `EngineException`.
 
-use myotis_net::el::evm::CallOutcome;
+use myotis_net::el::evm::{CallOutcome, GasOutcome};
 use myotis_net::el::reader::{
     FeeEstimate, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedStorage,
 };
@@ -250,6 +250,24 @@ pub fn call_json(outcome: &CallOutcome) -> String {
             obj.insert("dataHex".into(), hex0x_var(data).into());
         }
         CallOutcome::Unavailable(reason) => {
+            obj.insert("status".into(), "unavailable".into());
+            obj.insert("reason".into(), reason.as_str().into());
+        }
+    }
+    serde_json::Value::Object(obj).to_string()
+}
+
+/// `estimateGas` result: `{"status":"ok","gas":N}` (a JSON number ≤ 30 M) or
+/// `{"status":"unavailable","reason":"…"}`. The Java side returns the number for
+/// `ok` and null otherwise (a reverting/unverifiable estimate has no number).
+pub fn estimate_json(outcome: &GasOutcome) -> String {
+    let mut obj = serde_json::Map::new();
+    match outcome {
+        GasOutcome::Estimate(gas) => {
+            obj.insert("status".into(), "ok".into());
+            obj.insert("gas".into(), json_u64(*gas));
+        }
+        GasOutcome::Unavailable(reason) => {
             obj.insert("status".into(), "unavailable".into());
             obj.insert("reason".into(), reason.as_str().into());
         }
@@ -501,6 +519,21 @@ mod tests {
         .unwrap();
         assert_eq!(un["status"], "unavailable");
         assert_eq!(un["reason"], "out of gas");
+    }
+
+    #[test]
+    fn estimate_json_shapes() {
+        let ok: serde_json::Value =
+            serde_json::from_str(&estimate_json(&GasOutcome::Estimate(24_150))).unwrap();
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(ok["gas"], 24_150);
+
+        let un: serde_json::Value = serde_json::from_str(&estimate_json(
+            &GasOutcome::Unavailable("execution reverted".to_string()),
+        ))
+        .unwrap();
+        assert_eq!(un["status"], "unavailable");
+        assert_eq!(un["reason"], "execution reverted");
     }
 
     fn sample_code() -> VerifiedCode {

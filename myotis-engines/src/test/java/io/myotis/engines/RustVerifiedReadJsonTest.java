@@ -244,6 +244,26 @@ class RustVerifiedReadJsonTest {
                 () -> RustChainHandle.callResultFromJson("{\"error\":\"no snap peer available\"}"));
     }
 
+    // ---- eth_estimateGas (estimateGasFromJson) ----
+
+    @Test
+    void okEstimateReturnsGasNumber() {
+        assertEquals(Long.valueOf(24_150L),
+                RustChainHandle.estimateGasFromJson("{\"status\":\"ok\",\"gas\":24150}"));
+    }
+
+    @Test
+    void unavailableEstimateIsNull() {
+        assertNull(RustChainHandle.estimateGasFromJson(
+                "{\"status\":\"unavailable\",\"reason\":\"execution reverted\"}"));
+    }
+
+    @Test
+    void estimateErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.estimateGasFromJson("{\"error\":\"handle not started\"}"));
+    }
+
     // ---- eth_getStorageAt (storageValueFromJson) ----
 
     @Test
