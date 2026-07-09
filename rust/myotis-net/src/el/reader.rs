@@ -636,10 +636,11 @@ impl ElReader {
         // per-fetch `block_on` is a fresh (non-nested) runtime entry.
         let joined = tokio::task::spawn_blocking(move || {
             let executor = EvmExecutor::new(oracle, proof_cache, bytecode_cache);
-            match from {
-                Some(f) => executor.call_view_from(f, to, &data, value, &ctx),
-                None => executor.call_view(to, &data, &ctx),
-            }
+            // A from-less call still honours `value` — the default sender is the zero
+            // ADDRESS, not zero value — so always thread `value` through
+            // call_view_from (call_view would force value = 0 and drop it).
+            let sender = from.unwrap_or([0u8; 20]);
+            executor.call_view_from(sender, to, &data, value, &ctx)
         })
         .await
         .map_err(|e| format!("eth_call task join error: {e}"))?;
