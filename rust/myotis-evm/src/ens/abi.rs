@@ -73,7 +73,7 @@ fn encode_bytes_args(args: &[&[u8]]) -> Vec<u8> {
 /// value exceeds [`MAX_INDEX`] (so a huge offset/length can't drive an OOB read or
 /// allocation).
 fn read_index(data: &[u8], pos: usize) -> Option<usize> {
-    let word = data.get(pos..pos + 32)?;
+    let word = data.get(pos..pos.checked_add(32)?)?;
     // High 24 bytes must be zero for the value to fit a sane index.
     if word[..24].iter().any(|&b| b != 0) {
         return None;

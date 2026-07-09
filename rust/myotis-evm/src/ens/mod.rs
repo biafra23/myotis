@@ -232,6 +232,13 @@ mod tests {
     const VITALIK: [u8; 20] = [0xd8; 20];
 
     #[test]
+    fn extended_resolver_id_is_the_resolve_selector() {
+        // The IExtendedResolver ERC-165 id is defined as the `resolve(bytes,bytes)`
+        // selector; lock the constant to it so an edit to either can't drift.
+        assert_eq!(EXTENDED_RESOLVER_INTERFACE_ID, abi::selector("resolve(bytes,bytes)"));
+    }
+
+    #[test]
     fn legacy_exact_resolver_resolves_addr() {
         let addr_sel = abi::selector("addr(bytes32)");
         let resolver_sel = abi::selector("resolver(bytes32)");
