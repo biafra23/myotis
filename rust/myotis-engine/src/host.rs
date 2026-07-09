@@ -451,6 +451,25 @@ pub fn get_block_by_number_json(handle: i64, block_tag: &str) -> String {
     }
 }
 
+/// `nativeFeeEstimateJson`: verified fee suggestion (`eth_gasPrice` +
+/// `eth_maxPriorityFeePerGas`) for a running handle. Returns
+/// `{"gasPriceWei":"…","maxPriorityFeePerGasWei":"…"}` (decimal wei), or
+/// `{"error": "..."}` when it can't verify right now. Both RPC methods read this
+/// one payload, so a paired gasPrice+maxPriorityFee poll shares a single compute.
+pub fn fee_estimate_json(handle: i64) -> String {
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    match engine.rt.block_on(async { reader.fee_estimate().await }) {
+        Ok(est) => eljson::fee_json(&est),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
 /// Parse an eth block selector to a target number: `None` = latest (the head).
 /// Mirrors the Java backend — latest/pending/safe/finalized all resolve to the
 /// optimistic head; earliest (genesis) and malformed/negative are not served

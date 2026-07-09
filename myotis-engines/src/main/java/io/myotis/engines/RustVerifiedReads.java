@@ -172,8 +172,28 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     @Override public String getBlockByHash(byte[] blockHash32, boolean fullTransactions) { return null; }
-    @Override public String gasPrice() { return null; }
-    @Override public String maxPriorityFeePerGas() { return null; }
+    @Override
+    public String gasPrice() {
+        // Decimal wei (next-block base fee + suggested tip), or null when unverifiable.
+        try {
+            return handle.feeEstimate().gasPriceWei();
+        } catch (RuntimeException e) {
+            log.debug("[engines] gasPrice unavailable: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    @Override
+    public String maxPriorityFeePerGas() {
+        // Decimal wei (median tip over recent verified blocks), or null.
+        try {
+            return handle.feeEstimate().maxPriorityFeePerGasWei();
+        } catch (RuntimeException e) {
+            log.debug("[engines] maxPriorityFeePerGas unavailable: {}", e.getMessage());
+            return null;
+        }
+    }
+
     @Override public String feeHistory(long blockCount, String newestBlock, double[] rewardPercentiles) { return null; }
     @Override public Long estimateGas(byte[] from, byte[] to, byte[] data, String valueWei) { return null; }
 

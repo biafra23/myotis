@@ -492,6 +492,54 @@ final class RustChainHandle implements ChainHandle {
         return json; // the verified block object
     }
 
+    /** A verified fee suggestion — both values decimal-wei strings. */
+    record FeeEstimate(String gasPriceWei, String maxPriorityFeePerGasWei) {}
+
+    /** How long a fee estimate is reused so a paired gasPrice+maxPriorityFee poll
+     *  shares one native compute (each is a 3-block verified fetch). */
+    private static final long FEE_CACHE_TTL_NANOS = 3_000_000_000L; // 3s
+    /** Value+timestamp in one volatile so a reader can't pair a fresh estimate with
+     *  a stale stamp (or vice versa). Monotonic nanoTime — immune to wall-clock/NTP
+     *  jumps that could otherwise expire the cache early or serve it too long. */
+    private record CachedFee(FeeEstimate est, long atNanos) {}
+    private volatile CachedFee cachedFee;
+
+    /**
+     * Verified fee suggestion, cached for {@link #FEE_CACHE_TTL_NANOS}. Throws
+     * {@link EngineException} when it can't verify (transport / not-running) — the
+     * error is never cached, so the next call retries.
+     */
+    FeeEstimate feeEstimate() {
+        CachedFee c = cachedFee;
+        if (c != null && System.nanoTime() - c.atNanos() < FEE_CACHE_TTL_NANOS) {
+            return c.est();
+        }
+        FeeEstimate est = feeFromJson(RustEngineNative.nativeFeeEstimateJson(handle));
+        cachedFee = new CachedFee(est, System.nanoTime());
+        return est;
+    }
+
+    /** Package-private test seam: fee JSON → {@link FeeEstimate} without JNI. */
+    static FeeEstimate feeFromJson(String json) {
+        JsonObject o = parseResultOrThrow(json, "fee");
+        String gas;
+        String tip;
+        try {
+            // Field extraction only — a type-mismatched value (asString on a non-
+            // string) is Rust-side shape drift → "malformed".
+            gas = stringOrNull(o, "gasPriceWei");
+            tip = stringOrNull(o, "maxPriorityFeePerGasWei");
+        } catch (RuntimeException e) {
+            throw new EngineException("malformed fee JSON from the Rust engine: " + e.getMessage(), e);
+        }
+        // Missing-field check OUTSIDE the try so its message isn't re-wrapped as
+        // "malformed" by the catch (EngineException is a RuntimeException).
+        if (gas == null || tip == null) {
+            throw new EngineException("fee JSON missing gasPriceWei/maxPriorityFeePerGasWei");
+        }
+        return new FeeEstimate(gas, tip);
+    }
+
     /** Package-private test seam: storage-at JSON → verified 32-byte word (or null). */
     static byte[] storageValueFromJson(String json) {
         JsonObject o = parseResultOrThrow(json, "storage");

@@ -23,7 +23,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 6; // 6: + nativeGetBlockByNumberJson
+    static final int EXPECTED_ABI_VERSION = 7; // 7: + nativeFeeEstimateJson
 
     private static final boolean AVAILABLE = load();
 
@@ -148,4 +148,12 @@ final class RustEngineNative {
      * handled Java-side (returns null before this native runs).
      */
     static native String nativeGetBlockByNumberJson(long handle, String blockTag);
+
+    /**
+     * Verified fee suggestion (`eth_gasPrice` + `eth_maxPriorityFeePerGas`) for a
+     * running handle, as JSON: {@code {"gasPriceWei":"…","maxPriorityFeePerGasWei":"…"}}
+     * (decimal wei), or an {@code "error"} object when it can't verify. Both RPC
+     * methods read this one payload so a paired poll shares a single compute.
+     */
+    static native String nativeFeeEstimateJson(long handle);
 }
