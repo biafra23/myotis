@@ -318,6 +318,16 @@ class RustVerifiedReadJsonTest {
     }
 
     @Test
+    void ensWithoutBlockNumberFailsClosed() {
+        // blockNumber is part of the pinned shape for every status — missing = drift.
+        assertThrows(EngineException.class, () -> RustChainHandle.ensResolutionFromJson(
+                "vitalik.eth",
+                "{\"status\":\"ok\",\"addressHex\":\"0xd8da6bf26964af9d7eed9e03e53415d37aa96045\"}"));
+        assertThrows(EngineException.class, () -> RustChainHandle.ensResolutionFromJson(
+                "vitalik.eth", "{\"status\":\"noRecord\"}"));
+    }
+
+    @Test
     void unknownEnsStatusFailsClosed() {
         assertThrows(EngineException.class, () -> RustChainHandle.ensResolutionFromJson(
                 "vitalik.eth", "{\"status\":\"weird\"}"));

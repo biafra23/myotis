@@ -61,7 +61,8 @@ final class RustEnsApi implements EnsApi {
             return handle.resolveEnsVerified(name);
         } catch (RuntimeException e) {
             // EngineException (transport / not running) or any unchecked failure:
-            // the EnsApi contract reports failures in the record, never throws.
+            // THIS impl folds every failure into the record's error (a deliberate
+            // divergence from the interface's throw-allowance — class javadoc).
             String why = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
             return new EnsResolutionResult(name, null, -1, false, why);
         }
@@ -104,6 +105,16 @@ final class RustEnsApi implements EnsApi {
 
     @Override
     public EnsInterfaceResult resolveInterfaceImplementer(String name, byte[] interfaceId4) {
-        return new EnsInterfaceResult(name, null, null, -1, false, NOT_IMPLEMENTED);
+        // Echo the queried id like JavaEnsApi does; a malformed id is its own error
+        // result (this impl never throws).
+        if (interfaceId4 == null || interfaceId4.length != 4) {
+            return new EnsInterfaceResult(name, null, null, -1, false,
+                    "interfaceId must be exactly 4 bytes");
+        }
+        StringBuilder hex = new StringBuilder("0x");
+        for (byte b : interfaceId4) {
+            hex.append(String.format("%02x", b));
+        }
+        return new EnsInterfaceResult(name, hex.toString(), null, -1, false, NOT_IMPLEMENTED);
     }
 }

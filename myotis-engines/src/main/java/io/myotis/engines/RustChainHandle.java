@@ -562,7 +562,13 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
         JsonObject o = parseResultOrThrow(json, "resolve-ens");
         try {
             String status = stringOrNull(o, "status");
-            long block = o.getLong("blockNumber", -1L);
+            // blockNumber is part of the pinned native shape for ALL statuses; a
+            // missing one is shape drift -> fail closed (like ok-without-address).
+            var bn = o.get("blockNumber");
+            if (bn == null || bn.isNull()) {
+                throw new EngineException("resolve-ens JSON: missing blockNumber");
+            }
+            long block = bn.asLong();
             // verified=false: the resolution IS proof-verified against the
             // beacon-anchored optimistic head, but "verified" in this API means a
             // beacon-FINALIZED root (see RustEnsApi) — don't overclaim.
