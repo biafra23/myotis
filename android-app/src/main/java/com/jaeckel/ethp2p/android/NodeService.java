@@ -516,11 +516,17 @@ public final class NodeService extends Service {
      *  on a poor network still completes first. */
     private static final long SYNC_RUN_CEILING_MS = 30 * 60_000L;
     private volatile java.util.concurrent.ScheduledExecutorService idleTicker;
-    /** The notification's current "title\ntext" content, so we re-notify only when it changes. */
+    /** The notification's current "title\ntext" content, so we re-notify only when it changes.
+     *  Guarded by {@link #notifLock} for an atomic diff-and-notify across the idle ticker,
+     *  boot threads, and the connectivity callback. */
     private volatile String notifiedContent;
+    private final Object notifLock = new Object();
     /** Default-network callback: refreshes the notification the moment connectivity changes,
      *  so "No network connection" appears/clears without waiting for the 30 s idle reconcile. */
     private volatile ConnectivityManager.NetworkCallback notifNetCallback;
+    /** Last device connectivity seen by the callback, so a capability jitter that doesn't flip
+     *  up↔down skips the (per-stack) readiness poll. */
+    private volatile Boolean lastNetworkUp;
 
     /** Note UI-originated activity so the idle controller keeps the node awake. */
     public void noteUiActivity() {
@@ -820,13 +826,17 @@ public final class NodeService extends Service {
     private void updateNotification() {
         if (!RUNNING.get()) return;
         try {
+            // Poll live state OUTSIDE the lock (status()/lifecycle() are blocking engine calls).
             String[] tt = notificationText();
             String key = tt[0] + "\n" + tt[1];
-            String shown = notifiedContent;
-            if (shown != null && shown.equals(key)) return;   // unchanged → skip the re-notify
-            notifiedContent = key;
-            NotificationManager nm = getSystemService(NotificationManager.class);
-            if (nm != null) nm.notify(NOTIFICATION_ID, buildNotification(tt[0], tt[1]));
+            // Diff-and-notify atomically so concurrent callers can't post out of order or both
+            // re-notify the same content; building the Notification is cheap (no engine calls).
+            synchronized (notifLock) {
+                if (key.equals(notifiedContent)) return;   // unchanged → skip the re-notify
+                notifiedContent = key;
+                NotificationManager nm = getSystemService(NotificationManager.class);
+                if (nm != null) nm.notify(NOTIFICATION_ID, buildNotification(tt[0], tt[1]));
+            }
         } catch (Throwable t) {
             LogBuffer.w(TAG, "notification update failed: " + t);
         }
@@ -886,17 +896,29 @@ public final class NodeService extends Service {
         try {
             ConnectivityManager cm = getSystemService(ConnectivityManager.class);
             if (cm == null) return;
+            lastNetworkUp = networkAvailable();   // seed so the first callback doesn't spuriously poll
             ConnectivityManager.NetworkCallback cb = new ConnectivityManager.NetworkCallback() {
-                @Override public void onAvailable(Network network) { updateNotification(); }
-                @Override public void onLost(Network network) { updateNotification(); }
+                @Override public void onAvailable(Network network) { onNotifConnectivityChanged(); }
+                @Override public void onLost(Network network) { onNotifConnectivityChanged(); }
                 @Override public void onCapabilitiesChanged(
-                        Network network, android.net.NetworkCapabilities caps) { updateNotification(); }
+                        Network network, android.net.NetworkCapabilities caps) { onNotifConnectivityChanged(); }
             };
             notifNetCallback = cb;
             cm.registerDefaultNetworkCallback(cb);
         } catch (Throwable t) {
             LogBuffer.w(TAG, "notification network callback registration failed: " + t);
         }
+    }
+
+    /** Refresh the notification only when device connectivity actually flipped up↔down —
+     *  capability callbacks fire often (signal / metering / validation changes) and each would
+     *  otherwise trigger a full per-stack readiness poll. */
+    private void onNotifConnectivityChanged() {
+        boolean up = networkAvailable();
+        Boolean prev = lastNetworkUp;
+        if (prev != null && prev == up) return;   // no real change → skip the readiness poll
+        lastNetworkUp = up;
+        updateNotification();
     }
 
     private void unregisterNotifNetworkCallback() {
@@ -1713,12 +1735,6 @@ public final class NodeService extends Service {
         unregisterNotifNetworkCallback();
         new Thread(this::doShutdown, "ethp2p-shutdown").start();
         super.onDestroy();
-    }
-
-    /** Build the ongoing notification from the current live state. */
-    private Notification buildNotification() {
-        String[] tt = notificationText();
-        return buildNotification(tt[0], tt[1]);
     }
 
     private Notification buildNotification(String title, String text) {
