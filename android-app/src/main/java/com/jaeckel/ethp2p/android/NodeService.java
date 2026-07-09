@@ -912,13 +912,21 @@ public final class NodeService extends Service {
 
     /** Refresh the notification only when device connectivity actually flipped up↔down —
      *  capability callbacks fire often (signal / metering / validation changes) and each would
-     *  otherwise trigger a full per-stack readiness poll. */
+     *  otherwise trigger a full per-stack readiness poll.
+     *
+     *  <p>NetworkCallback runs on the system's shared connectivity thread, so the blocking
+     *  readiness poll (h.status()) must NOT run here — offload to {@link #QUERY_POOL}. The
+     *  up↔down gate is checked under {@link #notifLock} so concurrent callbacks don't both poll. */
     private void onNotifConnectivityChanged() {
-        boolean up = networkAvailable();
-        Boolean prev = lastNetworkUp;
-        if (prev != null && prev == up) return;   // no real change → skip the readiness poll
-        lastNetworkUp = up;
-        updateNotification();
+        QUERY_POOL.execute(() -> {
+            boolean up = networkAvailable();
+            synchronized (notifLock) {
+                Boolean prev = lastNetworkUp;
+                if (prev != null && prev == up) return;   // no real change → skip the readiness poll
+                lastNetworkUp = up;
+            }
+            updateNotification();
+        });
     }
 
     private void unregisterNotifNetworkCallback() {
