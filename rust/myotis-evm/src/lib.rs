@@ -8,46 +8,48 @@
 //!
 //! This is the Rust twin of the Java `io.myotis.evm` module (see
 //! `docs/reimplementation/03` and the Milestone-C section of `…/07`). It is built
-//! up over several PRs; **EL-C-1 (this slice)** lands the foundation only:
+//! up over several PRs:
 //!
-//! * [`SnapStateOracle`] — the verified world-state trait, with an in-memory
-//!   [`FixtureSnapStateOracle`] for tests;
-//! * the cache tiers — [`StateProofCache`] (cross-call, `stateRoot`-keyed) and
-//!   [`BytecodeCache`] (content-addressed, forever), plus a per-call view cache
-//!   private to the adapter;
-//! * [`OracleDatabase`] — the `revm` `DatabaseRef` adapter over the oracle and
-//!   the caches.
+//! * the foundation ([`SnapStateOracle`] + [`FixtureSnapStateOracle`], the
+//!   [`StateProofCache`]/[`BytecodeCache`] tiers, and [`OracleDatabase`] — the
+//!   `revm` `DatabaseRef` adapter);
+//! * **EL-C-2 (this slice)**: the [`EvmExecutor`] — `eth_call` view calls over
+//!   verified state — and the mainnet [`fork`] table mapping
+//!   `(block_number, timestamp)` to a revm `SpecId`.
 //!
-//! The view-call / gas-estimation executor, the mainnet fork table, the async
-//! prefetch loop, and ENS/CCIP-Read arrive in the following Milestone-C slices.
+//! The async prefetch loop, `estimateGas`, and ENS/CCIP-Read arrive in the
+//! following slices.
 //!
-//! ## Wiring the EVM
+//! ## Running a view call
 //!
 //! ```ignore
 //! use std::sync::Arc;
-//! use myotis_evm::{OracleDatabase, cache::{NoopStateProofCache, NoopBytecodeCache}};
-//! use revm::database_interface::WrapDatabaseRef;
-//! use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
+//! use myotis_evm::{BlockContext, EvmExecutor, InMemoryStateProofCache, InMemoryBytecodeCache};
 //!
-//! let db = OracleDatabase::new(
-//!     oracle,                                  // Arc<dyn SnapStateOracle>
-//!     state_root,                              // the block's beacon-anchored root
-//!     Arc::new(NoopStateProofCache),
-//!     Arc::new(NoopBytecodeCache),
+//! let exec = EvmExecutor::new(
+//!     oracle,                                     // Arc<dyn SnapStateOracle>
+//!     Arc::new(InMemoryStateProofCache::new(8192)),
+//!     Arc::new(InMemoryBytecodeCache::new()),
 //! );
-//! let mut evm = Context::mainnet().with_db(WrapDatabaseRef(db)).build_mainnet();
-//! // evm.transact(TxEnv::builder()…build_fill())  // EL-C-2
+//! let ret = exec.call_view(token, &balance_of_calldata, &ctx)?; // BlockContext ctx
 //! ```
 
+pub mod block;
 pub mod cache;
 pub mod database;
+pub mod error;
+pub mod executor;
+pub mod fork;
 pub mod oracle;
 
+pub use block::BlockContext;
 pub use cache::{
     BytecodeCache, InMemoryBytecodeCache, InMemoryStateProofCache, NoopBytecodeCache,
     NoopStateProofCache, StateProofCache,
 };
 pub use database::OracleDatabase;
+pub use error::EvmError;
+pub use executor::EvmExecutor;
 pub use oracle::{OracleAccount, OracleError, SnapStateOracle};
 
 #[cfg(any(test, feature = "fixture"))]
