@@ -797,12 +797,13 @@ impl ElReader {
         if peers.is_empty() {
             return Err("no peer available to broadcast the transaction".to_string());
         }
-        let mut sent = 0usize;
-        for peer in &peers {
-            if peer.send_transaction(raw_tx).await.is_ok() {
-                sent += 1;
-            }
-        }
+        // Broadcast to all peers concurrently — the success criterion is just
+        // "≥1 peer received it", so there's no reason to serialize per-peer writes.
+        let sent = futures::future::join_all(peers.iter().map(|peer| peer.send_transaction(raw_tx)))
+            .await
+            .iter()
+            .filter(|r| r.is_ok())
+            .count();
         if sent == 0 {
             return Err("no peer accepted the transaction broadcast".to_string());
         }

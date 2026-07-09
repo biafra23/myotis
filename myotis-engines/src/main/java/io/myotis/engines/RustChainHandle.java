@@ -562,7 +562,18 @@ final class RustChainHandle implements ChainHandle {
         if (hex == null) {
             throw new EngineException("send-tx JSON missing txHash");
         }
-        return hexToBytes(hex);
+        byte[] hash;
+        try {
+            hash = hexToBytes(hex);
+        } catch (RuntimeException e) {
+            throw new EngineException("malformed send-tx txHash hex: " + e.getMessage(), e);
+        }
+        // A tx hash is exactly 32 bytes — fail closed rather than return a short/long
+        // array the caller (router → hexData) would silently mis-encode.
+        if (hash.length != 32) {
+            throw new EngineException("send-tx txHash is not 32 bytes: " + hash.length);
+        }
+        return hash;
     }
 
     /** Package-private test seam: storage-at JSON → verified 32-byte word (or null). */

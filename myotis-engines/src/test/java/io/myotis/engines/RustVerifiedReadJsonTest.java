@@ -300,4 +300,11 @@ class RustVerifiedReadJsonTest {
     void sendTxMissingHashThrows() {
         assertThrows(EngineException.class, () -> RustChainHandle.txHashFromJson("{}"));
     }
+
+    @Test
+    void sendTxNon32ByteHashThrows() {
+        // A txHash that isn't exactly 32 bytes fails closed (contract: 32-byte hash).
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.txHashFromJson("{\"txHash\":\"0xdead\"}"));
+    }
 }
