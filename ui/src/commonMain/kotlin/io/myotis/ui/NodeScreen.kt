@@ -103,6 +103,11 @@ fun NodeScreen(
     val onlineFlow = remember(netStatus) { netStatus.online() }
     val online by onlineFlow.collectAsState(initial = true)
     var tab by remember { mutableStateOf(0) }
+    // Logs-tab text filter, hoisted HERE deliberately: the `when (tab)` below disposes a
+    // tab's composition on switch, so any `remember` inside LogsTab dies with it. Living
+    // beside `tab` gives the filter the same lifetime as the tab selection itself (the
+    // level filter needs no hoisting — it write-throughs to logs.setLevel and is re-read).
+    var logFilter by remember { mutableStateOf("") }
 
     // Network selector: chips over the live stacks (or the enabled-set when stopped) drive which
     // chain Status + Query operate on, so a 2nd enabled chain (e.g. gnosis) is visible/queryable.
@@ -137,7 +142,7 @@ fun NodeScreen(
             when (tab) {
                 0 -> StatusTab(controller, current, network, online, onOpenNetworkSettings)
                 1 -> QueryTab(controller, settings, current, network, history)
-                2 -> LogsTab(logs)
+                2 -> LogsTab(logs, logFilter, onFilterChange = { logFilter = it })
                 3 -> SettingsTab(controller, settings, snapshots)
             }
         }
@@ -927,14 +932,13 @@ private fun StatusRow(key: String, value: String, color: Color? = null) {
  * copy the visible lines or clear the ring. Mirrors the Android Logs tab.
  */
 @Composable
-private fun LogsTab(logs: LogSource) {
+private fun LogsTab(logs: LogSource, filter: String, onFilterChange: (String) -> Unit) {
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
     val tz = remember { TimeZone.currentSystemDefault() }  // resolve once, not per row
     var lines by remember { mutableStateOf<List<LogLine>>(emptyList()) }
     var shown by remember { mutableStateOf<List<LogLine>>(emptyList()) }
     var lastVersion by remember { mutableStateOf(-1L) }
-    var filter by remember { mutableStateOf("") }
     var level by remember(logs) { mutableStateOf(logs.level()) }
 
     // Poll the cheap version counter; the O(n) snapshot of up to 50k lines runs off the main
@@ -985,7 +989,7 @@ private fun LogsTab(logs: LogSource) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
                 value = filter,
-                onValueChange = { filter = it },
+                onValueChange = onFilterChange,
                 label = { Text("Filter — tag or message") },
                 singleLine = true,
                 modifier = Modifier.weight(1f),
