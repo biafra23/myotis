@@ -11,16 +11,19 @@ use super::EnsError;
 
 /// The ENSIP-1 namehash of `name` (the 32-byte trie node). `namehash("") == 0`;
 /// otherwise `keccak256(namehash(parent) ‖ keccak256(label))` over labels
-/// right-to-left. Trailing dots are ignored (the root has no label), matching the
-/// Java `split(".")` trailing-empty removal.
+/// right-to-left. EVERY dot delimits a label — a trailing dot yields a trailing
+/// EMPTY label that hashes like any other (`namehash("eth.") != namehash("eth")`),
+/// exactly matching the Java `Namehash.of` (`split("\\.", -1)`, which keeps
+/// trailing empties). A trailing-dot name therefore lands on a node no real
+/// resolver serves → resolution fails safe with "no record" on both engines.
 pub fn namehash(name: &str) -> [u8; 32] {
     let mut node = [0u8; 32];
-    let lower = name.to_lowercase();
-    let trimmed = lower.trim_end_matches('.');
-    if trimmed.is_empty() {
+    if name.is_empty() {
         return node;
     }
-    for label in trimmed.split('.').rev() {
+    // `str::split('.')` keeps empty items (interior AND trailing), matching
+    // Java's `split("\\.", -1)`.
+    for label in name.to_lowercase().split('.').rev() {
         let label_hash = keccak256(label.as_bytes());
         node = keccak256_concat(&node, &label_hash);
     }
@@ -29,11 +32,13 @@ pub fn namehash(name: &str) -> [u8; 32] {
 
 /// The ENSIP-10 DNS wire encoding of `name`: each label as `<len><utf8>`,
 /// terminated by a `0x00` root byte. The root name encodes as `{0x00}`. Rejects
-/// an empty interior label or a label longer than 63 bytes (a malformed name a
-/// gateway would reject anyway).
+/// an empty label or a label longer than 63 bytes (a malformed name a gateway
+/// would reject anyway). At most ONE trailing dot is stripped (the FQDN root
+/// dot), matching the Java `DnsEncoder` — `"x.eth.."` is an empty-label error,
+/// not silently trimmed.
 pub fn dns_encode(name: &str) -> Result<Vec<u8>, EnsError> {
     let lower = name.to_lowercase();
-    let trimmed = lower.trim_end_matches('.');
+    let trimmed = lower.strip_suffix('.').unwrap_or(&lower);
     if trimmed.is_empty() {
         return Ok(vec![0x00]);
     }
@@ -80,10 +85,22 @@ mod tests {
     }
 
     #[test]
-    fn namehash_lowercases_and_ignores_trailing_dot() {
+    fn namehash_lowercases() {
         assert_eq!(namehash("VITALIK.ETH"), namehash("vitalik.eth"));
-        assert_eq!(namehash("eth."), namehash("eth"));
-        assert_eq!(namehash("vitalik.eth."), namehash("vitalik.eth"));
+    }
+
+    #[test]
+    fn namehash_trailing_dot_is_a_distinct_empty_label() {
+        // Java parity (`split("\\.", -1)`): a trailing dot adds an empty label, so
+        // the node differs from the undotted name — both engines then fail safe
+        // ("no record") for such input rather than diverging from each other.
+        assert_ne!(namehash("eth."), namehash("eth"));
+        assert_ne!(namehash("vitalik.eth."), namehash("vitalik.eth"));
+        // The exact recurrence: namehash("eth.") = node(root, "") then "eth".
+        let empty_label = keccak256(b"");
+        let step1 = keccak256_concat(&[0u8; 32], &empty_label);
+        let step2 = keccak256_concat(&step1, &keccak256(b"eth"));
+        assert_eq!(namehash("eth."), step2);
     }
 
     #[test]
@@ -105,5 +122,12 @@ mod tests {
         assert!(dns_encode("a..b").is_err()); // empty interior label
         let long = "x".repeat(64);
         assert!(dns_encode(&format!("{long}.eth")).is_err()); // > 63 bytes
+    }
+
+    #[test]
+    fn dns_encode_strips_at_most_one_trailing_dot() {
+        // One FQDN root dot is fine; a second is an empty label (Java DnsEncoder parity).
+        assert!(dns_encode("x.eth.").is_ok());
+        assert!(dns_encode("x.eth..").is_err());
     }
 }

@@ -78,8 +78,11 @@ fn read_index(data: &[u8], pos: usize) -> Option<usize> {
     if word[..24].iter().any(|&b| b != 0) {
         return None;
     }
-    let v = u64::from_be_bytes(word[24..32].try_into().ok()?) as usize;
-    (v <= MAX_INDEX).then_some(v)
+    // Bound-check in the u64 domain BEFORE casting: on a 32-bit target
+    // (armeabi-v7a Android), `as usize` would truncate — e.g. 2^32 → 0 — and
+    // silently bypass the MAX_INDEX guard.
+    let v = u64::from_be_bytes(word[24..32].try_into().ok()?);
+    (v <= MAX_INDEX as u64).then_some(v as usize)
 }
 
 /// Decode a 20-byte address from the first 32-byte word of `data` (left-padded).
@@ -96,10 +99,13 @@ pub fn decode_address(data: &[u8]) -> Option<[u8; 20]> {
     Some(addr)
 }
 
-/// Decode a `bool` from the first word of `data` (any non-zero → true).
+/// Decode a `bool` from the first word of `data`. Solidity's bool convention is
+/// the LAST byte of the word — only that byte is read (matching the Java
+/// `decodeBool`'s `result[31] != 0`), so a dirty word with a zero last byte is
+/// `false`, not misclassified as `true`.
 pub fn decode_bool(data: &[u8]) -> bool {
     match data.get(..32) {
-        Some(word) => word.iter().any(|&b| b != 0),
+        Some(word) => word[31] != 0,
         None => false,
     }
 }
@@ -107,7 +113,7 @@ pub fn decode_bool(data: &[u8]) -> bool {
 /// Decode the dynamic `bytes` at head slot `arg_index` (offset word → length word
 /// → data). `None` on any out-of-bounds / oversized field.
 pub fn decode_dynamic_bytes(data: &[u8], arg_index: usize) -> Option<Vec<u8>> {
-    let offset = read_index(data, arg_index * 32)?;
+    let offset = read_index(data, arg_index.checked_mul(32)?)?;
     let len = read_index(data, offset)?;
     let start = offset.checked_add(32)?;
     let end = start.checked_add(len)?;
@@ -144,6 +150,17 @@ mod tests {
         assert_eq!(decode_address(&word), None);
         // too short
         assert_eq!(decode_address(&[0u8; 20]), None);
+    }
+
+    #[test]
+    fn decode_bool_reads_only_the_last_byte() {
+        let mut dirty = [0u8; 32];
+        dirty[0] = 0xff; // dirty high byte, last byte zero → false (Solidity/Java)
+        assert!(!decode_bool(&dirty));
+        let mut truthy = [0u8; 32];
+        truthy[31] = 1;
+        assert!(decode_bool(&truthy));
+        assert!(!decode_bool(&[])); // short data → false
     }
 
     #[test]

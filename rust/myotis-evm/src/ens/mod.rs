@@ -9,8 +9,15 @@
 //!
 //! Scope of this slice: forward address resolution only. Reverse + forward-verify
 //! and CCIP-Read (`OffchainLookup`) offchain resolution are later slices — an
-//! `OffchainLookup` revert currently reads as "no record" (offchain names don't
-//! resolve until CCIP lands).
+//! `OffchainLookup` revert surfaces as the distinguishable
+//! [`EnsError::OffchainLookup`] (never folded into "no record"); driving the
+//! gateway arrives with CCIP (EL-C-5-3).
+//!
+//! One deliberate divergence from the Java `EnsResolver`: a NON-revert failure
+//! (state unavailable, halt) during the walk or `supportsInterface` probe
+//! propagates as [`EnsError::Call`] here, where Java folds it into "keep
+//! walking" / `false`. Failing closed is the safer contract — missing state must
+//! never read as "name unregistered".
 
 mod abi;
 mod name;
@@ -30,15 +37,26 @@ const REGISTRY: [u8; 20] = [
 /// `IExtendedResolver` (ENSIP-10 wildcard) ERC-165 interface id.
 const EXTENDED_RESOLVER_INTERFACE_ID: [u8; 4] = [0x90, 0x61, 0xb9, 0x23];
 
+/// The ERC-3668 `OffchainLookup(address,string[],bytes,bytes4,bytes)` revert
+/// selector — an offchain (CCIP-Read) name announcing itself.
+const OFFCHAIN_LOOKUP_SELECTOR: [u8; 4] = [0x55, 0x6f, 0x18, 0x30];
+
 /// An ENS resolution failure. `Ok(None)` from the resolver means "no record"
-/// (absent name, zero address, non-wildcard ancestor, or — for now — an offchain
-/// name); `EnsError` is a hard failure.
+/// (absent name, zero address, non-wildcard ancestor); `EnsError` is a hard
+/// failure — including an offchain name, which is DISTINGUISHABLE from "no
+/// record" (mirrors the Java `decodeOutcome`, which rethrows an `OffchainLookup`
+/// revert rather than folding it into empty).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnsError {
     /// The name is malformed (empty/oversized label).
     InvalidName(&'static str),
+    /// The resolver reverted with ERC-3668 `OffchainLookup`: the name resolves
+    /// OFFCHAIN via a CCIP-Read gateway, which this engine doesn't drive yet
+    /// (EL-C-5-3). Explicitly not "no record" — the record exists, offchain.
+    OffchainLookup,
     /// A resolution `eth_call` failed for a non-revert reason (state unavailable,
-    /// halt, unsupported chain). A revert is treated as "no record", not an error.
+    /// halt, unsupported chain). A plain revert is treated as "no record", not an
+    /// error.
     Call(EvmError),
 }
 
@@ -46,6 +64,10 @@ impl std::fmt::Display for EnsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EnsError::InvalidName(why) => write!(f, "invalid ENS name: {why}"),
+            EnsError::OffchainLookup => write!(
+                f,
+                "name resolves offchain (ERC-3668 OffchainLookup); CCIP-Read not yet supported"
+            ),
             EnsError::Call(e) => write!(f, "ENS resolution call failed: {e}"),
         }
     }
@@ -99,37 +121,58 @@ pub fn resolve_address(
 
     let node = namehash(name);
     let inner = abi::encode_call_bytes32("addr(bytes32)", &node);
+    // DNS-encode eagerly on BOTH paths (Java `dispatchResolve` parity): a
+    // malformed name (empty / oversized label) is rejected even when the legacy
+    // path wouldn't need the wire form.
+    let dns = dns_encode(name)?;
 
     let raw = if info.extended {
         // ENSIP-10: resolver.resolve(dnsEncode(name), addr(node)) → bytes wrapping
         // the inner return.
-        let dns = dns_encode(name)?;
         let call = abi::encode_resolve(&dns, &inner);
         match caller.eth_call(info.resolver, &call) {
             Ok(out) => match abi::decode_dynamic_bytes(&out, 0) {
                 Some(unwrapped) => unwrapped,
                 None => return Ok(None),
             },
-            // A plain revert (or an OffchainLookup, until CCIP lands) → no record.
-            Err(EvmError::Reverted { .. }) => return Ok(None),
+            Err(EvmError::Reverted { data }) => return revert_outcome(&data),
             Err(e) => return Err(EnsError::Call(e)),
         }
     } else {
         // Legacy exact resolver: resolver.addr(node) directly.
         match caller.eth_call(info.resolver, &inner) {
             Ok(out) => out,
-            Err(EvmError::Reverted { .. }) => return Ok(None),
+            Err(EvmError::Reverted { data }) => return revert_outcome(&data),
             Err(e) => return Err(EnsError::Call(e)),
         }
     };
 
-    // A zero address is "no record", not an answer.
+    // A zero address is "no record", not an answer. decode_address is stricter
+    // than the Java decoder (a dirty upper-12-byte word → None rather than
+    // slicing the trailing 20) — deliberately fail-safe for a fund-destination.
     Ok(abi::decode_address(&raw).filter(|a| a != &[0u8; 20]))
 }
 
-/// Walk the registry from the full name up to the root, returning the first
-/// non-zero resolver and whether it was found for the exact name + is a wildcard
-/// resolver.
+/// Classify a resolver-call revert: an ERC-3668 `OffchainLookup` is a
+/// distinguishable "resolves offchain" failure (never folded into "no record");
+/// any other revert is "no record".
+fn revert_outcome(data: &[u8]) -> Result<Option<[u8; 20]>, EnsError> {
+    if data.len() >= 4 && data[..4] == OFFCHAIN_LOOKUP_SELECTOR {
+        Err(EnsError::OffchainLookup)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Walk the registry from the full name up through its ancestors (the root node
+/// itself is NOT queried — Java's `walkResolver` stops at the last label, and the
+/// root has no resolver), returning the first non-zero resolver and whether it was
+/// found for the exact name + is a wildcard resolver.
+///
+/// The walk splits like Java's `split("\\.")`: trailing empty labels are dropped
+/// (interior ones kept), while [`namehash`] itself keeps them — the same
+/// asymmetry as the Java engine, so both engines treat a trailing-dot name
+/// identically (walk the trimmed suffixes, hash the raw name → "no record").
 fn find_resolver(caller: &dyn EthCaller, name: &str) -> Result<Option<ResolverInfo>, EnsError> {
     let lower = name.to_lowercase();
     let trimmed = lower.trim_end_matches('.');
@@ -139,7 +182,7 @@ fn find_resolver(caller: &dyn EthCaller, name: &str) -> Result<Option<ResolverIn
         trimmed.split('.').collect()
     };
 
-    for i in 0..=labels.len() {
+    for i in 0..labels.len() {
         let suffix = labels[i..].join(".");
         let suffix_node = namehash(&suffix);
         let call = abi::encode_call_bytes32("resolver(bytes32)", &suffix_node);
@@ -236,6 +279,60 @@ mod tests {
         // The IExtendedResolver ERC-165 id is defined as the `resolve(bytes,bytes)`
         // selector; lock the constant to it so an edit to either can't drift.
         assert_eq!(EXTENDED_RESOLVER_INTERFACE_ID, abi::selector("resolve(bytes,bytes)"));
+    }
+
+    #[test]
+    fn offchain_lookup_selector_is_locked() {
+        assert_eq!(
+            OFFCHAIN_LOOKUP_SELECTOR,
+            abi::selector("OffchainLookup(address,string[],bytes,bytes4,bytes)")
+        );
+    }
+
+    #[test]
+    fn offchain_lookup_revert_is_distinguishable_from_no_record() {
+        let resolver_sel = abi::selector("resolver(bytes32)");
+        let supports_sel = abi::selector("supportsInterface(bytes4)");
+        let resolve_sel = abi::selector("resolve(bytes,bytes)");
+        // A wildcard resolver that reverts with OffchainLookup(...) → the caller
+        // must see EnsError::OffchainLookup, NOT Ok(None).
+        let caller = MockCaller::new()
+            .on(move |t, cd| (t == REGISTRY && sel(cd) == resolver_sel).then(|| Ok(addr_word(RESOLVER))))
+            .on(move |t, cd| (t == RESOLVER && sel(cd) == supports_sel).then(|| Ok(bool_word(true))))
+            .on(move |t, cd| {
+                (t == RESOLVER && sel(cd) == resolve_sel).then(|| {
+                    let mut data = OFFCHAIN_LOOKUP_SELECTOR.to_vec();
+                    data.extend_from_slice(&[0u8; 32]); // truncated body — selector is enough
+                    Err(EvmError::Reverted { data })
+                })
+            });
+        assert_eq!(resolve_address(&caller, "offchain.eth"), Err(EnsError::OffchainLookup));
+        // A plain revert stays "no record".
+        let plain = MockCaller::new()
+            .on(move |t, cd| (t == REGISTRY && sel(cd) == resolver_sel).then(|| Ok(addr_word(RESOLVER))))
+            .on(move |t, cd| (t == RESOLVER && sel(cd) == supports_sel).then(revert))
+            .on(move |t, _cd| (t == RESOLVER).then(revert));
+        assert_eq!(resolve_address(&plain, "plain.eth"), Ok(None));
+    }
+
+    #[test]
+    fn dirty_supports_interface_word_is_not_extended() {
+        // A dirty word with a ZERO last byte must classify as legacy (Solidity
+        // bool = last byte), so the resolver is still queried via addr().
+        let resolver_sel = abi::selector("resolver(bytes32)");
+        let supports_sel = abi::selector("supportsInterface(bytes4)");
+        let addr_sel = abi::selector("addr(bytes32)");
+        let caller = MockCaller::new()
+            .on(move |t, cd| (t == REGISTRY && sel(cd) == resolver_sel).then(|| Ok(addr_word(RESOLVER))))
+            .on(move |t, cd| {
+                (t == RESOLVER && sel(cd) == supports_sel).then(|| {
+                    let mut dirty = vec![0u8; 32];
+                    dirty[0] = 0xff; // non-zero high byte, zero last byte
+                    Ok(dirty)
+                })
+            })
+            .on(move |t, cd| (t == RESOLVER && sel(cd) == addr_sel).then(|| Ok(addr_word(VITALIK))));
+        assert_eq!(resolve_address(&caller, "vitalik.eth").unwrap(), Some(VITALIK));
     }
 
     #[test]
