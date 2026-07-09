@@ -258,8 +258,18 @@ final class RustChainHandle implements ChainHandle {
         // EL pool/discovery counts now come from the Rust status JSON. The pool
         // keeps only snap-capable READY peers, so readyPeers == snapPeers (and
         // snapServingPeers is approximated by the same). Execution block numbers
-        // (optimistic head + finalized) now come from the beacon anchor via the
-        // status JSON; only verifiedHeadAgeMs remains a later follow-up.
+        // (optimistic head + finalized) come from the beacon anchor via the status.
+        //
+        // verifiedHeadAgeMs drives the host's readiness dot (< 45 s = ready/green).
+        // The Rust reader anchors every query to the peer's fresh head, so there is
+        // no separate head context to age: report 0 (fresh) exactly when a verified
+        // read CAN be served — SYNCED, with an anchored head and snap peers — else
+        // the Long.MAX_VALUE "no verified head yet" sentinel. This makes the dot
+        // match the engine's actual read capability (it was stuck amber before).
+        long verifiedHeadAgeMs = (s.beaconState() == BeaconState.SYNCED
+                && s.optimisticBlockNumber() > 0 && s.snapPeers() > 0)
+                ? 0L
+                : Long.MAX_VALUE;
         return new StatusSnapshot(
                 s.running(),
                 s.running() ? LifecycleState.RUNNING : LifecycleState.STOPPED,
@@ -283,7 +293,7 @@ final class RustChainHandle implements ChainHandle {
                 targetPeriod,
                 s.finalizedSlot() / 8192L, // finalizedPeriod (SLOTS_PER_SYNC_COMMITTEE_PERIOD)
                 targetPeriod,   // wallClockPeriod == the catch-up target
-                Long.MAX_VALUE, // verifiedHeadAgeMs (no verified RPC head yet)
+                verifiedHeadAgeMs,
                 List.<PeerInfo>of(),
                 // Idle-sleep metrics: the Rust engine does not idle-pause yet (pause()
                 // is a no-op — see below), so it never accrues pause stats.

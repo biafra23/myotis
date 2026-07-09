@@ -101,6 +101,27 @@ class RustStatusJsonTest {
         assertEquals(21000010L, s.optimisticBlockNumber());
         assertEquals(20999000L, s.finalizedBlockNumber());
         assertEquals(20999000L, s.executionBlockNumber());
+        // Not SYNCED → no verified head yet (readiness dot stays amber).
+        assertEquals(Long.MAX_VALUE, s.verifiedHeadAgeMs());
+    }
+
+    @Test
+    void syncedWithHeadAndPeersReportsFreshVerifiedHead() {
+        // SYNCED + an anchored optimistic head + snap peers → verified reads serve,
+        // so verifiedHeadAgeMs is 0 (fresh → ready/green), not the MAX sentinel.
+        String syncedJson = CATCHING_UP_JSON.replace("CATCHING_UP", "SYNCED");
+        StatusSnapshot s = RustChainHandle.statusFromJson("mainnet", syncedJson);
+        assertEquals(BeaconState.SYNCED, s.beaconState());
+        assertEquals(0L, s.verifiedHeadAgeMs());
+    }
+
+    @Test
+    void syncedButNoSnapPeersHasNoVerifiedHead() {
+        // SYNCED but zero snap peers → a verified read can't be served → MAX sentinel.
+        String noPeers = CATCHING_UP_JSON.replace("CATCHING_UP", "SYNCED")
+                .replace("\"snapPeers\":6", "\"snapPeers\":0");
+        StatusSnapshot s = RustChainHandle.statusFromJson("mainnet", noPeers);
+        assertEquals(Long.MAX_VALUE, s.verifiedHeadAgeMs());
     }
 
     @Test
