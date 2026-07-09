@@ -119,8 +119,10 @@ public final class ChainStack {
     /** Status source for the JSON-RPC myotis_status / myotis_beaconStatus methods; the
      *  wrapping handle late-binds it (see {@link #setStatusReads}) before start(). */
     private volatile io.myotis.api.NodeStatusReads statusReads;
-    /** Epoch ms of the first successful start; 0 until then. Drives {@link #uptimeSeconds()}. */
-    private volatile long startedAtMs;
+    /** Monotonic start time (ns) of the first start; drives {@link #uptimeSeconds()}. Paired
+     *  with {@link #started} because nanoTime()'s origin is arbitrary (0 is a valid reading). */
+    private volatile long startedAtNs;
+    private volatile boolean started;
 
     public ChainStack(NetworkConfig network,
                       ChainPorts ports,
@@ -184,7 +186,7 @@ public final class ChainStack {
      */
     public synchronized boolean start() {
         if (!phase.compareAndSet(STOPPED, RUNNING)) return true; // already started
-        if (startedAtMs == 0L) startedAtMs = System.currentTimeMillis();
+        if (!started) { startedAtNs = System.nanoTime(); started = true; }
         try {
             log.info("[{}] Node ID: {}", network.name(), nodeKey.nodeId().toHexString());
 
@@ -414,10 +416,10 @@ public final class ChainStack {
     /** Late-bind the JSON-RPC status source (the wrapping handle), before {@link #start()}. */
     public void setStatusReads(io.myotis.api.NodeStatusReads statusReads) { this.statusReads = statusReads; }
 
-    /** Node uptime in seconds since the first successful start; 0 before then. */
+    /** Node uptime in seconds since the first start; 0 before then. Monotonic (nanoTime),
+     *  so it's immune to wall-clock/NTP adjustments. */
     public long uptimeSeconds() {
-        long s = startedAtMs;
-        return s == 0L ? 0L : (System.currentTimeMillis() - s) / 1000L;
+        return !started ? 0L : (System.nanoTime() - startedAtNs) / 1_000_000_000L;
     }
 
     public int pauseCount() { return sleepMetrics.pauseCount(); }
