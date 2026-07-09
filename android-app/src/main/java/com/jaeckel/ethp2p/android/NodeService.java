@@ -1746,11 +1746,16 @@ public final class NodeService extends Service {
     }
 
     private Notification buildNotification(String title, String text) {
+        // Guard the channel creation like updateNotification() treats the manager as nullable —
+        // this also runs on the startForeground() path, which isn't wrapped in try/catch, so a
+        // (practically impossible) null manager must not NPE the service start.
         NotificationManager nm = getSystemService(NotificationManager.class);
-        NotificationChannel channel = new NotificationChannel(
-                CHANNEL_ID, "ethp2p node",
-                NotificationManager.IMPORTANCE_LOW);
-        nm.createNotificationChannel(channel);
+        if (nm != null) {
+            NotificationChannel channel = new NotificationChannel(
+                    CHANNEL_ID, "ethp2p node",
+                    NotificationManager.IMPORTANCE_LOW);
+            nm.createNotificationChannel(channel);
+        }
         return new Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle(title)
                 .setContentText(text)
