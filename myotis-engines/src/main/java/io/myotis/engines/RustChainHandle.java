@@ -540,6 +540,42 @@ final class RustChainHandle implements ChainHandle {
         return new FeeEstimate(gas, tip);
     }
 
+    /**
+     * Gossip a signed raw transaction and return its 32-byte hash. Throws
+     * {@link EngineException} when no peer could be reached / the input isn't a
+     * plausible tx. {@code rawTxHex} is the 0x-hex raw transaction.
+     */
+    byte[] sendRawTransactionVerified(String rawTxHex) {
+        return txHashFromJson(RustEngineNative.nativeSendRawTransactionJson(handle, rawTxHex));
+    }
+
+    /** Package-private test seam: send-tx JSON → the 32-byte tx hash (throws on error). */
+    static byte[] txHashFromJson(String json) {
+        JsonObject o = parseResultOrThrow(json, "sendRawTransaction");
+        String hex;
+        try {
+            hex = stringOrNull(o, "txHash");
+        } catch (RuntimeException e) {
+            throw new EngineException("malformed send-tx JSON from the Rust engine: " + e.getMessage(), e);
+        }
+        // Missing-field check OUTSIDE the try so its message isn't re-wrapped.
+        if (hex == null) {
+            throw new EngineException("send-tx JSON missing txHash");
+        }
+        byte[] hash;
+        try {
+            hash = hexToBytes(hex);
+        } catch (RuntimeException e) {
+            throw new EngineException("malformed send-tx txHash hex: " + e.getMessage(), e);
+        }
+        // A tx hash is exactly 32 bytes — fail closed rather than return a short/long
+        // array the caller (router → hexData) would silently mis-encode.
+        if (hash.length != 32) {
+            throw new EngineException("send-tx txHash is not 32 bytes: " + hash.length);
+        }
+        return hash;
+    }
+
     /** Package-private test seam: storage-at JSON → verified 32-byte word (or null). */
     static byte[] storageValueFromJson(String json) {
         JsonObject o = parseResultOrThrow(json, "storage");

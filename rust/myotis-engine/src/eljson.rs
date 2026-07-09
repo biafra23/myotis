@@ -231,6 +231,13 @@ pub fn fee_json(f: &FeeEstimate) -> String {
     serde_json::Value::Object(obj).to_string()
 }
 
+/// Serialize a broadcast transaction hash (`eth_sendRawTransaction`).
+pub fn tx_hash_json(hash: &[u8; 32]) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert("txHash".into(), hex0x(hash).into());
+    serde_json::Value::Object(obj).to_string()
+}
+
 /// A u64 as a minimal-hex QUANTITY (`0x0` for zero).
 fn hex_quantity(v: u64) -> String {
     format!("0x{v:x}")

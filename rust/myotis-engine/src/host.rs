@@ -451,6 +451,30 @@ pub fn get_block_by_number_json(handle: i64, block_tag: &str) -> String {
     }
 }
 
+/// `nativeSendRawTransactionJson`: gossip a signed raw transaction to peers and
+/// return `{"txHash":"0x…"}` (keccak256 of the raw tx), or `{"error": "..."}` when
+/// no peer could be reached / the input isn't a plausible tx. A WRITE — nothing is
+/// beacon-verified; the engine never signs. `raw_hex` is the 0x-hex raw tx.
+pub fn send_raw_transaction_json(handle: i64, raw_hex: &str) -> String {
+    let Some(raw) = parse_hex_bytes(raw_hex) else {
+        return eljson::error_json("invalid raw transaction hex");
+    };
+    if raw.is_empty() {
+        return eljson::error_json("empty raw transaction");
+    }
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    match engine.rt.block_on(async { reader.send_raw_transaction(&raw).await }) {
+        Ok(hash) => eljson::tx_hash_json(&hash),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
 /// `nativeFeeEstimateJson`: verified fee suggestion (`eth_gasPrice` +
 /// `eth_maxPriorityFeePerGas`) for a running handle. Returns
 /// `{"gasPriceWei":"…","maxPriorityFeePerGasWei":"…"}` (decimal wei), or
@@ -542,6 +566,26 @@ fn parse_address(hex: &str) -> Option<[u8; 20]> {
     let mut out = [0u8; 20];
     for (i, byte) in out.iter_mut().enumerate() {
         *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Parse a variable-length 0x-hex byte string (a raw transaction). `None` for odd
+/// length or a non-hex digit.
+fn parse_hex_bytes(hex: &str) -> Option<Vec<u8>> {
+    let hex = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
+    // Cap before allocating: a real tx is well under this (~1 MB), and the workspace
+    // builds with panic=abort, so an unbounded `with_capacity` on a hostile giant
+    // input could OOM-abort the JVM. Reject rather than allocate.
+    if hex.len() > 2 * 1024 * 1024 || hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let mut i = 0;
+    while i < hex.len() {
+        out.push(u8::from_str_radix(hex.get(i..i + 2)?, 16).ok()?);
+        i += 2;
     }
     Some(out)
 }
