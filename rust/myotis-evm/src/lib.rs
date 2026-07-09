@@ -42,6 +42,10 @@ pub mod executor;
 pub mod fork;
 pub mod oracle;
 
+// Re-exported so downstream crates implementing [`SnapStateOracle`] / building a
+// [`BlockContext`] can name revm's `U256` without depending on revm directly.
+pub use revm::primitives::U256;
+
 pub use block::BlockContext;
 pub use cache::{
     BytecodeCache, InMemoryBytecodeCache, InMemoryStateProofCache, NoopBytecodeCache,

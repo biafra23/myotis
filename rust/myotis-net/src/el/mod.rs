@@ -9,6 +9,7 @@
 pub mod anchor;
 pub mod discv4;
 pub mod eth;
+pub mod evm;
 pub mod peer;
 pub mod peercache;
 pub mod pool;

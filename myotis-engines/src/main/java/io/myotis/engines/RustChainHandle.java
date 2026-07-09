@@ -516,6 +516,34 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     }
 
     /**
+     * One verified {@code eth_call}: run it and return the result bytes, or null.
+     * {@code from} is empty for an anonymous sender; {@code valueDecimal} is wei as
+     * a decimal string. Throws {@link EngineException} on a transport / not-running
+     * failure (the adapter maps that to null).
+     */
+    byte[] ethCallVerified(
+            String fromHex, String toHex, String dataHex, String valueDecimal, String block) {
+        return callResultFromJson(
+                RustEngineNative.nativeEthCallJson(handle, fromHex, toHex, dataHex, valueDecimal, block));
+    }
+
+    /** Package-private test seam: call JSON → result bytes (or null) without JNI. */
+    static byte[] callResultFromJson(String json) {
+        JsonObject o = parseResultOrThrow(json, "call");
+        try {
+            // Only "ok" carries a result. A revert or an unavailable/unverifiable
+            // outcome is "no answer" → null, mirroring the reference engine (a
+            // reverting or unverifiable eth_call returns a JSON-RPC null, not -32000).
+            if ("ok".equals(stringOrNull(o, "status"))) {
+                return hexToBytes(stringOrNull(o, "resultHex")); // 0x / empty → empty bytes
+            }
+            return null;
+        } catch (RuntimeException e) {
+            throw new EngineException("malformed call JSON from the Rust engine: " + e.getMessage(), e);
+        }
+    }
+
+    /**
      * One verified 32-byte storage word at a RAW position (eth_getStorageAt), or
      * null when unverified. The value is left-padded to a full 32-byte word (a
      * zero/unset slot → 32 zero bytes). {@code position32Hex} is the 0x-hex 32-byte

@@ -24,7 +24,8 @@ pub mod ringlog;
 ///     nativeGetStorageProofJson), wired into the Java RustEngineNative /
 ///     RustChainHandle at the same time so no .so ever reports an ABI the
 ///     running Java engine treats as stale.
-pub const ABI_VERSION: i32 = 8;
+/// v9: added nativeEthCallJson (eth_call over verified state via the revm executor).
+pub const ABI_VERSION: i32 = 9;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
@@ -259,6 +260,33 @@ mod jni_shim {
         let address = read_string(&mut env, &address).unwrap_or_default();
         let position = read_string(&mut env, &position).unwrap_or_default();
         let json = crate::host::get_storage_at_json(handle, &address, &position);
+        match env.new_string(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// `RustEngineNative.nativeEthCallJson(long handle, String from, String to,
+    /// String data, String valueDecimal, String block)` — verified `eth_call` over
+    /// the revm executor. `from` empty ⇒ anonymous sender; `valueDecimal` is wei as
+    /// a decimal string.
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeEthCallJson(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        from: JString,
+        to: JString,
+        data: JString,
+        value: JString,
+        block: JString,
+    ) -> jstring {
+        let from = read_string(&mut env, &from).unwrap_or_default();
+        let to = read_string(&mut env, &to).unwrap_or_default();
+        let data = read_string(&mut env, &data).unwrap_or_default();
+        let value = read_string(&mut env, &value).unwrap_or_default();
+        let block = read_string(&mut env, &block).unwrap_or_default();
+        let json = crate::host::eth_call_json(handle, &from, &to, &data, &value, &block);
         match env.new_string(json) {
             Ok(s) => s.into_raw(),
             Err(_) => std::ptr::null_mut(),

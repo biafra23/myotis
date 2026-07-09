@@ -23,7 +23,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 8; // 8: + nativeSendRawTransactionJson
+    static final int EXPECTED_ABI_VERSION = 9; // 9: + nativeEthCallJson
 
     private static final boolean AVAILABLE = load();
 
@@ -138,6 +138,19 @@ final class RustEngineNative {
      * ERC-20 mapping form.
      */
     static native String nativeGetStorageAtJson(long handle, String address, String position);
+
+    /**
+     * A verified {@code eth_call} over the revm executor for a running handle, as
+     * JSON ({@code {"status":"ok","resultHex":"0x…"}} on success,
+     * {@code {"status":"revert","dataHex":"0x…"}} on a revert,
+     * {@code {"status":"unavailable","reason":"…"}} otherwise, or
+     * {@code {"error":"…"}} on a transport/bad-input failure). {@code from} is
+     * empty for an anonymous call; {@code value} is wei as a decimal string (an
+     * FFI-neutral scalar); {@code block} is the RPC block tag (already gated to the
+     * servable window on the Java side).
+     */
+    static native String nativeEthCallJson(
+            long handle, String from, String to, String data, String value, String block);
 
     /**
      * Verified {@code eth_getBlockByNumber} (transactions as hashes) for a running

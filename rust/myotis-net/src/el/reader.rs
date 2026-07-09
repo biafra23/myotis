@@ -27,9 +27,12 @@ use myotis_core::nodekey::NodeKey;
 use myotis_core::trie::{EMPTY_CODE_HASH, EMPTY_TRIE_ROOT};
 use myotis_core::triehash;
 
+use myotis_evm::{EvmError, EvmExecutor, InMemoryBytecodeCache, InMemoryStateProofCache, U256};
+
 use crate::el::anchor::ExecAnchor;
 use crate::el::discv4::{Discv4Config, Discv4Service};
 use crate::el::eth::session::EthConfig;
+use crate::el::evm::{block_context, CallOutcome, PoolOracle};
 use crate::el::peer::ManagedPeer;
 use crate::el::pool::{PeerPool, PoolConfig};
 use crate::el::snap::fetch::AccountOutcome;
@@ -202,7 +205,20 @@ pub struct ElReader {
     discovery: Discv4Service,
     pool: PeerPool,
     anchor: Arc<ExecAnchor>,
+    /// Cross-call EVM caches, shared across every `eth_call` on this reader. Both
+    /// hold `stateRoot`-keyed / content-addressed cryptographic facts, so reuse is
+    /// sound. Because a call pins to the CURRENT head (whose root advances ~every
+    /// 12 s), the win is on a burst of identical calls that land on the same head,
+    /// plus bytecode (content-addressed → never re-fetched once seen) — NOT across
+    /// a head advance. Freezing a per-block-number context so a slow retry reuses
+    /// the cache is a later dispatch-fairness refinement (EL-C-3).
+    evm_proof_cache: Arc<InMemoryStateProofCache>,
+    evm_bytecode_cache: Arc<InMemoryBytecodeCache>,
 }
+
+/// Per-kind bound for the cross-call state-proof cache (accounts and storage
+/// slots each). Generous — entries are small and eviction only trims the oldest.
+const EVM_PROOF_CACHE_ENTRIES: usize = 8192;
 
 impl ElReader {
     /// Start a mainnet reader with a freshly-generated ephemeral node key (the
@@ -249,7 +265,13 @@ impl ElReader {
         };
         let local_pubkey = key.public_key_bytes();
         let pool = PeerPool::start(key, local_pubkey, eth_cfg, cfg.pool_config, cache, rx);
-        Ok(ElReader { discovery, pool, anchor })
+        Ok(ElReader {
+            discovery,
+            pool,
+            anchor,
+            evm_proof_cache: Arc::new(InMemoryStateProofCache::new(EVM_PROOF_CACHE_ENTRIES)),
+            evm_bytecode_cache: Arc::new(InMemoryBytecodeCache::new()),
+        })
     }
 
     /// Count of live snap peers (for host status).
@@ -578,6 +600,55 @@ impl ElReader {
             }
         }
         Err(format!("all {total} snap peer(s) failed to serve verifiable bytecode: {last_err}"))
+    }
+
+    /// Verified `eth_call`: run a read-only call against the verified head's state.
+    ///
+    /// The block is pinned to the current verified head (the host gates the RPC
+    /// block param to the servable window before calling this, as it does for the
+    /// other reads). Builds a [`BlockContext`](myotis_evm::BlockContext) from the
+    /// head header, then runs the `revm` executor on a blocking thread — its
+    /// [`PoolOracle`] bridges each verified snap fetch to the network via
+    /// `block_on`, which is sound there (a blocking thread, not a runtime worker).
+    /// Returns [`CallOutcome`]: success data, revert data, or an unavailable/
+    /// unverifiable reason (the host maps the latter two to a JSON-RPC null).
+    pub async fn eth_call(
+        &self,
+        from: Option<[u8; 20]>,
+        to: [u8; 20],
+        data: Vec<u8>,
+        value: U256,
+        chain_id: u64,
+    ) -> Result<CallOutcome, String> {
+        let Some(block) = self.get_block_by_number(None).await? else {
+            return Err("no verified head to run eth_call against".to_string());
+        };
+        let ctx = block_context(&block.header, chain_id)?;
+        // Snapshot the snap peers once: one consistent set for the whole call.
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err("no snap peer available for eth_call".to_string());
+        }
+        let oracle = Arc::new(PoolOracle::new(peers, tokio::runtime::Handle::current()));
+        let proof_cache = Arc::clone(&self.evm_proof_cache);
+        let bytecode_cache = Arc::clone(&self.evm_bytecode_cache);
+        // Run the SYNCHRONOUS executor off the runtime worker so the oracle's
+        // per-fetch `block_on` is a fresh (non-nested) runtime entry.
+        let joined = tokio::task::spawn_blocking(move || {
+            let executor = EvmExecutor::new(oracle, proof_cache, bytecode_cache);
+            // A from-less call still honours `value` — the default sender is the zero
+            // ADDRESS, not zero value — so always thread `value` through
+            // call_view_from (call_view would force value = 0 and drop it).
+            let sender = from.unwrap_or([0u8; 20]);
+            executor.call_view_from(sender, to, &data, value, &ctx)
+        })
+        .await
+        .map_err(|e| format!("eth_call task join error: {e}"))?;
+        Ok(match joined {
+            Ok(bytes) => CallOutcome::Success(bytes),
+            Err(EvmError::Reverted { data }) => CallOutcome::Revert(data),
+            Err(other) => CallOutcome::Unavailable(other.to_string()),
+        })
     }
 
     /// Verified `eth_getBlockByNumber` (transactions as hashes). `target` is the
