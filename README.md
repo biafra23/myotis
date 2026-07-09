@@ -664,6 +664,8 @@ Ethereum's weak-subjectivity window is only ~28 hours of stake-weighted safety, 
 
 The task queries `/eth/v2/beacon/blocks/finalized` on three independent mainnet checkpoint providers (beaconstate.info, sync-mainnet.beaconcha.in, mainnet-checkpoint-sync.attestant.io), normalizes to the oldest observed finalized slot, re-queries each provider for the canonical block root at that slot, and requires byte-for-byte agreement before writing. Any disagreement aborts without modifying the source.
 
+The same machinery serves the other networks: `./gradlew refreshSepoliaCheckpoint` refreshes the `@checkpoint:sepolia` region from the eth-clients sepolia checkpoint providers, and `./gradlew refreshGnosisCheckpoint` refreshes `@checkpoint:gnosis` (its own task — Gnosis exposes a different API slice and fewer providers).
+
 ### Verification flow
 
 1. The beacon light client obtains a finalized execution state root (BLS-verified via sync committee signatures)
