@@ -283,22 +283,30 @@ final class RustChainHandle implements ChainHandle {
         // head last ADVANCED (a new block ~every 12 s resets it) — a REAL, changing
         // age, not a constant. Reported only when a verified read CAN be served
         // (SYNCED, an anchored head, snap peers); else the Long.MAX_VALUE "no
-        // verified head yet" sentinel. Monotonic nanoTime — a wall-clock/NTP jump
-        // must not distort the age.
+        // verified head yet" sentinel — and while NOT serveable we hold the advance
+        // clock at "now" so the age starts fresh the instant we become serveable
+        // (a not-serving stretch must not leak in as a stale age → amber flicker).
+        // Monotonic nanoTime — a wall-clock/NTP jump must not distort the age.
         long optHead = s.optimisticBlockNumber();
         long nowNanos = System.nanoTime();
-        long advanceNanos;
+        boolean serveable = s.beaconState() == BeaconState.SYNCED
+                && optHead > 0 && s.snapPeers() > 0;
+        long verifiedHeadAgeMs;
         synchronized (headAgeLock) {
-            if (optHead != lastHeadBlock) {
+            if (!serveable) {
+                // No verified head to age; keep the clock pinned to now so the first
+                // serveable poll starts near 0 rather than carrying the outage gap.
                 lastHeadBlock = optHead;
                 lastHeadAdvanceNanos = nowNanos;
+                verifiedHeadAgeMs = Long.MAX_VALUE;
+            } else {
+                if (optHead != lastHeadBlock) {
+                    lastHeadBlock = optHead;
+                    lastHeadAdvanceNanos = nowNanos;
+                }
+                verifiedHeadAgeMs = Math.max(0L, (nowNanos - lastHeadAdvanceNanos) / 1_000_000L);
             }
-            advanceNanos = lastHeadAdvanceNanos;
         }
-        long verifiedHeadAgeMs = (s.beaconState() == BeaconState.SYNCED
-                && optHead > 0 && s.snapPeers() > 0)
-                ? Math.max(0L, (nowNanos - advanceNanos) / 1_000_000L)
-                : Long.MAX_VALUE;
         return new StatusSnapshot(
                 s.running(),
                 s.running() ? LifecycleState.RUNNING : LifecycleState.STOPPED,

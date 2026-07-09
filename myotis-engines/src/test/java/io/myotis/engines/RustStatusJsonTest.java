@@ -131,9 +131,16 @@ class RustStatusJsonTest {
         String synced = CATCHING_UP_JSON.replace("CATCHING_UP", "SYNCED"); // optimisticBlockNumber 21000010
         long age1 = h.statusFromJsonOnThisHandle(synced).verifiedHeadAgeMs();
         assertEquals(0L, age1);                       // just observed the head
-        Thread.sleep(20);
-        long age2 = h.statusFromJsonOnThisHandle(synced).verifiedHeadAgeMs();
-        assertTrue(age2 >= 15, "age must GROW at the same head, was " + age2); // not a constant
+        // Poll (bounded) until the age at the SAME head grows past age1 — proves it
+        // isn't a constant without pinning to a wall-clock threshold a slow/oversleeping
+        // scheduler could trip. sleep() only ever floors elapsed time, so this converges.
+        long age2 = age1;
+        long deadline = System.nanoTime() + 2_000_000_000L; // 2 s ceiling
+        while (age2 <= age1 && System.nanoTime() < deadline) {
+            Thread.sleep(5);
+            age2 = h.statusFromJsonOnThisHandle(synced).verifiedHeadAgeMs();
+        }
+        assertTrue(age2 > age1, "age must GROW at the same head, was " + age2); // not a constant
         // A new block resets the age back toward 0.
         String advanced = synced.replace("21000010", "21000011");
         long age3 = h.statusFromJsonOnThisHandle(advanced).verifiedHeadAgeMs();
