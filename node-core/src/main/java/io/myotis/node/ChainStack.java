@@ -186,7 +186,6 @@ public final class ChainStack {
      */
     public synchronized boolean start() {
         if (!phase.compareAndSet(STOPPED, RUNNING)) return true; // already started
-        if (!started) { startedAtNs = System.nanoTime(); started = true; }
         try {
             log.info("[{}] Node ID: {}", network.name(), nodeKey.nodeId().toHexString());
 
@@ -227,6 +226,9 @@ public final class ChainStack {
             //    the refreshing DNS pool. The discv4-independent path NAT'd hosts need.
             if (maintainerEnabled) startPeerMaintainer();
 
+            // Anchor uptime only after a fully successful start (a failed start below tears
+            // the stack down via shutdown(), which clears `started` so a later start re-anchors).
+            if (!started) { startedAtNs = System.nanoTime(); started = true; }
             return true;
         } catch (Throwable t) {
             log.error("[{}] stack failed to start: {}", network.name(), t.toString());
@@ -347,6 +349,7 @@ public final class ChainStack {
      */
     public synchronized void shutdown() {
         phase.set(STOPPED);
+        started = false;   // a fresh start() after shutdown re-anchors uptime to that run
         ScheduledExecutorService pm = peerMaintainer;
         if (pm != null) { pm.shutdownNow(); peerMaintainer = null; }
         if (rpcServer != null) { try { rpcServer.stop(); } catch (Throwable ignored) {} }

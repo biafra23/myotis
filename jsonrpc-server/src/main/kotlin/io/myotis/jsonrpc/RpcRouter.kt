@@ -120,15 +120,17 @@ class RpcRouter(
             // Isolate the read like the IPC command does (CommandHandler wraps dispatch in
             // try/catch): a throw becomes a JSON-RPC error envelope, never a raw Ktor 500.
             return try {
+                val uptime = sr.uptimeSeconds()   // read once so both fields/branches agree
                 val result = if (method == "myotis_status")
-                    StatusJson.status(sr.status(), sr.uptimeSeconds())
+                    StatusJson.status(sr.status(), uptime)
                 else
-                    StatusJson.beaconStatus(sr.beaconStatus(), sr.uptimeSeconds())
+                    StatusJson.beaconStatus(sr.beaconStatus(), uptime)
                 logger.record(method, idStr, "LOCAL", 0)
                 resultEnvelope(id, result)
             } catch (e: Exception) {
                 logger.record(method, idStr, "ERROR", 0, -32603)
-                errorEnvelope(id, -32603, "status read failed: ${e.message}")
+                val detail = e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
+                errorEnvelope(id, -32603, "status read failed: $detail")
             }
         }
         val t0 = System.nanoTime()

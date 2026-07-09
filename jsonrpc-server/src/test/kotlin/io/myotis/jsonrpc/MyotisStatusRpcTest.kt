@@ -203,14 +203,19 @@ class MyotisStatusRpcTest {
     @Test fun myotisStatus_readThrows_errorsInternal_notRaw500() {
         // A throwing status source must become a JSON-RPC error envelope (like the IPC path),
         // not an unhandled exception surfacing as a raw HTTP 500.
+        // Throw with a NULL message so the error detail must fall back to the exception type
+        // (never the literal "status read failed: null").
         val throwing = object : NodeStatusReads {
-            override fun status(): StatusSnapshot = throw IllegalStateException("boom")
-            override fun beaconStatus(): BeaconStatus = throw IllegalStateException("boom")
+            override fun status(): StatusSnapshot = throw IllegalStateException()
+            override fun beaconStatus(): BeaconStatus = throw IllegalStateException()
             override fun uptimeSeconds() = 0L
         }
         val resp = route(throwing, """{"jsonrpc":"2.0","id":1,"method":"myotis_status","params":[]}""")
         val err = json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject
         assertEquals(-32603, err["code"]!!.jsonPrimitive.content.toInt())
+        val msg = err["message"]!!.jsonPrimitive.content
+        assertTrue(msg.contains("IllegalStateException"), "expected exception type in: $msg")
+        assertFalse(msg.contains("null"), "message must not leak a null: $msg")
     }
 
     @Test fun myotisStatus_unwired_errorsMethodNotSupported() {

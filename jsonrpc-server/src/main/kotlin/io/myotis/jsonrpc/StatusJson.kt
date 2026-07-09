@@ -23,7 +23,7 @@ import kotlinx.serialization.json.put
  * implied by `result` being present.
  *
  * The two serializers can't share code with CommandHandler (different module, no build
- * edge), so [StatusJsonTest] pins the shape to catch drift.
+ * edge), so [MyotisStatusRpcTest] pins the shape to catch drift.
  */
 internal object StatusJson {
 
