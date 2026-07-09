@@ -379,7 +379,9 @@ Spec: doc 03 §§3–7, doc 04 §3. New crate `myotis-evm` (sans-I/O; revm gated
      London). revm applies the correct precompile set per `SpecId`, so the "Shanghai keeps
      Istanbul precompiles" nuance needs no special handling (revm's `SHANGHAI` predates the
      Cancun KZG precompile). `BlockContext` (all fields from the verified header) →
-     `BlockEnv` (`prev_randao` feeds both `prevrandao` and `difficulty`). `EvmExecutor`
+     `BlockEnv` (post-merge `DIFFICULTY` reads `prevrandao`, so `difficulty` is 0 — its
+     true post-merge value; pre-merge difficulty and Cancun+ blob base fee aren't modelled,
+     as those blocks aren't servable). `EvmExecutor`
      with `call_view` (from-less zero sender) / `call_view_from` (explicit sender+value for
      `msg.sender`-gated contracts), a fresh per-call `OracleDatabase` over the shared
      caches, and `EvmError` (Reverted{data} / OutOfGas / Halted / ForkTooOld / Oracle /

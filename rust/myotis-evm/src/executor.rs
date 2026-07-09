@@ -45,6 +45,11 @@ pub const VIEW_CALL_GAS: u64 = 30_000_000;
 /// that needs `msg.sender` set (ERC-20 `transfer`/`approve`) uses [`EvmExecutor::call_view_from`].
 const VIEW_CALLER: Address = Address::ZERO;
 
+/// The only chain this executor runs: the fork table and `Context::mainnet()` are
+/// mainnet-specific, so a non-mainnet context is rejected rather than silently
+/// given mainnet forks. Relaxed when the fork table becomes chain-aware.
+const MAINNET_CHAIN_ID: u64 = 1;
+
 /// Executes view calls against verified state. Owns the shared cross-call caches,
 /// so repeated calls (e.g. a MetaMask number-pinned retry) reuse verified facts.
 pub struct EvmExecutor {
@@ -97,6 +102,13 @@ impl EvmExecutor {
         value: U256,
         ctx: &BlockContext,
     ) -> Result<Vec<u8>, EvmError> {
+        // Fail closed on a non-mainnet context: the fork table and Context::mainnet()
+        // below are mainnet-specific, so any other chain would run the wrong rules.
+        if ctx.chain_id != MAINNET_CHAIN_ID {
+            return Err(EvmError::UnsupportedChain {
+                chain_id: ctx.chain_id,
+            });
+        }
         let spec = spec_for(ctx.block_number, ctx.timestamp)?;
 
         let db = OracleDatabase::new(
@@ -328,6 +340,21 @@ mod tests {
             .call_view(TARGET, &[], &ctx(19_500_000, CANCUN_TIME + 1))
             .unwrap_err();
         assert!(matches!(err, EvmError::OutOfGas), "got {err:?}");
+    }
+
+    #[test]
+    fn non_mainnet_chain_is_rejected() {
+        let code = vec![
+            0x60u8, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+        ];
+        let exec = executor_with(code, None);
+        let mut c = ctx(19_500_000, CANCUN_TIME + 1);
+        c.chain_id = 100; // Gnosis — mainnet-only executor must fail closed
+        let err = exec.call_view(TARGET, &[], &c).unwrap_err();
+        assert!(
+            matches!(err, EvmError::UnsupportedChain { chain_id: 100 }),
+            "got {err:?}"
+        );
     }
 
     #[test]
