@@ -429,4 +429,55 @@ mod tests {
             .expect("cross-call hit");
         assert_eq!(info.balance, U256::from(500));
     }
+
+    #[test]
+    fn absent_account_is_cached_cross_call() {
+        // A proven ABSENCE must be cached cross-call too: an oracle that returns
+        // None once then errors proves the second call is served from the cache
+        // (Some(None)) rather than re-fetching an absent account.
+        struct AbsentOnce(AtomicUsize);
+        impl SnapStateOracle for AbsentOnce {
+            fn fetch_account(
+                &self,
+                _r: &[u8; 32],
+                _a: [u8; 20],
+            ) -> Result<Option<OracleAccount>, OracleError> {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(None)
+                } else {
+                    Err(OracleError::StateUnavailable {
+                        state_root: ROOT_A,
+                        address: ADDR,
+                        slot: None,
+                    })
+                }
+            }
+            fn fetch_storage(
+                &self,
+                _r: &[u8; 32],
+                _a: [u8; 20],
+                _s: U256,
+            ) -> Result<U256, OracleError> {
+                Ok(U256::ZERO)
+            }
+            fn fetch_bytecode(&self, _h: &[u8; 32]) -> Result<Vec<u8>, OracleError> {
+                Ok(Vec::new())
+            }
+        }
+        let oracle = Arc::new(AbsentOnce(AtomicUsize::new(0)));
+        let proofs: Arc<dyn StateProofCache> = Arc::new(InMemoryStateProofCache::new(16));
+        {
+            let d1 = db(
+                Arc::clone(&oracle) as Arc<dyn SnapStateOracle>,
+                ROOT_A,
+                Arc::clone(&proofs),
+                Arc::new(NoopBytecodeCache),
+            );
+            assert!(d1.basic_ref(Address::from(ADDR)).unwrap().is_none());
+        }
+        // Fresh call; the oracle would now error, so a clean `None` proves the
+        // absence was served from the cross-call cache.
+        let d2 = db(oracle, ROOT_A, proofs, Arc::new(NoopBytecodeCache));
+        assert!(d2.basic_ref(Address::from(ADDR)).unwrap().is_none());
+    }
 }

@@ -29,9 +29,25 @@ use crate::oracle::OracleAccount;
 /// Cross-call, `stateRoot`-keyed cache of proof-verified account and storage
 /// facts. Every getter/putter takes the `stateRoot` the fact was proven against;
 /// implementations MUST NOT return a value cached under a different root.
+///
+/// `get_account` returns `Option<Option<OracleAccount>>` so the two "absents" stay
+/// distinct: the OUTER `None` is a cache miss, while `Some(None)` is the cached,
+/// proof-verified fact that the account is ABSENT at this root. Absent-account
+/// reads are common in EVM execution (any never-touched address), so caching the
+/// exclusion proof — like storage caches a zero slot — keeps a repeated call from
+/// going cold to the oracle each time.
 pub trait StateProofCache: Send + Sync {
-    fn get_account(&self, state_root: &[u8; 32], address: &[u8; 20]) -> Option<OracleAccount>;
-    fn put_account(&self, state_root: &[u8; 32], address: &[u8; 20], account: &OracleAccount);
+    fn get_account(
+        &self,
+        state_root: &[u8; 32],
+        address: &[u8; 20],
+    ) -> Option<Option<OracleAccount>>;
+    fn put_account(
+        &self,
+        state_root: &[u8; 32],
+        address: &[u8; 20],
+        account: Option<OracleAccount>,
+    );
     fn get_storage(&self, state_root: &[u8; 32], address: &[u8; 20], slot: &U256) -> Option<U256>;
     fn put_storage(&self, state_root: &[u8; 32], address: &[u8; 20], slot: &U256, value: U256);
 }
@@ -42,10 +58,10 @@ pub trait StateProofCache: Send + Sync {
 pub struct NoopStateProofCache;
 
 impl StateProofCache for NoopStateProofCache {
-    fn get_account(&self, _root: &[u8; 32], _addr: &[u8; 20]) -> Option<OracleAccount> {
+    fn get_account(&self, _root: &[u8; 32], _addr: &[u8; 20]) -> Option<Option<OracleAccount>> {
         None
     }
-    fn put_account(&self, _root: &[u8; 32], _addr: &[u8; 20], _account: &OracleAccount) {}
+    fn put_account(&self, _root: &[u8; 32], _addr: &[u8; 20], _account: Option<OracleAccount>) {}
     fn get_storage(&self, _root: &[u8; 32], _addr: &[u8; 20], _slot: &U256) -> Option<U256> {
         None
     }
@@ -58,9 +74,10 @@ type StorageKey = ([u8; 32], [u8; 20], U256);
 /// A bounded, in-memory [`StateProofCache`]. Accounts and storage slots are
 /// bounded independently at `max_per_kind` entries, each evicting least-recently
 /// used. Thread-safe via a `Mutex` per kind (contention is trivial next to a
-/// network proof fetch).
+/// network proof fetch). The account value is `Option<OracleAccount>` so a
+/// proof-verified ABSENCE (`None`) is cached too.
 pub struct InMemoryStateProofCache {
-    accounts: Mutex<Lru<AccountKey, OracleAccount>>,
+    accounts: Mutex<Lru<AccountKey, Option<OracleAccount>>>,
     storage: Mutex<Lru<StorageKey, U256>>,
 }
 
@@ -76,14 +93,11 @@ impl InMemoryStateProofCache {
 }
 
 impl StateProofCache for InMemoryStateProofCache {
-    fn get_account(&self, root: &[u8; 32], addr: &[u8; 20]) -> Option<OracleAccount> {
+    fn get_account(&self, root: &[u8; 32], addr: &[u8; 20]) -> Option<Option<OracleAccount>> {
         self.accounts.lock().unwrap().get(&(*root, *addr)).cloned()
     }
-    fn put_account(&self, root: &[u8; 32], addr: &[u8; 20], account: &OracleAccount) {
-        self.accounts
-            .lock()
-            .unwrap()
-            .put((*root, *addr), account.clone());
+    fn put_account(&self, root: &[u8; 32], addr: &[u8; 20], account: Option<OracleAccount>) {
+        self.accounts.lock().unwrap().put((*root, *addr), account);
     }
     fn get_storage(&self, root: &[u8; 32], addr: &[u8; 20], slot: &U256) -> Option<U256> {
         self.storage

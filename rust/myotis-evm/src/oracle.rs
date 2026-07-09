@@ -118,9 +118,12 @@ impl std::error::Error for OracleError {}
 impl revm::database_interface::DBErrorMarker for OracleError {}
 
 fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+        // Writing into the buffer avoids the per-byte `String` a `format!` would
+        // allocate; `write!` to a `String` is infallible, so the result is ignored.
+        let _ = write!(s, "{b:02x}");
     }
     s
 }

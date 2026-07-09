@@ -357,8 +357,11 @@ Spec: doc 03 §§3–7, doc 04 §3. New crate `myotis-evm` (sans-I/O; revm gated
      SPIs. Validated by a real revm `transact` of an SLOAD-return contract through the adapter.
      Decisions: **revm `=41.0.0`, `default-features=false, features=["std"]`** — drops the
      C precompile backends (c-kzg/libsecp256k1/blst) for revm's pure-Rust fallbacks, so
-     `cargo tree` shows zero new C-linking crates (cargo-ndk/mobile-clean); revm's 1.91 MSRV
-     is met by the workspace `stable` toolchain. The oracle trait is **synchronous** (the
+     `cargo tree -p myotis-evm` COMPILES only k256 for crypto (`cargo tree -i c-kzg` /
+     `-i secp256k1-sys` print "nothing to print" — no C toolchain invoked, cargo-ndk/
+     mobile-clean). `c-kzg`/`secp256k1-sys` remain as unbuilt *entries* in the workspace
+     `Cargo.lock` (optional deps of `revm-precompile` that Cargo pins but our features never
+     enable). revm's 1.91 MSRV is met by the workspace `stable` toolchain. The oracle trait is **synchronous** (the
      async→sync bridge belongs in the I/O impl that wraps `ElReader`, not this sans-I/O
      crate); the **in-flight-dedup** tier is deferred to the async prefetch slice (a single
      synchronous `transact` reads serially, so the per-call view cache already dedups). Not

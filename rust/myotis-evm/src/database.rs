@@ -78,22 +78,23 @@ impl OracleDatabase {
         if let Some(cached) = self.view.lock().unwrap().accounts.get(&addr) {
             return Ok(cached.clone());
         }
-        // Tier 2 — a verified fact from an earlier call at this root.
-        if let Some(acc) = self.proof_cache.get_account(&self.state_root, &addr) {
+        // Tier 2 — a verified fact from an earlier call at this root. `Some(None)`
+        // is a cached ABSENCE (exclusion proof), still a hit — don't re-fetch.
+        if let Some(maybe_acc) = self.proof_cache.get_account(&self.state_root, &addr) {
             self.view
                 .lock()
                 .unwrap()
                 .accounts
-                .insert(addr, Some(acc.clone()));
-            return Ok(Some(acc));
+                .insert(addr, maybe_acc.clone());
+            return Ok(maybe_acc);
         }
         // Tier 3 — a fresh verified fetch. The lock is NOT held across it: the
         // oracle may block on the network, and a call runs single-threaded so
-        // there is no concurrent view-cache writer to race.
+        // there is no concurrent view-cache writer to race. Both a present account
+        // and a proven absence (`None`) are promoted to the cross-call cache.
         let fetched = self.oracle.fetch_account(&self.state_root, addr)?;
-        if let Some(ref acc) = fetched {
-            self.proof_cache.put_account(&self.state_root, &addr, acc);
-        }
+        self.proof_cache
+            .put_account(&self.state_root, &addr, fetched.clone());
         self.view
             .lock()
             .unwrap()
@@ -159,10 +160,14 @@ impl DatabaseRef for OracleDatabase {
         let got = keccak256(&bytes);
         if got != hash {
             return Err(OracleError::InvalidProof {
-                state_root: [0u8; 32],
+                // Carry the call's state root for telemetry; address is left zero
+                // because bytecode is content-addressed (keyed by code hash, not by
+                // an account) — the detail says so rather than implying an account.
+                state_root: self.state_root,
                 address: [0u8; 20],
                 detail: format!(
-                    "bytecode hash mismatch: expected {}, got {}",
+                    "bytecode hash mismatch (content-addressed, no account context): \
+                     expected {}, got {}",
                     B256::from(hash),
                     B256::from(got)
                 ),
