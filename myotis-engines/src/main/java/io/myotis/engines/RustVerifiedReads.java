@@ -92,7 +92,7 @@ final class RustVerifiedReads implements VerifiedReads {
 
     @Override
     public String getBalance(byte[] address, String block) {
-        if (!isHeadSelector(block)) return null;
+        if (!isServableBlock(block)) return null;
         AccountProofResult r = queryAccount(address);
         if (r == null || !isVerified(r)) return null;
         // A verified-absent account has balance 0 (eth semantics), even though the
@@ -102,7 +102,7 @@ final class RustVerifiedReads implements VerifiedReads {
 
     @Override
     public Long getTransactionCount(byte[] address, String block) {
-        if (!isHeadSelector(block)) return null;
+        if (!isServableBlock(block)) return null;
         AccountProofResult r = queryAccount(address);
         if (r == null || !isVerified(r)) return null;
         // Verified-absent → nonce 0 (r.nonce() is -1 when !exists). No pending
@@ -123,7 +123,7 @@ final class RustVerifiedReads implements VerifiedReads {
 
     @Override
     public byte[] getCode(byte[] address, String block) {
-        if (!isHeadSelector(block)) return null;
+        if (!isServableBlock(block)) return null;
         if (address == null || address.length != 20) return null;
         try {
             return handle.codeVerified(toHex(address));
@@ -135,7 +135,7 @@ final class RustVerifiedReads implements VerifiedReads {
 
     @Override
     public byte[] getStorageAt(byte[] address, byte[] slot32, String block) {
-        if (!isHeadSelector(block)) return null;
+        if (!isServableBlock(block)) return null;
         if (address == null || address.length != 20) return null;
         // The router pads the position to a full 32-byte word (asWord32) before the
         // call; reject anything else defensively.
@@ -206,7 +206,21 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     @Override public String feeHistory(long blockCount, String newestBlock, double[] rewardPercentiles) { return null; }
-    @Override public Long estimateGas(byte[] from, byte[] to, byte[] data, String valueWei) { return null; }
+    @Override
+    public Long estimateGas(byte[] from, byte[] to, byte[] data, String valueWei) {
+        // The trivial case only, without the EVM (EL-C): a plain value transfer to an
+        // EOA with no calldata costs exactly 21000 intrinsic gas. Anything else needs
+        // the EVM → null:
+        //  - to == null  → contract creation
+        //  - non-empty data → runs code
+        //  - a recipient WITH code (a contract, or a 7702-delegated EOA) → its
+        //    receive/fallback (or delegated code) can run on a bare value transfer.
+        if (to == null || to.length != 20) return null;
+        if (data != null && data.length != 0) return null;
+        byte[] code = getCode(to, "latest"); // verified recipient bytecode
+        if (code == null || code.length != 0) return null;
+        return 21_000L;
+    }
 
     // ---- helpers ----
 
@@ -234,10 +248,47 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     /** true for the head selector ("latest"/"pending"/default) the anchored reader serves. */
-    private static boolean isHeadSelector(String block) {
+    /** How far ABOVE the anchored head a number-pin is still served (the head may
+     *  advance a few blocks between eth_blockNumber and the pinned read). */
+    private static final long BLOCK_NUM_TOLERANCE = 16;
+    /** How far BELOW the anchored head a number-pin is still served from the head's
+     *  verified state (a genuinely older block can't be represented). */
+    private static final long BLOCK_NUM_LAG_TOLERANCE = 64;
+
+    /**
+     * Whether a block selector can be served from the anchored head. Accepts the
+     * head tags (latest/pending/safe/finalized/default) AND a specific block NUMBER
+     * within [head-64, head+16] — wallets (MetaMask) pin reads to the number they
+     * just got from eth_blockNumber, which is at/near the head; rejecting those
+     * left every number-pinned getBalance/getCode erroring. A genuinely older block
+     * (or earliest / not-synced) is not served (the reader is head-anchored).
+     * Mirrors the Java engine's {@code verifiedHeadFor} window.
+     */
+    private boolean isServableBlock(String block) {
+        // headBlockNumber() (a status read) is fetched only for the number path.
+        return blockInWindow(block, this::headBlockNumber);
+    }
+
+    /** Package-private, JNI-free: the block-window decision, with the anchored head
+     *  supplied lazily (fetched only when a numeric pin needs validating). */
+    static boolean blockInWindow(String block, java.util.function.Supplier<Long> head) {
         if (block == null || block.isBlank()) return true;
         String b = block.trim();
-        return b.equalsIgnoreCase("latest") || b.equalsIgnoreCase("pending");
+        if (b.equalsIgnoreCase("latest") || b.equalsIgnoreCase("pending")
+                || b.equalsIgnoreCase("safe") || b.equalsIgnoreCase("finalized")) {
+            return true;
+        }
+        if (b.equalsIgnoreCase("earliest")) return false;
+        long n;
+        try {
+            n = Long.decode(b); // 0x-hex or decimal block number
+        } catch (NumberFormatException e) {
+            return false;
+        }
+        if (n < 0) return false;
+        Long h = head.get();
+        if (h == null) return false; // not synced enough to validate the pin
+        return n >= h - BLOCK_NUM_LAG_TOLERANCE && n <= h + BLOCK_NUM_TOLERANCE;
     }
 
     /** Fixed-width bytes → lowercase 0x-hex (a 20-byte address or a 32-byte
