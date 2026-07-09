@@ -30,6 +30,7 @@ class RpcRouter(
     private val proxy: UpstreamProxy?,
     private val logger: MethodLogger,
     private val backend: io.myotis.api.VerifiedReads? = null,
+    private val statusReads: io.myotis.api.NodeStatusReads? = null,
 ) {
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
@@ -105,6 +106,40 @@ class RpcRouter(
         if (method == "myotis_rpcCoverage") {
             logger.record(method, idStr, "LOCAL", 0)
             return resultEnvelope(id, logger.coverage())
+        }
+        // Local node-status introspection — the JSON-RPC counterpart of the daemon's
+        // status / beacon-status IPC commands. Like myotis_rpcCoverage these bypass the
+        // verified backend, so a myotis-aware client can poll sync progress even when the
+        // node isn't synced / has no peers. -32601 when the host didn't wire a source.
+        if (method == "myotis_status" || method == "myotis_beaconStatus") {
+            val sr = statusReads
+            if (sr == null) {
+                logger.record(method, idStr, "ERROR", 0, -32601)
+                return errorEnvelope(id, -32601, "method '$method' is not supported by this node")
+            }
+            // Isolate the read like the IPC command does (CommandHandler wraps dispatch in
+            // try/catch): a throw becomes a JSON-RPC error envelope, never a raw Ktor 500.
+            return try {
+                // The reads can cross a JNI boundary into the native engine (the Rust host's
+                // nativeStatusJson), so run them on the IO dispatcher rather than blocking the
+                // Ktor CIO event loop — same as the verified handlers below. For the Java engine
+                // these are cheap in-memory reads, so this is a no-op there.
+                val result = withContext(Dispatchers.IO) {
+                    val uptime = sr.uptimeSeconds()   // read once so both fields/branches agree
+                    if (method == "myotis_status")
+                        StatusJson.status(sr.status(), uptime)
+                    else
+                        StatusJson.beaconStatus(sr.beaconStatus(), uptime)
+                }
+                logger.record(method, idStr, "LOCAL", 0)
+                resultEnvelope(id, result)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e   // never swallow coroutine cancellation (client disconnect / shutdown)
+            } catch (e: Exception) {
+                logger.record(method, idStr, "ERROR", 0, -32603)
+                val detail = e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
+                errorEnvelope(id, -32603, "status read failed: $detail")
+            }
         }
         val t0 = System.nanoTime()
         val verified = tryVerified(method, id, root)

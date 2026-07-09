@@ -116,6 +116,14 @@ public final class ChainStack {
     private volatile io.myotis.rpc.VerifiedRpcBackend rpcBackend;
     private volatile io.myotis.jsonrpc.MyotisRpcServer rpcServer;
 
+    /** Status source for the JSON-RPC myotis_status / myotis_beaconStatus methods; the
+     *  wrapping handle late-binds it (see {@link #setStatusReads}) before start(). */
+    private volatile io.myotis.api.NodeStatusReads statusReads;
+    /** Monotonic start time (ns) of the first start; drives {@link #uptimeSeconds()}. Paired
+     *  with {@link #started} because nanoTime()'s origin is arbitrary (0 is a valid reading). */
+    private volatile long startedAtNs;
+    private volatile boolean started;
+
     public ChainStack(NetworkConfig network,
                       ChainPorts ports,
                       NodeKey nodeKey,
@@ -218,6 +226,9 @@ public final class ChainStack {
             //    the refreshing DNS pool. The discv4-independent path NAT'd hosts need.
             if (maintainerEnabled) startPeerMaintainer();
 
+            // Anchor uptime only after a fully successful start (a failed start below tears
+            // the stack down via shutdown(), which clears `started` so a later start re-anchors).
+            if (!started) { startedAtNs = System.nanoTime(); started = true; }
             return true;
         } catch (Throwable t) {
             log.error("[{}] stack failed to start: {}", network.name(), t.toString());
@@ -338,6 +349,7 @@ public final class ChainStack {
      */
     public synchronized void shutdown() {
         phase.set(STOPPED);
+        started = false;   // a fresh start() after shutdown re-anchors uptime to that run
         ScheduledExecutorService pm = peerMaintainer;
         if (pm != null) { pm.shutdownNow(); peerMaintainer = null; }
         if (rpcServer != null) { try { rpcServer.stop(); } catch (Throwable ignored) {} }
@@ -404,6 +416,15 @@ public final class ChainStack {
     }
 
     // -- idle-sleep metrics (for status snapshots) --
+    /** Late-bind the JSON-RPC status source (the wrapping handle), before {@link #start()}. */
+    public void setStatusReads(io.myotis.api.NodeStatusReads statusReads) { this.statusReads = statusReads; }
+
+    /** Node uptime in seconds since the first start; 0 before then. Monotonic (nanoTime),
+     *  so it's immune to wall-clock/NTP adjustments. */
+    public long uptimeSeconds() {
+        return !started ? 0L : (System.nanoTime() - startedAtNs) / 1_000_000_000L;
+    }
+
     public int pauseCount() { return sleepMetrics.pauseCount(); }
     public long totalPausedMs() { return sleepMetrics.totalPausedMs(); }
     public long lastPauseEpochMs() { return sleepMetrics.lastPauseEpochMs(); }
@@ -772,7 +793,7 @@ public final class ChainStack {
                 // it survives pause() (keeps listening) while the backend underneath
                 // is torn down and rebuilt, and a request on a paused stack wakes it.
                 io.myotis.jsonrpc.MyotisRpcServer server =
-                        new io.myotis.jsonrpc.MyotisRpcServer(rpcPort, null, "127.0.0.1", gatedReads);
+                        new io.myotis.jsonrpc.MyotisRpcServer(rpcPort, null, "127.0.0.1", gatedReads, statusReads);
                 server.start();
                 this.rpcServer = server;
                 this.rpcBackend = backend;

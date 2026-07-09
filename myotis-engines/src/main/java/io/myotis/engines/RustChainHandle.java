@@ -15,6 +15,7 @@ import io.myotis.api.EngineException;
 import io.myotis.api.EnsApi;
 import io.myotis.api.HeadersResult;
 import io.myotis.api.LifecycleState;
+import io.myotis.api.NodeStatusReads;
 import io.myotis.api.PeerInfo;
 import io.myotis.api.StatusSnapshot;
 import io.myotis.api.StorageProofResult;
@@ -45,7 +46,7 @@ import java.util.List;
  * {@code 127.0.0.1:rpcPort} backed by {@link RustVerifiedReads}, mirroring how the
  * Java engine self-starts it inside {@code ChainStack}.
  */
-final class RustChainHandle implements ChainHandle {
+final class RustChainHandle implements ChainHandle, NodeStatusReads {
 
     private static final Logger log = LoggerFactory.getLogger(RustChainHandle.class);
 
@@ -61,6 +62,11 @@ final class RustChainHandle implements ChainHandle {
     private final RustVerifiedReads verifiedReads = new RustVerifiedReads(this);
     /** The running JSON-RPC server, or null when disabled / not started. */
     private volatile io.myotis.jsonrpc.MyotisRpcServer rpcServer;
+
+    /** Monotonic start time (ns) of the current run; drives {@link #uptimeSeconds()}. Paired
+     *  with {@link #started} because nanoTime()'s origin is arbitrary (0 is a valid reading). */
+    private volatile long startedAtNs;
+    private volatile boolean started;
 
     /** Head-freshness tracking for verifiedHeadAgeMs: the last optimistic-head block
      *  number seen, and the monotonic time it was first seen. The reported age is the
@@ -88,7 +94,11 @@ final class RustChainHandle implements ChainHandle {
     public synchronized boolean start() {
         boolean ok = RustEngineNative.nativeStart(handle);
         // Only expose the verified JSON-RPC endpoint once the native stack is up.
-        if (ok) startRpc();
+        if (ok) {
+            // Anchor uptime to this successful start (cleared in stop() so a restart re-anchors).
+            if (!started) { startedAtNs = System.nanoTime(); started = true; }
+            startRpc();
+        }
         return ok;
     }
 
@@ -100,6 +110,7 @@ final class RustChainHandle implements ChainHandle {
             try { server.stop(); } catch (Throwable ignored) {}
             this.rpcServer = null;
         }
+        started = false;   // a fresh start() after stop re-anchors uptime to that run
         RustEngineNative.nativeStop(handle);
     }
 
@@ -142,6 +153,13 @@ final class RustChainHandle implements ChainHandle {
         return System.currentTimeMillis();
     }
 
+    /** {@link NodeStatusReads}: node uptime for the JSON-RPC myotis_status result. Monotonic
+     *  (nanoTime), so it's immune to wall-clock/NTP adjustments; 0 before the first start. */
+    @Override
+    public long uptimeSeconds() {
+        return !started ? 0L : (System.nanoTime() - startedAtNs) / 1_000_000_000L;
+    }
+
     /**
      * Start the shared {@code jsonrpc-server} on {@code 127.0.0.1:rpcPort}, backed by
      * {@link RustVerifiedReads} — the Rust-engine counterpart to
@@ -160,7 +178,7 @@ final class RustChainHandle implements ChainHandle {
                 probe.bind(new java.net.InetSocketAddress("127.0.0.1", rpcPort));
             }
             io.myotis.jsonrpc.MyotisRpcServer server =
-                    new io.myotis.jsonrpc.MyotisRpcServer(rpcPort, null, "127.0.0.1", verifiedReads);
+                    new io.myotis.jsonrpc.MyotisRpcServer(rpcPort, null, "127.0.0.1", verifiedReads, this);
             server.start();
             this.rpcServer = server;
             log.info("[{}] JSON-RPC listening on http://127.0.0.1:{} (verified, strict)",
