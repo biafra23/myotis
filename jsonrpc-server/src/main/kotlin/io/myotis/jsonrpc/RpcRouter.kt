@@ -133,6 +133,8 @@ class RpcRouter(
                 }
                 logger.record(method, idStr, "LOCAL", 0)
                 resultEnvelope(id, result)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e   // never swallow coroutine cancellation (client disconnect / shutdown)
             } catch (e: Exception) {
                 logger.record(method, idStr, "ERROR", 0, -32603)
                 val detail = e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
