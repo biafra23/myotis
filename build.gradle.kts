@@ -150,7 +150,8 @@ fun registerCheckpointRefresh(taskName: String, network: String, endpoints: List
         val finalRoot = distinct.single().removePrefix("0x")
         val period = minSlot / 8192
         // Shared with the Java-side genesis constants via gradle.properties
-        val genesis = (project.property(genesisTimeProperty) as String).toLong()
+        val genesis = (project.findProperty(genesisTimeProperty) as? String)?.takeIf { it.isNotBlank() }?.toLongOrNull()
+            ?: throw GradleException("Property '$genesisTimeProperty' is missing, blank, or not a valid Long")
         val ts = Instant.ofEpochSecond(genesis + minSlot * 12)
         val date = DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(ZoneOffset.UTC).format(ts)
 
