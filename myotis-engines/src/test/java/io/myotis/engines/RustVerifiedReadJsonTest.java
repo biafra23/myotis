@@ -206,6 +206,44 @@ class RustVerifiedReadJsonTest {
                 () -> RustChainHandle.codeFromJson("{\"error\":\"no snap peer available\"}"));
     }
 
+    // ---- eth_call (callResultFromJson) ----
+
+    @Test
+    void okCallReturnsResultBytes() {
+        String json = "{\"status\":\"ok\",\"resultHex\":\"0x00000000000000000000000000000000"
+                + "0000000000000000000000000000002a\"}";
+        byte[] out = RustChainHandle.callResultFromJson(json);
+        byte[] expected = new byte[32];
+        expected[31] = 0x2a;
+        assertArrayEquals(expected, out);
+    }
+
+    @Test
+    void emptyOkCallIsEmptyArray() {
+        // A call that returns no data (resultHex "0x") → empty bytes, not null.
+        assertArrayEquals(new byte[0],
+                RustChainHandle.callResultFromJson("{\"status\":\"ok\",\"resultHex\":\"0x\"}"));
+    }
+
+    @Test
+    void revertedCallIsNull() {
+        // A revert carries data but is "no answer" at the RPC layer → null.
+        String json = "{\"status\":\"revert\",\"dataHex\":\"0x08c379a0\"}";
+        assertNull(RustChainHandle.callResultFromJson(json));
+    }
+
+    @Test
+    void unavailableCallIsNull() {
+        assertNull(RustChainHandle.callResultFromJson(
+                "{\"status\":\"unavailable\",\"reason\":\"out of gas\"}"));
+    }
+
+    @Test
+    void callErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.callResultFromJson("{\"error\":\"no snap peer available\"}"));
+    }
+
     // ---- eth_getStorageAt (storageValueFromJson) ----
 
     @Test

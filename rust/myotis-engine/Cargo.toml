@@ -16,6 +16,9 @@ myotis-consensus = { path = "../myotis-consensus" }
 # runtime of their own) — this is the only crate that pulls in tokio/libp2p; the
 # consensus crate stays sans-I/O.
 myotis-net = { path = "../myotis-net" }
+# Direct dep for U256 (value parsing) + the eth_call bridge types; also pulled
+# transitively via myotis-net. revm is gated inside myotis-evm.
+myotis-evm = { path = "../myotis-evm" }
 tokio = { version = "=1.52.3", features = ["rt-multi-thread"] }
 jni = { version = "0.21", default-features = false }
 # Compound values cross the JNI boundary as JSON (hand-JNI + JSON decision —

@@ -151,9 +151,29 @@ final class RustVerifiedReads implements VerifiedReads {
         }
     }
 
-    // ---- not yet served verified on the Rust engine (later EL-B / EL-C slices) ----
+    @Override
+    public byte[] call(byte[] from, byte[] to, byte[] data, String valueWei, String block) {
+        if (!isServableBlock(block)) return null;
+        if (to == null || to.length != 20) return null;        // 'to' is required
+        if (from != null && from.length != 20) return null;    // if present, must be 20 bytes
+        try {
+            // 'from' empty → anonymous zero sender; the revm executor runs the call
+            // over verified state and returns the result bytes (or null on a revert /
+            // unverifiable outcome, matching the reference engine).
+            return handle.ethCallVerified(
+                    from == null ? "" : toHex(from),
+                    toHex(to),
+                    data == null ? "" : toHex(data),
+                    valueWei == null ? "" : valueWei,
+                    block);
+        } catch (RuntimeException e) {
+            log.debug("[engines] verified eth_call unavailable: {}", e.getMessage());
+            return null;
+        }
+    }
 
-    @Override public byte[] call(byte[] from, byte[] to, byte[] data, String valueWei, String block) { return null; }
+    // ---- not yet served verified on the Rust engine (later EL-C slices) ----
+
     @Override
     public byte[] sendRawTransaction(byte[] rawTx) {
         if (rawTx == null || rawTx.length == 0) return null;

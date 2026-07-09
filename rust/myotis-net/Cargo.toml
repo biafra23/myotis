@@ -13,6 +13,9 @@ license = "MIT OR Apache-2.0"
 myotis-consensus = { path = "../myotis-consensus" }
 # EL primitives (keccak, RLP, NodeKey, ENR) — sans-I/O, same one-way rule.
 myotis-core = { path = "../myotis-core" }
+# The EVM (revm-backed) for eth_call over verified state — the I/O crate implements
+# myotis-evm's sync SnapStateOracle trait and bridges it to the async snap fetch path.
+myotis-evm = { path = "../myotis-evm" }
 
 # Exact pins: this crate owns the I/O surface and interop with live CL peers
 # depends on wire-level behavior of these exact versions (noise/yamux framing,

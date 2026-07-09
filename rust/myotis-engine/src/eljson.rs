@@ -8,6 +8,7 @@
 //! serializes `{"error": "..."}`, which the Java side raises as an
 //! `EngineException`.
 
+use myotis_net::el::evm::CallOutcome;
 use myotis_net::el::reader::{
     FeeEstimate, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedStorage,
 };
@@ -232,6 +233,30 @@ pub fn fee_json(f: &FeeEstimate) -> String {
 }
 
 /// Serialize a broadcast transaction hash (`eth_sendRawTransaction`).
+/// `eth_call` result: `{"status":"ok","resultHex":"0x…"}` on success,
+/// `{"status":"revert","dataHex":"0x…"}` on a revert, or
+/// `{"status":"unavailable","reason":"…"}` when it couldn't be executed/verified.
+/// The Java side returns the bytes for `ok` and a JSON-RPC null for the other two
+/// (matching the reference engine, which treats revert/unavailable as "no answer").
+pub fn call_json(outcome: &CallOutcome) -> String {
+    let mut obj = serde_json::Map::new();
+    match outcome {
+        CallOutcome::Success(data) => {
+            obj.insert("status".into(), "ok".into());
+            obj.insert("resultHex".into(), hex0x_var(data).into());
+        }
+        CallOutcome::Revert(data) => {
+            obj.insert("status".into(), "revert".into());
+            obj.insert("dataHex".into(), hex0x_var(data).into());
+        }
+        CallOutcome::Unavailable(reason) => {
+            obj.insert("status".into(), "unavailable".into());
+            obj.insert("reason".into(), reason.as_str().into());
+        }
+    }
+    serde_json::Value::Object(obj).to_string()
+}
+
 pub fn tx_hash_json(hash: &[u8; 32]) -> String {
     let mut obj = serde_json::Map::new();
     obj.insert("txHash".into(), hex0x(hash).into());
@@ -448,6 +473,34 @@ mod tests {
     fn error_json_shape() {
         let v: serde_json::Value = serde_json::from_str(&error_json("no snap peer")).unwrap();
         assert_eq!(v["error"], "no snap peer");
+    }
+
+    #[test]
+    fn call_json_shapes() {
+        // ok → status + resultHex
+        let ok: serde_json::Value =
+            serde_json::from_str(&call_json(&CallOutcome::Success(vec![0xde, 0xad]))).unwrap();
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(ok["resultHex"], "0xdead");
+
+        // empty success data serializes as 0x
+        let empty: serde_json::Value =
+            serde_json::from_str(&call_json(&CallOutcome::Success(Vec::new()))).unwrap();
+        assert_eq!(empty["resultHex"], "0x");
+
+        // revert → status + dataHex (the raw revert payload)
+        let rev: serde_json::Value =
+            serde_json::from_str(&call_json(&CallOutcome::Revert(vec![0x08, 0xc3]))).unwrap();
+        assert_eq!(rev["status"], "revert");
+        assert_eq!(rev["dataHex"], "0x08c3");
+
+        // unavailable → status + reason (a diagnostic string; the Java side nulls it)
+        let un: serde_json::Value = serde_json::from_str(&call_json(&CallOutcome::Unavailable(
+            "out of gas".to_string(),
+        )))
+        .unwrap();
+        assert_eq!(un["status"], "unavailable");
+        assert_eq!(un["reason"], "out of gas");
     }
 
     fn sample_code() -> VerifiedCode {

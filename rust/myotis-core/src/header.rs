@@ -18,7 +18,7 @@ use crate::{err, CoreError};
 /// Decoded EL block header. Big scalars (`difficulty`, `base_fee_per_gas`)
 /// are kept as minimal big-endian bytes (Java uses `BigInteger`; a fixed-width
 /// integer would silently cap what the wire allows).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BlockHeader {
     pub parent_hash: [u8; 32],
     pub ommers_hash: [u8; 32],

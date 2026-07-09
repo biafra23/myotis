@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use myotis_net::el::reader::ElReader;
 use myotis_net::{ChainConfig, SyncHandle, SyncState, SyncStatus};
+use myotis_evm::U256;
 
 use crate::eljson;
 
@@ -422,6 +423,69 @@ pub fn get_storage_at_json(handle: i64, address_hex: &str, position_hex: &str) -
         Ok(storage) => {
             eljson::storage_json(address_hex, None, &storage, finalized_slot, optimistic_slot)
         }
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// `nativeEthCallJson`: run a verified `eth_call` for a running handle. `from` is
+/// empty for an anonymous call; `to` is required; `data_hex` is the calldata;
+/// `value_dec` is the wei value as a decimal string (FFI-neutral); `block` is the
+/// RPC block tag (the Java side has already gated it to the servable window, so
+/// the call runs against the verified head). Returns the call JSON
+/// (`ok`/`revert`/`unavailable`, see [`eljson::call_json`]) or `{"error": "..."}`.
+pub fn eth_call_json(
+    handle: i64,
+    from_hex: &str,
+    to_hex: &str,
+    data_hex: &str,
+    value_dec: &str,
+    _block: &str,
+) -> String {
+    let Some(to) = parse_address(to_hex) else {
+        return eljson::error_json("invalid 'to' address (expected 20-byte hex)");
+    };
+    // 'from' is optional: empty → an anonymous zero-address sender.
+    let from = if from_hex.trim().is_empty() {
+        None
+    } else {
+        match parse_address(from_hex) {
+            Some(a) => Some(a),
+            None => return eljson::error_json("invalid 'from' address (expected 20-byte hex)"),
+        }
+    };
+    // Calldata may be empty (a bare value transfer / fallback call).
+    let data = if data_hex.trim().is_empty() {
+        Vec::new()
+    } else {
+        match parse_hex_bytes(data_hex) {
+            Some(d) => d,
+            None => return eljson::error_json("invalid call data (expected hex)"),
+        }
+    };
+    let value = if value_dec.trim().is_empty() {
+        U256::ZERO
+    } else {
+        match U256::from_str_radix(value_dec.trim(), 10) {
+            Ok(v) => v,
+            Err(_) => return eljson::error_json("invalid value (expected decimal wei)"),
+        }
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let reader = match snapshot_reader(engine, handle) {
+        Ok((reader, _, _)) => reader,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    // The Rust EL is mainnet-only (ElConfig::mainnet, network id 1), and the EVM
+    // executor rejects any other chain — thread the real chain id when multichain
+    // wiring lands.
+    const MAINNET_CHAIN_ID: u64 = 1;
+    match engine
+        .rt
+        .block_on(async { reader.eth_call(from, to, data, value, MAINNET_CHAIN_ID).await })
+    {
+        Ok(outcome) => eljson::call_json(&outcome),
         Err(e) => eljson::error_json(&e),
     }
 }
