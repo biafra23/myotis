@@ -490,6 +490,40 @@ pub fn eth_call_json(
     }
 }
 
+/// `nativeResolveEnsJson`: verified ENS forward resolution for a running handle.
+/// `name` is the ENS name (e.g. "vitalik.eth"); resolution runs the registry
+/// resolver-walk + addr/ENSIP-10 dispatch over verified eth_calls against the
+/// current head. Returns the ENS JSON (`ok`/`noRecord`/`offchain`, see
+/// [`eljson::ens_json`]) or `{"error": "..."}`.
+pub fn resolve_ens_json(handle: i64, name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        return eljson::error_json("empty ENS name");
+    }
+    // Bound the native input: real names are short; DNS-encoding caps labels at
+    // 63 bytes anyway, and an unbounded string shouldn't cross into the walk.
+    if name.len() > 512 {
+        return eljson::error_json("ENS name too long");
+    }
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let reader = match snapshot_reader(engine, handle) {
+        Ok((reader, _, _)) => reader,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    // Mainnet-only, like the other EVM reads (the executor rejects any other chain).
+    const MAINNET_CHAIN_ID: u64 = 1;
+    let owned = name.to_string();
+    match engine
+        .rt
+        .block_on(async { reader.resolve_ens(owned, MAINNET_CHAIN_ID).await })
+    {
+        Ok(outcome) => eljson::ens_json(&outcome),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
 /// `nativeEstimateGasJson`: verified `eth_estimateGas` for a call (`to` set) over the
 /// revm executor. Args as for [`eth_call_json`] minus the block (estimate always runs
 /// against the verified head). Returns the estimate JSON (`ok`/`unavailable`, see

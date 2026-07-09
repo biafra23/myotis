@@ -27,12 +27,15 @@ use myotis_core::nodekey::NodeKey;
 use myotis_core::trie::{EMPTY_CODE_HASH, EMPTY_TRIE_ROOT};
 use myotis_core::triehash;
 
-use myotis_evm::{EvmError, EvmExecutor, InMemoryBytecodeCache, InMemoryStateProofCache, U256};
+use myotis_evm::{
+    EnsError, EvmError, EvmExecutor, ExecutorCaller, InMemoryBytecodeCache,
+    InMemoryStateProofCache, U256,
+};
 
 use crate::el::anchor::ExecAnchor;
 use crate::el::discv4::{Discv4Config, Discv4Service};
 use crate::el::eth::session::EthConfig;
-use crate::el::evm::{block_context, CallOutcome, GasOutcome, PoolOracle};
+use crate::el::evm::{block_context, CallOutcome, EnsOutcome, GasOutcome, PoolOracle};
 use crate::el::peer::ManagedPeer;
 use crate::el::pool::{PeerPool, PoolConfig};
 use crate::el::snap::fetch::AccountOutcome;
@@ -219,6 +222,11 @@ pub struct ElReader {
 /// Per-kind bound for the cross-call state-proof cache (accounts and storage
 /// slots each). Generous — entries are small and eviction only trims the oldest.
 const EVM_PROOF_CACHE_ENTRIES: usize = 8192;
+
+/// Overall deadline for one ENS resolution walk (mirrors the Java
+/// `JavaEnsApi.RESOLVE_TIMEOUT_SEC` order of magnitude — the EnsApi contract
+/// promises a bounded worst case of ~2 min).
+const RESOLVE_ENS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl ElReader {
     /// Start a mainnet reader with a freshly-generated ephemeral node key (the
@@ -662,6 +670,37 @@ impl ElReader {
             Ok(gas) => GasOutcome::Estimate(gas),
             Err(e) => GasOutcome::Unavailable(e.to_string()),
         })
+    }
+
+    /// Verified ENS forward resolution: `name` → its address record, resolved
+    /// entirely over verified `eth_call`s against the current head (the registry
+    /// resolver-walk + `addr`/ENSIP-10 `resolve` in `myotis_evm::ens`). Runs the
+    /// whole walk on one blocking thread (each step's oracle fetch bridges via
+    /// `block_on`, same as [`Self::eth_call`]). An invalid name or a state failure
+    /// is `Err`; an offchain (CCIP) name is the distinguishable
+    /// [`EnsOutcome::Offchain`].
+    pub async fn resolve_ens(&self, name: String, chain_id: u64) -> Result<EnsOutcome, String> {
+        let (ctx, executor) = self.evm_setup(chain_id, "resolve-ens").await?;
+        let block_number = ctx.block_number;
+        let walk = tokio::task::spawn_blocking(move || {
+            let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
+            myotis_evm::resolve_address(&caller, &name)
+        });
+        // Overall deadline (the EnsApi contract promises a bounded worst case): the
+        // walk is a chain of per-request-bounded peer calls, but a many-label name
+        // against stalling peers could multiply far past that. On timeout the
+        // abandoned closure still runs out its in-flight peer call on the blocking
+        // thread (spawn_blocking can't be cancelled) — only the caller is released.
+        let joined = tokio::time::timeout(RESOLVE_ENS_DEADLINE, walk)
+            .await
+            .map_err(|_| "resolve-ens timed out".to_string())?
+            .map_err(|e| format!("resolve-ens task join error: {e}"))?;
+        match joined {
+            Ok(Some(address)) => Ok(EnsOutcome::Resolved { address, block_number }),
+            Ok(None) => Ok(EnsOutcome::NoRecord { block_number }),
+            Err(EnsError::OffchainLookup) => Ok(EnsOutcome::Offchain { block_number }),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     /// Shared setup for the EVM reads: a [`BlockContext`](myotis_evm::BlockContext)

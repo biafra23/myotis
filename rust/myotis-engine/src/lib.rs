@@ -26,7 +26,8 @@ pub mod ringlog;
 ///     running Java engine treats as stale.
 /// v9: added nativeEthCallJson (eth_call over verified state via the revm executor).
 /// v10: added nativeEstimateGasJson (eth_estimateGas over the revm executor).
-pub const ABI_VERSION: i32 = 10;
+/// v11: added nativeResolveEnsJson (ENS forward resolution over verified eth_calls).
+pub const ABI_VERSION: i32 = 11;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
@@ -313,6 +314,23 @@ mod jni_shim {
         let data = read_string(&mut env, &data).unwrap_or_default();
         let value = read_string(&mut env, &value).unwrap_or_default();
         let json = crate::host::estimate_gas_json(handle, &from, &to, &data, &value);
+        match env.new_string(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// `RustEngineNative.nativeResolveEnsJson(long handle, String name)` — verified
+    /// ENS forward resolution (name → address record) over the revm executor.
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeResolveEnsJson(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        name: JString,
+    ) -> jstring {
+        let name = read_string(&mut env, &name).unwrap_or_default();
+        let json = crate::host::resolve_ens_json(handle, &name);
         match env.new_string(json) {
             Ok(s) => s.into_raw(),
             Err(_) => std::ptr::null_mut(),

@@ -272,6 +272,67 @@ class RustVerifiedReadJsonTest {
                 () -> RustChainHandle.estimateGasFromJson("{\"status\":\"ok\"}"));
     }
 
+    // ---- resolve-ens (ensResolutionFromJson) ----
+
+    @Test
+    void okEnsResolutionCarriesAddressAndBlock() {
+        var r = RustChainHandle.ensResolutionFromJson("vitalik.eth",
+                "{\"status\":\"ok\",\"addressHex\":\"0xd8da6bf26964af9d7eed9e03e53415d37aa96045\","
+                + "\"blockNumber\":21000010}");
+        assertEquals("vitalik.eth", r.name());
+        assertEquals("0xd8da6bf26964af9d7eed9e03e53415d37aa96045", r.addressHex());
+        assertEquals(21000010L, r.blockNumber());
+        assertNull(r.error());
+    }
+
+    @Test
+    void noRecordEnsResolutionIsSuccessfulNull() {
+        // API convention: addressHex==null && error==null = successful "no record".
+        var r = RustChainHandle.ensResolutionFromJson("nonexistent.eth",
+                "{\"status\":\"noRecord\",\"blockNumber\":21000010}");
+        assertNull(r.addressHex());
+        assertNull(r.error());
+        assertEquals(21000010L, r.blockNumber());
+    }
+
+    @Test
+    void offchainEnsResolutionCarriesError() {
+        var r = RustChainHandle.ensResolutionFromJson("offchain.cb.id",
+                "{\"status\":\"offchain\",\"blockNumber\":21000010}");
+        assertNull(r.addressHex());
+        assertTrue(r.error().contains("offchain"));
+    }
+
+    @Test
+    void ensErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class, () -> RustChainHandle.ensResolutionFromJson(
+                "vitalik.eth", "{\"error\":\"no snap peer available\"}"));
+    }
+
+    @Test
+    void okEnsWithoutAddressFailsClosed() {
+        // status=ok without an addressHex is native shape drift -> EngineException,
+        // never a silent "no record" (same convention as okEstimateWithoutGasFailsClosed).
+        assertThrows(EngineException.class, () -> RustChainHandle.ensResolutionFromJson(
+                "vitalik.eth", "{\"status\":\"ok\",\"blockNumber\":21000010}"));
+    }
+
+    @Test
+    void ensWithoutBlockNumberFailsClosed() {
+        // blockNumber is part of the pinned shape for every status — missing = drift.
+        assertThrows(EngineException.class, () -> RustChainHandle.ensResolutionFromJson(
+                "vitalik.eth",
+                "{\"status\":\"ok\",\"addressHex\":\"0xd8da6bf26964af9d7eed9e03e53415d37aa96045\"}"));
+        assertThrows(EngineException.class, () -> RustChainHandle.ensResolutionFromJson(
+                "vitalik.eth", "{\"status\":\"noRecord\"}"));
+    }
+
+    @Test
+    void unknownEnsStatusFailsClosed() {
+        assertThrows(EngineException.class, () -> RustChainHandle.ensResolutionFromJson(
+                "vitalik.eth", "{\"status\":\"weird\"}"));
+    }
+
     // ---- eth_getStorageAt (storageValueFromJson) ----
 
     @Test

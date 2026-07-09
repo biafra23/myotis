@@ -8,7 +8,7 @@
 //! serializes `{"error": "..."}`, which the Java side raises as an
 //! `EngineException`.
 
-use myotis_net::el::evm::{CallOutcome, GasOutcome};
+use myotis_net::el::evm::{CallOutcome, EnsOutcome, GasOutcome};
 use myotis_net::el::reader::{
     FeeEstimate, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedStorage,
 };
@@ -252,6 +252,31 @@ pub fn call_json(outcome: &CallOutcome) -> String {
         CallOutcome::Unavailable(reason) => {
             obj.insert("status".into(), "unavailable".into());
             obj.insert("reason".into(), reason.as_str().into());
+        }
+    }
+    serde_json::Value::Object(obj).to_string()
+}
+
+/// ENS forward-resolution result: `{"status":"ok","addressHex":"0x…","blockNumber":N}`,
+/// `{"status":"noRecord","blockNumber":N}` (successfully determined absent — the
+/// Java side maps it to addressHex null + error null, the API's "no record"
+/// convention), or `{"status":"offchain","blockNumber":N}` (ERC-3668 name; the
+/// Java side sets a descriptive error — the record exists but needs CCIP-Read).
+pub fn ens_json(outcome: &EnsOutcome) -> String {
+    let mut obj = serde_json::Map::new();
+    match outcome {
+        EnsOutcome::Resolved { address, block_number } => {
+            obj.insert("status".into(), "ok".into());
+            obj.insert("addressHex".into(), hex0x_var(address).into());
+            obj.insert("blockNumber".into(), json_u64(*block_number));
+        }
+        EnsOutcome::NoRecord { block_number } => {
+            obj.insert("status".into(), "noRecord".into());
+            obj.insert("blockNumber".into(), json_u64(*block_number));
+        }
+        EnsOutcome::Offchain { block_number } => {
+            obj.insert("status".into(), "offchain".into());
+            obj.insert("blockNumber".into(), json_u64(*block_number));
         }
     }
     serde_json::Value::Object(obj).to_string()
@@ -535,6 +560,29 @@ mod tests {
         .unwrap();
         assert_eq!(un["status"], "unavailable");
         assert_eq!(un["reason"], "execution reverted");
+    }
+
+    #[test]
+    fn ens_json_shapes() {
+        let ok: serde_json::Value = serde_json::from_str(&ens_json(&EnsOutcome::Resolved {
+            address: [0xd8; 20],
+            block_number: 21_000_010,
+        }))
+        .unwrap();
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(ok["addressHex"], "0xd8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8");
+        assert_eq!(ok["blockNumber"], 21_000_010);
+
+        let none: serde_json::Value =
+            serde_json::from_str(&ens_json(&EnsOutcome::NoRecord { block_number: 21_000_010 }))
+                .unwrap();
+        assert_eq!(none["status"], "noRecord");
+        assert!(none.get("addressHex").is_none());
+
+        let off: serde_json::Value =
+            serde_json::from_str(&ens_json(&EnsOutcome::Offchain { block_number: 21_000_010 }))
+                .unwrap();
+        assert_eq!(off["status"], "offchain");
     }
 
     fn sample_code() -> VerifiedCode {

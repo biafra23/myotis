@@ -23,7 +23,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 10; // 10: + nativeEstimateGasJson
+    static final int EXPECTED_ABI_VERSION = 11; // 11: + nativeResolveEnsJson
 
     private static final boolean AVAILABLE = load();
 
@@ -162,6 +162,15 @@ final class RustEngineNative {
      */
     static native String nativeEstimateGasJson(
             long handle, String from, String to, String data, String value);
+
+    /**
+     * Verified ENS forward resolution (name → address record) over the revm
+     * executor, as JSON ({@code {"status":"ok","addressHex":"0x…","blockNumber":N}},
+     * {@code {"status":"noRecord",…}} for a successfully-determined absent record,
+     * {@code {"status":"offchain",…}} for an ERC-3668 name (exists, needs CCIP-Read),
+     * or {@code {"error":"…"}} on a transport/bad-input failure).
+     */
+    static native String nativeResolveEnsJson(long handle, String name);
 
     /**
      * Verified {@code eth_getBlockByNumber} (transactions as hashes) for a running
