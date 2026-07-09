@@ -37,6 +37,7 @@
 pub mod block;
 pub mod cache;
 pub mod database;
+pub mod ens;
 pub mod error;
 pub mod executor;
 pub mod fork;
@@ -52,6 +53,7 @@ pub use cache::{
     NoopStateProofCache, StateProofCache,
 };
 pub use database::OracleDatabase;
+pub use ens::{resolve_address, EnsError, EthCaller, ExecutorCaller};
 pub use error::EvmError;
 pub use executor::EvmExecutor;
 pub use oracle::{OracleAccount, OracleError, SnapStateOracle};
