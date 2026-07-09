@@ -28,6 +28,11 @@ pub const PRAGUE_TIME: u64 = 1_746_612_311;
 
 /// The revm `SpecId` a mainnet `(block_number, timestamp)` activates, or
 /// [`EvmError::ForkTooOld`] below London.
+///
+/// MAINNET ONLY. These are Ethereum mainnet activation points; a different chain
+/// (e.g. Gnosis) forks at different heights/times. When multichain `eth_call` is
+/// wired, this must become chain-aware (keyed on the context's chain id) — do not
+/// call it for a non-mainnet block.
 pub fn spec_for(block_number: u64, timestamp: u64) -> Result<SpecId, EvmError> {
     if timestamp >= PRAGUE_TIME {
         Ok(SpecId::PRAGUE)

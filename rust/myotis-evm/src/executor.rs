@@ -290,6 +290,18 @@ mod tests {
     }
 
     #[test]
+    fn prevrandao_opcode_returns_context_value() {
+        // PREVRANDAO PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 RETURN — opcode 0x44 reads
+        // prevrandao post-merge; must be the context's prev_randao ([0x33; 32]).
+        let code = vec![0x44u8, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let exec = executor_with(code, None);
+        let out = exec
+            .call_view(TARGET, &[], &ctx(19_500_000, CANCUN_TIME + 1))
+            .unwrap();
+        assert_eq!(out.as_slice(), &[0x33u8; 32]);
+    }
+
+    #[test]
     fn revert_surfaces_raw_data() {
         // PUSH1 0xAB PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 REVERT.
         let code = vec![0x60u8, 0xAB, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xfd];

@@ -23,8 +23,8 @@ pub struct BlockContext {
     pub base_fee_per_gas: u64,
     /// Block proposer: COINBASE opcode.
     pub coinbase: [u8; 20],
-    /// Post-merge PREVRANDAO (and the pre-merge DIFFICULTY slot — the two share
-    /// the field, as in the header): the DIFFICULTY/PREVRANDAO opcode.
+    /// The header's mixHash slot = post-merge PREVRANDAO. The DIFFICULTY/PREVRANDAO
+    /// opcode (0x44) reads this on every spec this engine serves (all post-merge).
     pub prev_randao: [u8; 32],
     /// EIP-155 chain id: CHAINID opcode (and the cfg chain id).
     pub chain_id: u64,
@@ -33,9 +33,17 @@ pub struct BlockContext {
 }
 
 impl BlockContext {
-    /// The revm [`BlockEnv`] for this context. `prev_randao` feeds both the
-    /// `prevrandao` field (post-merge) and `difficulty` (pre-merge) so revm reads
-    /// the right one for the active spec, exactly as the header packs them.
+    /// The revm [`BlockEnv`] for this context.
+    ///
+    /// Post-merge (every spec this engine serves), the DIFFICULTY opcode reads
+    /// `prevrandao`, so the `difficulty` field is unused and left 0 — which is also
+    /// the true value in a post-merge header. It is deliberately NOT fed from the
+    /// mixHash bytes: a pre-London..Paris block would then read a wrong difficulty,
+    /// but such blocks aren't servable anyway (no snap state, outside the anchored
+    /// head window). Likewise BLOBBASEFEE reads revm's default floor because
+    /// `BlockContext` carries no excess-blob-gas field yet (matching the Java
+    /// `BlockContextValues`, which maps no blob fields). Add a `difficulty` /
+    /// `excess_blob_gas` field here if pre-merge or blob-fee `eth_call` is ever needed.
     pub fn block_env(&self) -> BlockEnv {
         BlockEnv {
             number: U256::from(self.block_number),
@@ -43,7 +51,7 @@ impl BlockContext {
             gas_limit: self.gas_limit,
             basefee: self.base_fee_per_gas,
             beneficiary: Address::from(self.coinbase),
-            difficulty: U256::from_be_bytes(self.prev_randao),
+            difficulty: U256::ZERO,
             prevrandao: Some(B256::from(self.prev_randao)),
             ..BlockEnv::default()
         }
