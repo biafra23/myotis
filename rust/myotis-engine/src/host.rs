@@ -574,7 +574,11 @@ fn parse_address(hex: &str) -> Option<[u8; 20]> {
 /// length or a non-hex digit.
 fn parse_hex_bytes(hex: &str) -> Option<Vec<u8>> {
     let hex = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
-    if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+    // Cap before allocating: a real tx is well under this (~1 MB), and the workspace
+    // builds with panic=abort, so an unbounded `with_capacity` on a hostile giant
+    // input could OOM-abort the JVM. Reject rather than allocate.
+    if hex.len() > 2 * 1024 * 1024 || hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
         return None;
     }
     let mut out = Vec::with_capacity(hex.len() / 2);
