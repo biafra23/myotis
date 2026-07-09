@@ -540,6 +540,31 @@ final class RustChainHandle implements ChainHandle {
         return new FeeEstimate(gas, tip);
     }
 
+    /**
+     * Gossip a signed raw transaction and return its 32-byte hash. Throws
+     * {@link EngineException} when no peer could be reached / the input isn't a
+     * plausible tx. {@code rawTxHex} is the 0x-hex raw transaction.
+     */
+    byte[] sendRawTransactionVerified(String rawTxHex) {
+        return txHashFromJson(RustEngineNative.nativeSendRawTransactionJson(handle, rawTxHex));
+    }
+
+    /** Package-private test seam: send-tx JSON → the 32-byte tx hash (throws on error). */
+    static byte[] txHashFromJson(String json) {
+        JsonObject o = parseResultOrThrow(json, "sendRawTransaction");
+        String hex;
+        try {
+            hex = stringOrNull(o, "txHash");
+        } catch (RuntimeException e) {
+            throw new EngineException("malformed send-tx JSON from the Rust engine: " + e.getMessage(), e);
+        }
+        // Missing-field check OUTSIDE the try so its message isn't re-wrapped.
+        if (hex == null) {
+            throw new EngineException("send-tx JSON missing txHash");
+        }
+        return hexToBytes(hex);
+    }
+
     /** Package-private test seam: storage-at JSON → verified 32-byte word (or null). */
     static byte[] storageValueFromJson(String json) {
         JsonObject o = parseResultOrThrow(json, "storage");

@@ -23,7 +23,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 7; // 7: + nativeFeeEstimateJson
+    static final int EXPECTED_ABI_VERSION = 8; // 8: + nativeSendRawTransactionJson
 
     private static final boolean AVAILABLE = load();
 
@@ -156,4 +156,13 @@ final class RustEngineNative {
      * methods read this one payload so a paired poll shares a single compute.
      */
     static native String nativeFeeEstimateJson(long handle);
+
+    /**
+     * Gossip a signed raw transaction (`eth_sendRawTransaction`) to peers and
+     * return {@code {"txHash":"0x…"}} (keccak256 of the raw tx), or an
+     * {@code "error"} object when no peer could be reached. A WRITE — the engine
+     * never signs and nothing is beacon-verified. {@code rawTxHex} is the 0x-hex
+     * raw transaction.
+     */
+    static native String nativeSendRawTransactionJson(long handle, String rawTxHex);
 }

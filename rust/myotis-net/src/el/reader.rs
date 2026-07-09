@@ -779,6 +779,36 @@ impl ElReader {
         Ok(FeeEstimate { max_priority_fee_wei: tip, gas_price_wei: gas_price })
     }
 
+    /// Gossip a signed raw transaction to peers (the engine never signs) and return
+    /// `keccak256(rawTx)` — the tx hash — once at least one peer received the
+    /// broadcast. `Err` when the input isn't a plausible tx or no peer could be
+    /// reached. This is a WRITE: nothing is beacon-verified; the peers' mempools and
+    /// a later verified receipt lookup are what confirm inclusion.
+    pub async fn send_raw_transaction(&self, raw_tx: &[u8]) -> Result<[u8; 32], String> {
+        // Minimal sanity only (we never sign or fully validate — peers reject a bad
+        // tx): non-empty with a plausible prefix — a legacy RLP list (>= 0xc0) or an
+        // EIP-2718 type byte (0x01..=0x7f). Avoids gossiping obvious garbage.
+        match raw_tx.first() {
+            Some(&b) if b >= 0xc0 || (0x01..=0x7f).contains(&b) => {}
+            _ => return Err("not a valid raw transaction".to_string()),
+        }
+        let hash = keccak256(raw_tx);
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err("no peer available to broadcast the transaction".to_string());
+        }
+        let mut sent = 0usize;
+        for peer in &peers {
+            if peer.send_transaction(raw_tx).await.is_ok() {
+                sent += 1;
+            }
+        }
+        if sent == 0 {
+            return Err("no peer accepted the transaction broadcast".to_string());
+        }
+        Ok(hash)
+    }
+
     /// `(finalized_block_number, optimistic_block_number, is_synced)` snapshot.
     fn anchor_diagnostics(&self) -> (u64, u64, bool) {
         let fin = self.anchor.finalized_execution().map(|f| f.block_number).unwrap_or(0);

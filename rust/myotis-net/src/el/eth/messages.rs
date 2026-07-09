@@ -294,6 +294,19 @@ pub fn encode_get_receipts(request_id: u64, hashes: &[[u8; 32]]) -> Vec<u8> {
     encode_hash_request(request_id, hashes)
 }
 
+/// Encode an eth `Transactions` message carrying a single raw transaction (no
+/// request id — it's an unsolicited broadcast). A legacy tx (a bare RLP list) is
+/// embedded as-is; a typed tx (EIP-2718 `type_byte ‖ payload`) is wrapped as an
+/// RLP byte-string, per the eth wire rules.
+pub fn encode_transactions(raw_tx: &[u8]) -> Vec<u8> {
+    let element = if rlp::is_list_prefix(raw_tx) {
+        raw_tx.to_vec()
+    } else {
+        rlp::encode_bytes(raw_tx)
+    };
+    rlp::encode_list_payload(&element)
+}
+
 /// Decode a Receipts response into RAW consensus receipt bytes per block (the
 /// trie values). eth/66-68 form. Returns `(request_id, per_block_receipts)`.
 pub fn decode_receipts(rlp_bytes: &[u8]) -> Result<(u64, Vec<Vec<Vec<u8>>>), CoreError> {
@@ -420,6 +433,22 @@ fn fixed32(item: &Item) -> Result<[u8; 32], CoreError> {
 mod tests {
     use super::*;
     use myotis_core::keccak::keccak256;
+
+    #[test]
+    fn encode_transactions_wraps_legacy_and_typed() {
+        // Legacy tx (a bare RLP list) is embedded as-is: the outer item stays a list.
+        let legacy = rlp::encode(&Item::List(vec![Item::Bytes(vec![1]), Item::Bytes(vec![2])]));
+        let items = rlp::decode(&encode_transactions(&legacy)).unwrap().as_list().unwrap().to_vec();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].is_list());
+
+        // Typed tx (0x02 ‖ payload) is wrapped as a byte-string: the outer item is
+        // the raw envelope bytes recovered verbatim.
+        let typed = vec![0x02u8, 0xc2, 0x01, 0x02];
+        let items = rlp::decode(&encode_transactions(&typed)).unwrap().as_list().unwrap().to_vec();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].as_bytes().unwrap(), typed.as_slice());
+    }
 
     #[test]
     fn status_round_trip_67_and_69() {

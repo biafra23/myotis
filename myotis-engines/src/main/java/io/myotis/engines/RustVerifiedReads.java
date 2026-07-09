@@ -151,7 +151,18 @@ final class RustVerifiedReads implements VerifiedReads {
     // ---- not yet served verified on the Rust engine (later EL-B / EL-C slices) ----
 
     @Override public byte[] call(byte[] from, byte[] to, byte[] data, String valueWei, String block) { return null; }
-    @Override public byte[] sendRawTransaction(byte[] rawTx) { return null; }
+    @Override
+    public byte[] sendRawTransaction(byte[] rawTx) {
+        if (rawTx == null || rawTx.length == 0) return null;
+        try {
+            // The engine never signs — it gossips the user-signed tx and returns
+            // keccak256(rawTx). null on no-peer / not-a-tx (→ strict -32000).
+            return handle.sendRawTransactionVerified(toHex(rawTx));
+        } catch (RuntimeException e) {
+            log.debug("[engines] sendRawTransaction failed: {}", e.getMessage());
+            return null;
+        }
+    }
     @Override public String getTransactionReceipt(byte[] txHash) { return null; }
     @Override public String getTransactionByHash(byte[] txHash) { return null; }
 

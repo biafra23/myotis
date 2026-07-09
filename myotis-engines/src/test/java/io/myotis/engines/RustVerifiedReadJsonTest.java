@@ -279,4 +279,25 @@ class RustVerifiedReadJsonTest {
         assertThrows(EngineException.class,
                 () -> RustChainHandle.feeFromJson("{\"gasPriceWei\":\"100\"}"));
     }
+
+    // ---- eth_sendRawTransaction (txHashFromJson) ----
+
+    @Test
+    void txHashJsonMapsToHash() {
+        byte[] h = RustChainHandle.txHashFromJson("{\"txHash\":\"0x" + "ab".repeat(32) + "\"}");
+        byte[] expected = new byte[32];
+        java.util.Arrays.fill(expected, (byte) 0xab);
+        assertArrayEquals(expected, h);
+    }
+
+    @Test
+    void sendTxErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.txHashFromJson("{\"error\":\"no peer available to broadcast\"}"));
+    }
+
+    @Test
+    void sendTxMissingHashThrows() {
+        assertThrows(EngineException.class, () -> RustChainHandle.txHashFromJson("{}"));
+    }
 }

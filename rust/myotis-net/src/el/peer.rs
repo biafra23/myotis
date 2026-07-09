@@ -185,6 +185,20 @@ impl ManagedPeer {
         }
     }
 
+    /// Broadcast a single raw transaction to this peer via the eth `Transactions`
+    /// message (fire-and-forget — no request id, no response). `raw_tx` is the
+    /// consensus encoding. On a write failure the connection is dead, so fail every
+    /// in-flight request too (a partial frame corrupts the stream), same as
+    /// [`Self::request`].
+    pub async fn send_transaction(&self, raw_tx: &[u8]) -> Result<(), String> {
+        let body = messages::encode_transactions(raw_tx);
+        if let Err(e) = self.writer.lock().await.send(messages::TRANSACTIONS, &body).await {
+            fail_all(&self.pending, &self.closed, format!("peer write failure: {e}")).await;
+            return Err(e);
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // eth requests.
     // -----------------------------------------------------------------------
