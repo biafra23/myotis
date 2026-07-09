@@ -21,6 +21,7 @@ use revm::database_interface::DatabaseRef;
 use revm::primitives::{Address, Bytes, B256, U256};
 use revm::state::{AccountInfo, Bytecode};
 
+use myotis_core::keccak::keccak256;
 use myotis_core::trie::EMPTY_CODE_HASH;
 
 use crate::cache::{BytecodeCache, StateProofCache};
@@ -102,6 +103,21 @@ impl OracleDatabase {
     }
 }
 
+/// Build a revm [`Bytecode`] from verified raw code WITHOUT panicking.
+///
+/// `Bytecode::new_raw` is not panic-free — it `.expect()`s inside, and any blob
+/// beginning `0xEF01` (the EIP-7702 magic) that is not a well-formed 23-byte
+/// delegation makes it panic → `abort` under the workspace's release
+/// `panic = "abort"`. Such code is legal on-chain (e.g. pre-London `0xEF`-leading
+/// legacy code), so it must not crash the engine. `new_raw_checked` returns the
+/// correct `Eip7702` variant for a valid delegation and `Legacy` for everything
+/// else; on the rare malformed-`0xEF01` error we fall back to `new_legacy`, which
+/// loads the real verified bytes as legacy code (it reverts on the invalid `0xEF`
+/// opcode at run time — exactly what a full node does) and never panics.
+fn to_bytecode(bytes: Bytes) -> Bytecode {
+    Bytecode::new_raw_checked(bytes.clone()).unwrap_or_else(|_| Bytecode::new_legacy(bytes))
+}
+
 fn to_account_info(acc: &OracleAccount) -> AccountInfo {
     AccountInfo {
         balance: acc.balance,
@@ -131,12 +147,29 @@ impl DatabaseRef for OracleDatabase {
         if hash == EMPTY_CODE_HASH {
             return Ok(Bytecode::default());
         }
+        // A cache hit was verified (below) when first stored, and the cache is
+        // keyed by hash, so it needs no re-check.
         if let Some(bytes) = self.bytecode_cache.get(&hash) {
-            return Ok(Bytecode::new_raw(bytes));
+            return Ok(to_bytecode(bytes));
         }
         let bytes: Bytes = self.oracle.fetch_bytecode(&hash)?.into();
+        // Defense-in-depth at the trust boundary: bytecode is content-addressed,
+        // so re-verify keccak(code) == hash here even though the oracle already
+        // checked it. Fail closed on any mismatch — never execute unverified code.
+        let got = keccak256(&bytes);
+        if got != hash {
+            return Err(OracleError::InvalidProof {
+                state_root: [0u8; 32],
+                address: [0u8; 20],
+                detail: format!(
+                    "bytecode hash mismatch: expected {}, got {}",
+                    B256::from(hash),
+                    B256::from(got)
+                ),
+            });
+        }
         self.bytecode_cache.put(&hash, bytes.clone());
-        Ok(Bytecode::new_raw(bytes))
+        Ok(to_bytecode(bytes))
     }
 
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {

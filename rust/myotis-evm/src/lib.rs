@@ -249,6 +249,61 @@ mod tests {
     }
 
     #[test]
+    fn malformed_eip7702_prefixed_bytecode_does_not_panic() {
+        // Regression: verified bytecode beginning 0xEF01 that is NOT a well-formed
+        // 23-byte EIP-7702 delegation must load (as legacy), not abort the process
+        // (Bytecode::new_raw would panic → abort under panic="abort").
+        let mut fixture = FixtureSnapStateOracle::new();
+        let weird = vec![0xEFu8, 0x01, 0x02, 0x03]; // 0xEF01-prefixed, only 4 bytes
+        let hash = fixture.with_bytecode(weird.clone());
+        let d = db(
+            Arc::new(fixture),
+            ROOT_A,
+            Arc::new(NoopStateProofCache),
+            Arc::new(InMemoryBytecodeCache::new()),
+        );
+        let bc = d
+            .code_by_hash_ref(B256::from(hash))
+            .expect("must not panic/err");
+        assert_eq!(bc.original_bytes().as_ref(), weird.as_slice());
+    }
+
+    #[test]
+    fn bytecode_hash_mismatch_is_fail_closed() {
+        // An oracle that serves bytes NOT hashing to the requested code hash must
+        // be rejected (InvalidProof), never executed.
+        struct Liar;
+        impl SnapStateOracle for Liar {
+            fn fetch_account(
+                &self,
+                _r: &[u8; 32],
+                _a: [u8; 20],
+            ) -> Result<Option<OracleAccount>, OracleError> {
+                Ok(None)
+            }
+            fn fetch_storage(
+                &self,
+                _r: &[u8; 32],
+                _a: [u8; 20],
+                _s: U256,
+            ) -> Result<U256, OracleError> {
+                Ok(U256::ZERO)
+            }
+            fn fetch_bytecode(&self, _h: &[u8; 32]) -> Result<Vec<u8>, OracleError> {
+                Ok(vec![0x60, 0x00]) // does not hash to the requested (all-0x33) hash
+            }
+        }
+        let d = db(
+            Arc::new(Liar),
+            ROOT_A,
+            Arc::new(NoopStateProofCache),
+            Arc::new(InMemoryBytecodeCache::new()),
+        );
+        let err = d.code_by_hash_ref(B256::from([0x33u8; 32])).unwrap_err();
+        assert!(matches!(err, OracleError::InvalidProof { .. }));
+    }
+
+    #[test]
     fn blockhash_is_unsupported() {
         let d = db(
             Arc::new(FixtureSnapStateOracle::new()),
