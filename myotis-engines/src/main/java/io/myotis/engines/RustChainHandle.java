@@ -62,6 +62,17 @@ final class RustChainHandle implements ChainHandle {
     /** The running JSON-RPC server, or null when disabled / not started. */
     private volatile io.myotis.jsonrpc.MyotisRpcServer rpcServer;
 
+    /** Head-freshness tracking for verifiedHeadAgeMs: the last optimistic-head block
+     *  number seen, and the monotonic time it was first seen. The reported age is the
+     *  elapsed time since the head last ADVANCED — a real age (0 → ~12 s per block,
+     *  growing if the head stalls), not a constant. Guarded by {@link #headAgeLock}
+     *  so the paired check-and-update is atomic across concurrent status() callers
+     *  (UI poll + health thread) — a torn read would yield a spurious huge age.
+     *  A DEDICATED lock (not {@code this}) so it never contends with start()/stop(). */
+    private final Object headAgeLock = new Object();
+    private long lastHeadBlock = -1L;
+    private long lastHeadAdvanceNanos;
+
     RustChainHandle(long handle, String networkName, long chainId, int rpcPort) {
         this.handle = handle;
         this.networkName = networkName;
@@ -249,6 +260,12 @@ final class RustChainHandle implements ChainHandle {
         return new RustChainHandle(0L, network, 1L, 0).beaconStatus(ParsedStatus.parse(json));
     }
 
+    /** Package-private test seam: map a status JSON on THIS handle (so head-age
+     *  tracking persists across calls). Lets a test observe verifiedHeadAgeMs grow. */
+    StatusSnapshot statusFromJsonOnThisHandle(String json) {
+        return status(ParsedStatus.parse(json));
+    }
+
     private StatusSnapshot status(ParsedStatus s) {
         int peers = (int) Math.min(s.peerCount(), Integer.MAX_VALUE);
         // Older natives don't emit "targetPeriod" (parsed as 0): fall back to
@@ -258,8 +275,38 @@ final class RustChainHandle implements ChainHandle {
         // EL pool/discovery counts now come from the Rust status JSON. The pool
         // keeps only snap-capable READY peers, so readyPeers == snapPeers (and
         // snapServingPeers is approximated by the same). Execution block numbers
-        // (optimistic head + finalized) now come from the beacon anchor via the
-        // status JSON; only verifiedHeadAgeMs remains a later follow-up.
+        // (optimistic head + finalized) come from the beacon anchor via the status.
+        //
+        // verifiedHeadAgeMs drives the host's readiness dot (< 45 s = ready/green).
+        // The Rust reader anchors every query to the peer's fresh head; there's no
+        // separate head context to age, so age it by how long since the optimistic
+        // head last ADVANCED (a new block ~every 12 s resets it) — a REAL, changing
+        // age, not a constant. Reported only when a verified read CAN be served
+        // (SYNCED, an anchored head, snap peers); else the Long.MAX_VALUE "no
+        // verified head yet" sentinel — and while NOT serveable we hold the advance
+        // clock at "now" so the age starts fresh the instant we become serveable
+        // (a not-serving stretch must not leak in as a stale age → amber flicker).
+        // Monotonic nanoTime — a wall-clock/NTP jump must not distort the age.
+        long optHead = s.optimisticBlockNumber();
+        long nowNanos = System.nanoTime();
+        boolean serveable = s.beaconState() == BeaconState.SYNCED
+                && optHead > 0 && s.snapPeers() > 0;
+        long verifiedHeadAgeMs;
+        synchronized (headAgeLock) {
+            if (!serveable) {
+                // No verified head to age; keep the clock pinned to now so the first
+                // serveable poll starts near 0 rather than carrying the outage gap.
+                lastHeadBlock = optHead;
+                lastHeadAdvanceNanos = nowNanos;
+                verifiedHeadAgeMs = Long.MAX_VALUE;
+            } else {
+                if (optHead != lastHeadBlock) {
+                    lastHeadBlock = optHead;
+                    lastHeadAdvanceNanos = nowNanos;
+                }
+                verifiedHeadAgeMs = Math.max(0L, (nowNanos - lastHeadAdvanceNanos) / 1_000_000L);
+            }
+        }
         return new StatusSnapshot(
                 s.running(),
                 s.running() ? LifecycleState.RUNNING : LifecycleState.STOPPED,
@@ -283,7 +330,7 @@ final class RustChainHandle implements ChainHandle {
                 targetPeriod,
                 s.finalizedSlot() / 8192L, // finalizedPeriod (SLOTS_PER_SYNC_COMMITTEE_PERIOD)
                 targetPeriod,   // wallClockPeriod == the catch-up target
-                Long.MAX_VALUE, // verifiedHeadAgeMs (no verified RPC head yet)
+                verifiedHeadAgeMs,
                 List.<PeerInfo>of(),
                 // Idle-sleep metrics: the Rust engine does not idle-pause yet (pause()
                 // is a no-op — see below), so it never accrues pause stats.

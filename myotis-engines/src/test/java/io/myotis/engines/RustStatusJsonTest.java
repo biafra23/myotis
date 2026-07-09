@@ -101,6 +101,50 @@ class RustStatusJsonTest {
         assertEquals(21000010L, s.optimisticBlockNumber());
         assertEquals(20999000L, s.finalizedBlockNumber());
         assertEquals(20999000L, s.executionBlockNumber());
+        // Not SYNCED → no verified head yet (readiness dot stays amber).
+        assertEquals(Long.MAX_VALUE, s.verifiedHeadAgeMs());
+    }
+
+    @Test
+    void syncedWithHeadAndPeersReportsFreshVerifiedHead() {
+        // SYNCED + an anchored optimistic head + snap peers → verified reads serve,
+        // so verifiedHeadAgeMs is 0 (fresh → ready/green), not the MAX sentinel.
+        String syncedJson = CATCHING_UP_JSON.replace("CATCHING_UP", "SYNCED");
+        StatusSnapshot s = RustChainHandle.statusFromJson("mainnet", syncedJson);
+        assertEquals(BeaconState.SYNCED, s.beaconState());
+        assertEquals(0L, s.verifiedHeadAgeMs());
+    }
+
+    @Test
+    void syncedButNoSnapPeersHasNoVerifiedHead() {
+        // SYNCED but zero snap peers → a verified read can't be served → MAX sentinel.
+        String noPeers = CATCHING_UP_JSON.replace("CATCHING_UP", "SYNCED")
+                .replace("\"snapPeers\":6", "\"snapPeers\":0");
+        StatusSnapshot s = RustChainHandle.statusFromJson("mainnet", noPeers);
+        assertEquals(Long.MAX_VALUE, s.verifiedHeadAgeMs());
+    }
+
+    @Test
+    void verifiedHeadAgeGrowsBetweenBlocksAndResetsOnAdvance() throws InterruptedException {
+        // One persistent handle polled repeatedly — the real on-device behavior.
+        RustChainHandle h = new RustChainHandle(0L, "mainnet", 1L, 0);
+        String synced = CATCHING_UP_JSON.replace("CATCHING_UP", "SYNCED"); // optimisticBlockNumber 21000010
+        long age1 = h.statusFromJsonOnThisHandle(synced).verifiedHeadAgeMs();
+        assertEquals(0L, age1);                       // just observed the head
+        // Poll (bounded) until the age at the SAME head grows past age1 — proves it
+        // isn't a constant without pinning to a wall-clock threshold a slow/oversleeping
+        // scheduler could trip. sleep() only ever floors elapsed time, so this converges.
+        long age2 = age1;
+        long deadline = System.nanoTime() + 2_000_000_000L; // 2 s ceiling
+        while (age2 <= age1 && System.nanoTime() < deadline) {
+            Thread.sleep(5);
+            age2 = h.statusFromJsonOnThisHandle(synced).verifiedHeadAgeMs();
+        }
+        assertTrue(age2 > age1, "age must GROW at the same head, was " + age2); // not a constant
+        // A new block resets the age back toward 0.
+        String advanced = synced.replace("21000010", "21000011");
+        long age3 = h.statusFromJsonOnThisHandle(advanced).verifiedHeadAgeMs();
+        assertTrue(age3 < age2, "a new head must reset the age, was " + age3);
     }
 
     @Test
