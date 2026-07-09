@@ -405,6 +405,20 @@ Spec: doc 03 §§3–7, doc 04 §3. New crate `myotis-evm` (sans-I/O; revm gated
    via the `HttpGateway` port (blocking, wrapped `spawn_blocking`); callback re-entry capped
    at 1; ENS namehash/DNS-encode/ENSIP-10 discovery + record calls + reverse with mandatory
    forward-verification. Mainnet+sepolia only (`hasEns` gate).
+   - **Landed (EL-C-5-1): ENS forward resolution core** (`myotis-evm::ens`, sans-I/O). `namehash`
+     (ENSIP-1, lowercase-only — the same UTS-46 gap as Java) + `dns_encode` (ENSIP-10); a
+     hand-rolled ABI subset (`selector`, `bytes32`/`bytes4`/`address`/`bool`/dynamic-`bytes`
+     encode+decode, all bounds-checked, `MAX_INDEX = 64 MiB`); `resolve_address` — the registry
+     resolver-walk (registry `0x0000…2e1e`, up to the root), `supportsInterface(0x9061b923)`
+     wildcard detection, and `addr(bytes32)` directly (legacy exact) or wrapped in
+     `resolve(bytes,bytes)` (ENSIP-10) — every step an `eth_call` through the existing executor,
+     abstracted behind an `EthCaller` trait (`ExecutorCaller` for the real path; mocked in tests).
+     `Ok(None)` = no record (absent / zero-address / non-wildcard ancestor / — for now — offchain);
+     an `OffchainLookup` revert reads as "no record" until CCIP lands. Unit-tested with a scripted
+     mock (legacy, wildcard, no-resolver, ancestor-can't-answer-subname, zero-address) + canonical
+     namehash/DNS vectors. *Deferred:* reverse + forward-verify (C-5-2), CCIP-Read offchain
+     (C-5-3, HTTP via an injected `CcipGateway` port — no Rust HTTP dep), and the JNI/Java `EnsApi`
+     wiring (C-5-1b, replacing `RustChainHandle.ens() { return null; }`).
 
 Milestone-C gate: on a SYNCED mainnet daemon with `-Pengine=rust`, a real ERC-20
 `balanceOf` `eth_call`, an `estimateGas` for a token transfer, and a `resolve-ens` of a
