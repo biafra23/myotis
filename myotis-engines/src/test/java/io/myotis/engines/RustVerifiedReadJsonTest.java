@@ -310,6 +310,14 @@ class RustVerifiedReadJsonTest {
     }
 
     @Test
+    void okEnsWithoutAddressFailsClosed() {
+        // status=ok without an addressHex is native shape drift -> EngineException,
+        // never a silent "no record" (same convention as okEstimateWithoutGasFailsClosed).
+        assertThrows(EngineException.class, () -> RustChainHandle.ensResolutionFromJson(
+                "vitalik.eth", "{\"status\":\"ok\",\"blockNumber\":21000010}"));
+    }
+
+    @Test
     void unknownEnsStatusFailsClosed() {
         assertThrows(EngineException.class, () -> RustChainHandle.ensResolutionFromJson(
                 "vitalik.eth", "{\"status\":\"weird\"}"));

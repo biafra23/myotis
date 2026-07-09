@@ -567,8 +567,18 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
             // beacon-anchored optimistic head, but "verified" in this API means a
             // beacon-FINALIZED root (see RustEnsApi) — don't overclaim.
             return switch (status == null ? "" : status) {
-                case "ok" -> new EnsResolutionResult(
-                        name, stringOrNull(o, "addressHex"), block, false, null);
+                // status=ok MUST carry an address; a missing one is native shape
+                // drift -> fail closed (EngineException), NOT a silent result that
+                // would read as the API's successful "no record" (same convention
+                // as estimateGasFromJson's ok-without-gas).
+                case "ok" -> {
+                    String addressHex = stringOrNull(o, "addressHex");
+                    if (addressHex == null || addressHex.isBlank()) {
+                        throw new EngineException(
+                                "resolve-ens JSON: status=ok without an addressHex");
+                    }
+                    yield new EnsResolutionResult(name, addressHex, block, false, null);
+                }
                 // API convention: addressHex==null && error==null is a SUCCESSFUL
                 // "name has no record".
                 case "noRecord" -> new EnsResolutionResult(name, null, block, false, null);

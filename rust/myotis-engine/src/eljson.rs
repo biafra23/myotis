@@ -257,10 +257,6 @@ pub fn call_json(outcome: &CallOutcome) -> String {
     serde_json::Value::Object(obj).to_string()
 }
 
-/// `estimateGas` result: `{"status":"ok","gas":N}` (the buffered gas-limit estimate
-/// as a JSON number — the 1.15 buffer can put it slightly above the 30 M base) or
-/// `{"status":"unavailable","reason":"…"}`. The Java side returns the number for
-/// `ok` and null otherwise (a reverting/unverifiable estimate has no number).
 /// ENS forward-resolution result: `{"status":"ok","addressHex":"0x…","blockNumber":N}`,
 /// `{"status":"noRecord","blockNumber":N}` (successfully determined absent — the
 /// Java side maps it to addressHex null + error null, the API's "no record"
@@ -286,6 +282,10 @@ pub fn ens_json(outcome: &EnsOutcome) -> String {
     serde_json::Value::Object(obj).to_string()
 }
 
+/// `estimateGas` result: `{"status":"ok","gas":N}` (the buffered gas-limit estimate
+/// as a JSON number — the 1.15 buffer can put it slightly above the 30 M base) or
+/// `{"status":"unavailable","reason":"…"}`. The Java side returns the number for
+/// `ok` and null otherwise (a reverting/unverifiable estimate has no number).
 pub fn estimate_json(outcome: &GasOutcome) -> String {
     let mut obj = serde_json::Map::new();
     match outcome {

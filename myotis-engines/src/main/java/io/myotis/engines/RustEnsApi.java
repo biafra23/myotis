@@ -16,16 +16,23 @@ import io.myotis.api.EnsTextResult;
  * native resolver (registry walk + {@code addr}/ENSIP-10 dispatch over verified
  * eth_calls — EL-C-5-1); every other record type returns a graceful
  * "not implemented" error result until its slice lands (reverse+forward-verify
- * EL-C-5-2, CCIP-Read EL-C-5-3, further record types after). Per the
- * {@link EnsApi} contract, failures are reported in the result record's
- * {@code error} — methods never throw.
+ * EL-C-5-2, CCIP-Read EL-C-5-3, further record types after). Resolution failures
+ * are reported in the result record's {@code error}; this impl never throws (see
+ * the divergence note below).
  *
- * <p>The {@code root} parameter is currently advisory: the native resolver always
- * runs against the beacon-anchored optimistic head (AUTO-like freshness), so
- * {@code verified} is reported {@code false} — the resolution IS proof-verified
- * against the anchored head, but not against a beacon-FINALIZED root, which is
- * what {@code verified} means in this API. Finalized-root pinning is a later
- * refinement.
+ * <p>The native resolver always runs against the beacon-anchored optimistic head
+ * (AUTO-like freshness), so {@code verified} is reported {@code false} — the
+ * resolution IS proof-verified against the anchored head, but not against a
+ * beacon-FINALIZED root, which is what {@code verified} means in this API. An
+ * explicit {@link EnsRoot#FINALIZED} request is therefore rejected with an error
+ * result (never silently downgraded); finalized-root pinning is a later refinement.
+ *
+ * <p>Deliberate divergence from {@code JavaEnsApi}: that impl throws
+ * {@link io.myotis.api.EngineException} for the not-running state (per the EnsApi
+ * javadoc), while this one folds EVERY failure — including not-running — into the
+ * record's {@code error}. The native layer reports not-running as an error JSON,
+ * and distinguishing it by message string would be brittle; IPC consumers handle
+ * both shapes identically.
  */
 final class RustEnsApi implements EnsApi {
 
@@ -42,6 +49,13 @@ final class RustEnsApi implements EnsApi {
     public EnsResolutionResult resolveAddress(String name, EnsRoot root) {
         if (name == null || name.isBlank()) {
             return new EnsResolutionResult(name, null, -1, false, "empty ENS name");
+        }
+        if (root == EnsRoot.FINALIZED) {
+            // Fail closed rather than silently serving a weaker root than demanded:
+            // this engine resolves against the beacon-anchored OPTIMISTIC head only.
+            return new EnsResolutionResult(name, null, -1, false,
+                    "finalized-root resolution not supported on the rust engine yet"
+                    + " (resolves against the beacon-anchored optimistic head; use AUTO)");
         }
         try {
             return handle.resolveEnsVerified(name);

@@ -223,6 +223,11 @@ pub struct ElReader {
 /// slots each). Generous — entries are small and eviction only trims the oldest.
 const EVM_PROOF_CACHE_ENTRIES: usize = 8192;
 
+/// Overall deadline for one ENS resolution walk (mirrors the Java
+/// `JavaEnsApi.RESOLVE_TIMEOUT_SEC` order of magnitude — the EnsApi contract
+/// promises a bounded worst case of ~2 min).
+const RESOLVE_ENS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
 impl ElReader {
     /// Start a mainnet reader with a freshly-generated ephemeral node key (the
     /// CL side generates its libp2p identity per run too; a persistent EL
@@ -677,12 +682,19 @@ impl ElReader {
     pub async fn resolve_ens(&self, name: String, chain_id: u64) -> Result<EnsOutcome, String> {
         let (ctx, executor) = self.evm_setup(chain_id, "resolve-ens").await?;
         let block_number = ctx.block_number;
-        let joined = tokio::task::spawn_blocking(move || {
+        let walk = tokio::task::spawn_blocking(move || {
             let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
             myotis_evm::resolve_address(&caller, &name)
-        })
-        .await
-        .map_err(|e| format!("resolve-ens task join error: {e}"))?;
+        });
+        // Overall deadline (the EnsApi contract promises a bounded worst case): the
+        // walk is a chain of per-request-bounded peer calls, but a many-label name
+        // against stalling peers could multiply far past that. On timeout the
+        // abandoned closure still runs out its in-flight peer call on the blocking
+        // thread (spawn_blocking can't be cancelled) — only the caller is released.
+        let joined = tokio::time::timeout(RESOLVE_ENS_DEADLINE, walk)
+            .await
+            .map_err(|_| "resolve-ens timed out".to_string())?
+            .map_err(|e| format!("resolve-ens task join error: {e}"))?;
         match joined {
             Ok(Some(address)) => Ok(EnsOutcome::Resolved { address, block_number }),
             Ok(None) => Ok(EnsOutcome::NoRecord { block_number }),
