@@ -264,6 +264,14 @@ class RustVerifiedReadJsonTest {
                 () -> RustChainHandle.estimateGasFromJson("{\"error\":\"handle not started\"}"));
     }
 
+    @Test
+    void okEstimateWithoutGasFailsClosed() {
+        // status=ok but no numeric gas is native shape drift → EngineException, not a
+        // silent null (which would masquerade as a legitimate "unavailable").
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.estimateGasFromJson("{\"status\":\"ok\"}"));
+    }
+
     // ---- eth_getStorageAt (storageValueFromJson) ----
 
     @Test

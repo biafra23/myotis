@@ -257,7 +257,8 @@ pub fn call_json(outcome: &CallOutcome) -> String {
     serde_json::Value::Object(obj).to_string()
 }
 
-/// `estimateGas` result: `{"status":"ok","gas":N}` (a JSON number ≤ 30 M) or
+/// `estimateGas` result: `{"status":"ok","gas":N}` (the buffered gas-limit estimate
+/// as a JSON number — the 1.15 buffer can put it slightly above the 30 M base) or
 /// `{"status":"unavailable","reason":"…"}`. The Java side returns the number for
 /// `ok` and null otherwise (a reverting/unverifiable estimate has no number).
 pub fn estimate_json(outcome: &GasOutcome) -> String {

@@ -556,13 +556,18 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     /** Package-private test seam: estimateGas JSON → gas estimate (or null) without JNI. */
     static Long estimateGasFromJson(String json) {
         JsonObject o = parseResultOrThrow(json, "estimateGas");
+        // A revert / unavailable run has no estimate → null.
+        if (!"ok".equals(stringOrNull(o, "status"))) return null;
+        // status == "ok" MUST carry a numeric gas; a missing/non-numeric one is native
+        // shape drift → fail closed (EngineException), not a silent "unavailable".
         try {
-            // Only "ok" carries a number; a revert / unavailable run has no estimate → null.
             var gas = o.get("gas");
-            if ("ok".equals(stringOrNull(o, "status")) && gas != null && !gas.isNull()) {
-                return gas.asLong();
+            if (gas == null || gas.isNull()) {
+                throw new EngineException("estimateGas JSON: status=ok without a numeric 'gas' field");
             }
-            return null;
+            return gas.asLong();
+        } catch (EngineException e) {
+            throw e;
         } catch (RuntimeException e) {
             throw new EngineException(
                     "malformed estimateGas JSON from the Rust engine: " + e.getMessage(), e);
