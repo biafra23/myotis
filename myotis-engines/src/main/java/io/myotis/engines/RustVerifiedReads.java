@@ -14,21 +14,24 @@ import org.slf4j.LoggerFactory;
  * engine's already-live, beacon-anchored verified queries
  * ({@link RustChainHandle#requestAccount}) and status.
  *
- * <p>EL-B lands these methods incrementally. This first slice answers exactly the
- * reads a wallet needs before it can build a plain-ETH send — {@code chainId},
- * {@code getBalance}, {@code getTransactionCount}, and the beacon {@code syncState}
- * — all derived from the proof-verified account query. The remaining methods
- * return {@code null} ("cannot answer verified right now"), which the router maps
- * to a strict-mode JSON-RPC {@code -32000} until later slices wire them: bytecode
- * + raw-32-byte-slot natives ({@code getCode}/{@code getStorageAt}), block/tx/
- * receipt lookup, the fee trio, {@code sendRawTransaction}, and the revm-backed
- * {@code call}/{@code estimateGas} (EL-C).
+ * <p>It answers the reads a wallet needs for an ETH send, from the beacon-anchored,
+ * proof-verified queries: {@code chainId}, {@code headBlockNumber}, {@code syncState},
+ * {@code getBalance}, {@code getTransactionCount}, {@code getCode}, {@code getStorageAt},
+ * {@code getBlockByNumber}, {@code gasPrice}, {@code maxPriorityFeePerGas},
+ * {@code sendRawTransaction}, and a 21000 {@code estimateGas} shortcut for plain
+ * transfers. The EVM-backed reads — {@code call}, and {@code estimateGas} for a
+ * contract/calldata target — return {@code null} ("cannot answer verified right
+ * now"), which the router maps to a strict-mode {@code -32000}, until EL-C (revm).
  *
- * <p><b>Head-anchored only.</b> The Rust reader verifies against the peer's fresh
- * head (the CL-anchored latest state), so a {@code "latest"}/{@code "pending"}/
- * default block selector is answerable and any specific historical block returns
- * {@code null} (unverifiable here) rather than silently returning head data for
- * the wrong block.
+ * <p><b>Head-anchored.</b> The Rust reader verifies against the peer's fresh head
+ * (the CL-anchored latest state), so state reads resolve to that head. A selector
+ * of {@code latest}/{@code pending}/{@code safe}/{@code finalized}/default, OR a
+ * specific number within {@code [head-64, head+16]} (wallets pin reads to the
+ * just-fetched latest number), is served from the verified head. A genuinely older
+ * block returns {@code null} — the head state does NOT stand in for it. So within
+ * the lag window a near-head number resolves to the verified head state (standard
+ * light-client skew); a caller needing exact historical state below the window
+ * gets {@code null}, never head data mislabeled as an old block.
  *
  * <p><b>Never throws.</b> {@link RustChainHandle#requestAccount} raises an
  * {@link EngineException} on a transport / not-running failure, but the router's
@@ -92,7 +95,7 @@ final class RustVerifiedReads implements VerifiedReads {
 
     @Override
     public String getBalance(byte[] address, String block) {
-        if (!isHeadSelector(block)) return null;
+        if (!isServableBlock(block)) return null;
         AccountProofResult r = queryAccount(address);
         if (r == null || !isVerified(r)) return null;
         // A verified-absent account has balance 0 (eth semantics), even though the
@@ -102,7 +105,7 @@ final class RustVerifiedReads implements VerifiedReads {
 
     @Override
     public Long getTransactionCount(byte[] address, String block) {
-        if (!isHeadSelector(block)) return null;
+        if (!isServableBlock(block)) return null;
         AccountProofResult r = queryAccount(address);
         if (r == null || !isVerified(r)) return null;
         // Verified-absent → nonce 0 (r.nonce() is -1 when !exists). No pending
@@ -123,7 +126,7 @@ final class RustVerifiedReads implements VerifiedReads {
 
     @Override
     public byte[] getCode(byte[] address, String block) {
-        if (!isHeadSelector(block)) return null;
+        if (!isServableBlock(block)) return null;
         if (address == null || address.length != 20) return null;
         try {
             return handle.codeVerified(toHex(address));
@@ -135,7 +138,7 @@ final class RustVerifiedReads implements VerifiedReads {
 
     @Override
     public byte[] getStorageAt(byte[] address, byte[] slot32, String block) {
-        if (!isHeadSelector(block)) return null;
+        if (!isServableBlock(block)) return null;
         if (address == null || address.length != 20) return null;
         // The router pads the position to a full 32-byte word (asWord32) before the
         // call; reject anything else defensively.
@@ -206,7 +209,21 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     @Override public String feeHistory(long blockCount, String newestBlock, double[] rewardPercentiles) { return null; }
-    @Override public Long estimateGas(byte[] from, byte[] to, byte[] data, String valueWei) { return null; }
+    @Override
+    public Long estimateGas(byte[] from, byte[] to, byte[] data, String valueWei) {
+        // The trivial case only, without the EVM (EL-C): a plain value transfer to an
+        // EOA with no calldata costs exactly 21000 intrinsic gas. Anything else needs
+        // the EVM → null:
+        //  - to == null  → contract creation
+        //  - non-empty data → runs code
+        //  - a recipient WITH code (a contract, or a 7702-delegated EOA) → its
+        //    receive/fallback (or delegated code) can run on a bare value transfer.
+        if (to == null || to.length != 20) return null;
+        if (data != null && data.length != 0) return null;
+        byte[] code = getCode(to, "latest"); // verified recipient bytecode
+        if (code == null || code.length != 0) return null;
+        return 21_000L;
+    }
 
     // ---- helpers ----
 
@@ -233,11 +250,51 @@ final class RustVerifiedReads implements VerifiedReads {
         return r.verifyMethod() != null;
     }
 
-    /** true for the head selector ("latest"/"pending"/default) the anchored reader serves. */
-    private static boolean isHeadSelector(String block) {
+    /** How far ABOVE the anchored head a number-pin is still served (the head may
+     *  advance a few blocks between eth_blockNumber and the pinned read). */
+    private static final long BLOCK_NUM_TOLERANCE = 16;
+    /** How far BELOW the anchored head a number-pin is still served from the head's
+     *  verified state (a genuinely older block can't be represented). */
+    private static final long BLOCK_NUM_LAG_TOLERANCE = 64;
+
+    /**
+     * Whether a block selector can be served from the anchored head. Accepts the
+     * head tags (latest/pending/safe/finalized/default) AND a specific block NUMBER
+     * within [head-64, head+16] — wallets (MetaMask) pin reads to the number they
+     * just got from eth_blockNumber, which is at/near the head; rejecting those
+     * left every number-pinned getBalance/getCode erroring. A genuinely older block
+     * (or earliest / not-synced) is not served (the reader is head-anchored).
+     * Mirrors the Java engine's {@code verifiedHeadFor} window.
+     */
+    private boolean isServableBlock(String block) {
+        // headBlockNumber() (a status read) is fetched only for the number path.
+        return blockInWindow(block, this::headBlockNumber);
+    }
+
+    /** Package-private, JNI-free: the block-window decision, with the anchored head
+     *  supplied lazily (fetched only when a numeric pin needs validating). */
+    static boolean blockInWindow(String block, java.util.function.Supplier<Long> head) {
         if (block == null || block.isBlank()) return true;
         String b = block.trim();
-        return b.equalsIgnoreCase("latest") || b.equalsIgnoreCase("pending");
+        if (b.equalsIgnoreCase("latest") || b.equalsIgnoreCase("pending")
+                || b.equalsIgnoreCase("safe") || b.equalsIgnoreCase("finalized")) {
+            return true;
+        }
+        if (b.equalsIgnoreCase("earliest")) return false;
+        long n;
+        try {
+            // Explicit radix (not Long.decode, which reads a leading-zero decimal as
+            // octal). JSON-RPC block numbers are 0x-hex; decimal is tolerated too.
+            n = (b.startsWith("0x") || b.startsWith("0X"))
+                    ? Long.parseLong(b.substring(2), 16)
+                    : Long.parseLong(b, 10);
+        } catch (NumberFormatException e) {
+            return false;
+        }
+        if (n < 0) return false;
+        Long h = head.get();
+        if (h == null) return false; // not synced enough to validate the pin
+        return n >= h - BLOCK_NUM_LAG_TOLERANCE && n <= h + BLOCK_NUM_TOLERANCE;
     }
 
     /** Fixed-width bytes → lowercase 0x-hex (a 20-byte address or a 32-byte
