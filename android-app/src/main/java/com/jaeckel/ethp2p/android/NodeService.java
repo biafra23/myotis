@@ -924,8 +924,11 @@ public final class NodeService extends Service {
                 @Override public void onCapabilitiesChanged(
                         Network network, android.net.NetworkCapabilities caps) { onNotifConnectivityChanged(); }
             };
-            notifNetCallback = cb;
             cm.registerDefaultNetworkCallback(cb);
+            // Publish only AFTER registration succeeded: if register throws, the
+            // field stays null so the top-of-method guard lets a later call retry
+            // (a pre-assignment would wedge connectivity refreshes until restart).
+            notifNetCallback = cb;
         } catch (Throwable t) {
             LogBuffer.w(TAG, "notification network callback registration failed: " + t);
         }
@@ -1283,7 +1286,9 @@ public final class NodeService extends Service {
         // to match the manifest's <service android:foregroundServiceType="...">
         // declaration. API 29-33 ignore the third arg. minSdk is 29.
         String[] tt0 = notificationText();
-        notifiedContent = tt0[0] + "\n" + tt0[1];   // prime the diff key to the initial content
+        synchronized (notifLock) {   // the field's documented guard — keep the prime
+            notifiedContent = tt0[0] + "\n" + tt0[1];   // ordered with any concurrent diff-and-notify
+        }
         startForeground(NOTIFICATION_ID, buildNotification(tt0[0], tt0[1]),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
         startIdleTicker();
