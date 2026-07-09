@@ -49,7 +49,7 @@ class DiscV5ReseedTest {
 
     @Test
     void noBootnodesMeansNeverDue() {
-        // Sepolia pins clDiscv5Bootnodes to List.of(): with nothing to ping, a
+        // A network with no pinned CL bootnodes: with nothing to ping, a
         // re-seed must never fire (it would log "re-pinged 0 bootnode(s)"
         // every minute forever, reading as recovery where none is possible).
         DiscV5Service s = new DiscV5Service(NodeKey.generate(), List.of(), enr -> { });

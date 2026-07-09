@@ -184,22 +184,48 @@ public record NetworkConfig(
             ),
             // genesis_validators_root (sepolia)
             Bytes.fromHexString("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078").toArrayUnsafe(),
-            // trusted checkpoint: a recent finalized sepolia block root
-            Bytes.fromHexString("1f7c15e7e1a7be27b4e7e9b7bdb0e5e9b2aa5aebd33498ec04b58ef2adb5e9ce").toArrayUnsafe(),
-            0L, // checkpoint slot — unknown for sepolia, use 0 (spec-default). refresh job should fill this.
-            // current fork version: Electra on sepolia (0x90000073)
-            new byte[]{(byte) 0x90, 0x00, 0x00, 0x73},
-            0L, 0L, // no BPO active on sepolia
-            null, // prior fork version not pinned for sepolia
+            // @checkpoint:sepolia:begin — managed by `./gradlew refreshSepoliaCheckpoint`
+            // trusted checkpoint: recent finalized sepolia block root (slot 10657440, 2026-07-09, period 1300)
+            Bytes.fromHexString("8c3bc10ed8e1567dbdb60da360091c9af38e6b64e7de553a1ba2b0a5ffdfa5f6").toArrayUnsafe(),
+            10657440L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // @checkpoint:sepolia:end
+            // current fork version: Fulu on sepolia (0x90000075) — activated at epoch 272640 (2025-10-14)
+            new byte[]{(byte) 0x90, 0x00, 0x00, 0x75},
+            // EIP-7892 BLOB_SCHEDULE — latest active entry on sepolia:
+            // BPO2 at epoch 275712, MAX_BLOBS_PER_BLOCK=21 (2025-10-28). Folds into
+            // the fork digest XOR — see activeBlobParams.
+            275712L, 21L,
+            // No prior-fork fallback (same rationale as mainnet: stale digests
+            // wouldn't help us sync to the current head anyway).
+            null,
             // CL peer multiaddrs for sepolia
             List.of(
                     "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS"
             ),
             null,
             1655733600L, // sepolia beacon genesis: 2022-06-20 14:00:00 UTC
-            List.of(), // EL ENR trees — not pinned
-            List.of(), // CL ENR trees — not pinned
-            List.of()  // CL discv5 bootnodes — not pinned for sepolia this PR
+            // EL: Ethereum Foundation canonical sepolia tree (same EF signing key
+            // as the mainnet tree; the resolver verifies the signature).
+            List.of("enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.sepolia.ethdisco.net"),
+            List.of(), // CL ENR trees — no canonical single tree (same as mainnet)
+            // CL discv5 bootnodes — the canonical seed set for the sepolia beacon DHT.
+            // Mirrors eth-clients/sepolia metadata/bootstrap_nodes.yaml (EF, Teku,
+            // Lodestar). Seeds only: discv5's Kademlia loop expands beyond them.
+            List.of(
+                    // EF
+                    "enr:-Ku4QDZ_rCowZFsozeWr60WwLgOfHzv1Fz2cuMvJqN5iJzLxKtVjoIURY42X_YTokMi3IGstW5v32uSYZyGUXj9Q_IECh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCo_ujukAAAaf__________gmlkgnY0gmlwhIpEe5iJc2VjcDI1NmsxoQNHTpFdaNSCEWiN_QqT396nb0PzcUpLe3OVtLph-AciBYN1ZHCCIy0",
+                    "enr:-Ku4QHRyRwEPT7s0XLYzJ_EeeWvZTXBQb4UCGy1F_3m-YtCNTtDlGsCMr4UTgo4uR89pv11uM-xq4w6GKfKhqU31hTgCh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCo_ujukAAAaf__________gmlkgnY0gmlwhIrFM7WJc2VjcDI1NmsxoQI4diTwChN3zAAkarf7smOHCdFb1q3DSwdiQ_Lc_FdzFIN1ZHCCIy0",
+                    "enr:-Ku4QOkvvf0u5Hg4-HhY-SJmEyft77G5h3rUM8VF_e-Hag5cAma3jtmFoX4WElLAqdILCA-UWFRN1ZCDJJVuEHrFeLkDh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCo_ujukAAAaf__________gmlkgnY0gmlwhJK-AWeJc2VjcDI1NmsxoQLFcT5VE_NMiIC8Ll7GypWDnQ4UEmuzD7hF_Hf4veDJwIN1ZHCCIy0",
+                    "enr:-Ku4QH6tYsHKITYeHUu5kdfXgEZWI18EWk_2RtGOn1jBPlx2UlS_uF3Pm5Dx7tnjOvla_zs-wwlPgjnEOcQDWXey51QCh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCo_ujukAAAaf__________gmlkgnY0gmlwhIs7Mc6Jc2VjcDI1NmsxoQIET4Mlv9YzhrYhX_H9D7aWMemUrvki6W4J2Qo0YmFMp4N1ZHCCIy0",
+                    "enr:-Ku4QDmz-4c1InchGitsgNk4qzorWMiFUoaPJT4G0IiF8r2UaevrekND1o7fdoftNucirj7sFFTTn2-JdC2Ej0p1Mn8Ch2F0dG5ldHOIAAAAAAAAAACEZXRoMpCo_ujukAAAaf__________gmlkgnY0gmlwhKpA-liJc2VjcDI1NmsxoQMpHP5U1DK8O_JQU6FadmWbE42qEdcGlllR8HcSkkfWq4N1ZHCCIy0",
+                    // Teku
+                    "enr:-Iu4QKvMF7Ne_RSQoZGvavTuZ1QA5_Pgeb0nq_hrjhU8s0UDV3KhcMXJkGwOWhsDGZL3ISjL0CTP-hfoTjZtEtCEwR4BgmlkgnY0gmlwhAOAaySJc2VjcDI1NmsxoQNta5b_bexSSwwrGW2Re24MjfMntzFd0f2SAxQtMj3ueYN0Y3CCIyiDdWRwgiMo",
+                    // Lodestar
+                    "enr:-KG4QJejf8KVtMeAPWFhN_P0c4efuwu1pZHELTveiXUeim6nKYcYcMIQpGxxdgT2Xp9h-M5pr9gn2NbbwEAtxzu50Y8BgmlkgnY0gmlwhEEVkQCDaXA2kCoBBPnAEJg4AAAAAAAAAAGJc2VjcDI1NmsxoQLEh_eVvk07AQABvLkTGBQTrrIOQkzouMgSBtNHIRUxOIN1ZHCCIyiEdWRwNoIjKA",
+                    // remaining bootstrap_nodes.yaml entries (unattributed)
+                    "enr:-Iq4QMCTfIMXnow27baRUb35Q8iiFHSIDBJh6hQM5Axohhf4b6Kr_cOCu0htQ5WvVqKvFgY28893DHAg8gnBAXsAVqmGAX53x8JggmlkgnY0gmlwhLKAlv6Jc2VjcDI1NmsxoQK6S-Cii_KmfFdUJL2TANL3ksaKUnNXvTCv1tLwXs0QgIN1ZHCCIyk",
+                    "enr:-L64QC9Hhov4DhQ7mRukTOz4_jHm4DHlGL726NWH4ojH1wFgEwSin_6H95Gs6nW2fktTWbPachHJ6rUFu0iJNgA0SB2CARqHYXR0bmV0c4j__________4RldGgykDb6UBOQAABx__________-CaWSCdjSCaXCEA-2vzolzZWNwMjU2azGhA17lsUg60R776rauYMdrAz383UUgESoaHEzMkvm4K6k6iHN5bmNuZXRzD4N0Y3CCIyiDdWRwgiMo"
+            )
     );
 
     // Gnosis Chain (xDai). EL chainId 100; its own Consensus Layer (Gnosis Beacon

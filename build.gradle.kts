@@ -69,24 +69,19 @@ subprojects {
 }
 
 // -------------------------------------------------------------------------
-// Trust anchor refresh: fetch the current mainnet finalized block root from
-// multiple independent public checkpoint endpoints, cross-validate, and
-// rewrite the `@checkpoint:mainnet` region in NetworkConfig.java.
+// Trust anchor refresh: fetch the current finalized block root from multiple
+// independent public checkpoint endpoints, cross-validate, and rewrite the
+// `@checkpoint:<network>` region in NetworkConfig.java. Shared by the mainnet
+// and sepolia tasks (identical Beacon API shape and mainnet-preset slot math);
+// Gnosis has its own task below (different API surface, scarce endpoints).
 // -------------------------------------------------------------------------
 
-tasks.register("refreshMainnetCheckpoint") {
+fun registerCheckpointRefresh(taskName: String, network: String, endpoints: List<String>, genesisTimeProperty: String) =
+    tasks.register(taskName) {
     group = "trust"
-    description = "Fetch the finalized mainnet block root from 3 public checkpoint providers, cross-validate, and update NetworkConfig.java. Use -Pdry to preview the diff without writing."
+    description = "Fetch the finalized $network block root from ${endpoints.size} public checkpoint providers, cross-validate, and update NetworkConfig.java. Use -Pdry to preview the diff without writing."
 
     doLast {
-        // Three independent mainnet checkpoint-sync endpoints. These serve only a narrow
-        // slice of the Beacon API (/eth/v1/beacon/blocks/{id}/root + /eth/v2/beacon/blocks/{id}),
-        // which is enough for what we need here.
-        val endpoints = listOf(
-            "https://beaconstate.info",
-            "https://sync-mainnet.beaconcha.in",
-            "https://mainnet-checkpoint-sync.attestant.io",
-        )
         val dryRun = project.hasProperty("dry")
         val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
 
@@ -154,20 +149,21 @@ tasks.register("refreshMainnetCheckpoint") {
 
         val finalRoot = distinct.single().removePrefix("0x")
         val period = minSlot / 8192
-        // Shared with BeaconChainSpec.MAINNET_GENESIS_TIME via gradle.properties
-        val genesis = (project.property("ethp2p.mainnet.genesisTime") as String).toLong()
+        // Shared with the Java-side genesis constants via gradle.properties
+        val genesis = (project.findProperty(genesisTimeProperty) as? String)?.takeIf { it.isNotBlank() }?.toLongOrNull()
+            ?: throw GradleException("Property '$genesisTimeProperty' is missing, blank, or not a valid Long")
         val ts = Instant.ofEpochSecond(genesis + minSlot * 12)
         val date = DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(ZoneOffset.UTC).format(ts)
 
         val file = project(":networking").projectDir.resolve(
             "src/main/java/com/jaeckel/ethp2p/networking/NetworkConfig.java")
         val original = file.readText()
-        val beginMarker = "// @checkpoint:mainnet:begin"
-        val endMarker = "// @checkpoint:mainnet:end"
+        val beginMarker = "// @checkpoint:$network:begin"
+        val endMarker = "// @checkpoint:$network:end"
         val beginIdx = original.indexOf(beginMarker)
         val endIdx = original.indexOf(endMarker)
         if (beginIdx < 0 || endIdx < 0 || endIdx < beginIdx) {
-            throw GradleException("Could not find @checkpoint:mainnet:begin/end markers in NetworkConfig.java")
+            throw GradleException("Could not find @checkpoint:$network:begin/end markers in NetworkConfig.java")
         }
         // Preserve whatever line ending the source file uses so we don't mix CRLF/LF
         // when running on Windows.
@@ -179,11 +175,11 @@ tasks.register("refreshMainnetCheckpoint") {
         val indent = original.substring(beginLineStart, beginIdx)
 
         val replacement = buildString {
-            append(indent).append("// @checkpoint:mainnet:begin — managed by `./gradlew refreshMainnetCheckpoint`").append(eol)
-            append(indent).append("// trusted checkpoint: recent finalized mainnet block root (slot $minSlot, $date, period $period)").append(eol)
+            append(indent).append("// @checkpoint:$network:begin — managed by `./gradlew $taskName`").append(eol)
+            append(indent).append("// trusted checkpoint: recent finalized $network block root (slot $minSlot, $date, period $period)").append(eol)
             append(indent).append("Bytes.fromHexString(\"$finalRoot\").toArrayUnsafe(),").append(eol)
             append(indent).append("${minSlot}L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.").append(eol)
-            append(indent).append("// @checkpoint:mainnet:end")
+            append(indent).append("// @checkpoint:$network:end")
         }
         val updated = original.substring(0, beginLineStart) + replacement + original.substring(endMarkerEnd)
 
@@ -214,6 +210,30 @@ tasks.register("refreshMainnetCheckpoint") {
         }
     }
 }
+
+// Independent checkpoint-sync endpoints per network. These serve only a narrow
+// slice of the Beacon API (/eth/v1/beacon/blocks/{id}/root + /eth/v2/beacon/blocks/{id}),
+// which is enough for what we need here.
+registerCheckpointRefresh(
+    "refreshMainnetCheckpoint", "mainnet",
+    listOf(
+        "https://beaconstate.info",
+        "https://sync-mainnet.beaconcha.in",
+        "https://mainnet-checkpoint-sync.attestant.io",
+    ),
+    "ethp2p.mainnet.genesisTime",
+)
+// The full eth-clients/checkpoint-sync-endpoints sepolia list; the task needs
+// any 2 of them live for cross-validation.
+registerCheckpointRefresh(
+    "refreshSepoliaCheckpoint", "sepolia",
+    listOf(
+        "https://sepolia.beaconstate.info",
+        "https://checkpoint-sync.sepolia.ethpandaops.io",
+        "https://beaconstate-sepolia.chainsafe.io",
+    ),
+    "ethp2p.sepolia.genesisTime",
+)
 
 // -------------------------------------------------------------------------
 // Gnosis checkpoint refresh. Public Gnosis beacon endpoints serving the
