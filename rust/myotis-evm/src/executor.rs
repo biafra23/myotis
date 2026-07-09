@@ -190,7 +190,15 @@ impl EvmExecutor {
         ctx: &BlockContext,
     ) -> Result<u64, EvmError> {
         match self.execute(caller, target, calldata, value, ctx)? {
-            ExecutionResult::Success { gas, .. } => Ok(with_estimate_buffer(gas.spent())),
+            ExecutionResult::Success { gas, .. } => {
+                // The gas-limit base must cover BOTH the gross execution draw
+                // (`total_gas_spent`, before the EIP-3529 refund — so the run never
+                // OOGs mid-execution) AND the EIP-7623 calldata floor (`tx_gas_used`
+                // = max(spent−refund, floor_gas) — the minimum a Prague+ tx is
+                // charged). `max(total_gas_spent, tx_gas_used)` == `max(gross, floor)`.
+                let base = gas.total_gas_spent().max(gas.tx_gas_used());
+                Ok(with_estimate_buffer(base))
+            }
             ExecutionResult::Revert { output, .. } => {
                 Err(EvmError::Reverted { data: output.to_vec() })
             }
@@ -203,14 +211,11 @@ fn output_bytes(output: Output) -> Vec<u8> {
     output.into_data().to_vec()
 }
 
-/// The gas-limit estimate: gross gas × 1.15, rounded up (mirrors the Java engine's
-/// `ceil(total * 1.15)`). The base is revm's GROSS gas (`ResultGas::spent`: intrinsic
-/// + execution, BEFORE the EIP-3529 refund) — the correct base for a limit that never
-/// runs out mid-execution (the refund is only credited at the end, so the tx must be
-/// funded for the gross amount). `spent <= 30 M`, so `* 115` never overflows u64, but
-/// the u128 math + clamp keeps it panic-free regardless.
-fn with_estimate_buffer(spent: u64) -> u64 {
-    let scaled = (spent as u128 * 115).div_ceil(100);
+/// Apply the 1.15 headroom buffer to a gas base, rounded up (mirrors the Java
+/// engine's `ceil(total * 1.15)`). `base <= 30 M`, so `* 115` never overflows u64,
+/// but the u128 math + clamp keeps it panic-free regardless.
+fn with_estimate_buffer(base: u64) -> u64 {
+    let scaled = (base as u128 * 115).div_ceil(100);
     scaled.min(u64::MAX as u128) as u64
 }
 
@@ -424,6 +429,22 @@ mod tests {
             .estimate_gas([0x42; 20], TARGET, &[], U256::ZERO, &ctx(19_500_000, CANCUN_TIME + 1))
             .unwrap();
         assert!(sstore_est > stop_est, "SSTORE={sstore_est} must exceed STOP={stop_est}");
+    }
+
+    #[test]
+    fn estimate_gas_covers_the_eip7623_calldata_floor() {
+        use crate::fork::PRAGUE_TIME;
+        // A STOP contract ignores calldata, but on Prague+ EIP-7623 charges a floor of
+        // 21000 + 10*(zero + 4*nonzero) tokens. 200 nonzero bytes → floor 21000 +
+        // 10*800 = 29000, ABOVE the standard intrinsic (21000 + 16*200 = 24200) — so
+        // the estimate must reflect the FLOOR, or a real tx would be rejected below it.
+        let exec = executor_with(vec![0x00u8], None); // STOP
+        let calldata = vec![0x11u8; 200]; // 200 nonzero bytes
+        let est = exec
+            .estimate_gas([0x42; 20], TARGET, &calldata, U256::ZERO, &ctx(23_000_000, PRAGUE_TIME + 1))
+            .unwrap();
+        // floor = 29000; ceil(29000 * 1.15) = 33350.
+        assert!(est >= 33_350, "estimate must cover the EIP-7623 calldata floor, was {est}");
     }
 
     #[test]
