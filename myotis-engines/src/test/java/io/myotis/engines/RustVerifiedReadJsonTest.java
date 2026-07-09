@@ -244,6 +244,34 @@ class RustVerifiedReadJsonTest {
                 () -> RustChainHandle.callResultFromJson("{\"error\":\"no snap peer available\"}"));
     }
 
+    // ---- eth_estimateGas (estimateGasFromJson) ----
+
+    @Test
+    void okEstimateReturnsGasNumber() {
+        assertEquals(Long.valueOf(24_150L),
+                RustChainHandle.estimateGasFromJson("{\"status\":\"ok\",\"gas\":24150}"));
+    }
+
+    @Test
+    void unavailableEstimateIsNull() {
+        assertNull(RustChainHandle.estimateGasFromJson(
+                "{\"status\":\"unavailable\",\"reason\":\"execution reverted\"}"));
+    }
+
+    @Test
+    void estimateErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.estimateGasFromJson("{\"error\":\"handle not started\"}"));
+    }
+
+    @Test
+    void okEstimateWithoutGasFailsClosed() {
+        // status=ok but no numeric gas is native shape drift → EngineException, not a
+        // silent null (which would masquerade as a legitimate "unavailable").
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.estimateGasFromJson("{\"status\":\"ok\"}"));
+    }
+
     // ---- eth_getStorageAt (storageValueFromJson) ----
 
     @Test

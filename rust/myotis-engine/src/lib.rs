@@ -25,7 +25,8 @@ pub mod ringlog;
 ///     RustChainHandle at the same time so no .so ever reports an ABI the
 ///     running Java engine treats as stale.
 /// v9: added nativeEthCallJson (eth_call over verified state via the revm executor).
-pub const ABI_VERSION: i32 = 9;
+/// v10: added nativeEstimateGasJson (eth_estimateGas over the revm executor).
+pub const ABI_VERSION: i32 = 10;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
@@ -287,6 +288,31 @@ mod jni_shim {
         let value = read_string(&mut env, &value).unwrap_or_default();
         let block = read_string(&mut env, &block).unwrap_or_default();
         let json = crate::host::eth_call_json(handle, &from, &to, &data, &value, &block);
+        match env.new_string(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// `RustEngineNative.nativeEstimateGasJson(long handle, String from, String to,
+    /// String data, String valueDecimal)` — verified `eth_estimateGas` over the revm
+    /// executor (runs against the verified head; no block arg). `from` empty ⇒
+    /// anonymous sender; `valueDecimal` is wei as a decimal string.
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeEstimateGasJson(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        from: JString,
+        to: JString,
+        data: JString,
+        value: JString,
+    ) -> jstring {
+        let from = read_string(&mut env, &from).unwrap_or_default();
+        let to = read_string(&mut env, &to).unwrap_or_default();
+        let data = read_string(&mut env, &data).unwrap_or_default();
+        let value = read_string(&mut env, &value).unwrap_or_default();
+        let json = crate::host::estimate_gas_json(handle, &from, &to, &data, &value);
         match env.new_string(json) {
             Ok(s) => s.into_raw(),
             Err(_) => std::ptr::null_mut(),

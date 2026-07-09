@@ -490,6 +490,61 @@ pub fn eth_call_json(
     }
 }
 
+/// `nativeEstimateGasJson`: verified `eth_estimateGas` for a call (`to` set) over the
+/// revm executor. Args as for [`eth_call_json`] minus the block (estimate always runs
+/// against the verified head). Returns the estimate JSON (`ok`/`unavailable`, see
+/// [`eljson::estimate_json`]) or `{"error": "..."}`.
+pub fn estimate_gas_json(
+    handle: i64,
+    from_hex: &str,
+    to_hex: &str,
+    data_hex: &str,
+    value_dec: &str,
+) -> String {
+    let Some(to) = parse_address(to_hex) else {
+        return eljson::error_json("invalid 'to' address (expected 20-byte hex)");
+    };
+    let from = if from_hex.trim().is_empty() {
+        None
+    } else {
+        match parse_address(from_hex) {
+            Some(a) => Some(a),
+            None => return eljson::error_json("invalid 'from' address (expected 20-byte hex)"),
+        }
+    };
+    let data = if data_hex.trim().is_empty() {
+        Vec::new()
+    } else {
+        match parse_hex_bytes(data_hex) {
+            Some(d) => d,
+            None => return eljson::error_json("invalid call data (expected hex)"),
+        }
+    };
+    let value = if value_dec.trim().is_empty() {
+        U256::ZERO
+    } else {
+        match U256::from_str_radix(value_dec.trim(), 10) {
+            Ok(v) => v,
+            Err(_) => return eljson::error_json("invalid value (expected decimal wei)"),
+        }
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let reader = match snapshot_reader(engine, handle) {
+        Ok((reader, _, _)) => reader,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    const MAINNET_CHAIN_ID: u64 = 1;
+    match engine
+        .rt
+        .block_on(async { reader.estimate_gas(from, to, data, value, MAINNET_CHAIN_ID).await })
+    {
+        Ok(outcome) => eljson::estimate_json(&outcome),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
 /// `nativeGetBlockByNumberJson`: verified `eth_getBlockByNumber` (transactions as
 /// hashes) for a running handle. Returns the block JSON when found+verified, the
 /// literal `"null"` for a future/unknown block (eth's null), or `{"error": "..."}`

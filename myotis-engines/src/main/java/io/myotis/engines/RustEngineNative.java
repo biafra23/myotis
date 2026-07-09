@@ -23,7 +23,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 9; // 9: + nativeEthCallJson
+    static final int EXPECTED_ABI_VERSION = 10; // 10: + nativeEstimateGasJson
 
     private static final boolean AVAILABLE = load();
 
@@ -151,6 +151,17 @@ final class RustEngineNative {
      */
     static native String nativeEthCallJson(
             long handle, String from, String to, String data, String value, String block);
+
+    /**
+     * A verified {@code eth_estimateGas} over the revm executor for a running handle,
+     * as JSON ({@code {"status":"ok","gas":N}} on success,
+     * {@code {"status":"unavailable","reason":"…"}} for a revert/unverifiable run, or
+     * {@code {"error":"…"}} on a transport/bad-input failure). Runs against the verified
+     * head (no block arg). {@code from} empty ⇒ anonymous sender; {@code value} is wei
+     * as a decimal string.
+     */
+    static native String nativeEstimateGasJson(
+            long handle, String from, String to, String data, String value);
 
     /**
      * Verified {@code eth_getBlockByNumber} (transactions as hashes) for a running

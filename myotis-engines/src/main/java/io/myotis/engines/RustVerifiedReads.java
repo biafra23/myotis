@@ -231,18 +231,29 @@ final class RustVerifiedReads implements VerifiedReads {
     @Override public String feeHistory(long blockCount, String newestBlock, double[] rewardPercentiles) { return null; }
     @Override
     public Long estimateGas(byte[] from, byte[] to, byte[] data, String valueWei) {
-        // The trivial case only, without the EVM (EL-C): a plain value transfer to an
-        // EOA with no calldata costs exactly 21000 intrinsic gas. Anything else needs
-        // the EVM → null:
-        //  - to == null  → contract creation
-        //  - non-empty data → runs code
-        //  - a recipient WITH code (a contract, or a 7702-delegated EOA) → its
-        //    receive/fallback (or delegated code) can run on a bare value transfer.
+        // Contract creation (to == null) isn't handled.
         if (to == null || to.length != 20) return null;
-        if (data != null && data.length != 0) return null;
-        byte[] code = getCode(to, "latest"); // verified recipient bytecode
-        if (code == null || code.length != 0) return null;
-        return 21_000L;
+        if (from != null && from.length != 20) return null;
+        // Fast path: a plain value transfer (no calldata) to a codeless EOA costs
+        // exactly 21000 intrinsic gas — no EVM run needed. A recipient WITH code (a
+        // contract or a 7702-delegated EOA) can run its receive/fallback even on a
+        // bare transfer, so it falls through to the EVM.
+        if (data == null || data.length == 0) {
+            byte[] code = getCode(to, "latest"); // verified recipient bytecode
+            if (code != null && code.length == 0) return 21_000L;
+            if (code == null) return null; // couldn't verify the recipient → can't answer
+        }
+        // EVM path (EL-C): run the call and take the buffered gas-limit estimate.
+        try {
+            return handle.estimateGasVerified(
+                    from == null ? "" : toHex(from),
+                    toHex(to),
+                    data == null ? "" : toHex(data),
+                    valueWei == null ? "" : valueWei);
+        } catch (RuntimeException e) {
+            log.debug("[engines] verified estimateGas unavailable: {}", e.getMessage());
+            return null;
+        }
     }
 
     // ---- helpers ----

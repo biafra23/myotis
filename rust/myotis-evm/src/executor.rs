@@ -78,7 +78,7 @@ impl EvmExecutor {
         calldata: &[u8],
         ctx: &BlockContext,
     ) -> Result<Vec<u8>, EvmError> {
-        self.run(VIEW_CALLER, target, calldata, U256::ZERO, ctx)
+        self.call(VIEW_CALLER, target, calldata, U256::ZERO, ctx)
     }
 
     /// `eth_call` with an explicit `sender` and `value` — needed so `msg.sender`-
@@ -91,23 +91,38 @@ impl EvmExecutor {
         value: U256,
         ctx: &BlockContext,
     ) -> Result<Vec<u8>, EvmError> {
-        self.run(Address::from(sender), target, calldata, value, ctx)
+        self.call(Address::from(sender), target, calldata, value, ctx)
     }
 
-    fn run(
+    /// `estimateGas` for a call (`to` != null): run it and return the gas LIMIT that
+    /// would let it succeed. Reverts/halts yield no number (an `Err`) — the host
+    /// maps that to a JSON-RPC null, like the reference engine.
+    pub fn estimate_gas(
+        &self,
+        from: [u8; 20],
+        target: [u8; 20],
+        calldata: &[u8],
+        value: U256,
+        ctx: &BlockContext,
+    ) -> Result<u64, EvmError> {
+        self.estimate(Address::from(from), target, calldata, value, ctx)
+    }
+
+    /// The shared setup + `transact`, returning revm's raw result. Only DB / tx-
+    /// envelope failures become `Err` here; execution outcomes (success/revert/halt)
+    /// are returned for the caller to interpret.
+    fn execute(
         &self,
         caller: Address,
         target: [u8; 20],
         calldata: &[u8],
         value: U256,
         ctx: &BlockContext,
-    ) -> Result<Vec<u8>, EvmError> {
+    ) -> Result<ExecutionResult, EvmError> {
         // Fail closed on a non-mainnet context: the fork table and Context::mainnet()
         // below are mainnet-specific, so any other chain would run the wrong rules.
         if ctx.chain_id != MAINNET_CHAIN_ID {
-            return Err(EvmError::UnsupportedChain {
-                chain_id: ctx.chain_id,
-            });
+            return Err(EvmError::UnsupportedChain { chain_id: ctx.chain_id });
         }
         let spec = spec_for(ctx.block_number, ctx.timestamp)?;
 
@@ -120,9 +135,9 @@ impl EvmExecutor {
 
         let mut cfg = CfgEnv::new_with_spec(spec);
         cfg.chain_id = ctx.chain_id;
-        // A view call isn't a real tx: relax the transaction-level checks (see the
-        // module docs). `tx_gas_limit_cap` is raised to VIEW_CALL_GAS so the spec's
-        // own per-tx cap doesn't clip the full-block gas budget.
+        // Not a real tx: relax the transaction-level checks (see the module docs).
+        // `tx_gas_limit_cap` is raised to VIEW_CALL_GAS so the spec's own per-tx cap
+        // doesn't clip the full-block gas budget (also the estimate ceiling).
         cfg.disable_nonce_check = true;
         cfg.disable_balance_check = true;
         cfg.disable_base_fee = true;
@@ -144,12 +159,49 @@ impl EvmExecutor {
             .with_cfg(cfg)
             .build_mainnet();
 
-        let out = evm.transact(tx).map_err(map_evm_error)?;
-        match out.result {
+        Ok(evm.transact(tx).map_err(map_evm_error)?.result)
+    }
+
+    /// Run a call and return its output bytes (revert/halt → `Err`).
+    fn call(
+        &self,
+        caller: Address,
+        target: [u8; 20],
+        calldata: &[u8],
+        value: U256,
+        ctx: &BlockContext,
+    ) -> Result<Vec<u8>, EvmError> {
+        match self.execute(caller, target, calldata, value, ctx)? {
             ExecutionResult::Success { output, .. } => Ok(output_bytes(output)),
-            ExecutionResult::Revert { output, .. } => Err(EvmError::Reverted {
-                data: output.to_vec(),
-            }),
+            ExecutionResult::Revert { output, .. } => {
+                Err(EvmError::Reverted { data: output.to_vec() })
+            }
+            ExecutionResult::Halt { reason, .. } => Err(map_halt(reason)),
+        }
+    }
+
+    /// Run a call and return the gas-limit estimate (revert/halt → `Err`).
+    fn estimate(
+        &self,
+        caller: Address,
+        target: [u8; 20],
+        calldata: &[u8],
+        value: U256,
+        ctx: &BlockContext,
+    ) -> Result<u64, EvmError> {
+        match self.execute(caller, target, calldata, value, ctx)? {
+            ExecutionResult::Success { gas, .. } => {
+                // The gas-limit base must cover BOTH the gross execution draw
+                // (`total_gas_spent`, before the EIP-3529 refund — so the run never
+                // OOGs mid-execution) AND the EIP-7623 calldata floor (`tx_gas_used`
+                // = max(spent−refund, floor_gas) — the minimum a Prague+ tx is
+                // charged). `max(total_gas_spent, tx_gas_used)` == `max(gross, floor)`.
+                let base = gas.total_gas_spent().max(gas.tx_gas_used());
+                Ok(with_estimate_buffer(base))
+            }
+            ExecutionResult::Revert { output, .. } => {
+                Err(EvmError::Reverted { data: output.to_vec() })
+            }
             ExecutionResult::Halt { reason, .. } => Err(map_halt(reason)),
         }
     }
@@ -157,6 +209,14 @@ impl EvmExecutor {
 
 fn output_bytes(output: Output) -> Vec<u8> {
     output.into_data().to_vec()
+}
+
+/// Apply the 1.15 headroom buffer to a gas base, rounded up (mirrors the Java
+/// engine's `ceil(total * 1.15)`). `base <= 30 M`, so `* 115` never overflows u64,
+/// but the u128 math + clamp keeps it panic-free regardless.
+fn with_estimate_buffer(base: u64) -> u64 {
+    let scaled = (base as u128 * 115).div_ceil(100);
+    scaled.min(u64::MAX as u128) as u64
 }
 
 fn map_halt(reason: HaltReason) -> EvmError {
@@ -340,6 +400,62 @@ mod tests {
             .call_view(TARGET, &[], &ctx(19_500_000, CANCUN_TIME + 1))
             .unwrap_err();
         assert!(matches!(err, EvmError::OutOfGas), "got {err:?}");
+    }
+
+    #[test]
+    fn estimate_gas_applies_the_buffer_over_intrinsic() {
+        // A STOP contract does no EVM work, so gross gas ≈ the 21000 intrinsic (empty
+        // calldata). The estimate is ceil(21000 * 1.15) = 24150, plus at most a small
+        // cold-access charge — bounded well below a real-work call.
+        let exec = executor_with(vec![0x00u8], None); // STOP
+        let est = exec
+            .estimate_gas([0x42; 20], TARGET, &[], U256::ZERO, &ctx(19_500_000, CANCUN_TIME + 1))
+            .unwrap();
+        assert!(est >= 24_150, "estimate must apply the 1.15 buffer over intrinsic, was {est}");
+        assert!(est < 30_000, "a STOP contract shouldn't estimate real-work gas, was {est}");
+    }
+
+    #[test]
+    fn estimate_gas_reflects_evm_work() {
+        // A contract that SSTOREs must estimate strictly more than a no-op STOP —
+        // proving execution gas (not just intrinsic) is metered.
+        let stop = executor_with(vec![0x00u8], None);
+        let stop_est = stop
+            .estimate_gas([0x42; 20], TARGET, &[], U256::ZERO, &ctx(19_500_000, CANCUN_TIME + 1))
+            .unwrap();
+        // PUSH1 0x2a PUSH1 0x00 SSTORE STOP — a fresh (0→nonzero) storage write.
+        let sstore = executor_with(vec![0x60u8, 0x2a, 0x60, 0x00, 0x55, 0x00], None);
+        let sstore_est = sstore
+            .estimate_gas([0x42; 20], TARGET, &[], U256::ZERO, &ctx(19_500_000, CANCUN_TIME + 1))
+            .unwrap();
+        assert!(sstore_est > stop_est, "SSTORE={sstore_est} must exceed STOP={stop_est}");
+    }
+
+    #[test]
+    fn estimate_gas_covers_the_eip7623_calldata_floor() {
+        use crate::fork::PRAGUE_TIME;
+        // A STOP contract ignores calldata, but on Prague+ EIP-7623 charges a floor of
+        // 21000 + 10*(zero + 4*nonzero) tokens. 200 nonzero bytes → floor 21000 +
+        // 10*800 = 29000, ABOVE the standard intrinsic (21000 + 16*200 = 24200) — so
+        // the estimate must reflect the FLOOR, or a real tx would be rejected below it.
+        let exec = executor_with(vec![0x00u8], None); // STOP
+        let calldata = vec![0x11u8; 200]; // 200 nonzero bytes
+        let est = exec
+            .estimate_gas([0x42; 20], TARGET, &calldata, U256::ZERO, &ctx(23_000_000, PRAGUE_TIME + 1))
+            .unwrap();
+        // floor = 29000; ceil(29000 * 1.15) = 33350.
+        assert!(est >= 33_350, "estimate must cover the EIP-7623 calldata floor, was {est}");
+    }
+
+    #[test]
+    fn estimate_gas_reverts_yield_no_number() {
+        // PUSH1 0xAB PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 REVERT — a revert has no estimate.
+        let code = vec![0x60u8, 0xAB, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xfd];
+        let exec = executor_with(code, None);
+        let err = exec
+            .estimate_gas([0x42; 20], TARGET, &[], U256::ZERO, &ctx(19_500_000, CANCUN_TIME + 1))
+            .unwrap_err();
+        assert!(matches!(err, EvmError::Reverted { .. }), "got {err:?}");
     }
 
     #[test]

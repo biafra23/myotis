@@ -32,7 +32,7 @@ use myotis_evm::{EvmError, EvmExecutor, InMemoryBytecodeCache, InMemoryStateProo
 use crate::el::anchor::ExecAnchor;
 use crate::el::discv4::{Discv4Config, Discv4Service};
 use crate::el::eth::session::EthConfig;
-use crate::el::evm::{block_context, CallOutcome, PoolOracle};
+use crate::el::evm::{block_context, CallOutcome, GasOutcome, PoolOracle};
 use crate::el::peer::ManagedPeer;
 use crate::el::pool::{PeerPool, PoolConfig};
 use crate::el::snap::fetch::AccountOutcome;
@@ -620,22 +620,10 @@ impl ElReader {
         value: U256,
         chain_id: u64,
     ) -> Result<CallOutcome, String> {
-        let Some(block) = self.get_block_by_number(None).await? else {
-            return Err("no verified head to run eth_call against".to_string());
-        };
-        let ctx = block_context(&block.header, chain_id)?;
-        // Snapshot the snap peers once: one consistent set for the whole call.
-        let peers = self.pool.snap_peers().await;
-        if peers.is_empty() {
-            return Err("no snap peer available for eth_call".to_string());
-        }
-        let oracle = Arc::new(PoolOracle::new(peers, tokio::runtime::Handle::current()));
-        let proof_cache = Arc::clone(&self.evm_proof_cache);
-        let bytecode_cache = Arc::clone(&self.evm_bytecode_cache);
+        let (ctx, executor) = self.evm_setup(chain_id, "eth_call").await?;
         // Run the SYNCHRONOUS executor off the runtime worker so the oracle's
         // per-fetch `block_on` is a fresh (non-nested) runtime entry.
         let joined = tokio::task::spawn_blocking(move || {
-            let executor = EvmExecutor::new(oracle, proof_cache, bytecode_cache);
             // A from-less call still honours `value` — the default sender is the zero
             // ADDRESS, not zero value — so always thread `value` through
             // call_view_from (call_view would force value = 0 and drop it).
@@ -649,6 +637,58 @@ impl ElReader {
             Err(EvmError::Reverted { data }) => CallOutcome::Revert(data),
             Err(other) => CallOutcome::Unavailable(other.to_string()),
         })
+    }
+
+    /// Verified `eth_estimateGas` for a call (`to` set): run the call against the
+    /// verified head and return the gas-limit estimate. A revert / halt / unverifiable
+    /// run yields [`GasOutcome::Unavailable`] (no number → the host returns null, as
+    /// the reference engine does). Same head-pinning + executor bridge as [`Self::eth_call`].
+    pub async fn estimate_gas(
+        &self,
+        from: Option<[u8; 20]>,
+        to: [u8; 20],
+        data: Vec<u8>,
+        value: U256,
+        chain_id: u64,
+    ) -> Result<GasOutcome, String> {
+        let (ctx, executor) = self.evm_setup(chain_id, "estimateGas").await?;
+        let joined = tokio::task::spawn_blocking(move || {
+            let sender = from.unwrap_or([0u8; 20]);
+            executor.estimate_gas(sender, to, &data, value, &ctx)
+        })
+        .await
+        .map_err(|e| format!("estimateGas task join error: {e}"))?;
+        Ok(match joined {
+            Ok(gas) => GasOutcome::Estimate(gas),
+            Err(e) => GasOutcome::Unavailable(e.to_string()),
+        })
+    }
+
+    /// Shared setup for the EVM reads: a [`BlockContext`](myotis_evm::BlockContext)
+    /// from the verified head + an [`EvmExecutor`] over a fresh snap-peer snapshot and
+    /// the reader's cross-call caches. `what` names the caller in the error messages.
+    async fn evm_setup(
+        &self,
+        chain_id: u64,
+        what: &str,
+    ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
+        let Some(block) = self.get_block_by_number(None).await? else {
+            return Err(format!("no verified head to run {what} against"));
+        };
+        let ctx = block_context(&block.header, chain_id)?;
+        // Snapshot the snap peers once: one consistent set for the whole call.
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err(format!("no snap peer available for {what}"));
+        }
+        let oracle = Arc::new(PoolOracle::new(peers, tokio::runtime::Handle::current()));
+        // Bind the concrete Arc types first, then let the unsizing coercion to the
+        // trait objects happen at the constructor call (a coercion directly on
+        // `Arc::clone` would instead infer `Arc<dyn Trait>` and fail to type-check).
+        let proof_cache = Arc::clone(&self.evm_proof_cache);
+        let bytecode_cache = Arc::clone(&self.evm_bytecode_cache);
+        let executor = EvmExecutor::new(oracle, proof_cache, bytecode_cache);
+        Ok((ctx, executor))
     }
 
     /// Verified `eth_getBlockByNumber` (transactions as hashes). `target` is the
