@@ -65,9 +65,13 @@ final class RustChainHandle implements ChainHandle {
     /** Head-freshness tracking for verifiedHeadAgeMs: the last optimistic-head block
      *  number seen, and the monotonic time it was first seen. The reported age is the
      *  elapsed time since the head last ADVANCED — a real age (0 → ~12 s per block,
-     *  growing if the head stalls), not a constant. */
-    private volatile long lastHeadBlock = -1L;
-    private volatile long lastHeadAdvanceNanos;
+     *  growing if the head stalls), not a constant. Guarded by {@link #headAgeLock}
+     *  so the paired check-and-update is atomic across concurrent status() callers
+     *  (UI poll + health thread) — a torn read would yield a spurious huge age.
+     *  A DEDICATED lock (not {@code this}) so it never contends with start()/stop(). */
+    private final Object headAgeLock = new Object();
+    private long lastHeadBlock = -1L;
+    private long lastHeadAdvanceNanos;
 
     RustChainHandle(long handle, String networkName, long chainId, int rpcPort) {
         this.handle = handle;
@@ -283,13 +287,17 @@ final class RustChainHandle implements ChainHandle {
         // must not distort the age.
         long optHead = s.optimisticBlockNumber();
         long nowNanos = System.nanoTime();
-        if (optHead != lastHeadBlock) {
-            lastHeadBlock = optHead;
-            lastHeadAdvanceNanos = nowNanos;
+        long advanceNanos;
+        synchronized (headAgeLock) {
+            if (optHead != lastHeadBlock) {
+                lastHeadBlock = optHead;
+                lastHeadAdvanceNanos = nowNanos;
+            }
+            advanceNanos = lastHeadAdvanceNanos;
         }
         long verifiedHeadAgeMs = (s.beaconState() == BeaconState.SYNCED
                 && optHead > 0 && s.snapPeers() > 0)
-                ? Math.max(0L, (nowNanos - lastHeadAdvanceNanos) / 1_000_000L)
+                ? Math.max(0L, (nowNanos - advanceNanos) / 1_000_000L)
                 : Long.MAX_VALUE;
         return new StatusSnapshot(
                 s.running(),
