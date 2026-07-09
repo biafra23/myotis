@@ -14,21 +14,24 @@ import org.slf4j.LoggerFactory;
  * engine's already-live, beacon-anchored verified queries
  * ({@link RustChainHandle#requestAccount}) and status.
  *
- * <p>EL-B lands these methods incrementally. This first slice answers exactly the
- * reads a wallet needs before it can build a plain-ETH send — {@code chainId},
- * {@code getBalance}, {@code getTransactionCount}, and the beacon {@code syncState}
- * — all derived from the proof-verified account query. The remaining methods
- * return {@code null} ("cannot answer verified right now"), which the router maps
- * to a strict-mode JSON-RPC {@code -32000} until later slices wire them: bytecode
- * + raw-32-byte-slot natives ({@code getCode}/{@code getStorageAt}), block/tx/
- * receipt lookup, the fee trio, {@code sendRawTransaction}, and the revm-backed
- * {@code call}/{@code estimateGas} (EL-C).
+ * <p>It answers the reads a wallet needs for an ETH send, from the beacon-anchored,
+ * proof-verified queries: {@code chainId}, {@code headBlockNumber}, {@code syncState},
+ * {@code getBalance}, {@code getTransactionCount}, {@code getCode}, {@code getStorageAt},
+ * {@code getBlockByNumber}, {@code gasPrice}, {@code maxPriorityFeePerGas},
+ * {@code sendRawTransaction}, and a 21000 {@code estimateGas} shortcut for plain
+ * transfers. The EVM-backed reads — {@code call}, and {@code estimateGas} for a
+ * contract/calldata target — return {@code null} ("cannot answer verified right
+ * now"), which the router maps to a strict-mode {@code -32000}, until EL-C (revm).
  *
- * <p><b>Head-anchored only.</b> The Rust reader verifies against the peer's fresh
- * head (the CL-anchored latest state), so a {@code "latest"}/{@code "pending"}/
- * default block selector is answerable and any specific historical block returns
- * {@code null} (unverifiable here) rather than silently returning head data for
- * the wrong block.
+ * <p><b>Head-anchored.</b> The Rust reader verifies against the peer's fresh head
+ * (the CL-anchored latest state), so state reads resolve to that head. A selector
+ * of {@code latest}/{@code pending}/{@code safe}/{@code finalized}/default, OR a
+ * specific number within {@code [head-64, head+16]} (wallets pin reads to the
+ * just-fetched latest number), is served from the verified head. A genuinely older
+ * block returns {@code null} — the head state does NOT stand in for it. So within
+ * the lag window a near-head number resolves to the verified head state (standard
+ * light-client skew); a caller needing exact historical state below the window
+ * gets {@code null}, never head data mislabeled as an old block.
  *
  * <p><b>Never throws.</b> {@link RustChainHandle#requestAccount} raises an
  * {@link EngineException} on a transport / not-running failure, but the router's
@@ -247,7 +250,6 @@ final class RustVerifiedReads implements VerifiedReads {
         return r.verifyMethod() != null;
     }
 
-    /** true for the head selector ("latest"/"pending"/default) the anchored reader serves. */
     /** How far ABOVE the anchored head a number-pin is still served (the head may
      *  advance a few blocks between eth_blockNumber and the pinned read). */
     private static final long BLOCK_NUM_TOLERANCE = 16;
@@ -281,7 +283,11 @@ final class RustVerifiedReads implements VerifiedReads {
         if (b.equalsIgnoreCase("earliest")) return false;
         long n;
         try {
-            n = Long.decode(b); // 0x-hex or decimal block number
+            // Explicit radix (not Long.decode, which reads a leading-zero decimal as
+            // octal). JSON-RPC block numbers are 0x-hex; decimal is tolerated too.
+            n = (b.startsWith("0x") || b.startsWith("0X"))
+                    ? Long.parseLong(b.substring(2), 16)
+                    : Long.parseLong(b, 10);
         } catch (NumberFormatException e) {
             return false;
         }
