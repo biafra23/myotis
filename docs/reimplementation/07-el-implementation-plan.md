@@ -373,6 +373,26 @@ Spec: doc 03 §§3–7, doc 04 §3. New crate `myotis-evm` (sans-I/O; revm gated
    `eth_call` overload, `isStatic`, 30 M gas, EIP-7702 one-hop, BLOCKHASH unsupported →
    fail fast); mainnet fork schedule (throws below London; Shanghai keeps Istanbul
    precompiles) mapped to revm `SpecId`.
+   - **Landed (EL-C-2).** `fork::spec_for(block_number, timestamp) -> SpecId` — the
+     mainnet cascade verbatim (LONDON_BLOCK/PARIS_BLOCK/SHANGHAI_TIME/CANCUN_TIME/
+     PRAGUE_TIME; timestamp checked before block number; `EvmError::ForkTooOld` below
+     London). revm applies the correct precompile set per `SpecId`, so the "Shanghai keeps
+     Istanbul precompiles" nuance needs no special handling (revm's `SHANGHAI` predates the
+     Cancun KZG precompile). `BlockContext` (all fields from the verified header) →
+     `BlockEnv` (`prev_randao` feeds both `prevrandao` and `difficulty`). `EvmExecutor`
+     with `call_view` (from-less zero sender) / `call_view_from` (explicit sender+value for
+     `msg.sender`-gated contracts), a fresh per-call `OracleDatabase` over the shared
+     caches, and `EvmError` (Reverted{data} / OutOfGas / Halted / ForkTooOld / Oracle /
+     Transaction). Resolves the C-1 carry: **30 M gas** works via `CfgEnv.tx_gas_limit_cap =
+     Some(30M)` (overrides the EIP-7825 2²⁴ spec cap); the eth_call relaxations use revm's
+     pure-config `optional_*` features (`optional_balance_check`/`optional_block_gas_limit`/
+     `optional_eip3607`/`optional_no_base_fee` — still zero C crates, `cargo tree -i c-kzg`
+     prints nothing). EIP-7702 one-hop is handled by revm (the oracle serves the designator
+     as code). Tested with a fixture-backed `eth_call`: Cancun SLOAD-return uint256 (mirrors
+     the Java `EvmFactoryTest`), `msg.sender`/`msg.value` pass-through, revert-data surfacing,
+     out-of-gas, pre-London rejection; plus fork-boundary unit tests. *Not yet wired to the
+     host* — the production `SnapStateOracle` over `ElReader` (the async→sync bridge) and the
+     JNI/Java `eth_call` routing land in a following slice, which lights the live MetaMask path.
 3. **Prefetch + dispatch fairness.** Sentinel-on-miss convergence loop (cap 4, result only
    from a fully cache-hit run, fail closed); batch coalescing (64 path-sets/request,
    independent per-item verification, whole-chunk rotation); semaphore-bounded waves; lanes +
