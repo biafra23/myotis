@@ -101,7 +101,7 @@ public final class RustMyotisEngine implements MyotisEngine {
     private NetworkInfo networkInfo(String canonical) {
         if (canonical == null) return null;
         for (NetworkInfo n : availableNetworks()) {
-            if (n.name().equals(canonical)) return n;
+            if (canonical.equals(n.name())) return n;
         }
         return null;
     }

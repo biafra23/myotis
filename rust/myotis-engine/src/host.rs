@@ -185,18 +185,28 @@ pub fn start(handle: i64) -> bool {
         .as_deref()
         .and_then(|p| p.parent())
         .map(|dir| dir.join(format!("peers{el_suffix}.cache")));
+    // Explicit per-network match: a network without an EL config here runs
+    // CL-ONLY (EL queries report the reader unavailable, matching the non-fatal
+    // EL philosophy) — it must never silently inherit another chain's EL config.
     let el_config = match config.name {
-        "sepolia" => myotis_net::el::reader::ElConfig::sepolia(),
-        _ => myotis_net::el::reader::ElConfig::mainnet(),
-    };
-    let reader = match engine.rt.block_on(async {
-        ElReader::start_for(sync.exec_anchor(), el_cache_path, el_config).await
-    }) {
-        Ok(r) => Some(Arc::new(r)),
-        Err(e) => {
-            tracing::warn!(handle, error = %e, "EL reader failed to start; CL runs without EL");
+        "mainnet" => Some(myotis_net::el::reader::ElConfig::mainnet()),
+        "sepolia" => Some(myotis_net::el::reader::ElConfig::sepolia()),
+        other => {
+            tracing::warn!(handle, network = other, "no EL config for this network; CL runs without EL");
             None
         }
+    };
+    let reader = match el_config {
+        Some(cfg) => match engine.rt.block_on(async {
+            ElReader::start_for(sync.exec_anchor(), el_cache_path, cfg).await
+        }) {
+            Ok(r) => Some(Arc::new(r)),
+            Err(e) => {
+                tracing::warn!(handle, error = %e, "EL reader failed to start; CL runs without EL");
+                None
+            }
+        },
+        None => None,
     };
     // Re-lock and publish ONLY if the entry is still the same Created one: a
     // concurrent stop() may have removed it, or a racing start() may have already

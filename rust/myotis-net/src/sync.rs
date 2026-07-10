@@ -191,8 +191,6 @@ fn hex32(s: &str) -> [u8; 32] {
     out
 }
 
-/// Known light-client-serving mainnet peers — the Java `NetworkConfig.MAINNET`
-/// clPeerMultiaddrs list (nimbus/lodestar/lighthouse, discovered 2026-03-11).
 /// Pinned sepolia LC-serving peer multiaddrs (Java `NetworkConfig.SEPOLIA.clPeerMultiaddrs`).
 const SEPOLIA_STATIC_PEERS: &[&str] = &[
     "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS",
@@ -216,6 +214,8 @@ const SEPOLIA_BOOTSTRAP_ENRS: &[&str] = &[
     "enr:-L64QC9Hhov4DhQ7mRukTOz4_jHm4DHlGL726NWH4ojH1wFgEwSin_6H95Gs6nW2fktTWbPachHJ6rUFu0iJNgA0SB2CARqHYXR0bmV0c4j__________4RldGgykDb6UBOQAABx__________-CaWSCdjSCaXCEA-2vzolzZWNwMjU2azGhA17lsUg60R776rauYMdrAz383UUgESoaHEzMkvm4K6k6iHN5bmNuZXRzD4N0Y3CCIyiDdWRwgiMo",
 ];
 
+/// Known light-client-serving mainnet peers — the Java `NetworkConfig.MAINNET`
+/// clPeerMultiaddrs list (nimbus/lodestar/lighthouse, discovered 2026-03-11).
 const MAINNET_STATIC_PEERS: &[&str] = &[
     "/ip4/176.229.58.1/tcp/9001/p2p/16Uiu2HAmHu1BxzrSWg7sN9JyJenC5unK5ntdk5QFYqQdQyyD7x3a",
     "/ip4/81.172.166.237/tcp/9001/p2p/16Uiu2HAmRogw5aqM4ZuVEmZoQvFp25sUnnQ9wpGuWXRLFMmXc88j",

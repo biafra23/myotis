@@ -68,7 +68,8 @@ class RustCatalogParityTest {
                 "gnosis", 0, 0, 0, null, false, 0, true, "/tmp/myotis-test");
         EngineException e = assertThrows(EngineException.class,
                 () -> rust.create(cfg, null));
-        assertEquals(true, e.getMessage().contains("does not host gnosis"),
+        org.junit.jupiter.api.Assertions.assertTrue(
+                e.getMessage().contains("does not host gnosis"),
                 "unexpected message: " + e.getMessage());
     }
 }
