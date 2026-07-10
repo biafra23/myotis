@@ -1225,7 +1225,7 @@ mod tests {
             c.genesis_hash,
             hex32("d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3")
         );
-        assert!(!c.bootnodes.is_empty());
+        assert_eq!(c.bootnodes.len(), 4, "all four mainnet bootnodes must parse");
     }
 
     #[test]

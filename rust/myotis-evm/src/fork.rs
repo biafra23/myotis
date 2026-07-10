@@ -40,10 +40,13 @@ pub const SEPOLIA_PRAGUE_TIME: u64 = 1_741_159_776;
 /// [`EvmError::UnsupportedChain`] for a chain with no table here (e.g. Gnosis
 /// until its slice lands), [`EvmError::ForkTooOld`] below each chain's floor.
 ///
-/// KNOWN GAP (both engines, deliberately mirrored): the tables cap at PRAGUE even
-/// though mainnet and sepolia have since activated Osaka/Fusaka — the Java
-/// `EvmFactory` stops at Prague too. Adding OSAKA is a cross-engine follow-up so
-/// the two engines never diverge on spec selection.
+/// KNOWN GAPS vs the Java `EvmFactory` (cross-engine follow-ups):
+/// * both tables cap at PRAGUE even though mainnet and sepolia have since
+///   activated Osaka/Fusaka — Java stops at Prague too; add OSAKA to both.
+/// * Java applies the MAINNET timestamps to every chain, so a historical sepolia
+///   call in a window where the two schedules disagree (e.g. sepolia's
+///   [Prague, mainnet-Prague) gap) picks a different spec there — this table is
+///   the more correct side, and head-of-chain calls agree on both.
 pub fn spec_for(chain_id: u64, block_number: u64, timestamp: u64) -> Result<SpecId, EvmError> {
     match chain_id {
         1 => mainnet_spec(block_number, timestamp),

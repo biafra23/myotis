@@ -99,9 +99,10 @@ fn config_for(network_name: &str) -> Option<ChainConfig> {
     }
 }
 
-/// `nativeCreate`: allocate an id for a not-yet-started mainnet chain. Returns the
-/// id (`>= 1`), `UNSUPPORTED_NETWORK` (-2) for a canonical-but-not-mainnet network,
-/// or `CREATE_FAILED` (-1) for an unknown name / unavailable runtime.
+/// `nativeCreate`: allocate an id for a not-yet-started hosted chain (mainnet or
+/// sepolia). Returns the id (`>= 1`), `UNSUPPORTED_NETWORK` (-2) for a canonical
+/// network this engine doesn't host yet (gnosis), or `CREATE_FAILED` (-1) for an
+/// unknown name / unavailable runtime.
 pub fn create(network_name: &str, data_dir: &str) -> i64 {
     let Some(engine) = engine() else {
         return CREATE_FAILED;
@@ -675,8 +676,6 @@ fn parse_block_target(tag: &str) -> Result<Option<u64>, &'static str> {
     }
 }
 
-/// Snapshot `(reader, finalizedPeriod, wallClockPeriod)` for a running handle,
-/// or an error message. Holds the map lock only for the clone.
 /// Snapshot `(reader, chain_id)` for a running handle — the EVM reads
 /// (eth_call / estimateGas / resolve-ens) thread the handle's REAL chain id, so
 /// nothing downstream hardcodes a network.
@@ -695,6 +694,8 @@ fn snapshot_reader_evm(
     }
 }
 
+/// Snapshot `(reader, finalizedPeriod, wallClockPeriod)` for a running handle,
+/// or an error message. Holds the map lock only for the clone.
 fn snapshot_reader(
     engine: &EngineState,
     handle: i64,
