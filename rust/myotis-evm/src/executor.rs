@@ -464,10 +464,10 @@ mod tests {
         ];
         let exec = executor_with(code, None);
         let mut c = ctx(19_500_000, CANCUN_TIME + 1);
-        c.chain_id = 100; // Gnosis — no fork table yet, spec_for must fail closed
+        c.chain_id = 137; // Polygon — no fork table here, spec_for must fail closed
         let err = exec.call_view(TARGET, &[], &c).unwrap_err();
         assert!(
-            matches!(err, EvmError::UnsupportedChain { chain_id: 100 }),
+            matches!(err, EvmError::UnsupportedChain { chain_id: 137 }),
             "got {err:?}"
         );
     }

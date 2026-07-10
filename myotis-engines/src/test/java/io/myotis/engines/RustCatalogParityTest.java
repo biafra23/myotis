@@ -56,20 +56,18 @@ class RustCatalogParityTest {
     }
 
     @Test
-    void createRejectsUnhostedNetwork() {
-        // The native side is the source of truth for hosted networks: gnosis is
-        // canonical but has no Rust config yet, so nativeCreate returns
-        // UNSUPPORTED_NETWORK and create() raises a named EngineException (auto
-        // mode falls back to Java on it). Mainnet + sepolia pass this gate.
-        assumeTrue(RustMyotisEngine.isAvailable(),
-                "libmyotis_engine not on java.library.path — skipping native gate test");
+    void createRejectsUnknownNetwork() {
+        // All three CANONICAL networks (mainnet, sepolia, gnosis) are now hosted,
+        // so the remaining rejection path is a truly-unknown network name: it
+        // never reaches nativeCreate — canonicalNetworkName() rejects it first,
+        // raising a named EngineException (auto mode falls back to Java).
         RustMyotisEngine rust = new RustMyotisEngine();
         EngineConfig cfg = new EngineConfig(
-                "gnosis", 0, 0, 0, null, false, 0, true, "/tmp/myotis-test");
+                "not-a-real-network", 0, 0, 0, null, false, 0, true, "/tmp/myotis-test");
         EngineException e = assertThrows(EngineException.class,
                 () -> rust.create(cfg, null));
         org.junit.jupiter.api.Assertions.assertTrue(
-                e.getMessage().contains("does not host gnosis"),
+                e.getMessage().contains("not-a-real-network"),
                 "unexpected message: " + e.getMessage());
     }
 }

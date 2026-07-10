@@ -14,7 +14,15 @@ class RustEnsApiTest {
 
     private static RustEnsApi api() {
         // A never-started handle: only the pre-native guard paths are exercised.
-        return new RustEnsApi(new RustChainHandle(0L, "mainnet", 1L, 0));
+        return new RustEnsApi(new RustChainHandle(0L, "mainnet", 1L, 0, true));
+    }
+
+    @org.junit.jupiter.api.Test
+    void ensIsNullOnNetworksWithoutEns() {
+        // gnosis (hasEns=false) → ChainHandle.ens() is null; mainnet (true) → non-null.
+        assertNull(new RustChainHandle(0L, "gnosis", 100L, 0, false).ens());
+        org.junit.jupiter.api.Assertions.assertNotNull(
+                new RustChainHandle(0L, "mainnet", 1L, 0, true).ens());
     }
 
     @Test
