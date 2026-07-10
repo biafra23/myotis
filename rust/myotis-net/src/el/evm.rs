@@ -368,26 +368,49 @@ impl SnapStateOracle for PoolOracle {
         let fetch_item = |peer: Arc<ManagedPeer>, addr: [u8; 20], slots: Vec<U256>| {
             let sem = Arc::clone(&sem);
             async move {
-                if proof_sink.get_account(state_root, &addr).is_some()
-                    && slots
-                        .iter()
-                        .all(|s| proof_sink.get_storage(state_root, &addr, s).is_some())
-                {
+                // Only the slots this root doesn't already have — a RETRY after
+                // a partial failure re-fetches just the gaps, and a fully-cached
+                // item skips without touching the peer (no reputation signal).
+                let missing: Vec<U256> = slots
+                    .iter()
+                    .filter(|s| proof_sink.get_storage(state_root, &addr, s).is_none())
+                    .copied()
+                    .collect();
+                let account_cached = proof_sink.get_account(state_root, &addr).is_some();
+                if account_cached && missing.is_empty() {
                     return ItemOutcome::Skipped;
                 }
-                let leaf = {
-                    let _permit = sem.acquire().await;
-                    match peer.snap_get_account(state_root, &addr).await {
-                        Ok(AccountOutcome::Present(leaf)) => leaf,
-                        Ok(AccountOutcome::Absent) => {
-                            proof_sink.put_account(state_root, &addr, None);
-                            for slot in &slots {
-                                proof_sink.put_storage(state_root, &addr, slot, U256::ZERO);
-                            }
-                            self.leaf_memo.lock().unwrap().insert(addr, None);
-                            return ItemOutcome::Served;
+                // The account leaf: reuse this call's memo (primed target /
+                // earlier iterations) before spending a round-trip.
+                let memoed = self.leaf_memo.lock().unwrap().get(&addr).cloned();
+                let leaf = match memoed {
+                    Some(None) => {
+                        // Proven absent already — every slot is zero, no request.
+                        proof_sink.put_account(state_root, &addr, None);
+                        for slot in &missing {
+                            proof_sink.put_storage(state_root, &addr, slot, U256::ZERO);
                         }
-                        Err(_) => return ItemOutcome::Failed,
+                        return ItemOutcome::Skipped;
+                    }
+                    Some(Some(leaf)) => leaf,
+                    None => {
+                        // A closed semaphore (impossible in practice — nothing
+                        // closes it) must FAIL the item, never bypass the bound.
+                        let Ok(_permit) = sem.acquire().await else {
+                            return ItemOutcome::Failed;
+                        };
+                        match peer.snap_get_account(state_root, &addr).await {
+                            Ok(AccountOutcome::Present(leaf)) => leaf,
+                            Ok(AccountOutcome::Absent) => {
+                                proof_sink.put_account(state_root, &addr, None);
+                                for slot in &missing {
+                                    proof_sink.put_storage(state_root, &addr, slot, U256::ZERO);
+                                }
+                                self.leaf_memo.lock().unwrap().insert(addr, None);
+                                return ItemOutcome::Served;
+                            }
+                            Err(_) => return ItemOutcome::Failed,
+                        }
                     }
                 };
                 let Some(account) = leaf_account(&leaf) else {
@@ -396,18 +419,20 @@ impl SnapStateOracle for PoolOracle {
                 proof_sink.put_account(state_root, &addr, Some(account));
                 self.leaf_memo.lock().unwrap().insert(addr, Some(leaf.clone()));
                 if leaf.storage_root == EMPTY_TRIE_ROOT {
-                    for slot in &slots {
+                    for slot in &missing {
                         proof_sink.put_storage(state_root, &addr, slot, U256::ZERO);
                     }
                     return ItemOutcome::Served;
                 }
-                let values = futures::future::join_all(slots.iter().map(|slot| {
+                let values = futures::future::join_all(missing.iter().map(|slot| {
                     let position = slot.to_be_bytes::<32>();
                     let peer = Arc::clone(&peer);
                     let leaf = leaf.clone();
                     let sem = Arc::clone(&sem);
                     async move {
-                        let _permit = sem.acquire().await;
+                        let Ok(_permit) = sem.acquire().await else {
+                            return None; // closed semaphore = local failure
+                        };
                         peer.snap_get_storage(state_root, &addr, &leaf, &position)
                             .await
                             .ok()
@@ -415,12 +440,21 @@ impl SnapStateOracle for PoolOracle {
                     }
                 }))
                 .await;
-                for (slot, value) in slots.iter().zip(values) {
-                    if let Some(v) = value {
-                        proof_sink.put_storage(state_root, &addr, slot, v);
+                let mut any_slot_failed = false;
+                for (slot, value) in missing.iter().zip(values) {
+                    match value {
+                        Some(v) => proof_sink.put_storage(state_root, &addr, slot, v),
+                        None => any_slot_failed = true,
                     }
                 }
-                ItemOutcome::Served
+                // A partial slot failure fails the ITEM so the rotation retries
+                // it on the next peer — the retry only re-fetches the gaps
+                // (cached slots are filtered out above). Successful puts keep.
+                if any_slot_failed {
+                    ItemOutcome::Failed
+                } else {
+                    ItemOutcome::Served
+                }
             }
         };
 
@@ -484,7 +518,9 @@ impl SnapStateOracle for PoolOracle {
                     if code_sink.get(hash).is_some() {
                         return;
                     }
-                    let _permit = sem.acquire().await;
+                    let Ok(_permit) = sem.acquire().await else {
+                        return; // closed semaphore — never bypass the bound
+                    };
                     if let Ok(code) = peer.snap_get_bytecode(hash).await {
                         code_sink.put(hash, code.into());
                     }

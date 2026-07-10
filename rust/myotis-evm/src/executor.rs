@@ -289,9 +289,7 @@ impl EvmExecutor {
                     discovering = false;
                 } else {
                     self.prefetch_wave(ctx, &fresh);
-                    let mut merged = seen;
-                    merged.merge(fresh);
-                    seen = merged;
+                    seen.merge(fresh);
                 }
             } else {
                 // Real-run outcomes are authoritative: errors (incl. reverts —
@@ -303,9 +301,7 @@ impl EvmExecutor {
                 // Still discovering under real mode (a sentinel zero had hidden
                 // a branch): warm the stragglers and run again.
                 self.prefetch_wave(ctx, &fresh);
-                let mut merged = seen;
-                merged.merge(fresh);
-                seen = merged;
+                seen.merge(fresh);
             }
         }
         Err(EvmError::IterationLimitExceeded { cap })
