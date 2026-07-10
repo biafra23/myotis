@@ -1420,9 +1420,13 @@ fn decode_ccip_answer(
             .map(|(content_type, data)| EnsRecordValue::Abi { content_type, data }),
         EnsQuery::Reverse { address } => match myotis_evm::decode_name_answer(raw) {
             None => None,
-            Some(claimed) => match myotis_evm::resolve_address(caller, &claimed)? {
-                Some(fwd) if fwd == *address => Some(EnsRecordValue::Name(claimed)),
-                _ => None,
+            // Same hardening as the direct reverse path: a MALFORMED claimed
+            // name (adversarial gateway data) is a failed verify, never an
+            // error a malicious resolver can force.
+            Some(claimed) => match myotis_evm::resolve_address(caller, &claimed) {
+                Ok(Some(fwd)) if fwd == *address => Some(EnsRecordValue::Name(claimed)),
+                Ok(_) | Err(EnsError::InvalidName(_)) => None,
+                Err(e) => return Err(e),
             },
         },
     })
@@ -1431,6 +1435,74 @@ fn decode_ccip_answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ScriptedCaller(Vec<([u8; 20], Vec<u8>)>);
+    impl myotis_evm::EthCaller for ScriptedCaller {
+        fn eth_call(
+            &self,
+            target: [u8; 20],
+            calldata: &[u8],
+        ) -> Result<Vec<u8>, myotis_evm::EvmError> {
+            for (t, out) in &self.0 {
+                if *t == target {
+                    let _ = calldata;
+                    return Ok(out.clone());
+                }
+            }
+            Ok(vec![0u8; 32])
+        }
+    }
+
+    fn addr_word(a: [u8; 20]) -> Vec<u8> {
+        let mut w = vec![0u8; 32];
+        w[12..].copy_from_slice(&a);
+        w
+    }
+
+    #[test]
+    fn ccip_answer_decodes_per_query_kind() {
+        // Addr answers decode as addresses — NOT pubkey/bytes (the queryMethod
+        // mis-map regression class).
+        let caller = ScriptedCaller(Vec::new());
+        let addr = decode_ccip_answer(
+            &caller,
+            &EnsQuery::Addr { name: "a.eth".into() },
+            &addr_word([0xd8; 20]),
+        )
+        .unwrap();
+        assert_eq!(addr, Some(EnsRecordValue::Address([0xd8; 20])));
+        // The same 32-byte answer under a pubkey query is None (needs 64) —
+        // proving the kinds are NOT interchangeable.
+        let pk = decode_ccip_answer(
+            &caller,
+            &EnsQuery::Pubkey { name: "a.eth".into() },
+            &addr_word([0xd8; 20]),
+        )
+        .unwrap();
+        assert_eq!(pk, None);
+    }
+
+    #[test]
+    fn ccip_reverse_malformed_claimed_name_is_none_not_error() {
+        // A gateway-supplied claimed name with an interior empty label must be
+        // a failed forward-verify (None), never an InvalidName error.
+        let mut claimed = vec![0u8; 32];
+        claimed[31] = 0x20;
+        let name = b"a..eth";
+        let mut len = vec![0u8; 32];
+        len[31] = name.len() as u8;
+        claimed.extend_from_slice(&len);
+        claimed.extend_from_slice(name);
+        claimed.extend_from_slice(&[0u8; 26]);
+        let caller = ScriptedCaller(Vec::new());
+        let out = decode_ccip_answer(
+            &caller,
+            &EnsQuery::Reverse { address: [0xd8; 20] },
+            &claimed,
+        )
+        .unwrap();
+        assert_eq!(out, None);
+    }
 
     #[test]
     fn next_base_fee_at_target_is_unchanged() {

@@ -706,6 +706,33 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(off["status"], "offchain");
+        assert!(off.get("senderHex").is_none()); // unparseable tuple → no fields
+
+        // The FULL offchain envelope — the exact keys the Java CcipDriver reads
+        // (CcipDriverTest replays this literal as its input; the two are the
+        // halves of the cross-language pin).
+        let full: serde_json::Value = serde_json::from_str(&ens_record_json(
+            &EnsQueryOutcome::Offchain {
+                block_number: 21_000_010,
+                verified: true,
+                lookup: Some(Box::new(myotis_evm::OffchainLookup {
+                    sender: [0x5E; 20],
+                    urls: vec!["https://gw.example/{sender}/{data}.json".into()],
+                    call_data: vec![0xCA, 0x11],
+                    callback_function: [0xCB; 4],
+                    extra_data: vec![0xEE; 3],
+                })),
+                wrapped: true,
+            },
+        ))
+        .unwrap();
+        assert_eq!(full["senderHex"], format!("0x{}", "5e".repeat(20)));
+        assert_eq!(full["urls"][0], "https://gw.example/{sender}/{data}.json");
+        assert_eq!(full["callDataHex"], "0xca11");
+        assert_eq!(full["callbackFunctionHex"], "0xcbcbcbcb");
+        assert_eq!(full["extraDataHex"], "0xeeeeee");
+        assert_eq!(full["wrapped"], true);
+        assert_eq!(full["verified"], true);
     }
 
     fn sample_code() -> VerifiedCode {

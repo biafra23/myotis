@@ -28,6 +28,13 @@ import java.util.regex.Pattern;
  * that gateway failing; ONE round only ({@code MAX_RECURSION_DEPTH = 1}) — a
  * second OffchainLookup from the callback is an error.
  *
+ * <p>Documented divergence from the Java engine: Java's per-callView depth
+ * counter lets an OFFCHAIN reverse record be forward-verified by an OFFCHAIN
+ * forward resolver (two independent gateway rounds). Here the forward-verify's
+ * OffchainLookup surfaces as a second offchain envelope and hits the cap — a
+ * rare Basenames-style setup reports the cap error instead of chaining;
+ * chained CCIP is a possible later refinement.
+ *
  * <p>Failures throw {@link EngineException}; {@link RustEnsApi} folds them into
  * the result's error field (it never throws).
  */
@@ -143,6 +150,13 @@ final class CcipDriver {
                     continue;
                 }
                 String dataHex = m.group(1);
+                // Odd-length hex can never decode (Java parity: parseHex throws
+                // inside the per-URL loop) — record and try the NEXT url rather
+                // than letting the native reject it after failover is gone.
+                if (dataHex.length() % 2 != 0) {
+                    reasons.add("odd-length data hex from " + template);
+                    continue;
+                }
                 if (containsHttpError(dataHex)) {
                     reasons.add("gateway HttpError from " + template);
                     continue;

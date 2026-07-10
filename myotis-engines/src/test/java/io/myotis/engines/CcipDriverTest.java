@@ -17,6 +17,11 @@ class CcipDriverTest {
 
     private static final String SENDER = "0x" + "5e".repeat(20);
 
+    /**
+     * The exact envelope {@code eljson::ens_record_json} emits for a parsed
+     * OffchainLookup (its {@code ens_record_json_shapes} test pins the same
+     * literals — the two are the halves of the cross-language pin).
+     */
     private static String offchainJson(String... urls) {
         StringBuilder u = new StringBuilder();
         for (String url : urls) {
@@ -152,6 +157,31 @@ class CcipDriverTest {
             assertEquals(json, CcipDriver.drive(addrParams(), json, gw, p -> "unused"));
         }
         assertEquals(0, gw.requests.size());
+    }
+
+    @Test
+    void oddLengthDataHexFailsOverToNextUrl() {
+        // Odd-length hex can never decode natively — the driver must record it
+        // and try the NEXT url, not ship it to the native after failover ends.
+        var gw = new FakeGateway("{\"data\":\"0xabc\"}", "{\"data\":\"0xabcd\"}");
+        List<String> nativeCalls = new ArrayList<>();
+        CcipDriver.drive(addrParams(), offchainJson("u1", "u2"), gw, p -> {
+            nativeCalls.add(p);
+            return "{\"status\":\"noRecord\",\"blockNumber\":1,\"verified\":false}";
+        });
+        assertEquals(2, gw.requests.size());
+        assertTrue(nativeCalls.get(0).contains("\"responseHex\":\"0xabcd\""));
+    }
+
+    @Test
+    void senderOnlyTemplateIsPostWithSubstitution() {
+        var gw = new FakeGateway("{\"data\":\"0xaa\"}");
+        CcipDriver.drive(addrParams(), offchainJson("https://gw.example/{sender}"), gw,
+                p -> "{\"status\":\"noRecord\",\"blockNumber\":1,\"verified\":false}");
+        var req = gw.requests.get(0);
+        // No {data} in the template → POST, with {sender} still substituted.
+        assertEquals(HttpGateway.Method.POST, req.method());
+        assertEquals("https://gw.example/" + SENDER, req.url());
     }
 
     @Test

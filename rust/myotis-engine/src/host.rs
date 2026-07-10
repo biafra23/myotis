@@ -560,8 +560,13 @@ pub fn resolve_ens_json(handle: i64, name: &str) -> String {
 /// PEER_HEAD twin). Returns [`eljson::ens_record_json`] shapes or
 /// `{"error":"…"}`.
 pub fn ens_record_json(handle: i64, params_json: &str) -> String {
-    // Bound the native input like the other JSON natives.
-    if params_json.len() > 4096 {
+    // Bound the native input like the other JSON natives. ccipCallback carries
+    // gateway response payloads (L2-proof gateways return tens of KB), so it
+    // gets a wide bound sized to parse_hex_bytes' own 2 MiB-hex/field cap; the
+    // plain record queries keep the tight name-sized cap. The raw substring
+    // probe only widens the DoS-guard cap — the real method check follows.
+    let cap = if params_json.contains("\"ccipCallback\"") { 5 * 1024 * 1024 } else { 4096 };
+    if params_json.len() > cap {
         return eljson::error_json("ens params too long");
     }
     let params: serde_json::Value = match serde_json::from_str(params_json) {
@@ -570,20 +575,6 @@ pub fn ens_record_json(handle: i64, params_json: &str) -> String {
     };
     let str_field = |key: &str| -> Option<String> {
         params.get(key).and_then(|v| v.as_str()).map(str::to_string)
-    };
-    let u64_field = |key: &str| -> Option<u64> { params.get(key).and_then(|v| v.as_u64()) };
-    let name_field = |key: &str| -> Result<String, String> {
-        let Some(name) = str_field(key) else {
-            return Err(format!("missing {key}"));
-        };
-        let name = name.trim().to_string();
-        if name.is_empty() {
-            return Err(format!("empty {key}"));
-        }
-        if name.len() > 512 {
-            return Err(format!("{key} too long"));
-        }
-        Ok(name)
     };
 
     let Some(method) = str_field("method") else {
@@ -615,91 +606,9 @@ pub fn ens_record_json(handle: i64, params_json: &str) -> String {
         },
     };
 
-    let query = match query_method.as_str() {
-        "addr" | "contenthash" | "pubkey" => {
-            let name = match name_field("name") {
-                Ok(n) => n,
-                Err(e) => return eljson::error_json(&e),
-            };
-            match method.as_str() {
-                "addr" => EnsQuery::Addr { name },
-                "contenthash" => EnsQuery::Contenthash { name },
-                _ => EnsQuery::Pubkey { name },
-            }
-        }
-        "text" => {
-            let name = match name_field("name") {
-                Ok(n) => n,
-                Err(e) => return eljson::error_json(&e),
-            };
-            let Some(key) = str_field("key").filter(|k| !k.is_empty()) else {
-                return eljson::error_json("missing key");
-            };
-            if key.len() > 512 {
-                return eljson::error_json("key too long");
-            }
-            EnsQuery::Text { name, key }
-        }
-        "multicoin" => {
-            let name = match name_field("name") {
-                Ok(n) => n,
-                Err(e) => return eljson::error_json(&e),
-            };
-            let Some(coin_type) = u64_field("coinType") else {
-                return eljson::error_json("missing coinType");
-            };
-            EnsQuery::Multicoin { name, coin_type }
-        }
-        "abi" => {
-            let name = match name_field("name") {
-                Ok(n) => n,
-                Err(e) => return eljson::error_json(&e),
-            };
-            let Some(content_types) = u64_field("contentTypes") else {
-                return eljson::error_json("missing contentTypes");
-            };
-            EnsQuery::Abi { name, content_types }
-        }
-        "dnsRecord" => {
-            let name = match name_field("name") {
-                Ok(n) => n,
-                Err(e) => return eljson::error_json(&e),
-            };
-            let dns_name = match name_field("dnsName") {
-                Ok(n) => n,
-                Err(e) => return eljson::error_json(&e),
-            };
-            let resource = match u64_field("resource") {
-                Some(r) if r <= u64::from(u16::MAX) => r as u16,
-                Some(_) => return eljson::error_json("resource out of range (uint16)"),
-                None => return eljson::error_json("missing resource"),
-            };
-            EnsQuery::DnsRecord { name, dns_name, resource }
-        }
-        "interfaceImplementer" => {
-            let name = match name_field("name") {
-                Ok(n) => n,
-                Err(e) => return eljson::error_json(&e),
-            };
-            let Some(id_hex) = str_field("interfaceIdHex") else {
-                return eljson::error_json("missing interfaceIdHex");
-            };
-            let Some(id) = parse_hex_fixed::<4>(&id_hex) else {
-                return eljson::error_json("interfaceIdHex must be 4 bytes of hex");
-            };
-            EnsQuery::Interface { name, interface_id: id }
-        }
-        "reverse" => {
-            let Some(addr_hex) = str_field("addressHex") else {
-                return eljson::error_json("missing addressHex");
-            };
-            let Some(address) = parse_hex_fixed::<20>(&addr_hex) else {
-                // The Java EnsApi contract's message for a malformed reverse input.
-                return eljson::error_json("address must be a 20-byte hex string (40 hex chars)");
-            };
-            EnsQuery::Reverse { address }
-        }
-        other => return eljson::error_json(&format!("unknown ens method: {other}")),
+    let query = match parse_ens_query(&query_method, &params) {
+        Ok(q) => q,
+        Err(e) => return eljson::error_json(&e),
     };
 
     let Some(engine) = engine() else {
@@ -950,6 +859,91 @@ fn snapshot_reader_slots(
     }
 }
 
+/// Build the [`EnsQuery`] for one record method from the params JSON — shared
+/// by the direct dispatch AND the ccipCallback re-entry (which passes the
+/// ORIGINAL query's method as `queryMethod`), so the two paths can never
+/// disagree on decode semantics. `Err` is the user-facing message.
+fn parse_ens_query(query_method: &str, params: &serde_json::Value) -> Result<EnsQuery, String> {
+    let str_field = |key: &str| -> Option<String> {
+        params.get(key).and_then(|v| v.as_str()).map(str::to_string)
+    };
+    let u64_field = |key: &str| -> Option<u64> { params.get(key).and_then(|v| v.as_u64()) };
+    let name_field = |key: &str| -> Result<String, String> {
+        let Some(name) = str_field(key) else {
+            return Err(format!("missing {key}"));
+        };
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err(format!("empty {key}"));
+        }
+        if name.len() > 512 {
+            return Err(format!("{key} too long"));
+        }
+        Ok(name)
+    };
+
+    Ok(match query_method {
+        "addr" => EnsQuery::Addr { name: name_field("name")? },
+        "contenthash" => EnsQuery::Contenthash { name: name_field("name")? },
+        "pubkey" => EnsQuery::Pubkey { name: name_field("name")? },
+        "text" => {
+            let name = name_field("name")?;
+            let Some(key) = str_field("key").filter(|k| !k.is_empty()) else {
+                return Err("missing key".to_string());
+            };
+            if key.len() > 512 {
+                return Err("key too long".to_string());
+            }
+            EnsQuery::Text { name, key }
+        }
+        "multicoin" => {
+            let name = name_field("name")?;
+            let Some(coin_type) = u64_field("coinType") else {
+                return Err("missing coinType".to_string());
+            };
+            EnsQuery::Multicoin { name, coin_type }
+        }
+        "abi" => {
+            let name = name_field("name")?;
+            let Some(content_types) = u64_field("contentTypes") else {
+                return Err("missing contentTypes".to_string());
+            };
+            EnsQuery::Abi { name, content_types }
+        }
+        "dnsRecord" => {
+            let name = name_field("name")?;
+            let dns_name = name_field("dnsName")?;
+            let resource = match u64_field("resource") {
+                Some(r) if r <= u64::from(u16::MAX) => r as u16,
+                Some(_) => return Err("resource out of range (uint16)".to_string()),
+                None => return Err("missing resource".to_string()),
+            };
+            EnsQuery::DnsRecord { name, dns_name, resource }
+        }
+        "interfaceImplementer" => {
+            let name = name_field("name")?;
+            let Some(id_hex) = str_field("interfaceIdHex") else {
+                return Err("missing interfaceIdHex".to_string());
+            };
+            let Some(id) = parse_hex_fixed::<4>(&id_hex) else {
+                return Err("interfaceIdHex must be 4 bytes of hex".to_string());
+            };
+            EnsQuery::Interface { name, interface_id: id }
+        }
+        "reverse" => {
+            let Some(addr_hex) = str_field("addressHex") else {
+                return Err("missing addressHex".to_string());
+            };
+            let Some(address) = parse_hex_fixed::<20>(&addr_hex) else {
+                // The Java EnsApi contract's message for a malformed reverse input.
+                return Err("address must be a 20-byte hex string (40 hex chars)".to_string());
+            };
+            EnsQuery::Reverse { address }
+        }
+        other => return Err(format!("unknown ens method: {other}")),
+    })
+}
+
 /// Parse a `0x`-prefixed-or-bare hex string into exactly `N` bytes. Panic-free:
 /// `None` for any malformed input (JNI callers pass untrusted strings).
 fn parse_hex_fixed<const N: usize>(hex: &str) -> Option<[u8; N]> {
@@ -1104,6 +1098,39 @@ const NOT_STARTED_FALLBACK: &str = concat!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_ens_query_maps_every_method_correctly() {
+        use myotis_net::el::evm::EnsQuery;
+        let q = |method: &str, extra: &str| {
+            let json: serde_json::Value =
+                serde_json::from_str(&format!(r#"{{"name":"a.eth"{extra}}}"#)).unwrap();
+            parse_ens_query(method, &json)
+        };
+        // The addr/contenthash/pubkey trio must NEVER collapse into one arm —
+        // the ccipCallback re-entry passes these as queryMethod, and a mis-map
+        // decodes an address answer with pubkey semantics (a real regression).
+        assert!(matches!(q("addr", "").unwrap(), EnsQuery::Addr { .. }));
+        assert!(matches!(q("contenthash", "").unwrap(), EnsQuery::Contenthash { .. }));
+        assert!(matches!(q("pubkey", "").unwrap(), EnsQuery::Pubkey { .. }));
+        assert!(matches!(q("text", r#","key":"url""#).unwrap(), EnsQuery::Text { .. }));
+        assert!(matches!(q("multicoin", r#","coinType":60"#).unwrap(), EnsQuery::Multicoin { coin_type: 60, .. }));
+        assert!(matches!(q("abi", r#","contentTypes":15"#).unwrap(), EnsQuery::Abi { .. }));
+        assert!(matches!(
+            q("dnsRecord", r#","dnsName":"a.eth","resource":1"#).unwrap(),
+            EnsQuery::DnsRecord { resource: 1, .. }
+        ));
+        assert!(matches!(
+            q("interfaceImplementer", r#","interfaceIdHex":"0x9061b923""#).unwrap(),
+            EnsQuery::Interface { interface_id: [0x90, 0x61, 0xb9, 0x23], .. }
+        ));
+        let rev: serde_json::Value =
+            serde_json::from_str(&format!(r#"{{"addressHex":"0x{}"}}"#, "d8".repeat(20))).unwrap();
+        assert!(matches!(parse_ens_query("reverse", &rev).unwrap(), EnsQuery::Reverse { .. }));
+        // ccipCallback can never be a queryMethod (no native recursion).
+        assert!(parse_ens_query("ccipCallback", &rev).is_err());
+        assert!(parse_ens_query("bogus", &rev).is_err());
+    }
 
     #[test]
     fn not_started_status_shape_is_stable() {
