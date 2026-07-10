@@ -557,6 +557,16 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
         return ensResolutionFromJson(name, RustEngineNative.nativeResolveEnsJson(handle, name));
     }
 
+    /**
+     * One generic ENS record query (EL-C-5-2): raw params JSON in, raw record
+     * JSON out. Parsing/typing lives in {@link RustEnsApi} (its per-record
+     * fromJson seams are the golden-tested halves); this is only the native
+     * transport hop.
+     */
+    String ensRecordJson(String paramsJson) {
+        return RustEngineNative.nativeEnsRecordJson(handle, paramsJson);
+    }
+
     /** Package-private test seam: ENS JSON → {@link EnsResolutionResult} without JNI. */
     static EnsResolutionResult ensResolutionFromJson(String name, String json) {
         JsonObject o = parseResultOrThrow(json, "resolve-ens");

@@ -419,6 +419,30 @@ Spec: doc 03 §§3–7, doc 04 §3. New crate `myotis-evm` (sans-I/O; revm gated
      namehash/DNS vectors. *Deferred:* reverse + forward-verify (C-5-2), CCIP-Read offchain
      (C-5-3, HTTP via an injected `CcipGateway` port — no Rust HTTP dep), and the JNI/Java `EnsApi`
      wiring (C-5-1b, replacing `RustChainHandle.ens() { return null; }`).
+   - **Landed (EL-C-5-2): every ENS record type + reverse + root modes.** The walk generalized
+     into `resolve_record` (shared registry-walk → ENSIP-10-wrap-or-legacy dispatch → raw inner
+     bytes); typed wrappers `resolve_text` / `resolve_contenthash` / `resolve_multicoin` /
+     `resolve_pubkey` (fixed tuple, no offsets) / `resolve_abi` (contentType word NOT checked —
+     Java `decodeAbiResult` parity) / `resolve_dns_record` / `resolve_interface_implementer`, with
+     Java empty-record semantics per type. **dnsRecord ports the JAVA engine's signature
+     `dnsRecord(bytes32,bytes,uint16)` = `0xee8de1f7` (raw DNS wire name), which differs from the
+     mainnet PublicResolver ABI (`bytes32` name-hash, `0xa8fa5682`) — flagged upstream, ported
+     byte-for-byte.** `reverse_resolve`: EXACT `<hex>.addr.reverse` lookup (no walk / no
+     supportsInterface / no wrap — Java `resolveName` parity), `name(bytes32)`, then MANDATORY
+     forward-verify through the full forward path; empty record / no resolver / failed verify are
+     one indistinguishable `None`. Root modes (`EnsRootMode`): `Finalized` anchors the context at
+     `ExecAnchor::finalized_execution()` (header fetched over the verified window, then pinned to
+     the finalized hash + state root; fails closed — peers may prune the ~2-epoch-old root),
+     `Auto` = finalized-first-then-optimistic (Java AUTO-ladder shape; a finalized Value/Offchain
+     is returned, NoRecord/error falls back), `Optimistic` = the Java PEER_HEAD twin
+     (beacon-anchored here, strictly stronger). `verified` in results = "ran against the
+     finalized root". JNI: ONE generic `nativeEnsRecordJson(handle, paramsJson)` dispatch
+     (ABI 11 → 12); `RustEnsApi` implements the full `EnsApi` over it (never throws — documented
+     divergence), `resolveAddress` honors the caller's root, records/reverse hardcode AUTO
+     (JavaEnsApi parity). Cross-language goldens: `eljson::ens_record_json_shapes` ↔
+     `RustEnsRecordJsonTest`. The daemon gained a `reverse-ens` CLI command (both engines).
+     *Still deferred to C-5-3:* CCIP-Read (offchain names error distinguishably meanwhile);
+     resolver-discovery caching (Java's static 5-min cache) is a later optimisation.
 
 Milestone-C gate: on a SYNCED mainnet daemon with `-Pengine=rust`, a real ERC-20
 `balanceOf` `eth_call`, an `estimateGas` for a token transfer, and a `resolve-ens` of a

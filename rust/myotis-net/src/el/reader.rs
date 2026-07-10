@@ -35,7 +35,10 @@ use myotis_evm::{
 use crate::el::anchor::ExecAnchor;
 use crate::el::discv4::{Discv4Config, Discv4Service};
 use crate::el::eth::session::EthConfig;
-use crate::el::evm::{block_context, CallOutcome, EnsOutcome, GasOutcome, PoolOracle};
+use crate::el::evm::{
+    block_context, CallOutcome, EnsOutcome, EnsQuery, EnsQueryOutcome, EnsRecordValue,
+    EnsRootMode, GasOutcome, PoolOracle,
+};
 use crate::el::peer::ManagedPeer;
 use crate::el::pool::{PeerPool, PoolConfig};
 use crate::el::snap::fetch::AccountOutcome;
@@ -740,6 +743,111 @@ impl ElReader {
         }
     }
 
+    /// One [`EnsQuery`] against the root the caller demands (EL-C-5-2). `Auto`
+    /// mirrors the Java ladder: attempt the beacon-FINALIZED root first and
+    /// return its answer when it produced a value or an offchain marker;
+    /// otherwise (no record, or the finalized attempt failed — e.g. no peer
+    /// still serves that root) retry against the optimistic head. `Finalized`
+    /// fails closed instead of downgrading. `verified` in the outcome = "ran
+    /// against the finalized root".
+    pub async fn resolve_ens_query(
+        &self,
+        query: EnsQuery,
+        chain_id: u64,
+        root: EnsRootMode,
+    ) -> Result<EnsQueryOutcome, String> {
+        match root {
+            EnsRootMode::Finalized => self.ens_attempt(query, chain_id, true).await,
+            EnsRootMode::Optimistic => self.ens_attempt(query, chain_id, false).await,
+            EnsRootMode::Auto => {
+                match self.ens_attempt(query.clone(), chain_id, true).await {
+                    // A finalized value / offchain marker is the answer (an
+                    // offchain gateway response won't change with the root).
+                    Ok(out @ EnsQueryOutcome::Value { .. })
+                    | Ok(out @ EnsQueryOutcome::Offchain { .. }) => Ok(out),
+                    // No record at the finalized root, or the finalized attempt
+                    // itself failed → the optimistic head decides.
+                    Ok(EnsQueryOutcome::NoRecord { .. }) | Err(_) => {
+                        self.ens_attempt(query, chain_id, false).await
+                    }
+                }
+            }
+        }
+    }
+
+    /// One resolution attempt against one root (finalized or optimistic).
+    async fn ens_attempt(
+        &self,
+        query: EnsQuery,
+        chain_id: u64,
+        finalized: bool,
+    ) -> Result<EnsQueryOutcome, String> {
+        let (ctx, executor) = if finalized {
+            self.evm_setup_finalized(chain_id, "resolve-ens").await?
+        } else {
+            self.evm_setup(chain_id, "resolve-ens").await?
+        };
+        let block_number = ctx.block_number;
+        let walk = tokio::task::spawn_blocking(move || {
+            let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
+            run_ens_query(&caller, &query)
+        });
+        // Same overall deadline as resolve_ens — the walk is a chain of
+        // per-request-bounded peer calls that must not multiply unbounded.
+        let joined = tokio::time::timeout(RESOLVE_ENS_DEADLINE, walk)
+            .await
+            .map_err(|_| "resolve-ens timed out".to_string())?
+            .map_err(|e| format!("resolve-ens task join error: {e}"))?;
+        match joined {
+            Ok(Some(value)) => Ok(EnsQueryOutcome::Value { value, block_number, verified: finalized }),
+            Ok(None) => Ok(EnsQueryOutcome::NoRecord { block_number, verified: finalized }),
+            Err(EnsError::OffchainLookup) => {
+                Ok(EnsQueryOutcome::Offchain { block_number, verified: finalized })
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// [`Self::evm_setup`], anchored at the beacon-FINALIZED execution block
+    /// instead of the optimistic head. The header is fetched over the verified
+    /// hash-chain window and then CROSS-CHECKED against the finalized anchor's
+    /// own hash + state root, so the context provably IS the finalized state.
+    /// Note the servable-edge caveat: execution peers prune state, so a
+    /// finalized root (~2 epochs back) can be unservable — that fails closed
+    /// here or in the oracle, and AUTO falls back to the optimistic head.
+    async fn evm_setup_finalized(
+        &self,
+        chain_id: u64,
+        what: &str,
+    ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
+        let Some(fin) = self.anchor.finalized_execution() else {
+            return Err(format!("no beacon-finalized execution block for {what}"));
+        };
+        let Some(block) = self.get_block_by_number(Some(fin.block_number)).await? else {
+            return Err(format!(
+                "finalized block {} not fetchable for {what}",
+                fin.block_number
+            ));
+        };
+        // The window walk verified hash-linkage to the optimistic head; also pin
+        // the header to the finalized anchor itself (belt and braces — the
+        // finalized payload is the trust anchor this mode advertises).
+        if block.hash != fin.block_hash {
+            return Err(format!(
+                "finalized-block hash mismatch at {} for {what}",
+                fin.block_number
+            ));
+        }
+        if block.header.state_root != fin.state_root {
+            return Err(format!(
+                "finalized-block state-root mismatch at {} for {what}",
+                fin.block_number
+            ));
+        }
+        let ctx = block_context(&block.header, chain_id)?;
+        self.evm_executor_for(ctx, what).await
+    }
+
     /// Shared setup for the EVM reads: a [`BlockContext`](myotis_evm::BlockContext)
     /// from the verified head + an [`EvmExecutor`] over a fresh snap-peer snapshot and
     /// the reader's cross-call caches. `what` names the caller in the error messages.
@@ -752,6 +860,16 @@ impl ElReader {
             return Err(format!("no verified head to run {what} against"));
         };
         let ctx = block_context(&block.header, chain_id)?;
+        self.evm_executor_for(ctx, what).await
+    }
+
+    /// The executor half of the EVM setup: a fresh snap-peer snapshot + the
+    /// reader's cross-call caches bound over the given context.
+    async fn evm_executor_for(
+        &self,
+        ctx: myotis_evm::BlockContext,
+        what: &str,
+    ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
         // Snapshot the snap peers once: one consistent set for the whole call.
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
@@ -1151,6 +1269,46 @@ fn next_base_fee_calc(base: u128, gas_limit: u64, gas_used: u64) -> u128 {
         let delta = base.saturating_mul((gas_target - gas_used) as u128) / target / 8;
         base.saturating_sub(delta)
     }
+}
+
+/// Dispatch one [`EnsQuery`] to its `myotis_evm::ens` resolver function,
+/// folding each typed answer into [`EnsRecordValue`]. Runs on a blocking
+/// thread (every step's oracle fetch bridges via `block_on`).
+fn run_ens_query(
+    caller: &dyn myotis_evm::EthCaller,
+    query: &EnsQuery,
+) -> Result<Option<EnsRecordValue>, EnsError> {
+    Ok(match query {
+        EnsQuery::Addr { name } => {
+            myotis_evm::resolve_address(caller, name)?.map(EnsRecordValue::Address)
+        }
+        EnsQuery::Text { name, key } => {
+            myotis_evm::resolve_text(caller, name, key)?.map(EnsRecordValue::Text)
+        }
+        EnsQuery::Contenthash { name } => {
+            myotis_evm::resolve_contenthash(caller, name)?.map(EnsRecordValue::Bytes)
+        }
+        EnsQuery::Multicoin { name, coin_type } => {
+            myotis_evm::resolve_multicoin(caller, name, *coin_type)?.map(EnsRecordValue::Bytes)
+        }
+        EnsQuery::Pubkey { name } => myotis_evm::resolve_pubkey(caller, name)?
+            .map(|(x, y)| EnsRecordValue::Pubkey { x, y }),
+        EnsQuery::Abi { name, content_types } => {
+            myotis_evm::resolve_abi(caller, name, *content_types)?
+                .map(|(content_type, data)| EnsRecordValue::Abi { content_type, data })
+        }
+        EnsQuery::DnsRecord { name, dns_name, resource } => {
+            myotis_evm::resolve_dns_record(caller, name, dns_name, *resource)?
+                .map(EnsRecordValue::Bytes)
+        }
+        EnsQuery::Interface { name, interface_id } => {
+            myotis_evm::resolve_interface_implementer(caller, name, *interface_id)?
+                .map(EnsRecordValue::Address)
+        }
+        EnsQuery::Reverse { address } => {
+            myotis_evm::reverse_resolve(caller, *address)?.map(EnsRecordValue::Name)
+        }
+    })
 }
 
 #[cfg(test)]

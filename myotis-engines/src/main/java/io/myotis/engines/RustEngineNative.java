@@ -23,7 +23,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 11; // 11: + nativeResolveEnsJson
+    static final int EXPECTED_ABI_VERSION = 12; // 12: + nativeEnsRecordJson (EL-C-5-2)
 
     private static final boolean AVAILABLE = load();
 
@@ -176,6 +176,13 @@ final class RustEngineNative {
      * or {@code {"error":"…"}} on a transport/bad-input failure).
      */
     static native String nativeResolveEnsJson(long handle, String name);
+
+    /**
+     * One generic ENS record dispatch (EL-C-5-2): the method and its args travel
+     * in {@code paramsJson} (see the Rust {@code host::ens_record_json} doc for
+     * the exact shapes); returns the record JSON or {@code {"error": "..."}}.
+     */
+    static native String nativeEnsRecordJson(long handle, String paramsJson);
 
     /**
      * Verified {@code eth_getBlockByNumber} (transactions as hashes) for a running

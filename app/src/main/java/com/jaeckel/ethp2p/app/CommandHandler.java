@@ -67,6 +67,7 @@ public class CommandHandler {
                 case "get-account"             -> handleGetAccount(jsonLine);
                 case "get-storage"             -> handleGetStorage(jsonLine);
                 case "resolve-ens"             -> handleResolveEns(jsonLine);
+                case "reverse-ens"             -> handleReverseEns(jsonLine);
                 case "resolve-ens-text"        -> handleResolveEnsText(jsonLine);
                 case "resolve-ens-contenthash" -> handleResolveEnsContenthash(jsonLine);
                 case "resolve-ens-addr-coin"   -> handleResolveEnsAddrCoin(jsonLine);
@@ -339,6 +340,30 @@ public class CommandHandler {
             if (r.error() == null) {
                 return "{\"ok\":true,\"resolved\":false"
                         + ",\"name\":\"" + escapeJson(name) + "\""
+                        + ",\"beaconVerified\":false"
+                        + ",\"blockNumber\":" + r.blockNumber() + "}";
+            }
+            return jsonError(r.error());
+        } catch (EngineException | IllegalStateException e) {
+            return jsonError(e.getMessage());
+        }
+    }
+
+    private String handleReverseEns(String jsonLine) {
+        String address = extractString(jsonLine, "address");
+        try {
+            EnsResolutionResult r = ens().reverseResolve(address);
+            if (r.name() != null) {
+                return "{\"ok\":true,\"resolved\":true"
+                        + ",\"address\":\"" + escapeJson(address) + "\""
+                        + ",\"name\":\"" + escapeJson(r.name()) + "\""
+                        + ",\"beaconVerified\":" + r.verified()
+                        + ",\"blockNumber\":" + r.blockNumber() + "}";
+            }
+            // name==null && error==null = no (forward-verified) reverse record.
+            if (r.error() == null) {
+                return "{\"ok\":true,\"resolved\":false"
+                        + ",\"address\":\"" + escapeJson(address) + "\""
                         + ",\"beaconVerified\":false"
                         + ",\"blockNumber\":" + r.blockNumber() + "}";
             }

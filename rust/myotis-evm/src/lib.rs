@@ -53,7 +53,11 @@ pub use cache::{
     NoopStateProofCache, StateProofCache,
 };
 pub use database::OracleDatabase;
-pub use ens::{resolve_address, EnsError, EthCaller, ExecutorCaller};
+pub use ens::{
+    resolve_abi, resolve_address, resolve_contenthash, resolve_dns_record,
+    resolve_interface_implementer, resolve_multicoin, resolve_pubkey, resolve_text,
+    reverse_resolve, EnsError, EthCaller, ExecutorCaller,
+};
 pub use error::EvmError;
 pub use executor::EvmExecutor;
 pub use oracle::{OracleAccount, OracleError, SnapStateOracle};

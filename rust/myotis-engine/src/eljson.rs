@@ -8,7 +8,7 @@
 //! serializes `{"error": "..."}`, which the Java side raises as an
 //! `EngineException`.
 
-use myotis_net::el::evm::{CallOutcome, EnsOutcome, GasOutcome};
+use myotis_net::el::evm::{CallOutcome, EnsOutcome, EnsQueryOutcome, EnsRecordValue, GasOutcome};
 use myotis_net::el::reader::{
     FeeEstimate, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedStorage,
 };
@@ -277,6 +277,60 @@ pub fn ens_json(outcome: &EnsOutcome) -> String {
         EnsOutcome::Offchain { block_number } => {
             obj.insert("status".into(), "offchain".into());
             obj.insert("blockNumber".into(), json_u64(*block_number));
+        }
+    }
+    serde_json::Value::Object(obj).to_string()
+}
+
+/// ENS record-query result (EL-C-5-2, all record types + reverse). Shapes:
+/// - `{"status":"ok","blockNumber":N,"verified":b, <value keys>}` where the
+///   value keys are per record type: `addressHex` (addr / interfaceImplementer),
+///   `value` (text), `dataHex` (contenthash / multicoin / dnsRecord),
+///   `pubkeyXHex`+`pubkeyYHex` (pubkey), `contentType`+`dataHex` (ABI), or
+///   `name` (reverse).
+/// - `{"status":"noRecord","blockNumber":N,"verified":b}`
+/// - `{"status":"offchain","blockNumber":N,"verified":b}`
+///
+/// `verified` = the resolution ran against the beacon-FINALIZED root.
+pub fn ens_record_json(outcome: &EnsQueryOutcome) -> String {
+    let mut obj = serde_json::Map::new();
+    match outcome {
+        EnsQueryOutcome::Value { value, block_number, verified } => {
+            obj.insert("status".into(), "ok".into());
+            obj.insert("blockNumber".into(), json_u64(*block_number));
+            obj.insert("verified".into(), (*verified).into());
+            match value {
+                EnsRecordValue::Address(a) => {
+                    obj.insert("addressHex".into(), hex0x_var(a).into());
+                }
+                EnsRecordValue::Text(s) => {
+                    obj.insert("value".into(), s.as_str().into());
+                }
+                EnsRecordValue::Bytes(b) => {
+                    obj.insert("dataHex".into(), hex0x_var(b).into());
+                }
+                EnsRecordValue::Pubkey { x, y } => {
+                    obj.insert("pubkeyXHex".into(), hex0x_var(x).into());
+                    obj.insert("pubkeyYHex".into(), hex0x_var(y).into());
+                }
+                EnsRecordValue::Abi { content_type, data } => {
+                    obj.insert("contentType".into(), json_u64(*content_type));
+                    obj.insert("dataHex".into(), hex0x_var(data).into());
+                }
+                EnsRecordValue::Name(n) => {
+                    obj.insert("name".into(), n.as_str().into());
+                }
+            }
+        }
+        EnsQueryOutcome::NoRecord { block_number, verified } => {
+            obj.insert("status".into(), "noRecord".into());
+            obj.insert("blockNumber".into(), json_u64(*block_number));
+            obj.insert("verified".into(), (*verified).into());
+        }
+        EnsQueryOutcome::Offchain { block_number, verified } => {
+            obj.insert("status".into(), "offchain".into());
+            obj.insert("blockNumber".into(), json_u64(*block_number));
+            obj.insert("verified".into(), (*verified).into());
         }
     }
     serde_json::Value::Object(obj).to_string()
@@ -582,6 +636,57 @@ mod tests {
         let off: serde_json::Value =
             serde_json::from_str(&ens_json(&EnsOutcome::Offchain { block_number: 21_000_010 }))
                 .unwrap();
+        assert_eq!(off["status"], "offchain");
+    }
+
+    #[test]
+    fn ens_record_json_shapes() {
+        // One pin per value shape (the Java RustEnsApi parsers replay the same
+        // literals — the two halves of the cross-language golden).
+        let v = |value: EnsRecordValue| {
+            serde_json::from_str::<serde_json::Value>(&ens_record_json(&EnsQueryOutcome::Value {
+                value,
+                block_number: 21_000_010,
+                verified: true,
+            }))
+            .unwrap()
+        };
+
+        let addr = v(EnsRecordValue::Address([0xd8; 20]));
+        assert_eq!(addr["status"], "ok");
+        assert_eq!(addr["addressHex"], "0xd8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8");
+        assert_eq!(addr["blockNumber"], 21_000_010);
+        assert_eq!(addr["verified"], true);
+
+        let text = v(EnsRecordValue::Text("https://vitalik.ca".into()));
+        assert_eq!(text["value"], "https://vitalik.ca");
+
+        let bytes = v(EnsRecordValue::Bytes(vec![0xC0, 0xFF, 0xEE]));
+        assert_eq!(bytes["dataHex"], "0xc0ffee");
+
+        let pk = v(EnsRecordValue::Pubkey { x: [0x0A; 32], y: [0x0B; 32] });
+        assert_eq!(pk["pubkeyXHex"], format!("0x{}", "0a".repeat(32)));
+        assert_eq!(pk["pubkeyYHex"], format!("0x{}", "0b".repeat(32)));
+
+        let abi = v(EnsRecordValue::Abi { content_type: 1, data: b"{}".to_vec() });
+        assert_eq!(abi["contentType"], 1);
+        assert_eq!(abi["dataHex"], "0x7b7d");
+
+        let name = v(EnsRecordValue::Name("vitalik.eth".into()));
+        assert_eq!(name["name"], "vitalik.eth");
+
+        let none: serde_json::Value = serde_json::from_str(&ens_record_json(
+            &EnsQueryOutcome::NoRecord { block_number: 21_000_010, verified: false },
+        ))
+        .unwrap();
+        assert_eq!(none["status"], "noRecord");
+        assert_eq!(none["verified"], false);
+        assert!(none.get("dataHex").is_none());
+
+        let off: serde_json::Value = serde_json::from_str(&ens_record_json(
+            &EnsQueryOutcome::Offchain { block_number: 21_000_010, verified: false },
+        ))
+        .unwrap();
         assert_eq!(off["status"], "offchain");
     }
 
