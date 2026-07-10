@@ -248,6 +248,13 @@ pub fn resolve_interface_implementer(
 /// `resolveName` parity): the resolver is looked up at the EXACT
 /// `<hex>.addr.reverse` node — no ancestor walk, no `supportsInterface` probe,
 /// no ENSIP-10 wrap — and `name(bytes32)` is called directly on it.
+///
+/// One deliberate divergence from the Java reverse path: a plain REVERT during
+/// the reverse lookup (registry or `name()`) folds to `Ok(None)` here, where
+/// Java surfaces it as an error record — this matches the FORWARD path's
+/// revert-is-no-record classification on both engines, and a reverse resolver
+/// without a `name(bytes32)` function simply has no reverse record to give.
+/// Non-revert failures (state unavailable) still propagate as errors.
 pub fn reverse_resolve(
     caller: &dyn EthCaller,
     address: [u8; 20],
@@ -313,6 +320,12 @@ fn resolve_record(
     name: &str,
     inner_call: &[u8],
 ) -> Result<Option<Vec<u8>>, EnsError> {
+    // DNS-encode BEFORE the walk (Java `dispatchResolve` ordering): a malformed
+    // name (empty / oversized label) is always an InvalidName error — never a
+    // "no record" — even when the walk would find no resolver or the legacy
+    // path wouldn't need the wire form.
+    let dns = dns_encode(name)?;
+
     let Some(info) = find_resolver(caller, name)? else {
         return Ok(None);
     };
@@ -321,11 +334,6 @@ fn resolve_record(
     if !info.exact && !info.extended {
         return Ok(None);
     }
-
-    // DNS-encode eagerly on BOTH paths (Java `dispatchResolve` parity): a
-    // malformed name (empty / oversized label) is rejected even when the legacy
-    // path wouldn't need the wire form.
-    let dns = dns_encode(name)?;
 
     if info.extended {
         // ENSIP-10: resolver.resolve(dnsEncode(name), inner) → bytes wrapping
@@ -586,6 +594,18 @@ mod tests {
         // Registry returns zero for every suffix → no resolver anywhere.
         let caller = MockCaller::new().on(|_t, _cd| Some(Ok(vec![0u8; 32])));
         assert_eq!(resolve_address(&caller, "nonexistent.eth").unwrap(), None);
+    }
+
+    #[test]
+    fn malformed_name_errors_even_without_a_resolver() {
+        // DNS-encoding runs BEFORE the walk (Java dispatchResolve ordering): an
+        // interior empty label is InvalidName, never a clean "no record" — even
+        // when the registry has no resolver for any suffix.
+        let caller = MockCaller::new().on(|_t, _cd| Some(Ok(vec![0u8; 32])));
+        assert!(matches!(
+            resolve_address(&caller, "a..eth"),
+            Err(EnsError::InvalidName(_))
+        ));
     }
 
     #[test]

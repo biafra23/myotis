@@ -589,13 +589,18 @@ pub fn ens_record_json(handle: i64, params_json: &str) -> String {
     let Some(method) = str_field("method") else {
         return eljson::error_json("missing method");
     };
-    let root = match str_field("root").as_deref() {
-        None | Some("auto") => EnsRootMode::Auto,
-        Some("finalized") => EnsRootMode::Finalized,
-        // The Java EnsRoot.PEER_HEAD twin: don't wait for finality (here still
-        // beacon-anchored — this engine has no peer-claimed-head mode).
-        Some("optimistic") => EnsRootMode::Optimistic,
-        Some(other) => return eljson::error_json(&format!("unknown root mode: {other}")),
+    // Strict: a PRESENT root that isn't one of the known strings is an error
+    // (a non-string value must not silently read as the default).
+    let root = match params.get("root") {
+        None => EnsRootMode::Auto,
+        Some(v) => match v.as_str() {
+            Some("auto") => EnsRootMode::Auto,
+            Some("finalized") => EnsRootMode::Finalized,
+            // The Java EnsRoot.PEER_HEAD twin: don't wait for finality (here
+            // still beacon-anchored — no peer-claimed-head mode).
+            Some("optimistic") => EnsRootMode::Optimistic,
+            _ => return eljson::error_json(&format!("unknown root mode: {v}")),
+        },
     };
 
     let query = match method.as_str() {
@@ -618,6 +623,9 @@ pub fn ens_record_json(handle: i64, params_json: &str) -> String {
             let Some(key) = str_field("key").filter(|k| !k.is_empty()) else {
                 return eljson::error_json("missing key");
             };
+            if key.len() > 512 {
+                return eljson::error_json("key too long");
+            }
             EnsQuery::Text { name, key }
         }
         "multicoin" => {

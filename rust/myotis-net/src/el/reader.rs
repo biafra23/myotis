@@ -257,6 +257,14 @@ const EVM_PROOF_CACHE_ENTRIES: usize = 8192;
 /// promises a bounded worst case of ~2 min).
 const RESOLVE_ENS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Per-ATTEMPT deadline inside the ENS root ladder (the Java
+/// `VerifiedRpcBackend.ENS_TIMEOUT_SEC` twin): AUTO runs up to two attempts
+/// (finalized, then optimistic), each bounded here, with
+/// [`RESOLVE_ENS_DEADLINE`] as the outer cap on the whole query — so a stalled
+/// finalized attempt can't consume the optimistic attempt's budget, and the
+/// JNI caller's total block time stays within the API's ~2 min contract.
+const RESOLVE_ENS_ATTEMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl ElReader {
     /// Start a mainnet reader with a freshly-generated ephemeral node key (the
     /// CL side generates its libp2p identity per run too; a persistent EL
@@ -756,23 +764,31 @@ impl ElReader {
         chain_id: u64,
         root: EnsRootMode,
     ) -> Result<EnsQueryOutcome, String> {
-        match root {
-            EnsRootMode::Finalized => self.ens_attempt(query, chain_id, true).await,
-            EnsRootMode::Optimistic => self.ens_attempt(query, chain_id, false).await,
-            EnsRootMode::Auto => {
-                match self.ens_attempt(query.clone(), chain_id, true).await {
-                    // A finalized value / offchain marker is the answer (an
-                    // offchain gateway response won't change with the root).
-                    Ok(out @ EnsQueryOutcome::Value { .. })
-                    | Ok(out @ EnsQueryOutcome::Offchain { .. }) => Ok(out),
-                    // No record at the finalized root, or the finalized attempt
-                    // itself failed → the optimistic head decides.
-                    Ok(EnsQueryOutcome::NoRecord { .. }) | Err(_) => {
-                        self.ens_attempt(query, chain_id, false).await
+        // ONE outer deadline over the whole query — including context setups and
+        // both AUTO attempts — so the (synchronously blocking) JNI caller's worst
+        // case stays within the API's ~2 min contract regardless of root mode.
+        let ladder = async {
+            match root {
+                EnsRootMode::Finalized => self.ens_attempt(query, chain_id, true).await,
+                EnsRootMode::Optimistic => self.ens_attempt(query, chain_id, false).await,
+                EnsRootMode::Auto => {
+                    match self.ens_attempt(query.clone(), chain_id, true).await {
+                        // A finalized value / offchain marker is the answer (an
+                        // offchain gateway response won't change with the root).
+                        Ok(out @ EnsQueryOutcome::Value { .. })
+                        | Ok(out @ EnsQueryOutcome::Offchain { .. }) => Ok(out),
+                        // No record at the finalized root, or the finalized attempt
+                        // itself failed → the optimistic head decides.
+                        Ok(EnsQueryOutcome::NoRecord { .. }) | Err(_) => {
+                            self.ens_attempt(query, chain_id, false).await
+                        }
                     }
                 }
             }
-        }
+        };
+        tokio::time::timeout(RESOLVE_ENS_DEADLINE, ladder)
+            .await
+            .map_err(|_| "resolve-ens timed out".to_string())?
     }
 
     /// One resolution attempt against one root (finalized or optimistic).
@@ -792,11 +808,13 @@ impl ElReader {
             let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
             run_ens_query(&caller, &query)
         });
-        // Same overall deadline as resolve_ens — the walk is a chain of
-        // per-request-bounded peer calls that must not multiply unbounded.
-        let joined = tokio::time::timeout(RESOLVE_ENS_DEADLINE, walk)
+        // Per-attempt deadline (Java ENS_TIMEOUT_SEC twin): a stalled finalized
+        // walk must leave budget for AUTO's optimistic attempt under the outer
+        // cap. The timed-out spawn_blocking closure still runs out its in-flight
+        // peer call (can't be cancelled) — only the caller is released.
+        let joined = tokio::time::timeout(RESOLVE_ENS_ATTEMPT_DEADLINE, walk)
             .await
-            .map_err(|_| "resolve-ens timed out".to_string())?
+            .map_err(|_| "resolve-ens attempt timed out".to_string())?
             .map_err(|e| format!("resolve-ens task join error: {e}"))?;
         match joined {
             Ok(Some(value)) => Ok(EnsQueryOutcome::Value { value, block_number, verified: finalized }),

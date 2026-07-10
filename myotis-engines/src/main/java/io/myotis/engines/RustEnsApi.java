@@ -395,10 +395,15 @@ final class RustEnsApi implements EnsApi {
             }
         }
 
-        /** A mandatory string value field — absence is shape drift, fail closed. */
+        /**
+         * A mandatory string value field — absence is shape drift, fail closed.
+         * Only EMPTINESS is drift (the Rust side never emits an empty value):
+         * a whitespace-only text record is legitimate on-chain data and must
+         * pass through, so no isBlank() here.
+         */
         String requireString(String key) {
             var v = o.get(key);
-            if (v == null || v.isNull() || !v.isString() || v.asString().isBlank()) {
+            if (v == null || v.isNull() || !v.isString() || v.asString().isEmpty()) {
                 throw new EngineException("ens-record JSON: status=ok without " + key);
             }
             return v.asString();

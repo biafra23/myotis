@@ -199,6 +199,9 @@ pub fn decode_two_words(data: &[u8]) -> Option<([u8; 32], [u8; 32])> {
 /// Decode a `(uint256, bytes)` return (`ABI(bytes32,uint256)` → contentType,
 /// data). The uint must fit u64 (ENS content types are a small bitmask —
 /// anything larger is not a real record). `None` on malformed data.
+/// Known micro-divergence: a contentType in [2^63, 2^64) decodes here but makes
+/// Java's `longValueExact()` throw → empty there vs an error result here; only
+/// an adversarial resolver can produce it and no wrong value is delivered.
 pub fn decode_uint_bytes(data: &[u8]) -> Option<(u64, Vec<u8>)> {
     let word = data.get(..32)?;
     if word[..24].iter().any(|&b| b != 0) {
