@@ -146,6 +146,10 @@ impl EvmExecutor {
             .value(value)
             .data(calldata.to_vec().into())
             .gas_limit(VIEW_CALL_GAS)
+            // Explicit: build_fill() defaults the tx chain id to MAINNET (Some(1)),
+            // which revm validates against cfg.chain_id — on any other chain the
+            // call would die with "invalid chain ID" (found live on sepolia).
+            .chain_id(Some(ctx.chain_id))
             .build_fill();
 
         let mut evm = Context::mainnet()
@@ -466,6 +470,20 @@ mod tests {
             matches!(err, EvmError::UnsupportedChain { chain_id: 100 }),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn sepolia_context_executes_with_its_chain_id() {
+        // Regression (found live): build_fill() defaults tx.chain_id to mainnet's
+        // Some(1); without the explicit override every call on a non-mainnet chain
+        // fails revm's chain-id validation ("invalid chain ID"). CHAINID opcode:
+        // PUSH result of chainid, MSTORE, RETURN 32 bytes.
+        let code = vec![0x46u8, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let exec = executor_with(code, None);
+        let mut c = ctx(9_000_000, crate::fork::SEPOLIA_PRAGUE_TIME + 1);
+        c.chain_id = 11_155_111;
+        let out = exec.call_view(TARGET, &[], &c).expect("sepolia call must run");
+        assert_eq!(U256::from_be_slice(&out), U256::from(11_155_111u64));
     }
 
     #[test]
