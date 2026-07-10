@@ -562,11 +562,12 @@ pub fn resolve_ens_json(handle: i64, name: &str) -> String {
 pub fn ens_record_json(handle: i64, params_json: &str) -> String {
     // Bound the native input like the other JSON natives. ccipCallback carries
     // gateway response payloads (L2-proof gateways return tens of KB), so it
-    // gets a wide bound sized to parse_hex_bytes' own 2 MiB-hex/field cap; the
-    // plain record queries keep the tight name-sized cap. The raw substring
-    // probe only widens the DoS-guard cap — the real method check follows.
-    let cap = if params_json.contains("\"ccipCallback\"") { 5 * 1024 * 1024 } else { 4096 };
-    if params_json.len() > cap {
+    // gets a wide bound sized to parse_hex_bytes' own 2 MiB-hex/field cap; all
+    // other methods keep the tight name-sized cap, enforced AFTER the method is
+    // known (an exact check — a "ccipCallback" substring in some unrelated
+    // field can't widen a record query's cap). Parsing up to the wide bound
+    // first is bounded work.
+    if params_json.len() > 5 * 1024 * 1024 {
         return eljson::error_json("ens params too long");
     }
     let params: serde_json::Value = match serde_json::from_str(params_json) {
@@ -580,6 +581,9 @@ pub fn ens_record_json(handle: i64, params_json: &str) -> String {
     let Some(method) = str_field("method") else {
         return eljson::error_json("missing method");
     };
+    if method != "ccipCallback" && params_json.len() > 4096 {
+        return eljson::error_json("ens params too long");
+    }
     // method:"ccipCallback" re-enters after a host-driven gateway round: the
     // ORIGINAL query travels as queryMethod + its usual fields (drives the
     // decode semantics + reverse forward-verify), plus the callback tuple.

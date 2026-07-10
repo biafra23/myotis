@@ -178,9 +178,10 @@ final class CcipDriver {
     private static boolean containsHttpError(String dataHex) {
         String bare = dataHex.startsWith("0x") ? dataHex.substring(2) : dataHex;
         String needle = "ca7a4e75";
-        String lower = bare.toLowerCase(java.util.Locale.ROOT);
-        for (int i = 0; i + needle.length() <= lower.length(); i += 2) {
-            if (lower.startsWith(needle, i)) {
+        // regionMatches(ignoreCase) scans in place — no lowercase copy of a
+        // potentially multi-MB L2-proof response.
+        for (int i = 0; i + needle.length() <= bare.length(); i += 2) {
+            if (bare.regionMatches(true, i, needle, 0, needle.length())) {
                 return true;
             }
         }

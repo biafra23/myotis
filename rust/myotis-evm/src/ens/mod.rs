@@ -53,10 +53,13 @@ pub enum EnsError {
     /// The resolver reverted with ERC-3668 `OffchainLookup`: the record resolves
     /// OFFCHAIN via a CCIP-Read gateway. Carries the decoded 5-tuple (when the
     /// revert body parsed) so the HOST can drive the gateway and re-enter via
-    /// the callback (EL-C-5-3 — HTTP stays outside this crate by design), plus
-    /// whether the revert came from inside the ENSIP-10 `resolve()` wrap (the
-    /// callback's answer then needs the same bytes-unwrap). A tuple that fails
-    /// to parse is `lookup: None` — still distinguishable from "no record".
+    /// the callback (EL-C-5-3 — HTTP stays outside this crate by design).
+    /// `wrapped` = the ORIGINAL dispatch went through the ENSIP-10 `resolve()`
+    /// wrap, so whichever callback round finally answers must bytes-unwrap its
+    /// return; it describes the original call's decode contract, NOT where this
+    /// particular revert occurred, and is therefore carried unchanged through
+    /// callback rounds. A tuple that fails to parse is `lookup: None` — still
+    /// distinguishable from "no record".
     OffchainLookup { lookup: Option<Box<OffchainLookup>>, wrapped: bool },
     /// A resolution `eth_call` failed for a non-revert reason (state unavailable,
     /// halt, unsupported chain). A plain revert is treated as "no record", not an
@@ -442,6 +445,10 @@ pub fn ccip_callback(
                 Ok(Some(out))
             }
         }
+        // A second OffchainLookup carries the ORIGINAL `wrapped` forward: the
+        // flag is the original call's decode contract (see the variant doc),
+        // so a deeper round — if the cap were ever raised — still applies the
+        // right final unwrap.
         Err(EvmError::Reverted { data }) => revert_outcome(&data, wrapped),
         Err(e) => Err(EnsError::Call(e)),
     }
