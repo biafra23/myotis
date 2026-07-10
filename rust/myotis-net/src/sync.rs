@@ -145,6 +145,45 @@ impl ChainConfig {
         }
     }
 
+    /// Gnosis Chain — values duplicated verbatim from the Java
+    /// `NetworkConfig.GNOSIS`. Its own beacon chain: 5 s slots, 16-slot epochs
+    /// (still 8192 slots per sync-committee period: 512 epochs × 16), and a
+    /// prior-fork digest fallback (Electra) accepted alongside the Fulu digest.
+    pub fn gnosis() -> Self {
+        Self {
+            name: "gnosis",
+            chain_id: 100,
+            // Fulu on Gnosis (0x06000064), active since 2026-04-14.
+            fork_version: [0x06, 0x00, 0x00, 0x64],
+            // Electra — accepted as a discv5 fork-digest fallback.
+            prior_fork_version: Some([0x05, 0x00, 0x00, 0x64]),
+            genesis_validators_root: hex32(
+                "f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47",
+            ),
+            genesis_time: 1_638_993_340, // 2021-12-08 19:55:40 UTC
+            seconds_per_slot: 5,
+            slots_per_epoch: 16,
+            // EIP-7892: Gnosis has no explicit BLOB_SCHEDULE — clients fold the
+            // Electra-baseline params (ELECTRA_FORK_EPOCH=1337856, MAX_BLOBS=2)
+            // into the Fulu digest. Yields the live-verified digest 0x3237dab6.
+            blob_params_epoch: 1_337_856,
+            blob_params_max_blobs: 2,
+            // Copied verbatim from the @checkpoint:gnosis:begin/end region of
+            // NetworkConfig.java (slot 28516336, 2026-06-16, period 3480 —
+            // deliberately one period behind head, see refreshGnosisCheckpoint).
+            // A refresh must be mirrored here by hand until plan PR7.
+            checkpoint_root: hex32(
+                "dc1ce049946173d38463595f907f19893e4fd956c740913fb70d94d34e07e789",
+            ),
+            checkpoint_slot: 28_516_336,
+            static_peers: Vec::new(), // none pinned — discv5 bootnodes seed discovery
+            bootstrap_enrs: GNOSIS_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
+            discv5_port: 0,
+            snapshot_path: None,
+            cl_peer_cache_path: None,
+        }
+    }
+
     /// Fork digests accepted when filtering discv5 ENRs — current first, then
     /// the prior fork's when configured (`NetworkConfig.acceptedForkDigests`).
     pub fn accepted_fork_digests(&self) -> Vec<[u8; 4]> {
@@ -212,6 +251,19 @@ const SEPOLIA_BOOTSTRAP_ENRS: &[&str] = &[
     // remaining bootstrap_nodes.yaml entries (unattributed)
     "enr:-Iq4QMCTfIMXnow27baRUb35Q8iiFHSIDBJh6hQM5Axohhf4b6Kr_cOCu0htQ5WvVqKvFgY28893DHAg8gnBAXsAVqmGAX53x8JggmlkgnY0gmlwhLKAlv6Jc2VjcDI1NmsxoQK6S-Cii_KmfFdUJL2TANL3ksaKUnNXvTCv1tLwXs0QgIN1ZHCCIyk",
     "enr:-L64QC9Hhov4DhQ7mRukTOz4_jHm4DHlGL726NWH4ojH1wFgEwSin_6H95Gs6nW2fktTWbPachHJ6rUFu0iJNgA0SB2CARqHYXR0bmV0c4j__________4RldGgykDb6UBOQAABx__________-CaWSCdjSCaXCEA-2vzolzZWNwMjU2azGhA17lsUg60R776rauYMdrAz383UUgESoaHEzMkvm4K6k6iHN5bmNuZXRzD4N0Y3CCIyiDdWRwgiMo",
+];
+
+/// Gnosis CL discv5 bootstrap ENRs (Java `NetworkConfig.GNOSIS.clDiscv5Bootnodes`
+/// — gnosischain/configs bootstrap_nodes.txt).
+const GNOSIS_BOOTSTRAP_ENRS: &[&str] = &[
+    "enr:-Ly4QIAhiTHk6JdVhCdiLwT83wAolUFo5J4nI5HrF7-zJO_QEw3cmEGxC1jvqNNUN64Vu-xxqDKSM528vKRNCehZAfEBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCCS-QxAgAAZP__________gmlkgnY0gmlwhEFtZ5SJc2VjcDI1NmsxoQJwgL5C-30E8RJmW8gCb7sfwWvvfre7wGcCeV4X1G2wJYhzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA",
+    "enr:-Ly4QDhEjlkf8fwO5uWAadexy88GXZneTuUCIPHhv98v8ZfXMtC0S1S_8soiT0CMEgoeLe9Db01dtkFQUnA9YcnYC_8Bh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCCS-QxAgAAZP__________gmlkgnY0gmlwhEFtZ5WJc2VjcDI1NmsxoQMRSho89q2GKx_l2FZhR1RmnSiQr6o_9hfXfQUuW6bjMohzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA",
+    "enr:-Ly4QLKgv5M2D4DYJgo6s4NG_K4zu4sk5HOLCfGCdtgoezsbfRbfGpQ4iSd31M88ec3DHA5FWVbkgIas9EaJeXia0nwBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCCS-QxAgAAZP__________gmlkgnY0gmlwhI1eYRaJc2VjcDI1NmsxoQLpK_A47iNBkVjka9Mde1F-Kie-R0sq97MCNKCxt2HwOIhzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA",
+    "enr:-Ly4QF_0qvji6xqXrhQEhwJR1W9h5dXV7ZjVCN_NlosKxcgZW6emAfB_KXxEiPgKr_-CZG8CWvTiojEohG1ewF7P368Bh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCCS-QxAgAAZP__________gmlkgnY0gmlwhI1eYUqJc2VjcDI1NmsxoQIpNRUT6llrXqEbjkAodsZOyWv8fxQkyQtSvH4sg2D7n4hzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA",
+    "enr:-Ly4QCD5D99p36WafgTSxB6kY7D2V1ca71C49J4VWI2c8UZCCPYBvNRWiv0-HxOcbpuUdwPVhyWQCYm1yq2ZH0ukCbQBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCCS-QxAgAAZP__________gmlkgnY0gmlwhI1eYVSJc2VjcDI1NmsxoQJJMSV8iSZ8zvkgbi8cjIGEUVJeekLqT0LQha_co-siT4hzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA",
+    "enr:-KK4QKXJq1QOVWuJAGige4uaT8LRPQGCVRf3lH3pxjaVScMRUfFW1eiiaz8RwOAYvw33D4EX-uASGJ5QVqVCqwccxa-Bi4RldGgykCGm-DYDAABk__________-CaWSCdjSCaXCEM0QnzolzZWNwMjU2azGhAhNvrRkpuK4MWTf3WqiOXSOePL8Zc-wKVpZ9FQx_BDadg3RjcIIjKIN1ZHCCIyg",
+    "enr:-LO4QO87Rn2ejN3SZdXkx7kv8m11EZ3KWWqoIN5oXwQ7iXR9CVGd1dmSyWxOL1PGsdIqeMf66OZj4QGEJckSi6okCdWBpIdhdHRuZXRziAAAAABgAAAAhGV0aDKQPr_UhAQAAGT__________4JpZIJ2NIJpcIQj0iX1iXNlY3AyNTZrMaEDd-_eqFlWWJrUfEp8RhKT9NxdYaZoLHvsp3bbejPyOoeDdGNwgiMog3VkcIIjKA",
+    "enr:-LK4QIJUAxX9uNgW4ACkq8AixjnSTcs9sClbEtWRq9F8Uy9OEExsr4ecpBTYpxX66cMk6pUHejCSX3wZkK2pOCCHWHEBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpA-v9SEBAAAZP__________gmlkgnY0gmlwhCPSnDuJc2VjcDI1NmsxoQNuaAjFE-ANkH3pbeBdPiEIwjR5kxFuKaBWxHkqFuPz5IN0Y3CCIyiDdWRwgiMo",
 ];
 
 /// Known light-client-serving mainnet peers — the Java `NetworkConfig.MAINNET`
@@ -1897,6 +1949,37 @@ mod tests {
         assert_eq!(c.accepted_fork_digests(), vec![[0x74, 0xD0, 0x14, 0x59]]);
         assert_eq!(c.static_peers.len(), 1);
         assert_eq!(c.bootstrap_enrs.len(), 9);
+    }
+
+    #[test]
+    fn gnosis_config_matches_networkconfig_java() {
+        let c = ChainConfig::gnosis();
+        assert_eq!(c.chain_id, 100);
+        assert_eq!(c.fork_version, [0x06, 0x00, 0x00, 0x64]); // Fulu on Gnosis
+        assert_eq!(c.prior_fork_version, Some([0x05, 0x00, 0x00, 0x64])); // Electra
+        assert_eq!(c.checkpoint_slot, 28_516_336);
+        assert_eq!(
+            hex_str(&c.checkpoint_root),
+            "dc1ce049946173d38463595f907f19893e4fd956c740913fb70d94d34e07e789"
+        );
+        assert_eq!(
+            hex_str(&c.genesis_validators_root),
+            "f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47"
+        );
+        assert_eq!(c.genesis_time, 1_638_993_340);
+        assert_eq!((c.seconds_per_slot, c.slots_per_epoch), (5, 16));
+        assert_eq!((c.blob_params_epoch, c.blob_params_max_blobs), (1_337_856, 2));
+        // 512 epochs x 16 slots = the same 8192-slot period as mainnet-preset.
+        assert_eq!(spec::compute_sync_committee_period(c.checkpoint_slot), 3480);
+        // Live-verified digests the Java computes (NetworkConfig.GNOSIS
+        // currentForkDigest / acceptedForkDigests): Fulu first, Electra fallback.
+        assert_eq!(c.current_fork_digest(), [0x32, 0x37, 0xDA, 0xB6]);
+        assert_eq!(
+            c.accepted_fork_digests(),
+            vec![[0x32, 0x37, 0xDA, 0xB6], [0x7D, 0x5A, 0xAB, 0x40]]
+        );
+        assert!(c.static_peers.is_empty());
+        assert_eq!(c.bootstrap_enrs.len(), 8);
     }
 
     #[test]

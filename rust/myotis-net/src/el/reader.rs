@@ -59,6 +59,9 @@ pub struct ElConfig {
     /// Path to the EL peer cache (`dataDir/peers.cache`) for warm-start; `None`
     /// runs without persistence.
     pub cache_path: Option<std::path::PathBuf>,
+    /// Network floor for the suggested priority fee (wei) — the Java
+    /// `NetworkConfig.minSuggestedTipWei` (mainnet/sepolia 0.1 gwei; gnosis 0.001).
+    pub min_suggested_tip_wei: u128,
 }
 
 impl ElConfig {
@@ -82,6 +85,7 @@ impl ElConfig {
             listen_port: 30303,
             pool_config: PoolConfig::default(),
             cache_path: None,
+            min_suggested_tip_wei: 100_000_000, // 0.1 gwei
         }
     }
 
@@ -108,6 +112,31 @@ impl ElConfig {
             listen_port: 30305,
             pool_config: PoolConfig::default(),
             cache_path: None,
+            min_suggested_tip_wei: 100_000_000, // 0.1 gwei
+        }
+    }
+    /// Gnosis EL parameters — verbatim from the Java `NetworkConfig.GNOSIS`. The
+    /// fork-id is the pinned Fulu/Osaka-head hash from live gnosis peers' eth Status.
+    pub fn gnosis() -> ElConfig {
+        const GNOSIS_BOOTNODES: &[&str] = &[
+            "65.109.103.148:30303",
+            "65.109.103.149:30303",
+            "141.94.97.22:30303",
+            "141.94.97.74:30303",
+            "141.94.97.84:30303",
+            "51.68.39.206:30303",
+        ];
+        ElConfig {
+            network_id: 100,
+            genesis_hash: hex32("4f1dd23188aab3a76b463e4af801b52b1248ef073c648cbdc4c9333d3da79756"),
+            fork_id_hash: [0xcf, 0xca, 0x38, 0x7c],
+            fork_next: 0,
+            bootnodes: GNOSIS_BOOTNODES.iter().filter_map(|s| s.parse().ok()).collect(),
+            discv4_port: 0,
+            listen_port: 30304, // gnosis conventional EL port (Java defaultElPort)
+            pool_config: PoolConfig::default(),
+            cache_path: None,
+            min_suggested_tip_wei: 1_000_000, // 0.001 gwei — cheap-chain floor
         }
     }
 }
@@ -214,11 +243,6 @@ const BLOCK_LOOKBACK_MAX: u64 = 256;
 /// (mirrors the Java `TIP_SUGGEST_BLOCKS`).
 const TIP_SUGGEST_BLOCKS: u64 = 3;
 
-/// Mainnet floor for the suggested tip: 0.1 gwei (mirrors the Java `MIN_SUGGESTED_TIP`).
-/// The Rust engine is mainnet-only, so this is a constant here rather than the
-/// network-aware `minSuggestedTipWei`.
-const MIN_SUGGESTED_TIP_WEI: u128 = 100_000_000;
-
 /// A verified fee suggestion (`eth_gasPrice` + `eth_maxPriorityFeePerGas`), both
 /// in wei. The tip is the median effective priority fee over the last
 /// `TIP_SUGGEST_BLOCKS` verified blocks (floored); the gas price is the next
@@ -234,6 +258,8 @@ pub struct ElReader {
     discovery: Discv4Service,
     pool: PeerPool,
     anchor: Arc<ExecAnchor>,
+    /// Network floor for the suggested tip (from `ElConfig::min_suggested_tip_wei`).
+    min_suggested_tip_wei: u128,
     /// Cross-call EVM caches, shared across every `eth_call` on this reader. Both
     /// hold `stateRoot`-keyed / content-addressed cryptographic facts, so reuse is
     /// sound. Because a call pins to the CURRENT head (whose root advances ~every
@@ -314,6 +340,7 @@ impl ElReader {
             discovery,
             pool,
             anchor,
+            min_suggested_tip_wei: cfg.min_suggested_tip_wei,
             evm_proof_cache: Arc::new(InMemoryStateProofCache::new(EVM_PROOF_CACHE_ENTRIES)),
             evm_bytecode_cache: Arc::new(InMemoryBytecodeCache::new()),
         })
@@ -871,7 +898,7 @@ impl ElReader {
 
     /// Verified fee suggestion (`eth_gasPrice` + `eth_maxPriorityFeePerGas`). Samples
     /// the last `TIP_SUGGEST_BLOCKS` beacon-anchored blocks: median per-tx effective
-    /// tip (floored at `MIN_SUGGESTED_TIP_WEI`) as the priority fee, and next-block
+    /// tip (floored at the network's `min_suggested_tip_wei`) as the priority fee, and next-block
     /// base fee + that tip as the legacy gas price. `Err` when it can't verify.
     pub async fn fee_estimate(&self) -> Result<FeeEstimate, String> {
         let head_num = self.anchor.optimistic_block_number();
@@ -955,10 +982,10 @@ impl ElReader {
             }
         }
         let tip = if tips.is_empty() {
-            MIN_SUGGESTED_TIP_WEI
+            self.min_suggested_tip_wei
         } else {
             tips.sort_unstable();
-            tips[tips.len() / 2].max(MIN_SUGGESTED_TIP_WEI)
+            tips[tips.len() / 2].max(self.min_suggested_tip_wei)
         };
         // Gas price = the NEXT block's base fee (from the head header) + the tip.
         let head_header = &window[window.len() - 1].header;
@@ -1240,5 +1267,21 @@ mod tests {
         assert_eq!(cfg.fork_next, 0);
         assert_eq!(cfg.bootnodes.len(), 5, "all five sepolia bootnodes must parse");
         assert_eq!(cfg.listen_port, 30305);
+        assert_eq!(cfg.min_suggested_tip_wei, 100_000_000);
+    }
+
+    #[test]
+    fn gnosis_config_pins_known_values() {
+        let cfg = ElConfig::gnosis();
+        assert_eq!(cfg.network_id, 100);
+        assert_eq!(
+            cfg.genesis_hash,
+            super::hex32("4f1dd23188aab3a76b463e4af801b52b1248ef073c648cbdc4c9333d3da79756")
+        );
+        assert_eq!(cfg.fork_id_hash, [0xcf, 0xca, 0x38, 0x7c]);
+        assert_eq!(cfg.fork_next, 0);
+        assert_eq!(cfg.bootnodes.len(), 6, "all six gnosis bootnodes must parse");
+        assert_eq!(cfg.listen_port, 30304);
+        assert_eq!(cfg.min_suggested_tip_wei, 1_000_000, "gnosis cheap-chain tip floor");
     }
 }

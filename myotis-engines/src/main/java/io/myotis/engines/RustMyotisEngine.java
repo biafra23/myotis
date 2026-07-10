@@ -116,8 +116,8 @@ public final class RustMyotisEngine implements MyotisEngine {
         }
         // The native side is the single source of truth for which networks it
         // hosts: nativeCreate returns UNSUPPORTED_NETWORK for a canonical network
-        // whose Rust config hasn't landed (today: gnosis), and auto mode falls
-        // back to Java on the exception.
+        // whose Rust config hasn't landed yet, and auto mode falls back to Java
+        // on the exception.
         long id = RustEngineNative.nativeCreate(canonical, config.dataDir());
         if (id == RustEngineNative.UNSUPPORTED_NETWORK) {
             throw new EngineException(
@@ -130,7 +130,7 @@ public final class RustMyotisEngine implements MyotisEngine {
         // Mirror JavaMyotisEngine: honour a host-supplied RPC port, else the
         // network's catalog default (mainnet 8545, sepolia 8547, ...).
         int rpcPort = config.rpcPort() > 0 ? config.rpcPort() : net.defaultRpcPort();
-        RustChainHandle handle = new RustChainHandle(id, canonical, net.chainId(), rpcPort);
+        RustChainHandle handle = new RustChainHandle(id, canonical, net.chainId(), rpcPort, net.hasEns());
         // Atomic claim (mirrors JavaMyotisEngine.putIfAbsent): reject a re-create rather
         // than orphaning the previous handle's native entry. On a lost race, release the
         // native handle we just allocated so it doesn't leak a tokio/libp2p host.

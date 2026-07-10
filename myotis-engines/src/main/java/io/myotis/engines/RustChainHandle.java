@@ -80,11 +80,13 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     private long lastHeadBlock = -1L;
     private long lastHeadAdvanceNanos;
 
-    RustChainHandle(long handle, String networkName, long chainId, int rpcPort) {
+    RustChainHandle(long handle, String networkName, long chainId, int rpcPort, boolean hasEns) {
         this.handle = handle;
         this.networkName = networkName;
         this.chainId = chainId;
         this.rpcPort = rpcPort;
+        // Networks without ENS (e.g. gnosis) get no EnsApi — ens() returns null.
+        this.ensApi = hasEns ? new RustEnsApi(this) : null;
     }
 
     @Override public String networkName() { return networkName; }
@@ -271,12 +273,12 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
      * Package-private test seam: exercises the JSON→snapshot mapping without JNI.
      */
     static StatusSnapshot statusFromJson(String network, String json) {
-        return new RustChainHandle(0L, network, 1L, 0).status(ParsedStatus.parse(json));
+        return new RustChainHandle(0L, network, 1L, 0, false).status(ParsedStatus.parse(json));
     }
 
     /** Package-private test seam: JSON→{@link BeaconStatus} without JNI. */
     static BeaconStatus beaconStatusFromJson(String network, String json) {
-        return new RustChainHandle(0L, network, 1L, 0).beaconStatus(ParsedStatus.parse(json));
+        return new RustChainHandle(0L, network, 1L, 0, false).beaconStatus(ParsedStatus.parse(json));
     }
 
     /** Package-private test seam: map a status JSON on THIS handle (so head-age
@@ -420,7 +422,10 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
 
     @Override public VerifiedReads reads() { return rpcServer != null ? verifiedReads : null; }
 
-    private final EnsApi ensApi = new RustEnsApi(this);
+    // Non-null only for ENS-capable networks (gnosis has no ENS registry — the
+    // ChainHandle contract returns null there). Assigned in the constructor since
+    // it depends on hasEns.
+    private final EnsApi ensApi;
 
     @Override public EnsApi ens() { return ensApi; }
 
