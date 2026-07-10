@@ -116,8 +116,8 @@ public final class RustMyotisEngine implements MyotisEngine {
         }
         // The native side is the single source of truth for which networks it
         // hosts: nativeCreate returns UNSUPPORTED_NETWORK for a canonical network
-        // whose Rust config hasn't landed (today: gnosis), and auto mode falls
-        // back to Java on the exception.
+        // whose Rust config hasn't landed yet, and auto mode falls back to Java
+        // on the exception.
         long id = RustEngineNative.nativeCreate(canonical, config.dataDir());
         if (id == RustEngineNative.UNSUPPORTED_NETWORK) {
             throw new EngineException(

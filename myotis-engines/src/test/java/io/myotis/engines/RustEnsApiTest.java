@@ -17,12 +17,11 @@ class RustEnsApiTest {
         return new RustEnsApi(new RustChainHandle(0L, "mainnet", 1L, 0, true));
     }
 
-    @org.junit.jupiter.api.Test
+    @Test
     void ensIsNullOnNetworksWithoutEns() {
         // gnosis (hasEns=false) → ChainHandle.ens() is null; mainnet (true) → non-null.
         assertNull(new RustChainHandle(0L, "gnosis", 100L, 0, false).ens());
-        org.junit.jupiter.api.Assertions.assertNotNull(
-                new RustChainHandle(0L, "mainnet", 1L, 0, true).ens());
+        assertNotNull(new RustChainHandle(0L, "mainnet", 1L, 0, true).ens());
     }
 
     @Test
