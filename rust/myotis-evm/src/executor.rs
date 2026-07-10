@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use revm::context::result::{ExecutionResult, HaltReason, Output};
 use revm::context::{CfgEnv, TxEnv};
-use revm::database_interface::DBErrorMarker;
+use revm::database_interface::{DBErrorMarker, DatabaseRef};
 use revm::primitives::{Address, TxKind, U256};
 use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
 
@@ -40,6 +40,10 @@ use crate::oracle::{OracleError, SnapStateOracle};
 /// per-tx gas cap so revm's spec-default cap (2²⁴ on the latest fork, EIP-7825)
 /// doesn't clip an `eth_call` that legitimately wants the full block budget.
 pub const VIEW_CALL_GAS: u64 = 30_000_000;
+
+/// The exact intrinsic cost of a plain value transfer — the empty-calldata
+/// no-code estimate short-circuit's answer (unbuffered; Java parity).
+const PLAIN_TRANSFER_GAS: u64 = 21_000;
 
 /// The from-less `eth_call` sender: the zero address (Geth's default). A caller
 /// that needs `msg.sender` set (ERC-20 `transfer`/`approve`) uses [`EvmExecutor::call_view_from`].
@@ -188,6 +192,25 @@ impl EvmExecutor {
         value: U256,
         ctx: &BlockContext,
     ) -> Result<u64, EvmError> {
+        // Java `rpcEstimateGas` parity: a plain transfer (empty calldata) to a
+        // CODELESS account costs exactly 21000 — no EVM run and NO 1.15 buffer
+        // (it's exact). One verified account fetch through the caching database
+        // decides it; an account WITH code (contract, or an EIP-7702-delegated
+        // EOA) falls through to the full estimate.
+        if calldata.is_empty() {
+            let db = OracleDatabase::new(
+                Arc::clone(&self.oracle),
+                ctx.state_root,
+                Arc::clone(&self.proof_cache),
+                Arc::clone(&self.bytecode_cache),
+            );
+            let no_code = db
+                .basic_ref(Address::from(target))?
+                .is_none_or(|a| a.code_hash.0 == myotis_core::trie::EMPTY_CODE_HASH);
+            if no_code {
+                return Ok(PLAIN_TRANSFER_GAS);
+            }
+        }
         match self.execute(caller, target, calldata, value, ctx)? {
             ExecutionResult::Success { gas, .. } => {
                 // The gas-limit base must cover BOTH the gross execution draw
@@ -399,6 +422,72 @@ mod tests {
             .call_view(TARGET, &[], &ctx(19_500_000, CANCUN_TIME + 1))
             .unwrap_err();
         assert!(matches!(err, EvmError::OutOfGas), "got {err:?}");
+    }
+
+    #[test]
+    fn plain_transfer_to_codeless_account_is_exactly_21000() {
+        // Empty calldata + no code → the short-circuit answers 21000 EXACTLY
+        // (no 1.15 buffer, no EVM run — Java rpcEstimateGas parity).
+        let fx = FixtureSnapStateOracle::new().with_account(
+            ROOT,
+            TARGET,
+            OracleAccount {
+                nonce: 1,
+                balance: U256::from(1_000_000u64),
+                code_hash: myotis_core::trie::EMPTY_CODE_HASH,
+                storage_root: [0x9; 32],
+            },
+        );
+        let exec = EvmExecutor::new(
+            Arc::new(fx),
+            Arc::new(NoopStateProofCache),
+            Arc::new(NoopBytecodeCache),
+        );
+        let est = exec
+            .estimate_gas([0x42; 20], TARGET, &[], U256::from(1u64), &ctx(19_500_000, CANCUN_TIME + 1))
+            .unwrap();
+        assert_eq!(est, 21_000);
+    }
+
+    #[test]
+    fn plain_transfer_to_absent_account_is_exactly_21000() {
+        // A proven-absent recipient has no code either — same exact answer.
+        // The fixture treats any un-added account as proven ABSENT.
+        let fx = FixtureSnapStateOracle::new();
+        let exec = EvmExecutor::new(
+            Arc::new(fx),
+            Arc::new(NoopStateProofCache),
+            Arc::new(NoopBytecodeCache),
+        );
+        let est = exec
+            .estimate_gas([0x42; 20], TARGET, &[], U256::ZERO, &ctx(19_500_000, CANCUN_TIME + 1))
+            .unwrap();
+        assert_eq!(est, 21_000);
+    }
+
+    #[test]
+    fn calldata_to_codeless_account_skips_the_short_circuit() {
+        // Non-empty calldata must NOT short-circuit (EIP-7623 floor + intrinsic
+        // calldata gas apply) — the estimate is buffered and above 21000.
+        let fx = FixtureSnapStateOracle::new().with_account(
+            ROOT,
+            TARGET,
+            OracleAccount {
+                nonce: 1,
+                balance: U256::ZERO,
+                code_hash: myotis_core::trie::EMPTY_CODE_HASH,
+                storage_root: [0x9; 32],
+            },
+        );
+        let exec = EvmExecutor::new(
+            Arc::new(fx),
+            Arc::new(NoopStateProofCache),
+            Arc::new(NoopBytecodeCache),
+        );
+        let est = exec
+            .estimate_gas([0x42; 20], TARGET, &[0xFFu8; 8], U256::ZERO, &ctx(19_500_000, CANCUN_TIME + 1))
+            .unwrap();
+        assert!(est > 21_000, "calldata must not short-circuit, was {est}");
     }
 
     #[test]

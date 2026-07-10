@@ -207,6 +207,10 @@ fn u256_be(bytes: &[u8]) -> Option<U256> {
 pub struct PoolOracle {
     peers: Vec<Arc<ManagedPeer>>,
     handle: Handle,
+    /// Snap-quality reputation sink (None in tests): serves confirm a peer,
+    /// failures count toward DENIED — the same sinks the block path feeds, so
+    /// eth_call fetch outcomes shape the next run's dial order too (EL-C-3).
+    quality: Option<crate::el::pool::SnapQualitySink>,
     /// Per-call memo of fetched account leaves (keyed by address; the state root
     /// is fixed for the call). Dedups the account fetch that both `fetch_account`
     /// and every `fetch_storage` on the same contract need. `Some(None)` caches a
@@ -215,11 +219,27 @@ pub struct PoolOracle {
 }
 
 impl PoolOracle {
-    pub fn new(peers: Vec<Arc<ManagedPeer>>, handle: Handle) -> PoolOracle {
+    pub fn new(
+        peers: Vec<Arc<ManagedPeer>>,
+        handle: Handle,
+        quality: Option<crate::el::pool::SnapQualitySink>,
+    ) -> PoolOracle {
         PoolOracle {
             peers,
             handle,
+            quality,
             leaf_memo: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record one per-peer fetch outcome (no-op without a sink).
+    async fn record(quality: &Option<crate::el::pool::SnapQualitySink>, peer: &ManagedPeer, served: bool) {
+        if let Some(q) = quality {
+            if served {
+                q.served(peer.addr()).await;
+            } else {
+                q.failed(peer.addr()).await;
+            }
         }
     }
 
@@ -234,13 +254,20 @@ impl PoolOracle {
             return Ok(cached.clone());
         }
         // No lock held across the network fetch.
+        let quality = self.quality.clone();
         let fetched = self.handle.block_on(async {
             for peer in &self.peers {
                 match peer.snap_get_account(state_root, &address).await {
-                    Ok(AccountOutcome::Present(leaf)) => return Some(Some(leaf)),
-                    Ok(AccountOutcome::Absent) => return Some(None),
+                    Ok(AccountOutcome::Present(leaf)) => {
+                        Self::record(&quality, peer, true).await;
+                        return Some(Some(leaf));
+                    }
+                    Ok(AccountOutcome::Absent) => {
+                        Self::record(&quality, peer, true).await;
+                        return Some(None);
+                    }
                     // Bad proof / transport for this peer — try the next.
-                    Err(_) => continue,
+                    Err(_) => Self::record(&quality, peer, false).await,
                 }
             }
             None
@@ -301,14 +328,18 @@ impl SnapStateOracle for PoolOracle {
             return Ok(U256::ZERO);
         }
         let position = slot.to_be_bytes::<32>();
+        let quality = self.quality.clone();
         let fetched = self.handle.block_on(async {
             for peer in &self.peers {
                 match peer
                     .snap_get_storage(state_root, &address, &leaf, &position)
                     .await
                 {
-                    Ok(value) => return Some(value),
-                    Err(_) => continue,
+                    Ok(value) => {
+                        Self::record(&quality, peer, true).await;
+                        return Some(value);
+                    }
+                    Err(_) => Self::record(&quality, peer, false).await,
                 }
             }
             None
@@ -331,11 +362,15 @@ impl SnapStateOracle for PoolOracle {
     fn fetch_bytecode(&self, code_hash: &[u8; 32]) -> Result<Vec<u8>, OracleError> {
         // Content-addressed: snap_get_bytecode checks keccak(code) == code_hash,
         // so any peer's bytes are trusted iff they hash correctly.
+        let quality = self.quality.clone();
         let fetched = self.handle.block_on(async {
             for peer in &self.peers {
                 match peer.snap_get_bytecode(code_hash).await {
-                    Ok(code) => return Some(code),
-                    Err(_) => continue,
+                    Ok(code) => {
+                        Self::record(&quality, peer, true).await;
+                        return Some(code);
+                    }
+                    Err(_) => Self::record(&quality, peer, false).await,
                 }
             }
             None

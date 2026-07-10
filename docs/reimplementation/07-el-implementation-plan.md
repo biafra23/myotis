@@ -464,6 +464,22 @@ Milestone-C gate: on a SYNCED mainnet daemon with `-Pengine=rust`, a real ERC-20
 known name (including one CCIP-Read/offchain name) all return verified results matching the
 Java engine's.
 
+## EL-C-3 (dispatch fairness / performance parity) — in progress
+
+- **Landed (EL-C-3-1): oracle quick wins.** (a) The cross-call state-proof cache grows
+  8 192 → 65 536 entries/kind (Java `STATE_PROOF_CACHE_MAX` parity — sized for a
+  ~1000-token sweep). (b) `estimateGas` gains the Java `rpcEstimateGas` short-circuit:
+  empty calldata + codeless (or proven-absent) recipient → exactly 21 000, no EVM run,
+  NO 1.15 buffer; an account WITH code (contract / EIP-7702-delegated EOA) falls through.
+  (c) Snap-quality reputation now flows from the EVM oracle path: `PoolOracle` records
+  per-peer serve/failure into the same `ElPeerCache` sinks the block path feeds (via the
+  new cloneable `SnapQualitySink`), so eth_call outcomes shape the next run's dial order.
+- **Next (EL-C-3-2): batch fan-out + speculative prefetch.** Port PrefetchingEvmExecutor's
+  sentinel convergence loop (cap 4, last-two-real, prime-target, hit-only fast path,
+  fail-closed IterationLimitExceeded) + the 64-path-set batch (concurrent per-peer
+  fan-out, one verify+cache pass, chunk-level rotation, best-effort). Lanes (heavy/small
+  + SnapLaneGate semaphore) after.
+
 ## Multichain (post-Milestone-C)
 
 - **MC-1 (landed): sepolia hosted by the Rust engine.** `ChainConfig::sepolia()` /

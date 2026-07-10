@@ -283,6 +283,14 @@ impl PeerPool {
         cache.flush();
     }
 
+    /// A cloneable, task-safe handle onto the snap-quality sinks — hands the
+    /// EVM oracle's fetch loops the same reputation recording the block path
+    /// uses, without holding the whole pool (the pool owns task handles and is
+    /// deliberately not Clone).
+    pub fn quality_sink(&self) -> SnapQualitySink {
+        SnapQualitySink { inner: Arc::clone(&self.inner) }
+    }
+
     /// Stop the pool: flush the peer cache, abort the background tasks, and drop
     /// all held peers (closing them).
     pub async fn stop(self) {
@@ -594,5 +602,29 @@ mod tests {
 
         pool.stop().await;
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// See [`PeerPool::quality_sink`]. The Java `SnapQualitySink` twin: serves
+/// confirm a peer (dial-first next run), failures count toward DENIED after
+/// the cache's consecutive-failure threshold. Dirty-gated flush inside.
+#[derive(Clone)]
+pub struct SnapQualitySink {
+    inner: Arc<PoolInner>,
+}
+
+impl SnapQualitySink {
+    /// A snap fetch against `addr` returned usable proof material.
+    pub async fn served(&self, addr: std::net::SocketAddr) {
+        let mut cache = self.inner.cache.lock().await;
+        cache.record_snap_served(addr);
+        cache.flush();
+    }
+
+    /// A snap fetch against `addr` failed (bad proof / transport / timeout).
+    pub async fn failed(&self, addr: std::net::SocketAddr) {
+        let mut cache = self.inner.cache.lock().await;
+        cache.record_snap_failure(addr);
+        cache.flush();
     }
 }
