@@ -322,13 +322,19 @@ impl SnapStateOracle for PoolOracle {
         }
     }
 
-    /// Best-effort batch warm-up (EL-C-3-2; the Java `fetchBatch` twin adapted to
-    /// this transport): chunk the account items at 64 path-sets, pin each chunk
-    /// to ONE peer (rotating per chunk), fan its account+slot fetches out
-    /// CONCURRENTLY (≤48 in flight — the Java `PREFETCH_MAX_IN_FLIGHT`), and
-    /// write verified results straight into the cross-call sinks. Failures are
-    /// silent per item; the per-item path re-fetches whatever is missing.
-    /// Bytecode (content-addressed) fans out over rotating peers the same way.
+    /// Best-effort batch warm-up (EL-C-3-2; the Java `fetchBatch` +
+    /// `prefetchInParallel` twin adapted to this transport): chunk the account
+    /// items at 64 path-sets, pin each chunk to ONE peer per attempt (rotating
+    /// on retry — failed items get up to 3 attempts across peers, Java
+    /// `DEFAULT_MAX_ATTEMPTS`), run ALL chunks concurrently under one
+    /// per-REQUEST 48-permit semaphore (Java `PREFETCH_MAX_IN_FLIGHT` — bounds
+    /// wire requests, not items, so a 1000-slot item can't flood a peer), and
+    /// bound the WHOLE wave at 30 s (Java `PREFETCH_WAVE_TIMEOUT_SEC`).
+    /// Verified results go straight into the cross-call sinks (and the account
+    /// leaf memo, so the serial fallback needn't re-fetch). Failures are silent
+    /// per item; the per-item path re-fetches whatever is missing. Note: unlike
+    /// Java's one-getTrieNodes-per-chunk framing, this transport sends one
+    /// request per account/slot — the win is concurrency, not fewer messages.
     fn prefetch_batch(
         &self,
         state_root: &[u8; 32],
@@ -339,89 +345,146 @@ impl SnapStateOracle for PoolOracle {
     ) {
         use futures::stream::{self, StreamExt};
         const BATCH_PATHSET_CHUNK: usize = 64; // Java SnapBackedStateOracle parity
-        const MAX_IN_FLIGHT: usize = 48; // Java PREFETCH_MAX_IN_FLIGHT
+        const MAX_IN_FLIGHT: usize = 48; // Java PREFETCH_MAX_IN_FLIGHT (per request)
+        const MAX_ATTEMPTS: usize = 3; // Java DEFAULT_MAX_ATTEMPTS
+        const WAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
         if self.peers.is_empty() || (accounts.is_empty() && code_hashes.is_empty()) {
             return;
         }
+        let sem = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
         let quality = self.quality.clone();
-        self.handle.block_on(async {
-            for (chunk_idx, chunk) in accounts.chunks(BATCH_PATHSET_CHUNK).enumerate() {
-                let peer = &self.peers[chunk_idx % self.peers.len()];
-                let served: Vec<bool> = stream::iter(chunk.iter().map(|(addr, slots)| {
-                    let peer = Arc::clone(peer);
+
+        /// One item's outcome for retry + reputation bookkeeping.
+        enum ItemOutcome {
+            Skipped, // already cached — no request sent, no reputation signal
+            Served,
+            Failed,
+        }
+
+        // One (account, slots) item against one peer: account leaf first (its
+        // proof also decides absent/empty-trie zero-slots), then the slots
+        // concurrently — every wire request behind its own semaphore permit.
+        let fetch_item = |peer: Arc<ManagedPeer>, addr: [u8; 20], slots: Vec<U256>| {
+            let sem = Arc::clone(&sem);
+            async move {
+                if proof_sink.get_account(state_root, &addr).is_some()
+                    && slots
+                        .iter()
+                        .all(|s| proof_sink.get_storage(state_root, &addr, s).is_some())
+                {
+                    return ItemOutcome::Skipped;
+                }
+                let leaf = {
+                    let _permit = sem.acquire().await;
+                    match peer.snap_get_account(state_root, &addr).await {
+                        Ok(AccountOutcome::Present(leaf)) => leaf,
+                        Ok(AccountOutcome::Absent) => {
+                            proof_sink.put_account(state_root, &addr, None);
+                            for slot in &slots {
+                                proof_sink.put_storage(state_root, &addr, slot, U256::ZERO);
+                            }
+                            self.leaf_memo.lock().unwrap().insert(addr, None);
+                            return ItemOutcome::Served;
+                        }
+                        Err(_) => return ItemOutcome::Failed,
+                    }
+                };
+                let Some(account) = leaf_account(&leaf) else {
+                    return ItemOutcome::Failed; // oversized balance scalar
+                };
+                proof_sink.put_account(state_root, &addr, Some(account));
+                self.leaf_memo.lock().unwrap().insert(addr, Some(leaf.clone()));
+                if leaf.storage_root == EMPTY_TRIE_ROOT {
+                    for slot in &slots {
+                        proof_sink.put_storage(state_root, &addr, slot, U256::ZERO);
+                    }
+                    return ItemOutcome::Served;
+                }
+                let values = futures::future::join_all(slots.iter().map(|slot| {
+                    let position = slot.to_be_bytes::<32>();
+                    let peer = Arc::clone(&peer);
+                    let leaf = leaf.clone();
+                    let sem = Arc::clone(&sem);
                     async move {
-                        // Skip items another call already proved at this root.
-                        if proof_sink.get_account(state_root, addr).is_some()
-                            && slots.iter().all(|s| {
-                                proof_sink.get_storage(state_root, addr, s).is_some()
-                            })
-                        {
-                            return true;
-                        }
-                        let leaf = match peer.snap_get_account(state_root, addr).await {
-                            Ok(AccountOutcome::Present(leaf)) => leaf,
-                            Ok(AccountOutcome::Absent) => {
-                                proof_sink.put_account(state_root, addr, None);
-                                // Every slot of a proven-absent account is zero.
-                                for slot in slots {
-                                    proof_sink.put_storage(state_root, addr, slot, U256::ZERO);
-                                }
-                                return true;
-                            }
-                            Err(_) => return false,
-                        };
-                        let Some(account) = leaf_account(&leaf) else {
-                            return false; // oversized balance scalar — not cacheable
-                        };
-                        proof_sink.put_account(state_root, addr, Some(account));
-                        if leaf.storage_root == EMPTY_TRIE_ROOT {
-                            for slot in slots {
-                                proof_sink.put_storage(state_root, addr, slot, U256::ZERO);
-                            }
-                            return true;
-                        }
-                        // The item's slots, concurrently on the SAME peer.
-                        let values = futures::future::join_all(slots.iter().map(|slot| {
-                            let position = slot.to_be_bytes::<32>();
-                            let peer = Arc::clone(&peer);
-                            let leaf = leaf.clone();
-                            async move {
-                                peer.snap_get_storage(state_root, addr, &leaf, &position)
-                                    .await
-                                    .ok()
-                                    .and_then(|bytes| u256_be(&bytes))
-                            }
-                        }))
-                        .await;
-                        for (slot, value) in slots.iter().zip(values) {
-                            if let Some(v) = value {
-                                proof_sink.put_storage(state_root, addr, slot, v);
-                            }
-                        }
-                        true
+                        let _permit = sem.acquire().await;
+                        peer.snap_get_storage(state_root, &addr, &leaf, &position)
+                            .await
+                            .ok()
+                            .and_then(|bytes| u256_be(&bytes))
                     }
                 }))
-                .buffer_unordered(MAX_IN_FLIGHT)
-                .collect()
                 .await;
-                // Chunk-level reputation: any served item confirms the peer; a
-                // chunk where EVERYTHING failed strikes it.
-                if let Some(q) = &quality {
-                    if served.iter().any(|&ok| ok) {
-                        q.served(peer.addr()).await;
-                    } else if !served.is_empty() {
-                        q.failed(peer.addr()).await;
+                for (slot, value) in slots.iter().zip(values) {
+                    if let Some(v) = value {
+                        proof_sink.put_storage(state_root, &addr, slot, v);
                     }
                 }
+                ItemOutcome::Served
             }
+        };
+
+        let wave = async {
+            // ALL chunks concurrently (each pinned to its own rotating peer).
+            let chunk_runs = accounts.chunks(BATCH_PATHSET_CHUNK).enumerate().map(
+                |(chunk_idx, chunk)| {
+                    let quality = quality.clone();
+                    let fetch_item = &fetch_item;
+                    async move {
+                        // Items still needing a fetch; failed ones retry on the
+                        // next peer (Java tryWithRetries chunk rotation).
+                        let mut pending: Vec<&([u8; 20], Vec<U256>)> = chunk.iter().collect();
+                        let attempts = MAX_ATTEMPTS.min(self.peers.len()).max(1);
+                        for attempt in 0..attempts {
+                            if pending.is_empty() {
+                                break;
+                            }
+                            let peer =
+                                &self.peers[(chunk_idx + attempt) % self.peers.len()];
+                            let outcomes = futures::future::join_all(pending.iter().map(
+                                |(addr, slots)| {
+                                    fetch_item(Arc::clone(peer), *addr, slots.clone())
+                                },
+                            ))
+                            .await;
+                            let mut still_failed = Vec::new();
+                            let mut served_any = false;
+                            let mut asked_any = false;
+                            for (item, outcome) in pending.into_iter().zip(outcomes) {
+                                match outcome {
+                                    ItemOutcome::Served => served_any = true,
+                                    ItemOutcome::Failed => {
+                                        asked_any = true;
+                                        still_failed.push(item);
+                                    }
+                                    // Cache-skips carry NO reputation signal —
+                                    // the peer was never asked.
+                                    ItemOutcome::Skipped => {}
+                                }
+                            }
+                            if let Some(q) = &quality {
+                                if served_any {
+                                    q.served(peer.addr()).await;
+                                } else if asked_any {
+                                    q.failed(peer.addr()).await;
+                                }
+                            }
+                            pending = still_failed;
+                        }
+                    }
+                },
+            );
+            futures::future::join_all(chunk_runs).await;
+
             // Bytecode: content-addressed, verified by hash inside the peer call.
             let code_fetches = code_hashes.iter().enumerate().map(|(i, hash)| {
                 let peer = Arc::clone(&self.peers[i % self.peers.len()]);
+                let sem = Arc::clone(&sem);
                 async move {
                     if code_sink.get(hash).is_some() {
                         return;
                     }
+                    let _permit = sem.acquire().await;
                     if let Ok(code) = peer.snap_get_bytecode(hash).await {
                         code_sink.put(hash, code.into());
                     }
@@ -431,6 +494,12 @@ impl SnapStateOracle for PoolOracle {
                 .buffer_unordered(MAX_IN_FLIGHT)
                 .collect::<Vec<()>>()
                 .await;
+        };
+        // The whole wave is bounded (Java PREFETCH_WAVE_TIMEOUT_SEC): on timeout
+        // whatever landed is kept and the loop's next iteration proceeds — an
+        // eth_call must never hang on a slow warm-up.
+        self.handle.block_on(async {
+            let _ = tokio::time::timeout(WAVE_TIMEOUT, wave).await;
         });
     }
 

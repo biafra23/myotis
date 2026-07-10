@@ -271,6 +271,15 @@ impl EvmExecutor {
                 // run: return it (the hit-only fast path). A sentinel failure
                 // (zeroes tripping a require()) is tolerated; its partial
                 // access set still drives the wave.
+                //
+                // Two deliberate deviations from Java here: (1) the access diff
+                // includes CODE hashes (Java diffs only accounts+slots) — a
+                // code-only discovery keeps the wave warm instead of going
+                // serial, and determinism over verified state still guarantees
+                // convergence; (2) a hit-only run's REVERT returns immediately
+                // (Java re-derives the identical revert from the next real run
+                // — all-verified reads make the outcome deterministic, so this
+                // is the same answer one iteration sooner).
                 if fresh.is_empty() {
                     if db.sentinel_misses() == misses_before {
                         if let Ok(result) = outcome {
@@ -700,6 +709,148 @@ mod tests {
             .estimate_gas([0x42; 20], TARGET, &[0xFFu8; 8], U256::ZERO, &ctx(19_500_000, CANCUN_TIME + 1))
             .unwrap();
         assert!(est > 21_000, "calldata must not short-circuit, was {est}");
+    }
+
+    #[test]
+    fn prefetched_and_direct_agree() {
+        // The Java prefetchedAndDirectAgree differential: the convergence loop
+        // and a direct single execution must return byte-identical results —
+        // the no-sentinel-leak invariant, pinned end-to-end.
+        let code = vec![0x60u8, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let exec = executor_with(code, Some(U256::from(1234u64)));
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        let looped = exec.call_view(TARGET, &[], &c).unwrap();
+        let direct = {
+            let spec = spec_for(c.chain_id, c.block_number, c.timestamp).unwrap();
+            let db = exec.database_for(&c);
+            match exec
+                .execute_with_db(&db, spec, Address::from([0u8; 20]), TARGET, &[], U256::ZERO, &c)
+                .unwrap()
+            {
+                ExecutionResult::Success { output, .. } => output_bytes(output),
+                other => panic!("direct run must succeed, got {other:?}"),
+            }
+        };
+        assert_eq!(looped, direct);
+    }
+
+    #[test]
+    fn warm_cache_converges_with_zero_oracle_fetches() {
+        // Hit-only fast path: with REAL shared caches warmed by a first call,
+        // the second identical call must touch the oracle ZERO times.
+        #[derive(Default)]
+        struct Counting {
+            inner: FixtureSnapStateOracle,
+            fetches: std::sync::atomic::AtomicUsize,
+        }
+        impl crate::oracle::SnapStateOracle for Counting {
+            fn fetch_account(
+                &self, r: &[u8; 32], a: [u8; 20],
+            ) -> Result<Option<OracleAccount>, crate::oracle::OracleError> {
+                self.fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.fetch_account(r, a)
+            }
+            fn fetch_storage(
+                &self, r: &[u8; 32], a: [u8; 20], s: U256,
+            ) -> Result<U256, crate::oracle::OracleError> {
+                self.fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.fetch_storage(r, a, s)
+            }
+            fn fetch_bytecode(&self, h: &[u8; 32]) -> Result<Vec<u8>, crate::oracle::OracleError> {
+                self.fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.fetch_bytecode(h)
+            }
+        }
+        let code = vec![0x60u8, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let ch = keccak256(&code);
+        let mut fx = FixtureSnapStateOracle::new().with_account(
+            ROOT, TARGET,
+            OracleAccount { nonce: 1, balance: U256::ZERO, code_hash: ch, storage_root: [0x9; 32] },
+        );
+        assert_eq!(fx.with_bytecode(code), ch);
+        let fx = fx.with_storage(ROOT, TARGET, [0u8; 32], U256::from(7u64));
+        let oracle = Arc::new(Counting { inner: fx, fetches: Default::default() });
+        let exec = EvmExecutor::new(
+            Arc::clone(&oracle) as Arc<dyn crate::oracle::SnapStateOracle>,
+            Arc::new(crate::cache::InMemoryStateProofCache::new(1024)),
+            Arc::new(crate::cache::InMemoryBytecodeCache::default()),
+        );
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        assert_eq!(
+            U256::from_be_slice(&exec.call_view(TARGET, &[], &c).unwrap()),
+            U256::from(7u64)
+        );
+        let after_first = oracle.fetches.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            U256::from_be_slice(&exec.call_view(TARGET, &[], &c).unwrap()),
+            U256::from(7u64)
+        );
+        let after_second = oracle.fetches.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(after_first, after_second, "warm second call must not touch the oracle");
+    }
+
+    #[test]
+    fn two_hop_dependency_converges_with_two_waves() {
+        // slot0 holds K; the contract then SLOADs K — the loop's raison d'être:
+        // hop 1 discovers slot0, hop 2 discovers slot K, two waves, converge.
+        // PUSH1 0 SLOAD SLOAD PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 RETURN
+        #[derive(Default)]
+        struct Recording {
+            inner: FixtureSnapStateOracle,
+            waves: std::sync::Mutex<Vec<Vec<([u8; 20], Vec<U256>)>>>,
+        }
+        impl crate::oracle::SnapStateOracle for Recording {
+            fn fetch_account(
+                &self, r: &[u8; 32], a: [u8; 20],
+            ) -> Result<Option<OracleAccount>, crate::oracle::OracleError> {
+                self.inner.fetch_account(r, a)
+            }
+            fn fetch_storage(
+                &self, r: &[u8; 32], a: [u8; 20], s: U256,
+            ) -> Result<U256, crate::oracle::OracleError> {
+                self.inner.fetch_storage(r, a, s)
+            }
+            fn fetch_bytecode(&self, h: &[u8; 32]) -> Result<Vec<u8>, crate::oracle::OracleError> {
+                self.inner.fetch_bytecode(h)
+            }
+            fn prefetch_batch(
+                &self,
+                _root: &[u8; 32],
+                accounts: &[([u8; 20], Vec<U256>)],
+                _code: &[[u8; 32]],
+                _ps: &dyn crate::cache::StateProofCache,
+                _cs: &dyn crate::cache::BytecodeCache,
+            ) {
+                self.waves.lock().unwrap().push(accounts.to_vec());
+            }
+        }
+        let code = vec![0x60u8, 0x00, 0x54, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let ch = keccak256(&code);
+        let mut fx = FixtureSnapStateOracle::new().with_account(
+            ROOT, TARGET,
+            OracleAccount { nonce: 1, balance: U256::ZERO, code_hash: ch, storage_root: [0x9; 32] },
+        );
+        assert_eq!(fx.with_bytecode(code), ch);
+        let mut k = [0u8; 32];
+        k[31] = 5;
+        let fx = fx
+            .with_storage(ROOT, TARGET, [0u8; 32], U256::from(5u64)) // slot0 → K=5
+            .with_storage(ROOT, TARGET, k, U256::from(42u64)); // slot5 → 42
+        let rec = Arc::new(Recording { inner: fx, waves: Default::default() });
+        let exec = EvmExecutor::new(
+            Arc::clone(&rec) as Arc<dyn crate::oracle::SnapStateOracle>,
+            Arc::new(NoopStateProofCache),
+            Arc::new(NoopBytecodeCache),
+        );
+        let out = exec.call_view(TARGET, &[], &ctx(19_500_000, CANCUN_TIME + 1)).unwrap();
+        assert_eq!(U256::from_be_slice(&out), U256::from(42u64));
+        let waves = rec.waves.lock().unwrap();
+        assert!(waves.len() >= 2, "two dependency hops need two waves, got {}", waves.len());
+        let slot_in = |w: &Vec<([u8; 20], Vec<U256>)>, s: U256| {
+            w.iter().any(|(a, slots)| *a == TARGET && slots.contains(&s))
+        };
+        assert!(slot_in(&waves[0], U256::ZERO), "hop 1 discovers slot 0");
+        assert!(slot_in(&waves[1], U256::from(5u64)), "hop 2 discovers slot K");
     }
 
     #[test]

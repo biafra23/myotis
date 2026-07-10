@@ -487,10 +487,16 @@ Java engine's.
   fail-closed `IterationLimitExceeded` (pinned by the cap=1 twin of Java's
   `iterationCapOfOneAlwaysExceeds`). `estimateGas` bypasses the loop (Java parity).
   The wave rides `SnapStateOracle::prefetch_batch` (default no-op for fixtures):
-  `PoolOracle` chunks 64 path-sets (Java `BATCH_PATHSET_CHUNK`), pins each chunk to one
-  peer (chunk-level rotation), fans account+slot fetches out concurrently (≤48 in
-  flight, Java `PREFETCH_MAX_IN_FLIGHT`), writes verified results into the cross-call
-  sinks, and feeds chunk-level reputation. Bytecode fans out content-addressed.
+  `PoolOracle` chunks 64 path-sets (Java `BATCH_PATHSET_CHUNK` — here rotation
+  granularity, NOT message coalescing: this transport sends one request per
+  account/slot, matching the Java EthHandlerSnapPeer fan-out; the win is
+  concurrency), runs ALL chunks concurrently, pins each chunk to one peer per
+  attempt with retry rotation (3 attempts, Java `DEFAULT_MAX_ATTEMPTS`), bounds
+  wire requests with a shared 48-permit semaphore (Java `PREFETCH_MAX_IN_FLIGHT`,
+  per REQUEST) and the whole wave at 30 s (Java `PREFETCH_WAVE_TIMEOUT_SEC`),
+  writes verified results into the cross-call sinks + the account-leaf memo, and
+  feeds chunk-level reputation (cache-skips carry no signal). Bytecode fans out
+  content-addressed.
   *Still deferred (EL-C-3-3):* lanes (heavy/small + the SnapLaneGate semaphore),
   in-flight dedup for concurrent calls, the whole-result RPC cache.
 

@@ -52,6 +52,10 @@ struct ViewCache {
 /// consecutive snapshots to find newly-discovered dependencies (the Java
 /// `AccessTracker` twin, collapsed to the DB layer: every revm read passes
 /// through here, so no separate opcode tracer is needed).
+/// Growth is gas-bounded, not attacker-controlled: cold reads cost revm gas
+/// regardless of what this DB returns (sentinel zeros included), so one 30 M
+/// run tops out around ~14k distinct slots / ~11k accounts; `seen` accumulates
+/// ≤4 largely-overlapping iterations and dies with the per-call database.
 #[derive(Debug, Default, Clone)]
 pub struct AccessSet {
     pub accounts: std::collections::HashSet<[u8; 20]>,
@@ -138,10 +142,6 @@ impl OracleDatabase {
         std::mem::take(&mut self.track.lock().unwrap().set)
     }
 
-    /// The state root this database is pinned to.
-    pub fn state_root(&self) -> [u8; 32] {
-        self.state_root
-    }
 
     /// Resolve an account through the three tiers. Returns the cached/ fetched
     /// account, or `None` when proven absent.
