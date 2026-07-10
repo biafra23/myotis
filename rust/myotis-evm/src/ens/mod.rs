@@ -292,9 +292,13 @@ pub fn reverse_resolve(
 
     // Forward-verify through the FULL forward path (registry walk + ENSIP-10):
     // the claimed name must resolve back to the queried address, byte-equal.
-    match resolve_address(caller, &claimed)? {
-        Some(fwd) if fwd == address => Ok(Some(claimed)),
-        _ => Ok(None),
+    // A MALFORMED claimed name is a failed verify (no record), not an error —
+    // a malicious reverse record must not be able to force an error result
+    // where "no verified reverse record" is the truthful answer.
+    match resolve_address(caller, &claimed) {
+        Ok(Some(fwd)) if fwd == address => Ok(Some(claimed)),
+        Ok(_) | Err(EnsError::InvalidName(_)) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -825,6 +829,14 @@ mod tests {
         // The reverse record claims "vitalik.eth" but the forward resolution of
         // that name points at a DIFFERENT address → the claim is discarded.
         let caller = reverse_caller("vitalik.eth", [0xBA; 20]);
+        assert_eq!(reverse_resolve(&caller, VITALIK).unwrap(), None);
+    }
+
+    #[test]
+    fn reverse_malformed_claimed_name_is_none_not_error() {
+        // A malicious reverse record claiming a malformed name ("a..eth") must
+        // read as a failed forward-verify (None) — not surface InvalidName.
+        let caller = reverse_caller("a..eth", VITALIK);
         assert_eq!(reverse_resolve(&caller, VITALIK).unwrap(), None);
     }
 
