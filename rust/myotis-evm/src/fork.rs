@@ -26,14 +26,35 @@ pub const CANCUN_TIME: u64 = 1_710_338_135;
 /// Prague activation timestamp (EIP-7702, …).
 pub const PRAGUE_TIME: u64 = 1_746_612_311;
 
-/// The revm `SpecId` a mainnet `(block_number, timestamp)` activates, or
-/// [`EvmError::ForkTooOld`] below London.
+/// Sepolia fork-activation timestamps (go-ethereum `SepoliaChainConfig`).
+/// Sepolia launched with London active and merged in mid-2022, so anything the
+/// beacon-anchored engine can serve is far past Shanghai; below Shanghai fails
+/// closed as too old (no archive, and older sepolia forks aren't modelled).
+pub const SEPOLIA_SHANGHAI_TIME: u64 = 1_677_557_088;
+/// Sepolia Cancun activation timestamp.
+pub const SEPOLIA_CANCUN_TIME: u64 = 1_706_655_072;
+/// Sepolia Prague activation timestamp.
+pub const SEPOLIA_PRAGUE_TIME: u64 = 1_741_159_776;
+
+/// The revm `SpecId` a `(chain_id, block_number, timestamp)` activates:
+/// [`EvmError::UnsupportedChain`] for a chain with no table here (e.g. Gnosis
+/// until its slice lands), [`EvmError::ForkTooOld`] below each chain's floor.
 ///
-/// MAINNET ONLY. These are Ethereum mainnet activation points; a different chain
-/// (e.g. Gnosis) forks at different heights/times. When multichain `eth_call` is
-/// wired, this must become chain-aware (keyed on the context's chain id) — do not
-/// call it for a non-mainnet block.
-pub fn spec_for(block_number: u64, timestamp: u64) -> Result<SpecId, EvmError> {
+/// KNOWN GAP (both engines, deliberately mirrored): the tables cap at PRAGUE even
+/// though mainnet and sepolia have since activated Osaka/Fusaka — the Java
+/// `EvmFactory` stops at Prague too. Adding OSAKA is a cross-engine follow-up so
+/// the two engines never diverge on spec selection.
+pub fn spec_for(chain_id: u64, block_number: u64, timestamp: u64) -> Result<SpecId, EvmError> {
+    match chain_id {
+        1 => mainnet_spec(block_number, timestamp),
+        11_155_111 => sepolia_spec(block_number, timestamp),
+        other => Err(EvmError::UnsupportedChain { chain_id: other }),
+    }
+}
+
+/// The mainnet cascade: pre-merge forks by block number, post-merge by timestamp
+/// (timestamp checked first — a post-merge block is always past the merge block).
+fn mainnet_spec(block_number: u64, timestamp: u64) -> Result<SpecId, EvmError> {
     if timestamp >= PRAGUE_TIME {
         Ok(SpecId::PRAGUE)
     } else if timestamp >= CANCUN_TIME {
@@ -52,6 +73,23 @@ pub fn spec_for(block_number: u64, timestamp: u64) -> Result<SpecId, EvmError> {
     }
 }
 
+/// The sepolia cascade — all timestamp-gated (sepolia merged before Shanghai, and
+/// nothing pre-Shanghai is servable by a beacon-anchored engine).
+fn sepolia_spec(block_number: u64, timestamp: u64) -> Result<SpecId, EvmError> {
+    if timestamp >= SEPOLIA_PRAGUE_TIME {
+        Ok(SpecId::PRAGUE)
+    } else if timestamp >= SEPOLIA_CANCUN_TIME {
+        Ok(SpecId::CANCUN)
+    } else if timestamp >= SEPOLIA_SHANGHAI_TIME {
+        Ok(SpecId::SHANGHAI)
+    } else {
+        Err(EvmError::ForkTooOld {
+            block_number,
+            timestamp,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,38 +97,60 @@ mod tests {
     #[test]
     fn below_london_is_rejected() {
         assert!(matches!(
-            spec_for(LONDON_BLOCK - 1, 0),
+            spec_for(1, LONDON_BLOCK - 1, 0),
             Err(EvmError::ForkTooOld { .. })
         ));
-        assert!(matches!(spec_for(0, 0), Err(EvmError::ForkTooOld { .. })));
+        assert!(matches!(spec_for(1, 0, 0), Err(EvmError::ForkTooOld { .. })));
     }
 
     #[test]
     fn each_boundary_maps_to_its_spec() {
         // London/Paris are block-gated; timestamp below Shanghai so it doesn't win.
-        assert_eq!(spec_for(LONDON_BLOCK, 0).unwrap(), SpecId::LONDON);
-        assert_eq!(spec_for(PARIS_BLOCK - 1, 0).unwrap(), SpecId::LONDON);
-        assert_eq!(spec_for(PARIS_BLOCK, 0).unwrap(), SpecId::MERGE);
+        assert_eq!(spec_for(1, LONDON_BLOCK, 0).unwrap(), SpecId::LONDON);
+        assert_eq!(spec_for(1, PARIS_BLOCK - 1, 0).unwrap(), SpecId::LONDON);
+        assert_eq!(spec_for(1, PARIS_BLOCK, 0).unwrap(), SpecId::MERGE);
         // Post-merge forks are timestamp-gated (block number well past Paris).
         assert_eq!(
-            spec_for(20_000_000, SHANGHAI_TIME).unwrap(),
+            spec_for(1, 20_000_000, SHANGHAI_TIME).unwrap(),
             SpecId::SHANGHAI
         );
         assert_eq!(
-            spec_for(20_000_000, CANCUN_TIME - 1).unwrap(),
+            spec_for(1, 20_000_000, CANCUN_TIME - 1).unwrap(),
             SpecId::SHANGHAI
         );
-        assert_eq!(spec_for(20_000_000, CANCUN_TIME).unwrap(), SpecId::CANCUN);
+        assert_eq!(spec_for(1, 20_000_000, CANCUN_TIME).unwrap(), SpecId::CANCUN);
         assert_eq!(
-            spec_for(20_000_000, PRAGUE_TIME - 1).unwrap(),
+            spec_for(1, 20_000_000, PRAGUE_TIME - 1).unwrap(),
             SpecId::CANCUN
         );
-        assert_eq!(spec_for(20_000_000, PRAGUE_TIME).unwrap(), SpecId::PRAGUE);
+        assert_eq!(spec_for(1, 20_000_000, PRAGUE_TIME).unwrap(), SpecId::PRAGUE);
+    }
+
+    #[test]
+    fn sepolia_boundaries_map_to_their_specs() {
+        let s = 11_155_111u64;
+        assert_eq!(spec_for(s, 9_000_000, SEPOLIA_PRAGUE_TIME).unwrap(), SpecId::PRAGUE);
+        assert_eq!(spec_for(s, 9_000_000, SEPOLIA_PRAGUE_TIME - 1).unwrap(), SpecId::CANCUN);
+        assert_eq!(spec_for(s, 9_000_000, SEPOLIA_CANCUN_TIME).unwrap(), SpecId::CANCUN);
+        assert_eq!(spec_for(s, 9_000_000, SEPOLIA_CANCUN_TIME - 1).unwrap(), SpecId::SHANGHAI);
+        assert_eq!(spec_for(s, 9_000_000, SEPOLIA_SHANGHAI_TIME).unwrap(), SpecId::SHANGHAI);
+        assert!(matches!(
+            spec_for(s, 9_000_000, SEPOLIA_SHANGHAI_TIME - 1),
+            Err(EvmError::ForkTooOld { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_chain_is_unsupported() {
+        assert!(matches!(
+            spec_for(100, 20_000_000, SEPOLIA_PRAGUE_TIME),
+            Err(EvmError::UnsupportedChain { chain_id: 100 })
+        ));
     }
 
     #[test]
     fn timestamp_takes_precedence_over_block_for_post_merge() {
         // A block at the merge height but with a Cancun timestamp is Cancun.
-        assert_eq!(spec_for(PARIS_BLOCK, CANCUN_TIME).unwrap(), SpecId::CANCUN);
+        assert_eq!(spec_for(1, PARIS_BLOCK, CANCUN_TIME).unwrap(), SpecId::CANCUN);
     }
 }

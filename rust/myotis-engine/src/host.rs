@@ -88,10 +88,13 @@ fn engine() -> Option<&'static EngineState> {
         .as_ref()
 }
 
-/// Resolve a config for a canonical/alias network name. R1: mainnet only.
+/// Resolve a config for a canonical/alias network name. Hosted: mainnet +
+/// sepolia (gnosis is the remaining catalog network — its own beacon-chain
+/// parameters land with the gnosis slice).
 fn config_for(network_name: &str) -> Option<ChainConfig> {
     match crate::catalog::canonical_network_name(network_name) {
         Some("mainnet") => Some(ChainConfig::mainnet()),
+        Some("sepolia") => Some(ChainConfig::sepolia()),
         _ => None,
     }
 }
@@ -103,14 +106,13 @@ pub fn create(network_name: &str, data_dir: &str) -> i64 {
     let Some(engine) = engine() else {
         return CREATE_FAILED;
     };
-    // Unknown network → CREATE_FAILED; canonical-but-not-mainnet → UNSUPPORTED.
+    // Unknown network → CREATE_FAILED; canonical-but-not-hosted → UNSUPPORTED.
     let mut config = match crate::catalog::canonical_network_name(network_name) {
         None => return CREATE_FAILED,
-        Some("mainnet") => match config_for(network_name) {
+        Some(_) => match config_for(network_name) {
             Some(c) => c,
-            None => return CREATE_FAILED,
+            None => return UNSUPPORTED_NETWORK,
         },
-        Some(_) => return UNSUPPORTED_NETWORK,
     };
     // Persistence lives under the host's dataDir, in the SAME files (names and
     // formats) the Java hosts/engine maintain — `sync-state[-net].snapshot` and
@@ -165,21 +167,30 @@ pub fn start(handle: i64) -> bool {
         Err(_) => return false,
     };
     // Start the EL reader against the sync loop's execution anchor (the CL→EL
-    // bridge). Mainnet-only for now, matching the CL host scope. A failure
-    // (e.g. a discv4 UDP bind error) is non-fatal: the CL still runs and EL
-    // queries report the reader unavailable, rather than failing the whole start.
-    // The EL peer cache sits alongside the CL snapshot under the host's dataDir
-    // (`peers.cache`, the same file the Java daemon writes), so verified snap
-    // peers warm-start across restarts and engine switches.
+    // bridge). A failure (e.g. a discv4 UDP bind error) is non-fatal: the CL
+    // still runs and EL queries report the reader unavailable, rather than
+    // failing the whole start. The EL peer cache sits alongside the CL snapshot
+    // under the host's dataDir, suffixed like the CL files (`peers.cache` bare
+    // on mainnet — the same file the Java daemon writes — `peers-sepolia.cache`
+    // etc. otherwise), so verified snap peers warm-start across restarts and
+    // engine switches without cross-network contamination.
+    let el_suffix = if config.name == "mainnet" {
+        String::new()
+    } else {
+        format!("-{}", config.name)
+    };
     let el_cache_path = config
         .snapshot_path
         .as_deref()
         .and_then(|p| p.parent())
-        .map(|dir| dir.join("peers.cache"));
-    let reader = match engine
-        .rt
-        .block_on(async { ElReader::start_mainnet(sync.exec_anchor(), el_cache_path).await })
-    {
+        .map(|dir| dir.join(format!("peers{el_suffix}.cache")));
+    let el_config = match config.name {
+        "sepolia" => myotis_net::el::reader::ElConfig::sepolia(),
+        _ => myotis_net::el::reader::ElConfig::mainnet(),
+    };
+    let reader = match engine.rt.block_on(async {
+        ElReader::start_for(sync.exec_anchor(), el_cache_path, el_config).await
+    }) {
         Ok(r) => Some(Arc::new(r)),
         Err(e) => {
             tracing::warn!(handle, error = %e, "EL reader failed to start; CL runs without EL");
@@ -473,17 +484,13 @@ pub fn eth_call_json(
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
     };
-    let reader = match snapshot_reader(engine, handle) {
-        Ok((reader, _, _)) => reader,
+    let (reader, chain_id) = match snapshot_reader_evm(engine, handle) {
+        Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    // The Rust EL is mainnet-only (ElConfig::mainnet, network id 1), and the EVM
-    // executor rejects any other chain — thread the real chain id when multichain
-    // wiring lands.
-    const MAINNET_CHAIN_ID: u64 = 1;
     match engine
         .rt
-        .block_on(async { reader.eth_call(from, to, data, value, MAINNET_CHAIN_ID).await })
+        .block_on(async { reader.eth_call(from, to, data, value, chain_id).await })
     {
         Ok(outcome) => eljson::call_json(&outcome),
         Err(e) => eljson::error_json(&e),
@@ -508,16 +515,14 @@ pub fn resolve_ens_json(handle: i64, name: &str) -> String {
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
     };
-    let reader = match snapshot_reader(engine, handle) {
-        Ok((reader, _, _)) => reader,
+    let (reader, chain_id) = match snapshot_reader_evm(engine, handle) {
+        Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    // Mainnet-only, like the other EVM reads (the executor rejects any other chain).
-    const MAINNET_CHAIN_ID: u64 = 1;
     let owned = name.to_string();
     match engine
         .rt
-        .block_on(async { reader.resolve_ens(owned, MAINNET_CHAIN_ID).await })
+        .block_on(async { reader.resolve_ens(owned, chain_id).await })
     {
         Ok(outcome) => eljson::ens_json(&outcome),
         Err(e) => eljson::error_json(&e),
@@ -565,14 +570,13 @@ pub fn estimate_gas_json(
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
     };
-    let reader = match snapshot_reader(engine, handle) {
-        Ok((reader, _, _)) => reader,
+    let (reader, chain_id) = match snapshot_reader_evm(engine, handle) {
+        Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    const MAINNET_CHAIN_ID: u64 = 1;
     match engine
         .rt
-        .block_on(async { reader.estimate_gas(from, to, data, value, MAINNET_CHAIN_ID).await })
+        .block_on(async { reader.estimate_gas(from, to, data, value, chain_id).await })
     {
         Ok(outcome) => eljson::estimate_json(&outcome),
         Err(e) => eljson::error_json(&e),
@@ -673,6 +677,24 @@ fn parse_block_target(tag: &str) -> Result<Option<u64>, &'static str> {
 
 /// Snapshot `(reader, finalizedPeriod, wallClockPeriod)` for a running handle,
 /// or an error message. Holds the map lock only for the clone.
+/// Snapshot `(reader, chain_id)` for a running handle — the EVM reads
+/// (eth_call / estimateGas / resolve-ens) thread the handle's REAL chain id, so
+/// nothing downstream hardcodes a network.
+fn snapshot_reader_evm(
+    engine: &EngineState,
+    handle: i64,
+) -> Result<(Arc<ElReader>, u64), &'static str> {
+    let map = engine.handles.lock().map_err(|_| "engine lock poisoned")?;
+    match map.get(&handle) {
+        Some(ChainEntry::Running(config, _, Some(reader))) => {
+            Ok((Arc::clone(reader), config.chain_id))
+        }
+        Some(ChainEntry::Running(_, _, None)) => Err("EL reader unavailable on this handle"),
+        Some(ChainEntry::Created(_)) => Err("handle not started"),
+        None => Err("unknown handle"),
+    }
+}
+
 fn snapshot_reader(
     engine: &EngineState,
     handle: i64,

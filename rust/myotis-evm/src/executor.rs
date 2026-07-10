@@ -45,11 +45,6 @@ pub const VIEW_CALL_GAS: u64 = 30_000_000;
 /// that needs `msg.sender` set (ERC-20 `transfer`/`approve`) uses [`EvmExecutor::call_view_from`].
 const VIEW_CALLER: Address = Address::ZERO;
 
-/// The only chain this executor runs: the fork table and `Context::mainnet()` are
-/// mainnet-specific, so a non-mainnet context is rejected rather than silently
-/// given mainnet forks. Relaxed when the fork table becomes chain-aware.
-const MAINNET_CHAIN_ID: u64 = 1;
-
 /// Executes view calls against verified state. Owns the shared cross-call caches,
 /// so repeated calls (e.g. a MetaMask number-pinned retry) reuse verified facts.
 pub struct EvmExecutor {
@@ -119,12 +114,12 @@ impl EvmExecutor {
         value: U256,
         ctx: &BlockContext,
     ) -> Result<ExecutionResult, EvmError> {
-        // Fail closed on a non-mainnet context: the fork table and Context::mainnet()
-        // below are mainnet-specific, so any other chain would run the wrong rules.
-        if ctx.chain_id != MAINNET_CHAIN_ID {
-            return Err(EvmError::UnsupportedChain { chain_id: ctx.chain_id });
-        }
-        let spec = spec_for(ctx.block_number, ctx.timestamp)?;
+        // Chain-aware fork selection: an unknown chain id fails closed with
+        // UnsupportedChain inside spec_for (never silently mainnet rules). The
+        // `Context::mainnet()` builder below is chain-neutral standard-Ethereum
+        // rules — the chain id itself is set via cfg.chain_id, and every chain
+        // spec_for knows (mainnet, sepolia) is rule-identical at a given SpecId.
+        let spec = spec_for(ctx.chain_id, ctx.block_number, ctx.timestamp)?;
 
         let db = OracleDatabase::new(
             Arc::clone(&self.oracle),

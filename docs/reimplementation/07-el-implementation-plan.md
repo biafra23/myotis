@@ -425,6 +425,32 @@ Milestone-C gate: on a SYNCED mainnet daemon with `-Pengine=rust`, a real ERC-20
 known name (including one CCIP-Read/offchain name) all return verified results matching the
 Java engine's.
 
+## Multichain (post-Milestone-C)
+
+- **MC-1 (landed): sepolia hosted by the Rust engine.** `ChainConfig::sepolia()` /
+  `ElConfig::sepolia()` mirror the Java `NetworkConfig.SEPOLIA` (PR #192's corrected
+  values: Fulu `0x90000075`, BPO2 epoch 275712/21, checkpoint slot 10657440; EL fork-id
+  `0x268956b6`, 5 bootnodes, port 30305). `ChainConfig` gained `chain_id`, threaded
+  through eth_call/estimateGas/resolve-ens (no hardcoded network downstream). The EVM
+  fork table is chain-aware (`spec_for(chain_id, block, ts)` — mainnet + sepolia tables;
+  unknown chain fails closed with `UnsupportedChain`); the executor's mainnet-only guard
+  is gone. Host `config_for`/`create` route sepolia; the EL peer cache is per-network
+  (`peers-sepolia.cache`); the Java `RustMyotisEngine` "mainnet only" gate is replaced by
+  the native `UNSUPPORTED_NETWORK` contract + catalog-driven rpc port/chain id. Parity
+  tests pin the sepolia CL config incl. the cross-language fork digest (`0x74d01459`,
+  computed identically by `NetworkConfig.SEPOLIA.currentForkDigest()` and Rust
+  `fork_digest_bpo`). Sepolia checkpoint refreshes (`refreshSepoliaCheckpoint`) must be
+  hand-mirrored into `ChainConfig::sepolia()` like mainnet's, until the plan-PR7 task
+  rewrite covers the Rust constants.
+- **MC-2 (next): gnosis.** Own beacon chain (5s slots / 16-slot epochs — the Rust
+  `ChainConfig` fields are already generic), `refreshGnosisCheckpoint` mirroring, gnosis
+  `ElConfig` + EVM fork table, per-chain tip floor (gnosis 0.001 gwei vs 0.1), no ENS
+  (`has_ens=false` must gate `RustChainHandle.ens()` to null).
+- **Known gap (both engines, deliberately mirrored): fork tables cap at PRAGUE** even
+  though mainnet + sepolia have activated Osaka/Fusaka (sepolia `osakaTime` 1760427360,
+  go-ethereum `SepoliaChainConfig`). Adding OSAKA is a cross-engine follow-up so the two
+  engines never diverge on spec selection.
+
 ## Cross-cutting rules & risks
 
 - **Panic-free natives** (workspace `panic="abort"` makes `catch_unwind` a no-op) — checked

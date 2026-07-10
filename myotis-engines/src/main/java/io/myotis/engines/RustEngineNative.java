@@ -65,6 +65,11 @@ final class RustEngineNative {
     /** ABI handshake; returns the library's compiled-in ABI version. */
     static native int nativeInit();
 
+    /** {@code nativeCreate} sentinel: the network is canonical but this engine
+     *  doesn't host it yet (must match {@code UNSUPPORTED_NETWORK} in
+     *  rust/myotis-engine/src/host.rs). */
+    static final long UNSUPPORTED_NETWORK = -2;
+
     /** The embedded network catalog as a JSON array of NetworkInfo objects. */
     static native String nativeAvailableNetworksJson();
 
