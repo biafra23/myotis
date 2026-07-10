@@ -537,8 +537,17 @@ public final class NodeService extends Service {
      *  on a poor network still completes first. */
     private static final long SYNC_RUN_CEILING_MS = 30 * 60_000L;
     private volatile java.util.concurrent.ScheduledExecutorService idleTicker;
-    /** What the notification currently shows, to notify() only on transitions. */
-    private volatile Boolean notifiedSleeping;
+    /** The notification's current "title\ntext" content, so we re-notify only when it changes.
+     *  Guarded by {@link #notifLock} for an atomic diff-and-notify across the idle ticker,
+     *  boot threads, and the connectivity callback. */
+    private volatile String notifiedContent;
+    private final Object notifLock = new Object();
+    /** Default-network callback: refreshes the notification the moment connectivity changes,
+     *  so "No network connection" appears/clears without waiting for the 30 s idle reconcile. */
+    private volatile ConnectivityManager.NetworkCallback notifNetCallback;
+    /** Last device connectivity seen by the callback, so a capability jitter that doesn't flip
+     *  up↔down skips the (per-stack) readiness poll. */
+    private volatile Boolean lastNetworkUp;
 
     /** Note UI-originated activity so the idle controller keeps the node awake. */
     public void noteUiActivity() {
@@ -833,20 +842,125 @@ public final class NodeService extends Service {
         }
     }
 
-    /** Re-issue the foreground notification when the sleeping/active state changed —
-     *  including engine-initiated wakes (an RPC request resumed a paused stack). */
+    /** Re-issue the foreground notification when its content changed — the sleeping/active
+     *  state (incl. engine-initiated wakes), the per-network readiness, or connectivity. */
     private void updateNotification() {
         if (!RUNNING.get()) return;
-        boolean sleeping = allStacksPaused();
-        Boolean shown = notifiedSleeping;
-        if (shown != null && shown == sleeping) return;
-        notifiedSleeping = sleeping;
         try {
-            NotificationManager nm = getSystemService(NotificationManager.class);
-            if (nm != null) nm.notify(NOTIFICATION_ID, buildNotification(sleeping));
+            // Poll live state OUTSIDE the lock (status()/lifecycle() are blocking engine calls).
+            String[] tt = notificationText();
+            String key = tt[0] + "\n" + tt[1];
+            // Diff-and-notify atomically so concurrent callers can't post out of order or both
+            // re-notify the same content; building the Notification is cheap (no engine calls).
+            synchronized (notifLock) {
+                if (key.equals(notifiedContent)) return;   // unchanged → skip the re-notify
+                notifiedContent = key;
+                NotificationManager nm = getSystemService(NotificationManager.class);
+                if (nm != null) nm.notify(NOTIFICATION_ID, buildNotification(tt[0], tt[1]));
+            }
         } catch (Throwable t) {
             LogBuffer.w(TAG, "notification update failed: " + t);
         }
+    }
+
+    /**
+     * The ongoing notification's {@code [title, text]}, derived from live node + connectivity
+     * state. Priority: idle-sleep (networking intentionally off) → no device network → per-network
+     * readiness. Readiness mirrors the in-app {@code ReadinessStrip} tiers.
+     */
+    private String[] notificationText() {
+        if (allStacksPaused()) {
+            return new String[]{"ethp2p node sleeping", "Networking off — a wallet request wakes it"};
+        }
+        if (!networkAvailable()) {
+            // Actively meant to be running, but the device has no connectivity — surface it: the
+            // node can't discover peers or sync until a network returns.
+            return new String[]{"ethp2p node running", "No network connection"};
+        }
+        return new String[]{"ethp2p node running", readinessSummary()};
+    }
+
+    /** Per-network readiness on one line, e.g. {@code "mainnet ready · gnosis syncing"}; sorted by
+     *  network name so the text is stable across polls. Empty (pre-boot) → {@code "Starting…"}. */
+    private String readinessSummary() {
+        java.util.List<String> names = new java.util.ArrayList<>(handles.keySet());
+        java.util.Collections.sort(names);
+        StringBuilder sb = new StringBuilder();
+        for (String n : names) {
+            ChainHandle h = handles.get(n);
+            if (h == null) continue;
+            if (sb.length() > 0) sb.append(" · ");
+            sb.append(n).append(' ').append(readinessWord(h));
+        }
+        return sb.length() == 0 ? "Starting…" : sb.toString();
+    }
+
+    /** One-word readiness for a stack, mirroring the app's {@code ReadinessStrip} tiers:
+     *  {@code sleeping} (paused) → {@code syncing} (beacon not SYNCED) → {@code warming up}
+     *  (SYNCED but no verified head yet, so reads would 503) → {@code ready}. */
+    private static String readinessWord(ChainHandle h) {
+        try {
+            if (h.lifecycle() == io.myotis.api.LifecycleState.PAUSED) return "sleeping";
+            StatusSnapshot s = h.status();
+            if (s.beaconState() != BeaconState.SYNCED) return "syncing";
+            if (s.verifiedHeadAgeMs() == Long.MAX_VALUE) return "warming up";
+            return "ready";
+        } catch (Throwable t) {
+            return "…";
+        }
+    }
+
+    /** Register a default-network callback that refreshes the notification on connectivity
+     *  changes, so the "No network connection" line appears/clears promptly. Best-effort. */
+    private void registerNotifNetworkCallback() {
+        if (notifNetCallback != null) return;
+        try {
+            ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+            if (cm == null) return;
+            lastNetworkUp = networkAvailable();   // seed so the first callback doesn't spuriously poll
+            ConnectivityManager.NetworkCallback cb = new ConnectivityManager.NetworkCallback() {
+                @Override public void onAvailable(Network network) { onNotifConnectivityChanged(); }
+                @Override public void onLost(Network network) { onNotifConnectivityChanged(); }
+                @Override public void onCapabilitiesChanged(
+                        Network network, android.net.NetworkCapabilities caps) { onNotifConnectivityChanged(); }
+            };
+            cm.registerDefaultNetworkCallback(cb);
+            // Publish only AFTER registration succeeded: if register throws, the
+            // field stays null so the top-of-method guard lets a later call retry
+            // (a pre-assignment would wedge connectivity refreshes until restart).
+            notifNetCallback = cb;
+        } catch (Throwable t) {
+            LogBuffer.w(TAG, "notification network callback registration failed: " + t);
+        }
+    }
+
+    /** Refresh the notification only when device connectivity actually flipped up↔down —
+     *  capability callbacks fire often (signal / metering / validation changes) and each would
+     *  otherwise trigger a full per-stack readiness poll.
+     *
+     *  <p>NetworkCallback runs on the system's shared connectivity thread, so the blocking
+     *  readiness poll (h.status()) must NOT run here — offload to {@link #QUERY_POOL}. The
+     *  up↔down gate is checked under {@link #notifLock} so concurrent callbacks don't both poll. */
+    private void onNotifConnectivityChanged() {
+        QUERY_POOL.execute(() -> {
+            boolean up = networkAvailable();
+            synchronized (notifLock) {
+                Boolean prev = lastNetworkUp;
+                if (prev != null && prev == up) return;   // no real change → skip the readiness poll
+                lastNetworkUp = up;
+            }
+            updateNotification();
+        });
+    }
+
+    private void unregisterNotifNetworkCallback() {
+        ConnectivityManager.NetworkCallback cb = notifNetCallback;
+        notifNetCallback = null;
+        if (cb == null) return;
+        try {
+            ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+            if (cm != null) cm.unregisterNetworkCallback(cb);
+        } catch (Throwable ignored) {}
     }
 
     // Runs the BLOCKING engine-API calls (requestAccount, ens().resolveAddress) off the
@@ -1171,10 +1285,14 @@ public final class NodeService extends Service {
         // API 34+ requires the foregroundServiceType to be passed here and
         // to match the manifest's <service android:foregroundServiceType="...">
         // declaration. API 29-33 ignore the third arg. minSdk is 29.
-        notifiedSleeping = false;
-        startForeground(NOTIFICATION_ID, buildNotification(false),
+        String[] tt0 = notificationText();
+        synchronized (notifLock) {   // the field's documented guard — keep the prime
+            notifiedContent = tt0[0] + "\n" + tt0[1];   // ordered with any concurrent diff-and-notify
+        }
+        startForeground(NOTIFICATION_ID, buildNotification(tt0[0], tt0[1]),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
         startIdleTicker();
+        registerNotifNetworkCallback();
 
         // Boot every enabled network as its own stack (Step 9). Each Netty/libp2p boot is
         // blocking-ish, so build + start each on its own worker; they bind distinct ports
@@ -1715,21 +1833,25 @@ public final class NodeService extends Service {
         // tears every stack down under each network's bootLock, so a subsequent
         // service start can't race with a half-finished close.
         RUNNING.set(false);
+        unregisterNotifNetworkCallback();
         new Thread(this::doShutdown, "ethp2p-shutdown").start();
         super.onDestroy();
     }
 
-    private Notification buildNotification(boolean sleeping) {
+    private Notification buildNotification(String title, String text) {
+        // Guard the channel creation like updateNotification() treats the manager as nullable —
+        // this also runs on the startForeground() path, which isn't wrapped in try/catch, so a
+        // (practically impossible) null manager must not NPE the service start.
         NotificationManager nm = getSystemService(NotificationManager.class);
-        NotificationChannel channel = new NotificationChannel(
-                CHANNEL_ID, "ethp2p node",
-                NotificationManager.IMPORTANCE_LOW);
-        nm.createNotificationChannel(channel);
+        if (nm != null) {
+            NotificationChannel channel = new NotificationChannel(
+                    CHANNEL_ID, "ethp2p node",
+                    NotificationManager.IMPORTANCE_LOW);
+            nm.createNotificationChannel(channel);
+        }
         return new Notification.Builder(this, CHANNEL_ID)
-                .setContentTitle(sleeping ? "ethp2p node sleeping" : "ethp2p node running")
-                .setContentText(sleeping
-                        ? "Networking off — a wallet request wakes it"
-                        : null)
+                .setContentTitle(title)
+                .setContentText(text)
                 .setSmallIcon(android.R.drawable.stat_sys_download)
                 .setOngoing(true)
                 .build();

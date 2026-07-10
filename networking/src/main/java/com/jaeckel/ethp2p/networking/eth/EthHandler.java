@@ -1056,10 +1056,11 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 return;
             }
             long blockNum = headers.get(0).header().number;
-            // Reject obviously stale headers. We use a static minimum rather than
-            // chainHead because chainHead can be poisoned by malicious peers.
-            // Mainnet is ~24.6M as of March 2026; 20M gives ample margin.
-            if (blockNum < 20_000_000) {
+            // Reject obviously stale headers. We use a static per-network minimum
+            // rather than chainHead because chainHead can be poisoned by malicious
+            // peers. (A flat mainnet-scale literal here rejected EVERY honest
+            // sepolia peer — sepolia's head is far below mainnet's.)
+            if (blockNum < network.minSensibleHeadBlock()) {
                 log.warn("[snap] Peer {} returned stale header (block #{}), skipping",
                         remoteAddress, blockNum);
                 result.completeExceptionally(new RuntimeException(
@@ -1166,7 +1167,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 return;
             }
             long blockNum = headers.get(0).header().number;
-            if (blockNum < 1_000_000) {
+            // Same per-network staleness floor as the account path above.
+            if (blockNum < network.minSensibleHeadBlock()) {
                 log.warn("[snap] Peer {} returned stale header (block #{}), skipping for storage query",
                     remoteAddress, blockNum);
                 result.completeExceptionally(new RuntimeException(
