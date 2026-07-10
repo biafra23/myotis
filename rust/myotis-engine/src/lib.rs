@@ -27,7 +27,9 @@ pub mod ringlog;
 /// v9: added nativeEthCallJson (eth_call over verified state via the revm executor).
 /// v10: added nativeEstimateGasJson (eth_estimateGas over the revm executor).
 /// v11: added nativeResolveEnsJson (ENS forward resolution over verified eth_calls).
-pub const ABI_VERSION: i32 = 11;
+/// v12: added nativeEnsRecordJson (all ENS record types + reverse + root modes,
+///      one generic dispatch — EL-C-5-2).
+pub const ABI_VERSION: i32 = 12;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
@@ -331,6 +333,25 @@ mod jni_shim {
     ) -> jstring {
         let name = read_string(&mut env, &name).unwrap_or_default();
         let json = crate::host::resolve_ens_json(handle, &name);
+        match env.new_string(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// `RustEngineNative.nativeEnsRecordJson(long handle, String paramsJson)` —
+    /// one generic dispatch for every ENS record query (text, contenthash,
+    /// multi-coin, pubkey, ABI, dnsRecord, interfaceImplementer, reverse, and
+    /// root-aware addr). The method + args travel in `paramsJson`.
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeEnsRecordJson(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        params_json: JString,
+    ) -> jstring {
+        let params = read_string(&mut env, &params_json).unwrap_or_default();
+        let json = crate::host::ens_record_json(handle, &params);
         match env.new_string(json) {
             Ok(s) => s.into_raw(),
             Err(_) => std::ptr::null_mut(),

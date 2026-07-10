@@ -51,6 +51,68 @@ pub fn encode_resolve(dns_name: &[u8], inner_call: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `selector ‖ bytes32 ‖ head-tail(string)` — one static node + one dynamic
+/// string arg (`text(bytes32,string)`). The string's offset is relative to the
+/// start of the args (after the selector), so with one static word ahead of it
+/// the offset is 0x40.
+pub fn encode_call_bytes32_string(signature: &str, node: &[u8; 32], s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(4 + 32 * 3 + bytes.len().next_multiple_of(32));
+    out.extend_from_slice(&selector(signature));
+    out.extend_from_slice(node);
+    out.extend_from_slice(&word(0x40)); // offset: past node word + offset word
+    out.extend_from_slice(&word(bytes.len() as u64));
+    out.extend_from_slice(bytes);
+    let pad = (32 - (bytes.len() % 32)) % 32;
+    out.extend(std::iter::repeat_n(0u8, pad));
+    out
+}
+
+/// `selector ‖ bytes32 ‖ uint256(v)` — one static node + one static uint arg
+/// (`addr(bytes32,uint256)` multi-coin, `ABI(bytes32,uint256)`).
+pub fn encode_call_bytes32_u64(signature: &str, node: &[u8; 32], v: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 64);
+    out.extend_from_slice(&selector(signature));
+    out.extend_from_slice(node);
+    out.extend_from_slice(&word(v));
+    out
+}
+
+/// `selector ‖ bytes32 ‖ offset ‖ uint(v) ‖ len‖data‖pad` — one static node, one
+/// dynamic `bytes`, one static uint (`dnsRecord(bytes32,bytes,uint16)` — the
+/// JAVA ENGINE's signature, selector 0xee8de1f7, taking the RAW DNS wire name;
+/// note this differs from the mainnet PublicResolver ABI, which takes
+/// `keccak256(wireName)` as `bytes32` — ported byte-for-byte for parity).
+pub fn encode_call_bytes32_bytes_u64(
+    signature: &str,
+    node: &[u8; 32],
+    dyn_bytes: &[u8],
+    v: u64,
+) -> Vec<u8> {
+    let pad = (32 - (dyn_bytes.len() % 32)) % 32;
+    let mut out = Vec::with_capacity(4 + 32 * 4 + dyn_bytes.len() + pad);
+    out.extend_from_slice(&selector(signature));
+    out.extend_from_slice(node);
+    out.extend_from_slice(&word(0x60)); // offset: past the three head words
+    out.extend_from_slice(&word(v));
+    out.extend_from_slice(&word(dyn_bytes.len() as u64));
+    out.extend_from_slice(dyn_bytes);
+    out.extend(std::iter::repeat_n(0u8, pad));
+    out
+}
+
+/// `selector ‖ bytes32 ‖ bytes4-left-aligned` —
+/// `interfaceImplementer(bytes32,bytes4)`.
+pub fn encode_call_bytes32_bytes4(signature: &str, node: &[u8; 32], id: [u8; 4]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 64);
+    out.extend_from_slice(&selector(signature));
+    out.extend_from_slice(node);
+    let mut w = [0u8; 32];
+    w[..4].copy_from_slice(&id);
+    out.extend_from_slice(&w);
+    out
+}
+
 /// Head-tail encoding of N dynamic `bytes` args: N offset words, then each arg as
 /// `length ‖ data ‖ zero-pad-to-32`.
 fn encode_bytes_args(args: &[&[u8]]) -> Vec<u8> {
@@ -120,6 +182,36 @@ pub fn decode_dynamic_bytes(data: &[u8], arg_index: usize) -> Option<Vec<u8>> {
     data.get(start..end).map(<[u8]>::to_vec)
 }
 
+/// Decode the dynamic `string` at head slot 0 (offset → length → UTF-8 data,
+/// invalid sequences replaced — Java `new String(bytes, UTF_8)` parity).
+pub fn decode_string(data: &[u8]) -> Option<String> {
+    decode_dynamic_bytes(data, 0).map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
+/// Decode the two static 32-byte words of a `(bytes32,bytes32)` return
+/// (`pubkey(bytes32)` → x, y). `None` if shorter than 64 bytes.
+pub fn decode_two_words(data: &[u8]) -> Option<([u8; 32], [u8; 32])> {
+    let x: [u8; 32] = data.get(..32)?.try_into().ok()?;
+    let y: [u8; 32] = data.get(32..64)?.try_into().ok()?;
+    Some((x, y))
+}
+
+/// Decode a `(uint256, bytes)` return (`ABI(bytes32,uint256)` → contentType,
+/// data). The uint must fit u64 (ENS content types are a small bitmask —
+/// anything larger is not a real record). `None` on malformed data.
+/// Known micro-divergence: a contentType in [2^63, 2^64) decodes here but makes
+/// Java's `longValueExact()` throw → empty there vs an error result here; only
+/// an adversarial resolver can produce it and no wrong value is delivered.
+pub fn decode_uint_bytes(data: &[u8]) -> Option<(u64, Vec<u8>)> {
+    let word = data.get(..32)?;
+    if word[..24].iter().any(|&b| b != 0) {
+        return None;
+    }
+    let v = u64::from_be_bytes(word[24..32].try_into().ok()?);
+    let bytes = decode_dynamic_bytes(data, 1)?;
+    Some((v, bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +263,80 @@ mod tests {
         let enc = encode_bytes_args(&[a, b]);
         assert_eq!(decode_dynamic_bytes(&enc, 0).unwrap(), a);
         assert_eq!(decode_dynamic_bytes(&enc, 1).unwrap(), b);
+    }
+
+    #[test]
+    fn record_selectors_are_correct() {
+        // The ENSIP record-profile selectors, pinned against their published ids.
+        assert_eq!(selector("text(bytes32,string)"), [0x59, 0xd1, 0xd4, 0x3c]);
+        assert_eq!(selector("contenthash(bytes32)"), [0xbc, 0x1c, 0x58, 0xd1]);
+        assert_eq!(selector("addr(bytes32,uint256)"), [0xf1, 0xcb, 0x7e, 0x06]);
+        assert_eq!(selector("pubkey(bytes32)"), [0xc8, 0x69, 0x02, 0x33]);
+        assert_eq!(selector("ABI(bytes32,uint256)"), [0x22, 0x03, 0xab, 0x56]);
+        // The JAVA ENGINE's dnsRecord signature (raw wire name as `bytes`) — NOT
+        // the mainnet PublicResolver's dnsRecord(bytes32,bytes32,uint16) 0xa8fa5682.
+        assert_eq!(selector("dnsRecord(bytes32,bytes,uint16)"), [0xee, 0x8d, 0xe1, 0xf7]);
+        assert_eq!(selector("interfaceImplementer(bytes32,bytes4)"), [0x12, 0x4a, 0x31, 0x9c]);
+    }
+
+    #[test]
+    fn encode_bytes32_string_shape() {
+        let node = [0xABu8; 32];
+        let enc = encode_call_bytes32_string("text(bytes32,string)", &node, "avatar");
+        assert_eq!(&enc[..4], &[0x59, 0xd1, 0xd4, 0x3c]);
+        assert_eq!(&enc[4..36], &node);
+        assert_eq!(enc[36..68], word(0x40)); // offset past the two head words
+        assert_eq!(enc[68..100], word(6)); // "avatar".len()
+        assert_eq!(&enc[100..106], b"avatar");
+        assert_eq!(enc.len(), 4 + 32 * 3 + 32); // padded to a full word
+        assert!(enc[106..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn encode_bytes32_u64_and_bytes4_shapes() {
+        let node = [0x11u8; 32];
+        let mc = encode_call_bytes32_u64("addr(bytes32,uint256)", &node, 60);
+        assert_eq!(&mc[..4], &[0xf1, 0xcb, 0x7e, 0x06]);
+        assert_eq!(mc[36..68], word(60));
+
+        let ii = encode_call_bytes32_bytes4(
+            "interfaceImplementer(bytes32,bytes4)",
+            &node,
+            [0x5b, 0x5e, 0x13, 0x9f],
+        );
+        assert_eq!(&ii[..4], &[0x12, 0x4a, 0x31, 0x9c]);
+        assert_eq!(&ii[36..40], &[0x5b, 0x5e, 0x13, 0x9f]); // left-aligned
+        assert!(ii[40..68].iter().all(|&b| b == 0));
+
+        // dnsRecord: node ‖ offset(0x60) ‖ resource ‖ len ‖ wire ‖ pad
+        let wire = [0x07u8, b'v', b'i', b't', b'a', b'l', b'i', b'k', 0x03, b'e', b't', b'h', 0x00];
+        let dr = encode_call_bytes32_bytes_u64("dnsRecord(bytes32,bytes,uint16)", &node, &wire, 1);
+        assert_eq!(&dr[..4], &[0xee, 0x8d, 0xe1, 0xf7]);
+        assert_eq!(dr[36..68], word(0x60));
+        assert_eq!(dr[68..100], word(1)); // A record
+        assert_eq!(dr[100..132], word(wire.len() as u64));
+        assert_eq!(&dr[132..132 + wire.len()], &wire);
+        assert_eq!(dr.len(), 132 + 32); // wire padded to one word
+    }
+
+    #[test]
+    fn decode_two_words_and_uint_bytes() {
+        let mut pk = vec![0x0Au8; 32];
+        pk.extend_from_slice(&[0x0Bu8; 32]);
+        assert_eq!(decode_two_words(&pk), Some(([0x0A; 32], [0x0B; 32])));
+        assert_eq!(decode_two_words(&pk[..40]), None);
+
+        // (uint256=1, bytes="hi")
+        let mut ab = word(1).to_vec();
+        ab.extend_from_slice(&word(0x40)); // offset of the bytes
+        ab.extend_from_slice(&word(2));
+        ab.extend_from_slice(b"hi");
+        ab.extend_from_slice(&[0u8; 30]);
+        assert_eq!(decode_uint_bytes(&ab), Some((1, b"hi".to_vec())));
+        // dirty high bytes in the uint word → None
+        let mut dirty = ab.clone();
+        dirty[0] = 1;
+        assert_eq!(decode_uint_bytes(&dirty), None);
     }
 
     #[test]

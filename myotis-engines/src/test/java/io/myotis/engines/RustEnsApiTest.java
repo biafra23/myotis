@@ -9,7 +9,11 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** The RustEnsApi paths that need no native library (guards + graceful stubs). */
+/**
+ * The RustEnsApi paths that need no native library — the pre-native input
+ * guards, which must fold into error results (this impl never throws). The
+ * JSON→record mapping is covered by {@link RustEnsRecordJsonTest}.
+ */
 class RustEnsApiTest {
 
     private static RustEnsApi api() {
@@ -25,40 +29,54 @@ class RustEnsApiTest {
     }
 
     @Test
-    void finalizedRootIsRejectedNotDowngraded() {
-        EnsResolutionResult r = api().resolveAddress("vitalik.eth", EnsRoot.FINALIZED);
-        assertNull(r.addressHex());
-        assertNotNull(r.error());
-        assertTrue(r.error().contains("finalized"), r.error());
-    }
-
-    @Test
     void blankNameIsAnErrorResult() {
         EnsResolutionResult r = api().resolveAddress("  ", EnsRoot.AUTO);
         assertNull(r.addressHex());
         assertNotNull(r.error());
+        // FINALIZED is a supported root now (EL-C-5-2) — the blank-name guard is
+        // root-independent and must not mention finalized.
+        EnsResolutionResult fin = api().resolveAddress("  ", EnsRoot.FINALIZED);
+        assertNotNull(fin.error());
     }
 
     @Test
-    void unimplementedRecordTypesReturnGracefulErrors() {
-        // Never throws; error set, no value fields populated as answers.
+    void blankInputsFoldToErrorResultsForEveryRecordType() {
+        // Never throws; error set, no value fields populated as answers. These
+        // all stop at the input guard — no native call on a never-started handle.
         var api = api();
-        assertNotNull(api.resolveText("a.eth", "url").error());
-        assertNotNull(api.resolveContenthash("a.eth").error());
-        assertNotNull(api.resolveMultiCoinAddr("a.eth", 60).error());
-        assertNotNull(api.resolvePubkey("a.eth").error());
-        assertNotNull(api.resolveAbi("a.eth", 1).error());
-        assertNotNull(api.resolveDnsRecord("a.eth", "a.eth.", 1).error());
-        assertNotNull(api.resolveInterfaceImplementer("a.eth", new byte[] {1, 2, 3, 4}).error());
-        assertNotNull(api.reverseResolve("0x" + "11".repeat(20)).error());
+        assertNotNull(api.resolveText(" ", "url").error());
+        assertNotNull(api.resolveText("a.eth", " ").error());
+        assertNotNull(api.resolveContenthash(" ").error());
+        assertNotNull(api.resolveMultiCoinAddr(" ", 60).error());
+        assertNotNull(api.resolveMultiCoinAddr("a.eth", -1).error());
+        assertNotNull(api.resolvePubkey(" ").error());
+        assertNotNull(api.resolveAbi(" ", 1).error());
+        assertNotNull(api.resolveAbi("a.eth", -1).error());
+        assertNotNull(api.resolveDnsRecord(" ", "a.eth.", 1).error());
+        assertNotNull(api.resolveDnsRecord("a.eth", " ", 1).error());
+        assertNotNull(api.resolveDnsRecord("a.eth", "a.eth.", -1).error());
+        assertNotNull(api.resolveDnsRecord("a.eth", "a.eth.", 0x10000).error());
+    }
+
+    @Test
+    void malformedReverseAddressIsAnErrorResult() {
+        // JavaEnsApi THROWS for this; this impl folds it (documented divergence).
+        var api = api();
+        var bad = api.reverseResolve("0x1234");
+        assertNull(bad.name());
+        assertTrue(bad.error().contains("40 hex chars"), bad.error());
+        assertNotNull(api.reverseResolve(null).error());
+        assertNotNull(api.reverseResolve("zz".repeat(20)).error());
     }
 
     @Test
     void interfaceImplementerEchoesQueriedIdAndValidatesLength() {
         var api = api();
-        // The queried id is echoed (JavaEnsApi parity) even on the stub error result.
-        var ok = api.resolveInterfaceImplementer("a.eth", new byte[] {(byte) 0x90, 0x61, (byte) 0xb9, 0x23});
+        // The queried id is echoed (JavaEnsApi parity) even on a guard error
+        // result (blank name keeps this on the no-native path).
+        var ok = api.resolveInterfaceImplementer(" ", new byte[] {(byte) 0x90, 0x61, (byte) 0xb9, 0x23});
         assertEquals("0x9061b923", ok.interfaceIdHex());
+        assertNotNull(ok.error());
         // A malformed id is its own error result, never an echo or a throw.
         var bad = api.resolveInterfaceImplementer("a.eth", new byte[] {1, 2, 3});
         assertNull(bad.interfaceIdHex());

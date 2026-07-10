@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use myotis_net::el::evm::{EnsQuery, EnsRootMode};
 use myotis_net::el::reader::ElReader;
 use myotis_net::{ChainConfig, SyncHandle, SyncState, SyncStatus};
 use myotis_evm::U256;
@@ -542,6 +543,171 @@ pub fn resolve_ens_json(handle: i64, name: &str) -> String {
     }
 }
 
+/// `nativeEnsRecordJson`: one generic dispatch for every ENS record query
+/// (EL-C-5-2) — the "one RPC dispatch layer" shape, so record types don't
+/// multiply natives. `params_json` carries the method and its args:
+///
+/// ```json
+/// {"method":"text","name":"a.eth","key":"url","root":"auto"}
+/// {"method":"addr"|"contenthash"|"pubkey","name":"a.eth","root":"finalized"}
+/// {"method":"multicoin","name":"a.eth","coinType":0}
+/// {"method":"abi","name":"a.eth","contentTypes":15}
+/// {"method":"dnsRecord","name":"a.eth","dnsName":"a.eth","resource":1}
+/// {"method":"interfaceImplementer","name":"a.eth","interfaceIdHex":"0x5b5e139f"}
+/// {"method":"reverse","addressHex":"0x…40-hex"}
+/// ```
+///
+/// `root` is optional: `"auto"` (default — finalized first, optimistic
+/// fallback), `"finalized"` (fails closed), or `"optimistic"` (the Java
+/// PEER_HEAD twin). Returns [`eljson::ens_record_json`] shapes or
+/// `{"error":"…"}`.
+pub fn ens_record_json(handle: i64, params_json: &str) -> String {
+    // Bound the native input like the other JSON natives.
+    if params_json.len() > 4096 {
+        return eljson::error_json("ens params too long");
+    }
+    let params: serde_json::Value = match serde_json::from_str(params_json) {
+        Ok(v) => v,
+        Err(e) => return eljson::error_json(&format!("bad ens params JSON: {e}")),
+    };
+    let str_field = |key: &str| -> Option<String> {
+        params.get(key).and_then(|v| v.as_str()).map(str::to_string)
+    };
+    let u64_field = |key: &str| -> Option<u64> { params.get(key).and_then(|v| v.as_u64()) };
+    let name_field = |key: &str| -> Result<String, String> {
+        let Some(name) = str_field(key) else {
+            return Err(format!("missing {key}"));
+        };
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err(format!("empty {key}"));
+        }
+        if name.len() > 512 {
+            return Err(format!("{key} too long"));
+        }
+        Ok(name)
+    };
+
+    let Some(method) = str_field("method") else {
+        return eljson::error_json("missing method");
+    };
+    // Strict: a PRESENT root that isn't one of the known strings is an error
+    // (a non-string value must not silently read as the default).
+    let root = match params.get("root") {
+        None => EnsRootMode::Auto,
+        Some(v) => match v.as_str() {
+            Some("auto") => EnsRootMode::Auto,
+            Some("finalized") => EnsRootMode::Finalized,
+            // The Java EnsRoot.PEER_HEAD twin: don't wait for finality (here
+            // still beacon-anchored — no peer-claimed-head mode).
+            Some("optimistic") => EnsRootMode::Optimistic,
+            _ => return eljson::error_json(&format!("unknown root mode: {v}")),
+        },
+    };
+
+    let query = match method.as_str() {
+        "addr" | "contenthash" | "pubkey" => {
+            let name = match name_field("name") {
+                Ok(n) => n,
+                Err(e) => return eljson::error_json(&e),
+            };
+            match method.as_str() {
+                "addr" => EnsQuery::Addr { name },
+                "contenthash" => EnsQuery::Contenthash { name },
+                _ => EnsQuery::Pubkey { name },
+            }
+        }
+        "text" => {
+            let name = match name_field("name") {
+                Ok(n) => n,
+                Err(e) => return eljson::error_json(&e),
+            };
+            let Some(key) = str_field("key").filter(|k| !k.is_empty()) else {
+                return eljson::error_json("missing key");
+            };
+            if key.len() > 512 {
+                return eljson::error_json("key too long");
+            }
+            EnsQuery::Text { name, key }
+        }
+        "multicoin" => {
+            let name = match name_field("name") {
+                Ok(n) => n,
+                Err(e) => return eljson::error_json(&e),
+            };
+            let Some(coin_type) = u64_field("coinType") else {
+                return eljson::error_json("missing coinType");
+            };
+            EnsQuery::Multicoin { name, coin_type }
+        }
+        "abi" => {
+            let name = match name_field("name") {
+                Ok(n) => n,
+                Err(e) => return eljson::error_json(&e),
+            };
+            let Some(content_types) = u64_field("contentTypes") else {
+                return eljson::error_json("missing contentTypes");
+            };
+            EnsQuery::Abi { name, content_types }
+        }
+        "dnsRecord" => {
+            let name = match name_field("name") {
+                Ok(n) => n,
+                Err(e) => return eljson::error_json(&e),
+            };
+            let dns_name = match name_field("dnsName") {
+                Ok(n) => n,
+                Err(e) => return eljson::error_json(&e),
+            };
+            let resource = match u64_field("resource") {
+                Some(r) if r <= u64::from(u16::MAX) => r as u16,
+                Some(_) => return eljson::error_json("resource out of range (uint16)"),
+                None => return eljson::error_json("missing resource"),
+            };
+            EnsQuery::DnsRecord { name, dns_name, resource }
+        }
+        "interfaceImplementer" => {
+            let name = match name_field("name") {
+                Ok(n) => n,
+                Err(e) => return eljson::error_json(&e),
+            };
+            let Some(id_hex) = str_field("interfaceIdHex") else {
+                return eljson::error_json("missing interfaceIdHex");
+            };
+            let Some(id) = parse_hex_fixed::<4>(&id_hex) else {
+                return eljson::error_json("interfaceIdHex must be 4 bytes of hex");
+            };
+            EnsQuery::Interface { name, interface_id: id }
+        }
+        "reverse" => {
+            let Some(addr_hex) = str_field("addressHex") else {
+                return eljson::error_json("missing addressHex");
+            };
+            let Some(address) = parse_hex_fixed::<20>(&addr_hex) else {
+                // The Java EnsApi contract's message for a malformed reverse input.
+                return eljson::error_json("address must be a 20-byte hex string (40 hex chars)");
+            };
+            EnsQuery::Reverse { address }
+        }
+        other => return eljson::error_json(&format!("unknown ens method: {other}")),
+    };
+
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, chain_id) = match snapshot_reader_evm(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    match engine
+        .rt
+        .block_on(async { reader.resolve_ens_query(query, chain_id, root).await })
+    {
+        Ok(outcome) => eljson::ens_record_json(&outcome),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
 /// `nativeEstimateGasJson`: verified `eth_estimateGas` for a call (`to` set) over the
 /// revm executor. Args as for [`eth_call_json`] minus the block (estimate always runs
 /// against the verified head). Returns the estimate JSON (`ok`/`unavailable`, see
@@ -740,6 +906,20 @@ fn snapshot_reader_slots(
         Some(ChainEntry::Created(_)) => Err("handle not started"),
         None => Err("unknown handle"),
     }
+}
+
+/// Parse a `0x`-prefixed-or-bare hex string into exactly `N` bytes. Panic-free:
+/// `None` for any malformed input (JNI callers pass untrusted strings).
+fn parse_hex_fixed<const N: usize>(hex: &str) -> Option<[u8; N]> {
+    let hex = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
+    if hex.len() != 2 * N || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Parse a `0x`-prefixed-or-bare 40-char hex address into 20 bytes. Panic-free:

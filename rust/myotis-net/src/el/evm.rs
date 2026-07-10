@@ -76,6 +76,77 @@ pub enum EnsOutcome {
     Offchain { block_number: u64 },
 }
 
+/// Which state root an ENS query resolves against (the Java `EnsRoot` twin —
+/// this engine has no PEER_HEAD mode; its non-finalized root is the
+/// beacon-anchored OPTIMISTIC head, strictly stronger than a peer-claimed head).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsRootMode {
+    /// Try the beacon-FINALIZED root first; fall back to the optimistic head if
+    /// the finalized attempt errors or finds no record (Java AUTO-ladder parity).
+    Auto,
+    /// The beacon-FINALIZED root only — a failure is an error, never a silent
+    /// downgrade.
+    Finalized,
+    /// The beacon-anchored optimistic head only (the Java `PEER_HEAD` twin —
+    /// "don't wait for finality"; here it is still beacon-anchored, not
+    /// peer-claimed). Reports `verified=false`.
+    Optimistic,
+}
+
+/// One ENS query — every record type the resolver serves (EL-C-5-2).
+#[derive(Debug, Clone)]
+pub enum EnsQuery {
+    /// Forward `name → address` (the EL-C-5-1 read, now root-aware).
+    Addr { name: String },
+    /// `text(bytes32,string)`.
+    Text { name: String, key: String },
+    /// `contenthash(bytes32)`.
+    Contenthash { name: String },
+    /// ENSIP-9 `addr(bytes32,uint256)`.
+    Multicoin { name: String, coin_type: u64 },
+    /// `pubkey(bytes32)`.
+    Pubkey { name: String },
+    /// `ABI(bytes32,uint256)`.
+    Abi { name: String, content_types: u64 },
+    /// `dnsRecord(bytes32,bytes,uint16)` (the Java engine's signature).
+    DnsRecord { name: String, dns_name: String, resource: u16 },
+    /// `interfaceImplementer(bytes32,bytes4)`.
+    Interface { name: String, interface_id: [u8; 4] },
+    /// Reverse `address → name`, forward-verified.
+    Reverse { address: [u8; 20] },
+}
+
+/// A resolved record value, shaped per query type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnsRecordValue {
+    /// `Addr` / `Interface` answers.
+    Address([u8; 20]),
+    /// `Text` answers.
+    Text(String),
+    /// `Contenthash` / `Multicoin` / `DnsRecord` answers (raw bytes).
+    Bytes(Vec<u8>),
+    /// `Pubkey` answers.
+    Pubkey { x: [u8; 32], y: [u8; 32] },
+    /// `Abi` answers.
+    Abi { content_type: u64, data: Vec<u8> },
+    /// `Reverse` answers (the forward-verified primary name).
+    Name(String),
+}
+
+/// The outcome of an [`EnsQuery`]. `verified` = the resolution ran against the
+/// beacon-FINALIZED root (the API's meaning of "verified"); the optimistic-head
+/// path reports `false`.
+#[derive(Debug, Clone)]
+pub enum EnsQueryOutcome {
+    /// The record resolved to this value.
+    Value { value: EnsRecordValue, block_number: u64, verified: bool },
+    /// Successfully determined there is no record.
+    NoRecord { block_number: u64, verified: bool },
+    /// The record resolves OFFCHAIN (ERC-3668) — needs a CCIP-Read gateway
+    /// (EL-C-5-3). Distinguishable from `NoRecord` by design.
+    Offchain { block_number: u64, verified: bool },
+}
+
 /// Build a [`BlockContext`] from a verified head header. `chain_id` comes from the
 /// chain config (the header carries no chain id).
 pub fn block_context(header: &BlockHeader, chain_id: u64) -> Result<BlockContext, String> {
