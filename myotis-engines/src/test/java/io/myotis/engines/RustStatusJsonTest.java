@@ -127,7 +127,7 @@ class RustStatusJsonTest {
     @Test
     void verifiedHeadAgeGrowsBetweenBlocksAndResetsOnAdvance() throws InterruptedException {
         // One persistent handle polled repeatedly — the real on-device behavior.
-        RustChainHandle h = new RustChainHandle(0L, "mainnet", 1L, 0);
+        RustChainHandle h = new RustChainHandle(0L, "mainnet", 1L, 0, true);
         String synced = CATCHING_UP_JSON.replace("CATCHING_UP", "SYNCED"); // optimisticBlockNumber 21000010
         long age1 = h.statusFromJsonOnThisHandle(synced).verifiedHeadAgeMs();
         assertEquals(0L, age1);                       // just observed the head

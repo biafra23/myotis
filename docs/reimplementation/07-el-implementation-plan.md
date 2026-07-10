@@ -481,10 +481,23 @@ Java engine's.
   `fork_digest_bpo`). Sepolia checkpoint refreshes (`refreshSepoliaCheckpoint`) must be
   hand-mirrored into `ChainConfig::sepolia()` like mainnet's, until the plan-PR7 task
   rewrite covers the Rust constants.
-- **MC-2 (next): gnosis.** Own beacon chain (5s slots / 16-slot epochs — the Rust
-  `ChainConfig` fields are already generic), `refreshGnosisCheckpoint` mirroring, gnosis
-  `ElConfig` + EVM fork table, per-chain tip floor (gnosis 0.001 gwei vs 0.1), no ENS
-  (`has_ens=false` must gate `RustChainHandle.ens()` to null).
+- **MC-2 (landed): gnosis hosted by the Rust engine.** `ChainConfig::gnosis()` /
+  `ElConfig::gnosis()` mirror the Java `NetworkConfig.GNOSIS` (own beacon chain: 5s slots,
+  16-slot epochs, gvr `f5dcb556…`, Fulu fork `0x06000064` / prior Electra `0x05000064`,
+  blob params 1337856/2, checkpoint slot 28516336; EL network_id 100, genesis `4f1dd231…`,
+  fork-id `0xcfca387c`, 6 bootnodes, port 30304). The sync-committee period stays 8192
+  slots — gnosis uses `EPOCHS_PER_SYNC_COMMITTEE_PERIOD=512`, so 512×16 = 8192, numerically
+  identical to mainnet's 256×32 (checkpoint slot 28516336 → period 3480). The per-network
+  `min_suggested_tip_wei` floor became an `ElConfig`/`ElReader` field (gnosis 0.001 gwei =
+  1_000_000; mainnet/sepolia keep 0.1 gwei). EVM fork table gained the gnosis cascade
+  (Shanghai `0x64c8edbc` / Cancun `0x65ef4dbc` / Prague `0x68122dbc`, all timestamp-gated,
+  fail-closed below Shanghai) pinned to the nethermind `gnosis.json` hex. Gnosis has no ENS:
+  catalog `has_ens=false` threads through `RustMyotisEngine.create` → `RustChainHandle` so
+  `ens()` returns null. Parity tests pin the CL config incl. both fork digests (current Fulu+BPO
+  `0x3237dab6`, prior Electra `0x7d5aab40`). Validated live: the gnosis checkpoint bootstrap
+  discovered a CL peer (fork-digest correct) and verified against the genesis validators root
+  (`period=3480`, state `CATCHING_UP`); full SYNCED is peer-supply-bound on the dev host, as with
+  mainnet. `refreshGnosisCheckpoint` is hand-mirrored into `ChainConfig::gnosis()` like the others.
 - **Known gap (both engines, deliberately mirrored): fork tables cap at PRAGUE** even
   though mainnet + sepolia have activated Osaka/Fusaka (sepolia `osakaTime` 1760427360,
   go-ethereum `SepoliaChainConfig`). Adding OSAKA is a cross-engine follow-up so the two

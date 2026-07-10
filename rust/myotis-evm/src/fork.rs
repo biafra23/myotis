@@ -51,6 +51,7 @@ pub fn spec_for(chain_id: u64, block_number: u64, timestamp: u64) -> Result<Spec
     match chain_id {
         1 => mainnet_spec(block_number, timestamp),
         11_155_111 => sepolia_spec(block_number, timestamp),
+        100 => gnosis_spec(block_number, timestamp),
         other => Err(EvmError::UnsupportedChain { chain_id: other }),
     }
 }
@@ -84,6 +85,31 @@ fn sepolia_spec(block_number: u64, timestamp: u64) -> Result<SpecId, EvmError> {
     } else if timestamp >= SEPOLIA_CANCUN_TIME {
         Ok(SpecId::CANCUN)
     } else if timestamp >= SEPOLIA_SHANGHAI_TIME {
+        Ok(SpecId::SHANGHAI)
+    } else {
+        Err(EvmError::ForkTooOld {
+            block_number,
+            timestamp,
+        })
+    }
+}
+
+/// Gnosis Shanghai activation timestamp (nethermind gnosis.json
+/// eip3855TransitionTimestamp 0x64c8edbc = 2023-08-01). Gnosis merged before
+/// Shanghai, so anything a beacon-anchored engine can serve is at/after it.
+pub const GNOSIS_SHANGHAI_TIME: u64 = 1_690_889_660;
+/// Gnosis Cancun activation timestamp (0x65ef4dbc = 2024-03-11).
+pub const GNOSIS_CANCUN_TIME: u64 = 1_710_181_820;
+/// Gnosis Prague activation timestamp (0x68122dbc = 2025-04-30).
+pub const GNOSIS_PRAGUE_TIME: u64 = 1_746_021_820;
+
+/// The gnosis cascade — all timestamp-gated (gnosis merged before Shanghai).
+fn gnosis_spec(block_number: u64, timestamp: u64) -> Result<SpecId, EvmError> {
+    if timestamp >= GNOSIS_PRAGUE_TIME {
+        Ok(SpecId::PRAGUE)
+    } else if timestamp >= GNOSIS_CANCUN_TIME {
+        Ok(SpecId::CANCUN)
+    } else if timestamp >= GNOSIS_SHANGHAI_TIME {
         Ok(SpecId::SHANGHAI)
     } else {
         Err(EvmError::ForkTooOld {
@@ -144,10 +170,32 @@ mod tests {
     }
 
     #[test]
+    fn gnosis_fork_times_pin_the_nethermind_hex() {
+        // Guards against a decimal-conversion slip: these MUST equal the
+        // nethermind gnosis.json hex activation timestamps, not a paraphrase.
+        assert_eq!(GNOSIS_SHANGHAI_TIME, 0x64c8_edbc); // 1_690_889_660
+        assert_eq!(GNOSIS_CANCUN_TIME, 0x65ef_4dbc); // 1_710_181_820
+        assert_eq!(GNOSIS_PRAGUE_TIME, 0x6812_2dbc); // 1_746_021_820
+    }
+
+    #[test]
+    fn gnosis_boundaries_map_to_their_specs() {
+        let g = 100u64;
+        assert_eq!(spec_for(g, 30_000_000, GNOSIS_PRAGUE_TIME).unwrap(), SpecId::PRAGUE);
+        assert_eq!(spec_for(g, 30_000_000, GNOSIS_PRAGUE_TIME - 1).unwrap(), SpecId::CANCUN);
+        assert_eq!(spec_for(g, 30_000_000, GNOSIS_CANCUN_TIME).unwrap(), SpecId::CANCUN);
+        assert_eq!(spec_for(g, 30_000_000, GNOSIS_SHANGHAI_TIME).unwrap(), SpecId::SHANGHAI);
+        assert!(matches!(
+            spec_for(g, 30_000_000, GNOSIS_SHANGHAI_TIME - 1),
+            Err(EvmError::ForkTooOld { .. })
+        ));
+    }
+
+    #[test]
     fn unknown_chain_is_unsupported() {
         assert!(matches!(
-            spec_for(100, 20_000_000, SEPOLIA_PRAGUE_TIME),
-            Err(EvmError::UnsupportedChain { chain_id: 100 })
+            spec_for(137, 20_000_000, SEPOLIA_PRAGUE_TIME),
+            Err(EvmError::UnsupportedChain { chain_id: 137 })
         ));
     }
 

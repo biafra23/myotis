@@ -96,6 +96,7 @@ fn config_for(network_name: &str) -> Option<ChainConfig> {
     match crate::catalog::canonical_network_name(network_name) {
         Some("mainnet") => Some(ChainConfig::mainnet()),
         Some("sepolia") => Some(ChainConfig::sepolia()),
+        Some("gnosis") => Some(ChainConfig::gnosis()),
         _ => None,
     }
 }
@@ -192,6 +193,7 @@ pub fn start(handle: i64) -> bool {
     let el_config = match config.name {
         "mainnet" => Some(myotis_net::el::reader::ElConfig::mainnet()),
         "sepolia" => Some(myotis_net::el::reader::ElConfig::sepolia()),
+        "gnosis" => Some(myotis_net::el::reader::ElConfig::gnosis()),
         other => {
             tracing::warn!(handle, network = other, "no EL config for this network; CL runs without EL");
             None
