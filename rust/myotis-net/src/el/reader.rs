@@ -275,8 +275,14 @@ pub struct ElReader {
 }
 
 /// Per-kind bound for the cross-call state-proof cache (accounts and storage
-/// slots each). Generous — entries are small and eviction only trims the oldest.
-const EVM_PROOF_CACHE_ENTRIES: usize = 8192;
+/// slots each) — Java `STATE_PROOF_CACHE_MAX` parity: sized so a ~1000-token
+/// balance sweep's slots survive across the prefetch convergence loop and
+/// repeat calls. Honest ceiling: BOTH kinds fully populated cost ~40 MB
+/// (hashbrown buckets: accounts ~176 B, storage ~128 B × 128k buckets each),
+/// and full population is reachable on a long-running daemon because keys
+/// include the state_root (every new head re-proves). Same order as the Java
+/// cache at the same count; eviction is LRU.
+const EVM_PROOF_CACHE_ENTRIES: usize = 65_536;
 
 /// Overall deadline for one ENS resolution walk (mirrors the Java
 /// `JavaEnsApi.RESOLVE_TIMEOUT_SEC` order of magnitude — the EnsApi contract
@@ -987,7 +993,11 @@ impl ElReader {
         if peers.is_empty() {
             return Err(format!("no snap peer available for {what}"));
         }
-        let oracle = Arc::new(PoolOracle::new(peers, tokio::runtime::Handle::current()));
+        let oracle = Arc::new(PoolOracle::new(
+            peers,
+            tokio::runtime::Handle::current(),
+            Some(self.pool.quality_sink()),
+        ));
         // Bind the concrete Arc types first, then let the unsizing coercion to the
         // trait objects happen at the constructor call (a coercion directly on
         // `Arc::clone` would instead infer `Arc<dyn Trait>` and fail to type-check).
