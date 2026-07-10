@@ -589,6 +589,18 @@ pub fn ens_record_json(handle: i64, params_json: &str) -> String {
     let Some(method) = str_field("method") else {
         return eljson::error_json("missing method");
     };
+    // method:"ccipCallback" re-enters after a host-driven gateway round: the
+    // ORIGINAL query travels as queryMethod + its usual fields (drives the
+    // decode semantics + reverse forward-verify), plus the callback tuple.
+    let is_ccip = method == "ccipCallback";
+    let query_method = if is_ccip {
+        match str_field("queryMethod") {
+            Some(m) => m,
+            None => return eljson::error_json("missing queryMethod"),
+        }
+    } else {
+        method.clone()
+    };
     // Strict: a PRESENT root that isn't one of the known strings is an error
     // (a non-string value must not silently read as the default).
     let root = match params.get("root") {
@@ -603,7 +615,7 @@ pub fn ens_record_json(handle: i64, params_json: &str) -> String {
         },
     };
 
-    let query = match method.as_str() {
+    let query = match query_method.as_str() {
         "addr" | "contenthash" | "pubkey" => {
             let name = match name_field("name") {
                 Ok(n) => n,
@@ -697,6 +709,38 @@ pub fn ens_record_json(handle: i64, params_json: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
+    if is_ccip {
+        let Some(sender) = str_field("senderHex").and_then(|h| parse_hex_fixed::<20>(&h)) else {
+            return eljson::error_json("missing/malformed senderHex");
+        };
+        let Some(callback) =
+            str_field("callbackFunctionHex").and_then(|h| parse_hex_fixed::<4>(&h))
+        else {
+            return eljson::error_json("missing/malformed callbackFunctionHex");
+        };
+        let Some(response) = str_field("responseHex").and_then(|h| parse_hex_bytes(&h)) else {
+            return eljson::error_json("missing/malformed responseHex");
+        };
+        let Some(extra) = str_field("extraDataHex").and_then(|h| parse_hex_bytes(&h)) else {
+            return eljson::error_json("missing/malformed extraDataHex");
+        };
+        let Some(wrapped) = params.get("wrapped").and_then(|v| v.as_bool()) else {
+            return eljson::error_json("missing wrapped");
+        };
+        let Some(finalized) = params.get("finalized").and_then(|v| v.as_bool()) else {
+            return eljson::error_json("missing finalized");
+        };
+        return match engine.rt.block_on(async {
+            reader
+                .ens_ccip_callback(
+                    query, chain_id, finalized, sender, callback, response, extra, wrapped,
+                )
+                .await
+        }) {
+            Ok(outcome) => eljson::ens_record_json(&outcome),
+            Err(e) => eljson::error_json(&e),
+        };
+    }
     match engine
         .rt
         .block_on(async { reader.resolve_ens_query(query, chain_id, root).await })

@@ -327,10 +327,28 @@ pub fn ens_record_json(outcome: &EnsQueryOutcome) -> String {
             obj.insert("blockNumber".into(), json_u64(*block_number));
             obj.insert("verified".into(), (*verified).into());
         }
-        EnsQueryOutcome::Offchain { block_number, verified } => {
+        EnsQueryOutcome::Offchain { block_number, verified, lookup, wrapped } => {
             obj.insert("status".into(), "offchain".into());
             obj.insert("blockNumber".into(), json_u64(*block_number));
             obj.insert("verified".into(), (*verified).into());
+            obj.insert("wrapped".into(), (*wrapped).into());
+            // The gateway tuple, when the revert body parsed — the host drives
+            // the CCIP round with these and re-enters via method:"ccipCallback".
+            if let Some(l) = lookup {
+                obj.insert("senderHex".into(), hex0x_var(&l.sender).into());
+                obj.insert(
+                    "urls".into(),
+                    serde_json::Value::Array(
+                        l.urls.iter().map(|u| u.as_str().into()).collect(),
+                    ),
+                );
+                obj.insert("callDataHex".into(), hex0x_var(&l.call_data).into());
+                obj.insert(
+                    "callbackFunctionHex".into(),
+                    hex0x_var(&l.callback_function).into(),
+                );
+                obj.insert("extraDataHex".into(), hex0x_var(&l.extra_data).into());
+            }
         }
     }
     serde_json::Value::Object(obj).to_string()
@@ -684,7 +702,7 @@ mod tests {
         assert!(none.get("dataHex").is_none());
 
         let off: serde_json::Value = serde_json::from_str(&ens_record_json(
-            &EnsQueryOutcome::Offchain { block_number: 21_000_010, verified: false },
+            &EnsQueryOutcome::Offchain { block_number: 21_000_010, verified: false, lookup: None, wrapped: false },
         ))
         .unwrap();
         assert_eq!(off["status"], "offchain");

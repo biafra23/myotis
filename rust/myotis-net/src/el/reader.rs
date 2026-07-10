@@ -746,7 +746,7 @@ impl ElReader {
         match joined {
             Ok(Some(address)) => Ok(EnsOutcome::Resolved { address, block_number }),
             Ok(None) => Ok(EnsOutcome::NoRecord { block_number }),
-            Err(EnsError::OffchainLookup) => Ok(EnsOutcome::Offchain { block_number }),
+            Err(EnsError::OffchainLookup { .. }) => Ok(EnsOutcome::Offchain { block_number }),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -791,6 +791,70 @@ impl ElReader {
             .map_err(|_| "resolve-ens timed out".to_string())?
     }
 
+    /// One ERC-3668 CALLBACK re-entry (EL-C-5-3): the host drove the gateway;
+    /// this executes `sender.callbackFunction(response, extraData)` against the
+    /// SAME root kind as the original attempt and decodes the answer with the
+    /// original query's record semantics. A second `OffchainLookup` from the
+    /// callback surfaces as `Offchain` again — the HOST enforces the recursion
+    /// cap (Java `MAX_RECURSION_DEPTH = 1`). For a `Reverse` query the decoded
+    /// claimed name is forward-verified here, exactly like the direct path.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn ens_ccip_callback(
+        &self,
+        query: EnsQuery,
+        chain_id: u64,
+        finalized: bool,
+        sender: [u8; 20],
+        callback_function: [u8; 4],
+        response: Vec<u8>,
+        extra_data: Vec<u8>,
+        wrapped: bool,
+    ) -> Result<EnsQueryOutcome, String> {
+        let attempt = async {
+            let (ctx, executor) = if finalized {
+                self.evm_setup_finalized(chain_id, "resolve-ens").await?
+            } else {
+                self.evm_setup(chain_id, "resolve-ens").await?
+            };
+            let block_number = ctx.block_number;
+            let walk = tokio::task::spawn_blocking(move || {
+                let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
+                let raw = myotis_evm::ccip_callback(
+                    &caller,
+                    sender,
+                    callback_function,
+                    &response,
+                    &extra_data,
+                    wrapped,
+                )?;
+                let Some(raw) = raw else { return Ok(None) };
+                decode_ccip_answer(&caller, &query, &raw)
+            });
+            let joined = tokio::time::timeout(RESOLVE_ENS_ATTEMPT_DEADLINE, walk)
+                .await
+                .map_err(|_| "resolve-ens attempt timed out".to_string())?
+                .map_err(|e| format!("resolve-ens task join error: {e}"))?;
+            match joined {
+                Ok(Some(value)) => {
+                    Ok(EnsQueryOutcome::Value { value, block_number, verified: finalized })
+                }
+                Ok(None) => Ok(EnsQueryOutcome::NoRecord { block_number, verified: finalized }),
+                Err(EnsError::OffchainLookup { lookup, wrapped }) => {
+                    Ok(EnsQueryOutcome::Offchain {
+                        block_number,
+                        verified: finalized,
+                        lookup,
+                        wrapped,
+                    })
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        };
+        tokio::time::timeout(RESOLVE_ENS_DEADLINE, attempt)
+            .await
+            .map_err(|_| "resolve-ens timed out".to_string())?
+    }
+
     /// One resolution attempt against one root (finalized or optimistic).
     async fn ens_attempt(
         &self,
@@ -819,9 +883,12 @@ impl ElReader {
         match joined {
             Ok(Some(value)) => Ok(EnsQueryOutcome::Value { value, block_number, verified: finalized }),
             Ok(None) => Ok(EnsQueryOutcome::NoRecord { block_number, verified: finalized }),
-            Err(EnsError::OffchainLookup) => {
-                Ok(EnsQueryOutcome::Offchain { block_number, verified: finalized })
-            }
+            Err(EnsError::OffchainLookup { lookup, wrapped }) => Ok(EnsQueryOutcome::Offchain {
+                block_number,
+                verified: finalized,
+                lookup,
+                wrapped,
+            }),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -1326,6 +1393,38 @@ fn run_ens_query(
         EnsQuery::Reverse { address } => {
             myotis_evm::reverse_resolve(caller, *address)?.map(EnsRecordValue::Name)
         }
+    })
+}
+
+/// Decode a CCIP callback's raw answer with the ORIGINAL query's record
+/// semantics (single source: the myotis-evm `decode_*_answer` helpers). A
+/// `Reverse` claimed name is forward-verified here, exactly like the direct
+/// path (the forward walk may itself surface `OffchainLookup` — propagated).
+fn decode_ccip_answer(
+    caller: &dyn myotis_evm::EthCaller,
+    query: &EnsQuery,
+    raw: &[u8],
+) -> Result<Option<EnsRecordValue>, EnsError> {
+    Ok(match query {
+        EnsQuery::Addr { .. } | EnsQuery::Interface { .. } => {
+            myotis_evm::decode_address_answer(raw).map(EnsRecordValue::Address)
+        }
+        EnsQuery::Text { .. } => myotis_evm::decode_text_answer(raw).map(EnsRecordValue::Text),
+        EnsQuery::Contenthash { .. } | EnsQuery::Multicoin { .. } | EnsQuery::DnsRecord { .. } => {
+            myotis_evm::decode_bytes_answer(raw).map(EnsRecordValue::Bytes)
+        }
+        EnsQuery::Pubkey { .. } => {
+            myotis_evm::decode_pubkey_answer(raw).map(|(x, y)| EnsRecordValue::Pubkey { x, y })
+        }
+        EnsQuery::Abi { .. } => myotis_evm::decode_abi_answer(raw)
+            .map(|(content_type, data)| EnsRecordValue::Abi { content_type, data }),
+        EnsQuery::Reverse { address } => match myotis_evm::decode_name_answer(raw) {
+            None => None,
+            Some(claimed) => match myotis_evm::resolve_address(caller, &claimed)? {
+                Some(fwd) if fwd == *address => Some(EnsRecordValue::Name(claimed)),
+                _ => None,
+            },
+        },
     })
 }
 

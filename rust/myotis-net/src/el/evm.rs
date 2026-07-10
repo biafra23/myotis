@@ -142,9 +142,17 @@ pub enum EnsQueryOutcome {
     Value { value: EnsRecordValue, block_number: u64, verified: bool },
     /// Successfully determined there is no record.
     NoRecord { block_number: u64, verified: bool },
-    /// The record resolves OFFCHAIN (ERC-3668) — needs a CCIP-Read gateway
-    /// (EL-C-5-3). Distinguishable from `NoRecord` by design.
-    Offchain { block_number: u64, verified: bool },
+    /// The record resolves OFFCHAIN (ERC-3668): the host must drive a CCIP-Read
+    /// gateway round with the carried tuple, then re-enter via the callback
+    /// (`method:"ccipCallback"`). `lookup` is `None` when the revert's tuple was
+    /// unparseable (still distinguishable from `NoRecord`); `wrapped` = the
+    /// revert came from inside the ENSIP-10 `resolve()` wrap.
+    Offchain {
+        block_number: u64,
+        verified: bool,
+        lookup: Option<Box<myotis_evm::OffchainLookup>>,
+        wrapped: bool,
+    },
 }
 
 /// Build a [`BlockContext`] from a verified head header. `chain_id` comes from the
