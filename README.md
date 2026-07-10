@@ -93,7 +93,7 @@ The app runs the node as a foreground `NodeService` (Start/Stop in the UI). Once
 ./gradlew :app-desktop:run -Pengine=rust
 ```
 
-Build a native installer for the host OS with jpackage. **jpackage is host-OS-bound**: the `.dmg` can only be produced on macOS and the `.deb` only on Linux (CI builds each on its matching runner — `desktop-dmg.yml` / `desktop-linux-deb.yml`); locally you get the format for your platform.
+Build a native installer for the host OS with jpackage. **jpackage is host-OS-bound**: the `.dmg` can only be produced on macOS and the `.deb` only on Linux (CI builds each on its matching runner — `desktop-dmg.yml` / `desktop-linux-deb.yml`); locally you get the format for your OS. Only macOS and Linux formats are configured today — Windows packaging (`.msi`) isn't enabled yet, so these tasks fail on a Windows host.
 
 ```bash
 # macOS → build a .dmg  (output under app-desktop/build/compose/binaries/main/dmg/)
@@ -109,7 +109,7 @@ Build a native installer for the host OS with jpackage. **jpackage is host-OS-bo
 ./gradlew :app-desktop:runDistributable
 ```
 
-The bundle embeds a full Java 21 runtime (the `:networking`/`:myotis-evm` backend ships Java-21 classes and reaches JDK modules reflectively, so the whole module graph is included). Packaged builds currently ship the Java engine; the Rust engine is loaded only on the `run`/`syncSmoke` dev tasks until the packaging PR bundles the native lib. Logs roll under `~/.myotis/logs`; adjust the app log level with `-Dmyotis.log.level`.
+The bundle embeds a full Java 21 runtime (the `:networking`/`:myotis-evm` backend ships Java-21 classes and reaches JDK modules reflectively, so the whole module graph is included). Packaged builds currently ship the Java engine; the Rust engine is loaded only on the `run`/`syncSmoke` dev tasks until the packaging PR bundles the native lib. Logs roll under `~/.myotis/logs`; the app's log level comes from the `myotis.log.level` JVM system property (default `INFO`). Note that a `-D` flag on a `./gradlew :app-desktop:run` command line reaches the Gradle JVM, not the app — for a packaged app, edit the `java-options` in the bundle's generated `Myotis.cfg`.
 
 ### Desktop daemon
 
