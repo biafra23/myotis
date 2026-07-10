@@ -45,6 +45,20 @@ pub const VIEW_CALL_GAS: u64 = 30_000_000;
 /// no-code estimate short-circuit's answer (unbuffered; Java parity).
 const PLAIN_TRANSFER_GAS: u64 = 21_000;
 
+/// Precompiles are CODELESS in state yet execute logic — an empty-calldata
+/// call to one still charges its base gas, so the 21000 short-circuit must
+/// not claim it. Conservatively covers 0x…0001 ..= 0x…01ff (mainnet uses
+/// 0x01..0x11 through Prague; the headroom absorbs future forks and
+/// RIP-7212-style 0x100 assignments — a stray fall-through only costs a full
+/// estimate run). NOTE: the Java engine's rpcEstimateGas short-circuits these
+/// today (same under-estimate) — flagged for the same fix there.
+fn in_precompile_range(addr: &[u8; 20]) -> bool {
+    addr[..18].iter().all(|&b| b == 0) && {
+        let low = u16::from_be_bytes([addr[18], addr[19]]);
+        (1..=0x01FF).contains(&low)
+    }
+}
+
 /// The from-less `eth_call` sender: the zero address (Geth's default). A caller
 /// that needs `msg.sender` set (ERC-20 `transfer`/`approve`) uses [`EvmExecutor::call_view_from`].
 const VIEW_CALLER: Address = Address::ZERO;
@@ -201,7 +215,7 @@ impl EvmExecutor {
         // exactly like the full path, never answering 21000 for a context the
         // executor wouldn't execute.
         spec_for(ctx.chain_id, ctx.block_number, ctx.timestamp)?;
-        if calldata.is_empty() {
+        if calldata.is_empty() && !in_precompile_range(&target) {
             let db = OracleDatabase::new(
                 Arc::clone(&self.oracle),
                 ctx.state_root,
@@ -467,6 +481,31 @@ mod tests {
             .estimate_gas([0x42; 20], TARGET, &[], U256::ZERO, &ctx(19_500_000, CANCUN_TIME + 1))
             .unwrap();
         assert_eq!(est, 21_000);
+    }
+
+    #[test]
+    fn precompile_target_is_never_short_circuited() {
+        // Precompiles are codeless in state but still execute: the identity
+        // precompile (0x04) with empty calldata costs 21000 + its base gas, so
+        // answering a bare 21000 would under-estimate. The guard forces the
+        // full metered path (which prices the precompile via revm).
+        let mut precompile = [0u8; 20];
+        precompile[19] = 0x04;
+        let fx = FixtureSnapStateOracle::new(); // absent everywhere, like real state
+        let exec = EvmExecutor::new(
+            Arc::new(fx),
+            Arc::new(NoopStateProofCache),
+            Arc::new(NoopBytecodeCache),
+        );
+        let est = exec
+            .estimate_gas([0x42; 20], precompile, &[], U256::ZERO, &ctx(19_500_000, CANCUN_TIME + 1))
+            .unwrap();
+        assert!(est > 21_000, "a precompile call must be metered, was {est}");
+        // The zero address is NOT a precompile — burns short-circuit normally.
+        let est0 = exec
+            .estimate_gas([0x42; 20], [0u8; 20], &[], U256::ZERO, &ctx(19_500_000, CANCUN_TIME + 1))
+            .unwrap();
+        assert_eq!(est0, 21_000);
     }
 
     #[test]
