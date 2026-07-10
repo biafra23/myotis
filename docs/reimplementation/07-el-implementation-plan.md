@@ -441,8 +441,23 @@ Spec: doc 03 §§3–7, doc 04 §3. New crate `myotis-evm` (sans-I/O; revm gated
      divergence), `resolveAddress` honors the caller's root, records/reverse hardcode AUTO
      (JavaEnsApi parity). Cross-language goldens: `eljson::ens_record_json_shapes` ↔
      `RustEnsRecordJsonTest`. The daemon gained a `reverse-ens` CLI command (both engines).
-     *Still deferred to C-5-3:* CCIP-Read (offchain names error distinguishably meanwhile);
-     resolver-discovery caching (Java's static 5-min cache) is a later optimisation.
+     *Still deferred:* resolver-discovery caching (Java's static 5-min cache) — a later
+     optimisation.
+   - **Landed (EL-C-5-3): CCIP-Read (ERC-3668).** Split at the HTTP boundary: the NATIVE side
+     decodes the OffchainLookup 5-tuple (Java `OffchainLookupRevert` bounds: body ≥160, ≤32
+     URLs; unparseable → `lookup:None`, still distinguishable from no-record) and carries it +
+     the ENSIP-10 `wrapped` flag through `status:"offchain"` JSON; the HOST (`CcipDriver` in
+     `myotis-engines`) drives the gateway over the `HttpGateway` port — serial URLs, GET iff
+     `{data}` in the template (pre-substitution), else POST `{"sender","data"}`, lenient
+     `"data"` regex extraction, `HttpError` selector `0xca7a4e75` substring scan, per-URL
+     failure reasons — then re-enters via `method:"ccipCallback"` (same dispatch native, ABI
+     stays 12): the callback runs as a verified eth_call against the SAME root kind, its answer
+     is bytes-unwrapped when wrapped and decoded via the shared `decode_*_answer` helpers
+     (reverse claimed-names forward-verify inside the continuation). Recursion cap 1 (Java
+     `MAX_RECURSION_DEPTH`), enforced host-side. CCIP scope divergence (documented): the Java
+     engine's executor-level decorator would gateway ANY call in the walk; the Rust split
+     drives CCIP only for the record call itself (registry/supportsInterface reads never
+     legitimately revert OffchainLookup on-chain). No Rust HTTP dependency, per the plan.
 
 Milestone-C gate: on a SYNCED mainnet daemon with `-Pengine=rust`, a real ERC-20
 `balanceOf` `eth_call`, an `estimateGas` for a token transfer, and a `resolve-ens` of a

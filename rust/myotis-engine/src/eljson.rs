@@ -327,10 +327,28 @@ pub fn ens_record_json(outcome: &EnsQueryOutcome) -> String {
             obj.insert("blockNumber".into(), json_u64(*block_number));
             obj.insert("verified".into(), (*verified).into());
         }
-        EnsQueryOutcome::Offchain { block_number, verified } => {
+        EnsQueryOutcome::Offchain { block_number, verified, lookup, wrapped } => {
             obj.insert("status".into(), "offchain".into());
             obj.insert("blockNumber".into(), json_u64(*block_number));
             obj.insert("verified".into(), (*verified).into());
+            obj.insert("wrapped".into(), (*wrapped).into());
+            // The gateway tuple, when the revert body parsed — the host drives
+            // the CCIP round with these and re-enters via method:"ccipCallback".
+            if let Some(l) = lookup {
+                obj.insert("senderHex".into(), hex0x_var(&l.sender).into());
+                obj.insert(
+                    "urls".into(),
+                    serde_json::Value::Array(
+                        l.urls.iter().map(|u| u.as_str().into()).collect(),
+                    ),
+                );
+                obj.insert("callDataHex".into(), hex0x_var(&l.call_data).into());
+                obj.insert(
+                    "callbackFunctionHex".into(),
+                    hex0x_var(&l.callback_function).into(),
+                );
+                obj.insert("extraDataHex".into(), hex0x_var(&l.extra_data).into());
+            }
         }
     }
     serde_json::Value::Object(obj).to_string()
@@ -684,10 +702,37 @@ mod tests {
         assert!(none.get("dataHex").is_none());
 
         let off: serde_json::Value = serde_json::from_str(&ens_record_json(
-            &EnsQueryOutcome::Offchain { block_number: 21_000_010, verified: false },
+            &EnsQueryOutcome::Offchain { block_number: 21_000_010, verified: false, lookup: None, wrapped: false },
         ))
         .unwrap();
         assert_eq!(off["status"], "offchain");
+        assert!(off.get("senderHex").is_none()); // unparseable tuple → no fields
+
+        // The FULL offchain envelope — the exact keys the Java CcipDriver reads
+        // (CcipDriverTest replays this literal as its input; the two are the
+        // halves of the cross-language pin).
+        let full: serde_json::Value = serde_json::from_str(&ens_record_json(
+            &EnsQueryOutcome::Offchain {
+                block_number: 21_000_010,
+                verified: true,
+                lookup: Some(Box::new(myotis_evm::OffchainLookup {
+                    sender: [0x5E; 20],
+                    urls: vec!["https://gw.example/{sender}/{data}.json".into()],
+                    call_data: vec![0xCA, 0x11],
+                    callback_function: [0xCB; 4],
+                    extra_data: vec![0xEE; 3],
+                })),
+                wrapped: true,
+            },
+        ))
+        .unwrap();
+        assert_eq!(full["senderHex"], format!("0x{}", "5e".repeat(20)));
+        assert_eq!(full["urls"][0], "https://gw.example/{sender}/{data}.json");
+        assert_eq!(full["callDataHex"], "0xca11");
+        assert_eq!(full["callbackFunctionHex"], "0xcbcbcbcb");
+        assert_eq!(full["extraDataHex"], "0xeeeeee");
+        assert_eq!(full["wrapped"], true);
+        assert_eq!(full["verified"], true);
     }
 
     fn sample_code() -> VerifiedCode {

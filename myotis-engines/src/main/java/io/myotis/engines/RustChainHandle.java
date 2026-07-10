@@ -80,13 +80,26 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     private long lastHeadBlock = -1L;
     private long lastHeadAdvanceNanos;
 
+    /** CCIP-Read HTTP transport from EnginePorts; null = offchain names error. */
+    private final io.myotis.api.ports.HttpGateway httpGateway;
+
     RustChainHandle(long handle, String networkName, long chainId, int rpcPort, boolean hasEns) {
+        this(handle, networkName, chainId, rpcPort, hasEns, null);
+    }
+
+    RustChainHandle(long handle, String networkName, long chainId, int rpcPort, boolean hasEns,
+            io.myotis.api.ports.HttpGateway httpGateway) {
         this.handle = handle;
         this.networkName = networkName;
         this.chainId = chainId;
         this.rpcPort = rpcPort;
+        this.httpGateway = httpGateway;
         // Networks without ENS (e.g. gnosis) get no EnsApi — ens() returns null.
         this.ensApi = hasEns ? new RustEnsApi(this) : null;
+    }
+
+    io.myotis.api.ports.HttpGateway httpGateway() {
+        return httpGateway;
     }
 
     @Override public String networkName() { return networkName; }

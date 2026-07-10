@@ -54,9 +54,10 @@ pub use cache::{
 };
 pub use database::OracleDatabase;
 pub use ens::{
-    resolve_abi, resolve_address, resolve_contenthash, resolve_dns_record,
+    ccip_callback, decode_abi_answer, decode_address_answer, decode_bytes_answer,
+    decode_name_answer, decode_pubkey_answer, decode_text_answer, resolve_abi, resolve_address, resolve_contenthash, resolve_dns_record,
     resolve_interface_implementer, resolve_multicoin, resolve_pubkey, resolve_text,
-    reverse_resolve, EnsError, EthCaller, ExecutorCaller,
+    reverse_resolve, EnsError, EthCaller, ExecutorCaller, OffchainLookup,
 };
 pub use error::EvmError;
 pub use executor::EvmExecutor;

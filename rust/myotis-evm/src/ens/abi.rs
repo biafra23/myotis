@@ -188,6 +188,35 @@ pub fn decode_string(data: &[u8]) -> Option<String> {
     decode_dynamic_bytes(data, 0).map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
+/// Decode a `string[]` at the byte offset held in head slot `arg_index`:
+/// array length, then per-element offsets (relative to the array data start),
+/// each element length-prefixed UTF-8 (lossy). Capped at `max` elements; `None`
+/// on any out-of-bounds/oversized field.
+pub fn decode_string_array(data: &[u8], arg_index: usize, max: usize) -> Option<Vec<String>> {
+    let array = read_index(data, arg_index.checked_mul(32)?)?;
+    let len = read_index(data, array)?;
+    if len > max {
+        return None;
+    }
+    let base = array.checked_add(32)?;
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let rel = read_index(data, base.checked_add(i.checked_mul(32)?)?)?;
+        let elem = base.checked_add(rel)?;
+        let elen = read_index(data, elem)?;
+        let start = elem.checked_add(32)?;
+        let bytes = data.get(start..start.checked_add(elen)?)?;
+        out.push(String::from_utf8_lossy(bytes).into_owned());
+    }
+    Some(out)
+}
+
+/// Encode two dynamic `bytes` args head-tail (the ERC-3668 callback's
+/// `(response, extraData)` payload — appended after the callback selector).
+pub fn encode_two_bytes_args(a: &[u8], b: &[u8]) -> Vec<u8> {
+    encode_bytes_args(&[a, b])
+}
+
 /// Decode the two static 32-byte words of a `(bytes32,bytes32)` return
 /// (`pubkey(bytes32)` → x, y). `None` if shorter than 64 bytes.
 pub fn decode_two_words(data: &[u8]) -> Option<([u8; 32], [u8; 32])> {

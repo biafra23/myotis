@@ -20,8 +20,12 @@ import io.myotis.api.EnsTextResult;
  * ONE generic dispatch native ({@code nativeEnsRecordJson}) — forward address,
  * text, contenthash, multi-coin, pubkey, ABI, dnsRecord, interfaceImplementer,
  * and reverse resolution with mandatory forward-verify (EL-C-5-2). CCIP-Read
- * (ERC-3668 offchain names) is the remaining slice (EL-C-5-3): an offchain name
- * reports a descriptive error, distinguishable from "no record".
+ * (ERC-3668, EL-C-5-3) is driven host-side: the native resolver surfaces the
+ * OffchainLookup tuple, {@link CcipDriver} performs the gateway round over the
+ * {@link io.myotis.api.ports.HttpGateway} port, and the callback re-enters the
+ * native resolver as a verified eth_call. Without a configured gateway (or on
+ * an unparseable tuple) an offchain name reports a descriptive error,
+ * distinguishable from "no record".
  *
  * <p>Roots: {@code resolveAddress} honors the caller's {@link EnsRoot} —
  * FINALIZED resolves against the beacon-FINALIZED execution root and fails
@@ -40,9 +44,13 @@ import io.myotis.api.EnsTextResult;
  */
 final class RustEnsApi implements EnsApi {
 
-    /** The offchain-name error until CCIP-Read lands (EL-C-5-3). */
+    /**
+     * The error for an offchain name that CCIP could NOT be driven for: the
+     * OffchainLookup tuple didn't parse (the driver only acts on a full tuple)
+     * — or a stale native returned offchain without one.
+     */
     private static final String OFFCHAIN =
-            "name resolves offchain (ERC-3668); CCIP-Read not yet supported on the rust engine";
+            "name resolves offchain (ERC-3668) but the OffchainLookup was not actionable";
 
     private final RustChainHandle handle;
 
@@ -59,7 +67,7 @@ final class RustEnsApi implements EnsApi {
         }
         try {
             JsonObject params = params("addr").add("name", name).add("root", rootParam(root));
-            return addressFromJson(name, handle.ensRecordJson(params.toString()));
+            return addressFromJson(name, exec(params));
         } catch (RuntimeException e) {
             return new EnsResolutionResult(name, null, -1, false, why(e));
         }
@@ -90,7 +98,7 @@ final class RustEnsApi implements EnsApi {
         String canonical = "0x" + bare;
         try {
             JsonObject params = params("reverse").add("addressHex", canonical);
-            return reverseFromJson(canonical, handle.ensRecordJson(params.toString()));
+            return reverseFromJson(canonical, exec(params));
         } catch (RuntimeException e) {
             return new EnsResolutionResult(null, canonical, -1, false, why(e));
         }
@@ -123,7 +131,7 @@ final class RustEnsApi implements EnsApi {
         }
         try {
             JsonObject params = params("text").add("name", name).add("key", key);
-            return textFromJson(name, key, handle.ensRecordJson(params.toString()));
+            return textFromJson(name, key, exec(params));
         } catch (RuntimeException e) {
             return new EnsTextResult(name, key, null, -1, false, why(e));
         }
@@ -147,7 +155,7 @@ final class RustEnsApi implements EnsApi {
         }
         try {
             JsonObject params = params("contenthash").add("name", name);
-            return contenthashFromJson(name, handle.ensRecordJson(params.toString()));
+            return contenthashFromJson(name, exec(params));
         } catch (RuntimeException e) {
             return new EnsContenthashResult(name, null, -1, false, why(e));
         }
@@ -174,7 +182,7 @@ final class RustEnsApi implements EnsApi {
         }
         try {
             JsonObject params = params("multicoin").add("name", name).add("coinType", coinType);
-            return multiCoinFromJson(name, coinType, handle.ensRecordJson(params.toString()));
+            return multiCoinFromJson(name, coinType, exec(params));
         } catch (RuntimeException e) {
             return new EnsMultiCoinResult(name, coinType, null, -1, false, why(e));
         }
@@ -199,7 +207,7 @@ final class RustEnsApi implements EnsApi {
         }
         try {
             JsonObject params = params("pubkey").add("name", name);
-            return pubkeyFromJson(name, handle.ensRecordJson(params.toString()));
+            return pubkeyFromJson(name, exec(params));
         } catch (RuntimeException e) {
             return new EnsPubkeyResult(name, null, null, -1, false, why(e));
         }
@@ -226,7 +234,7 @@ final class RustEnsApi implements EnsApi {
         }
         try {
             JsonObject params = params("abi").add("name", name).add("contentTypes", contentTypes);
-            return abiFromJson(name, handle.ensRecordJson(params.toString()));
+            return abiFromJson(name, exec(params));
         } catch (RuntimeException e) {
             return new EnsAbiResult(name, 0, null, -1, false, why(e));
         }
@@ -262,7 +270,7 @@ final class RustEnsApi implements EnsApi {
             JsonObject params = params("dnsRecord")
                     .add("name", name).add("dnsName", dnsName).add("resource", recordType);
             return dnsRecordFromJson(
-                    name, dnsName, recordType, handle.ensRecordJson(params.toString()));
+                    name, dnsName, recordType, exec(params));
         } catch (RuntimeException e) {
             return new EnsDnsRecordResult(name, dnsName, recordType, null, -1, false, why(e));
         }
@@ -301,7 +309,7 @@ final class RustEnsApi implements EnsApi {
         try {
             JsonObject params = params("interfaceImplementer")
                     .add("name", name).add("interfaceIdHex", idHex);
-            return interfaceFromJson(name, idHex, handle.ensRecordJson(params.toString()));
+            return interfaceFromJson(name, idHex, exec(params));
         } catch (RuntimeException e) {
             return new EnsInterfaceResult(name, idHex, null, -1, false, why(e));
         }
@@ -319,6 +327,18 @@ final class RustEnsApi implements EnsApi {
     }
 
     // ---- plumbing ----
+
+    /**
+     * One native record query + any CCIP-Read rounds it demands (EL-C-5-3):
+     * an offchain answer with a parsed tuple drives the HttpGateway via
+     * {@link CcipDriver} and re-enters the native callback path; everything
+     * else passes straight through to the record parsers.
+     */
+    private String exec(JsonObject params) {
+        String json = handle.ensRecordJson(params.toString());
+        return CcipDriver.drive(params, json, handle.httpGateway(),
+                p -> handle.ensRecordJson(p));
+    }
 
     private static JsonObject params(String method) {
         return Json.object().add("method", method);

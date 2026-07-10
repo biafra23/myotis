@@ -50,23 +50,49 @@ const OFFCHAIN_LOOKUP_SELECTOR: [u8; 4] = [0x55, 0x6f, 0x18, 0x30];
 pub enum EnsError {
     /// The name is malformed (empty/oversized label).
     InvalidName(&'static str),
-    /// The resolver reverted with ERC-3668 `OffchainLookup`: the name resolves
-    /// OFFCHAIN via a CCIP-Read gateway, which this engine doesn't drive yet
-    /// (EL-C-5-3). Explicitly not "no record" — the record exists, offchain.
-    OffchainLookup,
+    /// The resolver reverted with ERC-3668 `OffchainLookup`: the record resolves
+    /// OFFCHAIN via a CCIP-Read gateway. Carries the decoded 5-tuple (when the
+    /// revert body parsed) so the HOST can drive the gateway and re-enter via
+    /// the callback (EL-C-5-3 — HTTP stays outside this crate by design).
+    /// `wrapped` = the ORIGINAL dispatch went through the ENSIP-10 `resolve()`
+    /// wrap, so whichever callback round finally answers must bytes-unwrap its
+    /// return; it describes the original call's decode contract, NOT where this
+    /// particular revert occurred, and is therefore carried unchanged through
+    /// callback rounds. A tuple that fails to parse is `lookup: None` — still
+    /// distinguishable from "no record".
+    OffchainLookup { lookup: Option<Box<OffchainLookup>>, wrapped: bool },
     /// A resolution `eth_call` failed for a non-revert reason (state unavailable,
     /// halt, unsupported chain). A plain revert is treated as "no record", not an
     /// error.
     Call(EvmError),
 }
 
+/// The decoded ERC-3668 `OffchainLookup(address,string[],bytes,bytes4,bytes)`
+/// revert body (Java `OffchainLookupRevert` twin — same bounds: body ≥ 160
+/// bytes, ≤ 32 URLs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffchainLookup {
+    /// The callback TARGET (Java parity: the callback is sent to the tuple's
+    /// sender, and no sender==callee check is made — a lying resolver can only
+    /// redirect its own callback).
+    pub sender: [u8; 20],
+    /// Gateway URL templates (`{sender}` / `{data}` substitution — host-side).
+    pub urls: Vec<String>,
+    /// The data for the gateway request.
+    pub call_data: Vec<u8>,
+    /// The 4-byte callback selector on `sender`.
+    pub callback_function: [u8; 4],
+    /// Opaque state echoed into the callback.
+    pub extra_data: Vec<u8>,
+}
+
 impl std::fmt::Display for EnsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EnsError::InvalidName(why) => write!(f, "invalid ENS name: {why}"),
-            EnsError::OffchainLookup => write!(
+            EnsError::OffchainLookup { .. } => write!(
                 f,
-                "name resolves offchain (ERC-3668 OffchainLookup); CCIP-Read not yet supported"
+                "name resolves offchain (ERC-3668 OffchainLookup); a CCIP-Read gateway round is required"
             ),
             EnsError::Call(e) => write!(f, "ENS resolution call failed: {e}"),
         }
@@ -118,7 +144,7 @@ pub fn resolve_address(
     // A zero address is "no record", not an answer. decode_address is stricter
     // than the Java decoder (a dirty upper-12-byte word → None rather than
     // slicing the trailing 20) — deliberately fail-safe for a fund-destination.
-    Ok(abi::decode_address(&raw).filter(|a| a != &[0u8; 20]))
+    Ok(decode_address_answer(&raw))
 }
 
 /// Resolve a `text(bytes32,string)` record. `Ok(None)` = no record (absent
@@ -133,7 +159,7 @@ pub fn resolve_text(
     let Some(raw) = resolve_record(caller, name, &inner)? else {
         return Ok(None);
     };
-    Ok(abi::decode_string(&raw).filter(|s| !s.is_empty()))
+    Ok(decode_text_answer(&raw))
 }
 
 /// Resolve a `contenthash(bytes32)` record (raw multicodec bytes). `Ok(None)` =
@@ -147,7 +173,7 @@ pub fn resolve_contenthash(
     let Some(raw) = resolve_record(caller, name, &inner)? else {
         return Ok(None);
     };
-    Ok(abi::decode_dynamic_bytes(&raw, 0).filter(|b| !b.is_empty()))
+    Ok(decode_bytes_answer(&raw))
 }
 
 /// Resolve an ENSIP-9 multi-coin `addr(bytes32,uint256)` record (raw
@@ -162,7 +188,7 @@ pub fn resolve_multicoin(
     let Some(raw) = resolve_record(caller, name, &inner)? else {
         return Ok(None);
     };
-    Ok(abi::decode_dynamic_bytes(&raw, 0).filter(|b| !b.is_empty()))
+    Ok(decode_bytes_answer(&raw))
 }
 
 /// Resolve a `pubkey(bytes32)` record — a fixed `(bytes32 x, bytes32 y)` tuple,
@@ -176,7 +202,7 @@ pub fn resolve_pubkey(
     let Some(raw) = resolve_record(caller, name, &inner)? else {
         return Ok(None);
     };
-    Ok(abi::decode_two_words(&raw).filter(|(x, y)| x != &[0u8; 32] || y != &[0u8; 32]))
+    Ok(decode_pubkey_answer(&raw))
 }
 
 /// Resolve an `ABI(bytes32,uint256)` record → `(contentType, data)`. `Ok(None)`
@@ -192,7 +218,7 @@ pub fn resolve_abi(
     let Some(raw) = resolve_record(caller, name, &inner)? else {
         return Ok(None);
     };
-    Ok(abi::decode_uint_bytes(&raw).filter(|(_, data)| !data.is_empty()))
+    Ok(decode_abi_answer(&raw))
 }
 
 /// Resolve a `dnsRecord(bytes32,bytes,uint16)` record: `dns_name` is the DNS
@@ -216,7 +242,7 @@ pub fn resolve_dns_record(
     let Some(raw) = resolve_record(caller, name, &inner)? else {
         return Ok(None);
     };
-    Ok(abi::decode_dynamic_bytes(&raw, 0).filter(|b| !b.is_empty()))
+    Ok(decode_bytes_answer(&raw))
 }
 
 /// Resolve an `interfaceImplementer(bytes32,bytes4)` record (EIP-1820 over
@@ -235,7 +261,7 @@ pub fn resolve_interface_implementer(
     let Some(raw) = resolve_record(caller, name, &inner)? else {
         return Ok(None);
     };
-    Ok(abi::decode_address(&raw).filter(|a| a != &[0u8; 20]))
+    Ok(decode_address_answer(&raw))
 }
 
 /// Reverse-resolve `address` → its primary ENS name, **forward-verified**: the
@@ -279,14 +305,15 @@ pub fn reverse_resolve(
     let raw = match caller.eth_call(resolver, &name_call) {
         Ok(out) => out,
         Err(EvmError::Reverted { data }) => {
-            return match revert_outcome(&data) {
+            // name() is a direct legacy-style call — never ENSIP-10-wrapped.
+            return match revert_outcome(&data, false) {
                 Ok(_) => Ok(None),
                 Err(e) => Err(e),
             }
         }
         Err(e) => return Err(EnsError::Call(e)),
     };
-    let Some(claimed) = abi::decode_string(&raw).filter(|s| !s.is_empty()) else {
+    let Some(claimed) = decode_name_answer(&raw) else {
         return Ok(None);
     };
 
@@ -310,6 +337,40 @@ fn reverse_name(address: [u8; 20]) -> String {
     }
     s.push_str(".addr.reverse");
     s
+}
+
+/// Decode an address-shaped answer (addr / interfaceImplementer): strict
+/// (dirty upper 12 bytes → None) and zero → None. Shared by the direct path
+/// and the CCIP callback continuation.
+pub fn decode_address_answer(raw: &[u8]) -> Option<[u8; 20]> {
+    abi::decode_address(raw).filter(|a| a != &[0u8; 20])
+}
+
+/// Decode a text answer: dynamic string, empty → None.
+pub fn decode_text_answer(raw: &[u8]) -> Option<String> {
+    abi::decode_string(raw).filter(|s| !s.is_empty())
+}
+
+/// Decode a bytes answer (contenthash / multicoin / dnsRecord): empty → None.
+pub fn decode_bytes_answer(raw: &[u8]) -> Option<Vec<u8>> {
+    abi::decode_dynamic_bytes(raw, 0).filter(|b| !b.is_empty())
+}
+
+/// Decode a pubkey answer (fixed tuple): BOTH-zero → None.
+pub fn decode_pubkey_answer(raw: &[u8]) -> Option<([u8; 32], [u8; 32])> {
+    abi::decode_two_words(raw).filter(|(x, y)| x != &[0u8; 32] || y != &[0u8; 32])
+}
+
+/// Decode an ABI answer: `(contentType, data)`, empty data → None (the
+/// contentType word alone is NOT checked — Java parity).
+pub fn decode_abi_answer(raw: &[u8]) -> Option<(u64, Vec<u8>)> {
+    abi::decode_uint_bytes(raw).filter(|(_, data)| !data.is_empty())
+}
+
+/// Decode a reverse `name()` answer: dynamic string, empty → None. The caller
+/// must still forward-verify the claimed name.
+pub fn decode_name_answer(raw: &[u8]) -> Option<String> {
+    abi::decode_string(raw).filter(|s| !s.is_empty())
 }
 
 /// The shared resolution path every record type rides: find the (possibly
@@ -345,29 +406,87 @@ fn resolve_record(
         let call = abi::encode_resolve(&dns, inner_call);
         match caller.eth_call(info.resolver, &call) {
             Ok(out) => Ok(abi::decode_dynamic_bytes(&out, 0)),
-            Err(EvmError::Reverted { data }) => revert_outcome(&data),
+            Err(EvmError::Reverted { data }) => revert_outcome(&data, true),
             Err(e) => Err(EnsError::Call(e)),
         }
     } else {
         // Legacy exact resolver: dispatch the inner call directly.
         match caller.eth_call(info.resolver, inner_call) {
             Ok(out) => Ok(Some(out)),
-            Err(EvmError::Reverted { data }) => revert_outcome(&data),
+            Err(EvmError::Reverted { data }) => revert_outcome(&data, false),
             Err(e) => Err(EnsError::Call(e)),
         }
     }
 }
 
+/// Execute one ERC-3668 CALLBACK re-entry (EL-C-5-3): the host drove the
+/// gateway and hands back its response; this calls
+/// `sender.callbackFunction(response, extraData)` as a verified eth_call and
+/// returns the raw answer bytes (bytes-unwrapped when the original revert came
+/// from inside the ENSIP-10 wrap). A plain revert is "no record" (Java
+/// `decodeOutcome` parity); ANOTHER OffchainLookup revert surfaces
+/// distinguishably so the host can enforce the recursion cap (Java
+/// `MAX_RECURSION_DEPTH = 1`).
+pub fn ccip_callback(
+    caller: &dyn EthCaller,
+    sender: [u8; 20],
+    callback_function: [u8; 4],
+    response: &[u8],
+    extra_data: &[u8],
+    wrapped: bool,
+) -> Result<Option<Vec<u8>>, EnsError> {
+    let mut call = callback_function.to_vec();
+    call.extend_from_slice(&abi::encode_two_bytes_args(response, extra_data));
+    match caller.eth_call(sender, &call) {
+        Ok(out) => {
+            if wrapped {
+                Ok(abi::decode_dynamic_bytes(&out, 0))
+            } else {
+                Ok(Some(out))
+            }
+        }
+        // A second OffchainLookup carries the ORIGINAL `wrapped` forward: the
+        // flag is the original call's decode contract (see the variant doc),
+        // so a deeper round — if the cap were ever raised — still applies the
+        // right final unwrap.
+        Err(EvmError::Reverted { data }) => revert_outcome(&data, wrapped),
+        Err(e) => Err(EnsError::Call(e)),
+    }
+}
+
 /// Classify a resolver-call revert: an ERC-3668 `OffchainLookup` is a
-/// distinguishable "resolves offchain" failure (never folded into "no record");
-/// any other revert is "no record".
-fn revert_outcome(data: &[u8]) -> Result<Option<Vec<u8>>, EnsError> {
+/// distinguishable "resolves offchain" failure carrying the decoded gateway
+/// tuple (never folded into "no record"); any other revert is "no record".
+fn revert_outcome(data: &[u8], wrapped: bool) -> Result<Option<Vec<u8>>, EnsError> {
     if data.len() >= 4 && data[..4] == OFFCHAIN_LOOKUP_SELECTOR {
-        Err(EnsError::OffchainLookup)
+        Err(EnsError::OffchainLookup {
+            lookup: decode_offchain_lookup(&data[4..]).map(Box::new),
+            wrapped,
+        })
     } else {
         Ok(None)
     }
 }
+
+/// Decode the `OffchainLookup` revert BODY (after the selector): head slots are
+/// sender, urls offset, callData offset, callbackFunction (bytes4
+/// left-aligned), extraData offset (Java `OffchainLookupRevert.parseBody`
+/// bounds: ≥ 160 bytes, ≤ 32 URLs). `None` on any malformed field — the host
+/// then reports "offchain, but unparseable" instead of calling a gateway.
+fn decode_offchain_lookup(body: &[u8]) -> Option<OffchainLookup> {
+    if body.len() < 160 {
+        return None;
+    }
+    let sender = abi::decode_address(body)?;
+    let urls = abi::decode_string_array(body, 1, MAX_CCIP_URLS)?;
+    let call_data = abi::decode_dynamic_bytes(body, 2)?;
+    let callback_function: [u8; 4] = body.get(96..100)?.try_into().ok()?;
+    let extra_data = abi::decode_dynamic_bytes(body, 4)?;
+    Some(OffchainLookup { sender, urls, call_data, callback_function, extra_data })
+}
+
+/// Java `OffchainLookupRevert.MAX_URLS` twin.
+const MAX_CCIP_URLS: usize = 32;
 
 /// Walk the registry from the full name up through its ancestors (the root node
 /// itself is NOT queried — Java's `walkResolver` stops at the last label, and the
@@ -511,7 +630,12 @@ mod tests {
                     Err(EvmError::Reverted { data })
                 })
             });
-        assert_eq!(resolve_address(&caller, "offchain.eth"), Err(EnsError::OffchainLookup));
+        // A truncated body decodes to lookup:None but the WRAPPED flag and the
+        // offchain classification survive.
+        assert!(matches!(
+            resolve_address(&caller, "offchain.eth"),
+            Err(EnsError::OffchainLookup { lookup: None, wrapped: true })
+        ));
         // A plain revert stays "no record".
         let plain = MockCaller::new()
             .on(move |t, cd| (t == REGISTRY && sel(cd) == resolver_sel).then(|| Ok(addr_word(RESOLVER))))
@@ -848,6 +972,120 @@ mod tests {
         // Resolver set but name() returns an empty string.
         let caller = reverse_caller("", VITALIK);
         assert_eq!(reverse_resolve(&caller, VITALIK).unwrap(), None);
+    }
+
+    // ---- CCIP-Read (EL-C-5-3) ----
+
+    /// Hand-build a full OffchainLookup revert body (selector + 5-tuple).
+    fn offchain_revert_body(urls: &[&str]) -> Vec<u8> {
+        let word = |v: u64| {
+            let mut w = [0u8; 32];
+            w[24..].copy_from_slice(&v.to_be_bytes());
+            w
+        };
+        let dyn_bytes = |b: &[u8]| {
+            let mut out = word(b.len() as u64).to_vec();
+            out.extend_from_slice(b);
+            out.extend(std::iter::repeat_n(0u8, (32 - (b.len() % 32)) % 32));
+            out
+        };
+        // Tail parts: urls array, callData, extraData — offsets from body start.
+        let mut urls_tail = word(urls.len() as u64).to_vec();
+        let mut elems = Vec::new();
+        let mut rel = urls.len() * 32;
+        for u in urls {
+            urls_tail.extend_from_slice(&word(rel as u64));
+            let e = dyn_bytes(u.as_bytes());
+            rel += e.len();
+            elems.extend_from_slice(&e);
+        }
+        urls_tail.extend_from_slice(&elems);
+        let call_data = dyn_bytes(&[0xCA, 0x11]);
+        let extra_data = dyn_bytes(&[0xEE; 3]);
+
+        let urls_off = 160u64;
+        let calldata_off = urls_off + urls_tail.len() as u64;
+        let extra_off = calldata_off + call_data.len() as u64;
+
+        let mut body = OFFCHAIN_LOOKUP_SELECTOR.to_vec();
+        body.extend_from_slice(&addr_word([0x5E; 20])); // sender
+        body.extend_from_slice(&word(urls_off));
+        body.extend_from_slice(&word(calldata_off));
+        let mut cb = [0u8; 32];
+        cb[..4].copy_from_slice(&[0xCB, 0xCB, 0xCB, 0xCB]); // left-aligned bytes4
+        body.extend_from_slice(&cb);
+        body.extend_from_slice(&word(extra_off));
+        body.extend_from_slice(&urls_tail);
+        body.extend_from_slice(&call_data);
+        body.extend_from_slice(&extra_data);
+        body
+    }
+
+    #[test]
+    fn offchain_lookup_tuple_round_trips() {
+        let body = offchain_revert_body(&["https://gw.example/{sender}/{data}", "https://b.example"]);
+        let got = decode_offchain_lookup(&body[4..]).expect("decodes");
+        assert_eq!(got.sender, [0x5E; 20]);
+        assert_eq!(got.urls, vec!["https://gw.example/{sender}/{data}", "https://b.example"]);
+        assert_eq!(got.call_data, vec![0xCA, 0x11]);
+        assert_eq!(got.callback_function, [0xCB, 0xCB, 0xCB, 0xCB]);
+        assert_eq!(got.extra_data, vec![0xEE; 3]);
+
+        // The resolver path carries the tuple out through the error.
+        let resolver_sel = abi::selector("resolver(bytes32)");
+        let supports_sel = abi::selector("supportsInterface(bytes4)");
+        let body2 = body.clone();
+        let caller = MockCaller::new()
+            .on(move |t, cd| (t == REGISTRY && sel(cd) == resolver_sel).then(|| Ok(addr_word(RESOLVER))))
+            .on(move |t, cd| (t == RESOLVER && sel(cd) == supports_sel).then(revert))
+            .on(move |t, _cd| (t == RESOLVER).then(|| Err(EvmError::Reverted { data: body2.clone() })));
+        match resolve_address(&caller, "offchain.eth") {
+            Err(EnsError::OffchainLookup { lookup: Some(l), wrapped: false }) => {
+                assert_eq!(l.sender, [0x5E; 20]);
+                assert_eq!(l.urls.len(), 2);
+            }
+            other => panic!("expected carried tuple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_url_list_is_rejected() {
+        let urls: Vec<String> = (0..33).map(|i| format!("https://{i}.example")).collect();
+        let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let body = offchain_revert_body(&refs);
+        assert!(decode_offchain_lookup(&body[4..]).is_none()); // > MAX_CCIP_URLS
+    }
+
+    #[test]
+    fn ccip_callback_calls_sender_and_unwraps() {
+        const SENDER: [u8; 20] = [0x5E; 20];
+        let caller = MockCaller::new().on(move |t, cd| {
+            if t != SENDER || cd[..4] != [0xCB, 0xCB, 0xCB, 0xCB] {
+                return None;
+            }
+            // (response, extraData) arrive head-tail after the selector.
+            let resp = abi::decode_dynamic_bytes(&cd[4..], 0).unwrap();
+            let extra = abi::decode_dynamic_bytes(&cd[4..], 1).unwrap();
+            assert_eq!(resp, vec![0xAA]);
+            assert_eq!(extra, vec![0xEE; 3]);
+            // Return bytes-wrapping of an addr word (the wrapped path unwraps).
+            Some(Ok(dyn_bytes_return(&addr_word(VITALIK))))
+        });
+        let out = ccip_callback(&caller, SENDER, [0xCB; 4], &[0xAA], &[0xEE; 3], true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(abi::decode_address(&out), Some(VITALIK));
+        // A second OffchainLookup revert from the callback stays distinguishable
+        // (the host enforces the recursion cap).
+        let again = MockCaller::new().on(move |t, _cd| {
+            (t == SENDER).then(|| {
+                Err(EvmError::Reverted { data: OFFCHAIN_LOOKUP_SELECTOR.to_vec() })
+            })
+        });
+        assert!(matches!(
+            ccip_callback(&again, SENDER, [0xCB; 4], &[0xAA], &[], false),
+            Err(EnsError::OffchainLookup { .. })
+        ));
     }
 
     #[test]

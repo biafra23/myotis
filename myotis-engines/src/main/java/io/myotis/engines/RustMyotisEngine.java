@@ -130,7 +130,8 @@ public final class RustMyotisEngine implements MyotisEngine {
         // Mirror JavaMyotisEngine: honour a host-supplied RPC port, else the
         // network's catalog default (mainnet 8545, sepolia 8547, ...).
         int rpcPort = config.rpcPort() > 0 ? config.rpcPort() : net.defaultRpcPort();
-        RustChainHandle handle = new RustChainHandle(id, canonical, net.chainId(), rpcPort, net.hasEns());
+        RustChainHandle handle = new RustChainHandle(id, canonical, net.chainId(), rpcPort,
+                net.hasEns(), ports != null ? ports.httpGateway() : null);
         // Atomic claim (mirrors JavaMyotisEngine.putIfAbsent): reject a re-create rather
         // than orphaning the previous handle's native entry. On a lost race, release the
         // native handle we just allocated so it doesn't leak a tokio/libp2p host.

@@ -773,7 +773,7 @@ impl ElReader {
         match joined {
             Ok(Some(address)) => Ok(EnsOutcome::Resolved { address, block_number }),
             Ok(None) => Ok(EnsOutcome::NoRecord { block_number }),
-            Err(EnsError::OffchainLookup) => Ok(EnsOutcome::Offchain { block_number }),
+            Err(EnsError::OffchainLookup { .. }) => Ok(EnsOutcome::Offchain { block_number }),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -818,6 +818,70 @@ impl ElReader {
             .map_err(|_| "resolve-ens timed out".to_string())?
     }
 
+    /// One ERC-3668 CALLBACK re-entry (EL-C-5-3): the host drove the gateway;
+    /// this executes `sender.callbackFunction(response, extraData)` against the
+    /// SAME root kind as the original attempt and decodes the answer with the
+    /// original query's record semantics. A second `OffchainLookup` from the
+    /// callback surfaces as `Offchain` again — the HOST enforces the recursion
+    /// cap (Java `MAX_RECURSION_DEPTH = 1`). For a `Reverse` query the decoded
+    /// claimed name is forward-verified here, exactly like the direct path.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn ens_ccip_callback(
+        &self,
+        query: EnsQuery,
+        chain_id: u64,
+        finalized: bool,
+        sender: [u8; 20],
+        callback_function: [u8; 4],
+        response: Vec<u8>,
+        extra_data: Vec<u8>,
+        wrapped: bool,
+    ) -> Result<EnsQueryOutcome, String> {
+        let attempt = async {
+            let (ctx, executor) = if finalized {
+                self.evm_setup_finalized(chain_id, "resolve-ens").await?
+            } else {
+                self.evm_setup(chain_id, "resolve-ens").await?
+            };
+            let block_number = ctx.block_number;
+            let walk = tokio::task::spawn_blocking(move || {
+                let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
+                let raw = myotis_evm::ccip_callback(
+                    &caller,
+                    sender,
+                    callback_function,
+                    &response,
+                    &extra_data,
+                    wrapped,
+                )?;
+                let Some(raw) = raw else { return Ok(None) };
+                decode_ccip_answer(&caller, &query, &raw)
+            });
+            let joined = tokio::time::timeout(RESOLVE_ENS_ATTEMPT_DEADLINE, walk)
+                .await
+                .map_err(|_| "resolve-ens attempt timed out".to_string())?
+                .map_err(|e| format!("resolve-ens task join error: {e}"))?;
+            match joined {
+                Ok(Some(value)) => {
+                    Ok(EnsQueryOutcome::Value { value, block_number, verified: finalized })
+                }
+                Ok(None) => Ok(EnsQueryOutcome::NoRecord { block_number, verified: finalized }),
+                Err(EnsError::OffchainLookup { lookup, wrapped }) => {
+                    Ok(EnsQueryOutcome::Offchain {
+                        block_number,
+                        verified: finalized,
+                        lookup,
+                        wrapped,
+                    })
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        };
+        tokio::time::timeout(RESOLVE_ENS_DEADLINE, attempt)
+            .await
+            .map_err(|_| "resolve-ens timed out".to_string())?
+    }
+
     /// One resolution attempt against one root (finalized or optimistic).
     async fn ens_attempt(
         &self,
@@ -846,9 +910,12 @@ impl ElReader {
         match joined {
             Ok(Some(value)) => Ok(EnsQueryOutcome::Value { value, block_number, verified: finalized }),
             Ok(None) => Ok(EnsQueryOutcome::NoRecord { block_number, verified: finalized }),
-            Err(EnsError::OffchainLookup) => {
-                Ok(EnsQueryOutcome::Offchain { block_number, verified: finalized })
-            }
+            Err(EnsError::OffchainLookup { lookup, wrapped }) => Ok(EnsQueryOutcome::Offchain {
+                block_number,
+                verified: finalized,
+                lookup,
+                wrapped,
+            }),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -1356,9 +1423,113 @@ fn run_ens_query(
     })
 }
 
+/// Decode a CCIP callback's raw answer with the ORIGINAL query's record
+/// semantics (single source: the myotis-evm `decode_*_answer` helpers). A
+/// `Reverse` claimed name is forward-verified here, exactly like the direct
+/// path (the forward walk may itself surface `OffchainLookup` — propagated).
+fn decode_ccip_answer(
+    caller: &dyn myotis_evm::EthCaller,
+    query: &EnsQuery,
+    raw: &[u8],
+) -> Result<Option<EnsRecordValue>, EnsError> {
+    Ok(match query {
+        EnsQuery::Addr { .. } | EnsQuery::Interface { .. } => {
+            myotis_evm::decode_address_answer(raw).map(EnsRecordValue::Address)
+        }
+        EnsQuery::Text { .. } => myotis_evm::decode_text_answer(raw).map(EnsRecordValue::Text),
+        EnsQuery::Contenthash { .. } | EnsQuery::Multicoin { .. } | EnsQuery::DnsRecord { .. } => {
+            myotis_evm::decode_bytes_answer(raw).map(EnsRecordValue::Bytes)
+        }
+        EnsQuery::Pubkey { .. } => {
+            myotis_evm::decode_pubkey_answer(raw).map(|(x, y)| EnsRecordValue::Pubkey { x, y })
+        }
+        EnsQuery::Abi { .. } => myotis_evm::decode_abi_answer(raw)
+            .map(|(content_type, data)| EnsRecordValue::Abi { content_type, data }),
+        EnsQuery::Reverse { address } => match myotis_evm::decode_name_answer(raw) {
+            None => None,
+            // Same hardening as the direct reverse path: a MALFORMED claimed
+            // name (adversarial gateway data) is a failed verify, never an
+            // error a malicious resolver can force.
+            Some(claimed) => match myotis_evm::resolve_address(caller, &claimed) {
+                Ok(Some(fwd)) if fwd == *address => Some(EnsRecordValue::Name(claimed)),
+                Ok(_) | Err(EnsError::InvalidName(_)) => None,
+                Err(e) => return Err(e),
+            },
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ScriptedCaller(Vec<([u8; 20], Vec<u8>)>);
+    impl myotis_evm::EthCaller for ScriptedCaller {
+        fn eth_call(
+            &self,
+            target: [u8; 20],
+            calldata: &[u8],
+        ) -> Result<Vec<u8>, myotis_evm::EvmError> {
+            for (t, out) in &self.0 {
+                if *t == target {
+                    let _ = calldata;
+                    return Ok(out.clone());
+                }
+            }
+            Ok(vec![0u8; 32])
+        }
+    }
+
+    fn addr_word(a: [u8; 20]) -> Vec<u8> {
+        let mut w = vec![0u8; 32];
+        w[12..].copy_from_slice(&a);
+        w
+    }
+
+    #[test]
+    fn ccip_answer_decodes_per_query_kind() {
+        // Addr answers decode as addresses — NOT pubkey/bytes (the queryMethod
+        // mis-map regression class).
+        let caller = ScriptedCaller(Vec::new());
+        let addr = decode_ccip_answer(
+            &caller,
+            &EnsQuery::Addr { name: "a.eth".into() },
+            &addr_word([0xd8; 20]),
+        )
+        .unwrap();
+        assert_eq!(addr, Some(EnsRecordValue::Address([0xd8; 20])));
+        // The same 32-byte answer under a pubkey query is None (needs 64) —
+        // proving the kinds are NOT interchangeable.
+        let pk = decode_ccip_answer(
+            &caller,
+            &EnsQuery::Pubkey { name: "a.eth".into() },
+            &addr_word([0xd8; 20]),
+        )
+        .unwrap();
+        assert_eq!(pk, None);
+    }
+
+    #[test]
+    fn ccip_reverse_malformed_claimed_name_is_none_not_error() {
+        // A gateway-supplied claimed name with an interior empty label must be
+        // a failed forward-verify (None), never an InvalidName error.
+        let mut claimed = vec![0u8; 32];
+        claimed[31] = 0x20;
+        let name = b"a..eth";
+        let mut len = vec![0u8; 32];
+        len[31] = name.len() as u8;
+        claimed.extend_from_slice(&len);
+        claimed.extend_from_slice(name);
+        claimed.extend_from_slice(&[0u8; 26]);
+        let caller = ScriptedCaller(Vec::new());
+        let out = decode_ccip_answer(
+            &caller,
+            &EnsQuery::Reverse { address: [0xd8; 20] },
+            &claimed,
+        )
+        .unwrap();
+        assert_eq!(out, None);
+    }
 
     #[test]
     fn next_base_fee_at_target_is_unchanged() {
