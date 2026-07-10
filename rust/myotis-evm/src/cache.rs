@@ -201,6 +201,11 @@ impl<K: std::hash::Hash + Eq + Clone, V> Lru<K, V> {
         // Lowest tick == least recently touched. Ticks are monotonic within the
         // map's lifetime; a `wrapping_add` overflow would need 2^64 operations,
         // far beyond any process lifetime, so ordering is effectively total.
+        //
+        // O(len) scan per eviction: sub-millisecond even at the 65 536-entry
+        // cap and dwarfed by the network fetch that precedes every insert —
+        // but if EL-C-3-2's batch fan-out makes inserts burst (64/chunk), move
+        // to an ordered/amortized structure before raising capacity again.
         if let Some(victim) = self
             .map
             .iter()

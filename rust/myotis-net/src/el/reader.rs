@@ -277,7 +277,11 @@ pub struct ElReader {
 /// Per-kind bound for the cross-call state-proof cache (accounts and storage
 /// slots each) — Java `STATE_PROOF_CACHE_MAX` parity: sized so a ~1000-token
 /// balance sweep's slots survive across the prefetch convergence loop and
-/// repeat calls (~64k small entries ≈ a few MB; eviction is LRU).
+/// repeat calls. Honest ceiling: BOTH kinds fully populated cost ~40 MB
+/// (hashbrown buckets: accounts ~176 B, storage ~128 B × 128k buckets each),
+/// and full population is reachable on a long-running daemon because keys
+/// include the state_root (every new head re-proves). Same order as the Java
+/// cache at the same count; eviction is LRU.
 const EVM_PROOF_CACHE_ENTRIES: usize = 65_536;
 
 /// Overall deadline for one ENS resolution walk (mirrors the Java

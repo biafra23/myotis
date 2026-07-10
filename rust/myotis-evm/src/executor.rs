@@ -196,7 +196,11 @@ impl EvmExecutor {
         // CODELESS account costs exactly 21000 — no EVM run and NO 1.15 buffer
         // (it's exact). One verified account fetch through the caching database
         // decides it; an account WITH code (contract, or an EIP-7702-delegated
-        // EOA) falls through to the full estimate.
+        // EOA) falls through to the full estimate. Fork/chain validation still
+        // runs FIRST — an unsupported chain or too-old fork fails closed here
+        // exactly like the full path, never answering 21000 for a context the
+        // executor wouldn't execute.
+        spec_for(ctx.chain_id, ctx.block_number, ctx.timestamp)?;
         if calldata.is_empty() {
             let db = OracleDatabase::new(
                 Arc::clone(&self.oracle),
@@ -463,6 +467,46 @@ mod tests {
             .estimate_gas([0x42; 20], TARGET, &[], U256::ZERO, &ctx(19_500_000, CANCUN_TIME + 1))
             .unwrap();
         assert_eq!(est, 21_000);
+    }
+
+    #[test]
+    fn oracle_failure_during_short_circuit_is_an_error_not_21000() {
+        // State unavailable must NEVER read as "no code → 21000" — that would
+        // hand out a plausible number for a recipient we couldn't verify.
+        struct FailingOracle;
+        impl crate::oracle::SnapStateOracle for FailingOracle {
+            fn fetch_account(
+                &self,
+                state_root: &[u8; 32],
+                address: [u8; 20],
+            ) -> Result<Option<OracleAccount>, crate::oracle::OracleError> {
+                Err(crate::oracle::OracleError::StateUnavailable {
+                    state_root: *state_root,
+                    address,
+                    slot: None,
+                })
+            }
+            fn fetch_storage(
+                &self,
+                _: &[u8; 32],
+                _: [u8; 20],
+                _: U256,
+            ) -> Result<U256, crate::oracle::OracleError> {
+                unreachable!("short-circuit only fetches the account")
+            }
+            fn fetch_bytecode(&self, _: &[u8; 32]) -> Result<Vec<u8>, crate::oracle::OracleError> {
+                unreachable!("short-circuit only fetches the account")
+            }
+        }
+        let exec = EvmExecutor::new(
+            Arc::new(FailingOracle),
+            Arc::new(NoopStateProofCache),
+            Arc::new(NoopBytecodeCache),
+        );
+        let got = exec.estimate_gas(
+            [0x42; 20], TARGET, &[], U256::ZERO, &ctx(19_500_000, CANCUN_TIME + 1),
+        );
+        assert!(got.is_err(), "state-unavailable must be an error, got {got:?}");
     }
 
     #[test]
