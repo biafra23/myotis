@@ -37,6 +37,9 @@ use crate::status::{fork_digest, fork_digest_bpo, StatusMessage};
 #[derive(Debug, Clone)]
 pub struct ChainConfig {
     pub name: &'static str,
+    /// The EL chain id (EIP-155) — threaded into the EVM reads (eth_call /
+    /// estimateGas / ENS) so nothing downstream hardcodes a network.
+    pub chain_id: u64,
     pub fork_version: [u8; 4],
     /// Prior fork version, accepted as a discv5 fork-digest fallback (the Java
     /// `NetworkConfig.acceptedForkDigests`). None for mainnet (on Fulu; stale
@@ -74,6 +77,7 @@ impl ChainConfig {
     pub fn mainnet() -> Self {
         Self {
             name: "mainnet",
+            chain_id: 1,
             // Fulu, activated at slot 13164544 (2025-12-03).
             fork_version: [0x06, 0x00, 0x00, 0x00],
             prior_fork_version: None,
@@ -97,6 +101,44 @@ impl ChainConfig {
             checkpoint_slot: 14_560_000,
             static_peers: MAINNET_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: MAINNET_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
+            discv5_port: 0,
+            snapshot_path: None,
+            cl_peer_cache_path: None,
+        }
+    }
+
+    /// Sepolia — values duplicated verbatim from the Java
+    /// `NetworkConfig.SEPOLIA` (networking/src/main/java/.../NetworkConfig.java),
+    /// whose sepolia CL wiring landed in PR #192.
+    pub fn sepolia() -> Self {
+        Self {
+            name: "sepolia",
+            chain_id: 11_155_111,
+            // Fulu on sepolia (0x90000075) — activated at epoch 272640 (2025-10-14).
+            fork_version: [0x90, 0x00, 0x00, 0x75],
+            // No prior-fork fallback (same rationale as mainnet: stale digests
+            // wouldn't help us sync to the current head anyway).
+            prior_fork_version: None,
+            genesis_validators_root: hex32(
+                "d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078",
+            ),
+            genesis_time: 1_655_733_600, // 2022-06-20 14:00:00 UTC
+            seconds_per_slot: 12, // mainnet preset
+            slots_per_epoch: 32,
+            // EIP-7892 BLOB_SCHEDULE — latest active entry on sepolia: BPO2 at
+            // epoch 275712, MAX_BLOBS_PER_BLOCK=21 (2025-10-28).
+            blob_params_epoch: 275_712,
+            blob_params_max_blobs: 21,
+            // Copied verbatim from the @checkpoint:sepolia:begin/end region of
+            // NetworkConfig.java (slot 10657440, 2026-07-09, period 1300). Like
+            // mainnet, `./gradlew refreshSepoliaCheckpoint` rewrites only the Java
+            // region — a refresh must be mirrored here by hand until plan PR7.
+            checkpoint_root: hex32(
+                "8c3bc10ed8e1567dbdb60da360091c9af38e6b64e7de553a1ba2b0a5ffdfa5f6",
+            ),
+            checkpoint_slot: 10_657_440,
+            static_peers: SEPOLIA_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
+            bootstrap_enrs: SEPOLIA_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
             snapshot_path: None,
             cl_peer_cache_path: None,
@@ -148,6 +190,29 @@ fn hex32(s: &str) -> [u8; 32] {
     }
     out
 }
+
+/// Pinned sepolia LC-serving peer multiaddrs (Java `NetworkConfig.SEPOLIA.clPeerMultiaddrs`).
+const SEPOLIA_STATIC_PEERS: &[&str] = &[
+    "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS",
+];
+
+/// Sepolia CL discv5 bootstrap ENRs (Java `NetworkConfig.SEPOLIA.clDiscv5Bootnodes` —
+/// mirrors eth-clients/sepolia metadata/bootstrap_nodes.yaml: EF, Teku, Lodestar).
+const SEPOLIA_BOOTSTRAP_ENRS: &[&str] = &[
+    // EF
+    "enr:-Ku4QDZ_rCowZFsozeWr60WwLgOfHzv1Fz2cuMvJqN5iJzLxKtVjoIURY42X_YTokMi3IGstW5v32uSYZyGUXj9Q_IECh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCo_ujukAAAaf__________gmlkgnY0gmlwhIpEe5iJc2VjcDI1NmsxoQNHTpFdaNSCEWiN_QqT396nb0PzcUpLe3OVtLph-AciBYN1ZHCCIy0",
+    "enr:-Ku4QHRyRwEPT7s0XLYzJ_EeeWvZTXBQb4UCGy1F_3m-YtCNTtDlGsCMr4UTgo4uR89pv11uM-xq4w6GKfKhqU31hTgCh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCo_ujukAAAaf__________gmlkgnY0gmlwhIrFM7WJc2VjcDI1NmsxoQI4diTwChN3zAAkarf7smOHCdFb1q3DSwdiQ_Lc_FdzFIN1ZHCCIy0",
+    "enr:-Ku4QOkvvf0u5Hg4-HhY-SJmEyft77G5h3rUM8VF_e-Hag5cAma3jtmFoX4WElLAqdILCA-UWFRN1ZCDJJVuEHrFeLkDh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCo_ujukAAAaf__________gmlkgnY0gmlwhJK-AWeJc2VjcDI1NmsxoQLFcT5VE_NMiIC8Ll7GypWDnQ4UEmuzD7hF_Hf4veDJwIN1ZHCCIy0",
+    "enr:-Ku4QH6tYsHKITYeHUu5kdfXgEZWI18EWk_2RtGOn1jBPlx2UlS_uF3Pm5Dx7tnjOvla_zs-wwlPgjnEOcQDWXey51QCh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCo_ujukAAAaf__________gmlkgnY0gmlwhIs7Mc6Jc2VjcDI1NmsxoQIET4Mlv9YzhrYhX_H9D7aWMemUrvki6W4J2Qo0YmFMp4N1ZHCCIy0",
+    "enr:-Ku4QDmz-4c1InchGitsgNk4qzorWMiFUoaPJT4G0IiF8r2UaevrekND1o7fdoftNucirj7sFFTTn2-JdC2Ej0p1Mn8Ch2F0dG5ldHOIAAAAAAAAAACEZXRoMpCo_ujukAAAaf__________gmlkgnY0gmlwhKpA-liJc2VjcDI1NmsxoQMpHP5U1DK8O_JQU6FadmWbE42qEdcGlllR8HcSkkfWq4N1ZHCCIy0",
+    // Teku
+    "enr:-Iu4QKvMF7Ne_RSQoZGvavTuZ1QA5_Pgeb0nq_hrjhU8s0UDV3KhcMXJkGwOWhsDGZL3ISjL0CTP-hfoTjZtEtCEwR4BgmlkgnY0gmlwhAOAaySJc2VjcDI1NmsxoQNta5b_bexSSwwrGW2Re24MjfMntzFd0f2SAxQtMj3ueYN0Y3CCIyiDdWRwgiMo",
+    // Lodestar
+    "enr:-KG4QJejf8KVtMeAPWFhN_P0c4efuwu1pZHELTveiXUeim6nKYcYcMIQpGxxdgT2Xp9h-M5pr9gn2NbbwEAtxzu50Y8BgmlkgnY0gmlwhEEVkQCDaXA2kCoBBPnAEJg4AAAAAAAAAAGJc2VjcDI1NmsxoQLEh_eVvk07AQABvLkTGBQTrrIOQkzouMgSBtNHIRUxOIN1ZHCCIyiEdWRwNoIjKA",
+    // remaining bootstrap_nodes.yaml entries (unattributed)
+    "enr:-Iq4QMCTfIMXnow27baRUb35Q8iiFHSIDBJh6hQM5Axohhf4b6Kr_cOCu0htQ5WvVqKvFgY28893DHAg8gnBAXsAVqmGAX53x8JggmlkgnY0gmlwhLKAlv6Jc2VjcDI1NmsxoQK6S-Cii_KmfFdUJL2TANL3ksaKUnNXvTCv1tLwXs0QgIN1ZHCCIyk",
+    "enr:-L64QC9Hhov4DhQ7mRukTOz4_jHm4DHlGL726NWH4ojH1wFgEwSin_6H95Gs6nW2fktTWbPachHJ6rUFu0iJNgA0SB2CARqHYXR0bmV0c4j__________4RldGgykDb6UBOQAABx__________-CaWSCdjSCaXCEA-2vzolzZWNwMjU2azGhA17lsUg60R776rauYMdrAz383UUgESoaHEzMkvm4K6k6iHN5bmNuZXRzD4N0Y3CCIyiDdWRwgiMo",
+];
 
 /// Known light-client-serving mainnet peers — the Java `NetworkConfig.MAINNET`
 /// clPeerMultiaddrs list (nimbus/lodestar/lighthouse, discovered 2026-03-11).
@@ -1803,6 +1868,35 @@ mod tests {
         assert_eq!(c.accepted_fork_digests(), vec![[0x8C, 0x9F, 0x62, 0xFE]]);
         assert_eq!(c.static_peers.len(), 18);
         assert_eq!(c.bootstrap_enrs.len(), 17);
+        assert_eq!(c.chain_id, 1);
+    }
+
+    #[test]
+    fn sepolia_config_matches_networkconfig_java() {
+        let c = ChainConfig::sepolia();
+        assert_eq!(c.chain_id, 11_155_111);
+        assert_eq!(c.fork_version, [0x90, 0x00, 0x00, 0x75]); // Fulu on sepolia
+        assert_eq!(c.checkpoint_slot, 10_657_440);
+        assert_eq!(
+            hex_str(&c.checkpoint_root),
+            "8c3bc10ed8e1567dbdb60da360091c9af38e6b64e7de553a1ba2b0a5ffdfa5f6"
+        );
+        assert_eq!(
+            hex_str(&c.genesis_validators_root),
+            "d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078"
+        );
+        assert_eq!(c.genesis_time, 1_655_733_600);
+        assert_eq!(c.seconds_per_slot, 12);
+        assert_eq!(c.slots_per_epoch, 32);
+        assert_eq!((c.blob_params_epoch, c.blob_params_max_blobs), (275_712, 21));
+        // Checkpoint period 1300 (slot / 8192) — matches the Java region comment.
+        assert_eq!(spec::compute_sync_committee_period(c.checkpoint_slot), 1300);
+        // The live digest the Java computes (verified by running
+        // NetworkConfig.SEPOLIA.currentForkDigest() — BPO2 folded in).
+        assert_eq!(c.current_fork_digest(), [0x74, 0xD0, 0x14, 0x59]);
+        assert_eq!(c.accepted_fork_digests(), vec![[0x74, 0xD0, 0x14, 0x59]]);
+        assert_eq!(c.static_peers.len(), 1);
+        assert_eq!(c.bootstrap_enrs.len(), 9);
     }
 
     #[test]

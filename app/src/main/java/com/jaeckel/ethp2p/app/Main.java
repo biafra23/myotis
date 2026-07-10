@@ -300,7 +300,12 @@ public final class Main {
                     ? new EngineConfig(network, 0, 0, 0,
                             syncSnapshotFile(network).toString(), gossipsubEnabled,
                             SNAP_PEER_TARGET, strict, dataDir)
-                    : new EngineConfig(network, portOverride, 9000, 8545,
+                    : new EngineConfig(network, portOverride, 9000,
+                            // Legacy 8545 stays pinned for mainnet (byte-identical
+                            // single-network behavior); other networks take their
+                            // catalog default (0 = engine default; sepolia 8547) so a
+                            // sepolia daemon beside a mainnet one doesn't collide.
+                            "mainnet".equals(network) ? 8545 : 0,
                             syncSnapshotFile(network).toString(), gossipsubEnabled,
                             SNAP_PEER_TARGET, strict, dataDir);
             // dnsServers=null → resolver's default DNS (the daemon, unlike Android, has

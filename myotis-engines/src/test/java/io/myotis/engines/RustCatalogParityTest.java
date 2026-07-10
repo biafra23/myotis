@@ -56,15 +56,20 @@ class RustCatalogParityTest {
     }
 
     @Test
-    void createRejectsNonMainnet() {
-        // R1 hosts mainnet only; a canonical-but-unsupported network is a named
-        // EngineException (auto mode falls back to Java on it).
+    void createRejectsUnhostedNetwork() {
+        // The native side is the source of truth for hosted networks: gnosis is
+        // canonical but has no Rust config yet, so nativeCreate returns
+        // UNSUPPORTED_NETWORK and create() raises a named EngineException (auto
+        // mode falls back to Java on it). Mainnet + sepolia pass this gate.
+        assumeTrue(RustMyotisEngine.isAvailable(),
+                "libmyotis_engine not on java.library.path — skipping native gate test");
         RustMyotisEngine rust = new RustMyotisEngine();
         EngineConfig cfg = new EngineConfig(
                 "gnosis", 0, 0, 0, null, false, 0, true, "/tmp/myotis-test");
         EngineException e = assertThrows(EngineException.class,
                 () -> rust.create(cfg, null));
-        assertEquals(true, e.getMessage().contains("mainnet only"),
+        org.junit.jupiter.api.Assertions.assertTrue(
+                e.getMessage().contains("does not host gnosis"),
                 "unexpected message: " + e.getMessage());
     }
 }

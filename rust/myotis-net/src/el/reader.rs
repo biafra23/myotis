@@ -84,6 +84,32 @@ impl ElConfig {
             cache_path: None,
         }
     }
+
+    /// Sepolia EL parameters — duplicated verbatim from the Java
+    /// `NetworkConfig.SEPOLIA` (fork-id is the post-BPO2/Fusaka pinned hash the
+    /// Java engine also carries; a hard fork needs a bump here, same as mainnet).
+    pub fn sepolia() -> ElConfig {
+        const SEPOLIA_BOOTNODES: &[&str] = &[
+            "138.197.51.181:30303",
+            "146.190.1.103:30303",
+            "170.64.250.88:30303",
+            "139.59.49.206:30303",
+            "138.68.123.152:30303",
+        ];
+        ElConfig {
+            network_id: 11_155_111,
+            genesis_hash: hex32("25a5cc106eea7138acab33231d7160d69cb777ee0c2c553fcddf5138993e6dd9"),
+            fork_id_hash: [0x26, 0x89, 0x56, 0xb6],
+            fork_next: 0,
+            bootnodes: SEPOLIA_BOOTNODES.iter().filter_map(|s| s.parse().ok()).collect(),
+            discv4_port: 0,
+            // Sepolia's conventional EL port (Java `defaultElPort` 30305);
+            // informational for a dialer, like mainnet's 30303.
+            listen_port: 30305,
+            pool_config: PoolConfig::default(),
+            cache_path: None,
+        }
+    }
 }
 
 /// A verified account query result — the account data, the proof verdict, and
@@ -237,8 +263,19 @@ impl ElReader {
         anchor: Arc<ExecAnchor>,
         cache_path: Option<std::path::PathBuf>,
     ) -> Result<ElReader, String> {
+        ElReader::start_for(anchor, cache_path, ElConfig::mainnet()).await
+    }
+
+    /// Start a reader for any network's [`ElConfig`] with a freshly-generated
+    /// ephemeral node key (see [`Self::start_mainnet`] for the key rationale).
+    /// `base` is the network's config; `cache_path` overrides its peer cache.
+    pub async fn start_for(
+        anchor: Arc<ExecAnchor>,
+        cache_path: Option<std::path::PathBuf>,
+        base: ElConfig,
+    ) -> Result<ElReader, String> {
         let key = generate_node_key()?;
-        let cfg = ElConfig { cache_path, ..ElConfig::mainnet() };
+        let cfg = ElConfig { cache_path, ..base };
         ElReader::start(key, anchor, cfg).await
     }
 
@@ -1188,6 +1225,20 @@ mod tests {
             c.genesis_hash,
             hex32("d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3")
         );
-        assert!(!c.bootnodes.is_empty());
+        assert_eq!(c.bootnodes.len(), 4, "all four mainnet bootnodes must parse");
+    }
+
+    #[test]
+    fn sepolia_config_pins_known_values() {
+        let cfg = ElConfig::sepolia();
+        assert_eq!(cfg.network_id, 11_155_111);
+        assert_eq!(
+            cfg.genesis_hash,
+            super::hex32("25a5cc106eea7138acab33231d7160d69cb777ee0c2c553fcddf5138993e6dd9")
+        );
+        assert_eq!(cfg.fork_id_hash, [0x26, 0x89, 0x56, 0xb6]);
+        assert_eq!(cfg.fork_next, 0);
+        assert_eq!(cfg.bootnodes.len(), 5, "all five sepolia bootnodes must parse");
+        assert_eq!(cfg.listen_port, 30305);
     }
 }

@@ -97,27 +97,40 @@ public final class RustMyotisEngine implements MyotisEngine {
     // multi-step create (nativeCreate → putIfAbsent) and teardown are not. These are
     // cold lifecycle paths, so the coarse lock costs nothing. (synchronized is
     // reentrant, so shutdownAll → stop() on the same thread is fine.)
+    /** The catalog entry for a canonical name, or null when unknown. */
+    private NetworkInfo networkInfo(String canonical) {
+        if (canonical == null) return null;
+        for (NetworkInfo n : availableNetworks()) {
+            if (canonical.equals(n.name())) return n;
+        }
+        return null;
+    }
+
     @Override
     public synchronized ChainHandle create(EngineConfig config, EnginePorts ports) {
         if (config == null) throw new EngineException("engine config is required");
         String canonical = canonicalNetworkName(config.networkName());
-        if (!"mainnet".equals(canonical)) {
-            // R1 hosts mainnet only; auto mode falls back to Java on this.
-            throw new EngineException("the R1 Rust engine hosts mainnet only (got: "
-                    + canonical + ")");
+        NetworkInfo net = networkInfo(canonical);
+        if (net == null) {
+            throw new EngineException("unknown network: " + config.networkName());
         }
+        // The native side is the single source of truth for which networks it
+        // hosts: nativeCreate returns UNSUPPORTED_NETWORK for a canonical network
+        // whose Rust config hasn't landed (today: gnosis), and auto mode falls
+        // back to Java on the exception.
         long id = RustEngineNative.nativeCreate(canonical, config.dataDir());
+        if (id == RustEngineNative.UNSUPPORTED_NETWORK) {
+            throw new EngineException(
+                    "the Rust engine does not host " + canonical + " yet");
+        }
         if (id < 0) {
-            // On this path the network is always mainnet (checked above), so id < 0
-            // means the Rust runtime could not initialize. Named so auto mode falls back.
             throw new EngineException("the Rust engine could not initialize the runtime for "
                     + canonical);
         }
         // Mirror JavaMyotisEngine: honour a host-supplied RPC port, else the
-        // mainnet default (8545). The Rust engine hosts mainnet only, so the
-        // per-network default is a constant here.
-        int rpcPort = config.rpcPort() > 0 ? config.rpcPort() : 8545;
-        RustChainHandle handle = new RustChainHandle(id, canonical, 1L, rpcPort);
+        // network's catalog default (mainnet 8545, sepolia 8547, ...).
+        int rpcPort = config.rpcPort() > 0 ? config.rpcPort() : net.defaultRpcPort();
+        RustChainHandle handle = new RustChainHandle(id, canonical, net.chainId(), rpcPort);
         // Atomic claim (mirrors JavaMyotisEngine.putIfAbsent): reject a re-create rather
         // than orphaning the previous handle's native entry. On a lost race, release the
         // native handle we just allocated so it doesn't leak a tokio/libp2p host.
