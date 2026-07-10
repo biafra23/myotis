@@ -31,7 +31,7 @@ use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
 
 use crate::block::BlockContext;
 use crate::cache::{BytecodeCache, StateProofCache};
-use crate::database::OracleDatabase;
+use crate::database::{AccessSet, OracleDatabase};
 use crate::error::EvmError;
 use crate::fork::spec_for;
 use crate::oracle::{OracleError, SnapStateOracle};
@@ -40,6 +40,20 @@ use crate::oracle::{OracleError, SnapStateOracle};
 /// per-tx gas cap so revm's spec-default cap (2²⁴ on the latest fork, EIP-7825)
 /// doesn't clip an `eth_call` that legitimately wants the full block budget.
 pub const VIEW_CALL_GAS: u64 = 30_000_000;
+
+/// Speculative-prefetch convergence cap (Java `DEFAULT_ITERATION_CAP` — plan-
+/// mandated 4): at most two sentinel discovery passes, then real runs; a call
+/// still discovering at the cap fails closed.
+const PREFETCH_ITERATION_CAP: usize = 4;
+
+/// Interpret a converged real run for the call path.
+fn finish_call(result: ExecutionResult) -> Result<Vec<u8>, EvmError> {
+    match result {
+        ExecutionResult::Success { output, .. } => Ok(output_bytes(output)),
+        ExecutionResult::Revert { output, .. } => Err(EvmError::Reverted { data: output.to_vec() }),
+        ExecutionResult::Halt { reason, .. } => Err(map_halt(reason)),
+    }
+}
 
 /// The exact intrinsic cost of a plain value transfer — the empty-calldata
 /// no-code estimate short-circuit's answer (unbuffered; Java parity).
@@ -138,14 +152,33 @@ impl EvmExecutor {
         // rules — the chain id itself is set via cfg.chain_id, and every chain
         // spec_for knows (mainnet, sepolia) is rule-identical at a given SpecId.
         let spec = spec_for(ctx.chain_id, ctx.block_number, ctx.timestamp)?;
+        let db = self.database_for(ctx);
+        self.execute_with_db(&db, spec, caller, target, calldata, value, ctx)
+    }
 
-        let db = OracleDatabase::new(
+    fn database_for(&self, ctx: &BlockContext) -> OracleDatabase {
+        OracleDatabase::new(
             Arc::clone(&self.oracle),
             ctx.state_root,
             Arc::clone(&self.proof_cache),
             Arc::clone(&self.bytecode_cache),
-        );
+        )
+    }
 
+    /// One `transact` against a caller-owned database (the convergence loop
+    /// shares ONE database — and thus one per-call view cache — across all of
+    /// its iterations, so fetched state carries forward).
+    #[allow(clippy::too_many_arguments)]
+    fn execute_with_db(
+        &self,
+        db: &OracleDatabase,
+        spec: revm::primitives::hardfork::SpecId,
+        caller: Address,
+        target: [u8; 20],
+        calldata: &[u8],
+        value: U256,
+        ctx: &BlockContext,
+    ) -> Result<ExecutionResult, EvmError> {
         let mut cfg = CfgEnv::new_with_spec(spec);
         cfg.chain_id = ctx.chain_id;
         // Not a real tx: relax the transaction-level checks (see the module docs).
@@ -179,7 +212,13 @@ impl EvmExecutor {
         Ok(evm.transact(tx).map_err(map_evm_error)?.result)
     }
 
-    /// Run a call and return its output bytes (revert/halt → `Err`).
+    /// Run a call and return its output bytes (revert/halt → `Err`), via the
+    /// speculative prefetch CONVERGENCE LOOP (the Java `PrefetchingEvmExecutor.
+    /// runConvergent` twin): sentinel discovery passes hand out zero-shaped
+    /// placeholders for network misses while recording every access; each pass
+    /// discovers one data-dependency hop, whose fresh accesses are batch-warmed
+    /// in one parallel wave; the last two iterations always run REAL. Fails
+    /// closed with [`EvmError::IterationLimitExceeded`] at the cap.
     fn call(
         &self,
         caller: Address,
@@ -188,13 +227,103 @@ impl EvmExecutor {
         value: U256,
         ctx: &BlockContext,
     ) -> Result<Vec<u8>, EvmError> {
-        match self.execute(caller, target, calldata, value, ctx)? {
-            ExecutionResult::Success { output, .. } => Ok(output_bytes(output)),
-            ExecutionResult::Revert { output, .. } => {
-                Err(EvmError::Reverted { data: output.to_vec() })
-            }
-            ExecutionResult::Halt { reason, .. } => Err(map_halt(reason)),
+        self.call_capped(caller, target, calldata, value, ctx, PREFETCH_ITERATION_CAP)
+    }
+
+    /// [`Self::call`] with an explicit iteration cap (tests pin the fail-closed
+    /// cap behavior with cap=1, mirroring Java's `iterationCapOfOneAlwaysExceeds`).
+    #[allow(clippy::too_many_arguments)]
+    fn call_capped(
+        &self,
+        caller: Address,
+        target: [u8; 20],
+        calldata: &[u8],
+        value: U256,
+        ctx: &BlockContext,
+        cap: usize,
+    ) -> Result<Vec<u8>, EvmError> {
+        let spec = spec_for(ctx.chain_id, ctx.block_number, ctx.timestamp)?;
+        let db = self.database_for(ctx);
+
+        // Prime the target's account + code synchronously (sentinel OFF, not
+        // access-tracked — Java parity) so iteration 0 executes real top-level
+        // code instead of a sentinel empty account.
+        if let Some(acc) = db.basic_ref(Address::from(target))? {
+            db.code_by_hash_ref(acc.code_hash)?;
         }
+        let _ = db.take_access_set(); // the prime is not part of any snapshot
+
+        let mut seen = AccessSet::default();
+        let mut discovering = true;
+        for iter in 0..cap {
+            // Sentinel while still discovering, but the LAST TWO iterations are
+            // always real (one final wave + one warm real run).
+            let sentinel = discovering && iter + 2 < cap;
+            db.set_sentinel(sentinel);
+            let misses_before = db.sentinel_misses();
+            let outcome = self.execute_with_db(&db, spec, caller, target, calldata, value, ctx);
+            db.set_sentinel(false);
+            let fresh = db.take_access_set().minus(&seen);
+
+            if sentinel {
+                // A sentinel run that discovered nothing new AND handed out no
+                // placeholder was all verified hits — byte-identical to a real
+                // run: return it (the hit-only fast path). A sentinel failure
+                // (zeroes tripping a require()) is tolerated; its partial
+                // access set still drives the wave.
+                if fresh.is_empty() {
+                    if db.sentinel_misses() == misses_before {
+                        if let Ok(result) = outcome {
+                            return finish_call(result);
+                        }
+                    }
+                    discovering = false;
+                } else {
+                    self.prefetch_wave(ctx, &fresh);
+                    let mut merged = seen;
+                    merged.merge(fresh);
+                    seen = merged;
+                }
+            } else {
+                // Real-run outcomes are authoritative: errors (incl. reverts —
+                // they ARE the answer, callers key on the revert data) propagate.
+                let result = outcome?;
+                if fresh.is_empty() {
+                    return finish_call(result); // converged
+                }
+                // Still discovering under real mode (a sentinel zero had hidden
+                // a branch): warm the stragglers and run again.
+                self.prefetch_wave(ctx, &fresh);
+                let mut merged = seen;
+                merged.merge(fresh);
+                seen = merged;
+            }
+        }
+        Err(EvmError::IterationLimitExceeded { cap })
+    }
+
+    /// One best-effort parallel warm-up wave over freshly-discovered accesses:
+    /// slots grouped per account + the touched accounts + code hashes, handed to
+    /// the oracle's batch primitive (concurrent per-peer fan-out on the network
+    /// oracle; no-op on fixtures).
+    fn prefetch_wave(&self, ctx: &BlockContext, fresh: &AccessSet) {
+        let mut by_account: std::collections::HashMap<[u8; 20], Vec<U256>> =
+            std::collections::HashMap::new();
+        for addr in &fresh.accounts {
+            by_account.entry(*addr).or_default();
+        }
+        for (addr, slot) in &fresh.slots {
+            by_account.entry(*addr).or_default().push(*slot);
+        }
+        let items: Vec<([u8; 20], Vec<U256>)> = by_account.into_iter().collect();
+        let code_hashes: Vec<[u8; 32]> = fresh.code_hashes.iter().copied().collect();
+        self.oracle.prefetch_batch(
+            &ctx.state_root,
+            &items,
+            &code_hashes,
+            &*self.proof_cache,
+            &*self.bytecode_cache,
+        );
     }
 
     /// Run a call and return the gas-limit estimate (revert/halt → `Err`).
@@ -571,6 +700,98 @@ mod tests {
             .estimate_gas([0x42; 20], TARGET, &[0xFFu8; 8], U256::ZERO, &ctx(19_500_000, CANCUN_TIME + 1))
             .unwrap();
         assert!(est > 21_000, "calldata must not short-circuit, was {est}");
+    }
+
+    #[test]
+    fn iteration_cap_of_one_always_exceeds() {
+        // Java iterationCapOfOneAlwaysExceeds twin: any state-reading call needs
+        // ≥2 iterations to converge (discover, then confirm), so cap=1 must fail
+        // CLOSED — never answer from a run that was still discovering.
+        let code = vec![0x60u8, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let exec = executor_with(code, Some(U256::from(7u64)));
+        let got = exec.call_capped(
+            Address::from([0u8; 20]), TARGET, &[], U256::ZERO,
+            &ctx(19_500_000, CANCUN_TIME + 1), 1,
+        );
+        assert!(
+            matches!(got, Err(EvmError::IterationLimitExceeded { cap: 1 })),
+            "cap=1 must fail closed, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn sentinel_revert_is_tolerated_and_real_run_answers() {
+        // The contract REVERTs when slot0 == 0 — exactly what the sentinel pass
+        // sees (placeholder zero). The revert must be swallowed, the discovered
+        // slot warmed, and the REAL run (slot0 = 7) return successfully.
+        // PUSH1 0 SLOAD PUSH1 0x0b JUMPI PUSH1 0 PUSH1 0 REVERT JUMPDEST
+        // PUSH1 0 SLOAD PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 RETURN
+        let code = vec![
+            0x60u8, 0x00, 0x54, 0x60, 0x0b, 0x57, 0x60, 0x00, 0x60, 0x00, 0xfd, 0x5b,
+            0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+        ];
+        let exec = executor_with(code, Some(U256::from(7u64)));
+        let out = exec
+            .call_view(TARGET, &[], &ctx(19_500_000, CANCUN_TIME + 1))
+            .expect("sentinel revert must not surface; the real run answers");
+        assert_eq!(U256::from_be_slice(&out), U256::from(7u64));
+    }
+
+    #[test]
+    fn prefetch_wave_carries_the_discovered_slot() {
+        // A recording oracle: the wave must fire with the SLOAD-discovered slot
+        // grouped under the target account.
+        #[derive(Default)]
+        struct Recording {
+            inner: FixtureSnapStateOracle,
+            waves: std::sync::Mutex<Vec<Vec<([u8; 20], Vec<U256>)>>>,
+        }
+        impl crate::oracle::SnapStateOracle for Recording {
+            fn fetch_account(
+                &self, r: &[u8; 32], a: [u8; 20],
+            ) -> Result<Option<OracleAccount>, crate::oracle::OracleError> {
+                self.inner.fetch_account(r, a)
+            }
+            fn fetch_storage(
+                &self, r: &[u8; 32], a: [u8; 20], s: U256,
+            ) -> Result<U256, crate::oracle::OracleError> {
+                self.inner.fetch_storage(r, a, s)
+            }
+            fn fetch_bytecode(&self, h: &[u8; 32]) -> Result<Vec<u8>, crate::oracle::OracleError> {
+                self.inner.fetch_bytecode(h)
+            }
+            fn prefetch_batch(
+                &self,
+                _root: &[u8; 32],
+                accounts: &[([u8; 20], Vec<U256>)],
+                _code: &[[u8; 32]],
+                _ps: &dyn crate::cache::StateProofCache,
+                _cs: &dyn crate::cache::BytecodeCache,
+            ) {
+                self.waves.lock().unwrap().push(accounts.to_vec());
+            }
+        }
+        let code = vec![0x60u8, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let ch = keccak256(&code);
+        let mut fx = FixtureSnapStateOracle::new().with_account(
+            ROOT, TARGET,
+            OracleAccount { nonce: 1, balance: U256::ZERO, code_hash: ch, storage_root: [0x9; 32] },
+        );
+        assert_eq!(fx.with_bytecode(code), ch);
+        let fx = fx.with_storage(ROOT, TARGET, [0u8; 32], U256::from(7u64));
+        let rec = Arc::new(Recording { inner: fx, waves: std::sync::Mutex::new(Vec::new()) });
+        let exec = EvmExecutor::new(
+            Arc::clone(&rec) as Arc<dyn crate::oracle::SnapStateOracle>,
+            Arc::new(NoopStateProofCache),
+            Arc::new(NoopBytecodeCache),
+        );
+        let out = exec.call_view(TARGET, &[], &ctx(19_500_000, CANCUN_TIME + 1)).unwrap();
+        assert_eq!(U256::from_be_slice(&out), U256::from(7u64));
+        let waves = rec.waves.lock().unwrap();
+        assert!(!waves.is_empty(), "the sentinel pass must trigger a wave");
+        let first = &waves[0];
+        let target_item = first.iter().find(|(a, _)| *a == TARGET).expect("target in wave");
+        assert!(target_item.1.contains(&U256::ZERO), "slot 0 must ride the wave");
     }
 
     #[test]

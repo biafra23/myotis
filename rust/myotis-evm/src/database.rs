@@ -41,6 +41,54 @@ struct ViewCache {
     /// `None` marks an address proven absent — cached so we don't re-fetch it.
     accounts: HashMap<[u8; 20], Option<OracleAccount>>,
     storage: HashMap<([u8; 20], U256), U256>,
+    /// Per-call bytecode (the Java `SyncStateView` holds code too): keeps the
+    /// primed/fetched code alive across the convergence loop's iterations even
+    /// when the shared bytecode cache is a Noop — a sentinel pass must execute
+    /// the REAL primed code, not an empty placeholder.
+    code: HashMap<[u8; 32], Bytes>,
+}
+
+/// Everything one execution TOUCHED (hit or miss) — the prefetch loop diffs
+/// consecutive snapshots to find newly-discovered dependencies (the Java
+/// `AccessTracker` twin, collapsed to the DB layer: every revm read passes
+/// through here, so no separate opcode tracer is needed).
+#[derive(Debug, Default, Clone)]
+pub struct AccessSet {
+    pub accounts: std::collections::HashSet<[u8; 20]>,
+    pub slots: std::collections::HashSet<([u8; 20], U256)>,
+    pub code_hashes: std::collections::HashSet<[u8; 32]>,
+}
+
+impl AccessSet {
+    pub fn is_empty(&self) -> bool {
+        self.accounts.is_empty() && self.slots.is_empty() && self.code_hashes.is_empty()
+    }
+
+    /// The entries of `self` not present in `seen`.
+    pub fn minus(&self, seen: &AccessSet) -> AccessSet {
+        AccessSet {
+            accounts: self.accounts.difference(&seen.accounts).copied().collect(),
+            slots: self.slots.difference(&seen.slots).copied().collect(),
+            code_hashes: self.code_hashes.difference(&seen.code_hashes).copied().collect(),
+        }
+    }
+
+    pub fn merge(&mut self, other: AccessSet) {
+        self.accounts.extend(other.accounts);
+        self.slots.extend(other.slots);
+        self.code_hashes.extend(other.code_hashes);
+    }
+}
+
+/// Sentinel-mode + access-tracking state (the Java `SyncStateView` sentinel
+/// semantics): with sentinel ON, a read that would need the network (tier 3)
+/// instead returns a zero-shaped placeholder WITHOUT caching it and bumps the
+/// miss counter — one cheap discovery pass per data-dependency hop.
+#[derive(Default)]
+struct Track {
+    sentinel: bool,
+    misses: u64,
+    set: AccessSet,
 }
 
 /// A `revm` state source backed by a verified oracle + the caches, pinned to one
@@ -51,6 +99,7 @@ pub struct OracleDatabase {
     proof_cache: Arc<dyn StateProofCache>,
     bytecode_cache: Arc<dyn BytecodeCache>,
     view: Mutex<ViewCache>,
+    track: Mutex<Track>,
 }
 
 impl OracleDatabase {
@@ -68,12 +117,36 @@ impl OracleDatabase {
             proof_cache,
             bytecode_cache,
             view: Mutex::new(ViewCache::default()),
+            track: Mutex::new(Track::default()),
         }
+    }
+
+    /// Toggle sentinel mode (prefetch discovery passes). OFF by default.
+    pub fn set_sentinel(&self, on: bool) {
+        self.track.lock().unwrap().sentinel = on;
+    }
+
+    /// Cumulative count of sentinel placeholders handed out — if a run finishes
+    /// with this unchanged, every read was a verified hit and the run is
+    /// byte-identical to a real one (the hit-only fast path).
+    pub fn sentinel_misses(&self) -> u64 {
+        self.track.lock().unwrap().misses
+    }
+
+    /// Snapshot AND clear the per-iteration access set (misses stay cumulative).
+    pub fn take_access_set(&self) -> AccessSet {
+        std::mem::take(&mut self.track.lock().unwrap().set)
+    }
+
+    /// The state root this database is pinned to.
+    pub fn state_root(&self) -> [u8; 32] {
+        self.state_root
     }
 
     /// Resolve an account through the three tiers. Returns the cached/ fetched
     /// account, or `None` when proven absent.
     fn account(&self, addr: [u8; 20]) -> Result<Option<OracleAccount>, OracleError> {
+        self.track.lock().unwrap().set.accounts.insert(addr);
         // Tier 1 — this call.
         if let Some(cached) = self.view.lock().unwrap().accounts.get(&addr) {
             return Ok(cached.clone());
@@ -87,6 +160,16 @@ impl OracleDatabase {
                 .accounts
                 .insert(addr, maybe_acc.clone());
             return Ok(maybe_acc);
+        }
+        // Sentinel: a would-be network fetch instead hands out a zero-shaped
+        // placeholder (revm sees a nonexistent account), UNCACHED so a later
+        // real pass re-fetches, and counts the miss.
+        {
+            let mut track = self.track.lock().unwrap();
+            if track.sentinel {
+                track.misses += 1;
+                return Ok(None);
+            }
         }
         // Tier 3 — a fresh verified fetch. The lock is NOT held across it: the
         // oracle may block on the network, and a call runs single-threaded so
@@ -148,10 +231,25 @@ impl DatabaseRef for OracleDatabase {
         if hash == EMPTY_CODE_HASH {
             return Ok(Bytecode::default());
         }
+        self.track.lock().unwrap().set.code_hashes.insert(hash);
+        // Tier 1 — this call's view (primed target code lives here).
+        if let Some(bytes) = self.view.lock().unwrap().code.get(&hash) {
+            return Ok(to_bytecode(bytes.clone()));
+        }
         // A cache hit was verified (below) when first stored, and the cache is
         // keyed by hash, so it needs no re-check.
         if let Some(bytes) = self.bytecode_cache.get(&hash) {
+            self.view.lock().unwrap().code.insert(hash, bytes.clone());
             return Ok(to_bytecode(bytes));
+        }
+        // Sentinel: empty code, uncached, counted — nested CALLs short-circuit
+        // in discovery passes (expected; the real pass executes them).
+        {
+            let mut track = self.track.lock().unwrap();
+            if track.sentinel {
+                track.misses += 1;
+                return Ok(Bytecode::default());
+            }
         }
         let bytes: Bytes = self.oracle.fetch_bytecode(&hash)?.into();
         // Defense-in-depth at the trust boundary: bytecode is content-addressed,
@@ -174,11 +272,13 @@ impl DatabaseRef for OracleDatabase {
             });
         }
         self.bytecode_cache.put(&hash, bytes.clone());
+        self.view.lock().unwrap().code.insert(hash, bytes.clone());
         Ok(to_bytecode(bytes))
     }
 
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let addr = address.into_array();
+        self.track.lock().unwrap().set.slots.insert((addr, index));
         // Tier 1.
         if let Some(v) = self.view.lock().unwrap().storage.get(&(addr, index)) {
             return Ok(*v);
@@ -190,6 +290,14 @@ impl DatabaseRef for OracleDatabase {
         {
             self.view.lock().unwrap().storage.insert((addr, index), v);
             return Ok(v);
+        }
+        // Sentinel: placeholder zero, uncached, counted (see `account`).
+        {
+            let mut track = self.track.lock().unwrap();
+            if track.sentinel {
+                track.misses += 1;
+                return Ok(U256::ZERO);
+            }
         }
         // Tier 3 — verified fetch (the oracle handles the account/storage-root and
         // empty-trie short-circuit internally). Lock released across it as above.

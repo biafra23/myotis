@@ -151,6 +151,22 @@ pub trait SnapStateOracle: Send + Sync {
     /// Bytecode whose `keccak256` equals `code_hash` (content-addressed, so not
     /// tied to a state root). Empty for the empty-code hash.
     fn fetch_bytecode(&self, code_hash: &[u8; 32]) -> Result<Vec<u8>, OracleError>;
+
+    /// Best-effort BATCH warm-up (the Java `fetchBatch` twin, EL-C-3-2): fetch +
+    /// verify every `(account, slots…)` item and every code hash CONCURRENTLY
+    /// where the transport allows, writing verified results into the sinks.
+    /// Silent on failure — the per-item path re-fetches whatever is missing, so
+    /// batching can never weaken correctness. Default: no-op (a fixture needs
+    /// no warm-up; its per-item fetches are free).
+    fn prefetch_batch(
+        &self,
+        _state_root: &[u8; 32],
+        _accounts: &[([u8; 20], Vec<U256>)],
+        _code_hashes: &[[u8; 32]],
+        _proof_sink: &dyn crate::cache::StateProofCache,
+        _code_sink: &dyn crate::cache::BytecodeCache,
+    ) {
+    }
 }
 
 #[cfg(any(test, feature = "fixture"))]

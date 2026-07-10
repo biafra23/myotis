@@ -28,7 +28,10 @@ use tokio::runtime::Handle;
 
 use myotis_core::header::BlockHeader;
 use myotis_core::trie::{AccountLeaf, EMPTY_TRIE_ROOT};
-use myotis_evm::{BlockContext, OracleAccount, OracleError, SnapStateOracle, U256};
+use myotis_evm::{
+    BlockContext, BytecodeCache, OracleAccount, OracleError, SnapStateOracle, StateProofCache,
+    U256,
+};
 
 use crate::el::peer::ManagedPeer;
 use crate::el::snap::fetch::AccountOutcome;
@@ -179,6 +182,18 @@ pub fn block_context(header: &BlockHeader, chain_id: u64) -> Result<BlockContext
     })
 }
 
+/// Map a proof-verified account leaf to the oracle's account shape; `None` when
+/// the balance scalar is oversized (an adversarial leaf can't reach here, but
+/// stay panic-free).
+fn leaf_account(leaf: &AccountLeaf) -> Option<OracleAccount> {
+    Some(OracleAccount {
+        nonce: leaf.nonce,
+        balance: u256_be(&leaf.balance)?,
+        code_hash: leaf.code_hash,
+        storage_root: leaf.storage_root,
+    })
+}
+
 /// A minimal big-endian scalar → `u64`, saturating rather than panicking. Base
 /// fee never approaches `u64::MAX` on mainnet; a longer/oversized scalar (which a
 /// proof-verified header can't produce) saturates instead of aborting.
@@ -293,24 +308,130 @@ impl SnapStateOracle for PoolOracle {
         address: [u8; 20],
     ) -> Result<Option<OracleAccount>, OracleError> {
         match self.leaf(state_root, address)? {
-            Some(leaf) => {
-                let balance = u256_be(&leaf.balance).ok_or_else(|| OracleError::InvalidProof {
+            Some(leaf) => leaf_account(&leaf)
+                .ok_or_else(|| OracleError::InvalidProof {
                     state_root: *state_root,
                     address,
                     detail: format!(
                         "account balance scalar too long ({} bytes)",
                         leaf.balance.len()
                     ),
-                })?;
-                Ok(Some(OracleAccount {
-                    nonce: leaf.nonce,
-                    balance,
-                    code_hash: leaf.code_hash,
-                    storage_root: leaf.storage_root,
-                }))
-            }
+                })
+                .map(Some),
             None => Ok(None),
         }
+    }
+
+    /// Best-effort batch warm-up (EL-C-3-2; the Java `fetchBatch` twin adapted to
+    /// this transport): chunk the account items at 64 path-sets, pin each chunk
+    /// to ONE peer (rotating per chunk), fan its account+slot fetches out
+    /// CONCURRENTLY (≤48 in flight — the Java `PREFETCH_MAX_IN_FLIGHT`), and
+    /// write verified results straight into the cross-call sinks. Failures are
+    /// silent per item; the per-item path re-fetches whatever is missing.
+    /// Bytecode (content-addressed) fans out over rotating peers the same way.
+    fn prefetch_batch(
+        &self,
+        state_root: &[u8; 32],
+        accounts: &[([u8; 20], Vec<U256>)],
+        code_hashes: &[[u8; 32]],
+        proof_sink: &dyn StateProofCache,
+        code_sink: &dyn BytecodeCache,
+    ) {
+        use futures::stream::{self, StreamExt};
+        const BATCH_PATHSET_CHUNK: usize = 64; // Java SnapBackedStateOracle parity
+        const MAX_IN_FLIGHT: usize = 48; // Java PREFETCH_MAX_IN_FLIGHT
+
+        if self.peers.is_empty() || (accounts.is_empty() && code_hashes.is_empty()) {
+            return;
+        }
+        let quality = self.quality.clone();
+        self.handle.block_on(async {
+            for (chunk_idx, chunk) in accounts.chunks(BATCH_PATHSET_CHUNK).enumerate() {
+                let peer = &self.peers[chunk_idx % self.peers.len()];
+                let served: Vec<bool> = stream::iter(chunk.iter().map(|(addr, slots)| {
+                    let peer = Arc::clone(peer);
+                    async move {
+                        // Skip items another call already proved at this root.
+                        if proof_sink.get_account(state_root, addr).is_some()
+                            && slots.iter().all(|s| {
+                                proof_sink.get_storage(state_root, addr, s).is_some()
+                            })
+                        {
+                            return true;
+                        }
+                        let leaf = match peer.snap_get_account(state_root, addr).await {
+                            Ok(AccountOutcome::Present(leaf)) => leaf,
+                            Ok(AccountOutcome::Absent) => {
+                                proof_sink.put_account(state_root, addr, None);
+                                // Every slot of a proven-absent account is zero.
+                                for slot in slots {
+                                    proof_sink.put_storage(state_root, addr, slot, U256::ZERO);
+                                }
+                                return true;
+                            }
+                            Err(_) => return false,
+                        };
+                        let Some(account) = leaf_account(&leaf) else {
+                            return false; // oversized balance scalar — not cacheable
+                        };
+                        proof_sink.put_account(state_root, addr, Some(account));
+                        if leaf.storage_root == EMPTY_TRIE_ROOT {
+                            for slot in slots {
+                                proof_sink.put_storage(state_root, addr, slot, U256::ZERO);
+                            }
+                            return true;
+                        }
+                        // The item's slots, concurrently on the SAME peer.
+                        let values = futures::future::join_all(slots.iter().map(|slot| {
+                            let position = slot.to_be_bytes::<32>();
+                            let peer = Arc::clone(&peer);
+                            let leaf = leaf.clone();
+                            async move {
+                                peer.snap_get_storage(state_root, addr, &leaf, &position)
+                                    .await
+                                    .ok()
+                                    .and_then(|bytes| u256_be(&bytes))
+                            }
+                        }))
+                        .await;
+                        for (slot, value) in slots.iter().zip(values) {
+                            if let Some(v) = value {
+                                proof_sink.put_storage(state_root, addr, slot, v);
+                            }
+                        }
+                        true
+                    }
+                }))
+                .buffer_unordered(MAX_IN_FLIGHT)
+                .collect()
+                .await;
+                // Chunk-level reputation: any served item confirms the peer; a
+                // chunk where EVERYTHING failed strikes it.
+                if let Some(q) = &quality {
+                    if served.iter().any(|&ok| ok) {
+                        q.served(peer.addr()).await;
+                    } else if !served.is_empty() {
+                        q.failed(peer.addr()).await;
+                    }
+                }
+            }
+            // Bytecode: content-addressed, verified by hash inside the peer call.
+            let code_fetches = code_hashes.iter().enumerate().map(|(i, hash)| {
+                let peer = Arc::clone(&self.peers[i % self.peers.len()]);
+                async move {
+                    if code_sink.get(hash).is_some() {
+                        return;
+                    }
+                    if let Ok(code) = peer.snap_get_bytecode(hash).await {
+                        code_sink.put(hash, code.into());
+                    }
+                }
+            });
+            stream::iter(code_fetches)
+                .buffer_unordered(MAX_IN_FLIGHT)
+                .collect::<Vec<()>>()
+                .await;
+        });
     }
 
     fn fetch_storage(

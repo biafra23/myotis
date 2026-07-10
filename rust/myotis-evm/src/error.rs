@@ -32,6 +32,10 @@ pub enum EvmError {
     /// revm rejected the transaction envelope itself (should not happen for a
     /// well-formed view call — surfaced rather than swallowed).
     Transaction { detail: String },
+    /// The speculative prefetch convergence loop didn't settle within its
+    /// iteration cap (Java `IterationLimitExceeded` twin) — fail closed rather
+    /// than answer from a run that was still discovering state.
+    IterationLimitExceeded { cap: usize },
 }
 
 impl From<OracleError> for EvmError {
@@ -57,6 +61,10 @@ impl std::fmt::Display for EvmError {
                 write!(f, "unsupported chain id {chain_id} (executor is mainnet-only)")
             }
             EvmError::Transaction { detail } => write!(f, "invalid transaction: {detail}"),
+            EvmError::IterationLimitExceeded { cap } => write!(
+                f,
+                "call did not converge within {cap} prefetch iterations"
+            ),
         }
     }
 }
