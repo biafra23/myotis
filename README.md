@@ -70,7 +70,7 @@ A number-pinned read (wallets pin every read to the block they just saw) is serv
 
 ## Run
 
-Myotis runs in two forms: the **Android app** (the wallet node, with the verified JSON-RPC server for a same-device wallet) and the **desktop daemon/CLI** (the same engine for development, with a CLI/IPC command surface). Both run the full devp2p + libp2p stack, the beacon light client, and the local EVM.
+Myotis runs in three forms: the **Android app** and the **desktop app** (both Compose GUIs over the shared `:ui`, running the wallet node with the verified JSON-RPC server), and the **desktop daemon/CLI** (the same engine for development, with a CLI/IPC command surface). All three run the full devp2p + libp2p stack, the beacon light client, and the local EVM.
 
 ### Android
 
@@ -80,6 +80,36 @@ Myotis runs in two forms: the **Android app** (the wallet node, with the verifie
 ```
 
 The app runs the node as a foreground `NodeService` (Start/Stop in the UI). Once it reaches `SYNCED`, the JSON-RPC server is live on `127.0.0.1:8545`; point an on-device MetaMask at `http://localhost:8545` (custom network, chain id 1). The app persists the sync snapshot, the known-state-root window, and light-client-capable peers, so warm restarts reach `SYNCED` in ~10 s. minSdk 29.
+
+### Desktop app (GUI)
+
+`:app-desktop` is the Compose-Multiplatform desktop GUI — the same `:ui` NodeScreen the Android app hosts, driving the Java backend in-process. It shows sync status, peers, and the Logs tab, and serves the same verified JSON-RPC.
+
+```bash
+# Run from source (dev loop) — starts the GUI, compiling the Rust engine first
+./gradlew :app-desktop:run
+
+# Pick the engine: java (default) | rust | auto
+./gradlew :app-desktop:run -Pengine=rust
+```
+
+Build a native installer for the host OS with jpackage. **jpackage is host-OS-bound**: the `.dmg` can only be produced on macOS and the `.deb` only on Linux (CI builds each on its matching runner — `desktop-dmg.yml` / `desktop-linux-deb.yml`); locally you get the format for your OS. Only macOS and Linux formats are configured today — Windows packaging (`.msi`) isn't enabled yet, so these tasks fail on a Windows host.
+
+```bash
+# macOS → build a .dmg  (output under app-desktop/build/compose/binaries/main/dmg/)
+./gradlew :app-desktop:packageDmg
+
+# Linux → build a .deb  (output under app-desktop/build/compose/binaries/main/deb/)
+./gradlew :app-desktop:packageDeb
+
+# Or just the right format for whatever OS you're on
+./gradlew :app-desktop:packageDistributionForCurrentOS
+
+# Run the packaged app straight out of the build dir (no installer step)
+./gradlew :app-desktop:runDistributable
+```
+
+The bundle embeds a full Java 21 runtime (the `:networking`/`:myotis-evm` backend ships Java-21 classes and reaches JDK modules reflectively, so the whole module graph is included). Packaged builds currently ship the Java engine; the Rust engine is loaded only on the `run`/`syncSmoke` dev tasks until the packaging PR bundles the native lib. Logs roll under `~/.myotis/logs`; the app's log level comes from the `myotis.log.level` JVM system property (default `INFO`). Note that a `-D` flag on a `./gradlew :app-desktop:run` command line reaches the Gradle JVM, not the app — for a packaged app, edit the `java-options` in the bundle's generated `Myotis.cfg`.
 
 ### Desktop daemon
 
