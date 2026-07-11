@@ -44,17 +44,17 @@ subprojects {
             exclude(group = "io.netty", module = "netty-transport-native-epoll")
             exclude(group = "io.netty", module = "netty-transport-native-kqueue")
             exclude(group = "io.netty", module = "netty-transport-native-unix-common")
-        // Besu 26.4 drags log4j-slf4j2-impl — a SECOND slf4j provider — plus
-        // log4j-core. Whichever provider classloads first gets ALL logging;
-        // jpackage's flattened classpath deterministically picked log4j and the
-        // desktop app's Logs tab (a LOGBACK appender) went dark. Logback is
-        // this repo's one true backend: drop the competing provider + core
-        // everywhere; Besu's log4j-api calls route into slf4j via the
-        // log4j-to-slf4j bridge (added in :myotis-evm).
-        exclude(group = "org.apache.logging.log4j", module = "log4j-slf4j2-impl")
-        exclude(group = "org.apache.logging.log4j", module = "log4j-slf4j-impl")
-        exclude(group = "org.apache.logging.log4j", module = "log4j-slf4j18-impl")
-        exclude(group = "org.apache.logging.log4j", module = "log4j-core")
+            // Besu 26.4 drags log4j-slf4j2-impl — a SECOND slf4j provider — plus
+            // log4j-core. Whichever provider classloads first gets ALL logging;
+            // jpackage's flattened classpath deterministically picked log4j and the
+            // desktop app's Logs tab (a LOGBACK appender) went dark. Logback is
+            // this repo's one true backend: drop the competing provider + core
+            // everywhere; Besu's log4j-api calls route into slf4j via the
+            // log4j-to-slf4j bridge (added in :myotis-evm).
+            exclude(group = "org.apache.logging.log4j", module = "log4j-slf4j2-impl")
+            exclude(group = "org.apache.logging.log4j", module = "log4j-slf4j-impl")
+            exclude(group = "org.apache.logging.log4j", module = "log4j-slf4j18-impl")
+            exclude(group = "org.apache.logging.log4j", module = "log4j-core")
         }
         return@subprojects
     }
