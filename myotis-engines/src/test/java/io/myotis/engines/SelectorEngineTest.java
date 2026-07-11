@@ -40,6 +40,10 @@ class SelectorEngineTest {
     @AfterEach
     void resetChoice() {
         Engines.select("java");
+        // The engine is a process-global singleton: if an assertion fired between a
+        // test's create() and its stop(), the network would stay hosted and poison
+        // later tests. stop() is a no-op when nothing is hosted.
+        Engines.engine().stop("mainnet");
     }
 
     // --- minimal working ports so the JAVA path can actually create ---
