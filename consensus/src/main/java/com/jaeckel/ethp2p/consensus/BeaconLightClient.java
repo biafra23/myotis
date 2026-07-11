@@ -886,32 +886,34 @@ public class BeaconLightClient implements AutoCloseable {
         for (BeaconP2PService.PeerInfo pi : connected) {
             lcByPeerId.put(pi.peerId(), pi.supportsLightClient());
         }
-        List<String> newConfirmed = new ArrayList<>();
-        List<String> newDenied = new ArrayList<>();
-        for (String ma : copyPeers(false)) {
-            String pid = peerIdOf(ma);
-            Boolean lc = pid != null ? lcByPeerId.get(pid) : null;
-            if (lc == null) continue; // not Identified this round
-            if (lc) {
-                // Non-short-circuit |: apply both set updates, report only CHANGES —
-                // the classification sweep runs this every cycle, so unconditional
-                // reporting would fire the persistence callback with no-op payloads
-                // each round.
-                if (peersNoLcUpdates.remove(ma) | provenLightClient.add(ma)) newConfirmed.add(ma);
-            } else if (!provenLightClient.contains(ma)) {
-                // Mirror the cache's stickiness IN MEMORY: an Identify list lacking
-                // light_client never demotes a peer that demonstrably served us —
-                // without this the per-cycle sweep would re-demote a serve-proven
-                // peer every 12s and wedge it out of the fan-out window.
-                if (peersNoLcUpdates.add(ma)) newDenied.add(ma);
+        synchronized (lcVerdictLock) {
+            List<String> newConfirmed = new ArrayList<>();
+            List<String> newDenied = new ArrayList<>();
+            for (String ma : copyPeers(false)) {
+                String pid = peerIdOf(ma);
+                Boolean lc = pid != null ? lcByPeerId.get(pid) : null;
+                if (lc == null) continue; // not Identified this round
+                if (lc) {
+                    // Non-short-circuit |: apply both set updates, report only CHANGES —
+                    // the classification sweep runs this every cycle, so unconditional
+                    // reporting would fire the persistence callback with no-op payloads
+                    // each round.
+                    if (peersNoLcUpdates.remove(ma) | provenLightClient.add(ma)) newConfirmed.add(ma);
+                } else if (!provenLightClient.contains(ma)) {
+                    // Mirror the cache's stickiness IN MEMORY: an Identify list lacking
+                    // light_client never demotes a peer that demonstrably served us —
+                    // without this the per-cycle sweep would re-demote a serve-proven
+                    // peer every 12s and wedge it out of the fan-out window.
+                    if (peersNoLcUpdates.add(ma)) newDenied.add(ma);
+                }
             }
-        }
-        // Persist the whole round's verdicts in one shot — a per-peer callback would
-        // trigger a disk rewrite for each of dozens of peers identified in parallel.
-        java.util.function.BiConsumer<java.util.Collection<String>, java.util.Collection<String>> verdictCb =
-                onLightClientVerdict;
-        if (verdictCb != null && (!newConfirmed.isEmpty() || !newDenied.isEmpty())) {
-            verdictCb.accept(newConfirmed, newDenied);
+            // Persist the whole round's verdicts in one shot — a per-peer callback would
+            // trigger a disk rewrite for each of dozens of peers identified in parallel.
+            java.util.function.BiConsumer<java.util.Collection<String>, java.util.Collection<String>> verdictCb =
+                    onLightClientVerdict;
+            if (verdictCb != null && (!newConfirmed.isEmpty() || !newDenied.isEmpty())) {
+                verdictCb.accept(newConfirmed, newDenied);
+            }
         }
     }
 
@@ -941,7 +943,7 @@ public class BeaconLightClient implements AutoCloseable {
         }
         if (untried.isEmpty()) return;
         List<CompletableFuture<Void>> batch = new ArrayList<>(CLASSIFY_SWEEP_BATCH);
-        int start = classifySweepCursor % untried.size();
+        int start = Math.floorMod(classifySweepCursor, untried.size()); // floorMod: survives cursor overflow
         classifySweepCursor += CLASSIFY_SWEEP_BATCH;
         for (int i = 0; i < Math.min(CLASSIFY_SWEEP_BATCH, untried.size()); i++) {
             if (!running) return;
@@ -2230,35 +2232,48 @@ public class BeaconLightClient implements AutoCloseable {
      * queues counts as confirmed (it served; the rejection was transient).
      */
     private void recordLcVerdicts(java.util.Queue<String> confirmed, java.util.Queue<String> denied) {
-        List<String> newConfirmed = new ArrayList<>();
-        List<String> newDenied = new ArrayList<>();
-        java.util.Set<String> confirmedSet = new java.util.HashSet<>();
-        for (String p; (p = confirmed.poll()) != null; ) {
-            confirmedSet.add(p);
-            // Deliberately NO recentServes stamp here: that map means "last
-            // SUCCESSFUL (verified) light-client response" — it backs the
-            // servedPeersLastMinute health signal and the recency ordering.
-            // Stamping decode-only losers would show ~16 peers "serving"
-            // during a stale-committee stall (the exact stall the metric
-            // exists to expose) and recency-rank unverifiable responders
-            // first. The round's WINNER gets its stamp via notifyPeerSuccess.
-            boolean changed = peersNoLcUpdates.remove(p) | provenLightClient.add(p);
-            if (changed) newConfirmed.add(p);
-        }
-        for (String p; (p = denied.poll()) != null; ) {
-            if (confirmedSet.contains(p)) continue;
-            // A hard protocol rejection DOES demote a proven peer in memory (unlike
-            // the Identify sweep's weaker list-absence signal): the peer's mux just
-            // said it no longer speaks the protocol. Non-short-circuit | for the
-            // same report-only-changes gating as the confirm arm.
-            if (provenLightClient.remove(p) | peersNoLcUpdates.add(p)) newDenied.add(p);
-        }
-        java.util.function.BiConsumer<java.util.Collection<String>, java.util.Collection<String>> cb =
-                onLightClientVerdict;
-        if (cb != null && (!newConfirmed.isEmpty() || !newDenied.isEmpty())) {
-            cb.accept(newConfirmed, newDenied);
+        synchronized (lcVerdictLock) {
+            List<String> newConfirmed = new ArrayList<>();
+            List<String> newDenied = new ArrayList<>();
+            java.util.Set<String> confirmedSet = new java.util.HashSet<>();
+            for (String p; (p = confirmed.poll()) != null; ) {
+                confirmedSet.add(p);
+                // Deliberately NO recentServes stamp here: that map means "last
+                // SUCCESSFUL (verified) light-client response" — it backs the
+                // servedPeersLastMinute health signal and the recency ordering.
+                // Stamping decode-only losers would show ~16 peers "serving"
+                // during a stale-committee stall (the exact stall the metric
+                // exists to expose) and recency-rank unverifiable responders
+                // first. The round's WINNER gets its stamp via notifyPeerSuccess.
+                boolean changed = peersNoLcUpdates.remove(p) | provenLightClient.add(p);
+                if (changed) newConfirmed.add(p);
+            }
+            for (String p; (p = denied.poll()) != null; ) {
+                if (confirmedSet.contains(p)) continue;
+                // A hard protocol rejection DOES demote a proven peer in memory (unlike
+                // the Identify sweep's weaker list-absence signal): the peer's mux just
+                // said it no longer speaks the protocol. Non-short-circuit | for the
+                // same report-only-changes gating as the confirm arm.
+                if (provenLightClient.remove(p) | peersNoLcUpdates.add(p)) newDenied.add(p);
+            }
+            java.util.function.BiConsumer<java.util.Collection<String>, java.util.Collection<String>> cb =
+                    onLightClientVerdict;
+            if (cb != null && (!newConfirmed.isEmpty() || !newDenied.isEmpty())) {
+                cb.accept(newConfirmed, newDenied);
+            }
         }
     }
+
+    /**
+     * Serializes the two verdict appliers ({@link #recordLcVerdicts} on the poll
+     * thread, {@link #applyIdentifyVerdicts} on the catch-up executor): their
+     * check-then-act sequences over the proven/nolc set PAIR aren't atomic on
+     * their own, so an interleaving could transiently leave a peer in both sets
+     * (or neither) and mis-gate the change-only persistence reports. Dedicated
+     * lock (not {@code this}, which other lifecycle paths monitor) — both bodies
+     * are cheap set ops plus an at-most-once-per-change cache write.
+     */
+    private final Object lcVerdictLock = new Object();
 
     /**
      * Push the current store state into the shared {@link BeaconSyncState}.
