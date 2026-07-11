@@ -7,6 +7,7 @@ netty-kotlin = "main-SNAPSHOT"
 bouncycastle = "1.78.1"
 junit = "5.10.0"
 slf4j = "2.0.12"
+log4j = "2.25.3"  # matches Besu 26.4's log4j-bom; bump in lockstep with Besu
 logback = "1.5.6"
 snappy = "0.4"
 milagro = "0.4.0"
@@ -69,6 +70,7 @@ netty-handler       = { module = "com.github.biafra23.netty-kotlin:netty-handler
 bouncycastle        = { module = "org.bouncycastle:bcprov-jdk18on",        version.ref = "bouncycastle" }
 
 slf4j-api           = { module = "org.slf4j:slf4j-api",                   version.ref = "slf4j" }
+log4j-to-slf4j      = { module = "org.apache.logging.log4j:log4j-to-slf4j", version.ref = "log4j" }
 logback-classic     = { module = "ch.qos.logback:logback-classic",         version.ref = "logback" }
 
 snappy              = { module = "org.iq80.snappy:snappy",                  version.ref = "snappy" }
