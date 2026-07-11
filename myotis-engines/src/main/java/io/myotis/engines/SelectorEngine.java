@@ -151,7 +151,18 @@ public final class SelectorEngine implements MyotisEngine {
      * engine badge) — routing stays on {@link #owners} via get/stop.
      */
     String ownerKind(String networkName) {
+        if (networkName == null) return null;
         MyotisEngine owner = owners.get(networkName);
+        if (owner == null) {
+            // Callers pass canonical names (host snapshots carry them), but tolerate
+            // an alias. Best-effort only: canonicalNetworkName throws on unknown
+            // names, and a display accessor must never throw.
+            try {
+                owner = owners.get(java.canonicalNetworkName(networkName));
+            } catch (EngineException e) {
+                return null;
+            }
+        }
         if (owner == null) return null;
         return owner instanceof RustMyotisEngine ? "rust" : "java";
     }
