@@ -60,6 +60,17 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
+      # The packaged app bundles the Rust engine (appResources): build it from
+      # source here. prepareRustAppResources fails the build if the lib is
+      # missing, so this step is REQUIRED, not optional.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
@@ -121,7 +132,16 @@ jobs:
           echo "bundled libjvm: $info"
           echo "$info" | grep -q "$want_elf" \
             || { echo "::error::ELF arch mismatch: expected $want_elf in: $info"; exit 1; }
-          echo "OK: ${{ matrix.arch }} deb is $want_deb/$want_elf"
+          # The bundled Rust engine must exist AND match (both legs build on
+          # native-arch runners so cargo's host triple is already right; this
+          # assertion keeps that assumption honest).
+          rustlib=$(find "$ex" -type f -name 'libmyotis_engine.so' | head -n1 || true)
+          [ -n "$rustlib" ] || { echo "::error::libmyotis_engine.so missing from the deb"; exit 1; }
+          rustinfo=$(file -b "$rustlib")
+          echo "bundled rust engine: $rustinfo"
+          echo "$rustinfo" | grep -q "$want_elf" \
+            || { echo "::error::rust engine ELF arch mismatch: expected $want_elf in: $rustinfo"; exit 1; }
+          echo "OK: ${{ matrix.arch }} deb is $want_deb/$want_elf (rust engine bundled)"
 
       - name: Upload DEB
         uses: actions/upload-artifact@v4

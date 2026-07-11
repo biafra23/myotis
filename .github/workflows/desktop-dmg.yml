@@ -78,6 +78,23 @@ jobs:
           distribution: 'temurin'
           architecture: ${{ matrix.java-arch }}
 
+      # The packaged app bundles the Rust engine (appResources): build it from
+      # source here. prepareRustAppResources fails the build if the lib is
+      # missing, so this step is REQUIRED, not optional.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Both matrix legs run on arm64 macos-14; the x64 leg is a Rosetta
+          # cross-build. cargo builds its HOST triple regardless of the JVM's
+          # arch, so the x64 leg must cross-compile explicitly or the x64 dmg
+          # would bundle an arm64 dylib (dead engine toggle on Intel Macs).
+          targets: ${{ matrix.arch == 'x64' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin' }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
@@ -96,6 +113,12 @@ jobs:
       # right-click → Open the first time; notarization (Apple Developer ID) is a follow-up.
       # Retry to ride out transient repo-resolution blips.
       - name: Build macOS .dmg (${{ matrix.arch }})
+        env:
+          # Explicit triple on BOTH legs (the arm64 value equals the host, so
+          # it's a no-op there) — an empty-string env var is NOT null and
+          # would otherwise flow into `--target ""` (this exact failure took
+          # down the arm64 leg's first CI run).
+          RUST_TARGET: ${{ matrix.arch == 'x64' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin' }}
         run: |
           GRADLE_ARGS="-Porg.gradle.java.installations.auto-detect=false -Porg.gradle.java.installations.auto-download=false -Porg.gradle.java.installations.paths=$JAVA_HOME"
           for attempt in 1 2 3; do
@@ -146,6 +169,16 @@ jobs:
           echo "$archs" | tr ' ' '\n' | grep -qx "$want" \
             || { echo "::error::arch mismatch: expected $want, got [$archs] for the ${{ matrix.arch }} dmg"; exit 1; }
           echo "OK: ${{ matrix.arch }} dmg launcher is $want"
+          # The bundled Rust engine must exist AND match the dmg's arch — a
+          # wrong-arch dylib loads nothing and leaves the engine toggle dead
+          # (invisible to the launcher check above).
+          rustlib=$(find "$mnt" -type f -name 'libmyotis_engine.dylib' | head -n1 || true)
+          [ -n "$rustlib" ] || { echo "::error::libmyotis_engine.dylib missing from the dmg"; exit 1; }
+          rustarchs=$(lipo -archs "$rustlib")
+          echo "bundled rust engine: $rustlib -> [$rustarchs]"
+          echo "$rustarchs" | tr ' ' '\n' | grep -qx "$want" \
+            || { echo "::error::rust engine arch mismatch: expected $want, got [$rustarchs]"; exit 1; }
+          echo "OK: bundled rust engine is $want"
 
       - name: Upload DMG
         uses: actions/upload-artifact@v4
