@@ -104,9 +104,17 @@ fun NodeScreen(
     val online by onlineFlow.collectAsState(initial = true)
     var tab by remember { mutableStateOf(0) }
 
-    // Network selector: chips over the live stacks (or the enabled-set when stopped) drive which
-    // chain Status + Query operate on, so a 2nd enabled chain (e.g. gnosis) is visible/queryable.
-    val chains = snapshots.keys.toList().ifEmpty { settings.enabledNetworks() }
+    // Network selector: chips over the ENABLED set (the Settings switches), plus any
+    // still-live stack. Sourcing from settings rather than the live map keeps a
+    // runtime-stopped chain's chip visible — Stop on the Status page is decoupled from
+    // the Settings enable switch, so an enabled-but-stopped chain stays selectable and
+    // can be started again from Status. enabledNetworks() is a plain read (no snapshot
+    // state), so SettingsTab bumps enabledRev on every toggle to re-derive the chips
+    // immediately — without it they'd lag until the boot/stop lands in `snapshots`.
+    var enabledRev by remember { mutableStateOf(0) }
+    val chains = remember(enabledRev, snapshots) {
+        (settings.enabledNetworks() + snapshots.keys).distinct()
+    }
     var selected by remember { mutableStateOf<String?>(null) }
     val network = selected?.takeIf { it in chains } ?: chains.firstOrNull() ?: settings.primaryNetwork()
     val current = snapshots[network]
@@ -115,7 +123,7 @@ fun NodeScreen(
         Column(Modifier.fillMaxSize().padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Myotis", style = MaterialTheme.typography.headlineSmall)
-                if (chains.size > 1) {
+                if (chains.isNotEmpty()) {
                     Spacer(Modifier.width(12.dp))
                     NetworkChips(chains, network, onSelect = { selected = it })
                 }
@@ -135,16 +143,16 @@ fun NodeScreen(
             Spacer(Modifier.height(16.dp))
 
             when (tab) {
-                0 -> StatusTab(controller, current, network, online, onOpenNetworkSettings)
+                0 -> StatusTab(controller, settings, current, network, online, onOpenNetworkSettings)
                 1 -> QueryTab(controller, settings, current, network, history)
                 2 -> LogsTab(logs)
-                3 -> SettingsTab(controller, settings, snapshots)
+                3 -> SettingsTab(controller, settings, snapshots, onEnabledChanged = { enabledRev++ })
             }
         }
     }
 }
 
-/** Horizontally-scrolling chips to pick the chain Status + Query act on (shown when >1 enabled). */
+/** Horizontally-scrolling chips over the enabled chains — picks the chain Status + Query act on. */
 @Composable
 private fun NetworkChips(chains: List<String>, selected: String, onSelect: (String) -> Unit) {
     Row(
@@ -222,6 +230,9 @@ private fun SettingsTab(
     controller: NodeController,
     settings: Settings,
     snapshots: Map<String, NodeSnapshot>,
+    // Notifies the screen that the persisted enabled set changed, so the network
+    // chips (derived from settings, not snapshot state) re-derive immediately.
+    onEnabledChanged: () -> Unit = {},
 ) {
     val networks = remember { settings.allNetworks() }
     // Per-network enabled toggle + RPC-port text, seeded from persisted settings. Toggling a
@@ -268,6 +279,7 @@ private fun SettingsTab(
                             enabled[id] = on
                             settings.setNetworkEnabled(id, on)
                             if (on) controller.enableNetwork(id) else controller.disableNetwork(id)
+                            onEnabledChanged()
                         },
                     )
                 }
@@ -420,6 +432,7 @@ private fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Un
 @Composable
 private fun StatusTab(
     controller: NodeController,
+    settings: Settings,
     snap: NodeSnapshot?,
     primary: String,
     online: Boolean,
@@ -440,18 +453,25 @@ private fun StatusTab(
 
         Spacer(Modifier.height(16.dp))
         // A snapshot for `primary` exists only while its stack is registered (running or
-        // mid-boot): Start disabled once up, Stop only while it is. Stop the primary network
-        // specifically so the pairing reads correctly once more networks are added.
+        // mid-boot): Start disabled once up, Stop only while it is. Start/Stop here are
+        // RUNTIME-only (startNetwork/stopNetwork) — deliberately decoupled from the
+        // Settings enable switches, so stopping a chain from Status does not flip its
+        // switch off. The one exception: Start on a chain that isn't enabled at all
+        // (e.g. fresh install, nothing on) goes through enableNetwork so a cold host
+        // has an enabled set to boot.
         val primaryActive = snap != null
         Row {
             Button(
-                onClick = { controller.enableNetwork(primary) },
+                onClick = {
+                    if (settings.isNetworkEnabled(primary)) controller.startNetwork(primary)
+                    else controller.enableNetwork(primary)
+                },
                 // Don't offer Start while offline — discovery can't reach any peer.
                 enabled = !primaryActive && online,
             ) { Text("Start $primary") }
             Spacer(Modifier.width(8.dp))
             OutlinedButton(
-                onClick = { controller.disableNetwork(primary) },
+                onClick = { controller.stopNetwork(primary) },
                 enabled = primaryActive,
             ) { Text("Stop") }
         }

@@ -65,6 +65,15 @@ class DesktopNodeController(
         get() = engine.hostedNetworks().any { engine.get(it)?.isRunning == true }
 
     override fun enableNetwork(name: String) {
+        // Settings semantics: persist the enabled flag, then the runtime start. (The shared
+        // SettingsTab also persists before calling this — idempotent — but hosts must not
+        // rely on that: the interface contract is that enableNetwork persists.)
+        settings.setNetworkEnabled(engine.canonicalNetworkName(name), true)
+        startNetwork(name)
+    }
+
+    override fun startNetwork(name: String) {
+        // Runtime-only start (Status page): never touches the persisted enabled flag.
         // Resolve the canonical name up front (xdai/gbc → gnosis, case-folds): the boot lock
         // and the key/cache filenames must use the canonical form, or an alias would
         // double-boot and leak.
@@ -124,13 +133,22 @@ class DesktopNodeController(
     }
 
     override fun disableNetwork(name: String) {
+        // Settings semantics: persist the flag off, then the runtime stop.
+        settings.setNetworkEnabled(engine.canonicalNetworkName(name), false)
+        stopNetwork(name)
+    }
+
+    override fun stopNetwork(name: String) {
+        // Runtime-only stop (Status page): never touches the persisted enabled flag.
         val canonical = engine.canonicalNetworkName(name)
         synchronized(bootLock(canonical)) { dropNetwork(canonical) }
     }
 
     override fun rebootNetwork(name: String) {
-        disableNetwork(name)
-        enableNetwork(name)
+        // stop+start, NOT disable+enable: a reboot (e.g. RPC-port change) must not
+        // rewrite the persisted enabled flags.
+        stopNetwork(name)
+        startNetwork(name)
     }
 
     override fun shutdown() {

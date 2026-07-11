@@ -86,8 +86,9 @@ new Thread(() -> { if (!stack.start()) stacks.remove(n); }, "ethp2p-boot-" + n).
   **Move the all-stacks-down `stopForeground/stopSelf` here** — today the single-stack
   boot-failure path calls it (~1332); per-stack failures must NOT stop the service.
 - Delete `switchNetwork`/`restartWithCurrentSettings`/`restartAfterShutdown` (~254–276,
-  174). An RPC-port change for `n` = `disableNetwork(n); enableNetwork(n)` (only that
-  stack reboots). Keep the **Stop→Start race** safety: `ChainStack.start()`/`shutdown()`
+  174). An RPC-port change for `n` = `rebootNetwork(n)` (only that stack reboots; NOT
+  disable+enable — those persist the enabled flag, a reboot must never rewrite it).
+  Keep the **Stop→Start race** safety: `ChainStack.start()`/`shutdown()`
   are already `synchronized` together, so a fast disable→enable on one stack serializes
   on that stack's monitor (this replaces the old service-wide `restartAfterShutdown`
   dance — verify on device that a port-change reboot of one chain doesn't flap the
