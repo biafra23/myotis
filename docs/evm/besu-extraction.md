@@ -80,7 +80,7 @@ not exercise that path; Phase 2 will, against real ERC-20 contracts.)
 ## Hard-fork awareness
 
 `EvmFactory.buildForBlock(BlockContext)` selects between London / Paris
-(post-merge, block-keyed) / Shanghai / Cancun / Prague (timestamp-keyed)
+(post-merge, block-keyed) / Shanghai / Cancun / Prague / Osaka (timestamp-keyed)
 using mainnet's published transition values. Pre-London is intentionally
 unsupported — the wallet only operates on recent finalised heads. Add a
 test per fork transition (one block before, one block after) before any
@@ -93,6 +93,7 @@ Precompile sets are paired with the fork:
 - Shanghai → `istanbul(gc)` again (KZG point-evaluation arrives in Cancun)
 - Cancun → `cancun(gc)` (adds 0x0a)
 - Prague → `prague(gc)` (BLS12-381 precompiles)
+- Osaka → `osaka(gc)` (adds P256VERIFY at 0x100; ModExp repriced per EIP-7883)
 
 ## Determinism audit
 

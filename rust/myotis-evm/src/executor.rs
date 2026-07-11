@@ -62,8 +62,8 @@ const PLAIN_TRANSFER_GAS: u64 = 21_000;
 /// Precompiles are CODELESS in state yet execute logic — an empty-calldata
 /// call to one still charges its base gas, so the 21000 short-circuit must
 /// not claim it. Conservatively covers 0x…0001 ..= 0x…01ff (mainnet uses
-/// 0x01..0x11 through Prague; the headroom absorbs future forks and
-/// RIP-7212-style 0x100 assignments — a stray fall-through only costs a full
+/// 0x01..0x11 through Prague, 0x100 = P256VERIFY since Osaka; the headroom
+/// absorbs future assignments — a stray fall-through only costs a full
 /// estimate run). NOTE: the Java engine's rpcEstimateGas short-circuits these
 /// today (same under-estimate) — flagged for the same fix there.
 fn in_precompile_range(addr: &[u8; 20]) -> bool {
