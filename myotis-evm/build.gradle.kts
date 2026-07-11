@@ -20,8 +20,11 @@ java {
 dependencies {
     implementation(project(":core"))
 
-    // Besu EVM. Brings in besu-datatypes transitively, but pin both so the
-    // version catalog is the single bump-point.
+    // Besu EVM 26.4.0 — the final-Fusaka EVM (CLZ, P256VERIFY, EOF removed).
+    // 25.7+ renamed the artifactIds (evm → besu-evm); transitives (tuweni
+    // 2.7.2 — the same version as our Kotlin fork, killing the old io.tmio
+    // collision at the source — caffeine, guava, jna, besu-native, jc-kzg)
+    // flow from the real POMs.
     implementation(libs.besu.evm)
     implementation(libs.besu.datatypes)
 

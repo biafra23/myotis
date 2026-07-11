@@ -67,6 +67,15 @@ subprojects {
         useJUnitPlatform()
     }
 
+    // Besu 26.4's imported BOM pins junit-platform 1.13 onto every test
+    // classpath that (transitively) sees :myotis-evm; without a matching
+    // launcher the engine fails discovery ("unaligned versions of the
+    // junit-platform-engine and junit-platform-launcher jars"). One aligned
+    // launcher for every JVM module.
+    dependencies {
+        "testRuntimeOnly"("org.junit.platform:junit-platform-launcher")
+    }
+
     tasks.withType<JavaCompile> {
         options.encoding = "UTF-8"
     }

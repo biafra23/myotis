@@ -84,7 +84,7 @@ public final class PrefetchingTracer implements OperationTracer {
             case OP_SLOAD -> {
                 UInt256 slot = UInt256.fromBytes(Bytes32.leftPad(frame.getStackItem(0)));
                 io.myotis.evm.Address owner = io.myotis.evm.Address.of(
-                        frame.getRecipientAddress().toArrayUnsafe());
+                        frame.getRecipientAddress().getBytes().toArrayUnsafe());
                 tracker.recordStorage(owner, slot.toUnsignedBigInteger());
                 tracker.recordAccount(owner);
             }
