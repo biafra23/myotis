@@ -116,4 +116,35 @@ class BeaconLightClientPeerPoolTest {
         assertEquals(false, pool(c).contains(addr(1)), "tail-most old peer should be evicted");
         assertTrue(c.addPeer(addr(1)), "an evicted peer must be re-addable");
     }
+
+    /** The proven tier sorts most-recently-served first (so the finality fan-out
+     *  window always contains the server that answered seconds ago); never-served
+     *  proven peers follow, unproven peers last — the Rust
+     *  {@code proven_tier_orders_by_serve_recency} twin. */
+    @Test
+    @SuppressWarnings("unchecked")
+    void provenTierOrdersByServeRecency() throws Exception {
+        BeaconLightClient c = newClient();
+        String never = addr(1), old = addr(2), recent = addr(3), unproven = addr(4);
+        c.addPeer(never);
+        c.addPeer(old);
+        c.addPeer(recent);
+        c.addPeer(unproven);
+        c.setProvenLightClient(List.of(never, old, recent));
+
+        // recentServes keys by peerId (the /p2p/ suffix of addr()).
+        Field f = BeaconLightClient.class.getDeclaredField("recentServes");
+        f.setAccessible(true);
+        Map<String, Long> serves = (Map<String, Long>) f.get(c);
+        serves.put("16Uiu2HAm2", System.nanoTime() - 1_000_000L);
+        serves.put("16Uiu2HAm3", System.nanoTime());
+
+        var m = BeaconLightClient.class.getDeclaredMethod("copyPeers");
+        m.setAccessible(true);
+        List<String> ordered = (List<String>) m.invoke(c);
+        assertEquals(recent, ordered.get(0), "most recently served proven peer first");
+        assertEquals(old, ordered.get(1), "older served proven peer second");
+        assertEquals(never, ordered.get(2), "never-served proven peer after servers");
+        assertEquals(unproven, ordered.get(3), "unproven peer last");
+    }
 }

@@ -1935,94 +1935,195 @@ public class BeaconLightClient implements AutoCloseable {
         // Honor the Lodestar exclusion — finality polling is part of the
         // debug surface for Lighthouse/Teku/Prysm reliability.
         //
-        // Cap the per-cycle iteration. Without this, when every peer's
-        // finality update fails (typical when the committee is stale and
-        // can't be advanced because peers pruned the LC updates we'd
-        // need), we'd serially iterate ~1000 peers at up to 10s each =
-        // burning hours per cycle. That starves the syncLoop's
-        // wall-clock catchUpSyncCommittee retry at the top of the next
-        // call and locks the daemon in CATCHING_UP indefinitely. 16 is
-        // enough to find a working peer when one exists; the syncLoop
-        // re-fires every 12s so we cycle through fresh selections fast.
-        final int POLL_FINALITY_PEER_LIMIT = 16;
-        int tried = 0;
-        for (String peer : copyPeers()) {
+        // Parallel fan-out, first VERIFIED apply wins — the Rust engine's
+        // poll_finality shape, replacing the old sequential loop. Sequentially,
+        // a round burned 1-10s per dead candidate before reaching a live server
+        // (on-device: ~28s rounds, verified-head age spiking past 2 minutes
+        // whenever a round found no server at all). The cap still bounds the
+        // per-cycle dial count; copyPeers() puts the proven tier first and
+        // sorts it most-recently-served first (winners get promoted to the
+        // tier below), so a known-live server stays inside the fan-out window.
+        final int POLL_FINALITY_FANOUT = 16;
+        // Heal a late winner from a PREVIOUS round: if its BLS verify outlasted
+        // that round's 12s deadline, the store advanced but the poll thread had
+        // moved on, skipping updateSyncState/persistSnapshot — and re-polling the
+        // same update reports "no advance", so the lag would otherwise persist
+        // until a NEW update publishes.
+        if (store.isInitialized() && store.getFinalizedSlot() > syncState.getFinalizedSlot()) {
+            updateSyncState();
+            persistSnapshot();
+        }
+        List<String> peers = copyPeers();
+        if (peers.size() > POLL_FINALITY_FANOUT) {
+            peers = peers.subList(0, POLL_FINALITY_FANOUT);
+        }
+        if (peers.isEmpty()) return;
+
+        final CompletableFuture<FinalityPollWin> winner = new CompletableFuture<>();
+        final java.util.concurrent.atomic.AtomicInteger remaining =
+                new java.util.concurrent.atomic.AtomicInteger(peers.size());
+        // Round-scoped strike buffer (parity with the Rust poll_finality
+        // accounting, which learned this on-device): a parallel fan-out mints
+        // up to N-1 speculative losses per round, and feeding each into the
+        // host's strike-based cache eviction empties it of every proven server.
+        // A round WITH a winner discards the buffered failures (the losers
+        // merely raced a success); a fully-failed round strikes every failed
+        // peer once. Deliberate divergence from the OLD sequential loop, same
+        // trade the Rust side made: a dead peer AHEAD of the winner used to
+        // accrue a strike per round and cache-evict in ~3 polls; now it is
+        // never struck while rounds keep winning — the recency sort in
+        // orderByLightClient demotes it instead.
+        final java.util.Queue<String> roundFailures = new java.util.concurrent.ConcurrentLinkedQueue<>();
+
+        for (String peer : peers) {
             if (!running) return;
-            if (tried++ >= POLL_FINALITY_PEER_LIMIT) {
-                log.debug("[beacon] pollFinalityUpdate: tried {} peers, no advance — will retry next cycle",
-                        POLL_FINALITY_PEER_LIMIT);
-                return;
-            }
-            try {
-                byte[] response = p2pService
-                        .requestFinalityUpdate(peer)
-                        .get(10, TimeUnit.SECONDS);
-                // Relay-cache the raw SSZ so peers who query us get the
-                // latest finality update we just received, without having to
-                // re-ask upstream.
-                p2pService.cacheFinalityUpdate(response);
+            // Per-attempt deadline via the req/resp layer (closes the stream on
+            // expiry — an outer orTimeout would leave it accumulating; see the
+            // requestFinalityUpdate javadoc). Completion hops to catchUpExecutor:
+            // the BLS sync-aggregate verify inside processFinalityUpdate must NOT
+            // run on a netty event loop thread (see the catchUpExecutor comment —
+            // the catch-up fan-out honors the same rule), and its single thread
+            // both serializes the up-to-16 verifies and makes the isDone bail
+            // free for every response behind the winner.
+            p2pService.requestFinalityUpdate(peer, 10_000L)
+                    .whenCompleteAsync((response, ex) -> {
+                        // A finished round ignores stragglers entirely: no strike
+                        // (they raced a success), no apply (the winner advanced us).
+                        if (winner.isDone()) return;
+                        if (ex != null) {
+                            Throwable root = ex;
+                            while (root.getCause() != null) root = root.getCause();
+                            log.debug("[beacon] Finality update failed from {}: {}", peer,
+                                    root.getMessage() != null ? root.getMessage()
+                                            : root.getClass().getSimpleName());
+                            roundFailures.add(peer);
+                        } else {
+                            try {
+                                com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("finality", response);
+                                LightClientFinalityUpdate update = LightClientFinalityUpdate.decode(response);
 
-                com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("finality", response);
-                LightClientFinalityUpdate update = LightClientFinalityUpdate.decode(response);
-
-                final boolean finalityApplied;
-                // Writers serialize on catchUpApplyLock (see its javadoc): without this a
-                // straggler catch-up applier's gate-check→store-next sequence can interleave
-                // with this finality apply's rotation and re-arm a stale next committee.
-                synchronized (catchUpApplyLock) {
-                    finalityApplied = store.isInitialized() && processor.processFinalityUpdate(update);
-                }
-                if (finalityApplied) {
-                    updateSyncState();
-                    fillChainStateRoots(peer, true);
-                    notifyPeerSuccess(peer);
-                    // Steady-state advance — persist so a restart resumes here
-                    // (no-op unless the committee period actually moved).
-                    persistSnapshot();
-                    log.debug("[beacon] Finality update applied from {}, finalizedSlot={}",
-                            peer, store.getFinalizedSlot());
-                    return;
-                }
-
-                // Seeded mode: update sync state directly from finality update
-                if (!store.isInitialized()) {
-                    LightClientHeader fh = update.finalizedHeader();
-                    byte[] sr = fh.execution().stateRoot();
-                    if (sr != null && sr.length == 32) {
-                        long slot = fh.beacon().slot();
-                        syncState.recordStateRoot(slot, sr, false);
-                        // Also record the attested header's execution state root
-                        long attestedSlot = update.attestedHeader().beacon().slot();
-                        byte[] attestedRoot = update.attestedHeader().execution().stateRoot();
-                        if (attestedRoot != null && attestedRoot.length == 32) {
-                            syncState.recordStateRoot(attestedSlot, attestedRoot, false);
+                                final boolean finalityApplied;
+                                // Writers serialize on catchUpApplyLock (see its javadoc): without
+                                // this a straggler catch-up applier's gate-check→store-next sequence
+                                // can interleave with this finality apply's rotation and re-arm a
+                                // stale next committee. Two same-round appliers also serialize here;
+                                // the second usually reports no-advance and simply doesn't win.
+                                synchronized (catchUpApplyLock) {
+                                    finalityApplied = store.isInitialized()
+                                            && processor.processFinalityUpdate(update);
+                                }
+                                if (finalityApplied) {
+                                    winner.complete(new FinalityPollWin(peer, response, update, true));
+                                    return;
+                                }
+                                if (!store.isInitialized()) {
+                                    // Seeded mode: any decodable update with a plausible exec
+                                    // state root wins; the poll thread runs the seed branch.
+                                    byte[] sr = update.finalizedHeader().execution().stateRoot();
+                                    if (sr != null && sr.length == 32) {
+                                        winner.complete(new FinalityPollWin(peer, response, update, false));
+                                        return;
+                                    }
+                                }
+                                // Decoded but did not advance: not a strike (sequential parity —
+                                // the old loop just moved on), simply not a win either.
+                                log.debug("[beacon] Finality update from {} did not advance state", peer);
+                            } catch (Exception e) {
+                                log.debug("[beacon] Finality update decode/apply failed from {}: {}",
+                                        peer, e.getMessage());
+                                roundFailures.add(peer);
+                            }
                         }
-                        // Fill intermediate blocks to cover recent state roots
-                        byte[] attestedBlockRoot = update.attestedHeader().beacon().hashTreeRoot();
-                        log.debug("[beacon] Seeded poll: finalizedSlot={}, attestedSlot={}, filling {} slots",
-                                slot, attestedSlot, attestedSlot - slot);
-                        fillChainStateRoots(peer, false, slot, attestedSlot, attestedBlockRoot);
-                        notifyPeerSuccess(peer);
-                        if (slot > syncState.getFinalizedSlot()) {
-                            long execBlockNum = fh.execution().blockNumber();
-                            byte[] execBlockHash = fh.execution().blockHash();
-                            syncState.update(slot, sr, update.signatureSlot(), execBlockNum, execBlockHash);
-                            log.debug("[beacon] Finality update refreshed from {}, finalizedSlot={}", peer, slot);
+                        if (remaining.decrementAndGet() == 0 && !winner.isDone()) {
+                            winner.completeExceptionally(new java.util.concurrent.TimeoutException(
+                                    "no finality advance from " + roundFailures.size() + " failed peers"));
                         }
-                        return;
-                    }
-                }
+                    }, catchUpExecutor);
+        }
 
-                log.debug("[beacon] Finality update from {} did not advance state", peer);
-            } catch (Exception e) {
-                String msg = e.getMessage() != null ? e.getMessage()
-                        : e.getClass().getSimpleName()
-                          + (e.getCause() != null ? ": " + e.getCause().getMessage() : "");
-                log.debug("[beacon] Finality update failed from {}: {}", peer, msg);
-                notifyPeerFailure(peer);
+        FinalityPollWin win;
+        try {
+            // 10s per-request timeout + decode/apply slack; the 12s sync cycle
+            // re-fires either way.
+            win = winner.get(12, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            // Future.get can surface InterruptedException: restore the flag so
+            // shutdown propagation isn't silently swallowed (the sync loop's
+            // sleep then exits promptly).
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
             }
+            // A late winner (a BLS verify outlasting the deadline on the
+            // catch-up executor) must still void the round's strikes — strikes
+            // are only for rounds that truly found no server. Its follow-ups
+            // are skipped; the store already advanced and the store-ahead check
+            // at the top of the next poll heals BeaconSyncState/snapshot.
+            boolean lateWin = winner.isDone() && !winner.isCompletedExceptionally();
+            if (!lateWin) {
+                for (String p : roundFailures) notifyPeerFailure(p);
+            }
+            log.debug("[beacon] pollFinalityUpdate: fan-out of {} peer(s), no advance this cycle{}",
+                    peers.size(), lateWin ? " (late winner, follow-ups next round)" : "");
+            return;
+        }
+
+        // Winner follow-ups run HERE, on the poll thread: fillChainStateRoots does
+        // its own blocking req/resp round-trips, which must stay off the (single)
+        // catch-up executor thread the fan-out callbacks run on.
+        // Relay-cache the WINNER's raw SSZ (last write wins in the relay cache, so
+        // caching per-response from concurrent callbacks could leave a losing,
+        // staler update as what we serve peers — the sequential loop always ended
+        // on the winner's bytes).
+        p2pService.cacheFinalityUpdate(win.raw());
+        if (win.applied()) {
+            updateSyncState();
+            fillChainStateRoots(win.peer(), true);
+            // The winner just demonstrably served light-client data: promote it to
+            // the proven tier (the Rust pool's mark_proven analog) so the recency
+            // ordering applies to it even if Identify never flagged it.
+            provenLightClient.add(win.peer());
+            peersNoLcUpdates.remove(win.peer());
+            notifyPeerSuccess(win.peer());
+            // Steady-state advance — persist so a restart resumes here
+            // (no-op unless the committee period actually moved).
+            persistSnapshot();
+            log.debug("[beacon] Finality update applied from {}, finalizedSlot={}",
+                    win.peer(), store.getFinalizedSlot());
+            return;
+        }
+
+        // Seeded mode: update sync state directly from the winning finality update.
+        LightClientHeader fh = win.update().finalizedHeader();
+        byte[] sr = fh.execution().stateRoot();
+        long slot = fh.beacon().slot();
+        syncState.recordStateRoot(slot, sr, false);
+        // Also record the attested header's execution state root
+        long attestedSlot = win.update().attestedHeader().beacon().slot();
+        byte[] attestedRoot = win.update().attestedHeader().execution().stateRoot();
+        if (attestedRoot != null && attestedRoot.length == 32) {
+            syncState.recordStateRoot(attestedSlot, attestedRoot, false);
+        }
+        // Fill intermediate blocks to cover recent state roots
+        byte[] attestedBlockRoot = win.update().attestedHeader().beacon().hashTreeRoot();
+        log.debug("[beacon] Seeded poll: finalizedSlot={}, attestedSlot={}, filling {} slots",
+                slot, attestedSlot, attestedSlot - slot);
+        fillChainStateRoots(win.peer(), false, slot, attestedSlot, attestedBlockRoot);
+        notifyPeerSuccess(win.peer());
+        if (slot > syncState.getFinalizedSlot()) {
+            long execBlockNum = fh.execution().blockNumber();
+            byte[] execBlockHash = fh.execution().blockHash();
+            syncState.update(slot, sr, win.update().signatureSlot(), execBlockNum, execBlockHash);
+            log.debug("[beacon] Finality update refreshed from {}, finalizedSlot={}", win.peer(), slot);
         }
     }
+
+    /** A finality-poll round's winning response: the peer, the raw SSZ (for the
+     *  relay cache — cached on the poll thread so the winner's bytes are what we
+     *  serve), the decoded update, and whether it was a VERIFIED store apply
+     *  ({@code applied}) or a seeded-mode candidate the poll thread still has to
+     *  run the seed branch for. */
+    private record FinalityPollWin(
+            String peer, byte[] raw, LightClientFinalityUpdate update, boolean applied) {}
 
     /**
      * Push the current store state into the shared {@link BeaconSyncState}.
@@ -2247,7 +2348,11 @@ public class BeaconLightClient implements AutoCloseable {
     }
 
     /** Confirmed light_client servers first, proven non-LC peers last, rest in between —
-     *  so finality polls / bootstrap hit peers that actually serve light-client first. */
+     *  so finality polls / bootstrap hit peers that actually serve light-client first.
+     *  Within the confirmed tier, most-recently-served first: a server that answered
+     *  seconds ago is almost certainly still good, so any bounded slice (the finality
+     *  fan-out window, catch-up batches) contains it even when the proven set is large
+     *  and littered with servers that are flagged LC-capable but currently at capacity. */
     private List<String> orderByLightClient(List<String> peers) {
         if (provenLightClient.isEmpty() && peersNoLcUpdates.isEmpty()) return peers;
         List<String> first = new ArrayList<>(), mid = new ArrayList<>(), last = new ArrayList<>();
@@ -2255,6 +2360,22 @@ public class BeaconLightClient implements AutoCloseable {
             if (provenLightClient.contains(p)) first.add(p);
             else if (peersNoLcUpdates.contains(p)) last.add(p);
             else mid.add(p);
+        }
+        if (first.size() > 1 && !recentServes.isEmpty()) {
+            // recentServes prunes to a 60s window, so "recently served" decays on its
+            // own; never-served proven peers sort after all recent servers, keeping
+            // their existing relative order (sort is stable). Snapshot the timestamps
+            // BEFORE sorting: recentServes mutates concurrently (bootstrap-callback
+            // successes, status-thread prunes), and a comparator over live state can
+            // trip TimSort's consistency check mid-sort.
+            final java.util.HashMap<String, Long> at = new java.util.HashMap<>();
+            for (String p : first) {
+                String pid = peerIdOf(p);
+                Long t = recentServes.get(pid != null ? pid : p);
+                if (t != null) at.put(p, t);
+            }
+            first.sort(java.util.Comparator.comparingLong(
+                    (String p) -> at.getOrDefault(p, Long.MIN_VALUE)).reversed());
         }
         List<String> out = new ArrayList<>(peers.size());
         out.addAll(first); out.addAll(mid); out.addAll(last);

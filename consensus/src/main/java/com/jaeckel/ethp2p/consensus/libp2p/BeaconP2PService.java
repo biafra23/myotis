@@ -980,8 +980,20 @@ public class BeaconP2PService implements AutoCloseable {
     }
 
     public CompletableFuture<byte[]> requestFinalityUpdate(String peerMultiaddr) {
+        return requestFinalityUpdate(peerMultiaddr, 0L);
+    }
+
+    /**
+     * Variant with a per-attempt deadline; {@code timeoutMs <= 0} means none.
+     * Same rationale as {@link #requestUpdatesByRange(String, long, int, long)}:
+     * the deadline closes the underlying libp2p stream, where an {@code orTimeout}
+     * on the returned future would only complete the wrapper and leave the
+     * stream accumulating — that matters for the finality poll's parallel
+     * fan-out, which opens up to 16 streams per round.
+     */
+    public CompletableFuture<byte[]> requestFinalityUpdate(String peerMultiaddr, long timeoutMs) {
         // No request body for finality_update — send nothing, just close write side
-        return doReqResp(peerMultiaddr, FINALITY, new byte[0])
+        return doReqResp(peerMultiaddr, FINALITY, new byte[0], timeoutMs)
                 .thenApply(BeaconP2PService::decodeSingleResponse);
     }
 

@@ -650,16 +650,34 @@ impl PeerPool {
                 && (!respect_cooldown || pool.cooled_down(id))
         };
         let mut out: Vec<Peer> = Vec::with_capacity(n);
-        // Tier 1: peers that actually served light-client data before.
+        // Tier 1: peers that actually served light-client data before —
+        // most-recently-served first (recent_serves already backs the
+        // served-last-minute metric). A server that answered seconds ago is
+        // almost certainly still good, so a bounded batch always contains it
+        // even when the proven set outgrows `n` and carries servers that are
+        // flagged capable but currently at capacity. Never-served proven
+        // peers keep their pool order after the recent ones (stable sort).
+        let mut tier1: Vec<&Peer> = self
+            .peers
+            .iter()
+            .filter(|p| self.proven.contains(&p.id) && ok(self, &p.id))
+            .collect();
+        tier1.sort_by_key(|p| std::cmp::Reverse(self.recent_serves.get(&p.id).copied()));
+        for p in tier1 {
+            if out.len() >= n {
+                break;
+            }
+            if !out.iter().any(|q| q.id == p.id) {
+                out.push(p.clone());
+            }
+        }
         // Tier 2: positive-signal peers (Identify-confirmed LC servers).
-        for tier in [&self.proven, prefer] {
-            for p in &self.peers {
-                if out.len() >= n {
-                    break;
-                }
-                if tier.contains(&p.id) && ok(self, &p.id) && !out.iter().any(|q| q.id == p.id) {
-                    out.push(p.clone());
-                }
+        for p in &self.peers {
+            if out.len() >= n {
+                break;
+            }
+            if prefer.contains(&p.id) && ok(self, &p.id) && !out.iter().any(|q| q.id == p.id) {
+                out.push(p.clone());
             }
         }
         // Fill from a rotating window of the rest.
@@ -1613,7 +1631,8 @@ fn apply_staged_step(
 }
 
 /// One finality-poll pass: try peers until one update verifies and applies —
-/// the Java `pollFinalityUpdate` steady-state branch (POLL_FINALITY_PEER_LIMIT=16).
+/// the Java `pollFinalityUpdate` steady-state branch (POLL_FINALITY_FANOUT=16,
+/// which now mirrors this fan-out shape and round accounting).
 /// Returns true when an update verified AND applied (the resume guard's
 /// confirmation signal).
 async fn poll_finality(
@@ -1642,21 +1661,16 @@ async fn poll_finality(
             }
         })
         .collect();
-    // Round-scoped cache accounting. The Java poll is SEQUENTIAL, proven-first,
-    // stop-at-first-success: live proven servers usually answer first try, so
-    // peers behind the winner are never dialed and accrue no strikes, while a
-    // DEAD tier-0 peer is tried at the head of every poll and evicted from the
-    // persistent cache after 3 polls. This parallel fan-out must reproduce
-    // those OUTCOMES, not the per-dial mechanics: dialing 16 at once mints up
-    // to 15 speculative losses per 12 s round, and feeding each into the
-    // cache's 3-strike eviction emptied it of every proven server on-device
-    // (peers=209, catch_up_servers=0). So: failures are buffered per round;
-    // a round WITH a winner discards them (the losers raced a success — the
-    // Java analog was never dialed); a fully-failed round strikes every failed
-    // peer once (the Java analog dialed the whole list and struck each). Dead
-    // proven servers thus still evict in ~3 fully-failed encounters, and the
-    // cache can't accumulate them unboundedly. Session-pool note_failure stays
-    // per-dial: it exists precisely to rotate the live fan-out.
+    // Round-scoped cache accounting (the Java poll now fans out with the same
+    // rule). Dialing 16 at once mints up to 15 speculative losses per 12 s
+    // round, and feeding each into the cache's 3-strike eviction emptied it of
+    // every proven server on-device (peers=209, catch_up_servers=0). So:
+    // failures are buffered per round; a round WITH a winner discards them
+    // (the losers raced a success); a fully-failed round strikes every failed
+    // peer once. Dead proven servers thus still evict in ~3 fully-failed
+    // encounters, and the cache can't accumulate them unboundedly.
+    // Session-pool note_failure stays per-dial: it exists precisely to rotate
+    // the live fan-out.
     let mut round_failures: Vec<String> = Vec::new();
     let mut applied = false;
     while let Some((peer, res)) = in_flight.next().await {
@@ -2037,6 +2051,40 @@ mod tests {
         // than none — catch_up bounces to rediscovery instead of thrashing).
         let all_skip: HashSet<PeerId> = ids.iter().copied().collect();
         assert!(pool.candidates(4, true, false, &HashSet::new(), &all_skip).is_empty());
+    }
+
+    #[test]
+    fn proven_tier_orders_by_serve_recency() {
+        let mut pool = PeerPool::new();
+        let mut ids = Vec::new();
+        for i in 0..4u8 {
+            let kp = libp2p::identity::Keypair::generate_secp256k1();
+            let id = kp.public().to_peer_id();
+            ids.push(id);
+            pool.add(id, format!("/ip4/10.0.1.{i}/tcp/9000").parse().unwrap());
+        }
+        // Three proven servers; ids[1] served longest ago, ids[3] most recently,
+        // ids[0] is proven but never served (Identify-confirmed only via
+        // mark_proven from an earlier session's cache seed, say).
+        for id in [ids[0], ids[1], ids[3]] {
+            pool.mark_proven(id);
+        }
+        pool.note_served(ids[1]);
+        // Instant::now() can be coarse (Windows ~15ms ticks); equal timestamps
+        // would stable-sort back to pool order and flake the assertion below.
+        let t0 = std::time::Instant::now();
+        while std::time::Instant::now() == t0 {
+            std::hint::spin_loop();
+        }
+        pool.note_served(ids[3]); // strictly later ⇒ more recent
+
+        let c = pool.candidates(4, false, false, &HashSet::new(), &HashSet::new());
+        // Most-recently-served proven first, then older serves, then the
+        // never-served proven peer, then the unproven rest.
+        assert_eq!(c[0].id, ids[3], "most recent server leads the batch");
+        assert_eq!(c[1].id, ids[1], "older server second");
+        assert_eq!(c[2].id, ids[0], "never-served proven after recent servers");
+        assert_eq!(c[3].id, ids[2], "unproven peer last");
     }
 
     #[test]
