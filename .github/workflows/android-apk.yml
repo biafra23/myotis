@@ -43,6 +43,39 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
+      # Build the Rust engine jniLibs FROM SOURCE so the published APK can
+      # never ship the committed binaries stale (a recurring failure mode:
+      # ABI-compatible but feature-stale .so files pass the version handshake
+      # silently). The committed jniLibs remain the fallback for local builds
+      # without cargo. The runner's preinstalled NDK is found via
+      # ANDROID_NDK_HOME / $ANDROID_HOME/ndk by the cargoNdkAndroid task.
+      - name: Set up Rust (Android targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      # Explicit + guarded: cargoNdkAndroid self-skips when its toolchain is
+      # missing — in CI that must FAIL, not silently fall back to the committed
+      # binaries. The newer-than check catches any silent skip.
+      - name: Build Rust jniLibs from source
+        run: |
+          ./gradlew cargoNdkAndroid --stacktrace
+          for abi in arm64-v8a x86_64; do
+            lib="android-app/src/main/jniLibs/$abi/libmyotis_engine.so"
+            [ "$lib" -nt gradlew ] \
+              || { echo "::error::$lib was NOT rebuilt (cargoNdkAndroid self-skipped?)"; exit 1; }
+          done
+
       # The ubuntu-latest runner ships an Android SDK via $ANDROID_HOME, which
       # AGP picks up automatically when local.properties is absent. No extra
       # sdkmanager calls needed for compileSdk 34.
