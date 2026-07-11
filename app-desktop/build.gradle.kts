@@ -38,6 +38,8 @@ dependencies {
 
     // The shared backend + the daemon's file-backed cache adapters / CCIP gateway, reused.
     implementation(project(":node-core"))
+    // Engine selector: DesktopNodeController defaults to Engines.engine().
+    implementation(project(":myotis-engines"))
     implementation(project(":app"))
     implementation(project(":networking"))
     implementation(project(":consensus"))
@@ -112,6 +114,27 @@ compose.desktop {
                 packageVersion = "0.1.0"
                 debMaintainer = "dirk@jaeckel.com"
             }
+        }
+    }
+}
+
+// Dev runs load the Rust engine lib via an ABSOLUTE path (-Dmyotis.engine.lib), set
+// only on these JavaExec tasks — deliberately NOT via compose.desktop jvmArgs, which
+// would bake a dev-machine path into packaged apps. Packaged desktop builds ship
+// without the Rust engine until the packaging PR.
+tasks.withType<JavaExec>().matching { it.name == "run" || it.name == "syncSmoke" }.configureEach {
+    dependsOn(rootProject.tasks.named("cargoBuildHost"))
+    // -Pengine=java|rust|auto → -Dmyotis.engine (same knob as :app run).
+    (project.findProperty("engine") as String?)?.let { systemProperty("myotis.engine", it) }
+    doFirst {
+        val os = System.getProperty("os.name").lowercase()
+        val lib = when {
+            os.contains("mac") -> "libmyotis_engine.dylib"
+            os.contains("win") -> "myotis_engine.dll"
+            else -> "libmyotis_engine.so"
+        }
+        rootProject.file("rust/target/release/$lib").takeIf { it.exists() }?.let {
+            systemProperty("myotis.engine.lib", it.absolutePath)
         }
     }
 }

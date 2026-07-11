@@ -51,6 +51,15 @@ dependencies {
     testRuntimeOnly(libs.logback.classic)
 }
 
+tasks.test {
+    // Regeneration knob for the EL-core conformance corpus (ElCoreVectorConformanceTest):
+    // forward it into the forked test JVM, where -D on the gradlew line doesn't reach.
+    // Same pattern as :consensus and myotis.lc.writeExpected.
+    System.getProperty("myotis.el.writeExpected")?.let {
+        systemProperty("myotis.el.writeExpected", it)
+    }
+}
+
 tasks.register<JavaExec>("dnsSmoke") {
     group = "verification"
     description = "Live DNS smoke test against the Ethereum Foundation EL tree"

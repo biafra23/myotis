@@ -55,6 +55,16 @@ interface NodeController {
     fun applyBlsBackend()
 
     /**
+     * Re-apply the engine choice (Java ⇄ Rust) to the process-global selector after
+     * [Settings.setRustEngineEnabled] flips the preference. Unlike the BLS toggle this is
+     * NOT live: networks keep the engine that created them — the new choice applies when a
+     * network is (re)started. The Rust engine is experimental (catalog-only today), so the
+     * enabled state maps to the selector's `auto` mode, which falls back to Java per
+     * network until the Rust engine can host it.
+     */
+    fun applyEngineChoice()
+
+    /**
      * Wipe a network's peer caches — clear the live stack's backoff/blacklist and delete the
      * on-disk EL/CL peer cache files — so discovery starts from a fresh slate. Safe whether or
      * not the network is currently running.
@@ -142,6 +152,9 @@ interface Settings {
     /** true = use bundled native blst (default on Android); false = pure-Java Milagro. */
     fun nativeBlsEnabled(): Boolean
     fun setNativeBlsEnabled(v: Boolean)
+    /** true = prefer the (experimental) Rust engine for newly started networks; default false. */
+    fun rustEngineEnabled(): Boolean
+    fun setRustEngineEnabled(v: Boolean)
 
     /**
      * Minutes of no RPC/UI activity before a running stack is paused into idle sleep
@@ -191,6 +204,12 @@ data class NodeSnapshot(
     val snapServingPeers: Int,      // peers actually in the serving pool now (drives readiness)
     val clConnectedPeers: Int,      // connected CL libp2p peers (usually 0 — connections are short-lived)
     val clServedPeersLastMin: Int,  // distinct peers that served a light-client response in the last 60s
+    val clCachedPeers: Int,         // CL peers in cl-peers[-net].cache (live file count)
+    val clCachedProven: Int,        // …of which proven catch-up servers (served-range token)
+    val clCachedNolc: Int,          // …of which known non-LC (skipped when dialing for updates)
+    val elCachedPeers: Int,         // EL peers in peers[-net].cache (live file count)
+    val elCachedSnapOk: Int,        // …of which snap-serving confirmed
+    val elCachedSnapBad: Int,       // …of which snap-serving denied
     val discoveredPeers: Int,
     val backedOffPeers: Int,        // peers in dial backoff right now
     val blacklistedPeers: Int,      // peers permanently blacklisted this session

@@ -117,6 +117,10 @@ public class DaemonClient {
                 if (args.length < 2) throw new IllegalArgumentException("Usage: resolve-ens <name.eth>");
                 yield "{\"cmd\":\"resolve-ens\",\"name\":\"" + esc(args[1]) + "\"}";
             }
+            case "reverse-ens" -> {
+                if (args.length < 2) throw new IllegalArgumentException("Usage: reverse-ens <0xaddress>");
+                yield "{\"cmd\":\"reverse-ens\",\"address\":\"" + esc(args[1]) + "\"}";
+            }
             case "resolve-ens-text" -> {
                 if (args.length < 3) throw new IllegalArgumentException(
                     "Usage: resolve-ens-text <name.eth> <key>");

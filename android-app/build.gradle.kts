@@ -177,6 +177,7 @@ kotlin {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.3")
 
     implementation(project(":core"))
@@ -205,6 +206,9 @@ dependencies {
     // hosts). NodeService builds one ChainStack per enabled network via Android cache
     // adapters, so the per-network EL+CL+RPC lifecycle lives once for both hosts.
     implementation(project(":node-core"))
+    // Engine selector: NodeService.ENGINE is Engines.engine(); the Settings "Rust
+    // engine" toggle drives it via NodeService.applyEngineChoice.
+    implementation(project(":myotis-engines"))
 
     // Shared Compose-Multiplatform UI + the NodeController/Settings seam. The Android
     // actuals (AndroidNodeController/AndroidSettings) back it with NodeService, so the
@@ -264,4 +268,11 @@ dependencies {
     // (resume → sync → persist snapshot → pause), so wakes stay fast after
     // days of sleep. Java-only Worker — no ktx/coroutines artifact needed.
     implementation(libs.androidx.work.runtime)
+}
+
+// Rebuild the Rust jniLibs from source when the full toolchain (cargo +
+// cargo-ndk + NDK) is on this machine; cargoNdkAndroid self-skips otherwise
+// and the committed jniLibs ship as-is. Root build.gradle.kts owns the task.
+tasks.matching { it.name == "preBuild" }.configureEach {
+    dependsOn(rootProject.tasks.named("cargoNdkAndroid"))
 }

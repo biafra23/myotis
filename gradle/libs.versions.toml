@@ -36,6 +36,9 @@ ktor = "3.0.3"
 kotlinx-coroutines = "1.9.0"
 kotlinx-serialization = "1.7.3"
 kotlinx-datetime = "0.6.1"
+# Tiny (~30 KB), dependency-free, Android-safe JSON parser for :myotis-engines'
+# JNI JSON marshalling (hand-JNI decision, docs/reimplementation/05).
+minimal-json = "0.9.5"
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
@@ -48,6 +51,7 @@ kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform",  version.ref
 compose-multiplatform = { id = "org.jetbrains.compose",             version.ref = "compose-multiplatform" }
 
 [libraries]
+minimal-json        = { module = "com.eclipsesource.minimal-json:minimal-json", version.ref = "minimal-json" }
 tuweni-bytes        = { module = "com.github.biafra23.tuweni-kotlin:tuweni-bytes",       version.ref = "tuweni" }
 tuweni-rlp          = { module = "com.github.biafra23.tuweni-kotlin:tuweni-rlp",         version.ref = "tuweni" }
 tuweni-crypto       = { module = "com.github.biafra23.tuweni-kotlin:tuweni-crypto",      version.ref = "tuweni" }

@@ -27,6 +27,15 @@ kotlin {
                 implementation(libs.kotlinx.datetime)  // local-time formatting in the Logs tab
             }
         }
+        // Desktop-JVM UI tests: drive the real composables headless (skiko software
+        // rendering — no display needed, CI-safe). Regression tests for screen-level
+        // state lifetimes (e.g. the Logs-tab filter surviving tab switches) live here.
+        val desktopTest by getting {
+            dependencies {
+                implementation(compose.desktop.uiTestJUnit4)
+                implementation(compose.desktop.currentOs)
+            }
+        }
     }
 }
 

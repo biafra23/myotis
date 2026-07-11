@@ -66,7 +66,7 @@ class JavaMyotisEngineTest {
     void createDefaultsPortsGeneratesKeyAndRegisters() {
         JavaMyotisEngine engine = new JavaMyotisEngine();
         MemoryKeyStore keyStore = new MemoryKeyStore();
-        EngineConfig config = new EngineConfig("gnosis", 0, 0, 0, null, false, 0, true);
+        EngineConfig config = new EngineConfig("gnosis", 0, 0, 0, null, false, 0, true, null);
 
         ChainHandle handle = engine.create(config, testPorts(keyStore));
         assertNotNull(handle);
@@ -91,7 +91,7 @@ class JavaMyotisEngineTest {
     @Test
     void lifecycleSurfaceOnNeverStartedHandle() {
         JavaMyotisEngine engine = new JavaMyotisEngine();
-        EngineConfig config = new EngineConfig("gnosis", 0, 0, 0, null, false, 0, true);
+        EngineConfig config = new EngineConfig("gnosis", 0, 0, 0, null, false, 0, true, null);
         ChainHandle handle = engine.create(config, testPorts(new MemoryKeyStore()));
 
         assertEquals(io.myotis.api.LifecycleState.STOPPED, handle.lifecycle());
@@ -130,7 +130,7 @@ class JavaMyotisEngineTest {
         secret[31] = 1; // valid non-zero scalar
         keyStore.keys.put("sepolia", secret.clone());
 
-        engine.create(new EngineConfig("sepolia", 0, 0, 0, null, false, 0, true),
+        engine.create(new EngineConfig("sepolia", 0, 0, 0, null, false, 0, true, null),
                 testPorts(keyStore));
         // The stored key was used, not overwritten.
         assertEquals(1, keyStore.keys.get("sepolia")[31]);
@@ -143,7 +143,7 @@ class JavaMyotisEngineTest {
         MemoryKeyStore keyStore = new MemoryKeyStore();
         keyStore.keys.put("mainnet", new byte[16]); // wrong length
         assertThrows(EngineException.class, () ->
-                engine.create(new EngineConfig("mainnet", 0, 0, 0, null, false, 0, true),
+                engine.create(new EngineConfig("mainnet", 0, 0, 0, null, false, 0, true, null),
                         testPorts(keyStore)));
     }
 }

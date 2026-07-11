@@ -1,0 +1,13 @@
+[package]
+name = "myotis-consensus"
+version = "0.1.0"
+edition = "2021"
+description = "Myotis sync-committee light client (pure Rust; grows through the Rust-engine PRs)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# The pure BLS verify core (no JNI — this crate is a plain lib).
+myotis-bls = { path = "../myotis-bls", default-features = false }
+# SSZ merkleization is SHA-256 only; the containers themselves are hand-decoded
+# (fork-polymorphic layouts — see src/ssz.rs for why not ssz_derive).
+sha2 = "0.10"

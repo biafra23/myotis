@@ -120,13 +120,21 @@ class RpcRouter(
             // Isolate the read like the IPC command does (CommandHandler wraps dispatch in
             // try/catch): a throw becomes a JSON-RPC error envelope, never a raw Ktor 500.
             return try {
-                val uptime = sr.uptimeSeconds()   // read once so both fields/branches agree
-                val result = if (method == "myotis_status")
-                    StatusJson.status(sr.status(), uptime)
-                else
-                    StatusJson.beaconStatus(sr.beaconStatus(), uptime)
+                // The reads can cross a JNI boundary into the native engine (the Rust host's
+                // nativeStatusJson), so run them on the IO dispatcher rather than blocking the
+                // Ktor CIO event loop — same as the verified handlers below. For the Java engine
+                // these are cheap in-memory reads, so this is a no-op there.
+                val result = withContext(Dispatchers.IO) {
+                    val uptime = sr.uptimeSeconds()   // read once so both fields/branches agree
+                    if (method == "myotis_status")
+                        StatusJson.status(sr.status(), uptime)
+                    else
+                        StatusJson.beaconStatus(sr.beaconStatus(), uptime)
+                }
                 logger.record(method, idStr, "LOCAL", 0)
                 resultEnvelope(id, result)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e   // never swallow coroutine cancellation (client disconnect / shutdown)
             } catch (e: Exception) {
                 logger.record(method, idStr, "ERROR", 0, -32603)
                 val detail = e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName

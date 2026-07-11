@@ -23,6 +23,9 @@ dependencies {
     // file-backed cache adapters + the JVM CCIP gateway and hosts the same stacks
     // the Android app does.
     implementation(project(":node-core"))
+    // The engine selector: Main's composition root is Engines.engine(), routing to
+    // the Java or Rust engine per -Dmyotis.engine.
+    implementation(project(":myotis-engines"))
     // :app source references io.netty.channel.* (via :networking's RLPxConnector
     // API). With io.netty excluded group-wide, the fork must be on :app's compile
     // classpath explicitly (:networking declares it as implementation, so it
@@ -56,19 +59,49 @@ tasks.register<JavaExec>("run") {
     javaLauncher = javaToolchains.launcherFor {
         languageVersion = JavaLanguageVersion.of(21)
     }
-    // If the native blst lib (rust/myotis-bls) is built, put it on java.library.path so
-    // BlsBackends auto-selects the native backend (~15x faster BLS verify). Falls back to
-    // Milagro if absent. Build: (cd rust/myotis-bls && cargo build --release).
+    // Build the Rust workspace first (no-op without cargo; instant when unchanged) and
+    // put its release dir on java.library.path so BlsBackends auto-selects the native
+    // backend (~15x faster BLS verify). Falls back to Milagro when cargo is absent.
     // Override choice with -Dmyotis.bls.backend=milagro|native|compare.
-    rootProject.file("rust/myotis-bls/target/release").takeIf { it.exists() }?.let {
-        systemProperty(
-            "java.library.path",
-            it.absolutePath + System.getProperty("path.separator") + System.getProperty("java.library.path"),
-        )
+    dependsOn(rootProject.tasks.named("cargoBuildHost"))
+    // Resolved in doFirst — the dir only exists AFTER cargoBuildHost has run once.
+    doFirst {
+        rootProject.file("rust/target/release").takeIf { it.exists() }?.let {
+            systemProperty(
+                "java.library.path",
+                it.absolutePath + System.getProperty("path.separator") + System.getProperty("java.library.path"),
+            )
+        }
     }
     // -Pbls=milagro|native|compare|auto → -Dmyotis.bls.backend (e.g. compare logs a
     // per-verify Milagro-vs-native head-to-head during a live sync).
     (project.findProperty("bls") as String?)?.let { systemProperty("myotis.bls.backend", it) }
+    // -Pengine=java|rust|auto → -Dmyotis.engine (the :myotis-engines selector).
+    // Fail fast on a typo: an unrecognized value would otherwise silently fall
+    // back to the Java engine (Engines.normalize warns + yields java), so a
+    // `-Pengine=rust.` runs Java without it being obvious. Blank → unset (default
+    // java).
+    (project.findProperty("engine") as? String)?.takeIf { it.isNotBlank() }?.let { raw ->
+        val v = raw.trim().lowercase()
+        if (v !in listOf("java", "rust", "auto")) {
+            throw GradleException("-Pengine must be one of java|rust|auto (got '$raw')")
+        }
+        systemProperty("myotis.engine", v)
+    }
+    // -Prustlog=<filter> → RUST_LOG for the Rust engine's tracing (drained to
+    // stdout via the `rust` logger). Gradle's run task doesn't forward the
+    // shell's RUST_LOG to the forked JVM, so set it explicitly. Accepts the full
+    // env_logger/tracing syntax: `-Prustlog=debug` for everything, or a targeted
+    // filter like `-Prustlog=myotis_net=debug,info` (default when unset:
+    // info with the noisy deps at warn).
+    // Guard against a blank value: `-Prustlog=` would set RUST_LOG="" and
+    // OVERRIDE the engine's default filter with an empty one (silencing the Rust
+    // logs) — treat blank as unset so the default stands.
+    (project.findProperty("rustlog") as? String)?.takeIf { it.isNotBlank() }
+        ?.let { environment("RUST_LOG", it) }
+    // -Plcdump=<dir> → -Dmyotis.lc.dumpVectors: capture raw light-client SSZ
+    // (bootstrap/updates/finality) for the rust/testdata conformance corpus.
+    (project.findProperty("lcdump") as String?)?.let { systemProperty("myotis.lc.dumpVectors", it) }
     // Pass -Pargs="status" / -Pargs="get-headers 21000000 3" etc. to the JVM main
     // Pass -Pnetwork=sepolia to select a testnet (default: mainnet)
     val appArgs = mutableListOf<String>()
@@ -95,13 +128,11 @@ tasks.register<JavaExec>("run") {
     appArgs.addAll(cmdArgs)
     args(appArgs)
     // Force our logback config over the one trueblocks-kotlin bundles on the
-    // classpath. Daemon (no -Pargs) → truncate-on-start devp2p.log; client command
-    // → console-only so it never wipes the running daemon's log.
+    // classpath. Both are console-only (stdout); the daemon vs client split just
+    // differs in log levels. Follow the daemon with `./gradlew :app:run` in the
+    // terminal (or redirect its stdout).
     systemProperty(
         "logback.configurationFile",
         if (cmdArgs.isEmpty()) "logback-daemon.xml" else "logback-client.xml",
     )
-    // Stable daemon log at the repo root regardless of the JVM working dir (which
-    // defaults to the :app module dir). `tail -F devp2p.log` from the repo root.
-    systemProperty("myotis.logfile", rootProject.file("devp2p.log").absolutePath)
 }

@@ -15,7 +15,7 @@ send against `127.0.0.1:8545` was recorded into
 ## Running
 ```bash
 # 1. start a synced daemon (serves http://127.0.0.1:8545)
-./gradlew :app:run            # wait until devp2p.log shows it serving
+./gradlew :app:run            # wait until stdout shows it serving
 
 # 2. replay the golden session against it
 python3 tools/mm-replay/replay.py tools/mm-replay/sessions/metamask-send-mainnet.jsonl

@@ -1,8 +1,7 @@
 <!-- Client-command logging config. Forced via -Dlogback.configurationFile=logback-client.xml
      in the :app `run` task whenever -Pargs is present (status/peers/get-account/etc).
-     Console-only on purpose: a short-lived client invocation must NOT open (and with
-     append=false TRUNCATE) the daemon's devp2p.log, which would wipe the running
-     service's log out from under a `tail -F`. -->
+     Console-only with quieter levels than the daemon config, so a short-lived client
+     command (which shares the terminal/stdout) prints just its result, not a firehose. -->
 <configuration>
     <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
         <encoder>

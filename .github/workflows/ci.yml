@@ -1,11 +1,15 @@
 name: CI & Release
 
 on:
+  # Scope push to main + release tags so a branch push that also has an open PR
+  # doesn't build twice (the PR is covered by pull_request below).
   push:
     branches: [ "main" ]
     tags: [ "v*" ]
+  # pull_request unscoped (any base branch), matching the other workflows: keeps
+  # Build and Test on PRs that don't target main — e.g. the rust-engine
+  # integration branch, whose checkpoint PRs previously skipped this job.
   pull_request:
-    branches: [ "main" ]
 
 jobs:
   build:

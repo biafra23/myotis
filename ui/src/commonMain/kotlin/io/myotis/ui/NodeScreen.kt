@@ -103,6 +103,11 @@ fun NodeScreen(
     val onlineFlow = remember(netStatus) { netStatus.online() }
     val online by onlineFlow.collectAsState(initial = true)
     var tab by remember { mutableStateOf(0) }
+    // Logs-tab text filter, hoisted HERE deliberately: the `when (tab)` below disposes a
+    // tab's composition on switch, so any `remember` inside LogsTab dies with it. Living
+    // beside `tab` gives the filter the same lifetime as the tab selection itself (the
+    // level filter needs no hoisting — it write-throughs to logs.setLevel and is re-read).
+    var logFilter by remember { mutableStateOf("") }
 
     // Network selector: chips over the ENABLED set (the Settings switches), plus any
     // still-live stack. Sourcing from settings rather than the live map keeps a
@@ -145,7 +150,7 @@ fun NodeScreen(
             when (tab) {
                 0 -> StatusTab(controller, settings, current, network, online, onOpenNetworkSettings)
                 1 -> QueryTab(controller, settings, current, network, history)
-                2 -> LogsTab(logs)
+                2 -> LogsTab(logs, logFilter, onFilterChange = { logFilter = it })
                 3 -> SettingsTab(controller, settings, snapshots, onEnabledChanged = { enabledRev++ })
             }
         }
@@ -253,6 +258,7 @@ private fun SettingsTab(
     var stayAwakeCharging by remember { mutableStateOf(settings.stayAwakeWhileCharging()) }
     var strictFreshness by remember { mutableStateOf(settings.strictStateFreshness()) }
     var nativeBls by remember { mutableStateOf(settings.nativeBlsEnabled()) }
+    var rustEngine by remember { mutableStateOf(settings.rustEngineEnabled()) }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
@@ -376,6 +382,21 @@ private fun SettingsTab(
             "On (default): use the bundled native blst library for sync-committee BLS " +
                 "verification (much faster than pure-Java). Off: force the pure-Java Milagro path — " +
                 "slower, but useful if the native library fails to load. Applies immediately.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        // Engine choice applies per network (re)start — running networks keep their engine.
+        SwitchRow(
+            label = "Rust engine (experimental)",
+            checked = rustEngine,
+            onChange = { on -> rustEngine = on; settings.setRustEngineEnabled(on); controller.applyEngineChoice() },
+        )
+        Text(
+            "Off (default): the proven Java engine runs every network. On: prefer the " +
+                "experimental Rust engine where it can serve — it is being built out and " +
+                "currently falls back to the Java engine for hosting. Applies when a " +
+                "network is (re)started, not to already-running networks.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -589,6 +610,10 @@ private fun StatusView(s: NodeSnapshot) {
         StatusRow("EL block", s.executionBlockNumber.toString())
         StatusRow("CL peers", "served ${s.clServedPeersLastMin}/min, con ${s.clConnectedPeers}")
         StatusRow("EL peers", "ready ${s.readyPeers}, snap ${s.snapPeers}, serving ${s.snapServingPeers}")
+        // Cache rows: "proven" (CL) / "snap-ok" (EL) predict how fast the NEXT
+        // cold start finds servers — the cache learning is visible live.
+        StatusRow("CL cache", "${s.clCachedPeers} (proven ${s.clCachedProven}, nolc ${s.clCachedNolc})")
+        StatusRow("EL cache", "${s.elCachedPeers} (snap-ok ${s.elCachedSnapOk}, snap-bad ${s.elCachedSnapBad})")
         StatusRow("Discovered", s.discoveredPeers.toString())
         StatusRow("Discv5 peers", s.discv5Peers.toString())
         StatusRow("In backoff", s.backedOffPeers.toString())
@@ -927,14 +952,13 @@ private fun StatusRow(key: String, value: String, color: Color? = null) {
  * copy the visible lines or clear the ring. Mirrors the Android Logs tab.
  */
 @Composable
-private fun LogsTab(logs: LogSource) {
+private fun LogsTab(logs: LogSource, filter: String, onFilterChange: (String) -> Unit) {
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
     val tz = remember { TimeZone.currentSystemDefault() }  // resolve once, not per row
     var lines by remember { mutableStateOf<List<LogLine>>(emptyList()) }
     var shown by remember { mutableStateOf<List<LogLine>>(emptyList()) }
     var lastVersion by remember { mutableStateOf(-1L) }
-    var filter by remember { mutableStateOf("") }
     var level by remember(logs) { mutableStateOf(logs.level()) }
 
     // Poll the cheap version counter; the O(n) snapshot of up to 50k lines runs off the main
@@ -985,7 +1009,7 @@ private fun LogsTab(logs: LogSource) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
                 value = filter,
-                onValueChange = { filter = it },
+                onValueChange = onFilterChange,
                 label = { Text("Filter — tag or message") },
                 singleLine = true,
                 modifier = Modifier.weight(1f),

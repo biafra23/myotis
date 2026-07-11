@@ -4,7 +4,8 @@ import io.myotis.api.ChainHandle;
 import io.myotis.api.EngineConfig;
 import io.myotis.api.MyotisEngine;
 import io.myotis.api.ports.EnginePorts;
-import io.myotis.node.api.JavaMyotisEngine;
+import io.myotis.engines.Engines;
+import io.myotis.engines.SelectorEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -94,6 +95,53 @@ public final class Main {
     }
 
     /**
+     * Drain the Rust engine's tracing ring to the {@code rust} logger (→ stdout)
+     * on a short poll, so its own logs surface near-real-time under
+     * {@code -Pengine=rust}. A daemon thread for the process lifetime; the ring
+     * is process-global (all networks) and drainRustLogs is a no-op under the
+     * Java engine. Observability must never take the daemon down, so every
+     * failure is swallowed. Mirrors the desktop/Android hosts' pump.
+     */
+    private static void startRustLogPump() {
+        Logger rustLog = LoggerFactory.getLogger("rust");
+        Thread pump = new Thread(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    String batch = Engines.drainRustLogs(1000);
+                    if (!batch.isEmpty()) {
+                        for (String line : batch.split("\n")) {
+                            if (line.isBlank()) continue;
+                            String s = line.strip();
+                            // The Rust fmt layer puts the level first; preserve it.
+                            if (s.startsWith("ERROR")) rustLog.error("{}", line);
+                            else if (s.startsWith("WARN")) rustLog.warn("{}", line);
+                            else rustLog.info("{}", line);
+                        }
+                    }
+                } catch (Throwable t) {
+                    // Never let log draining take the daemon down — but don't
+                    // swallow an interrupt: restore the flag and stop.
+                    if (t instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    // Any other error is dropped; keep pumping.
+                }
+                try {
+                    // Short poll → near-real-time without a busy spin. The ring
+                    // buffers between drains, so nothing is lost at this cadence.
+                    Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }, "myotis-rust-logs");
+        pump.setDaemon(true);
+        pump.start();
+    }
+
+    /**
      * Node-identity key file, per network — mainnet keeps the legacy {@code nodekey.hex}, every
      * other network gets {@code nodekey-<net>.hex}. This holds regardless of how many networks the
      * daemon hosts, so a network always has a stable identity of its own: previously a
@@ -136,7 +184,10 @@ public final class Main {
         }
         String[] cmdArgs = remaining.toArray(new String[0]);
 
-        MyotisEngine engine = new JavaMyotisEngine();
+        // The selector replaces the old `new JavaMyotisEngine()` composition-root line:
+        // -Dmyotis.engine=java|rust|auto picks the engine (default java; `./gradlew
+        // :app:run -Pengine=rust` passes it through).
+        MyotisEngine engine = Engines.engine();
 
         // Client commands / purge target a single network — the first listed. Canonicalize
         // aliases (xdai/gbc → gnosis) so the client targets the SAME socket the daemon
@@ -242,13 +293,21 @@ public final class Main {
             // (-Dmyotis.rpc.strictStateFreshness=false — see OPTIMISATIONS_AND_LIMITATIONS.md).
             boolean strict = Boolean.parseBoolean(
                     System.getProperty("myotis.rpc.strictStateFreshness", "true"));
+            // dataDir: the daemon's caches/keys are working-dir-relative files, so the
+            // working dir IS its data dir (used by engines that persist their own state).
+            String dataDir = Path.of("").toAbsolutePath().toString();
             EngineConfig config = multi
                     ? new EngineConfig(network, 0, 0, 0,
                             syncSnapshotFile(network).toString(), gossipsubEnabled,
-                            SNAP_PEER_TARGET, strict)
-                    : new EngineConfig(network, portOverride, 9000, 8545,
+                            SNAP_PEER_TARGET, strict, dataDir)
+                    : new EngineConfig(network, portOverride, 9000,
+                            // Legacy 8545 stays pinned for mainnet (byte-identical
+                            // single-network behavior); other networks take their
+                            // catalog default (0 = engine default; sepolia 8547) so a
+                            // sepolia daemon beside a mainnet one doesn't collide.
+                            "mainnet".equals(network) ? 8545 : 0,
                             syncSnapshotFile(network).toString(), gossipsubEnabled,
-                            SNAP_PEER_TARGET, strict);
+                            SNAP_PEER_TARGET, strict, dataDir);
             // dnsServers=null → resolver's default DNS (the daemon, unlike Android, has
             // system DNS config). The snap maintainer (SNAP_PEER_TARGET) keeps snap peers
             // topped up from the cache + a refreshing EIP-1459 DNS pool — helps networks
@@ -273,10 +332,15 @@ public final class Main {
             }
 
             // get-transactions (TrueBlocks debug stream) is the documented exemption from
-            // the API boundary — it takes the raw connector via the CONCRETE engine's
-            // debug accessor, wired only here at the composition root.
-            DebugCommands debugCommands = engine instanceof JavaMyotisEngine je
-                    ? new DebugCommands(je.debugStack(network).connector())
+            // the API boundary — it takes the raw connector via the CONCRETE Java engine's
+            // debug accessor (through the selector's javaDelegate), wired only here at the
+            // composition root. Null when this network isn't Java-hosted: the debug stream
+            // doesn't survive an engine swap, by design.
+            var debugStack = engine instanceof SelectorEngine se
+                    ? se.javaDelegate().debugStack(network)
+                    : null;
+            DebugCommands debugCommands = debugStack != null
+                    ? new DebugCommands(debugStack.connector())
                     : null;
 
             CommandHandler commandHandler = new CommandHandler(handle, stopLatch, debugCommands);
@@ -293,6 +357,12 @@ public final class Main {
             }
             servers.add(server);
         }
+
+        // Relay the Rust engine's own tracing to stdout (via the `rust` logger)
+        // so `-Pengine=rust` sync/EL activity is visible in the daemon log. The
+        // ring is process-global, so one pump covers every network; it is a
+        // no-op under the Java engine. Daemon-only path (client commands exit).
+        startRustLogPump();
 
         // 2. Run cleanup exactly once, whether reached via the await() below or the
         //    shutdown hook (Ctrl-C / SIGTERM, or normal exit after await returns).

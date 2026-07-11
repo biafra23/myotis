@@ -18,6 +18,11 @@ package io.myotis.api;
  *                             hosts should enable it)
  * @param strictStateFreshness true → strict 2-minute state freshness (production);
  *                             false → relaxed (experimental)
+ * @param dataDir              directory for engine-owned private state (peer caches,
+ *                             working files) for engines that persist their own — the
+ *                             Rust engine requires it; the Java engine ignores it (its
+ *                             caches come in through the {@code EnginePorts} cache
+ *                             ports instead). Nullable while only the Java engine runs.
  */
 public record EngineConfig(
         String networkName,
@@ -27,5 +32,6 @@ public record EngineConfig(
         String syncSnapshotPath,
         boolean gossipsubEnabled,
         int targetSnapPeers,
-        boolean strictStateFreshness) {
+        boolean strictStateFreshness,
+        String dataDir) {
 }

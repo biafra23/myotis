@@ -108,6 +108,7 @@ public final class NodeService extends Service {
     private static final String K_DEEP_POOL = "deepPoolThreshold";
     private static final String K_STRICT_FRESHNESS = "strictStateFreshness";
     private static final String K_NATIVE_BLS = "nativeBls";
+    private static final String K_RUST_ENGINE = "rustEngine";
     private static final String K_IDLE_PAUSE_MIN = "idlePauseMinutes";
     private static final String K_STAY_AWAKE_CHARGING = "stayAwakeWhileCharging";
     public static final int DEFAULT_IDLE_PAUSE_MIN = 5;
@@ -129,10 +130,11 @@ public final class NodeService extends Service {
      * The engine, and its static network catalog for the pref helpers below (they're
      * static — callable from Activities without a bound service). One process-global
      * engine mirrors the process-global RUNNING flag: service instances come and go,
-     * the hosted-network registry persists across them. The single line naming a
-     * concrete engine class.
+     * the hosted-network registry persists across them. The composition root is the
+     * :myotis-engines selector — `myotis.engine` (the Settings "Rust engine" toggle
+     * via {@link #applyEngineChoice}) picks Java or Rust per network (re)start.
      */
-    private static final MyotisEngine ENGINE = new io.myotis.node.api.JavaMyotisEngine();
+    private static final MyotisEngine ENGINE = io.myotis.engines.Engines.engine();
     private static final List<NetworkInfo> NETWORKS = ENGINE.availableNetworks();
 
     private static NetworkInfo networkInfo(String canonical) {
@@ -323,6 +325,25 @@ public final class NodeService extends Service {
      *  ({@code -Pbls=compare} on the daemon); no build type defaults to it. */
     public static String blsBackendChoice(android.content.Context c) {
         return nativeBlsEnabled(c) ? "auto" : "milagro";
+    }
+    /** Settings toggle: prefer the (experimental) Rust engine for newly started networks.
+     *  Default off — the Java engine is the proven path. */
+    public static boolean rustEngineEnabled(android.content.Context c) {
+        return prefs(c).getBoolean(K_RUST_ENGINE, false);
+    }
+    public static void setRustEngineEnabled(android.content.Context c, boolean v) {
+        prefs(c).edit().putBoolean(K_RUST_ENGINE, v).apply();
+    }
+    /** Apply the Rust-engine setting to the process-wide {@code Engines} selector. Maps
+     *  enabled → {@code auto} (prefer Rust where it can serve, fall back to Java with a
+     *  log — the Rust engine is catalog-only today), disabled → {@code java}. Unlike the
+     *  BLS toggle this is NOT live: networks keep the engine that created them; the new
+     *  choice applies on the next network (re)start. Returns the applied choice. */
+    public static String applyEngineChoice(android.content.Context c) {
+        String choice = rustEngineEnabled(c) ? "auto" : "java";
+        System.setProperty(io.myotis.engines.Engines.PROP, choice);
+        io.myotis.engines.Engines.select(choice);
+        return choice;
     }
     /** Live-update the snap-peer target (no restart) on every live stack and persist it. */
     public void setTargetSnapPeers(int v) {
@@ -980,8 +1001,11 @@ public final class NodeService extends Service {
                 @Override public void onCapabilitiesChanged(
                         Network network, android.net.NetworkCapabilities caps) { onNotifConnectivityChanged(); }
             };
-            notifNetCallback = cb;
             cm.registerDefaultNetworkCallback(cb);
+            // Publish only AFTER registration succeeded: if register throws, the
+            // field stays null so the top-of-method guard lets a later call retry
+            // (a pre-assignment would wedge connectivity refreshes until restart).
+            notifNetCallback = cb;
         } catch (Throwable t) {
             LogBuffer.w(TAG, "notification network callback registration failed: " + t);
         }
@@ -1052,7 +1076,9 @@ public final class NodeService extends Service {
                                       // this is what head builds / heavy confirm screens use.
                                       // Can be far below snapPeers when peers bench out, which
                                       // is what made "54 snap peers but amber/stuck" so confusing.
-            int cachedPeers,
+            int cachedPeers,           // EL peers in peers[-net].cache (live file count)
+            int elCachedSnapOk,        // …of which snap-serving confirmed (snapok token)
+            int elCachedSnapBad,       // …of which snap-serving denied (snapbad token)
             int attemptedPeers,
             int backedOffPeers,
             int blacklistedPeers,
@@ -1067,7 +1093,9 @@ public final class NodeService extends Service {
                                       // response in the last 60s — CL connections are
                                       // short-lived, so clPeersConnected is usually 0
                                       // and THIS is the "are we being fed?" signal
-            int clPeersCached,
+            int clPeersCached,         // CL peers in cl-peers[-net].cache (live file count)
+            int clCachedProven,        // …of which proven catch-up servers (served-range token)
+            int clCachedNolc,          // …of which known non-LC (nolc token)
             long finalizedSlot,
             long executionBlockNumber,
             String executionBlockHashHex, // null until first finality update
@@ -1330,11 +1358,14 @@ public final class NodeService extends Service {
         // sync failure diagnosable instead of a silent "it doesn't work".
         ProcessHealthDiag.logLastExitReason(this);
         startHealthHeartbeat();
+        startRustLogPump();
         // API 34+ requires the foregroundServiceType to be passed here and
         // to match the manifest's <service android:foregroundServiceType="...">
         // declaration. API 29-33 ignore the third arg. minSdk is 29.
         String[] tt0 = notificationText();
-        notifiedContent = tt0[0] + "\n" + tt0[1];   // prime the diff key to the initial content
+        synchronized (notifLock) {   // the field's documented guard — keep the prime
+            notifiedContent = tt0[0] + "\n" + tt0[1];   // ordered with any concurrent diff-and-notify
+        }
         startForeground(NOTIFICATION_ID, buildNotification(tt0[0], tt0[1]),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
         startIdleTicker();
@@ -1366,10 +1397,14 @@ public final class NodeService extends Service {
             // toggle; re-applying here keeps a freshly (re)started stack consistent. (This is
             // an internal engine seam, not part of the api — deliberate.)
             String blsChoice = applyBlsBackend(this);
+            // Same idea for the engine choice: the Settings toggle also applies it on flip,
+            // re-applying here makes a freshly (re)started network honor the current setting.
+            String engineChoice = applyEngineChoice(this);
             LogBuffer.i(TAG, "[" + n + "] booting (snap target " + snapTarget(this)
                     + ", rpc port " + rpcPort
                     + ", state-freshness " + (strictStateFreshness(this) ? "strict" : "relaxed")
-                    + ", bls " + blsChoice + ")");
+                    + ", bls " + blsChoice
+                    + ", engine " + engineChoice + ")");
 
             // create() + start() under the per-network bootLock: a Stop→Start / disable→enable
             // has this boot wait for the old instance's teardown (which holds the same lock) to
@@ -1420,7 +1455,10 @@ public final class NodeService extends Service {
                         netCacheFor(n, "sync-state", ".snapshot").getAbsolutePath(),
                         /*gossipsub*/ false,
                         snapTarget(this),
-                        strictStateFreshness(this));
+                        strictStateFreshness(this),
+                        // Reconstructible engine-owned state belongs with the other network
+                        // caches so "Clear cache" wipes it too.
+                        getCacheDir().getAbsolutePath());
                 EnginePorts ports = new EnginePorts(
                         // Identity: legacy mainnet keeps nodekey.hex; other chains get a
                         // per-network key so two chains never share an identity.
@@ -1667,8 +1705,11 @@ public final class NodeService extends Service {
         boolean running = RUNNING.get();
         StatusSnapshot s = h.status();
         BeaconStatus bs = h.beaconStatus();
-        int cachedEl = cachedElCounts.getOrDefault(network, 0);
-        int cachedCl = cachedClCounts.getOrDefault(network, 0);
+        // Live counts from the cache FILES (mtime-memoized): the files are the
+        // cross-engine truth — the Rust engine writes them directly, so the
+        // boot-time cachedElCounts/cachedClCounts maps go stale mid-run.
+        CacheFileStats.ElStats elCache = CacheFileStats.el(netCacheFor(network, "peers", ".cache").toPath());
+        CacheFileStats.ClStats clCache = CacheFileStats.cl(netCacheFor(network, "cl-peers", ".cache").toPath());
         String beaconState = bs.state() == BeaconState.STARTING ? "STOPPED" : bs.state().name();
         // Catch-up progress: preserve the historical -1-until-known convention (the engine
         // API defaults these to 0 pre-beacon) for the UI's determinate progress bar.
@@ -1680,10 +1721,11 @@ public final class NodeService extends Service {
             // Covers both a stopped stack and a PAUSED one (running=false, warm state
             // retained) — the lifecycle string lets the UI tell them apart.
             return new Snapshot(running, lifecycle, startTimeMs, 0, 0, 0, 0, /*snapServing*/0,
-                    cachedEl, s.attemptedDials(), s.backedOffPeers(),
+                    elCache.total(), elCache.snapOk(), elCache.snapBad(), s.attemptedDials(), s.backedOffPeers(),
                     s.blacklistedPeers(), s.discv5TableSize(), 0,
                     beaconState, bs.bootstrapped(), bs.connectedPeers(), (int) bs.lightClientPeers(),
-                    bs.servedPeersLastMinute(), cachedCl, bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
+                    bs.servedPeersLastMinute(), clCache.total(), clCache.proven(), clCache.nolc(),
+                    bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
                     s.syncStartPeriod(), syncCurrent, syncTarget,
                     Long.MAX_VALUE, List.of(), network,
                     s.pauseCount(), s.totalPausedMs(), s.lastPauseEpochMs(),
@@ -1692,10 +1734,11 @@ public final class NodeService extends Service {
         return new Snapshot(true, lifecycle, startTimeMs,
                 s.discoveredPeers(), s.connectedPeers(), s.readyPeers(),
                 s.snapPeers(), s.snapServingPeers(),
-                cachedEl, s.attemptedDials(), s.backedOffPeers(),
+                elCache.total(), elCache.snapOk(), elCache.snapBad(), s.attemptedDials(), s.backedOffPeers(),
                 s.blacklistedPeers(), s.discv5TableSize(), 0,
                 beaconState, bs.bootstrapped(), bs.connectedPeers(), (int) bs.lightClientPeers(),
-                bs.servedPeersLastMinute(), cachedCl, bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
+                bs.servedPeersLastMinute(), clCache.total(), clCache.proven(), clCache.nolc(),
+                bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
                 s.syncStartPeriod(), syncCurrent, syncTarget,
                 s.verifiedHeadAgeMs(), s.readyPeerList(), network,
                 s.pauseCount(), s.totalPausedMs(), s.lastPauseEpochMs(),
@@ -1712,6 +1755,57 @@ public final class NodeService extends Service {
      *  next service start. An OOM-kill is a SIGKILL with no onDestroy, so on that path the
      *  thread runs until the kill — the last emitted line is the clue we want. */
     private volatile Thread healthThread;
+
+    /** Rust-engine log pump for THIS service instance — same lifecycle contract
+     *  as {@link #healthThread}. Pumps the engine's drainable tracing ring into
+     *  {@link LogBuffer} (Logs tab + logcat) every 5 s; before this seam every
+     *  Rust-side incident on a phone had to be diagnosed blind. Runs on EVERY
+     *  build type (unlike the heartbeat): a 5 s poll of an in-memory ring is
+     *  nearly free, and the ring is empty unless the Rust engine is active. */
+    private volatile Thread rustLogThread;
+
+    private static final long RUST_LOG_DRAIN_MS = 5_000;
+    private static final int RUST_LOG_DRAIN_MAX = 500;
+
+    private void startRustLogPump() {
+        if (rustLogThread != null) return;
+        Thread t = new Thread(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    String batch = io.myotis.engines.Engines.drainRustLogs(RUST_LOG_DRAIN_MAX);
+                    if (!batch.isEmpty()) {
+                        for (String line : batch.split("\n")) {
+                            // Preserve severity: tracing's fmt layer puts the
+                            // level first (time disabled) — "ERROR …"/"WARN …".
+                            String trimmed = line.trim();
+                            if (trimmed.startsWith("ERROR")) LogBuffer.e("rust", line);
+                            else if (trimmed.startsWith("WARN")) LogBuffer.w("rust", line);
+                            else LogBuffer.i("rust", line);
+                        }
+                    }
+                } catch (Throwable ignored) {
+                    // Observability must never take the process down. But an
+                    // interrupt is a cancellation request, not a drain failure —
+                    // restore the flag and exit the drain thread promptly.
+                    if (ignored instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+                // Sleep OUTSIDE the try above: a persistently-throwing drain
+                // (e.g. a failed Engines static init) must stay a 5 s poll,
+                // never an unthrottled busy loop pinning a core.
+                try {
+                    Thread.sleep(RUST_LOG_DRAIN_MS);
+                } catch (InterruptedException e) {
+                    return; // onDestroy interrupted us
+                }
+            }
+        }, "ethp2p-rust-logs");
+        t.setDaemon(true);
+        rustLogThread = t;
+        t.start();
+    }
 
     /**
      * Emit one consolidated health line every {@link #HEARTBEAT_INTERVAL_MS}: process
@@ -1808,6 +1902,11 @@ public final class NodeService extends Service {
         if (hb != null) {
             hb.interrupt();
             healthThread = null;
+        }
+        Thread rl = rustLogThread;
+        if (rl != null) {
+            rl.interrupt();
+            rustLogThread = null;
         }
         stopIdleTicker();
         // Same fire-and-forget pattern as shutdown(): the system gives us a

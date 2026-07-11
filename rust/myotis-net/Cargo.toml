@@ -1,0 +1,53 @@
+[package]
+name = "myotis-net"
+version = "0.1.0"
+edition = "2021"
+description = "Myotis consensus-layer networking: discv5 discovery + libp2p eth2 req/resp + the light-client sync loop (ALL I/O lives here; myotis-consensus stays sans-I/O)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# The sans-I/O verification core this crate drives. The dependency is strictly
+# one-way: myotis-consensus must never grow a dependency on this crate (or on
+# tokio/libp2p/discv5 through any other path) — that's the wasm32 canary's job
+# to enforce (root build.gradle.kts `cargoCheckWasm`).
+myotis-consensus = { path = "../myotis-consensus" }
+# EL primitives (keccak, RLP, NodeKey, ENR) — sans-I/O, same one-way rule.
+myotis-core = { path = "../myotis-core" }
+# The EVM (revm-backed) for eth_call over verified state — the I/O crate implements
+# myotis-evm's sync SnapStateOracle trait and bridges it to the async snap fetch path.
+myotis-evm = { path = "../myotis-evm" }
+
+# Exact pins: this crate owns the I/O surface and interop with live CL peers
+# depends on wire-level behavior of these exact versions (noise/yamux framing,
+# discv5 packet format). Cargo.lock would pin them anyway; the `=` makes the
+# intent explicit and survives lockfile regeneration.
+tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net", "io-util"] }
+libp2p = { version = "=0.56.0", features = ["tokio", "tcp", "noise", "yamux", "identify", "request-response", "secp256k1", "macros"] }
+discv5 = "=0.11.0"
+snap = "=1.1.1"
+tracing = "=0.1.44"
+futures = "=0.3.32"
+async-trait = "=0.1.89"
+# EL discv4 (el::discv4): SO_RCVBUF sizing on the UDP socket (the Android
+# NEIGHBORS-truncation trap — docs/reimplementation/02 §9.10) and entropy for
+# FindNode random targets. Both are I/O-crate concerns by the sans-I/O rules.
+socket2 = "=0.5.10"
+getrandom = "=0.2.17"
+# RLPx (el::rlpx): ECIES (AES-128-CTR + HMAC-SHA256 + concat-KDF over SHA-256)
+# and the framed transport (AES-256-CTR + AES-256-ECB MAC + streaming Keccak-256).
+# All RustCrypto, pure Rust, cargo-ndk-clean. snap (snappy) is already in-tree.
+aes = "=0.8.4"
+ctr = "=0.9.2"
+cipher = "=0.4.4"
+hmac = "=0.12.1"
+sha2 = "=0.10.9"
+sha3 = "=0.10.9"
+# Audited constant-time equality for the ECIES + frame MAC comparisons (a
+# hand-rolled loop risks LLVM lowering it to an early-exit branch).
+subtle = "=2.6.1"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "live_sync"

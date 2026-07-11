@@ -1,0 +1,37 @@
+[package]
+name = "myotis-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Rust implementation of the io.myotis.api engine contract (JNI cdylib)"
+license = "MIT OR Apache-2.0"
+
+[lib]
+# libmyotis_engine.{so,dylib,dll} — loaded by :myotis-engines' RustEngineNative.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+myotis-consensus = { path = "../myotis-consensus" }
+# The consensus-layer I/O + light-client sync loop. The engine OWNS the tokio
+# runtime that drives it (the JNI natives are called from JVM threads with no
+# runtime of their own) — this is the only crate that pulls in tokio/libp2p; the
+# consensus crate stays sans-I/O.
+myotis-net = { path = "../myotis-net" }
+# Direct dep for U256 (value parsing) + the eth_call bridge types; also pulled
+# transitively via myotis-net. revm is gated inside myotis-evm.
+myotis-evm = { path = "../myotis-evm" }
+tokio = { version = "=1.52.3", features = ["rt-multi-thread"] }
+jni = { version = "0.21", default-features = false }
+# Compound values cross the JNI boundary as JSON (hand-JNI + JSON decision —
+# docs/reimplementation/05). Schemas are pinned by golden tests on both sides.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Global tracing subscriber feeding the drainable ring buffer behind
+# nativeDrainLogs — the on-device observability seam (Rust logs were
+# invisible on Android; hosts pump the drain into their own log pipeline).
+tracing = "=0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# The block/header types (re-exported through myotis-net) are constructed directly
+# in the block_json golden test; myotis-core is otherwise transitive via myotis-net.
+myotis-core = { path = "../myotis-core" }

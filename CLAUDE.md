@@ -34,12 +34,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ./gradlew :app:run -Pargs="get-headers 21000000 3"
 ./gradlew :app:run -Pargs=stop
 ./gradlew :app:run -Pargs=purge-cache
+
+# Rust workspace (rust/ — native BLS + the growing Rust engine). OPTIONAL:
+# without cargo these self-skip with one note; pure-Java build unaffected.
+./gradlew cargoBuildHost   # cargo build --release (auto-runs before :app:run / :consensus:test)
+./gradlew cargoTest        # cargo test --workspace (part of `check`)
+./gradlew cargoNdkAndroid  # Android jniLibs (needs cargo-ndk + NDK; committed jniLibs are the fallback)
 ```
 
 ## Architecture
 
 Key Gradle modules:
 
+- **myotis-engines** — the engine SELECTOR (`Engines`/`SelectorEngine`/`RustMyotisEngine`):
+  hosts' composition roots call `Engines.engine()`; `myotis.engine=java|rust|auto` routes
+  each network (re)start to the Java engine or the Rust one (`rust/myotis-engine`,
+  hand-JNI, compound values as JSON pinned by golden tests both sides).
 - **myotis-api** — THE ENGINE CONTRACT: zero-dependency Java-17 interfaces
   (`io.myotis.api` + `io.myotis.api.ports`) every host consumes exclusively.
   FFI-portable types only (byte[], String, long, double[], enums, flat records;
@@ -74,11 +84,17 @@ Key Gradle modules:
 - Network configs (genesis hash, fork ID, bootnodes) live in `NetworkConfig`
 - **Hosts talk ONLY to `:myotis-api`** (`MyotisEngine`/`ChainHandle`): host runtime
   paths in the daemon, desktop, and Android don't import engine internals
-  (node-core/networking/consensus types). Documented exemptions: the single
-  `new JavaMyotisEngine()` at each composition root; the daemon's `get-transactions`
-  debug stream (`DebugCommands` via `JavaMyotisEngine.debugStack`); Android's
-  BLS-backend toggle (`BlsBackends` — an internal engine seam, deliberately not on
-  the API); and `:app`'s `testing/MainnetPeerBootstrap` (an integration-test fixture).
+  (node-core/networking/consensus types). Composition roots use the `:myotis-engines`
+  selector (`Engines.engine()`; `myotis.engine=java|rust|auto`, default java —
+  `-Pengine=…` on run tasks), which routes to the Java engine (node-core) or the
+  Rust engine (rust/myotis-engine via hand-JNI + JSON). Documented exemptions: the
+  single `Engines.engine()` line at each composition root; the daemon's
+  `get-transactions` debug stream (`DebugCommands` via `SelectorEngine.javaDelegate()
+  .debugStack`); the Settings toggles for the BLS backend (`BlsBackends`) and the
+  engine (`Engines`), and the Rust log drain (`Engines.drainRustLogs` —
+  hosts pump the engine's tracing ring into their log pipeline) — internal
+  seams, deliberately not on the API; and `:app`'s
+  `testing/MainnetPeerBootstrap` (an integration-test fixture).
 
 ## Platform & language direction
 

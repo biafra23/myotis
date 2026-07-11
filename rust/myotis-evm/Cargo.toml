@@ -1,0 +1,42 @@
+[package]
+name = "myotis-evm"
+version = "0.1.0"
+edition = "2021"
+description = "Myotis EVM: view-call / gas-estimation over SNAP-proof-verified state (revm behind a SnapStateOracle trait; sans-I/O). Grows through the EL-phase Milestone-C PRs (docs/reimplementation/07)."
+license = "MIT OR Apache-2.0"
+
+# Sans-I/O like myotis-core / myotis-consensus: no tokio, sockets, fs, clock, or
+# entropy in this crate. The oracle trait is SYNCHRONOUS by contract — the
+# async→sync bridge (blocking on the tokio snap-fetch path) lives in the I/O
+# crate that implements the trait, never here (see the SnapStateOracle docs).
+# NOT on the wasm32 canary: revm pulls `std`, so this crate is host/mobile only.
+[dependencies]
+myotis-core = { path = "../myotis-core" }
+
+# revm — the EVM. THE one heavy EL dependency, deliberately gated to this crate
+# (docs/reimplementation/07, Milestone C). `default-features = false` + `std`
+# only drops revm's C-building precompile backends (c-kzg, libsecp256k1, blst)
+# in favour of its pure-Rust fallbacks (k256, …). `cargo tree -p myotis-evm`
+# COMPILES only k256 for crypto — `cargo tree -i c-kzg` / `-i secp256k1-sys` print
+# "nothing to print", so no C toolchain is invoked for this crate's build (no
+# cargo-ndk / mobile burden). NB: `c-kzg` and `secp256k1-sys` still appear as
+# ENTRIES in the workspace `Cargo.lock` — they are optional deps of `revm-precompile`
+# that Cargo pins for reproducibility but our feature selection never enables or
+# builds. The `optional_*` features are pure config (no new crates): they expose
+# the CfgEnv `disable_*` flags an `eth_call` needs — a view call runs with a real
+# header base fee but zero gas price, an arbitrary/zero sender that may hold code,
+# and 30 M gas regardless of the block limit. Exact-pinned like every workspace
+# dep; a revm bump is a deliberate, reviewed change (its API churns across majors).
+revm = { version = "=41.0.0", default-features = false, features = [
+    "std",
+    "optional_balance_check",
+    "optional_block_gas_limit",
+    "optional_eip3607",
+    "optional_no_base_fee",
+] }
+
+[features]
+# In-memory FixtureSnapStateOracle for downstream tests (the engine crate's
+# EVM tests). Off by default so it never ships in the engine .so; the crate's
+# own tests see it through `cfg(test)`.
+fixture = []
