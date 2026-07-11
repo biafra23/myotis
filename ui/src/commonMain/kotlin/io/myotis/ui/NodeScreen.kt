@@ -108,7 +108,10 @@ fun NodeScreen(
     // still-live stack. Sourcing from settings rather than the live map keeps a
     // runtime-stopped chain's chip visible — Stop on the Status page is decoupled from
     // the Settings enable switch, so an enabled-but-stopped chain stays selectable and
-    // can be started again from Status.
+    // can be started again from Status. enabledNetworks() is a plain read (no snapshot
+    // state): a Settings toggle re-derives it via the boot/stop it triggers changing
+    // `snapshots` within one 2s poll (or via any tab switch), so chips may lag a toggle
+    // by a beat but self-heal.
     val chains = (settings.enabledNetworks() + snapshots.keys).distinct()
     var selected by remember { mutableStateOf<String?>(null) }
     val network = selected?.takeIf { it in chains } ?: chains.firstOrNull() ?: settings.primaryNetwork()

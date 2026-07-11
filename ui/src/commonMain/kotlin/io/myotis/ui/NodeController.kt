@@ -27,8 +27,9 @@ interface NodeController {
     /**
      * Runtime-only start: bring the stack up WITHOUT touching the persisted enabled
      * flag. The Status page's Start button — starting a stopped chain there must not
-     * flip its Settings switch. Callers ensure the network is enabled (or the service
-     * already running); a cold host boots the enabled set, which then includes it.
+     * flip its Settings switch. Callers ensure the network is ENABLED (a disabled
+     * chain routes through [enableNetwork] instead): hosts may boot only the enabled
+     * set (Android's cold service does) or refuse disabled chains outright.
      */
     fun startNetwork(name: String)
 

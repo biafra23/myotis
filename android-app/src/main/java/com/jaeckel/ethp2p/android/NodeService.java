@@ -376,23 +376,31 @@ public final class NodeService extends Service {
             return;
         }
         if (handles.containsKey(n)) return;
-        new Thread(() -> buildAndStart(n), "ethp2p-boot-" + n).start();
+        long gen = stopGen(n);
+        new Thread(() -> runBoot(n, gen), "ethp2p-boot-" + n).start();
     }
 
     /**
      * Runtime-only stop (the Status page's Stop button): remove and shut down the stack
      * on a worker WITHOUT touching the persisted enabled flag — the chain stays enabled
      * and boots again on the next service start. If it was the last live stack, the
-     * whole service stops (mirrors a Stop-node tap).
+     * whole service stops (mirrors a Stop-node tap): a service with zero stacks has
+     * nothing to host, and its notification would read "Starting…" forever.
      */
     public void stopNetwork(String name) {
         String n = canonicalNetwork(name);
+        // Invalidate any queued/in-flight boot of this chain. The old disable path got
+        // this for free from buildAndStart's enabled-flag re-check; a runtime stop
+        // leaves the flag on, so without the generation bump a boot that loses the
+        // bootLock race would resurrect the chain the user just stopped.
+        stopGens.computeIfAbsent(n, k -> new java.util.concurrent.atomic.AtomicLong()).incrementAndGet();
         forgetStack(n);   // drop from the UI's live map immediately
         new Thread(() -> {
             synchronized (bootLock(n)) {
                 try { ENGINE.stop(n); } catch (Throwable ignored) {}
             }
-            stopIfNoStacksLeft();
+            // userStop=true: an empty map is decisive even though flags stay enabled.
+            stopIfNoStacksLeft(true);
         }, "ethp2p-stop-" + n).start();
     }
 
@@ -412,11 +420,12 @@ public final class NodeService extends Service {
         // to SYNCED again before the idle controller may pause it. buildAndStart re-stamps the
         // start clocks. (rebootNetwork doesn't go through forgetStack, so clear it explicitly here.)
         reachedSynced.remove(n);
+        long gen = stopGen(n);
         new Thread(() -> {
             synchronized (bootLock(n)) {
                 try { ENGINE.stop(n); } catch (Throwable ignored) {}
             }
-            buildAndStart(n);   // re-acquires bootLock(n) for its start() — frees ports first
+            runBoot(n, gen);   // re-acquires bootLock(n) for its start() — frees ports first
         }, "ethp2p-reboot-" + n).start();
     }
 
@@ -441,15 +450,53 @@ public final class NodeService extends Service {
         return false;
     }
 
+    /** Boots currently inside {@link #runBoot} — guards {@link #stopIfNoStacksLeft}
+     *  against the transiently-empty {@link #handles} map while a chain is still
+     *  spinning up (a boot only registers its handle once start() succeeds). */
+    private final java.util.concurrent.atomic.AtomicInteger bootsInFlight =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    /** Per-network stop generation, bumped by {@link #stopNetwork}. Boot threads
+     *  snapshot it at spawn and bail if it moved — see the stopNetwork comment. */
+    private final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong> stopGens =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    private long stopGen(String n) {
+        return stopGens.computeIfAbsent(n, k -> new java.util.concurrent.atomic.AtomicLong()).get();
+    }
+
     /**
-     * Stop the whole foreground service once the last stack is gone AND no network is still
-     * enabled — i.e. the user disabled the last chain. The enabled-set guard matters because a
-     * boot-bail can see the map transiently empty while other enabled chains are still spinning
-     * up; without it, disabling one chain mid-boot could wrongly stop the whole service.
+     * The boot-thread entry around {@link #buildAndStart}: counts the boot in flight,
+     * and once it finishes (success, bail, or failure) gives the service-stop check
+     * one shot. The gen comparison finishes a runtime stop that raced this boot: the
+     * stop's own check ran while this boot was still in flight and skipped.
      */
-    private void stopIfNoStacksLeft() {
-        if (handles.isEmpty() && !anyNetworkEnabled() && RUNNING.compareAndSet(true, false)) {
-            LogBuffer.i(TAG, "no networks left enabled; stopping service");
+    private void runBoot(String n, long gen) {
+        bootsInFlight.incrementAndGet();
+        try {
+            buildAndStart(n, gen);
+        } finally {
+            bootsInFlight.decrementAndGet();
+            stopIfNoStacksLeft(stopGen(n) != gen);
+        }
+    }
+
+    /**
+     * Stop the whole foreground service once the last stack is gone and no boot is in
+     * flight. {@code userStop} (Status Stop / Settings disable, incl. one racing a boot —
+     * see {@link #runBoot}) makes the empty map decisive even while networks are still
+     * ENABLED: a runtime stop keeps the flags on by design, and a zero-stack service has
+     * nothing to host (its notification would read "Starting…" forever). Start cold-starts
+     * the service again and onStartCommand boots the enabled set. Non-user callers
+     * (boot-bail/failure paths) keep the old enabled-set guard, so a failed boot with
+     * enabled chains leaves the service up exactly as before. The boots-in-flight guard
+     * covers the transiently-empty map while another chain is still spinning up.
+     */
+    private void stopIfNoStacksLeft(boolean userStop) {
+        if (handles.isEmpty() && bootsInFlight.get() == 0
+                && (userStop || !anyNetworkEnabled())
+                && RUNNING.compareAndSet(true, false)) {
+            LogBuffer.i(TAG, "no stacks left; stopping service");
             stopForeground(STOP_FOREGROUND_REMOVE);
             stopSelf();
         }
@@ -1289,7 +1336,8 @@ public final class NodeService extends Service {
         // blocking-ish, so build + start each on its own worker; they bind distinct ports
         // (NetworkConfig.defaultElPort/Discv5Port/RpcPort) so they never collide.
         for (String n : enabledNetworks(this)) {
-            new Thread(() -> buildAndStart(n), "ethp2p-boot-" + n).start();
+            long gen = stopGen(n);
+            new Thread(() -> runBoot(n, gen), "ethp2p-boot-" + n).start();
         }
         return START_NOT_STICKY;
     }
@@ -1301,7 +1349,7 @@ public final class NodeService extends Service {
      * internally, so a fast disable→enable (or rebootNetwork) of the same chain waits for
      * its own ports to free. Stops the service only if the very last stack fails to come up.
      */
-    private void buildAndStart(String netName) {
+    private void buildAndStart(String netName, long gen) {
         String n = canonicalNetwork(netName);
         ChainHandle created = null;
         try {
@@ -1319,14 +1367,15 @@ public final class NodeService extends Service {
             // create() + start() under the per-network bootLock: a Stop→Start / disable→enable
             // has this boot wait for the old instance's teardown (which holds the same lock) to
             // free the ports AND unregister from the engine (create() throws on a still-hosted
-            // network). A whole-service Stop or a per-network disable could race this boot, so
-            // bail if either says the chain is no longer wanted — re-checked after start() too,
-            // since start() blocks and the race window spans it.
+            // network). A whole-service Stop, a per-network disable, or a runtime stopNetwork
+            // (which bumps the stop generation instead of the enabled flag) could race this
+            // boot, so bail if any says the chain is no longer wanted — re-checked after
+            // start() too, since start() blocks and the race window spans it. runBoot fires
+            // the service-stop check after every bail/return path.
             synchronized (bootLock(n)) {
-                if (!RUNNING.get() || !isNetworkEnabled(this, n)) {
+                if (!RUNNING.get() || !isNetworkEnabled(this, n) || stopGen(n) != gen) {
                     LogBuffer.i(TAG, "[" + n + "] stop/disable raced boot; skipping");
                     forgetStack(n);
-                    stopIfNoStacksLeft();
                     return;
                 }
                 if (ENGINE.get(n) != null) {
@@ -1382,14 +1431,12 @@ public final class NodeService extends Service {
                     LogBuffer.e(TAG, "[" + n + "] node stack failed to start");
                     forgetStack(n);
                     try { ENGINE.stop(n); } catch (Throwable ignored) {}
-                    stopIfNoStacksLeft();
                     return;
                 }
-                if (!RUNNING.get() || !isNetworkEnabled(this, n)) {
+                if (!RUNNING.get() || !isNetworkEnabled(this, n) || stopGen(n) != gen) {
                     LogBuffer.i(TAG, "[" + n + "] stop/disable raced start; tearing down");
                     forgetStack(n);
                     try { ENGINE.stop(n); } catch (Throwable ignored) {}
-                    stopIfNoStacksLeft();
                     return;
                 }
             }
@@ -1413,7 +1460,7 @@ public final class NodeService extends Service {
                     }
                 }
             }
-            stopIfNoStacksLeft();
+            // service-stop check happens in runBoot's finally, after the in-flight count drops
         }
     }
 
