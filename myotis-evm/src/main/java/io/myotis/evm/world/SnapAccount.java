@@ -69,7 +69,7 @@ final class SnapAccount implements MutableAccount {
         this(besuAddress, view);
         this.nonce = 0L;
         this.balance = Wei.ZERO;
-        this.codeHash = Hash.EMPTY.getBytes().toArrayUnsafe();
+        this.codeHash = Hash.EMPTY.getBytes().toArray();
         this.loadedCode = Bytes.EMPTY;
     }
 
@@ -77,7 +77,7 @@ final class SnapAccount implements MutableAccount {
         SnapAccount a = new SnapAccount(src.getAddress(), view);
         a.nonce = src.getNonce();
         a.balance = src.getBalance();
-        a.codeHash = src.getCodeHash().getBytes().toArrayUnsafe();
+        a.codeHash = src.getCodeHash().getBytes().toArray();
         a.loadedCode = src.getCode();
         // Inherit storage journals from the parent so writes performed
         // earlier in the same transaction are visible inside nested calls.
@@ -225,6 +225,6 @@ final class SnapAccount implements MutableAccount {
     }
 
     private boolean codeHashIsEmpty() {
-        return java.util.Arrays.equals(codeHash, Hash.EMPTY.getBytes().toArrayUnsafe());
+        return java.util.Arrays.equals(codeHash, Hash.EMPTY.getBytes().toArray());
     }
 }

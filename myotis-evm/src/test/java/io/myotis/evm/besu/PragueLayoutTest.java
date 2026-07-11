@@ -3,7 +3,6 @@ package io.myotis.evm.besu;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.math.BigInteger;
 import org.hyperledger.besu.datatypes.Address;
 import org.hyperledger.besu.evm.gascalculator.PragueGasCalculator;
 import org.hyperledger.besu.evm.precompile.MainnetPrecompiledContracts;
@@ -43,8 +42,10 @@ class PragueLayoutTest {
                 "P256VERIFY is Osaka-only");
         // KZG point-eval (0x0a, Cancun+) still registered.
         assertTrue(reg.get(addr(0x0a)) != null, "KZG point-eval must exist");
-        // Sanity: chain-id-flavored factory agrees.
-        BigInteger one = BigInteger.ONE;
-        assertTrue(one.signum() > 0);
+        // Sanity: the hand-built P256 address really is 0x…0100.
+        assertTrue(
+                Address.wrap(org.apache.tuweni.bytes.Bytes.wrap(p256))
+                        .equals(Address.fromHexString("0x0000000000000000000000000000000000000100")),
+                "p256 byte array must encode address 0x100");
     }
 }
