@@ -94,7 +94,7 @@ public final class SnapWorldUpdater implements WorldUpdater {
         // EVM-side account record — the EVM treats absent accounts as
         // empty (nonce=0, balance=0, no code) and the AccountState the
         // oracle returns for a miss already encodes that.
-        Address own = Address.of(address.toArrayUnsafe());
+        Address own = Address.of(address.getBytes().toArrayUnsafe());
         AccountState state = baseView.account(own);
         SnapAccount a = SnapAccount.fromState(state, baseView);
         touched.put(address, a);

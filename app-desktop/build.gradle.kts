@@ -12,7 +12,9 @@ plugins {
 
 kotlin { jvmToolchain(21) }
 
-// Besu (via :myotis-evm) drags in the pre-rename tuweni coordinates io.tmio:tuweni-* 2.4.2,
+// Historical (Besu ≤24.12; 26.4 targets tuweni 2.7.2 so io.tmio is gone from the
+// graph — the exclude stays as a cheap guard):
+// Besu (via :myotis-evm) dragged in the pre-rename tuweni coordinates io.tmio:tuweni-* 2.4.2,
 // whose org.apache.tuweni.bytes.Bytes collides with the JitPack Kotlin fork we use
 // (com.github.biafra23.tuweni-kotlin 2.7.2). A single classloader loads only ONE Bytes for
 // that FQN: tuweni-rlp 2.7.2 (BytesRLPWriter.kt) needs the 2.7.2 Bytes' Kotlin `Companion`,

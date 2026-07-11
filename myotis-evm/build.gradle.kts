@@ -20,10 +20,24 @@ java {
 dependencies {
     implementation(project(":core"))
 
-    // Besu EVM. Brings in besu-datatypes transitively, but pin both so the
-    // version catalog is the single bump-point.
+    // Besu EVM 26.4.0 — the final-Fusaka EVM (CLZ, P256VERIFY, EOF removed).
+    // 25.7+ renamed the artifactIds (evm → besu-evm); transitives (tuweni
+    // 2.7.2 — the same version as our Kotlin fork, killing the old io.tmio
+    // collision at the source — caffeine, guava, jna, besu-native, jc-kzg)
+    // flow from the real POMs.
     implementation(libs.besu.evm)
     implementation(libs.besu.datatypes)
+    // Former POM-transitives of besu:evm, now explicit (versions from the
+    // 26.4.0 release tarball's lib/):
+    implementation("com.github.ben-manes.caffeine:caffeine:3.2.3")
+    implementation("com.google.guava:guava:33.5.0-jre")
+    implementation("net.java.dev.jna:jna:5.18.1")
+    // besu-native crypto (secp256k1/r1 + gnark precompile backends) — still
+    // published publicly:
+    implementation("org.hyperledger.besu:secp256k1:1.5.0")
+    implementation("org.hyperledger.besu:secp256r1:1.5.0")
+    implementation("org.hyperledger.besu:gnark:1.5.0")
+    implementation("org.hyperledger.besu:arithmetic:1.5.0")
 
     // Tuweni Bytes/UInt256 are part of Besu's public API surface, so we use
     // the same coordinates here for ABI codec inputs/outputs.

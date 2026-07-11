@@ -69,7 +69,7 @@ final class SnapAccount implements MutableAccount {
         this(besuAddress, view);
         this.nonce = 0L;
         this.balance = Wei.ZERO;
-        this.codeHash = Hash.EMPTY.toArrayUnsafe();
+        this.codeHash = Hash.EMPTY.getBytes().toArrayUnsafe();
         this.loadedCode = Bytes.EMPTY;
     }
 
@@ -77,7 +77,7 @@ final class SnapAccount implements MutableAccount {
         SnapAccount a = new SnapAccount(src.getAddress(), view);
         a.nonce = src.getNonce();
         a.balance = src.getBalance();
-        a.codeHash = src.getCodeHash().toArrayUnsafe();
+        a.codeHash = src.getCodeHash().getBytes().toArrayUnsafe();
         a.loadedCode = src.getCode();
         // Inherit storage journals from the parent so writes performed
         // earlier in the same transaction are visible inside nested calls.
@@ -99,7 +99,7 @@ final class SnapAccount implements MutableAccount {
 
     @Override
     public Hash getAddressHash() {
-        return Hash.hash(besuAddress);
+        return Hash.hash(besuAddress.getBytes());
     }
 
     @Override
@@ -145,7 +145,7 @@ final class SnapAccount implements MutableAccount {
         if (v != null) return v;
         UInt256 orig = originalStorage.get(slot);
         if (orig != null) return orig;
-        UInt256 fetched = view.storage(Address.of(besuAddress.toArrayUnsafe()), slot);
+        UInt256 fetched = view.storage(Address.of(besuAddress.getBytes().toArrayUnsafe()), slot);
         originalStorage.put(slot, fetched);
         return fetched;
     }
@@ -154,7 +154,7 @@ final class SnapAccount implements MutableAccount {
     public UInt256 getOriginalStorageValue(UInt256 slot) {
         UInt256 cached = originalStorage.get(slot);
         if (cached != null) return cached;
-        UInt256 fetched = view.storage(Address.of(besuAddress.toArrayUnsafe()), slot);
+        UInt256 fetched = view.storage(Address.of(besuAddress.getBytes().toArrayUnsafe()), slot);
         originalStorage.put(slot, fetched);
         return fetched;
     }
@@ -194,7 +194,7 @@ final class SnapAccount implements MutableAccount {
         // Lazily seed the original-value cache so a subsequent getOriginalStorageValue
         // returns the pre-write value rather than the journalled write.
         originalStorage.computeIfAbsent(key,
-                k -> view.storage(Address.of(besuAddress.toArrayUnsafe()), k));
+                k -> view.storage(Address.of(besuAddress.getBytes().toArrayUnsafe()), k));
         updatedStorage.put(key, value);
     }
 
@@ -225,6 +225,6 @@ final class SnapAccount implements MutableAccount {
     }
 
     private boolean codeHashIsEmpty() {
-        return java.util.Arrays.equals(codeHash, Hash.EMPTY.toArrayUnsafe());
+        return java.util.Arrays.equals(codeHash, Hash.EMPTY.getBytes().toArrayUnsafe());
     }
 }

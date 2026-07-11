@@ -151,7 +151,7 @@ public final class DefaultEvmExecutor implements EvmExecutor {
                 .blockValues(new BlockContextValues(blockContext))
                 .completer(f -> {})
                 .miningBeneficiary(besuCoinbase)
-                .blockHashLookup(n -> {
+                .blockHashLookup((bhFrame, n) -> {
                     throw new UnsupportedOperationException(
                             "BLOCKHASH not implemented; needs a verified block-hash provider");
                 })
@@ -210,7 +210,7 @@ public final class DefaultEvmExecutor implements EvmExecutor {
             contractCode = delegateAccount == null ? Bytes.EMPTY : delegateAccount.getCode();
             contractCodeHash = delegateAccount == null ? Hash.EMPTY : delegateAccount.getCodeHash();
         }
-        return evm.getCode(contractCodeHash, contractCode);
+        return evm.getOrCreateCachedJumpDest(contractCodeHash, contractCode);
     }
 
     /**
@@ -294,7 +294,7 @@ public final class DefaultEvmExecutor implements EvmExecutor {
                 // it as a "weak randomness" source). Fail fast instead; the
                 // EVM will surface this as PRECOMPILE_ERROR / opaque halt and
                 // we relabel it via the halt-reason mapping below.
-                .blockHashLookup(n -> {
+                .blockHashLookup((bhFrame, n) -> {
                     throw new UnsupportedOperationException(
                             "BLOCKHASH not implemented; needs a verified block-hash provider");
                 })

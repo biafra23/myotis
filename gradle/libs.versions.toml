@@ -18,10 +18,13 @@ jblst = "0.3.15"
 jvm-libp2p = "1.3.2-RELEASE"
 trueblocks-kotlin = "main-SNAPSHOT"
 dnsjava = "3.6.2"
-# Hyperledger Besu, used by myotis-evm. Pinned to a recent stable that ships
-# all currently-active mainnet precompiles. Bumping requires a fork-rule audit
-# in EvmFactory and a pass over docs/besu-extraction.md.
-besu = "24.12.2"
+# Hyperledger Besu (myotis-evm). NOTE: 25.7+ RENAMED the maven artifactIds
+# (evm → besu-evm; internal:algorithms → internal:besu-crypto-algorithms) —
+# probing the old names 404s and looks like publishing stopped; it didn't.
+# Bumping requires a fork-rule audit in EvmFactory, a pass over
+# docs/besu-extraction.md, AND rebasing the Android ART fork
+# (biafra23/besu, tag <ver>-android.N — android-app substitutes it in).
+besu = "26.4.0"
 agp = "8.7.3"
 kotlin = "2.0.21"
 compose-bom = "2024.11.00"
@@ -79,12 +82,9 @@ jvm-libp2p          = { module = "io.libp2p:jvm-libp2p",                   versi
 trueblocks-kotlin   = { module = "com.github.biafra23:trueblocks-kotlin", version.ref = "trueblocks-kotlin" }
 dnsjava             = { module = "dnsjava:dnsjava",                       version.ref = "dnsjava" }
 discovery           = { module = "io.consensys.protocols:discovery",       version.ref = "discovery" }
-
-# Besu EVM module. The standalone `evm` artifact is the heart of the Phase 0
-# spike — a hand-rolled WorldUpdater plugs into it. `besu-datatypes` carries
-# the Address/Wei/Hash value types the EVM expects on its API.
-besu-evm            = { module = "org.hyperledger.besu:evm",              version.ref = "besu" }
+besu-evm            = { module = "org.hyperledger.besu:besu-evm",         version.ref = "besu" }
 besu-datatypes      = { module = "org.hyperledger.besu:besu-datatypes",   version.ref = "besu" }
+
 
 androidx-compose-bom              = { module = "androidx.compose:compose-bom", version.ref = "compose-bom" }
 androidx-activity-compose         = { module = "androidx.activity:activity-compose", version.ref = "activity-compose" }

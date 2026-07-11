@@ -14,7 +14,7 @@ plugins {
 // Caffeine) and publishes them via JitPack. See besu-android-fork/README.md.
 // We swap only these two modules to the fork — scoped to :android-app so the
 // JVM daemon stays on upstream Besu, where those APIs work.
-val besuForkVersion = "24.12.2-android.2"
+val besuForkVersion = "26.4.0-android.1"
 
 // The JitPack netty-kotlin fork republishes netty-common/buffer/etc. with the
 // same fully-qualified classes; the JVM tolerates the shadowing but the dexer
@@ -34,10 +34,13 @@ configurations.all {
     // JitPack); everything else stays upstream. Eager `all` so AGP's classpaths
     // pick up the resolutionStrategy before they resolve.
     resolutionStrategy.dependencySubstitution {
-        substitute(module("org.hyperledger.besu:evm"))
-            .using(module("com.github.biafra23.besu:evm:$besuForkVersion"))
-        substitute(module("org.hyperledger.besu.internal:algorithms"))
-            .using(module("com.github.biafra23.besu:algorithms:$besuForkVersion"))
+        substitute(module("org.hyperledger.besu:besu-evm"))
+            .using(module("com.github.biafra23.besu:besu-evm:$besuForkVersion"))
+        // 26.4 renamed the crypto module's distribution artifact; our vendored
+        // repo serves it as besu-crypto-algorithms — swap THAT to the fork's
+        // algorithms module (same sources, ART-patched BesuProvider ctor).
+        substitute(module("org.hyperledger.besu.internal:besu-crypto-algorithms"))
+            .using(module("com.github.biafra23.besu:besu-crypto-algorithms:$besuForkVersion"))
         // The fork's POMs import org.hyperledger.besu:bom:24.12.2, which Besu
         // never publishes to Maven Central; redirect it to the fork-published
         // bom. The fork is pinned to version 24.12.2, so its other sibling refs
@@ -47,13 +50,15 @@ configurations.all {
         substitute(platform(module("org.hyperledger.besu:bom")))
             .using(platform(module("com.github.biafra23.besu:bom:$besuForkVersion")))
     }
-    // Besu (via :myotis-evm) pulls the pre-rename tuweni coordinates
-    // io.tmio:tuweni-* 2.4.2, whose org.apache.tuweni.* classes collide with
-    // our JitPack fork (com.github.biafra23.tuweni-kotlin 2.7.2-jvm17.1) —
-    // D8 rejects the duplicates. Strip io.tmio and route Besu's tuweni to the
-    // fork (same package, newer version; API-compatible for the units/bytes
-    // Besu uses).
+    // Historical: Besu ≤24.12 pulled the pre-rename io.tmio:tuweni-* 2.4.2,
+    // colliding with our tuweni fork. Besu 26.4 targets tuweni 2.7.2 (the
+    // fork's exact version) so nothing pulls io.tmio anymore — the exclude
+    // stays as a cheap guard against a transitive reintroducing it.
     exclude(group = "io.tmio")
+    // tuweni's post-rename coordinates (io.consensys.tuweni, pulled by the
+    // Besu 26.4 fork's POM) collide with our Kotlin fork the same way io.tmio
+    // did — same classes, D8 rejects the duplicates. The fork supplies them.
+    exclude(group = "io.consensys.tuweni")
     // Requesting the STANDARD_JVM Guava variant (below) clashes with the
     // `android` variant that Besu pulls transitively — both provide the guava
     // capability. Resolve the conflict toward the JRE variant, which is the one
@@ -70,9 +75,10 @@ configurations.all {
             }
         }
     }
-    // (No Caffeine pin needed: the fork's CodeCache drops Caffeine, so nothing
-    // on the EVM path loads a Caffeine class — its StripedBuffer/System.Logger
-    // Android incompatibilities never trigger.)
+    // (No Caffeine pin needed: the fork drops Caffeine from
+    // JumpDestOnlyCodeCache AND nulls the 14 static precompile result caches
+    // 26.4 added — nothing on the EVM path constructs a Caffeine cache, so its
+    // StripedBuffer/System.Logger ART incompatibilities never trigger.)
 }
 
 // Optional JSON-RPC upstream-proxy URL (DEBUG/dev only) read from local.properties
