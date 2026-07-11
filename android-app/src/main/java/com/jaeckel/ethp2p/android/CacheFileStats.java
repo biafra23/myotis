@@ -22,7 +22,9 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 final class CacheFileStats {
 
-    /** CL: total cached peers, proven catch-up servers (served-range token), nolc-flagged. */
+    /** CL: total cached peers, proven LC servers (served-range or {@code lc} token),
+     *  nolc-flagged. Buckets are mutually exclusive (proven wins over nolc), so
+     *  {@code total - proven - nolc} is the untried remainder the UI shows. */
     record ClStats(int total, int proven, int nolc) {
         static final ClStats EMPTY = new ClStats(0, 0, 0);
     }
@@ -90,16 +92,19 @@ final class CacheFileStats {
             // Per-PEER flags, not per-token: the loader merges multiple
             // range/legacy tokens on one line into a single served range
             // (widening), so counting per token could show proven > total.
-            boolean hasRange = false;
+            // Proven now includes Identify-confirmed `lc` peers, not just
+            // catch-up servers — and beats nolc — so the three buckets
+            // (proven / nolc / untried-remainder) always sum to total.
+            boolean hasLcSignal = false;
             boolean hasNolc = false;
             String[] tokens = trimmed.split("\t");
             for (int i = 1; i < tokens.length; i++) {
                 String tok = tokens[i];
                 if (tok.equals("nolc")) hasNolc = true;
-                else if (isServedRange(tok)) hasRange = true;
+                else if (tok.equals("lc") || isServedRange(tok)) hasLcSignal = true;
             }
-            if (hasRange) proven++;
-            if (hasNolc) nolc++;
+            if (hasLcSignal) proven++;
+            else if (hasNolc) nolc++;
         }
         return new ClStats(total, proven, nolc);
     }

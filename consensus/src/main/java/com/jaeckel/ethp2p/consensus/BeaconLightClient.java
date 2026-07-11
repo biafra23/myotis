@@ -1974,6 +1974,15 @@ public class BeaconLightClient implements AutoCloseable {
         // never struck while rounds keep winning — the recency sort in
         // orderByLightClient demotes it instead.
         final java.util.Queue<String> roundFailures = new java.util.concurrent.ConcurrentLinkedQueue<>();
+        // Classification harvest — independent of the round outcome and of the
+        // strike buffer above. With few proven servers the fan-out fills with
+        // UNTRIED cache candidates anyway; record what each dial teaches us so
+        // the probe isn't wasted: a decodable finality update (winner or loser)
+        // proves the peer serves light-client data; a NoSuchRemoteProtocol
+        // rejection proves it doesn't (deliberately NOT the connection-closed /
+        // timeout failures — that's how genuine-but-at-capacity servers fail).
+        final java.util.Queue<String> lcConfirmed = new java.util.concurrent.ConcurrentLinkedQueue<>();
+        final java.util.Queue<String> lcDenied = new java.util.concurrent.ConcurrentLinkedQueue<>();
 
         for (String peer : peers) {
             if (!running) return;
@@ -1996,11 +2005,21 @@ public class BeaconLightClient implements AutoCloseable {
                             log.debug("[beacon] Finality update failed from {}: {}", peer,
                                     root.getMessage() != null ? root.getMessage()
                                             : root.getClass().getSimpleName());
+                            // Definitive non-server: the peer's mux said it has no such
+                            // protocol. Matched by simple name to avoid pinning libp2p's
+                            // internal package layout.
+                            if ("NoSuchRemoteProtocolException".equals(root.getClass().getSimpleName())) {
+                                lcDenied.add(peer);
+                            }
                             roundFailures.add(peer);
                         } else {
                             try {
                                 com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("finality", response);
                                 LightClientFinalityUpdate update = LightClientFinalityUpdate.decode(response);
+                                // Decodable update ⇒ the peer serves the LC protocol,
+                                // whether or not it wins the round. Dial-priority signal
+                                // only — trust still requires the verified apply below.
+                                lcConfirmed.add(peer);
 
                                 final boolean finalityApplied;
                                 // Writers serialize on catchUpApplyLock (see its javadoc): without
@@ -2062,6 +2081,7 @@ public class BeaconLightClient implements AutoCloseable {
             if (!lateWin) {
                 for (String p : roundFailures) notifyPeerFailure(p);
             }
+            recordLcVerdicts(lcConfirmed, lcDenied);
             log.debug("[beacon] pollFinalityUpdate: fan-out of {} peer(s), no advance this cycle{}",
                     peers.size(), lateWin ? " (late winner, follow-ups next round)" : "");
             return;
@@ -2075,14 +2095,12 @@ public class BeaconLightClient implements AutoCloseable {
         // staler update as what we serve peers — the sequential loop always ended
         // on the winner's bytes).
         p2pService.cacheFinalityUpdate(win.raw());
+        // Classification harvest (covers the winner too — a decodable response
+        // queued it as confirmed, which is the Rust mark_proven analog).
+        recordLcVerdicts(lcConfirmed, lcDenied);
         if (win.applied()) {
             updateSyncState();
             fillChainStateRoots(win.peer(), true);
-            // The winner just demonstrably served light-client data: promote it to
-            // the proven tier (the Rust pool's mark_proven analog) so the recency
-            // ordering applies to it even if Identify never flagged it.
-            provenLightClient.add(win.peer());
-            peersNoLcUpdates.remove(win.peer());
             notifyPeerSuccess(win.peer());
             // Steady-state advance — persist so a restart resumes here
             // (no-op unless the committee period actually moved).
@@ -2124,6 +2142,38 @@ public class BeaconLightClient implements AutoCloseable {
      *  run the seed branch for. */
     private record FinalityPollWin(
             String peer, byte[] raw, LightClientFinalityUpdate update, boolean applied) {}
+
+    /**
+     * Apply a poll round's classification harvest (poll thread, once per round):
+     * confirmed peers join the proven tier (recency-ordered by copyPeers) and
+     * denied peers the nolc tier — mirroring the Identify-round verdicts — and
+     * ONLY the peers whose state actually changed are pushed to the host's
+     * verdict callback, so a round that merely re-confirms the same winner
+     * doesn't trigger a cache-file rewrite every 12s. A peer somehow in both
+     * queues counts as confirmed (it served; the rejection was transient).
+     */
+    private void recordLcVerdicts(java.util.Queue<String> confirmed, java.util.Queue<String> denied) {
+        List<String> newConfirmed = new ArrayList<>();
+        List<String> newDenied = new ArrayList<>();
+        java.util.Set<String> confirmedSet = new java.util.HashSet<>();
+        for (String p; (p = confirmed.poll()) != null; ) {
+            confirmedSet.add(p);
+            peersNoLcUpdates.remove(p);
+            if (provenLightClient.add(p)) newConfirmed.add(p);
+            String pid = peerIdOf(p);
+            recentServes.put(pid != null ? pid : p, System.nanoTime());
+        }
+        for (String p; (p = denied.poll()) != null; ) {
+            if (confirmedSet.contains(p)) continue;
+            provenLightClient.remove(p);
+            if (peersNoLcUpdates.add(p)) newDenied.add(p);
+        }
+        java.util.function.BiConsumer<java.util.Collection<String>, java.util.Collection<String>> cb =
+                onLightClientVerdict;
+        if (cb != null && (!newConfirmed.isEmpty() || !newDenied.isEmpty())) {
+            cb.accept(newConfirmed, newDenied);
+        }
+    }
 
     /**
      * Push the current store state into the shared {@link BeaconSyncState}.
