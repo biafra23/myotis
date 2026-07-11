@@ -136,12 +136,17 @@ val prepareRustAppResources = tasks.register("prepareRustAppResources") {
 // into the image — our staging must run before IT (depending only on the
 // package*/createDistributable* umbrella tasks is too late: the internal copy
 // consumes the dir first).
-tasks.matching {
-    it.name == "prepareAppResources"
-        || it.name.startsWith("package") || it.name.startsWith("createDistributable")
-        || it.name.startsWith("createReleaseDistributable")
-        || it.name.startsWith("runDistributable") || it.name.startsWith("runRelease")
-}.configureEach { dependsOn(prepareRustAppResources) }
+tasks.configureEach {
+    // configureEach (not tasks.matching{}, which realizes every task eagerly):
+    // the name check runs lazily as each task is configured.
+    if (name == "prepareAppResources"
+        || name.startsWith("package") || name.startsWith("createDistributable")
+        || name.startsWith("createReleaseDistributable")
+        || name.startsWith("runDistributable") || name.startsWith("runRelease")
+    ) {
+        dependsOn(prepareRustAppResources)
+    }
+}
 
 compose.desktop {
     application {

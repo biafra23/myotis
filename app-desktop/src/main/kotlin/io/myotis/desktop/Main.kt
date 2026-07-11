@@ -18,7 +18,9 @@ fun main() {
     // -Dmyotis.engine.lib (absolute path) and win; a missing lib leaves the
     // property unset, and the selector's Java fallback still works.
     if (System.getProperty("myotis.engine.lib") == null) {
-        System.getProperty("compose.application.resources.dir")?.let { dir ->
+        System.getProperty("compose.application.resources.dir")
+            ?.takeIf { it.isNotBlank() } // blank would resolve against the CWD
+            ?.let { dir ->
             val os = System.getProperty("os.name").lowercase()
             val lib = when {
                 os.contains("mac") -> "libmyotis_engine.dylib"

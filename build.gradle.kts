@@ -206,7 +206,8 @@ val hostLibNames = run {
 // --target the x64 dmg would bundle an arm64 dylib (dead engine toggle on
 // Intel Macs, invisible to a launcher-only arch check).
 val rustTargetTriple: String? =
-    (findProperty("rustTarget") as String?) ?: System.getenv("RUST_TARGET")
+    ((findProperty("rustTarget") as? String) ?: System.getenv("RUST_TARGET"))
+        ?.takeIf { it.isNotBlank() } // an empty env var must mean "host", never --target ""
 
 // Where cargo puts the host libs: target/release, or target/<triple>/release
 // when cross-compiling. Exposed (with the lib names) for :app-desktop's

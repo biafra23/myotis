@@ -114,8 +114,11 @@ jobs:
       # Retry to ride out transient repo-resolution blips.
       - name: Build macOS .dmg (${{ matrix.arch }})
         env:
-          # Cross-compile the Rust engine on the Rosetta leg (see Set up Rust).
-          RUST_TARGET: ${{ matrix.arch == 'x64' && 'x86_64-apple-darwin' || '' }}
+          # Explicit triple on BOTH legs (the arm64 value equals the host, so
+          # it's a no-op there) — an empty-string env var is NOT null and
+          # would otherwise flow into `--target ""` (this exact failure took
+          # down the arm64 leg's first CI run).
+          RUST_TARGET: ${{ matrix.arch == 'x64' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin' }}
         run: |
           GRADLE_ARGS="-Porg.gradle.java.installations.auto-detect=false -Porg.gradle.java.installations.auto-download=false -Porg.gradle.java.installations.paths=$JAVA_HOME"
           for attempt in 1 2 3; do
