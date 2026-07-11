@@ -208,7 +208,7 @@ data class NodeSnapshot(
     val clConnectedPeers: Int,      // connected CL libp2p peers (usually 0 — connections are short-lived)
     val clServedPeersLastMin: Int,  // distinct peers that served a light-client response in the last 60s
     val clCachedPeers: Int,         // CL peers in cl-peers[-net].cache (live file count)
-    val clCachedProven: Int,        // …of which proven catch-up servers (served-range token)
+    val clCachedProven: Int,        // …of which proven LC servers (served range/bootstrap or lc token)
     val clCachedNolc: Int,          // …of which known non-LC (skipped when dialing for updates)
     val elCachedPeers: Int,         // EL peers in peers[-net].cache (live file count)
     val elCachedSnapOk: Int,        // …of which snap-serving confirmed

@@ -19,17 +19,25 @@ public class CacheFileStatsTest {
                 "/ip4/1.1.1.1/tcp/9000/p2p/16Ua\t1770-1795\tb1480\tlc",   // proven (range)
                 "/ip4/2.2.2.2/tcp/9000/p2p/16Ub\t1777",                    // proven (legacy bare floor)
                 "/ip4/3.3.3.3/tcp/9000/p2p/16Uc\tnolc",
-                "/ip4/4.4.4.4/tcp/9000/p2p/16Ud\tb1480\tlc",              // bootstrap+lc, NOT proven
-                "/ip4/5.5.5.5/tcp/9000/p2p/16Ue",
+                "/ip4/4.4.4.4/tcp/9000/p2p/16Ud\tb1480\tlc",              // proven (bootstrap-served + lc)
+                "/ip4/5.5.5.5/tcp/9000/p2p/16Ue",                          // untried (no verdict tokens)
                 // Multi-token line the loader accepts by WIDENING into one
                 // range — must count as ONE proven peer, never two (the
                 // per-token bug showed proven > total).
                 "/ip4/6.6.6.6/tcp/9000/p2p/16Uf\t1770-1795\t1777",
+                // Conflict line: buckets are mutually exclusive, proven wins —
+                // the status row's three buckets must always sum to total.
+                "/ip4/7.7.7.7/tcp/9000/p2p/16Ug\t1770-1795\tnolc",
+                // Bare bootstrap token: served a light_client_bootstrap ⇒ proven,
+                // not "untried" (bootstrap IS a light-client protocol).
+                "/ip4/8.8.8.8/tcp/9000/p2p/16Uh\tb1500",
                 "# comment / stray line",
                 ""));
-        assertEquals(6, s.total());
-        assertEquals(3, s.proven());
+        assertEquals(8, s.total());
+        assertEquals(6, s.proven());
         assertEquals(1, s.nolc());
+        // untried = total - proven - nolc, the row's derived third bucket
+        assertEquals(1, s.total() - s.proven() - s.nolc());
     }
 
     @Test

@@ -1094,8 +1094,8 @@ public final class NodeService extends Service {
                                       // short-lived, so clPeersConnected is usually 0
                                       // and THIS is the "are we being fed?" signal
             int clPeersCached,         // CL peers in cl-peers[-net].cache (live file count)
-            int clCachedProven,        // …of which proven catch-up servers (served-range token)
-            int clCachedNolc,          // …of which known non-LC (nolc token)
+            int clCachedProven,        // …of which proven LC servers (served-range or lc token)
+            int clCachedNolc,          // …of which known non-LC (nolc token; proven wins on conflict)
             long finalizedSlot,
             long executionBlockNumber,
             String executionBlockHashHex, // null until first finality update

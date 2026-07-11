@@ -179,7 +179,7 @@ public class BeaconLightClient implements AutoCloseable {
     // servers instead of re-Identifying the whole fork-matched set (most of which are
     // full nodes without the light-client server).
     private final Set<String> provenLightClient = java.util.concurrent.ConcurrentHashMap.newKeySet();
-    /** Notified (confirmedLcMultiaddrs, deniedLcMultiaddrs) once per Identify round, batched so
+    /** Notified (confirmedLcMultiaddrs, deniedLcMultiaddrs) once per Identify round or finality-poll round, batched so
      *  the host persists the whole round in a single rewrite rather than once per peer. */
     private volatile java.util.function.BiConsumer<java.util.Collection<String>, java.util.Collection<String>> onLightClientVerdict;
 
@@ -722,6 +722,9 @@ public class BeaconLightClient implements AutoCloseable {
                 // whether LC-capable peers are accumulating or bleeding off.
                 if (++cycleCount % 5 == 0) logPeerPoolStats();
                 pollFinalityUpdate();
+                // Background classification of untried pool peers (fire-and-forget;
+                // never blocks the cycle) — drains the cache's untried bucket.
+                classifyUntriedPeers();
                 Thread.sleep(pollIntervalMs);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -868,29 +871,92 @@ public class BeaconLightClient implements AutoCloseable {
             }
         }
 
-        // Record each peer's light_client verdict (keyed by multiaddr) for in-session
-        // prioritization + cache persistence, so a restart dials known light-client
-        // servers first. Identify is per-peerId; map it back to our multiaddrs.
+        applyIdentifyVerdicts(connected);
+    }
+
+    /**
+     * Record each connected peer's light_client verdict (keyed by multiaddr) for
+     * in-session prioritization + cache persistence, so a restart dials known
+     * light-client servers first. Identify is per-peerId; map it back to our
+     * multiaddrs. Shared by the boot Identify round and the steady-state
+     * {@link #classifyUntriedPeers} sweep.
+     */
+    private void applyIdentifyVerdicts(List<BeaconP2PService.PeerInfo> connected) {
         java.util.Map<String, Boolean> lcByPeerId = new java.util.HashMap<>();
         for (BeaconP2PService.PeerInfo pi : connected) {
             lcByPeerId.put(pi.peerId(), pi.supportsLightClient());
         }
-        List<String> newConfirmed = new ArrayList<>();
-        List<String> newDenied = new ArrayList<>();
+        synchronized (lcVerdictLock) {
+            List<String> newConfirmed = new ArrayList<>();
+            List<String> newDenied = new ArrayList<>();
+            for (String ma : copyPeers(false)) {
+                String pid = peerIdOf(ma);
+                Boolean lc = pid != null ? lcByPeerId.get(pid) : null;
+                if (lc == null) continue; // not Identified this round
+                if (lc) {
+                    // Non-short-circuit |: apply both set updates, report only CHANGES —
+                    // the classification sweep runs this every cycle, so unconditional
+                    // reporting would fire the persistence callback with no-op payloads
+                    // each round.
+                    if (peersNoLcUpdates.remove(ma) | provenLightClient.add(ma)) newConfirmed.add(ma);
+                } else if (!provenLightClient.contains(ma)) {
+                    // Mirror the cache's stickiness IN MEMORY: an Identify list lacking
+                    // light_client never demotes a peer that demonstrably served us —
+                    // without this the per-cycle sweep would re-demote a serve-proven
+                    // peer every 12s and wedge it out of the fan-out window.
+                    if (peersNoLcUpdates.add(ma)) newDenied.add(ma);
+                }
+            }
+            // Persist the whole round's verdicts in one shot — a per-peer callback would
+            // trigger a disk rewrite for each of dozens of peers identified in parallel.
+            java.util.function.BiConsumer<java.util.Collection<String>, java.util.Collection<String>> verdictCb =
+                    onLightClientVerdict;
+            if (verdictCb != null && (!newConfirmed.isEmpty() || !newDenied.isEmpty())) {
+                verdictCb.accept(newConfirmed, newDenied);
+            }
+        }
+    }
+
+    /** Untried peers Identified per sync cycle by the background classification
+     *  sweep — small enough to be invisible next to the fan-out's dials, big
+     *  enough to classify the whole in-pool backlog in tens of minutes. */
+    private static final int CLASSIFY_SWEEP_BATCH = 4;
+    /** Rotating cursor over the untried peers so consecutive sweeps walk the
+     *  backlog instead of re-probing the same head. */
+    private int classifySweepCursor = 0;
+
+    /**
+     * Steady-state classification sweep: Identify a small rotating batch of
+     * UNTRIED pool peers (no lc/nolc verdict yet) per sync cycle, so the cache's
+     * untried mass drains into proven/nolc instead of waiting for a fan-out
+     * probe to happen to hit each peer. Fire-and-forget: the Identify batch runs
+     * async and applies verdicts on the catch-up executor; the sync loop never
+     * blocks on it. Verdicts persist through the same batched callback the boot
+     * Identify round uses.
+     */
+    private void classifyUntriedPeers() {
+        List<String> untried = new ArrayList<>();
         for (String ma : copyPeers(false)) {
-            String pid = peerIdOf(ma);
-            Boolean lc = pid != null ? lcByPeerId.get(pid) : null;
-            if (lc == null) continue; // not Identified this round
-            if (lc) { provenLightClient.add(ma); peersNoLcUpdates.remove(ma); newConfirmed.add(ma); }
-            else { peersNoLcUpdates.add(ma); provenLightClient.remove(ma); newDenied.add(ma); }
+            if (!provenLightClient.contains(ma) && !peersNoLcUpdates.contains(ma)) {
+                untried.add(ma);
+            }
         }
-        // Persist the whole round's verdicts in one shot — a per-peer callback would
-        // trigger a disk rewrite for each of dozens of peers identified in parallel.
-        java.util.function.BiConsumer<java.util.Collection<String>, java.util.Collection<String>> verdictCb =
-                onLightClientVerdict;
-        if (verdictCb != null && (!newConfirmed.isEmpty() || !newDenied.isEmpty())) {
-            verdictCb.accept(newConfirmed, newDenied);
+        if (untried.isEmpty()) return;
+        List<CompletableFuture<Void>> batch = new ArrayList<>(CLASSIFY_SWEEP_BATCH);
+        int start = Math.floorMod(classifySweepCursor, untried.size()); // floorMod: survives cursor overflow
+        classifySweepCursor += CLASSIFY_SWEEP_BATCH;
+        for (int i = 0; i < Math.min(CLASSIFY_SWEEP_BATCH, untried.size()); i++) {
+            if (!running) return;
+            String peer = untried.get((start + i) % untried.size());
+            batch.add(p2pService.queryIdentify(peer).handle((v, ex) -> null));
         }
+        CompletableFuture.allOf(batch.toArray(new CompletableFuture[0]))
+                .whenCompleteAsync((v, ex) -> {
+                    if (!running) return;
+                    // A failed/timed-out Identify yields no PeerInfo entry and stays
+                    // untried — deliberately: unreachable ≠ not-an-LC-server.
+                    applyIdentifyVerdicts(p2pService.getConnectedPeers());
+                }, catchUpExecutor);
     }
 
     /**
@@ -1941,8 +2007,9 @@ public class BeaconLightClient implements AutoCloseable {
         // (on-device: ~28s rounds, verified-head age spiking past 2 minutes
         // whenever a round found no server at all). The cap still bounds the
         // per-cycle dial count; copyPeers() puts the proven tier first and
-        // sorts it most-recently-served first (winners get promoted to the
-        // tier below), so a known-live server stays inside the fan-out window.
+        // sorts it most-recently-served first (every decodable responder gets
+        // confirmed into the tier — see the classification harvest below), so
+        // a known-live server stays inside the fan-out window.
         final int POLL_FINALITY_FANOUT = 16;
         // Heal a late winner from a PREVIOUS round: if its BLS verify outlasted
         // that round's 12s deadline, the store advanced but the poll thread had
@@ -1974,6 +2041,18 @@ public class BeaconLightClient implements AutoCloseable {
         // never struck while rounds keep winning — the recency sort in
         // orderByLightClient demotes it instead.
         final java.util.Queue<String> roundFailures = new java.util.concurrent.ConcurrentLinkedQueue<>();
+        // Classification harvest — independent of the round outcome and of the
+        // strike buffer above. With few proven servers the fan-out fills with
+        // UNTRIED cache candidates anyway; record what each dial teaches us so
+        // the probe isn't wasted: a decodable finality update (winner or loser)
+        // proves the peer serves light-client data; a NoSuchRemoteProtocol
+        // rejection proves it doesn't (deliberately NOT the connection-closed /
+        // timeout failures — that's how genuine-but-at-capacity servers fail).
+        // NOTE cross-engine divergence: the Rust poll treats UnsupportedProtocol
+        // as neutral and never persists lc for decode-only responders — both
+        // engines share the cache file, so align Rust when it grows a sweep.
+        final java.util.Queue<String> lcConfirmed = new java.util.concurrent.ConcurrentLinkedQueue<>();
+        final java.util.Queue<String> lcDenied = new java.util.concurrent.ConcurrentLinkedQueue<>();
 
         for (String peer : peers) {
             if (!running) return;
@@ -1996,11 +2075,21 @@ public class BeaconLightClient implements AutoCloseable {
                             log.debug("[beacon] Finality update failed from {}: {}", peer,
                                     root.getMessage() != null ? root.getMessage()
                                             : root.getClass().getSimpleName());
+                            // Definitive non-server: the peer's mux said it has no such
+                            // protocol. Matched by simple name to avoid pinning libp2p's
+                            // internal package layout.
+                            if ("NoSuchRemoteProtocolException".equals(root.getClass().getSimpleName())) {
+                                lcDenied.add(peer);
+                            }
                             roundFailures.add(peer);
                         } else {
                             try {
                                 com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("finality", response);
                                 LightClientFinalityUpdate update = LightClientFinalityUpdate.decode(response);
+                                // Decodable update ⇒ the peer serves the LC protocol,
+                                // whether or not it wins the round. Dial-priority signal
+                                // only — trust still requires the verified apply below.
+                                lcConfirmed.add(peer);
 
                                 final boolean finalityApplied;
                                 // Writers serialize on catchUpApplyLock (see its javadoc): without
@@ -2053,6 +2142,13 @@ public class BeaconLightClient implements AutoCloseable {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
+            // Close the round BEFORE harvesting: on a get() timeout the winner
+            // future is still open, so straggler callbacks would pass the
+            // isDone gate and enqueue verdicts into queues we've already
+            // drained — silently losing exactly the classifications this
+            // harvest exists to keep. completeExceptionally is a no-op if a
+            // late winner already completed it, preserving the lateWin check.
+            winner.completeExceptionally(new java.util.concurrent.TimeoutException("round closed"));
             // A late winner (a BLS verify outlasting the deadline on the
             // catch-up executor) must still void the round's strikes — strikes
             // are only for rounds that truly found no server. Its follow-ups
@@ -2062,6 +2158,7 @@ public class BeaconLightClient implements AutoCloseable {
             if (!lateWin) {
                 for (String p : roundFailures) notifyPeerFailure(p);
             }
+            recordLcVerdicts(lcConfirmed, lcDenied);
             log.debug("[beacon] pollFinalityUpdate: fan-out of {} peer(s), no advance this cycle{}",
                     peers.size(), lateWin ? " (late winner, follow-ups next round)" : "");
             return;
@@ -2075,14 +2172,14 @@ public class BeaconLightClient implements AutoCloseable {
         // staler update as what we serve peers — the sequential loop always ended
         // on the winner's bytes).
         p2pService.cacheFinalityUpdate(win.raw());
+        // Classification harvest (covers the winner too — a decodable response
+        // queued it as confirmed — dial-priority signal only, unlike Rust's
+        // verified-apply-gated mark_proven; Java's provenLightClient is the
+        // Identify-grade tier).
+        recordLcVerdicts(lcConfirmed, lcDenied);
         if (win.applied()) {
             updateSyncState();
             fillChainStateRoots(win.peer(), true);
-            // The winner just demonstrably served light-client data: promote it to
-            // the proven tier (the Rust pool's mark_proven analog) so the recency
-            // ordering applies to it even if Identify never flagged it.
-            provenLightClient.add(win.peer());
-            peersNoLcUpdates.remove(win.peer());
             notifyPeerSuccess(win.peer());
             // Steady-state advance — persist so a restart resumes here
             // (no-op unless the committee period actually moved).
@@ -2124,6 +2221,59 @@ public class BeaconLightClient implements AutoCloseable {
      *  run the seed branch for. */
     private record FinalityPollWin(
             String peer, byte[] raw, LightClientFinalityUpdate update, boolean applied) {}
+
+    /**
+     * Apply a poll round's classification harvest (poll thread, once per round):
+     * confirmed peers join the proven tier (recency-ordered by copyPeers) and
+     * denied peers the nolc tier — mirroring the Identify-round verdicts — and
+     * ONLY the peers whose state actually changed are pushed to the host's
+     * verdict callback, so a round that merely re-confirms the same winner
+     * doesn't trigger a cache-file rewrite every 12s. A peer somehow in both
+     * queues counts as confirmed (it served; the rejection was transient).
+     */
+    private void recordLcVerdicts(java.util.Queue<String> confirmed, java.util.Queue<String> denied) {
+        synchronized (lcVerdictLock) {
+            List<String> newConfirmed = new ArrayList<>();
+            List<String> newDenied = new ArrayList<>();
+            java.util.Set<String> confirmedSet = new java.util.HashSet<>();
+            for (String p; (p = confirmed.poll()) != null; ) {
+                confirmedSet.add(p);
+                // Deliberately NO recentServes stamp here: that map means "last
+                // SUCCESSFUL (verified) light-client response" — it backs the
+                // servedPeersLastMinute health signal and the recency ordering.
+                // Stamping decode-only losers would show ~16 peers "serving"
+                // during a stale-committee stall (the exact stall the metric
+                // exists to expose) and recency-rank unverifiable responders
+                // first. The round's WINNER gets its stamp via notifyPeerSuccess.
+                boolean changed = peersNoLcUpdates.remove(p) | provenLightClient.add(p);
+                if (changed) newConfirmed.add(p);
+            }
+            for (String p; (p = denied.poll()) != null; ) {
+                if (confirmedSet.contains(p)) continue;
+                // A hard protocol rejection DOES demote a proven peer in memory (unlike
+                // the Identify sweep's weaker list-absence signal): the peer's mux just
+                // said it no longer speaks the protocol. Non-short-circuit | for the
+                // same report-only-changes gating as the confirm arm.
+                if (provenLightClient.remove(p) | peersNoLcUpdates.add(p)) newDenied.add(p);
+            }
+            java.util.function.BiConsumer<java.util.Collection<String>, java.util.Collection<String>> cb =
+                    onLightClientVerdict;
+            if (cb != null && (!newConfirmed.isEmpty() || !newDenied.isEmpty())) {
+                cb.accept(newConfirmed, newDenied);
+            }
+        }
+    }
+
+    /**
+     * Serializes the two verdict appliers ({@link #recordLcVerdicts} on the poll
+     * thread, {@link #applyIdentifyVerdicts} on the catch-up executor): their
+     * check-then-act sequences over the proven/nolc set PAIR aren't atomic on
+     * their own, so an interleaving could transiently leave a peer in both sets
+     * (or neither) and mis-gate the change-only persistence reports. Dedicated
+     * lock (not {@code this}, which other lifecycle paths monitor) — both bodies
+     * are cheap set ops plus an at-most-once-per-change cache write.
+     */
+    private final Object lcVerdictLock = new Object();
 
     /**
      * Push the current store state into the shared {@link BeaconSyncState}.

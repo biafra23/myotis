@@ -96,6 +96,25 @@ public class BeaconP2PService implements AutoCloseable {
     /** Cached agent version (client ID) per peer ID. */
     private final Map<String, String> peerAgentVersions = new ConcurrentHashMap<>();
 
+    /** Cap for the two Identify caches above. Boot-time Identify touched ~64
+     *  peers so growth never mattered; the steady-state classification sweep
+     *  Identifies the whole pool over time on an always-on host, so the maps
+     *  need a bound. Eviction is arbitrary-batch (CHM iteration order): the
+     *  caches are best-effort — a re-Identify repopulates an evicted entry. */
+    private static final int IDENTIFY_CACHE_MAX = 2048;
+
+    private <V> void boundedPut(Map<String, V> cache, String key, V value) {
+        if (cache.size() >= IDENTIFY_CACHE_MAX && !cache.containsKey(key)) {
+            int evict = IDENTIFY_CACHE_MAX / 8;
+            var it = cache.keySet().iterator();
+            while (evict-- > 0 && it.hasNext()) {
+                it.next();
+                it.remove();
+            }
+        }
+        cache.put(key, value);
+    }
+
     /**
      * Peer's advertised {@code earliest_available_slot} from its Status (v2),
      * keyed by peer ID. Lets catch-up skip peers that can't serve an old period
@@ -277,10 +296,10 @@ public class BeaconP2PService implements AutoCloseable {
                 sp.getController().thenCompose(ctrl -> ctrl.id()).thenAccept(idMsg -> {
                     List<String> protos = idMsg.getProtocolsList().stream()
                             .map(Object::toString).toList();
-                    peerProtocols.put(pid, protos);
+                    boundedPut(peerProtocols, pid, protos);
                     String agent = idMsg.getAgentVersion();
                     if (agent != null && !agent.isEmpty()) {
-                        peerAgentVersions.put(pid, agent);
+                        boundedPut(peerAgentVersions, pid, agent);
                     }
                     long lcCount = protos.stream().filter(p -> p.contains("light_client")).count();
                     log.debug("[beacon-p2p] Identify auto-query for {}: agent={}, {} protocols ({} light_client)",
@@ -839,6 +858,21 @@ public class BeaconP2PService implements AutoCloseable {
             PeerId peerId = peerAddr.getPeerId();
             if (peerId == null) return CompletableFuture.failedFuture(new IllegalArgumentException("no peer id"));
 
+            // Honor the Goodbye cooldown exactly like doReqResp: re-dialing a peer
+            // that just told us to go away is the signal that gets us scored down.
+            // Boot-time Identify never hit this; the steady-state classification
+            // sweep re-dials pool peers continuously, so it must respect it.
+            Long cooldownUntil = goodbyeUntilMs.get(peerId.toString());
+            if (cooldownUntil != null) {
+                long remaining = cooldownUntil - System.currentTimeMillis();
+                if (remaining > 0) {
+                    return CompletableFuture.failedFuture(
+                            new RuntimeException("peer " + peerId + " in Goodbye cooldown for "
+                                    + remaining + "ms"));
+                }
+                goodbyeUntilMs.remove(peerId.toString());
+            }
+
             CompletableFuture<io.libp2p.core.Connection> connFuture = findOrConnect(h, peerId, peerAddr);
             return connFuture.thenCompose(conn -> {
                 StreamPromise<IdentifyController> streamPromise =
@@ -852,10 +886,10 @@ public class BeaconP2PService implements AutoCloseable {
                 try {
                     PeerId pid = new Multiaddr(peerMultiaddr).getPeerId();
                     if (pid != null) {
-                        peerProtocols.put(pid.toString(), protoStrings);
+                        boundedPut(peerProtocols, pid.toString(), protoStrings);
                         String agent = idMsg.getAgentVersion();
                         if (agent != null && !agent.isEmpty()) {
-                            peerAgentVersions.put(pid.toString(), agent);
+                            boundedPut(peerAgentVersions, pid.toString(), agent);
                         }
                     }
                 } catch (Exception ignored) {}

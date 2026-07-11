@@ -33,19 +33,28 @@ object CacheFileStats {
             if (!t.startsWith("/")) continue
             total++
             // Per-PEER flags (loader merges multiple range tokens by widening).
-            var hasRange = false; var hasNolc = false
+            // Mirror of the Android CacheFileStats.parseCl: proven = ANY positive
+            // LC signal (served catch-up range, Identify-confirmed `lc`, or served
+            // bootstrap `b<period>`), and proven beats nolc — mutually exclusive
+            // buckets so the shared NodeScreen row's derived
+            // `untried = total - proven - nolc` always sums and never goes negative.
+            var hasLcSignal = false; var hasNolc = false
             val tokens = t.split('\t')
             for (i in 1 until tokens.size) {
                 when {
                     tokens[i] == "nolc" -> hasNolc = true
-                    isServedRange(tokens[i]) -> hasRange = true
+                    tokens[i] == "lc" || isBootstrapToken(tokens[i]) ||
+                        isServedRange(tokens[i]) -> hasLcSignal = true
                 }
             }
-            if (hasRange) proven++
-            if (hasNolc) nolc++
+            if (hasLcSignal) proven++ else if (hasNolc) nolc++
         }
         ClStats(total, proven, nolc)
     }
+
+    /** `b<period>` — the peer served a light_client_bootstrap at that period. */
+    private fun isBootstrapToken(tok: String): Boolean =
+        tok.length > 1 && tok[0] == 'b' && tok.substring(1).all { it in '0'..'9' }
 
     fun el(file: Path): ElStats = memoized(file, ElStats.EMPTY) { lines ->
         var total = 0; var snapOk = 0; var snapBad = 0
