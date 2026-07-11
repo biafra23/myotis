@@ -1074,7 +1074,7 @@ async fn try_bootstrap(
     // cache unboundedly and — once they filled the 8-candidate proven tier —
     // wedge a fresh bootstrap forever on the same dead dials every round.
     let mut round_failures: Vec<String> = Vec::new();
-    let mut fail = |pool: &mut PeerPool, buf: &mut Vec<String>, id: PeerId| {
+    let fail = |pool: &mut PeerPool, buf: &mut Vec<String>, id: PeerId| {
         pool.note_failure(id);
         if let Some(p) = peers.iter().find(|p| p.id == id) {
             buf.push(format!("{}/p2p/{}", p.addr, p.id));

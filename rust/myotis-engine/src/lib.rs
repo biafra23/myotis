@@ -381,7 +381,7 @@ mod jni_shim {
     /// `{"gasPriceWei","maxPriorityFeePerGasWei"}` or `{"error": "..."}`.
     #[no_mangle]
     pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeFeeEstimateJson(
-        mut env: JNIEnv,
+        env: JNIEnv,
         _class: JClass,
         handle: jlong,
     ) -> jstring {
