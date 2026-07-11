@@ -130,7 +130,8 @@ fun NodeScreen(
                 Text("Myotis", style = MaterialTheme.typography.headlineSmall)
                 if (chains.isNotEmpty()) {
                     Spacer(Modifier.width(12.dp))
-                    NetworkChips(chains, network, onSelect = { selected = it })
+                    NetworkChips(chains, network, engineOf = { snapshots[it]?.engine },
+                        onSelect = { selected = it })
                 }
             }
             Spacer(Modifier.height(8.dp))
@@ -159,7 +160,12 @@ fun NodeScreen(
 
 /** Horizontally-scrolling chips over the enabled chains — picks the chain Status + Query act on. */
 @Composable
-private fun NetworkChips(chains: List<String>, selected: String, onSelect: (String) -> Unit) {
+private fun NetworkChips(
+    chains: List<String>,
+    selected: String,
+    engineOf: (String) -> String?,
+    onSelect: (String) -> Unit,
+) {
     Row(
         Modifier.horizontalScroll(rememberScrollState()),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -169,7 +175,12 @@ private fun NetworkChips(chains: List<String>, selected: String, onSelect: (Stri
             FilterChip(
                 selected = c == selected,
                 onClick = { onSelect(c) },
-                label = { Text(c.replaceFirstChar { it.uppercase() }) },
+                label = {
+                    // One-letter engine suffix — "Mainnet (r)" = rust, "(j)" = java —
+                    // so multi-network users see per-network engine at a glance.
+                    val eng = engineOf(c)?.firstOrNull()?.let { " ($it)" } ?: ""
+                    Text(c.replaceFirstChar { it.uppercase() } + eng)
+                },
             )
         }
     }

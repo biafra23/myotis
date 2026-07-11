@@ -40,6 +40,10 @@ class SelectorEngineTest {
     @AfterEach
     void resetChoice() {
         Engines.select("java");
+        // The engine is a process-global singleton: if an assertion fired between a
+        // test's create() and its stop(), the network would stay hosted and poison
+        // later tests. shutdownAll() clears every hosted network on both engines.
+        Engines.engine().shutdownAll();
     }
 
     // --- minimal working ports so the JAVA path can actually create ---
@@ -127,6 +131,24 @@ class SelectorEngineTest {
         e.stop("mainnet");
         assertNull(e.get("mainnet"));
         assertTrue(e.hostedNetworks().isEmpty());
+    }
+
+    @Test
+    void engineKindForReportsOwnerAndNullWhenNotHosted() {
+        assertNull(Engines.engineKindFor("mainnet"));
+        Engines.engine().create(config("mainnet"), ports());
+        assertEquals("java", Engines.engineKindFor("mainnet"));
+        Engines.engine().stop("mainnet");
+        assertNull(Engines.engineKindFor("mainnet"));
+        // Never throws: null, aliases, and unknown names all answer quietly.
+        assertNull(Engines.engineKindFor(null));
+        assertNull(Engines.engineKindFor("no-such-network"));
+    }
+
+    @Test
+    void engineKindForResolvesAliases() {
+        Engines.engine().create(config("gnosis"), ports());
+        assertEquals("java", Engines.engineKindFor("xdai"));
     }
 
     @Test

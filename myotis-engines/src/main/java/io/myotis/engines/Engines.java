@@ -62,6 +62,16 @@ public final class Engines {
         return ENGINE;
     }
 
+    /**
+     * Which engine hosts {@code network} right now: {@code "java"}, {@code "rust"}, or
+     * {@code null} when it isn't hosted. A documented host-UI exemption (like the
+     * Settings engine toggle): the java/rust distinction is a selector concept, so it
+     * deliberately isn't on the {@code MyotisEngine} API. Display-only.
+     */
+    public static String engineKindFor(String network) {
+        return ENGINE.ownerKind(network);
+    }
+
     /** The current choice: {@code java}, {@code rust}, or {@code auto}. */
     public static String choice() {
         return choice;
