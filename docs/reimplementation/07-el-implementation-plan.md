@@ -474,11 +474,31 @@ Java engine's.
   (c) Snap-quality reputation now flows from the EVM oracle path: `PoolOracle` records
   per-peer serve/failure into the same `ElPeerCache` sinks the block path feeds (via the
   new cloneable `SnapQualitySink`), so eth_call outcomes shape the next run's dial order.
-- **Next (EL-C-3-2): batch fan-out + speculative prefetch.** Port PrefetchingEvmExecutor's
-  sentinel convergence loop (cap 4, last-two-real, prime-target, hit-only fast path,
-  fail-closed IterationLimitExceeded) + the 64-path-set batch (concurrent per-peer
-  fan-out, one verify+cache pass, chunk-level rotation, best-effort). Lanes (heavy/small
-  + SnapLaneGate semaphore) after.
+- **Landed (EL-C-3-2): speculative prefetch + batch fan-out.** The Java
+  `PrefetchingEvmExecutor.runConvergent` twin lives in `EvmExecutor::call`: ONE
+  `OracleDatabase` shared across iterations (per-call view now includes BYTECODE — a
+  sentinel pass must execute the primed code, not a placeholder); prime-target
+  (untracked); sentinel passes return zero-shaped placeholders UNCACHED while recording
+  every access at the DB layer (Java's tracer+view collapse — every revm read passes
+  through `basic_ref`/`storage_ref`/`code_by_hash_ref`); per-iteration access diffs
+  drive best-effort parallel waves; hit-only fast path (no fresh accesses + no sentinel
+  misses → the sentinel run IS the answer); sentinel reverts tolerated; last two
+  iterations always real; real-run reverts propagate (they're the answer); cap 4 →
+  fail-closed `IterationLimitExceeded` (pinned by the cap=1 twin of Java's
+  `iterationCapOfOneAlwaysExceeds`). `estimateGas` bypasses the loop (Java parity).
+  The wave rides `SnapStateOracle::prefetch_batch` (default no-op for fixtures):
+  `PoolOracle` chunks 64 path-sets (Java `BATCH_PATHSET_CHUNK` — here rotation
+  granularity, NOT message coalescing: this transport sends one request per
+  account/slot, matching the Java EthHandlerSnapPeer fan-out; the win is
+  concurrency), runs ALL chunks concurrently, pins each chunk to one peer per
+  attempt with retry rotation (3 attempts, Java `DEFAULT_MAX_ATTEMPTS`), bounds
+  wire requests with a shared 48-permit semaphore (Java `PREFETCH_MAX_IN_FLIGHT`,
+  per REQUEST) and the whole wave at 30 s (Java `PREFETCH_WAVE_TIMEOUT_SEC`),
+  writes verified results into the cross-call sinks + the account-leaf memo, and
+  feeds chunk-level reputation (cache-skips carry no signal). Bytecode fans out
+  content-addressed.
+  *Still deferred (EL-C-3-3):* lanes (heavy/small + the SnapLaneGate semaphore),
+  in-flight dedup for concurrent calls, the whole-result RPC cache.
 
 ## Multichain (post-Milestone-C)
 

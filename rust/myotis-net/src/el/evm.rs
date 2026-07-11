@@ -28,7 +28,10 @@ use tokio::runtime::Handle;
 
 use myotis_core::header::BlockHeader;
 use myotis_core::trie::{AccountLeaf, EMPTY_TRIE_ROOT};
-use myotis_evm::{BlockContext, OracleAccount, OracleError, SnapStateOracle, U256};
+use myotis_evm::{
+    BlockContext, BytecodeCache, OracleAccount, OracleError, SnapStateOracle, StateProofCache,
+    U256,
+};
 
 use crate::el::peer::ManagedPeer;
 use crate::el::snap::fetch::AccountOutcome;
@@ -179,6 +182,18 @@ pub fn block_context(header: &BlockHeader, chain_id: u64) -> Result<BlockContext
     })
 }
 
+/// Map a proof-verified account leaf to the oracle's account shape; `None` when
+/// the balance scalar is oversized (an adversarial leaf can't reach here, but
+/// stay panic-free).
+fn leaf_account(leaf: &AccountLeaf) -> Option<OracleAccount> {
+    Some(OracleAccount {
+        nonce: leaf.nonce,
+        balance: u256_be(&leaf.balance)?,
+        code_hash: leaf.code_hash,
+        storage_root: leaf.storage_root,
+    })
+}
+
 /// A minimal big-endian scalar → `u64`, saturating rather than panicking. Base
 /// fee never approaches `u64::MAX` on mainnet; a longer/oversized scalar (which a
 /// proof-verified header can't produce) saturates instead of aborting.
@@ -293,24 +308,235 @@ impl SnapStateOracle for PoolOracle {
         address: [u8; 20],
     ) -> Result<Option<OracleAccount>, OracleError> {
         match self.leaf(state_root, address)? {
-            Some(leaf) => {
-                let balance = u256_be(&leaf.balance).ok_or_else(|| OracleError::InvalidProof {
+            Some(leaf) => leaf_account(&leaf)
+                .ok_or_else(|| OracleError::InvalidProof {
                     state_root: *state_root,
                     address,
                     detail: format!(
                         "account balance scalar too long ({} bytes)",
                         leaf.balance.len()
                     ),
-                })?;
-                Ok(Some(OracleAccount {
-                    nonce: leaf.nonce,
-                    balance,
-                    code_hash: leaf.code_hash,
-                    storage_root: leaf.storage_root,
-                }))
-            }
+                })
+                .map(Some),
             None => Ok(None),
         }
+    }
+
+    /// Best-effort batch warm-up (EL-C-3-2; the Java `fetchBatch` +
+    /// `prefetchInParallel` twin adapted to this transport): chunk the account
+    /// items at 64 path-sets, pin each chunk to ONE peer per attempt (rotating
+    /// on retry — failed items get up to 3 attempts across peers, Java
+    /// `DEFAULT_MAX_ATTEMPTS`), run ALL chunks concurrently under one
+    /// per-REQUEST 48-permit semaphore (Java `PREFETCH_MAX_IN_FLIGHT` — bounds
+    /// wire requests, not items, so a 1000-slot item can't flood a peer), and
+    /// bound the WHOLE wave at 30 s (Java `PREFETCH_WAVE_TIMEOUT_SEC`).
+    /// Verified results go straight into the cross-call sinks (and the account
+    /// leaf memo, so the serial fallback needn't re-fetch). Failures are silent
+    /// per item; the per-item path re-fetches whatever is missing. Note: unlike
+    /// Java's one-getTrieNodes-per-chunk framing, this transport sends one
+    /// request per account/slot — the win is concurrency, not fewer messages.
+    fn prefetch_batch(
+        &self,
+        state_root: &[u8; 32],
+        accounts: &[([u8; 20], Vec<U256>)],
+        code_hashes: &[[u8; 32]],
+        proof_sink: &dyn StateProofCache,
+        code_sink: &dyn BytecodeCache,
+    ) {
+        use futures::stream::{self, StreamExt};
+        const BATCH_PATHSET_CHUNK: usize = 64; // Java SnapBackedStateOracle parity
+        const MAX_IN_FLIGHT: usize = 48; // Java PREFETCH_MAX_IN_FLIGHT (per request)
+        const MAX_ATTEMPTS: usize = 3; // Java DEFAULT_MAX_ATTEMPTS
+        const WAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+        if self.peers.is_empty() || (accounts.is_empty() && code_hashes.is_empty()) {
+            return;
+        }
+        let sem = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+        let quality = self.quality.clone();
+
+        /// One item's outcome for retry + reputation bookkeeping.
+        enum ItemOutcome {
+            Skipped, // already cached — no request sent, no reputation signal
+            Served,
+            Failed,
+        }
+
+        // One (account, slots) item against one peer: account leaf first (its
+        // proof also decides absent/empty-trie zero-slots), then the slots
+        // concurrently — every wire request behind its own semaphore permit.
+        let fetch_item = |peer: Arc<ManagedPeer>, addr: [u8; 20], slots: Vec<U256>| {
+            let sem = Arc::clone(&sem);
+            async move {
+                // Only the slots this root doesn't already have — a RETRY after
+                // a partial failure re-fetches just the gaps, and a fully-cached
+                // item skips without touching the peer (no reputation signal).
+                let missing: Vec<U256> = slots
+                    .iter()
+                    .filter(|s| proof_sink.get_storage(state_root, &addr, s).is_none())
+                    .copied()
+                    .collect();
+                let account_cached = proof_sink.get_account(state_root, &addr).is_some();
+                if account_cached && missing.is_empty() {
+                    return ItemOutcome::Skipped;
+                }
+                // The account leaf: reuse this call's memo (primed target /
+                // earlier iterations) before spending a round-trip.
+                let memoed = self.leaf_memo.lock().unwrap().get(&addr).cloned();
+                let leaf = match memoed {
+                    Some(None) => {
+                        // Proven absent already — every slot is zero, no request.
+                        proof_sink.put_account(state_root, &addr, None);
+                        for slot in &missing {
+                            proof_sink.put_storage(state_root, &addr, slot, U256::ZERO);
+                        }
+                        return ItemOutcome::Skipped;
+                    }
+                    Some(Some(leaf)) => leaf,
+                    None => {
+                        // A closed semaphore (impossible in practice — nothing
+                        // closes it) must FAIL the item, never bypass the bound.
+                        let Ok(_permit) = sem.acquire().await else {
+                            return ItemOutcome::Failed;
+                        };
+                        match peer.snap_get_account(state_root, &addr).await {
+                            Ok(AccountOutcome::Present(leaf)) => leaf,
+                            Ok(AccountOutcome::Absent) => {
+                                proof_sink.put_account(state_root, &addr, None);
+                                for slot in &missing {
+                                    proof_sink.put_storage(state_root, &addr, slot, U256::ZERO);
+                                }
+                                self.leaf_memo.lock().unwrap().insert(addr, None);
+                                return ItemOutcome::Served;
+                            }
+                            Err(_) => return ItemOutcome::Failed,
+                        }
+                    }
+                };
+                let Some(account) = leaf_account(&leaf) else {
+                    return ItemOutcome::Failed; // oversized balance scalar
+                };
+                proof_sink.put_account(state_root, &addr, Some(account));
+                self.leaf_memo.lock().unwrap().insert(addr, Some(leaf.clone()));
+                if leaf.storage_root == EMPTY_TRIE_ROOT {
+                    for slot in &missing {
+                        proof_sink.put_storage(state_root, &addr, slot, U256::ZERO);
+                    }
+                    return ItemOutcome::Served;
+                }
+                let values = futures::future::join_all(missing.iter().map(|slot| {
+                    let position = slot.to_be_bytes::<32>();
+                    let peer = Arc::clone(&peer);
+                    let leaf = leaf.clone();
+                    let sem = Arc::clone(&sem);
+                    async move {
+                        let Ok(_permit) = sem.acquire().await else {
+                            return None; // closed semaphore = local failure
+                        };
+                        peer.snap_get_storage(state_root, &addr, &leaf, &position)
+                            .await
+                            .ok()
+                            .and_then(|bytes| u256_be(&bytes))
+                    }
+                }))
+                .await;
+                let mut any_slot_failed = false;
+                for (slot, value) in missing.iter().zip(values) {
+                    match value {
+                        Some(v) => proof_sink.put_storage(state_root, &addr, slot, v),
+                        None => any_slot_failed = true,
+                    }
+                }
+                // A partial slot failure fails the ITEM so the rotation retries
+                // it on the next peer — the retry only re-fetches the gaps
+                // (cached slots are filtered out above). Successful puts keep.
+                if any_slot_failed {
+                    ItemOutcome::Failed
+                } else {
+                    ItemOutcome::Served
+                }
+            }
+        };
+
+        let wave = async {
+            // ALL chunks concurrently (each pinned to its own rotating peer).
+            let chunk_runs = accounts.chunks(BATCH_PATHSET_CHUNK).enumerate().map(
+                |(chunk_idx, chunk)| {
+                    let quality = quality.clone();
+                    let fetch_item = &fetch_item;
+                    async move {
+                        // Items still needing a fetch; failed ones retry on the
+                        // next peer (Java tryWithRetries chunk rotation).
+                        let mut pending: Vec<&([u8; 20], Vec<U256>)> = chunk.iter().collect();
+                        let attempts = MAX_ATTEMPTS.min(self.peers.len()).max(1);
+                        for attempt in 0..attempts {
+                            if pending.is_empty() {
+                                break;
+                            }
+                            let peer =
+                                &self.peers[(chunk_idx + attempt) % self.peers.len()];
+                            let outcomes = futures::future::join_all(pending.iter().map(
+                                |(addr, slots)| {
+                                    fetch_item(Arc::clone(peer), *addr, slots.clone())
+                                },
+                            ))
+                            .await;
+                            let mut still_failed = Vec::new();
+                            let mut served_any = false;
+                            let mut asked_any = false;
+                            for (item, outcome) in pending.into_iter().zip(outcomes) {
+                                match outcome {
+                                    ItemOutcome::Served => served_any = true,
+                                    ItemOutcome::Failed => {
+                                        asked_any = true;
+                                        still_failed.push(item);
+                                    }
+                                    // Cache-skips carry NO reputation signal —
+                                    // the peer was never asked.
+                                    ItemOutcome::Skipped => {}
+                                }
+                            }
+                            if let Some(q) = &quality {
+                                if served_any {
+                                    q.served(peer.addr()).await;
+                                } else if asked_any {
+                                    q.failed(peer.addr()).await;
+                                }
+                            }
+                            pending = still_failed;
+                        }
+                    }
+                },
+            );
+            futures::future::join_all(chunk_runs).await;
+
+            // Bytecode: content-addressed, verified by hash inside the peer call.
+            let code_fetches = code_hashes.iter().enumerate().map(|(i, hash)| {
+                let peer = Arc::clone(&self.peers[i % self.peers.len()]);
+                let sem = Arc::clone(&sem);
+                async move {
+                    if code_sink.get(hash).is_some() {
+                        return;
+                    }
+                    let Ok(_permit) = sem.acquire().await else {
+                        return; // closed semaphore — never bypass the bound
+                    };
+                    if let Ok(code) = peer.snap_get_bytecode(hash).await {
+                        code_sink.put(hash, code.into());
+                    }
+                }
+            });
+            stream::iter(code_fetches)
+                .buffer_unordered(MAX_IN_FLIGHT)
+                .collect::<Vec<()>>()
+                .await;
+        };
+        // The whole wave is bounded (Java PREFETCH_WAVE_TIMEOUT_SEC): on timeout
+        // whatever landed is kept and the loop's next iteration proceeds — an
+        // eth_call must never hang on a slow warm-up.
+        self.handle.block_on(async {
+            let _ = tokio::time::timeout(WAVE_TIMEOUT, wave).await;
+        });
     }
 
     fn fetch_storage(
