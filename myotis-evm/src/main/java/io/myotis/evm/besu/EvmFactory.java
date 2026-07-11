@@ -8,6 +8,7 @@ import org.hyperledger.besu.evm.gascalculator.CancunGasCalculator;
 import org.hyperledger.besu.evm.gascalculator.GasCalculator;
 import org.hyperledger.besu.evm.gascalculator.LondonGasCalculator;
 import org.hyperledger.besu.evm.gascalculator.PragueGasCalculator;
+import org.hyperledger.besu.evm.gascalculator.OsakaGasCalculator;
 import org.hyperledger.besu.evm.gascalculator.ShanghaiGasCalculator;
 import org.hyperledger.besu.evm.internal.EvmConfiguration;
 import org.hyperledger.besu.evm.precompile.MainnetPrecompiledContracts;
@@ -25,6 +26,8 @@ import org.hyperledger.besu.evm.precompile.PrecompileContractRegistry;
  *   <li>Shanghai — timestamp {@code 1_681_338_455} (block ~17_034_870)
  *   <li>Cancun — timestamp {@code 1_710_338_135} (block ~19_426_587)
  *   <li>Prague — timestamp {@code 1_746_612_311} (block ~22_431_084)
+ *   <li>Osaka — timestamp {@code 1_764_798_551} (Fusaka's EL half: CLZ,
+ *       P256VERIFY at 0x100, ModExp repricing)
  * </ul>
  *
  * <p>For pre-merge ranges we use the block number; for post-merge we use the
@@ -44,6 +47,14 @@ public final class EvmFactory {
     public static final long SHANGHAI_TIME  = 1_681_338_455L;
     public static final long CANCUN_TIME    = 1_710_338_135L;
     public static final long PRAGUE_TIME    = 1_746_612_311L;
+    /** Fusaka's EL fork (CLZ, P256VERIFY, ModExp repricing) — go-ethereum
+     *  MainnetChainConfig.OsakaTime (2025-12-03). NOTE the known asymmetry:
+     *  this table uses MAINNET times for every chain (the Rust engine's
+     *  spec_for is per-chain); harmless at the beacon-anchored head since all
+     *  hosted chains activated Osaka long ago, and the ≤256-block historical
+     *  window can no longer straddle the boundary — full chain-awareness here
+     *  remains a tracked follow-up. */
+    public static final long OSAKA_TIME     = 1_764_798_551L;
 
     private EvmFactory() {}
 
@@ -54,6 +65,11 @@ public final class EvmFactory {
         long blockNumber = ctx.blockNumber();
         long ts = ctx.timestamp();
 
+        if (ts >= OSAKA_TIME) {
+            EVM evm = MainnetEVMs.osaka(chainId, cfg);
+            GasCalculator gc = new OsakaGasCalculator();
+            return new EvmAndPrecompiles(evm, MainnetPrecompiledContracts.osaka(gc), gc, EvmSpecVersion.OSAKA);
+        }
         if (ts >= PRAGUE_TIME) {
             EVM evm = MainnetEVMs.prague(chainId, cfg);
             GasCalculator gc = new PragueGasCalculator();

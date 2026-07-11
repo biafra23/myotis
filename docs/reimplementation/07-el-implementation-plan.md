@@ -534,10 +534,18 @@ Java engine's.
   discovered a CL peer (fork-digest correct) and verified against the genesis validators root
   (`period=3480`, state `CATCHING_UP`); full SYNCED is peer-supply-bound on the dev host, as with
   mainnet. `refreshGnosisCheckpoint` is hand-mirrored into `ChainConfig::gnosis()` like the others.
-- **Known gap (both engines, deliberately mirrored): fork tables cap at PRAGUE** even
-  though mainnet + sepolia have activated Osaka/Fusaka (sepolia `osakaTime` 1760427360,
-  go-ethereum `SepoliaChainConfig`). Adding OSAKA is a cross-engine follow-up so the two
-  engines never diverge on spec selection.
+- **CLOSED: OSAKA on both engines** (after the Besu 26.4.0 bump made the Java side
+  capable). Both fork tables gained the Osaka rung in ONE coordinated change: mainnet
+  1764798551 / sepolia 1760427360 (go-ethereum ChainConfig) / gnosis 1776168380
+  (0x69de2dbc, nethermind — hex-pinned like the other gnosis times), boundary-tested on
+  both sides (`osaka_boundaries_map_on_every_chain` ↔ `OsakaBoundaryTest`, which also
+  pins P256VERIFY present under Osaka and absent under Prague). Known residuals: the
+  Java table stays MAINNET-times-for-all-chains — harmless TODAY (every hosted chain is
+  past both schedules' boundaries) but time-contingent: the next fork's rollout re-opens
+  a head-reachable divergence window on sepolia/gnosis, so Java chain-awareness MUST
+  land before the next fork constant is added to either table; estimateGas's 30 M view
+  ceiling exceeds Osaka's EIP-7825 2^24 per-tx cap (an estimate >16.7 M can't be a
+  valid post-Osaka tx — shared semantics, both engines).
 
 ## Cross-cutting rules & risks
 

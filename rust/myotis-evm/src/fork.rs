@@ -26,6 +26,10 @@ pub const CANCUN_TIME: u64 = 1_710_338_135;
 /// Prague activation timestamp (EIP-7702, …).
 pub const PRAGUE_TIME: u64 = 1_746_612_311;
 
+/// Mainnet Osaka (Fusaka's EL fork: CLZ, P256VERIFY, ModExp repricing) —
+/// go-ethereum MainnetChainConfig.OsakaTime (2025-12-03).
+pub const OSAKA_TIME: u64 = 1_764_798_551;
+
 /// Sepolia fork-activation timestamps (go-ethereum `SepoliaChainConfig`).
 /// Sepolia launched with London active and merged in mid-2022, so anything the
 /// beacon-anchored engine can serve is far past Shanghai; below Shanghai fails
@@ -35,18 +39,20 @@ pub const SEPOLIA_SHANGHAI_TIME: u64 = 1_677_557_088;
 pub const SEPOLIA_CANCUN_TIME: u64 = 1_706_655_072;
 /// Sepolia Prague activation timestamp.
 pub const SEPOLIA_PRAGUE_TIME: u64 = 1_741_159_776;
+/// Sepolia Osaka — go-ethereum SepoliaChainConfig.OsakaTime (2025-10-14).
+pub const SEPOLIA_OSAKA_TIME: u64 = 1_760_427_360;
 
 /// The revm `SpecId` a `(chain_id, block_number, timestamp)` activates:
 /// [`EvmError::UnsupportedChain`] for a chain with no table here (e.g. Gnosis
 /// until its slice lands), [`EvmError::ForkTooOld`] below each chain's floor.
 ///
-/// KNOWN GAPS vs the Java `EvmFactory` (cross-engine follow-ups):
-/// * both tables cap at PRAGUE even though mainnet and sepolia have since
-///   activated Osaka/Fusaka — Java stops at Prague too; add OSAKA to both.
-/// * Java applies the MAINNET timestamps to every chain, so a historical sepolia
-///   call in a window where the two schedules disagree (e.g. sepolia's
-///   [Prague, mainnet-Prague) gap) picks a different spec there — this table is
-///   the more correct side, and head-of-chain calls agree on both.
+/// KNOWN GAP vs the Java `EvmFactory` (cross-engine follow-up): Java applies
+/// the MAINNET timestamps to every chain, while this table is per-chain. The
+/// divergence windows are all in the past today (every hosted chain is beyond
+/// both schedules' last boundary), BUT the argument is time-contingent: the
+/// next fork's rollout re-opens a window on sepolia/gnosis between their
+/// activation and mainnet's. Java chain-awareness MUST land before the next
+/// fork constant is added to either table.
 pub fn spec_for(chain_id: u64, block_number: u64, timestamp: u64) -> Result<SpecId, EvmError> {
     match chain_id {
         1 => mainnet_spec(block_number, timestamp),
@@ -59,6 +65,9 @@ pub fn spec_for(chain_id: u64, block_number: u64, timestamp: u64) -> Result<Spec
 /// The mainnet cascade: pre-merge forks by block number, post-merge by timestamp
 /// (timestamp checked first — a post-merge block is always past the merge block).
 fn mainnet_spec(block_number: u64, timestamp: u64) -> Result<SpecId, EvmError> {
+    if timestamp >= OSAKA_TIME {
+        return Ok(SpecId::OSAKA);
+    }
     if timestamp >= PRAGUE_TIME {
         Ok(SpecId::PRAGUE)
     } else if timestamp >= CANCUN_TIME {
@@ -80,6 +89,9 @@ fn mainnet_spec(block_number: u64, timestamp: u64) -> Result<SpecId, EvmError> {
 /// The sepolia cascade — all timestamp-gated (sepolia merged before Shanghai, and
 /// nothing pre-Shanghai is servable by a beacon-anchored engine).
 fn sepolia_spec(block_number: u64, timestamp: u64) -> Result<SpecId, EvmError> {
+    if timestamp >= SEPOLIA_OSAKA_TIME {
+        return Ok(SpecId::OSAKA);
+    }
     if timestamp >= SEPOLIA_PRAGUE_TIME {
         Ok(SpecId::PRAGUE)
     } else if timestamp >= SEPOLIA_CANCUN_TIME {
@@ -102,9 +114,15 @@ pub const GNOSIS_SHANGHAI_TIME: u64 = 1_690_889_660;
 pub const GNOSIS_CANCUN_TIME: u64 = 1_710_181_820;
 /// Gnosis Prague activation timestamp (0x68122dbc = 2025-04-30).
 pub const GNOSIS_PRAGUE_TIME: u64 = 1_746_021_820;
+/// Gnosis Osaka activation timestamp (0x69de2dbc = 2026-04-14, nethermind
+/// gnosis.json — hex-pinned like the other gnosis fork times).
+pub const GNOSIS_OSAKA_TIME: u64 = 1_776_168_380;
 
 /// The gnosis cascade — all timestamp-gated (gnosis merged before Shanghai).
 fn gnosis_spec(block_number: u64, timestamp: u64) -> Result<SpecId, EvmError> {
+    if timestamp >= GNOSIS_OSAKA_TIME {
+        return Ok(SpecId::OSAKA);
+    }
     if timestamp >= GNOSIS_PRAGUE_TIME {
         Ok(SpecId::PRAGUE)
     } else if timestamp >= GNOSIS_CANCUN_TIME {
@@ -167,6 +185,52 @@ mod tests {
             spec_for(s, 9_000_000, SEPOLIA_SHANGHAI_TIME - 1),
             Err(EvmError::ForkTooOld { .. })
         ));
+    }
+
+    #[test]
+    fn osaka_boundaries_map_on_every_chain() {
+        // Mainnet
+        assert_eq!(spec_for(1, 21_000_000, OSAKA_TIME).unwrap(), SpecId::OSAKA);
+        assert_eq!(spec_for(1, 21_000_000, OSAKA_TIME - 1).unwrap(), SpecId::PRAGUE);
+        // Sepolia
+        let s = 11_155_111u64;
+        assert_eq!(spec_for(s, 9_000_000, SEPOLIA_OSAKA_TIME).unwrap(), SpecId::OSAKA);
+        assert_eq!(spec_for(s, 9_000_000, SEPOLIA_OSAKA_TIME - 1).unwrap(), SpecId::PRAGUE);
+        // Gnosis
+        let g = 100u64;
+        assert_eq!(spec_for(g, 30_000_000, GNOSIS_OSAKA_TIME).unwrap(), SpecId::OSAKA);
+        assert_eq!(spec_for(g, 30_000_000, GNOSIS_OSAKA_TIME - 1).unwrap(), SpecId::PRAGUE);
+    }
+
+    #[test]
+    fn osaka_wires_p256verify_and_prague_does_not() {
+        // Twin of the Java OsakaBoundaryTest's registry assertions: don't just
+        // trust revm's wiring across future bumps — pin that the OSAKA
+        // precompile set serves 0x…0100 (EIP-7951) and PRAGUE's does not.
+        use revm::precompile::{PrecompileSpecId, Precompiles};
+        let mut p256 = [0u8; 20];
+        p256[18] = 0x01;
+        let addr = revm::primitives::Address::from(p256);
+        assert!(
+            Precompiles::new(PrecompileSpecId::OSAKA).get(&addr).is_some(),
+            "P256VERIFY must be in the OSAKA set"
+        );
+        assert!(
+            Precompiles::new(PrecompileSpecId::PRAGUE).get(&addr).is_none(),
+            "P256VERIFY is Osaka-only"
+        );
+    }
+
+    #[test]
+    fn osaka_times_pin_their_sources() {
+        // Cross-BASE pins (hex vs the decimal constants): a transposition typo
+        // in either form can't survive both representations — the guard that
+        // caught the gnosis decimal-slip bug, now applied to every chain.
+        // Sources: go-ethereum MainnetChainConfig / SepoliaChainConfig
+        // OsakaTime; nethermind gnosis.json eip*TransitionTimestamps.
+        assert_eq!(OSAKA_TIME, 0x6930_b057); // 1_764_798_551, 2025-12-03
+        assert_eq!(SEPOLIA_OSAKA_TIME, 0x68ed_fd60); // 1_760_427_360, 2025-10-14
+        assert_eq!(GNOSIS_OSAKA_TIME, 0x69de_2dbc); // 1_776_168_380, 2026-04-14
     }
 
     #[test]
