@@ -95,7 +95,12 @@ public final class SelectorEngine implements MyotisEngine {
     }
 
     @Override
-    public ChainHandle create(EngineConfig config, EnginePorts ports) {
+    public synchronized ChainHandle create(EngineConfig config, EnginePorts ports) {
+        // synchronized: the cross-engine duplicate check below is check-then-act —
+        // without the lock, two concurrent creates racing a settings flip could
+        // host the same network on BOTH engines (each engine's own putIfAbsent
+        // guard only covers its own registry). Creates are rare and fast (start()
+        // is the slow part), so the coarse lock costs nothing.
         // Read the choice ONCE: a concurrent select() between resolving the target and
         // deciding fallback behavior must not turn an in-flight auto-create into a hard
         // failure (or vice versa).

@@ -1708,7 +1708,13 @@ public final class NodeService extends Service {
                         }
                     }
                 } catch (Throwable ignored) {
-                    // Observability must never take the process down.
+                    // Observability must never take the process down. But an
+                    // interrupt is a cancellation request, not a drain failure —
+                    // restore the flag and exit the drain thread promptly.
+                    if (ignored instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
                 }
                 // Sleep OUTSIDE the try above: a persistently-throwing drain
                 // (e.g. a failed Engines static init) must stay a 5 s poll,
