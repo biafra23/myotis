@@ -26,6 +26,8 @@ import org.hyperledger.besu.evm.precompile.PrecompileContractRegistry;
  *   <li>Shanghai — timestamp {@code 1_681_338_455} (block ~17_034_870)
  *   <li>Cancun — timestamp {@code 1_710_338_135} (block ~19_426_587)
  *   <li>Prague — timestamp {@code 1_746_612_311} (block ~22_431_084)
+ *   <li>Osaka — timestamp {@code 1_764_798_551} (Fusaka's EL half: CLZ,
+ *       P256VERIFY at 0x100, ModExp repricing)
  * </ul>
  *
  * <p>For pre-merge ranges we use the block number; for post-merge we use the
