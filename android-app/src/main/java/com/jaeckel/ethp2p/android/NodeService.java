@@ -376,8 +376,7 @@ public final class NodeService extends Service {
             return;
         }
         if (handles.containsKey(n)) return;
-        long gen = stopGen(n);
-        new Thread(() -> runBoot(n, gen), "ethp2p-boot-" + n).start();
+        spawnBoot(n, stopGen(n), null, "ethp2p-boot-" + n);
     }
 
     /**
@@ -420,13 +419,13 @@ public final class NodeService extends Service {
         // to SYNCED again before the idle controller may pause it. buildAndStart re-stamps the
         // start clocks. (rebootNetwork doesn't go through forgetStack, so clear it explicitly here.)
         reachedSynced.remove(n);
-        long gen = stopGen(n);
-        new Thread(() -> {
+        // preBoot tears the old instance down; buildAndStart then re-acquires
+        // bootLock(n) for its start() — the teardown frees the ports first.
+        spawnBoot(n, stopGen(n), () -> {
             synchronized (bootLock(n)) {
                 try { ENGINE.stop(n); } catch (Throwable ignored) {}
             }
-            runBoot(n, gen);   // re-acquires bootLock(n) for its start() — frees ports first
-        }, "ethp2p-reboot-" + n).start();
+        }, "ethp2p-reboot-" + n);
     }
 
     /** Drop all NodeService-side bookkeeping for a network (the engine-side stop happens separately). */
@@ -450,7 +449,8 @@ public final class NodeService extends Service {
         return false;
     }
 
-    /** Boots currently inside {@link #runBoot} — guards {@link #stopIfNoStacksLeft}
+    /** Boots claimed by {@link #spawnBoot} (on the calling thread, before the worker
+     *  starts) and released in the worker's finally — guards {@link #stopIfNoStacksLeft}
      *  against the transiently-empty {@link #handles} map while a chain is still
      *  spinning up (a boot only registers its handle once start() succeeds). */
     private final java.util.concurrent.atomic.AtomicInteger bootsInFlight =
@@ -466,25 +466,33 @@ public final class NodeService extends Service {
     }
 
     /**
-     * The boot-thread entry around {@link #buildAndStart}: counts the boot in flight,
-     * and once it finishes (success, bail, or failure) gives the service-stop check
-     * one shot. The gen comparison finishes a runtime stop that raced this boot: the
-     * stop's own check ran while this boot was still in flight and skipped.
+     * Spawn a boot worker for {@code n}: runs {@code preBoot} (nullable — reboot's
+     * old-instance teardown), then {@link #buildAndStart}, and once the worker
+     * finishes (success, bail, or failure) gives the service-stop check one shot.
+     * The in-flight count is claimed HERE, on the CALLING thread, before start():
+     * claimed inside the worker there'd be a scheduling gap in which a concurrent
+     * user stop sees zero boots in flight over an empty map and tears the service
+     * down under the pending boot. The gen comparison in the finally finishes a
+     * runtime stop that raced this boot: the stop's own check ran while this boot
+     * was still in flight and skipped.
      */
-    private void runBoot(String n, long gen) {
+    private void spawnBoot(String n, long gen, Runnable preBoot, String threadName) {
         bootsInFlight.incrementAndGet();
-        try {
-            buildAndStart(n, gen);
-        } finally {
-            bootsInFlight.decrementAndGet();
-            stopIfNoStacksLeft(stopGen(n) != gen);
-        }
+        new Thread(() -> {
+            try {
+                if (preBoot != null) preBoot.run();
+                buildAndStart(n, gen);
+            } finally {
+                bootsInFlight.decrementAndGet();
+                stopIfNoStacksLeft(stopGen(n) != gen);
+            }
+        }, threadName).start();
     }
 
     /**
      * Stop the whole foreground service once the last stack is gone and no boot is in
      * flight. {@code userStop} (Status Stop / Settings disable, incl. one racing a boot —
-     * see {@link #runBoot}) makes the empty map decisive even while networks are still
+     * see {@link #spawnBoot}) makes the empty map decisive even while networks are still
      * ENABLED: a runtime stop keeps the flags on by design, and a zero-stack service has
      * nothing to host (its notification would read "Starting…" forever). Start cold-starts
      * the service again and onStartCommand boots the enabled set. Non-user callers
@@ -1336,8 +1344,7 @@ public final class NodeService extends Service {
         // blocking-ish, so build + start each on its own worker; they bind distinct ports
         // (NetworkConfig.defaultElPort/Discv5Port/RpcPort) so they never collide.
         for (String n : enabledNetworks(this)) {
-            long gen = stopGen(n);
-            new Thread(() -> runBoot(n, gen), "ethp2p-boot-" + n).start();
+            spawnBoot(n, stopGen(n), null, "ethp2p-boot-" + n);
         }
         return START_NOT_STICKY;
     }
@@ -1370,7 +1377,7 @@ public final class NodeService extends Service {
             // network). A whole-service Stop, a per-network disable, or a runtime stopNetwork
             // (which bumps the stop generation instead of the enabled flag) could race this
             // boot, so bail if any says the chain is no longer wanted — re-checked after
-            // start() too, since start() blocks and the race window spans it. runBoot fires
+            // start() too, since start() blocks and the race window spans it. spawnBoot's worker fires
             // the service-stop check after every bail/return path.
             synchronized (bootLock(n)) {
                 if (!RUNNING.get() || !isNetworkEnabled(this, n) || stopGen(n) != gen) {
@@ -1460,7 +1467,7 @@ public final class NodeService extends Service {
                     }
                 }
             }
-            // service-stop check happens in runBoot's finally, after the in-flight count drops
+            // service-stop check happens in the boot worker's finally, after the in-flight count drops
         }
     }
 
