@@ -77,12 +77,14 @@ public final class EvmFactory {
      * rather than silently getting mainnet fork times).
      */
     public static EvmAndPrecompiles buildForBlock(BlockContext ctx) {
+        java.util.Objects.requireNonNull(ctx, "ctx");
         final long chainId;
         try {
             chainId = ctx.chainId().longValueExact();
-        } catch (ArithmeticException | NullPointerException e) {
+        } catch (ArithmeticException e) {
             // Same friendly type as the unknown-id path — never leak the raw
             // ArithmeticException (module convention, see AbiDecoder).
+            // BlockContext enforces a non-null chainId, so only overflow lands here.
             throw new IllegalArgumentException("unsupported chain id " + ctx.chainId(), e);
         }
         if (chainId == 1L) {
