@@ -20,4 +20,20 @@ class ForkTimePinsTest {
         assertEquals(0x681b_3057L, EvmFactory.PRAGUE_TIME);
         assertEquals(0x6930_b057L, EvmFactory.OSAKA_TIME);
     }
+
+    @Test
+    void sepoliaForkTimesMatchTheirHexForms() {
+        assertEquals(0x63fd_7d60L, EvmFactory.SEPOLIA_SHANGHAI_TIME);
+        assertEquals(0x65b9_7d60L, EvmFactory.SEPOLIA_CANCUN_TIME);
+        assertEquals(0x67c7_fd60L, EvmFactory.SEPOLIA_PRAGUE_TIME);
+        assertEquals(0x68ed_fd60L, EvmFactory.SEPOLIA_OSAKA_TIME);
+    }
+
+    @Test
+    void gnosisForkTimesMatchTheNethermindHex() {
+        assertEquals(0x64c8_edbcL, EvmFactory.GNOSIS_SHANGHAI_TIME);
+        assertEquals(0x65ef_4dbcL, EvmFactory.GNOSIS_CANCUN_TIME);
+        assertEquals(0x6812_2dbcL, EvmFactory.GNOSIS_PRAGUE_TIME);
+        assertEquals(0x69de_2dbcL, EvmFactory.GNOSIS_OSAKA_TIME);
+    }
 }
