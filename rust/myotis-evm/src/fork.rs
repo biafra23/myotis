@@ -46,13 +46,9 @@ pub const SEPOLIA_OSAKA_TIME: u64 = 1_760_427_360;
 /// [`EvmError::UnsupportedChain`] for a chain with no table here (e.g. Gnosis
 /// until its slice lands), [`EvmError::ForkTooOld`] below each chain's floor.
 ///
-/// KNOWN GAP vs the Java `EvmFactory` (cross-engine follow-up): Java applies
-/// the MAINNET timestamps to every chain, while this table is per-chain. The
-/// divergence windows are all in the past today (every hosted chain is beyond
-/// both schedules' last boundary), BUT the argument is time-contingent: the
-/// next fork's rollout re-opens a window on sepolia/gnosis between their
-/// activation and mainnet's. Java chain-awareness MUST land before the next
-/// fork constant is added to either table.
+/// The Java `EvmFactory` mirrors this table PER CHAIN (its per-chain cascades
+/// and the ChainAwareForkTest are the twins of this function and its tests) —
+/// keep the two in lockstep whenever a fork constant is added.
 pub fn spec_for(chain_id: u64, block_number: u64, timestamp: u64) -> Result<SpecId, EvmError> {
     match chain_id {
         1 => mainnet_spec(block_number, timestamp),

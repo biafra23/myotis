@@ -539,11 +539,11 @@ Java engine's.
   1764798551 / sepolia 1760427360 (go-ethereum ChainConfig) / gnosis 1776168380
   (0x69de2dbc, nethermind — hex-pinned like the other gnosis times), boundary-tested on
   both sides (`osaka_boundaries_map_on_every_chain` ↔ `OsakaBoundaryTest`, which also
-  pins P256VERIFY present under Osaka and absent under Prague). Known residuals: the
-  Java table stays MAINNET-times-for-all-chains — harmless TODAY (every hosted chain is
-  past both schedules' boundaries) but time-contingent: the next fork's rollout re-opens
-  a head-reachable divergence window on sepolia/gnosis, so Java chain-awareness MUST
-  land before the next fork constant is added to either table; estimateGas's 30 M view
+  pins P256VERIFY present under Osaka and absent under Prague). Known residuals: (RESOLVED
+  in the follow-up chain-awareness change: the Java EvmFactory now carries per-chain
+  cascades — mainnet/sepolia/gnosis, unknown chain ids fail closed like Rust's
+  UnsupportedChain — twinned by ChainAwareForkTest and cross-base-pinned by
+  ForkTimePinsTest); estimateGas's 30 M view
   ceiling exceeds Osaka's EIP-7825 2^24 per-tx cap (an estimate >16.7 M can't be a
   valid post-Osaka tx — shared semantics, both engines).
 
