@@ -198,7 +198,7 @@ jobs:
           # (no shell escaping of backticks/quotes) and renders as intended.
           notes=$(mktemp)
           cat > "$notes" <<'NOTES'
-          First public build of the Myotis wallet apps (pre-release).
+          Pre-release build of the Myotis wallet apps.
 
           **Android (`*-android-debug.apk`)** — unsigned *debug* build. Install via
           "Install unknown apps". Not a signed release build.
