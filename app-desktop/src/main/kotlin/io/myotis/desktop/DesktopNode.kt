@@ -306,6 +306,7 @@ class DesktopNodeController(
             running = s.running(),
             lifecycle = s.lifecycle().name,
             network = s.network(),
+            engine = Engines.engineKindFor(s.network()),
             beaconState = s.beaconState().name,
             connectedPeers = s.connectedPeers(),
             readyPeers = s.readyPeers(),

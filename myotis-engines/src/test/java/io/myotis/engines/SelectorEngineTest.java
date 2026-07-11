@@ -130,6 +130,15 @@ class SelectorEngineTest {
     }
 
     @Test
+    void engineKindForReportsOwnerAndNullWhenNotHosted() {
+        assertNull(Engines.engineKindFor("mainnet"));
+        Engines.engine().create(config("mainnet"), ports());
+        assertEquals("java", Engines.engineKindFor("mainnet"));
+        Engines.engine().stop("mainnet");
+        assertNull(Engines.engineKindFor("mainnet"));
+    }
+
+    @Test
     void autoCreateFallsBackToJavaWhenRustCannotHost() {
         // With the library: rust create() fails (R0) → auto falls back to java.
         // Without: auto resolves straight to java. Either way create() must succeed.

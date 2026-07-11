@@ -58,6 +58,16 @@ public final class Engines {
      * to be {@code new JavaMyotisEngine()}. Always the same {@link SelectorEngine}
      * instance; the underlying choice is consulted per {@code create()} call.
      */
+    /**
+     * Which engine hosts {@code network} right now: {@code "java"}, {@code "rust"}, or
+     * {@code null} when it isn't hosted. A documented host-UI exemption (like the
+     * Settings engine toggle): the java/rust distinction is a selector concept, so it
+     * deliberately isn't on the {@code MyotisEngine} API. Display-only.
+     */
+    public static String engineKindFor(String network) {
+        return ENGINE.ownerKind(network);
+    }
+
     public static MyotisEngine engine() {
         return ENGINE;
     }

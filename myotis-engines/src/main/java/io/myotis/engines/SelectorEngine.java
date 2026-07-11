@@ -145,6 +145,17 @@ public final class SelectorEngine implements MyotisEngine {
         return handle;
     }
 
+    /**
+     * Which engine hosts {@code networkName} right now: {@code "java"}, {@code "rust"},
+     * or {@code null} when the network isn't hosted. Display-only (the Status screen's
+     * engine badge) — routing stays on {@link #owners} via get/stop.
+     */
+    String ownerKind(String networkName) {
+        MyotisEngine owner = owners.get(networkName);
+        if (owner == null) return null;
+        return owner instanceof RustMyotisEngine ? "rust" : "java";
+    }
+
     @Override
     public ChainHandle get(String networkName) {
         MyotisEngine owner = owners.get(networkName);

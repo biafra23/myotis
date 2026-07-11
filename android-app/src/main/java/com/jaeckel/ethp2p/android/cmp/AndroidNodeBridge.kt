@@ -144,6 +144,7 @@ private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
     running = running(),
     lifecycle = lifecycle(),
     network = network(),
+    engine = io.myotis.engines.Engines.engineKindFor(network()),
     beaconState = beaconState(),
     connectedPeers = connectedPeers(),
     readyPeers = readyPeers(),
