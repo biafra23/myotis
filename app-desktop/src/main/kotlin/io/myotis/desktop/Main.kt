@@ -12,6 +12,23 @@ import java.nio.file.Path
  * view fills in as they sync.
  */
 fun main() {
+    // PACKAGED apps: Compose ships appResources inside the bundle and exposes
+    // the dir via this property — point the engine loader at the bundled Rust
+    // lib BEFORE anything touches Engines. Dev runs pass an explicit
+    // -Dmyotis.engine.lib (absolute path) and win; a missing lib leaves the
+    // property unset, and the selector's Java fallback still works.
+    if (System.getProperty("myotis.engine.lib") == null) {
+        System.getProperty("compose.application.resources.dir")?.let { dir ->
+            val os = System.getProperty("os.name").lowercase()
+            val lib = when {
+                os.contains("mac") -> "libmyotis_engine.dylib"
+                os.contains("win") -> "myotis_engine.dll"
+                else -> "libmyotis_engine.so"
+            }
+            val f = Path.of(dir, lib).toFile()
+            if (f.isFile) System.setProperty("myotis.engine.lib", f.absolutePath)
+        }
+    }
     val dataDir = Path.of(System.getProperty("user.home"), ".myotis")
     // settings first: the controller reads it at boot (configured RPC port + snap target).
     val settings = DesktopSettings()

@@ -60,6 +60,17 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
+      # The packaged app bundles the Rust engine (appResources): build it from
+      # source here. prepareRustAppResources fails the build if the lib is
+      # missing, so this step is REQUIRED, not optional.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 

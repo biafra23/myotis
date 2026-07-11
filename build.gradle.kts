@@ -61,6 +61,15 @@ subprojects {
         exclude(group = "io.netty", module = "netty-transport-native-epoll")
         exclude(group = "io.netty", module = "netty-transport-native-kqueue")
         exclude(group = "io.netty", module = "netty-transport-native-unix-common")
+        // Besu 26.4 pulls tuweni under its post-rename coordinates
+        // (io.consensys.tuweni) — the same org.apache.tuweni classes as our
+        // Kotlin fork but WITHOUT the Kotlin Companion objects. Whichever jar
+        // classloads first wins: gradle-run happened to pick the fork, but
+        // jpackage's flattened classpath picked the upstream jar and the
+        // packaged desktop app died at launch (NoSuchFieldError:
+        // Bytes.Companion). The fork supplies these classes everywhere —
+        // exclude the upstream twins for every JVM module.
+        exclude(group = "io.consensys.tuweni")
     }
 
     tasks.test {

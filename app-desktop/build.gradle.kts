@@ -32,6 +32,14 @@ kotlin { jvmToolchain(21) }
 // the fork (reaches SYNCED), so it's safe to do the same here.
 configurations.all {
     exclude(group = "io.tmio")
+    // Besu 26.4 pulls tuweni under its POST-RENAME coordinates
+    // (io.consensys.tuweni) — the same Bytes classes as our Kotlin fork but
+    // WITHOUT the Kotlin Companion. The gradle-run daemon happened to
+    // classload the fork first; jpackage's flattened classpath let the Java
+    // jar win and the PACKAGED app died at launch with
+    // NoSuchFieldError: Bytes.Companion (found by launching the app image).
+    // The fork supplies these classes; exclude the upstream twins.
+    exclude(group = "io.consensys.tuweni")
     exclude(group = "io.netty")
 }
 
@@ -73,6 +81,65 @@ tasks.register<JavaExec>("syncSmoke") {
     systemProperty("myotis.logfile", rootProject.file("devp2p.log").absolutePath)
 }
 
+// ---------------------------------------------------------------------------
+// Bundle the Rust engine into PACKAGED desktop apps (dmg/deb/distributable):
+// cargoBuildHost's host lib is staged into Compose's appResources under the
+// current os-arch subdir; jpackage ships that dir inside the app and exposes
+// it at runtime via the `compose.application.resources.dir` system property,
+// which Main.kt forwards to the engine loader (-Dmyotis.engine.lib). Dev
+// `run`/`syncSmoke` keep their absolute-path wiring below and never bake a
+// path into packages. FAIL-LOUD: packaging without cargo must error, never
+// silently ship a Java-only app with a dead engine toggle (same philosophy
+// as the APK workflow's self-skip guard).
+// ---------------------------------------------------------------------------
+val rustHostLibName = run {
+    val os = System.getProperty("os.name").lowercase()
+    when {
+        os.contains("mac") -> "libmyotis_engine.dylib"
+        os.contains("win") -> "myotis_engine.dll"
+        else -> "libmyotis_engine.so"
+    }
+}
+val composeOsArchDir = run {
+    val os = System.getProperty("os.name").lowercase()
+    val arch = System.getProperty("os.arch").lowercase()
+    val osPart = when {
+        os.contains("mac") -> "macos"
+        os.contains("win") -> "windows"
+        else -> "linux"
+    }
+    val archPart = if (arch == "aarch64" || arch == "arm64") "arm64" else "x64"
+    "$osPart-$archPart"
+}
+
+val prepareRustAppResources = tasks.register<Copy>("prepareRustAppResources") {
+    group = "build"
+    description = "Stage the Rust engine host lib into Compose appResources for packaging"
+    dependsOn(rootProject.tasks.named("cargoBuildHost"))
+    from(rootProject.file("rust/target/release/$rustHostLibName"))
+    into(layout.buildDirectory.dir("rustAppResources/$composeOsArchDir"))
+    doLast {
+        val staged = layout.buildDirectory
+            .file("rustAppResources/$composeOsArchDir/$rustHostLibName").get().asFile
+        check(staged.isFile) {
+            "Rust engine lib missing ($staged) — packaging requires cargo " +
+                "(cargoBuildHost self-skipped?). A packaged app must never " +
+                "silently ship without the Rust engine."
+        }
+    }
+}
+
+// Compose's own internal prepareAppResources task copies appResourcesRootDir
+// into the image — our staging must run before IT (depending only on the
+// package*/createDistributable* umbrella tasks is too late: the internal copy
+// consumes the dir first).
+tasks.matching {
+    it.name == "prepareAppResources"
+        || it.name.startsWith("package") || it.name.startsWith("createDistributable")
+        || it.name.startsWith("createReleaseDistributable")
+        || it.name.startsWith("runDistributable") || it.name.startsWith("runRelease")
+}.configureEach { dependsOn(prepareRustAppResources) }
+
 compose.desktop {
     application {
         mainClass = "io.myotis.desktop.MainKt"
@@ -90,6 +157,8 @@ compose.desktop {
             languageVersion.set(JavaLanguageVersion.of(21))
         }.get().metadata.installationPath.asFile.absolutePath
         nativeDistributions {
+            // The staged Rust engine lib (see prepareRustAppResources above).
+            appResourcesRootDir.set(layout.buildDirectory.dir("rustAppResources"))
             // jpackage is host-OS-bound: the .dmg can only be produced on macOS, the .deb only
             // on Linux. CI builds each on its matching runner (desktop-dmg.yml /
             // desktop-linux-deb.yml); locally you get the format for your OS. Msi when a
