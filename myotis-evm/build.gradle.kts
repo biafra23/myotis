@@ -31,7 +31,7 @@ dependencies {
     // log4j-core are excluded repo-wide (see the root build) so Logback stays
     // the single backend — this bridge routes Besu's log4j-api calls into
     // slf4j/Logback instead of dropping them.
-    runtimeOnly("org.apache.logging.log4j:log4j-to-slf4j:2.25.3")
+    runtimeOnly(libs.log4j.to.slf4j)
 
     // Tuweni Bytes/UInt256 are part of Besu's public API surface, so we use
     // the same coordinates here for ABI codec inputs/outputs.

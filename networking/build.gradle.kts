@@ -13,8 +13,8 @@ java {
 dependencies {
     // discv5 logs through log4j-api; log4j-core is excluded repo-wide (root
     // build — Logback is the single backend), so bridge it for this module's
-    // tests/dnsSmoke too. Version floats on Besu's log4j-bom elsewhere; pin here.
-    testRuntimeOnly("org.apache.logging.log4j:log4j-to-slf4j:2.25.3")
+    // tests/dnsSmoke too.
+    testRuntimeOnly(libs.log4j.to.slf4j)
     implementation(project(":core"))
     implementation(libs.tuweni.bytes)
     implementation(libs.tuweni.rlp)
