@@ -22,7 +22,7 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 final class CacheFileStats {
 
-    /** CL: total cached peers, proven LC servers (served-range or {@code lc} token),
+    /** CL: total cached peers, proven LC servers (served catch-up range, served bootstrap {@code b<period>}, or {@code lc} token),
      *  nolc-flagged. Buckets are mutually exclusive (proven wins over nolc), so
      *  {@code total - proven - nolc} is the untried remainder the UI shows. */
     record ClStats(int total, int proven, int nolc) {

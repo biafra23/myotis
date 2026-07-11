@@ -615,7 +615,7 @@ private fun StatusView(s: NodeSnapshot) {
         StatusRow(
             "CL cache",
             "${s.clCachedPeers} (proven ${s.clCachedProven}, nolc ${s.clCachedNolc}, " +
-                "untried ${(s.clCachedPeers - s.clCachedProven - s.clCachedNolc).coerceAtLeast(0)})",
+                "untried ${s.clCachedPeers - s.clCachedProven - s.clCachedNolc})",
         )
         StatusRow("EL cache", "${s.elCachedPeers} (snap-ok ${s.elCachedSnapOk}, snap-bad ${s.elCachedSnapBad})")
         StatusRow("Discovered", s.discoveredPeers.toString())
