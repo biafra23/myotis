@@ -342,14 +342,35 @@ public final class NodeService extends Service {
     }
 
     /**
-     * Enable a network: persist the flag and bring its stack up. If the service isn't
-     * running yet, start it (onStartCommand boots the whole enabled-set); otherwise build
-     * and start just this stack on a worker. No-op if it's already live.
+     * Enable a network (Settings semantics): persist the flag AND bring its stack up
+     * via {@link #startNetwork}.
      */
     public void enableNetwork(String name) {
-        noteUiActivity();
         String n = canonicalNetwork(name);
         setNetworkEnabled(this, n, true);
+        startNetwork(n);
+    }
+
+    /**
+     * Disable a network (Settings semantics): persist the flag off AND shut its stack
+     * down via {@link #stopNetwork}.
+     */
+    public void disableNetwork(String name) {
+        String n = canonicalNetwork(name);
+        setNetworkEnabled(this, n, false);
+        stopNetwork(n);
+    }
+
+    /**
+     * Runtime-only start (the Status page's Start button): bring the stack up WITHOUT
+     * touching the persisted enabled flag. If the service isn't running yet, start it
+     * (onStartCommand boots the whole enabled-set — callers ensure the network is in it,
+     * or go through {@link #enableNetwork}); otherwise build and start just this stack
+     * on a worker. No-op if it's already live.
+     */
+    public void startNetwork(String name) {
+        noteUiActivity();
+        String n = canonicalNetwork(name);
         if (!RUNNING.get()) {
             startForegroundService(new Intent(this, NodeService.class));
             return;
@@ -359,19 +380,20 @@ public final class NodeService extends Service {
     }
 
     /**
-     * Disable a network: persist the flag, remove and shut down its stack on a worker. If it
-     * was the last live stack, the whole service stops (mirrors a Stop-node tap).
+     * Runtime-only stop (the Status page's Stop button): remove and shut down the stack
+     * on a worker WITHOUT touching the persisted enabled flag — the chain stays enabled
+     * and boots again on the next service start. If it was the last live stack, the
+     * whole service stops (mirrors a Stop-node tap).
      */
-    public void disableNetwork(String name) {
+    public void stopNetwork(String name) {
         String n = canonicalNetwork(name);
-        setNetworkEnabled(this, n, false);
         forgetStack(n);   // drop from the UI's live map immediately
         new Thread(() -> {
             synchronized (bootLock(n)) {
                 try { ENGINE.stop(n); } catch (Throwable ignored) {}
             }
             stopIfNoStacksLeft();
-        }, "ethp2p-disable-" + n).start();
+        }, "ethp2p-stop-" + n).start();
     }
 
     /**
