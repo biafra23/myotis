@@ -92,14 +92,8 @@ tasks.register<JavaExec>("syncSmoke") {
 // silently ship a Java-only app with a dead engine toggle (same philosophy
 // as the APK workflow's self-skip guard).
 // ---------------------------------------------------------------------------
-val rustHostLibName = run {
-    val os = System.getProperty("os.name").lowercase()
-    when {
-        os.contains("mac") -> "libmyotis_engine.dylib"
-        os.contains("win") -> "myotis_engine.dll"
-        else -> "libmyotis_engine.so"
-    }
-}
+val rustHostLibName = rootProject.extra["rustEngineLibName"] as String
+val rustReleaseDir = rootProject.extra["rustReleaseDir"] as String
 val composeOsArchDir = run {
     val os = System.getProperty("os.name").lowercase()
     val arch = System.getProperty("os.arch").lowercase()
@@ -112,19 +106,28 @@ val composeOsArchDir = run {
     "$osPart-$archPart"
 }
 
-val prepareRustAppResources = tasks.register<Copy>("prepareRustAppResources") {
+val prepareRustAppResources = tasks.register("prepareRustAppResources") {
     group = "build"
     description = "Stage the Rust engine host lib into Compose appResources for packaging"
     dependsOn(rootProject.tasks.named("cargoBuildHost"))
-    from(rootProject.file("rust/target/release/$rustHostLibName"))
-    into(layout.buildDirectory.dir("rustAppResources/$composeOsArchDir"))
+    val src = rootProject.file("$rustReleaseDir/$rustHostLibName")
+    val destDir = layout.buildDirectory.dir("rustAppResources/$composeOsArchDir")
+    inputs.files(src).optional() // optional so the ACTION runs even when absent
+    outputs.dir(destDir)
+    // A plain task, NOT Copy: a Copy with a missing source is skipped as
+    // NO-SOURCE — actions included — so its doLast guard never fires and
+    // packaging silently ships a Java-only app (empirically reproduced in
+    // review). Plain-task actions always run; the check below is the real
+    // fail-loud gate.
     doLast {
-        val staged = layout.buildDirectory
-            .file("rustAppResources/$composeOsArchDir/$rustHostLibName").get().asFile
-        check(staged.isFile) {
-            "Rust engine lib missing ($staged) — packaging requires cargo " +
+        check(src.isFile) {
+            "Rust engine lib missing ($src) — packaging requires cargo " +
                 "(cargoBuildHost self-skipped?). A packaged app must never " +
                 "silently ship without the Rust engine."
+        }
+        copy {
+            from(src)
+            into(destDir)
         }
     }
 }

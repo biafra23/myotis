@@ -190,24 +190,52 @@ val hostLibNames = run {
     val os = System.getProperty("os.name").lowercase()
     listOf("myotis_bls", "myotis_engine").map {
         when {
-            os.contains("win") -> "$it.dll"
+            // mac first, matching the copies in app-desktop/Main.kt — the
+            // branch ORDER is harmless today but consistent ordering is how
+            // copy-paste drift stays visible.
             os.contains("mac") -> "lib$it.dylib"
+            os.contains("win") -> "$it.dll"
             else -> "lib$it.so"
         }
     }
 }
+
+// Optional cross-target triple (-PrustTarget=… or RUST_TARGET env): needed by
+// the x64 dmg CI leg, which runs on arm64 runners under Rosetta — cargo builds
+// its HOST triple regardless of the JVM's arch, so without an explicit
+// --target the x64 dmg would bundle an arm64 dylib (dead engine toggle on
+// Intel Macs, invisible to a launcher-only arch check).
+val rustTargetTriple: String? =
+    (findProperty("rustTarget") as String?) ?: System.getenv("RUST_TARGET")
+
+// Where cargo puts the host libs: target/release, or target/<triple>/release
+// when cross-compiling. Exposed (with the lib names) for :app-desktop's
+// packaging staging.
+val rustReleaseDir = if (rustTargetTriple != null) {
+    "rust/target/$rustTargetTriple/release"
+} else {
+    "rust/target/release"
+}
+extra["rustReleaseDir"] = rustReleaseDir
+extra["rustEngineLibName"] = hostLibNames.last() // lib?myotis_engine.{dylib,so,dll}
 
 tasks.register<Exec>("cargoBuildHost") {
     group = "rust"
     description = "cargo build --release for the host OS (self-skips when cargo is missing)"
     onlyIf { rustAvailable }
     workingDir = file("rust")
-    commandLine("cargo", "build", "--release", "--workspace")
+    commandLine(
+        buildList {
+            addAll(listOf("cargo", "build", "--release", "--workspace"))
+            rustTargetTriple?.let { addAll(listOf("--target", it)) }
+        }
+    )
     inputs.files(rustSources).withPathSensitivity(PathSensitivity.RELATIVE)
     // Toolchain identity is an input: a rustc upgrade with unchanged sources
     // must rebuild, or stale artifacts survive UP-TO-DATE checks.
     inputs.property("cargoVersion", cargoVersion)
-    outputs.files(hostLibNames.map { file("rust/target/release/$it") })
+    inputs.property("rustTarget", rustTargetTriple ?: "host")
+    outputs.files(hostLibNames.map { file("$rustReleaseDir/$it") })
 }
 
 val cargoTest = tasks.register<Exec>("cargoTest") {
