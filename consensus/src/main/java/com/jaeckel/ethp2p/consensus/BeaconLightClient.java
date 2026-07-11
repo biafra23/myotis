@@ -892,8 +892,19 @@ public class BeaconLightClient implements AutoCloseable {
             String pid = peerIdOf(ma);
             Boolean lc = pid != null ? lcByPeerId.get(pid) : null;
             if (lc == null) continue; // not Identified this round
-            if (lc) { provenLightClient.add(ma); peersNoLcUpdates.remove(ma); newConfirmed.add(ma); }
-            else { peersNoLcUpdates.add(ma); provenLightClient.remove(ma); newDenied.add(ma); }
+            if (lc) {
+                // Non-short-circuit |: apply both set updates, report only CHANGES —
+                // the classification sweep runs this every cycle, so unconditional
+                // reporting would fire the persistence callback with no-op payloads
+                // each round.
+                if (peersNoLcUpdates.remove(ma) | provenLightClient.add(ma)) newConfirmed.add(ma);
+            } else if (!provenLightClient.contains(ma)) {
+                // Mirror the cache's stickiness IN MEMORY: an Identify list lacking
+                // light_client never demotes a peer that demonstrably served us —
+                // without this the per-cycle sweep would re-demote a serve-proven
+                // peer every 12s and wedge it out of the fan-out window.
+                if (peersNoLcUpdates.add(ma)) newDenied.add(ma);
+            }
         }
         // Persist the whole round's verdicts in one shot — a per-peer callback would
         // trigger a disk rewrite for each of dozens of peers identified in parallel.
@@ -2236,8 +2247,11 @@ public class BeaconLightClient implements AutoCloseable {
         }
         for (String p; (p = denied.poll()) != null; ) {
             if (confirmedSet.contains(p)) continue;
-            provenLightClient.remove(p);
-            if (peersNoLcUpdates.add(p)) newDenied.add(p);
+            // A hard protocol rejection DOES demote a proven peer in memory (unlike
+            // the Identify sweep's weaker list-absence signal): the peer's mux just
+            // said it no longer speaks the protocol. Non-short-circuit | for the
+            // same report-only-changes gating as the confirm arm.
+            if (provenLightClient.remove(p) | peersNoLcUpdates.add(p)) newDenied.add(p);
         }
         java.util.function.BiConsumer<java.util.Collection<String>, java.util.Collection<String>> cb =
                 onLightClientVerdict;
