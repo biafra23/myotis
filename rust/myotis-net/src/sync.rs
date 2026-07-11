@@ -1631,7 +1631,8 @@ fn apply_staged_step(
 }
 
 /// One finality-poll pass: try peers until one update verifies and applies —
-/// the Java `pollFinalityUpdate` steady-state branch (POLL_FINALITY_PEER_LIMIT=16).
+/// the Java `pollFinalityUpdate` steady-state branch (POLL_FINALITY_FANOUT=16,
+/// which now mirrors this fan-out shape and round accounting).
 /// Returns true when an update verified AND applied (the resume guard's
 /// confirmation signal).
 async fn poll_finality(
@@ -1660,21 +1661,16 @@ async fn poll_finality(
             }
         })
         .collect();
-    // Round-scoped cache accounting. The Java poll is SEQUENTIAL, proven-first,
-    // stop-at-first-success: live proven servers usually answer first try, so
-    // peers behind the winner are never dialed and accrue no strikes, while a
-    // DEAD tier-0 peer is tried at the head of every poll and evicted from the
-    // persistent cache after 3 polls. This parallel fan-out must reproduce
-    // those OUTCOMES, not the per-dial mechanics: dialing 16 at once mints up
-    // to 15 speculative losses per 12 s round, and feeding each into the
-    // cache's 3-strike eviction emptied it of every proven server on-device
-    // (peers=209, catch_up_servers=0). So: failures are buffered per round;
-    // a round WITH a winner discards them (the losers raced a success — the
-    // Java analog was never dialed); a fully-failed round strikes every failed
-    // peer once (the Java analog dialed the whole list and struck each). Dead
-    // proven servers thus still evict in ~3 fully-failed encounters, and the
-    // cache can't accumulate them unboundedly. Session-pool note_failure stays
-    // per-dial: it exists precisely to rotate the live fan-out.
+    // Round-scoped cache accounting (the Java poll now fans out with the same
+    // rule). Dialing 16 at once mints up to 15 speculative losses per 12 s
+    // round, and feeding each into the cache's 3-strike eviction emptied it of
+    // every proven server on-device (peers=209, catch_up_servers=0). So:
+    // failures are buffered per round; a round WITH a winner discards them
+    // (the losers raced a success); a fully-failed round strikes every failed
+    // peer once. Dead proven servers thus still evict in ~3 fully-failed
+    // encounters, and the cache can't accumulate them unboundedly.
+    // Session-pool note_failure stays per-dial: it exists precisely to rotate
+    // the live fan-out.
     let mut round_failures: Vec<String> = Vec::new();
     let mut applied = false;
     while let Some((peer, res)) = in_flight.next().await {
@@ -2074,7 +2070,13 @@ mod tests {
             pool.mark_proven(id);
         }
         pool.note_served(ids[1]);
-        pool.note_served(ids[3]); // later ⇒ more recent
+        // Instant::now() can be coarse (Windows ~15ms ticks); equal timestamps
+        // would stable-sort back to pool order and flake the assertion below.
+        let t0 = std::time::Instant::now();
+        while std::time::Instant::now() == t0 {
+            std::hint::spin_loop();
+        }
+        pool.note_served(ids[3]); // strictly later ⇒ more recent
 
         let c = pool.candidates(4, false, false, &HashSet::new(), &HashSet::new());
         // Most-recently-served proven first, then older serves, then the

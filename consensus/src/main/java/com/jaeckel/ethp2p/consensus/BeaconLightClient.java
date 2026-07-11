@@ -1940,8 +1940,9 @@ public class BeaconLightClient implements AutoCloseable {
         // a round burned 1-10s per dead candidate before reaching a live server
         // (on-device: ~28s rounds, verified-head age spiking past 2 minutes
         // whenever a round found no server at all). The cap still bounds the
-        // per-cycle dial count; copyPeers() orders proven + recently-served
-        // servers first so they're always inside the fan-out window.
+        // per-cycle dial count; copyPeers() puts the proven tier first and
+        // sorts it most-recently-served first (winners get promoted to the
+        // tier below), so a known-live server stays inside the fan-out window.
         final int POLL_FINALITY_FANOUT = 16;
         List<String> peers = copyPeers();
         if (peers.size() > POLL_FINALITY_FANOUT) {
@@ -1956,20 +1957,27 @@ public class BeaconLightClient implements AutoCloseable {
         // accounting, which learned this on-device): a parallel fan-out mints
         // up to N-1 speculative losses per round, and feeding each into the
         // host's strike-based cache eviction empties it of every proven server.
-        // The sequential loop never dialed peers behind the winner, so they
-        // accrued no strikes. Reproduce the OUTCOME: a round WITH a winner
-        // discards the buffered failures (the losers merely raced a success);
-        // a fully-failed round strikes every failed peer once (the sequential
-        // analog dialed the whole list and struck each).
+        // A round WITH a winner discards the buffered failures (the losers
+        // merely raced a success); a fully-failed round strikes every failed
+        // peer once. Deliberate divergence from the OLD sequential loop, same
+        // trade the Rust side made: a dead peer AHEAD of the winner used to
+        // accrue a strike per round and cache-evict in ~3 polls; now it is
+        // never struck while rounds keep winning — the recency sort in
+        // orderByLightClient demotes it instead.
         final java.util.Queue<String> roundFailures = new java.util.concurrent.ConcurrentLinkedQueue<>();
 
         for (String peer : peers) {
             if (!running) return;
             // Per-attempt deadline via the req/resp layer (closes the stream on
             // expiry — an outer orTimeout would leave it accumulating; see the
-            // requestFinalityUpdate javadoc).
+            // requestFinalityUpdate javadoc). Completion hops to catchUpExecutor:
+            // the BLS sync-aggregate verify inside processFinalityUpdate must NOT
+            // run on a netty event loop thread (see the catchUpExecutor comment —
+            // the catch-up fan-out honors the same rule), and its single thread
+            // both serializes the up-to-16 verifies and makes the isDone bail
+            // free for every response behind the winner.
             p2pService.requestFinalityUpdate(peer, 10_000L)
-                    .whenComplete((response, ex) -> {
+                    .whenCompleteAsync((response, ex) -> {
                         // A finished round ignores stragglers entirely: no strike
                         // (they raced a success), no apply (the winner advanced us).
                         if (winner.isDone()) return;
@@ -1982,10 +1990,6 @@ public class BeaconLightClient implements AutoCloseable {
                             roundFailures.add(peer);
                         } else {
                             try {
-                                // Relay-cache the raw SSZ so peers who query us get the
-                                // latest finality update we just received, without having
-                                // to re-ask upstream.
-                                p2pService.cacheFinalityUpdate(response);
                                 com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("finality", response);
                                 LightClientFinalityUpdate update = LightClientFinalityUpdate.decode(response);
 
@@ -2000,7 +2004,7 @@ public class BeaconLightClient implements AutoCloseable {
                                             && processor.processFinalityUpdate(update);
                                 }
                                 if (finalityApplied) {
-                                    winner.complete(new FinalityPollWin(peer, update, true));
+                                    winner.complete(new FinalityPollWin(peer, response, update, true));
                                     return;
                                 }
                                 if (!store.isInitialized()) {
@@ -2008,7 +2012,7 @@ public class BeaconLightClient implements AutoCloseable {
                                     // state root wins; the poll thread runs the seed branch.
                                     byte[] sr = update.finalizedHeader().execution().stateRoot();
                                     if (sr != null && sr.length == 32) {
-                                        winner.complete(new FinalityPollWin(peer, update, false));
+                                        winner.complete(new FinalityPollWin(peer, response, update, false));
                                         return;
                                     }
                                 }
@@ -2025,27 +2029,45 @@ public class BeaconLightClient implements AutoCloseable {
                             winner.completeExceptionally(new java.util.concurrent.TimeoutException(
                                     "no finality advance from " + roundFailures.size() + " failed peers"));
                         }
-                    });
+                    }, catchUpExecutor);
         }
 
-        final FinalityPollWin win;
+        FinalityPollWin win;
         try {
             // 10s per-request timeout + decode/apply slack; the 12s sync cycle
             // re-fires either way.
             win = winner.get(12, TimeUnit.SECONDS);
         } catch (Exception e) {
-            for (String p : roundFailures) notifyPeerFailure(p);
-            log.debug("[beacon] pollFinalityUpdate: fan-out of {} peer(s), no advance — will retry next cycle",
-                    peers.size());
+            // A late winner (a BLS verify outlasting the deadline on the
+            // catch-up executor) must still void the round's strikes — strikes
+            // are only for rounds that truly found no server. Its follow-ups
+            // are skipped; the store already advanced and the next winning
+            // round re-syncs BeaconSyncState/snapshot.
+            boolean lateWin = winner.isDone() && !winner.isCompletedExceptionally();
+            if (!lateWin) {
+                for (String p : roundFailures) notifyPeerFailure(p);
+            }
+            log.debug("[beacon] pollFinalityUpdate: fan-out of {} peer(s), no advance this cycle{}",
+                    peers.size(), lateWin ? " (late winner, follow-ups next round)" : "");
             return;
         }
 
         // Winner follow-ups run HERE, on the poll thread: fillChainStateRoots does
-        // its own blocking req/resp round-trips, which must stay off libp2p
-        // callback threads (the fan-out callbacks above only decode + apply).
+        // its own blocking req/resp round-trips, which must stay off the (single)
+        // catch-up executor thread the fan-out callbacks run on.
+        // Relay-cache the WINNER's raw SSZ (last write wins in the relay cache, so
+        // caching per-response from concurrent callbacks could leave a losing,
+        // staler update as what we serve peers — the sequential loop always ended
+        // on the winner's bytes).
+        p2pService.cacheFinalityUpdate(win.raw());
         if (win.applied()) {
             updateSyncState();
             fillChainStateRoots(win.peer(), true);
+            // The winner just demonstrably served light-client data: promote it to
+            // the proven tier (the Rust pool's mark_proven analog) so the recency
+            // ordering applies to it even if Identify never flagged it.
+            provenLightClient.add(win.peer());
+            peersNoLcUpdates.remove(win.peer());
             notifyPeerSuccess(win.peer());
             // Steady-state advance — persist so a restart resumes here
             // (no-op unless the committee period actually moved).
@@ -2080,10 +2102,13 @@ public class BeaconLightClient implements AutoCloseable {
         }
     }
 
-    /** A finality-poll round's winning response: the peer, its decoded update, and
-     *  whether it was a VERIFIED store apply ({@code applied}) or a seeded-mode
-     *  candidate the poll thread still has to run the seed branch for. */
-    private record FinalityPollWin(String peer, LightClientFinalityUpdate update, boolean applied) {}
+    /** A finality-poll round's winning response: the peer, the raw SSZ (for the
+     *  relay cache — cached on the poll thread so the winner's bytes are what we
+     *  serve), the decoded update, and whether it was a VERIFIED store apply
+     *  ({@code applied}) or a seeded-mode candidate the poll thread still has to
+     *  run the seed branch for. */
+    private record FinalityPollWin(
+            String peer, byte[] raw, LightClientFinalityUpdate update, boolean applied) {}
 
     /**
      * Push the current store state into the shared {@link BeaconSyncState}.
@@ -2324,12 +2349,18 @@ public class BeaconLightClient implements AutoCloseable {
         if (first.size() > 1 && !recentServes.isEmpty()) {
             // recentServes prunes to a 60s window, so "recently served" decays on its
             // own; never-served proven peers sort after all recent servers, keeping
-            // their existing relative order (sort is stable).
-            first.sort(java.util.Comparator.comparingLong((String p) -> {
+            // their existing relative order (sort is stable). Snapshot the timestamps
+            // BEFORE sorting: recentServes mutates concurrently (bootstrap-callback
+            // successes, status-thread prunes), and a comparator over live state can
+            // trip TimSort's consistency check mid-sort.
+            final java.util.HashMap<String, Long> at = new java.util.HashMap<>();
+            for (String p : first) {
                 String pid = peerIdOf(p);
                 Long t = recentServes.get(pid != null ? pid : p);
-                return t == null ? Long.MIN_VALUE : t;
-            }).reversed());
+                if (t != null) at.put(p, t);
+            }
+            first.sort(java.util.Comparator.comparingLong(
+                    (String p) -> at.getOrDefault(p, Long.MIN_VALUE)).reversed());
         }
         List<String> out = new ArrayList<>(peers.size());
         out.addAll(first); out.addAll(mid); out.addAll(last);
