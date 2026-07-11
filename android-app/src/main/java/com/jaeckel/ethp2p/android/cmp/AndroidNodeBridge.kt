@@ -71,6 +71,20 @@ class AndroidNodeController(
         }
     }
     override fun disableNetwork(name: String) { serviceProvider()?.disableNetwork(name) }
+
+    override fun startNetwork(name: String) {
+        // Runtime-only start — same isRunning gate as enableNetwork, but the cold path must
+        // NOT persist the enabled flag. onStartService boots the persisted enabled set; the
+        // Status page only offers runtime Start for enabled chains (a disabled chain routes
+        // through enableNetwork), so the started set includes [name].
+        val svc = serviceProvider()
+        if (svc != null && NodeService.isRunning()) {
+            svc.startNetwork(name)
+        } else {
+            onStartService()
+        }
+    }
+    override fun stopNetwork(name: String) { serviceProvider()?.stopNetwork(name) }
     override fun rebootNetwork(name: String) { serviceProvider()?.rebootNetwork(name) }
     override fun shutdown() { serviceProvider()?.shutdown() }
     override fun setTargetSnapPeers(target: Int) { serviceProvider()?.setTargetSnapPeers(target) }

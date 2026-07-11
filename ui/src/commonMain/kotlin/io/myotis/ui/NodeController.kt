@@ -15,8 +15,31 @@ interface NodeController {
     /** Live per-network snapshots, keyed by network name, for the UI to render. */
     fun snapshots(): Flow<Map<String, NodeSnapshot>>
 
+    /**
+     * Settings semantics: persist the network's enabled flag AND bring its stack up.
+     * The enabled flag is what boots on the next app/service start.
+     */
     fun enableNetwork(name: String)
+
+    /** Settings semantics: persist the enabled flag off AND tear the stack down. */
     fun disableNetwork(name: String)
+
+    /**
+     * Runtime-only start: bring the stack up WITHOUT touching the persisted enabled
+     * flag. The Status page's Start button — starting a stopped chain there must not
+     * flip its Settings switch. Callers ensure the network is ENABLED (a disabled
+     * chain routes through [enableNetwork] instead): hosts may boot only the enabled
+     * set (Android's cold service does) or refuse disabled chains outright.
+     */
+    fun startNetwork(name: String)
+
+    /**
+     * Runtime-only stop: tear the stack down WITHOUT touching the persisted enabled
+     * flag. The Status page's Stop button — the chain stays enabled and comes back
+     * on the next app/service start.
+     */
+    fun stopNetwork(name: String)
+
     fun rebootNetwork(name: String)
     fun shutdown()
 

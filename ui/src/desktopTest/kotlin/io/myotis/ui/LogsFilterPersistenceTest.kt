@@ -78,6 +78,8 @@ class LogsFilterPersistenceTest {
         override fun snapshots(): Flow<Map<String, NodeSnapshot>> = flowOf(emptyMap())
         override fun enableNetwork(name: String) {}
         override fun disableNetwork(name: String) {}
+        override fun startNetwork(name: String) {}
+        override fun stopNetwork(name: String) {}
         override fun rebootNetwork(name: String) {}
         override fun shutdown() {}
         override fun setTargetSnapPeers(target: Int) {}
