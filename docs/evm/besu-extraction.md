@@ -81,7 +81,7 @@ not exercise that path; Phase 2 will, against real ERC-20 contracts.)
 
 `EvmFactory.buildForBlock(BlockContext)` selects between London / Paris
 (post-merge, block-keyed) / Shanghai / Cancun / Prague / Osaka (timestamp-keyed)
-using mainnet's published transition values. Pre-London is intentionally
+using each hosted chain's own published transition values (per-chain cascades; unknown chain ids fail closed). Pre-London is intentionally
 unsupported — the wallet only operates on recent finalised heads. Add a
 test per fork transition (one block before, one block after) before any
 upgrade.

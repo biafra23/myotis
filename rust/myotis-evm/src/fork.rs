@@ -43,8 +43,8 @@ pub const SEPOLIA_PRAGUE_TIME: u64 = 1_741_159_776;
 pub const SEPOLIA_OSAKA_TIME: u64 = 1_760_427_360;
 
 /// The revm `SpecId` a `(chain_id, block_number, timestamp)` activates:
-/// [`EvmError::UnsupportedChain`] for a chain with no table here (e.g. Gnosis
-/// until its slice lands), [`EvmError::ForkTooOld`] below each chain's floor.
+/// [`EvmError::UnsupportedChain`] for a chain with no table here,
+/// [`EvmError::ForkTooOld`] below each chain's floor.
 ///
 /// The Java `EvmFactory` mirrors this table PER CHAIN (its per-chain cascades
 /// and the ChainAwareForkTest are the twins of this function and its tests) —

@@ -15,11 +15,13 @@ import org.hyperledger.besu.evm.precompile.MainnetPrecompiledContracts;
 import org.hyperledger.besu.evm.precompile.PrecompileContractRegistry;
 
 /**
- * Builds Besu {@link EVM} instances configured for the correct mainnet hard
- * fork at a given block.
+ * Builds Besu {@link EVM} instances configured for the correct hard fork of
+ * the TARGET CHAIN at a given block — per-chain cascades for mainnet, sepolia
+ * and gnosis (the Rust {@code spec_for} twin); unknown chain ids fail closed.
  *
  * <p>Mainnet fork boundaries (block-number-keyed up through the Merge,
- * timestamp-keyed afterwards):
+ * timestamp-keyed afterwards; sepolia/gnosis schedules live on their own
+ * constants below, cross-base-pinned in ForkTimePinsTest):
  * <ul>
  *   <li>London — {@code 12_965_000}
  *   <li>Paris (Merge) — {@code 15_537_394}
@@ -75,7 +77,14 @@ public final class EvmFactory {
      * rather than silently getting mainnet fork times).
      */
     public static EvmAndPrecompiles buildForBlock(BlockContext ctx) {
-        long chainId = ctx.chainId().longValueExact();
+        final long chainId;
+        try {
+            chainId = ctx.chainId().longValueExact();
+        } catch (ArithmeticException | NullPointerException e) {
+            // Same friendly type as the unknown-id path — never leak the raw
+            // ArithmeticException (module convention, see AbiDecoder).
+            throw new IllegalArgumentException("unsupported chain id " + ctx.chainId(), e);
+        }
         if (chainId == 1L) {
             return mainnetSpec(ctx);
         }

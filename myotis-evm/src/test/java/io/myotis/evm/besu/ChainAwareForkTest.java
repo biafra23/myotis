@@ -32,8 +32,13 @@ class ChainAwareForkTest {
         long s = 11_155_111L;
         assertEquals(EvmSpecVersion.OSAKA, spec(s, 9_000_000, EvmFactory.SEPOLIA_OSAKA_TIME));
         assertEquals(EvmSpecVersion.PRAGUE, spec(s, 9_000_000, EvmFactory.SEPOLIA_OSAKA_TIME - 1));
+        // Exact activation instants (Rust twin parity — a >= flipped to > on
+        // any rung diverges the engines for one second per fork):
+        assertEquals(EvmSpecVersion.PRAGUE, spec(s, 9_000_000, EvmFactory.SEPOLIA_PRAGUE_TIME));
         assertEquals(EvmSpecVersion.CANCUN, spec(s, 9_000_000, EvmFactory.SEPOLIA_PRAGUE_TIME - 1));
+        assertEquals(EvmSpecVersion.CANCUN, spec(s, 9_000_000, EvmFactory.SEPOLIA_CANCUN_TIME));
         assertEquals(EvmSpecVersion.SHANGHAI, spec(s, 9_000_000, EvmFactory.SEPOLIA_CANCUN_TIME - 1));
+        assertEquals(EvmSpecVersion.SHANGHAI, spec(s, 9_000_000, EvmFactory.SEPOLIA_SHANGHAI_TIME));
         // THE case the old mainnet-times-for-all table got wrong: sepolia's
         // Osaka window before mainnet's activation.
         assertEquals(EvmSpecVersion.OSAKA, spec(s, 9_000_000, EvmFactory.OSAKA_TIME - 1_000_000));
@@ -46,8 +51,11 @@ class ChainAwareForkTest {
         long g = 100L;
         assertEquals(EvmSpecVersion.OSAKA, spec(g, 30_000_000, EvmFactory.GNOSIS_OSAKA_TIME));
         assertEquals(EvmSpecVersion.PRAGUE, spec(g, 30_000_000, EvmFactory.GNOSIS_OSAKA_TIME - 1));
+        assertEquals(EvmSpecVersion.PRAGUE, spec(g, 30_000_000, EvmFactory.GNOSIS_PRAGUE_TIME));
         assertEquals(EvmSpecVersion.CANCUN, spec(g, 30_000_000, EvmFactory.GNOSIS_PRAGUE_TIME - 1));
+        assertEquals(EvmSpecVersion.CANCUN, spec(g, 30_000_000, EvmFactory.GNOSIS_CANCUN_TIME));
         assertEquals(EvmSpecVersion.SHANGHAI, spec(g, 30_000_000, EvmFactory.GNOSIS_CANCUN_TIME - 1));
+        assertEquals(EvmSpecVersion.SHANGHAI, spec(g, 30_000_000, EvmFactory.GNOSIS_SHANGHAI_TIME));
         // The flip side: mainnet's Osaka time must NOT flip gnosis early.
         assertEquals(EvmSpecVersion.PRAGUE, spec(g, 30_000_000, EvmFactory.OSAKA_TIME));
         assertThrows(IllegalArgumentException.class,
@@ -58,6 +66,9 @@ class ChainAwareForkTest {
     void mainnetCascadeUnchanged() {
         assertEquals(EvmSpecVersion.OSAKA, spec(1, 21_000_000, EvmFactory.OSAKA_TIME));
         assertEquals(EvmSpecVersion.PRAGUE, spec(1, 21_000_000, EvmFactory.OSAKA_TIME - 1));
+        assertEquals(EvmSpecVersion.PRAGUE, spec(1, 21_000_000, EvmFactory.PRAGUE_TIME));
+        assertEquals(EvmSpecVersion.CANCUN, spec(1, 21_000_000, EvmFactory.CANCUN_TIME));
+        assertEquals(EvmSpecVersion.SHANGHAI, spec(1, 19_000_000, EvmFactory.SHANGHAI_TIME));
         assertEquals(EvmSpecVersion.PARIS, spec(1, 15_537_394, EvmFactory.SHANGHAI_TIME - 1));
         assertEquals(EvmSpecVersion.LONDON, spec(1, 12_965_000, EvmFactory.SHANGHAI_TIME - 1));
     }
