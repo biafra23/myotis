@@ -1944,6 +1944,15 @@ public class BeaconLightClient implements AutoCloseable {
         // sorts it most-recently-served first (winners get promoted to the
         // tier below), so a known-live server stays inside the fan-out window.
         final int POLL_FINALITY_FANOUT = 16;
+        // Heal a late winner from a PREVIOUS round: if its BLS verify outlasted
+        // that round's 12s deadline, the store advanced but the poll thread had
+        // moved on, skipping updateSyncState/persistSnapshot — and re-polling the
+        // same update reports "no advance", so the lag would otherwise persist
+        // until a NEW update publishes.
+        if (store.isInitialized() && store.getFinalizedSlot() > syncState.getFinalizedSlot()) {
+            updateSyncState();
+            persistSnapshot();
+        }
         List<String> peers = copyPeers();
         if (peers.size() > POLL_FINALITY_FANOUT) {
             peers = peers.subList(0, POLL_FINALITY_FANOUT);
@@ -2038,11 +2047,17 @@ public class BeaconLightClient implements AutoCloseable {
             // re-fires either way.
             win = winner.get(12, TimeUnit.SECONDS);
         } catch (Exception e) {
+            // Future.get can surface InterruptedException: restore the flag so
+            // shutdown propagation isn't silently swallowed (the sync loop's
+            // sleep then exits promptly).
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             // A late winner (a BLS verify outlasting the deadline on the
             // catch-up executor) must still void the round's strikes — strikes
             // are only for rounds that truly found no server. Its follow-ups
-            // are skipped; the store already advanced and the next winning
-            // round re-syncs BeaconSyncState/snapshot.
+            // are skipped; the store already advanced and the store-ahead check
+            // at the top of the next poll heals BeaconSyncState/snapshot.
             boolean lateWin = winner.isDone() && !winner.isCompletedExceptionally();
             if (!lateWin) {
                 for (String p : roundFailures) notifyPeerFailure(p);
