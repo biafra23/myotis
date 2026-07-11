@@ -109,10 +109,12 @@ fun NodeScreen(
     // runtime-stopped chain's chip visible — Stop on the Status page is decoupled from
     // the Settings enable switch, so an enabled-but-stopped chain stays selectable and
     // can be started again from Status. enabledNetworks() is a plain read (no snapshot
-    // state): a Settings toggle re-derives it via the boot/stop it triggers changing
-    // `snapshots` within one 2s poll (or via any tab switch), so chips may lag a toggle
-    // by a beat but self-heal.
-    val chains = (settings.enabledNetworks() + snapshots.keys).distinct()
+    // state), so SettingsTab bumps enabledRev on every toggle to re-derive the chips
+    // immediately — without it they'd lag until the boot/stop lands in `snapshots`.
+    var enabledRev by remember { mutableStateOf(0) }
+    val chains = remember(enabledRev, snapshots) {
+        (settings.enabledNetworks() + snapshots.keys).distinct()
+    }
     var selected by remember { mutableStateOf<String?>(null) }
     val network = selected?.takeIf { it in chains } ?: chains.firstOrNull() ?: settings.primaryNetwork()
     val current = snapshots[network]
@@ -144,7 +146,7 @@ fun NodeScreen(
                 0 -> StatusTab(controller, settings, current, network, online, onOpenNetworkSettings)
                 1 -> QueryTab(controller, settings, current, network, history)
                 2 -> LogsTab(logs)
-                3 -> SettingsTab(controller, settings, snapshots)
+                3 -> SettingsTab(controller, settings, snapshots, onEnabledChanged = { enabledRev++ })
             }
         }
     }
@@ -228,6 +230,9 @@ private fun SettingsTab(
     controller: NodeController,
     settings: Settings,
     snapshots: Map<String, NodeSnapshot>,
+    // Notifies the screen that the persisted enabled set changed, so the network
+    // chips (derived from settings, not snapshot state) re-derive immediately.
+    onEnabledChanged: () -> Unit = {},
 ) {
     val networks = remember { settings.allNetworks() }
     // Per-network enabled toggle + RPC-port text, seeded from persisted settings. Toggling a
@@ -274,6 +279,7 @@ private fun SettingsTab(
                             enabled[id] = on
                             settings.setNetworkEnabled(id, on)
                             if (on) controller.enableNetwork(id) else controller.disableNetwork(id)
+                            onEnabledChanged()
                         },
                     )
                 }
