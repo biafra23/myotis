@@ -39,12 +39,8 @@ dependencies {
     implementation(project(":jsonrpc-server"))
     implementation(project(":rpc-backend"))
 
-    // node-core source references io.netty.channel.* via :networking's RLPxConnector
-    // API; :networking declares netty as implementation (not exposed transitively),
-    // so declare it here for the compile classpath (same as :app).
-    implementation(libs.netty.transport)
-    implementation(libs.netty.codec)
-    implementation(libs.netty.handler)
+    // io.netty.channel.* (RLPxConnector's API surface) arrives transitively:
+    // :networking declares netty-transport as `api`.
 
     implementation(libs.tuweni.bytes)
     implementation(libs.tuweni.units)

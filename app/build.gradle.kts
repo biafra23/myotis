@@ -16,13 +16,8 @@ dependencies {
     // The engine selector: Main's composition root is Engines.engine(), routing to
     // the Java or Rust engine per -Dmyotis.engine.
     implementation(project(":myotis-engines"))
-    // :app source references io.netty.channel.* (via :networking's RLPxConnector
-    // API); :networking declares netty as implementation, so it isn't exposed
-    // transitively — declare it here for the compile classpath. Gradle's
-    // highest-version conflict resolution keeps the runtime on 4.2.x everywhere.
-    implementation(libs.netty.transport)
-    implementation(libs.netty.codec)
-    implementation(libs.netty.handler)
+    // io.netty.channel.* (RLPxConnector's API surface) arrives transitively:
+    // :networking declares netty-transport as `api`.
     implementation(libs.tuweni.bytes)
     implementation(libs.tuweni.rlp)
     implementation(libs.tuweni.crypto)

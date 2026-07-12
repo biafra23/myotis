@@ -1,3 +1,11 @@
+plugins {
+    // java-library (on top of the root's java): RLPxConnector's public surface
+    // returns io.netty.channel.ChannelFuture, so netty-transport is an API
+    // dependency — consumers (:app, :node-core) get it on their compile
+    // classpath transitively instead of redeclaring it.
+    `java-library`
+}
+
 java {
     // Bumped from 17 to 21 because io.consensys.protocols:discovery:26.4.0
     // (ConsenSys discv5) publishes Gradle module metadata declaring a JVM-21
@@ -19,7 +27,7 @@ dependencies {
     implementation(libs.tuweni.bytes)
     implementation(libs.tuweni.rlp)
     implementation(libs.tuweni.crypto)
-    implementation(libs.netty.transport)
+    api(libs.netty.transport) // leaked by RLPxConnector's API (ChannelFuture) — see plugins block
     implementation(libs.netty.codec)
     implementation(libs.netty.handler)
     implementation(libs.bouncycastle)
