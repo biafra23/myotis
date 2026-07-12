@@ -169,6 +169,10 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
                 stack.lastPauseEpochMs(),
                 stack.lastResumeEpochMs(),
                 stack.lastWakeReason(),
+                stack.serveStats().headerRequests(),
+                stack.serveStats().headerRequestsServed(),
+                stack.serveStats().bodyRequests(),
+                stack.serveStats().bodyRequestsServed(),
                 stack.lcHunting());
     }
 

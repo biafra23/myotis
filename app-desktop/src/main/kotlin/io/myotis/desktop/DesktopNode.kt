@@ -373,6 +373,10 @@ class DesktopNodeController(
             // boot path's startNsByNetwork key — no re-canonicalization needed here.
             uptimeSeconds = startNsByNetwork[network]
                 ?.let { (System.nanoTime() - it) / 1_000_000_000L } ?: 0L,
+            peerHeaderRequests = s.peerHeaderRequests(),
+            peerHeaderRequestsServed = s.peerHeaderRequestsServed(),
+            peerBodyRequests = s.peerBodyRequests(),
+            peerBodyRequestsServed = s.peerBodyRequestsServed(),
             readyPeerList = s.readyPeerList().map { PeerRow(it.remoteAddress(), it.snapSupported(), it.clientId()) },
             pauseCount = s.pauseCount(),
             totalPausedMs = s.totalPausedMs(),

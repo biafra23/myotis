@@ -9,6 +9,7 @@ import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
 import com.jaeckel.ethp2p.networking.discv4.KademliaTable;
 import com.jaeckel.ethp2p.networking.discv5.DiscV5Service;
 import com.jaeckel.ethp2p.networking.dns.DnsEnrResolver;
+import com.jaeckel.ethp2p.networking.eth.ServeStats;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
 import io.myotis.api.LifecycleState;
 import org.apache.tuweni.bytes.Bytes;
@@ -108,6 +109,9 @@ public final class ChainStack {
     private volatile ScheduledExecutorService peerMaintainer;
 
     // -- live components (built in start()) ------------------------------------
+    /** Inbound-serve counters (peers asking US for headers/bodies). Stack-owned so the
+     *  numbers survive pause/resume connector rebuilds; see ServeStats. */
+    private final ServeStats serveStats = new ServeStats();
     private volatile RLPxConnector connector;
     private volatile DiscV4Service discV4;
     private volatile DiscV5Service discV5;
@@ -248,7 +252,9 @@ public final class ChainStack {
 
             // Anchor uptime only after a fully successful start (a failed start below tears
             // the stack down via shutdown(), which clears `started` so a later start re-anchors).
-            if (!started) { startedAtNs = System.nanoTime(); started = true; }
+            // The serve counters share the same epoch: reset here (first start and any
+            // start-after-shutdown), never on pause/resume — matching uptime exactly.
+            if (!started) { startedAtNs = System.nanoTime(); started = true; serveStats.reset(); }
             return true;
         } catch (Throwable t) {
             log.error("[{}] stack failed to start: {}", network.name(), t.toString());
@@ -482,6 +488,9 @@ public final class ChainStack {
     }
     public LifecycleState lifecycle() { return phase.get(); }
     public RLPxConnector connector() { return connector; }
+
+    /** Inbound-serve counters for the status surfaces. */
+    public ServeStats serveStats() { return serveStats; }
     public DiscV4Service discV4() { return discV4; }
     public DiscV5Service discV5() { return discV5; }
     public BeaconSyncState beaconSyncState() { return beaconSyncState; }
@@ -636,7 +645,7 @@ public final class ChainStack {
             if (!headers.isEmpty()) {
                 log.debug("[{}] {} block header(s) received", network.name(), headers.size());
             }
-        }, (address, publicKeyHex, snap) -> peerCache.add(address, publicKeyHex, snap));
+        }, (address, publicKeyHex, snap) -> peerCache.add(address, publicKeyHex, snap), serveStats);
         // Apply a window size set before start(): setServedBlockWindow may have run while
         // connector was still null (hosts read Settings before booting the stack).
         conn.servedWindow().setMaxWindow(servedBlockWindow);

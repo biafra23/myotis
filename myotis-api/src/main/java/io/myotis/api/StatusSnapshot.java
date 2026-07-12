@@ -39,6 +39,12 @@ import java.util.List;
  * @param lastResumeEpochMs     wall-clock ms of the most recent DEMAND wake; 0 if none
  *                              (a foreground/observation wake does not update this)
  * @param lastWakeReason        {@link WakeReason} tag of the most recent demand wake; null if none
+ * @param peerHeaderRequests    inbound GetBlockHeaders requests from peers this run
+ * @param peerHeaderRequestsServed  of those, answered with at least one header
+ * @param peerBodyRequests      inbound GetBlockBodies requests from peers this run
+ * @param peerBodyRequestsServed    of those, answered with at least one body (always 0
+ *                              today — a light client holds no bodies; requests get a
+ *                              prompt empty response)
  * @param lcHunting             LC hunt engaged: the beacon light client is starved of
  *                              light-client servers and is aggressively discovering/probing
  *                              for new ones (bootstrap stall, starved catch-up, or finality
@@ -74,5 +80,9 @@ public record StatusSnapshot(
         long lastPauseEpochMs,
         long lastResumeEpochMs,
         String lastWakeReason,
+        long peerHeaderRequests,
+        long peerHeaderRequestsServed,
+        long peerBodyRequests,
+        long peerBodyRequestsServed,
         boolean lcHunting) {
 }

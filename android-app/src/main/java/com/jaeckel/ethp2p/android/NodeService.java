@@ -1136,6 +1136,10 @@ public final class NodeService extends Service {
             long lastPauseEpochMs,        // wall-clock ms of the last pause; 0 if never
             long lastResumeEpochMs,       // wall-clock ms of the last DEMAND wake; 0 if none
             String lastWakeReason,        // reason tag of the last demand wake; null if none
+            long peerHeaderRequests,      // inbound GetBlockHeaders from peers this run
+            long peerHeaderRequestsServed,//   ...answered with >=1 header
+            long peerBodyRequests,        // inbound GetBlockBodies from peers this run
+            long peerBodyRequestsServed,  //   ...answered with >=1 body (always 0 today)
             boolean lcHunting) {}         // LC hunt engaged (starved of light-client servers)
 
     /** Result of a get-account query. Mirrors the JVM daemon's JSON response shape. */
@@ -1778,7 +1782,9 @@ public final class NodeService extends Service {
                     s.syncStartPeriod(), syncCurrent, syncTarget,
                     Long.MAX_VALUE, List.of(), network,
                     s.pauseCount(), s.totalPausedMs(), s.lastPauseEpochMs(),
-                    s.lastResumeEpochMs(), s.lastWakeReason(), s.lcHunting());
+                    s.lastResumeEpochMs(), s.lastWakeReason(),
+                    s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
+                    s.peerBodyRequests(), s.peerBodyRequestsServed(), s.lcHunting());
         }
         return new Snapshot(true, lifecycle, chainStartMs,
                 s.discoveredPeers(), s.connectedPeers(), s.readyPeers(),
@@ -1791,7 +1797,9 @@ public final class NodeService extends Service {
                 s.syncStartPeriod(), syncCurrent, syncTarget,
                 s.verifiedHeadAgeMs(), s.readyPeerList(), network,
                 s.pauseCount(), s.totalPausedMs(), s.lastPauseEpochMs(),
-                s.lastResumeEpochMs(), s.lastWakeReason(), s.lcHunting());
+                s.lastResumeEpochMs(), s.lastWakeReason(),
+                s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
+                s.peerBodyRequests(), s.peerBodyRequestsServed(), s.lcHunting());
     }
 
     // ---- Failure forensics (see ProcessHealthDiag) ----

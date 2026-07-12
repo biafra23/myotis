@@ -157,6 +157,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     // eth/69 block range. Owned by the connector, shared across all peer connections, so
     // a header fetched on one connection is servable (and advertised) on all of them.
     private final ServedHeaderWindow servedWindow;
+    // Shared per-network counters of what peers ask us to serve (owned by the stack so
+    // they survive pause/resume connector rebuilds). Null when constructed through the
+    // stats-less connector ctor (the MainnetPeerBootstrap test fixture).
+    private final ServeStats serveStats;
     // Set by the connector; invoked after we cache new headers so the connector can push a
     // BlockRangeUpdate to eth/69 peers when the servable range grows. Null in test fixtures.
     private volatile Runnable onWindowUpdated;
@@ -189,7 +193,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     }
 
     public EthHandler(NodeKey nodeKey, int tcpPort, NetworkConfig network,
-                      ChainHead chainHead, ServedHeaderWindow servedWindow,
+                      ChainHead chainHead, ServedHeaderWindow servedWindow, ServeStats serveStats,
                       Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders,
                       Runnable onReady) {
         this.nodeKey = nodeKey;
@@ -197,6 +201,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         this.network = network;
         this.chainHead = chainHead;
         this.servedWindow = servedWindow;
+        this.serveStats = serveStats;
         this.onHeaders = onHeaders;
         this.onReady = onReady;
 
@@ -442,15 +447,22 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         switch (msg.code()) {
             case ETH_GET_BLOCK_HEADERS -> {
                 // Peer is requesting headers from us. Serve from cache or return empty.
+                // Demand is counted before parsing/answering: a malformed request or a
+                // failed send still registers as "asked".
+                if (serveStats != null) serveStats.headerAsked();
                 try {
                     org.apache.tuweni.bytes.Bytes payload = org.apache.tuweni.bytes.Bytes.wrap(msg.payload());
-                    long[] reqIdHolder = new long[1];
+                    // reqId is a uint64 (geth uses rand.Uint64(): ~half have bit 63 set).
+                    // Keep it as raw RLP bytes and echo it verbatim — readLong()+writeLong()
+                    // corrupts high-bit ids (writeLong truncates negative longs), making the
+                    // peer drop our response as unsolicited.
+                    org.apache.tuweni.bytes.Bytes[] reqIdHolder = new org.apache.tuweni.bytes.Bytes[1];
                     long[] blockNumHolder = new long[1];
                     int[] countHolder = new int[1];
                     String[] hashHolder = new String[1];     // short hex for logging
                     String[] fullHashHolder = new String[1]; // full hex for cache lookup
                     org.apache.tuweni.rlp.RLP.decodeList(payload, reader -> {
-                        reqIdHolder[0] = reader.readLong();
+                        reqIdHolder[0] = reader.readValue();
                         reader.readList(r -> {
                             org.apache.tuweni.bytes.Bytes start = r.readValue();
                             if (start.size() <= 8) {
@@ -469,7 +481,11 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                         });
                         return null;
                     });
-                    long reqId = reqIdHolder[0];
+                    org.apache.tuweni.bytes.Bytes reqId = reqIdHolder[0];
+                    if (reqId == null || reqId.size() > 8) {
+                        log.debug("[eth] GetBlockHeaders with malformed reqId — dropped");
+                        return;
+                    }
                     long blockNum = blockNumHolder[0];
                     int count = countHolder[0];
                     String requestedHash = hashHolder[0];
@@ -492,7 +508,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     }
 
                     byte[] response = org.apache.tuweni.rlp.RLP.encodeList(w -> {
-                        w.writeLong(reqId);
+                        w.writeValue(reqId); // verbatim echo of the uint64 id — see above
                         w.writeList(l -> {
                             for (byte[] h : cached) {
                                 l.writeRLP(org.apache.tuweni.bytes.Bytes.wrap(h));
@@ -508,9 +524,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     log.info("[eth] PEER ASKS: GetBlockHeaders({}, count={}, reqId={}) | " +
                              "WE CLAIMED bestHash={} | PEER CLAIMED bestHash={} | " +
                              "SERVING {} from cache (cacheSize={}) | {}ms after READY",
-                        requested, count, reqId, ourBestHash, peerBestHash,
+                        requested, count, reqId.toHexString(), ourBestHash, peerBestHash,
                         cached.size(), headerCache.size(), msSinceReady);
                     rlpxHandler.sendMessage(ctx, ETH_BLOCK_HEADERS, response);
+                    if (serveStats != null && !cached.isEmpty()) serveStats.headerServed();
                 } catch (Exception e) {
                     log.warn("[eth] Failed to handle GetBlockHeaders from peer", e);
                 }
@@ -589,6 +606,34 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                                 pendingReceiptRequests.remove(reqId);
                         if (future != null) future.completeExceptionally(e);
                     }
+                }
+            }
+            case ETH_GET_BLOCK_BODIES -> {
+                // A peer asking US for block bodies. A light client holds none, so answer
+                // with a prompt empty list (mirrors the snap empty-answer convention) instead
+                // of letting the peer time out — and count the demand for the status page.
+                if (serveStats != null) serveStats.bodyAsked();
+                try {
+                    // reqId is a uint64 — peek and echo the raw RLP bytes verbatim (a
+                    // readLong/writeLong round-trip corrupts high-bit ids; see the
+                    // GetBlockHeaders case).
+                    org.apache.tuweni.bytes.Bytes reqId = org.apache.tuweni.rlp.RLP.decodeList(
+                            org.apache.tuweni.bytes.Bytes.wrap(msg.payload()),
+                            reader -> reader.readValue());
+                    if (reqId.size() <= 8) {
+                        byte[] response = org.apache.tuweni.rlp.RLP.encodeList(w -> {
+                            w.writeValue(reqId);
+                            w.writeList(l -> { });
+                        }).toArrayUnsafe();
+                        rlpxHandler.sendMessage(ctx, ETH_BLOCK_BODIES, response);
+                        log.debug("[eth] PEER ASKS: GetBlockBodies(reqId={}) — served empty (no bodies held)",
+                                reqId.toHexString());
+                    } else {
+                        log.debug("[eth] GetBlockBodies with malformed reqId ({} bytes) — dropped, peer will time out",
+                                reqId.size());
+                    }
+                } catch (Exception e) {
+                    log.debug("[eth] Failed to answer GetBlockBodies from peer: {}", e.getMessage());
                 }
             }
             case ETH_BLOCK_RANGE_UPDATE -> {

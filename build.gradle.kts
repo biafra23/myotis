@@ -52,6 +52,9 @@ subprojects {
         exclude(group = "io.netty", module = "netty-transport-native-epoll")
         exclude(group = "io.netty", module = "netty-transport-native-kqueue")
         exclude(group = "io.netty", module = "netty-transport-native-unix-common")
+        // jvm-libp2p constrains in the QUIC codec (+ big per-OS natives); we only use
+        // its TCP transport and ran without QUIC classes throughout the fork era.
+        exclude(group = "io.netty", module = "netty-codec-native-quic")
         exclude(group = "org.apache.logging.log4j", module = "log4j-slf4j2-impl")
         exclude(group = "org.apache.logging.log4j", module = "log4j-slf4j-impl")
         exclude(group = "org.apache.logging.log4j", module = "log4j-slf4j18-impl")
@@ -70,17 +73,9 @@ subprojects {
         }
     }
 
-    configurations.all {
-        // Besu 26.4 pulls tuweni under its post-rename coordinates
-        // (io.consensys.tuweni) — the same org.apache.tuweni classes as our
-        // Kotlin fork but WITHOUT the Kotlin Companion objects. Whichever jar
-        // classloads first wins: gradle-run happened to pick the fork, but
-        // jpackage's flattened classpath picked the upstream jar and the
-        // packaged desktop app died at launch (NoSuchFieldError:
-        // Bytes.Companion). The fork supplies these classes everywhere —
-        // exclude the upstream twins for every JVM module.
-        exclude(group = "io.consensys.tuweni")
-    }
+    // (Historical: while the tuweni-kotlin fork was in use, io.consensys.tuweni was
+    // excluded here project-wide to prevent duplicate org.apache.tuweni classes.
+    // Upstream io.consensys.tuweni is canonical again — single source per class.)
 
     tasks.test {
         useJUnitPlatform()

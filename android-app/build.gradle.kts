@@ -16,11 +16,6 @@ plugins {
 // JVM daemon stays on upstream Besu, where those APIs work.
 val besuForkVersion = "26.4.0-android.1"
 
-// The JitPack netty-kotlin fork republishes netty-common/buffer/etc. with the
-// same fully-qualified classes; the JVM tolerates the shadowing but the dexer
-// doesn't. vertx-core (transitive via tuweni-crypto) drags upstream netty in,
-// so strip it project-wide and rely on the fork.
-//
 // log4j-api is excluded because its `LogManager.getLogger()` no-args overload
 // uses StackWalker to name the logger after the caller class, and Android's
 // StackWalker returns null `getDeclaringClass()` for some frames — every
@@ -28,7 +23,6 @@ val besuForkVersion = "26.4.0-android.1"
 // blows up at <clinit>. Replaced with a tiny shim under
 // src/main/java/org/apache/logging/log4j that routes to slf4j.
 configurations.all {
-    exclude(group = "io.netty")
     exclude(group = "org.apache.logging.log4j")
     // Swap Besu's evm + algorithms to the Android-patched fork (biafra23/besu via
     // JitPack); everything else stays upstream. Eager `all` so AGP's classpaths
@@ -55,10 +49,6 @@ configurations.all {
     // fork's exact version) so nothing pulls io.tmio anymore — the exclude
     // stays as a cheap guard against a transitive reintroducing it.
     exclude(group = "io.tmio")
-    // tuweni's post-rename coordinates (io.consensys.tuweni, pulled by the
-    // Besu 26.4 fork's POM) collide with our Kotlin fork the same way io.tmio
-    // did — same classes, D8 rejects the duplicates. The fork supplies them.
-    exclude(group = "io.consensys.tuweni")
     // Requesting the STANDARD_JVM Guava variant (below) clashes with the
     // `android` variant that Besu pulls transitively — both provide the guava
     // capability. Resolve the conflict toward the JRE variant, which is the one
@@ -151,10 +141,13 @@ android {
                 "META-INF/LGPL2.1",
                 "META-INF/INDEX.LIST",
                 "META-INF/io.netty.versions.properties",
+                // Upstream netty jars each carry license texts under META-INF/license/;
+                // several ship identical filenames and the merger rejects duplicates.
+                "META-INF/license/**",
                 "META-INF/com.jaeckel.versions.properties",
             )
-            // The jitpack netty-kotlin fork ships the same native-image hint
-            // file as upstream netty-common; just take the first one.
+            // Multiple netty modules ship the same native-image hint file;
+            // metadata-only, take the first.
             pickFirsts += setOf(
                 "META-INF/native-image/io.netty/netty-common/native-image.properties",
                 // jvm-libp2p drags in four bouncycastle jars (bcprov, bcpkix,
@@ -249,7 +242,14 @@ dependencies {
     implementation(libs.netty.transport)
 
     // consensus stack — BeaconLightClient, libp2p, BLS, snappy.
-    implementation(libs.jvm.libp2p)
+    implementation(libs.jvm.libp2p) {
+        // Mirror :consensus (single-netty policy): keep libp2p's own netty set out —
+        // it drags netty-tcnative-boringssl (macOS/Windows natives, ~9.6 MB of dead
+        // APK weight), codec-http, and epoll classes we never load. The netty modules
+        // we DO use (transport/codec/handler 4.2.x + their transitives) arrive via
+        // :networking/:consensus, exactly like the daemon.
+        exclude(group = "io.netty")
+    }
     implementation(libs.milagro)
     implementation(libs.snappy)
 

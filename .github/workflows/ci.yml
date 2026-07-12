@@ -32,7 +32,7 @@ jobs:
 
       # Robust Gradle dependency + plugin caching. Restores the base-branch cache
       # (read-only on PRs) so artifacts that already built on main — Besu, AGP,
-      # the JitPack netty/tuweni forks — come from cache instead of being re-fetched
+      # the JitPack Besu fork — come from cache instead of being re-fetched
       # from flaky external repos on every run.
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4

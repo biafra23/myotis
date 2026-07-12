@@ -63,6 +63,10 @@ class MyotisStatusRpcTest {
         /* lastPauseEpochMs */ 111L,
         /* lastResumeEpochMs */ 222L,
         lastWakeReason,
+        /* peerHeaderRequests */ 0L,
+        /* peerHeaderRequestsServed */ 0L,
+        /* peerBodyRequests */ 0L,
+        /* peerBodyRequestsServed */ 0L,
         /* lcHunting */ false,
     )
 
