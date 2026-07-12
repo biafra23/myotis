@@ -285,6 +285,13 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
 /// Returns true only when this call moved the handle Running → Paused (the
 /// idempotent already-paused semantics live on the Java side, which owns the
 /// sleep accounting).
+///
+/// CALLER CONTRACT: pause/resume/start/stop on one handle must not run
+/// concurrently — the `Paused` entry is published BEFORE the async teardown
+/// below finishes, so a resume racing into that window would spin a second
+/// sync loop up against the same snapshot/peer-cache files while the first is
+/// still shutting down. The Java `RustChainHandle` serializes all four on its
+/// lifecycle monitor (they are `synchronized`), which is the only caller.
 pub fn pause(handle: i64) -> bool {
     let Some(engine) = engine() else {
         return false;
@@ -389,6 +396,7 @@ pub fn status_json(handle: i64) -> String {
             let el = match reader {
                 Some(r) => engine.rt.block_on(async {
                     ElCounts {
+                        reader_available: true,
                         snap_peers: r.snap_peer_count().await,
                         discovered: r.discovered_count(),
                         attempted: r.attempted_count().await,
@@ -414,6 +422,11 @@ pub fn status_json(handle: i64) -> String {
 /// not-started handle or when the EL reader failed to start).
 #[derive(Default)]
 struct ElCounts {
+    /// Whether the EL reader is up on this RUNNING handle. False = the reader
+    /// failed to start (the documented CL-only degraded mode): EL queries can
+    /// NEVER succeed until a pause/resume rebuilds it, so the Java wake gate
+    /// fast-fails instead of holding the full wake cap.
+    reader_available: bool,
     snap_peers: usize,
     discovered: usize,
     attempted: usize,
@@ -1195,6 +1208,9 @@ fn status_object(
     obj.insert("finalizedRootHex".into(), hex32(&s.finalized_root).into());
     // EL pool/discovery counts (the Rust engine's execution-layer side). The
     // pool keeps only snap-capable READY peers, so readyPeers == snapPeers.
+    // elReaderAvailable distinguishes "EL warming up" from "EL reader failed to
+    // start" (the CL-only degraded mode) — the wake gate fast-fails the latter.
+    obj.insert("elReaderAvailable".into(), el.reader_available.into());
     obj.insert("snapPeers".into(), el.snap_peers.into());
     obj.insert("readyPeers".into(), el.snap_peers.into());
     obj.insert("discoveredPeers".into(), el.discovered.into());
@@ -1221,6 +1237,7 @@ const NOT_STARTED_FALLBACK: &str = concat!(
     r#""currentPeriod":0,"targetPeriod":0,"peerCount":0,"servedPeersLastMinute":0,"#,
     r#""discv5TableSize":0,"syncStartPeriod":-1,"#,
     r#""finalizedRootHex":"0000000000000000000000000000000000000000000000000000000000000000","#,
+    r#""elReaderAvailable":false,"#,
     r#""snapPeers":0,"readyPeers":0,"discoveredPeers":0,"attemptedDials":0,"#,
     r#""backedOffPeers":0,"blacklistedPeers":0,"optimisticBlockNumber":0,"#,
     r#""finalizedBlockNumber":0,"executionBlockNumber":0}"#,
@@ -1285,6 +1302,7 @@ mod tests {
             v["finalizedRootHex"],
             "0000000000000000000000000000000000000000000000000000000000000000"
         );
+        assert_eq!(v["elReaderAvailable"], false);
         // EL counts are zero for a not-started handle.
         for k in ["snapPeers", "readyPeers", "discoveredPeers", "attemptedDials",
                   "backedOffPeers", "blacklistedPeers", "optimisticBlockNumber",
@@ -1311,6 +1329,7 @@ mod tests {
             sync_start_period: 1777,
         };
         let el = ElCounts {
+            reader_available: true,
             snap_peers: 5,
             discovered: 240,
             attempted: 14,
@@ -1341,6 +1360,7 @@ mod tests {
         assert_eq!(synced["finalizedRootHex"], hex32(&[0xab; 32]));
         // EL counts reflect the pool/discovery snapshot (snapPeers drives
         // readyPeers, since the pool holds only snap-capable READY peers).
+        assert_eq!(synced["elReaderAvailable"], true);
         assert_eq!(synced["snapPeers"], 5);
         assert_eq!(synced["readyPeers"], 5);
         assert_eq!(synced["discoveredPeers"], 240);
@@ -1393,6 +1413,7 @@ mod tests {
         .unwrap();
         assert_eq!(v["running"], false);
         assert_eq!(v["paused"], true);
+        assert_eq!(v["elReaderAvailable"], false);
         assert_eq!(v["beaconState"], "SYNCED");
         assert_eq!(v["bootstrapped"], true);
         assert_eq!(v["finalizedSlot"], 14_560_000);

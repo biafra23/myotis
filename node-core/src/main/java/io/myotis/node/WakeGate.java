@@ -83,6 +83,11 @@ public final class WakeGate {
                 Thread.currentThread().interrupt();
                 return false;
             }
+            // Still parked: this request IS ongoing activity. Re-stamp every poll so a
+            // wake-hold longer than the host's idle window can't leave the activity
+            // clock stale and let the idle controller re-pause the stack under the
+            // parked request (a wake/pause ping-pong until the cap expires).
+            noteActivity();
         }
     }
 

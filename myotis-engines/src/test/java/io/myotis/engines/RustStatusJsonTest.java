@@ -37,6 +37,7 @@ class RustStatusJsonTest {
             + "\"currentPeriod\":0,\"targetPeriod\":0,\"peerCount\":0,\"servedPeersLastMinute\":0,"
             + "\"discv5TableSize\":0,\"syncStartPeriod\":-1,"
             + "\"finalizedRootHex\":\"0000000000000000000000000000000000000000000000000000000000000000\","
+            + "\"elReaderAvailable\":false,"
             + "\"snapPeers\":0,\"readyPeers\":0,\"discoveredPeers\":0,\"attemptedDials\":0,"
             + "\"backedOffPeers\":0,\"blacklistedPeers\":0}";
 
@@ -47,6 +48,7 @@ class RustStatusJsonTest {
             + "\"currentPeriod\":1777,\"targetPeriod\":1795,\"peerCount\":5,\"servedPeersLastMinute\":2,"
             + "\"discv5TableSize\":7,\"syncStartPeriod\":1777,"
             + "\"finalizedRootHex\":\"58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e\","
+            + "\"elReaderAvailable\":true,"
             + "\"snapPeers\":6,\"readyPeers\":6,\"discoveredPeers\":240,\"attemptedDials\":14,"
             + "\"backedOffPeers\":30,\"blacklistedPeers\":66,"
             + "\"optimisticBlockNumber\":21000010,\"finalizedBlockNumber\":20999000,"
@@ -65,6 +67,7 @@ class RustStatusJsonTest {
             + "\"currentPeriod\":1777,\"targetPeriod\":1795,\"peerCount\":0,\"servedPeersLastMinute\":0,"
             + "\"discv5TableSize\":0,\"syncStartPeriod\":1777,"
             + "\"finalizedRootHex\":\"58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e\","
+            + "\"elReaderAvailable\":false,"
             + "\"snapPeers\":0,\"readyPeers\":0,\"discoveredPeers\":0,\"attemptedDials\":0,"
             + "\"backedOffPeers\":0,\"blacklistedPeers\":0,"
             + "\"optimisticBlockNumber\":0,\"finalizedBlockNumber\":0,\"executionBlockNumber\":0}";

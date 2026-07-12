@@ -235,6 +235,14 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
      * "handle not started"/"unknown handle" error (mirrors JavaChainHandle.awaitWake).
      */
     private void awaitWake() {
+        // Fast-fail the unrecoverable-while-RUNNING state (the twin of
+        // ChainStack.awaitReadyForReads' "RUNNING with no backend" fast-fail):
+        // RUNNING with no EL reader means the reader failed at start (the CL-only
+        // degraded mode). No amount of waiting produces one without a pause→resume,
+        // so let the native's precise "EL reader unavailable" error surface
+        // immediately instead of holding every query the full ~90 s cap.
+        ParsedStatus probe = readStatus();
+        if (probe.running() && !probe.elReaderAvailable()) return;
         wakeGate.await(WAKE_WAIT_CAP_MS);
         if (lifecycle() == LifecycleState.PAUSED) {
             throw new EngineException("node did not become ready within "
@@ -344,6 +352,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     private record ParsedStatus(
             boolean running,
             boolean paused,
+            boolean elReaderAvailable,
             BeaconState beaconState,
             boolean bootstrapped,
             long finalizedSlot,
@@ -370,6 +379,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 return new ParsedStatus(
                         o.getBoolean("running", false),
                         o.getBoolean("paused", false),
+                        o.getBoolean("elReaderAvailable", false),
                         BeaconState.valueOf(o.getString("beaconState", "STARTING")),
                         o.getBoolean("bootstrapped", false),
                         o.getLong("finalizedSlot", 0L),
@@ -394,8 +404,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
         }
 
         static ParsedStatus notRunning() {
-            return new ParsedStatus(false, false, BeaconState.STARTING, false, 0L, 0L, 0L, 0L, 0L,
-                    0, 0, -1L, 0, 0, 0, 0, 0, 0L, 0L);
+            return new ParsedStatus(false, false, false, BeaconState.STARTING, false, 0L, 0L, 0L,
+                    0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0L, 0L);
         }
     }
 
