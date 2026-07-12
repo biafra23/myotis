@@ -1,6 +1,6 @@
 [package]
 name = "myotis-bls"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Native BLS12-381 fast-aggregate-verify (blst) behind a JNI shim for Myotis"
 license = "MIT OR Apache-2.0"

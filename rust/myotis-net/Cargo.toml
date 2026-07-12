@@ -1,6 +1,6 @@
 [package]
 name = "myotis-net"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Myotis consensus-layer networking: discv5 discovery + libp2p eth2 req/resp + the light-client sync loop (ALL I/O lives here; myotis-consensus stays sans-I/O)"
 license = "MIT OR Apache-2.0"
