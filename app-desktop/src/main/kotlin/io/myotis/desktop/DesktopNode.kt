@@ -27,6 +27,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
+import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.io.path.createDirectories
@@ -342,13 +343,20 @@ class DesktopNodeController(
 }
 
 /**
- * Minimal in-memory desktop settings (Step 1). File-backed persistence is a follow-up.
+ * Desktop settings, file-backed so every toggle survives an app restart (Android parity —
+ * there SharedPreferences does this for free). [file] is a java.util.Properties file under
+ * the app data dir (`~/.myotis/settings.properties`); null keeps the store in-memory
+ * (tests, syncSmoke). Loaded once at construction; every setter rewrites the file.
+ * Unknown keys and unparsable values fall back to the defaults, so a hand-edited or
+ * older-version file can't break boot.
+ *
  * Network metadata comes from the engine's [NetworkInfo] catalog — no engine-internal
  * config types. Read/written from both the UI thread and the boot threads, so every
  * access is guarded by `synchronized(this)` over the non-thread-safe backing collections.
  */
 class DesktopSettings(
     private val networks: List<NetworkInfo> = Engines.engine().availableNetworks(),
+    private val file: Path? = null,
 ) : Settings {
     private val enabled = linkedSetOf("mainnet")
     private val ports = HashMap<String, Int>()
@@ -358,8 +366,12 @@ class DesktopSettings(
     // Desktop has no bundled native blst yet (Milagro-only), so the honest default is off; the
     // toggle persists but DesktopNodeController.applyBlsBackend() is a no-op until the dylib ships.
     private var nativeBls = false
-    // The Rust engine is experimental (catalog-only today) — off by default everywhere.
+    // The Rust engine is experimental — off by default everywhere.
     private var rustEngine = false
+
+    init {
+        load()
+    }
 
     private fun info(network: String): NetworkInfo? = networks.firstOrNull { it.name() == network }
 
@@ -369,7 +381,7 @@ class DesktopSettings(
     override fun isNetworkEnabled(name: String): Boolean = synchronized(this) { name in enabled }
     override fun setNetworkEnabled(name: String, on: Boolean) = synchronized(this) {
         if (on) enabled.add(name) else enabled.remove(name)
-        Unit
+        persist()
     }
     override fun rpcPortFor(network: String): Int = synchronized(this) {
         ports[network] ?: defaultRpcPort(network)
@@ -378,23 +390,75 @@ class DesktopSettings(
         // Clamp to the valid TCP range, falling back to the network default on out-of-range
         // input (parity with Android's NodeService.setRpcPort).
         ports[network] = if (port in 1024..65535) port else defaultRpcPort(network)
-        Unit
+        persist()
     }
     override fun snapTarget(): Int = synchronized(this) { snap }
-    override fun setSnapTarget(v: Int) = synchronized(this) { snap = v }
+    override fun setSnapTarget(v: Int) = synchronized(this) { snap = v; persist() }
 
     override fun displayName(network: String): String = info(network)?.displayName() ?: network
     override fun defaultRpcPort(network: String): Int = info(network)?.defaultRpcPort() ?: 8545
     override fun hasEns(network: String): Boolean = info(network)?.hasEns() ?: false
 
     override fun deepPoolThreshold(): Int = synchronized(this) { deep }
-    override fun setDeepPool(v: Int) = synchronized(this) { deep = v }
+    override fun setDeepPool(v: Int) = synchronized(this) { deep = v; persist() }
     override fun strictStateFreshness(): Boolean = synchronized(this) { strict }
-    override fun setStrictStateFreshness(v: Boolean) = synchronized(this) { strict = v }
+    override fun setStrictStateFreshness(v: Boolean) = synchronized(this) { strict = v; persist() }
     override fun nativeBlsEnabled(): Boolean = synchronized(this) { nativeBls }
-    override fun setNativeBlsEnabled(v: Boolean) = synchronized(this) { nativeBls = v }
+    override fun setNativeBlsEnabled(v: Boolean) = synchronized(this) { nativeBls = v; persist() }
     override fun rustEngineEnabled(): Boolean = synchronized(this) { rustEngine }
-    override fun setRustEngineEnabled(v: Boolean) = synchronized(this) { rustEngine = v }
+    override fun setRustEngineEnabled(v: Boolean) = synchronized(this) { rustEngine = v; persist() }
+
+    /** Best-effort load; a missing or unreadable file just keeps the defaults. */
+    private fun load() {
+        val f = file ?: return
+        if (!Files.exists(f)) return
+        val p = java.util.Properties()
+        if (runCatching { Files.newInputStream(f).use(p::load) }.isFailure) return
+        p.getProperty(K_ENABLED)?.let { csv ->
+            // Key present = the user's explicit set (possibly empty). Unknown names are
+            // dropped so a stale/hand-edited entry can't feed startNetwork() a bad name.
+            enabled.clear()
+            csv.split(',').map(String::trim).filter { it.isNotEmpty() && info(it) != null }
+                .forEach(enabled::add)
+        }
+        networks.forEach { n ->
+            p.getProperty("$K_RPC_PORT_PREFIX${n.name()}")?.toIntOrNull()
+                ?.takeIf { it in 1024..65535 }
+                ?.let { ports[n.name()] = it }
+        }
+        p.getProperty(K_SNAP)?.toIntOrNull()?.let { snap = it.coerceIn(1, 128) }
+        p.getProperty(K_DEEP)?.toIntOrNull()?.let { deep = it.coerceIn(1, 128) }
+        p.getProperty(K_STRICT)?.toBooleanStrictOrNull()?.let { strict = it }
+        p.getProperty(K_NATIVE_BLS)?.toBooleanStrictOrNull()?.let { nativeBls = it }
+        p.getProperty(K_RUST_ENGINE)?.toBooleanStrictOrNull()?.let { rustEngine = it }
+    }
+
+    /** Best-effort rewrite (same idiom as [DesktopQueryHistory]); called under `this`. */
+    private fun persist() {
+        val f = file ?: return
+        runCatching {
+            f.parent?.let(Files::createDirectories)
+            val p = java.util.Properties()
+            p.setProperty(K_ENABLED, enabled.joinToString(","))
+            ports.forEach { (net, port) -> p.setProperty("$K_RPC_PORT_PREFIX$net", port.toString()) }
+            p.setProperty(K_SNAP, snap.toString())
+            p.setProperty(K_DEEP, deep.toString())
+            p.setProperty(K_STRICT, strict.toString())
+            p.setProperty(K_NATIVE_BLS, nativeBls.toString())
+            p.setProperty(K_RUST_ENGINE, rustEngine.toString())
+            Files.newOutputStream(f).use { p.store(it, "Myotis desktop settings") }
+        }
+    }
+
+    private companion object {
+        const val K_ENABLED = "networks.enabled"
+        const val K_RPC_PORT_PREFIX = "rpcPort."
+        const val K_SNAP = "snapTarget"
+        const val K_DEEP = "deepPool"
+        const val K_STRICT = "strictStateFreshness"
+        const val K_NATIVE_BLS = "nativeBls"
+        const val K_RUST_ENGINE = "rustEngine"
+    }
 }
 
 /** Desktop is treated as always-online (no Android ConnectivityManager). */

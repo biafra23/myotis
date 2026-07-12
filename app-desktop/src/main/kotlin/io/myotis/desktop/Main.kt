@@ -33,8 +33,12 @@ fun main() {
     }
     val dataDir = Path.of(System.getProperty("user.home"), ".myotis")
     // settings first: the controller reads it at boot (configured RPC port + snap target).
-    val settings = DesktopSettings()
+    val settings = DesktopSettings(file = dataDir.resolve("settings.properties"))
     val controller = DesktopNodeController(dataDir, settings)
+    // Apply the persisted engine choice BEFORE the first network start, so a saved
+    // Rust-engine preference survives a restart (Android parity: NodeService applies
+    // it at service start). Networks keep the engine that created them.
+    controller.applyEngineChoice()
     val history = DesktopQueryHistory(dataDir.resolve("query-history.tsv"))
     settings.enabledNetworks().forEach(controller::startNetwork)
 
