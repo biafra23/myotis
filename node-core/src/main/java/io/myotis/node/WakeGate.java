@@ -17,8 +17,13 @@ import java.util.function.Supplier;
  * <p>Extracted from {@code ChainStack} so the wait/single-flight behavior is
  * hermetically testable — every dependency (phase, readiness, resume action,
  * clock) is injected.
+ *
+ * <p>Public (not package-private) because the Rust engine's Java shim
+ * ({@code io.myotis.engines.RustChainHandle}) reuses the same wake-on-request
+ * primitive over its native lifecycle, so the two engines can't drift on the
+ * hold/single-flight semantics.
  */
-final class WakeGate {
+public final class WakeGate {
 
     private final Supplier<LifecycleState> phase;
     private final BooleanSupplier ready;
@@ -39,8 +44,8 @@ final class WakeGate {
      * @param pollMs         wait-loop poll interval
      * @param wakeThreadName name for the spawned resume thread
      */
-    WakeGate(Supplier<LifecycleState> phase, BooleanSupplier ready, Runnable resume,
-             LongSupplier clock, long pollMs, String wakeThreadName) {
+    public WakeGate(Supplier<LifecycleState> phase, BooleanSupplier ready, Runnable resume,
+                    LongSupplier clock, long pollMs, String wakeThreadName) {
         this.phase = phase;
         this.ready = ready;
         this.resume = resume;
@@ -59,7 +64,7 @@ final class WakeGate {
      *         stack is {@code STOPPED}, still {@code PAUSED} at the deadline
      *         (resume kept failing), or the wait was interrupted.
      */
-    boolean await(long capMs) {
+    public boolean await(long capMs) {
         noteActivity();
         // Monotonic deadline (nanoTime, overflow-safe compare): capMs is a DURATION, so an
         // NTP / manual wall-clock step must not extend or prematurely expire the hold. The
@@ -82,17 +87,17 @@ final class WakeGate {
     }
 
     /** Note activity and kick a wake if paused, without blocking (status probes). */
-    void poke() {
+    public void poke() {
         noteActivity();
         if (phase.get() == LifecycleState.PAUSED) triggerWake();
     }
 
-    void noteActivity() {
+    public void noteActivity() {
         lastActivityMs.set(clock.getAsLong());
     }
 
     /** Epoch millis of the last {@link #await}/{@link #poke}; 0 if none yet. */
-    long lastActivityMs() {
+    public long lastActivityMs() {
         return lastActivityMs.get();
     }
 

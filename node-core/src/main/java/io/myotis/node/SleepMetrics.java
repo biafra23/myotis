@@ -21,8 +21,13 @@ package io.myotis.node;
  * monitor (pause/resume are {@code synchronized}), and the volatile-free reads are
  * fine for the status snapshot (a torn read at worst shows a value one transition
  * stale, which is harmless for a diagnostic display).
+ *
+ * <p>Public (not package-private) because the Rust engine's Java shim
+ * ({@code io.myotis.engines.RustChainHandle}) reuses the same accounting —
+ * including the observer-effect rule — over its native pause/resume, so the two
+ * engines' status screens can't drift.
  */
-final class SleepMetrics {
+public final class SleepMetrics {
 
     private int pauseCount;
     private long totalPausedNanos;
@@ -32,7 +37,7 @@ final class SleepMetrics {
     private String lastWakeReason;        // null = never woken by a demand wake
 
     /** Record entry into idle sleep. */
-    void onPause(long nowEpochMs, long nowNanos) {
+    public void onPause(long nowEpochMs, long nowNanos) {
         pauseCount++;
         lastPauseEpochMs = nowEpochMs;
         lastPauseNanos = nowNanos;
@@ -43,7 +48,7 @@ final class SleepMetrics {
      * only records the reason/time as the "last wake" when {@code recordAsWake} (i.e. a
      * demand wake, not a foreground observation).
      */
-    void onResume(long nowEpochMs, long nowNanos, String reason, boolean recordAsWake) {
+    public void onResume(long nowEpochMs, long nowNanos, String reason, boolean recordAsWake) {
         if (lastPauseNanos != 0) {
             totalPausedNanos += nowNanos - lastPauseNanos;
             lastPauseNanos = 0;
@@ -54,9 +59,9 @@ final class SleepMetrics {
         }
     }
 
-    int pauseCount() { return pauseCount; }
-    long totalPausedMs() { return totalPausedNanos / 1_000_000L; }
-    long lastPauseEpochMs() { return lastPauseEpochMs; }
-    long lastResumeEpochMs() { return lastResumeEpochMs; }
-    String lastWakeReason() { return lastWakeReason; }
+    public int pauseCount() { return pauseCount; }
+    public long totalPausedMs() { return totalPausedNanos / 1_000_000L; }
+    public long lastPauseEpochMs() { return lastPauseEpochMs; }
+    public long lastResumeEpochMs() { return lastResumeEpochMs; }
+    public String lastWakeReason() { return lastWakeReason; }
 }

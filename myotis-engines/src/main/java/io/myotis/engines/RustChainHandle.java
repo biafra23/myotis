@@ -46,6 +46,13 @@ import java.util.List;
  * {@link #start()} this handle self-starts the shared {@code jsonrpc-server} on
  * {@code 127.0.0.1:rpcPort} backed by {@link RustVerifiedReads}, mirroring how the
  * Java engine self-starts it inside {@code ChainStack}.
+ *
+ * <p>Idle sleep is REAL on this engine (the Java engine's behaviour, mirrored for
+ * Android): {@link #pause()} tears the native networking down while the handle and
+ * the JSON-RPC listener stay, {@link #resume(String)} warm-starts from the
+ * persisted snapshot/peer caches, and every verified read below crosses the same
+ * {@code WakeGate} the Java engine uses — a request on a paused stack wakes it and
+ * is held (bounded, ~90 s) until the node can answer.
  */
 final class RustChainHandle implements ChainHandle, NodeStatusReads {
 
@@ -96,6 +103,11 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
         this.httpGateway = httpGateway;
         // Networks without ENS (e.g. gnosis) get no EnsApi — ens() returns null.
         this.ensApi = hasEns ? new RustEnsApi(this) : null;
+        // Wake-on-request over the NATIVE lifecycle: the same primitive ChainStack
+        // wires, so the two engines share the hold/single-flight semantics.
+        this.wakeGate = new io.myotis.node.WakeGate(this::lifecycle, this::readyForReads,
+                () -> resume(io.myotis.api.WakeReason.REQUEST),
+                System::currentTimeMillis, WAKE_POLL_MS, "wake-resume-" + networkName);
     }
 
     io.myotis.api.ports.HttpGateway httpGateway() {
@@ -130,43 +142,151 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
         RustEngineNative.nativeStop(handle);
     }
 
-    // ---- idle-sleep lifecycle: NO-OP on the Rust engine (see class javadoc) ----
+    // ---- idle-sleep lifecycle (mirrors ChainStack.pause/resume) ----
     //
-    // The Java engine idle-pauses by tearing down + rebuilding its networking
-    // (ChainStack.pause/resume via WakeGate). The Rust engine owns a tokio/libp2p
-    // stack it can't cheaply suspend yet, so it implements the contract as a no-op:
-    // it simply never idle-sleeps. pause() reports it did NOT pause (stays RUNNING);
-    // resume() is a no-op success; lifecycle() is RUNNING/STOPPED (never PAUSED); and
-    // lastActivityEpochMillis() reports "now" so a host idle controller sees constant
-    // activity and never attempts a pause. Real Rust pause/resume is a later follow-up.
+    // pause() tears the native networking down (zero sockets, zero timers — the
+    // radio can sleep) while the handle, its persisted warm state, and the
+    // JSON-RPC LISTENER stay: a verified read arriving while paused goes through
+    // the wake gate below, which triggers a single-flight resume(REQUEST) and
+    // holds the request (bounded) until the node can answer. resume() re-runs
+    // the native start path, which warm-starts from the persisted snapshot /
+    // peer caches (no checkpoint re-bootstrap, no cold discovery). The
+    // pause/resume accounting reuses the Java engine's SleepMetrics — including
+    // the FOREGROUND observer-effect rule — so the two engines' status screens
+    // can't drift.
+
+    /** Max time a verified read arriving on a paused stack is held while the wake
+     *  completes (mirrors ChainStack.WAKE_WAIT_CAP_MS). */
+    static final long WAKE_WAIT_CAP_MS = 90_000L;
+    /** Wake-wait poll interval (mirrors ChainStack.WAKE_POLL_MS). */
+    private static final long WAKE_POLL_MS = 250L;
+
+    /** Wake-on-request: activity stamping + single-flight resume + bounded request
+     *  hold — the same primitive ChainStack wires (assigned in the constructor). */
+    private final io.myotis.node.WakeGate wakeGate;
+    /** Idle-sleep bookkeeping (pause count / total paused / last wake) for the
+     *  status screens. Mutated only under this handle's lifecycle monitor
+     *  (pause/resume are synchronized), like ChainStack. */
+    private final io.myotis.node.SleepMetrics sleepMetrics = new io.myotis.node.SleepMetrics();
+    /** Requests currently being served; while non-zero lastActivityEpochMillis
+     *  reports "now" so the host idle timer never pauses the stack mid-query. */
+    private final java.util.concurrent.atomic.AtomicInteger inFlight =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     @Override
-    public boolean pause() {
-        // Did not enter PAUSED — the Rust engine keeps RUNNING.
-        return false;
+    public synchronized boolean pause() {
+        if (RustEngineNative.nativePause(handle)) {
+            sleepMetrics.onPause(System.currentTimeMillis(), System.nanoTime());
+            log.info("[{}] paused (networking torn down; RPC keeps listening)", networkName);
+            return true;
+        }
+        // No transition — idempotent success only when already PAUSED (a
+        // created/stopped handle reports false, per the ChainHandle contract).
+        return lifecycle() == LifecycleState.PAUSED;
     }
 
     @Override
     public boolean resume() {
-        // Always RUNNING → resume is a no-op success (mirrors the "already RUNNING" case).
-        return isRunning();
+        return resume(io.myotis.api.WakeReason.MANUAL);
     }
 
     @Override
-    public boolean resume(String reason) {
-        return resume();
+    public synchronized boolean resume(String reason) {
+        if (isRunning()) return true; // no-op success, no accounting (mirrors ChainStack)
+        if (RustEngineNative.nativeResume(handle)) {
+            // Foreground (observation) wakes count toward the total but must not
+            // overwrite the last-wake reason — see WakeReason / SleepMetrics.
+            sleepMetrics.onResume(System.currentTimeMillis(), System.nanoTime(), reason,
+                    !io.myotis.api.WakeReason.FOREGROUND.equals(reason));
+            // The listener normally survived the pause; if the FIRST start's bind
+            // failed this retries it best-effort (mirrors ChainStack.resume).
+            startRpc();
+            log.info("[{}] resumed ({})", networkName, reason);
+            return true;
+        }
+        // Not paused (stopped), or the rebuild failed and the native side stayed
+        // PAUSED (retryable) — either way, not RUNNING now.
+        log.warn("[{}] resume ({}) did not start the stack (stayed {})",
+                networkName, reason, lifecycle());
+        return false;
     }
 
     @Override
     public LifecycleState lifecycle() {
-        return isRunning() ? LifecycleState.RUNNING : LifecycleState.STOPPED;
+        ParsedStatus s = readStatus();
+        if (s.running()) return LifecycleState.RUNNING;
+        return s.paused() ? LifecycleState.PAUSED : LifecycleState.STOPPED;
     }
 
     @Override
     public long lastActivityEpochMillis() {
-        // No activity tracking; report "now" so a host idle timer never elapses and
-        // never tries to pause (which would be a no-op returning false anyway).
-        return System.currentTimeMillis();
+        // Epoch millis of the last gated verified read / operator query; 0 if none.
+        // While a request is in flight this reports "now" so the host idle timer
+        // holds off (mirrors ChainStack.lastActivityMs).
+        return inFlight.get() > 0 ? System.currentTimeMillis() : wakeGate.lastActivityMs();
+    }
+
+    /**
+     * Wake-and-wait shared by every verified read / operator query below: a query
+     * on a paused stack triggers the (single-flight) resume and waits up to the cap
+     * for readiness. A RUNNING-but-cold stack proceeds at the deadline — the native
+     * query produces its own precise bounded errors. Only PAUSED-at-deadline
+     * (resume kept failing) throws; a STOPPED stack falls through to the native's
+     * "handle not started"/"unknown handle" error (mirrors JavaChainHandle.awaitWake).
+     */
+    private void awaitWake() {
+        wakeGate.await(WAKE_WAIT_CAP_MS);
+        if (lifecycle() == LifecycleState.PAUSED) {
+            throw new EngineException("node did not become ready within "
+                    + (WAKE_WAIT_CAP_MS / 1000) + "s (paused; resume failing)");
+        }
+    }
+
+    /** Adapter seam ({@link RustVerifiedReads#headBlockNumber}): wake-and-hold;
+     *  false when no verified answer is possible right now. */
+    boolean awaitReadyForReads() {
+        try {
+            awaitWake();
+            return true;
+        } catch (EngineException e) {
+            return false;
+        }
+    }
+
+    /** Adapter seam: note activity and kick a wake if paused, without blocking
+     *  (status probes — {@link RustVerifiedReads#syncState}). */
+    void noteActivityAndWake() {
+        wakeGate.poke();
+    }
+
+    /**
+     * The wake-on-request choke point every verified read crosses before its JNI
+     * call (the Rust-engine twin of ChainStack.awaitReadyForReads + the
+     * begin/endRequest in-flight guard): stamps activity, wakes a paused stack,
+     * holds bounded until reads are answerable, and marks the request in flight so
+     * the host idle timer can't pause the stack mid-query.
+     */
+    private <T> T gated(java.util.function.Supplier<T> nativeCall) {
+        awaitWake();
+        inFlight.incrementAndGet();
+        try {
+            return nativeCall.get();
+        } finally {
+            inFlight.decrementAndGet();
+        }
+    }
+
+    /** Readiness for verified reads — the serveable predicate status() ages the
+     *  head by: SYNCED, an anchored optimistic head, and snap peers to query
+     *  (the Rust twin of ChainStack.readyForReads). */
+    private boolean readyForReads() {
+        try {
+            ParsedStatus s = readStatus();
+            return s.running() && s.beaconState() == BeaconState.SYNCED
+                    && s.optimisticBlockNumber() > 0 && s.snapPeers() > 0;
+        } catch (RuntimeException e) {
+            return false; // an unreadable status is "not ready", never a wake-loop crash
+        }
     }
 
     /** {@link NodeStatusReads}: node uptime for the JSON-RPC myotis_status result. Monotonic
@@ -219,9 +339,11 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     }
 
     /** The parsed native status object — CL fields plus the EL pool/discovery
-     *  counts. Older natives omit the EL keys → they default to 0. */
+     *  counts. Older natives omit the EL keys → they default to 0 (and the
+     *  paused key → false, so an older .so can only ever look RUNNING/STOPPED). */
     private record ParsedStatus(
             boolean running,
+            boolean paused,
             BeaconState beaconState,
             boolean bootstrapped,
             long finalizedSlot,
@@ -247,6 +369,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 if (o.isEmpty()) return notRunning(); // "{}" == unknown handle
                 return new ParsedStatus(
                         o.getBoolean("running", false),
+                        o.getBoolean("paused", false),
                         BeaconState.valueOf(o.getString("beaconState", "STARTING")),
                         o.getBoolean("bootstrapped", false),
                         o.getLong("finalizedSlot", 0L),
@@ -271,8 +394,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
         }
 
         static ParsedStatus notRunning() {
-            return new ParsedStatus(false, BeaconState.STARTING, false, 0L, 0L, 0L, 0L, 0L, 0, 0, -1L,
-                    0, 0, 0, 0, 0, 0L, 0L);
+            return new ParsedStatus(false, false, BeaconState.STARTING, false, 0L, 0L, 0L, 0L, 0L,
+                    0, 0, -1L, 0, 0, 0, 0, 0, 0L, 0L);
         }
     }
 
@@ -343,7 +466,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
         }
         return new StatusSnapshot(
                 s.running(),
-                s.running() ? LifecycleState.RUNNING : LifecycleState.STOPPED,
+                s.running() ? LifecycleState.RUNNING
+                        : s.paused() ? LifecycleState.PAUSED : LifecycleState.STOPPED,
                 networkName,
                 s.beaconState(),
                 peers,                 // connectedPeers (CL libp2p peers)
@@ -366,13 +490,13 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 targetPeriod,   // wallClockPeriod == the catch-up target
                 verifiedHeadAgeMs,
                 List.<PeerInfo>of(),
-                // Idle-sleep metrics: the Rust engine does not idle-pause yet (pause()
-                // is a no-op — see below), so it never accrues pause stats.
-                0,      // pauseCount
-                0L,     // totalPausedMs
-                0L,     // lastPauseEpochMs
-                0L,     // lastResumeEpochMs
-                null,   // lastWakeReason
+                // Idle-sleep metrics, accounted Java-side across the native
+                // pause/resume transitions (same SleepMetrics as the Java engine).
+                sleepMetrics.pauseCount(),
+                sleepMetrics.totalPausedMs(),
+                sleepMetrics.lastPauseEpochMs(),
+                sleepMetrics.lastResumeEpochMs(),
+                sleepMetrics.lastWakeReason(),
                 // Inbound-serve counters: not yet surfaced in the Rust engine's status
                 // JSON — zeros until its telemetry grows the fields.
                 0L, 0L, 0L, 0L);
@@ -471,7 +595,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     @Override
     public AccountProofResult requestAccount(String hexAddress) {
         JsonObject o = parseResultOrThrow(
-                RustEngineNative.nativeRequestAccountJson(handle, hexAddress), "account");
+                gated(() -> RustEngineNative.nativeRequestAccountJson(handle, hexAddress)),
+                "account");
         return accountFromJson(hexAddress, o);
     }
 
@@ -514,7 +639,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     @Override
     public StorageProofResult getStorageProof(String hexAddress, long slot, String holderHexOrNull) {
         JsonObject o = parseResultOrThrow(
-                RustEngineNative.nativeGetStorageProofJson(handle, hexAddress, slot, holderHexOrNull),
+                gated(() -> RustEngineNative.nativeGetStorageProofJson(
+                        handle, hexAddress, slot, holderHexOrNull)),
                 "storage");
         return storageFromJson(hexAddress, slot, o);
     }
@@ -533,7 +659,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
      * transport / not-running failure (the adapter maps that to null).
      */
     byte[] codeVerified(String hexAddress) {
-        return codeFromJson(RustEngineNative.nativeGetCodeJson(handle, hexAddress));
+        return codeFromJson(gated(() -> RustEngineNative.nativeGetCodeJson(handle, hexAddress)));
     }
 
     /** Package-private test seam: code JSON → verified bytecode (or null) without JNI. */
@@ -555,8 +681,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
      */
     byte[] ethCallVerified(
             String fromHex, String toHex, String dataHex, String valueDecimal, String block) {
-        return callResultFromJson(
-                RustEngineNative.nativeEthCallJson(handle, fromHex, toHex, dataHex, valueDecimal, block));
+        return callResultFromJson(gated(() -> RustEngineNative.nativeEthCallJson(
+                handle, fromHex, toHex, dataHex, valueDecimal, block)));
     }
 
     /** Package-private test seam: call JSON → result bytes (or null) without JNI. */
@@ -581,7 +707,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
      * not-running failure (the RustEnsApi adapter maps that to an error result).
      */
     EnsResolutionResult resolveEnsVerified(String name) {
-        return ensResolutionFromJson(name, RustEngineNative.nativeResolveEnsJson(handle, name));
+        return ensResolutionFromJson(name,
+                gated(() -> RustEngineNative.nativeResolveEnsJson(handle, name)));
     }
 
     /**
@@ -591,7 +718,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
      * transport hop.
      */
     String ensRecordJson(String paramsJson) {
-        return RustEngineNative.nativeEnsRecordJson(handle, paramsJson);
+        return gated(() -> RustEngineNative.nativeEnsRecordJson(handle, paramsJson));
     }
 
     /** Package-private test seam: ENS JSON → {@link EnsResolutionResult} without JNI. */
@@ -645,8 +772,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
      * string. Throws {@link EngineException} on a transport / not-running failure.
      */
     Long estimateGasVerified(String fromHex, String toHex, String dataHex, String valueDecimal) {
-        return estimateGasFromJson(
-                RustEngineNative.nativeEstimateGasJson(handle, fromHex, toHex, dataHex, valueDecimal));
+        return estimateGasFromJson(gated(() -> RustEngineNative.nativeEstimateGasJson(
+                handle, fromHex, toHex, dataHex, valueDecimal)));
     }
 
     /** Package-private test seam: estimateGas JSON → gas estimate (or null) without JNI. */
@@ -677,8 +804,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
      * position. Throws {@link EngineException} on a transport / not-running failure.
      */
     byte[] storageAtVerified(String hexAddress, String position32Hex) {
-        return storageValueFromJson(
-                RustEngineNative.nativeGetStorageAtJson(handle, hexAddress, position32Hex));
+        return storageValueFromJson(gated(() -> RustEngineNative.nativeGetStorageAtJson(
+                handle, hexAddress, position32Hex)));
     }
 
     /**
@@ -688,7 +815,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
      * {@code blockTag} is an eth block selector ({@code "latest"} / 0x-hex number).
      */
     String blockByNumberJson(String blockTag) {
-        return blockJsonOrThrow(RustEngineNative.nativeGetBlockByNumberJson(handle, blockTag));
+        return blockJsonOrThrow(
+                gated(() -> RustEngineNative.nativeGetBlockByNumberJson(handle, blockTag)));
     }
 
     /** Package-private test seam: native block payload → block JSON | "null" | throw. */
@@ -732,9 +860,12 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     FeeEstimate feeEstimate() {
         CachedFee c = cachedFee;
         if (c != null && System.nanoTime() - c.atNanos() < FEE_CACHE_TTL_NANOS) {
+            // Still a host-visible read: stamp activity (and kick a wake) even on a
+            // cache hit, so a fee-polling wallet keeps the idle timer honest.
+            noteActivityAndWake();
             return c.est();
         }
-        FeeEstimate est = feeFromJson(RustEngineNative.nativeFeeEstimateJson(handle));
+        FeeEstimate est = feeFromJson(gated(() -> RustEngineNative.nativeFeeEstimateJson(handle)));
         cachedFee = new CachedFee(est, System.nanoTime());
         return est;
     }
@@ -766,7 +897,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
      * plausible tx. {@code rawTxHex} is the 0x-hex raw transaction.
      */
     byte[] sendRawTransactionVerified(String rawTxHex) {
-        return txHashFromJson(RustEngineNative.nativeSendRawTransactionJson(handle, rawTxHex));
+        return txHashFromJson(
+                gated(() -> RustEngineNative.nativeSendRawTransactionJson(handle, rawTxHex)));
     }
 
     /** Package-private test seam: send-tx JSON → the 32-byte tx hash (throws on error). */
