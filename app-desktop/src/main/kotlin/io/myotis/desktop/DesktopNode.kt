@@ -27,7 +27,10 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.io.path.createDirectories
 
@@ -342,13 +345,20 @@ class DesktopNodeController(
 }
 
 /**
- * Minimal in-memory desktop settings (Step 1). File-backed persistence is a follow-up.
+ * Desktop settings, file-backed so every toggle survives an app restart (Android parity —
+ * there SharedPreferences does this for free). [file] is a java.util.Properties file under
+ * the app data dir (`~/.myotis/settings.properties`); null keeps the store in-memory
+ * (tests, syncSmoke). Loaded once at construction; every setter rewrites the file.
+ * Unknown keys and unparsable values fall back to the defaults, so a hand-edited or
+ * older-version file can't break boot.
+ *
  * Network metadata comes from the engine's [NetworkInfo] catalog — no engine-internal
  * config types. Read/written from both the UI thread and the boot threads, so every
  * access is guarded by `synchronized(this)` over the non-thread-safe backing collections.
  */
 class DesktopSettings(
     private val networks: List<NetworkInfo> = Engines.engine().availableNetworks(),
+    private val file: Path? = null,
 ) : Settings {
     private val enabled = linkedSetOf("mainnet")
     private val ports = HashMap<String, Int>()
@@ -358,8 +368,18 @@ class DesktopSettings(
     // Desktop has no bundled native blst yet (Milagro-only), so the honest default is off; the
     // toggle persists but DesktopNodeController.applyBlsBackend() is a no-op until the dylib ships.
     private var nativeBls = false
-    // The Rust engine is experimental (catalog-only today) — off by default everywhere.
+    // The Rust engine is experimental — off by default everywhere.
     private var rustEngine = false
+
+    /** Serializes file writes, separate from the state lock (`this`) so settings
+     *  readers never wait on disk I/O. */
+    private val ioLock = Any()
+    private var stateSeq = 0L   // guarded by `this`
+    private var writtenSeq = 0L // guarded by [ioLock]
+
+    init {
+        load()
+    }
 
     private fun info(network: String): NetworkInfo? = networks.firstOrNull { it.name() == network }
 
@@ -367,34 +387,130 @@ class DesktopSettings(
     override fun primaryNetwork(): String = synchronized(this) { enabled.firstOrNull() ?: "mainnet" }
     override fun allNetworks(): List<String> = networks.map { it.name() }
     override fun isNetworkEnabled(name: String): Boolean = synchronized(this) { name in enabled }
-    override fun setNetworkEnabled(name: String, on: Boolean) = synchronized(this) {
+    override fun setNetworkEnabled(name: String, on: Boolean) = mutate {
         if (on) enabled.add(name) else enabled.remove(name)
-        Unit
     }
     override fun rpcPortFor(network: String): Int = synchronized(this) {
         ports[network] ?: defaultRpcPort(network)
     }
-    override fun setRpcPort(network: String, port: Int) = synchronized(this) {
+    override fun setRpcPort(network: String, port: Int) = mutate {
         // Clamp to the valid TCP range, falling back to the network default on out-of-range
         // input (parity with Android's NodeService.setRpcPort).
         ports[network] = if (port in 1024..65535) port else defaultRpcPort(network)
-        Unit
     }
     override fun snapTarget(): Int = synchronized(this) { snap }
-    override fun setSnapTarget(v: Int) = synchronized(this) { snap = v }
+    // Clamp like Android's NodeService (1..128) so the live value and the reloaded
+    // value can't differ (load() applies the same clamp).
+    override fun setSnapTarget(v: Int) = mutate { snap = v.coerceIn(1, 128) }
 
     override fun displayName(network: String): String = info(network)?.displayName() ?: network
     override fun defaultRpcPort(network: String): Int = info(network)?.defaultRpcPort() ?: 8545
     override fun hasEns(network: String): Boolean = info(network)?.hasEns() ?: false
 
     override fun deepPoolThreshold(): Int = synchronized(this) { deep }
-    override fun setDeepPool(v: Int) = synchronized(this) { deep = v }
+    override fun setDeepPool(v: Int) = mutate { deep = v.coerceIn(1, 128) }
     override fun strictStateFreshness(): Boolean = synchronized(this) { strict }
-    override fun setStrictStateFreshness(v: Boolean) = synchronized(this) { strict = v }
+    override fun setStrictStateFreshness(v: Boolean) = mutate { strict = v }
     override fun nativeBlsEnabled(): Boolean = synchronized(this) { nativeBls }
-    override fun setNativeBlsEnabled(v: Boolean) = synchronized(this) { nativeBls = v }
+    override fun setNativeBlsEnabled(v: Boolean) = mutate { nativeBls = v }
     override fun rustEngineEnabled(): Boolean = synchronized(this) { rustEngine }
-    override fun setRustEngineEnabled(v: Boolean) = synchronized(this) { rustEngine = v }
+    override fun setRustEngineEnabled(v: Boolean) = mutate { rustEngine = v }
+
+    /** Best-effort load; a missing or unreadable file just keeps the defaults. */
+    private fun load() {
+        val f = file ?: return
+        if (!Files.exists(f)) return
+        val p = java.util.Properties()
+        if (runCatching { Files.newInputStream(f).use(p::load) }.isFailure) return
+        p.getProperty(K_ENABLED)?.let { csv ->
+            // Key present = the user's explicit set (possibly empty). Unknown names are
+            // dropped so a stale/hand-edited entry can't feed startNetwork() a bad name.
+            enabled.clear()
+            csv.split(',').map(String::trim).filter { it.isNotEmpty() && info(it) != null }
+                .forEach(enabled::add)
+        }
+        networks.forEach { n ->
+            p.getProperty("$K_RPC_PORT_PREFIX${n.name()}")?.toIntOrNull()
+                ?.takeIf { it in 1024..65535 }
+                ?.let { ports[n.name()] = it }
+        }
+        p.getProperty(K_SNAP)?.toIntOrNull()?.let { snap = it.coerceIn(1, 128) }
+        p.getProperty(K_DEEP)?.toIntOrNull()?.let { deep = it.coerceIn(1, 128) }
+        p.getProperty(K_STRICT)?.toBooleanStrictOrNull()?.let { strict = it }
+        p.getProperty(K_NATIVE_BLS)?.toBooleanStrictOrNull()?.let { nativeBls = it }
+        p.getProperty(K_RUST_ENGINE)?.toBooleanStrictOrNull()?.let { rustEngine = it }
+    }
+
+    /**
+     * Apply [change] under the state lock, snapshot the state, then write the snapshot
+     * to disk OUTSIDE that lock — settings readers (UI thread included) never wait on
+     * disk I/O. The write stays synchronous on the calling thread (it's a ~200-byte
+     * file written only when the user flips a Settings control, and a synchronous
+     * write keeps restart-persistence deterministically testable); [ioLock] serializes
+     * concurrent writers and the sequence number drops a stale snapshot that lost the
+     * race to a newer one.
+     */
+    private fun mutate(change: () -> Unit) {
+        val f = file
+        if (f == null) {
+            synchronized(this) { change() }
+            return
+        }
+        val p: java.util.Properties
+        val seq: Long
+        synchronized(this) {
+            change()
+            p = snapshot()
+            seq = ++stateSeq
+        }
+        persist(f, p, seq)
+    }
+
+    /** Snapshot the state as Properties; must be called under the state lock. */
+    private fun snapshot(): java.util.Properties {
+        val p = java.util.Properties()
+        p.setProperty(K_ENABLED, enabled.joinToString(","))
+        ports.forEach { (net, port) -> p.setProperty("$K_RPC_PORT_PREFIX$net", port.toString()) }
+        p.setProperty(K_SNAP, snap.toString())
+        p.setProperty(K_DEEP, deep.toString())
+        p.setProperty(K_STRICT, strict.toString())
+        p.setProperty(K_NATIVE_BLS, nativeBls.toString())
+        p.setProperty(K_RUST_ENGINE, rustEngine.toString())
+        return p
+    }
+
+    /** Best-effort rewrite. Writes temp + atomic move so a crash mid-write can't leave
+     *  a truncated file; failures are logged (a silently unwritable settings file would
+     *  look exactly like the bug this class fixes). */
+    private fun persist(f: Path, p: java.util.Properties, seq: Long) {
+        synchronized(ioLock) {
+            if (seq <= writtenSeq) return // a newer snapshot already landed
+            writtenSeq = seq
+            runCatching {
+                f.parent?.let(Files::createDirectories)
+                val tmp = f.resolveSibling("${f.fileName}.tmp")
+                Files.newOutputStream(tmp).use { p.store(it, "Myotis desktop settings") }
+                try {
+                    Files.move(tmp, f, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+                } catch (_: AtomicMoveNotSupportedException) {
+                    Files.move(tmp, f, StandardCopyOption.REPLACE_EXISTING)
+                }
+            }.onFailure {
+                log.warn("settings not persisted to {}: {}", f, it.toString())
+            }
+        }
+    }
+
+    private companion object {
+        val log: org.slf4j.Logger = org.slf4j.LoggerFactory.getLogger(DesktopSettings::class.java)
+        const val K_ENABLED = "networks.enabled"
+        const val K_RPC_PORT_PREFIX = "rpcPort."
+        const val K_SNAP = "snapTarget"
+        const val K_DEEP = "deepPool"
+        const val K_STRICT = "strictStateFreshness"
+        const val K_NATIVE_BLS = "nativeBls"
+        const val K_RUST_ENGINE = "rustEngine"
+    }
 }
 
 /** Desktop is treated as always-online (no Android ConnectivityManager). */

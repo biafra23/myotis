@@ -69,6 +69,19 @@ dependencies {
     // implementation (not runtimeOnly): DesktopLogAppender compiles against logback's
     // AppenderBase/ILoggingEvent to tee logs into the in-app Logs tab's in-memory ring.
     implementation(libs.logback.classic)
+
+    testImplementation(platform(libs.junit.bom))
+    testImplementation(libs.junit.jupiter)
+    // The Compose plugin drags an older junit-platform-launcher onto the test runtime
+    // classpath; pin the bom-aligned one or the jupiter engine fails discovery
+    // ("OutputDirectoryProvider not available … unaligned versions").
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+}
+
+// This module skips the root `java`-plugin conventions (Compose brings its own plugins),
+// so wire the JUnit platform here like :app does.
+tasks.withType<Test> {
+    useJUnitPlatform()
 }
 
 // Headless check that the Desktop controller drives node-core (no display needed).
