@@ -1499,14 +1499,18 @@ public final class NodeService extends Service {
             LogBuffer.i(TAG, "[" + n + "] node stack started (RPC " + rpcPort + ")");
         } catch (Exception e) {
             LogBuffer.e(TAG, "[" + n + "] node boot failed", e);
-            forgetStack(n);
-            // Tear down only the instance THIS boot created, under the lock, and only
-            // while it is still the registered one — after we dropped the lock a racing
-            // enable may have registered a fresh healthy instance that must not be
-            // stopped by our failure cleanup.
-            if (created != null) {
-                synchronized (bootLock(n)) {
-                    if (ENGINE.get(n) == created) {
+            // Clean up ONLY this attempt's state, under the lock. The exception released
+            // the bootLock, so a racing enable may already have registered a fresh healthy
+            // instance — an unconditional forgetStack here would wipe that instance's
+            // handle + stamps (and before the lock was even taken, an early throw would
+            // wipe a previous healthy run's bookkeeping). Tear down iff the registered
+            // handle is still OURS, or nothing is registered (then only stale cache/count
+            // bookkeeping from this attempt can remain).
+            synchronized (bootLock(n)) {
+                ChainHandle current = handles.get(n);
+                if (created != null ? current == created : current == null) {
+                    forgetStack(n);
+                    if (created != null && ENGINE.get(n) == created) {
                         try { ENGINE.stop(n); } catch (Throwable ignored) {}
                     }
                 }

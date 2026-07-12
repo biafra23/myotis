@@ -119,7 +119,16 @@ class DesktopNodeController(
                     JavaHttpCcipGateway(),
                     null, null,              // engine default logger/clock
                 )
-                val handle = engine.create(config, ports)
+                // create() is all-or-nothing (nothing registered on failure), so on a throw
+                // dropNetwork only forgets the cache instances retained above — leaving them
+                // would hand clearCaches a live-looking instance for a network that never
+                // booted. engine.stop() on an unregistered network is a no-op.
+                val handle = try {
+                    engine.create(config, ports)
+                } catch (t: Throwable) {
+                    dropNetwork(canonical)
+                    throw t
+                }
                 // start() is fault-isolated: false (resources closed) on failure rather than a
                 // throw. Either way, drop the network so a later enable can retry — leaving a
                 // dead entry would report "running" forever and block retries.
