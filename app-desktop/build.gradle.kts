@@ -20,27 +20,14 @@ kotlin { jvmToolchain(21) }
 // that FQN: tuweni-rlp 2.7.2 (BytesRLPWriter.kt) needs the 2.7.2 Bytes' Kotlin `Companion`,
 // which the 2.4.2 class lacks → NoSuchFieldError at launch. The `gradle run` daemon happens
 // to load the 2.7.2 jar first; jpackage's flattened classpath lets the 2.4.2 one win. Strip
-// io.tmio so only the 2.7.2 fork remains (same packages; Besu already runs against 2.7.2 on
+// io.tmio so only one tuweni 2.7.2 remains (same packages; Besu already runs against 2.7.2 on
 // the daemon, so 2.4.2 is unneeded) — mirrors the :android-app exclusion.
-//
-// io.netty: the same class of conflict. The JitPack netty-kotlin fork
-// (com.github.biafra23.netty-kotlin, 4.2.x) republishes io.netty.* classes; Besu / vertx /
-// jvm-libp2p drag in upstream io.netty 4.1.115. Both ship e.g. io.netty.channel
-// .SingleThreadEventLoop, and the fork's NioEventLoopGroup calls a 4.2.x constructor the
-// 4.1.115 class lacks → NoSuchMethodError, so the stack fails to start in the flattened
-// jpackage bundle. The :app daemon excludes io.netty group-wide and runs end-to-end on only
-// the fork (reaches SYNCED), so it's safe to do the same here.
+// (Historical: while the Kotlin tuweni/netty forks were in use, io.consensys.tuweni and
+// io.netty were also excluded here to prevent duplicate-class crashes in the flattened
+// jpackage bundle. Upstream is canonical again, so those excludes are gone — a single
+// source per class.)
 configurations.all {
     exclude(group = "io.tmio")
-    // Besu 26.4 pulls tuweni under its POST-RENAME coordinates
-    // (io.consensys.tuweni) — the same Bytes classes as our Kotlin fork but
-    // WITHOUT the Kotlin Companion. The gradle-run daemon happened to
-    // classload the fork first; jpackage's flattened classpath let the Java
-    // jar win and the PACKAGED app died at launch with
-    // NoSuchFieldError: Bytes.Companion (found by launching the app image).
-    // The fork supplies these classes; exclude the upstream twins.
-    exclude(group = "io.consensys.tuweni")
-    exclude(group = "io.netty")
 }
 
 dependencies {

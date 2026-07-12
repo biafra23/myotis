@@ -792,8 +792,8 @@ DNS resolution is best-effort: on timeout, missing TXT records, or signature mis
 
 ### Key dependencies
 
-- **Tuweni 2.7.2** (`tuweni-kotlin` fork, `2.7.2-jvm17.1`) -- RLP encoding, SECP256K1, byte utilities
-- **Netty 4.2.x (modified)** -- NIO transport. Uses a modified Netty archive based on 4.2 that has been rewritten in Kotlin. This is a proof-of-concept for migrating the Java codebase to Kotlin to enable use in a Compose Multiplatform project
+- **Tuweni 2.7.2** (upstream, `io.consensys.tuweni` on Maven Central) -- RLP encoding, SECP256K1, byte utilities
+- **Netty 4.2.x** (upstream) -- NIO transport. (The earlier Kotlin-transpiled tuweni/netty forks existed to explore a Kotlin-Multiplatform engine; multiplatform now comes from the Rust engine, so the forks were retired.)
 - **BouncyCastle** -- SECP256K1 crypto provider
 - **jvm-libp2p** -- beacon chain P2P networking (consensus module)
 - **dnsjava 3.6** -- TXT-record resolution for EIP-1459 ENR tree walks
