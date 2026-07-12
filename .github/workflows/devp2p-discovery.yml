@@ -29,20 +29,19 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-${{ hashFiles('**/*.gradle.kts', '**/gradle-wrapper.properties') }}
+          key: gradle-${{ hashFiles('**/*.gradle.kts', 'gradle/libs.versions.toml', '**/gradle-wrapper.properties') }}
           restore-keys: gradle-
 
       - name: Build
-        # --offline: jitpack 403 workaround (com.github.biafra23.tuweni-kotlin fork);
-        # build from the restored Gradle cache until the jitpack issue is resolved.
-        # (Gradle --offline only blocks dependency fetches, not the app's own networking.)
-        run: ./gradlew build -x test --no-daemon --offline
+        # (--offline was a jitpack-403 workaround for the retired tuweni-kotlin fork;
+        # deps now come from Maven Central, so fetch normally.)
+        run: ./gradlew build -x test --no-daemon
 
       - name: Run devp2p discovery (5 min timeout)
         id: discovery
         run: |
           # Capture output; allow the app to exit with non-zero (timeout case) without failing
-          ./gradlew :app:run --no-daemon --offline 2>&1 | tee discovery.log || true
+          ./gradlew :app:run --no-daemon 2>&1 | tee discovery.log || true
 
       - name: Report result
         run: |

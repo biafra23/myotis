@@ -21,13 +21,6 @@ plugins {
     `java-library`
 }
 
-configurations.all {
-    // Mirror :app / :android-app: strip upstream io.netty so the JitPack
-    // netty-kotlin fork (republished under the same io.netty.* names, supplied by
-    // :networking/:consensus) is the single netty on the runtime classpath.
-    exclude(group = "io.netty")
-}
-
 java {
     sourceCompatibility = JavaVersion.VERSION_21
     targetCompatibility = JavaVersion.VERSION_21
@@ -46,12 +39,8 @@ dependencies {
     implementation(project(":jsonrpc-server"))
     implementation(project(":rpc-backend"))
 
-    // node-core source references io.netty.channel.* via :networking's RLPxConnector
-    // API; with io.netty excluded group-wide the fork must be on the compile
-    // classpath explicitly (same as :app).
-    implementation(libs.netty.transport)
-    implementation(libs.netty.codec)
-    implementation(libs.netty.handler)
+    // io.netty.channel.* (RLPxConnector's API surface) arrives transitively:
+    // :networking declares netty-transport as `api`.
 
     implementation(libs.tuweni.bytes)
     implementation(libs.tuweni.units)

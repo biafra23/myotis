@@ -11,13 +11,11 @@ dependencies {
     implementation(libs.snappy)
     implementation(libs.slf4j.api)
     implementation(libs.milagro)
-    // jvm-libp2p transitively pulls UPSTREAM io.netty (4.1.x). On Android we
-    // strip io.netty group-wide and let the JitPack netty-kotlin fork (same
-    // io.netty.* FQCNs, different coordinates) satisfy it. The JVM daemon must
-    // resolve to the EXACT SAME netty bytecode as Android, otherwise the two
-    // run different transport stacks and any libp2p reliability difference is
-    // un-diagnosable. Exclude upstream io.netty here and supply the fork
-    // explicitly (mirrors :networking's discovery exclude).
+    // Single-netty policy (one netty everywhere — Android, daemon, desktop — so
+    // any libp2p reliability difference stays diagnosable): exclude jvm-libp2p's
+    // own netty 4.2.10 set (which includes tcnative/codec-http modules we never
+    // load) and supply the catalog's netty explicitly; libp2p ran fine on this
+    // reduced 4.2 set throughout the netty-kotlin era.
     implementation(libs.jvm.libp2p) {
         exclude(group = "io.netty")
     }

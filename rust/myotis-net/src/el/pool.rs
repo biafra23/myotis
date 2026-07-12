@@ -536,14 +536,24 @@ mod tests {
 
     #[tokio::test]
     async fn warm_start_dials_cached_peers_and_survives_a_flush() {
-        // Seed the cache with a snap peer at a blackhole address (RFC 5737
-        // TEST-NET-1 — the dial never completes, which is fine: we assert the
-        // warm-start CLAIMED it, and that the cache survives the load→flush).
+        // Seed the cache with a snap peer at a LOCAL listener that accepts TCP but
+        // never speaks, using a VALID secp256k1 pubkey. Both halves are load-bearing:
+        // the dial does TCP connect first (loopback: instant success), then ECIES
+        // auth — where an off-curve key like the old [9u8; 64] fails ecdh_x in ~1 ms
+        // BEFORE the auth write, unclaiming the address before the first poll. With
+        // a real key the auth write lands in the kernel buffer and the ack read
+        // parks against the 10 s HANDSHAKE_TIMEOUT (far beyond this test), so the
+        // address stays claimed in `attempted` while we poll. (The old version used
+        // TEST-NET-1 as a "blackhole", which is routing-dependent: hosts returning
+        // ENETUNREACH failed the connect instantly — flaky by machine.)
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let remote = NodeKey::from_secret_bytes(&myotis_core::keccak::keccak256(b"warm-remote")).unwrap();
         let path = std::env::temp_dir().join(format!("myotis-pool-warm-{}.cache", std::process::id()));
         let _ = std::fs::remove_file(&path);
         {
             let mut seed = ElPeerCache::load(path.clone());
-            seed.add("192.0.2.1:30303".parse().unwrap(), &[9u8; 64], true);
+            seed.add(addr, &remote.public_key_bytes(), true);
             seed.flush();
         }
 
@@ -569,7 +579,8 @@ mod tests {
             rx,
         );
         // The warm-start branch dials the cached peer, claiming its address.
-        // Poll briefly (the blackhole dial hangs on connect, so it stays claimed).
+        // Poll briefly (the silent listener parks the handshake, so the address
+        // stays claimed).
         let mut attempted = 0;
         for _ in 0..40 {
             attempted = pool.attempted_count().await;
@@ -581,6 +592,7 @@ mod tests {
         assert_eq!(attempted, 1, "warm start should have dialed the cached peer");
 
         pool.stop().await;
+        drop(listener); // kept alive so the pending dial stayed claimed while polling
         // The cached peer survived load → warm-start → flush-on-stop.
         assert_eq!(ElPeerCache::load(path.clone()).len(), 1);
         let _ = std::fs::remove_file(&path);
