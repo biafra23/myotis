@@ -113,7 +113,7 @@ than failing while a refresh is in flight:
   (`eth_getTransactionCount`), since a stale nonce breaks transaction signing.
 - **≤ ~12.8 min** — header-only last resort (e.g. `eth_blockNumber`,
   `eth_getBlockByNumber`), and the cap for state reads only if strict state
-  freshness is explicitly disabled (`myotis.rpc.strictStateFreshness=false`;
+  freshness is explicitly disabled (`-Dmyotis.rpc.strictStateFreshness=false`;
   Android exposes this as a Settings toggle, off by default).
 
 Beyond the applicable cap the node **refuses** (JSON-RPC `-32000`, IPC
