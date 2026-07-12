@@ -566,10 +566,6 @@ public final class NodeService extends Service {
         return BOOT_LOCKS.computeIfAbsent(canonicalNetwork(network), k -> new Object());
     }
 
-    // Service-global uptime stamp (the whole service, not a single chain). Owned by the
-    // next start; never cleared in doShutdown — see the PR #82 note there.
-    private volatile long startTimeMs;
-
     // ---------------------------------------------------------------------
     // Idle sleep controller: pause a stack's networking after idlePauseMinutes
     // of no RPC / UI activity. The engine self-wakes on an incoming JSON-RPC
@@ -1066,7 +1062,9 @@ public final class NodeService extends Service {
             String lifecycle,         // "RUNNING" | "PAUSED" | "STOPPED" — PAUSED is the
                                       // idle sleep state: networking off, RPC listening,
                                       // warm state retained, first request wakes it
-            long startTimeMs,
+            long startTimeMs,         // start stamp of THIS network's stack (per engine
+                                      // start; resets on every network/engine reboot),
+                                      // 0 when the stack isn't live — drives the UI uptime
             int discoveredPeers,
             int connectedPeers,
             int readyPeers,
@@ -1352,7 +1350,6 @@ public final class NodeService extends Service {
             LogBuffer.i(TAG, "start requested but node is already running");
             return START_NOT_STICKY;
         }
-        startTimeMs = System.currentTimeMillis();
         // Failure forensics: report how the PREVIOUS process died (OOM-kill vs crash
         // vs clean), then start the health heartbeat. This is what makes an on-device
         // sync failure diagnosable instead of a silent "it doesn't work".
@@ -1471,6 +1468,13 @@ public final class NodeService extends Service {
 
                 ChainHandle handle = ENGINE.create(config, ports);
                 created = handle;
+                // Drop the previous run's start stamps BEFORE publishing the handle: the
+                // UI poll renders a snapshot as soon as handles has an entry, and start()
+                // below blocks for seconds — a stale stamp would show the old run's
+                // uptime (plus downtime) until the fresh stamp lands. Removed-then-
+                // restamped, a mid-boot snapshot reads 0s instead.
+                stackStartMs.remove(n);
+                stackStartNano.remove(n);
                 handles.put(n, handle);
                 if (!handle.start()) {
                     LogBuffer.e(TAG, "[" + n + "] node stack failed to start");
@@ -1484,11 +1488,13 @@ public final class NodeService extends Service {
                     try { ENGINE.stop(n); } catch (Throwable ignored) {}
                     return;
                 }
+                // A freshly-booted stack gets a full idle window before the controller
+                // may pause it (its engine activity clock starts at 0). Stamped INSIDE the
+                // bootLock: written outside it, a racing stopNetwork's forgetStack could
+                // remove the stamp first and have this put leak it back for a dead network.
+                stackStartMs.put(n, System.currentTimeMillis());
+                stackStartNano.put(n, System.nanoTime());   // monotonic clock for the sync-run ceiling
             }
-            // A freshly-booted stack gets a full idle window before the controller
-            // may pause it (its engine activity clock starts at 0).
-            stackStartMs.put(n, System.currentTimeMillis());
-            stackStartNano.put(n, System.nanoTime());   // monotonic clock for the sync-run ceiling
             updateNotification();
             LogBuffer.i(TAG, "[" + n + "] node stack started (RPC " + rpcPort + ")");
         } catch (Exception e) {
@@ -1603,16 +1609,15 @@ public final class NodeService extends Service {
         cachedClCounts.clear();
         elCaches.clear();
         clCaches.clear();
-        // Safe to clear (unlike startTimeMs below): a Stop->Start just re-runs the SYNCED-once
-        // gate until the restarted stack re-observes SYNCED — fast off the warm store, no freeze.
+        // Safe to clear: a Stop->Start just re-runs the SYNCED-once gate until the restarted
+        // stack re-observes SYNCED — fast off the warm store, no freeze. stackStartMs is
+        // deliberately NOT cleared here (it's static, per-network, and owned by boots): a
+        // whole-service stop may leave stale entries, but they're invisible — handles was
+        // cleared above so no snapshot is rendered — and the next boot of each network
+        // removes its stamp before publishing the handle, then re-stamps after start()
+        // succeeds. Clearing here would race a quick Stop->Start's fresh boot (the old
+        // service-global startTimeMs had exactly that clobber bug).
         reachedSynced.clear();
-        // NB: do NOT clear startTimeMs here. doShutdown() runs on a worker thread and its
-        // teardown takes seconds; a quick Stop -> Start has onStartCommand() flip RUNNING back
-        // to true and stamp a fresh startTimeMs while we're still mid-teardown (buildAndStart's
-        // ChainStack.start blocks on the synchronized monitor we hold). Writing startTimeMs = 0L
-        // here would clobber that fresh stamp, and since the UI shows the uptime row whenever
-        // running==true, uptime would jump to now - 0 (~epoch millis) and freeze. startTimeMs is
-        // owned by the next start (onStartCommand stamps it); leaving the old value is harmless.
         LogBuffer.i(TAG, "node shutdown complete");
     }
 
@@ -1703,6 +1708,13 @@ public final class NodeService extends Service {
      *  the string this UI has always shown pre-beacon). */
     private Snapshot snapshotOf(String network, ChainHandle h) {
         boolean running = RUNNING.get();
+        // Uptime is per-ENGINE-START, not per-service-start: stackStartMs is removed when a
+        // fresh boot publishes its handle and re-stamped once its start() succeeds (and
+        // removed again on per-network teardown), so a network restart — including an
+        // engine-toggle reboot — restarts the UI's uptime counter from zero, reading 0s
+        // while the new stack is still starting. A service-global stamp would keep
+        // counting across chain restarts.
+        long chainStartMs = stackStartMs.getOrDefault(network, 0L);
         StatusSnapshot s = h.status();
         BeaconStatus bs = h.beaconStatus();
         // Live counts from the cache FILES (mtime-memoized): the files are the
@@ -1720,7 +1732,7 @@ public final class NodeService extends Service {
         if (!running || !s.running()) {
             // Covers both a stopped stack and a PAUSED one (running=false, warm state
             // retained) — the lifecycle string lets the UI tell them apart.
-            return new Snapshot(running, lifecycle, startTimeMs, 0, 0, 0, 0, /*snapServing*/0,
+            return new Snapshot(running, lifecycle, chainStartMs, 0, 0, 0, 0, /*snapServing*/0,
                     elCache.total(), elCache.snapOk(), elCache.snapBad(), s.attemptedDials(), s.backedOffPeers(),
                     s.blacklistedPeers(), s.discv5TableSize(), 0,
                     beaconState, bs.bootstrapped(), bs.connectedPeers(), (int) bs.lightClientPeers(),
@@ -1731,7 +1743,7 @@ public final class NodeService extends Service {
                     s.pauseCount(), s.totalPausedMs(), s.lastPauseEpochMs(),
                     s.lastResumeEpochMs(), s.lastWakeReason());
         }
-        return new Snapshot(true, lifecycle, startTimeMs,
+        return new Snapshot(true, lifecycle, chainStartMs,
                 s.discoveredPeers(), s.connectedPeers(), s.readyPeers(),
                 s.snapPeers(), s.snapServingPeers(),
                 elCache.total(), elCache.snapOk(), elCache.snapBad(), s.attemptedDials(), s.backedOffPeers(),
