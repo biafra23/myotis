@@ -85,14 +85,21 @@ impl EthSession {
 
             // Send our Status in the negotiated version.
             let status = if eth_version >= 69 {
+                // eth/69 (EIP-7642) block range: a promise of what we can SERVE. This
+                // engine is a pure outbound client with no header-serving path at all,
+                // so advertise the genesis-only [0, 0] range — the same thing the Java
+                // twin advertises while its ServedHeaderWindow is empty. Claiming
+                // [0, head] (or any window under the head) invites header requests we
+                // can never answer, which gets us scored down and dropped.
                 messages::encode_status69(
                     eth_version,
                     cfg.network_id,
                     &cfg.genesis_hash,
-                    &cfg.head_hash,
+                    &cfg.genesis_hash, // latestBlockHash: genesis — the one block we name
                     &cfg.fork_id_hash,
                     cfg.fork_next,
-                    cfg.head_number,
+                    0, // earliestBlock
+                    0, // latestBlock
                 )
             } else {
                 messages::encode_status(
