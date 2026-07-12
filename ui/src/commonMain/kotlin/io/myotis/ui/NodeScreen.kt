@@ -654,7 +654,7 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
                 s.engine == "rust" -> "always on — Rust engine can't idle-sleep yet"
                 s.pauseCount == 0 -> "never slept"
                 else -> "${formatDuration(s.totalPausedMs)} over ${s.pauseCount} " +
-                    if (s.pauseCount == 1) "pause" else "pauses"
+                    "${if (s.pauseCount == 1) "pause" else "pauses"}"
             },
         )
         if (s.lastResumeEpochMs > 0) {
