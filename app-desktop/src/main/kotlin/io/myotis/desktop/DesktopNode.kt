@@ -371,6 +371,12 @@ class DesktopSettings(
     // The Rust engine is experimental — off by default everywhere.
     private var rustEngine = false
 
+    /** Serializes file writes, separate from the state lock (`this`) so settings
+     *  readers never wait on disk I/O. */
+    private val ioLock = Any()
+    private var stateSeq = 0L   // guarded by `this`
+    private var writtenSeq = 0L // guarded by [ioLock]
+
     init {
         load()
     }
@@ -381,36 +387,34 @@ class DesktopSettings(
     override fun primaryNetwork(): String = synchronized(this) { enabled.firstOrNull() ?: "mainnet" }
     override fun allNetworks(): List<String> = networks.map { it.name() }
     override fun isNetworkEnabled(name: String): Boolean = synchronized(this) { name in enabled }
-    override fun setNetworkEnabled(name: String, on: Boolean) = synchronized(this) {
+    override fun setNetworkEnabled(name: String, on: Boolean) = mutate {
         if (on) enabled.add(name) else enabled.remove(name)
-        persist()
     }
     override fun rpcPortFor(network: String): Int = synchronized(this) {
         ports[network] ?: defaultRpcPort(network)
     }
-    override fun setRpcPort(network: String, port: Int) = synchronized(this) {
+    override fun setRpcPort(network: String, port: Int) = mutate {
         // Clamp to the valid TCP range, falling back to the network default on out-of-range
         // input (parity with Android's NodeService.setRpcPort).
         ports[network] = if (port in 1024..65535) port else defaultRpcPort(network)
-        persist()
     }
     override fun snapTarget(): Int = synchronized(this) { snap }
     // Clamp like Android's NodeService (1..128) so the live value and the reloaded
     // value can't differ (load() applies the same clamp).
-    override fun setSnapTarget(v: Int) = synchronized(this) { snap = v.coerceIn(1, 128); persist() }
+    override fun setSnapTarget(v: Int) = mutate { snap = v.coerceIn(1, 128) }
 
     override fun displayName(network: String): String = info(network)?.displayName() ?: network
     override fun defaultRpcPort(network: String): Int = info(network)?.defaultRpcPort() ?: 8545
     override fun hasEns(network: String): Boolean = info(network)?.hasEns() ?: false
 
     override fun deepPoolThreshold(): Int = synchronized(this) { deep }
-    override fun setDeepPool(v: Int) = synchronized(this) { deep = v.coerceIn(1, 128); persist() }
+    override fun setDeepPool(v: Int) = mutate { deep = v.coerceIn(1, 128) }
     override fun strictStateFreshness(): Boolean = synchronized(this) { strict }
-    override fun setStrictStateFreshness(v: Boolean) = synchronized(this) { strict = v; persist() }
+    override fun setStrictStateFreshness(v: Boolean) = mutate { strict = v }
     override fun nativeBlsEnabled(): Boolean = synchronized(this) { nativeBls }
-    override fun setNativeBlsEnabled(v: Boolean) = synchronized(this) { nativeBls = v; persist() }
+    override fun setNativeBlsEnabled(v: Boolean) = mutate { nativeBls = v }
     override fun rustEngineEnabled(): Boolean = synchronized(this) { rustEngine }
-    override fun setRustEngineEnabled(v: Boolean) = synchronized(this) { rustEngine = v; persist() }
+    override fun setRustEngineEnabled(v: Boolean) = mutate { rustEngine = v }
 
     /** Best-effort load; a missing or unreadable file just keeps the defaults. */
     private fun load() {
@@ -437,30 +441,63 @@ class DesktopSettings(
         p.getProperty(K_RUST_ENGINE)?.toBooleanStrictOrNull()?.let { rustEngine = it }
     }
 
-    /** Best-effort rewrite; called under `this`. Writes temp + atomic move so a crash
-     *  mid-write can't leave a truncated file; failures are logged (a silently
-     *  unwritable settings file would look exactly like the bug this class fixes). */
-    private fun persist() {
-        val f = file ?: return
-        runCatching {
-            f.parent?.let(Files::createDirectories)
-            val p = java.util.Properties()
-            p.setProperty(K_ENABLED, enabled.joinToString(","))
-            ports.forEach { (net, port) -> p.setProperty("$K_RPC_PORT_PREFIX$net", port.toString()) }
-            p.setProperty(K_SNAP, snap.toString())
-            p.setProperty(K_DEEP, deep.toString())
-            p.setProperty(K_STRICT, strict.toString())
-            p.setProperty(K_NATIVE_BLS, nativeBls.toString())
-            p.setProperty(K_RUST_ENGINE, rustEngine.toString())
-            val tmp = f.resolveSibling("${f.fileName}.tmp")
-            Files.newOutputStream(tmp).use { p.store(it, "Myotis desktop settings") }
-            try {
-                Files.move(tmp, f, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-            } catch (_: AtomicMoveNotSupportedException) {
-                Files.move(tmp, f, StandardCopyOption.REPLACE_EXISTING)
+    /**
+     * Apply [change] under the state lock, snapshot the state, then write the snapshot
+     * to disk OUTSIDE that lock — settings readers (UI thread included) never wait on
+     * disk I/O. The write stays synchronous on the calling thread (it's a ~200-byte
+     * file written only when the user flips a Settings control, and a synchronous
+     * write keeps restart-persistence deterministically testable); [ioLock] serializes
+     * concurrent writers and the sequence number drops a stale snapshot that lost the
+     * race to a newer one.
+     */
+    private fun mutate(change: () -> Unit) {
+        val f = file
+        if (f == null) {
+            synchronized(this) { change() }
+            return
+        }
+        val p: java.util.Properties
+        val seq: Long
+        synchronized(this) {
+            change()
+            p = snapshot()
+            seq = ++stateSeq
+        }
+        persist(f, p, seq)
+    }
+
+    /** Snapshot the state as Properties; must be called under the state lock. */
+    private fun snapshot(): java.util.Properties {
+        val p = java.util.Properties()
+        p.setProperty(K_ENABLED, enabled.joinToString(","))
+        ports.forEach { (net, port) -> p.setProperty("$K_RPC_PORT_PREFIX$net", port.toString()) }
+        p.setProperty(K_SNAP, snap.toString())
+        p.setProperty(K_DEEP, deep.toString())
+        p.setProperty(K_STRICT, strict.toString())
+        p.setProperty(K_NATIVE_BLS, nativeBls.toString())
+        p.setProperty(K_RUST_ENGINE, rustEngine.toString())
+        return p
+    }
+
+    /** Best-effort rewrite. Writes temp + atomic move so a crash mid-write can't leave
+     *  a truncated file; failures are logged (a silently unwritable settings file would
+     *  look exactly like the bug this class fixes). */
+    private fun persist(f: Path, p: java.util.Properties, seq: Long) {
+        synchronized(ioLock) {
+            if (seq <= writtenSeq) return // a newer snapshot already landed
+            writtenSeq = seq
+            runCatching {
+                f.parent?.let(Files::createDirectories)
+                val tmp = f.resolveSibling("${f.fileName}.tmp")
+                Files.newOutputStream(tmp).use { p.store(it, "Myotis desktop settings") }
+                try {
+                    Files.move(tmp, f, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+                } catch (_: AtomicMoveNotSupportedException) {
+                    Files.move(tmp, f, StandardCopyOption.REPLACE_EXISTING)
+                }
+            }.onFailure {
+                log.warn("settings not persisted to {}: {}", f, it.toString())
             }
-        }.onFailure {
-            log.warn("settings not persisted to {}: {}", f, it.toString())
         }
     }
 
