@@ -49,8 +49,11 @@ class DesktopNodeController(
 
     private val log = org.slf4j.LoggerFactory.getLogger(DesktopNodeController::class.java)
 
+    // Per-network engine-start stamp driving the UI uptime: stamped on each successful
+    // start (any engine, Java or Rust) and cleared on drop, so the uptime counter restarts
+    // from zero on every network/engine (re)boot — it is NOT the controller's (app's) lifetime.
     // nanoTime, not currentTimeMillis: wall-clock / NTP steps must not skew uptime.
-    private val startNs = System.nanoTime()
+    private val startNsByNetwork = ConcurrentHashMap<String, Long>()
     // Per-network boot locks keyed by CANONICAL name, mirroring Android's NodeService.bootLocks:
     // serialize enable/disable for one network without a global lock, so a slow boot of network
     // A never blocks shutdown or lifecycle ops on B. The engine's registry is thread-safe, so
@@ -61,6 +64,9 @@ class DesktopNodeController(
     private val peerCaches = ConcurrentHashMap<String, PeerCache>()
     private val clPeerCaches = ConcurrentHashMap<String, CLPeerCache>()
     private fun bootLock(canonical: String): Any = bootLocks.computeIfAbsent(canonical) { Any() }
+    // Pairs the boot path's read-settings-then-apply of the served-block window with the
+    // Save fan-out, so a Save can never be overwritten by a concurrently booting network.
+    private val servedWindowApplyLock = Any()
 
     init {
         dataDir.createDirectories()
@@ -116,11 +122,26 @@ class DesktopNodeController(
                     JavaHttpCcipGateway(),
                     null, null,              // engine default logger/clock
                 )
-                val handle = engine.create(config, ports)
-                // Apply the Settings served-block window before start(): the stack anchors
-                // its ServedHeaderWindow when the connector is built, so the very first
-                // eth/69 Status already advertises the configured size.
-                handle.setServedBlockWindow(settings.servedBlockWindow())
+                // create() is all-or-nothing (nothing registered on failure), so on a throw
+                // dropNetwork only forgets the cache instances retained above — leaving them
+                // would hand clearCaches a live-looking instance for a network that never
+                // booted. engine.stop() on an unregistered network is a no-op.
+                val handle = try {
+                    engine.create(config, ports)
+                } catch (t: Throwable) {
+                    dropNetwork(canonical)
+                    throw t
+                }
+                // Apply the Settings served-block window before start() (so the very first
+                // eth/69 Status advertises the configured size), reading the setting INSIDE
+                // servedWindowApplyLock: the Save fan-out takes the same lock, and create()
+                // above already made this handle visible to hostedNetworks() — so either the
+                // fan-out reaches this handle, or our read observes its already-persisted
+                // value. Without the pairing a Save landing between our read and apply
+                // would be overwritten, leaving the live window one Save behind settings.
+                synchronized(servedWindowApplyLock) {
+                    handle.setServedBlockWindow(settings.servedBlockWindow())
+                }
                 // start() is fault-isolated: false (resources closed) on failure rather than a
                 // throw. Either way, drop the network so a later enable can retry — leaving a
                 // dead entry would report "running" forever and block retries.
@@ -131,6 +152,7 @@ class DesktopNodeController(
                     throw t
                 }
                 if (!ok) dropNetwork(canonical)
+                else startNsByNetwork[canonical] = System.nanoTime() // uptime anchors to THIS start
             }
         }, "desktop-boot-$canonical").apply { isDaemon = true }.start()
     }
@@ -140,6 +162,7 @@ class DesktopNodeController(
         engine.stop(canonical)
         peerCaches.remove(canonical)
         clPeerCaches.remove(canonical)
+        startNsByNetwork.remove(canonical) // next start re-anchors uptime
     }
 
     override fun disableNetwork(name: String) {
@@ -169,6 +192,7 @@ class DesktopNodeController(
         // the stopped-chain purge path rather than clear()ing a closed instance.
         peerCaches.clear()
         clPeerCaches.clear()
+        startNsByNetwork.clear() // symmetry with dropNetwork: no stamp outlives its stack
     }
 
     override fun setTargetSnapPeers(target: Int) {
@@ -176,7 +200,11 @@ class DesktopNodeController(
     }
 
     override fun setServedBlockWindow(blocks: Int) {
-        engine.hostedNetworks().forEach { engine.get(it)?.setServedBlockWindow(blocks) }
+        // Same lock as the boot-path read+apply: see the comment there. (The SettingsTab
+        // persists via settings.setServedBlockWindow BEFORE calling this.)
+        synchronized(servedWindowApplyLock) {
+            engine.hostedNetworks().forEach { engine.get(it)?.setServedBlockWindow(blocks) }
+        }
     }
 
     override fun applyBlsBackend() {
@@ -262,7 +290,7 @@ class DesktopNodeController(
     override fun snapshots(): Flow<Map<String, NodeSnapshot>> = flow {
         while (true) {
             emit(engine.hostedNetworks().mapNotNull { name ->
-                engine.get(name)?.let { name to snapshotOf(it) }
+                engine.get(name)?.let { name to snapshotOf(name, it) }
             }.toMap())
             delay(2000)
         }
@@ -303,7 +331,7 @@ class DesktopNodeController(
         }, "myotis-rust-logs").apply { isDaemon = true }.start()
     }
 
-    private fun snapshotOf(handle: ChainHandle): NodeSnapshot {
+    private fun snapshotOf(network: String, handle: ChainHandle): NodeSnapshot {
         val s = handle.status()
         // Live counts parsed from the cache FILES (the cross-engine truth; the
         // Rust engine writes them directly). Memoized on (mtime, size).
@@ -341,7 +369,10 @@ class DesktopNodeController(
             syncCurrentPeriod = s.syncCurrentPeriod(),
             syncTargetPeriod = s.syncTargetPeriod(),
             verifiedHeadAgeMs = s.verifiedHeadAgeMs(),
-            uptimeSeconds = (System.nanoTime() - startNs) / 1_000_000_000L,
+            // hostedNetworks() keys are canonical (create() canonicalizes), matching the
+            // boot path's startNsByNetwork key — no re-canonicalization needed here.
+            uptimeSeconds = startNsByNetwork[network]
+                ?.let { (System.nanoTime() - it) / 1_000_000_000L } ?: 0L,
             readyPeerList = s.readyPeerList().map { PeerRow(it.remoteAddress(), it.snapSupported(), it.clientId()) },
             pauseCount = s.pauseCount(),
             totalPausedMs = s.totalPausedMs(),
