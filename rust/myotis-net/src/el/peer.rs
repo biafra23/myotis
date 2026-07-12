@@ -237,10 +237,18 @@ impl ManagedPeer {
         // range WE requested — a hostile peer answering with fabricated far-future
         // numbers could otherwise pin the window's eviction floor at ~u64::MAX
         // (killing serving until restart) and poison the advertised eth/69 range.
-        let hi = block_number.saturating_add(max_headers);
-        self.remember_served(headers.iter().filter(|vh| {
-            vh.header.number >= block_number && vh.header.number < hi
-        }));
+        // Only the simple ascending-contiguous shape is remembered: with skip or
+        // reverse in play a span filter would admit attacker numbers between the
+        // steps, and every production fetch (verdict walks) is skip=0/ascending —
+        // exotic shapes just skip the (side-channel) window population. The
+        // RETURNED headers are unaffected either way; verification consumes them
+        // unfiltered and checks hashes itself.
+        if skip == 0 && !reverse {
+            let hi = block_number.saturating_add(max_headers);
+            self.remember_served(headers.iter().filter(|vh| {
+                vh.header.number >= block_number && vh.header.number < hi
+            }));
+        }
         Ok(headers)
     }
 
@@ -616,7 +624,12 @@ fn serve_headers(ctx: &ServeContext, payload: &[u8]) -> Option<Vec<u8>> {
     let (id, origin, max, skip, reverse) = messages::decode_get_block_headers(payload).ok()?;
     let raws = match origin {
         HeadersOrigin::Number(n) if skip == 0 && !reverse => ctx.window.run_from(n, max),
-        HeadersOrigin::Hash(h) if max >= 1 => ctx.window.by_hash(&h).into_iter().collect(),
+        // By-hash also requires the simple shape, keeping "exotic (skip/reverse)
+        // falls through to the empty answer" true for both arms — and keeping
+        // header_requests_served honest about what we chose to serve.
+        HeadersOrigin::Hash(h) if max >= 1 && skip == 0 && !reverse => {
+            ctx.window.by_hash(&h).into_iter().collect()
+        }
         _ => Vec::new(),
     };
     if raws.is_empty() {
@@ -686,6 +699,10 @@ mod tests {
         assert!(serve_headers(&ctx, &messages::encode_get_block_headers_by_number(1, 990, 3, 0, false)).is_none());
         assert!(serve_headers(&ctx, &messages::encode_get_block_headers_by_number(1, 101, 3, 1, false)).is_none());
         assert!(serve_headers(&ctx, &messages::encode_get_block_headers_by_number(1, 101, 3, 0, true)).is_none());
+        // Exotic shapes are unserved on the by-hash arm too (docs: skip/reverse
+        // always fall through to the empty answer).
+        assert!(serve_headers(&ctx, &messages::encode_get_block_headers_by_hash(1, &hash(104), 1, 1, false)).is_none());
+        assert!(serve_headers(&ctx, &messages::encode_get_block_headers_by_hash(1, &hash(104), 1, 0, true)).is_none());
         assert!(serve_headers(&ctx, b"junk").is_none());
     }
 

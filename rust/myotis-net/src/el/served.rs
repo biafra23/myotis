@@ -8,7 +8,9 @@
 //! `[earliestBlock, latestBlock]` and gets an empty response scores us down. So
 //! [`ServedHeaders::advertise`] never names a block we do not hold: both ends of
 //! the returned range are held headers, and an empty window advertises nothing
-//! (the session falls back to the honest genesis-only `[0, 0]`).
+//! (the session then falls back to a minimal genesis-only `[0, 0]` — itself a
+//! small residual over-claim, since unlike Java no genesis header RLP is
+//! embedded to serve; see the handshake comment in `eth::session`).
 //!
 //! One instance per network, owned by the peer pool and shared with every
 //! managed peer, so a header fetched on one connection is servable on all of
