@@ -85,11 +85,14 @@ class ElEthVectorConformanceTest {
     void replayReproducesRecordedVerdicts() throws Exception {
         Map<String, String> actual = new TreeMap<>();
 
-        // (1) Status encode bytes (eth/68 + eth/69).
-        byte[] s68 = StatusMessage.encode(68, 1, GENESIS, BEST, FORK, 0, 0);
+        // (1) Status encode bytes (eth/68 + eth/69). eth/68 carries no range, so its
+        // earliestBlock argument is inert. eth/69 pins the served block range: a light
+        // client advertises only a recent window [head-32, head], not [0, head].
+        byte[] s68 = StatusMessage.encode(68, 1, GENESIS, BEST, FORK, 0, 0, 0);
         actual.put("status.eth68.bytes", Bytes.wrap(s68).toUnprefixedHexString());
-        byte[] s69 = StatusMessage.encode(69, 100, GENESIS, BEST, FORK, 0, 21_000_000L);
+        byte[] s69 = StatusMessage.encode(69, 100, GENESIS, BEST, FORK, 0, 21_000_000L - 32, 21_000_000L);
         actual.put("status.eth69.bytes", Bytes.wrap(s69).toUnprefixedHexString());
+        actual.put("status.eth69.earliestBlock", Long.toString(StatusMessage.decode69(s69).earliestBlock));
 
         // Decode round-trip pins.
         StatusMessage d68 = StatusMessage.decode(s68);

@@ -45,12 +45,19 @@ fn replay_reproduces_recorded_verdicts() {
     actual.insert("status.eth68.networkId".into(), d68.network_id.to_string());
     actual.insert("status.eth68.genesis".into(), hex(&d68.genesis_hash));
 
-    let s69 = messages::encode_status69(69, 100, &genesis, &best, &FORK, 0, 21_000_000);
+    // eth/69 pins the served block range: a light client advertises only a recent
+    // window [head-32, head], not [0, head] (mirrors ElEthVectorConformanceTest).
+    let s69 =
+        messages::encode_status69(69, 100, &genesis, &best, &FORK, 0, 21_000_000 - 32, 21_000_000);
     actual.insert("status.eth69.bytes".into(), hex(&s69));
     let d69 = messages::decode_status(&s69, 69).unwrap();
     actual.insert(
         "status.eth69.latestBlock".into(),
         d69.latest_block.unwrap().to_string(),
+    );
+    actual.insert(
+        "status.eth69.earliestBlock".into(),
+        d69.earliest_block.unwrap().to_string(),
     );
     actual.insert("status.eth69.latestHash".into(), hex(&d69.best_hash));
 

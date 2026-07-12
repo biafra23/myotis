@@ -4,6 +4,7 @@ import com.jaeckel.ethp2p.core.crypto.NodeKey;
 import com.jaeckel.ethp2p.networking.ChainHead;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
 import com.jaeckel.ethp2p.networking.eth.EthHandler;
+import com.jaeckel.ethp2p.networking.eth.ServedHeaderWindow;
 import com.jaeckel.ethp2p.networking.eth.TxGossipObserver;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockBodiesMessage;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
@@ -66,6 +67,14 @@ public final class RLPxConnector implements AutoCloseable {
     private final Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders;
     private final PeerReadyCallback peerReadyCallback;
     private final Set<EthHandler> activeHandlers = ConcurrentHashMap.newKeySet();
+    /** Shared store of recent headers we advertise + serve via the eth/69 block range,
+     *  one per network, shared across all peer connections. */
+    private final ServedHeaderWindow servedWindow;
+    /** Last eth/69 range we broadcast, to suppress duplicate BlockRangeUpdate spam.
+     *  Guarded by {@link #rangeBroadcastLock} (event-loop threads race to update it). */
+    private long lastBroadcastEarliest = -1;
+    private long lastBroadcastLatest = -1;
+    private final Object rangeBroadcastLock = new Object();
     /** Optional mempool-gossip sink, applied to every handler so a node can watch its
      *  own broadcast txs propagate. Null until a consumer (the RPC backend) registers. */
     private volatile TxGossipObserver txGossipObserver;
@@ -102,6 +111,35 @@ public final class RLPxConnector implements AutoCloseable {
         this.group = new NioEventLoopGroup(4);
         this.onHeaders = onHeaders;
         this.peerReadyCallback = peerReadyCallback;
+        // Seed genesis (always servable for fork probes) where we embed its RLP.
+        byte[] genesisRlp = "mainnet".equals(network.name())
+                ? NetworkConfig.MAINNET_GENESIS_HEADER_RLP : null;
+        this.servedWindow = new ServedHeaderWindow(
+                EthHandler.DEFAULT_SERVED_BLOCK_WINDOW, network.genesisHash(), genesisRlp);
+    }
+
+    /** The shared served-header window (for a later Settings-driven size knob). */
+    public ServedHeaderWindow servedWindow() {
+        return servedWindow;
+    }
+
+    /**
+     * Broadcast our current eth/69 servable range to already-connected peers when it
+     * changes. Called after a connection caches new recent headers. The dedup decision is
+     * made under a lock (event-loop threads race here), but the actual sends happen outside
+     * it — each {@link EthHandler#sendBlockRangeUpdate} re-reads the window itself.
+     */
+    private void broadcastRangeIfChanged() {
+        ChainHead.Head head = chainHead.get();
+        ServedHeaderWindow.Range r = servedWindow.advertise(head.blockNumber(), head.blockHash());
+        synchronized (rangeBroadcastLock) {
+            if (r.earliest() == lastBroadcastEarliest && r.latest() == lastBroadcastLatest) return;
+            lastBroadcastEarliest = r.earliest();
+            lastBroadcastLatest = r.latest();
+        }
+        for (EthHandler h : activeHandlers) {
+            h.sendBlockRangeUpdate();
+        }
     }
 
     /**
@@ -128,8 +166,11 @@ public final class RLPxConnector implements AutoCloseable {
                 peerReadyCallback.onPeerReady(peerAddr, pubKeyHex, snap);
             }
         };
-        EthHandler ethHandler = new EthHandler(localKey, tcpPort, network, chainHead, onHeaders, onReady);
+        EthHandler ethHandler = new EthHandler(localKey, tcpPort, network, chainHead, servedWindow, onHeaders, onReady);
         handlerRef[0] = ethHandler;
+        // When this connection caches new recent headers, our servable range may grow —
+        // tell already-connected eth/69 peers via BlockRangeUpdate.
+        ethHandler.setWindowUpdateListener(this::broadcastRangeIfChanged);
         ethHandler.setRemoteAddress(peerAddr.getAddress().getHostAddress() + ":" + peerAddr.getPort());
 
         Bootstrap bootstrap = new Bootstrap()

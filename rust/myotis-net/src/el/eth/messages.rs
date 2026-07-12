@@ -39,6 +39,8 @@ pub struct Status {
     pub fork_next: u64,
     /// eth/69 only (`None` on 67-68).
     pub latest_block: Option<u64>,
+    /// eth/69 only (`None` on 67-68): the oldest block the peer can serve.
+    pub earliest_block: Option<u64>,
 }
 
 /// Encode our Status for eth/67-68: `[version, networkId, td(empty), bestHash,
@@ -63,6 +65,10 @@ pub fn encode_status(
 
 /// Encode our Status for eth/69: `[version, networkId, genesis, [forkHash,
 /// forkNext], earliestBlock, latestBlock, latestBlockHash]` (no td).
+///
+/// The eth/69 (EIP-7642) block range is a promise of what we can SERVE — the
+/// Java twin advertises only its held header window (never `[0, head]`), and
+/// callers here must do the same.
 pub fn encode_status69(
     eth_version: u64,
     network_id: u64,
@@ -70,6 +76,7 @@ pub fn encode_status69(
     latest_block_hash: &[u8; 32],
     fork_id_hash: &[u8; 4],
     fork_next: u64,
+    earliest_block: u64,
     latest_block: u64,
 ) -> Vec<u8> {
     rlp::encode(&Item::List(vec![
@@ -77,7 +84,7 @@ pub fn encode_status69(
         Item::Bytes(rlp::u64_to_minimal_be(network_id)),
         Item::Bytes(genesis_hash.to_vec()),
         fork_id_item(fork_id_hash, fork_next),
-        Item::Bytes(rlp::u64_to_minimal_be(0)), // earliestBlock (we anchor at genesis)
+        Item::Bytes(rlp::u64_to_minimal_be(earliest_block)),
         Item::Bytes(rlp::u64_to_minimal_be(latest_block)),
         Item::Bytes(latest_block_hash.to_vec()),
     ]))
@@ -108,6 +115,7 @@ pub fn decode_status(rlp_bytes: &[u8], eth_version: u64) -> Result<Status, CoreE
             fork_id_hash: fork_id_hash(fork)?,
             fork_next: fork.get(1).map_or(Ok(0), Item::as_u64)?,
             latest_block: Some(items[5].as_u64()?),
+            earliest_block: Some(items[4].as_u64()?),
         })
     } else {
         // [version, networkId, td, bestHash, genesis, forkId]. forkId is
@@ -124,6 +132,7 @@ pub fn decode_status(rlp_bytes: &[u8], eth_version: u64) -> Result<Status, CoreE
             fork_id_hash: fork_id_hash(fork)?,
             fork_next: fork.get(1).map_or(Ok(0), Item::as_u64)?,
             latest_block: None,
+            earliest_block: None,
         })
     }
 }
@@ -466,11 +475,12 @@ mod tests {
         assert!(d67.is_compatible(1, &genesis));
         assert!(!d67.is_compatible(2, &genesis));
 
-        let s69 = encode_status69(69, 100, &genesis, &best, &fork, 0, 21_000_000);
+        let s69 = encode_status69(69, 100, &genesis, &best, &fork, 0, 21_000_000 - 32, 21_000_000);
         let d69 = decode_status(&s69, 69).unwrap();
         assert_eq!(d69.network_id, 100);
         assert_eq!(d69.best_hash, best);
         assert_eq!(d69.latest_block, Some(21_000_000));
+        assert_eq!(d69.earliest_block, Some(21_000_000 - 32));
         assert_eq!(d69.fork_id_hash, fork);
     }
 
