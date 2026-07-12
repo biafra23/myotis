@@ -128,7 +128,16 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             pendingTrieNodeRequests = new ConcurrentHashMap<>();
 
 
-    // Cache received headers so we can serve them back to peers (by block number)
+    // Default eth/69 served-block window: how many blocks below the head we retain and
+    // advertise as servable. Kept small on purpose — we are a light client, not an
+    // archive node, and over-advertising invites history requests we cannot answer.
+    // The connector constructs the (shared) window with this default; a later Settings
+    // knob overrides it live. See ServedHeaderWindow.
+    public static final int DEFAULT_SERVED_BLOCK_WINDOW = 32;
+
+    // Per-connection cache of received headers (used for our own request/response
+    // bookkeeping). Serving to peers goes through the SHARED servedWindow below, which
+    // is what the advertised eth/69 range is derived from.
     private static final int MAX_CACHE_ENTRIES = 10_000;
     private final Map<Long, byte[]> headerCache = Collections.synchronizedMap(
             new LinkedHashMap<>(16, 0.75f, true) {
@@ -144,10 +153,24 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 }
             });
 
+    // Shared store of recent headers we can serve, and the source of the advertised
+    // eth/69 block range. Owned by the connector, shared across all peer connections, so
+    // a header fetched on one connection is servable (and advertised) on all of them.
+    private final ServedHeaderWindow servedWindow;
+    // Set by the connector; invoked after we cache new headers so the connector can push a
+    // BlockRangeUpdate to eth/69 peers when the servable range grows. Null in test fixtures.
+    private volatile Runnable onWindowUpdated;
+
     private RLPxHandler rlpxHandler; // reference to the RLPx layer for sending
     private volatile ChannelHandlerContext readyCtx; // stored when state reaches READY
     private volatile long readyTimestamp; // when we entered READY state
-    private int negotiatedEthVersion = 68; // default, updated during Hello negotiation
+    // volatile: written on this connection's event-loop thread during Hello, but read
+    // cross-thread from the connector's BlockRangeUpdate broadcast (which iterates all
+    // connections' handlers).
+    private volatile int negotiatedEthVersion = 68; // default, updated during Hello negotiation
+    // eth/69 (EIP-7642) BlockRangeUpdate, message id 0x11 within the eth capability.
+    // On eth/68 the same id is the obsolete NewBlockHashes, so this is version-gated.
+    private static final int ETH_BLOCK_RANGE_UPDATE = 0x11;
 
     /** Optional sink for mempool-gossip tx hashes, set by the connector. When present
      *  AND {@link TxGossipObserver#watchingAny()} is true, inbound Transactions (0x12)
@@ -166,13 +189,14 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     }
 
     public EthHandler(NodeKey nodeKey, int tcpPort, NetworkConfig network,
-                      ChainHead chainHead,
+                      ChainHead chainHead, ServedHeaderWindow servedWindow,
                       Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders,
                       Runnable onReady) {
         this.nodeKey = nodeKey;
         this.tcpPort = tcpPort;
         this.network = network;
         this.chainHead = chainHead;
+        this.servedWindow = servedWindow;
         this.onHeaders = onHeaders;
         this.onReady = onReady;
 
@@ -190,6 +214,29 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             log.info("[eth] Pre-cached mainnet genesis header ({} bytes, hash={})",
                     genesisRlp.length, network.genesisHash().toShortHexString());
         }
+    }
+
+    /** Register a listener the connector uses to broadcast a BlockRangeUpdate when our
+     *  servable window grows (idempotent). */
+    public void setWindowUpdateListener(Runnable r) {
+        this.onWindowUpdated = r;
+    }
+
+    /**
+     * Send an eth/69 BlockRangeUpdate advertising our current servable range. No-op
+     * unless we're READY on an eth/69 peer. Called by the connector when the shared
+     * window grows so already-connected peers learn they can ask us for more.
+     */
+    public void sendBlockRangeUpdate() {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY || negotiatedEthVersion < 69) return;
+        ChainHead.Head head = chainHead.get();
+        // Advertise only held blocks — both ends of the Range, not the chain head.
+        ServedHeaderWindow.Range r = servedWindow.advertise(head.blockNumber(), head.blockHash());
+        byte[] payload = BlockRangeUpdateMessage.encode(r.earliest(), r.latest(), r.latestHash());
+        rlpxHandler.sendMessage(ctx, ETH_BLOCK_RANGE_UPDATE, payload);
+        log.debug("[eth] Sent BlockRangeUpdate range=[{},{}] to {}",
+                r.earliest(), r.latest(), clientId != null ? clientId : remoteAddress);
     }
 
     /** Set the remote address early (at connect time), before the handshake completes. */
@@ -428,14 +475,17 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     String requestedHash = hashHolder[0];
                     String fullHash = fullHashHolder[0];
 
-                    // Try to serve from cache — by hash or by number
+                    // Serve from the shared served-window (what we advertise), falling
+                    // back to this connection's own header cache. By hash or by number.
                     java.util.List<byte[]> cached = new java.util.ArrayList<>();
                     if (fullHash != null) {
-                        byte[] h = hashCache.get(fullHash);
+                        byte[] h = servedWindow.getByHash(fullHash);
+                        if (h == null) h = hashCache.get(fullHash);
                         if (h != null) cached.add(h);
                     } else if (blockNum >= 0) {
                         for (int i = 0; i < count && cached.size() < count; i++) {
-                            byte[] h = headerCache.get(blockNum + i);
+                            byte[] h = servedWindow.getByNumber(blockNum + i);
+                            if (h == null) h = headerCache.get(blockNum + i);
                             if (h != null) cached.add(h);
                             else break;
                         }
@@ -475,6 +525,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                         byte[] raw = vh.rawRlp().toArrayUnsafe();
                         headerCache.put(vh.header().number, raw);
                         hashCache.put(vh.hash().toHexString(), raw);
+                        // Make it servable to peers via the shared window + advertised range.
+                        servedWindow.put(vh.header().number, vh.hash(), raw);
                         log.debug("[eth] Cached header for block #{} hash={}",
                                 vh.header().number, vh.hash().toShortHexString());
                         chainHead.update(vh.header().number, vh.hash());
@@ -482,6 +534,12 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                             latestStateRootBlockNumber = vh.header().number;
                             latestStateRoot = vh.header().stateRoot;
                         }
+                    }
+                    // Our servable range may have grown — let the connector push a
+                    // BlockRangeUpdate to eth/69 peers who were told a narrower range.
+                    if (!decoded.headers().isEmpty()) {
+                        Runnable w = onWindowUpdated;
+                        if (w != null) w.run();
                     }
                     // Complete pending future
                     CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future =
@@ -530,6 +588,22 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                         CompletableFuture<List<List<org.apache.tuweni.bytes.Bytes>>> future =
                                 pendingReceiptRequests.remove(reqId);
                         if (future != null) future.completeExceptionally(e);
+                    }
+                }
+            }
+            case ETH_BLOCK_RANGE_UPDATE -> {
+                // eth/69: a peer telling us its servable range changed. We don't yet route
+                // requests by peer range, so just log it. On eth/68 id 0x11 is the obsolete
+                // NewBlockHashes — the version guard drops it here (a light client ignores
+                // NewBlockHashes regardless), so it deliberately never reaches `default`.
+                if (negotiatedEthVersion >= 69) {
+                    try {
+                        BlockRangeUpdateMessage.Decoded u = BlockRangeUpdateMessage.decode(msg.payload());
+                        log.debug("[eth] Peer BlockRangeUpdate: range=[{},{}] from {}",
+                                u.earliestBlock(), u.latestBlock(),
+                                clientId != null ? clientId : remoteAddress);
+                    } catch (Exception e) {
+                        log.debug("[eth] Malformed BlockRangeUpdate ignored: {}", e.getMessage());
                     }
                 }
             }
@@ -770,16 +844,25 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         ChainHead.Head head = chainHead.get();
         byte[] forkIdHash = network.forkIdHash();
         long forkNext = network.forkNext();
-        org.apache.tuweni.bytes.Bytes32 bestHash = head.blockNumber() > 0 ? head.blockHash() : network.bestBlockHash();
+        org.apache.tuweni.bytes.Bytes32 headHash = head.blockNumber() > 0 ? head.blockHash() : network.bestBlockHash();
         long blockNumber = head.blockNumber();
+        // eth/69 block range: advertise only what we actually hold, never [0, head] and
+        // never latest=head (head is the network's head from peers, not a block we hold).
+        // Both ends of the window's Range are held headers (or genesis). eth/67-68 has no
+        // range; it announces the head as bestHash for fork/sync as before.
+        ServedHeaderWindow.Range range = servedWindow.advertise(blockNumber, headHash);
+        boolean eth69 = negotiatedEthVersion >= 69;
+        org.apache.tuweni.bytes.Bytes32 bestHash = eth69 ? range.latestHash() : headHash;
+        long latestBlock = eth69 ? range.latest() : blockNumber;
+        long earliestBlock = range.earliest();
         String modeLabel = "CHAINHEAD";
 
         ourBestHash = bestHash.toShortHexString();
         byte[] payload = StatusMessage.encode(
             negotiatedEthVersion, network.networkId(), network.genesisHash(),
-            bestHash, forkIdHash, forkNext, blockNumber);
-        log.info("[eth] Sending Status [{}] ({} bytes, eth/{}): bestHash={} block={} forkIdHash={} forkNext={} peer={} hex={}",
-            modeLabel, payload.length, negotiatedEthVersion, ourBestHash, blockNumber,
+            bestHash, forkIdHash, forkNext, earliestBlock, latestBlock);
+        log.info("[eth] Sending Status [{}] ({} bytes, eth/{}): bestHash={} range=[{},{}] forkIdHash={} forkNext={} peer={} hex={}",
+            modeLabel, payload.length, negotiatedEthVersion, ourBestHash, earliestBlock, latestBlock,
             bytesToHex(forkIdHash, forkIdHash.length), forkNext,
             clientId != null ? clientId : remoteAddress,
             bytesToHex(payload, payload.length));

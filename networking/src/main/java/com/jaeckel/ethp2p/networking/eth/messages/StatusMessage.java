@@ -46,12 +46,16 @@ public final class StatusMessage {
 
     /**
      * Encode an eth/67-68 Status message.
+     *
+     * @param earliestBlock oldest block we can serve, for the eth/69 block range
+     *                      (ignored by eth/67-68, which carry no range)
      */
     public static byte[] encode(int ethVersion, long networkId, Bytes32 genesisHash,
                                 Bytes32 bestHash, byte[] forkIdHash, long forkNext,
-                                long latestBlockNumber) {
+                                long earliestBlock, long latestBlockNumber) {
         if (ethVersion >= 69) {
-            return encode69(ethVersion, networkId, genesisHash, bestHash, forkIdHash, forkNext, latestBlockNumber);
+            return encode69(ethVersion, networkId, genesisHash, bestHash, forkIdHash, forkNext,
+                    earliestBlock, latestBlockNumber);
         }
         return RLP.encodeList(writer -> {
             writer.writeInt(ethVersion);
@@ -72,7 +76,7 @@ public final class StatusMessage {
      */
     private static byte[] encode69(int ethVersion, long networkId, Bytes32 genesisHash,
                                    Bytes32 latestBlockHash, byte[] forkIdHash, long forkNext,
-                                   long latestBlockNumber) {
+                                   long earliestBlock, long latestBlockNumber) {
         return RLP.encodeList(writer -> {
             writer.writeInt(ethVersion);
             writer.writeLong(networkId);
@@ -81,8 +85,13 @@ public final class StatusMessage {
                 forkWriter.writeValue(Bytes.wrap(forkIdHash));
                 forkWriter.writeLong(forkNext);
             });
-            writer.writeLong(0);              // earliestBlock (we have genesis = block 0)
-            writer.writeLong(latestBlockNumber); // latestBlock from chain head
+            // eth/69 (EIP-7642) block range: the span of blocks we can actually serve.
+            // We are a light client, not an archive — advertising [0, head] (as we used
+            // to) invites peers to request arbitrary historical blocks we don't hold,
+            // producing empty responses that get us scored down and dropped. Advertise
+            // only the recent window we back from the beacon-verified header chain.
+            writer.writeLong(earliestBlock);
+            writer.writeLong(latestBlockNumber);
             writer.writeValue(latestBlockHash);
         }).toArrayUnsafe();
     }
