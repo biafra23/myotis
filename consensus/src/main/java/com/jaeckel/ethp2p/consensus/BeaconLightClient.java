@@ -107,6 +107,10 @@ public class BeaconLightClient implements AutoCloseable {
      *  committee period is current) → finality starvation → hunt. Matches the
      *  Rust engine's SYNCED_SLOT_SLACK_EPOCHS. */
     static final int HUNT_SLACK_EPOCHS = 5;
+    /** Catch-up (period behind wall clock) with zero store progress for this
+     *  long → the catch-up fan-out itself is starved → hunt. A progressing
+     *  catch-up never hunts. Matches the Rust HUNT_CATCHUP_STALL. */
+    static final long HUNT_CATCHUP_STALL_MS = 120_000;
     /** Widened finality fan-out while hunting (steady-state is 16). */
     private static final int HUNT_POLL_FANOUT = 32;
     /** Widened per-cycle Identify classification batch while hunting. */
@@ -125,21 +129,37 @@ public class BeaconLightClient implements AutoCloseable {
         this.huntBoostListener = listener;
     }
 
+    /** Store-progress tracking for the starved-catch-up trigger; sync-loop
+     *  thread only. Any advance of (period, finalized slot) resets the clock. */
+    private long huntLastProgressNanos = System.nanoTime();
+    private long huntLastSeenPeriod = -1;
+    private long huntLastSeenFinalizedSlot = -1;
+
     /**
-     * Should the LC hunt run this cycle? Two triggers, both meaning "starved
-     * of light-client servers": bootstrap stalled past the window, or the
-     * committee period is current but the finalized head has aged past the
-     * freshness slack (catch-up done, nobody serves finality). Pure function
-     * so the triggers are unit-testable; the mirror of the Rust hunt_due.
+     * Should the LC hunt run this cycle? Three triggers, all meaning "starved
+     * of light-client servers": bootstrap stalled past the window; catch-up
+     * (period behind wall clock) with zero store progress past
+     * {@link #HUNT_CATCHUP_STALL_MS} (a progressing catch-up never hunts —
+     * its own wide fan-out covers the pool); or the committee period is
+     * current but the finalized head has aged past the freshness slack
+     * (catch-up done, nobody serves finality). {@code engaged} adds
+     * hysteresis to the finality trigger — engage at the full slack,
+     * disengage one epoch fresher — so a lone boundary-slow server can't
+     * flap the discovery boost every cycle. Pure function so the triggers
+     * are unit-testable; the mirror of the Rust hunt_due.
      */
-    static boolean huntDue(boolean storeInitialized, long sinceStartMs, long wallSlot,
+    static boolean huntDue(boolean engaged, boolean storeInitialized, long sinceStartMs,
+                           long sinceProgressMs, long wallSlot,
                            long committeePeriod, long finalizedSlot, int slotsPerEpoch) {
         if (!storeInitialized) {
             return sinceStartMs >= HUNT_BOOTSTRAP_STALL_MS;
         }
         long wallPeriod = BeaconChainSpec.computeSyncCommitteePeriod(wallSlot);
-        return wallPeriod == committeePeriod
-                && finalizedSlot + (long) HUNT_SLACK_EPOCHS * slotsPerEpoch < wallSlot;
+        if (wallPeriod > committeePeriod) {
+            return sinceProgressMs >= HUNT_CATCHUP_STALL_MS;
+        }
+        int slackEpochs = engaged ? HUNT_SLACK_EPOCHS - 1 : HUNT_SLACK_EPOCHS;
+        return finalizedSlot + (long) slackEpochs * slotsPerEpoch < wallSlot;
     }
 
     /** Recompute the hunt state for this cycle and notify the host on a
@@ -148,9 +168,21 @@ public class BeaconLightClient implements AutoCloseable {
         long sinceStartMs = (System.nanoTime() - syncStartNanos) / 1_000_000L;
         long wallSlot = (System.currentTimeMillis() / 1000 - clGenesisTime)
                 / Math.max(1, secondsPerSlot);
-        boolean due = huntDue(store.isInitialized(), sinceStartMs, wallSlot,
-                syncState.getCurrentSyncCommitteePeriod(), syncState.getFinalizedSlot(),
-                slotsPerEpoch);
+        // Read the freshest of store/syncState: after a late-BLS "heal" win
+        // the store can lead syncState for one cycle, and lagging would
+        // spuriously engage the hunt for that cycle.
+        long finalizedSlot = store.isInitialized()
+                ? Math.max(store.getFinalizedSlot(), syncState.getFinalizedSlot())
+                : syncState.getFinalizedSlot();
+        long period = syncState.getCurrentSyncCommitteePeriod();
+        if (period != huntLastSeenPeriod || finalizedSlot != huntLastSeenFinalizedSlot) {
+            huntLastSeenPeriod = period;
+            huntLastSeenFinalizedSlot = finalizedSlot;
+            huntLastProgressNanos = System.nanoTime();
+        }
+        long sinceProgressMs = (System.nanoTime() - huntLastProgressNanos) / 1_000_000L;
+        boolean due = huntDue(hunting, store.isInitialized(), sinceStartMs, sinceProgressMs,
+                wallSlot, period, finalizedSlot, slotsPerEpoch);
         if (due == hunting) return;
         hunting = due;
         if (due) {
@@ -791,6 +823,13 @@ public class BeaconLightClient implements AutoCloseable {
         long pollIntervalMs = slotSeconds * 1000L;
         int cycleCount = 0;
         long syncStartNanos = System.nanoTime();
+        // Reset the hunt on every (re)entry: resume() rebuilds this loop AND
+        // the host may have rebuilt discv5 (a fresh service starts unboosted).
+        // Starting from false makes the first updateHunting a transition, so a
+        // still-starved resume re-fires the listener and re-boosts the NEW
+        // discovery service instead of silently assuming the old one heard.
+        hunting = false;
+        huntLastProgressNanos = System.nanoTime();
         while (running) {
             try {
                 // Every 5 cycles (~60s), log pool stats so it's easy to see

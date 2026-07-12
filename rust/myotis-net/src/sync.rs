@@ -912,14 +912,18 @@ async fn run_sync(
     }
 
     // LC hunt state: engaged whenever the chain is starved of light-client
-    // servers (bootstrap stall or finality starvation — see hunt_due). While
-    // engaged, discovery lookups run boosted and each cycle burst-probes the
-    // unproven pool tail; confirmations persist into the CL peer cache so the
-    // next start dials them first.
+    // servers (bootstrap stall, starved catch-up, or finality starvation —
+    // see hunt_due). While engaged, discovery lookups run boosted and each
+    // cycle burst-probes the unproven pool tail; confirmations persist into
+    // the CL peer cache so the next start dials them first.
     let sync_started = Instant::now();
     let mut hunt_probed: HashMap<PeerId, Instant> = HashMap::new();
     let mut hunt_confirmed: HashSet<PeerId> = HashSet::new();
     let mut hunting = false;
+    // Store-progress tracking for the starved-catch-up trigger: any advance
+    // of (period, finalized slot) resets the stall clock.
+    let mut last_progress = Instant::now();
+    let mut last_seen_progress = (0u64, 0u64);
 
     // One loop for all phases: bootstrap (when the store isn't initialized —
     // fresh start OR after a poisoned resume was discarded), catch-up when
@@ -927,9 +931,16 @@ async fn run_sync(
     loop {
         drain_discovered(&mut peer_rx, &mut pool);
 
+        let seen = (processor.store.current_period(), processor.store.finalized_slot());
+        if seen != last_seen_progress {
+            last_seen_progress = seen;
+            last_progress = Instant::now();
+        }
         let hunt_now = hunt_due(
+            hunting,
             processor.store.is_initialized(),
             sync_started.elapsed(),
+            last_progress.elapsed(),
             config.current_slot_estimate(),
             processor.store.current_period(),
             processor.store.finalized_slot(),
@@ -1005,12 +1016,21 @@ async fn run_sync(
             }
             let poisoned = catch_up(&config, &client, &mut pool, &mut processor, &status_tx,
                 &mut peer_rx, &mut staged_updates, &mut clcache, &mut resume,
-                &mut last_persisted_period, &anchor)
+                &mut last_persisted_period, &anchor, &hunt_confirmed)
                 .await;
             // Batch-persist every cache verdict from the catch-up rounds in
             // one write, OFF the per-peer hot path (review: no blocking I/O
             // inside the parallel peer loop).
             clcache.flush();
+            if hunting && processor.store.current_period() == last_seen_progress.0 {
+                // catch_up returned with no period progress while starved —
+                // probe for new servers before the next round (lc-confirms
+                // feed both the cache and catch-up's prefer tier).
+                hunt_round(&client, &mut pool, &mut processor, &mut clcache,
+                    &mut hunt_probed, &mut hunt_confirmed)
+                    .await;
+                clcache.flush();
+            }
             if poisoned {
                 // The restored snapshot can't verify anything (corrupt on
                 // disk, framing-valid): discard it and the store, and fall
@@ -1358,20 +1378,41 @@ const HUNT_FANOUT: usize = 24;
 /// cycle while starved, and a peer that just failed won't recover in 12 s.
 const HUNT_REPROBE: Duration = Duration::from_secs(600);
 
-/// Should the LC hunt run this cycle? Two triggers, both meaning "we are
+/// Catch-up (committee period behind wall clock) with ZERO store progress for
+/// this long → the catch-up fan-out itself is starved of servers → hunt. A
+/// healthy catch-up applies a period every few seconds; two minutes of
+/// nothing means nobody in the pool serves `updates_by_range`, and only the
+/// hunt (boosted discovery + probing) can break that chicken-and-egg. Also
+/// keeps a hunt ENGAGED when finality starvation crosses a period boundary
+/// (the store period falls behind but the starvation is the same).
+const HUNT_CATCHUP_STALL: Duration = Duration::from_secs(120);
+
+/// Should the LC hunt run this cycle? Three triggers, all meaning "we are
 /// starved of light-client servers":
 /// - **Bootstrap stall**: the store never initialized and we've been trying
 ///   longer than [`HUNT_BOOTSTRAP_STALL`] — bootstrap itself can't find a
 ///   server.
+/// - **Starved catch-up**: the committee period is behind wall clock AND the
+///   store hasn't advanced for [`HUNT_CATCHUP_STALL`]. A *progressing*
+///   catch-up never hunts — its own wide fan-out covers the pool, and
+///   hunting there would just double-dial it.
 /// - **Finality starvation**: the committee period is current but the
 ///   finalized head has aged past the SYNCED freshness slack — catch-up is
 ///   done, yet nobody serves us finality updates (the state the status
 ///   surface shows as CATCHING_UP at `period X / X`).
 ///
+/// `engaged` adds hysteresis to the finality trigger: engage at the full
+/// slack, disengage only once finality is a full epoch fresher — a pool
+/// whose lone server applies right at the boundary must not flap the
+/// discovery boost on/off every cycle.
+///
 /// Pure function of its inputs so the triggers are unit-testable.
+#[allow(clippy::too_many_arguments)]
 fn hunt_due(
+    engaged: bool,
     store_initialized: bool,
     since_sync_start: Duration,
+    since_progress: Duration,
     wall_slot: u64,
     store_period: u64,
     finalized_slot: u64,
@@ -1381,8 +1422,12 @@ fn hunt_due(
         return since_sync_start >= HUNT_BOOTSTRAP_STALL;
     }
     let wall_period = spec::compute_sync_committee_period(wall_slot);
-    wall_period == store_period
-        && finalized_slot + SYNCED_SLOT_SLACK_EPOCHS * slots_per_epoch < wall_slot
+    if wall_period > store_period {
+        return since_progress >= HUNT_CATCHUP_STALL;
+    }
+    let slack_epochs =
+        if engaged { SYNCED_SLOT_SLACK_EPOCHS - 1 } else { SYNCED_SLOT_SLACK_EPOCHS };
+    finalized_slot + slack_epochs * slots_per_epoch < wall_slot
 }
 
 /// Consecutive no-progress rounds before returning to the outer loop (which
@@ -1416,6 +1461,7 @@ async fn catch_up(
     resume: &mut ResumeGuard,
     last_persisted_period: &mut u64,
     anchor: &ExecAnchor,
+    hunt_confirmed: &HashSet<PeerId>,
 ) -> bool {
     let mut idle_rounds = 0u32;
     // Exponential pause after fruitless rounds: hammering the whole pool every
@@ -1460,7 +1506,10 @@ async fn catch_up(
         tracing::info!(from_period = committee_period, wall_period, span,
             staged = staged.len(), "catch-up: requesting updates_by_range");
 
-        let (lc_servers, earliest_slots) = client.catchup_peer_meta().await;
+        let (mut lc_servers, earliest_slots) = client.catchup_peer_meta().await;
+        // Hunt-confirmed servers join the Identify-confirmed prefer tier —
+        // same dial-priority-only trust level (see poll_finality).
+        lc_servers.extend(hunt_confirmed.iter().copied());
         // Skip peers whose advertised earliest_available_slot proves their
         // light-client history begins in a LATER period than the one we need —
         // they'd only return far-future updates the period gate discards (Java
@@ -2344,18 +2393,34 @@ mod tests {
         let slack = SYNCED_SLOT_SLACK_EPOCHS * epoch; // 160 slots
         let wall = 10_000_000u64;
         let period = spec::compute_sync_committee_period(wall);
+        let z = Duration::ZERO;
 
         // Bootstrap stall: only after the stall window.
-        assert!(!hunt_due(false, Duration::from_secs(10), wall, 0, 0, epoch));
-        assert!(hunt_due(false, HUNT_BOOTSTRAP_STALL, wall, 0, 0, epoch));
+        assert!(!hunt_due(false, false, Duration::from_secs(10), z, wall, 0, 0, epoch));
+        assert!(hunt_due(false, false, HUNT_BOOTSTRAP_STALL, z, wall, 0, 0, epoch));
 
         // Finality starvation: period current + finalized older than slack.
-        assert!(hunt_due(true, Duration::ZERO, wall, period, wall - slack - 1, epoch));
+        assert!(hunt_due(false, true, z, z, wall, period, wall - slack - 1, epoch));
         // Fresh finality → no hunt.
-        assert!(!hunt_due(true, Duration::ZERO, wall, period, wall - 64, epoch));
-        // Period behind wall clock → catch-up territory, not the hunt's
-        // (catch-up has its own wide fan-out; hunting would double-dial).
-        assert!(!hunt_due(true, Duration::ZERO, wall, period - 1, wall - slack - 1, epoch));
+        assert!(!hunt_due(false, true, z, z, wall, period, wall - 64, epoch));
+
+        // PROGRESSING catch-up (period behind, store advancing) → no hunt:
+        // catch-up's own wide fan-out covers the pool; hunting double-dials.
+        assert!(!hunt_due(false, true, z, z, wall, period - 1, wall - slack - 1, epoch));
+        // STARVED catch-up (no store progress past the stall window) → hunt.
+        assert!(hunt_due(false, true, z, HUNT_CATCHUP_STALL, wall, period - 1,
+            wall - slack - 1, epoch));
+        // ...and an ENGAGED hunt survives the period boundary the same way
+        // (finality starvation rotating into catch-up must not disengage).
+        assert!(hunt_due(true, true, z, HUNT_CATCHUP_STALL, wall, period - 1,
+            wall - slack - 1, epoch));
+
+        // Hysteresis on the finality trigger: at staleness between the
+        // engaged and disengaged thresholds, an engaged hunt stays on and a
+        // disengaged one stays off (no flapping at the boundary).
+        let between = wall - slack + epoch - 1; // stale by SLACK-1 epochs + 1 slot
+        assert!(hunt_due(true, true, z, z, wall, period, between, epoch));
+        assert!(!hunt_due(false, true, z, z, wall, period, between, epoch));
     }
 
     #[test]

@@ -109,10 +109,14 @@ async fn main() {
     let mut spawned = 0usize;
 
     let deadline = Instant::now() + Duration::from_secs(crawl_secs);
-    let finality_wire = codec::encode_request(&[]); // finality_update carries no body
+    // finality_update carries NO request content — send truly empty wire
+    // bytes, exactly like the production poll (sync.rs poll_finality). An
+    // encode_request(&[]) would prepend a stray length byte that strict
+    // servers reject, skewing the census toward responded-undecodable.
+    let finality_wire: Vec<u8> = Vec::new();
 
     let mut results: Vec<(String, String, Verdict, f64)> = Vec::new();
-    let mut spawn_probe = |peer_id: libp2p::PeerId,
+    let spawn_probe = |peer_id: libp2p::PeerId,
                            addr: libp2p::Multiaddr,
                            seen: &mut HashSet<String>,
                            spawned: &mut usize| {
