@@ -455,6 +455,12 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     }
 
     @Override
+    public void setServedBlockWindow(int blocks) {
+        log.debug("[engines] setServedBlockWindow({}) is a no-op on the R1 Rust engine (CL-only: no eth layer)",
+                blocks);
+    }
+
+    @Override
     public void clearPeerState() {
         log.debug("[engines] clearPeerState is a no-op on the R1 Rust engine (CL-only)");
     }

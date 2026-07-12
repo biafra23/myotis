@@ -64,6 +64,9 @@ class DesktopNodeController(
     private val peerCaches = ConcurrentHashMap<String, PeerCache>()
     private val clPeerCaches = ConcurrentHashMap<String, CLPeerCache>()
     private fun bootLock(canonical: String): Any = bootLocks.computeIfAbsent(canonical) { Any() }
+    // Pairs the boot path's read-settings-then-apply of the served-block window with the
+    // Save fan-out, so a Save can never be overwritten by a concurrently booting network.
+    private val servedWindowApplyLock = Any()
 
     init {
         dataDir.createDirectories()
@@ -129,6 +132,16 @@ class DesktopNodeController(
                     dropNetwork(canonical)
                     throw t
                 }
+                // Apply the Settings served-block window before start() (so the very first
+                // eth/69 Status advertises the configured size), reading the setting INSIDE
+                // servedWindowApplyLock: the Save fan-out takes the same lock, and create()
+                // above already made this handle visible to hostedNetworks() — so either the
+                // fan-out reaches this handle, or our read observes its already-persisted
+                // value. Without the pairing a Save landing between our read and apply
+                // would be overwritten, leaving the live window one Save behind settings.
+                synchronized(servedWindowApplyLock) {
+                    handle.setServedBlockWindow(settings.servedBlockWindow())
+                }
                 // start() is fault-isolated: false (resources closed) on failure rather than a
                 // throw. Either way, drop the network so a later enable can retry — leaving a
                 // dead entry would report "running" forever and block retries.
@@ -184,6 +197,14 @@ class DesktopNodeController(
 
     override fun setTargetSnapPeers(target: Int) {
         engine.hostedNetworks().forEach { engine.get(it)?.setTargetSnapPeers(target) }
+    }
+
+    override fun setServedBlockWindow(blocks: Int) {
+        // Same lock as the boot-path read+apply: see the comment there. (The SettingsTab
+        // persists via settings.setServedBlockWindow BEFORE calling this.)
+        synchronized(servedWindowApplyLock) {
+            engine.hostedNetworks().forEach { engine.get(it)?.setServedBlockWindow(blocks) }
+        }
     }
 
     override fun applyBlsBackend() {
@@ -381,6 +402,7 @@ class DesktopSettings(
     private val enabled = linkedSetOf("mainnet")
     private val ports = HashMap<String, Int>()
     private var snap = 32
+    private var servedWindow = 32
     private var deep = 16
     private var strict = true
     // Desktop has no bundled native blst yet (Milagro-only), so the honest default is off; the
@@ -420,6 +442,9 @@ class DesktopSettings(
     // Clamp like Android's NodeService (1..128) so the live value and the reloaded
     // value can't differ (load() applies the same clamp).
     override fun setSnapTarget(v: Int) = mutate { snap = v.coerceIn(1, 128) }
+    override fun servedBlockWindow(): Int = synchronized(this) { servedWindow }
+    // Clamp like ChainStack.setServedBlockWindow (1..4096) so live and reloaded values agree.
+    override fun setServedBlockWindow(v: Int) = mutate { servedWindow = v.coerceIn(1, 4096) }
 
     override fun displayName(network: String): String = info(network)?.displayName() ?: network
     override fun defaultRpcPort(network: String): Int = info(network)?.defaultRpcPort() ?: 8545
@@ -453,6 +478,7 @@ class DesktopSettings(
                 ?.let { ports[n.name()] = it }
         }
         p.getProperty(K_SNAP)?.toIntOrNull()?.let { snap = it.coerceIn(1, 128) }
+        p.getProperty(K_SERVED_WINDOW)?.toIntOrNull()?.let { servedWindow = it.coerceIn(1, 4096) }
         p.getProperty(K_DEEP)?.toIntOrNull()?.let { deep = it.coerceIn(1, 128) }
         p.getProperty(K_STRICT)?.toBooleanStrictOrNull()?.let { strict = it }
         p.getProperty(K_NATIVE_BLS)?.toBooleanStrictOrNull()?.let { nativeBls = it }
@@ -490,6 +516,7 @@ class DesktopSettings(
         p.setProperty(K_ENABLED, enabled.joinToString(","))
         ports.forEach { (net, port) -> p.setProperty("$K_RPC_PORT_PREFIX$net", port.toString()) }
         p.setProperty(K_SNAP, snap.toString())
+        p.setProperty(K_SERVED_WINDOW, servedWindow.toString())
         p.setProperty(K_DEEP, deep.toString())
         p.setProperty(K_STRICT, strict.toString())
         p.setProperty(K_NATIVE_BLS, nativeBls.toString())
@@ -524,6 +551,7 @@ class DesktopSettings(
         const val K_ENABLED = "networks.enabled"
         const val K_RPC_PORT_PREFIX = "rpcPort."
         const val K_SNAP = "snapTarget"
+        const val K_SERVED_WINDOW = "servedBlockWindow"
         const val K_DEEP = "deepPool"
         const val K_STRICT = "strictStateFreshness"
         const val K_NATIVE_BLS = "nativeBls"

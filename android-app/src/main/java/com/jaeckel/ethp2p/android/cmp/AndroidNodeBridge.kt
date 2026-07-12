@@ -88,6 +88,7 @@ class AndroidNodeController(
     override fun rebootNetwork(name: String) { serviceProvider()?.rebootNetwork(name) }
     override fun shutdown() { serviceProvider()?.shutdown() }
     override fun setTargetSnapPeers(target: Int) { serviceProvider()?.setTargetSnapPeers(target) }
+    override fun setServedBlockWindow(blocks: Int) { serviceProvider()?.setServedBlockWindow(blocks) }
     override fun applyBlsBackend() { NodeService.applyBlsBackend(appContext) }
     override fun applyEngineChoice() { NodeService.applyEngineChoice(appContext) }
     override fun clearCaches(network: String) { serviceProvider()?.clearCaches(network) }
@@ -188,6 +189,8 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun setRpcPort(network: String, port: Int) = NodeService.setRpcPort(ctx, network, port)
     override fun snapTarget(): Int = NodeService.snapTarget(ctx)
     override fun setSnapTarget(v: Int) = NodeService.setSnapTargetPref(ctx, v)
+    override fun servedBlockWindow(): Int = NodeService.servedBlockWindow(ctx)
+    override fun setServedBlockWindow(v: Int) = NodeService.setServedBlockWindowPref(ctx, v)
 
     override fun displayName(network: String): String = NodeService.displayName(network)
     override fun defaultRpcPort(network: String): Int = NodeService.defaultRpcPort(network)

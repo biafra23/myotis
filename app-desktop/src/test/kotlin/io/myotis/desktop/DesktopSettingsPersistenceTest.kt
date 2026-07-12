@@ -29,6 +29,7 @@ class DesktopSettingsPersistenceTest {
         first.setNetworkEnabled("mainnet", false)
         first.setRpcPort("gnosis", 9999)
         first.setSnapTarget(48)
+        first.setServedBlockWindow(64)
         first.setDeepPool(8)
         first.setStrictStateFreshness(false)
         first.setNativeBlsEnabled(true)
@@ -40,6 +41,7 @@ class DesktopSettingsPersistenceTest {
         assertFalse(second.isNetworkEnabled("mainnet"))
         assertEquals(9999, second.rpcPortFor("gnosis"))
         assertEquals(48, second.snapTarget())
+        assertEquals(64, second.servedBlockWindow())
         assertEquals(8, second.deepPoolThreshold())
         assertFalse(second.strictStateFreshness())
         assertTrue(second.nativeBlsEnabled())
@@ -60,6 +62,7 @@ class DesktopSettingsPersistenceTest {
         assertFalse(s.rustEngineEnabled())
         assertTrue(s.strictStateFreshness())
         assertEquals(32, s.snapTarget())
+        assertEquals(32, s.servedBlockWindow())
         assertEquals(16, s.deepPoolThreshold())
     }
 
@@ -73,6 +76,7 @@ class DesktopSettingsPersistenceTest {
             rpcPort.gnosis=99
             rpcPort.mainnet=not-a-number
             snapTarget=100000
+            servedBlockWindow=-7
             deepPool=zero
             rustEngine=yes-please
             strictStateFreshness=false
@@ -86,6 +90,7 @@ class DesktopSettingsPersistenceTest {
         assertEquals(8545, s.rpcPortFor("mainnet"))
         // Ints clamped, bad bools fall back to their defaults, good ones apply.
         assertEquals(128, s.snapTarget())
+        assertEquals(1, s.servedBlockWindow())
         assertEquals(16, s.deepPoolThreshold())
         assertFalse(s.rustEngineEnabled())
         assertFalse(s.strictStateFreshness())

@@ -264,6 +264,7 @@ private fun SettingsTab(
         }
     }
     var snapTarget by remember { mutableStateOf(settings.snapTarget().toString()) }
+    var servedWindow by remember { mutableStateOf(settings.servedBlockWindow().toString()) }
     var deepPool by remember { mutableStateOf(settings.deepPoolThreshold().toString()) }
     var idlePause by remember { mutableStateOf(settings.idlePauseMinutes().toString()) }
     var stayAwakeCharging by remember { mutableStateOf(settings.stayAwakeWhileCharging()) }
@@ -318,6 +319,14 @@ private fun SettingsTab(
             value = snapTarget,
             onValueChange = { snapTarget = it.filter(Char::isDigit).take(3) },
             label = { Text("Snap-peer target (default 32)") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = servedWindow,
+            onValueChange = { servedWindow = it.filter(Char::isDigit).take(4) },
+            label = { Text("Served-block window (eth/69, default 32)") },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             modifier = Modifier.fillMaxWidth(),
@@ -414,16 +423,19 @@ private fun SettingsTab(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Text(
-            "An RPC-port change reboots that chain; snap-peer target applies live to every " +
-                "running chain, and the readiness threshold persists for the next check.",
+            "An RPC-port change reboots that chain; the snap-peer target and served-block " +
+                "window apply live to every running chain, and the readiness threshold persists " +
+                "for the next check.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Button(
             onClick = {
                 val snap = snapTarget.toIntOrNull() ?: 32
+                val window = servedWindow.toIntOrNull() ?: 32
                 val deep = deepPool.toIntOrNull() ?: 16
                 settings.setSnapTarget(snap)          // persist
+                settings.setServedBlockWindow(window) // persist
                 settings.setDeepPool(deep)            // persist (read at readiness-check time)
                 // Idle sleep: persisted only on hosts that run the controller; the tick reads it
                 // live. Blank/invalid input keeps the CURRENT value rather than silently enabling
@@ -432,6 +444,7 @@ private fun SettingsTab(
                     settings.setIdlePauseMinutes(idlePause.toIntOrNull() ?: settings.idlePauseMinutes())
                 }
                 controller.setTargetSnapPeers(snap)   // live-apply to running stacks
+                controller.setServedBlockWindow(window) // live-apply to running stacks
                 networks.forEach { id ->
                     // Compare the EFFECTIVE (post-clamp) persisted port before vs after, not the
                     // raw typed value: setRpcPort clamps out-of-range input to the network default,

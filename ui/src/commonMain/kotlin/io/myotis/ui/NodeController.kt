@@ -46,6 +46,9 @@ interface NodeController {
     /** Live-update the snap-peer target on all running stacks. */
     fun setTargetSnapPeers(target: Int)
 
+    /** Live-update the eth/69 served-block window on all running stacks. */
+    fun setServedBlockWindow(blocks: Int)
+
     /**
      * Re-apply the BLS backend to the process-global selector after [Settings.setNativeBlsEnabled]
      * flips the preference (Android: native blst ⇄ pure-Java Milagro). Takes effect immediately —
@@ -134,6 +137,10 @@ interface Settings {
     fun setRpcPort(network: String, port: Int)
     fun snapTarget(): Int
     fun setSnapTarget(v: Int)
+    /** eth/69 served-block window: how many recent headers the node retains and
+     *  advertises as servable to peers (EIP-7642 Status range). */
+    fun servedBlockWindow(): Int
+    fun setServedBlockWindow(v: Int)
 
     // --- network metadata (so commonMain need not reference the Java NetworkConfig) ---
     /** Human-facing name for the Settings row, e.g. "Gnosis Chain". */
