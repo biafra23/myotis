@@ -290,6 +290,14 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     private boolean readyForReads() {
         try {
             ParsedStatus s = readStatus();
+            // RUNNING with no EL reader is terminal-until-pause/resume (the CL-only
+            // degraded mode): more waiting cannot help, so report "attempt the read
+            // now" and let the native surface its precise "EL reader unavailable"
+            // error. The pre-gate probe in awaitWake covers the already-RUNNING
+            // case without stamping activity; this covers a wake whose resume
+            // lands in the degraded mode MID-HOLD, which would otherwise park the
+            // request for the full cap.
+            if (s.running() && !s.elReaderAvailable()) return true;
             return s.running() && s.beaconState() == BeaconState.SYNCED
                     && s.optimisticBlockNumber() > 0 && s.snapPeers() > 0;
         } catch (RuntimeException e) {
