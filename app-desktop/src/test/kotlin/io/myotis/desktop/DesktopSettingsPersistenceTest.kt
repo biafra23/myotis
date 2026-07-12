@@ -96,6 +96,6 @@ class DesktopSettingsPersistenceTest {
         val s = DesktopSettings(nets, null)
         s.setRustEngineEnabled(true)
         assertTrue(s.rustEngineEnabled())
-        assertEquals(0, Files.list(dir).count(), "no file must be written")
+        assertEquals(0, Files.list(dir).use { it.count() }, "no file must be written")
     }
 }

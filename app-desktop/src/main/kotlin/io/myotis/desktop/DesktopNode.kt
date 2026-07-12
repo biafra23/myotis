@@ -27,8 +27,10 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
+import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.io.path.createDirectories
 
@@ -393,14 +395,16 @@ class DesktopSettings(
         persist()
     }
     override fun snapTarget(): Int = synchronized(this) { snap }
-    override fun setSnapTarget(v: Int) = synchronized(this) { snap = v; persist() }
+    // Clamp like Android's NodeService (1..128) so the live value and the reloaded
+    // value can't differ (load() applies the same clamp).
+    override fun setSnapTarget(v: Int) = synchronized(this) { snap = v.coerceIn(1, 128); persist() }
 
     override fun displayName(network: String): String = info(network)?.displayName() ?: network
     override fun defaultRpcPort(network: String): Int = info(network)?.defaultRpcPort() ?: 8545
     override fun hasEns(network: String): Boolean = info(network)?.hasEns() ?: false
 
     override fun deepPoolThreshold(): Int = synchronized(this) { deep }
-    override fun setDeepPool(v: Int) = synchronized(this) { deep = v; persist() }
+    override fun setDeepPool(v: Int) = synchronized(this) { deep = v.coerceIn(1, 128); persist() }
     override fun strictStateFreshness(): Boolean = synchronized(this) { strict }
     override fun setStrictStateFreshness(v: Boolean) = synchronized(this) { strict = v; persist() }
     override fun nativeBlsEnabled(): Boolean = synchronized(this) { nativeBls }
@@ -433,7 +437,9 @@ class DesktopSettings(
         p.getProperty(K_RUST_ENGINE)?.toBooleanStrictOrNull()?.let { rustEngine = it }
     }
 
-    /** Best-effort rewrite (same idiom as [DesktopQueryHistory]); called under `this`. */
+    /** Best-effort rewrite; called under `this`. Writes temp + atomic move so a crash
+     *  mid-write can't leave a truncated file; failures are logged (a silently
+     *  unwritable settings file would look exactly like the bug this class fixes). */
     private fun persist() {
         val f = file ?: return
         runCatching {
@@ -446,11 +452,20 @@ class DesktopSettings(
             p.setProperty(K_STRICT, strict.toString())
             p.setProperty(K_NATIVE_BLS, nativeBls.toString())
             p.setProperty(K_RUST_ENGINE, rustEngine.toString())
-            Files.newOutputStream(f).use { p.store(it, "Myotis desktop settings") }
+            val tmp = f.resolveSibling("${f.fileName}.tmp")
+            Files.newOutputStream(tmp).use { p.store(it, "Myotis desktop settings") }
+            try {
+                Files.move(tmp, f, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(tmp, f, StandardCopyOption.REPLACE_EXISTING)
+            }
+        }.onFailure {
+            log.warn("settings not persisted to {}: {}", f, it.toString())
         }
     }
 
     private companion object {
+        val log: org.slf4j.Logger = org.slf4j.LoggerFactory.getLogger(DesktopSettings::class.java)
         const val K_ENABLED = "networks.enabled"
         const val K_RPC_PORT_PREFIX = "rpcPort."
         const val K_SNAP = "snapTarget"
