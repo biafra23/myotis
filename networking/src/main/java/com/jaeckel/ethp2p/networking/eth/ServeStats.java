@@ -35,6 +35,16 @@ public final class ServeStats {
     /** We answered a GetBlockBodies with ≥1 body (never happens today). */
     public void bodyServed() { bodyRequestsServed.incrementAndGet(); }
 
+    /** Zero all counters. Called where the stack re-anchors uptime (a fresh start
+     *  after shutdown) so the status page's counters and uptime share one epoch;
+     *  deliberately NOT called on pause/resume (a pause is not a restart). */
+    public void reset() {
+        headerRequests.set(0);
+        headerRequestsServed.set(0);
+        bodyRequests.set(0);
+        bodyRequestsServed.set(0);
+    }
+
     public long headerRequests() { return headerRequests.get(); }
     public long headerRequestsServed() { return headerRequestsServed.get(); }
     public long bodyRequests() { return bodyRequests.get(); }

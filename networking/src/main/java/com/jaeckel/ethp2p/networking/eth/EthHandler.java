@@ -628,6 +628,9 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                         rlpxHandler.sendMessage(ctx, ETH_BLOCK_BODIES, response);
                         log.debug("[eth] PEER ASKS: GetBlockBodies(reqId={}) — served empty (no bodies held)",
                                 reqId.toHexString());
+                    } else {
+                        log.debug("[eth] GetBlockBodies with malformed reqId ({} bytes) — dropped, peer will time out",
+                                reqId.size());
                     }
                 } catch (Exception e) {
                     log.debug("[eth] Failed to answer GetBlockBodies from peer: {}", e.getMessage());

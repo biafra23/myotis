@@ -252,7 +252,9 @@ public final class ChainStack {
 
             // Anchor uptime only after a fully successful start (a failed start below tears
             // the stack down via shutdown(), which clears `started` so a later start re-anchors).
-            if (!started) { startedAtNs = System.nanoTime(); started = true; }
+            // The serve counters share the same epoch: reset here (first start and any
+            // start-after-shutdown), never on pause/resume — matching uptime exactly.
+            if (!started) { startedAtNs = System.nanoTime(); started = true; serveStats.reset(); }
             return true;
         } catch (Throwable t) {
             log.error("[{}] stack failed to start: {}", network.name(), t.toString());
