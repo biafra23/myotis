@@ -14,7 +14,8 @@ engine differences called out where they exist.
   `"state":"SYNCED"`, and a query such as `get-account` returns
   `"verifyMethod":"headerChain"` (or `"stateRootMatch"`) instead of a `failReason`.
 - **Over JSON-RPC** (Android's loopback `127.0.0.1:8545`): requests return data
-  instead of error `-32000` ("can't be answered verified right now — retryable").
+  instead of error `-32000` (method cannot be served verified right now —
+  retryable).
 
 Being *synced* is necessary but not sufficient: a node can be beacon-SYNCED and
 still unable to serve reads (e.g. no snap-serving peers yet). Readiness is the
@@ -40,8 +41,8 @@ when all three of these hold:
    parent-hash-verified header chain. "Verified head age" (below) measures how
    fresh this gate is; `readyForReads` requires it to be finite.
 
-The engine-internal check is exactly gates 1 + 3
-(`ChainStack.readyForReads()`: state == `SYNCED` **and**
+The engine-internal check is gates 1 + 3, plus the stack actually running
+(`ChainStack.readyForReads()`: stack `RUNNING`, state == `SYNCED`, **and**
 `verifiedHeadAgeMs != Long.MAX_VALUE`); gate 2 is implied because a head context
 cannot be built or refreshed without snap peers.
 
