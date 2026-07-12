@@ -373,6 +373,12 @@ impl ElReader {
         self.pool.attempted_count().await
     }
 
+    /// Inbound-serve counters `(header_asked, header_served, body_asked,
+    /// body_served)` — what OTHER peers ask us for. Lock-free.
+    pub fn serve_stats(&self) -> (u64, u64, u64, u64) {
+        self.pool.serve_stats()
+    }
+
     pub async fn blacklist_count(&self) -> usize {
         self.pool.blacklist_count().await
     }

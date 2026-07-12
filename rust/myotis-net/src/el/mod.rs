@@ -15,6 +15,7 @@ pub mod peercache;
 pub mod pool;
 pub mod reader;
 pub mod rlpx;
+pub mod served;
 pub mod snap;
 pub mod tx;
 pub mod verify;
