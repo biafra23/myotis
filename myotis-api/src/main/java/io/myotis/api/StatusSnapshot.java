@@ -33,6 +33,12 @@ import java.util.List;
  * @param verifiedHeadAgeMs     age of the last verified RPC head context;
  *                              {@code Long.MAX_VALUE} = none built yet
  * @param readyPeerList         per-peer detail for the READY peers, snap-capable first
+ * @param peerHeaderRequests    inbound GetBlockHeaders requests from peers this run
+ * @param peerHeaderRequestsServed  of those, answered with at least one header
+ * @param peerBodyRequests      inbound GetBlockBodies requests from peers this run
+ * @param peerBodyRequestsServed    of those, answered with at least one body (always 0
+ *                              today — a light client holds no bodies; requests get a
+ *                              prompt empty response)
  * @param pauseCount            times this stack entered idle sleep since start
  * @param totalPausedMs         cumulative time spent paused (ms), across all pauses
  * @param lastPauseEpochMs      wall-clock ms of the most recent pause; 0 if never paused
@@ -69,5 +75,9 @@ public record StatusSnapshot(
         long totalPausedMs,
         long lastPauseEpochMs,
         long lastResumeEpochMs,
-        String lastWakeReason) {
+        String lastWakeReason,
+        long peerHeaderRequests,
+        long peerHeaderRequestsServed,
+        long peerBodyRequests,
+        long peerBodyRequestsServed) {
 }

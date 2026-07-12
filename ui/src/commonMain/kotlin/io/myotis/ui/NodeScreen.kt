@@ -644,6 +644,10 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
                 "untried ${s.clCachedPeers - s.clCachedProven - s.clCachedNolc})",
         )
         StatusRow("EL cache", "${s.elCachedPeers} (snap-ok ${s.elCachedSnapOk}, snap-bad ${s.elCachedSnapBad})")
+        // What peers ask US for: demand for our served headers/blocks, and how often we
+        // could answer. Bodies-served stays 0 (light client; prompt empty replies).
+        StatusRow("Peer asks · headers", "${s.peerHeaderRequests} asked, ${s.peerHeaderRequestsServed} served")
+        StatusRow("Peer asks · blocks", "${s.peerBodyRequests} asked, ${s.peerBodyRequestsServed} served")
         StatusRow("Discovered", s.discoveredPeers.toString())
         StatusRow("Discv5 peers", s.discv5Peers.toString())
         StatusRow("In backoff", s.backedOffPeers.toString())

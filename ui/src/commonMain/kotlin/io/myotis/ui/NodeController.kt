@@ -231,6 +231,13 @@ data class NodeSnapshot(
     val syncTargetPeriod: Long,
     val verifiedHeadAgeMs: Long,
     val uptimeSeconds: Long,
+    // Inbound-serve counters: peers asking US for data (eth GetBlockHeaders /
+    // GetBlockBodies), and how often we answered non-empty. Bodies-served is 0
+    // today (a light client holds none; they get a prompt empty reply).
+    val peerHeaderRequests: Long,
+    val peerHeaderRequestsServed: Long,
+    val peerBodyRequests: Long,
+    val peerBodyRequestsServed: Long,
     val readyPeerList: List<PeerRow>,  // per-peer detail for the READY peers
     // Idle-sleep metrics (pseudo-sleep observability). See WakeReason.
     val pauseCount: Int,               // times the stack idle-slept since start

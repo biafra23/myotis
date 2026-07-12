@@ -5,6 +5,7 @@ import com.jaeckel.ethp2p.networking.ChainHead;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
 import com.jaeckel.ethp2p.networking.eth.EthHandler;
 import com.jaeckel.ethp2p.networking.eth.ServedHeaderWindow;
+import com.jaeckel.ethp2p.networking.eth.ServeStats;
 import com.jaeckel.ethp2p.networking.eth.TxGossipObserver;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockBodiesMessage;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
@@ -70,6 +71,8 @@ public final class RLPxConnector implements AutoCloseable {
     /** Shared store of recent headers we advertise + serve via the eth/69 block range,
      *  one per network, shared across all peer connections. */
     private final ServedHeaderWindow servedWindow;
+    /** Stack-owned serve counters (nullable); passed to every handler. */
+    private final ServeStats serveStats;
     /** Last eth/69 range we broadcast, to suppress duplicate BlockRangeUpdate spam.
      *  Guarded by {@link #rangeBroadcastLock} (event-loop threads race to update it). */
     private long lastBroadcastEarliest = -1;
@@ -104,6 +107,14 @@ public final class RLPxConnector implements AutoCloseable {
     public RLPxConnector(NodeKey localKey, int tcpPort, NetworkConfig network,
                          Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders,
                          PeerReadyCallback peerReadyCallback) {
+        this(localKey, tcpPort, network, onHeaders, peerReadyCallback, null);
+    }
+
+    /** @param serveStats stack-owned inbound-serve counters shared across connections and
+     *                    across connector rebuilds (pause/resume); null → not counted */
+    public RLPxConnector(NodeKey localKey, int tcpPort, NetworkConfig network,
+                         Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders,
+                         PeerReadyCallback peerReadyCallback, ServeStats serveStats) {
         this.localKey = localKey;
         this.tcpPort = tcpPort;
         this.network = network;
@@ -111,6 +122,7 @@ public final class RLPxConnector implements AutoCloseable {
         this.group = new NioEventLoopGroup(4);
         this.onHeaders = onHeaders;
         this.peerReadyCallback = peerReadyCallback;
+        this.serveStats = serveStats;
         // Seed genesis (always servable for fork probes) where we embed its RLP.
         byte[] genesisRlp = "mainnet".equals(network.name())
                 ? NetworkConfig.MAINNET_GENESIS_HEADER_RLP : null;
@@ -166,7 +178,7 @@ public final class RLPxConnector implements AutoCloseable {
                 peerReadyCallback.onPeerReady(peerAddr, pubKeyHex, snap);
             }
         };
-        EthHandler ethHandler = new EthHandler(localKey, tcpPort, network, chainHead, servedWindow, onHeaders, onReady);
+        EthHandler ethHandler = new EthHandler(localKey, tcpPort, network, chainHead, servedWindow, serveStats, onHeaders, onReady);
         handlerRef[0] = ethHandler;
         // When this connection caches new recent headers, our servable range may grow —
         // tell already-connected eth/69 peers via BlockRangeUpdate.
