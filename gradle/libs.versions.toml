@@ -1,9 +1,14 @@
 [versions]
-tuweni = "2.7.2-jvm17.1"
+# Upstream Tuweni (post-rename Maven coordinates io.consensys.tuweni, still the
+# org.apache.tuweni packages). Java-21 bytecode, plain POMs (no Gradle-metadata JVM
+# floor) — 17-target modules compile against it fine and Android dexes classfile 65
+# already (discv5). Replaces the tuweni-kotlin KMP fork: multiplatform now comes from
+# the Rust engine, not from Kotlin-transpiled Java deps.
+tuweni = "2.7.2"
 discovery = "26.4.0"
-#netty-kotlin = "c5a8303903"
-netty-kotlin = "main-SNAPSHOT"
-#netty = "4.2.7.Final"
+# Upstream Netty (NIO-only usage; Android-safe). Replaces the netty-kotlin
+# transpile PoC — same io.netty.* FQCNs, so this is a coordinate swap.
+netty = "4.2.10.Final"  # matches jvm-libp2p 1.3.2's netty constraint (one netty everywhere)
 bouncycastle = "1.78.1"
 junit = "5.10.0"
 slf4j = "2.0.12"
@@ -56,16 +61,16 @@ compose-multiplatform = { id = "org.jetbrains.compose",             version.ref 
 
 [libraries]
 minimal-json        = { module = "com.eclipsesource.minimal-json:minimal-json", version.ref = "minimal-json" }
-tuweni-bytes        = { module = "com.github.biafra23.tuweni-kotlin:tuweni-bytes",       version.ref = "tuweni" }
-tuweni-rlp          = { module = "com.github.biafra23.tuweni-kotlin:tuweni-rlp",         version.ref = "tuweni" }
-tuweni-crypto       = { module = "com.github.biafra23.tuweni-kotlin:tuweni-crypto",      version.ref = "tuweni" }
-tuweni-merkle-trie  = { module = "com.github.biafra23.tuweni-kotlin:tuweni-merkle-trie", version.ref = "tuweni" }
-tuweni-ssz          = { module = "com.github.biafra23.tuweni-kotlin:tuweni-ssz",         version.ref = "tuweni" }
-tuweni-units        = { module = "com.github.biafra23.tuweni-kotlin:tuweni-units",       version.ref = "tuweni" }
+tuweni-bytes        = { module = "io.consensys.tuweni:tuweni-bytes",       version.ref = "tuweni" }
+tuweni-rlp          = { module = "io.consensys.tuweni:tuweni-rlp",         version.ref = "tuweni" }
+tuweni-crypto       = { module = "io.consensys.tuweni:tuweni-crypto",      version.ref = "tuweni" }
+tuweni-merkle-trie  = { module = "io.consensys.tuweni:tuweni-merkle-trie", version.ref = "tuweni" }
+tuweni-ssz          = { module = "io.consensys.tuweni:tuweni-ssz",         version.ref = "tuweni" }
+tuweni-units        = { module = "io.consensys.tuweni:tuweni-units",       version.ref = "tuweni" }
 
-netty-transport     = { module = "com.github.biafra23.netty-kotlin:netty-transport",               version.ref = "netty-kotlin" }
-netty-codec         = { module = "com.github.biafra23.netty-kotlin:netty-codec",                   version.ref = "netty-kotlin" }
-netty-handler       = { module = "com.github.biafra23.netty-kotlin:netty-handler",                 version.ref = "netty-kotlin" }
+netty-transport     = { module = "io.netty:netty-transport", version.ref = "netty" }
+netty-codec         = { module = "io.netty:netty-codec",     version.ref = "netty" }
+netty-handler       = { module = "io.netty:netty-handler",   version.ref = "netty" }
 
 bouncycastle        = { module = "org.bouncycastle:bcprov-jdk18on",        version.ref = "bouncycastle" }
 

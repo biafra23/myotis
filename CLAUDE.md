@@ -71,7 +71,7 @@ Key Gradle modules:
 
 ## Key Dependencies
 
-- **Tuweni 2.7.2** (ConsenSys) — RLP encoding, SECP256K1, byte utilities. Fetched from ConsenSys Maven repo.
+- **Tuweni 2.7.2** (upstream `io.consensys.tuweni`, Maven Central; original `org.apache.tuweni` packages) — RLP encoding, SECP256K1, byte utilities.
 - **Netty 4.2.x** — NIO-only (no epoll/kqueue). 4-thread `NioEventLoopGroup` for RLPx.
 - **BouncyCastle** — SECP256K1 crypto provider
 

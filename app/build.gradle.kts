@@ -1,13 +1,3 @@
-// The daemon must run the SAME netty as the Android app: the JitPack
-// netty-kotlin fork, not upstream io.netty. jvm-libp2p (via :consensus) and
-// Besu's netty-bom (via :myotis-evm) would otherwise drag upstream io.netty
-// onto the runtime classpath. Strip it group-wide; the fork (republished under
-// the same io.netty.* package names) is supplied by :consensus and :networking
-// and satisfies every io.netty.* reference at runtime. Mirrors android-app.
-configurations.all {
-    exclude(group = "io.netty")
-}
-
 dependencies {
     implementation(project(":core"))
     implementation(project(":networking"))
@@ -27,9 +17,9 @@ dependencies {
     // the Java or Rust engine per -Dmyotis.engine.
     implementation(project(":myotis-engines"))
     // :app source references io.netty.channel.* (via :networking's RLPxConnector
-    // API). With io.netty excluded group-wide, the fork must be on :app's compile
-    // classpath explicitly (:networking declares it as implementation, so it
-    // isn't exposed transitively). Same fork artifacts as android-app/:consensus.
+    // API); :networking declares netty as implementation, so it isn't exposed
+    // transitively — declare it here for the compile classpath. Gradle's
+    // highest-version conflict resolution keeps the runtime on 4.2.x everywhere.
     implementation(libs.netty.transport)
     implementation(libs.netty.codec)
     implementation(libs.netty.handler)
