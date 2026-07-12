@@ -372,7 +372,10 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 0L,     // totalPausedMs
                 0L,     // lastPauseEpochMs
                 0L,     // lastResumeEpochMs
-                null);  // lastWakeReason
+                null,   // lastWakeReason
+                // Inbound-serve counters: not yet surfaced in the Rust engine's status
+                // JSON — zeros until its telemetry grows the fields.
+                0L, 0L, 0L, 0L);
     }
 
     @Override
