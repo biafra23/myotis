@@ -405,9 +405,11 @@ private fun SettingsTab(
         )
         Text(
             "Off (default): the proven Java engine runs every network. On: prefer the " +
-                "experimental Rust engine where it can serve — it is being built out and " +
-                "currently falls back to the Java engine for hosting. Applies when a " +
-                "network is (re)started, not to already-running networks.",
+                "experimental Rust engine where it can serve (it hosts all networks today), " +
+                "falling back to the Java engine otherwise. Applies when a network is " +
+                "(re)started, not to already-running networks. Note: Rust-hosted networks " +
+                "do NOT idle-sleep yet — they stay always-on regardless of the idle-sleep " +
+                "setting (the Status screen's Sleep row says so per network).",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -480,7 +482,7 @@ private fun StatusTab(
             Text("Node stopped — no data for $primary")
         } else {
             SyncProgressBar(snap)
-            StatusView(snap)
+            StatusView(snap, hostSleeps = settings.supportsIdleSleep())
         }
 
         Spacer(Modifier.height(16.dp))
@@ -608,7 +610,7 @@ private fun OfflineBanner(onOpenNetworkSettings: () -> Unit) {
 }
 
 @Composable
-private fun StatusView(s: NodeSnapshot) {
+private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
     val tz = remember { TimeZone.currentSystemDefault() }
     Column {
         StatusRow("Network", s.network)
@@ -641,11 +643,19 @@ private fun StatusView(s: NodeSnapshot) {
         // Pseudo-sleep observability: how much the node has idle-slept, and when/why it
         // last woke. Foreground (opening the app) is excluded from the "last woke" reason,
         // so this keeps showing the last real request/catch-up wake even as you view it.
+        // Two hosts can't sleep AT ALL — say so instead of a misleading "never slept":
+        // desktop has no idle controller (supportsIdleSleep=false; nothing ever triggers
+        // a pause), and Rust-hosted networks no-op pause() and report constant activity
+        // until Rust pause/resume lands.
         StatusRow(
             "Sleep",
-            if (s.pauseCount == 0) "never slept"
-            else "${formatDuration(s.totalPausedMs)} over ${s.pauseCount} " +
-                if (s.pauseCount == 1) "pause" else "pauses",
+            when {
+                !hostSleeps -> "always on — no idle-sleep controller on this host"
+                s.engine == "rust" -> "always on — Rust engine can't idle-sleep yet"
+                s.pauseCount == 0 -> "never slept"
+                else -> "${formatDuration(s.totalPausedMs)} over ${s.pauseCount} " +
+                    "${if (s.pauseCount == 1) "pause" else "pauses"}"
+            },
         )
         if (s.lastResumeEpochMs > 0) {
             val slept = if (s.lastPauseEpochMs > 0) " · slept ${formatLogTime(s.lastPauseEpochMs, tz)}" else ""
