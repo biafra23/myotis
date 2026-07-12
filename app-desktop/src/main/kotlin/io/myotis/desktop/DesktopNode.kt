@@ -49,8 +49,11 @@ class DesktopNodeController(
 
     private val log = org.slf4j.LoggerFactory.getLogger(DesktopNodeController::class.java)
 
+    // Per-network engine-start stamp driving the UI uptime: stamped on each successful
+    // start (any engine, Java or Rust) and cleared on drop, so the uptime counter restarts
+    // from zero on every network/engine (re)boot — it is NOT the controller's (app's) lifetime.
     // nanoTime, not currentTimeMillis: wall-clock / NTP steps must not skew uptime.
-    private val startNs = System.nanoTime()
+    private val startNsByNetwork = ConcurrentHashMap<String, Long>()
     // Per-network boot locks keyed by CANONICAL name, mirroring Android's NodeService.bootLocks:
     // serialize enable/disable for one network without a global lock, so a slow boot of network
     // A never blocks shutdown or lifecycle ops on B. The engine's registry is thread-safe, so
@@ -116,7 +119,16 @@ class DesktopNodeController(
                     JavaHttpCcipGateway(),
                     null, null,              // engine default logger/clock
                 )
-                val handle = engine.create(config, ports)
+                // create() is all-or-nothing (nothing registered on failure), so on a throw
+                // dropNetwork only forgets the cache instances retained above — leaving them
+                // would hand clearCaches a live-looking instance for a network that never
+                // booted. engine.stop() on an unregistered network is a no-op.
+                val handle = try {
+                    engine.create(config, ports)
+                } catch (t: Throwable) {
+                    dropNetwork(canonical)
+                    throw t
+                }
                 // start() is fault-isolated: false (resources closed) on failure rather than a
                 // throw. Either way, drop the network so a later enable can retry — leaving a
                 // dead entry would report "running" forever and block retries.
@@ -127,6 +139,7 @@ class DesktopNodeController(
                     throw t
                 }
                 if (!ok) dropNetwork(canonical)
+                else startNsByNetwork[canonical] = System.nanoTime() // uptime anchors to THIS start
             }
         }, "desktop-boot-$canonical").apply { isDaemon = true }.start()
     }
@@ -136,6 +149,7 @@ class DesktopNodeController(
         engine.stop(canonical)
         peerCaches.remove(canonical)
         clPeerCaches.remove(canonical)
+        startNsByNetwork.remove(canonical) // next start re-anchors uptime
     }
 
     override fun disableNetwork(name: String) {
@@ -165,6 +179,7 @@ class DesktopNodeController(
         // the stopped-chain purge path rather than clear()ing a closed instance.
         peerCaches.clear()
         clPeerCaches.clear()
+        startNsByNetwork.clear() // symmetry with dropNetwork: no stamp outlives its stack
     }
 
     override fun setTargetSnapPeers(target: Int) {
@@ -254,7 +269,7 @@ class DesktopNodeController(
     override fun snapshots(): Flow<Map<String, NodeSnapshot>> = flow {
         while (true) {
             emit(engine.hostedNetworks().mapNotNull { name ->
-                engine.get(name)?.let { name to snapshotOf(it) }
+                engine.get(name)?.let { name to snapshotOf(name, it) }
             }.toMap())
             delay(2000)
         }
@@ -295,7 +310,7 @@ class DesktopNodeController(
         }, "myotis-rust-logs").apply { isDaemon = true }.start()
     }
 
-    private fun snapshotOf(handle: ChainHandle): NodeSnapshot {
+    private fun snapshotOf(network: String, handle: ChainHandle): NodeSnapshot {
         val s = handle.status()
         // Live counts parsed from the cache FILES (the cross-engine truth; the
         // Rust engine writes them directly). Memoized on (mtime, size).
@@ -333,7 +348,10 @@ class DesktopNodeController(
             syncCurrentPeriod = s.syncCurrentPeriod(),
             syncTargetPeriod = s.syncTargetPeriod(),
             verifiedHeadAgeMs = s.verifiedHeadAgeMs(),
-            uptimeSeconds = (System.nanoTime() - startNs) / 1_000_000_000L,
+            // hostedNetworks() keys are canonical (create() canonicalizes), matching the
+            // boot path's startNsByNetwork key — no re-canonicalization needed here.
+            uptimeSeconds = startNsByNetwork[network]
+                ?.let { (System.nanoTime() - it) / 1_000_000_000L } ?: 0L,
             readyPeerList = s.readyPeerList().map { PeerRow(it.remoteAddress(), it.snapSupported(), it.clientId()) },
             pauseCount = s.pauseCount(),
             totalPausedMs = s.totalPausedMs(),
