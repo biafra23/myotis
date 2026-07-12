@@ -474,6 +474,12 @@ public final class ChainStack {
     public NetworkConfig network() { return network; }
     public ChainPorts ports() { return ports; }
     public boolean isRunning() { return phase.get() == RUNNING; }
+
+    /** LC hunt engaged on the beacon light client (starved of LC servers). */
+    public boolean lcHunting() {
+        BeaconLightClient b = beaconLightClient;
+        return b != null && b.isHunting();
+    }
     public LifecycleState lifecycle() { return phase.get(); }
     public RLPxConnector connector() { return connector; }
     public DiscV4Service discV4() { return discV4; }

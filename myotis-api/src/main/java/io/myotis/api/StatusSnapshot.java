@@ -39,6 +39,10 @@ import java.util.List;
  * @param lastResumeEpochMs     wall-clock ms of the most recent DEMAND wake; 0 if none
  *                              (a foreground/observation wake does not update this)
  * @param lastWakeReason        {@link WakeReason} tag of the most recent demand wake; null if none
+ * @param lcHunting             LC hunt engaged: the beacon light client is starved of
+ *                              light-client servers and is aggressively discovering/probing
+ *                              for new ones (bootstrap stall, starved catch-up, or finality
+ *                              starvation)
  */
 public record StatusSnapshot(
         boolean running,
@@ -69,5 +73,6 @@ public record StatusSnapshot(
         long totalPausedMs,
         long lastPauseEpochMs,
         long lastResumeEpochMs,
-        String lastWakeReason) {
+        String lastWakeReason,
+        boolean lcHunting) {
 }

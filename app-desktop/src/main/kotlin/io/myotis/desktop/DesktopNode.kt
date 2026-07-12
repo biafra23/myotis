@@ -379,6 +379,7 @@ class DesktopNodeController(
             lastPauseEpochMs = s.lastPauseEpochMs(),
             lastResumeEpochMs = s.lastResumeEpochMs(),
             lastWakeReason = s.lastWakeReason(),
+            lcHunting = s.lcHunting(),
         )
     }
 }

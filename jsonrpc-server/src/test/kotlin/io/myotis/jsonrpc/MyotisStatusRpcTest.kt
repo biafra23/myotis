@@ -63,6 +63,7 @@ class MyotisStatusRpcTest {
         /* lastPauseEpochMs */ 111L,
         /* lastResumeEpochMs */ 222L,
         lastWakeReason,
+        /* lcHunting */ false,
     )
 
     private fun beaconStatus(

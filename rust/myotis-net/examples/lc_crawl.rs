@@ -64,7 +64,7 @@ async fn main() {
     let wall_slot = |cfg: &ChainConfig| -> u64 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         now.saturating_sub(cfg.genesis_time) / cfg.seconds_per_slot.max(1)
     };

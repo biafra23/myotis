@@ -238,7 +238,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
             int backedOffPeers,
             int blacklistedPeers,
             long optimisticBlockNumber,
-            long finalizedBlockNumber) {
+            long finalizedBlockNumber,
+            boolean lcHunting) {
 
         static ParsedStatus parse(String json) {
             if (json == null || json.isBlank()) return notRunning();
@@ -263,7 +264,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                         o.getInt("backedOffPeers", 0),
                         o.getInt("blacklistedPeers", 0),
                         o.getLong("optimisticBlockNumber", 0L),
-                        o.getLong("finalizedBlockNumber", 0L));
+                        o.getLong("finalizedBlockNumber", 0L),
+                        o.getBoolean("lcHunting", false));
             } catch (RuntimeException e) {
                 throw new EngineException(
                         "malformed status JSON from the Rust engine: " + e.getMessage(), e);
@@ -272,7 +274,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
 
         static ParsedStatus notRunning() {
             return new ParsedStatus(false, BeaconState.STARTING, false, 0L, 0L, 0L, 0L, 0L, 0, 0, -1L,
-                    0, 0, 0, 0, 0, 0L, 0L);
+                    0, 0, 0, 0, 0, 0L, 0L, false);
         }
     }
 
@@ -372,7 +374,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 0L,     // totalPausedMs
                 0L,     // lastPauseEpochMs
                 0L,     // lastResumeEpochMs
-                null);  // lastWakeReason
+                null,   // lastWakeReason
+                s.lcHunting());
     }
 
     @Override

@@ -129,6 +129,11 @@ public class BeaconLightClient implements AutoCloseable {
         this.huntBoostListener = listener;
     }
 
+    /** Whether the LC hunt is currently engaged (drives the hosts' status banner). */
+    public boolean isHunting() {
+        return hunting;
+    }
+
     /** Store-progress tracking for the starved-catch-up trigger; sync-loop
      *  thread only. Any advance of (period, finalized slot) resets the clock. */
     private long huntLastProgressNanos = System.nanoTime();
@@ -166,7 +171,9 @@ public class BeaconLightClient implements AutoCloseable {
      *  transition. Never throws (a hook failure must not kill the sync loop). */
     private void updateHunting(long syncStartNanos) {
         long sinceStartMs = (System.nanoTime() - syncStartNanos) / 1_000_000L;
-        long wallSlot = (System.currentTimeMillis() / 1000 - clGenesisTime)
+        // Clamp at 0: a badly-set clock (behind genesis) must degrade to
+        // "slot 0 / no hunt", never a negative slot (Rust: saturating_sub).
+        long wallSlot = Math.max(0L, System.currentTimeMillis() / 1000 - clGenesisTime)
                 / Math.max(1, secondsPerSlot);
         // Read the freshest of store/syncState: after a late-BLS "heal" win
         // the store can lead syncState for one cycle, and lagging would
@@ -174,7 +181,10 @@ public class BeaconLightClient implements AutoCloseable {
         long finalizedSlot = store.isInitialized()
                 ? Math.max(store.getFinalizedSlot(), syncState.getFinalizedSlot())
                 : syncState.getFinalizedSlot();
-        long period = syncState.getCurrentSyncCommitteePeriod();
+        long period = store.isInitialized()
+                ? Math.max(store.getCurrentSyncCommitteePeriod(),
+                           syncState.getCurrentSyncCommitteePeriod())
+                : syncState.getCurrentSyncCommitteePeriod();
         if (period != huntLastSeenPeriod || finalizedSlot != huntLastSeenFinalizedSlot) {
             huntLastSeenPeriod = period;
             huntLastSeenFinalizedSlot = finalizedSlot;

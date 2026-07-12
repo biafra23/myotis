@@ -362,6 +362,8 @@ pub struct SyncStatus {
     pub discv5_table_size: usize,
     /// Period this run's catch-up started from; -1 until bootstrap/resume.
     pub sync_start_period: i64,
+    /// LC hunt engaged (starved of light-client servers — see hunt_due).
+    pub hunting: bool,
 }
 
 impl SyncStatus {
@@ -378,6 +380,7 @@ impl SyncStatus {
             served_peers_last_min: 0,
             discv5_table_size: 0,
             sync_start_period: -1,
+            hunting: false,
         }
     }
 }
@@ -736,8 +739,9 @@ impl PeerPool {
             return Vec::new();
         }
         let now = Instant::now();
-        let fresh =
-            |id: &PeerId| probed.get(id).is_none_or(|t| now.duration_since(*t) >= reprobe);
+        let fresh = |id: &PeerId| {
+            probed.get(id).is_none_or(|t| now.saturating_duration_since(*t) >= reprobe)
+        };
         let mut out: Vec<Peer> = Vec::with_capacity(n);
         let start = self.sweep % self.peers.len();
         self.sweep = self.sweep.wrapping_add(n);
@@ -901,7 +905,7 @@ async fn run_sync(
                     // catch-up apply, hiding the resume from the UI and from
                     // on-device forensics.
                     refresh_local_status(&config, &processor, &local_status);
-                    publish_status(&config, &client, &processor, &pool, &status_tx, &anchor).await;
+                    publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, false).await;
                 }
                 Some(_) => tracing::info!(
                     "persisted snapshot not newer than the embedded checkpoint — bootstrapping fresh"),
@@ -987,7 +991,7 @@ async fn run_sync(
             if bootstrapped {
                 persist_snapshot(&config, &processor, &mut last_persisted_period);
                 refresh_local_status(&config, &processor, &local_status);
-                publish_status(&config, &client, &processor, &pool, &status_tx, &anchor).await;
+                publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, hunting).await;
             } else {
                 if hunting {
                     // Pre-bootstrap the finality probe still classifies: a
@@ -1016,7 +1020,7 @@ async fn run_sync(
             }
             let poisoned = catch_up(&config, &client, &mut pool, &mut processor, &status_tx,
                 &mut peer_rx, &mut staged_updates, &mut clcache, &mut resume,
-                &mut last_persisted_period, &anchor, &hunt_confirmed)
+                &mut last_persisted_period, &anchor, &hunt_confirmed, hunting)
                 .await;
             // Batch-persist every cache verdict from the catch-up rounds in
             // one write, OFF the per-peer hot path (review: no blocking I/O
@@ -1050,7 +1054,7 @@ async fn run_sync(
                 // Publish the reset immediately: without this the status watch
                 // keeps the DISCARDED snapshot's CATCHING_UP periods frozen on
                 // screen for the whole re-bootstrap.
-                publish_status(&config, &client, &processor, &pool, &status_tx, &anchor).await;
+                publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, hunting).await;
                 continue;
             }
             // Backstop only: catch_up persists each applied period itself,
@@ -1058,7 +1062,7 @@ async fn run_sync(
             // with an unpersisted advance.
             persist_snapshot(&config, &processor, &mut last_persisted_period);
             refresh_local_status(&config, &processor, &local_status);
-            publish_status(&config, &client, &processor, &pool, &status_tx, &anchor).await;
+            publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, hunting).await;
             if spec::compute_sync_committee_period(config.current_slot_estimate())
                 > processor.store.current_period()
             {
@@ -1089,7 +1093,7 @@ async fn run_sync(
         // No-op unless the period advanced (force-rotate can move it here too).
         persist_snapshot(&config, &processor, &mut last_persisted_period);
         refresh_local_status(&config, &processor, &local_status);
-        publish_status(&config, &client, &processor, &pool, &status_tx, &anchor).await;
+        publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, hunting).await;
 
         tokio::time::sleep(Duration::from_secs(config.seconds_per_slot)).await;
     }
@@ -1462,6 +1466,7 @@ async fn catch_up(
     last_persisted_period: &mut u64,
     anchor: &ExecAnchor,
     hunt_confirmed: &HashSet<PeerId>,
+    hunting: bool,
 ) -> bool {
     let mut idle_rounds = 0u32;
     // Exponential pause after fruitless rounds: hammering the whole pool every
@@ -1721,7 +1726,7 @@ async fn catch_up(
                     clcache.record_served(&key, before_period, before_period);
                 }
                 persist_snapshot(config, processor, last_persisted_period);
-                publish_status(config, client, processor, &*pool, status_tx, anchor).await;
+                publish_status(config, client, processor, &*pool, status_tx, anchor, hunting).await;
                 tokio::task::yield_now().await;
             }
             tracing::info!(applied, staged = staged.len(),
@@ -1735,7 +1740,7 @@ async fn catch_up(
                 // is what keeps an Android kill (reinstall, OOM, user swipe)
                 // from losing every verified period since bootstrap
                 // (observed: 4 periods re-verified after a reinstall).
-                publish_status(config, client, processor, &*pool, status_tx, anchor).await;
+                publish_status(config, client, processor, &*pool, status_tx, anchor, hunting).await;
                 persist_snapshot(config, processor, last_persisted_period);
             }
             idle_rounds = 0;
@@ -1962,7 +1967,7 @@ async fn hunt_round(
     // Bound the map: starved runs hunt every cycle and discovery keeps
     // feeding; entries past the re-probe window are dead weight.
     if probed.len() > 4096 {
-        probed.retain(|_, t| now.duration_since(*t) < HUNT_REPROBE);
+        probed.retain(|_, t| now.saturating_duration_since(*t) < HUNT_REPROBE);
     }
     let attempted = peers.len();
     let mut in_flight: FuturesUnordered<_> = peers
@@ -2010,7 +2015,13 @@ async fn hunt_round(
                     newly_confirmed += 1;
                 }
                 clcache.mark_lc(&addr);
-                if processor.process_finality_update(&update) {
+                // Skip the BLS verify once a winner applied this round — it's
+                // the expensive step (~17s/update on Android/ART) and the
+                // starvation is already over; a decodable response was enough
+                // to harvest the lc confirm above. Stragglers stay
+                // lc-confirmed, not proven — the same speculative-loser rule
+                // as poll_finality's early break.
+                if !applied && processor.process_finality_update(&update) {
                     // Verified apply — the same full-win treatment as a
                     // poll_finality winner.
                     pool.mark_proven(peer.id);
@@ -2109,6 +2120,7 @@ async fn publish_status(
     pool: &PeerPool,
     status_tx: &watch::Sender<SyncStatus>,
     anchor: &ExecAnchor,
+    hunting: bool,
 ) {
     let store = &processor.store;
     update_exec_anchor(store, anchor);
@@ -2139,6 +2151,7 @@ async fn publish_status(
             .discv5_table_size
             .load(std::sync::atomic::Ordering::Relaxed),
         sync_start_period: pool.sync_start_period,
+        hunting,
     };
     let _ = status_tx.send(status);
 }

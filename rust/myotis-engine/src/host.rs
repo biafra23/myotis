@@ -1067,6 +1067,9 @@ fn status_object(
     obj.insert("servedPeersLastMinute".into(), s.served_peers_last_min.into());
     obj.insert("discv5TableSize".into(), s.discv5_table_size.into());
     obj.insert("syncStartPeriod".into(), s.sync_start_period.into());
+    // LC hunt engaged (starved of light-client servers) — drives the hosts'
+    // hunt banner on the Status screen.
+    obj.insert("lcHunting".into(), s.hunting.into());
     obj.insert("finalizedRootHex".into(), hex32(&s.finalized_root).into());
     // EL pool/discovery counts (the Rust engine's execution-layer side). The
     // pool keeps only snap-capable READY peers, so readyPeers == snapPeers.
@@ -1094,7 +1097,7 @@ const NOT_STARTED_FALLBACK: &str = concat!(
     r#"{"running":false,"network":"mainnet","beaconState":"STARTING","#,
     r#""bootstrapped":false,"finalizedSlot":0,"optimisticSlot":0,"#,
     r#""currentPeriod":0,"targetPeriod":0,"peerCount":0,"servedPeersLastMinute":0,"#,
-    r#""discv5TableSize":0,"syncStartPeriod":-1,"#,
+    r#""discv5TableSize":0,"syncStartPeriod":-1,"lcHunting":false,"#,
     r#""finalizedRootHex":"0000000000000000000000000000000000000000000000000000000000000000","#,
     r#""snapPeers":0,"readyPeers":0,"discoveredPeers":0,"attemptedDials":0,"#,
     r#""backedOffPeers":0,"blacklistedPeers":0,"optimisticBlockNumber":0,"#,
@@ -1183,6 +1186,7 @@ mod tests {
             served_peers_last_min: 3,
             discv5_table_size: 12,
             sync_start_period: 1777,
+            hunting: false,
         };
         let el = ElCounts {
             snap_peers: 5,
@@ -1245,6 +1249,7 @@ mod tests {
             served_peers_last_min: 3,
             discv5_table_size: 12,
             sync_start_period: 1777,
+            hunting: false,
         };
         let v: serde_json::Value =
             serde_json::from_str(&status_object(true, Some(s), 1770, ElCounts::default())).unwrap();
