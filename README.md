@@ -15,11 +15,14 @@ A built-in **JSON-RPC server** exposes a verified subset of the Ethereum API ove
 
 Built in Java 21 on the [tuweni](https://github.com/apache/incubator-tuweni) libraries (RLP, SECP256K1, byte utilities; via a Kotlin-rewrite fork), with in-house SSZ and Merkle-Patricia verification, a pure-Java BLS verifier, and an embedded Hyperledger Besu EVM. JVM 17 bytecode where the Android consumer needs it; long-term direction is Kotlin + Compose Multiplatform.
 
+There are now **two interchangeable engines** behind the same zero-dependency API (`:myotis-api`): the original **Java engine** and a **Rust engine** (`rust/` Cargo workspace — discv4/discv5, RLPx, eth/66-69, snap/1, beacon light client, revm-based EVM, ENS + CCIP-Read, multichain). Hosts pick one per network via the `:myotis-engines` selector (`myotis.engine=java|rust|auto`, default `java`; `-Pengine=…` on run tasks, a Settings toggle in the apps). Behavioral parity is pinned by shared conformance vectors and golden tests on both sides — see [Engines](#engines-java-and-rust).
+
 ## Documentation
 
 - [Architecture](docs/architecture-doc.md) — Describes the target design for how the library will obtain and cryptographically verify all Ethereum data without relying on JSON-RPC providers; not all parts are implemented yet.
 - [Benefits](docs/benefits-doc.md) — Explains why a trustless wallet matters and what risks centralized RPC providers pose to users.
 - [Implementation Status](docs/implementation-status.md) — Current implementation progress and what remains to be done.
+- [Readiness & Verified Head Age](docs/readiness-and-verified-head-age.md) — When the node counts as synced and ready to answer queries, and what the "verified head age" on the Status screen means.
 - [Re-Implementation Specification](docs/reimplementation/README.md) — A language-agnostic spec for rebuilding Myotis (everything except the Android-specific host) as a cross-platform engine in Go or Rust, consumable from Desktop, Android, and iOS apps.
 
 ## Wallet API — verified JSON-RPC over HTTP
@@ -109,7 +112,7 @@ Build a native installer for the host OS with jpackage. **jpackage is host-OS-bo
 ./gradlew :app-desktop:runDistributable
 ```
 
-The bundle embeds a full Java 21 runtime (the `:networking`/`:myotis-evm` backend ships Java-21 classes and reaches JDK modules reflectively, so the whole module graph is included). Packaged builds currently ship the Java engine; the Rust engine is loaded only on the `run`/`syncSmoke` dev tasks until the packaging PR bundles the native lib. Logs roll under `~/.myotis/logs`; the app's log level comes from the `myotis.log.level` JVM system property (default `INFO`). Note that a `-D` flag on a `./gradlew :app-desktop:run` command line reaches the Gradle JVM, not the app — for a packaged app, edit the `java-options` in the bundle's generated `Myotis.cfg`.
+The bundle embeds a full Java 21 runtime (the `:networking`/`:myotis-evm` backend ships Java-21 classes and reaches JDK modules reflectively, so the whole module graph is included). Packaged builds (dmg/deb/`runDistributable`) **bundle the Rust engine** as an app resource — packaging fails loudly if cargo isn't available, so an installed app can always switch engines. Logs roll under `~/.myotis/logs`; the app's log level comes from the `myotis.log.level` JVM system property (default `INFO`). Note that a `-D` flag on a `./gradlew :app-desktop:run` command line reaches the Gradle JVM, not the app — for a packaged app, edit the `java-options` in the bundle's generated `Myotis.cfg`.
 
 ### Desktop daemon
 
@@ -722,10 +725,33 @@ The light client syncs from the **beacon chain P2P network** (libp2p) -- fully d
 
 > **Debug only (not for production):** During development, the light client can also seed initial state from a local beacon node's HTTP API (e.g. Lighthouse on `http://localhost:5052`). This is a convenience fallback for debugging and will not be part of a future release. Helper scripts: `scripts/lighthouse.sh`, `scripts/lodestar.sh`.
 
+## Engines: Java and Rust
+
+Myotis is mid-migration from a single Java implementation to a **Rust engine** that reimplements the whole verification stack natively. Both engines live behind the same contract and are interchangeable per network at (re)start:
+
+- **The contract** is `:myotis-api` — zero-dependency Java-17 interfaces (`MyotisEngine`/`ChainHandle`, FFI-portable types only). Hosts (Android app, desktop app, daemon) consume *only* this API and never import engine internals.
+- **The Java engine** is the original implementation (`node-core` adapters over the `networking`/`consensus`/`myotis-evm` modules).
+- **The Rust engine** is the `rust/` Cargo workspace (`myotis-core`, `myotis-net`, `myotis-consensus`, `myotis-bls`, `myotis-evm`, `myotis-engine`): discv4 + discv5 discovery, RLPx/eth/snap, the beacon light client with BLS via blst, a revm-based EVM with the same snap-proof state oracle, ENS incl. CCIP-Read, and multichain (mainnet, Sepolia, Gnosis). It reaches the JVM through hand-written JNI; compound values cross as JSON, pinned by golden tests on both sides.
+- **Selection**: the `:myotis-engines` selector (`Engines.engine()`) routes each network to an engine via the `myotis.engine` property — `java` (default), `rust`, or `auto`. On run tasks use `-Pengine=rust`; in the apps it's a Settings toggle (applies on network restart). The Status screen shows which engine hosts each network — "Mainnet (r)" vs "(j)".
+- **Parity** is enforced by shared conformance vectors (BLS fixtures, a captured mainnet light-client corpus, the EL verification-ladder vectors) run against both implementations, plus a benchmark gate for the JNI path.
+
+Rust builds are **optional for the pure-Java dev loop**: without cargo the Gradle tasks self-skip and the committed Android jniLibs act as the fallback. Release artifacts don't rely on that fallback — CI builds the Rust engine from source for the APK (`cargoNdkAndroid`) and bundles it into the packaged desktop apps.
+
+```bash
+./gradlew cargoBuildHost    # cargo build --release (auto-runs before :app:run / :consensus:test)
+./gradlew cargoTest         # cargo test --workspace (part of `check`)
+./gradlew cargoNdkAndroid   # Android jniLibs (needs cargo-ndk + NDK)
+./gradlew :app:run -Pengine=rust          # daemon on the Rust engine
+./gradlew :app-desktop:run -Pengine=rust  # desktop GUI on the Rust engine
+```
+
 ## Architecture
 
-Eight Gradle modules:
+Key Gradle modules (plus the `rust/` Cargo workspace):
 
+- **myotis-api** -- the engine contract: zero-dependency interfaces every host consumes exclusively
+- **myotis-engines** -- the engine selector (`Engines.engine()`; `myotis.engine=java|rust|auto`) routing to the Java engine or the Rust one over JNI
+- **node-core** -- the Java engine's adapters (`JavaMyotisEngine`/`JavaChainHandle`) plus the verification ladder over the modules below
 - **core** -- cryptographic identity (`NodeKey`), data types (`BlockHeader`), ENR decoding
 - **networking** -- protocol layers, all Netty-based:
   - `discv4` -- UDP peer discovery (ping/pong/findnode/neighbors)
@@ -737,7 +763,10 @@ Eight Gradle modules:
 - **myotis-evm** -- Hyperledger Besu EVM running against a SNAP-backed `StateOracle`. Powers ENS resolution, `eth_call`, and local gas estimation (`DefaultEvmExecutor.estimateGas` — intrinsic + EVM-metered + 15% safety buffer). Includes `CcipReadEvmExecutor` for ERC-3668 off-chain lookups and `PrefetchingEvmExecutor` (multi-hop speculative prefetch) to amortize SNAP round-trips.
 - **myotis-ens** -- ENS resolver (`EnsResolver`, `ReverseLookup`) using the Universal Resolver via the local EVM. Forward and reverse resolution, ENSIP-10 wildcards, ERC-3668 off-chain records.
 - **jsonrpc-server** -- host-agnostic verified JSON-RPC router (Kotlin/Ktor). `RpcRouter` maps the Ethereum API onto a `MyotisRpcBackend` interface that the Android `NodeService` implements against its connector + beacon state. Strict permissionless mode by default; binds loopback only. (Consumed by `android-app`; the daemon uses its own CLI/IPC surface instead.)
+- **rpc-backend** -- the verified RPC backend (`VerifiedRpcBackend`): anchored-head building, serve-stale policy, and the readiness probe (`verifiedHeadAgeMs`) shared by the JSON-RPC server and the hosts
+- **ui** -- shared Compose Multiplatform `NodeScreen` (status, readiness strip, peers, logs, settings) used by both apps
 - **app** -- daemon/CLI entry point, Unix domain socket IPC server, peer caching
+- **app-desktop** -- the Compose desktop GUI over `:ui`, packaged with jpackage (dmg/deb), bundling the Rust engine
 - **android-app** -- the Android wallet node (`NodeService` foreground service). Runs the full devp2p + libp2p stack, the local EVM, and the JSON-RPC server on-device, with Android-native peer/snapshot caching and a Compose UI; persists the sync snapshot, the known-state-root window, and light-client-capable peers for fast warm restarts (~10 s vs. a cold checkpoint bootstrap).
 
 ### Protocol flow
