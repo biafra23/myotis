@@ -96,6 +96,8 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
 
     @Override public void setTargetSnapPeers(int target) { stack.setTargetSnapPeers(target); }
 
+    @Override public void setServedBlockWindow(int blocks) { stack.setServedBlockWindow(blocks); }
+
     @Override
     public void clearPeerState() {
         stack.backoff().clear();

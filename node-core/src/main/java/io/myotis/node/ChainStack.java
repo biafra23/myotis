@@ -170,6 +170,21 @@ public final class ChainStack {
         this.targetSnapPeers = target;
     }
 
+    /** eth/69 served-block window size; applied to the connector's shared
+     *  ServedHeaderWindow when it is built and live via {@link #setServedBlockWindow}. */
+    private volatile int servedBlockWindow =
+            com.jaeckel.ethp2p.networking.eth.EthHandler.DEFAULT_SERVED_BLOCK_WINDOW;
+
+    /** Live-update the eth/69 served-block window (no restart). Clamped to [1, 4096]:
+     *  0/negative would kill header serving entirely, and an unbounded window is an
+     *  archive-node promise a light client can't keep (also a memory knob, ~500 B/header). */
+    public void setServedBlockWindow(int blocks) {
+        int clamped = Math.max(1, Math.min(blocks, 4096));
+        this.servedBlockWindow = clamped;
+        RLPxConnector conn = connector;
+        if (conn != null) conn.servedWindow().setMaxWindow(clamped);
+    }
+
     // -------------------------------------------------------------------------
     // Lifecycle
     // -------------------------------------------------------------------------
@@ -209,6 +224,11 @@ public final class ChainStack {
 
             // 2. RLPx connector + immediate cached / DNS-direct dials.
             this.connector = buildConnector();
+            // Re-apply after publish: a Save racing this build can read connector==null in
+            // setServedBlockWindow (skipping the live apply) after buildConnector already read
+            // the old field value — without this, the new size would sit unapplied until the
+            // next Save. Idempotent when there was no race.
+            this.connector.servedWindow().setMaxWindow(Math.max(1, Math.min(servedBlockWindow, 4096)));
             dialInitialPeers(dnsElEnrs);
 
             // 3. discv4.
@@ -281,6 +301,11 @@ public final class ChainStack {
         log.info("[{}] resuming from pause ({})", network.name(), reason);
         try {
             this.connector = buildConnector();
+            // Re-apply after publish: a Save racing this build can read connector==null in
+            // setServedBlockWindow (skipping the live apply) after buildConnector already read
+            // the old field value — without this, the new size would sit unapplied until the
+            // next Save. Idempotent when there was no race.
+            this.connector.servedWindow().setMaxWindow(Math.max(1, Math.min(servedBlockWindow, 4096)));
             dialInitialPeers(dnsElPool);
             startDiscV4(dnsElPool);          // essential — throws on bind failure
             startDiscV5();                   // non-essential, warn-and-continue
@@ -601,11 +626,15 @@ public final class ChainStack {
     }
 
     private RLPxConnector buildConnector() {
-        return new RLPxConnector(nodeKey, ports.elPort(), network, headers -> {
+        RLPxConnector conn = new RLPxConnector(nodeKey, ports.elPort(), network, headers -> {
             if (!headers.isEmpty()) {
                 log.debug("[{}] {} block header(s) received", network.name(), headers.size());
             }
         }, (address, publicKeyHex, snap) -> peerCache.add(address, publicKeyHex, snap));
+        // Apply a window size set before start(): setServedBlockWindow may have run while
+        // connector was still null (hosts read Settings before booting the stack).
+        conn.servedWindow().setMaxWindow(servedBlockWindow);
+        return conn;
     }
 
     private void dialCachedPeers() {

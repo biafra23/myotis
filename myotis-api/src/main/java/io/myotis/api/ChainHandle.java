@@ -73,6 +73,16 @@ public interface ChainHandle {
     void setTargetSnapPeers(int target);
 
     /**
+     * Live-update the eth/69 served-block window (no restart): how many recent block
+     * headers this node retains and advertises as servable to peers via the EIP-7642
+     * Status range / BlockRangeUpdate. Clamped by the engine at both ends
+     * (currently [1, 4096]: 0 would disable serving; an unbounded window is an
+     * archive-node promise a light client cannot keep).
+     * Engines without an EL treat this as a no-op.
+     */
+    void setServedBlockWindow(int blocks);
+
+    /**
      * Clear the live dial bookkeeping — backoff entries and this session's
      * blacklist — so discovery re-dials from a fresh slate. On-disk peer-cache
      * FILES are host-owned; deleting those is the host's job.

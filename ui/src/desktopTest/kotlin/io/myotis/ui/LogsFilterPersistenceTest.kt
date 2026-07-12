@@ -83,6 +83,7 @@ class LogsFilterPersistenceTest {
         override fun rebootNetwork(name: String) {}
         override fun shutdown() {}
         override fun setTargetSnapPeers(target: Int) {}
+        override fun setServedBlockWindow(blocks: Int) {}
         override fun applyBlsBackend() {}
         override fun applyEngineChoice() {}
         override fun clearCaches(network: String) {}
@@ -103,6 +104,8 @@ class LogsFilterPersistenceTest {
         override fun setRpcPort(network: String, port: Int) {}
         override fun snapTarget(): Int = 3
         override fun setSnapTarget(v: Int) {}
+        override fun servedBlockWindow(): Int = 32
+        override fun setServedBlockWindow(v: Int) {}
         override fun displayName(network: String): String = network
         override fun defaultRpcPort(network: String): Int = 8545
         override fun hasEns(network: String): Boolean = true

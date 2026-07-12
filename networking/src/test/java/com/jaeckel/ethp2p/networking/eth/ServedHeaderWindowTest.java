@@ -84,6 +84,27 @@ class ServedHeaderWindowTest {
     }
 
     @Test
+    void liveShrinkEvictsAndLiveGrowRefills() {
+        // The Settings knob calls setMaxWindow on a live window: shrinking must evict the
+        // tail immediately (the advertised range must never exceed the new cap), growing
+        // widens the cap and the window refills as new headers arrive.
+        ServedHeaderWindow w = new ServedHeaderWindow(10, hash(0), rlp(0));
+        for (long n = 100; n <= 109; n++) w.put(n, hash(n), rlp(n));
+
+        w.setMaxWindow(3);
+        ServedHeaderWindow.Range shrunk = w.advertise(109, hash(109));
+        assertEquals(107, shrunk.earliest());
+        assertEquals(109, shrunk.latest());
+        assertNull(w.getByNumber(106), "shrink evicts below the new cap");
+
+        w.setMaxWindow(5);
+        for (long n = 110; n <= 111; n++) w.put(n, hash(n), rlp(n));
+        ServedHeaderWindow.Range grown = w.advertise(111, hash(111));
+        assertEquals(107, grown.earliest(), "grow keeps survivors and refills forward");
+        assertEquals(111, grown.latest());
+    }
+
+    @Test
     void servesHeldHeadersByNumberAndHashAndAlwaysGenesis() {
         ServedHeaderWindow w = new ServedHeaderWindow(32, hash(0), rlp(0));
         w.put(105, hash(105), rlp(105));

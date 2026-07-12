@@ -105,6 +105,7 @@ public final class NodeService extends Service {
     private static final String K_NETWORK = "network";
     private static final String K_RPC_PORT = "rpcPort";
     private static final String K_SNAP_TARGET = "snapTarget";
+    private static final String K_SERVED_WINDOW = "servedBlockWindow";
     private static final String K_DEEP_POOL = "deepPoolThreshold";
     private static final String K_STRICT_FRESHNESS = "strictStateFreshness";
     private static final String K_NATIVE_BLS = "nativeBls";
@@ -252,6 +253,17 @@ public final class NodeService extends Service {
     public static void setSnapTargetPref(android.content.Context c, int v) {
         prefs(c).edit().putInt(K_SNAP_TARGET, clampInt(v, 1, 128, DEFAULT_SNAP_TARGET)).apply();
     }
+    /** eth/69 served-block window (1-4096, default 32) — recent headers retained and
+     *  advertised as servable to peers. NB clampInt resets OUT-OF-RANGE input to the
+     *  DEFAULT (32) — matching snapTarget's semantics — whereas desktop/ChainStack
+     *  coerce to the nearer bound; within this host, persisted and live values always
+     *  agree because both paths clamp identically. */
+    public static int servedBlockWindow(android.content.Context c) {
+        return clampInt(prefs(c).getInt(K_SERVED_WINDOW, 32), 1, 4096, 32);
+    }
+    public static void setServedBlockWindowPref(android.content.Context c, int v) {
+        prefs(c).edit().putInt(K_SERVED_WINDOW, clampInt(v, 1, 4096, 32)).apply();
+    }
     /** UI readiness "deep pool" threshold (1–128, default 16). */
     public static int deepPoolThreshold(android.content.Context c) {
         return clampInt(prefs(c).getInt(K_DEEP_POOL, DEFAULT_DEEP_POOL), 1, 128, DEFAULT_DEEP_POOL);
@@ -351,6 +363,13 @@ public final class NodeService extends Service {
         this.targetSnapPeers = c;
         setSnapTargetPref(this, c);
         for (ChainHandle h : handles.values()) h.setTargetSnapPeers(c);
+    }
+
+    /** Live-update the eth/69 served-block window (no restart) on every live stack and persist it. */
+    public void setServedBlockWindow(int v) {
+        int c = clampInt(v, 1, 4096, 32);
+        setServedBlockWindowPref(this, c);
+        for (ChainHandle h : handles.values()) h.setServedBlockWindow(c);
     }
 
     /** Currently live networks (a chip per entry), in display order. */
@@ -1471,6 +1490,10 @@ public final class NodeService extends Service {
 
                 ChainHandle handle = ENGINE.create(config, ports);
                 created = handle;
+                // Apply the Settings served-block window before start(): the stack anchors
+                // its ServedHeaderWindow when the connector is built, so the very first
+                // eth/69 Status already advertises the configured size.
+                handle.setServedBlockWindow(servedBlockWindow(this));
                 handles.put(n, handle);
                 if (!handle.start()) {
                     LogBuffer.e(TAG, "[" + n + "] node stack failed to start");
