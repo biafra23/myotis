@@ -11,6 +11,7 @@
 //! `myotis-consensus` clock-free.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -419,6 +420,9 @@ impl SyncHandle {
             bootstrap_enrs: config.bootstrap_enrs.clone(),
             accepted_fork_digests: config.accepted_fork_digests(),
             listen_port: config.discv5_port,
+            // Shared with run_sync's hunt trigger; discovery re-spawns reuse
+            // the same flag, so a boost survives a discv5 restart.
+            hunt_boost: Arc::new(AtomicBool::new(false)),
         };
 
         let exec_anchor = Arc::new(ExecAnchor::new());
@@ -716,6 +720,42 @@ impl PeerPool {
         }
         out
     }
+
+    /// Up to `n` LC-hunt candidates from the UNPROVEN pool tail: skips the
+    /// proven tier (the regular finality fan-out already covers it), proven
+    /// non-servers, and peers probed within the re-probe window. Rotates via
+    /// the same sweep offset as [`Self::candidates`], so consecutive hunt
+    /// rounds walk different pool regions instead of re-hammering the head.
+    fn explore_candidates(
+        &mut self,
+        n: usize,
+        probed: &HashMap<PeerId, Instant>,
+        reprobe: Duration,
+    ) -> Vec<Peer> {
+        if self.peers.is_empty() {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        let fresh =
+            |id: &PeerId| probed.get(id).is_none_or(|t| now.duration_since(*t) >= reprobe);
+        let mut out: Vec<Peer> = Vec::with_capacity(n);
+        let start = self.sweep % self.peers.len();
+        self.sweep = self.sweep.wrapping_add(n);
+        for i in 0..self.peers.len() {
+            if out.len() >= n {
+                break;
+            }
+            let p = &self.peers[(start + i) % self.peers.len()];
+            if self.proven.contains(&p.id)
+                || self.no_lc_updates.contains(&p.id)
+                || !fresh(&p.id)
+            {
+                continue;
+            }
+            out.push(p.clone());
+        }
+        out
+    }
 }
 
 fn parse_static_peer(multiaddr: &str) -> Option<Peer> {
@@ -871,11 +911,41 @@ async fn run_sync(
         }
     }
 
+    // LC hunt state: engaged whenever the chain is starved of light-client
+    // servers (bootstrap stall or finality starvation — see hunt_due). While
+    // engaged, discovery lookups run boosted and each cycle burst-probes the
+    // unproven pool tail; confirmations persist into the CL peer cache so the
+    // next start dials them first.
+    let sync_started = Instant::now();
+    let mut hunt_probed: HashMap<PeerId, Instant> = HashMap::new();
+    let mut hunt_confirmed: HashSet<PeerId> = HashSet::new();
+    let mut hunting = false;
+
     // One loop for all phases: bootstrap (when the store isn't initialized —
     // fresh start OR after a poisoned resume was discarded), catch-up when
     // behind, finality polling in steady state.
     loop {
         drain_discovered(&mut peer_rx, &mut pool);
+
+        let hunt_now = hunt_due(
+            processor.store.is_initialized(),
+            sync_started.elapsed(),
+            config.current_slot_estimate(),
+            processor.store.current_period(),
+            processor.store.finalized_slot(),
+            config.slots_per_epoch,
+        );
+        if hunt_now != hunting {
+            hunting = hunt_now;
+            discovery_cfg.hunt_boost.store(hunting, Ordering::Relaxed);
+            if hunting {
+                tracing::info!(pool = pool.len(),
+                    "LC hunt engaged — starved of light-client servers \
+                     (boosted discovery + unproven-tail probing)");
+            } else {
+                tracing::info!(confirmed = hunt_confirmed.len(), "LC hunt disengaged");
+            }
+        }
 
         if !discovery_up {
             if discovery_retry_in == 0 {
@@ -895,14 +965,29 @@ async fn run_sync(
         }
 
         if !processor.store.is_initialized() {
-            let bootstrapped =
-                try_bootstrap(&config, &client, &mut pool, &mut processor, &mut clcache).await;
+            // Hunting widens the bootstrap fan-out and prefers hunt-confirmed
+            // LC servers (a peer that answered ANY light-client request is the
+            // best bootstrap bet in a starved pool).
+            let fanout = if hunting { 16 } else { 8 };
+            let bootstrapped = try_bootstrap(&config, &client, &mut pool, &mut processor,
+                &mut clcache, fanout, &hunt_confirmed)
+                .await;
             clcache.flush(); // one write per attempt round, win or lose
             if bootstrapped {
                 persist_snapshot(&config, &processor, &mut last_persisted_period);
                 refresh_local_status(&config, &processor, &local_status);
                 publish_status(&config, &client, &processor, &pool, &status_tx, &anchor).await;
             } else {
+                if hunting {
+                    // Pre-bootstrap the finality probe still classifies: a
+                    // decodable response marks the peer lc-confirmed (it can't
+                    // APPLY without a committee, and that's fine — the confirm
+                    // feeds the next bootstrap round's prefer tier).
+                    hunt_round(&client, &mut pool, &mut processor, &mut clcache,
+                        &mut hunt_probed, &mut hunt_confirmed)
+                        .await;
+                    clcache.flush();
+                }
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
@@ -966,10 +1051,19 @@ async fn run_sync(
         }
 
         in_catchup = false; // reaching here means the committee is current
-        if poll_finality(&client, &mut pool, &mut processor, &mut clcache).await {
+        let applied =
+            poll_finality(&client, &mut pool, &mut processor, &mut clcache, &hunt_confirmed)
+                .await;
+        if applied {
             // A finality update verified against the (possibly restored)
             // committee — the snapshot is genuine.
             resume.confirm();
+        } else if hunting {
+            // Starved and the proven/preferred tiers came up dry — burst-probe
+            // the unproven pool tail for new LC servers.
+            hunt_round(&client, &mut pool, &mut processor, &mut clcache,
+                &mut hunt_probed, &mut hunt_confirmed)
+                .await;
         }
         clcache.flush(); // batch any finality-round evictions into one write
         // No-op unless the period advanced (force-rotate can move it here too).
@@ -1044,12 +1138,14 @@ async fn try_bootstrap(
     pool: &mut PeerPool,
     processor: &mut LightClientProcessor,
     clcache: &mut crate::clcache::ClPeerCache,
+    fanout: usize,
+    prefer: &HashSet<PeerId>,
 ) -> bool {
     if pool.is_empty() {
         tracing::info!("bootstrap: no peers yet (waiting on discovery)");
         return false;
     }
-    let peers = pool.candidates(8, false, false, &HashSet::new(), &HashSet::new());
+    let peers = pool.candidates(fanout, false, false, prefer, &HashSet::new());
     tracing::info!(peers = peers.len(), root = %hex_str(&config.checkpoint_root),
         slot = config.checkpoint_slot, "bootstrap: requesting by checkpoint root");
 
@@ -1241,6 +1337,53 @@ const UPDATES_BATCH_MAX: u64 = 128;
 /// wins (Java CATCHUP_FANOUT_MAX is 48; the discovered pool is failure-heavy,
 /// so a wide fan-out is what makes rounds land).
 const CATCHUP_FANOUT: usize = 32;
+
+// ---------------------------------------------------------------------------
+// LC hunt mode — aggressive server discovery when the chain is starved.
+// ---------------------------------------------------------------------------
+
+/// Still un-bootstrapped this long after sync start → hunt. A healthy network
+/// bootstraps in seconds; a minute of failure means the candidate pool holds
+/// no reachable LC server and waiting on the polite lookup cadence won't fix
+/// it (the sepolia starvation incident: 4 fresh servers were discoverable
+/// within minutes once lookups and probing ran aggressively).
+const HUNT_BOOTSTRAP_STALL: Duration = Duration::from_secs(60);
+
+/// Peers probed per hunt round, drawn from the UNPROVEN pool tail — the tier
+/// the regular finality fan-out reaches last. Bounded per ~12 s round so hunt
+/// mode stays a burst, not a flood.
+const HUNT_FANOUT: usize = 24;
+
+/// Don't re-probe the same peer within this window — hunts run every poll
+/// cycle while starved, and a peer that just failed won't recover in 12 s.
+const HUNT_REPROBE: Duration = Duration::from_secs(600);
+
+/// Should the LC hunt run this cycle? Two triggers, both meaning "we are
+/// starved of light-client servers":
+/// - **Bootstrap stall**: the store never initialized and we've been trying
+///   longer than [`HUNT_BOOTSTRAP_STALL`] — bootstrap itself can't find a
+///   server.
+/// - **Finality starvation**: the committee period is current but the
+///   finalized head has aged past the SYNCED freshness slack — catch-up is
+///   done, yet nobody serves us finality updates (the state the status
+///   surface shows as CATCHING_UP at `period X / X`).
+///
+/// Pure function of its inputs so the triggers are unit-testable.
+fn hunt_due(
+    store_initialized: bool,
+    since_sync_start: Duration,
+    wall_slot: u64,
+    store_period: u64,
+    finalized_slot: u64,
+    slots_per_epoch: u64,
+) -> bool {
+    if !store_initialized {
+        return since_sync_start >= HUNT_BOOTSTRAP_STALL;
+    }
+    let wall_period = spec::compute_sync_committee_period(wall_slot);
+    wall_period == store_period
+        && finalized_slot + SYNCED_SLOT_SLACK_EPOCHS * slots_per_epoch < wall_slot
+}
 
 /// Consecutive no-progress rounds before returning to the outer loop (which
 /// refreshes the discovered-peer pool and republishes status). Rounds inside
@@ -1640,8 +1783,12 @@ async fn poll_finality(
     pool: &mut PeerPool,
     processor: &mut LightClientProcessor,
     clcache: &mut crate::clcache::ClPeerCache,
+    hunt_confirmed: &HashSet<PeerId>,
 ) -> bool {
-    let lc_servers = client.lc_update_servers().await;
+    let mut lc_servers = client.lc_update_servers().await;
+    // Hunt-confirmed servers (decodable LC response this run) join the
+    // Identify-confirmed prefer tier — same dial-priority-only trust level.
+    lc_servers.extend(hunt_confirmed.iter().copied());
     // No earliest-slot skip here: finality polling asks for the LATEST update,
     // which every synced peer holds regardless of how far its history is pruned.
     let peers = pool.candidates(16, false, false, &lc_servers, &HashSet::new());
@@ -1730,6 +1877,109 @@ async fn poll_finality(
             clcache.mark_failure(addr);
         }
     }
+    applied
+}
+
+/// One LC-hunt burst: probe up to [`HUNT_FANOUT`] UNPROVEN pool peers with a
+/// `light_client_finality_update` request and harvest every verdict:
+/// - verified apply → full win: proven tier + cache success + `lc` token
+///   (ends the starvation this round);
+/// - decodable but not applied/advancing → `lc`-confirmed: persisted to the
+///   cache and preferred by subsequent poll/bootstrap rounds (dial-priority
+///   only — trust still requires a verified apply, PR #217's rule);
+/// - `UnsupportedProtocol` → `nolc` in pool + cache, never re-probed;
+/// - dial/timeout/garbage → pool failure only. Deliberately NOT a cache
+///   strike: hunt targets are mostly fresh discoveries the cache has never
+///   vouched for, and striking them would churn the file with dead entries.
+///
+/// Returns true when an update verified AND applied.
+async fn hunt_round(
+    client: &ReqRespClient,
+    pool: &mut PeerPool,
+    processor: &mut LightClientProcessor,
+    clcache: &mut crate::clcache::ClPeerCache,
+    probed: &mut HashMap<PeerId, Instant>,
+    confirmed: &mut HashSet<PeerId>,
+) -> bool {
+    let peers = pool.explore_candidates(HUNT_FANOUT, probed, HUNT_REPROBE);
+    if peers.is_empty() {
+        tracing::debug!("LC hunt: no unprobed candidates (waiting on discovery)");
+        return false;
+    }
+    let now = Instant::now();
+    for p in &peers {
+        probed.insert(p.id, now);
+    }
+    // Bound the map: starved runs hunt every cycle and discovery keeps
+    // feeding; entries past the re-probe window are dead weight.
+    if probed.len() > 4096 {
+        probed.retain(|_, t| now.duration_since(*t) < HUNT_REPROBE);
+    }
+    let attempted = peers.len();
+    let mut in_flight: FuturesUnordered<_> = peers
+        .into_iter()
+        .map(|peer| {
+            let client = client.clone();
+            async move {
+                let res = client
+                    .request_raw(peer.id, peer.addr.clone(), protocols::FINALITY_UPDATE, Vec::new())
+                    .await;
+                (peer, res)
+            }
+        })
+        .collect();
+    let mut applied = false;
+    let mut newly_confirmed = 0usize;
+    let mut nolc = 0usize;
+    while let Some((peer, res)) = in_flight.next().await {
+        let raw = match res {
+            Ok(raw) => raw,
+            Err(RequestError::UnsupportedProtocol) => {
+                nolc += 1;
+                pool.mark_no_lc_updates(peer.id);
+                clcache.mark_nolc(&format!("{}/p2p/{}", peer.addr, peer.id));
+                continue;
+            }
+            Err(e) => {
+                if e != RequestError::Shutdown {
+                    pool.note_failure(peer.id);
+                }
+                continue;
+            }
+        };
+        let ssz_payload = match codec::decode_response(&raw, true) {
+            Ok(d) => d.ssz_payload,
+            Err(_) => {
+                pool.note_failure(peer.id);
+                continue;
+            }
+        };
+        match LightClientFinalityUpdate::decode(&ssz_payload) {
+            Ok(update) => {
+                let addr = format!("{}/p2p/{}", peer.addr, peer.id);
+                if confirmed.insert(peer.id) {
+                    newly_confirmed += 1;
+                }
+                clcache.mark_lc(&addr);
+                if processor.process_finality_update(&update) {
+                    // Verified apply — the same full-win treatment as a
+                    // poll_finality winner.
+                    pool.mark_proven(peer.id);
+                    pool.note_served(peer.id);
+                    clcache.note_success(&addr);
+                    applied = true;
+                    tracing::info!(peer = %peer.id,
+                        finalized_slot = processor.store.finalized_slot(),
+                        "LC hunt: finality update applied from new server");
+                }
+            }
+            Err(_) => {
+                pool.note_failure(peer.id);
+            }
+        }
+    }
+    tracing::info!(attempted, newly_confirmed, nolc, applied,
+        "LC hunt round complete");
     applied
 }
 
@@ -2051,6 +2301,61 @@ mod tests {
         // than none — catch_up bounces to rediscovery instead of thrashing).
         let all_skip: HashSet<PeerId> = ids.iter().copied().collect();
         assert!(pool.candidates(4, true, false, &HashSet::new(), &all_skip).is_empty());
+    }
+
+    #[test]
+    fn explore_candidates_targets_the_unproven_unprobed_tail() {
+        let mut pool = PeerPool::new();
+        let mut ids = Vec::new();
+        for i in 0..5u8 {
+            let kp = libp2p::identity::Keypair::generate_secp256k1();
+            let id = kp.public().to_peer_id();
+            ids.push(id);
+            pool.add(id, format!("/ip4/10.0.1.{i}/tcp/9000").parse().unwrap());
+        }
+        pool.mark_proven(ids[0]); // regular poll's tier 1 — hunt skips it
+        pool.mark_no_lc_updates(ids[1]); // proven non-server — hunt skips it
+        let mut probed: HashMap<PeerId, Instant> = HashMap::new();
+        probed.insert(ids[2], Instant::now()); // probed seconds ago — inside window
+
+        let c = pool.explore_candidates(5, &probed, HUNT_REPROBE);
+        let got: HashSet<PeerId> = c.iter().map(|p| p.id).collect();
+        assert!(!got.contains(&ids[0]), "proven excluded");
+        assert!(!got.contains(&ids[1]), "nolc excluded");
+        assert!(!got.contains(&ids[2]), "recently probed excluded");
+        assert!(got.contains(&ids[3]) && got.contains(&ids[4]), "unproven tail included");
+
+        // A peer probed LONGER than the window ago becomes eligible again.
+        probed.insert(ids[2], Instant::now() - HUNT_REPROBE - Duration::from_secs(1));
+        let c = pool.explore_candidates(5, &probed, HUNT_REPROBE);
+        assert!(c.iter().any(|p| p.id == ids[2]), "window expiry re-admits");
+
+        // Exhausted pool (everything probed) returns empty, not a repeat.
+        let now = Instant::now();
+        for id in &ids {
+            probed.insert(*id, now);
+        }
+        assert!(pool.explore_candidates(5, &probed, HUNT_REPROBE).is_empty());
+    }
+
+    #[test]
+    fn hunt_due_triggers() {
+        let epoch = 32u64;
+        let slack = SYNCED_SLOT_SLACK_EPOCHS * epoch; // 160 slots
+        let wall = 10_000_000u64;
+        let period = spec::compute_sync_committee_period(wall);
+
+        // Bootstrap stall: only after the stall window.
+        assert!(!hunt_due(false, Duration::from_secs(10), wall, 0, 0, epoch));
+        assert!(hunt_due(false, HUNT_BOOTSTRAP_STALL, wall, 0, 0, epoch));
+
+        // Finality starvation: period current + finalized older than slack.
+        assert!(hunt_due(true, Duration::ZERO, wall, period, wall - slack - 1, epoch));
+        // Fresh finality → no hunt.
+        assert!(!hunt_due(true, Duration::ZERO, wall, period, wall - 64, epoch));
+        // Period behind wall clock → catch-up territory, not the hunt's
+        // (catch-up has its own wide fan-out; hunting would double-dial).
+        assert!(!hunt_due(true, Duration::ZERO, wall, period - 1, wall - slack - 1, epoch));
     }
 
     #[test]

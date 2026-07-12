@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use discv5::enr::{CombinedKey, CombinedPublicKey, EnrPublicKey, NodeId};
@@ -41,6 +41,12 @@ pub struct DiscoveryConfig {
     pub accepted_fork_digests: Vec<[u8; 4]>,
     /// UDP port to bind. 0 lets the OS pick.
     pub listen_port: u16,
+    /// LC-hunt escalation flag, shared with the sync loop: while `true`,
+    /// lookup rounds run back-to-back (short sleep) instead of the polite
+    /// steady-state cadence, so the pool fills with fresh candidates fast when
+    /// the chain is starved of light-client servers. Cleared by the sync loop
+    /// the moment finality flows again.
+    pub hunt_boost: Arc<AtomicBool>,
 }
 
 /// Spawn the discovery task. Discovered, fork-matched peers stream out on the
@@ -96,6 +102,7 @@ pub async fn spawn(
         config.accepted_fork_digests,
         bootnodes,
         Arc::clone(&table_size),
+        config.hunt_boost,
         tx,
     ));
     Ok((task, table_size))
@@ -106,6 +113,7 @@ async fn run_lookups(
     accepted_digests: Vec<[u8; 4]>,
     bootnodes: Vec<Enr>,
     table_size: Arc<AtomicUsize>,
+    hunt_boost: Arc<AtomicBool>,
     tx: mpsc::Sender<DiscoveredPeer>,
 ) {
     let mut seen: HashSet<NodeId> = HashSet::new();
@@ -164,7 +172,12 @@ async fn run_lookups(
         if tx.is_closed() {
             return;
         }
-        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        // LC hunt: when the sync loop is starved of light-client servers it
+        // flips hunt_boost and lookups run near back-to-back — each random-
+        // target FINDNODE walks a different DHT region, so cadence is the
+        // enumeration throttle. 15 s is the polite steady-state.
+        let pause = if hunt_boost.load(Ordering::Relaxed) { 2 } else { 15 };
+        tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
         // Bound the dedup set: discovery on mainnet finds thousands of nodes.
         if seen.len() > 16_384 {
             seen.clear();
