@@ -32,11 +32,12 @@ class RustStatusJsonTest {
 
     /** The committed not-started golden shape — byte-for-byte the Rust fallback const. */
     private static final String NOT_STARTED_JSON =
-            "{\"running\":false,\"network\":\"mainnet\",\"beaconState\":\"STARTING\","
+            "{\"running\":false,\"paused\":false,\"network\":\"mainnet\",\"beaconState\":\"STARTING\","
             + "\"bootstrapped\":false,\"finalizedSlot\":0,\"optimisticSlot\":0,"
             + "\"currentPeriod\":0,\"targetPeriod\":0,\"peerCount\":0,\"servedPeersLastMinute\":0,"
             + "\"discv5TableSize\":0,\"syncStartPeriod\":-1,"
             + "\"finalizedRootHex\":\"0000000000000000000000000000000000000000000000000000000000000000\","
+            + "\"elReaderAvailable\":false,"
             + "\"snapPeers\":0,\"readyPeers\":0,\"discoveredPeers\":0,\"attemptedDials\":0,"
             + "\"backedOffPeers\":0,\"blacklistedPeers\":0}";
 
@@ -47,6 +48,7 @@ class RustStatusJsonTest {
             + "\"currentPeriod\":1777,\"targetPeriod\":1795,\"peerCount\":5,\"servedPeersLastMinute\":2,"
             + "\"discv5TableSize\":7,\"syncStartPeriod\":1777,"
             + "\"finalizedRootHex\":\"58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e\","
+            + "\"elReaderAvailable\":true,"
             + "\"snapPeers\":6,\"readyPeers\":6,\"discoveredPeers\":240,\"attemptedDials\":14,"
             + "\"backedOffPeers\":30,\"blacklistedPeers\":66,"
             + "\"optimisticBlockNumber\":21000010,\"finalizedBlockNumber\":20999000,"
@@ -57,10 +59,52 @@ class RustStatusJsonTest {
         Security.addProvider(new BouncyCastleProvider());
     }
 
+    /** The idle-slept shape: running=false + paused=true, the beacon fields frozen
+     *  at pause time (still SYNCED), and all EL counts zero (networking torn down). */
+    private static final String PAUSED_JSON =
+            "{\"running\":false,\"paused\":true,\"network\":\"mainnet\",\"beaconState\":\"SYNCED\","
+            + "\"bootstrapped\":true,\"finalizedSlot\":14560000,\"optimisticSlot\":14560032,"
+            + "\"currentPeriod\":1777,\"targetPeriod\":1795,\"peerCount\":0,\"servedPeersLastMinute\":0,"
+            + "\"discv5TableSize\":0,\"syncStartPeriod\":1777,"
+            + "\"finalizedRootHex\":\"58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e\","
+            + "\"elReaderAvailable\":false,"
+            + "\"snapPeers\":0,\"readyPeers\":0,\"discoveredPeers\":0,\"attemptedDials\":0,"
+            + "\"backedOffPeers\":0,\"blacklistedPeers\":0,"
+            + "\"optimisticBlockNumber\":0,\"finalizedBlockNumber\":0,\"executionBlockNumber\":0}";
+
+    @Test
+    void pausedStatusMapsToPausedLifecycleWithFrozenBeaconFields() {
+        StatusSnapshot s = RustChainHandle.statusFromJson("mainnet", PAUSED_JSON);
+        // The API contract: paused ⇒ running=false, lifecycle=PAUSED.
+        assertFalse(s.running());
+        assertEquals(io.myotis.api.LifecycleState.PAUSED, s.lifecycle());
+        // Warm beacon fields keep showing while asleep (frozen at pause time).
+        assertEquals(BeaconState.SYNCED, s.beaconState());
+        assertEquals(14560000L, s.finalizedSlot());
+        assertEquals(1777L, s.syncCurrentPeriod());
+        assertEquals(1795L, s.syncTargetPeriod());
+        // Networking is down: no snap peers / anchored head → no verified head to age.
+        assertEquals(0, s.snapPeers());
+        assertEquals(Long.MAX_VALUE, s.verifiedHeadAgeMs());
+        // No pause has been driven THROUGH this Java handle (the metrics are
+        // Java-side accounting over pause()/resume() calls, not status parsing).
+        assertEquals(0, s.pauseCount());
+        assertEquals(0L, s.totalPausedMs());
+    }
+
+    @Test
+    void oldShapeWithoutPausedKeyReadsAsStopped() {
+        // An older .so has no "paused" key: not-running parses as STOPPED, never PAUSED.
+        StatusSnapshot s = RustChainHandle.statusFromJson("mainnet",
+                "{\"running\":false,\"network\":\"mainnet\",\"beaconState\":\"STARTING\"}");
+        assertEquals(io.myotis.api.LifecycleState.STOPPED, s.lifecycle());
+    }
+
     @Test
     void notStartedStatusMapsToStartingSnapshot() {
         StatusSnapshot s = RustChainHandle.statusFromJson("mainnet", NOT_STARTED_JSON);
         assertFalse(s.running());
+        assertEquals(io.myotis.api.LifecycleState.STOPPED, s.lifecycle());
         assertEquals("mainnet", s.network());
         assertEquals(BeaconState.STARTING, s.beaconState());
         assertEquals(0, s.connectedPeers());
@@ -210,6 +254,13 @@ class RustStatusJsonTest {
             assertFalse(s.running());
             assertEquals(BeaconState.STARTING, s.beaconState());
             assertEquals("mainnet", s.network());
+
+            // Idle sleep on a created-but-not-started handle: not RUNNING → pause
+            // refuses, not PAUSED → resume refuses, and no accounting accrues.
+            assertFalse(handle.pause());
+            assertFalse(handle.resume());
+            assertEquals(io.myotis.api.LifecycleState.STOPPED, handle.lifecycle());
+            assertEquals(0, handle.status().pauseCount());
 
             // Re-creating an already-hosted network must throw, not silently orphan
             // the live handle's native entry (the double-create leak guard).

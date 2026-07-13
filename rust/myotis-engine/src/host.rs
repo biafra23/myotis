@@ -9,7 +9,12 @@
 //!     nothing runs yet.
 //!   - `start` calls `SyncHandle::start` inside the runtime and swaps the entry
 //!     to `Running(ChainConfig, SyncHandle)`.
-//!   - `status_json` reads the live `SyncStatus` (or the not-started shape).
+//!   - `pause`/`resume` are the idle-sleep pair (the ChainHandle contract's
+//!     PAUSED): pause tears the networking down but keeps the handle (and its
+//!     last status) as `Paused`; resume re-runs the start path, warm-starting
+//!     from the persisted snapshot / peer caches.
+//!   - `status_json` reads the live `SyncStatus` (or the not-started / frozen
+//!     paused shape).
 //!   - `stop` removes the entry and awaits the handle's shutdown.
 //!
 //! PANIC POLICY: the workspace builds with `panic = "abort"`, so `catch_unwind`
@@ -55,6 +60,13 @@ enum ChainEntry {
     /// query can clone it out and run OUTSIDE the handle-map lock (a verified
     /// read can take up to ~60 s for a header-chain walk).
     Running(Arc<ChainConfig>, SyncHandle, Option<Arc<ElReader>>),
+    /// An idle-slept chain (the ChainHandle contract's PAUSED): networking is
+    /// fully torn down (zero sockets, zero timers — the radio can sleep) but the
+    /// handle stays valid and `resume` re-runs the start path, which warm-starts
+    /// from the persisted snapshot / peer caches under the host's dataDir (no
+    /// checkpoint re-bootstrap). Carries the last `SyncStatus` observed at pause
+    /// time so status reads keep reporting the warm beacon fields while asleep.
+    Paused(Arc<ChainConfig>, SyncStatus),
 }
 
 /// The single legitimate engine singleton. Owns the runtime + the handle map;
@@ -143,9 +155,36 @@ pub fn create(network_name: &str, data_dir: &str) -> i64 {
     }
 }
 
+/// Which not-running entry a spin-up expects to transition from: `start` runs a
+/// `Created` handle, `resume` a `Paused` one. The publish step re-checks the SAME
+/// variant, so a racing stop/start/pause can never be silently overwritten.
+#[derive(Clone, Copy, PartialEq)]
+enum SpinUpFrom {
+    Created,
+    Paused,
+}
+
 /// `nativeStart`: start the sync loop for a created handle. Returns true on
-/// success; false for an unknown id, an already-running handle, or a start error.
+/// success; false for an unknown id, an already-running/paused handle, or a
+/// start error.
 pub fn start(handle: i64) -> bool {
+    spin_up(handle, SpinUpFrom::Created)
+}
+
+/// `nativeResume`: rebuild networking for a paused handle (the ChainHandle
+/// contract's resume). Same fault isolation as `start`: on failure the entry
+/// stays `Paused` (retryable). Returns true only when this call moved the
+/// handle Paused → Running; the idempotent already-running semantics live on
+/// the Java side, which owns the sleep accounting.
+pub fn resume(handle: i64) -> bool {
+    spin_up(handle, SpinUpFrom::Paused)
+}
+
+/// The shared start/resume path: build the sync loop + EL reader for a handle
+/// currently in the `from` state and publish it as `Running`. Resume is a real
+/// warm start — `SyncHandle::start` resumes from the persisted snapshot and the
+/// EL pool from its peer cache, so no checkpoint re-bootstrap / cold discovery.
+fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
     let Some(engine) = engine() else {
         return false;
     };
@@ -158,9 +197,10 @@ pub fn start(handle: i64) -> bool {
             Ok(m) => m,
             Err(_) => return false,
         };
-        match map.get(&handle) {
-            Some(ChainEntry::Created(c)) => Arc::clone(c),
-            _ => return false, // unknown id, or already running
+        match (from, map.get(&handle)) {
+            (SpinUpFrom::Created, Some(ChainEntry::Created(c))) => Arc::clone(c),
+            (SpinUpFrom::Paused, Some(ChainEntry::Paused(c, _))) => Arc::clone(c),
+            _ => return false, // unknown id, or not in the expected state
         }
     };
     // SyncHandle::start must run inside the tokio runtime (it spawns tasks).
@@ -211,10 +251,11 @@ pub fn start(handle: i64) -> bool {
         },
         None => None,
     };
-    // Re-lock and publish ONLY if the entry is still the same Created one: a
-    // concurrent stop() may have removed it, or a racing start() may have already
-    // published a Running one, while we were starting. Either way, shut the handle
-    // we just started down rather than orphan its tokio/libp2p host.
+    // Re-lock and publish ONLY if the entry is still the same Created/Paused one
+    // we spun up from: a concurrent stop() may have removed it, or a racing
+    // start()/resume() may have already published a Running one, while we were
+    // starting. Either way, shut the handle we just started down rather than
+    // orphan its tokio/libp2p host.
     let mut map = match engine.handles.lock() {
         Ok(m) => m,
         Err(_) => {
@@ -222,8 +263,9 @@ pub fn start(handle: i64) -> bool {
             return false;
         }
     };
-    match map.get(&handle) {
-        Some(ChainEntry::Created(_)) => {
+    match (from, map.get(&handle)) {
+        (SpinUpFrom::Created, Some(ChainEntry::Created(_)))
+        | (SpinUpFrom::Paused, Some(ChainEntry::Paused(..))) => {
             map.insert(handle, ChainEntry::Running(config, sync, reader));
             true
         }
@@ -233,6 +275,67 @@ pub fn start(handle: i64) -> bool {
             false
         }
     }
+}
+
+/// `nativePause`: idle-sleep a RUNNING handle (the ChainHandle contract's pause):
+/// swap the entry to `Paused` — freezing the last observed `SyncStatus` for the
+/// status reads — then tear the sync loop + EL reader down OUTSIDE the lock.
+/// Warm state survives on disk (the sync loop persists its snapshot as it
+/// verifies; the EL pool persists its peer cache), so `resume` warm-starts.
+/// Returns true only when this call moved the handle Running → Paused (the
+/// idempotent already-paused semantics live on the Java side, which owns the
+/// sleep accounting).
+///
+/// CALLER CONTRACT: pause/resume/start/stop on one handle must not run
+/// concurrently — the `Paused` entry is published BEFORE the async teardown
+/// below finishes, so a resume racing into that window would spin a second
+/// sync loop up against the same snapshot/peer-cache files while the first is
+/// still shutting down. The Java `RustChainHandle` serializes all four on its
+/// lifecycle monitor (they are `synchronized`), which is the only caller.
+pub fn pause(handle: i64) -> bool {
+    let Some(engine) = engine() else {
+        return false;
+    };
+    let (sync, reader) = {
+        let mut map = match engine.handles.lock() {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        // remove-then-reinsert (not get) because the teardown needs OWNERSHIP of
+        // the SyncHandle; a non-Running entry is put back untouched.
+        match map.remove(&handle) {
+            Some(ChainEntry::Running(config, sync, reader)) => {
+                let mut frozen = sync.status();
+                // The frozen status keeps the warm STORE facts (state, slots,
+                // periods) but must not keep live-CONNECTION facts: the libp2p
+                // host and discovery are about to go down, and a paused status
+                // reporting pause-time peer counts would read as live ones.
+                frozen.peer_count = 0;
+                frozen.served_peers_last_min = 0;
+                frozen.discv5_table_size = 0;
+                map.insert(handle, ChainEntry::Paused(config, frozen));
+                (sync, reader)
+            }
+            Some(other) => {
+                map.insert(handle, other);
+                return false; // created-but-not-started, or already paused
+            }
+            None => return false, // unknown id
+        }
+    };
+    // Await the async teardown outside the map lock, like stop().
+    engine.rt.block_on(async move {
+        sync.stop().await;
+        if let Some(reader) = reader {
+            if let Ok(reader) = Arc::try_unwrap(reader) {
+                reader.stop().await;
+            }
+            // An in-flight verified read still holds a clone: its Drop aborts
+            // the reader's tasks when the last Arc goes (same as stop()).
+        }
+    });
+    tracing::info!(handle, "paused (networking torn down; warm state persisted)");
+    true
 }
 
 /// Shut down a started-but-not-published sync handle + reader (the lost-race
@@ -265,6 +368,8 @@ pub fn status_json(handle: i64) -> String {
         // for a created-but-not-started handle — matching the Java engine.
         Created(u64),
         Running(SyncStatus, u64, Option<Arc<ElReader>>),
+        // The status frozen at pause time (warm beacon fields keep showing).
+        Paused(SyncStatus, u64),
         Unknown,
     }
     let snap = {
@@ -277,15 +382,21 @@ pub fn status_json(handle: i64) -> String {
             Some(ChainEntry::Running(config, sync, reader)) => {
                 Snap::Running(sync.status(), config.wall_clock_period(), reader.clone())
             }
+            Some(ChainEntry::Paused(config, frozen)) => {
+                Snap::Paused(frozen.clone(), config.wall_clock_period())
+            }
             None => Snap::Unknown,
         }
     };
     match snap {
-        Snap::Created(wall) => status_object(false, None, wall, ElCounts::default()),
+        Snap::Created(wall) => {
+            status_object(Lifecycle::NotStarted, None, wall, ElCounts::default())
+        }
         Snap::Running(status, wall, reader) => {
             let el = match reader {
                 Some(r) => engine.rt.block_on(async {
                     ElCounts {
+                        reader_available: true,
                         snap_peers: r.snap_peer_count().await,
                         discovered: r.discovered_count(),
                         attempted: r.attempted_count().await,
@@ -297,7 +408,11 @@ pub fn status_json(handle: i64) -> String {
                 }),
                 None => ElCounts::default(),
             };
-            status_object(true, Some(status), wall, el)
+            status_object(Lifecycle::Running, Some(status), wall, el)
+        }
+        // EL counts are zero while paused: the pool/discovery are torn down.
+        Snap::Paused(frozen, wall) => {
+            status_object(Lifecycle::Paused, Some(frozen), wall, ElCounts::default())
         }
         Snap::Unknown => "{}".to_string(),
     }
@@ -307,6 +422,11 @@ pub fn status_json(handle: i64) -> String {
 /// not-started handle or when the EL reader failed to start).
 #[derive(Default)]
 struct ElCounts {
+    /// Whether the EL reader is up on this RUNNING handle. False = the reader
+    /// failed to start (the documented CL-only degraded mode): EL queries can
+    /// NEVER succeed until a pause/resume rebuilds it, so the Java wake gate
+    /// fast-fails instead of holding the full wake cap.
+    reader_available: bool,
     snap_peers: usize,
     discovered: usize,
     attempted: usize,
@@ -824,6 +944,7 @@ fn snapshot_reader_evm(
             Ok((Arc::clone(reader), config.chain_id))
         }
         Some(ChainEntry::Running(_, _, None)) => Err("EL reader unavailable on this handle"),
+        Some(ChainEntry::Paused(..)) => Err("handle is paused"),
         Some(ChainEntry::Created(_)) => Err("handle not started"),
         None => Err("unknown handle"),
     }
@@ -843,6 +964,7 @@ fn snapshot_reader(
             config.wall_clock_period(),
         )),
         Some(ChainEntry::Running(_, _, None)) => Err("EL reader unavailable on this handle"),
+        Some(ChainEntry::Paused(..)) => Err("handle is paused"),
         Some(ChainEntry::Created(_)) => Err("handle not started"),
         None => Err("unknown handle"),
     }
@@ -860,6 +982,7 @@ fn snapshot_reader_slots(
             Ok((Arc::clone(reader), s.finalized_slot, s.optimistic_slot))
         }
         Some(ChainEntry::Running(_, _, None)) => Err("EL reader unavailable on this handle"),
+        Some(ChainEntry::Paused(..)) => Err("handle is paused"),
         Some(ChainEntry::Created(_)) => Err("handle not started"),
         None => Err("unknown handle"),
     }
@@ -1033,27 +1156,42 @@ fn hex32(bytes: &[u8; 32]) -> String {
     s
 }
 
+/// Coarse lifecycle of one handle for the status JSON — the native half of the
+/// API's `LifecycleState` (a Created handle reports NotStarted; the map has no
+/// entry at all for a stopped/unknown one, which reads as `"{}"`).
+#[derive(Clone, Copy, PartialEq)]
+enum Lifecycle {
+    NotStarted,
+    Running,
+    Paused,
+}
+
 /// Serialize the status object with EXACTLY the keys the Java `RustChainHandle`
-/// parses (camelCase). `running=false` / `status=None` → the not-started shape.
+/// parses (camelCase). `NotStarted` / `status=None` → the not-started shape;
+/// `Paused` carries the SyncStatus frozen at pause time (warm beacon fields).
 /// Built by hand (not serde) so the key set + ordering is the golden contract
 /// both `status_json_shape` tests pin.
 fn status_object(
-    running: bool,
+    lifecycle: Lifecycle,
     status: Option<SyncStatus>,
     target_period: u64,
     el: ElCounts,
 ) -> String {
     let s = status.unwrap_or_else(SyncStatus::initial);
-    // A not-started handle reports STARTING; a running one maps its live state.
-    let beacon = if running {
-        beacon_state(s.state)
-    } else {
+    // A not-started handle reports STARTING; a running/paused one maps its
+    // live/frozen state.
+    let beacon = if lifecycle == Lifecycle::NotStarted {
         "STARTING"
+    } else {
+        beacon_state(s.state)
     };
-    let bootstrapped = running
+    let bootstrapped = lifecycle != Lifecycle::NotStarted
         && matches!(s.state, SyncState::CatchingUp | SyncState::Synced);
     let mut obj = serde_json::Map::new();
-    obj.insert("running".into(), running.into());
+    obj.insert("running".into(), (lifecycle == Lifecycle::Running).into());
+    // The PAUSED discriminator (running=false, paused=true → the API's PAUSED;
+    // both false → STOPPED). Older Java wrappers ignore the unknown key.
+    obj.insert("paused".into(), (lifecycle == Lifecycle::Paused).into());
     obj.insert("network".into(), "mainnet".into());
     obj.insert("beaconState".into(), beacon.into());
     obj.insert("bootstrapped".into(), bootstrapped.into());
@@ -1070,6 +1208,9 @@ fn status_object(
     obj.insert("finalizedRootHex".into(), hex32(&s.finalized_root).into());
     // EL pool/discovery counts (the Rust engine's execution-layer side). The
     // pool keeps only snap-capable READY peers, so readyPeers == snapPeers.
+    // elReaderAvailable distinguishes "EL warming up" from "EL reader failed to
+    // start" (the CL-only degraded mode) — the wake gate fast-fails the latter.
+    obj.insert("elReaderAvailable".into(), el.reader_available.into());
     obj.insert("snapPeers".into(), el.snap_peers.into());
     obj.insert("readyPeers".into(), el.snap_peers.into());
     obj.insert("discoveredPeers".into(), el.discovered.into());
@@ -1091,11 +1232,12 @@ fn status_object(
 /// The exact not-started shape, used only if serde ever failed (it can't for a
 /// primitive object) — keeps this function total.
 const NOT_STARTED_FALLBACK: &str = concat!(
-    r#"{"running":false,"network":"mainnet","beaconState":"STARTING","#,
+    r#"{"running":false,"paused":false,"network":"mainnet","beaconState":"STARTING","#,
     r#""bootstrapped":false,"finalizedSlot":0,"optimisticSlot":0,"#,
     r#""currentPeriod":0,"targetPeriod":0,"peerCount":0,"servedPeersLastMinute":0,"#,
     r#""discv5TableSize":0,"syncStartPeriod":-1,"#,
     r#""finalizedRootHex":"0000000000000000000000000000000000000000000000000000000000000000","#,
+    r#""elReaderAvailable":false,"#,
     r#""snapPeers":0,"readyPeers":0,"discoveredPeers":0,"attemptedDials":0,"#,
     r#""backedOffPeers":0,"blacklistedPeers":0,"optimisticBlockNumber":0,"#,
     r#""finalizedBlockNumber":0,"executionBlockNumber":0}"#,
@@ -1141,9 +1283,10 @@ mod tests {
     #[test]
     fn not_started_status_shape_is_stable() {
         // The golden not-started object (parsed by the Java RustChainHandle test).
-        let json = status_object(false, None, 0, ElCounts::default());
+        let json = status_object(Lifecycle::NotStarted, None, 0, ElCounts::default());
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
         assert_eq!(v["running"], false);
+        assert_eq!(v["paused"], false);
         assert_eq!(v["network"], "mainnet");
         assert_eq!(v["beaconState"], "STARTING");
         assert_eq!(v["bootstrapped"], false);
@@ -1159,6 +1302,7 @@ mod tests {
             v["finalizedRootHex"],
             "0000000000000000000000000000000000000000000000000000000000000000"
         );
+        assert_eq!(v["elReaderAvailable"], false);
         // EL counts are zero for a not-started handle.
         for k in ["snapPeers", "readyPeers", "discoveredPeers", "attemptedDials",
                   "backedOffPeers", "blacklistedPeers", "optimisticBlockNumber",
@@ -1185,6 +1329,7 @@ mod tests {
             sync_start_period: 1777,
         };
         let el = ElCounts {
+            reader_available: true,
             snap_peers: 5,
             discovered: 240,
             attempted: 14,
@@ -1193,9 +1338,15 @@ mod tests {
             optimistic_block: 21_000_010,
             finalized_block: 20_999_000,
         };
-        let synced: serde_json::Value =
-            serde_json::from_str(&status_object(true, Some(mk(SyncState::Synced)), 1795, el)).unwrap();
+        let synced: serde_json::Value = serde_json::from_str(&status_object(
+            Lifecycle::Running,
+            Some(mk(SyncState::Synced)),
+            1795,
+            el,
+        ))
+        .unwrap();
         assert_eq!(synced["running"], true);
+        assert_eq!(synced["paused"], false);
         assert_eq!(synced["beaconState"], "SYNCED");
         assert_eq!(synced["bootstrapped"], true);
         assert_eq!(synced["finalizedSlot"], 100);
@@ -1209,6 +1360,7 @@ mod tests {
         assert_eq!(synced["finalizedRootHex"], hex32(&[0xab; 32]));
         // EL counts reflect the pool/discovery snapshot (snapPeers drives
         // readyPeers, since the pool holds only snap-capable READY peers).
+        assert_eq!(synced["elReaderAvailable"], true);
         assert_eq!(synced["snapPeers"], 5);
         assert_eq!(synced["readyPeers"], 5);
         assert_eq!(synced["discoveredPeers"], 240);
@@ -1224,11 +1376,71 @@ mod tests {
             (SyncState::Bootstrapping, "SYNCING", false),
             (SyncState::CatchingUp, "CATCHING_UP", true),
         ] {
-            let v: serde_json::Value =
-                serde_json::from_str(&status_object(true, Some(mk(st)), 1795, ElCounts::default())).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&status_object(
+                Lifecycle::Running,
+                Some(mk(st)),
+                1795,
+                ElCounts::default(),
+            ))
+            .unwrap();
             assert_eq!(v["beaconState"], expect);
             assert_eq!(v["bootstrapped"], boot);
         }
+    }
+
+    #[test]
+    fn paused_status_keeps_frozen_beacon_fields() {
+        // A paused handle: running=false + paused=true (the Java side's PAUSED),
+        // the beacon fields frozen at pause time, and all EL counts zero (the
+        // pool/discovery are torn down while asleep).
+        let frozen = SyncStatus {
+            state: SyncState::Synced,
+            finalized_slot: 14_560_000,
+            finalized_root: [0xab; 32],
+            optimistic_slot: 14_560_032,
+            period: 1777,
+            peer_count: 7,
+            served_peers_last_min: 3,
+            discv5_table_size: 12,
+            sync_start_period: 1777,
+        };
+        let v: serde_json::Value = serde_json::from_str(&status_object(
+            Lifecycle::Paused,
+            Some(frozen),
+            1795,
+            ElCounts::default(),
+        ))
+        .unwrap();
+        assert_eq!(v["running"], false);
+        assert_eq!(v["paused"], true);
+        assert_eq!(v["elReaderAvailable"], false);
+        assert_eq!(v["beaconState"], "SYNCED");
+        assert_eq!(v["bootstrapped"], true);
+        assert_eq!(v["finalizedSlot"], 14_560_000);
+        assert_eq!(v["currentPeriod"], 1777);
+        assert_eq!(v["targetPeriod"], 1795);
+        for k in ["snapPeers", "readyPeers", "discoveredPeers", "attemptedDials",
+                  "backedOffPeers", "blacklistedPeers", "optimisticBlockNumber",
+                  "finalizedBlockNumber", "executionBlockNumber"] {
+            assert_eq!(v[k], 0, "{k} should be 0 while paused");
+        }
+    }
+
+    #[test]
+    fn pause_and_resume_reject_unknown_and_not_started_handles() {
+        // Unknown ids: neither transition applies (and nothing panics).
+        assert!(!pause(i64::MIN));
+        assert!(!resume(i64::MIN));
+        // A created-but-never-started handle can't pause (it isn't RUNNING) and
+        // can't resume (it isn't PAUSED) — and stays intact/startable after both.
+        let id = create("mainnet", "");
+        assert!(id >= 1, "create failed: {id}");
+        assert!(!pause(id));
+        assert!(!resume(id));
+        let v: serde_json::Value = serde_json::from_str(&status_json(id)).unwrap();
+        assert_eq!(v["running"], false);
+        assert_eq!(v["paused"], false);
+        stop(id);
     }
 
     #[test]
@@ -1246,8 +1458,13 @@ mod tests {
             discv5_table_size: 12,
             sync_start_period: 1777,
         };
-        let v: serde_json::Value =
-            serde_json::from_str(&status_object(true, Some(s), 1770, ElCounts::default())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&status_object(
+            Lifecycle::Running,
+            Some(s),
+            1770,
+            ElCounts::default(),
+        ))
+        .unwrap();
         assert_eq!(v["currentPeriod"], 1777);
         assert_eq!(v["targetPeriod"], 1777);
     }
