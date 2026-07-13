@@ -677,15 +677,14 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         // Pseudo-sleep observability: how much the node has idle-slept, and when/why it
         // last woke. Foreground (opening the app) is excluded from the "last woke" reason,
         // so this keeps showing the last real request/catch-up wake even as you view it.
-        // Two hosts can't sleep AT ALL — say so instead of a misleading "never slept":
-        // desktop has no idle controller (supportsIdleSleep=false; nothing ever triggers
-        // a pause), and Rust-hosted networks no-op pause() and report constant activity
-        // until Rust pause/resume lands.
+        // Both engines idle-sleep now (the Rust engine pauses/warm-resumes natively);
+        // only a host WITHOUT an idle controller can't sleep at all — say so instead
+        // of a misleading "never slept" (desktop: supportsIdleSleep=false, nothing
+        // ever triggers a pause).
         StatusRow(
             "Sleep",
             when {
                 !hostSleeps -> "always on — no idle-sleep controller on this host"
-                s.engine == "rust" -> "always on — Rust engine can't idle-sleep yet"
                 s.pauseCount == 0 -> "never slept"
                 else -> "${formatDuration(s.totalPausedMs)} over ${s.pauseCount} " +
                     "${if (s.pauseCount == 1) "pause" else "pauses"}"

@@ -66,6 +66,10 @@ final class RustVerifiedReads implements VerifiedReads {
         // at a block > N is not a trust violation — just the standard light-client
         // skew that wallets (MetaMask) tolerate.
         try {
+            // Wake-and-hold first (mirrors GatedVerifiedReads.headBlockNumber): a
+            // request on a paused stack triggers the resume and is held until the
+            // node can answer, rather than serving the frozen pause-time head.
+            if (!handle.awaitReadyForReads()) return null;
             long head = handle.status().optimisticBlockNumber();
             return head > 0 ? head : null;
         } catch (RuntimeException e) {
@@ -77,6 +81,10 @@ final class RustVerifiedReads implements VerifiedReads {
     @Override
     public SyncState syncState() {
         try {
+            // Note activity and kick a wake if paused, but answer NON-blocking from
+            // the (frozen) status — wallets gate on sync state, and holding a status
+            // probe for the full wake would deadlock them (mirrors GatedVerifiedReads).
+            handle.noteActivityAndWake();
             return switch (handle.status().beaconState()) {
                 case SYNCED -> SyncState.SYNCED;
                 case CATCHING_UP -> SyncState.CATCHING_UP;
