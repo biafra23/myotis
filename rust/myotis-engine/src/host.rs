@@ -410,6 +410,7 @@ pub fn status_json(handle: i64) -> String {
                             header_requests_served: h_served,
                             body_requests: b_asked,
                             body_requests_served: b_served,
+                            el_hunting: r.el_hunting(),
                         }
                     }
                 }),
@@ -449,6 +450,9 @@ struct ElCounts {
     header_requests_served: u64,
     body_requests: u64,
     body_requests_served: u64,
+    /// EL hunt engaged: the snap serving pool has been empty past the stall
+    /// window and the pool maintainer is in emergency re-dial mode.
+    el_hunting: bool,
 }
 
 /// `nativeStop`: remove + shut down a handle's sync loop. No-op for unknown id.
@@ -1243,6 +1247,8 @@ fn status_object(
     obj.insert("peerBodyRequests".into(), el.body_requests.into());
     obj.insert("peerBodyRequestsServed".into(), el.body_requests_served.into());
     obj.insert("executionBlockNumber".into(), el.finalized_block.into());
+    // EL hunt flag (snap serving pool empty past the stall window).
+    obj.insert("elHunting".into(), el.el_hunting.into());
     // A hand-built object of primitives always serializes; fall back to the
     // literal not-started shape rather than panic on the (impossible) error.
     serde_json::to_string(&serde_json::Value::Object(obj))
@@ -1260,7 +1266,7 @@ const NOT_STARTED_FALLBACK: &str = concat!(
     r#""elReaderAvailable":false,"#,
     r#""snapPeers":0,"readyPeers":0,"discoveredPeers":0,"attemptedDials":0,"#,
     r#""backedOffPeers":0,"blacklistedPeers":0,"optimisticBlockNumber":0,"#,
-    r#""finalizedBlockNumber":0,"executionBlockNumber":0,"#,
+    r#""finalizedBlockNumber":0,"executionBlockNumber":0,"elHunting":false,"#,
     r#""peerHeaderRequests":0,"peerHeaderRequestsServed":0,"#,
     r#""peerBodyRequests":0,"peerBodyRequestsServed":0}"#,
 );
@@ -1364,6 +1370,7 @@ mod tests {
             header_requests_served: 2,
             body_requests: 1,
             body_requests_served: 0,
+    el_hunting: false,
         };
         let synced: serde_json::Value = serde_json::from_str(&status_object(
             Lifecycle::Running,

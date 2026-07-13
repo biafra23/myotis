@@ -49,6 +49,9 @@ import java.util.List;
  *                              light-client servers and is aggressively discovering/probing
  *                              for new ones (bootstrap stall, starved catch-up, or finality
  *                              starvation)
+ * @param elHunting             EL hunt engaged: the snap serving pool has been empty past
+ *                              the stall window and the peer maintainer is in emergency
+ *                              re-dial mode (backoff bypass for confirmed snap servers)
  */
 public record StatusSnapshot(
         boolean running,
@@ -84,5 +87,6 @@ public record StatusSnapshot(
         long peerHeaderRequestsServed,
         long peerBodyRequests,
         long peerBodyRequestsServed,
-        boolean lcHunting) {
+        boolean lcHunting,
+        boolean elHunting) {
 }

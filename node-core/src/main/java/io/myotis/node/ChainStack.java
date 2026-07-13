@@ -70,6 +70,18 @@ public final class ChainStack {
     private static final int DNS_DIALS_PER_MIN = 60;         // rolling-minute rate cap
     private static final int DNS_POOL_MAX = 600;             // candidate-pool size cap
     private static final long DNS_REFRESH_INTERVAL_MS = 4 * 60 * 1000L;
+    /** EL hunt: the snap SERVING pool has been empty this long → emergency mode.
+     *  Deliberately zero-based, not target-based — on snap-scarce chains (gnosis)
+     *  the target is unreachable and a below-target trigger would hunt forever;
+     *  zero serving is the state where verified reads are actually impossible.
+     *  The hunt bypasses transient backoffs for cache-CONFIRMED snap servers
+     *  (they served chain-verified snap data — wrong-chain impossible), doubles
+     *  the DNS dial budget, and shortens the DNS re-walk interval. The Rust
+     *  engine's pool maintainer applies the same trigger (EL_HUNT_STALL). */
+    static final long EL_HUNT_STALL_MS = 60_000L;
+    /** DNS ENR re-walk interval while the EL hunt is engaged (vs 4 min normally). */
+    private static final long DNS_REFRESH_HUNT_INTERVAL_MS = 60_000L;
+
     /** Max time a verified read arriving on a paused stack is held while the wake completes. */
     public static final long WAKE_WAIT_CAP_MS = 90_000L;
     /** Wake-wait poll interval. */
@@ -107,6 +119,11 @@ public final class ChainStack {
     private volatile long dnsDialWindowStartMs = 0L;
     private final AtomicInteger dnsDialsInWindow = new AtomicInteger(0);
     private volatile ScheduledExecutorService peerMaintainer;
+    /** Wall-clock ms since the snap serving pool went empty; 0 = not empty. Written
+     *  by the maintainer tick, read by {@link #elHunting()} / the status snapshot. */
+    private volatile long snapZeroSinceMs = 0L;
+    /** EL hunt engaged (see EL_HUNT_STALL_MS). Maintainer-tick-updated. */
+    private volatile boolean elHunting = false;
 
     // -- live components (built in start()) ------------------------------------
     /** Inbound-serve counters (peers asking US for headers/bodies). Stack-owned so the
@@ -485,6 +502,17 @@ public final class ChainStack {
     public boolean lcHunting() {
         BeaconLightClient b = beaconLightClient;
         return b != null && b.isHunting();
+    }
+
+    /** EL hunt engaged: snap serving pool empty past the stall window. */
+    public boolean elHunting() {
+        return elHunting;
+    }
+
+    /** Pure trigger for the EL hunt (unit-tested; the Rust pool's el_hunt_due twin):
+     *  serving pool empty AND it has been empty past the stall window. */
+    static boolean elHuntDue(int servingPeers, long zeroSinceMs, long nowMs) {
+        return servingPeers == 0 && zeroSinceMs > 0 && nowMs - zeroSinceMs >= EL_HUNT_STALL_MS;
     }
     public LifecycleState lifecycle() { return phase.get(); }
     public RLPxConnector connector() { return connector; }
@@ -922,8 +950,26 @@ public final class ChainStack {
             RLPxConnector conn = connector;
             if (conn == null) return;
             int snapPeers = conn.activeSnapHandlers().size();
-            if (snapPeers >= targetSnapPeers) return;
             long now = System.currentTimeMillis();
+            // EL hunt bookkeeping: stall clock while the SERVING pool is empty,
+            // trigger + transition logs (Rust maintainer_loop twin).
+            if (snapPeers > 0) {
+                snapZeroSinceMs = 0L;
+                if (elHunting) {
+                    elHunting = false;
+                    log.info("[{}][peers] EL hunt disengaged — snap peer serving again", network.name());
+                }
+            } else if (snapZeroSinceMs == 0L) {
+                snapZeroSinceMs = now;
+            }
+            boolean hunting = elHuntDue(snapPeers, snapZeroSinceMs, now);
+            if (hunting && !elHunting) {
+                elHunting = true;
+                log.info("[{}][peers] EL hunt engaged — snap serving pool empty {}s "
+                        + "(bypassing transient backoffs for confirmed snap servers, "
+                        + "boosted DNS budget)", network.name(), EL_HUNT_STALL_MS / 1000);
+            }
+            if (snapPeers >= targetSnapPeers) return;
             log.info("[{}][peers] {} snap peer(s) < target {}; re-dialing cached + DNS pool",
                     network.name(), snapPeers, targetSnapPeers);
             // 1) Re-dial known snap peers from the cache, proven snap-servers first.
@@ -935,6 +981,13 @@ public final class ChainStack {
             for (CachedPeer p : snapCached) {
                 if (conn.activeSnapHandlers().size() >= targetSnapPeers) break;
                 try {
+                    // Hunting: free a CONFIRMED snap server's transient backoff so
+                    // this pass dials it NOW. Confirmed = it served chain-verified
+                    // snap data, so wrong-chain is impossible; blacklisted node ids
+                    // and unproven peers keep their timers.
+                    if (hunting && p.snapQuality() == SnapQuality.CONFIRMED) {
+                        backoff.remove(p.address().getHostString() + ":" + p.address().getPort());
+                    }
                     dialCachedSnapPeer(conn, p, now);
                 } catch (Exception e) {
                     log.warn("[{}][peers] skipping cached peer: {}", network.name(), e.getMessage());
@@ -944,7 +997,9 @@ public final class ChainStack {
             //    bounded by a per-cycle batch and a rolling-minute rate cap.
             List<Enr> pool = dnsElPool;
             if (!pool.isEmpty() && conn.activeSnapHandlers().size() < targetSnapPeers) {
-                int budget = Math.min(DNS_MAINTAIN_DIAL_BATCH, dnsDialBudget());
+                // Hunting doubles both the per-cycle batch and the rolling-minute cap.
+                int batchCap = hunting ? DNS_MAINTAIN_DIAL_BATCH * 2 : DNS_MAINTAIN_DIAL_BATCH;
+                int budget = Math.min(batchCap, dnsDialBudget(hunting));
                 int dialed = 0;
                 for (Enr enr : pool) {
                     if (dialed >= budget || attempted.size() >= MAX_ATTEMPTED) break;
@@ -960,9 +1015,10 @@ public final class ChainStack {
             }
             // 3) Grow/refresh the candidate pool — only while still below target and no
             //    more often than DNS_REFRESH_INTERVAL_MS.
+            long refreshInterval = hunting ? DNS_REFRESH_HUNT_INTERVAL_MS : DNS_REFRESH_INTERVAL_MS;
             if (conn.activeSnapHandlers().size() < targetSnapPeers
                     && !dnsResolving.get()
-                    && System.currentTimeMillis() - lastDnsResolveMs > DNS_REFRESH_INTERVAL_MS) {
+                    && System.currentTimeMillis() - lastDnsResolveMs > refreshInterval) {
                 Thread t = new Thread(this::refreshDnsPool, "dns-el-refresh-" + network.name());
                 t.setDaemon(true);
                 t.start();
@@ -1022,13 +1078,18 @@ public final class ChainStack {
     }
 
     /** Remaining DNS-pool dials allowed in the current rolling minute (see DNS_DIALS_PER_MIN). */
-    private int dnsDialBudget() {
+    private int dnsDialBudget(boolean hunting) {
+        int cap = hunting ? DNS_DIALS_PER_MIN * 2 : DNS_DIALS_PER_MIN;
+        return Math.max(0, cap - dnsDialsInWindowCount());
+    }
+
+    private int dnsDialsInWindowCount() {
         long now = System.currentTimeMillis();
         if (now - dnsDialWindowStartMs >= 60_000L) {
             dnsDialWindowStartMs = now;
             dnsDialsInWindow.set(0);
         }
-        return Math.max(0, DNS_DIALS_PER_MIN - dnsDialsInWindow.get());
+        return dnsDialsInWindow.get();
     }
 
     /** Dial one DNS-resolved (EIP-1459) EL enode over RLPx — same attempted/backoff/blacklist

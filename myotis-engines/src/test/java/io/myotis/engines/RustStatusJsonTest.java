@@ -49,7 +49,7 @@ class RustStatusJsonTest {
             "{\"running\":true,\"network\":\"mainnet\",\"beaconState\":\"CATCHING_UP\","
             + "\"bootstrapped\":true,\"finalizedSlot\":14560000,\"optimisticSlot\":14560032,"
             + "\"currentPeriod\":1777,\"targetPeriod\":1795,\"peerCount\":5,\"servedPeersLastMinute\":2,"
-            + "\"discv5TableSize\":7,\"syncStartPeriod\":1777,\"lcHunting\":true,"
+            + "\"discv5TableSize\":7,\"syncStartPeriod\":1777,\"lcHunting\":true,\"elHunting\":true,"
             + "\"finalizedRootHex\":\"58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e\","
             + "\"elReaderAvailable\":true,"
             + "\"snapPeers\":6,\"readyPeers\":6,\"discoveredPeers\":240,\"attemptedDials\":14,"
@@ -122,8 +122,9 @@ class RustStatusJsonTest {
         assertEquals(0L, s.optimisticBlockNumber());
         assertEquals(0, s.snapPeers());
         assertEquals(Long.MAX_VALUE, s.verifiedHeadAgeMs());
-        // Older natives omit lcHunting → defaults to false, never throws.
+        // Older natives omit the hunt keys → default to false, never throw.
         assertFalse(s.lcHunting());
+        assertFalse(s.elHunting());
     }
 
     @Test
@@ -145,6 +146,7 @@ class RustStatusJsonTest {
         assertEquals(1777L, s.syncStartPeriod());
         assertEquals(14560000L / 8192L, s.finalizedPeriod());
         assertTrue(s.lcHunting());
+        assertTrue(s.elHunting());
         // EL pool/discovery counts now flow through (not hardcoded 0). The pool
         // holds only snap-capable READY peers, so readyPeers == snapPeers.
         assertEquals(6, s.snapPeers());

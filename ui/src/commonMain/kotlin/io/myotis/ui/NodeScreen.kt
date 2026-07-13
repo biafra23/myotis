@@ -553,9 +553,14 @@ private fun StatusTab(
  *  starvation while the state still reads SYNCED on the Java engine). */
 @Composable
 private fun HuntBanner(s: NodeSnapshot) {
-    if (!s.running || !s.lcHunting) return
+    if (!s.running) return
+    val targets = buildList {
+        if (s.lcHunting) add("light-client servers")
+        if (s.elHunting) add("snap peers")
+    }
+    if (targets.isEmpty()) return
     Text(
-        "Hunting for light-client servers…",
+        "Hunting for ${targets.joinToString(" and ")}…",
         style = MaterialTheme.typography.bodySmall,
         color = Color(0xFFF9A825), // amber — same signal family as "warming up"
         modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)

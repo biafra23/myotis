@@ -382,7 +382,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
             long peerHeaderRequestsServed,
             long peerBodyRequests,
             long peerBodyRequestsServed,
-            boolean lcHunting) {
+            boolean lcHunting,
+            boolean elHunting) {
 
         static ParsedStatus parse(String json) {
             if (json == null || json.isBlank()) return notRunning();
@@ -414,7 +415,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                         o.getLong("peerHeaderRequestsServed", 0L),
                         o.getLong("peerBodyRequests", 0L),
                         o.getLong("peerBodyRequestsServed", 0L),
-                        o.getBoolean("lcHunting", false));
+                        o.getBoolean("lcHunting", false),
+                        o.getBoolean("elHunting", false));
             } catch (RuntimeException e) {
                 throw new EngineException(
                         "malformed status JSON from the Rust engine: " + e.getMessage(), e);
@@ -423,7 +425,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
 
         static ParsedStatus notRunning() {
             return new ParsedStatus(false, false, false, BeaconState.STARTING, false, 0L, 0L, 0L,
-                    0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, false);
+                    0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, false, false);
         }
     }
 
@@ -530,7 +532,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 s.peerHeaderRequestsServed(),
                 s.peerBodyRequests(),
                 s.peerBodyRequestsServed(),
-                s.lcHunting());
+                s.lcHunting(),
+                s.elHunting());
     }
 
     @Override

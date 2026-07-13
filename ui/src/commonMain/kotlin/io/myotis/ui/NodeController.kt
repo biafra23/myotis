@@ -247,6 +247,8 @@ data class NodeSnapshot(
     val lastWakeReason: String?,       // reason of the last demand wake; null if none
     val lcHunting: Boolean = false,    // LC hunt engaged: starved of light-client servers,
                                        // aggressively discovering/probing for new ones
+    val elHunting: Boolean = false,    // EL hunt engaged: snap serving pool empty past the
+                                       // stall window, emergency re-dials running
 )
 
 /** One connected READY peer, for the Status peer list. */
