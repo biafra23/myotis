@@ -95,6 +95,122 @@ public class BeaconLightClient implements AutoCloseable {
      */
     private volatile int secondsPerSlot = BeaconChainSpec.SECONDS_PER_SLOT;
     private volatile int slotsPerEpoch = BeaconChainSpec.SLOTS_PER_EPOCH;
+
+    // -------------------------------------------------------------------------
+    // LC hunt mode — aggressive server discovery when the chain is starved
+    // (the Rust engine's twin lives in sync.rs; triggers and thresholds match).
+    // -------------------------------------------------------------------------
+
+    /** Still un-bootstrapped this long after the sync loop started → hunt. */
+    static final long HUNT_BOOTSTRAP_STALL_MS = 60_000;
+    /** Finalized head older than this many epochs behind wall clock (while the
+     *  committee period is current) → finality starvation → hunt. Matches the
+     *  Rust engine's SYNCED_SLOT_SLACK_EPOCHS. */
+    static final int HUNT_SLACK_EPOCHS = 5;
+    /** Catch-up (period behind wall clock) with zero store progress for this
+     *  long → the catch-up fan-out itself is starved → hunt. A progressing
+     *  catch-up never hunts. Matches the Rust HUNT_CATCHUP_STALL. */
+    static final long HUNT_CATCHUP_STALL_MS = 120_000;
+    /** Widened finality fan-out while hunting (steady-state is 16). */
+    private static final int HUNT_POLL_FANOUT = 32;
+    /** Widened per-cycle Identify classification batch while hunting. */
+    private static final int HUNT_CLASSIFY_BATCH = 16;
+
+    /** True while the hunt triggers hold; drives the widened fan-outs here and
+     *  the host's discovery boost via {@link #setHuntBoostListener}. */
+    private volatile boolean hunting = false;
+    /** Host hook flipped on hunt transitions (ChainStack points it at the CL
+     *  discv5 service's lookup boost). Nullable. */
+    private volatile java.util.function.Consumer<Boolean> huntBoostListener;
+
+    /** Register the host's discovery-boost hook (called with true when the LC
+     *  hunt engages, false when it disengages). */
+    public void setHuntBoostListener(java.util.function.Consumer<Boolean> listener) {
+        this.huntBoostListener = listener;
+    }
+
+    /** Whether the LC hunt is currently engaged (drives the hosts' status banner). */
+    public boolean isHunting() {
+        return hunting;
+    }
+
+    /** Store-progress tracking for the starved-catch-up trigger; sync-loop
+     *  thread only. Any advance of (period, finalized slot) resets the clock. */
+    private long huntLastProgressNanos = System.nanoTime();
+    private long huntLastSeenPeriod = -1;
+    private long huntLastSeenFinalizedSlot = -1;
+
+    /**
+     * Should the LC hunt run this cycle? Three triggers, all meaning "starved
+     * of light-client servers": bootstrap stalled past the window; catch-up
+     * (period behind wall clock) with zero store progress past
+     * {@link #HUNT_CATCHUP_STALL_MS} (a progressing catch-up never hunts —
+     * its own wide fan-out covers the pool); or the committee period is
+     * current but the finalized head has aged past the freshness slack
+     * (catch-up done, nobody serves finality). {@code engaged} adds
+     * hysteresis to the finality trigger — engage at the full slack,
+     * disengage one epoch fresher — so a lone boundary-slow server can't
+     * flap the discovery boost every cycle. Pure function so the triggers
+     * are unit-testable; the mirror of the Rust hunt_due.
+     */
+    static boolean huntDue(boolean engaged, boolean storeInitialized, long sinceStartMs,
+                           long sinceProgressMs, long wallSlot,
+                           long committeePeriod, long finalizedSlot, int slotsPerEpoch) {
+        if (!storeInitialized) {
+            return sinceStartMs >= HUNT_BOOTSTRAP_STALL_MS;
+        }
+        long wallPeriod = BeaconChainSpec.computeSyncCommitteePeriod(wallSlot);
+        if (wallPeriod > committeePeriod) {
+            return sinceProgressMs >= HUNT_CATCHUP_STALL_MS;
+        }
+        int slackEpochs = engaged ? HUNT_SLACK_EPOCHS - 1 : HUNT_SLACK_EPOCHS;
+        return finalizedSlot + (long) slackEpochs * slotsPerEpoch < wallSlot;
+    }
+
+    /** Recompute the hunt state for this cycle and notify the host on a
+     *  transition. Never throws (a hook failure must not kill the sync loop). */
+    private void updateHunting(long syncStartNanos) {
+        long sinceStartMs = (System.nanoTime() - syncStartNanos) / 1_000_000L;
+        // Clamp at 0: a badly-set clock (behind genesis) must degrade to
+        // "slot 0 / no hunt", never a negative slot (Rust: saturating_sub).
+        long wallSlot = Math.max(0L, System.currentTimeMillis() / 1000 - clGenesisTime)
+                / Math.max(1, secondsPerSlot);
+        // Read the freshest of store/syncState: after a late-BLS "heal" win
+        // the store can lead syncState for one cycle, and lagging would
+        // spuriously engage the hunt for that cycle.
+        long finalizedSlot = store.isInitialized()
+                ? Math.max(store.getFinalizedSlot(), syncState.getFinalizedSlot())
+                : syncState.getFinalizedSlot();
+        long period = store.isInitialized()
+                ? Math.max(store.getCurrentSyncCommitteePeriod(),
+                           syncState.getCurrentSyncCommitteePeriod())
+                : syncState.getCurrentSyncCommitteePeriod();
+        if (period != huntLastSeenPeriod || finalizedSlot != huntLastSeenFinalizedSlot) {
+            huntLastSeenPeriod = period;
+            huntLastSeenFinalizedSlot = finalizedSlot;
+            huntLastProgressNanos = System.nanoTime();
+        }
+        long sinceProgressMs = (System.nanoTime() - huntLastProgressNanos) / 1_000_000L;
+        boolean due = huntDue(hunting, store.isInitialized(), sinceStartMs, sinceProgressMs,
+                wallSlot, period, finalizedSlot, slotsPerEpoch);
+        if (due == hunting) return;
+        hunting = due;
+        if (due) {
+            log.info("[beacon] LC hunt engaged — starved of light-client servers "
+                    + "(boosted discovery, finality fan-out {}, classify batch {})",
+                    HUNT_POLL_FANOUT, HUNT_CLASSIFY_BATCH);
+        } else {
+            log.info("[beacon] LC hunt disengaged");
+        }
+        java.util.function.Consumer<Boolean> listener = huntBoostListener;
+        if (listener != null) {
+            try {
+                listener.accept(due);
+            } catch (Exception e) {
+                log.warn("[beacon] hunt boost listener failed: {}", e.getMessage());
+            }
+        }
+    }
     private final byte[] genesisValidatorsRoot; // 32-byte genesis validators root
     private final long clGenesisTime;         // beacon chain genesis time (seconds since epoch)
     private final java.util.function.Consumer<String> onPeerSuccess; // nullable; called with multiaddr on success
@@ -716,11 +832,22 @@ public class BeaconLightClient implements AutoCloseable {
         int slotSeconds = secondsPerSlot > 0 ? secondsPerSlot : BeaconChainSpec.SECONDS_PER_SLOT;
         long pollIntervalMs = slotSeconds * 1000L;
         int cycleCount = 0;
+        long syncStartNanos = System.nanoTime();
+        // Reset the hunt on every (re)entry: resume() rebuilds this loop AND
+        // the host may have rebuilt discv5 (a fresh service starts unboosted).
+        // Starting from false makes the first updateHunting a transition, so a
+        // still-starved resume re-fires the listener and re-boosts the NEW
+        // discovery service instead of silently assuming the old one heard.
+        hunting = false;
+        huntLastProgressNanos = System.nanoTime();
         while (running) {
             try {
                 // Every 5 cycles (~60s), log pool stats so it's easy to see
                 // whether LC-capable peers are accumulating or bleeding off.
                 if (++cycleCount % 5 == 0) logPeerPoolStats();
+                // LC hunt trigger check — widens this cycle's fan-outs and
+                // flips the host's discovery boost on transitions.
+                updateHunting(syncStartNanos);
                 pollFinalityUpdate();
                 // Background classification of untried pool peers (fire-and-forget;
                 // never blocks the cycle) — drains the cache's untried bucket.
@@ -942,10 +1069,13 @@ public class BeaconLightClient implements AutoCloseable {
             }
         }
         if (untried.isEmpty()) return;
-        List<CompletableFuture<Void>> batch = new ArrayList<>(CLASSIFY_SWEEP_BATCH);
+        // Hunting drains the untried bucket 4x faster — classification is what
+        // turns a starved pool into a dialable lc-confirmed tier.
+        final int sweepBatch = hunting ? HUNT_CLASSIFY_BATCH : CLASSIFY_SWEEP_BATCH;
+        List<CompletableFuture<Void>> batch = new ArrayList<>(sweepBatch);
         int start = Math.floorMod(classifySweepCursor, untried.size()); // floorMod: survives cursor overflow
-        classifySweepCursor += CLASSIFY_SWEEP_BATCH;
-        for (int i = 0; i < Math.min(CLASSIFY_SWEEP_BATCH, untried.size()); i++) {
+        classifySweepCursor += sweepBatch;
+        for (int i = 0; i < Math.min(sweepBatch, untried.size()); i++) {
             if (!running) return;
             String peer = untried.get((start + i) % untried.size());
             batch.add(p2pService.queryIdentify(peer).handle((v, ex) -> null));
@@ -2010,7 +2140,10 @@ public class BeaconLightClient implements AutoCloseable {
         // sorts it most-recently-served first (every decodable responder gets
         // confirmed into the tier — see the classification harvest below), so
         // a known-live server stays inside the fan-out window.
-        final int POLL_FINALITY_FANOUT = 16;
+        // Hunting widens the fan-out so the round reaches past the proven tier
+        // into untried peers (copyPeers puts proven first; the tail is where a
+        // new server can only be found).
+        final int POLL_FINALITY_FANOUT = hunting ? HUNT_POLL_FANOUT : 16;
         // Heal a late winner from a PREVIOUS round: if its BLS verify outlasted
         // that round's 12s deadline, the store advanced but the poll thread had
         // moved on, skipping updateSyncState/persistSnapshot — and re-polling the

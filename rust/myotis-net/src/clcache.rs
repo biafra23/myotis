@@ -164,6 +164,21 @@ impl ClPeerCache {
         self.failures.remove(addr);
     }
 
+    /// LC-hunt confirmation: the peer answered a light-client request with a
+    /// DECODABLE response (dial-priority signal only — trust still requires a
+    /// verified apply, same rule as the Java fan-out harvest). Persists the
+    /// `lc` token so the next start dials this peer in the lc-confirmed
+    /// bucket, and clears any nolc mark/failure streak.
+    pub fn mark_lc(&mut self, addr: &str) {
+        let mut changed = self.ensure(addr);
+        changed |= self.lc.insert(addr.to_string());
+        changed |= self.nolc.remove(addr);
+        self.failures.remove(addr);
+        if changed {
+            self.dirty = true;
+        }
+    }
+
     /// A peer served the bootstrap for `period` — deepest kept, where deepest
     /// means HIGHEST (Java `recordBootstrap` keeps the max).
     pub fn record_bootstrap(&mut self, addr: &str, period: u64) {
@@ -385,6 +400,27 @@ mod tests {
         assert!(order[0].contains("4.4.4.4"), "widest proven first: {order:?}");
         assert!(order[1].contains("1.1.1.1"), "narrow proven second: {order:?}");
         assert!(order[2].contains("2.2.2.2"), "bootstrap third: {order:?}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn mark_lc_persists_confirms_and_clears_nolc() {
+        let p = tmp_path("marklc");
+        let mut c = ClPeerCache::load(p.clone());
+        // A hunt confirm on a peer previously marked nolc flips it to lc.
+        c.mark_nolc("/ip4/3.3.3.3/tcp/9000/p2p/16Uccc");
+        c.mark_lc("/ip4/3.3.3.3/tcp/9000/p2p/16Uccc");
+        assert!(!c.is_nolc("/ip4/3.3.3.3/tcp/9000/p2p/16Uccc"));
+        // A brand-new hunt confirm is cached at all.
+        c.mark_lc("/ip4/4.4.4.4/tcp/9000/p2p/16Uddd");
+        c.flush();
+        let c2 = ClPeerCache::load(p.clone());
+        assert!(c2.peers().iter().any(|a| a.contains("4.4.4.4")), "hunt confirm persisted");
+        assert!(!c2.is_nolc("/ip4/3.3.3.3/tcp/9000/p2p/16Uccc"), "lc flip persisted");
+        // The lc token survives the round-trip: a later nolc must not demote.
+        let mut c3 = c2;
+        c3.mark_nolc("/ip4/4.4.4.4/tcp/9000/p2p/16Uddd");
+        assert!(!c3.is_nolc("/ip4/4.4.4.4/tcp/9000/p2p/16Uddd"));
         let _ = std::fs::remove_file(&p);
     }
 }

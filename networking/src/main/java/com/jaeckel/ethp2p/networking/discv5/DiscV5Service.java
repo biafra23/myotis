@@ -45,6 +45,16 @@ public final class DiscV5Service implements AutoCloseable {
     private ScheduledExecutorService scheduler;
     private final Set<String> seenEnrs = new HashSet<>();
 
+    /** LC hunt boost: while true each poll tick fires extra random-target
+     *  search rounds (set by the host when the beacon light client is starved
+     *  of LC servers — see BeaconLightClient.setHuntBoostListener). */
+    private volatile boolean huntBoost;
+
+    /** Flip the hunt boost (idempotent; safe from any thread). */
+    public void setHuntBoost(boolean on) {
+        this.huntBoost = on;
+    }
+
     // Empty-table re-seed: the library pings bootnodes exactly ONCE, inside
     // start(). If that initial round loses (device network not up yet, transient
     // UDP loss — both observed on-device), or the table later decays to empty
@@ -235,6 +245,14 @@ public final class DiscV5Service implements AutoCloseable {
             // Kick a background search so the table keeps expanding between
             // polls rather than stalling at whatever the bootnodes returned.
             system.searchForNewPeers();
+            // LC hunt boost: extra random-target rounds per tick while the
+            // light client is starved of servers — each walks a different DHT
+            // region, so rounds-per-tick is the enumeration throttle (the Rust
+            // twin shortens its lookup sleep to the same effect).
+            if (huntBoost) {
+                system.searchForNewPeers();
+                system.searchForNewPeers();
+            }
             reseedIfWedged(live[0]);
             // One INFO line per 15s poll so the daemon log makes it obvious
             // whether the library is making progress. The library itself logs

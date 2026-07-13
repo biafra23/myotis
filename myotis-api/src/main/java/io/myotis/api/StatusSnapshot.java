@@ -45,6 +45,10 @@ import java.util.List;
  * @param peerBodyRequestsServed    of those, answered with at least one body (always 0
  *                              today — a light client holds no bodies; requests get a
  *                              prompt empty response)
+ * @param lcHunting             LC hunt engaged: the beacon light client is starved of
+ *                              light-client servers and is aggressively discovering/probing
+ *                              for new ones (bootstrap stall, starved catch-up, or finality
+ *                              starvation)
  */
 public record StatusSnapshot(
         boolean running,
@@ -79,5 +83,6 @@ public record StatusSnapshot(
         long peerHeaderRequests,
         long peerHeaderRequestsServed,
         long peerBodyRequests,
-        long peerBodyRequestsServed) {
+        long peerBodyRequestsServed,
+        boolean lcHunting) {
 }

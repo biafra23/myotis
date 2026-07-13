@@ -494,6 +494,7 @@ private fun StatusTab(
         if (snap == null) {
             Text("Node stopped — no data for $primary")
         } else {
+            HuntBanner(snap)
             SyncProgressBar(snap)
             StatusView(snap, hostSleeps = settings.supportsIdleSleep())
         }
@@ -544,6 +545,22 @@ private fun StatusTab(
             snap.readyPeerList.forEach { PeerRowView(it) }
         }
     }
+}
+
+/** LC hunt banner: shown while the light client is starved of servers and hunting
+ *  aggressively (boosted discovery + probing). Sits ABOVE the sync progress bar
+ *  when both are visible, and shows on its own when the bar is gone (e.g. finality
+ *  starvation while the state still reads SYNCED on the Java engine). */
+@Composable
+private fun HuntBanner(s: NodeSnapshot) {
+    if (!s.running || !s.lcHunting) return
+    Text(
+        "Hunting for light-client servers…",
+        style = MaterialTheme.typography.bodySmall,
+        color = Color(0xFFF9A825), // amber — same signal family as "warming up"
+        modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)
+            .semantics { contentDescription = "LC hunt active: searching for light-client servers" },
+    )
 }
 
 /** App-wide beacon sync banner: indeterminate while bootstrapping, determinate as the light
@@ -640,7 +657,7 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         // cold start finds servers — the cache learning is visible live.
         StatusRow(
             "CL cache",
-            "${s.clCachedPeers} (proven ${s.clCachedProven}, nolc ${s.clCachedNolc}, " +
+            "${s.clCachedPeers} (lc ${s.clCachedProven}, nolc ${s.clCachedNolc}, " +
                 "untried ${s.clCachedPeers - s.clCachedProven - s.clCachedNolc})",
         )
         StatusRow("EL cache", "${s.elCachedPeers} (snap-ok ${s.elCachedSnapOk}, snap-bad ${s.elCachedSnapBad})")

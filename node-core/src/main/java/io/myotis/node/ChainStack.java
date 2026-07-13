@@ -480,6 +480,12 @@ public final class ChainStack {
     public NetworkConfig network() { return network; }
     public ChainPorts ports() { return ports; }
     public boolean isRunning() { return phase.get() == RUNNING; }
+
+    /** LC hunt engaged on the beacon light client (starved of LC servers). */
+    public boolean lcHunting() {
+        BeaconLightClient b = beaconLightClient;
+        return b != null && b.isHunting();
+    }
     public LifecycleState lifecycle() { return phase.get(); }
     public RLPxConnector connector() { return connector; }
 
@@ -792,6 +798,14 @@ public final class ChainStack {
         blc.setOnLightClientVerdict(clPeerCache::markLightClientBatch);
         blc.setSnapshotFile(syncSnapshotFile);
         blc.setGossipsubEnabled(gossipsubEnabled);
+        // LC hunt: when the light client is starved of servers it flips this
+        // and the CL discv5 service runs extra lookup rounds per tick. Read
+        // the field at call time — discv5 (re)starts independently of the
+        // beacon client, so an early registration must not pin a dead ref.
+        blc.setHuntBoostListener(on -> {
+            DiscV5Service d5 = discV5;
+            if (d5 != null) d5.setHuntBoost(on);
+        });
         blc.start();
         this.beaconLightClient = blc;
         log.info("[{}] Beacon light client started with {} CL peer(s)", network.name(), clPeers.size());

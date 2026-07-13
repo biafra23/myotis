@@ -180,6 +180,7 @@ private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
     lastPauseEpochMs = lastPauseEpochMs(),
     lastResumeEpochMs = lastResumeEpochMs(),
     lastWakeReason = lastWakeReason(),
+    lcHunting = lcHunting(),
 )
 
 /** Android actual of [Settings] over the NodeService SharedPreferences statics. */

@@ -245,6 +245,8 @@ data class NodeSnapshot(
     val lastPauseEpochMs: Long,        // wall-clock ms of the last pause; 0 if never
     val lastResumeEpochMs: Long,       // wall-clock ms of the last DEMAND wake; 0 if none
     val lastWakeReason: String?,       // reason of the last demand wake; null if none
+    val lcHunting: Boolean = false,    // LC hunt engaged: starved of light-client servers,
+                                       // aggressively discovering/probing for new ones
 )
 
 /** One connected READY peer, for the Status peer list. */

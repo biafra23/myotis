@@ -1139,7 +1139,8 @@ public final class NodeService extends Service {
             long peerHeaderRequests,      // inbound GetBlockHeaders from peers this run
             long peerHeaderRequestsServed,//   ...answered with >=1 header
             long peerBodyRequests,        // inbound GetBlockBodies from peers this run
-            long peerBodyRequestsServed) {} //  ...answered with >=1 body (always 0 today)
+            long peerBodyRequestsServed,  //   ...answered with >=1 body (always 0 today)
+            boolean lcHunting) {}         // LC hunt engaged (starved of light-client servers)
 
     /** Result of a get-account query. Mirrors the JVM daemon's JSON response shape. */
     public record AccountQueryResult(
@@ -1783,7 +1784,7 @@ public final class NodeService extends Service {
                     s.pauseCount(), s.totalPausedMs(), s.lastPauseEpochMs(),
                     s.lastResumeEpochMs(), s.lastWakeReason(),
                     s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
-                    s.peerBodyRequests(), s.peerBodyRequestsServed());
+                    s.peerBodyRequests(), s.peerBodyRequestsServed(), s.lcHunting());
         }
         return new Snapshot(true, lifecycle, chainStartMs,
                 s.discoveredPeers(), s.connectedPeers(), s.readyPeers(),
@@ -1798,7 +1799,7 @@ public final class NodeService extends Service {
                 s.pauseCount(), s.totalPausedMs(), s.lastPauseEpochMs(),
                 s.lastResumeEpochMs(), s.lastWakeReason(),
                 s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
-                s.peerBodyRequests(), s.peerBodyRequestsServed());
+                s.peerBodyRequests(), s.peerBodyRequestsServed(), s.lcHunting());
     }
 
     // ---- Failure forensics (see ProcessHealthDiag) ----
