@@ -29,7 +29,10 @@ pub mod ringlog;
 /// v11: added nativeResolveEnsJson (ENS forward resolution over verified eth_calls).
 /// v12: added nativeEnsRecordJson (all ENS record types + reverse + root modes,
 ///      one generic dispatch — EL-C-5-2).
-pub const ABI_VERSION: i32 = 12;
+/// v13: added the idle-sleep surface (nativePause/nativeResume) and the
+///      `paused` key in the status JSON, wired into the Java RustEngineNative /
+///      RustChainHandle at the same time.
+pub const ABI_VERSION: i32 = 13;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
@@ -188,6 +191,44 @@ mod jni_shim {
         handle: jlong,
     ) {
         crate::host::stop(handle);
+    }
+
+    // ---------------------------------------------------------------------
+    // Idle-sleep surface (ABI 13): the ChainHandle contract's pause/resume.
+    // Both return true ONLY on an actual transition (Running→Paused resp.
+    // Paused→Running); the Java wrapper layers the contract's idempotent
+    // semantics and the sleep accounting on top.
+    // ---------------------------------------------------------------------
+
+    /// `RustEngineNative.nativePause(long handle)` — tear down networking, keep
+    /// the handle as PAUSED (warm state persisted for the resume warm-start).
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativePause(
+        _env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+    ) -> jboolean {
+        if crate::host::pause(handle) {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
+    }
+
+    /// `RustEngineNative.nativeResume(long handle)` — rebuild networking for a
+    /// paused handle. False when the rebuild failed (the handle stays PAUSED,
+    /// retryable) or the handle isn't paused.
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeResume(
+        _env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+    ) -> jboolean {
+        if crate::host::resume(handle) {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
     }
 
     // ---------------------------------------------------------------------

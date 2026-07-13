@@ -23,7 +23,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 12; // 12: + nativeEnsRecordJson (EL-C-5-2)
+    static final int EXPECTED_ABI_VERSION = 13; // 13: + nativePause/nativeResume (idle sleep)
 
     private static final boolean AVAILABLE = load();
 
@@ -99,6 +99,25 @@ final class RustEngineNative {
 
     /** Remove and shut down a handle's sync loop. No-op for an unknown id. */
     static native void nativeStop(long handle);
+
+    // ---- Idle-sleep surface (ABI 13). See RustChainHandle. ----
+
+    /**
+     * Idle-sleep a RUNNING handle: tear all networking down (zero sockets, zero
+     * timers) but keep the handle PAUSED with its warm state persisted, so
+     * {@link #nativeResume} warm-starts. True ONLY on an actual RUNNING→PAUSED
+     * transition — the wrapper layers the contract's idempotent semantics (and
+     * the sleep accounting) on top.
+     */
+    static native boolean nativePause(long handle);
+
+    /**
+     * Rebuild networking for a PAUSED handle (warm start from the persisted
+     * snapshot / peer caches — no checkpoint re-bootstrap). True ONLY on an
+     * actual PAUSED→RUNNING transition; false when the rebuild failed (the
+     * handle stays PAUSED, retryable) or the handle isn't paused.
+     */
+    static native boolean nativeResume(long handle);
 
     /** Up to {@code max} buffered engine tracing lines (oldest first,
      *  newline-joined; empty when idle). The drainable-ring end of the
