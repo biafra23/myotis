@@ -119,7 +119,7 @@ public final class ChainStack {
     private volatile long dnsDialWindowStartMs = 0L;
     private final AtomicInteger dnsDialsInWindow = new AtomicInteger(0);
     private volatile ScheduledExecutorService peerMaintainer;
-    /** Wall-clock ms since the snap serving pool went empty; 0 = not empty. Written
+    /** Monotonic ms (nanoTime-derived) since the snap serving pool went empty; 0 = not empty. Written
      *  by the maintainer tick, read by {@link #elHunting()} / the status snapshot. */
     private volatile long snapZeroSinceMs = 0L;
     /** EL hunt engaged (see EL_HUNT_STALL_MS). Maintainer-tick-updated. */
@@ -365,6 +365,13 @@ public final class ChainStack {
      * would block re-dials on resume.
      */
     private void closeNetworkingComponents() {
+        // EL hunt state must not leak across a pause: the wall time spent
+        // paused would otherwise count toward the stall window and the first
+        // maintainer tick after resume would trip emergency mode instantly
+        // (the Rust engine rebuilds its pool with fresh state on resume —
+        // keep the engines' behavior aligned).
+        snapZeroSinceMs = 0L;
+        elHunting = false;
         ScheduledExecutorService pm = peerMaintainer;
         if (pm != null) { pm.shutdownNow(); peerMaintainer = null; }
         io.myotis.rpc.VerifiedRpcBackend backend = rpcBackend;
@@ -953,6 +960,7 @@ public final class ChainStack {
             long now = System.currentTimeMillis();
             // EL hunt bookkeeping: stall clock while the SERVING pool is empty,
             // trigger + transition logs (Rust maintainer_loop twin).
+            long monotonicNowMs = System.nanoTime() / 1_000_000L;
             if (snapPeers > 0) {
                 snapZeroSinceMs = 0L;
                 if (elHunting) {
@@ -960,9 +968,11 @@ public final class ChainStack {
                     log.info("[{}][peers] EL hunt disengaged — snap peer serving again", network.name());
                 }
             } else if (snapZeroSinceMs == 0L) {
-                snapZeroSinceMs = now;
+                snapZeroSinceMs = monotonicNowMs;
             }
-            boolean hunting = elHuntDue(snapPeers, snapZeroSinceMs, now);
+            // Monotonic clock: an NTP jump during a momentary outage must not
+            // fake a 60s stall (same rule as verifiedHeadAgeMs).
+            boolean hunting = elHuntDue(snapPeers, snapZeroSinceMs, monotonicNowMs);
             if (hunting && !elHunting) {
                 elHunting = true;
                 log.info("[{}][peers] EL hunt engaged — snap serving pool empty {}s "
@@ -981,12 +991,17 @@ public final class ChainStack {
             for (CachedPeer p : snapCached) {
                 if (conn.activeSnapHandlers().size() >= targetSnapPeers) break;
                 try {
-                    // Hunting: free a CONFIRMED snap server's transient backoff so
+                    // Hunting: free a CONFIRMED snap server's TRANSIENT backoff so
                     // this pass dials it NOW. Confirmed = it served chain-verified
-                    // snap data, so wrong-chain is impossible; blacklisted node ids
-                    // and unproven peers keep their timers.
+                    // snap data. The backoff map holds transient (30s) and
+                    // incompatible (10min) entries under the same key, so only clear
+                    // entries within the transient window — a peer re-marked
+                    // incompatible after its confirm (post-fork lag) keeps its
+                    // 10-min timer instead of being re-dialed every 10s tick.
                     if (hunting && p.snapQuality() == SnapQuality.CONFIRMED) {
-                        backoff.remove(p.address().getHostString() + ":" + p.address().getPort());
+                        String key = p.address().getHostString() + ":" + p.address().getPort();
+                        backoff.computeIfPresent(key,
+                                (k, exp) -> exp - now > BACKOFF_TRANSIENT_MS ? exp : null);
                     }
                     dialCachedSnapPeer(conn, p, now);
                 } catch (Exception e) {

@@ -483,14 +483,22 @@ async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
             continue;
         }
         if hunting {
-            // Emergency: free the transient backoffs of CONFIRMED snap servers
+            // Emergency: free the TRANSIENT backoffs of CONFIRMED snap servers
             // so the dial loop below reaches them NOW instead of after the
             // standard cool-off. Confirmed = served us chain-verified snap
-            // data — safe to re-dial eagerly; blacklisted node ids and
-            // non-confirmed peers keep their timers.
+            // data. Entries whose remaining window exceeds the transient
+            // length are INCOMPATIBLE (10 min) — keep those: try_dial's
+            // blacklist check would block the dial anyway, but the timer
+            // must stay honest too. Non-confirmed peers keep their timers.
+            let now = Instant::now();
             let mut backoff = inner.backoff.lock().await;
             for c in cached.iter().filter(|c| c.quality == SnapQuality::Confirmed) {
-                backoff.remove(&c.addr);
+                if backoff
+                    .get(&c.addr)
+                    .is_some_and(|exp| exp.saturating_duration_since(now) <= BACKOFF_TRANSIENT)
+                {
+                    backoff.remove(&c.addr);
+                }
             }
         }
         tracing::debug!(

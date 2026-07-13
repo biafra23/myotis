@@ -1370,7 +1370,7 @@ mod tests {
             header_requests_served: 2,
             body_requests: 1,
             body_requests_served: 0,
-    el_hunting: false,
+            el_hunting: false,
         };
         let synced: serde_json::Value = serde_json::from_str(&status_object(
             Lifecycle::Running,
