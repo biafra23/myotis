@@ -33,6 +33,7 @@ use myotis_core::rlp;
 use myotis_core::trie::{AccountLeaf, EMPTY_CODE_HASH, EMPTY_TRIE_ROOT};
 
 use crate::el::anchor::ExecAnchor;
+use crate::el::served::ServeContext;
 use crate::el::eth::messages::{self, Status, VerifiedHeader};
 use crate::el::eth::session::EthSession;
 use crate::el::rlpx::transport::{
@@ -75,6 +76,9 @@ pub struct ManagedPeer {
     /// cache records snap-serve/failure outcomes under.
     addr: SocketAddr,
     snap_codes: Option<snap::SnapCodes>,
+    /// Pool-shared serving surface (window + counters); None in fixtures that
+    /// spawn a peer without a pool.
+    serve: Option<ServeContext>,
 }
 
 impl ManagedPeer {
@@ -83,7 +87,14 @@ impl ManagedPeer {
     /// requests and answers Ping/Get\* on its own.
     pub fn spawn(session: EthSession, addr: SocketAddr) -> ManagedPeer {
         let (conn, eth_version, snap, peer_status, peer_hello) = session.into_parts();
-        Self::from_connection(conn, eth_version, snap, peer_status, peer_hello, addr)
+        Self::from_connection(conn, eth_version, snap, peer_status, peer_hello, addr, None)
+    }
+
+    /// As [`spawn`](Self::spawn), wiring the pool's shared serving surface so this
+    /// peer answers GetBlockHeaders from the window and counts inbound demand.
+    pub fn spawn_serving(session: EthSession, addr: SocketAddr, serve: ServeContext) -> ManagedPeer {
+        let (conn, eth_version, snap, peer_status, peer_hello) = session.into_parts();
+        Self::from_connection(conn, eth_version, snap, peer_status, peer_hello, addr, Some(serve))
     }
 
     fn from_connection(
@@ -93,6 +104,7 @@ impl ManagedPeer {
         peer_status: Status,
         peer_hello: Hello,
         addr: SocketAddr,
+        serve: Option<ServeContext>,
     ) -> ManagedPeer {
         let (reader, writer, peer_pubkey) = conn.split();
         let snap_codes = snap.then(|| snap::SnapCodes::for_eth_version(eth_version));
@@ -106,6 +118,7 @@ impl ManagedPeer {
             Arc::clone(&pending),
             Arc::clone(&closed),
             snap_codes,
+            serve.clone(),
         ));
 
         ManagedPeer {
@@ -121,6 +134,7 @@ impl ManagedPeer {
             peer_pubkey,
             addr,
             snap_codes,
+            serve,
         }
     }
 
@@ -219,6 +233,22 @@ impl ManagedPeer {
             .await?;
         let (_rid, headers) = messages::decode_block_headers(&payload)
             .map_err(|e| format!("BlockHeaders decode: {}", e.0))?;
+        // Window-poisoning guard: only remember headers whose number lies in the
+        // range WE requested — a hostile peer answering with fabricated far-future
+        // numbers could otherwise pin the window's eviction floor at ~u64::MAX
+        // (killing serving until restart) and poison the advertised eth/69 range.
+        // Only the simple ascending-contiguous shape is remembered: with skip or
+        // reverse in play a span filter would admit attacker numbers between the
+        // steps, and every production fetch (verdict walks) is skip=0/ascending —
+        // exotic shapes just skip the (side-channel) window population. The
+        // RETURNED headers are unaffected either way; verification consumes them
+        // unfiltered and checks hashes itself.
+        if skip == 0 && !reverse {
+            let hi = block_number.saturating_add(max_headers);
+            self.remember_served(headers.iter().filter(|vh| {
+                vh.header.number >= block_number && vh.header.number < hi
+            }));
+        }
         Ok(headers)
     }
 
@@ -235,7 +265,23 @@ impl ManagedPeer {
             .await?;
         let (_rid, headers) = messages::decode_block_headers(&payload)
             .map_err(|e| format!("BlockHeaders decode: {}", e.0))?;
+        // Same poisoning guard as the by-number path: only the header whose hash
+        // is the one WE asked for may enter the window.
+        self.remember_served(headers.iter().filter(|vh| vh.hash == *block_hash));
         Ok(headers)
+    }
+
+    /// Make freshly received, REQUEST-MATCHED headers servable to OTHER peers:
+    /// headers this node fetches (verdict walks, head probes) land in the
+    /// pool-shared window, raw wire bytes + recomputed hash — the same integrity
+    /// level as the Java window. Callers filter to what they actually requested
+    /// (see the poisoning guards at both call sites). No-op without a pool.
+    fn remember_served<'a>(&self, headers: impl Iterator<Item = &'a messages::VerifiedHeader>) {
+        if let Some(ctx) = &self.serve {
+            for vh in headers {
+                ctx.window.put(vh.header.number, vh.hash, vh.raw_rlp.clone());
+            }
+        }
     }
 
     /// Request block bodies by hash.
@@ -436,6 +482,7 @@ async fn read_loop(
     pending: PendingMap,
     closed: Arc<AtomicBool>,
     snap_codes: Option<snap::SnapCodes>,
+    serve: Option<ServeContext>,
 ) {
     loop {
         let frame = match reader.recv().await {
@@ -465,6 +512,27 @@ async fn read_loop(
             )
             .await;
             break;
+        }
+
+        // Inbound header/body requests: count demand (before parsing, so malformed
+        // requests register too), then try to SERVE headers from the shared window.
+        // Anything unservable falls through to the well-behaved empty answer below.
+        if let Some(ctx) = &serve {
+            if code == messages::GET_BLOCK_HEADERS {
+                ctx.stats.header_asked();
+                if let Some(resp) = serve_headers(ctx, &frame.payload) {
+                    if let Err(e) = writer.lock().await.send(messages::BLOCK_HEADERS, &resp).await {
+                        fail_all(&pending, &closed, format!("peer write failure on served headers: {e}"))
+                            .await;
+                        break;
+                    }
+                    ctx.stats.header_served();
+                    continue;
+                }
+            } else if code == messages::GET_BLOCK_BODIES {
+                ctx.stats.body_asked();
+                // No bodies to serve (light client) — the empty answer below replies.
+            }
         }
 
         // An inbound Get* request we answer with an empty response.
@@ -546,6 +614,30 @@ fn leading_request_id(payload: &[u8]) -> Option<u64> {
     rlp::decode(items.first()?).ok()?.as_u64().ok()
 }
 
+/// Serve an inbound GetBlockHeaders from the shared window, or `None` when the
+/// request is malformed, exotic (skip/reverse), or asks for blocks we don't hold
+/// (the caller then answers empty — never a fabricated response). Serves the two
+/// shapes real peers use: an ascending run by number, and a single header by
+/// hash (fork/head probes).
+fn serve_headers(ctx: &ServeContext, payload: &[u8]) -> Option<Vec<u8>> {
+    use messages::HeadersOrigin;
+    let (id, origin, max, skip, reverse) = messages::decode_get_block_headers(payload).ok()?;
+    let raws = match origin {
+        HeadersOrigin::Number(n) if skip == 0 && !reverse => ctx.window.run_from(n, max),
+        // By-hash also requires the simple shape, keeping "exotic (skip/reverse)
+        // falls through to the empty answer" true for both arms — and keeping
+        // header_requests_served honest about what we chose to serve.
+        HeadersOrigin::Hash(h) if max >= 1 && skip == 0 && !reverse => {
+            ctx.window.by_hash(&h).into_iter().collect()
+        }
+        _ => Vec::new(),
+    };
+    if raws.is_empty() {
+        return None;
+    }
+    Some(messages::encode_block_headers_response(id, &raws))
+}
+
 /// A p2p Disconnect body is `[reason]` (or a bare `reason`); decode it.
 fn describe_disconnect(payload: &[u8]) -> String {
     let reason = rlp::decode(payload)
@@ -561,6 +653,58 @@ fn describe_disconnect(payload: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn serve_ctx(window: crate::el::served::ServedHeaders) -> ServeContext {
+        ServeContext {
+            window: std::sync::Arc::new(window),
+            stats: std::sync::Arc::new(crate::el::served::ServeStats::default()),
+        }
+    }
+
+    #[test]
+    fn serve_headers_answers_a_held_run_and_round_trips() {
+        use crate::el::served::ServedHeaders;
+        // Real header RLP: use the corpus-independent path — encode a minimal
+        // list per "header" (serve is byte-preserving, decode isn't re-run here).
+        let w = ServedHeaders::new(32);
+        let raw = |n: u64| rlp::encode(&rlp::Item::List(vec![rlp::Item::Bytes(vec![n as u8])]));
+        let hash = |n: u64| {
+            let mut h = [0u8; 32];
+            h[0] = n as u8;
+            h
+        };
+        for n in 100..=105u64 {
+            w.put(n, hash(n), raw(n));
+        }
+        let ctx = serve_ctx(w);
+
+        // [reqId, [origin=101, max=3, skip=0, reverse=0]]
+        let req = messages::encode_get_block_headers_by_number(7, 101, 3, 0, false);
+        let resp = serve_headers(&ctx, &req).expect("held run must serve");
+        // Response is [reqId, [h101, h102, h103]] with byte-identical headers.
+        let items = rlp::raw_list_items(&resp).unwrap();
+        assert_eq!(rlp::decode(items[0]).unwrap().as_u64().unwrap(), 7);
+        let served = rlp::raw_list_items(items[1]).unwrap();
+        assert_eq!(served.len(), 3);
+        assert_eq!(served[0], &raw(101)[..]);
+        assert_eq!(served[2], &raw(103)[..]);
+
+        // By hash: single header.
+        let req = messages::encode_get_block_headers_by_hash(9, &hash(104), 1, 0, false);
+        let resp = serve_headers(&ctx, &req).expect("held hash must serve");
+        let items = rlp::raw_list_items(&resp).unwrap();
+        assert_eq!(rlp::raw_list_items(items[1]).unwrap().len(), 1);
+
+        // Unheld start, exotic shapes (skip/reverse), and malformed → None (empty answer path).
+        assert!(serve_headers(&ctx, &messages::encode_get_block_headers_by_number(1, 990, 3, 0, false)).is_none());
+        assert!(serve_headers(&ctx, &messages::encode_get_block_headers_by_number(1, 101, 3, 1, false)).is_none());
+        assert!(serve_headers(&ctx, &messages::encode_get_block_headers_by_number(1, 101, 3, 0, true)).is_none());
+        // Exotic shapes are unserved on the by-hash arm too (docs: skip/reverse
+        // always fall through to the empty answer).
+        assert!(serve_headers(&ctx, &messages::encode_get_block_headers_by_hash(1, &hash(104), 1, 1, false)).is_none());
+        assert!(serve_headers(&ctx, &messages::encode_get_block_headers_by_hash(1, &hash(104), 1, 0, true)).is_none());
+        assert!(serve_headers(&ctx, b"junk").is_none());
+    }
 
     #[test]
     fn leading_request_id_reads_reqid() {

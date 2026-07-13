@@ -62,6 +62,7 @@ impl EthSession {
         mut conn: RlpxConnection,
         local_pubkey: &[u8; 64],
         cfg: &EthConfig,
+        served_range: Option<(u64, u64, [u8; 32])>,
     ) -> Result<EthSession, String> {
         let fut = async {
             // Send our Hello first (Java sends on RLPX_READY).
@@ -85,21 +86,28 @@ impl EthSession {
 
             // Send our Status in the negotiated version.
             let status = if eth_version >= 69 {
-                // eth/69 (EIP-7642) block range: a promise of what we can SERVE. This
-                // engine is a pure outbound client with no header-serving path at all,
-                // so advertise the genesis-only [0, 0] range — the same thing the Java
-                // twin advertises while its ServedHeaderWindow is empty. Claiming
-                // [0, head] (or any window under the head) invites header requests we
-                // can never answer, which gets us scored down and dropped.
+                // eth/69 (EIP-7642) block range: a promise of what we can SERVE — only
+                // blocks the pool's ServedHeaders window actually holds (both ends of
+                // `served_range` are held headers). None (empty window / no pool) falls
+                // back to the minimal genesis-only [0, 0] — NB a small residual
+                // over-claim: unlike Java we embed no genesis header RLP, so a genesis
+                // probe still gets an empty answer (pre-existing; Java-parity seeding is
+                // a follow-up). Claiming [0, head] (or any window under the head)
+                // invites header requests we can never answer, which gets us scored
+                // down and dropped.
+                let (earliest, latest, latest_hash) = match served_range {
+                    Some((e, l, h)) => (e, l, h),
+                    None => (0, 0, cfg.genesis_hash),
+                };
                 messages::encode_status69(
                     eth_version,
                     cfg.network_id,
                     &cfg.genesis_hash,
-                    &cfg.genesis_hash, // latestBlockHash: genesis — the one block we name
+                    &latest_hash,
                     &cfg.fork_id_hash,
                     cfg.fork_next,
-                    0, // earliestBlock
-                    0, // latestBlock
+                    earliest,
+                    latest,
                 )
             } else {
                 messages::encode_status(

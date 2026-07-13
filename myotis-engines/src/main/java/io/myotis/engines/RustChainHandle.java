@@ -377,7 +377,11 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
             int backedOffPeers,
             int blacklistedPeers,
             long optimisticBlockNumber,
-            long finalizedBlockNumber) {
+            long finalizedBlockNumber,
+            long peerHeaderRequests,
+            long peerHeaderRequestsServed,
+            long peerBodyRequests,
+            long peerBodyRequestsServed) {
 
         static ParsedStatus parse(String json) {
             if (json == null || json.isBlank()) return notRunning();
@@ -404,7 +408,11 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                         o.getInt("backedOffPeers", 0),
                         o.getInt("blacklistedPeers", 0),
                         o.getLong("optimisticBlockNumber", 0L),
-                        o.getLong("finalizedBlockNumber", 0L));
+                        o.getLong("finalizedBlockNumber", 0L),
+                        o.getLong("peerHeaderRequests", 0L),
+                        o.getLong("peerHeaderRequestsServed", 0L),
+                        o.getLong("peerBodyRequests", 0L),
+                        o.getLong("peerBodyRequestsServed", 0L));
             } catch (RuntimeException e) {
                 throw new EngineException(
                         "malformed status JSON from the Rust engine: " + e.getMessage(), e);
@@ -413,7 +421,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
 
         static ParsedStatus notRunning() {
             return new ParsedStatus(false, false, false, BeaconState.STARTING, false, 0L, 0L, 0L,
-                    0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0L, 0L);
+                    0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L);
         }
     }
 
@@ -515,9 +523,11 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 sleepMetrics.lastPauseEpochMs(),
                 sleepMetrics.lastResumeEpochMs(),
                 sleepMetrics.lastWakeReason(),
-                // Inbound-serve counters: not yet surfaced in the Rust engine's status
-                // JSON — zeros until its telemetry grows the fields.
-                0L, 0L, 0L, 0L);
+                // Inbound-serve counters, parsed from the Rust engine's status JSON.
+                s.peerHeaderRequests(),
+                s.peerHeaderRequestsServed(),
+                s.peerBodyRequests(),
+                s.peerBodyRequestsServed());
     }
 
     @Override

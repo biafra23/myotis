@@ -138,7 +138,7 @@ async fn try_peer(
     let Ok(conn) = RlpxConnection::dial(Arc::clone(&key), addr, peer_pubkey).await else {
         return outcome;
     };
-    let session = match EthSession::handshake(conn, &key.public_key_bytes(), cfg).await {
+    let session = match EthSession::handshake(conn, &key.public_key_bytes(), cfg, None).await {
         Ok(s) => s,
         Err(e) => {
             if e.contains("incompatible peer") {

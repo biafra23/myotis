@@ -163,7 +163,7 @@ async fn try_peer(
         Ok(c) => c,
         Err(_) => return outcome,
     };
-    let mut session = match EthSession::handshake(conn, &key.public_key_bytes(), cfg).await {
+    let mut session = match EthSession::handshake(conn, &key.public_key_bytes(), cfg, None).await {
         Ok(s) => s,
         Err(e) => {
             // "incompatible peer" means we DID decode the peer's Status and our

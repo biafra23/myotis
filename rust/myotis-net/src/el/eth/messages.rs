@@ -163,6 +163,53 @@ fn fork_id_hash(fork: &[Item]) -> Result<[u8; 4], CoreError> {
 // GetBlockHeaders (0x13) / BlockHeaders (0x14).
 // ---------------------------------------------------------------------------
 
+/// A peer's GetBlockHeaders origin: by number or by hash (fork probes).
+pub enum HeadersOrigin {
+    Number(u64),
+    Hash([u8; 32]),
+}
+
+/// Decode an INBOUND GetBlockHeaders request:
+/// `[reqId, [origin, maxHeaders, skip, reverse]]` → `(reqId, origin, max, skip, reverse)`.
+/// The origin is a hash iff it is exactly 32 bytes (numbers are minimal-BE ≤ 8).
+pub fn decode_get_block_headers(
+    payload: &[u8],
+) -> Result<(u64, HeadersOrigin, u64, u64, bool), CoreError> {
+    let top = rlp::decode(payload)?;
+    let items = top.as_list()?;
+    if items.len() < 2 {
+        return Err(CoreError("GetBlockHeaders: missing query".into()));
+    }
+    let id = items[0].as_u64()?;
+    let q = items[1].as_list()?;
+    if q.len() < 4 {
+        return Err(CoreError("GetBlockHeaders: short query".into()));
+    }
+    let origin_bytes = q[0].as_bytes()?;
+    let origin = if origin_bytes.len() == 32 {
+        let mut h = [0u8; 32];
+        h.copy_from_slice(origin_bytes);
+        HeadersOrigin::Hash(h)
+    } else if origin_bytes.len() <= 8 {
+        HeadersOrigin::Number(q[0].as_u64()?)
+    } else {
+        return Err(CoreError("GetBlockHeaders: origin is neither number nor hash".into()));
+    };
+    Ok((id, origin, q[1].as_u64()?, q[2].as_u64()?, q[3].as_u64()? != 0))
+}
+
+/// Encode a BlockHeaders RESPONSE `[reqId, [header, ...]]` from raw header RLP
+/// items (served back exactly as they arrived on the wire — byte-preserving).
+pub fn encode_block_headers_response(request_id: u64, raw_headers: &[Vec<u8>]) -> Vec<u8> {
+    let mut inner = Vec::new();
+    for h in raw_headers {
+        inner.extend_from_slice(h);
+    }
+    let mut body = rlp::encode(&Item::Bytes(rlp::u64_to_minimal_be(request_id)));
+    body.extend_from_slice(&rlp::encode_list_payload(&inner));
+    rlp::encode_list_payload(&body)
+}
+
 /// Encode GetBlockHeaders by block number. ALL of eth/66-69 wrap the request
 /// id (only the Status shape and bloomless receipts changed in eth/69 — the
 /// Java `EthHandler` decodes every version with the reqId path).
@@ -440,6 +487,35 @@ fn fixed32(item: &Item) -> Result<[u8; 32], CoreError> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn get_block_headers_request_decode_round_trips() {
+        let by_num = encode_get_block_headers_by_number(42, 21_000_000, 16, 2, true);
+        let (id, origin, max, skip, reverse) = decode_get_block_headers(&by_num).unwrap();
+        assert_eq!(id, 42);
+        assert!(matches!(origin, HeadersOrigin::Number(21_000_000)));
+        assert_eq!((max, skip, reverse), (16, 2, true));
+
+        let h = [0xabu8; 32];
+        let by_hash = encode_get_block_headers_by_hash(7, &h, 1, 0, false);
+        let (id, origin, ..) = decode_get_block_headers(&by_hash).unwrap();
+        assert_eq!(id, 7);
+        assert!(matches!(origin, HeadersOrigin::Hash(x) if x == h));
+
+        assert!(decode_get_block_headers(b"junk").is_err());
+    }
+
+    #[test]
+    fn block_headers_response_is_byte_preserving() {
+        let h1 = rlp::encode(&Item::List(vec![Item::Bytes(vec![1, 2, 3])]));
+        let h2 = rlp::encode(&Item::List(vec![Item::Bytes(vec![4])]));
+        let resp = encode_block_headers_response(9, &[h1.clone(), h2.clone()]);
+        let items = rlp::raw_list_items(&resp).unwrap();
+        assert_eq!(rlp::decode(items[0]).unwrap().as_u64().unwrap(), 9);
+        let served = rlp::raw_list_items(items[1]).unwrap();
+        assert_eq!(served, vec![&h1[..], &h2[..]]);
+    }
+
     use super::*;
     use myotis_core::keccak::keccak256;
 
