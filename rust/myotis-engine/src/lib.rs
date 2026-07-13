@@ -32,7 +32,7 @@ pub mod ringlog;
 /// v13: added the idle-sleep surface (nativePause/nativeResume) and the
 ///      `paused` key in the status JSON, wired into the Java RustEngineNative /
 ///      RustChainHandle at the same time.
-pub const ABI_VERSION: i32 = 13;
+pub const ABI_VERSION: i32 = 14;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
@@ -191,6 +191,19 @@ mod jni_shim {
         handle: jlong,
     ) {
         crate::host::stop(handle);
+    }
+
+    /// `RustEngineNative.nativeSetServedBlockWindow(long, int)` (ABI 14): live
+    /// Settings knob for the eth/69 served-block window. No-op (returns via the
+    /// host fn) on a not-started/paused/CL-only handle.
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeSetServedBlockWindow(
+        _env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        blocks: jint,
+    ) {
+        crate::host::set_served_block_window(handle, blocks);
     }
 
     // ---------------------------------------------------------------------

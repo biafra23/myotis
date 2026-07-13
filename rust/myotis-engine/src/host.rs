@@ -478,6 +478,24 @@ pub fn stop(handle: i64) {
 /// `nativeRequestAccountJson`: run a verified account query for a running
 /// handle, returning the `AccountProofResult` JSON, or `{"error": "..."}` for a
 /// transport / not-running / bad-input failure.
+/// Live-set the eth/69 served-block window on a RUNNING handle's EL reader.
+/// Returns false (no-op) for a not-started/paused/EL-less handle — the Java
+/// wrapper treats that as "nothing to apply", matching the no-op contract.
+pub fn set_served_block_window(handle: i64, blocks: i32) -> bool {
+    let Some(engine) = engine() else { return false };
+    let map = match engine.handles.lock() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    match map.get(&handle) {
+        Some(ChainEntry::Running(_, _, Some(reader))) => {
+            reader.set_served_block_window(blocks.max(1) as u64);
+            true
+        }
+        _ => false,
+    }
+}
+
 pub fn request_account_json(handle: i64, address_hex: &str) -> String {
     let Some(address) = parse_address(address_hex) else {
         return eljson::error_json("invalid address (expected 20-byte hex)");

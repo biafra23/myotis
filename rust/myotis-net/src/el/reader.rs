@@ -379,6 +379,11 @@ impl ElReader {
         self.pool.serve_stats()
     }
 
+    /// Live-adjust the eth/69 served-block window (Settings knob).
+    pub fn set_served_block_window(&self, blocks: u64) {
+        self.pool.set_served_block_window(blocks);
+    }
+
     pub async fn blacklist_count(&self) -> usize {
         self.pool.blacklist_count().await
     }

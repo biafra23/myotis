@@ -204,6 +204,18 @@ impl ManagedPeer {
     /// consensus encoding. On a write failure the connection is dead, so fail every
     /// in-flight request too (a partial frame corrupts the stream), same as
     /// [`Self::request`].
+    /// Push an eth/69 BlockRangeUpdate advertising our current servable range.
+    /// No-op on eth/68- peers (id 0x11 is NewBlockHashes there) or a closed peer.
+    pub async fn send_block_range_update(&self, earliest: u64, latest: u64, latest_hash: [u8; 32]) {
+        if self.eth_version < 69 || self.is_closed() {
+            return;
+        }
+        let body = messages::encode_block_range_update(earliest, latest, &latest_hash);
+        // A write failure just means the peer is going away; the read loop's
+        // fail_all handles teardown. Don't fail_all here — this is fire-and-forget.
+        let _ = self.writer.lock().await.send(messages::BLOCK_RANGE_UPDATE, &body).await;
+    }
+
     pub async fn send_transaction(&self, raw_tx: &[u8]) -> Result<(), String> {
         let body = messages::encode_transactions(raw_tx);
         if let Err(e) = self.writer.lock().await.send(messages::TRANSACTIONS, &body).await {

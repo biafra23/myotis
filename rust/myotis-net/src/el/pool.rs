@@ -87,6 +87,9 @@ struct PoolInner {
     cache: Mutex<ElPeerCache>,
     /// Recent headers we can serve to peers + the eth/69 advertised range source.
     served: Arc<ServedHeaders>,
+    /// Last (earliest, latest) we broadcast via BlockRangeUpdate, to suppress
+    /// duplicate sends when the maintainer tick finds an unchanged range.
+    last_broadcast_range: Mutex<Option<(u64, u64)>>,
     /// Inbound peer-demand counters for the status page.
     serve_stats: Arc<ServeStats>,
 }
@@ -234,6 +237,7 @@ impl PeerPool {
             blacklist: Mutex::new(HashSet::new()),
             cache: Mutex::new(cache),
             served: Arc::new(ServedHeaders::default()),
+            last_broadcast_range: Mutex::new(None),
             serve_stats: Arc::new(ServeStats::default()),
         });
         // Both the discv4 dialer and the maintainer dial through one shared
@@ -282,6 +286,12 @@ impl PeerPool {
     /// body_served)` for the status page. Lock-free.
     pub fn serve_stats(&self) -> (u64, u64, u64, u64) {
         self.inner.serve_stats.snapshot()
+    }
+
+    /// Live-adjust the eth/69 served-block window (Settings knob). Shrinking
+    /// evicts immediately; the next maintainer tick broadcasts the new range.
+    pub fn set_served_block_window(&self, blocks: u64) {
+        self.inner.served.set_window(blocks);
     }
 
     /// Node ids blacklisted as wrong-chain this run.
@@ -425,9 +435,34 @@ async fn try_dial(
 /// top back up. Twin of the Java `ChainStack.maintainSnapPeers` loop — the
 /// discv4 dialer alone can starve on a long-running daemon once its stream goes
 /// quiet and pooled peers die, so this keeps the pool healed from the cache.
+/// Send BlockRangeUpdate to all live eth/69 peers when our servable range has
+/// changed since the last broadcast. Peers snapshot-then-send outside the peers
+/// lock so a slow writer can't stall the maintainer.
+async fn broadcast_range_if_changed(inner: &Arc<PoolInner>) {
+    let Some((earliest, latest, latest_hash)) = inner.served.advertise() else {
+        return; // empty window — nothing new to promise
+    };
+    {
+        let mut last = inner.last_broadcast_range.lock().await;
+        if *last == Some((earliest, latest)) {
+            return;
+        }
+        *last = Some((earliest, latest));
+    }
+    let peers: Vec<Arc<ManagedPeer>> =
+        inner.peers.lock().await.iter().map(|p| Arc::clone(&p.peer)).collect();
+    for peer in peers {
+        peer.send_block_range_update(earliest, latest, latest_hash).await;
+    }
+}
+
 async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
     loop {
         tokio::time::sleep(MAINTAINER_INTERVAL).await;
+        // Keep the eth/69 advertised range honest over a connection's lifetime:
+        // a peer told a narrow range at handshake would otherwise get empty
+        // answers once the window slides forward. Broadcast on change (deduped).
+        broadcast_range_if_changed(&inner).await;
         // prune_closed frees dead peers' addresses so try_dial can re-dial them.
         let live = inner.prune_closed().await;
         if live >= inner.pool_cfg.target_snap_peers {

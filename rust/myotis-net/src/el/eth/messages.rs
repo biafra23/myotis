@@ -13,6 +13,9 @@ use myotis_core::CoreError;
 // Absolute eth message codes (p2p base 0x10).
 pub const STATUS: u64 = 0x10;
 pub const NEW_BLOCK_HASHES: u64 = 0x11;
+/// eth/69 (EIP-7642) BlockRangeUpdate — same id 0x11 as the obsolete
+/// NewBlockHashes, so senders MUST gate on the negotiated version.
+pub const BLOCK_RANGE_UPDATE: u64 = 0x11;
 pub const TRANSACTIONS: u64 = 0x12;
 pub const GET_BLOCK_HEADERS: u64 = 0x13;
 pub const BLOCK_HEADERS: u64 = 0x14;
@@ -69,6 +72,16 @@ pub fn encode_status(
 /// The eth/69 (EIP-7642) block range is a promise of what we can SERVE — the
 /// Java twin advertises only its held header window (never `[0, head]`), and
 /// callers here must do the same.
+/// eth/69 BlockRangeUpdate body `[earliestBlock, latestBlock, latestBlockHash]`.
+/// Sent to already-connected peers when our servable range changes.
+pub fn encode_block_range_update(earliest: u64, latest: u64, latest_hash: &[u8; 32]) -> Vec<u8> {
+    rlp::encode(&Item::List(vec![
+        Item::Bytes(rlp::u64_to_minimal_be(earliest)),
+        Item::Bytes(rlp::u64_to_minimal_be(latest)),
+        Item::Bytes(latest_hash.to_vec()),
+    ]))
+}
+
 pub fn encode_status69(
     eth_version: u64,
     network_id: u64,
@@ -503,6 +516,17 @@ mod tests {
         assert!(matches!(origin, HeadersOrigin::Hash(x) if x == h));
 
         assert!(decode_get_block_headers(b"junk").is_err());
+    }
+
+    #[test]
+    fn block_range_update_round_trips() {
+        let h = [0xab_u8; 32];
+        let enc = encode_block_range_update(20_999_968, 21_000_000, &h);
+        let items = rlp::raw_list_items(&enc).unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(rlp::decode(items[0]).unwrap().as_u64().unwrap(), 20_999_968);
+        assert_eq!(rlp::decode(items[1]).unwrap().as_u64().unwrap(), 21_000_000);
+        assert_eq!(rlp::decode(items[2]).unwrap().as_bytes().unwrap(), &h[..]);
     }
 
     #[test]

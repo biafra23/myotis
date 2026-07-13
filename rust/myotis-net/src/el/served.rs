@@ -46,7 +46,9 @@ struct Inner {
 /// Bounded shared store of recent servable headers.
 pub struct ServedHeaders {
     inner: Mutex<Inner>,
-    window: u64,
+    /// Live-settable window size (the Settings knob adjusts it, mirroring the
+    /// Java `ServedHeaderWindow.setMaxWindow`). Read on every put.
+    window: AtomicU64,
 }
 
 impl Default for ServedHeaders {
@@ -57,7 +59,35 @@ impl Default for ServedHeaders {
 
 impl ServedHeaders {
     pub fn new(window: u64) -> ServedHeaders {
-        ServedHeaders { inner: Mutex::new(Inner::default()), window: window.max(1) }
+        ServedHeaders { inner: Mutex::new(Inner::default()), window: AtomicU64::new(window.max(1)) }
+    }
+
+    /// Live-adjust the window (Settings). Clamped ≥ 1; shrinking evicts the tail
+    /// immediately so the advertised range can never exceed the new cap.
+    pub fn set_window(&self, window: u64) {
+        self.window.store(window.max(1), Ordering::Relaxed);
+        let mut g = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Self::evict_locked(&mut g, self.window.load(Ordering::Relaxed));
+    }
+
+    /// Evict everything below the newest-window band. Caller holds the lock.
+    fn evict_locked(g: &mut Inner, window: u64) {
+        let top = match g.by_number.keys().next_back() {
+            Some(&t) => t,
+            None => return,
+        };
+        let floor = top.saturating_sub(window - 1);
+        while let Some((&n, _)) = g.by_number.first_key_value() {
+            if n >= floor {
+                break;
+            }
+            if let Some((h, _)) = g.by_number.remove(&n) {
+                g.by_hash.remove(&h);
+            }
+        }
     }
 
     /// Record a header we hold (raw wire RLP, hash recomputed at decode).
@@ -77,20 +107,7 @@ impl ServedHeaders {
             }
         }
         g.by_hash.insert(hash, number);
-        // Evict below the newest-window band.
-        let top = match g.by_number.keys().next_back() {
-            Some(&t) => t,
-            None => return,
-        };
-        let floor = top.saturating_sub(self.window - 1);
-        while let Some((&n, _)) = g.by_number.first_key_value() {
-            if n >= floor {
-                break;
-            }
-            if let Some((h, _)) = g.by_number.remove(&n) {
-                g.by_hash.remove(&h);
-            }
-        }
+        Self::evict_locked(&mut g, self.window.load(Ordering::Relaxed));
     }
 
     /// The contiguous run of held headers starting at `start` (ascending, no
@@ -257,6 +274,23 @@ mod tests {
         assert_eq!(w.by_hash(&hash(1)), None, "stale hash dropped");
         assert_eq!(w.by_hash(&hash(2)), Some(raw(2)));
         assert_eq!(w.advertise(), Some((50, 50, hash(2))));
+    }
+
+    #[test]
+    fn set_window_shrinks_and_grows_live() {
+        let w = ServedHeaders::new(10);
+        for n in 100..=109 {
+            w.put(n, hash(n), raw(n));
+        }
+        w.set_window(3);
+        assert_eq!(w.advertise(), Some((107, 109, hash(109))));
+        assert!(w.run_from(106, 1).is_empty(), "shrink evicts below the new cap");
+        w.set_window(5);
+        for n in 110..=111 {
+            w.put(n, hash(n), raw(n));
+        }
+        // survivors (107..109) + new (110,111) all within the 5-cap band [107,111]
+        assert_eq!(w.advertise(), Some((107, 111, hash(111))));
     }
 
     #[test]

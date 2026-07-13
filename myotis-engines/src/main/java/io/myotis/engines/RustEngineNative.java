@@ -23,7 +23,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 13; // 13: + nativePause/nativeResume (idle sleep)
+    static final int EXPECTED_ABI_VERSION = 14; // 14: + nativeSetServedBlockWindow
 
     private static final boolean AVAILABLE = load();
 
@@ -118,6 +118,12 @@ final class RustEngineNative {
      * handle stays PAUSED, retryable) or the handle isn't paused.
      */
     static native boolean nativeResume(long handle);
+
+    /**
+     * Live-set the eth/69 served-block window (Settings knob). Silently a no-op
+     * on a not-started / paused / CL-only handle — the host fn absorbs it.
+     */
+    static native void nativeSetServedBlockWindow(long handle, int blocks);
 
     /** Up to {@code max} buffered engine tracing lines (oldest first,
      *  newline-joined; empty when idle). The drainable-ring end of the

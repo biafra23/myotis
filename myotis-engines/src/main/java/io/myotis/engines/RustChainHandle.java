@@ -614,8 +614,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
 
     @Override
     public void setServedBlockWindow(int blocks) {
-        log.debug("[engines] setServedBlockWindow({}) is a no-op on the R1 Rust engine (CL-only: no eth layer)",
-                blocks);
+        // Live-applied on a running EL handle; the native absorbs it as a no-op
+        // when the handle isn't started or has no EL reader.
+        RustEngineNative.nativeSetServedBlockWindow(handle, blocks);
     }
 
     @Override
