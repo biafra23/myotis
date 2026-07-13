@@ -119,9 +119,13 @@ public final class ChainStack {
     private volatile long dnsDialWindowStartMs = 0L;
     private final AtomicInteger dnsDialsInWindow = new AtomicInteger(0);
     private volatile ScheduledExecutorService peerMaintainer;
-    /** Monotonic ms (nanoTime-derived) since the snap serving pool went empty; 0 = not empty. Written
+    /** Monotonic ms (nanoTime-derived) when the snap serving pool went empty. Only
+     *  meaningful while {@link #snapZeroActive}; nanoTime's origin is arbitrary (can
+     *  be ≤ 0), so an explicit flag marks validity instead of a 0 sentinel. Written
      *  by the maintainer tick, read by {@link #elHunting()} / the status snapshot. */
     private volatile long snapZeroSinceMs = 0L;
+    /** True while the serving pool is empty and {@link #snapZeroSinceMs} is valid. */
+    private volatile boolean snapZeroActive = false;
     /** EL hunt engaged (see EL_HUNT_STALL_MS). Maintainer-tick-updated. */
     private volatile boolean elHunting = false;
 
@@ -371,6 +375,7 @@ public final class ChainStack {
         // (the Rust engine rebuilds its pool with fresh state on resume —
         // keep the engines' behavior aligned).
         snapZeroSinceMs = 0L;
+        snapZeroActive = false;
         elHunting = false;
         ScheduledExecutorService pm = peerMaintainer;
         if (pm != null) { pm.shutdownNow(); peerMaintainer = null; }
@@ -517,9 +522,11 @@ public final class ChainStack {
     }
 
     /** Pure trigger for the EL hunt (unit-tested; the Rust pool's el_hunt_due twin):
-     *  serving pool empty AND it has been empty past the stall window. */
-    static boolean elHuntDue(int servingPeers, long zeroSinceMs, long nowMs) {
-        return servingPeers == 0 && zeroSinceMs > 0 && nowMs - zeroSinceMs >= EL_HUNT_STALL_MS;
+     *  serving pool empty AND it has been empty past the stall window. The explicit
+     *  {@code zeroActive} flag (not a timestamp sentinel) keeps this correct on
+     *  platforms where nanoTime readings are zero or negative. */
+    static boolean elHuntDue(int servingPeers, boolean zeroActive, long zeroSinceMs, long nowMs) {
+        return servingPeers == 0 && zeroActive && nowMs - zeroSinceMs >= EL_HUNT_STALL_MS;
     }
     public LifecycleState lifecycle() { return phase.get(); }
     public RLPxConnector connector() { return connector; }
@@ -962,17 +969,18 @@ public final class ChainStack {
             // trigger + transition logs (Rust maintainer_loop twin).
             long monotonicNowMs = System.nanoTime() / 1_000_000L;
             if (snapPeers > 0) {
-                snapZeroSinceMs = 0L;
+                snapZeroActive = false;
                 if (elHunting) {
                     elHunting = false;
                     log.info("[{}][peers] EL hunt disengaged — snap peer serving again", network.name());
                 }
-            } else if (snapZeroSinceMs == 0L) {
+            } else if (!snapZeroActive) {
+                snapZeroActive = true;
                 snapZeroSinceMs = monotonicNowMs;
             }
             // Monotonic clock: an NTP jump during a momentary outage must not
             // fake a 60s stall (same rule as verifiedHeadAgeMs).
-            boolean hunting = elHuntDue(snapPeers, snapZeroSinceMs, monotonicNowMs);
+            boolean hunting = elHuntDue(snapPeers, snapZeroActive, snapZeroSinceMs, monotonicNowMs);
             if (hunting && !elHunting) {
                 elHunting = true;
                 log.info("[{}][peers] EL hunt engaged — snap serving pool empty {}s "
