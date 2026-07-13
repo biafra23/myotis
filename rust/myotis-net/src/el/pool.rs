@@ -459,6 +459,13 @@ async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
         tokio::time::sleep(MAINTAINER_INTERVAL).await;
         // prune_closed frees dead peers' addresses so try_dial can re-dial them.
         let live = inner.prune_closed().await;
+        // target == 0 = maintainer deliberately idle: an empty pool is the
+        // EXPECTED state — never engage the hunt (Java maintainSnapPeers twin).
+        if inner.pool_cfg.target_snap_peers == 0 {
+            zero_since = None;
+            inner.hunting.store(false, Ordering::Relaxed);
+            continue;
+        }
         if live > 0 {
             zero_since = None;
             if inner.hunting.swap(false, Ordering::Relaxed) {

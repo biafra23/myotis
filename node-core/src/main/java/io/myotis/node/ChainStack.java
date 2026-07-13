@@ -963,6 +963,17 @@ public final class ChainStack {
         try {
             RLPxConnector conn = connector;
             if (conn == null) return;
+            // target <= 0 = maintainer deliberately idle: an empty pool is the
+            // EXPECTED state, not starvation — never engage (or advertise) the
+            // hunt, and clear any state left from a previous target.
+            if (targetSnapPeers <= 0) {
+                snapZeroActive = false;
+                if (elHunting) {
+                    elHunting = false;
+                    log.info("[{}][peers] EL hunt disengaged — snap target set to 0", network.name());
+                }
+                return;
+            }
             int snapPeers = conn.activeSnapHandlers().size();
             long now = System.currentTimeMillis();
             // EL hunt bookkeeping: stall clock while the SERVING pool is empty,
