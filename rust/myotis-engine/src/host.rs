@@ -395,15 +395,22 @@ pub fn status_json(handle: i64) -> String {
         Snap::Running(status, wall, reader) => {
             let el = match reader {
                 Some(r) => engine.rt.block_on(async {
-                    ElCounts {
-                        reader_available: true,
-                        snap_peers: r.snap_peer_count().await,
-                        discovered: r.discovered_count(),
-                        attempted: r.attempted_count().await,
-                        backed_off: r.backoff_count().await,
-                        blacklisted: r.blacklist_count().await,
-                        optimistic_block: r.optimistic_block_number(),
-                        finalized_block: r.finalized_block_number(),
+                    {
+                        let (h_asked, h_served, b_asked, b_served) = r.serve_stats();
+                        ElCounts {
+                            reader_available: true,
+                            snap_peers: r.snap_peer_count().await,
+                            discovered: r.discovered_count(),
+                            attempted: r.attempted_count().await,
+                            backed_off: r.backoff_count().await,
+                            blacklisted: r.blacklist_count().await,
+                            optimistic_block: r.optimistic_block_number(),
+                            finalized_block: r.finalized_block_number(),
+                            header_requests: h_asked,
+                            header_requests_served: h_served,
+                            body_requests: b_asked,
+                            body_requests_served: b_served,
+                        }
                     }
                 }),
                 None => ElCounts::default(),
@@ -436,6 +443,12 @@ struct ElCounts {
     optimistic_block: u64,
     /// Finalized execution block number (0 before the anchor has one).
     finalized_block: u64,
+    /// Inbound peer demand: GetBlockHeaders asked / answered non-empty, and
+    /// GetBlockBodies asked / answered non-empty (the latter always 0 today).
+    header_requests: u64,
+    header_requests_served: u64,
+    body_requests: u64,
+    body_requests_served: u64,
 }
 
 /// `nativeStop`: remove + shut down a handle's sync loop. No-op for unknown id.
@@ -1225,6 +1238,10 @@ fn status_object(
     // payload's block), matching the StatusSnapshot field semantics.
     obj.insert("optimisticBlockNumber".into(), el.optimistic_block.into());
     obj.insert("finalizedBlockNumber".into(), el.finalized_block.into());
+    obj.insert("peerHeaderRequests".into(), el.header_requests.into());
+    obj.insert("peerHeaderRequestsServed".into(), el.header_requests_served.into());
+    obj.insert("peerBodyRequests".into(), el.body_requests.into());
+    obj.insert("peerBodyRequestsServed".into(), el.body_requests_served.into());
     obj.insert("executionBlockNumber".into(), el.finalized_block.into());
     // A hand-built object of primitives always serializes; fall back to the
     // literal not-started shape rather than panic on the (impossible) error.
@@ -1243,7 +1260,9 @@ const NOT_STARTED_FALLBACK: &str = concat!(
     r#""elReaderAvailable":false,"#,
     r#""snapPeers":0,"readyPeers":0,"discoveredPeers":0,"attemptedDials":0,"#,
     r#""backedOffPeers":0,"blacklistedPeers":0,"optimisticBlockNumber":0,"#,
-    r#""finalizedBlockNumber":0,"executionBlockNumber":0}"#,
+    r#""finalizedBlockNumber":0,"executionBlockNumber":0,"#,
+    r#""peerHeaderRequests":0,"peerHeaderRequestsServed":0,"#,
+    r#""peerBodyRequests":0,"peerBodyRequestsServed":0}"#,
 );
 
 #[cfg(test)]
@@ -1341,6 +1360,10 @@ mod tests {
             blacklisted: 66,
             optimistic_block: 21_000_010,
             finalized_block: 20_999_000,
+            header_requests: 6,
+            header_requests_served: 2,
+            body_requests: 1,
+            body_requests_served: 0,
         };
         let synced: serde_json::Value = serde_json::from_str(&status_object(
             Lifecycle::Running,
@@ -1354,6 +1377,10 @@ mod tests {
         assert_eq!(synced["beaconState"], "SYNCED");
         assert_eq!(synced["bootstrapped"], true);
         assert_eq!(synced["finalizedSlot"], 100);
+        assert_eq!(synced["peerHeaderRequests"], 6);
+        assert_eq!(synced["peerHeaderRequestsServed"], 2);
+        assert_eq!(synced["peerBodyRequests"], 1);
+        assert_eq!(synced["peerBodyRequestsServed"], 0);
         assert_eq!(synced["optimisticSlot"], 132);
         assert_eq!(synced["currentPeriod"], 1777);
         assert_eq!(synced["targetPeriod"], 1795);

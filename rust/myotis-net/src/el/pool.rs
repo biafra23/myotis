@@ -30,6 +30,7 @@ use myotis_core::nodekey::NodeKey;
 use crate::el::discv4::TableEntry;
 use crate::el::eth::session::{EthConfig, EthSession};
 use crate::el::peer::ManagedPeer;
+use crate::el::served::{ServeContext, ServeStats, ServedHeaders};
 use crate::el::peercache::ElPeerCache;
 use crate::el::rlpx::transport::RlpxConnection;
 
@@ -84,6 +85,10 @@ struct PoolInner {
     blacklist: Mutex<HashSet<[u8; 64]>>,
     /// Proven snap-capable peers, persisted for warm-start on the next run.
     cache: Mutex<ElPeerCache>,
+    /// Recent headers we can serve to peers + the eth/69 advertised range source.
+    served: Arc<ServedHeaders>,
+    /// Inbound peer-demand counters for the status page.
+    serve_stats: Arc<ServeStats>,
 }
 
 impl PoolInner {
@@ -141,7 +146,9 @@ impl PoolInner {
     async fn dial_one(self: &Arc<PoolInner>, addr: SocketAddr, pubkey: [u8; 64]) {
         let result = async {
             let conn = RlpxConnection::dial(Arc::clone(&self.key), addr, pubkey).await?;
-            EthSession::handshake(conn, &self.local_pubkey, &self.cfg).await
+            // eth/69 Status advertises only the window's held range (None → the
+            // honest genesis-only [0, 0]); see ServedHeaders::advertise.
+            EthSession::handshake(conn, &self.local_pubkey, &self.cfg, self.served.advertise()).await
         }
         .await;
 
@@ -153,7 +160,14 @@ impl PoolInner {
                 // failures/non-snap stay at debug to avoid the discv4 cross-chain
                 // noise (most discovered peers are other networks or full).
                 tracing::info!(%addr, eth = session.eth_version, "el dial: snap peer connected");
-                let peer = Arc::new(ManagedPeer::spawn(session, addr));
+                let peer = Arc::new(ManagedPeer::spawn_serving(
+                    session,
+                    addr,
+                    ServeContext {
+                        window: Arc::clone(&self.served),
+                        stats: Arc::clone(&self.serve_stats),
+                    },
+                ));
                 // Keep `addr` in `attempted` while connected — dropped by
                 // prune_closed when the peer later closes.
                 self.peers.lock().await.push(PooledPeer { addr, peer });
@@ -219,6 +233,8 @@ impl PeerPool {
             backoff: Mutex::new(HashMap::new()),
             blacklist: Mutex::new(HashSet::new()),
             cache: Mutex::new(cache),
+            served: Arc::new(ServedHeaders::default()),
+            serve_stats: Arc::new(ServeStats::default()),
         });
         // Both the discv4 dialer and the maintainer dial through one shared
         // concurrency budget.
@@ -260,6 +276,12 @@ impl PeerPool {
     /// Addresses dialed and not yet failed (in-flight or connected).
     pub async fn attempted_count(&self) -> usize {
         self.inner.attempted.lock().await.len()
+    }
+
+    /// Inbound-serve counters `(header_asked, header_served, body_asked,
+    /// body_served)` for the status page. Lock-free.
+    pub fn serve_stats(&self) -> (u64, u64, u64, u64) {
+        self.inner.serve_stats.snapshot()
     }
 
     /// Node ids blacklisted as wrong-chain this run.

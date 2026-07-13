@@ -39,7 +39,10 @@ class RustStatusJsonTest {
             + "\"finalizedRootHex\":\"0000000000000000000000000000000000000000000000000000000000000000\","
             + "\"elReaderAvailable\":false,"
             + "\"snapPeers\":0,\"readyPeers\":0,\"discoveredPeers\":0,\"attemptedDials\":0,"
-            + "\"backedOffPeers\":0,\"blacklistedPeers\":0}";
+            + "\"backedOffPeers\":0,\"blacklistedPeers\":0,\"optimisticBlockNumber\":0,"
+            + "\"finalizedBlockNumber\":0,\"executionBlockNumber\":0,"
+            + "\"peerHeaderRequests\":0,\"peerHeaderRequestsServed\":0,"
+            + "\"peerBodyRequests\":0,\"peerBodyRequestsServed\":0}";
 
     /** A synthetic catching-up shape (real running numbers, incl. EL counts). */
     private static final String CATCHING_UP_JSON =
@@ -52,7 +55,9 @@ class RustStatusJsonTest {
             + "\"snapPeers\":6,\"readyPeers\":6,\"discoveredPeers\":240,\"attemptedDials\":14,"
             + "\"backedOffPeers\":30,\"blacklistedPeers\":66,"
             + "\"optimisticBlockNumber\":21000010,\"finalizedBlockNumber\":20999000,"
-            + "\"executionBlockNumber\":20999000}";
+            + "\"executionBlockNumber\":20999000,"
+            + "\"peerHeaderRequests\":6,\"peerHeaderRequestsServed\":2,"
+            + "\"peerBodyRequests\":1,\"peerBodyRequestsServed\":0}";
 
     @BeforeAll
     static void setup() {
@@ -132,6 +137,11 @@ class RustStatusJsonTest {
         assertEquals(1795L, s.syncTargetPeriod());
         assertEquals(1795L, s.wallClockPeriod());
         assertEquals(7, s.discv5TableSize());
+        // Inbound-serve counters flow from the engine's status JSON (not zeros).
+        assertEquals(6L, s.peerHeaderRequests());
+        assertEquals(2L, s.peerHeaderRequestsServed());
+        assertEquals(1L, s.peerBodyRequests());
+        assertEquals(0L, s.peerBodyRequestsServed());
         assertEquals(1777L, s.syncStartPeriod());
         assertEquals(14560000L / 8192L, s.finalizedPeriod());
         assertTrue(s.lcHunting());
