@@ -379,6 +379,11 @@ impl ElReader {
         self.pool.serve_stats()
     }
 
+    /// EL hunt engaged on the pool (serving pool empty past the stall window).
+    pub fn el_hunting(&self) -> bool {
+        self.pool.el_hunting()
+    }
+
     pub async fn blacklist_count(&self) -> usize {
         self.pool.blacklist_count().await
     }

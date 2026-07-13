@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,7 +32,7 @@ use crate::el::discv4::TableEntry;
 use crate::el::eth::session::{EthConfig, EthSession};
 use crate::el::peer::ManagedPeer;
 use crate::el::served::{ServeContext, ServeStats, ServedHeaders};
-use crate::el::peercache::ElPeerCache;
+use crate::el::peercache::{ElPeerCache, SnapQuality};
 use crate::el::rlpx::transport::RlpxConnection;
 
 /// Wrong-chain peers: don't retry the address for a long while (Java's
@@ -43,6 +44,21 @@ const BACKOFF_TRANSIENT: Duration = Duration::from_secs(30);
 /// How often the maintainer checks the pool and tops it back up to target
 /// (Java's `maintainSnapPeers` fixed delay).
 const MAINTAINER_INTERVAL: Duration = Duration::from_secs(10);
+
+/// EL hunt: the serving pool has been EMPTY this long → emergency mode. Not
+/// "below target" — on snap-scarce chains (gnosis) the target is simply
+/// unreachable and hunting forever would burn network for nothing; zero
+/// serving is the state where verified reads are actually impossible. The
+/// hunt bypasses TRANSIENT backoffs for cache-CONFIRMED snap servers (they
+/// served chain-verified snap data — wrong-chain is impossible, so an eager
+/// re-dial is safe). Blacklist and incompatible entries stay respected.
+const EL_HUNT_STALL: Duration = Duration::from_secs(60);
+
+/// Pure trigger: pool empty AND it has been empty past the stall window.
+fn el_hunt_due(live: usize, zero_since: Option<Instant>, now: Instant) -> bool {
+    live == 0
+        && zero_since.is_some_and(|t| now.saturating_duration_since(t) >= EL_HUNT_STALL)
+}
 
 /// Pool tunables.
 #[derive(Debug, Clone, Copy)]
@@ -89,6 +105,9 @@ struct PoolInner {
     served: Arc<ServedHeaders>,
     /// Inbound peer-demand counters for the status page.
     serve_stats: Arc<ServeStats>,
+    /// EL hunt engaged (serving pool empty past the stall window) — drives the
+    /// hosts' status banner and the maintainer's backoff bypass.
+    hunting: AtomicBool,
 }
 
 impl PoolInner {
@@ -235,6 +254,7 @@ impl PeerPool {
             cache: Mutex::new(cache),
             served: Arc::new(ServedHeaders::default()),
             serve_stats: Arc::new(ServeStats::default()),
+            hunting: AtomicBool::new(false),
         });
         // Both the discv4 dialer and the maintainer dial through one shared
         // concurrency budget.
@@ -319,6 +339,12 @@ impl PeerPool {
     /// deliberately not Clone).
     pub fn quality_sink(&self) -> SnapQualitySink {
         SnapQualitySink { inner: Arc::clone(&self.inner) }
+    }
+
+    /// EL hunt engaged: the serving pool has been empty past the stall window
+    /// and the maintainer is in emergency mode (see EL_HUNT_STALL).
+    pub fn el_hunting(&self) -> bool {
+        self.inner.hunting.load(Ordering::Relaxed)
     }
 
     /// Stop the pool: flush the peer cache, abort the background tasks, and drop
@@ -426,10 +452,34 @@ async fn try_dial(
 /// discv4 dialer alone can starve on a long-running daemon once its stream goes
 /// quiet and pooled peers die, so this keeps the pool healed from the cache.
 async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
+    // EL-hunt stall clock: Some(t) while the pool has been continuously empty
+    // since t. Maintainer-task-local — nothing else needs it.
+    let mut zero_since: Option<Instant> = None;
     loop {
         tokio::time::sleep(MAINTAINER_INTERVAL).await;
         // prune_closed frees dead peers' addresses so try_dial can re-dial them.
         let live = inner.prune_closed().await;
+        // target == 0 = maintainer deliberately idle: an empty pool is the
+        // EXPECTED state — never engage the hunt (Java maintainSnapPeers twin).
+        if inner.pool_cfg.target_snap_peers == 0 {
+            zero_since = None;
+            inner.hunting.store(false, Ordering::Relaxed);
+            continue;
+        }
+        if live > 0 {
+            zero_since = None;
+            if inner.hunting.swap(false, Ordering::Relaxed) {
+                tracing::info!(live, "EL hunt disengaged — snap peer serving again");
+            }
+        } else {
+            zero_since.get_or_insert_with(Instant::now);
+        }
+        let hunting = el_hunt_due(live, zero_since, Instant::now());
+        if hunting && !inner.hunting.swap(true, Ordering::Relaxed) {
+            tracing::info!(stall_secs = EL_HUNT_STALL.as_secs(),
+                "EL hunt engaged — serving pool empty past the stall window \
+                 (bypassing transient backoffs for cache-confirmed snap servers)");
+        }
         if live >= inner.pool_cfg.target_snap_peers {
             continue;
         }
@@ -439,10 +489,30 @@ async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
         if cached.is_empty() {
             continue;
         }
+        if hunting {
+            // Emergency: free the TRANSIENT backoffs of CONFIRMED snap servers
+            // so the dial loop below reaches them NOW instead of after the
+            // standard cool-off. Confirmed = served us chain-verified snap
+            // data. Entries whose remaining window exceeds the transient
+            // length are INCOMPATIBLE (10 min) — keep those: try_dial's
+            // blacklist check would block the dial anyway, but the timer
+            // must stay honest too. Non-confirmed peers keep their timers.
+            let now = Instant::now();
+            let mut backoff = inner.backoff.lock().await;
+            for c in cached.iter().filter(|c| c.quality == SnapQuality::Confirmed) {
+                if backoff
+                    .get(&c.addr)
+                    .is_some_and(|exp| exp.saturating_duration_since(now) <= BACKOFF_TRANSIENT)
+                {
+                    backoff.remove(&c.addr);
+                }
+            }
+        }
         tracing::debug!(
             live,
             target = inner.pool_cfg.target_snap_peers,
             cached = cached.len(),
+            hunting,
             "EL pool below target — maintainer re-dialing cached snap peers"
         );
         for c in cached {
@@ -664,6 +734,19 @@ mod tests {
 
         pool.stop().await;
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn el_hunt_due_triggers_only_on_sustained_empty_pool() {
+        let now = Instant::now();
+        // Any live peer → never hunt, regardless of how long the pool WAS empty.
+        assert!(!el_hunt_due(1, Some(now - EL_HUNT_STALL * 2), now));
+        // Empty but not yet past the stall window → no hunt (fresh starts and
+        // brief blips must not trip emergency mode).
+        assert!(!el_hunt_due(0, Some(now - Duration::from_secs(5)), now));
+        assert!(!el_hunt_due(0, None, now));
+        // Empty past the window → hunt.
+        assert!(el_hunt_due(0, Some(now - EL_HUNT_STALL), now));
     }
 }
 
