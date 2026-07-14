@@ -255,8 +255,13 @@ const RECEIPT_INITIAL_LOOKBACK_BLOCKS: u64 = 8;
 const RECEIPT_MAX_SCAN_BLOCKS_PER_POLL: u64 = 128;
 
 /// Idle TTL for a per-tx receipt scan cursor (the Java `RECEIPT_SCAN_TTL_MS`):
-/// an entry untouched this long is dropped on the next lookup.
+/// an entry untouched this long is dropped by the next sweep.
 const RECEIPT_SCAN_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How often the cursor map's TTL sweep may run (piggybacked on lookups; the
+/// Java twin uses a background warmer tick). Well under the TTL, so eviction
+/// lags it by at most a small fraction.
+const RECEIPT_SCAN_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Per-peer deadline for one receipt scan attempt (window fetch + per-block
 /// bodies) — the Java stage timeout (`HEADER_CHAIN_TIMEOUT_SEC`); on expiry the
@@ -345,9 +350,14 @@ pub struct ElReader {
     /// each entry's tokio Mutex serializes the (network-slow) scan per tx hash,
     /// so concurrent polls for the SAME tx don't duplicate fetches while
     /// different txs proceed in parallel.
-    tx_scans: std::sync::Mutex<
-        std::collections::HashMap<[u8; 32], Arc<tokio::sync::Mutex<TxScanState>>>,
-    >,
+    tx_scans: std::sync::Mutex<TxScanMap>,
+}
+
+/// The scan-cursor map plus its last TTL sweep — one lock covers both, so the
+/// sweep can be time-gated without a second synchronization point.
+struct TxScanMap {
+    map: std::collections::HashMap<[u8; 32], Arc<tokio::sync::Mutex<TxScanState>>>,
+    last_sweep: std::time::Instant,
 }
 
 /// Per-kind bound for the cross-call state-proof cache (accounts and storage
@@ -436,7 +446,10 @@ impl ElReader {
             min_suggested_tip_wei: cfg.min_suggested_tip_wei,
             evm_proof_cache: Arc::new(InMemoryStateProofCache::new(EVM_PROOF_CACHE_ENTRIES)),
             evm_bytecode_cache: Arc::new(InMemoryBytecodeCache::new()),
-            tx_scans: std::sync::Mutex::new(std::collections::HashMap::new()),
+            tx_scans: std::sync::Mutex::new(TxScanMap {
+                map: std::collections::HashMap::new(),
+                last_sweep: std::time::Instant::now(),
+            }),
         })
     }
 
@@ -1164,29 +1177,12 @@ impl ElReader {
         // The contiguous forward window [target .. head] (back + 1 headers), in one
         // request. back < BLOCK_LOOKBACK_MAX (256) bounds this to ~150 KB, within the
         // eth response soft limit; a peer that caps its response below back+1 fails
-        // the length check below and is skipped (fails closed — the caller tries the
-        // next peer), so deep pins carry a slightly higher liveness risk than a
-        // batched fetch would. The common case (latest / a few blocks back) is one
-        // small response.
-        let window = peer.get_block_headers_by_number(target_num, back + 1, 0, false).await?;
-        if window.len() as u64 != back + 1 {
-            return Err(format!("peer returned {} headers, expected {}", window.len(), back + 1));
-        }
-        // The window's head must BE the beacon-anchored head, and each header must
-        // hash-link to the next — proving the target header chains to the verified
-        // head (the trust gate: head_hash is the light-client-attested exec hash).
-        if &window[window.len() - 1].hash != head_hash {
-            return Err("window head does not match the beacon-anchored head hash".to_string());
-        }
-        for i in 0..window.len() - 1 {
-            if window[i + 1].header.parent_hash != window[i].hash {
-                return Err("header window is not hash-linked".to_string());
-            }
-        }
+        // the anchored-window length check and is skipped (fails closed — the caller
+        // tries the next peer), so deep pins carry a slightly higher liveness risk
+        // than a batched fetch would. The common case (latest / a few blocks back) is
+        // one small response.
+        let window = fetch_anchored_window(peer, target_num, back + 1, head_hash).await?;
         let vh = &window[0];
-        if vh.header.number != target_num {
-            return Err("peer returned the wrong target block number".to_string());
-        }
         // Body: verify its transactions against the (now trusted) transactions_root.
         let bodies = peer.get_block_bodies(&[vh.hash]).await?;
         let body = bodies.into_iter().next().ok_or("peer returned no block body")?;
@@ -1244,18 +1240,7 @@ impl ElReader {
         count: u64,
         head_hash: &[u8; 32],
     ) -> Result<FeeEstimate, String> {
-        let window = peer.get_block_headers_by_number(start, count, 0, false).await?;
-        if window.len() as u64 != count {
-            return Err(format!("peer returned {} headers, expected {}", window.len(), count));
-        }
-        if &window[window.len() - 1].hash != head_hash {
-            return Err("window head does not match the beacon-anchored head hash".to_string());
-        }
-        for i in 0..window.len() - 1 {
-            if window[i + 1].header.parent_hash != window[i].hash {
-                return Err("header window is not hash-linked".to_string());
-            }
-        }
+        let window = fetch_anchored_window(peer, start, count, head_hash).await?;
         let hashes: Vec<[u8; 32]> = window.iter().map(|vh| vh.hash).collect();
         let bodies = peer.get_block_bodies(&hashes).await?;
         if bodies.len() != window.len() {
@@ -1339,6 +1324,14 @@ impl ElReader {
     /// (Java's anchor-failure path answers "null"), and a block whose body
     /// fetch fails aborts that peer's scan instead of being silently skipped —
     /// stricter, so a skipped block can never masquerade as "not seen".
+    ///
+    /// COVERAGE CAVEAT (Java parity): "not seen" means not seen in the SCANNED
+    /// coverage. A tx mined more than [`RECEIPT_INITIAL_LOOKBACK_BLOCKS`] below
+    /// the head before its FIRST poll, or inside a catch-up gap the
+    /// [`RECEIPT_MAX_SCAN_BLOCKS_PER_POLL`] cap skipped, keeps reading as null.
+    /// The Java engine narrows this for the wallet's own txs via the sent-tx
+    /// watch's broadcast-head reachback — that lands with the sent-tx slice
+    /// (milestone B chunk 3).
     pub async fn get_transaction_receipt(
         &self,
         tx_hash: [u8; 32],
@@ -1369,6 +1362,17 @@ impl ElReader {
         }
 
         if st.found.is_none() {
+            // A short reorg can pull the optimistic head BELOW an
+            // already-scanned height. Clamp the cursor so the replacement
+            // blocks are rescanned as the head re-advances — otherwise
+            // `from = high + 1 > head` skips scanning until the head passes the
+            // stale cursor, and a tx mined in a replacement block would keep
+            // reading as a verified "not seen" in the meantime.
+            if let Some(high) = st.high_scanned {
+                if high > head_num {
+                    st.high_scanned = Some(head_num);
+                }
+            }
             let mut from = match st.high_scanned {
                 None => head_num.saturating_sub(RECEIPT_INITIAL_LOOKBACK_BLOCKS - 1),
                 Some(high) => high + 1,
@@ -1426,6 +1430,10 @@ impl ElReader {
         let Some(loc) = st.found.clone() else {
             return Ok(None); // verified "not seen" in the scanned coverage → eth null
         };
+        // The cursor is settled; release it before the receipt round-trip so
+        // concurrent polls for the SAME tx aren't serialized behind network I/O
+        // (the Java twin's synchronized block also ends at locateMinedTx).
+        drop(st);
 
         // Fetch + verify the block's receipts against the (anchored) header's
         // receiptsRoot, then build the result. Receipts are re-fetched per poll
@@ -1451,21 +1459,27 @@ impl ElReader {
         Err(format!("all {total} snap peer(s) failed to serve verifiable receipts: {last_err}"))
     }
 
-    /// Get-or-create the per-tx scan cursor, evicting idle entries (TTL) on the
-    /// way. `Err` only on a poisoned lock (can't happen under panic="abort",
-    /// but never panic here).
+    /// Get-or-create the per-tx scan cursor. The idle-TTL sweep is time-gated
+    /// (at most once per [`RECEIPT_SCAN_SWEEP_INTERVAL`]) so a burst of
+    /// distinct hashes — the map key is attacker-suppliable via the public RPC
+    /// — costs O(1) per lookup, not an O(n) walk each time (the Java twin
+    /// evicts on a background warmer tick). `Err` only on a poisoned lock
+    /// (can't happen under panic="abort", but never panic here).
     fn tx_scan_state(
         &self,
         tx_hash: [u8; 32],
     ) -> Result<Arc<tokio::sync::Mutex<TxScanState>>, String> {
-        let mut map = self.tx_scans.lock().map_err(|_| "engine lock poisoned".to_string())?;
+        let mut scans = self.tx_scans.lock().map_err(|_| "engine lock poisoned".to_string())?;
         let now = std::time::Instant::now();
-        // An entry whose tokio lock is HELD is in use — keep it regardless.
-        map.retain(|_, st| match st.try_lock() {
-            Ok(guard) => now.duration_since(guard.last_touched) < RECEIPT_SCAN_TTL,
-            Err(_) => true,
-        });
-        Ok(Arc::clone(map.entry(tx_hash).or_insert_with(|| {
+        if now.duration_since(scans.last_sweep) >= RECEIPT_SCAN_SWEEP_INTERVAL {
+            scans.last_sweep = now;
+            // An entry whose tokio lock is HELD is in use — keep it regardless.
+            scans.map.retain(|_, st| match st.try_lock() {
+                Ok(guard) => now.duration_since(guard.last_touched) < RECEIPT_SCAN_TTL,
+                Err(_) => true,
+            });
+        }
+        Ok(Arc::clone(scans.map.entry(tx_hash).or_insert_with(|| {
             Arc::new(tokio::sync::Mutex::new(TxScanState {
                 high_scanned: None,
                 found: None,
@@ -1513,29 +1527,19 @@ impl ElReader {
         count: u64,
         head_hash: &[u8; 32],
     ) -> Result<bool, String> {
-        let window =
-            peer.get_block_headers_by_number(loc.header.number, count, 0, false).await?;
-        if window.len() as u64 != count {
-            return Err(format!("peer returned {} headers, expected {count}", window.len()));
-        }
-        if &window[window.len() - 1].hash != head_hash {
-            return Err("window head does not match the beacon-anchored head hash".to_string());
-        }
-        for i in 0..window.len() - 1 {
-            if window[i + 1].header.parent_hash != window[i].hash {
-                return Err("header window is not hash-linked".to_string());
-            }
-        }
+        let window = fetch_anchored_window(peer, loc.header.number, count, head_hash).await?;
         Ok(window[0].hash == loc.block_hash)
     }
 
     /// Scan `[from..head]` against one peer for the tx hash: fetch the header
-    /// window, anchor it to the beacon head + hash-link it, then walk the blocks
-    /// NEWEST-first (a just-mined tx is found on the first body checked), each
-    /// body verified against its header's `transactionsRoot` before its tx
-    /// hashes are trusted. Any fetch/verify failure fails the WHOLE scan for
-    /// this peer (→ next peer) — a skipped block could otherwise read as a
-    /// verified "not seen".
+    /// window, anchor it to the beacon head + hash-link it, then check the
+    /// blocks NEWEST-first (a just-mined tx is found on the first body
+    /// checked), each body verified against its header's `transactionsRoot`
+    /// before its tx hashes are trusted. Bodies are requested concurrently (the
+    /// Java twin's bodyFutures — one pipelined round instead of up-to-128
+    /// serial RTTs). Any fetch/verify failure fails the WHOLE scan for this
+    /// peer (→ next peer) — a skipped block could otherwise read as a verified
+    /// "not seen".
     async fn scan_blocks_from(
         &self,
         peer: &ManagedPeer,
@@ -1545,24 +1549,16 @@ impl ElReader {
         want: &[u8; 32],
     ) -> Result<Option<TxLocation>, String> {
         let count = head_num - from + 1;
-        let window = peer.get_block_headers_by_number(from, count, 0, false).await?;
-        if window.len() as u64 != count {
-            return Err(format!("peer returned {} headers, expected {count}", window.len()));
-        }
-        if &window[window.len() - 1].hash != head_hash {
-            return Err("window head does not match the beacon-anchored head hash".to_string());
-        }
-        for i in 0..window.len() - 1 {
-            if window[i + 1].header.parent_hash != window[i].hash {
-                return Err("header window is not hash-linked".to_string());
-            }
-        }
-        if window[0].header.number != from {
-            return Err("peer returned the wrong starting block number".to_string());
-        }
-        for vh in window.iter().rev() {
-            let bodies = peer.get_block_bodies(&[vh.hash]).await?;
-            let body = bodies.into_iter().next().ok_or("peer returned no block body")?;
+        let window = fetch_anchored_window(peer, from, count, head_hash).await?;
+        // One single-hash request per block (bounded per-response size), all in
+        // flight at once on this peer's multiplexed connection.
+        let all_bodies = futures::future::join_all(window.iter().map(|vh| {
+            let hash = [vh.hash]; // owned by the future (the request outlives this closure)
+            async move { peer.get_block_bodies(&hash).await }
+        }))
+        .await;
+        for (vh, bodies) in window.iter().zip(all_bodies).rev() {
+            let body = bodies?.into_iter().next().ok_or("peer returned no block body")?;
             if !triehash::verify(&body.transactions, &vh.header.transactions_root) {
                 return Err(format!(
                     "block {} body does not match the header transactionsRoot",
@@ -1637,12 +1633,11 @@ fn build_verified_receipt(
     let decoded = crate::el::receipt::decode(&receipts[loc.index])?;
     let mut prev_cum = 0u64;
     let mut log_index_base = 0u64;
-    for (j, prior) in receipts[..loc.index].iter().enumerate() {
+    for prior in &receipts[..loc.index] {
         let prev = crate::el::receipt::decode(prior)?;
         log_index_base += prev.logs.len() as u64;
-        if j == loc.index - 1 {
-            prev_cum = prev.cumulative_gas_used;
-        }
+        // The last iteration leaves receipt[index-1]'s cumulative gas here.
+        prev_cum = prev.cumulative_gas_used;
     }
     let gas_used = decoded.cumulative_gas_used.saturating_sub(prev_cum);
     let tx_summary = tx::decode_summary(&loc.raw_tx);
@@ -1668,6 +1663,40 @@ fn build_verified_receipt(
         effective_gas_price,
         contract_address,
     })
+}
+
+/// Fetch the contiguous header window `[from ..= from+count-1]` from one peer
+/// and run the trust gate every anchored read shares: exact length, the right
+/// starting number, the window head IS the beacon-anchored head hash, and every
+/// header hash-links to the next. This is the sole gate that turns
+/// peer-supplied headers into trusted ones — one implementation, four callers
+/// (block serve, fee estimate, receipt scan, canonicality re-check), so a
+/// hardening never has to be applied in four places.
+async fn fetch_anchored_window(
+    peer: &ManagedPeer,
+    from: u64,
+    count: u64,
+    head_hash: &[u8; 32],
+) -> Result<Vec<crate::el::eth::messages::VerifiedHeader>, String> {
+    let window = peer.get_block_headers_by_number(from, count, 0, false).await?;
+    if window.len() as u64 != count {
+        return Err(format!("peer returned {} headers, expected {count}", window.len()));
+    }
+    if window[0].header.number != from {
+        return Err("peer returned the wrong starting block number".to_string());
+    }
+    // The window's head must BE the beacon-anchored head, and each header must
+    // hash-link to the next — proving every header in it chains to the verified
+    // head (the trust gate: head_hash is the light-client-attested exec hash).
+    if &window[window.len() - 1].hash != head_hash {
+        return Err("window head does not match the beacon-anchored head hash".to_string());
+    }
+    for i in 0..window.len() - 1 {
+        if window[i + 1].header.parent_hash != window[i].hash {
+            return Err("header window is not hash-linked".to_string());
+        }
+    }
+    Ok(window)
 }
 
 /// Fetch a peer's fresh head header and return `(state_root, block_number)`.
