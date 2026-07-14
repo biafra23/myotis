@@ -26,7 +26,7 @@ extern "C" {
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
- * differs from the version this header was written against (13). */
+ * differs from the version this header was written against (14). */
 int32_t myotis_init(void);
 
 /* Up to `max` buffered tracing lines, oldest first, newline-joined; ""
@@ -87,6 +87,9 @@ char *myotis_resolve_ens_json(int64_t handle, const char *name);
 char *myotis_ens_record_json(int64_t handle, const char *params_json);
 /* Block JSON, the literal "null", or {"error"}. */
 char *myotis_get_block_by_number_json(int64_t handle, const char *block_tag);
+/* Receipt JSON, the literal "null" (verified not-seen), or {"error"}. */
+char *myotis_get_transaction_receipt_json(int64_t handle,
+                                          const char *tx_hash_hex);
 /* {"gasPriceWei","maxPriorityFeePerGasWei"} or {"error"}. */
 char *myotis_fee_estimate_json(int64_t handle);
 /* {"txHash":"0x..."} or {"error"}. */

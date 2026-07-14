@@ -286,6 +286,21 @@ pub unsafe extern "C" fn myotis_get_block_by_number_json(
     into_c(crate::host::get_block_by_number_json(handle, &block_tag))
 }
 
+/// Verified `eth_getTransactionReceipt` (`nativeGetTransactionReceiptJson`
+/// twin). Returns the receipt JSON, the literal `"null"` (verified "not seen"
+/// — pending/unknown), or `{"error": ...}`.
+///
+/// # Safety
+/// `tx_hash_hex` must be null or a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_get_transaction_receipt_json(
+    handle: i64,
+    tx_hash_hex: *const c_char,
+) -> *mut c_char {
+    let tx_hash_hex = read_string(tx_hash_hex).unwrap_or_default();
+    into_c(crate::host::get_transaction_receipt_json(handle, &tx_hash_hex))
+}
+
 /// Verified fee estimate: `{"gasPriceWei","maxPriorityFeePerGasWei"}` or
 /// `{"error": ...}` (`nativeFeeEstimateJson` twin).
 #[no_mangle]
