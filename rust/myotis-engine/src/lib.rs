@@ -9,6 +9,7 @@
 //! tokio runtime this crate owns (see `host`). R1 is CL-only + mainnet-only; Gnosis
 //! and the EL surface land later.
 
+mod capi;
 pub mod catalog;
 mod eljson;
 mod host;
