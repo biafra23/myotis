@@ -32,7 +32,9 @@ pub mod ringlog;
 /// v13: added the idle-sleep surface (nativePause/nativeResume) and the
 ///      `paused` key in the status JSON, wired into the Java RustEngineNative /
 ///      RustChainHandle at the same time.
-pub const ABI_VERSION: i32 = 13;
+/// v14: added nativeGetTransactionReceiptJson (verified eth_getTransactionReceipt
+///      over the incremental beacon-anchored tx scan).
+pub const ABI_VERSION: i32 = 14;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
@@ -427,6 +429,24 @@ mod jni_shim {
         handle: jlong,
     ) -> jstring {
         let json = crate::host::fee_estimate_json(handle);
+        match env.new_string(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// `RustEngineNative.nativeGetTransactionReceiptJson(long handle, String txHashHex)`
+    /// — verified `eth_getTransactionReceipt`. Returns the receipt JSON, the literal
+    /// `"null"` (verified "not seen" — pending/unknown), or `{"error": "..."}`.
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeGetTransactionReceiptJson(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        tx_hash_hex: JString,
+    ) -> jstring {
+        let tx_hash_hex = read_string(&mut env, &tx_hash_hex).unwrap_or_default();
+        let json = crate::host::get_transaction_receipt_json(handle, &tx_hash_hex);
         match env.new_string(json) {
             Ok(s) => s.into_raw(),
             Err(_) => std::ptr::null_mut(),

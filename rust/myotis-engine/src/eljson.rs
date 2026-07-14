@@ -10,7 +10,7 @@
 
 use myotis_net::el::evm::{CallOutcome, EnsOutcome, EnsQueryOutcome, EnsRecordValue, GasOutcome};
 use myotis_net::el::reader::{
-    FeeEstimate, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedStorage,
+    FeeEstimate, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedReceipt, VerifiedStorage,
 };
 
 /// The header-chain gap cap the ladder enforces (mirrors the Java
@@ -219,6 +219,112 @@ pub fn block_json(b: &VerifiedBlock) -> String {
         s.push('"');
     }
     s.push_str("],\"uncles\":[]}");
+    s
+}
+
+/// Serialize a verified receipt to the `eth_getTransactionReceipt` JSON. Mirrors
+/// the Java `VerifiedRpcBackend.buildReceiptJson` field set, ordering, and
+/// QUANTITY encoding exactly — hand-built (not serde) so the shape is the pinned
+/// cross-language contract:
+///
+/// - `from` appears only when the tx decoded AND its sender recovered;
+///   `to`/`contractAddress` only when the tx decoded (a call carries
+///   `contractAddress: null`, a creation `to: null`); `effectiveGasPrice` only
+///   when computable — an undecodable (future-type) tx serves the partial
+///   receipt without the tx-derived fields.
+/// - `status` appears only for post-Byzantium receipts (a pre-Byzantium
+///   stateRoot receipt gets neither `status` nor `root`).
+/// - `logIndex` is BLOCK-global (`log_index_base` + the position in this
+///   receipt), and every log carries `removed: false`.
+pub fn receipt_json(r: &VerifiedReceipt) -> String {
+    let tx_hash = hex0x(&r.tx_hash);
+    let block_hash = hex0x(&r.block_hash);
+    let tx_index = hex_quantity(r.tx_index);
+    let block_number = hex_quantity(r.block_number);
+    let mut s = String::with_capacity(1024);
+    s.push_str("{\"transactionHash\":\"");
+    s.push_str(&tx_hash);
+    s.push_str("\",\"transactionIndex\":\"");
+    s.push_str(&tx_index);
+    s.push_str("\",\"blockHash\":\"");
+    s.push_str(&block_hash);
+    s.push_str("\",\"blockNumber\":\"");
+    s.push_str(&block_number);
+    s.push_str("\",\"cumulativeGasUsed\":\"");
+    s.push_str(&hex_quantity(r.receipt.cumulative_gas_used));
+    s.push_str("\",\"gasUsed\":\"");
+    s.push_str(&hex_quantity(r.gas_used));
+    s.push('"');
+    if let Some(tx) = &r.tx {
+        if let Some(from) = &tx.from {
+            s.push_str(",\"from\":\"");
+            s.push_str(&hex0x_var(from));
+            s.push('"');
+        }
+        match &tx.to {
+            Some(to) => {
+                s.push_str(",\"to\":\"");
+                s.push_str(&hex0x_var(to));
+                s.push_str("\",\"contractAddress\":null");
+            }
+            None => {
+                s.push_str(",\"to\":null,\"contractAddress\":");
+                match &r.contract_address {
+                    Some(created) => {
+                        s.push('"');
+                        s.push_str(&hex0x_var(created));
+                        s.push('"');
+                    }
+                    None => s.push_str("null"),
+                }
+            }
+        }
+        if let Some(eff) = r.effective_gas_price {
+            s.push_str(",\"effectiveGasPrice\":\"");
+            s.push_str(&format!("0x{eff:x}"));
+            s.push('"');
+        }
+    }
+    if r.receipt.has_status {
+        s.push_str(",\"status\":\"");
+        s.push_str(if r.receipt.success { "0x1" } else { "0x0" });
+        s.push('"');
+    }
+    s.push_str(",\"type\":\"");
+    s.push_str(&hex_quantity(u64::from(r.receipt.ty)));
+    s.push_str("\",\"logsBloom\":\"");
+    s.push_str(&hex0x_var(&r.receipt.logs_bloom));
+    s.push_str("\",\"logs\":[");
+    for (k, log) in r.receipt.logs.iter().enumerate() {
+        if k > 0 {
+            s.push(',');
+        }
+        s.push_str("{\"address\":\"");
+        s.push_str(&hex0x_var(&log.address));
+        s.push_str("\",\"topics\":[");
+        for (t, topic) in log.topics.iter().enumerate() {
+            if t > 0 {
+                s.push(',');
+            }
+            s.push('"');
+            s.push_str(&hex0x_var(topic));
+            s.push('"');
+        }
+        s.push_str("],\"data\":\"");
+        s.push_str(&hex0x_var(&log.data));
+        s.push_str("\",\"blockNumber\":\"");
+        s.push_str(&block_number);
+        s.push_str("\",\"blockHash\":\"");
+        s.push_str(&block_hash);
+        s.push_str("\",\"transactionHash\":\"");
+        s.push_str(&tx_hash);
+        s.push_str("\",\"transactionIndex\":\"");
+        s.push_str(&tx_index);
+        s.push_str("\",\"logIndex\":\"");
+        s.push_str(&hex_quantity(r.log_index_base + k as u64));
+        s.push_str("\",\"removed\":false}");
+    }
+    s.push_str("]}");
     s
 }
 
@@ -856,6 +962,121 @@ mod tests {
         assert!(v.get("blobGasUsed").is_none());
         assert!(v.get("excessBlobGas").is_none());
         assert!(v.get("parentBeaconBlockRoot").is_none());
+    }
+
+    fn sample_receipt() -> VerifiedReceipt {
+        use myotis_net::el::receipt::{DecodedReceipt, ReceiptLog};
+        use myotis_net::el::tx::TxSummary;
+        VerifiedReceipt {
+            tx_hash: [0xa1; 32],
+            tx_index: 2,
+            block_hash: [0x99; 32],
+            block_number: 21_000_000,
+            gas_used: 51_000,
+            log_index_base: 7,
+            receipt: DecodedReceipt {
+                ty: 2,
+                has_status: true,
+                success: true,
+                cumulative_gas_used: 1_000_000,
+                logs_bloom: vec![0u8; 256],
+                logs: vec![ReceiptLog {
+                    address: vec![0xaa; 20],
+                    topics: vec![vec![0x11; 32], vec![0x22; 32]],
+                    data: vec![0xde, 0xad],
+                }],
+            },
+            tx: Some(TxSummary {
+                ty: 2,
+                nonce: 5,
+                to: Some([0xbb; 20]),
+                gas_price: None,
+                max_priority_fee_per_gas: Some(2_000_000_000),
+                max_fee_per_gas: Some(50_000_000_000),
+                from: Some([0xcc; 20]),
+            }),
+            effective_gas_price: Some(12_000_000_000),
+            contract_address: None,
+        }
+    }
+
+    #[test]
+    fn receipt_json_shape_and_values() {
+        // The Java RustVerifiedReadJsonTest replays this shape — the two are the
+        // halves of the cross-language golden (mirrors buildReceiptJson).
+        let v: serde_json::Value =
+            serde_json::from_str(&receipt_json(&sample_receipt())).expect("valid json");
+        assert_eq!(v["transactionHash"], hex0x(&[0xa1; 32]));
+        assert_eq!(v["transactionIndex"], "0x2");
+        assert_eq!(v["blockHash"], hex0x(&[0x99; 32]));
+        assert_eq!(v["blockNumber"], "0x1406f40"); // 21_000_000
+        assert_eq!(v["cumulativeGasUsed"], "0xf4240"); // 1_000_000
+        assert_eq!(v["gasUsed"], "0xc738"); // 51_000
+        assert_eq!(v["from"], hex0x_var(&[0xcc; 20]));
+        assert_eq!(v["to"], hex0x_var(&[0xbb; 20]));
+        assert_eq!(v["contractAddress"], serde_json::Value::Null);
+        assert_eq!(v["effectiveGasPrice"], "0x2cb417800"); // 12 gwei
+        assert_eq!(v["status"], "0x1");
+        assert_eq!(v["type"], "0x2");
+        assert_eq!(v["logsBloom"].as_str().unwrap().len(), 2 + 512);
+        let log = &v["logs"][0];
+        assert_eq!(log["address"], hex0x_var(&[0xaa; 20]));
+        assert_eq!(log["topics"][0], hex0x(&[0x11; 32]));
+        assert_eq!(log["topics"][1], hex0x(&[0x22; 32]));
+        assert_eq!(log["data"], "0xdead");
+        assert_eq!(log["blockNumber"], "0x1406f40");
+        assert_eq!(log["blockHash"], hex0x(&[0x99; 32]));
+        assert_eq!(log["transactionHash"], hex0x(&[0xa1; 32]));
+        assert_eq!(log["transactionIndex"], "0x2");
+        assert_eq!(log["logIndex"], "0x7"); // block-global: base 7 + position 0
+        assert_eq!(log["removed"], false);
+    }
+
+    #[test]
+    fn creation_receipt_carries_contract_address_and_null_to() {
+        let mut r = sample_receipt();
+        if let Some(tx) = &mut r.tx {
+            tx.to = None;
+        }
+        r.contract_address = Some([0xdd; 20]);
+        let v: serde_json::Value = serde_json::from_str(&receipt_json(&r)).unwrap();
+        assert_eq!(v["to"], serde_json::Value::Null);
+        assert_eq!(v["contractAddress"], hex0x_var(&[0xdd; 20]));
+    }
+
+    #[test]
+    fn undecodable_tx_serves_the_partial_receipt() {
+        // The tx-derived fields are simply absent; the verified core fields stay.
+        let mut r = sample_receipt();
+        r.tx = None;
+        r.effective_gas_price = None;
+        r.contract_address = None;
+        let v: serde_json::Value = serde_json::from_str(&receipt_json(&r)).unwrap();
+        assert!(v.get("from").is_none());
+        assert!(v.get("to").is_none());
+        assert!(v.get("contractAddress").is_none());
+        assert!(v.get("effectiveGasPrice").is_none());
+        assert_eq!(v["status"], "0x1");
+        assert_eq!(v["gasUsed"], "0xc738");
+    }
+
+    #[test]
+    fn pre_byzantium_receipt_omits_status() {
+        let mut r = sample_receipt();
+        r.receipt.has_status = false;
+        r.receipt.success = false;
+        let v: serde_json::Value = serde_json::from_str(&receipt_json(&r)).unwrap();
+        assert!(v.get("status").is_none());
+        assert!(v.get("root").is_none()); // Java omits the stateRoot form entirely
+        assert_eq!(v["type"], "0x2");
+    }
+
+    #[test]
+    fn failed_tx_receipt_reports_status_zero() {
+        let mut r = sample_receipt();
+        r.receipt.success = false;
+        let v: serde_json::Value = serde_json::from_str(&receipt_json(&r)).unwrap();
+        assert_eq!(v["status"], "0x0");
     }
 
     #[test]

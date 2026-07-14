@@ -23,7 +23,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 13; // 13: + nativePause/nativeResume (idle sleep)
+    static final int EXPECTED_ABI_VERSION = 14; // 14: + nativeGetTransactionReceiptJson
 
     private static final boolean AVAILABLE = load();
 
@@ -229,4 +229,15 @@ final class RustEngineNative {
      * raw transaction.
      */
     static native String nativeSendRawTransactionJson(long handle, String rawTxHex);
+
+    /**
+     * Verified {@code eth_getTransactionReceipt} for a running handle.
+     * {@code txHashHex} is the 0x-hex 32-byte transaction hash. Returns the
+     * receipt JSON object (verified against the containing block's
+     * {@code receiptsRoot}), the literal {@code "null"} for a verified
+     * "not seen" (pending/unknown tx — the wallet keeps polling), or an
+     * {@code "error"} object for a transport / not-running / can't-verify
+     * failure.
+     */
+    static native String nativeGetTransactionReceiptJson(long handle, String txHashHex);
 }
