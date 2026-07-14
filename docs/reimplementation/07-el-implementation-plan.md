@@ -336,8 +336,14 @@ Spec: README §5.3, doc 04 §2. Highlights per PR-sized chunk:
      receipt decode (`el/receipt.rs`), tx summary + sender recovery for
      `from`/`to`/`contractAddress`/`effectiveGasPrice` (`el/tx.rs` `decode_summary`), and the
      `buildReceiptJson`-pinned JSON (`eljson::receipt_json`, block-global `logIndex`).
-     Still open from this chunk: `getTransactionByHash`, `feeHistory`, the sent-tx
-     broadcast-head reachback + pending overlay (chunk 3).
+   - **Landed (confirm-loop slice): `eth_getTransactionByHash` + `eth_getBlockByHash`**
+     (ABI v15, `nativeGetTransactionByHashJson` / `nativeGetBlockByHashJson`): the shared
+     `locate_mined_tx` cursor + the full tx decode (`TxSummary` extended to the
+     `buildTxJson` field set — chainId/gas/value/input/v/r/s), and the verified
+     block-hash→number LRU (`blockHashToNumber` twin, populated by the receipt scan and
+     the by-number serve) resolving `getBlockByHash` through the verified by-number path
+     with the reorg re-check. Still open from this chunk: `feeHistory`; the sent-tx
+     broadcast-head reachback + own-tx pending answers + pending overlay (chunk 3).
 3. **`sendRawTransaction` + pending overlay.** Gossip raw bytes to all READY peers, return
    `keccak256(rawTx)`, cache own-tx bytes (shows pending until mined), rebroadcast until the
    gossip echo (the EL-A5 hash-observation hook); pending-nonce overlay — only-raises,

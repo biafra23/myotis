@@ -74,12 +74,16 @@ fn scalar_u128(item: &Item) -> Option<u128> {
 // consumes). Legacy (incl. EIP-155), 2930, 1559, 4844, 7702; unknown → None.
 // ---------------------------------------------------------------------------
 
-/// The tx fields an `eth_getTransactionReceipt` response derives from the
-/// (transactionsRoot-verified) raw tx bytes.
+/// The decoded tx fields the verified-read responses derive from the
+/// (transactionsRoot-verified) raw tx bytes: the receipt's
+/// `from`/`to`/`contractAddress`/`effectiveGasPrice` inputs plus the full
+/// `eth_getTransactionByHash` field set (the Java `EthTxDecoder.DecodedTx`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxSummary {
     /// 0 legacy, 1 = 2930, 2 = 1559, 3 = 4844, 4 = 7702.
     pub ty: u8,
+    /// `None` only for a pre-EIP-155 legacy tx (v = 27/28).
+    pub chain_id: Option<u64>,
     pub nonce: u64,
     /// `None` = contract creation (an empty `to` field).
     pub to: Option<[u8; 20]>,
@@ -89,9 +93,22 @@ pub struct TxSummary {
     pub max_priority_fee_per_gas: Option<u128>,
     /// 1559+; `None` otherwise.
     pub max_fee_per_gas: Option<u128>,
+    /// The gas limit.
+    pub gas: u64,
+    /// The wei value as minimal big-endian bytes (empty = 0) — kept as raw
+    /// scalar bytes because a value can exceed u128.
+    pub value: Vec<u8>,
+    /// The calldata (`input`).
+    pub input: Vec<u8>,
+    /// The signature's v: the raw legacy v (27/28 or the EIP-155 form), or the
+    /// typed tx's yParity (0/1).
+    pub v: u64,
+    /// Signature r/s, left-padded to 32 bytes (the JSON DATA form).
+    pub r: [u8; 32],
+    pub s: [u8; 32],
     /// The recovered sender, or `None` when the signature is unrecoverable
     /// (mirrors the Java decoder: a bad signature is a missing field, never an
-    /// error — the receipt is still served without the derived fields).
+    /// error — the response is still served without the derived fields).
     pub from: Option<[u8; 20]>,
 }
 
@@ -122,12 +139,17 @@ pub fn decode_summary(raw: &[u8]) -> Option<TxSummary> {
     if list.len() != expected {
         return None;
     }
+    let chain_id = list.first()?.as_u64().ok()?;
     let nonce = list.get(1)?.as_u64().ok()?;
     let to = to_field(list.get(to_idx)?)?;
     let (gas_price, max_priority, max_fee) = match gas_price_idx {
         Some(i) => (Some(scalar_u128(list.get(i)?)?), None, None),
         None => (None, Some(scalar_u128(list.get(2)?)?), Some(scalar_u128(list.get(3)?)?)),
     };
+    // gas sits just before `to`; value and data just after (every typed layout).
+    let gas = list.get(to_idx - 1)?.as_u64().ok()?;
+    let value = scalar_bytes(list.get(to_idx + 1)?)?;
+    let input = list.get(to_idx + 2)?.as_bytes().ok()?.to_vec();
     // Signing preimage: type ‖ rlp([all fields except yParity, r, s]). The raw
     // item slices are canonical wire bytes, so re-wrapping them is byte-exact.
     let mut unsigned = Vec::new();
@@ -136,20 +158,27 @@ pub fn decode_summary(raw: &[u8]) -> Option<TxSummary> {
     }
     let mut preimage = vec![first];
     preimage.extend_from_slice(&rlp::encode_list_payload(&unsigned));
-    let recid = list.get(expected - 3)?.as_u64().ok();
-    let from = recover_sender(
-        &keccak256(&preimage),
-        list.get(expected - 2)?,
-        list.get(expected - 1)?,
-        recid,
-    );
+    // The typed v IS the recovery id (yParity); consensus requires 0/1, so a
+    // wider value fails the whole decode (Java would emit it but its recovery
+    // throws the same way — no real tx reaches here with yParity > 1).
+    let v = list.get(expected - 3)?.as_u64().ok()?;
+    let r_item = list.get(expected - 2)?;
+    let s_item = list.get(expected - 1)?;
+    let from = recover_sender(&keccak256(&preimage), r_item, s_item, Some(v));
     Some(TxSummary {
         ty: first,
+        chain_id: Some(chain_id),
         nonce,
         to,
         gas_price,
         max_priority_fee_per_gas: max_priority,
         max_fee_per_gas: max_fee,
+        gas,
+        value,
+        input,
+        v,
+        r: pad32(r_item)?,
+        s: pad32(s_item)?,
         from,
     })
 }
@@ -164,35 +193,47 @@ fn decode_summary_legacy(raw: &[u8]) -> Option<TxSummary> {
     }
     let nonce = list.first()?.as_u64().ok()?;
     let gas_price = scalar_u128(list.get(1)?)?;
+    let gas = list.get(2)?.as_u64().ok()?;
     let to = to_field(list.get(3)?)?;
-    let v = list.get(6)?.as_u64().ok();
+    let value = scalar_bytes(list.get(4)?)?;
+    let input = list.get(5)?.as_bytes().ok()?.to_vec();
+    let v = list.get(6)?.as_u64().ok()?;
     let raws = rlp::raw_list_items(raw).ok()?;
     let mut unsigned = Vec::new();
     for item in raws.get(..6)? {
         unsigned.extend_from_slice(item);
     }
-    let recid = match v {
-        Some(v @ 27..=28) => Some(v - 27), // pre-155: sign over the 6 tx fields
-        Some(v) if v >= 35 => {
+    let (chain_id, recid) = match v {
+        27..=28 => (None, Some(v - 27)), // pre-155: sign over the 6 tx fields
+        v if v >= 35 => {
             // EIP-155: the preimage appends [chainId, 0, 0].
             let chain_id = (v - 35) / 2;
             unsigned.extend_from_slice(&rlp::encode_u64(chain_id));
             unsigned.extend_from_slice(&[0x80, 0x80]); // two empty scalars
-            Some((v - 35) % 2)
+            (Some(chain_id), Some((v - 35) % 2))
         }
-        // v below 27 (or unreadably wide) can't map to a recovery id; keep the
-        // decoded summary but drop the sender, like the Java recover() fallback.
-        _ => None,
+        // v below 27 can't map to a recovery id; keep the decoded summary but
+        // drop the sender, like the Java recover() fallback.
+        _ => (None, None),
     };
     let preimage = rlp::encode_list_payload(&unsigned);
-    let from = recover_sender(&keccak256(&preimage), list.get(7)?, list.get(8)?, recid);
+    let r_item = list.get(7)?;
+    let s_item = list.get(8)?;
+    let from = recover_sender(&keccak256(&preimage), r_item, s_item, recid);
     Some(TxSummary {
         ty: 0,
+        chain_id,
         nonce,
         to,
         gas_price: Some(gas_price),
         max_priority_fee_per_gas: None,
         max_fee_per_gas: None,
+        gas,
+        value,
+        input,
+        v,
+        r: pad32(r_item)?,
+        s: pad32(s_item)?,
         from,
     })
 }
@@ -239,6 +280,25 @@ fn pad32_into(item: &Item, out: &mut [u8]) -> Option<()> {
     }
     out[32 - bytes.len()..].copy_from_slice(bytes);
     Some(())
+}
+
+/// A minimal-BE RLP scalar left-padded to a fresh 32-byte word (the JSON DATA
+/// form of a signature scalar).
+fn pad32(item: &Item) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    pad32_into(item, &mut out)?;
+    Some(out)
+}
+
+/// A minimal-BE RLP scalar as raw bytes (a wei value — can exceed u128, so it
+/// stays bytes). `None` if it isn't a byte string or is wider than a 32-byte
+/// word (not a valid EVM scalar).
+fn scalar_bytes(item: &Item) -> Option<Vec<u8>> {
+    let bytes = item.as_bytes().ok()?;
+    if bytes.len() > 32 {
+        return None;
+    }
+    Some(bytes.to_vec())
 }
 
 /// The effective gas price a mined tx paid (the receipt convention): the
@@ -403,9 +463,23 @@ mod tests {
         );
         let t = decode_summary(&raw).expect("decodes");
         assert_eq!(t.ty, 0);
+        assert_eq!(t.chain_id, Some(1)); // v = 37 → EIP-155 chainId 1
         assert_eq!(t.nonce, 9);
         assert_eq!(t.gas_price, Some(20_000_000_000));
+        assert_eq!(t.gas, 21_000);
         assert_eq!(t.to, Some([0x35; 20]));
+        assert_eq!(t.value, be(1_000_000_000_000_000_000)); // 1 ETH
+        assert!(t.input.is_empty());
+        assert_eq!(t.v, 37);
+        // r/s are the spec vector's scalars, left-padded to 32 bytes.
+        assert_eq!(
+            t.r.to_vec(),
+            hex("28ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276")
+        );
+        assert_eq!(
+            t.s.to_vec(),
+            hex("67cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83")
+        );
         assert_eq!(
             t.from.map(|f| f.to_vec()),
             Some(hex("9d8a62f656a8d1615c1294fd71e9cfb3e4855a4f"))
@@ -445,11 +519,15 @@ mod tests {
 
         let t = decode_summary(&raw).expect("decodes");
         assert_eq!(t.ty, 2);
+        assert_eq!(t.chain_id, Some(1));
         assert_eq!(t.nonce, 7);
         assert_eq!(t.to, None); // creation
         assert_eq!(t.gas_price, None);
         assert_eq!(t.max_priority_fee_per_gas, Some(2_000_000_000));
         assert_eq!(t.max_fee_per_gas, Some(50_000_000_000));
+        assert_eq!(t.gas, 21_000);
+        assert!(t.value.is_empty()); // 0
+        assert_eq!(t.v, sig[64] as u64);
         assert_eq!(t.from, Some(expected));
 
         // The created contract address: keccak256(rlp([from, nonce]))[12..].
@@ -497,27 +575,35 @@ mod tests {
         assert_eq!(decode_summary(&raw), None);
     }
 
-    #[test]
-    fn effective_gas_price_matches_the_receipt_convention() {
-        let legacy = TxSummary {
-            ty: 0,
-            nonce: 0,
-            to: None,
-            gas_price: Some(30_000_000_000),
-            max_priority_fee_per_gas: None,
-            max_fee_per_gas: None,
-            from: None,
-        };
-        assert_eq!(effective_gas_price(&legacy, 10_000_000_000), Some(30_000_000_000));
-
-        let dyn_fee = TxSummary {
-            ty: 2,
+    /// A zero-filled summary for tests that only care about the fee fields.
+    fn bare_summary(ty: u8) -> TxSummary {
+        TxSummary {
+            ty,
+            chain_id: None,
             nonce: 0,
             to: None,
             gas_price: None,
+            max_priority_fee_per_gas: None,
+            max_fee_per_gas: None,
+            gas: 0,
+            value: Vec::new(),
+            input: Vec::new(),
+            v: 0,
+            r: [0u8; 32],
+            s: [0u8; 32],
+            from: None,
+        }
+    }
+
+    #[test]
+    fn effective_gas_price_matches_the_receipt_convention() {
+        let legacy = TxSummary { gas_price: Some(30_000_000_000), ..bare_summary(0) };
+        assert_eq!(effective_gas_price(&legacy, 10_000_000_000), Some(30_000_000_000));
+
+        let dyn_fee = TxSummary {
             max_priority_fee_per_gas: Some(2_000_000_000),
             max_fee_per_gas: Some(50_000_000_000),
-            from: None,
+            ..bare_summary(2)
         };
         // base 10 + min(2, 40) = 12 gwei.
         assert_eq!(effective_gas_price(&dyn_fee, 10_000_000_000), Some(12_000_000_000));

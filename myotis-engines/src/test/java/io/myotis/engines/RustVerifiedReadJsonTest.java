@@ -431,6 +431,46 @@ class RustVerifiedReadJsonTest {
         assertThrows(EngineException.class, () -> RustChainHandle.receiptJsonOrThrow("not json"));
     }
 
+    // ---- eth_getTransactionByHash (transactionJsonOrThrow) ----
+
+    @Test
+    void transactionJsonPassesThroughObject() {
+        // The exact shape the Rust eljson::tx_json emits (its
+        // tx_json_shape_and_values test pins the other half of this golden):
+        // buildTxJson field order, minimal-hex QUANTITYs, 32-byte DATA r/s.
+        String tx = "{\"hash\":\"0x" + "a1".repeat(32) + "\""
+                + ",\"blockHash\":\"0x" + "99".repeat(32) + "\""
+                + ",\"blockNumber\":\"0x1406f40\",\"transactionIndex\":\"0x2\""
+                + ",\"type\":\"0x2\",\"chainId\":\"0x1\",\"nonce\":\"0x5\""
+                + ",\"from\":\"0x" + "cc".repeat(20) + "\""
+                + ",\"to\":\"0x" + "bb".repeat(20) + "\""
+                + ",\"value\":\"0xde0b6b3a7640000\",\"gas\":\"0x15f90\""
+                + ",\"maxFeePerGas\":\"0xba43b7400\",\"maxPriorityFeePerGas\":\"0x77359400\""
+                + ",\"input\":\"0xa9059cbb\",\"v\":\"0x1\",\"yParity\":\"0x1\""
+                + ",\"r\":\"0x" + "11".repeat(32) + "\",\"s\":\"0x" + "22".repeat(32) + "\"}";
+        assertEquals(tx, RustChainHandle.transactionJsonOrThrow(tx));
+    }
+
+    @Test
+    void transactionNullLiteralIsVerifiedNotSeen() {
+        // "null" (a verified unknown/pending tx) passes through → the router
+        // emits a JSON null result, not an error.
+        assertEquals("null", RustChainHandle.transactionJsonOrThrow("null"));
+    }
+
+    @Test
+    void transactionErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class, () -> RustChainHandle.transactionJsonOrThrow(
+                "{\"error\":\"transaction located but its type cannot be decoded\"}"));
+    }
+
+    @Test
+    void transactionBlankOrMalformedPayloadThrows() {
+        assertThrows(EngineException.class, () -> RustChainHandle.transactionJsonOrThrow(null));
+        assertThrows(EngineException.class, () -> RustChainHandle.transactionJsonOrThrow(""));
+        assertThrows(EngineException.class, () -> RustChainHandle.transactionJsonOrThrow("not json"));
+    }
+
     // ---- eth_gasPrice / eth_maxPriorityFeePerGas (feeFromJson) ----
 
     @Test

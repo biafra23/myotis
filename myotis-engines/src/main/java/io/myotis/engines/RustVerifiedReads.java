@@ -17,11 +17,11 @@ import org.slf4j.LoggerFactory;
  * <p>It answers the reads a wallet needs for an ETH send, from the beacon-anchored,
  * proof-verified queries: {@code chainId}, {@code headBlockNumber}, {@code syncState},
  * {@code getBalance}, {@code getTransactionCount}, {@code getCode}, {@code getStorageAt},
- * {@code getBlockByNumber}, {@code getTransactionReceipt}, {@code gasPrice},
- * {@code maxPriorityFeePerGas}, {@code sendRawTransaction}, plus the EVM-backed
- * {@code call} and {@code estimateGas} (revm over proof-verified state). Not yet
- * served verified — {@code getTransactionByHash}, {@code getBlockByHash},
- * {@code feeHistory}, and full-transaction blocks — return {@code null} ("cannot
+ * {@code getBlockByNumber}, {@code getBlockByHash}, {@code getTransactionReceipt},
+ * {@code getTransactionByHash}, {@code gasPrice}, {@code maxPriorityFeePerGas},
+ * {@code sendRawTransaction}, plus the EVM-backed {@code call} and
+ * {@code estimateGas} (revm over proof-verified state). Not yet served verified —
+ * {@code feeHistory} and full-transaction blocks — return {@code null} ("cannot
  * answer verified right now"), which the router maps to a strict-mode {@code -32000}.
  *
  * <p><b>Head-anchored.</b> The Rust reader verifies against the peer's fresh head
@@ -209,8 +209,22 @@ final class RustVerifiedReads implements VerifiedReads {
         }
     }
 
-    // Not yet served verified on the Rust engine (null → strict -32000).
-    @Override public String getTransactionByHash(byte[] txHash) { return null; }
+    @Override
+    public String getTransactionByHash(byte[] txHash) {
+        // A tx hash is exactly 32 bytes; anything else can't be answered.
+        if (txHash == null || txHash.length != 32) return null;
+        try {
+            // The tx JSON (located via the transactionsRoot-verified scan, fully
+            // decoded incl. the recovered sender), the "null" literal (verified
+            // "not seen" — unknown/pending), or throws when it can't verify
+            // (→ null → strict -32000). Unlike the Java engine there is no
+            // own-sent-tx pending answer yet (needs the sent-tx cache).
+            return handle.transactionByHashJson(toHex(txHash));
+        } catch (RuntimeException e) {
+            log.debug("[engines] verified tx read unavailable: {}", e.getMessage());
+            return null;
+        }
+    }
 
     @Override
     public String getBlockByNumber(String block, boolean fullTransactions) {
@@ -228,7 +242,21 @@ final class RustVerifiedReads implements VerifiedReads {
         }
     }
 
-    @Override public String getBlockByHash(byte[] blockHash32, boolean fullTransactions) { return null; }
+    @Override
+    public String getBlockByHash(byte[] blockHash32, boolean fullTransactions) {
+        // Full tx objects aren't served verified (mirrors getBlockByNumber).
+        if (fullTransactions) return null;
+        if (blockHash32 == null || blockHash32.length != 32) return null;
+        try {
+            // The block JSON, the "null" literal (a hash this engine never
+            // verified / reorged away), or throws (→ null → strict -32000).
+            return handle.blockByHashJson(toHex(blockHash32));
+        } catch (RuntimeException e) {
+            log.debug("[engines] verified block-by-hash read unavailable: {}", e.getMessage());
+            return null;
+        }
+    }
+
     @Override
     public String gasPrice() {
         // Decimal wei (next-block base fee + suggested tip), or null when unverifiable.

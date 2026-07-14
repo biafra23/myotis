@@ -864,9 +864,36 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 gated(() -> RustEngineNative.nativeGetTransactionReceiptJson(handle, txHashHex)));
     }
 
+    /**
+     * Verified eth_getTransactionByHash: the tx JSON object, the literal
+     * {@code "null"} (a verified "not seen" — unknown/pending tx), or throws
+     * {@link EngineException} when it can't verify (transport / not-running /
+     * an undecodable located tx). {@code txHashHex} is the 0x-hex 32-byte hash.
+     */
+    String transactionByHashJson(String txHashHex) {
+        return transactionJsonOrThrow(
+                gated(() -> RustEngineNative.nativeGetTransactionByHashJson(handle, txHashHex)));
+    }
+
+    /**
+     * Verified eth_getBlockByHash (transactions as hashes): the block JSON
+     * object, the literal {@code "null"} (a hash this engine never verified /
+     * reorged away — eth's unknown-block null), or throws {@link EngineException}
+     * when it can't verify. {@code blockHashHex} is the 0x-hex 32-byte hash.
+     */
+    String blockByHashJson(String blockHashHex) {
+        return blockJsonOrThrow(
+                gated(() -> RustEngineNative.nativeGetBlockByHashJson(handle, blockHashHex)));
+    }
+
     /** Package-private test seam: native block payload → block JSON | "null" | throw. */
     static String blockJsonOrThrow(String json) {
         return jsonObjectOrThrow(json, "block");
+    }
+
+    /** Package-private test seam: native tx payload → tx JSON | "null" | throw. */
+    static String transactionJsonOrThrow(String json) {
+        return jsonObjectOrThrow(json, "transaction");
     }
 
     /** Package-private test seam: native receipt payload → receipt JSON | "null" | throw. */
