@@ -1,0 +1,10 @@
+# Kotlin/Native cinterop over the Rust engine's plain C ABI (rust/myotis-engine/
+# src/capi.rs). staticLibraries absorbs libmyotis_engine.a into the klib — and from
+# there into the MyotisKit framework — so the Xcode project never links Rust
+# directly. The library search path is passed per-target from build.gradle.kts
+# (-libraryPath): device and simulator archives live in different cargo dirs.
+# The include dir (rust/include) is likewise supplied from build.gradle.kts.
+package = io.myotis.engine.capi
+headers = myotis_engine.h
+headerFilter = myotis_engine.h
+staticLibraries = libmyotis_engine.a
