@@ -299,6 +299,26 @@ impl ManagedPeer {
         Ok(bodies)
     }
 
+    /// Request transaction receipts by block hash, returning the RAW canonical
+    /// consensus receipt bytes per block — the receipts-trie values, ready for
+    /// `triehash::verify` against a header's `receiptsRoot`. An eth/69 peer's
+    /// bloomless response is re-canonicalized (bloom recomputed) by the decoder,
+    /// so callers see one shape across versions.
+    pub async fn get_receipts(&self, hashes: &[[u8; 32]]) -> Result<Vec<Vec<Vec<u8>>>, String> {
+        let payload = self
+            .request(messages::GET_RECEIPTS, messages::RECEIPTS, |id| {
+                messages::encode_get_receipts(id, hashes)
+            })
+            .await?;
+        let (_rid, blocks) = if self.eth_version >= 69 {
+            messages::decode_receipts69(&payload)
+                .map_err(|e| format!("Receipts (eth/69) decode: {}", e.0))?
+        } else {
+            messages::decode_receipts(&payload).map_err(|e| format!("Receipts decode: {}", e.0))?
+        };
+        Ok(blocks)
+    }
+
     // -----------------------------------------------------------------------
     // snap/1 verified state fetch (shares the eth peer's RLPx connection).
     // -----------------------------------------------------------------------

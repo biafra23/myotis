@@ -853,25 +853,50 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 gated(() -> RustEngineNative.nativeGetBlockByNumberJson(handle, blockTag)));
     }
 
+    /**
+     * Verified eth_getTransactionReceipt: the receipt JSON object, the literal
+     * {@code "null"} (a verified "not seen" — pending/unknown tx, the wallet keeps
+     * polling), or throws {@link EngineException} when it can't verify (transport /
+     * not-running). {@code txHashHex} is the 0x-hex 32-byte tx hash.
+     */
+    String transactionReceiptJson(String txHashHex) {
+        return receiptJsonOrThrow(
+                gated(() -> RustEngineNative.nativeGetTransactionReceiptJson(handle, txHashHex)));
+    }
+
     /** Package-private test seam: native block payload → block JSON | "null" | throw. */
     static String blockJsonOrThrow(String json) {
+        return jsonObjectOrThrow(json, "block");
+    }
+
+    /** Package-private test seam: native receipt payload → receipt JSON | "null" | throw. */
+    static String receiptJsonOrThrow(String json) {
+        return jsonObjectOrThrow(json, "receipt");
+    }
+
+    /** The shared tri-state native payload parse: a JSON object passes through, the
+     *  {@code "null"} literal (a VERIFIED eth-null) passes through, an {@code error}
+     *  object / blank / malformed payload throws {@link EngineException}. */
+    private static String jsonObjectOrThrow(String json, String what) {
         if (json == null || json.isBlank()) {
-            throw new EngineException("blank block JSON from the Rust engine (native failure?)");
+            throw new EngineException(
+                    "blank " + what + " JSON from the Rust engine (native failure?)");
         }
-        // The eth-null literal (verified future/unknown block) is not a JSON object;
-        // return it before parsing so the router can emit a JSON null result.
+        // The eth-null literal (a verified negative) is not a JSON object; return it
+        // before parsing so the router can emit a JSON null result.
         if (json.equals("null")) return "null";
         JsonObject o;
         try {
             o = Json.parse(json).asObject();
         } catch (RuntimeException e) {
-            throw new EngineException("malformed block JSON from the Rust engine: " + e.getMessage(), e);
+            throw new EngineException(
+                    "malformed " + what + " JSON from the Rust engine: " + e.getMessage(), e);
         }
         var error = o.get("error");
         if (error != null && !error.isNull()) {
             throw new EngineException(error.isString() ? error.asString() : error.toString());
         }
-        return json; // the verified block object
+        return json; // the verified object
     }
 
     /** A verified fee suggestion — both values decimal-wei strings. */

@@ -17,11 +17,12 @@ import org.slf4j.LoggerFactory;
  * <p>It answers the reads a wallet needs for an ETH send, from the beacon-anchored,
  * proof-verified queries: {@code chainId}, {@code headBlockNumber}, {@code syncState},
  * {@code getBalance}, {@code getTransactionCount}, {@code getCode}, {@code getStorageAt},
- * {@code getBlockByNumber}, {@code gasPrice}, {@code maxPriorityFeePerGas},
- * {@code sendRawTransaction}, and a 21000 {@code estimateGas} shortcut for plain
- * transfers. The EVM-backed reads — {@code call}, and {@code estimateGas} for a
- * contract/calldata target — return {@code null} ("cannot answer verified right
- * now"), which the router maps to a strict-mode {@code -32000}, until EL-C (revm).
+ * {@code getBlockByNumber}, {@code getTransactionReceipt}, {@code gasPrice},
+ * {@code maxPriorityFeePerGas}, {@code sendRawTransaction}, plus the EVM-backed
+ * {@code call} and {@code estimateGas} (revm over proof-verified state). Not yet
+ * served verified — {@code getTransactionByHash}, {@code getBlockByHash},
+ * {@code feeHistory}, and full-transaction blocks — return {@code null} ("cannot
+ * answer verified right now"), which the router maps to a strict-mode {@code -32000}.
  *
  * <p><b>Head-anchored.</b> The Rust reader verifies against the peer's fresh head
  * (the CL-anchored latest state), so state reads resolve to that head. A selector
@@ -180,8 +181,6 @@ final class RustVerifiedReads implements VerifiedReads {
         }
     }
 
-    // ---- not yet served verified on the Rust engine (later EL-C slices) ----
-
     @Override
     public byte[] sendRawTransaction(byte[] rawTx) {
         if (rawTx == null || rawTx.length == 0) return null;
@@ -194,7 +193,23 @@ final class RustVerifiedReads implements VerifiedReads {
             return null;
         }
     }
-    @Override public String getTransactionReceipt(byte[] txHash) { return null; }
+
+    @Override
+    public String getTransactionReceipt(byte[] txHash) {
+        // A tx hash is exactly 32 bytes; anything else can't be answered.
+        if (txHash == null || txHash.length != 32) return null;
+        try {
+            // The receipt JSON (verified vs the anchored header's receiptsRoot), the
+            // "null" literal (verified "not seen" — pending/unknown, the wallet keeps
+            // polling), or throws when it can't verify (→ null → strict -32000).
+            return handle.transactionReceiptJson(toHex(txHash));
+        } catch (RuntimeException e) {
+            log.debug("[engines] verified receipt read unavailable: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    // Not yet served verified on the Rust engine (null → strict -32000).
     @Override public String getTransactionByHash(byte[] txHash) { return null; }
 
     @Override

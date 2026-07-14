@@ -328,6 +328,16 @@ Spec: README §5.3, doc 04 §2. Highlights per PR-sized chunk:
    `transactionsRoot`/`receiptsRoot` (eth/69 bloomless handled by EL-A2's recompute);
    `gasPrice`/`maxPriorityFeePerGas`/`feeHistory` from verified headers + bodies + receipts
    (gas-used-weighted percentiles).
+   - **Landed (receipt slice): `eth_getTransactionReceipt`** (ABI v14,
+     `nativeGetTransactionReceiptJson`): per-tx incremental scan cursor (`locateMinedTx`
+     twin — 8-block initial lookback, 128/poll catch-up cap, 10-min TTL, finalized-immutable
+     cache + `stillCanonical` reorg re-check), bodies vs `transactionsRoot` to locate the tx,
+     receipts vs `receiptsRoot` (`ManagedPeer::get_receipts`, eth/69 re-canonicalized),
+     receipt decode (`el/receipt.rs`), tx summary + sender recovery for
+     `from`/`to`/`contractAddress`/`effectiveGasPrice` (`el/tx.rs` `decode_summary`), and the
+     `buildReceiptJson`-pinned JSON (`eljson::receipt_json`, block-global `logIndex`).
+     Still open from this chunk: `getTransactionByHash`, `feeHistory`, the sent-tx
+     broadcast-head reachback + pending overlay (chunk 3).
 3. **`sendRawTransaction` + pending overlay.** Gossip raw bytes to all READY peers, return
    `keccak256(rawTx)`, cache own-tx bytes (shows pending until mined), rebroadcast until the
    gossip echo (the EL-A5 hash-observation hook); pending-nonce overlay — only-raises,

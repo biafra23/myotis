@@ -385,6 +385,52 @@ class RustVerifiedReadJsonTest {
         assertThrows(EngineException.class, () -> RustChainHandle.blockJsonOrThrow("not json"));
     }
 
+    // ---- eth_getTransactionReceipt (receiptJsonOrThrow) ----
+
+    @Test
+    void receiptJsonPassesThroughObject() {
+        // The exact shape the Rust eljson::receipt_json emits (its
+        // receipt_json_shape_and_values test pins the other half of this golden):
+        // buildReceiptJson field order, minimal-hex QUANTITYs, block-global logIndex.
+        String receipt = "{\"transactionHash\":\"0x" + "a1".repeat(32) + "\""
+                + ",\"transactionIndex\":\"0x2\""
+                + ",\"blockHash\":\"0x" + "99".repeat(32) + "\""
+                + ",\"blockNumber\":\"0x1406f40\""
+                + ",\"cumulativeGasUsed\":\"0xf4240\""
+                + ",\"gasUsed\":\"0xc738\""
+                + ",\"from\":\"0x" + "cc".repeat(20) + "\""
+                + ",\"to\":\"0x" + "bb".repeat(20) + "\",\"contractAddress\":null"
+                + ",\"effectiveGasPrice\":\"0x2cb417800\""
+                + ",\"status\":\"0x1\",\"type\":\"0x2\""
+                + ",\"logsBloom\":\"0x" + "00".repeat(256) + "\""
+                + ",\"logs\":[{\"address\":\"0x" + "aa".repeat(20) + "\""
+                + ",\"topics\":[\"0x" + "11".repeat(32) + "\"],\"data\":\"0xdead\""
+                + ",\"blockNumber\":\"0x1406f40\",\"blockHash\":\"0x" + "99".repeat(32) + "\""
+                + ",\"transactionHash\":\"0x" + "a1".repeat(32) + "\""
+                + ",\"transactionIndex\":\"0x2\",\"logIndex\":\"0x7\",\"removed\":false}]}";
+        assertEquals(receipt, RustChainHandle.receiptJsonOrThrow(receipt));
+    }
+
+    @Test
+    void receiptNullLiteralIsVerifiedNotSeen() {
+        // "null" (a verified pending/unknown tx) passes through → the router emits
+        // a JSON null result (eth's receipt-not-available convention), not an error.
+        assertEquals("null", RustChainHandle.receiptJsonOrThrow("null"));
+    }
+
+    @Test
+    void receiptErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.receiptJsonOrThrow("{\"error\":\"no snap peer available\"}"));
+    }
+
+    @Test
+    void receiptBlankOrMalformedPayloadThrows() {
+        assertThrows(EngineException.class, () -> RustChainHandle.receiptJsonOrThrow(null));
+        assertThrows(EngineException.class, () -> RustChainHandle.receiptJsonOrThrow(""));
+        assertThrows(EngineException.class, () -> RustChainHandle.receiptJsonOrThrow("not json"));
+    }
+
     // ---- eth_gasPrice / eth_maxPriorityFeePerGas (feeFromJson) ----
 
     @Test

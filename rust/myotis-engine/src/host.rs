@@ -881,6 +881,30 @@ pub fn get_block_by_number_json(handle: i64, block_tag: &str) -> String {
     }
 }
 
+/// `nativeGetTransactionReceiptJson`: verified `eth_getTransactionReceipt` for a
+/// running handle. `tx_hash_hex` is the 0x-hex 32-byte tx hash. Returns the
+/// receipt JSON when the tx is found+verified in the scanned window, the literal
+/// `"null"` for a verified "not seen" (pending/unknown — the wallet keeps
+/// polling), or `{"error": "..."}` when it can't verify right now (the Java side
+/// maps it to a null → -32000).
+pub fn get_transaction_receipt_json(handle: i64, tx_hash_hex: &str) -> String {
+    let Some(tx_hash) = parse_word32(tx_hash_hex) else {
+        return eljson::error_json("invalid transaction hash (expected 32-byte hex)");
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    match engine.rt.block_on(async { reader.get_transaction_receipt(tx_hash).await }) {
+        Ok(Some(receipt)) => eljson::receipt_json(&receipt),
+        Ok(None) => "null".to_string(), // verified "not seen" → eth null
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
 /// `nativeSendRawTransactionJson`: gossip a signed raw transaction to peers and
 /// return `{"txHash":"0x…"}` (keccak256 of the raw tx), or `{"error": "..."}` when
 /// no peer could be reached / the input isn't a plausible tx. A WRITE — nothing is
