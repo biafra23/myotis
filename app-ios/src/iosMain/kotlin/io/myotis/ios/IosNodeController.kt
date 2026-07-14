@@ -77,9 +77,15 @@ class IosNodeController(
 
     init {
         RustEngine.requireAbi()
-        NSFileManager.defaultManager.createDirectoryAtPath(
+        val created = NSFileManager.defaultManager.createDirectoryAtPath(
             dataDir, withIntermediateDirectories = true, attributes = null, error = null,
         )
+        if (!created) {
+            // The engine still runs (it treats dataDir as best-effort), but sync
+            // snapshots and peer caches won't persist — say so instead of letting
+            // every restart look like a mysterious cold boot.
+            logs.append("ERROR failed to create data directory at $dataDir — sync state will not persist")
+        }
         // Rust log pump — the only log producer on this host, so it feeds the
         // Logs tab directly. Process-lifetime, decoupled from UI collection
         // (parity with the desktop `myotis-rust-logs` thread).
@@ -181,26 +187,33 @@ class IosNodeController(
     override fun clearCaches(network: String) {
         val net = canonical(network)
         // The Rust engine owns its peer-cache files under dataDir (same names as
-        // the JVM hosts). Best-effort delete; a running stack may rewrite them —
-        // matching the JVM hosts' stopped-chain purge path is good enough here.
-        scope.launch(Dispatchers.IO) {
-            val suffix = if (net == "mainnet") "" else "-$net"
-            listOf("peers$suffix.cache", "cl-peers$suffix.cache").forEach {
-                NSFileManager.defaultManager.removeItemAtPath("$dataDir/$it", error = null)
+        // the JVM hosts). On the lifecycle lane + bootMutex, like desktop's
+        // per-network boot lock, so the delete can't interleave with a
+        // teardown/boot that would rewrite the files mid-purge.
+        scope.launch(lifecycleLane) {
+            bootMutex.withLock {
+                val suffix = if (net == "mainnet") "" else "-$net"
+                listOf("peers$suffix.cache", "cl-peers$suffix.cache").forEach {
+                    NSFileManager.defaultManager.removeItemAtPath("$dataDir/$it", error = null)
+                }
             }
         }
     }
 
     override fun resetSyncState(network: String) {
         val net = canonical(network)
-        scope.launch(Dispatchers.IO) {
-            val suffix = if (net == "mainnet") "" else "-$net"
-            // The snapshot and any sibling parts (e.g. the ".roots" accumulator).
-            val fm = NSFileManager.defaultManager
-            val names = fm.contentsOfDirectoryAtPath(dataDir, error = null)
-                ?.filterIsInstance<String>().orEmpty()
-            names.filter { it.startsWith("sync-state$suffix.snapshot") }
-                .forEach { fm.removeItemAtPath("$dataDir/$it", error = null) }
+        // Same lane + lock as clearCaches: the snapshot files are written on
+        // stop/pause, so the delete must not race a concurrent teardown.
+        scope.launch(lifecycleLane) {
+            bootMutex.withLock {
+                val suffix = if (net == "mainnet") "" else "-$net"
+                // The snapshot and any sibling parts (e.g. the ".roots" accumulator).
+                val fm = NSFileManager.defaultManager
+                val names = fm.contentsOfDirectoryAtPath(dataDir, error = null)
+                    ?.filterIsInstance<String>().orEmpty()
+                names.filter { it.startsWith("sync-state$suffix.snapshot") }
+                    .forEach { fm.removeItemAtPath("$dataDir/$it", error = null) }
+            }
         }
     }
 
@@ -264,9 +277,14 @@ class IosNodeController(
 
     private fun canonical(name: String): String = RustEngine.canonicalNetworkName(name) ?: name
 
-    private fun handleOrThrow(network: String): Long =
-        locked { handles[canonical(network)] }
+    private fun handleOrThrow(network: String): Long {
+        // Canonicalize BEFORE taking stateLock: canonical() crosses the FFI, and
+        // the lock is read on the UI thread (running, snapshots) — keep its
+        // critical section down to the map lookup.
+        val net = canonical(network)
+        return locked { handles[net] }
             ?: throw IllegalStateException("Node is not running on $network")
+    }
 
     /** Malformed JSON or an `{"error": ...}` envelope → throw (the Query tab renders it). */
     private fun parseOrThrow(json: String, what: String): JsonObject {
