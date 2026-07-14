@@ -135,6 +135,13 @@ examples/rn-demo/                 # bare RN app used as the validation harness
   `onMyotisLog`. This is exactly `AndroidNodeBridge.kt`'s snapshot-poll→Flow
   pattern and `IosNodeController.kt`'s 2 s `delay` loop, relocated. Pull
   (`chain.status()`) remains available.
+  The loop is **listener-gated**: it runs only while JS listeners are
+  registered — `startObserving`/`stopObserving` in interop mode, listener
+  count tracking with the New-Architecture `EventEmitter` — and is torn
+  down entirely when the last listener unsubscribes or the app backgrounds
+  (on iOS the chains pause then anyway). No listeners → zero polling →
+  zero wakeups; a fresh subscriber gets one immediate snapshot emit before
+  the cadence resumes.
 
 ### Lifecycle per platform
 
@@ -158,8 +165,14 @@ examples/rn-demo/                 # bare RN app used as the validation harness
   within the budget → `myotis_pause` → reschedule. Accept the platform
   truth: after long background periods the verified head is stale until the
   next resume (`readiness-and-verified-head-age.md` already models this).
-  A timing test must confirm `myotis_pause` completes well inside the iOS
-  grace window.
+  **Watchdog invariant**: every `beginBackgroundTask` is paired with an
+  `endBackgroundTask` on *both* exits — in a `defer` once `myotis_pause`
+  returns, and unconditionally in the expiration handler — because a
+  leaked or overrun background task gets the process killed by the iOS
+  watchdog. Likewise every `BGTask` path must reach `setTaskCompleted`
+  (including from `expirationHandler`). A timing test must confirm
+  `myotis_pause` completes well inside the iOS grace window — it is what
+  makes this pairing safe rather than hopeful.
 
 ### Packaging
 
@@ -176,6 +189,15 @@ examples/rn-demo/                 # bare RN app used as the validation harness
   binaries** (or a checked-in zip + checksum) so non-Mac contributors and
   CI build without Rust/Xcode; the `myotis_init` ABI handshake is the
   stale-binary guard, exactly like `RustEngineNative.EXPECTED_ABI_VERSION`.
+  On repository size: committed binaries do grow history on every engine
+  update — this is the repo's deliberate, existing trade-off (the Android
+  `.so`s are committed today for the same no-toolchain reason), and RN
+  *consumers* are unaffected either way, since the published npm tarball
+  ships the binaries and never touches git history. If growth becomes a
+  problem, the named escalation path is prebuilt archives on GitHub
+  Releases fetched by a checksum-pinned `prepare_command`/Gradle task (or
+  Git LFS); the `myotis_init` handshake stays the staleness guard in every
+  variant.
 
 ## Gaps to close
 
