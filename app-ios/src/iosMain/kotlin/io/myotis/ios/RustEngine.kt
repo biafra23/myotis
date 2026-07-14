@@ -38,8 +38,14 @@ object RustEngine {
 
     private val abiVersion: Int by lazy { myotis_init() }
 
-    /** Throws when the linked engine's ABI differs from what this host was
-     *  built against — fail loudly at startup instead of on a missing symbol. */
+    /**
+     * Throws when the linked engine's ABI differs from what this host was built
+     * against — fail loudly with a clear message instead of on drifted JSON or a
+     * missing symbol. EVERY public entry point below calls this first (cheap
+     * after the lazy first call), so no construction order can slip an FFI call
+     * past the handshake — the header's contract is "refuse to call anything
+     * else if the version differs".
+     */
     fun requireAbi() {
         val v = abiVersion
         check(v == EXPECTED_ABI_VERSION) {
@@ -57,33 +63,65 @@ object RustEngine {
         }
     }
 
-    fun drainLogs(max: Int): String = take(myotis_drain_logs(max)) ?: ""
+    fun drainLogs(max: Int): String {
+        requireAbi()
+        return take(myotis_drain_logs(max)) ?: ""
+    }
 
-    fun availableNetworksJson(): String = take(myotis_available_networks_json()) ?: "[]"
+    fun availableNetworksJson(): String {
+        requireAbi()
+        return take(myotis_available_networks_json()) ?: "[]"
+    }
 
     /** Canonical network name, or null for an unknown name/alias. */
-    fun canonicalNetworkName(nameOrAlias: String): String? =
-        take(myotis_canonical_network_name(nameOrAlias))
+    fun canonicalNetworkName(nameOrAlias: String): String? {
+        requireAbi()
+        return take(myotis_canonical_network_name(nameOrAlias))
+    }
 
     /** Handle id (>= 1), or a negative sentinel (-1 create failed, -2 unsupported). */
-    fun create(network: String, dataDir: String): Long = myotis_create(network, dataDir)
+    fun create(network: String, dataDir: String): Long {
+        requireAbi()
+        return myotis_create(network, dataDir)
+    }
 
-    fun start(handle: Long): Boolean = myotis_start(handle)
+    fun start(handle: Long): Boolean {
+        requireAbi()
+        return myotis_start(handle)
+    }
 
-    fun stop(handle: Long) = myotis_stop(handle)
+    fun stop(handle: Long) {
+        requireAbi()
+        myotis_stop(handle)
+    }
 
-    fun pause(handle: Long): Boolean = myotis_pause(handle)
+    fun pause(handle: Long): Boolean {
+        requireAbi()
+        return myotis_pause(handle)
+    }
 
-    fun resume(handle: Long): Boolean = myotis_resume(handle)
+    fun resume(handle: Long): Boolean {
+        requireAbi()
+        return myotis_resume(handle)
+    }
 
     /** Status JSON object; `"{}"` for an unknown handle. */
-    fun statusJson(handle: Long): String = take(myotis_status_json(handle)) ?: "{}"
+    fun statusJson(handle: Long): String {
+        requireAbi()
+        return take(myotis_status_json(handle)) ?: "{}"
+    }
 
     /** AccountProofResult JSON, or `{"error": ...}`. */
-    fun requestAccountJson(handle: Long, address: String): String =
-        take(myotis_request_account_json(handle, address)) ?: """{"error":"engine returned no result"}"""
+    fun requestAccountJson(handle: Long, address: String): String {
+        requireAbi()
+        return take(myotis_request_account_json(handle, address))
+            ?: """{"error":"engine returned no result"}"""
+    }
 
     /** Generic ENS record dispatch (method + args in [paramsJson]). */
-    fun ensRecordJson(handle: Long, paramsJson: String): String =
-        take(myotis_ens_record_json(handle, paramsJson)) ?: """{"error":"engine returned no result"}"""
+    fun ensRecordJson(handle: Long, paramsJson: String): String {
+        requireAbi()
+        return take(myotis_ens_record_json(handle, paramsJson))
+            ?: """{"error":"engine returned no result"}"""
+    }
 }

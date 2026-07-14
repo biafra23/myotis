@@ -365,6 +365,19 @@ gradle.taskGraph.whenReady {
     ) {
         logger.lifecycle("[rust] wasm32 canary skipped — needs rustup target wasm32-unknown-unknown + clang")
     }
+    // The iOS skips get a WARNING, not a note: unlike the other cargo tasks there
+    // is no committed fallback — the cinterop absorbs whatever (possibly stale)
+    // libmyotis_engine.a sits in rust/target, and only the runtime ABI handshake
+    // would catch the drift. A missing .a fails the cinterop outright.
+    listOf("cargoBuildIosDevice" to "aarch64-apple-ios", "cargoBuildIosSim" to "aarch64-apple-ios-sim")
+        .forEach { (task, triple) ->
+            if (allTasks.any { it.name == task } && (!isMacHost || rustSkipNote != null || triple !in installedRustupTargets)) {
+                logger.warn(
+                    "[rust] $task skipped (needs macOS + cargo + `rustup target add --toolchain stable $triple`) — " +
+                        "the iOS framework will embed the EXISTING rust/target/$triple/release/libmyotis_engine.a, which may be stale"
+                )
+            }
+        }
 }
 
 // -------------------------------------------------------------------------

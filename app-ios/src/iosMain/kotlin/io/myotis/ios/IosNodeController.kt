@@ -48,6 +48,13 @@ class IosNodeController(
 ) : NodeController {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    // Lifecycle ops are fire-and-forget from the UI; a single-lane dispatcher
+    // executes them in SUBMISSION order, so a quick disable→enable (or the
+    // reverse) can never invert into enable-then-disable the way independent
+    // Dispatchers.IO launches could. bootMutex still guards the check-then-act
+    // inside each op against any future caller outside the lane.
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private val lifecycleLane = Dispatchers.IO.limitedParallelism(1)
     private val bootMutex = Mutex()
 
     private val stateLock = NSLock()
@@ -110,17 +117,17 @@ class IosNodeController(
 
     override fun startNetwork(name: String) {
         val net = canonical(name)
-        scope.launch(Dispatchers.IO) { bootMutex.withLock { boot(net) } }
+        scope.launch(lifecycleLane) { bootMutex.withLock { boot(net) } }
     }
 
     override fun stopNetwork(name: String) {
         val net = canonical(name)
-        scope.launch(Dispatchers.IO) { bootMutex.withLock { drop(net) } }
+        scope.launch(lifecycleLane) { bootMutex.withLock { drop(net) } }
     }
 
     override fun rebootNetwork(name: String) {
         val net = canonical(name)
-        scope.launch(Dispatchers.IO) {
+        scope.launch(lifecycleLane) {
             bootMutex.withLock {
                 drop(net)
                 boot(net)
@@ -129,7 +136,7 @@ class IosNodeController(
     }
 
     override fun shutdown() {
-        scope.launch(Dispatchers.IO) {
+        scope.launch(lifecycleLane) {
             bootMutex.withLock {
                 locked { handles.keys.toList() }.forEach(::drop)
             }
@@ -238,7 +245,13 @@ class IosNodeController(
         val blockNumber = o.long("blockNumber", -1L)
         val verified = o.boolean("verified")
         return when (o.string("status")) {
-            "ok" -> EnsResult(name, o.string("addressHex"), blockNumber, verified, null)
+            // status ok MUST carry the address — a missing addressHex is shape
+            // drift, and mapping it to (address null, error null) would render
+            // as the authoritative "no record" answer. Fail closed instead,
+            // like RustEnsApi's Parsed.requireString does over JNI.
+            "ok" -> o.string("addressHex")
+                ?.let { EnsResult(name, it, blockNumber, verified, null) }
+                ?: EnsResult(name, null, blockNumber, verified, "malformed resolver reply (ok without addressHex)")
             // Successfully determined absent — the API's "no record" convention.
             "noRecord" -> EnsResult(name, null, blockNumber, verified, null)
             "offchain" -> EnsResult(
@@ -259,7 +272,12 @@ class IosNodeController(
     private fun parseOrThrow(json: String, what: String): JsonObject {
         val o = runCatching { engineJson.parseToJsonElement(json).jsonObject }
             .getOrElse { throw IllegalStateException("malformed $what reply from the engine") }
-        o.string("error")?.let { throw IllegalStateException(it) }
+        // ANY non-null error value is an error — not just a string one. The JNI
+        // twin (RustChainHandle.parseResultOrThrow) tolerates a structured value
+        // rather than misreading the envelope as a default-valued result.
+        o["error"]?.takeIf { it !is JsonNull }?.let {
+            throw IllegalStateException((it as? JsonPrimitive)?.content ?: it.toString())
+        }
         return o
     }
 
