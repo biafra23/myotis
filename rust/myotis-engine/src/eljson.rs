@@ -282,7 +282,7 @@ pub fn receipt_json(r: &VerifiedReceipt) -> String {
         }
         if let Some(eff) = r.effective_gas_price {
             s.push_str(",\"effectiveGasPrice\":\"");
-            s.push_str(&format!("0x{eff:x}"));
+            s.push_str(&hex_quantity_u128(eff));
             s.push('"');
         }
     }
@@ -379,14 +379,14 @@ pub fn tx_json(t: &VerifiedTransaction) -> String {
     s.push('"');
     if let Some(gp) = tx.gas_price {
         s.push_str(",\"gasPrice\":\"");
-        s.push_str(&format!("0x{gp:x}"));
+        s.push_str(&hex_quantity_u128(gp));
         s.push('"');
     }
     if let Some(max_fee) = tx.max_fee_per_gas {
         s.push_str(",\"maxFeePerGas\":\"");
-        s.push_str(&format!("0x{max_fee:x}"));
+        s.push_str(&hex_quantity_u128(max_fee));
         s.push_str("\",\"maxPriorityFeePerGas\":\"");
-        s.push_str(&format!("0x{:x}", tx.max_priority_fee_per_gas.unwrap_or(0)));
+        s.push_str(&hex_quantity_u128(tx.max_priority_fee_per_gas.unwrap_or(0)));
         s.push('"');
     }
     s.push_str(",\"input\":\"");
@@ -570,6 +570,12 @@ pub fn tx_hash_json(hash: &[u8; 32]) -> String {
 
 /// A u64 as a minimal-hex QUANTITY (`0x0` for zero).
 fn hex_quantity(v: u64) -> String {
+    format!("0x{v:x}")
+}
+
+/// The u128 sibling of [`hex_quantity`] (fee fields — per-gas wei exceeds u64):
+/// one place defines QUANTITY encoding for both widths.
+fn hex_quantity_u128(v: u128) -> String {
     format!("0x{v:x}")
 }
 

@@ -307,46 +307,9 @@ pub struct VerifiedTransaction {
     pub tx: TxSummary,
 }
 
-/// Recently-VERIFIED block hash → number, so `eth_getBlockByHash` (which
-/// wallets call right after a receipt to finalize a tx) can resolve to the
-/// verified by-number path (the Java `blockHashToNumber` twin: bounded LRU
-/// 512). Only hashes this reader itself verified enter the map.
-struct BlockHashLru {
-    map: std::collections::HashMap<[u8; 32], (u64, u64)>, // hash → (number, stamp)
-    clock: u64,
-}
-
-/// Entry cap for [`BlockHashLru`] (the Java cache's 512).
+/// Entry cap for the verified block-hash → number map (the Java
+/// `blockHashToNumber` cache's 512).
 const BLOCK_HASH_LRU_MAX: usize = 512;
-
-impl BlockHashLru {
-    fn new() -> BlockHashLru {
-        BlockHashLru { map: std::collections::HashMap::new(), clock: 0 }
-    }
-
-    /// Look a verified hash up, refreshing its LRU stamp.
-    fn get(&mut self, hash: &[u8; 32]) -> Option<u64> {
-        self.clock += 1;
-        let clock = self.clock;
-        self.map.get_mut(hash).map(|entry| {
-            entry.1 = clock;
-            entry.0
-        })
-    }
-
-    /// Remember a verified hash↔number, evicting the least-recently-used entry
-    /// beyond the cap (an O(cap) scan — only on inserts of a bounded-small map).
-    fn put(&mut self, hash: [u8; 32], number: u64) {
-        self.clock += 1;
-        self.map.insert(hash, (number, self.clock));
-        if self.map.len() > BLOCK_HASH_LRU_MAX {
-            if let Some(oldest) = self.map.iter().min_by_key(|(_, (_, stamp))| *stamp).map(|(h, _)| *h)
-            {
-                self.map.remove(&oldest);
-            }
-        }
-    }
-}
 
 /// Where a mined tx was found, cached per tx hash so wallet polls don't rescan
 /// (the Java `TxLocation`). The header/body were verified when this was built;
@@ -365,7 +328,9 @@ struct TxLocation {
 struct TxScanState {
     /// Highest block already scanned (`None` = never scanned).
     high_scanned: Option<u64>,
-    found: Option<TxLocation>,
+    /// `Arc` so a poll hands the cached location out by pointer bump — the
+    /// header + raw-tx bytes aren't re-copied on every wallet confirm poll.
+    found: Option<Arc<TxLocation>>,
     last_touched: std::time::Instant,
 }
 
@@ -405,9 +370,12 @@ pub struct ElReader {
     /// so concurrent polls for the SAME tx don't duplicate fetches while
     /// different txs proceed in parallel.
     tx_scans: std::sync::Mutex<TxScanMap>,
-    /// Verified block hash → number for `eth_getBlockByHash` (see
-    /// [`BlockHashLru`]); populated by the receipt scan and the by-number serve.
-    block_hash_numbers: std::sync::Mutex<BlockHashLru>,
+    /// Recently-VERIFIED block hash → number, so `eth_getBlockByHash` (which
+    /// wallets call right after a receipt to finalize a tx) resolves to the
+    /// verified by-number path (the Java `blockHashToNumber` twin). Populated
+    /// ONLY by blocks this reader itself verified (the receipt/tx scan and the
+    /// by-number serve); the shared LRU is the myotis-evm cache one.
+    block_hash_numbers: std::sync::Mutex<myotis_evm::Lru<[u8; 32], u64>>,
 }
 
 /// The scan-cursor map plus its last TTL sweep — one lock covers both, so the
@@ -507,7 +475,7 @@ impl ElReader {
                 map: std::collections::HashMap::new(),
                 last_sweep: std::time::Instant::now(),
             }),
-            block_hash_numbers: std::sync::Mutex::new(BlockHashLru::new()),
+            block_hash_numbers: std::sync::Mutex::new(myotis_evm::Lru::new(BLOCK_HASH_LRU_MAX)),
         })
     }
 
@@ -1177,13 +1145,7 @@ impl ElReader {
         &self,
         target: Option<u64>,
     ) -> Result<Option<VerifiedBlock>, String> {
-        let head_num = self.anchor.optimistic_block_number();
-        let Some(head_hash) = self.anchor.optimistic_block_hash() else {
-            return Err("no beacon-anchored head yet".to_string());
-        };
-        if head_num == 0 {
-            return Err("beacon not synced".to_string());
-        }
+        let (head_num, head_hash) = self.anchored_head()?;
         let target_num = target.unwrap_or(head_num);
         // A pin above the verified head is future/unknown, not an error.
         if target_num > head_num {
@@ -1259,13 +1221,7 @@ impl ElReader {
     /// tip (floored at the network's `min_suggested_tip_wei`) as the priority fee, and next-block
     /// base fee + that tip as the legacy gas price. `Err` when it can't verify.
     pub async fn fee_estimate(&self) -> Result<FeeEstimate, String> {
-        let head_num = self.anchor.optimistic_block_number();
-        let Some(head_hash) = self.anchor.optimistic_block_hash() else {
-            return Err("no beacon-anchored head yet".to_string());
-        };
-        if head_num == 0 {
-            return Err("beacon not synced".to_string());
-        }
+        let (head_num, head_hash) = self.anchored_head()?;
         // Sample [start..head]; never below genesis.
         let count = TIP_SUGGEST_BLOCKS.min(head_num + 1);
         let start = head_num + 1 - count;
@@ -1484,7 +1440,7 @@ impl ElReader {
     /// `None` = we never verified that hash. Poisoning is unreachable
     /// (panic="abort"); read as a miss rather than propagate.
     fn lookup_block_number(&self, block_hash: &[u8; 32]) -> Option<u64> {
-        self.block_hash_numbers.lock().ok()?.get(block_hash)
+        self.block_hash_numbers.lock().ok()?.get(block_hash).copied()
     }
 
     /// Remember a VERIFIED block hash↔number for `eth_getBlockByHash`.
@@ -1517,7 +1473,7 @@ impl ElReader {
         tx_hash: [u8; 32],
         head_num: u64,
         head_hash: &[u8; 32],
-    ) -> Result<Option<TxLocation>, String> {
+    ) -> Result<Option<Arc<TxLocation>>, String> {
         let state = self.tx_scan_state(tx_hash)?;
         let mut st = state.lock().await;
         st.last_touched = std::time::Instant::now();
@@ -1536,15 +1492,15 @@ impl ElReader {
 
         if st.found.is_none() {
             // A short reorg can pull the optimistic head BELOW an
-            // already-scanned height. Clamp the cursor so the replacement
-            // blocks are rescanned as the head re-advances — otherwise
-            // `from = high + 1 > head` skips scanning until the head passes the
-            // stale cursor, and a tx mined in a replacement block would keep
-            // reading as a verified "not seen" in the meantime.
-            if let Some(high) = st.high_scanned {
-                if high > head_num {
-                    st.high_scanned = Some(head_num);
-                }
+            // already-scanned height — everything scanned above the new head
+            // was replaced, and the fork may reach a few blocks deeper. Reset
+            // the cursor for a fresh initial-lookback scan (covers forks up to
+            // that depth past the new head); merely clamping to the new head
+            // would leave `from = head + 1` and never rescan the replacement
+            // head block itself, so a tx mined there would keep reading as a
+            // verified "not seen".
+            if st.high_scanned.is_some_and(|high| high > head_num) {
+                st.high_scanned = None;
             }
             let mut from = match st.high_scanned {
                 None => head_num.saturating_sub(RECEIPT_INITIAL_LOOKBACK_BLOCKS - 1),
@@ -1562,41 +1518,11 @@ impl ElReader {
             // from > head_num means the head hasn't advanced since the last
             // scan — nothing new to look at (the cached "not seen" stands).
             if from <= head_num {
-                let peers = self.pool.snap_peers().await;
-                if peers.is_empty() {
-                    return Err("no snap peer available".to_string());
-                }
-                let total = peers.len();
-                let mut scanned = false;
-                let mut last_err = String::new();
-                for peer in &peers {
-                    let attempt = tokio::time::timeout(
-                        RECEIPT_SCAN_DEADLINE,
-                        self.scan_blocks_from(peer, from, head_num, head_hash, &tx_hash),
-                    )
-                    .await
-                    .unwrap_or_else(|_| Err("tx scan timed out".to_string()));
-                    match attempt {
-                        Ok(found) => {
-                            self.pool.record_snap_served(peer.addr()).await;
-                            // Advance the cursor only after a fully verified
-                            // scan of [from..head] (found or not).
-                            st.high_scanned = Some(head_num);
-                            st.found = found;
-                            scanned = true;
-                            break;
-                        }
-                        Err(e) => {
-                            self.pool.record_snap_failure(peer.addr()).await;
-                            last_err = e;
-                        }
-                    }
-                }
-                if !scanned {
-                    return Err(format!(
-                        "all {total} snap peer(s) failed to serve a verifiable tx scan: {last_err}"
-                    ));
-                }
+                let found = self.scan_window(from, head_num, head_hash, &tx_hash).await?;
+                // Advance the cursor only after a fully verified scan of
+                // [from..head] (found or not) — an Err above leaves it put.
+                st.high_scanned = Some(head_num);
+                st.found = found.map(Arc::new);
             }
         }
 
@@ -1604,6 +1530,43 @@ impl ElReader {
         // follow-up round-trips (the Java twin's synchronized block also ends
         // at locateMinedTx).
         Ok(st.found.clone())
+    }
+
+    /// Run one `[from..head]` scan across the snap pool: try each peer (each
+    /// attempt bounded by [`RECEIPT_SCAN_DEADLINE`]) until one serves a fully
+    /// verified window, recording served/failure reputation per peer.
+    async fn scan_window(
+        &self,
+        from: u64,
+        head_num: u64,
+        head_hash: &[u8; 32],
+        tx_hash: &[u8; 32],
+    ) -> Result<Option<TxLocation>, String> {
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err("no snap peer available".to_string());
+        }
+        let total = peers.len();
+        let mut last_err = String::new();
+        for peer in &peers {
+            let attempt = tokio::time::timeout(
+                RECEIPT_SCAN_DEADLINE,
+                self.scan_blocks_from(peer, from, head_num, head_hash, tx_hash),
+            )
+            .await
+            .unwrap_or_else(|_| Err("tx scan timed out".to_string()));
+            match attempt {
+                Ok(found) => {
+                    self.pool.record_snap_served(peer.addr()).await;
+                    return Ok(found);
+                }
+                Err(e) => {
+                    self.pool.record_snap_failure(peer.addr()).await;
+                    last_err = e;
+                }
+            }
+        }
+        Err(format!("all {total} snap peer(s) failed to serve a verifiable tx scan: {last_err}"))
     }
 
     /// Get-or-create the per-tx scan cursor. The idle-TTL sweep is time-gated
@@ -2246,28 +2209,4 @@ mod tests {
         assert_eq!(cfg.min_suggested_tip_wei, 1_000_000, "gnosis cheap-chain tip floor");
     }
 
-    #[test]
-    fn block_hash_lru_caps_and_prefers_recently_used() {
-        let mut lru = BlockHashLru::new();
-        let hash = |n: u64| {
-            let mut h = [0u8; 32];
-            h[..8].copy_from_slice(&n.to_be_bytes());
-            h
-        };
-        for n in 0..BLOCK_HASH_LRU_MAX as u64 {
-            lru.put(hash(n), n);
-        }
-        // Touch entry 0 so it is the most recently used, then overflow by one:
-        // the eviction must take the LEAST recently used (entry 1), not 0.
-        assert_eq!(lru.get(&hash(0)), Some(0));
-        lru.put(hash(9999), 9999);
-        assert_eq!(lru.map.len(), BLOCK_HASH_LRU_MAX);
-        assert_eq!(lru.get(&hash(0)), Some(0), "recently-used entry survives");
-        assert_eq!(lru.get(&hash(1)), None, "least-recently-used entry evicted");
-        assert_eq!(lru.get(&hash(9999)), Some(9999));
-        // Re-inserting an existing hash updates in place (no growth).
-        lru.put(hash(0), 42);
-        assert_eq!(lru.get(&hash(0)), Some(42));
-        assert_eq!(lru.map.len(), BLOCK_HASH_LRU_MAX);
-    }
 }

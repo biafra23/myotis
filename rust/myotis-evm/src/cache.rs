@@ -158,14 +158,18 @@ impl BytecodeCache for InMemoryBytecodeCache {
 /// a new key overflows `cap` (n is the cap, negligible beside the network fetch
 /// an eviction stands in for). Recency is a monotonically increasing tick, not a
 /// wall clock — safe in the sans-I/O crate. `cap == 0` disables caching.
-struct Lru<K, V> {
+///
+/// Public: shared by the proof/bytecode caches here and by consumers with the
+/// same bounded-map need (the EL reader's verified block-hash → number map —
+/// the Java `blockHashToNumber` twin), so the eviction subtleties live once.
+pub struct Lru<K, V> {
     cap: usize,
     tick: u64,
     map: HashMap<K, (V, u64)>,
 }
 
 impl<K: std::hash::Hash + Eq + Clone, V> Lru<K, V> {
-    fn new(cap: usize) -> Lru<K, V> {
+    pub fn new(cap: usize) -> Lru<K, V> {
         Lru {
             cap,
             tick: 0,
@@ -173,7 +177,7 @@ impl<K: std::hash::Hash + Eq + Clone, V> Lru<K, V> {
         }
     }
 
-    fn get(&mut self, key: &K) -> Option<&V> {
+    pub fn get(&mut self, key: &K) -> Option<&V> {
         self.tick = self.tick.wrapping_add(1);
         let tick = self.tick;
         match self.map.get_mut(key) {
@@ -185,7 +189,7 @@ impl<K: std::hash::Hash + Eq + Clone, V> Lru<K, V> {
         }
     }
 
-    fn put(&mut self, key: K, value: V) {
+    pub fn put(&mut self, key: K, value: V) {
         if self.cap == 0 {
             return;
         }
@@ -214,5 +218,34 @@ impl<K: std::hash::Hash + Eq + Clone, V> Lru<K, V> {
         {
             self.map.remove(&victim);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Lru;
+
+    #[test]
+    fn lru_caps_and_prefers_recently_used() {
+        let mut lru: Lru<u64, u64> = Lru::new(4);
+        for n in 0..4 {
+            lru.put(n, n * 10);
+        }
+        // Touch entry 0 so it is the most recently used, then overflow by one:
+        // the eviction must take the LEAST recently used (entry 1), not 0.
+        assert_eq!(lru.get(&0), Some(&0));
+        lru.put(99, 990);
+        assert_eq!(lru.map.len(), 4);
+        assert_eq!(lru.get(&0), Some(&0), "recently-used entry survives");
+        assert_eq!(lru.get(&1), None, "least-recently-used entry evicted");
+        assert_eq!(lru.get(&99), Some(&990));
+        // Re-inserting an existing key updates in place (no growth, no evict).
+        lru.put(0, 42);
+        assert_eq!(lru.get(&0), Some(&42));
+        assert_eq!(lru.map.len(), 4);
+        // cap == 0 disables caching entirely.
+        let mut off: Lru<u64, u64> = Lru::new(0);
+        off.put(1, 1);
+        assert_eq!(off.get(&1), None);
     }
 }
