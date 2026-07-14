@@ -1474,8 +1474,13 @@ impl ElReader {
         if now.duration_since(scans.last_sweep) >= RECEIPT_SCAN_SWEEP_INTERVAL {
             scans.last_sweep = now;
             // An entry whose tokio lock is HELD is in use — keep it regardless.
+            // saturating: a concurrent poll can stamp last_touched AFTER `now`
+            // was captured; that reads as zero idle (kept), never a panic. (On
+            // Rust >= 1.60 plain duration_since saturates too — this just says
+            // so explicitly, matching the workspace's panic-free-by-construction
+            // policy under panic="abort".)
             scans.map.retain(|_, st| match st.try_lock() {
-                Ok(guard) => now.duration_since(guard.last_touched) < RECEIPT_SCAN_TTL,
+                Ok(guard) => now.saturating_duration_since(guard.last_touched) < RECEIPT_SCAN_TTL,
                 Err(_) => true,
             });
         }
