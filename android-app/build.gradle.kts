@@ -83,7 +83,7 @@ val rpcUpstream: String = run {
 
 android {
     namespace = "com.jaeckel.ethp2p.android"
-    compileSdk = 34
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.jaeckel.ethp2p.android"

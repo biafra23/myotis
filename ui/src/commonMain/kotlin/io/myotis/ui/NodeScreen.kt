@@ -1170,6 +1170,10 @@ private fun formatDuration(ms: Long): String {
 }
 
 /** HH:mm:ss.SSS in [tz] (matches the logback console/file pattern). */
+// The opt-in is for the iOS (klib) compile, where kotlinx-datetime 0.6.x resolves
+// Instant against the 2.2 stdlib's experimental kotlin.time.Instant; the JVM and
+// Android compiles resolve kotlinx-datetime's own stable Instant and ignore it.
+@OptIn(kotlin.time.ExperimentalTime::class)
 private fun formatLogTime(ms: Long, tz: TimeZone): String {
     val dt = Instant.fromEpochMilliseconds(ms).toLocalDateTime(tz)
     fun p2(n: Int) = n.toString().padStart(2, '0')

@@ -32,11 +32,13 @@ dnsjava = "3.6.2"
 # (biafra23/besu, tag <ver>-android.N — android-app substitutes it in).
 besu = "26.4.0"
 agp = "8.7.3"
-kotlin = "2.0.21"
+# Kotlin 2.2.21 is the FLOOR for the iOS target: it's the first release whose
+# Kotlin/Native supports Xcode 26 (required to link against the iOS 26 SDK).
+kotlin = "2.2.21"
 compose-bom = "2024.11.00"
-# Compose Multiplatform (shared UI for Android + Desktop, iOS later). 1.7.x pairs with
-# Kotlin 2.0.20+. Uses the Kotlin-2.0 compose-compiler plugin (already present).
-compose-multiplatform = "1.7.1"
+# Compose Multiplatform (shared UI for Android + Desktop + iOS). 1.9.x pairs with
+# Kotlin 2.2.20+. Uses the bundled compose-compiler plugin.
+compose-multiplatform = "1.9.3"
 activity-compose = "1.9.3"
 # JSON-RPC server (:jsonrpc-server). Ktor server+client + kotlinx are chosen for
 # Android compatibility (no java.net.http / com.sun.net.httpserver) and to match
@@ -44,7 +46,10 @@ activity-compose = "1.9.3"
 ktor = "3.0.3"
 kotlinx-coroutines = "1.9.0"
 kotlinx-serialization = "1.7.3"
-kotlinx-datetime = "0.6.1"
+# 0.6.2 = the compatibility release for the kotlin.time.Instant the 2.1.20+ stdlib
+# introduced. The iOS (klib) compile still resolves the experimental stdlib Instant
+# in :ui's formatLogTime — see the local @OptIn there.
+kotlinx-datetime = "0.6.2"
 # Tiny (~30 KB), dependency-free, Android-safe JSON parser for :myotis-engines'
 # JNI JSON marshalling (hand-JNI decision, docs/reimplementation/05).
 minimal-json = "0.9.5"
