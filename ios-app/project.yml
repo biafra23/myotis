@@ -1,0 +1,75 @@
+# XcodeGen spec for the iOS host app. Regenerate the .xcodeproj with:
+#   cd ios-app && xcodegen generate
+# The app is a thin SwiftUI shell around MyotisKit (the :app-ios Kotlin/Native
+# framework, which bundles the shared Compose UI + the Rust engine). The Run
+# Script phase builds/refreshes the framework via Gradle before compiling.
+name: Myotis
+options:
+  bundleIdPrefix: io.myotis
+  deploymentTarget:
+    iOS: "15.2"
+  createIntermediateGroups: true
+targets:
+  Myotis:
+    type: application
+    platform: iOS
+    sources:
+      - Myotis
+    info:
+      path: Myotis/Info.plist
+      properties:
+        CFBundleDisplayName: Myotis
+        UILaunchScreen: {}
+        # Compose Multiplatform's PlistSanityCheck refuses to start without this
+        # (it unlocks ProMotion refresh rates for Compose's own render loop).
+        CADisableMinimumFrameDurationOnPhone: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # The engine dials devp2p/libp2p peers directly; mDNS discovery inside
+        # libp2p can touch the local network on real devices.
+        NSLocalNetworkUsageDescription: >-
+          Myotis discovers and connects to Ethereum peers, which can include
+          nodes on your local network.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.myotis.ios
+        # Where :app-ios:embedAndSignAppleFrameworkForXcode stages MyotisKit.
+        FRAMEWORK_SEARCH_PATHS: $(SRCROOT)/../app-ios/build/xcode-frameworks/$(CONFIGURATION)/$(SDK_NAME)
+        # SystemConfiguration: referenced by the Rust engine's if-watch (interface
+        # watching inside libp2p-tcp); auto-linking can't see into the static
+        # archive, so the app names the framework explicitly.
+        OTHER_LDFLAGS: $(inherited) -framework MyotisKit -framework SystemConfiguration
+        # The Gradle phase writes outside Xcode's sandbox (build dirs, cargo).
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        SWIFT_VERSION: "5.0"
+    preBuildScripts:
+      - name: Build MyotisKit (Gradle + cargo)
+        script: |
+          cd "$SRCROOT/.."
+          ./gradlew :app-ios:embedAndSignAppleFrameworkForXcode
+        basedOnDependencyAnalysis: false
+  MyotisUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - MyotisUITests
+    dependencies:
+      - target: Myotis
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.myotis.ios.uitests
+        SWIFT_VERSION: "5.0"
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  Myotis:
+    build:
+      targets:
+        Myotis: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - MyotisUITests

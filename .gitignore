@@ -41,3 +41,8 @@ app/cacheDir/
 # Kotlin incremental-compile scratch + ad-hoc daemon logs
 .kotlin/
 *.log
+
+# Xcode (ios-app) — per-user state; the generated .xcodeproj itself is committed
+xcuserdata/
+*.xcworkspace/xcuserdata/
+ios-app/DerivedData/

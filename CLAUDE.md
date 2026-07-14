@@ -40,6 +40,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ./gradlew cargoBuildHost   # cargo build --release (auto-runs before :app:run / :consensus:test)
 ./gradlew cargoTest        # cargo test --workspace (part of `check`)
 ./gradlew cargoNdkAndroid  # Android jniLibs (needs cargo-ndk + NDK; committed jniLibs are the fallback)
+
+# iOS (macOS only; needs Xcode 26+ and the rustup targets on the toolchain the
+# workspace's rust-toolchain.toml selects — i.e.
+# `rustup target add --toolchain stable aarch64-apple-ios aarch64-apple-ios-sim`)
+./gradlew cargoBuildIosSim                              # libmyotis_engine.a for the arm64 simulator
+./gradlew cargoBuildIosDevice                           # libmyotis_engine.a for arm64 devices
+./gradlew :app-ios:linkDebugFrameworkIosSimulatorArm64  # MyotisKit.framework (runs cargo first)
+# The app itself builds from ios-app/ (Xcode project, regenerable with `xcodegen generate`):
+#   cd ios-app && xcodebuild -project Myotis.xcodeproj -scheme Myotis \
+#     -destination 'platform=iOS Simulator,name=<device>' build
 ```
 
 ## Architecture
@@ -64,6 +74,14 @@ Key Gradle modules:
 - **consensus** — Sync-committee light client (libp2p, BLS, SSZ)
 - **app** — Daemon/CLI entry point, Unix domain socket IPC server, peer caching
 - **myotis-evm** — Local EVM execution (Besu) against SNAP-verified state for view calls and gas estimation
+- **ui** — Shared Compose Multiplatform screens + the pure-Kotlin seams
+  (`NodeController`/`Settings`/`LogSource`/`NetworkStatus`/`QueryHistory`);
+  targets Android + Desktop JVM + iOS. Hosts supply the seam actuals.
+- **app-ios** — The iOS host: Kotlin/Native framework (`MyotisKit`) bundling `:ui`
+  with iOS seam actuals over the RUST engine's plain C ABI
+  (`rust/include/myotis_engine.h`, cinterop; libmyotis_engine.a is absorbed into
+  the framework). The JVM engine never runs on iOS. The Xcode shell lives in
+  `ios-app/` (regenerate with `xcodegen generate`).
 
 **Protocol flow**: `DiscV4Service` discovers peers → `Main` dials them via `RLPxConnector.connect()` → `RLPxHandler` performs ECIES handshake (state machine: HANDSHAKE_WRITE → HANDSHAKE_READ → FRAMED) → fires `RLPX_READY` event → `EthHandler` runs eth handshake (AWAITING_HELLO → AWAITING_STATUS → READY) → block header requests available.
 
@@ -96,6 +114,10 @@ Key Gradle modules:
   screen's per-network engine badge (`Engines.engineKindFor`) — internal
   seams, deliberately not on the API; and `:app`'s
   `testing/MainnetPeerBootstrap` (an integration-test fixture).
+  The iOS host (`:app-ios`) is the JVM-free analogue: it consumes the same
+  engine contract over the Rust engine's plain C ABI (`RustEngine.kt` mirrors
+  `RustEngineNative`; same JSON shapes, pinned by the same golden tests) and
+  never touches engine internals either.
 
 ## Platform & language direction
 
