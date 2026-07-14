@@ -1,24 +1,26 @@
 package io.myotis.ui
 
 import java.nio.file.Files
-import java.nio.file.Path
+import java.nio.file.Paths
 
 // The JVM-backed hosts (Android + Desktop) share these actuals verbatim —
-// plain java.nio, available on both (minSdk 29 covers java.nio.file).
+// plain java.nio, available on both. Paths.get, NOT Path.of: Path.of is
+// API 34 on Android (minSdk here is 29) and isn't desugared, so it would
+// NoSuchMethodError at runtime while compiling clean against SDK 35.
 
-internal actual fun statCacheFile(path: String): CacheFileIdentity? = try {
-    val p = Path.of(path)
+internal actual fun statCacheFile(path: String): CacheFileStat = try {
+    val p = Paths.get(path)
     if (Files.isRegularFile(p)) {
-        CacheFileIdentity(Files.getLastModifiedTime(p).toMillis(), Files.size(p))
+        CacheFileStat.Present(Files.getLastModifiedTime(p).toMillis(), Files.size(p))
     } else {
-        null
+        CacheFileStat.Missing
     }
 } catch (e: Exception) {
-    null
+    CacheFileStat.Unreadable
 }
 
 internal actual fun readCacheFileLines(path: String): List<String>? = try {
-    Files.readAllLines(Path.of(path))
+    Files.readAllLines(Paths.get(path))
 } catch (e: Exception) {
     null
 }

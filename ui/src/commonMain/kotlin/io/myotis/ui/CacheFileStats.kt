@@ -106,12 +106,20 @@ object CacheFileStats {
 
     private fun <T : Any> memoized(path: String, empty: T, parse: (List<String>) -> T): T {
         val cached = memo[path]
-        val id = statCacheFile(path)
-        if (id == null) {
-            // Missing/unreadable file: a purged cache really is empty — forget
-            // the memo rather than showing stale counts forever.
-            if (cached != null) memo = memo - path
-            return empty
+        val id = when (val stat = statCacheFile(path)) {
+            is CacheFileStat.Present -> stat
+            // Affirmatively gone: a purged cache really is empty — forget the
+            // memo rather than showing stale counts forever.
+            CacheFileStat.Missing -> {
+                if (cached != null) memo = memo - path
+                return empty
+            }
+            // TRANSIENT stat failure: show last-known counts rather than
+            // flashing zeros, and keep the memo for when the stat recovers.
+            CacheFileStat.Unreadable -> {
+                @Suppress("UNCHECKED_CAST")
+                return (cached?.stats as? T) ?: empty
+            }
         }
         if (cached != null && cached.mtime == id.mtimeMillis && cached.size == id.size) {
             @Suppress("UNCHECKED_CAST")
@@ -128,7 +136,9 @@ object CacheFileStats {
         // when the identity held across the read — a torn parse is shown once
         // but never sticks.
         val after = statCacheFile(path)
-        if (after != null && after.mtimeMillis == id.mtimeMillis && after.size == id.size) {
+        if (after is CacheFileStat.Present &&
+            after.mtimeMillis == id.mtimeMillis && after.size == id.size
+        ) {
             memo = memo + (path to Memo(id.mtimeMillis, id.size, stats))
         }
         return stats
@@ -151,11 +161,19 @@ object CacheFileStats {
     }
 }
 
-/** A cache file's change identity: parse results are memoized against it. */
-internal data class CacheFileIdentity(val mtimeMillis: Long, val size: Long)
+/**
+ * A cache file's stat outcome. [Missing] (affirmatively not a regular file)
+ * evicts the memo — a purged cache really is empty; [Unreadable] (transient
+ * stat failure) keeps showing last-known counts instead of flashing zeros.
+ */
+internal sealed interface CacheFileStat {
+    /** Change identity: parse results are memoized against it. */
+    data class Present(val mtimeMillis: Long, val size: Long) : CacheFileStat
+    data object Missing : CacheFileStat
+    data object Unreadable : CacheFileStat
+}
 
-/** Stat [path]; null when it doesn't exist / isn't a regular file / can't be statted. */
-internal expect fun statCacheFile(path: String): CacheFileIdentity?
+internal expect fun statCacheFile(path: String): CacheFileStat
 
 /** Read [path] as UTF-8 lines; null when the read fails (e.g. raced a rewrite). */
 internal expect fun readCacheFileLines(path: String): List<String>?

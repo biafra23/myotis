@@ -15,12 +15,17 @@ import platform.Foundation.NSNumber
 import platform.Foundation.dataWithContentsOfFile
 import platform.Foundation.timeIntervalSince1970
 
-internal actual fun statCacheFile(path: String): CacheFileIdentity? {
-    val attrs = NSFileManager.defaultManager.attributesOfItemAtPath(path, null) ?: return null
-    if (attrs[NSFileType] as? String != NSFileTypeRegular) return null
-    val mtime = (attrs[NSFileModificationDate] as? NSDate) ?: return null
-    val size = (attrs[NSFileSize] as? NSNumber) ?: return null
-    return CacheFileIdentity(
+internal actual fun statCacheFile(path: String): CacheFileStat {
+    val fm = NSFileManager.defaultManager
+    val attrs = fm.attributesOfItemAtPath(path, null)
+        // attributesOfItemAtPath conflates "no such file" with "stat failed";
+        // disambiguate so a transient failure keeps last-known counts while a
+        // genuinely purged cache reads as empty.
+        ?: return if (fm.fileExistsAtPath(path)) CacheFileStat.Unreadable else CacheFileStat.Missing
+    if (attrs[NSFileType] as? String != NSFileTypeRegular) return CacheFileStat.Missing
+    val mtime = (attrs[NSFileModificationDate] as? NSDate) ?: return CacheFileStat.Unreadable
+    val size = (attrs[NSFileSize] as? NSNumber) ?: return CacheFileStat.Unreadable
+    return CacheFileStat.Present(
         (mtime.timeIntervalSince1970 * 1000).toLong(),
         size.longLongValue,
     )
