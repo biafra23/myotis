@@ -38,6 +38,9 @@ dependencies {
     // Engine selector: DesktopNodeController defaults to Engines.engine().
     implementation(project(":myotis-engines"))
     implementation(project(":app"))
+    // TrueBlocks tx-history scan for the Query tab (documented API-boundary exemption:
+    // it reaches the raw connector via SelectorEngine.javaDelegate().debugStack).
+    implementation(project(":tx-history"))
     implementation(project(":networking"))
     implementation(project(":consensus"))
     implementation(project(":myotis-evm"))

@@ -96,6 +96,11 @@ milagro             = { module = "org.miracl.milagro.amcl:milagro-crypto-java", 
 jblst               = { module = "tech.pegasys:jblst",                        version.ref = "jblst" }
 jvm-libp2p          = { module = "io.libp2p:jvm-libp2p",                   version.ref = "jvm-libp2p" }
 trueblocks-kotlin   = { module = "com.github.biafra23:trueblocks-kotlin", version.ref = "trueblocks-kotlin" }
+# trueblocks-kotlin's own dependency, made explicit so :tx-history can call
+# Bloom.isMemberBytes(Address) at compile time (the JitPack POM exposes kethereum
+# only at runtime scope). Keep the version in lockstep with what trueblocks-kotlin
+# resolves transitively (0.86.0 today).
+kethereum-model     = { module = "com.github.komputing.kethereum:model",   version = "0.86.0" }
 dnsjava             = { module = "dnsjava:dnsjava",                       version.ref = "dnsjava" }
 discovery           = { module = "io.consensys.protocols:discovery",       version.ref = "discovery" }
 besu-evm            = { module = "org.hyperledger.besu:besu-evm",         version.ref = "besu" }
@@ -120,4 +125,5 @@ ktor-client-core           = { module = "io.ktor:ktor-client-core",  version.ref
 ktor-client-cio            = { module = "io.ktor:ktor-client-cio",   version.ref = "ktor" }
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinx-serialization" }
 kotlinx-coroutines-core    = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core",    version.ref = "kotlinx-coroutines" }
+kotlinx-coroutines-test    = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test",    version.ref = "kotlinx-coroutines" }
 kotlinx-datetime           = { module = "org.jetbrains.kotlinx:kotlinx-datetime",           version.ref = "kotlinx-datetime" }

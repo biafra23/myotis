@@ -21,7 +21,9 @@ dependencies {
     implementation(libs.tuweni.bytes)
     implementation(libs.tuweni.rlp)
     implementation(libs.tuweni.crypto)
-    implementation(libs.trueblocks.kotlin)
+    // TrueBlocks tx-history scan/parse service (the get-transactions debug stream);
+    // the trueblocks-kotlin lib itself is consumed inside :tx-history now.
+    implementation(project(":tx-history"))
     implementation(libs.slf4j.api)
     runtimeOnly(libs.logback.classic)
 

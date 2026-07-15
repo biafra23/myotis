@@ -334,13 +334,48 @@ public final class Main {
             // get-transactions (TrueBlocks debug stream) is the documented exemption from
             // the API boundary — it takes the raw connector via the CONCRETE Java engine's
             // debug accessor (through the selector's javaDelegate), wired only here at the
-            // composition root. Null when this network isn't Java-hosted: the debug stream
-            // doesn't survive an engine swap, by design.
-            var debugStack = engine instanceof SelectorEngine se
+            // composition root. Null when this network isn't Java-hosted (the debug stream
+            // doesn't survive an engine swap, by design) or isn't mainnet (the Unchained
+            // Index, its publisher contract, and the token table are mainnet-only — the
+            // old code would happily scan the mainnet index against a gnosis connector).
+            var debugStack = engine instanceof SelectorEngine se && "mainnet".equals(network)
                     ? se.javaDelegate().debugStack(network)
                     : null;
+            final ChainHandle debugHandle = handle;
             DebugCommands debugCommands = debugStack != null
-                    ? new DebugCommands(debugStack.connector())
+                    ? new DebugCommands(new io.myotis.txhistory.TxHistoryService(
+                            debugStack.connector(),
+                            // Reads gate on SYNCED (non-blocking check) so the manifest
+                            // eth_call degrades to the cached/hardcoded CID instead of
+                            // parking the scan on GatedVerifiedReads' readiness wait.
+                            () -> {
+                                var reads = debugHandle.reads();
+                                return reads != null
+                                        && reads.syncState() == io.myotis.api.SyncState.SYNCED
+                                        ? reads : null;
+                            },
+                            // Working-directory-relative like the daemon's other files
+                            // (peers.cache, sync-state.snapshot).
+                            java.nio.file.Path.of("trueblocks"),
+                            // The index publisher's current wallet, via VERIFIED ENS
+                            // (the name is re-pointed when TrueBlocks rotates wallets).
+                            // Best-effort: null (→ built-in default) when unsynced/no ENS.
+                            () -> {
+                                try {
+                                    var reads = debugHandle.reads();
+                                    if (reads == null
+                                            || reads.syncState() != io.myotis.api.SyncState.SYNCED) {
+                                        return null;
+                                    }
+                                    var ens = debugHandle.ens();
+                                    if (ens == null) return null;
+                                    return ens.resolveAddress(
+                                            io.myotis.txhistory.ManifestCidResolver.PUBLISHER_ENS_NAME,
+                                            io.myotis.api.EnsRoot.AUTO).addressHex();
+                                } catch (Exception e) {
+                                    return null;
+                                }
+                            }))
                     : null;
 
             CommandHandler commandHandler = new CommandHandler(handle, stopLatch, debugCommands);

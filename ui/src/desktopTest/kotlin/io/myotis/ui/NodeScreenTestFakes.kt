@@ -5,10 +5,11 @@ import kotlinx.coroutines.flow.flowOf
 
 /**
  * Shared no-op fakes for the [NodeScreen] seams, used by the desktop UI tests
- * (LogsFilterPersistenceTest, LogsTailFollowTest). Kept in one place so a
+ * (LogsFilterPersistenceTest, LogsTailFollowTest, TxScanUiTest — which subclasses
+ * FakeController to script specific seams). Kept in one place so a
  * NodeController/Settings interface change breaks exactly one fixture.
  */
-internal class FakeController : NodeController {
+internal open class FakeController : NodeController {
     override val running: Boolean = false
     override fun snapshots(): Flow<Map<String, NodeSnapshot>> = flowOf(emptyMap())
     override fun enableNetwork(name: String) {}

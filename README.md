@@ -598,45 +598,37 @@ Reads `interfaceImplementer(node, interfaceId)` (EIP-1820 over ENS) — the addr
 ./gradlew :app:run -Pargs="get-transactions 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 ```
 
-Returns all transactions for an address by looking them up in the [TrueBlocks Unchained Index](https://trueblocks.io/). Results are streamed as JSON-Lines (one JSON object per transaction), followed by a summary object.
+Returns all transactions for an address (mainnet only) by looking them up in the [TrueBlocks Unchained Index](https://trueblocks.io/). Results are streamed as JSON-Lines, newest first, followed by a summary object. The same scan powers the **desktop app's Query tab** ("Find transactions" under an address lookup): hits appear as block-number placeholders and upgrade in place to parsed rows, with a progress bar and a Stop button.
 
 **How it works:**
 
-1. Fetches the TrueBlocks manifest from IPFS (hardcoded CID: "[QmUBS83qjRmXmSgEvZADVv2ch47137jkgNbqfVVxQep5Y1](https://ipfs.unchainedindex.io/ipfs/QmUBS83qjRmXmSgEvZADVv2ch47137jkgNbqfVVxQep5Y1)")
+1. Resolves the **latest** manifest CID from the UnchainedIndex_V2 contract on mainnet (`manifestHashMap(publisher, "mainnet")` at [`0x0c316B70…183d`](https://etherscan.io/address/0x0c316b7042b419d07d343f2f4f5bd54ff731183d)) using myotis' own **verified eth_call** — no external RPC. The publisher is `publisher.unchainedindex.eth` (chifra's preferred publisher, resolved via myotis' verified ENS; the manifest map is permissionless, so only the ENS-designated publisher's slot is trusted — even trueblocks.eth's own slot holds a junk placeholder). The result is cached for 24h; when the node isn't synced the cached (or, as a last resort, a hardcoded known-good) CID is used and the output says so via `cidSource`.
 2. For each chunk in the manifest (scanned from newest to oldest blocks):
-   - Downloads the Bloom filter and checks if the address appears
-   - On a Bloom hit, downloads the index chunk and extracts appearance records (block number + transaction index)
+   - Downloads the Bloom filter (disk-cached under `trueblocks/`, content-addressed, immutable) and checks if the address appears
+   - On a Bloom hit, downloads the index chunk (also cached) and extracts appearance records (block number + transaction index)
 3. For each appearance, fetches the block header and body from devp2p peers and extracts the raw transaction
-4. Parses the transaction RLP into human-readable fields (supports legacy, EIP-2930, EIP-1559, and EIP-4844 transaction types)
+4. Decodes the transaction (legacy, EIP-2930, EIP-1559, EIP-4844, EIP-7702; sender recovered from the signature) and classifies it: plain ETH transfer, ERC-20 `transfer`/`transferFrom` of a well-known token (USDC, USDT, DAI, WETH, WBTC, …), generic contract call, or contract creation
 
-**Transaction fields:**
+**Stream shape** (succinct — one line per transaction, no raw tx hex):
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `blockNumber` | long | Block containing the transaction |
-| `transactionIndex` | int | Position within the block |
-| `type` | int | Transaction type (0=legacy, 1=EIP-2930, 2=EIP-1559, 3=EIP-4844) |
-| `nonce` | long | Sender's transaction count |
-| `to` | string | Recipient address (absent for contract creation) |
-| `value` | string | Value transferred in wei (hex) |
-| `gasLimit` | long | Gas limit |
-| `gasPrice` | string | Gas price in wei (type 0-1, hex) |
-| `maxPriorityFeePerGas` | string | Priority fee (type 2-3, hex) |
-| `maxFeePerGas` | string | Max fee (type 2-3, hex) |
-| `maxFeePerBlobGas` | string | Max blob fee (type 3, hex) |
-| `chainId` | long | Chain ID (type 1-3) |
-| `data` | string | Input data (hex, absent if empty) |
-| `rawTx` | string | Full raw transaction bytes (hex) |
-| `verified` | boolean | Always `false` (see limitations below) |
+```
+{"ok":true,"manifestCid":"Qm…","cidSource":"contract","chunks":8123,"latestIndexedBlock":22841000,"headBlock":22843511}
+{"ok":true,"blockNumber":22812345,"transactionIndex":41,"hash":"0x…","from":"0x…","to":"0xa0b86991…","kind":"erc20","token":"USDC","amount":"1250.50","recipient":"0x…","verified":false}
+{"ok":true,"blockNumber":22711000,"transactionIndex":3,"hash":"0x…","from":"0x…","to":"0x…","kind":"eth","eth":"1.25","wei":"1250000000000000000","verified":false}
+{"ok":true,"blockNumber":22600000,"transactionIndex":97,"hash":"0x…","from":"0x…","to":"0x…","kind":"call","calldataBytes":132,"selector":"0x38ed1739","verified":false}
+{"ok":true,"progress":{"chunksScanned":250,"totalChunks":8123,"range":"022300000-022310000","hits":3,"bytesDownloaded":31457280}}
+{"ok":true,"done":true,"totalTransactions":3}
+```
 
-The stream ends with `{"ok":true,"done":true,"totalTransactions":N}`.
+`kind` is one of `eth` (plain transfer; `eth` = amount in ETH, `wei` = exact), `erc20` (well-known-token transfer; decimals-adjusted `amount` + decoded `recipient`), `call` (generic call; `calldataBytes` + 4-byte `selector`, plus `eth` when value is attached), or `create` (contract creation). Failed resolutions stream as `{"ok":false,"blockNumber":…,"error":"…"}` and the scan continues. A progress heartbeat line appears every 250 chunks.
 
 **Limitations:**
 
 - **Blocks are not verified.** Individual transactions are not yet verified against the block's `transactionsRoot`. The `verified` field is always `false`. This means a malicious peer could serve tampered transaction data. Verification against the transactions trie is planned but not implemented.
-- **The Unchained Index is stale.** The manifest CID is hardcoded and points to a snapshot of the TrueBlocks index that is not kept up to date. Transactions in recent blocks will not be found. There is currently no mechanism to dynamically update the manifest CID.
+- **Index freshness depends on the publisher.** The manifest CID now tracks the on-chain publication, so the index is as fresh as TrueBlocks' latest publish (typically days behind the head, not years). The `latestIndexedBlock`/`headBlock` fields (and the desktop caption) show the gap; transactions above `latestIndexedBlock` will not be found.
+- **First full-history scan is heavy.** Every chunk's bloom filter is downloaded once (multi-GB across the whole chain history, kept forever in the `trueblocks/` cache); subsequent scans read blooms from disk. Newest chunks stream first, so recent history appears long before the scan completes — and the scan can be stopped at any point.
 - **Completeness is not guaranteed.** IPFS content-addressing guarantees the index data has not been tampered with, but it does not guarantee all appearances for an address are present. If the TrueBlocks index has missing entries (due to indexing gaps or incomplete coverage), transactions will be silently missed. A future mitigation is balance reconciliation -- computing the expected balance from fetched transactions and comparing it against the on-chain balance via snap proofs.
-- **Signature and access list data not returned.** The parsed JSON omits signature fields (v, r, s), access list details (type 1-2), and blob versioned hashes (type 3).
+- **Signature and access list data not returned.** The succinct JSON omits signature fields (v, r, s), access lists, blob hashes, and the raw transaction bytes; use `eth_getTransactionByHash` (verified JSON-RPC) with the returned `hash` for full detail on recent transactions.
 
 ### Dial a specific peer
 

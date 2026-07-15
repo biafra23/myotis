@@ -110,9 +110,13 @@ Key Gradle modules:
   selector (`Engines.engine()`; `myotis.engine=java|rust|auto`, default java —
   `-Pengine=…` on run tasks), which routes to the Java engine (node-core) or the
   Rust engine (rust/myotis-engine via hand-JNI + JSON). Documented exemptions: the
-  single `Engines.engine()` line at each composition root; the daemon's
-  `get-transactions` debug stream (`DebugCommands` via `SelectorEngine.javaDelegate()
-  .debugStack`); the Settings toggles for the BLS backend (`BlsBackends`) and the
+  single `Engines.engine()` line at each composition root; the TrueBlocks
+  transaction-history scan in `:tx-history` (`TxHistoryService` wraps the raw
+  `RLPxConnector`; UNVERIFIED, Java-engine + mainnet only), consumed by the daemon's
+  `get-transactions` debug stream (`DebugCommands`) and the desktop Query tab
+  (`DesktopNodeController.transactionHistory`) — both reach the connector via
+  `SelectorEngine.javaDelegate().debugStack` at their composition roots;
+  the Settings toggles for the BLS backend (`BlsBackends`) and the
   engine (`Engines`), the Rust log drain (`Engines.drainRustLogs` —
   hosts pump the engine's tracing ring into their log pipeline), and the Status
   screen's per-network engine badge (`Engines.engineKindFor`) — internal
