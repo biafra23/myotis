@@ -42,7 +42,8 @@ class RpcRouterTest {
         var lastSlot: ByteArray? = null
         override fun chainId() = 1L
         override fun headBlockNumber() = head
-        override fun syncState() = io.myotis.api.SyncState.SYNCED
+        var syncStateValue = io.myotis.api.SyncState.SYNCED
+        override fun syncState() = syncStateValue
         override fun call(from: ByteArray?, to: ByteArray, data: ByteArray,
                           valueWei: String?, block: String): ByteArray? {
             lastFrom = from; lastTo = to; lastData = data
@@ -496,6 +497,27 @@ class RpcRouterTest {
     @Test fun blockNumber_nullHead_fallsThrough() {
         assertTrue(hasError(route(FakeBackend(head = null),
             """{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}""")))
+    }
+
+    @Test fun syncing_synced_isFalse() {
+        // The spec's "not syncing" is the JSON literal false, not a string.
+        val resp = route(FakeBackend(head = 0x181af48),
+            """{"jsonrpc":"2.0","id":1,"method":"eth_syncing","params":[]}""")
+        assertTrue(resp.contains("\"result\":false"), resp)
+    }
+
+    @Test fun syncing_notSynced_reportsTruthyObjectWithZeroBounds() {
+        // The probe must answer promptly from syncState() alone — never a
+        // wake-holding head read — so the object carries zero bounds (no reads
+        // are served before SYNCED anyway); its truthy-ness is the signal.
+        for (state in listOf(io.myotis.api.SyncState.CATCHING_UP, io.myotis.api.SyncState.SYNCING)) {
+            val b = FakeBackend(head = 0x181af48)
+            b.syncStateValue = state
+            val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_syncing","params":[]}""")
+            assertTrue(resp.contains("\"startingBlock\":\"0x0\""), resp)
+            assertTrue(resp.contains("\"currentBlock\":\"0x0\""), resp)
+            assertTrue(resp.contains("\"highestBlock\":\"0x0\""), resp)
+        }
     }
 
     private fun ByteArray.toHex() = joinToString(prefix = "0x", separator = "") { "%02x".format(it.toInt() and 0xff) }
