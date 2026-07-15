@@ -203,9 +203,10 @@ class IosNodeController(
         // Everything guarded: an uncaught throw here would escape into the
         // lifecycleLane coroutine and terminate the Kotlin/Native process —
         // the listener is best-effort, the node must keep running without it.
+        // The port is resolved BEFORE the guard so onFailure can't throw again.
+        val port = runCatching { settings.rpcPortFor(net) }.getOrDefault(0)
+        if (port <= 0) return
         runCatching {
-            val port = settings.rpcPortFor(net)
-            if (port <= 0) return
             val chainId = engineJson.decodeFromString<List<IosNetworkInfo>>(RustEngine.availableNetworksJson())
                 .firstOrNull { it.name == net }?.chainId ?: return
             val server = MyotisRpcServer(
@@ -235,7 +236,7 @@ class IosNodeController(
             }
         }.onFailure {
             logs.append("ERROR failed to start the $net JSON-RPC listener: ${it.message}")
-            locked { rpcStates[net] = settings.rpcPortFor(net) to false }
+            locked { rpcStates[net] = port to false }
         }
     }
 
@@ -398,6 +399,10 @@ class IosNodeController(
     private fun snapshotOf(network: String, handle: Long): NodeSnapshot {
         val o = runCatching { engineJson.parseToJsonElement(RustEngine.statusJson(handle)).jsonObject }
             .getOrElse { JsonObject(emptyMap()) }
+        // One locked read each — a torn pair across two reads could render a
+        // clean stop as a red "port unavailable" for one poll.
+        val rpcState = locked { rpcStates[network] }
+        val rpcServer = locked { rpcServers[network] }
         // Live counts from the cache FILES (mtime-memoized, shared parser in
         // :ui) — the cross-engine truth the engine writes under dataDir.
         val suffix = if (network == "mainnet") "" else "-$network"
@@ -473,8 +478,11 @@ class IosNodeController(
             readyPeerList = emptyList(),                 // not exposed over the FFI yet
             pauseCount = 0, totalPausedMs = 0L,          // idle-sleep isn't wired on iOS yet
             lastPauseEpochMs = 0L, lastResumeEpochMs = 0L, lastWakeReason = null,
-            rpcPort = locked { rpcStates[network] }?.first ?: 0,
-            rpcServing = locked { rpcStates[network] }?.second ?: false,
+            rpcPort = rpcState?.first ?: 0,
+            // A started listener can still die asynchronously (contained by the
+            // server's supervisor) — consult the live server, not just the
+            // recorded start outcome.
+            rpcServing = (rpcState?.second ?: false) && (rpcServer?.isServing() ?: false),
             lcHunting = o.engineBoolean("lcHunting"),
             elHunting = o.engineBoolean("elHunting"),
         )

@@ -84,18 +84,31 @@ class MyotisRpcServer(
     @Volatile
     private var engine: EmbeddedServer<*, *>? = null
 
+    /** Set by the engine-scope exception handler; see [isServing]. */
+    @Volatile
+    private var failed = false
+
+    /** Whether the listener is up: started, and no engine-scope failure since.
+     *  Hosts poll this for their status surface (the iOS Status RPC row). */
+    fun isServing(): Boolean = engine != null && !failed
+
     fun start() {
         if (engine != null) return
-        // Contain EVERY async engine failure: Ktor CIO surfaces bind errors (and
-        // any other server-scope throw) asynchronously in its own coroutines,
-        // where an uncaught exception kills a Kotlin/Native process outright
-        // (seen live: EADDRINUSE from a TIME_WAIT-held port after a fast app
-        // relaunch). A supervised parent with a handler turns that class of
-        // crash into a log line + a dead listener the host can observe.
+        // Contain EVERY async engine failure: Ktor CIO surfaces some errors
+        // asynchronously in its own coroutines (seen live: EADDRINUSE from a
+        // TIME_WAIT-held port after a fast app relaunch), and an uncaught
+        // coroutine exception kills a Kotlin/Native process outright. The
+        // SupervisorJob is what contains them; the handler only OBSERVES —
+        // it also replaces Ktor CIO's per-connection default handler (which
+        // logs and ignores IO/cancellation), so it must never tear anything
+        // down: a stray connection exception is not a server death. [failed]
+        // records engine-scope deaths for isServing() without nulling
+        // [engine], which would break stop().
         val crashGuard = CoroutineExceptionHandler { _, e ->
-            rpcLogInfo(LOGGER, "[rpc] server failed: $e — continuing without JSON-RPC")
-            engine = null
+            failed = true
+            rpcLogInfo(LOGGER, "[rpc] server error: $e")
         }
+        failed = false
         val config = serverConfig(applicationEnvironment { }) {
             parentCoroutineContext = SupervisorJob() + crashGuard
             module(moduleBody())
