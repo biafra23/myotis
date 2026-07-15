@@ -41,9 +41,12 @@ object CacheFileStats {
     @Volatile
     private var memo: Map<String, Memo> = emptyMap()
 
-    fun cl(path: String): ClStats = memoized(path, ClStats.EMPTY, ::parseCl)
+    // Memo keys carry the parser kind: cl() and el() on the SAME path (a caller
+    // bug, but a cheap one to make impossible) must never serve each other's
+    // cached stats through the unchecked fast-path cast.
+    fun cl(path: String): ClStats = memoized("cl|$path", path, ClStats.EMPTY, ::parseCl)
 
-    fun el(path: String): ElStats = memoized(path, ElStats.EMPTY, ::parseEl)
+    fun el(path: String): ElStats = memoized("el|$path", path, ElStats.EMPTY, ::parseEl)
 
     /** Internal (not private) so the module's own tests can pin the formats. */
     internal fun parseCl(lines: List<String>): ClStats {
@@ -104,14 +107,14 @@ object CacheFileStats {
         return ElStats(total, snapOk, snapBad)
     }
 
-    private fun <T : Any> memoized(path: String, empty: T, parse: (List<String>) -> T): T {
-        val cached = memo[path]
+    private fun <T : Any> memoized(key: String, path: String, empty: T, parse: (List<String>) -> T): T {
+        val cached = memo[key]
         val id = when (val stat = statCacheFile(path)) {
             is CacheFileStat.Present -> stat
             // Affirmatively gone: a purged cache really is empty — forget the
             // memo rather than showing stale counts forever.
             CacheFileStat.Missing -> {
-                if (cached != null) memo = memo - path
+                if (cached != null) memo = memo - key
                 return empty
             }
             // TRANSIENT stat failure: show last-known counts rather than
@@ -139,7 +142,7 @@ object CacheFileStats {
         if (after is CacheFileStat.Present &&
             after.mtimeMillis == id.mtimeMillis && after.size == id.size
         ) {
-            memo = memo + (path to Memo(id.mtimeMillis, id.size, stats))
+            memo = memo + (key to Memo(id.mtimeMillis, id.size, stats))
         }
         return stats
     }

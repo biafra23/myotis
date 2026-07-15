@@ -33,8 +33,14 @@ internal actual fun statCacheFile(path: String): CacheFileStat {
 
 internal actual fun readCacheFileLines(path: String): List<String>? {
     val data = NSData.dataWithContentsOfFile(path) ?: return null
+    // Peer caches are a few KB; anything approaching this bound is corrupt.
+    // The check also keeps the NSUInteger→Int conversion below from ever
+    // truncating/going negative on a pathologically large file.
+    if (data.length > MAX_CACHE_FILE_BYTES) return null
     val length = data.length.toInt()
     if (length == 0) return emptyList()
     val bytes = data.bytes?.readBytes(length) ?: return null
     return bytes.decodeToString().lines()
 }
+
+private const val MAX_CACHE_FILE_BYTES: ULong = 67_108_864uL // 64 MiB
