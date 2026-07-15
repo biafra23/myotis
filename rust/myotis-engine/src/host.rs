@@ -1065,9 +1065,13 @@ pub fn fee_history_json(
         Err(myotis_net::el::reader::FeeHistoryError::Build(msg)) => {
             if let Ok(cache) = engine.fee_history_cache.lock() {
                 if let Some((last_key, json, at)) = cache.get(&handle) {
-                    if *last_key == key && at.elapsed() < FEE_HISTORY_STALE_MAX {
+                    // saturating + read once: explicit panic-free style (the
+                    // workspace convention under panic="abort"), and the gate
+                    // and the log line report the same age.
+                    let age = std::time::Instant::now().saturating_duration_since(*at);
+                    if *last_key == key && age < FEE_HISTORY_STALE_MAX {
                         tracing::info!(
-                            age_secs = at.elapsed().as_secs(),
+                            age_secs = age.as_secs(),
                             "eth_feeHistory serving STALE result"
                         );
                         return json.clone();
