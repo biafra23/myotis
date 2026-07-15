@@ -399,10 +399,10 @@ class IosNodeController(
     private fun snapshotOf(network: String, handle: Long): NodeSnapshot {
         val o = runCatching { engineJson.parseToJsonElement(RustEngine.statusJson(handle)).jsonObject }
             .getOrElse { JsonObject(emptyMap()) }
-        // One locked read each — a torn pair across two reads could render a
-        // clean stop as a red "port unavailable" for one poll.
-        val rpcState = locked { rpcStates[network] }
-        val rpcServer = locked { rpcServers[network] }
+        // ONE locked read for both maps — a drop() interleaving between two
+        // separate reads could pair a stale state with a missing server and
+        // render a clean stop as a red "port unavailable" for one poll.
+        val (rpcState, rpcServer) = locked { rpcStates[network] to rpcServers[network] }
         // Live counts from the cache FILES (mtime-memoized, shared parser in
         // :ui) — the cross-engine truth the engine writes under dataDir.
         val suffix = if (network == "mainnet") "" else "-$network"
