@@ -331,11 +331,12 @@ const SENT_TX_CACHE_MAX: usize = 256;
 /// dedupe repeats anyway.
 const TX_REBROADCAST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// The sent-tx state trio behind one lock (see the `sent_txs` field doc).
+/// The sent-tx state behind one lock (see the `sent_txs` field doc). The
+/// WATCH itself lives separately in the shared Arc every peer read loop also
+/// holds (gossip sightings) — see `ElReader::sent_tx_watch`.
 struct SentTxState {
-    watch: crate::el::sent_tx::SentTxTracker,
     pending_nonces: crate::el::sent_tx::PendingNonceTracker,
-    /// Lowercase-free raw bytes by tx hash — what a rebroadcast re-pushes.
+    /// Raw broadcast bytes by tx hash — what a rebroadcast re-pushes.
     bytes: myotis_evm::Lru<[u8; 32], Vec<u8>>,
     last_rebroadcast: std::time::Instant,
 }
@@ -480,6 +481,9 @@ pub struct ElReader {
     /// every access is a map poke; the rebroadcast collects its work under the
     /// lock and BROADCASTS outside it.
     sent_txs: std::sync::Mutex<SentTxState>,
+    /// The sent-tx WATCH, shared with every peer's read loop (which marks
+    /// gossip sightings) — the Java TxGossipObserver seam's equivalent.
+    sent_tx_watch: crate::el::sent_tx::SharedSentTxWatch,
 }
 
 /// The scan-cursor map plus its last TTL sweep — one lock covers both, so the
@@ -567,7 +571,18 @@ impl ElReader {
             None => crate::el::peercache::ElPeerCache::disabled(),
         };
         let local_pubkey = key.public_key_bytes();
-        let pool = PeerPool::start(key, local_pubkey, eth_cfg, cfg.pool_config, cache, rx);
+        let sent_tx_watch: crate::el::sent_tx::SharedSentTxWatch = Arc::new(
+            std::sync::Mutex::new(crate::el::sent_tx::SentTxTracker::new()),
+        );
+        let pool = PeerPool::start(
+            key,
+            local_pubkey,
+            eth_cfg,
+            cfg.pool_config,
+            cache,
+            rx,
+            Some(Arc::clone(&sent_tx_watch)),
+        );
         Ok(ElReader {
             discovery,
             pool,
@@ -581,11 +596,11 @@ impl ElReader {
             }),
             block_hash_numbers: std::sync::Mutex::new(myotis_evm::Lru::new(BLOCK_HASH_LRU_MAX)),
             sent_txs: std::sync::Mutex::new(SentTxState {
-                watch: crate::el::sent_tx::SentTxTracker::new(),
                 pending_nonces: crate::el::sent_tx::PendingNonceTracker::new(),
                 bytes: myotis_evm::Lru::new(SENT_TX_CACHE_MAX),
                 last_rebroadcast: std::time::Instant::now(),
             }),
+            sent_tx_watch,
         })
     }
 
@@ -1636,15 +1651,16 @@ impl ElReader {
             0 => None,
             n => Some(n),
         };
-        let mut st = self.sent_txs.lock().unwrap();
-        st.bytes.put(hash, raw_tx.to_vec());
-        if let Some(t) = tx::decode_summary(raw_tx) {
-            if let Some(from) = t.from {
-                st.pending_nonces.record(from, t.nonce, now);
+        {
+            let mut st = self.sent_txs.lock().unwrap();
+            st.bytes.put(hash, raw_tx.to_vec());
+            if let Some(t) = tx::decode_summary(raw_tx) {
+                if let Some(from) = t.from {
+                    st.pending_nonces.record(from, t.nonce, now);
+                }
             }
         }
-        st.watch.watch(hash, now, broadcast_head);
-        drop(st);
+        self.sent_tx_watch.lock().unwrap().watch(hash, now, broadcast_head);
         Ok(hash)
     }
 
@@ -1657,36 +1673,27 @@ impl ElReader {
         st.pending_nonces.overlay(sender, mined_count, std::time::Instant::now())
     }
 
-    /// Note a gossip sighting of a tx hash (the Java `onTxHashSeen` twin) —
-    /// a watched tx that the network echoes back stops being rebroadcast.
-    pub fn note_tx_seen(&self, tx_hash: &[u8; 32]) {
-        let mut st = self.sent_txs.lock().unwrap();
-        if let Some(latency) = st.watch.mark_seen(tx_hash, std::time::Instant::now()) {
-            tracing::info!(
-                hash = %tx_hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                latency_ms = latency.as_millis() as u64,
-                "sent tx first seen in gossip"
-            );
-        }
-    }
-
     /// Time-gated rebroadcast of our own not-yet-seen txs (the Java
     /// `rebroadcastPendingTxs` behind its 20 s gate). Piggybacks on the
     /// wallet's poll paths (see [`TX_REBROADCAST_INTERVAL`]); evicts expired
     /// watches first. The peer writes happen OUTSIDE the state lock.
     async fn maybe_rebroadcast_sent_txs(&self) {
+        let now = std::time::Instant::now();
+        let unseen = {
+            let mut watch = self.sent_tx_watch.lock().unwrap();
+            if !watch.watching_any() {
+                return;
+            }
+            watch.evict_expired(now);
+            watch.unseen()
+        };
         let work: Vec<Vec<u8>> = {
             let mut st = self.sent_txs.lock().unwrap();
-            let now = std::time::Instant::now();
-            if !st.watch.watching_any()
-                || now.saturating_duration_since(st.last_rebroadcast) < TX_REBROADCAST_INTERVAL
-            {
+            if now.saturating_duration_since(st.last_rebroadcast) < TX_REBROADCAST_INTERVAL {
                 return;
             }
             st.last_rebroadcast = now;
-            st.watch.evict_expired(now);
-            st.watch
-                .unseen()
+            unseen
                 .iter()
                 // Bytes aged out of the LRU → nothing to push (Java parity).
                 .filter_map(|h| st.bytes.get(h).cloned())
@@ -1761,7 +1768,7 @@ impl ElReader {
                     self.pool.record_snap_served(peer.addr()).await;
                     // A verified receipt IS inclusion — the watch is done
                     // (the Java rpcGetTransactionReceipt's confirmMined).
-                    self.sent_txs.lock().unwrap().watch.confirm_mined(&tx_hash);
+                    self.sent_tx_watch.lock().unwrap().confirm_mined(&tx_hash);
                     return Ok(Some(vr));
                 }
                 Err(e) => {
@@ -1800,7 +1807,7 @@ impl ElReader {
             return Ok(TxLookup::NotSeen);
         };
         // Located in a verified block: the watch is done with this tx.
-        self.sent_txs.lock().unwrap().watch.confirm_mined(&tx_hash);
+        self.sent_tx_watch.lock().unwrap().confirm_mined(&tx_hash);
         let tx = tx::decode_summary(&loc.raw_tx)
             .ok_or("transaction located but its type cannot be decoded")?;
         Ok(TxLookup::Mined(VerifiedTransaction {
@@ -2016,7 +2023,7 @@ impl ElReader {
                     // recorded at broadcast time — a tx mined right after a
                     // slow broadcast can sit below the default lookback. Still
                     // subject to the per-poll cap below.
-                    if let Some(bc_head) = self.sent_txs.lock().unwrap().watch.broadcast_head(&tx_hash)
+                    if let Some(bc_head) = self.sent_tx_watch.lock().unwrap().broadcast_head(&tx_hash)
                     {
                         if bc_head < first {
                             first = bc_head;

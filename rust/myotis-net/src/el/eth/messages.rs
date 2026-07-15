@@ -363,6 +363,41 @@ pub fn encode_transactions(raw_tx: &[u8]) -> Vec<u8> {
     rlp::encode_list_payload(&element)
 }
 
+/// Decode a `NewPooledTransactionHashes` announcement into its 32-byte tx
+/// hashes, tolerating BOTH wire shapes: the eth/68 triple
+/// `[types: bytes, sizes: [..], hashes: [h, ..]]` and the eth/66-67 flat list
+/// `[h, ..]`. Tolerant on purpose — this feeds only the sent-tx watch's
+/// "seen in gossip" signal (never a trust surface), so a malformed or
+/// unexpected announcement yields the hashes it can read, or none.
+pub fn decode_new_pooled_tx_hashes(payload: &[u8]) -> Vec<[u8; 32]> {
+    let Ok(top) = rlp::decode(payload) else {
+        return Vec::new();
+    };
+    let Ok(items) = top.as_list() else {
+        return Vec::new();
+    };
+    // eth/68: exactly [types, sizes, hashes] where the LAST item is the hash
+    // list. A flat eth/66 list of 3 hashes would ALSO be length 3 — the two
+    // are distinguished by the last item's kind (list vs 32-byte string).
+    if items.len() == 3 {
+        if let Ok(hashes) = items[2].as_list() {
+            return collect_hashes(hashes);
+        }
+    }
+    collect_hashes(items)
+}
+
+/// The 32-byte items of an RLP hash list; anything else is skipped.
+fn collect_hashes(items: &[Item]) -> Vec<[u8; 32]> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let bytes = item.as_bytes().ok()?;
+            <[u8; 32]>::try_from(bytes).ok()
+        })
+        .collect()
+}
+
 /// Decode a Receipts response into RAW consensus receipt bytes per block (the
 /// trie values). eth/66-68 form. Returns `(request_id, per_block_receipts)`.
 pub fn decode_receipts(rlp_bytes: &[u8]) -> Result<(u64, Vec<Vec<Vec<u8>>>), CoreError> {
@@ -518,6 +553,40 @@ mod tests {
 
     use super::*;
     use myotis_core::keccak::keccak256;
+
+    #[test]
+    fn decode_new_pooled_tx_hashes_reads_both_wire_shapes() {
+        let h1 = [0xaa; 32];
+        let h2 = [0xbb; 32];
+        // eth/66-67: a flat list of 32-byte hash strings.
+        let flat = rlp::encode(&Item::List(vec![
+            Item::Bytes(h1.to_vec()),
+            Item::Bytes(h2.to_vec()),
+        ]));
+        assert_eq!(decode_new_pooled_tx_hashes(&flat), vec![h1, h2]);
+
+        // eth/68: [types, sizes, hashes] — the hashes ride in the THIRD item.
+        let eth68 = rlp::encode(&Item::List(vec![
+            Item::Bytes(vec![0x02, 0x00]),
+            Item::List(vec![Item::Bytes(vec![0x80]), Item::Bytes(vec![0x70])]),
+            Item::List(vec![Item::Bytes(h1.to_vec()), Item::Bytes(h2.to_vec())]),
+        ]));
+        assert_eq!(decode_new_pooled_tx_hashes(&eth68), vec![h1, h2]);
+
+        // A flat list of exactly THREE hashes must not be mistaken for eth/68
+        // (its third item is a hash string, not a list).
+        let three = rlp::encode(&Item::List(vec![
+            Item::Bytes(h1.to_vec()),
+            Item::Bytes(h2.to_vec()),
+            Item::Bytes([0xcc; 32].to_vec()),
+        ]));
+        assert_eq!(decode_new_pooled_tx_hashes(&three).len(), 3);
+
+        // Tolerant: garbage and wrong-width items yield nothing/skip, no error.
+        assert!(decode_new_pooled_tx_hashes(&[0xff, 0x00]).is_empty());
+        let short = rlp::encode(&Item::List(vec![Item::Bytes(vec![1, 2, 3])]));
+        assert!(decode_new_pooled_tx_hashes(&short).is_empty());
+    }
 
     #[test]
     fn encode_transactions_wraps_legacy_and_typed() {

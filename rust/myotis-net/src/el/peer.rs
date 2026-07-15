@@ -87,14 +87,30 @@ impl ManagedPeer {
     /// requests and answers Ping/Get\* on its own.
     pub fn spawn(session: EthSession, addr: SocketAddr) -> ManagedPeer {
         let (conn, eth_version, snap, peer_status, peer_hello) = session.into_parts();
-        Self::from_connection(conn, eth_version, snap, peer_status, peer_hello, addr, None)
+        Self::from_connection(conn, eth_version, snap, peer_status, peer_hello, addr, None, None)
     }
 
     /// As [`spawn`](Self::spawn), wiring the pool's shared serving surface so this
-    /// peer answers GetBlockHeaders from the window and counts inbound demand.
-    pub fn spawn_serving(session: EthSession, addr: SocketAddr, serve: ServeContext) -> ManagedPeer {
+    /// peer answers GetBlockHeaders from the window and counts inbound demand,
+    /// plus the sent-tx watch so gossip sightings of our own broadcasts register
+    /// (the Java TxGossipObserver twin).
+    pub fn spawn_serving(
+        session: EthSession,
+        addr: SocketAddr,
+        serve: ServeContext,
+        tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
+    ) -> ManagedPeer {
         let (conn, eth_version, snap, peer_status, peer_hello) = session.into_parts();
-        Self::from_connection(conn, eth_version, snap, peer_status, peer_hello, addr, Some(serve))
+        Self::from_connection(
+            conn,
+            eth_version,
+            snap,
+            peer_status,
+            peer_hello,
+            addr,
+            Some(serve),
+            tx_watch,
+        )
     }
 
     fn from_connection(
@@ -105,6 +121,7 @@ impl ManagedPeer {
         peer_hello: Hello,
         addr: SocketAddr,
         serve: Option<ServeContext>,
+        tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
     ) -> ManagedPeer {
         let (reader, writer, peer_pubkey) = conn.split();
         let snap_codes = snap.then(|| snap::SnapCodes::for_eth_version(eth_version));
@@ -119,6 +136,7 @@ impl ManagedPeer {
             Arc::clone(&closed),
             snap_codes,
             serve.clone(),
+            tx_watch,
         ));
 
         ManagedPeer {
@@ -503,6 +521,7 @@ async fn read_loop(
     closed: Arc<AtomicBool>,
     snap_codes: Option<snap::SnapCodes>,
     serve: Option<ServeContext>,
+    tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
 ) {
     loop {
         let frame = match reader.recv().await {
@@ -513,6 +532,23 @@ async fn read_loop(
             }
         };
         let code = frame.message_code;
+
+        // Tx-hash gossip: the sent-tx watch's "the network has it" signal (the
+        // Java TxGossipObserver twin). watching_any() gates the decode — while
+        // nothing is watched (the common state) an announcement costs one
+        // atomic-ish lock poke and no parsing.
+        if code == messages::NEW_POOLED_TRANSACTION_HASHES {
+            if let Some(watch) = &tx_watch {
+                let mut w = watch.lock().unwrap();
+                if w.watching_any() {
+                    let now = std::time::Instant::now();
+                    for hash in messages::decode_new_pooled_tx_hashes(&frame.payload) {
+                        w.mark_seen(&hash, now);
+                    }
+                }
+            }
+            continue;
+        }
 
         if code == P2P_PING {
             // Pong body is an empty RLP list. A write failure (e.g. a half-closed

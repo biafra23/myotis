@@ -17,6 +17,11 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// The watch as shared between the reader (broadcast/rebroadcast/confirm) and
+/// every peer's read loop (gossip sightings). A std Mutex — every access is a
+/// brief map poke, never held across I/O.
+pub type SharedSentTxWatch = std::sync::Arc<std::sync::Mutex<SentTxTracker>>;
+
 /// How long a broadcast tx stays watched (rebroadcast candidates + the
 /// broadcast-head reachback) before the watch gives up. Java
 /// `SENT_TX_WATCH_TTL_MS = 180_000`.
