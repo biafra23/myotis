@@ -36,11 +36,11 @@ Tor carries **TCP streams only**. Myotis' transports:
 
 | Layer | Transport | Tor-able? |
 |---|---|---|
-| RLPx / eth / snap (port 30303) | TCP | Yes (SOCKS5) |
+| RLPx / eth / snap (port 30303) | TCP | Yes (Arti data stream) |
 | CL libp2p req/resp (port 9000) | TCP | Yes — but content-benign, may not need it |
 | discv4 (EL discovery) | UDP | **No** |
 | discv5 (CL discovery) | UDP | **No** |
-| EIP-1459 ENR trees | DNS TXT (dnsjava) | Not via SOCKS; needs DoH-over-Tor |
+| EIP-1459 ENR trees | DNS TXT (dnsjava) | Not directly; needs DoH over a Tor stream |
 | CCIP-Read gateways | HTTPS | Yes (standard) |
 
 Myotis is effectively **outbound-only** (a light client that dials), which is
@@ -59,25 +59,27 @@ makes or breaks the wallet experience, and Tor adds ~0.5–1.5 s per round trip
 plus ~1 s+ per circuit build. This is the strongest argument for routing **only
 the sensitive flows** through Tor and keeping bulk/benign flows direct.
 
-## 3. Tor client libraries and circuit isolation
+## 3. Tor client library: Arti, in the Rust engine
 
-Per-identity circuit isolation ("stream isolation") is a first-class Tor concept;
-how it's expressed depends on the library:
+Per-identity circuit isolation ("stream isolation") is a first-class Tor concept.
+The proposal targets **Arti** (the Tor Project's official Rust implementation,
+embeddable as a plain library) inside the **Rust engine** — and only there:
 
-- **Rust engine → Arti** (the Tor Project's official Rust implementation,
-  embeddable as a plain library). Isolation is an explicit API: an
-  `IsolationToken` attached to `StreamPrefs` per stream — streams with different
-  tokens never share a circuit — plus `TorClient::isolated_client()` for a fully
-  isolated handle. **One token per wallet address** gives exactly the property we
-  want: any single exit node ever sees queries for one address, not the user's
-  whole portfolio.
-- **Java engine → bundled Tor daemon** (tor-android/Orbot, kmp-tor; jtorctl for
-  the control port — there is no maintained pure-Java Tor). Isolation rides on
-  SOCKS5 credentials: `IsolateSOCKSAuth` is on by default, so streams presenting
-  different SOCKS username/password pairs get different circuits. The "parameter"
-  is simply the SOCKS username sent per CONNECT — use the address (or a hash of
-  it) as the username. (`SIGNAL NEWNYM` is the wrong tool: rate-limited ~10 s and
-  global, not per-connection.)
+- Isolation is an explicit API: an `IsolationToken` attached to `StreamPrefs`
+  per stream — streams with different tokens never share a circuit — plus
+  `TorClient::isolated_client()` for a fully isolated handle. **One token per
+  wallet address** gives exactly the property we want: any single exit node
+  ever sees queries for one address, not the user's whole portfolio.
+- **Android is covered by the same code.** The Rust engine already crosses to
+  Android as jniLibs (`cargoNdkAndroid`); Arti compiles for the same NDK
+  targets and embeds in the engine, so the Android host needs no separate Tor
+  integration (no bundled daemon, no Orbot dependency). Likewise iOS, where the
+  Rust engine is the only engine.
+- **The Java engine gets no Tor mode for now.** A Java path would mean bundling
+  a Tor daemon and driving it over SOCKS — deliberately out of scope; hosts
+  that want private mode select the Rust engine (`myotis.engine=rust`). This
+  also keeps the privacy machinery in one implementation instead of two
+  parity-tracked ones.
 
 Two properties to keep in mind:
 
@@ -229,7 +231,7 @@ and for not shipping a unique clientId on the Tor path.
 6. **Tx broadcast fan-out over Tor** — one circuit to a few aged peers, or
    several isolated circuits to disjoint peer subsets (stronger against a
    listening peer, more circuit builds)?
-7. **Mobile cost** — a bundled Tor client (kmp-tor / Arti on Android) keeps a
+7. **Mobile cost** — the embedded Arti client keeps a
    guard connection alive; interaction with idle-pause and battery needs design
    (probably: Tor client lifecycle == stack awake lifecycle).
 8. **DoH-over-Tor for the ENR tree walk** — which resolver, and does that
