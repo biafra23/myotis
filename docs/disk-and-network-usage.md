@@ -5,11 +5,25 @@ on Android, desktop, and iOS — including the peer caches, header/block storage
 there is none on disk), the daily traffic needed to stay synced, and the data cost of
 creating and sending a transaction.
 
+> **All numbers here are preliminary.** They are derived from today's code, and the
+> tuning is still moving: it may well be necessary to cause *more* network traffic —
+> more peers, wider fan-outs, speculative prefetching — to answer wallet queries in a
+> reasonable time (see [Optimisations & Limitations](../OPTIMISATIONS_AND_LIMITATIONS.md):
+> round-trip latency, not bandwidth, is the binding constraint). Revisit before quoting.
+
 **How these numbers were derived.** Every constant (cache formats, poll intervals,
 fan-outs, response caps) is taken from the code, with file references. Wire-volume
 figures are arithmetic on top of those constants plus a few **chain-level assumptions**
 (marked below) — average mainnet transaction rate, block body size, etc. Treat the
 byte totals as sizing estimates, not measurements.
+
+**Scope: only what a synced, wallet-serving client actually uses today.** Two planned
+features are deliberately **not** counted and must be added here once properly
+implemented: the **historical accumulators** (pre-Merge historical hashes, Bellatrix
+historical roots — today only roadmap items) and the **TrueBlocks Unchained Index**
+transaction-history path (`get-transactions` — currently a debug stream over a stale,
+hardcoded manifest, not production). Both will change the disk *and* network profile
+when they land.
 
 Chain-level assumptions used throughout (2025/26 ballparks):
 
@@ -32,8 +46,8 @@ Chain-level assumptions used throughout (2025/26 ballparks):
 | **Cold first sync** | ~1–10 MB (bootstrap ~25 KB + one ~25 KB update per committee period behind + peer discovery/handshakes). Minutes. |
 | **Warm restart** | Tens of KB (snapshot resume + one finality poll). ~10 s to `SYNCED`. |
 | **Staying synced, protocol minimum** | **< 1 MB/day** (~1.6 KB finality update per epoch + ~25 KB committee update per ~27 h). |
-| **Always-on daemon/desktop, defaults** | ~2–7 GB/day, dominated by inbound mempool gossip (peers push it; Myotis drops it) and fee/head warming (block bodies). Both are tunable — see [Knobs](#knobs-that-change-the-numbers). |
-| **Android in practice** | Near zero while idle (idle-pause after 5 min, default) + a few MB for the daily catch-up pass + ~50–200 MB per *active* wallet hour. |
+| **While awake, defaults (wallet-serving)** | **~2–6 MB/min**, dominated by inbound mempool gossip (peers push it; Myotis drops it) and fee/head warming (block bodies). Both are tunable — see [Knobs](#knobs-that-change-the-numbers). A never-sleeping daemon/desktop therefore lands at ~3–8 GB/day. |
+| **Android in practice** | Near zero while idle (idle-pause after 5 min, default) + a few MB for the daily catch-up pass; awake minutes cost the per-minute rate above (thinner phone peer pools trend toward its low end). |
 | **Creating + sending a tx** | Signing costs nothing (the wallet signs). Gating reads ~10–50 KB; the broadcast itself **~5 KB**; confirmation tracking ~1–2 MB (block bodies). |
 
 ---
@@ -88,9 +102,9 @@ cache-purge action deletes the caches and the snapshot.
   side re-fetches and re-verifies headers on demand.
 - **State/proofs/bytecode**: in-memory bounded LRUs only, keyed by state root — the
   root changes every slot, so persisting them would buy almost nothing.
-- **Accumulators**: the pre-Merge historical-hashes and Bellatrix historical-roots
-  accumulators on the roadmap are 32-byte *roots* embedded in code, not data files.
-  Nothing beyond logging config ships in `src/main/resources`.
+  Nothing beyond logging config ships in `src/main/resources` — no data blobs.
+  (The historical accumulators will add embedded data here once implemented — out of
+  scope for now, see the scope note at the top.)
 
 ### 1.3 RAM, for completeness
 
@@ -141,20 +155,26 @@ Two very different questions hide here: what the **protocol** requires, and what
 So the trust anchor itself costs **well under 1 MB/day**. Everything above that is
 peer management, redundancy, and wallet-serving freshness.
 
-### 3.2 What the default configuration spends (always-on host, mainnet)
+### 3.2 What the default configuration spends per minute (while awake, mainnet)
 
-| Term | Mechanism | Estimate/day |
+Rates below apply **only while the node is awake** — Android's idle-pause (§3.3) drops
+all of them to zero. Multiply by awake minutes to get a real daily figure; a host that
+never sleeps (daemon, desktop) runs them 1440×/day.
+
+| Term | Mechanism | Estimate/min awake |
 |---|---|---|
-| **Inbound mempool gossip** (received and dropped) | Full nodes push `Transactions` (0x12) / `NewPooledTransactionHashes` (0x18) to every peer; Myotis never asks for them and discards them on the event loop unless watching its own send (`EthHandler.java`, `TxGossipObserver`). Cost is unavoidable per open eth connection: ~38 B announcement/tx/peer + full bodies from the subset of peers that picked us for full forwarding. | **~1.5–5 GB** at the default 32-peer target (≈ 50–150 MB per peer) |
-| **Fee/head warming** (hosts serving the wallet API) | The head warmer rebuilds the verified head (~1 header / 5 s) and keeps the fee snapshot fresh: **3 block bodies every ~12 s** for the tip median (`VerifiedRpcBackend`: `FEE_SNAPSHOT_REFRESH_MS`/`TIP_CACHE_TTL_MS` = 12 s, `TIP_SUGGEST_BLOCKS` = 3, bodies not cached across refreshes) | **~1.5–2.5 GB** |
-| **CL finality polling** | Parallel fan-out of `light_client_finality_update` req/resp to **16 peers every slot** (12 s), first verified win; losers' responses still arrive (~1.5–2 KB each) (`BeaconLightClient.pollFinalityUpdate`) | **~30–200 MB** (depends on how many of the 16 respond) |
-| **Discovery upkeep** | discv4 refresh every 15 s (ping/pong/findnode ~150–170 B, inbound `NEIGHBORS` ≤ 1.3 KB) + discv5 poll every 15 s + inbound DHT traffic from other nodes | **~50–250 MB** |
-| **libp2p keepalive** | Ping (8 B payload) every 15 s per CL connection, a few dozen connections | ~10–20 MB |
-| **Committee rotation** | ~25 KB per period | negligible |
+| **Inbound mempool gossip** (received and dropped) | Full nodes push `Transactions` (0x12) / `NewPooledTransactionHashes` (0x18) to every peer; Myotis never asks for them and discards them on the event loop unless watching its own send (`EthHandler.java`, `TxGossipObserver`). Cost is unavoidable per open eth connection: ~38 B announcement/tx/peer + full bodies from the subset of peers that picked us for full forwarding. | **~1–3.5 MB** at the default 32-peer target (≈ 35–110 KB per peer) |
+| **Fee/head warming** (hosts serving the wallet API) | The head warmer rebuilds the verified head (~1 header / 5 s) and keeps the fee snapshot fresh: **3 block bodies every ~12 s** for the tip median (`VerifiedRpcBackend`: `FEE_SNAPSHOT_REFRESH_MS`/`TIP_CACHE_TTL_MS` = 12 s, `TIP_SUGGEST_BLOCKS` = 3, bodies not cached across refreshes) — ~15 bodies/min | **~1–1.7 MB** |
+| **CL finality polling** | Parallel fan-out of `light_client_finality_update` req/resp to **16 peers every slot** (12 s → 5 rounds/min), first verified win; losers' responses still arrive (~1.5–2 KB each) (`BeaconLightClient.pollFinalityUpdate`) | **~20–140 KB** (depends on how many of the 16 respond) |
+| **Discovery upkeep** | discv4 refresh every 15 s (ping/pong/findnode ~150–170 B, inbound `NEIGHBORS` ≤ 1.3 KB) + discv5 poll every 15 s + inbound DHT traffic from other nodes | **~35–175 KB** |
+| **libp2p keepalive** | Ping (8 B payload) every 15 s per CL connection, a few dozen connections | ~10 KB |
+| **Committee rotation** | ~25 KB per ~27.3 h period | negligible |
 
-**Ballpark: ~2–7 GB/day for an always-on, wallet-serving mainnet node at defaults.**
-The two big terms scale directly with knobs (§6): mempool gossip with the eth peer
-count, fee warming with whether a wallet-API host is running.
+**Ballpark: ~2–6 MB per awake minute for a wallet-serving mainnet node at defaults**
+(≈ 3–8 GB/day if never asleep). The two big terms scale directly with knobs (§6):
+mempool gossip with the eth peer count, fee warming with whether a wallet-API host is
+running. And per the note at the top: these rates may deliberately *grow* where more
+peers or more parallel fetching is what gets query latency to acceptable.
 
 **Gnosis:** 5 s slots make the CL poll fire 2.4× as often, and periods rotate every
 ~11.4 h — CL terms scale ×2.4; EL terms are smaller (smaller blocks, fewer peers).
@@ -171,8 +191,8 @@ the snapshot, and pauses again.
 So a phone wallet's realistic daily profile is:
 
 - **idle day**: a few MB (daily catch-up + the wake/resync around any notification-driven use);
-- **per active hour** (app foregrounded, wallet polling): ~50–200 MB, pro-rated from the
-  §3.2 terms;
+- **awake minutes** (app foregrounded, wallet polling): the §3.2 per-minute rate — a
+  phone's thinner peer pool trends toward its low end, call it **~1–4 MB/min**;
 - a **cold day-after-vacation open**: §2.1 catch-up — still only a few MB.
 
 iOS runs the same engine (Rust) with the same idle semantics available to the host;
