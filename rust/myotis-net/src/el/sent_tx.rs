@@ -164,7 +164,9 @@ impl PendingNonceTracker {
             self.by_sender.remove(sender);
             return mined_count;
         }
-        mined_count.max(e.nonce + 1)
+        // saturating: a u64::MAX nonce in a (self-signed) recorded tx must not
+        // wrap the +1 (panic-free workspace; the value is absurd, not unsafe).
+        mined_count.max(e.nonce.saturating_add(1))
     }
 
     /// Whether a live entry exists for this sender (logging helper).
