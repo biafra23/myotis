@@ -1,5 +1,6 @@
 package io.myotis.ios
 
+import io.myotis.jsonrpc.MyotisRpcServer
 import io.myotis.ui.AccountResult
 import io.myotis.ui.CacheFileStats
 import io.myotis.ui.EnsResult
@@ -61,6 +62,10 @@ class IosNodeController(
     private val stateLock = NSLock()
     private val handles = mutableMapOf<String, Long>()
     private val startMarks = mutableMapOf<String, TimeMark>()
+    // Per-network JSON-RPC listeners (loopback, strict). Foreground-only by iOS
+    // app-lifecycle nature; IosBackgroundKeepalive stretches that by the ~30 s
+    // background-task grace so an in-flight wallet call can finish.
+    private val rpcServers = mutableMapOf<String, MyotisRpcServer>()
     // Per-network head-advance tracking behind verifiedHeadAgeMs — the same
     // "age since the optimistic head last advanced" scheme RustChainHandle uses.
     private val headAges = mutableMapOf<String, HeadAge>()
@@ -167,10 +172,36 @@ class IosNodeController(
             handles[net] = handle
             startMarks[net] = TimeSource.Monotonic.markNow()
         }
+        startRpc(net)
+    }
+
+    /** Start the network's loopback JSON-RPC listener (JNI hosts' startRpc twin).
+     *  Best-effort: a bind failure logs and the node keeps running without RPC —
+     *  Ktor CIO surfaces bind errors asynchronously, so failures land in the log
+     *  pump rather than here. Caller holds [bootMutex]. */
+    private fun startRpc(net: String) {
+        val port = settings.rpcPortFor(net)
+        if (port <= 0) return
+        val chainId = engineJson.decodeFromString<List<IosNetworkInfo>>(RustEngine.availableNetworksJson())
+            .firstOrNull { it.name == net }?.chainId ?: return
+        val server = MyotisRpcServer(
+            port = port,
+            upstreamUrl = null,          // strict: never serve unverified data
+            host = "127.0.0.1",          // loopback only — unauthenticated endpoint
+            backend = IosRpcBackend(chainId) { locked { handles[net] } },
+            statusReads = IosRpcStatusSource(
+                handleProvider = { locked { handles[net] } },
+                startMarkProvider = { locked { startMarks[net] } },
+            ),
+        )
+        runCatching { server.start() }
+            .onSuccess { locked { rpcServers[net] = server } }
+            .onFailure { logs.append("ERROR failed to start the $net JSON-RPC listener: ${it.message}") }
     }
 
     /** Blocking stop; caller holds [bootMutex] and runs on IO. */
     private fun drop(net: String) {
+        locked { rpcServers.remove(net) }?.let { runCatching { it.stop() } }
         val handle = locked { handles.remove(net).also { startMarks.remove(net); headAges.remove(net) } }
         if (handle != null) RustEngine.stop(handle)
     }

@@ -20,6 +20,11 @@ private object AppRuntime {
     val history = IosQueryHistory()
 
     init {
+        // Route the JSON-RPC listener's access/server lines into the Logs tab
+        // (there is no slf4j pipeline on this host).
+        io.myotis.jsonrpc.IosRpcLog.sink = logs::append
+        // A short post-background grace so in-flight RPC calls can finish.
+        IosBackgroundKeepalive.install()
         settings.enabledNetworks().forEach(controller::startNetwork)
     }
 

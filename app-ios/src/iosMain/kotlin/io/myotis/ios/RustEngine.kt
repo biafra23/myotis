@@ -5,6 +5,16 @@ import io.myotis.engine.capi.myotis_canonical_network_name
 import io.myotis.engine.capi.myotis_create
 import io.myotis.engine.capi.myotis_drain_logs
 import io.myotis.engine.capi.myotis_ens_record_json
+import io.myotis.engine.capi.myotis_estimate_gas_json
+import io.myotis.engine.capi.myotis_eth_call_json
+import io.myotis.engine.capi.myotis_fee_estimate_json
+import io.myotis.engine.capi.myotis_get_block_by_hash_json
+import io.myotis.engine.capi.myotis_get_block_by_number_json
+import io.myotis.engine.capi.myotis_get_code_json
+import io.myotis.engine.capi.myotis_get_storage_at_json
+import io.myotis.engine.capi.myotis_get_transaction_by_hash_json
+import io.myotis.engine.capi.myotis_get_transaction_receipt_json
+import io.myotis.engine.capi.myotis_send_raw_transaction_json
 import io.myotis.engine.capi.myotis_init
 import io.myotis.engine.capi.myotis_pause
 import io.myotis.engine.capi.myotis_request_account_json
@@ -123,5 +133,45 @@ object RustEngine {
         requireAbi()
         return take(myotis_ens_record_json(handle, paramsJson))
             ?: """{"error":"engine returned no result"}"""
+    }
+
+    // ---- verified read surface behind the iOS JSON-RPC backend ----
+    // Same envelopes as over JNI (golden-pinned): {"error"} for transport /
+    // not-running, status-tagged objects for call/estimate, tri-state block/tx
+    // JSON (object | the literal "null" | {"error"}).
+
+    fun getCodeJson(handle: Long, address: String): String =
+        jsonCall { myotis_get_code_json(handle, address) }
+
+    fun getStorageAtJson(handle: Long, address: String, position32Hex: String): String =
+        jsonCall { myotis_get_storage_at_json(handle, address, position32Hex) }
+
+    fun ethCallJson(handle: Long, from: String, to: String, data: String, valueDecimal: String, block: String): String =
+        jsonCall { myotis_eth_call_json(handle, from, to, data, valueDecimal, block) }
+
+    fun estimateGasJson(handle: Long, from: String, to: String, data: String, valueDecimal: String): String =
+        jsonCall { myotis_estimate_gas_json(handle, from, to, data, valueDecimal) }
+
+    fun getBlockByNumberJson(handle: Long, blockTag: String): String =
+        jsonCall { myotis_get_block_by_number_json(handle, blockTag) }
+
+    fun getBlockByHashJson(handle: Long, blockHash32Hex: String): String =
+        jsonCall { myotis_get_block_by_hash_json(handle, blockHash32Hex) }
+
+    fun getTransactionByHashJson(handle: Long, txHash32Hex: String): String =
+        jsonCall { myotis_get_transaction_by_hash_json(handle, txHash32Hex) }
+
+    fun getTransactionReceiptJson(handle: Long, txHash32Hex: String): String =
+        jsonCall { myotis_get_transaction_receipt_json(handle, txHash32Hex) }
+
+    fun feeEstimateJson(handle: Long): String =
+        jsonCall { myotis_fee_estimate_json(handle) }
+
+    fun sendRawTransactionJson(handle: Long, rawTxHex: String): String =
+        jsonCall { myotis_send_raw_transaction_json(handle, rawTxHex) }
+
+    private inline fun jsonCall(call: () -> CPointer<ByteVar>?): String {
+        requireAbi()
+        return take(call()) ?: """{"error":"engine returned no result"}"""
     }
 }
