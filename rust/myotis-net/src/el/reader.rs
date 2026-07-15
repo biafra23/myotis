@@ -1555,7 +1555,7 @@ impl ElReader {
         let total = peers.len();
         let mut last_err = String::new();
         for peer in &peers {
-            match self.receipt_from(peer, &loc, &tx_hash).await {
+            match self.receipt_from(peer, &loc).await {
                 Ok(vr) => {
                     self.pool.record_snap_served(peer.addr()).await;
                     return Ok(Some(vr));
@@ -1991,7 +1991,6 @@ impl ElReader {
         &self,
         peer: &ManagedPeer,
         loc: &TxLocation,
-        tx_hash: &[u8; 32],
     ) -> Result<VerifiedReceipt, String> {
         let blocks = peer.get_receipts(&[loc.block_hash]).await?;
         let receipts = blocks.into_iter().next().ok_or("peer returned no receipts")?;
@@ -2002,7 +2001,7 @@ impl ElReader {
         if loc.index >= receipts.len() {
             return Err("tx index out of receipt range".to_string());
         }
-        build_verified_receipt(loc, &receipts, tx_hash)
+        build_verified_receipt(loc, &receipts)
     }
 
     /// `(finalized_block_number, optimistic_block_number, is_synced)` snapshot.
@@ -2028,7 +2027,6 @@ impl ElReader {
 fn build_verified_receipt(
     loc: &TxLocation,
     receipts: &[Vec<u8>],
-    tx_hash: &[u8; 32],
 ) -> Result<VerifiedReceipt, String> {
     let decoded = crate::el::receipt::decode(&receipts[loc.index])?;
     let mut prev_cum = 0u64;
