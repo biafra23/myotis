@@ -311,14 +311,24 @@ class RpcRouter(
             }
             "eth_getBlockReceipts" -> {
                 val p = root.params()
-                // One selector param: tag | 0x-hex number | 0x-32-byte hash. The
-                // engines disambiguate (a hash is unambiguous at 66 chars), so the
-                // raw string passes through; absent → "latest" per spec default.
+                // One selector param: tag | 0x-hex number | 0x-32-byte hash (absent →
+                // "latest" per spec). Validated HERE, strictly, because the two
+                // engines' bare-numeric conventions differ (Java Long.decode reads
+                // decimal, the Rust selector parser hex): only spec-shaped selectors
+                // pass, so the same request can never resolve to different blocks
+                // depending on which engine is behind the router. A JSON-number param
+                // is rejected like the sibling hex helpers reject non-strings.
                 val selParam = p?.getOrNull(0)
                 val selector: String = when {
                     selParam == null || selParam is JsonNull -> "latest"
-                    else -> (selParam as? JsonPrimitive)?.contentOrNull ?: return null
+                    else -> (selParam as? JsonPrimitive)
+                        ?.takeIf { it.isString }?.contentOrNull ?: return null
                 }
+                val specShaped = selector in setOf("latest", "pending", "safe", "finalized", "earliest")
+                    || (selector.length > 2 && selector.length <= 66
+                        && (selector.startsWith("0x") || selector.startsWith("0X"))
+                        && selector.drop(2).all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' })
+                if (!specShaped) return null
                 // Array string when served; "null" for a verified unknown/future
                 // block; Kotlin null (can't verify) → strict error.
                 val receiptsJson =

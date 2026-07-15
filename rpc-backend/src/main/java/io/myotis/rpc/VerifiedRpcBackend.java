@@ -2563,11 +2563,33 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     }
 
     /** Build the eth_getTransactionReceipt JSON object from VERIFIED receipt bytes.
-     *  {@code txHash} is the body's tx hash (already confirmed == the requested hash). */
+     *  {@code txHash} is the body's tx hash (already confirmed == the requested hash).
+     *  This single-receipt entry computes the running accumulators with a one-shot
+     *  pass over the preceding receipts; the batch path (eth_getBlockReceipts)
+     *  accumulates them across its loop instead, calling the shared
+     *  {@link #buildReceiptJsonAt} so a full block stays O(n). */
     private static String buildReceiptJson(List<Bytes> receipts, int idx,
                                            BlockHeader h, Bytes32 blockHash, Bytes32 txHash,
                                            byte[] rawTx) {
-        Receipt r = Receipt.decode(receipts.get(idx));
+        // Single pass over the preceding receipts: gasUsed needs receipt[idx-1]'s
+        // cumulative, logIndex needs the running log count — decode each only once.
+        long prevCum = 0L;
+        int logBase = 0;
+        for (int j = 0; j < idx; j++) {
+            Receipt prev = Receipt.decode(receipts.get(j));
+            logBase += prev.logs().size();
+            if (j == idx - 1) prevCum = prev.cumulativeGasUsed();
+        }
+        return buildReceiptJsonAt(Receipt.decode(receipts.get(idx)), idx, h, blockHash, txHash,
+                rawTx, prevCum, logBase);
+    }
+
+    /** The per-element receipt serializer both entries share: the caller supplies
+     *  the ALREADY-DECODED receipt and the running accumulators (previous
+     *  cumulative gas, block-global log-index base). */
+    private static String buildReceiptJsonAt(Receipt r, int idx,
+                                             BlockHeader h, Bytes32 blockHash, Bytes32 txHash,
+                                             byte[] rawTx, long prevCum, int logBase) {
         // Decode the (block-verified) tx so the receipt can carry from / to / contractAddress /
         // effectiveGasPrice. Without these MetaMask won't reconcile the receipt with its pending
         // tx and leaves it stuck "pending/submitted" even though we verified its inclusion.
@@ -2581,15 +2603,6 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             } catch (Exception decodeEx) {
                 tx = null;
             }
-        }
-        // Single pass over the preceding receipts: gasUsed needs receipt[idx-1]'s
-        // cumulative, logIndex needs the running log count — decode each only once.
-        long prevCum = 0L;
-        int logBase = 0;
-        for (int j = 0; j < idx; j++) {
-            Receipt prev = Receipt.decode(receipts.get(j));
-            logBase += prev.logs().size();
-            if (j == idx - 1) prevCum = prev.cumulativeGasUsed();
         }
         long gasUsed = r.cumulativeGasUsed() - prevCum;
 
@@ -2688,27 +2701,12 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
 
             long target = isTag ? headNum : pinned;
             if (target > headNum) {
-                // The pin is AHEAD of the preferred anchor. This is the NORMAL state on
-                // mobile, not an unknown block: eth_blockNumber advertises the CL
-                // optimistic number (advances every slot), while the snap-built /
-                // lastGood anchor trails it by the head build time (30-60s on a phone,
-                // i.e. several blocks). MetaMask pins reads to the number we just
-                // advertised, so denying it wedges the wallet's block tracker — observed
-                // live as eth_getBlockByNumber returning the "null" literal for 96% of
-                // polls (778 of 806), stalling tx tracking and the confirm screen.
-                // The beacon OPTIMISTIC payload is itself a light-client-verified anchor
-                // at/past the pin — re-anchor on it (its exec blockHash, via
-                // windowAnchoredToHash) and serve the block fully verified. Only a pin
-                // past even the optimistic number is genuinely future/unknown → "null".
-                // beaconSyncState is non-null (constructor requireNonNull), so read directly.
-                long optimisticNum = beaconSyncState.getOptimisticBlockNumber();
-                byte[] optimisticHash = beaconSyncState.getOptimisticBlockHash();
-                if (optimisticNum >= target && optimisticHash != null) {
-                    anchor = new HeaderAnchor(optimisticNum, null, optimisticHash);
-                    headNum = optimisticNum;
-                } else {
+                HeaderAnchor reanchored = reAnchorForPin(target);
+                if (reanchored == null) {
                     return "null";          // beyond the verified chain tip → eth null
                 }
+                anchor = reanchored;
+                headNum = reanchored.number();
             }
             long back = headNum - target;
             if (back >= BLOCK_LOOKBACK_MAX) return null;     // too far to verify cheaply → error
@@ -2762,6 +2760,31 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     }
 
     /**
+     * Re-anchor for a number pin AHEAD of the preferred (snap-built) anchor. This is
+     * the NORMAL state on mobile, not an unknown block: eth_blockNumber advertises the
+     * CL optimistic number (advances every slot), while the snap-built / lastGood
+     * anchor trails it by the head build time (30-60s on a phone, i.e. several
+     * blocks). MetaMask pins reads to the number we just advertised, so denying it
+     * wedges the wallet's block tracker — observed live as eth_getBlockByNumber
+     * returning the "null" literal for 96% of polls (778 of 806), stalling tx
+     * tracking and the confirm screen. The beacon OPTIMISTIC payload is itself a
+     * light-client-verified anchor at/past the pin — re-anchor on it (its exec
+     * blockHash, via windowAnchoredToHash) and serve fully verified. Returns null
+     * only when the pin is past even the optimistic number — genuinely
+     * future/unknown, the caller's eth "null". Shared by every by-number serve
+     * (blocks, block receipts) so the tuned rule can never diverge between them.
+     * beaconSyncState is non-null (constructor requireNonNull).
+     */
+    private HeaderAnchor reAnchorForPin(long target) {
+        long optimisticNum = beaconSyncState.getOptimisticBlockNumber();
+        byte[] optimisticHash = beaconSyncState.getOptimisticBlockHash();
+        if (optimisticNum >= target && optimisticHash != null) {
+            return new HeaderAnchor(optimisticNum, null, optimisticHash);
+        }
+        return null;
+    }
+
+    /**
      * eth_getBlockReceipts — every receipt of one block as a JSON array, verified.
      * The block resolves through the same anchored path as eth_getBlockByNumber
      * (a 0x-32-byte hash first resolves via the verified hash→number map, like
@@ -2800,7 +2823,10 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         long pinned = -1;
         if (!isTag) {
             try { pinned = Long.decode(b); } catch (Exception e) { return null; }
-            if (pinned < 0) return null;
+            // Genesis by number is rejected like the "earliest" tag above (and like
+            // the Rust engine's selector parser) — the two engines must answer the
+            // same request identically.
+            if (pinned <= 0) return null;
         }
         try {
             HeaderAnchor anchor = headerAnchor();
@@ -2811,14 +2837,12 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 // Same near-head re-anchor as getBlockByNumber: a pin just past the
                 // preferred anchor is the normal mobile state, and the beacon
                 // OPTIMISTIC payload is itself a verified anchor at/past it.
-                long optimisticNum = beaconSyncState.getOptimisticBlockNumber();
-                byte[] optimisticHash = beaconSyncState.getOptimisticBlockHash();
-                if (optimisticNum >= target && optimisticHash != null) {
-                    anchor = new HeaderAnchor(optimisticNum, null, optimisticHash);
-                    headNum = optimisticNum;
-                } else {
+                HeaderAnchor reanchored = reAnchorForPin(target);
+                if (reanchored == null) {
                     return "null"; // beyond the verified chain tip → eth null
                 }
+                anchor = reanchored;
+                headNum = reanchored.number();
             }
             long back = headNum - target;
             if (back >= BLOCK_LOOKBACK_MAX) return null; // too far to verify cheaply
@@ -2833,13 +2857,15 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             if (expectHash != null && !vh.hash().toHexString().equals(expectHash)) return "null";
             blockHashToNumber.put(vh.hash().toHexString(), vh.header().number);
 
-            // Body + receipts in flight together (one round of wall-clock).
+            // Body + receipts in flight together, ONE shared deadline for the pair
+            // (sequential .get calls would each start a fresh timeout — worst case
+            // twice the budget, not the "one round of wall-clock" this is for).
             CompletableFuture<List<BlockBodiesMessage.BlockBody>> bodiesF =
                     conn.requestBlockBodies(vh.hash());
             CompletableFuture<List<List<Bytes>>> rcptF = conn.requestReceipts(vh.hash());
-            List<BlockBodiesMessage.BlockBody> bodies =
-                    bodiesF.get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
-            List<List<Bytes>> rcptBlocks = rcptF.get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+            CompletableFuture.allOf(bodiesF, rcptF).get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+            List<BlockBodiesMessage.BlockBody> bodies = bodiesF.join();
+            List<List<Bytes>> rcptBlocks = rcptF.join();
             if (bodies.isEmpty() || rcptBlocks.isEmpty()) return null;
             List<Bytes> txs = bodies.get(0).transactions();
             List<Bytes> receipts = rcptBlocks.get(0);
@@ -2849,17 +2875,21 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 return null;
             }
 
-            // buildReceiptJson re-decodes the preceding receipts per index (its
-            // single-receipt contract), making this loop O(n²) in cheap RLP
-            // decodes — tens of ms for a full block, dwarfed by the two network
-            // round-trips above.
+            // One O(n) pass: each receipt decodes exactly once, the previous
+            // cumulative gas and the block-global log-index base accumulate
+            // across the loop (the Rust build_block_receipts twin).
             StringBuilder sb = new StringBuilder(256 * Math.max(1, receipts.size()));
             sb.append("[");
+            long prevCum = 0L;
+            int logBase = 0;
             for (int i = 0; i < receipts.size(); i++) {
                 if (i > 0) sb.append(",");
+                Receipt r = Receipt.decode(receipts.get(i));
                 Bytes32 txHash = Hash.keccak256(txs.get(i));
-                sb.append(buildReceiptJson(receipts, i, vh.header(), vh.hash(), txHash,
-                        txs.get(i).toArrayUnsafe()));
+                sb.append(buildReceiptJsonAt(r, i, vh.header(), vh.hash(), txHash,
+                        txs.get(i).toArrayUnsafe(), prevCum, logBase));
+                prevCum = r.cumulativeGasUsed();
+                logBase += r.logs().size();
             }
             return sb.append("]").toString();
         } catch (Exception e) {

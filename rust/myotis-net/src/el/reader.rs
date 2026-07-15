@@ -2039,30 +2039,51 @@ fn build_verified_receipt(
         // The last iteration leaves receipt[index-1]'s cumulative gas here.
         prev_cum = prev.cumulative_gas_used;
     }
-    let gas_used = decoded.cumulative_gas_used.saturating_sub(prev_cum);
-    let tx_summary = tx::decode_summary(&loc.raw_tx);
-    let effective_gas_price = tx_summary
-        .as_ref()
-        .and_then(|t| tx::effective_gas_price(t, header_base_fee(&loc.header)));
-    let contract_address = tx_summary.as_ref().and_then(|t| {
-        // Only a creation tx (empty `to`) with a recovered sender deploys.
-        match (&t.to, &t.from) {
-            (None, Some(from)) => Some(tx::contract_address(from, t.nonce)),
-            _ => None,
-        }
+    Ok(build_one_receipt(
+        &loc.header,
+        loc.block_hash,
+        loc.index as u64,
+        &loc.raw_tx,
+        decoded,
+        prev_cum,
+        log_index_base,
+    ))
+}
+
+/// The per-element construction both receipt paths share: the caller supplies
+/// the ALREADY-DECODED receipt and the running accumulators (previous
+/// cumulative gas, block-global log-index base). The subtle rules live once:
+/// the tx decodes DEFENSIVELY (an unknown future type yields a partial receipt,
+/// never an error), and only a creation tx with a recovered sender carries a
+/// contract address.
+fn build_one_receipt(
+    header: &BlockHeader,
+    block_hash: [u8; 32],
+    tx_index: u64,
+    raw_tx: &[u8],
+    decoded: DecodedReceipt,
+    prev_cum: u64,
+    log_index_base: u64,
+) -> VerifiedReceipt {
+    let tx_summary = tx::decode_summary(raw_tx);
+    let effective_gas_price =
+        tx_summary.as_ref().and_then(|t| tx::effective_gas_price(t, header_base_fee(header)));
+    let contract_address = tx_summary.as_ref().and_then(|t| match (&t.to, &t.from) {
+        (None, Some(from)) => Some(tx::contract_address(from, t.nonce)),
+        _ => None,
     });
-    Ok(VerifiedReceipt {
-        tx_hash: *tx_hash,
-        tx_index: loc.index as u64,
-        block_hash: loc.block_hash,
-        block_number: loc.header.number,
-        gas_used,
+    VerifiedReceipt {
+        tx_hash: keccak256(raw_tx),
+        tx_index,
+        block_hash,
+        block_number: header.number,
+        gas_used: decoded.cumulative_gas_used.saturating_sub(prev_cum),
         log_index_base,
         receipt: decoded,
         tx: tx_summary,
         effective_gas_price,
         contract_address,
-    })
+    }
 }
 
 /// Fetch the contiguous header window `[from ..= from+count-1]` from one peer
@@ -2111,36 +2132,23 @@ fn build_block_receipts(
     body: &crate::el::eth::messages::BlockBody,
     receipts: &[Vec<u8>],
 ) -> Result<Vec<VerifiedReceipt>, String> {
-    let base_fee = header_base_fee(header);
     let mut out = Vec::with_capacity(receipts.len());
     let mut prev_cum = 0u64;
     let mut log_index_base = 0u64;
     for (i, (raw_tx, receipt)) in body.transactions.iter().zip(receipts).enumerate() {
         let decoded = crate::el::receipt::decode(receipt)?;
-        // Tx-derived fields, decoded defensively like the single-receipt path:
-        // an unknown future tx type yields a receipt without them, never an error.
-        let tx_summary = tx::decode_summary(raw_tx);
-        let effective_gas_price =
-            tx_summary.as_ref().and_then(|t| tx::effective_gas_price(t, base_fee));
-        let contract_address = tx_summary.as_ref().and_then(|t| match (&t.to, &t.from) {
-            (None, Some(from)) => Some(tx::contract_address(from, t.nonce)),
-            _ => None,
-        });
         let log_count = decoded.logs.len() as u64;
-        let gas_used = decoded.cumulative_gas_used.saturating_sub(prev_cum);
-        prev_cum = decoded.cumulative_gas_used;
-        out.push(VerifiedReceipt {
-            tx_hash: keccak256(raw_tx),
-            tx_index: i as u64,
+        let cum = decoded.cumulative_gas_used;
+        out.push(build_one_receipt(
+            header,
             block_hash,
-            block_number: header.number,
-            gas_used,
+            i as u64,
+            raw_tx,
+            decoded,
+            prev_cum,
             log_index_base,
-            receipt: decoded,
-            tx: tx_summary,
-            effective_gas_price,
-            contract_address,
-        });
+        ));
+        prev_cum = cum;
         log_index_base += log_count;
     }
     Ok(out)
