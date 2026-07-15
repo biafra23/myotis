@@ -159,17 +159,15 @@ class IosRpcBackend(
     }
 
     override fun getBlockByNumber(block: String, fullTransactions: Boolean): String? {
-        if (fullTransactions) return null // full tx objects aren't served verified
         val handle = handleProvider() ?: return null
         val tag = block.ifBlank { "latest" }
-        return triStateJson(RustEngine.getBlockByNumberJson(handle, tag))
+        return triStateJson(RustEngine.getBlockByNumberJson(handle, tag, fullTransactions))
     }
 
     override fun getBlockByHash(blockHash32: ByteArray, fullTransactions: Boolean): String? {
-        if (fullTransactions) return null
         if (blockHash32.size != 32) return null
         val handle = handleProvider() ?: return null
-        return triStateJson(RustEngine.getBlockByHashJson(handle, hex(blockHash32)))
+        return triStateJson(RustEngine.getBlockByHashJson(handle, hex(blockHash32), fullTransactions))
     }
 
     override fun gasPrice(): String? {

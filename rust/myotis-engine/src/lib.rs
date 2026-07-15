@@ -43,7 +43,10 @@ pub mod ringlog;
 ///      receipts).
 /// v17: added nativeGetBlockReceiptsJson (verified eth_getBlockReceipts — one
 ///      anchored block's whole receipt list, body + receipts root-verified).
-pub const ABI_VERSION: i32 = 17;
+/// v18: nativeGetBlockByNumberJson + nativeGetBlockByHashJson gained a
+///      `boolean fullTransactions` parameter (fullTransactions=true blocks now
+///      served natively: decoded tx objects instead of hashes).
+pub const ABI_VERSION: i32 = 18;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
@@ -410,18 +413,24 @@ mod jni_shim {
         }
     }
 
-    /// `RustEngineNative.nativeGetBlockByNumberJson(long handle, String blockTag)`
-    /// — verified `eth_getBlockByNumber` (transactions as hashes). Returns the block
-    /// JSON, the literal `"null"`, or `{"error": "..."}`.
+    /// `RustEngineNative.nativeGetBlockByNumberJson(long handle, String blockTag,
+    /// boolean fullTransactions)` — verified `eth_getBlockByNumber`
+    /// (`fullTransactions` selects decoded tx objects over hashes). Returns the
+    /// block JSON, the literal `"null"`, or `{"error": "..."}`.
     #[no_mangle]
     pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeGetBlockByNumberJson(
         mut env: JNIEnv,
         _class: JClass,
         handle: jlong,
         block_tag: JString,
+        full_transactions: jboolean,
     ) -> jstring {
         let block_tag = read_string(&mut env, &block_tag).unwrap_or_default();
-        let json = crate::host::get_block_by_number_json(handle, &block_tag);
+        let json = crate::host::get_block_by_number_json(
+            handle,
+            &block_tag,
+            full_transactions != 0,
+        );
         match env.new_string(json) {
             Ok(s) => s.into_raw(),
             Err(_) => std::ptr::null_mut(),
@@ -526,9 +535,10 @@ mod jni_shim {
         }
     }
 
-    /// `RustEngineNative.nativeGetBlockByHashJson(long handle, String blockHashHex)`
-    /// — verified `eth_getBlockByHash` (transactions as hashes). Returns the block
-    /// JSON, the literal `"null"` (a hash this engine never verified), or
+    /// `RustEngineNative.nativeGetBlockByHashJson(long handle, String blockHashHex,
+    /// boolean fullTransactions)` — verified `eth_getBlockByHash`
+    /// (`fullTransactions` selects decoded tx objects over hashes). Returns the
+    /// block JSON, the literal `"null"` (a hash this engine never verified), or
     /// `{"error": "..."}`.
     #[no_mangle]
     pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeGetBlockByHashJson(
@@ -536,9 +546,14 @@ mod jni_shim {
         _class: JClass,
         handle: jlong,
         block_hash_hex: JString,
+        full_transactions: jboolean,
     ) -> jstring {
         let block_hash_hex = read_string(&mut env, &block_hash_hex).unwrap_or_default();
-        let json = crate::host::get_block_by_hash_json(handle, &block_hash_hex);
+        let json = crate::host::get_block_by_hash_json(
+            handle,
+            &block_hash_hex,
+            full_transactions != 0,
+        );
         match env.new_string(json) {
             Ok(s) => s.into_raw(),
             Err(_) => std::ptr::null_mut(),

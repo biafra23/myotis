@@ -2663,19 +2663,23 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
 
     /**
      * eth_getBlockByNumber, verified. Serves the block header fields from a
-     * beacon-anchored verified header plus the tx hashes from a body checked against
+     * beacon-anchored verified header plus the tx list from a body checked against
      * transactionsRoot — no snap state needed (so it works even where eth_call can't).
+     * {@code fullTx} selects full tx objects (decoded incl. the recovered sender,
+     * the buildTxJson shape) instead of hashes; an undecodable tx inside a verified
+     * body fails the serve (found-but-unrenderable is never "not found").
      * Returns the block JSON when verified; the literal "null" for a non-existent
      * (future) block (eth's standard); Java null when it can't verify (not synced)
-     * → router errors. fullTransactions=true (full tx objects, needs tx decode + sender
-     * recovery) is a follow-up — returns Java null for now.
+     * → router errors.
      */
     private String rpcGetBlockByNumber(String block, boolean fullTx) {
         RLPxConnector conn = connector;
-        if (conn == null || fullTx) return null;
+        if (conn == null) return null;
         // Classify the request up front so a fetch failure can decide whether stale-
         // serving is safe: only LATEST-ish tags (the wallet's block tracker) may fall
         // back to the cached head block; a number-pin must stay exact (see serveStaleBlock).
+        // The stale snapshot stores the HASHES form only, so a fullTx request never
+        // reads or writes it (a hashes-form block must not answer a fullTx request).
         String b = (block == null) ? "latest" : block;
         boolean isTag;
         switch (b) {
@@ -2696,7 +2700,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             // exec payload otherwise — block serving must survive snap-peer outages
             // (MetaMask's block tracker polls this and hangs the UI without it).
             HeaderAnchor anchor = headerAnchor();
-            if (anchor == null) return serveStaleBlock(isTag, pinned);
+            if (anchor == null) return fullTx ? null : serveStaleBlock(isTag, pinned);
             long headNum = anchor.number();
 
             long target = isTag ? headNum : pinned;
@@ -2714,7 +2718,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             List<BlockHeadersMessage.VerifiedHeader> window = conn
                     .requestBlockHeadersBatched(target, (int) (back + 1))
                     .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
-            if (!anchor.anchors(window)) return serveStaleBlock(isTag, pinned);
+            if (!anchor.anchors(window)) return fullTx ? null : serveStaleBlock(isTag, pinned);
             BlockHeadersMessage.VerifiedHeader vh = window.get(0); // target is first in [target..head]
             // Remember this verified hash↔number so eth_getBlockByHash can resolve it.
             blockHashToNumber.put(vh.hash().toHexString(), vh.header().number);
@@ -2722,21 +2726,23 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             List<BlockBodiesMessage.BlockBody> bodies = conn
                     .requestBlockBodies(vh.hash())
                     .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
-            if (bodies.isEmpty()) return serveStaleBlock(isTag, pinned);
+            if (bodies.isEmpty()) return fullTx ? null : serveStaleBlock(isTag, pinned);
             List<Bytes> txs = bodies.get(0).transactions();
-            if (!OrderedTrieRoot.verify(txs, vh.header().transactionsRoot)) return serveStaleBlock(isTag, pinned);
+            if (!OrderedTrieRoot.verify(txs, vh.header().transactionsRoot)) return fullTx ? null : serveStaleBlock(isTag, pinned);
 
-            String json = buildBlockJson(vh, txs);
+            String json = buildBlockJson(vh, txs, fullTx);
+            if (json == null) return null; // an undecodable tx in a verified body → can't render
             // Cache the head block (target == headNum) as the last-good latest; a fetch
             // failure on a later "latest" poll then serves this verified block bounded-stale
-            // instead of erroring. Historical pins aren't cached (they aren't "latest").
-            if (target == headNum) {
+            // instead of erroring. Historical pins aren't cached (they aren't "latest"),
+            // and only the HASHES form enters the snapshot (see above).
+            if (!fullTx && target == headNum) {
                 lastGoodLatestBlock = new BlockSnapshot(json, target, clock.elapsedMillis());
             }
             return json;
         } catch (Exception e) {
             log.info("[rpc] eth_getBlockByNumber failed: " + unwrap(e));
-            return serveStaleBlock(isTag, pinned);
+            return fullTx ? null : serveStaleBlock(isTag, pinned);
         }
     }
 
@@ -2748,15 +2754,20 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      *  → "null" (eth's unknown-block); the live confirm flow always pre-populates it via the
      *  preceding eth_getTransactionReceipt. */
     private String rpcGetBlockByHash(String blockHash, boolean fullTx) {
-        if (blockHash == null || fullTx) return null; // fullTx not served verified (mirrors by-number)
+        if (blockHash == null) return null;
         String key = blockHash.toLowerCase(java.util.Locale.ROOT);
         Long number = blockHashToNumber.get(key);
         if (number == null) return "null"; // not a block we've verified — unknown to us
-        String json = rpcGetBlockByNumber("0x" + Long.toHexString(number), false);
+        String json = rpcGetBlockByNumber("0x" + Long.toHexString(number), fullTx);
         if (json == null || "null".equals(json)) return json;
         // The verified by-number serve returns the CURRENTLY-canonical block at that height;
         // make sure it's still the one asked for (else a reorg remapped number → hash).
-        return json.contains("\"hash\":\"" + key + "\"") ? json : "null";
+        // Match the block's OWN "hash" field — its first occurrence (buildBlockJson emits
+        // number, then hash) — not a substring scan: with fullTx, every embedded tx object
+        // carries its own lowercase "hash" key, which a whole-string contains() would
+        // also match (the Rust twin compares block.hash structurally).
+        int i = json.indexOf("\"hash\":\"");
+        return i >= 0 && json.startsWith(key + "\"", i + 8) ? json : "null";
     }
 
     /**
@@ -2924,9 +2935,13 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         return null;
     }
 
-    /** Build the eth_getBlockByNumber JSON from a VERIFIED header + verified tx list
-     *  (transactions as hashes; fullTransactions=true is handled upstream as a follow-up). */
-    private static String buildBlockJson(BlockHeadersMessage.VerifiedHeader vh, List<Bytes> txs) {
+    /** Build the eth_getBlockByNumber JSON from a VERIFIED header + verified tx list.
+     *  {@code fullTx} emits full tx objects (the buildTxJson shape, decoded incl. the
+     *  recovered sender) instead of hashes. Returns Java null only in fullTx mode when
+     *  a tx inside the VERIFIED body can't be decoded — found-but-unrenderable is a
+     *  can't-serve, never a hash silently standing in for a requested object. */
+    private static String buildBlockJson(BlockHeadersMessage.VerifiedHeader vh, List<Bytes> txs,
+                                         boolean fullTx) {
         BlockHeader h = vh.header();
         StringBuilder sb = new StringBuilder(1024);
         sb.append("{\"number\":\"").append(hexQuantity(h.number)).append("\"");
@@ -2963,7 +2978,15 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         sb.append(",\"transactions\":[");
         for (int i = 0; i < txs.size(); i++) {
             if (i > 0) sb.append(",");
-            sb.append("\"").append(Hash.keccak256(txs.get(i)).toHexString()).append("\"");
+            Bytes32 txHash = Hash.keccak256(txs.get(i));
+            if (fullTx) {
+                String txJson = buildTxJson(txs.get(i).toArrayUnsafe(), txHash,
+                        vh.hash(), h.number, i);
+                if (txJson == null) return null; // undecodable tx in a verified body
+                sb.append(txJson);
+            } else {
+                sb.append("\"").append(txHash.toHexString()).append("\"");
+            }
         }
         sb.append("],\"uncles\":[]}");
         return sb.toString();

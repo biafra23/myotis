@@ -69,20 +69,28 @@ public final class EthTxDecoder {
             BigInteger sigR = toBig(r.readValue());
             BigInteger sigS = toBig(r.readValue());
 
+            // Legacy v = 2*chainId + 35: real chain ids exceed 2^31, so no int math.
+            // The Rust decoder reads v as a u64, so the bound is u64 — a wider v is
+            // malformed → whole decode fails (parity). BigInteger arithmetic below
+            // because v itself may not fit a SIGNED long ([2^63, 2^64)), while
+            // chainId = (v - 35) / 2 always does for v < 2^64.
+            if (v.signum() < 0 || v.bitLength() > 64) {
+                throw new ArithmeticException("legacy v out of u64 range");
+            }
             Long chainId = null;
-            int recId;
-            Bytes signing;
-            int vi = v.intValueExact();
-            if (vi == 27 || vi == 28) {
-                recId = vi - 27;
+            Bytes signing = null;
+            int recId = -1;
+            if (v.equals(BigInteger.valueOf(27)) || v.equals(BigInteger.valueOf(28))) {
+                recId = v.intValueExact() - 27; // pre-155: sign over the 6 tx fields
                 signing = RLP.encodeList(w -> {
                     w.writeLong(nonce); w.writeBigInteger(gasPrice); w.writeLong(gas);
                     w.writeValue(to); w.writeBigInteger(value); w.writeValue(input);
                 });
-            } else {
-                long cid = (vi - 35) / 2;       // EIP-155
+            } else if (v.compareTo(BigInteger.valueOf(35)) >= 0) {
+                BigInteger vMinus35 = v.subtract(BigInteger.valueOf(35));
+                long cid = vMinus35.shiftRight(1).longValueExact(); // EIP-155; < 2^63
                 chainId = cid;
-                recId = (vi - 35) % 2;
+                recId = vMinus35.testBit(0) ? 1 : 0;
                 final long fcid = cid;
                 signing = RLP.encodeList(w -> {
                     w.writeLong(nonce); w.writeBigInteger(gasPrice); w.writeLong(gas);
@@ -90,7 +98,10 @@ public final class EthTxDecoder {
                     w.writeLong(fcid); w.writeInt(0); w.writeInt(0);
                 });
             }
-            Bytes from = recover(Hash.keccak256(signing), sigR, sigS, recId);
+            // Any other v (< 27 or 29..34) can't map to a recovery id: keep the
+            // decoded summary but drop the sender — never a fabricated (negative)
+            // chainId (the Rust decoder's rule, mirrored for wire parity).
+            Bytes from = signing == null ? null : recover(Hash.keccak256(signing), sigR, sigS, recId);
             return new DecodedTx(0, chainId, nonce, gasPrice, null, null, gas, to, value,
                     input, v, sigR, sigS, from);
         });

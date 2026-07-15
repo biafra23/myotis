@@ -360,6 +360,15 @@ Spec: README §5.3, doc 04 §2. Highlights per PR-sized chunk:
      `rpcGetBlockReceipts` reuses `buildReceiptJson` per index). Selector is a tag,
      0x-number, or 0x-32-byte hash (hash resolves via the verified hash→number map
      with the reorg re-check, like `getBlockByHash`).
+   - **Landed (coverage extension): `fullTransactions=true` blocks** (ABI v18,
+     `nativeGetBlockByNumberJson`/`nativeGetBlockByHashJson` gained a
+     `boolean fullTransactions`): both engines now serve `eth_getBlockByNumber`/
+     `ByHash` with fully decoded tx objects — every element the
+     `eth_getTransactionByHash` shape (`decode_summary` incl. recovered sender /
+     `buildTxJson`), decoded from the same `transactionsRoot`-verified body the
+     hashes form already fetched. An undecodable tx fails the whole block
+     (found-but-unrenderable must never serve a partial list); the Java stale
+     re-serve (`lastGoodLatestBlock`) stays hashes-only.
 3. **`sendRawTransaction` + pending overlay.** Gossip raw bytes to all READY peers, return
    `keccak256(rawTx)`, cache own-tx bytes (shows pending until mined), rebroadcast until the
    gossip echo (the EL-A5 hash-observation hook); pending-nonce overlay — only-raises,

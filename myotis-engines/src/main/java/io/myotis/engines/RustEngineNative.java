@@ -23,7 +23,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 17; // 17: + nativeGetBlockReceiptsJson
+    static final int EXPECTED_ABI_VERSION = 18; // 18: block-by-number/hash gained fullTransactions
 
     private static final boolean AVAILABLE = load();
 
@@ -204,14 +204,16 @@ final class RustEngineNative {
     static native String nativeEnsRecordJson(long handle, String paramsJson);
 
     /**
-     * Verified {@code eth_getBlockByNumber} (transactions as hashes) for a running
-     * handle. {@code blockTag} is an eth block selector ({@code "latest"} / a
-     * 0x-hex number / …). Returns the block JSON object, the literal {@code "null"}
-     * for a future/unknown block (eth's null), or an {@code "error"} object for a
-     * transport / not-running / can't-verify failure. {@code fullTransactions} is
-     * handled Java-side (returns null before this native runs).
+     * Verified {@code eth_getBlockByNumber} for a running handle. {@code blockTag}
+     * is an eth block selector ({@code "latest"} / a 0x-hex number / …);
+     * {@code fullTransactions} selects fully decoded tx objects (the
+     * {@code nativeGetTransactionByHashJson} shape) instead of hashes. Returns
+     * the block JSON object, the literal {@code "null"} for a future/unknown
+     * block (eth's null), or an {@code "error"} object for a transport /
+     * not-running / can't-verify failure.
      */
-    static native String nativeGetBlockByNumberJson(long handle, String blockTag);
+    static native String nativeGetBlockByNumberJson(
+            long handle, String blockTag, boolean fullTransactions);
 
     /**
      * Verified fee suggestion (`eth_gasPrice` + `eth_maxPriorityFeePerGas`) for a
@@ -254,16 +256,17 @@ final class RustEngineNative {
     static native String nativeGetTransactionByHashJson(long handle, String txHashHex);
 
     /**
-     * Verified {@code eth_getBlockByHash} (transactions as hashes) for a running
-     * handle. {@code blockHashHex} is the 0x-hex 32-byte block hash, resolved
-     * against blocks this engine has ALREADY verified (receipt scans and by-number
-     * serves populate the map) and re-served via the verified by-number path.
-     * Returns the block JSON, the literal {@code "null"} for a hash never
-     * verified / reorged away (eth's unknown-block null), or an {@code "error"}
-     * object. {@code fullTransactions} is handled Java-side (returns null before
-     * this native runs).
+     * Verified {@code eth_getBlockByHash} for a running handle.
+     * {@code blockHashHex} is the 0x-hex 32-byte block hash, resolved against
+     * blocks this engine has ALREADY verified (receipt scans and by-number
+     * serves populate the map) and re-served via the verified by-number path;
+     * {@code fullTransactions} selects fully decoded tx objects instead of
+     * hashes. Returns the block JSON, the literal {@code "null"} for a hash
+     * never verified / reorged away (eth's unknown-block null), or an
+     * {@code "error"} object.
      */
-    static native String nativeGetBlockByHashJson(long handle, String blockHashHex);
+    static native String nativeGetBlockByHashJson(
+            long handle, String blockHashHex, boolean fullTransactions);
 
     /**
      * Verified {@code eth_getBlockReceipts} for a running handle. {@code selector}
