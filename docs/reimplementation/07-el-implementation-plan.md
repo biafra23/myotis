@@ -369,6 +369,20 @@ Spec: README §5.3, doc 04 §2. Highlights per PR-sized chunk:
      hashes form already fetched. An undecodable tx fails the whole block
      (found-but-unrenderable must never serve a partial list); the Java stale
      re-serve (`lastGoodLatestBlock`) stays hashes-only.
+   - **Landed (compat batch, router-only — both engines for free):**
+     `eth_accounts` (exactly `[]` — the node holds no keys), `net_listening`
+     (true — the discovery UDP listener), `net_peerCount` (from the
+     `myotis_status` snapshot's `connectedPeers`), `web3_sha3` (pure-Kotlin
+     Keccak-256 in commonMain, vector-pinned + Tuweni-cross-checked),
+     `eth_getBlockTransactionCountByNumber/ByHash` and
+     `eth_getUncleCountByBlockNumber/ByHash` (array sizes read out of the
+     verified block serve), `eth_getTransactionByBlockNumberAndIndex/
+     ByBlockHashAndIndex` (`transactions[i]` of a fullTransactions serve), and
+     `eth_getUncleByBlockNumberAndIndex/ByBlockHashAndIndex` (post-merge window
+     → always eth-null once the block resolves). Deliberately NOT included:
+     `eth_blobBaseFee` — the blob base-fee update fraction is fork-dependent
+     (and BPO forks reschedule it), so a router-side constant would silently go
+     stale; it needs an engine-side answer if it's ever wanted.
 3. **`sendRawTransaction` + pending overlay.** Gossip raw bytes to all READY peers, return
    `keccak256(rawTx)`, cache own-tx bytes (shows pending until mined), rebroadcast until the
    gossip echo (the EL-A5 hash-observation hook); pending-nonce overlay — only-raises,
