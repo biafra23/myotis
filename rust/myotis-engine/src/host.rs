@@ -1013,9 +1013,12 @@ pub fn fee_estimate_json(handle: i64) -> String {
 
 /// `nativeGetBlockReceiptsJson`: verified `eth_getBlockReceipts` for a running
 /// handle. `selector` is a tag, a 0x-hex block number, or a 0x-32-byte block
-/// hash (unambiguous at 66 chars — a block number is at most 18). Returns the
-/// receipts array JSON, the literal `"null"` (verified unknown/future block, or
-/// a hash this engine never verified), or `{"error": "..."}`.
+/// hash (unambiguous at 66 chars — a block number is at most 18); a BARE
+/// numeric is rejected — the engines' bare conventions differ (the Java engine
+/// reads decimal, [`parse_block_target`] hex), so the contract is 0x-only for
+/// callers that bypass the router's identical gate. Returns the receipts array
+/// JSON, the literal `"null"` (verified unknown/future block, or a hash this
+/// engine never verified), or `{"error": "..."}`.
 pub fn get_block_receipts_json(handle: i64, selector: &str) -> String {
     let selector = selector.trim();
     let Some(engine) = engine() else {
@@ -1034,6 +1037,12 @@ pub fn get_block_receipts_json(handle: i64, selector: &str) -> String {
         engine.rt.block_on(async { reader.get_block_receipts_by_hash(hash).await })
     } else {
         let tag = if selector.is_empty() { "latest" } else { selector };
+        let is_tag = matches!(tag, "latest" | "pending" | "safe" | "finalized" | "earliest");
+        if !is_tag && !(tag.starts_with("0x") || tag.starts_with("0X")) {
+            return eljson::error_json(
+                "invalid block selector (expected a tag, 0x-number, or 0x-hash)",
+            );
+        }
         let target = match parse_block_target(tag) {
             Ok(t) => t,
             Err(msg) => return eljson::error_json(msg),

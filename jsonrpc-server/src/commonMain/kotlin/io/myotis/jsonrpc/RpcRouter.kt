@@ -345,15 +345,20 @@ class RpcRouter(
                 // depending on which engine is behind the router. A JSON-number param
                 // is rejected like the sibling hex helpers reject non-strings.
                 val selParam = p?.getOrNull(0)
+                // Trimmed like both backends trim it, so the gate here never rejects
+                // a selector the engines would have served identically.
                 val selector: String = when {
                     selParam == null || selParam is JsonNull -> "latest"
                     else -> (selParam as? JsonPrimitive)
-                        ?.takeIf { it.isString }?.contentOrNull ?: return null
+                        ?.takeIf { it.isString }?.contentOrNull?.trim()?.ifEmpty { "latest" }
+                        ?: return null
                 }
+                // ASCII hex only — Char.isDigit() also accepts Unicode digits, which
+                // the engines' ASCII-only parsers would then reject inconsistently.
                 val specShaped = selector in setOf("latest", "pending", "safe", "finalized", "earliest")
                     || (selector.length > 2 && selector.length <= 66
                         && (selector.startsWith("0x") || selector.startsWith("0X"))
-                        && selector.drop(2).all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' })
+                        && selector.drop(2).all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' })
                 if (!specShaped) return null
                 // Array string when served; "null" for a verified unknown/future
                 // block; Kotlin null (can't verify) → strict error.
