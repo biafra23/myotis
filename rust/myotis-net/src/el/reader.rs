@@ -2036,6 +2036,18 @@ fn block_tx_tips(
     let body = bodies.into_iter().next().ok_or("peer returned no block body")?;
     verify_body_transactions(header, &body)?;
     if body.transactions.is_empty() {
+        // A root-verified EMPTY tx list ⇒ the anchored header must carry
+        // gasUsed 0 (same strictness as the non-empty path's final-sum check).
+        // Receipts are deliberately NOT consulted here — no weights to derive —
+        // matching the Java decodeBlockTips early return, and not making a
+        // quiet chain's feeHistory depend on how peers answer GetReceipts for
+        // zero-tx blocks.
+        if header.gas_used != 0 {
+            return Err(format!(
+                "block {} has no transactions but a non-zero header gasUsed {}",
+                header.number, header.gas_used
+            ));
+        }
         return Ok(Vec::new());
     }
     let receipts = receipt_blocks.into_iter().next().ok_or("peer returned no receipts")?;
