@@ -46,7 +46,7 @@ Chain-level assumptions used throughout (2025/26 ballparks):
 | **Cold first sync** | ~1–10 MB (bootstrap ~25 KB + one ~25 KB update per committee period behind + peer discovery/handshakes). Minutes. |
 | **Warm restart** | Tens of KB (snapshot resume + one finality poll). ~10 s to `SYNCED`. |
 | **Staying synced, protocol minimum** | **< 1 MB/day** (~1.6 KB finality update per epoch + ~25 KB committee update per ~27 h). |
-| **While awake, defaults (wallet-serving)** | **~2–6 MB/min**, dominated by inbound mempool gossip (peers push it; Myotis drops it) and fee/head warming (block bodies). Both are tunable — see [Knobs](#knobs-that-change-the-numbers). A never-sleeping daemon/desktop therefore lands at ~3–8 GB/day. |
+| **While awake, defaults (wallet-serving)** | **~2–6 MB/min**, dominated by inbound mempool gossip (peers push it; Myotis drops it) and fee/head warming (block bodies). Both are tunable — see [Knobs](#6-knobs-that-change-the-numbers). A never-sleeping daemon/desktop therefore lands at ~3–8 GB/day. |
 | **Android in practice** | Near zero while idle (idle-pause after 5 min, default) + a few MB for the daily catch-up pass; awake minutes cost the per-minute rate above (thinner phone peer pools trend toward its low end). |
 | **Creating + sending a tx** | Signing costs nothing (the wallet signs). Gating reads ~10–50 KB; the broadcast itself **~5 KB**; confirmation tracking ~1–2 MB (block bodies). |
 
@@ -78,7 +78,7 @@ Where the files live:
 
 | File | Contents | Size |
 |---|---|---|
-| `sync-state<suffix>.snapshot` | Beacon light-client store: finalized + optimistic headers, current **and** next sync committee (2 × 512 BLS pubkeys ≈ 48 KB), period/slots. Binary "LCSS" v1 (`consensus/.../LightClientStoreSnapshot.java`, Rust twin `rust/myotis-consensus/src/snapshot.rs`). Overwritten in place; bound to the chain by genesis-validators-root. | **~50 KB** (~26 KB when the next committee isn't held yet) |
+| `sync-state<suffix>.snapshot` | Beacon light-client store: finalized + optimistic headers, current **and** next sync committee (2 × 512 BLS pubkeys ≈ 48 KB), period/slots. Binary "LCSS" v1 (`consensus/.../lightclient/LightClientStoreSnapshot.java`, Rust twin `rust/myotis-consensus/src/snapshot.rs`). Overwritten in place; bound to the chain by genesis-validators-root. | **~50 KB** (~26 KB when the next committee isn't held yet) |
 | `sync-state<suffix>.snapshot.roots` | Recent state-root window sidecar, ≤ 64 entries × 41 B — lets a resume skip re-accumulating roots. | ≤ ~2.6 KB |
 | `peers<suffix>.cache` | EL peer cache: one TSV line per peer — `ip⇥port⇥pubkey(0x+128 hex)⇥snapFlag[⇥snapok\|snapbad]` (`app/.../PeerCache.java`, `rust/myotis-net/src/el/peercache.rs`). **No entry cap**; failed snap-servers are deprioritized (`snapbad`), never evicted. | ~150 B/peer → tens–hundreds of KB after weeks |
 | `cl-peers<suffix>.cache` | CL peer cache: `multiaddr[⇥periodRange][⇥b<period>][⇥lc\|nolc]` (`app/.../CLPeerCache.java`, `rust/myotis-net/src/clcache.rs`). Self-pruning: 3 consecutive failures evict the peer. | ~100 B/peer → a few–tens of KB |
@@ -108,7 +108,7 @@ cache-purge action deletes the caches and the snapshot.
 
 ### 1.3 RAM, for completeness
 
-The eth/69 **served-header window** (`networking/.../ServedHeaderWindow.java`) holds the
+The eth/69 **served-header window** (`networking/.../eth/ServedHeaderWindow.java`) holds the
 most recent headers in RAM to answer peers' `GetBlockHeaders`: default **32** headers ×
 ~500 B ≈ 16 KB, configurable up to 4096 (≈ 2 MB) (`EthHandler.DEFAULT_SERVED_BLOCK_WINDOW`,
 `ChainStack.setServedBlockWindow`). It does not survive restart — by design.
