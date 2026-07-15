@@ -211,13 +211,27 @@ pub fn block_json(b: &VerifiedBlock) -> String {
         s.push('"');
     }
     s.push_str(",\"transactions\":[");
-    for (i, txh) in b.tx_hashes.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
+    match &b.full_transactions {
+        // fullTransactions=true: each element is exactly the tx_json object
+        // (the Java buildBlockJson emits buildTxJson elements the same way).
+        Some(txs) => {
+            for (i, tx) in txs.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&tx_json(tx));
+            }
         }
-        s.push('"');
-        s.push_str(&hex0x(txh));
-        s.push('"');
+        None => {
+            for (i, txh) in b.tx_hashes.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push('"');
+                s.push_str(&hex0x(txh));
+                s.push('"');
+            }
+        }
     }
     s.push_str("],\"uncles\":[]}");
     s
@@ -1075,7 +1089,12 @@ mod tests {
             excess_blob_gas: Some(0),
             parent_beacon_block_root: Some([0x88; 32]),
         };
-        VB { hash: [0x99; 32], header, tx_hashes: vec![[0xa1; 32], [0xb2; 32]] }
+        VB {
+            hash: [0x99; 32],
+            header,
+            tx_hashes: vec![[0xa1; 32], [0xb2; 32]],
+            full_transactions: None,
+        }
     }
 
     #[test]
@@ -1105,6 +1124,28 @@ mod tests {
         assert_eq!(v["transactions"][0], hex0x(&[0xa1; 32]));
         assert_eq!(v["transactions"][1], hex0x(&[0xb2; 32]));
         assert!(v["uncles"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn full_transactions_block_embeds_tx_json_objects() {
+        // fullTransactions=true: each element is exactly the tx_json object
+        // (its own golden pins the fields); this pins the embedding.
+        let mut b = sample_block();
+        let mut tx1 = sample_transaction();
+        tx1.block_hash = b.hash;
+        tx1.block_number = b.header.number;
+        tx1.tx_index = 0;
+        let mut tx2 = tx1.clone();
+        tx2.tx_index = 1;
+        b.full_transactions = Some(vec![tx1, tx2]);
+        let v: serde_json::Value = serde_json::from_str(&block_json(&b)).expect("valid json");
+        assert_eq!(v["transactions"].as_array().unwrap().len(), 2);
+        assert_eq!(v["transactions"][0]["transactionIndex"], "0x0");
+        assert_eq!(v["transactions"][1]["transactionIndex"], "0x1");
+        assert_eq!(v["transactions"][0]["hash"], hex0x(&[0xa1; 32]));
+        assert_eq!(v["transactions"][0]["blockHash"], hex0x(&[0x99; 32]));
+        // The header fields are unaffected by the tx form.
+        assert_eq!(v["number"], "0x1406f40");
     }
 
     #[test]

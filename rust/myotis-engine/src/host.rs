@@ -873,13 +873,12 @@ pub fn estimate_gas_json(
     }
 }
 
-/// `nativeGetBlockByNumberJson`: verified `eth_getBlockByNumber` (transactions as
-/// hashes) for a running handle. Returns the block JSON when found+verified, the
-/// literal `"null"` for a future/unknown block (eth's null), or `{"error": "..."}`
-/// when it can't verify right now (which the Java side maps to a null → -32000).
-/// `fullTransactions=true` is handled on the Java side (returns null before this
-/// native runs), so this always serves the hashes-only shape.
-pub fn get_block_by_number_json(handle: i64, block_tag: &str) -> String {
+/// `nativeGetBlockByNumberJson`: verified `eth_getBlockByNumber` for a running
+/// handle. `full_transactions` selects fully decoded tx objects instead of
+/// hashes. Returns the block JSON when found+verified, the literal `"null"` for
+/// a future/unknown block (eth's null), or `{"error": "..."}` when it can't
+/// verify right now (which the Java side maps to a null → -32000).
+pub fn get_block_by_number_json(handle: i64, block_tag: &str, full_transactions: bool) -> String {
     let target = match parse_block_target(block_tag) {
         Ok(t) => t,
         Err(msg) => return eljson::error_json(msg),
@@ -891,7 +890,10 @@ pub fn get_block_by_number_json(handle: i64, block_tag: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(async { reader.get_block_by_number(target).await }) {
+    match engine
+        .rt
+        .block_on(async { reader.get_block_by_number(target, full_transactions).await })
+    {
         Ok(Some(block)) => eljson::block_json(&block),
         Ok(None) => "null".to_string(), // verified future/unknown block → eth null
         Err(e) => eljson::error_json(&e),
@@ -944,13 +946,16 @@ pub fn get_transaction_by_hash_json(handle: i64, tx_hash_hex: &str) -> String {
     }
 }
 
-/// `nativeGetBlockByHashJson`: verified `eth_getBlockByHash` (transactions as
-/// hashes) for a running handle. `block_hash_hex` is the 0x-hex 32-byte block
-/// hash. Returns the block JSON, the literal `"null"` for a hash this engine
-/// has never verified (eth's unknown-block null), or `{"error": "..."}`.
-/// `fullTransactions=true` is handled on the Java side (returns null before
-/// this native runs), matching `nativeGetBlockByNumberJson`.
-pub fn get_block_by_hash_json(handle: i64, block_hash_hex: &str) -> String {
+/// `nativeGetBlockByHashJson`: verified `eth_getBlockByHash` for a running
+/// handle. `block_hash_hex` is the 0x-hex 32-byte block hash;
+/// `full_transactions` selects fully decoded tx objects instead of hashes.
+/// Returns the block JSON, the literal `"null"` for a hash this engine has
+/// never verified (eth's unknown-block null), or `{"error": "..."}`.
+pub fn get_block_by_hash_json(
+    handle: i64,
+    block_hash_hex: &str,
+    full_transactions: bool,
+) -> String {
     let Some(block_hash) = parse_word32(block_hash_hex) else {
         return eljson::error_json("invalid block hash (expected 32-byte hex)");
     };
@@ -961,7 +966,10 @@ pub fn get_block_by_hash_json(handle: i64, block_hash_hex: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(async { reader.get_block_by_hash(block_hash).await }) {
+    match engine
+        .rt
+        .block_on(async { reader.get_block_by_hash(block_hash, full_transactions).await })
+    {
         Ok(Some(block)) => eljson::block_json(&block),
         Ok(None) => "null".to_string(), // never-verified/reorged-away hash → eth null
         Err(e) => eljson::error_json(&e),

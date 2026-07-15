@@ -271,9 +271,9 @@ pub unsafe extern "C" fn myotis_ens_record_json(
     into_c(crate::host::ens_record_json(handle, &params))
 }
 
-/// Verified `eth_getBlockByNumber`, transactions as hashes
-/// (`nativeGetBlockByNumberJson` twin). Returns the block JSON, the literal
-/// `"null"`, or `{"error": ...}`.
+/// Verified `eth_getBlockByNumber` (`nativeGetBlockByNumberJson` twin);
+/// `full_transactions` selects decoded tx objects over hashes. Returns the
+/// block JSON, the literal `"null"`, or `{"error": ...}`.
 ///
 /// # Safety
 /// `block_tag` must be null or a valid null-terminated C string.
@@ -281,9 +281,14 @@ pub unsafe extern "C" fn myotis_ens_record_json(
 pub unsafe extern "C" fn myotis_get_block_by_number_json(
     handle: i64,
     block_tag: *const c_char,
+    full_transactions: bool,
 ) -> *mut c_char {
     let block_tag = read_string(block_tag).unwrap_or_default();
-    into_c(crate::host::get_block_by_number_json(handle, &block_tag))
+    into_c(crate::host::get_block_by_number_json(
+        handle,
+        &block_tag,
+        full_transactions,
+    ))
 }
 
 /// Verified `eth_getTransactionReceipt` (`nativeGetTransactionReceiptJson`
@@ -316,9 +321,10 @@ pub unsafe extern "C" fn myotis_get_transaction_by_hash_json(
     into_c(crate::host::get_transaction_by_hash_json(handle, &tx_hash_hex))
 }
 
-/// Verified `eth_getBlockByHash` (`nativeGetBlockByHashJson` twin,
-/// transactions as hashes). Returns the block JSON, the literal `"null"` (a
-/// hash this engine never verified), or `{"error": ...}`.
+/// Verified `eth_getBlockByHash` (`nativeGetBlockByHashJson` twin);
+/// `full_transactions` selects decoded tx objects over hashes. Returns the
+/// block JSON, the literal `"null"` (a hash this engine never verified), or
+/// `{"error": ...}`.
 ///
 /// # Safety
 /// `block_hash_hex` must be null or a valid null-terminated C string.
@@ -326,9 +332,14 @@ pub unsafe extern "C" fn myotis_get_transaction_by_hash_json(
 pub unsafe extern "C" fn myotis_get_block_by_hash_json(
     handle: i64,
     block_hash_hex: *const c_char,
+    full_transactions: bool,
 ) -> *mut c_char {
     let block_hash_hex = read_string(block_hash_hex).unwrap_or_default();
-    into_c(crate::host::get_block_by_hash_json(handle, &block_hash_hex))
+    into_c(crate::host::get_block_by_hash_json(
+        handle,
+        &block_hash_hex,
+        full_transactions,
+    ))
 }
 
 /// Verified fee estimate: `{"gasPriceWei","maxPriorityFeePerGasWei"}` or
