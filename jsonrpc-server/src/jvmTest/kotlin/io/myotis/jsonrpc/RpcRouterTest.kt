@@ -111,7 +111,7 @@ class RpcRouterTest {
     }
 
     private fun route(backend: io.myotis.api.VerifiedReads?, body: String, proxy: UpstreamProxy? = null): String =
-        runBlocking { RpcRouter(proxy, MethodLogger(), backend).handle(body) }
+        runBlocking { RpcRouter(proxy, MethodLogger(), backend?.let { VerifiedReadsBackend(it) }).handle(body) }
 
     private fun result(resp: String): String? =
         json.parseToJsonElement(resp).jsonObject["result"]?.jsonPrimitive?.content
