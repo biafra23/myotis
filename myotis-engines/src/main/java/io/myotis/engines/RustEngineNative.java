@@ -23,7 +23,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 15; // 15: + nativeGetTransactionByHashJson / nativeGetBlockByHashJson
+    static final int EXPECTED_ABI_VERSION = 16; // 16: + nativeFeeHistoryJson
 
     private static final boolean AVAILABLE = load();
 
@@ -264,4 +264,18 @@ final class RustEngineNative {
      * this native runs).
      */
     static native String nativeGetBlockByHashJson(long handle, String blockHashHex);
+
+    /**
+     * Verified {@code eth_feeHistory} for a running handle: base fees and gas-used
+     * ratios from the beacon-anchored header window, reward percentiles (when
+     * requested) from bodies verified against {@code transactionsRoot} and receipts
+     * against {@code receiptsRoot} (geth's gas-used-weighted walk).
+     * {@code newestBlockTag} is the RPC block selector; {@code percentilesJson} is
+     * a JSON array of percentiles (e.g. {@code [25.0, 75.0]}), or empty to omit the
+     * reward matrix. Returns the feeHistory JSON object
+     * ({@code {"oldestBlock","baseFeePerGas","gasUsedRatio"[,"reward"]}}) or an
+     * {@code "error"} object — no {@code "null"} literal case for this method.
+     */
+    static native String nativeFeeHistoryJson(
+            long handle, long blockCount, String newestBlockTag, String percentilesJson);
 }

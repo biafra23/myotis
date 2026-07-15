@@ -338,6 +338,30 @@ pub extern "C" fn myotis_fee_estimate_json(handle: i64) -> *mut c_char {
     into_c(crate::host::fee_estimate_json(handle))
 }
 
+/// Verified `eth_feeHistory` (`nativeFeeHistoryJson` twin). `percentiles_json`
+/// is a JSON array of reward percentiles, or null/empty to omit the reward
+/// matrix. Returns the feeHistory JSON or `{"error": ...}`.
+///
+/// # Safety
+/// `newest_block_tag` and `percentiles_json` must each be null or valid
+/// null-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_fee_history_json(
+    handle: i64,
+    block_count: i64,
+    newest_block_tag: *const c_char,
+    percentiles_json: *const c_char,
+) -> *mut c_char {
+    let newest_block_tag = read_string(newest_block_tag).unwrap_or_default();
+    let percentiles_json = read_string(percentiles_json).unwrap_or_default();
+    into_c(crate::host::fee_history_json(
+        handle,
+        block_count,
+        &newest_block_tag,
+        &percentiles_json,
+    ))
+}
+
 /// Gossip a signed raw tx: `{"txHash":"0x…"}` or `{"error": ...}`
 /// (`nativeSendRawTransactionJson` twin).
 ///

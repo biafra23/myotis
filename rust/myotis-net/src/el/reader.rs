@@ -338,6 +338,37 @@ struct TxScanState {
 /// (mirrors the Java `TIP_SUGGEST_BLOCKS`).
 const TIP_SUGGEST_BLOCKS: u64 = 3;
 
+/// `eth_feeHistory` block-count clamp (the Java `FEE_HISTORY_MAX_BLOCKS`) —
+/// each block with reward percentiles costs a verified body + receipts fetch.
+const FEE_HISTORY_MAX_BLOCKS: u64 = 10;
+
+/// Per-peer deadline for one `eth_feeHistory` build (header window + the
+/// pipelined per-block body/receipt fetches) — the Java stage timeout.
+const FEE_HISTORY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a last-good `eth_feeHistory` result may be re-served when a fresh
+/// build fails (the Java `RPC_HEAD_SERVE_STALE_MAX_MS`: same request signature
+/// ⇒ identical verified data, just older — correct-but-stale, never wrong).
+const FEE_HISTORY_STALE_MAX: std::time::Duration = std::time::Duration::from_secs(64 * 12);
+
+/// A verified `eth_feeHistory` result (the Java `rpcFeeHistory` twin). Every
+/// value comes from the beacon-anchored header window; rewards additionally
+/// from bodies verified against `transactionsRoot` and receipts against
+/// `receiptsRoot` (gas-used-weighted percentile walk, geth's algorithm).
+#[derive(Debug, Clone)]
+pub struct FeeHistory {
+    pub oldest_block: u64,
+    /// `count + 1` entries: the requested blocks' base fees plus the NEXT
+    /// block's — its actual base fee when the anchored window extends past
+    /// `newest`, else the EIP-1559 prediction from `newest`.
+    pub base_fee_per_gas: Vec<u128>,
+    /// `count` entries: `gasUsed / gasLimit` (0.0 for a zero gasLimit).
+    pub gas_used_ratio: Vec<f64>,
+    /// `count` rows of one effective tip per requested percentile; `None` when
+    /// no percentiles were requested (the `reward` key is then omitted).
+    pub reward: Option<Vec<Vec<u128>>>,
+}
+
 /// A verified fee suggestion (`eth_gasPrice` + `eth_maxPriorityFeePerGas`), both
 /// in wei. The tip is the median effective priority fee over the last
 /// `TIP_SUGGEST_BLOCKS` verified blocks (floored); the gas price is the next
@@ -376,6 +407,11 @@ pub struct ElReader {
     /// ONLY by blocks this reader itself verified (the receipt/tx scan and the
     /// by-number serve); the shared LRU is the myotis-evm cache one.
     block_hash_numbers: std::sync::Mutex<myotis_evm::Lru<[u8; 32], u64>>,
+    /// The last successfully built `eth_feeHistory`, re-servable within
+    /// [`FEE_HISTORY_STALE_MAX`] for the SAME request signature when a fresh
+    /// build fails (the Java `lastGoodFeeHistory` twin — fees drift slowly and
+    /// the wallet re-polls, so correct-but-stale beats an error).
+    last_fee_history: std::sync::Mutex<Option<(String, FeeHistory, std::time::Instant)>>,
 }
 
 /// The scan-cursor map plus its last TTL sweep — one lock covers both, so the
@@ -476,6 +512,7 @@ impl ElReader {
                 last_sweep: std::time::Instant::now(),
             }),
             block_hash_numbers: std::sync::Mutex::new(myotis_evm::Lru::new(BLOCK_HASH_LRU_MAX)),
+            last_fee_history: std::sync::Mutex::new(None),
         })
     }
 
@@ -1296,6 +1333,172 @@ impl ElReader {
         Ok(FeeEstimate { max_priority_fee_wei: tip, gas_price_wei: gas_price })
     }
 
+    /// Verified `eth_feeHistory` (the Java `rpcFeeHistory` twin). `newest_block`
+    /// `None` = the latest tag (the beacon-anchored head); `reward_percentiles`
+    /// `None` omits the reward matrix (its per-block cost is a verified body +
+    /// receipts fetch). `block_count` is clamped to [`FEE_HISTORY_MAX_BLOCKS`];
+    /// the result reflects what was served.
+    ///
+    /// On a failed fresh build, the last-good result is re-served when it was
+    /// for the SAME request signature and is younger than
+    /// [`FEE_HISTORY_STALE_MAX`] (identical params ⇒ identical verified data,
+    /// just older — fees drift slowly and the wallet re-polls).
+    pub async fn fee_history(
+        &self,
+        block_count: u64,
+        newest_block: Option<u64>,
+        reward_percentiles: Option<&[f64]>,
+    ) -> Result<FeeHistory, String> {
+        // The exact request signature the stale-serve is keyed by.
+        let key = format!("{block_count}|{newest_block:?}|{reward_percentiles:?}");
+        match self.fee_history_fresh(block_count, newest_block, reward_percentiles).await {
+            Ok(history) => {
+                if let Ok(mut last) = self.last_fee_history.lock() {
+                    *last = Some((key, history.clone(), std::time::Instant::now()));
+                }
+                Ok(history)
+            }
+            Err(e) => {
+                if let Ok(last) = self.last_fee_history.lock() {
+                    if let Some((last_key, history, at)) = last.as_ref() {
+                        if *last_key == key && at.elapsed() < FEE_HISTORY_STALE_MAX {
+                            tracing::info!(
+                                age_secs = at.elapsed().as_secs(),
+                                "eth_feeHistory serving STALE result"
+                            );
+                            return Ok(history.clone());
+                        }
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// One fresh `eth_feeHistory` build (no stale fallback).
+    async fn fee_history_fresh(
+        &self,
+        block_count: u64,
+        newest_block: Option<u64>,
+        reward_percentiles: Option<&[f64]>,
+    ) -> Result<FeeHistory, String> {
+        if block_count == 0 {
+            return Err("blockCount must be at least 1".to_string());
+        }
+        let (head_num, head_hash) = self.anchored_head()?;
+        let newest = newest_block.unwrap_or(head_num);
+        if newest > head_num {
+            return Err("newest block is beyond the verified head".to_string());
+        }
+        let count = block_count.min(FEE_HISTORY_MAX_BLOCKS).min(newest + 1);
+        let oldest = newest + 1 - count;
+        if head_num - oldest >= BLOCK_LOOKBACK_MAX {
+            return Err(format!(
+                "oldest block {oldest} is beyond the {BLOCK_LOOKBACK_MAX}-block verify window"
+            ));
+        }
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err("no snap peer available".to_string());
+        }
+        let total = peers.len();
+        let mut last_err = String::new();
+        for peer in &peers {
+            let attempt = tokio::time::timeout(
+                FEE_HISTORY_DEADLINE,
+                self.fee_history_from(
+                    peer,
+                    oldest,
+                    count,
+                    head_num,
+                    &head_hash,
+                    reward_percentiles,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| Err("feeHistory build timed out".to_string()));
+            match attempt {
+                Ok(history) => {
+                    self.pool.record_snap_served(peer.addr()).await;
+                    return Ok(history);
+                }
+                Err(e) => {
+                    self.pool.record_snap_failure(peer.addr()).await;
+                    last_err = e;
+                }
+            }
+        }
+        Err(format!("all {total} snap peer(s) failed to serve a verifiable feeHistory: {last_err}"))
+    }
+
+    /// Build the fee history against one peer: one anchored window
+    /// `[oldest..head]` (the span past `newest` is what anchors it — and gives
+    /// the ACTUAL next-block base fee), then, when percentiles were requested,
+    /// every block's body + receipts fetched CONCURRENTLY (the Java pipelined
+    /// `verifiedBlockTipsAsync` — sequential per-block round-trips blew the
+    /// wallet's fee-poll timeout) and verified against `transactionsRoot` /
+    /// `receiptsRoot` before any tip is trusted.
+    async fn fee_history_from(
+        &self,
+        peer: &ManagedPeer,
+        oldest: u64,
+        count: u64,
+        head_num: u64,
+        head_hash: &[u8; 32],
+        reward_percentiles: Option<&[f64]>,
+    ) -> Result<FeeHistory, String> {
+        let window_len = head_num - oldest + 1;
+        let window = fetch_anchored_window(peer, oldest, window_len, head_hash).await?;
+        let count = count as usize;
+
+        let mut base_fee_per_gas: Vec<u128> =
+            window[..count].iter().map(|vh| header_base_fee(&vh.header)).collect();
+        // Entry count+1: the next block after `newest` — its actual base fee
+        // when the window extends past newest, else the EIP-1559 prediction.
+        base_fee_per_gas.push(if count < window.len() {
+            header_base_fee(&window[count].header)
+        } else {
+            next_base_fee(&window[count - 1].header)
+        });
+
+        let gas_used_ratio: Vec<f64> = window[..count]
+            .iter()
+            .map(|vh| {
+                let h = &vh.header;
+                if h.gas_limit > 0 { h.gas_used as f64 / h.gas_limit as f64 } else { 0.0 }
+            })
+            .collect();
+
+        let reward = match reward_percentiles {
+            None => None,
+            Some(percentiles) => {
+                // All bodies + receipts in flight at once on this peer's
+                // multiplexed connection; one slowest-block round-trip of
+                // wall-clock instead of 2×count sequential ones.
+                let per_block = futures::future::join_all(window[..count].iter().map(|vh| {
+                    let hash = [vh.hash];
+                    async move {
+                        let (bodies, receipts) = futures::future::join(
+                            peer.get_block_bodies(&hash),
+                            peer.get_receipts(&hash),
+                        )
+                        .await;
+                        (bodies, receipts)
+                    }
+                }))
+                .await;
+                let mut rows = Vec::with_capacity(count);
+                for (vh, (bodies, receipts)) in window[..count].iter().zip(per_block) {
+                    let tips = block_tx_tips(&vh.header, bodies?, receipts?)?;
+                    rows.push(percentile_rewards(tips, percentiles));
+                }
+                Some(rows)
+            }
+        };
+
+        Ok(FeeHistory { oldest_block: oldest, base_fee_per_gas, gas_used_ratio, reward })
+    }
+
     /// Gossip a signed raw transaction to peers (the engine never signs) and return
     /// `keccak256(rawTx)` — the tx hash — once at least one peer received the
     /// broadcast. `Err` when the input isn't a plausible tx or no peer could be
@@ -1817,6 +2020,73 @@ async fn fetch_anchored_window(
     Ok(window)
 }
 
+/// One block's per-tx `(effective_tip, gas_used)` list from its FETCHED body +
+/// receipts, verified against the (already anchored) header's
+/// `transactionsRoot` / `receiptsRoot` before anything is trusted (the Java
+/// `decodeBlockTips` twin). Strict like Java: an undecodable tx inside a
+/// verified body, a receipt-count mismatch, or a failed root fails the block.
+fn block_tx_tips(
+    header: &BlockHeader,
+    bodies: Vec<crate::el::eth::messages::BlockBody>,
+    receipt_blocks: Vec<Vec<Vec<u8>>>,
+) -> Result<Vec<(u128, u64)>, String> {
+    let body = bodies.into_iter().next().ok_or("peer returned no block body")?;
+    if !triehash::verify(&body.transactions, &header.transactions_root) {
+        return Err(format!(
+            "block {} body does not match the header transactionsRoot",
+            header.number
+        ));
+    }
+    if body.transactions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let receipts = receipt_blocks.into_iter().next().ok_or("peer returned no receipts")?;
+    if receipts.len() != body.transactions.len()
+        || !triehash::verify(&receipts, &header.receipts_root)
+    {
+        return Err(format!(
+            "block {} receipts do not match the header receiptsRoot ({} receipts for {} txs)",
+            header.number,
+            receipts.len(),
+            body.transactions.len()
+        ));
+    }
+    let base_fee = header_base_fee(header);
+    let mut out = Vec::with_capacity(body.transactions.len());
+    let mut prev_cum = 0u64;
+    for (raw, receipt) in body.transactions.iter().zip(&receipts) {
+        let tip = tx::effective_tip(raw, base_fee)
+            .ok_or_else(|| format!("block {} has an undecodable tx", header.number))?;
+        let cum = crate::el::receipt::decode(receipt)?.cumulative_gas_used;
+        out.push((tip, cum.saturating_sub(prev_cum)));
+        prev_cum = cum;
+    }
+    Ok(out)
+}
+
+/// Gas-used-weighted percentile rewards for one block — geth's algorithm, the
+/// Java `rewardJson` twin: sort txs by tip, walk each percentile's threshold
+/// over cumulative gasUsed, take that tx's tip. Empty block → zeros.
+fn percentile_rewards(mut tips: Vec<(u128, u64)>, percentiles: &[f64]) -> Vec<u128> {
+    if tips.is_empty() {
+        return vec![0; percentiles.len()];
+    }
+    tips.sort_unstable_by_key(|&(tip, _)| tip);
+    let total_gas: u64 = tips.iter().map(|&(_, gas)| gas).sum();
+    let mut out = Vec::with_capacity(percentiles.len());
+    let mut idx = 0usize;
+    let mut cum_gas = tips[0].1;
+    for &p in percentiles {
+        let threshold = total_gas as f64 * p / 100.0;
+        while (cum_gas as f64) < threshold && idx < tips.len() - 1 {
+            idx += 1;
+            cum_gas += tips[idx].1;
+        }
+        out.push(tips[idx].0);
+    }
+    out
+}
+
 /// Fetch a peer's fresh head header and return `(state_root, block_number)`.
 async fn fresh_head(peer: &ManagedPeer) -> Result<([u8; 32], u64), String> {
     let head_hash = peer.peer_status.best_hash;
@@ -2209,4 +2479,40 @@ mod tests {
         assert_eq!(cfg.min_suggested_tip_wei, 1_000_000, "gnosis cheap-chain tip floor");
     }
 
+    #[test]
+    fn percentile_rewards_walks_gas_weighted_thresholds() {
+        // Three txs, tips 1/5/10 gwei with gas weights 10k/70k/20k (total 100k).
+        // Sorted by tip the cumulative gas is 10k, 80k, 100k:
+        //   p10 → threshold 10k → cum 10k not < 10k → tip 1
+        //   p25 → threshold 25k → advance to cum 80k → tip 5
+        //   p90 → threshold 90k → advance to cum 100k → tip 10
+        let tips = vec![
+            (5_000_000_000u128, 70_000u64),
+            (1_000_000_000, 10_000),
+            (10_000_000_000, 20_000),
+        ];
+        assert_eq!(
+            percentile_rewards(tips.clone(), &[10.0, 25.0, 90.0]),
+            vec![1_000_000_000, 5_000_000_000, 10_000_000_000]
+        );
+        // 100th percentile lands on the last (highest-tip) tx.
+        assert_eq!(percentile_rewards(tips.clone(), &[100.0]), vec![10_000_000_000]);
+        // 0th percentile takes the cheapest tx (threshold 0 never advances).
+        assert_eq!(percentile_rewards(tips, &[0.0]), vec![1_000_000_000]);
+    }
+
+    #[test]
+    fn percentile_rewards_empty_block_is_zeros() {
+        assert_eq!(percentile_rewards(Vec::new(), &[25.0, 75.0]), vec![0, 0]);
+        assert!(percentile_rewards(Vec::new(), &[]).is_empty());
+    }
+
+    #[test]
+    fn percentile_rewards_zero_gas_weights_serve_the_cheapest_tip() {
+        // All-zero gas weights: every threshold is 0, the walk never advances →
+        // the cheapest tip for every percentile (mirrors the Java loop's
+        // `cumGas < threshold` never firing).
+        let tips = vec![(7u128, 0u64), (3, 0)];
+        assert_eq!(percentile_rewards(tips, &[50.0, 99.0]), vec![3, 3]);
+    }
 }

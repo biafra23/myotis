@@ -342,7 +342,15 @@ Spec: README §5.3, doc 04 §2. Highlights per PR-sized chunk:
      `buildTxJson` field set — chainId/gas/value/input/v/r/s), and the verified
      block-hash→number LRU (`blockHashToNumber` twin, populated by the receipt scan and
      the by-number serve) resolving `getBlockByHash` through the verified by-number path
-     with the reorg re-check. Still open from this chunk: `feeHistory`; the sent-tx
+     with the reorg re-check.
+   - **Landed (fees slice): `eth_feeHistory`** (ABI v16, `nativeFeeHistoryJson` +
+     `myotis_fee_history_json`): base fees / gas-used ratios from one anchored header
+     window `[oldest..head]` (the span past `newest` anchors it and gives the actual
+     next-block base fee), reward percentiles from bodies + receipts verified per block
+     against `transactionsRoot`/`receiptsRoot`, fetched concurrently (the Java
+     `verifiedBlockTipsAsync` pipelining), geth's gas-used-weighted percentile walk
+     (`percentile_rewards`), and the same-signature stale re-serve
+     (`lastGoodFeeHistory` twin). Chunk 2 is COMPLETE. Still open: the sent-tx
      broadcast-head reachback + own-tx pending answers + pending overlay (chunk 3).
 3. **`sendRawTransaction` + pending overlay.** Gossip raw bytes to all READY peers, return
    `keccak256(rawTx)`, cache own-tx bytes (shows pending until mined), rebroadcast until the

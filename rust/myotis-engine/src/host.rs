@@ -994,6 +994,70 @@ pub fn fee_estimate_json(handle: i64) -> String {
     }
 }
 
+/// `nativeFeeHistoryJson`: verified `eth_feeHistory` for a running handle.
+/// `newest_block_tag` is the RPC block selector; `percentiles_json` is a JSON
+/// array of reward percentiles (e.g. `[25.0,75.0]`), or empty/`"null"` to omit
+/// the reward matrix. Returns the feeHistory JSON
+/// (`{"oldestBlock","baseFeePerGas","gasUsedRatio"[,"reward"]}`) or
+/// `{"error": "..."}` — the Java engine's null/JSON two-state, no `"null"`
+/// literal case.
+pub fn fee_history_json(
+    handle: i64,
+    block_count: i64,
+    newest_block_tag: &str,
+    percentiles_json: &str,
+) -> String {
+    if block_count < 1 {
+        return eljson::error_json("blockCount must be at least 1");
+    }
+    // The feeHistory newest-block selector: head tags → latest (None); a number
+    // must be servable AT ALL (existence is re-checked against the head inside
+    // the reader); earliest/malformed are not served — mirrors rpcFeeHistory.
+    let newest = match parse_block_target(newest_block_tag.trim()) {
+        Ok(t) => t,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    let percentiles = match parse_percentiles(percentiles_json) {
+        Ok(p) => p,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    match engine.rt.block_on(async {
+        reader.fee_history(block_count as u64, newest, percentiles.as_deref()).await
+    }) {
+        Ok(history) => eljson::fee_history_json(&history),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// Parse the reward-percentiles JSON: absent (empty / `"null"`) → `None` (no
+/// reward matrix); else a JSON array of numbers. Bounded like the other JSON
+/// natives; the VALUES are not range-checked (the router owns RPC validation —
+/// this is the same pass-through the Java backend gets).
+fn parse_percentiles(json: &str) -> Result<Option<Vec<f64>>, &'static str> {
+    let json = json.trim();
+    if json.is_empty() || json == "null" {
+        return Ok(None);
+    }
+    if json.len() > 4096 {
+        return Err("percentiles JSON too long");
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(json).map_err(|_| "malformed percentiles JSON")?;
+    let arr = parsed.as_array().ok_or("percentiles must be a JSON array")?;
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        out.push(v.as_f64().ok_or("percentiles must be numbers")?);
+    }
+    Ok(Some(out))
+}
+
 /// Parse an eth block selector to a target number: `None` = latest (the head).
 /// Mirrors the Java backend — latest/pending/safe/finalized all resolve to the
 /// optimistic head; earliest (genesis) and malformed/negative are not served

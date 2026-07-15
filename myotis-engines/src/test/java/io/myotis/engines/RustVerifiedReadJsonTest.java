@@ -471,6 +471,37 @@ class RustVerifiedReadJsonTest {
         assertThrows(EngineException.class, () -> RustChainHandle.transactionJsonOrThrow("not json"));
     }
 
+    // ---- eth_feeHistory (feeHistoryJsonOrThrow) ----
+
+    @Test
+    void feeHistoryJsonPassesThroughObject() {
+        // The exact shape the Rust eljson::fee_history_json emits (its
+        // fee_history_json_shape_and_values test pins the other half of this
+        // golden): oldestBlock + hex QUANTITYs, raw JSON doubles, reward rows.
+        String feeHistory = "{\"oldestBlock\":\"0x1406f40\""
+                + ",\"baseFeePerGas\":[\"0x2540be400\",\"0x28fa6ae00\",\"0x2dfdc1c35\"]"
+                + ",\"gasUsedRatio\":[0.5,0.9932]"
+                + ",\"reward\":[[\"0x3b9aca00\",\"0x77359400\"],[\"0x0\",\"0xb2d05e00\"]]}";
+        assertEquals(feeHistory, RustChainHandle.feeHistoryJsonOrThrow(feeHistory));
+        // Without percentiles the reward key is absent — still a plain pass-through.
+        String noReward = "{\"oldestBlock\":\"0x1\",\"baseFeePerGas\":[\"0x0\",\"0x0\"]"
+                + ",\"gasUsedRatio\":[0.0,1.0]}";
+        assertEquals(noReward, RustChainHandle.feeHistoryJsonOrThrow(noReward));
+    }
+
+    @Test
+    void feeHistoryErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class, () -> RustChainHandle.feeHistoryJsonOrThrow(
+                "{\"error\":\"oldest block 20 is beyond the 256-block verify window\"}"));
+    }
+
+    @Test
+    void feeHistoryBlankOrMalformedPayloadThrows() {
+        assertThrows(EngineException.class, () -> RustChainHandle.feeHistoryJsonOrThrow(null));
+        assertThrows(EngineException.class, () -> RustChainHandle.feeHistoryJsonOrThrow(""));
+        assertThrows(EngineException.class, () -> RustChainHandle.feeHistoryJsonOrThrow("not json"));
+    }
+
     // ---- eth_gasPrice / eth_maxPriorityFeePerGas (feeFromJson) ----
 
     @Test

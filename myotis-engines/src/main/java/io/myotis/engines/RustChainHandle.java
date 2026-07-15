@@ -886,6 +886,23 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 gated(() -> RustEngineNative.nativeGetBlockByHashJson(handle, blockHashHex)));
     }
 
+    /**
+     * Verified eth_feeHistory: the result JSON object, or throws
+     * {@link EngineException} when it can't verify (transport / not-running /
+     * bad selector) — this method has no {@code "null"} literal case, but the
+     * shared tri-state parse tolerates one harmlessly. {@code percentilesJson}
+     * is a JSON array of reward percentiles, or empty to omit the reward matrix.
+     */
+    String feeHistoryJson(long blockCount, String newestBlockTag, String percentilesJson) {
+        return feeHistoryJsonOrThrow(gated(() -> RustEngineNative.nativeFeeHistoryJson(
+                handle, blockCount, newestBlockTag, percentilesJson)));
+    }
+
+    /** Package-private test seam: native feeHistory payload → JSON | throw. */
+    static String feeHistoryJsonOrThrow(String json) {
+        return jsonObjectOrThrow(json, "feeHistory");
+    }
+
     /** Package-private test seam: native block payload → block JSON | "null" | throw. */
     static String blockJsonOrThrow(String json) {
         return jsonObjectOrThrow(json, "block");

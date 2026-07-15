@@ -10,7 +10,7 @@
 
 use myotis_net::el::evm::{CallOutcome, EnsOutcome, EnsQueryOutcome, EnsRecordValue, GasOutcome};
 use myotis_net::el::reader::{
-    FeeEstimate, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedReceipt,
+    FeeEstimate, FeeHistory, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedReceipt,
     VerifiedStorage, VerifiedTransaction,
 };
 
@@ -414,6 +414,59 @@ pub fn tx_json(t: &VerifiedTransaction) -> String {
 /// Serialize a verified fee suggestion. Both values are decimal-wei strings (the
 /// FFI-neutral form the Java `VerifiedReads.gasPrice()/maxPriorityFeePerGas()`
 /// return); the Java side re-encodes to 0x-QUANTITY at the JSON-RPC boundary.
+/// Serialize a verified `eth_feeHistory` result. Mirrors the Java
+/// `rpcFeeHistory` emission exactly in shape: `oldestBlock` + every base fee /
+/// reward tip as minimal-hex QUANTITYs, `gasUsedRatio` as raw JSON numbers,
+/// and the `reward` key present only when percentiles were requested.
+/// (Ratio doubles use Rust's shortest round-trip formatting; Java's
+/// `Double.toString` may spell the same value differently — both parse to the
+/// identical double, which is the contract that matters for a JSON number.)
+pub fn fee_history_json(f: &FeeHistory) -> String {
+    let mut s = String::with_capacity(256);
+    s.push_str("{\"oldestBlock\":\"");
+    s.push_str(&hex_quantity(f.oldest_block));
+    s.push_str("\",\"baseFeePerGas\":[");
+    for (i, bf) in f.base_fee_per_gas.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('"');
+        s.push_str(&hex_quantity_u128(*bf));
+        s.push('"');
+    }
+    s.push_str("],\"gasUsedRatio\":[");
+    for (i, ratio) in f.gas_used_ratio.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        // {:?} keeps the ".0" on whole numbers (like Java's Double.toString),
+        // and stays shortest-round-trip elsewhere.
+        s.push_str(&format!("{ratio:?}"));
+    }
+    s.push(']');
+    if let Some(rows) = &f.reward {
+        s.push_str(",\"reward\":[");
+        for (i, row) in rows.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push('[');
+            for (j, tip) in row.iter().enumerate() {
+                if j > 0 {
+                    s.push(',');
+                }
+                s.push('"');
+                s.push_str(&hex_quantity_u128(*tip));
+                s.push('"');
+            }
+            s.push(']');
+        }
+        s.push(']');
+    }
+    s.push('}');
+    s
+}
+
 pub fn fee_json(f: &FeeEstimate) -> String {
     let mut obj = serde_json::Map::new();
     obj.insert("gasPriceWei".into(), f.gas_price_wei.to_string().into());
@@ -1246,6 +1299,44 @@ mod tests {
         assert!(v.get("from").is_none());
         assert_eq!(v["value"], "0x0");
         assert_eq!(v["input"], "0x");
+    }
+
+    #[test]
+    fn fee_history_json_shape_and_values() {
+        // The Java RustVerifiedReadJsonTest replays this shape — the two are the
+        // halves of the cross-language golden (mirrors rpcFeeHistory's emission).
+        let f = FeeHistory {
+            oldest_block: 21_000_000,
+            base_fee_per_gas: vec![10_000_000_000, 11_000_000_000, 12_345_678_901],
+            gas_used_ratio: vec![0.5, 0.9932],
+            reward: Some(vec![
+                vec![1_000_000_000, 2_000_000_000],
+                vec![0, 3_000_000_000],
+            ]),
+        };
+        let json = fee_history_json(&f);
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(v["oldestBlock"], "0x1406f40");
+        assert_eq!(v["baseFeePerGas"][0], "0x2540be400"); // 10 gwei
+        assert_eq!(v["baseFeePerGas"][2], "0x2dfdc1c35"); // the next-block entry
+        assert_eq!(v["baseFeePerGas"].as_array().unwrap().len(), 3); // count + 1
+        assert_eq!(v["gasUsedRatio"][0], 0.5);
+        assert_eq!(v["gasUsedRatio"][1], 0.9932);
+        assert_eq!(v["reward"][0][0], "0x3b9aca00"); // 1 gwei
+        assert_eq!(v["reward"][1][0], "0x0"); // empty-block zero tip
+        assert_eq!(v["reward"][1][1], "0xb2d05e00"); // 3 gwei
+        // Whole-number ratios keep the ".0" (Java Double.toString parity).
+        let whole = FeeHistory {
+            oldest_block: 1,
+            base_fee_per_gas: vec![0, 0],
+            gas_used_ratio: vec![0.0, 1.0],
+            reward: None,
+        };
+        let raw = fee_history_json(&whole);
+        assert!(raw.contains("\"gasUsedRatio\":[0.0,1.0]"), "raw: {raw}");
+        assert!(raw.contains("\"baseFeePerGas\":[\"0x0\",\"0x0\"]"), "raw: {raw}");
+        // No percentiles requested → the reward key is absent entirely.
+        assert!(!raw.contains("reward"));
     }
 
     #[test]
