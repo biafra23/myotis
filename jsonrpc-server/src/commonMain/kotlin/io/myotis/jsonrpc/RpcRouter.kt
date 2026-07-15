@@ -355,10 +355,14 @@ class RpcRouter(
                 // field → strict error, never a fabricated zero.
                 val sr = statusReads ?: return null
                 val peers = withContext(rpcIoDispatcher) {
-                    runCatching {
+                    try {
                         (sr.statusJson(sr.uptimeSeconds())["connectedPeers"] as? JsonPrimitive)
                             ?.contentOrNull?.toLongOrNull()
-                    }.getOrNull()
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e // never swallow cancellation (the myotis_status rule)
+                    } catch (e: Exception) {
+                        null
+                    }
                 } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexQuantity(peers)))
             }

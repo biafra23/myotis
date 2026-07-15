@@ -63,13 +63,19 @@ internal object Keccak256 {
         return out
     }
 
-    /** XOR one RATE-sized block into the state, lanes little-endian. */
+    /** XOR one RATE-sized block into the state, lanes little-endian
+     *  (unrolled — no per-byte loop bookkeeping on the 17 lanes per block). */
     private fun absorb(state: ULongArray, data: ByteArray, offset: Int) {
         for (i in 0 until RATE / 8) {
-            var lane = 0uL
-            for (j in 7 downTo 0) {
-                lane = (lane shl 8) or data[offset + i * 8 + j].toUByte().toULong()
-            }
+            val base = offset + i * 8
+            val lane = data[base].toUByte().toULong() or
+                (data[base + 1].toUByte().toULong() shl 8) or
+                (data[base + 2].toUByte().toULong() shl 16) or
+                (data[base + 3].toUByte().toULong() shl 24) or
+                (data[base + 4].toUByte().toULong() shl 32) or
+                (data[base + 5].toUByte().toULong() shl 40) or
+                (data[base + 6].toUByte().toULong() shl 48) or
+                (data[base + 7].toUByte().toULong() shl 56)
             state[i] = state[i] xor lane
         }
     }
