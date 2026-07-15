@@ -1,6 +1,5 @@
 package io.myotis.jsonrpc
 
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -15,6 +14,7 @@ import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import kotlin.time.TimeSource
 
 /**
  * Routes a JSON-RPC request body. Phase A: every method is relayed to the
@@ -29,8 +29,8 @@ import kotlinx.serialization.json.put
 class RpcRouter(
     private val proxy: UpstreamProxy?,
     private val logger: MethodLogger,
-    private val backend: io.myotis.api.VerifiedReads? = null,
-    private val statusReads: io.myotis.api.NodeStatusReads? = null,
+    private val backend: RpcBackend? = null,
+    private val statusReads: RpcStatusSource? = null,
 ) {
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
@@ -50,7 +50,7 @@ class RpcRouter(
     }
 
     suspend fun handle(body: String): String {
-        val t0 = System.nanoTime()
+        val t0 = TimeSource.Monotonic.markNow()
         val root = try {
             json.parseToJsonElement(body)
         } catch (e: Exception) {
@@ -85,7 +85,8 @@ class RpcRouter(
         }
     }
 
-    private fun elapsedMs(t0: Long): Long = (System.nanoTime() - t0) / 1_000_000
+    private fun elapsedMs(t0: TimeSource.Monotonic.ValueTimeMark): Long =
+        t0.elapsedNow().inWholeMilliseconds
 
     /** The request id rendered for the access log ({@code 42} / {@code "abc"} / {@code null}),
      *  bounded so a pathological id can't produce a giant log line. */
@@ -124,12 +125,10 @@ class RpcRouter(
                 // nativeStatusJson), so run them on the IO dispatcher rather than blocking the
                 // Ktor CIO event loop — same as the verified handlers below. For the Java engine
                 // these are cheap in-memory reads, so this is a no-op there.
-                val result = withContext(Dispatchers.IO) {
+                val result = withContext(rpcIoDispatcher) {
                     val uptime = sr.uptimeSeconds()   // read once so both fields/branches agree
-                    if (method == "myotis_status")
-                        StatusJson.status(sr.status(), uptime)
-                    else
-                        StatusJson.beaconStatus(sr.beaconStatus(), uptime)
+                    if (method == "myotis_status") sr.statusJson(uptime)
+                    else sr.beaconStatusJson(uptime)
                 }
                 logger.record(method, idStr, "LOCAL", 0)
                 resultEnvelope(id, result)
@@ -137,11 +136,11 @@ class RpcRouter(
                 throw e   // never swallow coroutine cancellation (client disconnect / shutdown)
             } catch (e: Exception) {
                 logger.record(method, idStr, "ERROR", 0, -32603)
-                val detail = e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
+                val detail = e.message?.takeIf { it.isNotBlank() } ?: (e::class.simpleName ?: "Exception")
                 errorEnvelope(id, -32603, "status read failed: $detail")
             }
         }
-        val t0 = System.nanoTime()
+        val t0 = TimeSource.Monotonic.markNow()
         val verified = tryVerified(method, id, root)
         if (verified != null) {
             logger.record(method!!, idStr, "VERIFIED", elapsedMs(t0))
@@ -163,7 +162,7 @@ class RpcRouter(
             }
         }
         // Dev-only proxy fallback (never used in production / strict mode).
-        val pt0 = System.nanoTime()
+        val pt0 = TimeSource.Monotonic.markNow()
         val forwardBody = wholeBody ?: json.encodeToString(JsonObject.serializer(), root)
         return try {
             val response = proxy.forward(forwardBody)
@@ -222,28 +221,28 @@ class RpcRouter(
                 } else null
                 val block = p.blockTag(1)
                 // VerifiedReads takes wei as a decimal string (FFI-neutral boundary).
-                val out = withContext(Dispatchers.IO) { b.call(from, to, data, value?.toString(), block) } ?: return null
+                val out = withContext(rpcIoDispatcher) { b.call(from, to, data, value, block) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexData(out)))
             }
             "eth_getBalance" -> {
                 val p = root.params()
                 val addr = (p?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
                 val block = p.blockTag(1)
-                val bal = withContext(Dispatchers.IO) { b.getBalance(addr, block) } ?: return null
+                val bal = withContext(rpcIoDispatcher) { b.getBalance(addr, block) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexQuantityDecimal(bal)))
             }
             "eth_getTransactionCount" -> {
                 val p = root.params()
                 val addr = (p?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
                 val block = p.blockTag(1)
-                val nonce = withContext(Dispatchers.IO) { b.getTransactionCount(addr, block) } ?: return null
+                val nonce = withContext(rpcIoDispatcher) { b.getTransactionCount(addr, block) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexQuantity(nonce)))
             }
             "eth_getCode" -> {
                 val p = root.params()
                 val addr = (p?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
                 val block = p.blockTag(1)
-                val code = withContext(Dispatchers.IO) { b.getCode(addr, block) } ?: return null
+                val code = withContext(rpcIoDispatcher) { b.getCode(addr, block) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexData(code)))
             }
             "eth_getStorageAt" -> {
@@ -251,12 +250,12 @@ class RpcRouter(
                 val addr = (p?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
                 val slot = (p?.getOrNull(1))?.asWord32() ?: return null
                 val block = p.blockTag(2)
-                val v = withContext(Dispatchers.IO) { b.getStorageAt(addr, slot, block) } ?: return null
+                val v = withContext(rpcIoDispatcher) { b.getStorageAt(addr, slot, block) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexData(v)))
             }
             "eth_sendRawTransaction" -> {
                 val raw = (root.params()?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
-                val hash = withContext(Dispatchers.IO) { b.sendRawTransaction(raw) } ?: return null
+                val hash = withContext(rpcIoDispatcher) { b.sendRawTransaction(raw) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexData(hash)))
             }
             "eth_getTransactionReceipt" -> {
@@ -267,14 +266,14 @@ class RpcRouter(
                 // CAN'T verify (not synced / no peer), which falls through to the strict
                 // error — so we never tell the wallet "pending on a healthy chain" when we
                 // actually couldn't check.
-                val receiptJson = withContext(Dispatchers.IO) { b.getTransactionReceipt(txHash) } ?: return null
+                val receiptJson = withContext(rpcIoDispatcher) { b.getTransactionReceipt(txHash) } ?: return null
                 resultEnvelope(id, json.parseToJsonElement(receiptJson)) // "null" → JsonNull result
             }
             "eth_getTransactionByHash" -> {
                 val txHash = (root.params()?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
                 // Object string when found (mined or pending-from-our-cache); "null" for a
                 // verified-unknown tx; Kotlin null (can't verify) → strict error.
-                val txJson = withContext(Dispatchers.IO) { b.getTransactionByHash(txHash) } ?: return null
+                val txJson = withContext(rpcIoDispatcher) { b.getTransactionByHash(txHash) } ?: return null
                 resultEnvelope(id, json.parseToJsonElement(txJson))
             }
             "eth_getBlockByNumber" -> {
@@ -290,7 +289,7 @@ class RpcRouter(
                 }
                 // Object string when found; "null" for a future/unknown block; Kotlin null
                 // (can't verify) → fall through to the strict error.
-                val blockJson = withContext(Dispatchers.IO) { b.getBlockByNumber(block, fullTx) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, fullTx) } ?: return null
                 resultEnvelope(id, json.parseToJsonElement(blockJson))
             }
             "eth_getBlockByHash" -> {
@@ -305,15 +304,15 @@ class RpcRouter(
                 }
                 // Object string when found; "null" for an unknown/non-canonical hash; Kotlin
                 // null (can't verify) → strict error.
-                val blockJson = withContext(Dispatchers.IO) { b.getBlockByHash(blockHash, fullTx) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, fullTx) } ?: return null
                 resultEnvelope(id, json.parseToJsonElement(blockJson))
             }
             "eth_gasPrice" -> {
-                val price = withContext(Dispatchers.IO) { b.gasPrice() } ?: return null
+                val price = withContext(rpcIoDispatcher) { b.gasPrice() } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexQuantityDecimal(price)))
             }
             "eth_maxPriorityFeePerGas" -> {
-                val tip = withContext(Dispatchers.IO) { b.maxPriorityFeePerGas() } ?: return null
+                val tip = withContext(rpcIoDispatcher) { b.maxPriorityFeePerGas() } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexQuantityDecimal(tip)))
             }
             "eth_feeHistory" -> {
@@ -343,7 +342,7 @@ class RpcRouter(
                     }
                     else -> return null
                 }
-                val historyJson = withContext(Dispatchers.IO) { b.feeHistory(blockCount, newest, pctArr) }
+                val historyJson = withContext(rpcIoDispatcher) { b.feeHistory(blockCount, newest, pctArr) }
                     ?: return null
                 resultEnvelope(id, json.parseToJsonElement(historyJson))
             }
@@ -360,7 +359,7 @@ class RpcRouter(
                     val s = (valueElement as? JsonPrimitive)?.contentOrNull ?: return null
                     parseWeiQuantity(s) ?: return null
                 } else null
-                val gas = withContext(Dispatchers.IO) { b.estimateGas(from, to, data, value?.toString()) } ?: return null
+                val gas = withContext(rpcIoDispatcher) { b.estimateGas(from, to, data, value) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexQuantity(gas)))
             }
             else -> null
@@ -405,30 +404,17 @@ class RpcRouter(
     }
 
     /** Ethereum JSON-RPC QUANTITY encoding: minimal hex, no leading zeros, 0 -> "0x0". */
-    private fun hexQuantity(v: Long): String = "0x" + java.lang.Long.toHexString(v)
-    private fun hexQuantity(v: java.math.BigInteger): String = "0x" + v.toString(16)
+    private fun hexQuantity(v: Long): String = RpcQuantities.hexQuantity(v)
 
-    /** QUANTITY encode a decimal wei string (the FFI-neutral form VerifiedReads returns for
-     *  balances/fees). Parsed to BigInteger, then minimal hex. */
-    private fun hexQuantityDecimal(decimal: String): String = "0x" + java.math.BigInteger(decimal).toString(16)
+    /** QUANTITY encode a decimal wei string (the FFI-neutral form the backend returns for
+     *  balances/fees). */
+    private fun hexQuantityDecimal(decimal: String): String = RpcQuantities.hexQuantityDecimal(decimal)
 
     /** Parse a JSON-RPC QUANTITY (hex `0x…` or decimal) as a wei value, enforcing EVM
-     *  semantics: unsigned and <= 256 bits. Returns null for malformed / negative /
-     *  out-of-range input. The length cap is checked BEFORE constructing the BigInteger so
-     *  an absurdly long string can't amplify parsing cost (0x + 64 hex digits, or ~78
-     *  decimal digits, covers the full 2^256 range). Shared by eth_call and eth_estimateGas
-     *  so both apply identical value validation. */
-    private fun parseWeiQuantity(s: String): java.math.BigInteger? {
-        if (s.isEmpty() || s.length > 80) return null
-        return try {
-            val v = if (s.startsWith("0x") || s.startsWith("0X"))
-                java.math.BigInteger(s.substring(2).ifEmpty { "0" }, 16)
-            else java.math.BigInteger(s)
-            if (v.signum() < 0 || v.bitLength() > 256) null else v
-        } catch (e: NumberFormatException) {
-            null
-        }
-    }
+     *  semantics: unsigned and <= 256 bits. Returns the normalized DECIMAL string (the
+     *  backend seam's wei form), or null for malformed / negative / out-of-range input.
+     *  Shared by eth_call and eth_estimateGas so both apply identical value validation. */
+    private fun parseWeiQuantity(s: String): String? = RpcQuantities.parseWeiQuantity(s)
 
     /** Ethereum JSON-RPC DATA encoding: 0x-prefixed, every byte rendered (leading
      *  zeros kept). Allocation-free — eth_getCode returns up to ~24KB of bytecode,
@@ -441,7 +427,7 @@ class RpcRouter(
             out[i * 2 + 2] = HEX_DIGITS[v ushr 4]
             out[i * 2 + 3] = HEX_DIGITS[v and 0x0f]
         }
-        return String(out)
+        return out.concatToString()
     }
 
     private fun JsonObject.method(): String? = this["method"]?.jsonPrimitive?.contentOrNull

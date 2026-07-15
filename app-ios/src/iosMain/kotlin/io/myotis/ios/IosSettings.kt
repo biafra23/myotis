@@ -2,7 +2,6 @@ package io.myotis.ios
 
 import io.myotis.ui.Settings
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
 import platform.Foundation.NSUserDefaults
 
 /** The slice of the engine's NetworkInfo catalog the Settings seam needs. */
@@ -15,7 +14,6 @@ internal data class IosNetworkInfo(
     val defaultRpcPort: Int,
 )
 
-internal val engineJson = Json { ignoreUnknownKeys = true }
 
 /**
  * The iOS [Settings] actual: NSUserDefaults-backed (the platform's

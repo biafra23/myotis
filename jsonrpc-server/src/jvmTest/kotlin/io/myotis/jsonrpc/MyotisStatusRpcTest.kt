@@ -186,7 +186,7 @@ class MyotisStatusRpcTest {
     }
 
     private fun route(statusReads: NodeStatusReads?, body: String): String =
-        runBlocking { RpcRouter(null, MethodLogger(), null, statusReads).handle(body) }
+        runBlocking { RpcRouter(null, MethodLogger(), null, statusReads?.let { NodeStatusSource(it) }).handle(body) }
 
     @Test fun myotisStatus_returnsResult_withoutBackend() {
         val stub = StubStatus(statusSnapshot(), beaconStatus(BeaconState.SYNCED), 42L)

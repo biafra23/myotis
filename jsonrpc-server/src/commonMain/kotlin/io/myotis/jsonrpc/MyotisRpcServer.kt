@@ -6,8 +6,9 @@ import io.ktor.server.engine.embeddedServer
 import io.ktor.server.engine.EmbeddedServer
 import io.ktor.server.plugins.cors.routing.CORS
 import io.ktor.server.request.receiveText
+import io.ktor.server.response.respondBytesWriter
 import io.ktor.server.response.respondText
-import io.ktor.server.response.respondTextWriter
+import io.ktor.utils.io.writeStringUtf8
 import kotlinx.coroutines.async
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
@@ -15,7 +16,7 @@ import io.ktor.server.routing.routing
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
-import org.slf4j.LoggerFactory
+import kotlin.concurrent.Volatile
 
 /**
  * Embedded JSON-RPC HTTP server for Myotis (Ktor CIO engine — Android-safe).
@@ -36,46 +37,34 @@ class MyotisRpcServer(
     private val port: Int,
     private val upstreamUrl: String? = null,
     private val host: String = "127.0.0.1",
-    private val backend: io.myotis.api.VerifiedReads? = null,
-    private val statusReads: io.myotis.api.NodeStatusReads? = null,
+    private val backend: RpcBackend? = null,
+    private val statusReads: RpcStatusSource? = null,
 ) {
-    private val log = LoggerFactory.getLogger(MyotisRpcServer::class.java)
+    private companion object {
+        const val LOGGER = "io.myotis.jsonrpc.MyotisRpcServer"
 
-    /** RPC access log (shared with [MethodLogger]): concise per-call lines land here at INFO;
-     *  this server adds the full request+response body at DEBUG. Filter the Logs tab on "rpc",
-     *  or `grep 'jsonrpc.access'` the daemon log; drop the level to DEBUG for full bodies. */
-    private val accessLog = LoggerFactory.getLogger(MethodLogger.ACCESS_LOGGER)
+        /** How often to trickle a keep-alive whitespace byte while a response is still
+         *  being computed. Short enough to reset any sane per-read socket timeout
+         *  (OkHttp defaults to 10s), long enough to stay invisible for normal calls. */
+        const val HEARTBEAT_INTERVAL_MS = 5_000L
+
+        /** Per-body cap for the DEBUG access log — keeps a large eth_call / batch from
+         *  blowing the Android 50k-line ring or producing one enormous line. */
+        const val MAX_BODY_LOG_CHARS = 4_096
+    }
 
     private val proxy: UpstreamProxy? = upstreamUrl?.takeIf { it.isNotBlank() }?.let { UpstreamProxy(it) }
     private val logger = MethodLogger()
     private val router = RpcRouter(proxy, logger, backend, statusReads)
 
     /**
-     * Optional request/response capture for debugging + replay. Off unless the
-     * system property {@code myotis.rpc.capture} names a file: then every
-     * exchange is appended as one JSON line {@code {"t":<ms>,"req":<body>,"resp":<body>}}.
-     * Lets us record a real client session (e.g. a MetaMask send) once and replay
-     * it at the daemon on a loop while hardening the backend — no browser needed.
-     * Synchronized append; best-effort (capture failures never affect serving).
+     * Optional request/response capture for debugging + replay (JVM-only —
+     * gated on the {@code myotis.rpc.capture} system property; a no-op on iOS).
+     * Blocking disk I/O, so run off the Ktor request thread.
      */
-    private val captureFile: java.io.File? =
-        System.getProperty("myotis.rpc.capture")?.takeIf { it.isNotBlank() }?.let { java.io.File(it) }
-
     private suspend fun capture(req: String, resp: String) {
-        val f = captureFile ?: return
-        // Off the Ktor request thread: the append is blocking disk I/O, so run it on
-        // the IO dispatcher. (Capture is a debug feature, off by default; this keeps
-        // it from stalling request handling when it IS on.)
-        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            try {
-                val line = buildString {
-                    append("{\"t\":").append(System.currentTimeMillis())
-                    append(",\"req\":").append(req.trim())
-                    append(",\"resp\":").append(resp.trim())
-                    append("}\n")
-                }
-                synchronized(this@MyotisRpcServer) { f.appendText(line) }
-            } catch (_: Exception) { /* capture is best-effort */ }
+        kotlinx.coroutines.withContext(rpcIoDispatcher) {
+            appendRpcCapture(req, resp)
         }
     }
 
@@ -86,17 +75,6 @@ class MyotisRpcServer(
         return if (t.length > MAX_BODY_LOG_CHARS) {
             t.substring(0, MAX_BODY_LOG_CHARS) + "…(" + (t.length - MAX_BODY_LOG_CHARS) + " more)"
         } else t
-    }
-
-    private companion object {
-        /** How often to trickle a keep-alive whitespace byte while a response is still
-         *  being computed. Short enough to reset any sane per-read socket timeout
-         *  (OkHttp defaults to 10s), long enough to stay invisible for normal calls. */
-        const val HEARTBEAT_INTERVAL_MS = 5_000L
-
-        /** Per-body cap for the DEBUG access log — keeps a large eth_call / batch from
-         *  blowing the Android 50k-line ring or producing one enormous line. */
-        const val MAX_BODY_LOG_CHARS = 4_096
     }
 
     @Volatile
@@ -133,26 +111,27 @@ class MyotisRpcServer(
                     // than leaking — structured concurrency. (Its 120s backend deadline
                     // also bounds it regardless.)
                     kotlinx.coroutines.coroutineScope {
-                        val pending = async(kotlinx.coroutines.Dispatchers.IO) {
+                        val pending = async(rpcIoDispatcher) {
                             router.handle(body)
                         }
-                        call.respondTextWriter(ContentType.Application.Json) {
+                        call.respondBytesWriter(ContentType.Application.Json) {
                             var response: String? = null
                             while (response == null) {
                                 response = kotlinx.coroutines.withTimeoutOrNull(
                                     HEARTBEAT_INTERVAL_MS) { pending.await() }
                                 if (response == null) {
-                                    write(" ")
+                                    writeStringUtf8(" ")
                                     flush()
                                 }
                             }
-                            write(response)
+                            writeStringUtf8(response)
                             // Full request+response at DEBUG (concise per-call INFO lines come
                             // from MethodLogger). One record for the whole exchange, incl. batches
                             // and parse errors; bodies capped so a big eth_call / batch can't blow
                             // the Android log ring or produce one enormous line.
-                            if (accessLog.isDebugEnabled) {
-                                accessLog.debug("[rpc] req={} resp={}", cap(body), cap(response))
+                            if (rpcLogDebugEnabled(MethodLogger.ACCESS_LOGGER)) {
+                                rpcLogDebug(MethodLogger.ACCESS_LOGGER,
+                                    "[rpc] req=${cap(body)} resp=${cap(response)}")
                             }
                             capture(body, response)
                         }
@@ -162,10 +141,9 @@ class MyotisRpcServer(
         }
         server.start(wait = false)
         engine = server
-        log.info(
-            "[rpc] JSON-RPC server listening on http://{}:{} (mode={})",
-            host, port, if (proxy != null) "proxy" else "strict",
-        )
+        rpcLogInfo(LOGGER,
+            "[rpc] JSON-RPC server listening on http://$host:$port " +
+                "(mode=${if (proxy != null) "proxy" else "strict"})")
     }
 
     fun stop() {
@@ -173,6 +151,6 @@ class MyotisRpcServer(
         engine = null
         proxy?.close()
         logger.logSummary()
-        log.info("[rpc] JSON-RPC server stopped")
+        rpcLogInfo(LOGGER, "[rpc] JSON-RPC server stopped")
     }
 }

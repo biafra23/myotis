@@ -887,7 +887,7 @@ public final class ChainStack {
                 // it survives pause() (keeps listening) while the backend underneath
                 // is torn down and rebuilt, and a request on a paused stack wakes it.
                 io.myotis.jsonrpc.MyotisRpcServer server =
-                        new io.myotis.jsonrpc.MyotisRpcServer(rpcPort, null, "127.0.0.1", gatedReads, statusReads);
+                        io.myotis.jsonrpc.MyotisRpc.server(rpcPort, null, "127.0.0.1", gatedReads, statusReads);
                 server.start();
                 this.rpcServer = server;
                 this.rpcBackend = backend;
