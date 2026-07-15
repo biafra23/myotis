@@ -1,9 +1,13 @@
 package io.myotis.jsonrpc
 
 import io.ktor.server.application.install
+import io.ktor.server.application.serverConfig
 import io.ktor.server.cio.CIO
-import io.ktor.server.engine.embeddedServer
 import io.ktor.server.engine.EmbeddedServer
+import io.ktor.server.engine.applicationEnvironment
+import io.ktor.server.engine.connector
+import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.SupervisorJob
 import io.ktor.server.plugins.cors.routing.CORS
 import io.ktor.server.request.receiveText
 import io.ktor.server.response.respondBytesWriter
@@ -82,7 +86,39 @@ class MyotisRpcServer(
 
     fun start() {
         if (engine != null) return
-        val server = embeddedServer(CIO, port = port, host = host) {
+        // Contain EVERY async engine failure: Ktor CIO surfaces bind errors (and
+        // any other server-scope throw) asynchronously in its own coroutines,
+        // where an uncaught exception kills a Kotlin/Native process outright
+        // (seen live: EADDRINUSE from a TIME_WAIT-held port after a fast app
+        // relaunch). A supervised parent with a handler turns that class of
+        // crash into a log line + a dead listener the host can observe.
+        val crashGuard = CoroutineExceptionHandler { _, e ->
+            rpcLogInfo(LOGGER, "[rpc] server failed: $e — continuing without JSON-RPC")
+            engine = null
+        }
+        val config = serverConfig(applicationEnvironment { }) {
+            parentCoroutineContext = SupervisorJob() + crashGuard
+            module(moduleBody())
+        }
+        val server = EmbeddedServer(config, CIO) {
+            // TIME_WAIT sockets from a previous instance's connections must
+            // not fail the re-bind (a fast app relaunch is normal on mobile);
+            // this also matches the hosts' SO_REUSEADDR bind probes.
+            reuseAddress = true
+            connector {
+                port = this@MyotisRpcServer.port
+                host = this@MyotisRpcServer.host
+            }
+        }
+        server.start(wait = false)
+        engine = server
+        rpcLogInfo(LOGGER,
+            "[rpc] JSON-RPC server listening on http://$host:$port " +
+                "(mode=${if (proxy != null) "proxy" else "strict"})")
+    }
+
+    /** The Ktor application module: CORS + /health + the JSON-RPC POST route. */
+    private fun moduleBody(): io.ktor.server.application.Application.() -> Unit = {
             install(CORS) {
                 anyHost()
                 allowHeader(HttpHeaders.ContentType)
@@ -138,12 +174,6 @@ class MyotisRpcServer(
                     }
                 }
             }
-        }
-        server.start(wait = false)
-        engine = server
-        rpcLogInfo(LOGGER,
-            "[rpc] JSON-RPC server listening on http://$host:$port " +
-                "(mode=${if (proxy != null) "proxy" else "strict"})")
     }
 
     fun stop() {

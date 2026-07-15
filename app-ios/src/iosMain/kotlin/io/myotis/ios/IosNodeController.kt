@@ -84,6 +84,8 @@ class IosNodeController(
     // app-lifecycle nature; IosBackgroundKeepalive stretches that by the ~30 s
     // background-task grace so an in-flight wallet call can finish.
     private val rpcServers = mutableMapOf<String, MyotisRpcServer>()
+    // Listener outcome per network for the Status "RPC" row: port to serving.
+    private val rpcStates = mutableMapOf<String, Pair<Int, Boolean>>()
     // Per-network head-advance tracking behind verifiedHeadAgeMs — the same
     // "age since the optimistic head last advanced" scheme RustChainHandle uses.
     private val headAges = mutableMapOf<String, HeadAge>()
@@ -223,11 +225,18 @@ class IosNodeController(
             // share the Mac's loopback, the second app's listener killed it.
             if (!loopbackPortFree(port)) {
                 logs.append("WARN [$net] JSON-RPC port $port unavailable; continuing without RPC")
+                locked { rpcStates[net] = port to false }
                 return
             }
             server.start()
-            locked { rpcServers[net] = server }
-        }.onFailure { logs.append("ERROR failed to start the $net JSON-RPC listener: ${it.message}") }
+            locked {
+                rpcServers[net] = server
+                rpcStates[net] = port to true
+            }
+        }.onFailure {
+            logs.append("ERROR failed to start the $net JSON-RPC listener: ${it.message}")
+            locked { rpcStates[net] = settings.rpcPortFor(net) to false }
+        }
     }
 
     /** Probe-bind 127.0.0.1:[port] and release it (SO_REUSEADDR, JVM-probe parity). */
@@ -255,7 +264,7 @@ class IosNodeController(
 
     /** Blocking stop; caller holds [bootMutex] and runs on IO. */
     private fun drop(net: String) {
-        locked { rpcServers.remove(net) }?.let { runCatching { it.stop() } }
+        locked { rpcStates.remove(net); rpcServers.remove(net) }?.let { runCatching { it.stop() } }
         val handle = locked { handles.remove(net).also { startMarks.remove(net); headAges.remove(net) } }
         if (handle != null) RustEngine.stop(handle)
     }
@@ -464,6 +473,8 @@ class IosNodeController(
             readyPeerList = emptyList(),                 // not exposed over the FFI yet
             pauseCount = 0, totalPausedMs = 0L,          // idle-sleep isn't wired on iOS yet
             lastPauseEpochMs = 0L, lastResumeEpochMs = 0L, lastWakeReason = null,
+            rpcPort = locked { rpcStates[network] }?.first ?: 0,
+            rpcServing = locked { rpcStates[network] }?.second ?: false,
             lcHunting = o.engineBoolean("lcHunting"),
             elHunting = o.engineBoolean("elHunting"),
         )
