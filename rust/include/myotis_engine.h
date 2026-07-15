@@ -26,7 +26,7 @@ extern "C" {
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
- * differs from the version this header was written against (14). */
+ * differs from the version this header was written against (16). */
 int32_t myotis_init(void);
 
 /* Up to `max` buffered tracing lines, oldest first, newline-joined; ""
@@ -98,6 +98,12 @@ char *myotis_get_block_by_hash_json(int64_t handle,
                                     const char *block_hash_hex);
 /* {"gasPriceWei","maxPriorityFeePerGasWei"} or {"error"}. */
 char *myotis_fee_estimate_json(int64_t handle);
+/* eth_feeHistory: {"oldestBlock","baseFeePerGas","gasUsedRatio"[,"reward"]}
+ * or {"error"}. percentiles_json is a JSON number array, or NULL/"" to omit
+ * the reward matrix. */
+char *myotis_fee_history_json(int64_t handle, int64_t block_count,
+                              const char *newest_block_tag,
+                              const char *percentiles_json);
 /* {"txHash":"0x..."} or {"error"}. */
 char *myotis_send_raw_transaction_json(int64_t handle, const char *raw_tx_hex);
 

@@ -75,7 +75,19 @@ struct EngineState {
     rt: tokio::runtime::Runtime,
     handles: Mutex<HashMap<i64, ChainEntry>>,
     next_id: AtomicI64,
+    /// Per-handle last-good `eth_feeHistory`: the EMITTED JSON plus the raw
+    /// request signature it answered, re-servable within
+    /// [`FEE_HISTORY_STALE_MAX`] when a fresh build fails for the SAME
+    /// signature (the Java `lastGoodFeeHistory` twin — identical params ⇒
+    /// identical verified data, just older; fees drift slowly and the wallet
+    /// re-polls). Kept at the JSON layer so a hit costs a String clone, never
+    /// a result rebuild. Entries die with their handle (see `stop`).
+    fee_history_cache: Mutex<HashMap<i64, (String, String, std::time::Instant)>>,
 }
+
+/// How long a last-good `eth_feeHistory` result may be re-served (the Java
+/// `RPC_HEAD_SERVE_STALE_MAX_MS`).
+const FEE_HISTORY_STALE_MAX: std::time::Duration = std::time::Duration::from_secs(64 * 12);
 
 static ENGINE: OnceLock<Option<EngineState>> = OnceLock::new();
 
@@ -94,6 +106,7 @@ fn engine() -> Option<&'static EngineState> {
                     handles: Mutex::new(HashMap::new()),
                     // Start at 1 so a valid id is never confused with the -1 sentinel.
                     next_id: AtomicI64::new(1),
+                    fee_history_cache: Mutex::new(HashMap::new()),
                 }),
                 Err(_) => None,
             }
@@ -467,6 +480,10 @@ pub fn stop(handle: i64) {
         Ok(mut m) => m.remove(&handle),
         Err(_) => return,
     };
+    // The handle's cached feeHistory dies with it.
+    if let Ok(mut cache) = engine.fee_history_cache.lock() {
+        cache.remove(&handle);
+    }
     if let Some(ChainEntry::Running(_, sync, reader)) = entry {
         engine.rt.block_on(async move {
             sync.stop().await;
@@ -992,6 +1009,100 @@ pub fn fee_estimate_json(handle: i64) -> String {
         Ok(est) => eljson::fee_json(&est),
         Err(e) => eljson::error_json(&e),
     }
+}
+
+/// `nativeFeeHistoryJson`: verified `eth_feeHistory` for a running handle.
+/// `newest_block_tag` is the RPC block selector; `percentiles_json` is a JSON
+/// array of reward percentiles (e.g. `[25.0,75.0]`), or empty/`"null"` to omit
+/// the reward matrix. Returns the feeHistory JSON
+/// (`{"oldestBlock","baseFeePerGas","gasUsedRatio"[,"reward"]}`) or
+/// `{"error": "..."}` — the Java engine's null/JSON two-state, no `"null"`
+/// literal case.
+pub fn fee_history_json(
+    handle: i64,
+    block_count: i64,
+    newest_block_tag: &str,
+    percentiles_json: &str,
+) -> String {
+    if block_count < 1 {
+        return eljson::error_json("blockCount must be at least 1");
+    }
+    // The feeHistory newest-block selector: head tags → latest (None); a number
+    // must be servable AT ALL (existence is re-checked against the head inside
+    // the reader); earliest/malformed are not served — mirrors rpcFeeHistory.
+    let newest = match parse_block_target(newest_block_tag.trim()) {
+        Ok(t) => t,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    let percentiles = match parse_percentiles(percentiles_json) {
+        Ok(p) => p,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    // The raw request strings ARE the stale-serve signature (the Java
+    // `blockCount + "|" + newestBlock + "|" + Arrays.toString(percentiles)`).
+    let key = format!("{block_count}|{}|{}", newest_block_tag.trim(), percentiles_json.trim());
+    match engine.rt.block_on(async {
+        reader.fee_history(block_count as u64, newest, percentiles.as_deref()).await
+    }) {
+        Ok(history) => {
+            let json = eljson::fee_history_json(&history);
+            if let Ok(mut cache) = engine.fee_history_cache.lock() {
+                cache.insert(handle, (key, json.clone(), std::time::Instant::now()));
+            }
+            json
+        }
+        // A Reject is a bad request against the CURRENT head — answered as the
+        // error (→ -32000), never from a stale snapshot (Java parity: only
+        // BUILD failures reach serveStaleFeeHistory).
+        Err(myotis_net::el::reader::FeeHistoryError::Reject(msg)) => eljson::error_json(&msg),
+        Err(myotis_net::el::reader::FeeHistoryError::Build(msg)) => {
+            if let Ok(cache) = engine.fee_history_cache.lock() {
+                if let Some((last_key, json, at)) = cache.get(&handle) {
+                    // saturating + read once: explicit panic-free style (the
+                    // workspace convention under panic="abort"), and the gate
+                    // and the log line report the same age.
+                    let age = std::time::Instant::now().saturating_duration_since(*at);
+                    if *last_key == key && age < FEE_HISTORY_STALE_MAX {
+                        tracing::info!(
+                            age_secs = age.as_secs(),
+                            "eth_feeHistory serving STALE result"
+                        );
+                        return json.clone();
+                    }
+                }
+            }
+            eljson::error_json(&msg)
+        }
+    }
+}
+
+/// Parse the reward-percentiles JSON: absent (empty / `"null"`) → `None` (no
+/// reward matrix); else a JSON array of numbers. Bounded like the other JSON
+/// natives; the VALUES are not range-checked (the router owns RPC validation —
+/// this is the same pass-through the Java backend gets).
+fn parse_percentiles(json: &str) -> Result<Option<Vec<f64>>, &'static str> {
+    let json = json.trim();
+    if json.is_empty() || json == "null" {
+        return Ok(None);
+    }
+    if json.len() > 4096 {
+        return Err("percentiles JSON too long");
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(json).map_err(|_| "malformed percentiles JSON")?;
+    let arr = parsed.as_array().ok_or("percentiles must be a JSON array")?;
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        out.push(v.as_f64().ok_or("percentiles must be numbers")?);
+    }
+    Ok(Some(out))
 }
 
 /// Parse an eth block selector to a target number: `None` = latest (the head).

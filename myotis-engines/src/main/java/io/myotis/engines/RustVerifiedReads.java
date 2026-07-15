@@ -19,10 +19,11 @@ import org.slf4j.LoggerFactory;
  * {@code getBalance}, {@code getTransactionCount}, {@code getCode}, {@code getStorageAt},
  * {@code getBlockByNumber}, {@code getBlockByHash}, {@code getTransactionReceipt},
  * {@code getTransactionByHash}, {@code gasPrice}, {@code maxPriorityFeePerGas},
- * {@code sendRawTransaction}, plus the EVM-backed {@code call} and
- * {@code estimateGas} (revm over proof-verified state). Not yet served verified —
- * {@code feeHistory} and full-transaction blocks — return {@code null} ("cannot
- * answer verified right now"), which the router maps to a strict-mode {@code -32000}.
+ * {@code feeHistory}, {@code sendRawTransaction}, plus the EVM-backed {@code call}
+ * and {@code estimateGas} (revm over proof-verified state). The one remaining
+ * gap — full-transaction blocks ({@code fullTransactions=true}) — returns
+ * {@code null} ("cannot answer verified right now", mirroring the Java engine),
+ * which the router maps to a strict-mode {@code -32000}.
  *
  * <p><b>Head-anchored.</b> The Rust reader verifies against the peer's fresh head
  * (the CL-anchored latest state), so state reads resolve to that head. A selector
@@ -279,7 +280,24 @@ final class RustVerifiedReads implements VerifiedReads {
         }
     }
 
-    @Override public String feeHistory(long blockCount, String newestBlock, double[] rewardPercentiles) { return null; }
+    @Override
+    public String feeHistory(long blockCount, String newestBlock, double[] rewardPercentiles) {
+        if (blockCount < 1) return null;
+        try {
+            // Percentiles cross as a JSON number array (compound values cross as
+            // JSON, like every other native); null → empty → no reward matrix.
+            // Arrays.toString emits "[25.0, 75.0]" — valid JSON.
+            String percentilesJson = rewardPercentiles == null
+                    ? "" : java.util.Arrays.toString(rewardPercentiles);
+            String tag = (newestBlock == null || newestBlock.isBlank()) ? "latest" : newestBlock;
+            // The feeHistory JSON object, or throws when it can't verify
+            // (→ null → strict -32000). No "null" literal case for this method.
+            return handle.feeHistoryJson(blockCount, tag, percentilesJson);
+        } catch (RuntimeException e) {
+            log.debug("[engines] verified feeHistory unavailable: {}", e.getMessage());
+            return null;
+        }
+    }
     @Override
     public Long estimateGas(byte[] from, byte[] to, byte[] data, String valueWei) {
         // Contract creation (to == null) isn't handled.

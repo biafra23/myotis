@@ -34,7 +34,7 @@ object RustEngine {
 
     /** Must match `ABI_VERSION` in rust/myotis-engine/src/lib.rs — the same
      *  handshake `RustEngineNative.EXPECTED_ABI_VERSION` performs over JNI. */
-    const val EXPECTED_ABI_VERSION = 15
+    const val EXPECTED_ABI_VERSION = 16
 
     private val abiVersion: Int by lazy { myotis_init() }
 

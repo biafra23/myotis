@@ -38,7 +38,10 @@ pub mod ringlog;
 /// v15: added nativeGetTransactionByHashJson + nativeGetBlockByHashJson (the
 ///      wallet's post-receipt confirm loop; the same locate machinery + the
 ///      verified block-hash→number map).
-pub const ABI_VERSION: i32 = 15;
+/// v16: added nativeFeeHistoryJson (verified eth_feeHistory: anchored header
+///      window + gas-used-weighted reward percentiles from verified bodies and
+///      receipts).
+pub const ABI_VERSION: i32 = 16;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
@@ -433,6 +436,33 @@ mod jni_shim {
         handle: jlong,
     ) -> jstring {
         let json = crate::host::fee_estimate_json(handle);
+        match env.new_string(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// `RustEngineNative.nativeFeeHistoryJson(long handle, long blockCount,
+    /// String newestBlockTag, String percentilesJson)` — verified `eth_feeHistory`.
+    /// `percentilesJson` is a JSON array of reward percentiles, or empty to omit
+    /// the reward matrix. Returns the feeHistory JSON or `{"error": "..."}`.
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeFeeHistoryJson(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        block_count: jlong,
+        newest_block_tag: JString,
+        percentiles_json: JString,
+    ) -> jstring {
+        let newest_block_tag = read_string(&mut env, &newest_block_tag).unwrap_or_default();
+        let percentiles_json = read_string(&mut env, &percentiles_json).unwrap_or_default();
+        let json = crate::host::fee_history_json(
+            handle,
+            block_count,
+            &newest_block_tag,
+            &percentiles_json,
+        );
         match env.new_string(json) {
             Ok(s) => s.into_raw(),
             Err(_) => std::ptr::null_mut(),
