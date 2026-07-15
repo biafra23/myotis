@@ -57,7 +57,7 @@ class RpcAccessLogTest {
     }
 
     private fun route(body: String) {
-        runBlocking { RpcRouter(null, MethodLogger(), StubBackend()).handle(body) }
+        runBlocking { RpcRouter(null, MethodLogger(), VerifiedReadsBackend(StubBackend())).handle(body) }
     }
 
     private fun lines(): List<String> = appender.list.map { it.formattedMessage }

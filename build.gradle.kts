@@ -40,6 +40,7 @@ subprojects {
     //   ui           → kotlin-multiplatform + com.android.library + compose
     //   app-desktop  → kotlin.jvm + compose (desktop)
     //   app-ios      → kotlin-multiplatform + compose (iOS framework)
+    //   jsonrpc-server → kotlin-multiplatform (JVM hosts + the iOS RPC listener)
     // Excludes shared by EVERY module (Android plugin modules included):
     // - native Netty transports, for Android compatibility;
     // - Besu 26.4's log4j: it drags log4j-slf4j2-impl — a SECOND slf4j
@@ -62,7 +63,7 @@ subprojects {
         exclude(group = "org.apache.logging.log4j", module = "log4j-core")
     }
 
-    if (name in setOf("android-app", "ui", "app-desktop", "app-ios")) {
+    if (name in setOf("android-app", "ui", "app-desktop", "app-ios", "jsonrpc-server")) {
         return@subprojects
     }
 

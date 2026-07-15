@@ -330,7 +330,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 probe.bind(new java.net.InetSocketAddress("127.0.0.1", rpcPort));
             }
             io.myotis.jsonrpc.MyotisRpcServer server =
-                    new io.myotis.jsonrpc.MyotisRpcServer(rpcPort, null, "127.0.0.1", verifiedReads, this);
+                    io.myotis.jsonrpc.MyotisRpc.server(rpcPort, null, "127.0.0.1", verifiedReads, this);
             server.start();
             this.rpcServer = server;
             log.info("[{}] JSON-RPC listening on http://127.0.0.1:{} (verified, strict)",
