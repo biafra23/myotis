@@ -59,7 +59,8 @@ The integration builds on three assets:
 The known drift: the `feat/ios-target` C ABI was written against engine
 ABI **13**; `main` is at **14**. `capi.rs`/`myotis_engine.h` lack
 `myotis_get_transaction_receipt_json` and their handshake expectation needs
-the bump. Per the lockstep rule (docs/reimplementation/05), every future ABI
+the bump. Per the lockstep rule
+(docs/reimplementation/05-engine-api-bindings.md), every future ABI
 bump must update **both shims and the C header together**.
 
 ## Decisions
@@ -95,7 +96,8 @@ and `:myotis-engines`' minimal-json layer (JSON decode, error mapping,
   UI and would force the K/N toolchain onto every RN consumer. (A UI-free
   K/N "engine-only" framework shared by `:app-ios` and RN was considered
   and rejected for the same toolchain-weight reason.)
-- **Not** via UniFFI: already rejected for the JVM (doc 05 §1), and with
+- **Not** via UniFFI: already rejected for the JVM
+  (docs/reimplementation/05-engine-api-bindings.md §1), and with
   zero engine→host callbacks in the FFI, UniFFI's main selling point
   (callback interfaces) buys nothing here.
 - Panic policy carries over: the workspace builds `panic = "abort"`, so the
