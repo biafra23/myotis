@@ -672,19 +672,32 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         StatusRow("Beacon", s.beaconState)
         StatusRow("EL block", s.executionBlockNumber.toString())
         StatusRow("CL peers", "served ${s.clServedPeersLastMin}/min, con ${s.clConnectedPeers}")
-        StatusRow("EL peers", "ready ${s.readyPeers}, snap ${s.snapPeers}, serving ${s.snapServingPeers}")
-        // Cache rows: "proven" (CL) / "snap" (EL) predict how fast the NEXT
-        // cold start finds servers — the cache learning is visible live.
+        // Same total-first shape as the cache rows (the pool holds only ready
+        // peers, so the total IS the ready count).
+        StatusRow("EL peers", "${s.readyPeers} · snap ${s.snapPeers} · serving ${s.snapServingPeers}")
+        // Cache rows: confirmed-server counts predict how fast the NEXT cold
+        // start finds servers — the cache learning is visible live. One icon
+        // vocabulary for both rows, sized for phone-width screens:
+        // ✓ confirmed server (CL: proven LC · EL: snap-ok), ✕ confirmed not
+        // (nolc / snap-bad), ? untried.
+        // The derived untried bucket can't go negative from ONE CacheFileStats
+        // parse (buckets are mutually exclusive per line), but coerce anyway so
+        // a future host feeding these fields from another source can't render
+        // "?-3".
         StatusRow(
             "CL cache",
-            "${s.clCachedPeers} (lc ${s.clCachedProven}, nolc ${s.clCachedNolc}, " +
-                "untried ${s.clCachedPeers - s.clCachedProven - s.clCachedNolc})",
+            "${s.clCachedPeers} · ✓${s.clCachedProven} ✕${s.clCachedNolc} " +
+                "?${(s.clCachedPeers - s.clCachedProven - s.clCachedNolc).coerceAtLeast(0)}",
         )
-        StatusRow("EL cache", "${s.elCachedPeers} (snap ${s.elCachedSnapOk}, nosnap ${s.elCachedSnapBad})")
+        StatusRow(
+            "EL cache",
+            "${s.elCachedPeers} · ✓${s.elCachedSnapOk} ✕${s.elCachedSnapBad} " +
+                "?${(s.elCachedPeers - s.elCachedSnapOk - s.elCachedSnapBad).coerceAtLeast(0)}",
+        )
         // What peers ask US for: demand for our served headers/blocks, and how often we
         // could answer. Bodies-served stays 0 (light client; prompt empty replies).
-        StatusRow("Peer asks · headers", "${s.peerHeaderRequests} asked, ${s.peerHeaderRequestsServed} served")
-        StatusRow("Peer asks · blocks", "${s.peerBodyRequests} asked, ${s.peerBodyRequestsServed} served")
+        StatusRow("Hdr asks", "${s.peerHeaderRequests} · served ${s.peerHeaderRequestsServed}")
+        StatusRow("Blk asks", "${s.peerBodyRequests} · served ${s.peerBodyRequestsServed}")
         StatusRow("Discovered", s.discoveredPeers.toString())
         StatusRow("Discv5 peers", s.discv5Peers.toString())
         StatusRow("In backoff", s.backedOffPeers.toString())
@@ -692,7 +705,7 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         StatusRow("Sync period", "${s.syncCurrentPeriod} / ${s.syncTargetPeriod}")
         // verifiedHeadAgeMs == Long.MAX_VALUE is the "no verified head yet" sentinel — show a
         // dash instead of the raw ~9.2e18 ms, which would read as a nonsensical age.
-        StatusRow("Verified head age", if (s.verifiedHeadAgeMs == Long.MAX_VALUE) "—" else "${s.verifiedHeadAgeMs} ms")
+        StatusRow("Head age", if (s.verifiedHeadAgeMs == Long.MAX_VALUE) "—" else "${s.verifiedHeadAgeMs} ms")
         StatusRow("Uptime", "${s.uptimeSeconds}s")
         // Pseudo-sleep observability: how much the node has idle-slept, and when/why it
         // last woke. Foreground (opening the app) is excluded from the "last woke" reason,
@@ -704,7 +717,7 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         StatusRow(
             "Sleep",
             when {
-                !hostSleeps -> "always on — no idle-sleep controller on this host"
+                !hostSleeps -> "always on"
                 s.pauseCount == 0 -> "never slept"
                 else -> "${formatDuration(s.totalPausedMs)} over ${s.pauseCount} " +
                     "${if (s.pauseCount == 1) "pause" else "pauses"}"
