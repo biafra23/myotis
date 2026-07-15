@@ -142,6 +142,18 @@ Design rules:
   to hours. This naturally pushes toward **rotating batches**: validate batch A,
   let it quarantine untouched while batch B is being probed; use aged batch A
   over Tor; retire and re-probe it later.
+- **Every background clearnet loop must respect the quarantine.** This is not
+  automatic: today's peer maintenance re-dials cached peers in the clear all the
+  time (`ChainStack.maintainSnapPeers` tops up the active pool from the cache
+  every 10 s; discovery re-pings table peers every 15 s). Left unmodified, those
+  loops would keep touching quarantining peers and perpetually reset their
+  clocks — no peer would ever mature. So quarantine membership must be a hard
+  filter on *all* clearnet contact, not just on probing: the maintainer and
+  dial ranking draw only from the active (clearnet) batch, quarantining peers
+  are excluded from clearnet dialing entirely, and the Tor-side pool is the only
+  consumer that ever contacts them again. (Unsolicited *inbound* contact — a
+  quarantined peer pinging us via discv4 — doesn't reset the clock: the property
+  is about what our IP initiates toward that peer.)
 - **Fail closed.** When the aged, multi-source-confirmed pool runs dry, the
   Tor-side path must error or wait for the pool to refill — never fall back to
   freshly discovered peers, or the property silently evaporates exactly when
@@ -155,11 +167,18 @@ Design rules:
   *you* found them, so they are Tor-usable on day one with **zero aging**. The
   personally-discovered, quality-validated pool matures in quarantine and
   gradually takes over.
-- **Implementation is small.** The peer-cache line format already carries
-  learned quality tokens; adding a last-clearnet-contact timestamp is one more
-  column, and the Tor-side dial ranking filters on
+- **Implementation is small — but in a separate file, not a new `peers.cache`
+  column.** `peers.cache` is shared byte-identically between the Java and Rust
+  engines, and each engine's rewrite path serializes only the columns it knows
+  (`PeerCache.java`, `peercache.rs`) — since the Java engine gets no Tor mode
+  (§3), a Java-side rewrite would silently strip a Tor-only column. Quarantine
+  metadata (`lastClearnetContact`, discovery-source confirmations) therefore
+  lives in a **Tor-only sidecar** (e.g. `peers-tor<suffix>.cache`) keyed by the
+  peer's public key, owned exclusively by the Rust engine's Tor mode. The
+  Tor-side dial ranking joins it against the shared cache and filters on
   `now − lastClearnetContact > randomizedThreshold` before the existing
-  `snapok` preference.
+  `snapok` preference. (Entries whose peer disappears from `peers.cache` are
+  pruned; a missing sidecar just means an empty Tor pool — fail closed, §5.)
 
 ## 6. Attacks the delay does NOT stop (each needs its own fix)
 
