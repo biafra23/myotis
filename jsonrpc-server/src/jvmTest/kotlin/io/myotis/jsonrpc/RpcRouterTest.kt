@@ -673,6 +673,40 @@ class RpcRouterTest {
         assertEquals(true, json.parseToJsonElement(resp).jsonObject["result"] is JsonNull, resp)
     }
 
+    @Test fun compatByNumber_bareNumericSelector_isStrictError() {
+        // A JSON-number (or bare-string) selector must not reach the backend: the
+        // engines' bare-numeric conventions differ (Java decimal vs Rust hex), so
+        // only spec-shaped selectors pass — same gate as eth_getBlockReceipts.
+        val b = FakeBackend().apply {
+            blockJson = """{"number":"0x10","transactions":[],"uncles":[]}"""
+        }
+        for (params in listOf("""[291]""", """["291"]""")) {
+            val resp = route(b,
+                """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockTransactionCountByNumber","params":$params}""")
+            assertEquals(-32000, errorCode(resp))
+            assertNull(b.lastBlockTag) // never reached the backend
+        }
+    }
+
+    @Test fun txByIndex_hugeButWellFormedIndex_isNullResult() {
+        // A well-formed QUANTITY beyond any real list (incl. leading-zero forms)
+        // is "past the end" → eth's null result, not a retryable-looking error.
+        val b = FakeBackend().apply {
+            blockJson = """{"number":"0x10","transactions":[{"hash":"0xaa"}],"uncles":[]}"""
+        }
+        for (idx in listOf("0x100000000", "0x0000000001")) {
+            val resp = route(b,
+                """{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionByBlockNumberAndIndex","params":["0x10","$idx"]}""")
+            val result = json.parseToJsonElement(resp).jsonObject["result"]
+            if (idx == "0x0000000001") {
+                // leading zeros are still index 1 → past this 1-tx list's end → null
+                assertEquals(true, result is JsonNull, resp)
+            } else {
+                assertEquals(true, result is JsonNull, resp)
+            }
+        }
+    }
+
     @Test fun compatMethods_malformedIndex_isStrictError() {
         // A JSON-number index (not the spec's 0x-hex string) must not be coerced.
         val b = FakeBackend().apply {

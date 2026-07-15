@@ -350,12 +350,15 @@ class RpcRouter(
             "net_listening" -> resultEnvelope(id, JsonPrimitive(true))
             "net_peerCount" -> {
                 // Served from the same status snapshot myotis_status exposes; no
-                // status source wired (or a shape-drifted snapshot) → strict error,
-                // never a fabricated zero.
+                // status source wired, a throwing read (it can cross an FFI, like
+                // the myotis_status handler guards for), or a snapshot without the
+                // field → strict error, never a fabricated zero.
                 val sr = statusReads ?: return null
                 val peers = withContext(rpcIoDispatcher) {
-                    (sr.statusJson(sr.uptimeSeconds())["connectedPeers"] as? JsonPrimitive)
-                        ?.contentOrNull?.toLongOrNull()
+                    runCatching {
+                        (sr.statusJson(sr.uptimeSeconds())["connectedPeers"] as? JsonPrimitive)
+                            ?.contentOrNull?.toLongOrNull()
+                    }.getOrNull()
                 } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexQuantity(peers)))
             }
@@ -368,7 +371,7 @@ class RpcRouter(
             // answer out of its JSON — the tri-state (object | "null" | Kotlin
             // null) carries through unchanged.
             "eth_getBlockTransactionCountByNumber" -> {
-                val block = root.params().blockTag(0)
+                val block = root.params().specShapedBlockTag(0) ?: return null
                 val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) } ?: return null
                 blockArraySizeResult(id, blockJson, "transactions")
             }
@@ -379,7 +382,7 @@ class RpcRouter(
             }
             "eth_getTransactionByBlockNumberAndIndex" -> {
                 val p = root.params()
-                val block = p.blockTag(0)
+                val block = p.specShapedBlockTag(0) ?: return null
                 val index = p?.getOrNull(1)?.asQuantityIndex() ?: return null
                 val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, true) } ?: return null
                 txAtIndexResult(id, blockJson, index)
@@ -392,7 +395,7 @@ class RpcRouter(
                 txAtIndexResult(id, blockJson, index)
             }
             "eth_getUncleCountByBlockNumber" -> {
-                val block = root.params().blockTag(0)
+                val block = root.params().specShapedBlockTag(0) ?: return null
                 val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) } ?: return null
                 blockArraySizeResult(id, blockJson, "uncles")
             }
@@ -403,7 +406,7 @@ class RpcRouter(
             }
             "eth_getUncleByBlockNumberAndIndex" -> {
                 val p = root.params()
-                val block = p.blockTag(0)
+                val block = p.specShapedBlockTag(0) ?: return null
                 val index = p?.getOrNull(1)?.asQuantityIndex() ?: return null
                 val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) } ?: return null
                 uncleAtIndexResult(id, blockJson, index)
@@ -433,13 +436,7 @@ class RpcRouter(
                         ?.takeIf { it.isString }?.contentOrNull?.trim()?.ifEmpty { "latest" }
                         ?: return null
                 }
-                // ASCII hex only — Char.isDigit() also accepts Unicode digits, which
-                // the engines' ASCII-only parsers would then reject inconsistently.
-                val specShaped = selector in setOf("latest", "pending", "safe", "finalized", "earliest")
-                    || (selector.length > 2 && selector.length <= 66
-                        && (selector.startsWith("0x") || selector.startsWith("0X"))
-                        && selector.drop(2).all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' })
-                if (!specShaped) return null
+                if (!specShapedSelector(selector)) return null
                 // Array string when served; "null" for a verified unknown/future
                 // block; Kotlin null (can't verify) → strict error.
                 val receiptsJson =
@@ -512,6 +509,24 @@ class RpcRouter(
     private fun JsonArray?.blockTag(index: Int): String =
         (this?.getOrNull(index) as? JsonPrimitive)?.contentOrNull ?: "latest"
 
+    /** Spec-shaped block selector gate: a tag, or 0x-hex ASCII (≤ 66 chars —
+     *  covers numbers and 32-byte hashes). Applied to every selector-taking
+     *  method ADDED since the engines split, because their bare-numeric
+     *  conventions differ (the Java engine reads bare as decimal — and octal
+     *  under a leading zero — the Rust parser as hex): only spec shapes pass,
+     *  so the same request can never resolve to different blocks depending on
+     *  which engine is behind the router. Trimmed like both backends trim. */
+    private fun specShapedSelector(s: String): Boolean =
+        s in setOf("latest", "pending", "safe", "finalized", "earliest")
+            || (s.length > 2 && s.length <= 66
+                && (s.startsWith("0x") || s.startsWith("0X"))
+                && s.drop(2).all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' })
+
+    /** [blockTag] + [specShapedSelector] for the compat batch's by-number
+     *  methods: the trimmed spec-shaped selector, or null (→ proxy/strict). */
+    private fun JsonArray?.specShapedBlockTag(index: Int): String? =
+        blockTag(index).trim().ifEmpty { "latest" }.takeIf { specShapedSelector(it) }
+
     /** Decode a storage position (QUANTITY or 32-byte DATA) to a left-padded
      *  32-byte big-endian key; null if not a hex string or wider than 32 bytes. */
     private fun JsonElement.asWord32(): ByteArray? {
@@ -531,15 +546,19 @@ class RpcRouter(
     }
 
     /** Parse a JSON-RPC QUANTITY index param (0x-hex string) as a non-negative
-     *  Int; null for malformed / non-string / absurd width (an index beyond
-     *  Int range can never address a block's tx/uncle list). */
+     *  Int; null only for MALFORMED input (non-string, no 0x, non-hex). A
+     *  well-formed value too large for any real tx/uncle list (or with
+     *  leading zeros pushing past Int) clamps to Int.MAX_VALUE — "past the
+     *  end", which the callers answer with eth's null result, not an error. */
     private fun JsonElement.asQuantityIndex(): Int? {
         val s = (this as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull ?: return null
-        if (!(s.startsWith("0x") || s.startsWith("0X")) || s.length <= 2 || s.length > 10) return null
+        if (!(s.startsWith("0x") || s.startsWith("0X")) || s.length <= 2 || s.length > 66) return null
         val h = s.substring(2)
         if (!h.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) return null
-        val v = h.toLong(16)
-        return if (v <= Int.MAX_VALUE) v.toInt() else null
+        val minimal = h.trimStart('0').ifEmpty { "0" }
+        if (minimal.length > 8) return Int.MAX_VALUE // can't address any real list
+        val v = minimal.toLong(16)
+        return if (v <= Int.MAX_VALUE) v.toInt() else Int.MAX_VALUE
     }
 
     /** eth_getBlockTransactionCountBy* / eth_getUncleCountBy*: the size of the
