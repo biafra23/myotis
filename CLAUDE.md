@@ -43,7 +43,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # iOS (macOS only; needs Xcode 26+ and the rustup targets on the toolchain the
 # workspace's rust-toolchain.toml selects — i.e.
-# `rustup target add --toolchain stable aarch64-apple-ios aarch64-apple-ios-sim`)
+# `rustup target add --toolchain stable aarch64-apple-ios aarch64-apple-ios-sim`).
+# Cargo stays optional here too: without the toolchain (and with no previously
+# built libmyotis_engine.a) :app-ios disables its framework tasks with a warning
+# instead of failing the build — the full toolchain is required only to actually
+# build the iOS app.
 ./gradlew cargoBuildIosSim                              # libmyotis_engine.a for the arm64 simulator
 ./gradlew cargoBuildIosDevice                           # libmyotis_engine.a for arm64 devices
 ./gradlew :app-ios:linkDebugFrameworkIosSimulatorArm64  # MyotisKit.framework (runs cargo first)

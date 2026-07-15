@@ -341,6 +341,21 @@ fun registerCargoBuildIos(taskName: String, triple: String) =
 registerCargoBuildIos("cargoBuildIosDevice", "aarch64-apple-ios")
 registerCargoBuildIos("cargoBuildIosSim", "aarch64-apple-ios-sim")
 
+// Whether the :app-ios framework chain can run at all: EVERY triple's
+// libmyotis_engine.a can either be built now (the cargo task's own onlyIf) or
+// absorbed from an earlier build. When false, :app-ios disables its whole task
+// chain (see its build file — it reads this single-sourced verdict) instead of
+// failing at the cinterop, keeping "cargo strictly optional" true build-wide.
+// All-or-nothing across the triples: the shared-source metadata/commonizer
+// tasks span both targets, so a half-enabled module would just move the
+// missing-input failure.
+val iosTriples = listOf("aarch64-apple-ios", "aarch64-apple-ios-sim")
+val iosFrameworkBuildable = iosTriples.all { triple ->
+    (rustAvailable && isMacHost && triple in installedRustupTargets) ||
+        file("rust/target/$triple/release/libmyotis_engine.a").exists()
+}
+extra["myotis.iosFrameworkBuildable"] = iosFrameworkBuildable
+
 // Exactly ONE note when Rust work was requested but is being skipped — enough
 // to explain the SKIPPED tasks without spamming every unrelated invocation.
 // (taskGraph.whenReady isn't configuration-cache-safe; this build doesn't
@@ -366,15 +381,23 @@ gradle.taskGraph.whenReady {
         logger.lifecycle("[rust] wasm32 canary skipped — needs rustup target wasm32-unknown-unknown + clang")
     }
     // The iOS skips get a WARNING, not a note: unlike the other cargo tasks there
-    // is no committed fallback — the cinterop absorbs whatever (possibly stale)
-    // libmyotis_engine.a sits in rust/target, and only the runtime ABI handshake
-    // would catch the drift. A missing .a fails the cinterop outright.
+    // is no committed fallback. With a previously built libmyotis_engine.a in
+    // rust/target the cinterop absorbs it (possibly STALE — only the runtime ABI
+    // handshake would catch the drift); with no .a at all, :app-ios disables its
+    // whole framework chain (see app-ios/build.gradle.kts) so a cargo-less build
+    // still passes.
     listOf("cargoBuildIosDevice" to "aarch64-apple-ios", "cargoBuildIosSim" to "aarch64-apple-ios-sim")
         .forEach { (task, triple) ->
             if (allTasks.any { it.name == task } && (!isMacHost || rustSkipNote != null || triple !in installedRustupTargets)) {
+                val prereqs = "needs macOS + cargo + `rustup target add --toolchain stable $triple`"
                 logger.warn(
-                    "[rust] $task skipped (needs macOS + cargo + `rustup target add --toolchain stable $triple`) — " +
-                        "the iOS framework will embed the EXISTING rust/target/$triple/release/libmyotis_engine.a, which may be stale"
+                    if (iosFrameworkBuildable)
+                        "[rust] $task skipped ($prereqs) — the iOS framework will embed the EXISTING " +
+                            "rust/target/$triple/release/libmyotis_engine.a, which may be stale"
+                    else
+                        "[rust] $task skipped ($prereqs) — the :app-ios framework tasks are disabled " +
+                            "(not every triple has a previously built libmyotis_engine.a to embed); " +
+                            "the rest of the build is unaffected"
                 )
             }
         }
