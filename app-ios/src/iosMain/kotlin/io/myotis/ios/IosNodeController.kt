@@ -84,6 +84,8 @@ class IosNodeController(
     // app-lifecycle nature; IosBackgroundKeepalive stretches that by the ~30 s
     // background-task grace so an in-flight wallet call can finish.
     private val rpcServers = mutableMapOf<String, MyotisRpcServer>()
+    // Listener outcome per network for the Status "RPC" row: port to serving.
+    private val rpcStates = mutableMapOf<String, Pair<Int, Boolean>>()
     // Per-network head-advance tracking behind verifiedHeadAgeMs — the same
     // "age since the optimistic head last advanced" scheme RustChainHandle uses.
     private val headAges = mutableMapOf<String, HeadAge>()
@@ -201,9 +203,10 @@ class IosNodeController(
         // Everything guarded: an uncaught throw here would escape into the
         // lifecycleLane coroutine and terminate the Kotlin/Native process —
         // the listener is best-effort, the node must keep running without it.
+        // The port is resolved BEFORE the guard so onFailure can't throw again.
+        val port = runCatching { settings.rpcPortFor(net) }.getOrDefault(0)
+        if (port <= 0) return
         runCatching {
-            val port = settings.rpcPortFor(net)
-            if (port <= 0) return
             val chainId = engineJson.decodeFromString<List<IosNetworkInfo>>(RustEngine.availableNetworksJson())
                 .firstOrNull { it.name == net }?.chainId ?: return
             val server = MyotisRpcServer(
@@ -223,11 +226,18 @@ class IosNodeController(
             // share the Mac's loopback, the second app's listener killed it.
             if (!loopbackPortFree(port)) {
                 logs.append("WARN [$net] JSON-RPC port $port unavailable; continuing without RPC")
+                locked { rpcStates[net] = port to false }
                 return
             }
             server.start()
-            locked { rpcServers[net] = server }
-        }.onFailure { logs.append("ERROR failed to start the $net JSON-RPC listener: ${it.message}") }
+            locked {
+                rpcServers[net] = server
+                rpcStates[net] = port to true
+            }
+        }.onFailure {
+            logs.append("ERROR failed to start the $net JSON-RPC listener: ${it.message}")
+            locked { rpcStates[net] = port to false }
+        }
     }
 
     /** Probe-bind 127.0.0.1:[port] and release it (SO_REUSEADDR, JVM-probe parity). */
@@ -255,7 +265,7 @@ class IosNodeController(
 
     /** Blocking stop; caller holds [bootMutex] and runs on IO. */
     private fun drop(net: String) {
-        locked { rpcServers.remove(net) }?.let { runCatching { it.stop() } }
+        locked { rpcStates.remove(net); rpcServers.remove(net) }?.let { runCatching { it.stop() } }
         val handle = locked { handles.remove(net).also { startMarks.remove(net); headAges.remove(net) } }
         if (handle != null) RustEngine.stop(handle)
     }
@@ -389,6 +399,10 @@ class IosNodeController(
     private fun snapshotOf(network: String, handle: Long): NodeSnapshot {
         val o = runCatching { engineJson.parseToJsonElement(RustEngine.statusJson(handle)).jsonObject }
             .getOrElse { JsonObject(emptyMap()) }
+        // ONE locked read for both maps — a drop() interleaving between two
+        // separate reads could pair a stale state with a missing server and
+        // render a clean stop as a red "port unavailable" for one poll.
+        val (rpcState, rpcServer) = locked { rpcStates[network] to rpcServers[network] }
         // Live counts from the cache FILES (mtime-memoized, shared parser in
         // :ui) — the cross-engine truth the engine writes under dataDir.
         val suffix = if (network == "mainnet") "" else "-$network"
@@ -464,6 +478,11 @@ class IosNodeController(
             readyPeerList = emptyList(),                 // not exposed over the FFI yet
             pauseCount = 0, totalPausedMs = 0L,          // idle-sleep isn't wired on iOS yet
             lastPauseEpochMs = 0L, lastResumeEpochMs = 0L, lastWakeReason = null,
+            rpcPort = rpcState?.first ?: 0,
+            // A started listener can still die asynchronously (contained by the
+            // server's supervisor) — consult the live server, not just the
+            // recorded start outcome.
+            rpcServing = (rpcState?.second ?: false) && (rpcServer?.isServing() ?: false),
             lcHunting = o.engineBoolean("lcHunting"),
             elHunting = o.engineBoolean("elHunting"),
         )

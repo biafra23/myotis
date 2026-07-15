@@ -1,9 +1,13 @@
 package io.myotis.jsonrpc
 
 import io.ktor.server.application.install
+import io.ktor.server.application.serverConfig
 import io.ktor.server.cio.CIO
-import io.ktor.server.engine.embeddedServer
 import io.ktor.server.engine.EmbeddedServer
+import io.ktor.server.engine.applicationEnvironment
+import io.ktor.server.engine.connector
+import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.SupervisorJob
 import io.ktor.server.plugins.cors.routing.CORS
 import io.ktor.server.request.receiveText
 import io.ktor.server.response.respondBytesWriter
@@ -80,9 +84,54 @@ class MyotisRpcServer(
     @Volatile
     private var engine: EmbeddedServer<*, *>? = null
 
+    /** Set by the engine-scope exception handler; see [isServing]. */
+    @Volatile
+    private var failed = false
+
+    /** Whether the listener is up: started, and no engine-scope failure since.
+     *  Hosts poll this for their status surface (the iOS Status RPC row). */
+    fun isServing(): Boolean = engine != null && !failed
+
     fun start() {
         if (engine != null) return
-        val server = embeddedServer(CIO, port = port, host = host) {
+        // Contain EVERY async engine failure: Ktor CIO surfaces some errors
+        // asynchronously in its own coroutines (seen live: EADDRINUSE from a
+        // TIME_WAIT-held port after a fast app relaunch), and an uncaught
+        // coroutine exception kills a Kotlin/Native process outright. The
+        // SupervisorJob is what contains them; the handler only OBSERVES —
+        // it also replaces Ktor CIO's per-connection default handler (which
+        // logs and ignores IO/cancellation), so it must never tear anything
+        // down: a stray connection exception is not a server death. [failed]
+        // records engine-scope deaths for isServing() without nulling
+        // [engine], which would break stop().
+        val crashGuard = CoroutineExceptionHandler { _, e ->
+            failed = true
+            rpcLogInfo(LOGGER, "[rpc] server error: $e")
+        }
+        failed = false
+        val config = serverConfig(applicationEnvironment { }) {
+            parentCoroutineContext = SupervisorJob() + crashGuard
+            module(moduleBody())
+        }
+        val server = EmbeddedServer(config, CIO) {
+            // TIME_WAIT sockets from a previous instance's connections must
+            // not fail the re-bind (a fast app relaunch is normal on mobile);
+            // this also matches the hosts' SO_REUSEADDR bind probes.
+            reuseAddress = true
+            connector {
+                port = this@MyotisRpcServer.port
+                host = this@MyotisRpcServer.host
+            }
+        }
+        server.start(wait = false)
+        engine = server
+        rpcLogInfo(LOGGER,
+            "[rpc] JSON-RPC server listening on http://$host:$port " +
+                "(mode=${if (proxy != null) "proxy" else "strict"})")
+    }
+
+    /** The Ktor application module: CORS + /health + the JSON-RPC POST route. */
+    private fun moduleBody(): io.ktor.server.application.Application.() -> Unit = {
             install(CORS) {
                 anyHost()
                 allowHeader(HttpHeaders.ContentType)
@@ -138,12 +187,6 @@ class MyotisRpcServer(
                     }
                 }
             }
-        }
-        server.start(wait = false)
-        engine = server
-        rpcLogInfo(LOGGER,
-            "[rpc] JSON-RPC server listening on http://$host:$port " +
-                "(mode=${if (proxy != null) "proxy" else "strict"})")
     }
 
     fun stop() {

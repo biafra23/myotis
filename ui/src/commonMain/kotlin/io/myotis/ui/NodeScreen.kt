@@ -702,6 +702,15 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         StatusRow("Discv5 peers", s.discv5Peers.toString())
         StatusRow("In backoff", s.backedOffPeers.toString())
         StatusRow("Blacklisted", s.blacklistedPeers.toString())
+        // JSON-RPC listener: where a same-device client reaches this network's
+        // verified endpoint — or why it can't (port squatted / bind failed).
+        if (s.rpcPort > 0) {
+            if (s.rpcServing) {
+                StatusRow("RPC", "127.0.0.1:${s.rpcPort}")
+            } else {
+                StatusRow("RPC", "port ${s.rpcPort} unavailable", color = MaterialTheme.colorScheme.error)
+            }
+        }
         StatusRow("Sync period", "${s.syncCurrentPeriod} / ${s.syncTargetPeriod}")
         // verifiedHeadAgeMs == Long.MAX_VALUE is the "no verified head yet" sentinel — show a
         // dash instead of the raw ~9.2e18 ms, which would read as a nonsensical age.

@@ -245,6 +245,12 @@ data class NodeSnapshot(
     val lastPauseEpochMs: Long,        // wall-clock ms of the last pause; 0 if never
     val lastResumeEpochMs: Long,       // wall-clock ms of the last DEMAND wake; 0 if none
     val lastWakeReason: String?,       // reason of the last demand wake; null if none
+    // JSON-RPC listener state, for the Status "RPC" row. rpcPort 0 = the host
+    // doesn't run/report a listener (row hidden — desktop/Android default until
+    // their hosts wire it); rpcServing = bound and serving on 127.0.0.1:rpcPort,
+    // false = the port was taken / the bind failed (the row says so).
+    val rpcPort: Int = 0,
+    val rpcServing: Boolean = false,
     val lcHunting: Boolean = false,    // LC hunt engaged: starved of light-client servers,
                                        // aggressively discovering/probing for new ones
     val elHunting: Boolean = false,    // EL hunt engaged: snap serving pool empty past the
