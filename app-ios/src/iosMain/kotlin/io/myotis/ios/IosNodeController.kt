@@ -27,8 +27,26 @@ import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.longOrNull
+import kotlinx.cinterop.IntVar
+import kotlinx.cinterop.alloc
+import kotlinx.cinterop.convert
+import kotlinx.cinterop.memScoped
+import kotlinx.cinterop.ptr
+import kotlinx.cinterop.reinterpret
+import kotlinx.cinterop.sizeOf
+import kotlinx.cinterop.value
 import platform.Foundation.NSFileManager
 import platform.Foundation.NSLock
+import platform.posix.AF_INET
+import platform.posix.SOCK_STREAM
+import platform.posix.SOL_SOCKET
+import platform.posix.SO_REUSEADDR
+import platform.posix.bind
+import platform.posix.close
+import platform.posix.setsockopt
+import platform.posix.sockaddr
+import platform.posix.sockaddr_in
+import platform.posix.socket
 import kotlin.time.TimeMark
 import kotlin.time.TimeSource
 
@@ -198,9 +216,38 @@ class IosNodeController(
                     startMarkProvider = { locked { startMarks[net] } },
                 ),
             )
+            // Deterministic up-front bind probe (JVM hosts' ServerSocket probe
+            // twin): Ktor CIO surfaces bind failures ASYNCHRONOUSLY inside its
+            // own coroutine scope, where they're uncaught — on Kotlin/Native
+            // that terminates the whole process. Seen live: two simulators
+            // share the Mac's loopback, the second app's listener killed it.
+            if (!loopbackPortFree(port)) {
+                logs.append("WARN [$net] JSON-RPC port $port unavailable; continuing without RPC")
+                return
+            }
             server.start()
             locked { rpcServers[net] = server }
         }.onFailure { logs.append("ERROR failed to start the $net JSON-RPC listener: ${it.message}") }
+    }
+
+    /** Probe-bind 127.0.0.1:[port] and release it (SO_REUSEADDR, JVM-probe parity). */
+    private fun loopbackPortFree(port: Int): Boolean = memScoped {
+        val fd = socket(AF_INET, SOCK_STREAM, 0)
+        if (fd < 0) return true // can't probe — let the server try its luck
+        try {
+            val one = alloc<IntVar>()
+            one.value = 1
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, one.ptr, sizeOf<IntVar>().convert())
+            val addr = alloc<sockaddr_in>().apply {
+                sin_family = AF_INET.convert()
+                sin_port = ((port and 0xff) shl 8 or (port ushr 8 and 0xff)).convert() // htons
+                sin_addr.s_addr = 0x0100007fu // 127.0.0.1, little-endian byte order
+                sin_len = sizeOf<sockaddr_in>().convert()
+            }
+            bind(fd, addr.ptr.reinterpret<sockaddr>(), sizeOf<sockaddr_in>().convert()) == 0
+        } finally {
+            close(fd)
+        }
     }
 
     /** Blocking stop; caller holds [bootMutex] and runs on IO. */
