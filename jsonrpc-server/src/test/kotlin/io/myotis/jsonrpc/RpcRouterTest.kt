@@ -3,6 +3,7 @@ package io.myotis.jsonrpc
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.jupiter.api.Assertions.assertArrayEquals
@@ -500,10 +501,12 @@ class RpcRouterTest {
     }
 
     @Test fun syncing_synced_isFalse() {
-        // The spec's "not syncing" is the JSON literal false, not a string.
+        // The spec's "not syncing" is the JSON BOOLEAN false — parse the
+        // envelope and check the literal, not a substring.
         val resp = route(FakeBackend(head = 0x181af48),
             """{"jsonrpc":"2.0","id":1,"method":"eth_syncing","params":[]}""")
-        assertTrue(resp.contains("\"result\":false"), resp)
+        val result = json.parseToJsonElement(resp).jsonObject["result"]
+        assertEquals(false, result?.jsonPrimitive?.booleanOrNull, resp)
     }
 
     @Test fun syncing_notSynced_reportsTruthyObjectWithZeroBounds() {
@@ -514,9 +517,10 @@ class RpcRouterTest {
             val b = FakeBackend(head = 0x181af48)
             b.syncStateValue = state
             val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_syncing","params":[]}""")
-            assertTrue(resp.contains("\"startingBlock\":\"0x0\""), resp)
-            assertTrue(resp.contains("\"currentBlock\":\"0x0\""), resp)
-            assertTrue(resp.contains("\"highestBlock\":\"0x0\""), resp)
+            val result = json.parseToJsonElement(resp).jsonObject["result"]!!.jsonObject
+            assertEquals("0x0", result["startingBlock"]?.jsonPrimitive?.content, resp)
+            assertEquals("0x0", result["currentBlock"]?.jsonPrimitive?.content, resp)
+            assertEquals("0x0", result["highestBlock"]?.jsonPrimitive?.content, resp)
         }
     }
 
