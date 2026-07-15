@@ -38,4 +38,4 @@ dependencyResolutionManagement {
     }
 }
 
-include("core", "networking", "consensus", "app", "android-app", "myotis-evm", "myotis-ens", "jsonrpc-server", "rpc-backend", "node-core", "ui", "app-desktop", "myotis-api", "myotis-engines")
+include("core", "networking", "consensus", "app", "android-app", "myotis-evm", "myotis-ens", "jsonrpc-server", "rpc-backend", "node-core", "ui", "app-desktop", "app-ios", "myotis-api", "myotis-engines")

@@ -1,7 +1,7 @@
 // :ui — the shared Compose-Multiplatform UI + the pure-Kotlin NodeController/Settings seam.
-// commonMain holds the screens + seam interfaces (no backend dependency); the Android and
-// Desktop hosts each supply the actuals. Targets: Android + Desktop JVM now (iOS later, once
-// the backend has a native/KMP path — see docs/bls-rust-acceleration.md for the on-ramp).
+// commonMain holds the screens + seam interfaces (no backend dependency); the Android,
+// Desktop, and iOS hosts each supply the actuals. Targets: Android + Desktop JVM + iOS
+// (arm64 device + arm64 simulator — :app-ios supplies the actuals over the Rust engine).
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
@@ -15,6 +15,8 @@ kotlin {
 
     androidTarget()
     jvm("desktop")
+    iosArm64()
+    iosSimulatorArm64()
 
     sourceSets {
         val commonMain by getting {
@@ -41,7 +43,7 @@ kotlin {
 
 android {
     namespace = "io.myotis.ui"
-    compileSdk = 34
+    compileSdk = 35
     defaultConfig {
         minSdk = 29
     }

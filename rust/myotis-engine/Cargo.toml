@@ -7,6 +7,9 @@ license = "MIT OR Apache-2.0"
 
 [lib]
 # libmyotis_engine.{so,dylib,dll} — loaded by :myotis-engines' RustEngineNative.
+# The iOS static archive is NOT listed here: the cargoBuildIos* Gradle tasks
+# build it with `cargo rustc --crate-type staticlib` (which overrides this
+# list), so host/Android builds don't pay for an archive they never consume.
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]

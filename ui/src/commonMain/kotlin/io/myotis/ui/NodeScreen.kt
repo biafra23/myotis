@@ -3,6 +3,7 @@ package io.myotis.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,11 +29,14 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -124,35 +128,46 @@ fun NodeScreen(
     val network = selected?.takeIf { it in chains } ?: chains.firstOrNull() ?: settings.primaryNetwork()
     val current = snapshots[network]
 
-    MaterialTheme {
-        Column(Modifier.fillMaxSize().padding(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Myotis", style = MaterialTheme.typography.headlineSmall)
-                if (chains.isNotEmpty()) {
-                    Spacer(Modifier.width(12.dp))
-                    NetworkChips(chains, network, engineOf = { snapshots[it]?.engine },
-                        onSelect = { selected = it })
+    // Follow the platform's light/dark appearance, and paint the scheme's own
+    // background behind everything. The Surface is load-bearing twice over:
+    // without it Compose draws over the host window's background (black in iOS
+    // dark mode) while the default MaterialTheme stays light — near-black text
+    // on black — and it is also what sets LocalContentColor to onBackground, so
+    // unspecified Text colors adapt. Every color in the screens below is a
+    // scheme token (the few literals are saturated status colors that read on
+    // both), so the two stock schemes are all it takes.
+    val colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()
+    MaterialTheme(colorScheme = colorScheme) {
+        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+            Column(Modifier.fillMaxSize().padding(16.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Myotis", style = MaterialTheme.typography.headlineSmall)
+                    if (chains.isNotEmpty()) {
+                        Spacer(Modifier.width(12.dp))
+                        NetworkChips(chains, network, engineOf = { snapshots[it]?.engine },
+                            onSelect = { selected = it })
+                    }
                 }
-            }
-            Spacer(Modifier.height(8.dp))
-            // Readiness traffic-light strip: the wallet's "safe to transact" signal for the
-            // selected chain. Uses the configurable deep-pool threshold from Settings.
-            ReadinessStrip(current, settings.deepPoolThreshold())
-            Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(8.dp))
+                // Readiness traffic-light strip: the wallet's "safe to transact" signal for the
+                // selected chain. Uses the configurable deep-pool threshold from Settings.
+                ReadinessStrip(current, settings.deepPoolThreshold())
+                Spacer(Modifier.height(12.dp))
 
-            TabRow(selectedTabIndex = tab) {
-                Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Status") })
-                Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Query") })
-                Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("Logs") })
-                Tab(selected = tab == 3, onClick = { tab = 3 }, text = { Text("Settings") })
-            }
-            Spacer(Modifier.height(16.dp))
+                TabRow(selectedTabIndex = tab) {
+                    Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Status") })
+                    Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Query") })
+                    Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("Logs") })
+                    Tab(selected = tab == 3, onClick = { tab = 3 }, text = { Text("Settings") })
+                }
+                Spacer(Modifier.height(16.dp))
 
-            when (tab) {
-                0 -> StatusTab(controller, settings, current, network, online, onOpenNetworkSettings)
-                1 -> QueryTab(controller, settings, current, network, history)
-                2 -> LogsTab(logs, logFilter, onFilterChange = { logFilter = it })
-                3 -> SettingsTab(controller, settings, snapshots, onEnabledChanged = { enabledRev++ })
+                when (tab) {
+                    0 -> StatusTab(controller, settings, current, network, online, onOpenNetworkSettings)
+                    1 -> QueryTab(controller, settings, current, network, history)
+                    2 -> LogsTab(logs, logFilter, onFilterChange = { logFilter = it })
+                    3 -> SettingsTab(controller, settings, snapshots, onEnabledChanged = { enabledRev++ })
+                }
             }
         }
     }
@@ -1170,6 +1185,10 @@ private fun formatDuration(ms: Long): String {
 }
 
 /** HH:mm:ss.SSS in [tz] (matches the logback console/file pattern). */
+// The opt-in is for the iOS (klib) compile, where kotlinx-datetime 0.6.x resolves
+// Instant against the 2.2 stdlib's experimental kotlin.time.Instant; the JVM and
+// Android compiles resolve kotlinx-datetime's own stable Instant and ignore it.
+@OptIn(kotlin.time.ExperimentalTime::class)
 private fun formatLogTime(ms: Long, tz: TimeZone): String {
     val dt = Instant.fromEpochMilliseconds(ms).toLocalDateTime(tz)
     fun p2(n: Int) = n.toString().padStart(2, '0')

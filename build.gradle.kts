@@ -39,6 +39,7 @@ subprojects {
     //   android-app  → com.android.application
     //   ui           → kotlin-multiplatform + com.android.library + compose
     //   app-desktop  → kotlin.jvm + compose (desktop)
+    //   app-ios      → kotlin-multiplatform + compose (iOS framework)
     // Excludes shared by EVERY module (Android plugin modules included):
     // - native Netty transports, for Android compatibility;
     // - Besu 26.4's log4j: it drags log4j-slf4j2-impl — a SECOND slf4j
@@ -61,7 +62,7 @@ subprojects {
         exclude(group = "org.apache.logging.log4j", module = "log4j-core")
     }
 
-    if (name in setOf("android-app", "ui", "app-desktop")) {
+    if (name in setOf("android-app", "ui", "app-desktop", "app-ios")) {
         return@subprojects
     }
 
@@ -262,9 +263,13 @@ tasks.named("check") { dependsOn(cargoTest) }
 // tripwire. Needs BOTH the rustup target installed AND clang on PATH (blst
 // compiles its C sources with clang for wasm); self-skips otherwise with one
 // lifecycle note, like every other cargo* task.
-val wasmTargetInstalled = rustAvailable &&
+val installedRustupTargets: Set<String> = if (rustAvailable) {
     probeTool("rustup", "target", "list", "--installed")
-        .lineSequence().any { it.trim() == "wasm32-unknown-unknown" }
+        .lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+} else {
+    emptySet()
+}
+val wasmTargetInstalled = "wasm32-unknown-unknown" in installedRustupTargets
 val clangAvailable = rustAvailable && probeTool("clang", "--version").isNotEmpty()
 val cargoCheckWasm = tasks.register<Exec>("cargoCheckWasm") {
     group = "rust"
@@ -308,6 +313,34 @@ tasks.register<Exec>("cargoNdkAndroid") {
     )
 }
 
+// iOS static libs (libmyotis_engine.a) for the :app-ios Kotlin/Native framework —
+// cinterop absorbs them into the framework over the plain C ABI (rust/include/
+// myotis_engine.h). One task per Apple triple; :app-ios wires each Kotlin/Native
+// target's cinterop to the matching task. Self-skips off-macOS or without the
+// rustup target (rustup target add aarch64-apple-ios aarch64-apple-ios-sim).
+val isMacHost = System.getProperty("os.name").lowercase().contains("mac")
+fun registerCargoBuildIos(taskName: String, triple: String) =
+    tasks.register<Exec>(taskName) {
+        group = "rust"
+        description = "cargo build --release -p myotis-engine for $triple (self-skips without cargo + the rustup target on macOS)"
+        onlyIf { rustAvailable && isMacHost && triple in installedRustupTargets }
+        workingDir = file("rust")
+        // `cargo rustc --crate-type staticlib` (not `cargo build`): only the .a is
+        // consumed on iOS, and building the crate's cdylib type too would fail the
+        // device link — rustc doesn't link compiler-rt builtins for iOS dylibs, so
+        // blst's ___chkstk_darwin stays undefined there. In the staticlib the symbol
+        // simply stays unresolved until the app link, where Xcode's clang provides it.
+        commandLine(
+            "cargo", "rustc", "--release", "--target", triple, "-p", "myotis-engine",
+            "--crate-type", "staticlib",
+        )
+        inputs.files(rustSources).withPathSensitivity(PathSensitivity.RELATIVE)
+        inputs.property("cargoVersion", cargoVersion)
+        outputs.files(file("rust/target/$triple/release/libmyotis_engine.a"))
+    }
+registerCargoBuildIos("cargoBuildIosDevice", "aarch64-apple-ios")
+registerCargoBuildIos("cargoBuildIosSim", "aarch64-apple-ios-sim")
+
 // Exactly ONE note when Rust work was requested but is being skipped — enough
 // to explain the SKIPPED tasks without spamming every unrelated invocation.
 // (taskGraph.whenReady isn't configuration-cache-safe; this build doesn't
@@ -332,6 +365,19 @@ gradle.taskGraph.whenReady {
     ) {
         logger.lifecycle("[rust] wasm32 canary skipped — needs rustup target wasm32-unknown-unknown + clang")
     }
+    // The iOS skips get a WARNING, not a note: unlike the other cargo tasks there
+    // is no committed fallback — the cinterop absorbs whatever (possibly stale)
+    // libmyotis_engine.a sits in rust/target, and only the runtime ABI handshake
+    // would catch the drift. A missing .a fails the cinterop outright.
+    listOf("cargoBuildIosDevice" to "aarch64-apple-ios", "cargoBuildIosSim" to "aarch64-apple-ios-sim")
+        .forEach { (task, triple) ->
+            if (allTasks.any { it.name == task } && (!isMacHost || rustSkipNote != null || triple !in installedRustupTargets)) {
+                logger.warn(
+                    "[rust] $task skipped (needs macOS + cargo + `rustup target add --toolchain stable $triple`) — " +
+                        "the iOS framework will embed the EXISTING rust/target/$triple/release/libmyotis_engine.a, which may be stale"
+                )
+            }
+        }
 }
 
 // -------------------------------------------------------------------------
