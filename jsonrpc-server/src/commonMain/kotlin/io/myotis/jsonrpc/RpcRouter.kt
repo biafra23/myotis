@@ -46,7 +46,7 @@ class RpcRouter(
             "eth_sendRawTransaction", "eth_getTransactionReceipt", "eth_getBlockByNumber",
             "eth_gasPrice", "eth_maxPriorityFeePerGas", "eth_feeHistory", "eth_estimateGas",
             "eth_getTransactionByHash", "eth_getBlockByHash", "eth_getBlockReceipts",
-            "web3_clientVersion",
+            "web3_clientVersion", "eth_syncing",
         )
     }
 
@@ -196,6 +196,33 @@ class RpcRouter(
             // connectivity check calls this first and rejects the node if it errors,
             // so a static identifier (not a proxy/-32601) is what lets rotki connect.
             "web3_clientVersion" -> resultEnvelope(id, JsonPrimitive("Myotis/verified-light-client"))
+            // Sync status straight from the beacon light client: `false` once
+            // SYNCED (the spec's "not syncing"), else a syncing object. Both
+            // arms answer PROMPTLY from the non-blocking syncState() — no
+            // headBlockNumber here, whose wake-and-hold (up to the 90s wake
+            // cap) would hang exactly the probe a wallet uses to decide
+            // whether the node is alive. The verified surface has no
+            // block-download notion (checkpoint bootstrap + sync-committee
+            // catch-up) and serves no reads before SYNCED, so zero bounds are
+            // the honest report; the object's truthy-ness is what clients act
+            // on (and progress-computing ones read 0%, never a false 100%).
+            "eth_syncing" -> {
+                // syncState() is non-blocking by contract, but on the Rust engine it
+                // still crosses an FFI — keep it off the server's event loop like
+                // every other backend read.
+                val synced = withContext(rpcIoDispatcher) {
+                    b.syncState() == RpcSyncState.SYNCED
+                }
+                if (synced) {
+                    resultEnvelope(id, JsonPrimitive(false))
+                } else {
+                    resultEnvelope(id, buildJsonObject {
+                        put("startingBlock", hexQuantity(0L))
+                        put("currentBlock", hexQuantity(0L))
+                        put("highestBlock", hexQuantity(0L))
+                    })
+                }
+            }
             // Verified beacon head; null (not synced) -> proxy.
             "eth_blockNumber" -> b.headBlockNumber()?.let { resultEnvelope(id, JsonPrimitive(hexQuantity(it))) }
 
