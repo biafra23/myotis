@@ -47,6 +47,11 @@ class RpcRouter(
             "eth_gasPrice", "eth_maxPriorityFeePerGas", "eth_feeHistory", "eth_estimateGas",
             "eth_getTransactionByHash", "eth_getBlockByHash", "eth_getBlockReceipts",
             "web3_clientVersion", "eth_syncing",
+            "eth_accounts", "net_listening", "net_peerCount", "web3_sha3",
+            "eth_getBlockTransactionCountByNumber", "eth_getBlockTransactionCountByHash",
+            "eth_getTransactionByBlockNumberAndIndex", "eth_getTransactionByBlockHashAndIndex",
+            "eth_getUncleCountByBlockNumber", "eth_getUncleCountByBlockHash",
+            "eth_getUncleByBlockNumberAndIndex", "eth_getUncleByBlockHashAndIndex",
         )
     }
 
@@ -335,6 +340,81 @@ class RpcRouter(
                 val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, fullTx) } ?: return null
                 resultEnvelope(id, json.parseToJsonElement(blockJson))
             }
+            // ---- compat batch: answers derived from reads already served above ----
+            // The node holds no keys and signs nothing: the accounts list is
+            // exactly empty — a verified-grade constant, not a stub.
+            "eth_accounts" -> resultEnvelope(id, JsonArray(emptyList()))
+            // Dialer-only on TCP, but the discovery UDP listener is live whenever
+            // the node runs — "actively listening for network connections" in the
+            // sense health probes mean it. Config-derived like eth_chainId.
+            "net_listening" -> resultEnvelope(id, JsonPrimitive(true))
+            "net_peerCount" -> {
+                // Served from the same status snapshot myotis_status exposes; no
+                // status source wired (or a shape-drifted snapshot) → strict error,
+                // never a fabricated zero.
+                val sr = statusReads ?: return null
+                val peers = withContext(rpcIoDispatcher) {
+                    (sr.statusJson(sr.uptimeSeconds())["connectedPeers"] as? JsonPrimitive)
+                        ?.contentOrNull?.toLongOrNull()
+                } ?: return null
+                resultEnvelope(id, JsonPrimitive(hexQuantity(peers)))
+            }
+            // Pure local compute (keccak-256 of the DATA param) — no chain state.
+            "web3_sha3" -> {
+                val data = (root.params()?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
+                resultEnvelope(id, JsonPrimitive(hexData(Keccak256.digest(data))))
+            }
+            // Counts/lookups below reuse the verified block serve and read the
+            // answer out of its JSON — the tri-state (object | "null" | Kotlin
+            // null) carries through unchanged.
+            "eth_getBlockTransactionCountByNumber" -> {
+                val block = root.params().blockTag(0)
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) } ?: return null
+                blockArraySizeResult(id, blockJson, "transactions")
+            }
+            "eth_getBlockTransactionCountByHash" -> {
+                val blockHash = (root.params()?.getOrNull(0))?.asHexBytes()?.takeIf { it.size == 32 } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, false) } ?: return null
+                blockArraySizeResult(id, blockJson, "transactions")
+            }
+            "eth_getTransactionByBlockNumberAndIndex" -> {
+                val p = root.params()
+                val block = p.blockTag(0)
+                val index = p?.getOrNull(1)?.asQuantityIndex() ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, true) } ?: return null
+                txAtIndexResult(id, blockJson, index)
+            }
+            "eth_getTransactionByBlockHashAndIndex" -> {
+                val p = root.params()
+                val blockHash = (p?.getOrNull(0))?.asHexBytes()?.takeIf { it.size == 32 } ?: return null
+                val index = p?.getOrNull(1)?.asQuantityIndex() ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, true) } ?: return null
+                txAtIndexResult(id, blockJson, index)
+            }
+            "eth_getUncleCountByBlockNumber" -> {
+                val block = root.params().blockTag(0)
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) } ?: return null
+                blockArraySizeResult(id, blockJson, "uncles")
+            }
+            "eth_getUncleCountByBlockHash" -> {
+                val blockHash = (root.params()?.getOrNull(0))?.asHexBytes()?.takeIf { it.size == 32 } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, false) } ?: return null
+                blockArraySizeResult(id, blockJson, "uncles")
+            }
+            "eth_getUncleByBlockNumberAndIndex" -> {
+                val p = root.params()
+                val block = p.blockTag(0)
+                val index = p?.getOrNull(1)?.asQuantityIndex() ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) } ?: return null
+                uncleAtIndexResult(id, blockJson, index)
+            }
+            "eth_getUncleByBlockHashAndIndex" -> {
+                val p = root.params()
+                val blockHash = (p?.getOrNull(0))?.asHexBytes()?.takeIf { it.size == 32 } ?: return null
+                val index = p?.getOrNull(1)?.asQuantityIndex() ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, false) } ?: return null
+                uncleAtIndexResult(id, blockJson, index)
+            }
             "eth_getBlockReceipts" -> {
                 val p = root.params()
                 // One selector param: tag | 0x-hex number | 0x-32-byte hash (absent →
@@ -448,6 +528,52 @@ class RpcRouter(
         } catch (e: IllegalArgumentException) {
             null
         }
+    }
+
+    /** Parse a JSON-RPC QUANTITY index param (0x-hex string) as a non-negative
+     *  Int; null for malformed / non-string / absurd width (an index beyond
+     *  Int range can never address a block's tx/uncle list). */
+    private fun JsonElement.asQuantityIndex(): Int? {
+        val s = (this as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull ?: return null
+        if (!(s.startsWith("0x") || s.startsWith("0X")) || s.length <= 2 || s.length > 10) return null
+        val h = s.substring(2)
+        if (!h.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) return null
+        val v = h.toLong(16)
+        return if (v <= Int.MAX_VALUE) v.toInt() else null
+    }
+
+    /** eth_getBlockTransactionCountBy* / eth_getUncleCountBy*: the size of the
+     *  served block's [key] array as a QUANTITY. "null" (unknown block) passes
+     *  through as a null result; a block object WITHOUT the array is shape
+     *  drift → Kotlin null → strict error, never a fabricated zero. */
+    private fun blockArraySizeResult(id: JsonElement, blockJson: String, key: String): String? {
+        val el = json.parseToJsonElement(blockJson)
+        if (el is JsonNull) return resultEnvelope(id, JsonNull)
+        val arr = (el as? JsonObject)?.get(key) as? JsonArray ?: return null
+        return resultEnvelope(id, JsonPrimitive(hexQuantity(arr.size.toLong())))
+    }
+
+    /** eth_getTransactionByBlock*AndIndex: `transactions[index]` of a fullTx
+     *  block serve. Unknown block or an index past the end → eth's null. */
+    private fun txAtIndexResult(id: JsonElement, blockJson: String, index: Int): String? {
+        val el = json.parseToJsonElement(blockJson)
+        if (el is JsonNull) return resultEnvelope(id, JsonNull)
+        val txs = (el as? JsonObject)?.get("transactions") as? JsonArray ?: return null
+        val tx = txs.getOrNull(index) ?: return resultEnvelope(id, JsonNull)
+        return resultEnvelope(id, tx)
+    }
+
+    /** eth_getUncleByBlock*AndIndex: the verified window is post-merge, so a
+     *  served block's uncle list is empty and any index is past the end →
+     *  eth's null. A NON-empty list (unreachable today — pre-merge blocks
+     *  aren't served) would be found-but-unrenderable (the block JSON carries
+     *  only uncle hashes, not the uncle header this method returns) → Kotlin
+     *  null → strict error, never null-as-if-absent. */
+    private fun uncleAtIndexResult(id: JsonElement, blockJson: String, index: Int): String? {
+        val el = json.parseToJsonElement(blockJson)
+        if (el is JsonNull) return resultEnvelope(id, JsonNull)
+        val uncles = (el as? JsonObject)?.get("uncles") as? JsonArray ?: return null
+        return if (index < uncles.size) null else resultEnvelope(id, JsonNull)
     }
 
     /** Decode a `0x…` hex JSON string to bytes; null if not a hex string. */

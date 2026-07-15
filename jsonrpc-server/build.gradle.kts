@@ -57,6 +57,13 @@ kotlin {
         jvmTest.dependencies {
             implementation(project.dependencies.platform(libs.junit.bom))
             implementation(libs.junit.jupiter)
+            // Cross-check the commonMain Keccak-256 against Tuweni's (KeccakTest) —
+            // test-only; the seam itself must stay dependency-free for iOS.
+            // Tuweni's keccak256 resolves via JCA, so BouncyCastle registers as
+            // the provider in the test.
+            implementation(libs.tuweni.bytes)
+            implementation(libs.tuweni.crypto)
+            implementation(libs.bouncycastle)
             // logback on the test COMPILE classpath (not just runtime): RpcAccessLogTest attaches a
             // ListAppender to the io.myotis.jsonrpc.access logger to assert the access-log lines.
             implementation(libs.logback.classic)

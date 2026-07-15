@@ -2,7 +2,11 @@ package io.myotis.jsonrpc
 
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.put
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -560,6 +564,123 @@ class RpcRouterTest {
             assertEquals("0x0", result["currentBlock"]?.jsonPrimitive?.content, resp)
             assertEquals("0x0", result["highestBlock"]?.jsonPrimitive?.content, resp)
         }
+    }
+
+    // ---- compat batch ----
+
+    @Test fun accounts_isExactlyEmpty() {
+        val resp = route(FakeBackend(), """{"jsonrpc":"2.0","id":1,"method":"eth_accounts","params":[]}""")
+        assertEquals(0, json.parseToJsonElement(resp).jsonObject["result"]!!.jsonArray.size, resp)
+    }
+
+    @Test fun netListening_isTrue() {
+        val resp = route(FakeBackend(), """{"jsonrpc":"2.0","id":1,"method":"net_listening","params":[]}""")
+        assertEquals(true, json.parseToJsonElement(resp).jsonObject["result"]?.jsonPrimitive?.booleanOrNull, resp)
+    }
+
+    @Test fun netPeerCount_fromStatusSnapshot() {
+        val sr = object : RpcStatusSource {
+            override fun uptimeSeconds() = 5L
+            override fun statusJson(uptimeSeconds: Long) =
+                buildJsonObject { put("connectedPeers", JsonPrimitive(7)) }
+            override fun beaconStatusJson(uptimeSeconds: Long) = buildJsonObject {}
+        }
+        val resp = runBlocking {
+            RpcRouter(null, MethodLogger(), VerifiedReadsBackend(FakeBackend()), sr)
+                .handle("""{"jsonrpc":"2.0","id":1,"method":"net_peerCount","params":[]}""")
+        }
+        assertEquals("0x7", result(resp))
+    }
+
+    @Test fun netPeerCount_withoutStatusSource_isStrictError() {
+        // No status source → -32000 ("can't answer right now"), never a fabricated 0x0.
+        val resp = route(FakeBackend(), """{"jsonrpc":"2.0","id":1,"method":"net_peerCount","params":[]}""")
+        assertEquals(-32000, errorCode(resp))
+    }
+
+    @Test fun web3Sha3_keccaksTheDataParam() {
+        // keccak256(0x68656c6c6f20776f726c64 = "hello world") — a public vector.
+        val resp = route(FakeBackend(),
+            """{"jsonrpc":"2.0","id":1,"method":"web3_sha3","params":["0x68656c6c6f20776f726c64"]}""")
+        assertEquals("0x47173285a8d7341e5e972fc677286384f802f8ef42a5ec5f03bbfa254cb01fad", result(resp))
+    }
+
+    @Test fun blockTransactionCount_countsTxArray_hashesForm() {
+        val b = FakeBackend().apply {
+            blockJson = """{"number":"0x10","transactions":["0xaa","0xbb","0xcc"],"uncles":[]}"""
+        }
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockTransactionCountByNumber","params":["0x10"]}""")
+        assertEquals("0x3", result(resp))
+        assertEquals(false, b.lastFullTx)   // counting needs only the hashes form
+        assertEquals("0x10", b.lastBlockTag)
+    }
+
+    @Test fun blockTransactionCount_unknownBlock_isNullResult() {
+        val b = FakeBackend().apply { blockJson = "null" }
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockTransactionCountByNumber","params":["0x10"]}""")
+        assertEquals(true, json.parseToJsonElement(resp).jsonObject["result"] is JsonNull, resp)
+    }
+
+    @Test fun txByBlockNumberAndIndex_picksTheEmbeddedObject() {
+        val b = FakeBackend().apply {
+            blockJson = """{"number":"0x10","transactions":[{"hash":"0xaa"},{"hash":"0xbb"}],"uncles":[]}"""
+        }
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionByBlockNumberAndIndex","params":["0x10","0x1"]}""")
+        val tx = json.parseToJsonElement(resp).jsonObject["result"]!!.jsonObject
+        assertEquals("0xbb", tx["hash"]?.jsonPrimitive?.content, resp)
+        assertEquals(true, b.lastFullTx)    // the lookup needs full tx objects
+    }
+
+    @Test fun txByBlockNumberAndIndex_pastEnd_isNullResult() {
+        val b = FakeBackend().apply {
+            blockJson = """{"number":"0x10","transactions":[{"hash":"0xaa"}],"uncles":[]}"""
+        }
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionByBlockNumberAndIndex","params":["0x10","0x5"]}""")
+        assertEquals(true, json.parseToJsonElement(resp).jsonObject["result"] is JsonNull, resp)
+    }
+
+    @Test fun txByBlockHashAndIndex_threadsTheHash() {
+        val b = FakeBackend().apply {
+            blockByHashJson = """{"number":"0x10","transactions":[{"hash":"0xaa"}],"uncles":[]}"""
+        }
+        val hash = "0x" + "ab".repeat(32)
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionByBlockHashAndIndex","params":["$hash","0x0"]}""")
+        val tx = json.parseToJsonElement(resp).jsonObject["result"]!!.jsonObject
+        assertEquals("0xaa", tx["hash"]?.jsonPrimitive?.content, resp)
+        assertEquals(hash, b.lastBlockHash!!.toHex())
+    }
+
+    @Test fun uncleCount_isZeroForServedBlocks() {
+        val b = FakeBackend().apply {
+            blockJson = """{"number":"0x10","transactions":[],"uncles":[]}"""
+        }
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getUncleCountByBlockNumber","params":["0x10"]}""")
+        assertEquals("0x0", result(resp))
+    }
+
+    @Test fun uncleByIndex_isNullResult_neverAnObject() {
+        val b = FakeBackend().apply {
+            blockJson = """{"number":"0x10","transactions":[],"uncles":[]}"""
+        }
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getUncleByBlockNumberAndIndex","params":["0x10","0x0"]}""")
+        assertEquals(true, json.parseToJsonElement(resp).jsonObject["result"] is JsonNull, resp)
+    }
+
+    @Test fun compatMethods_malformedIndex_isStrictError() {
+        // A JSON-number index (not the spec's 0x-hex string) must not be coerced.
+        val b = FakeBackend().apply {
+            blockJson = """{"number":"0x10","transactions":[{"hash":"0xaa"}],"uncles":[]}"""
+        }
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionByBlockNumberAndIndex","params":["0x10",1]}""")
+        assertEquals(-32000, errorCode(resp))
     }
 
     private fun ByteArray.toHex() = joinToString(prefix = "0x", separator = "") { "%02x".format(it.toInt() and 0xff) }
