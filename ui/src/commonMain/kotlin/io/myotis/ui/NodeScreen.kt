@@ -673,14 +673,14 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         StatusRow("EL block", s.executionBlockNumber.toString())
         StatusRow("CL peers", "served ${s.clServedPeersLastMin}/min, con ${s.clConnectedPeers}")
         StatusRow("EL peers", "ready ${s.readyPeers}, snap ${s.snapPeers}, serving ${s.snapServingPeers}")
-        // Cache rows: "proven" (CL) / "snap-ok" (EL) predict how fast the NEXT
+        // Cache rows: "proven" (CL) / "snap" (EL) predict how fast the NEXT
         // cold start finds servers — the cache learning is visible live.
         StatusRow(
             "CL cache",
             "${s.clCachedPeers} (lc ${s.clCachedProven}, nolc ${s.clCachedNolc}, " +
                 "untried ${s.clCachedPeers - s.clCachedProven - s.clCachedNolc})",
         )
-        StatusRow("EL cache", "${s.elCachedPeers} (snap-ok ${s.elCachedSnapOk}, snap-bad ${s.elCachedSnapBad})")
+        StatusRow("EL cache", "${s.elCachedPeers} (snap ${s.elCachedSnapOk}, nosnap ${s.elCachedSnapBad})")
         // What peers ask US for: demand for our served headers/blocks, and how often we
         // could answer. Bodies-served stays 0 (light client; prompt empty replies).
         StatusRow("Peer asks · headers", "${s.peerHeaderRequests} asked, ${s.peerHeaderRequestsServed} served")
