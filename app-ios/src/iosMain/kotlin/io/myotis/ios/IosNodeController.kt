@@ -233,7 +233,10 @@ class IosNodeController(
     /** Probe-bind 127.0.0.1:[port] and release it (SO_REUSEADDR, JVM-probe parity). */
     private fun loopbackPortFree(port: Int): Boolean = memScoped {
         val fd = socket(AF_INET, SOCK_STREAM, 0)
-        if (fd < 0) return true // can't probe — let the server try its luck
+        // Fail CLOSED when the probe can't even get a socket (fd exhaustion —
+        // Ktor's own bind would fail the same way, asynchronously and fatally).
+        // Skipping the listener is the safe degradation; RPC is best-effort.
+        if (fd < 0) return false
         try {
             val one = alloc<IntVar>()
             one.value = 1
