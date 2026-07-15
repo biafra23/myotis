@@ -411,9 +411,6 @@ pub fn tx_json(t: &VerifiedTransaction) -> String {
     s
 }
 
-/// Serialize a verified fee suggestion. Both values are decimal-wei strings (the
-/// FFI-neutral form the Java `VerifiedReads.gasPrice()/maxPriorityFeePerGas()`
-/// return); the Java side re-encodes to 0x-QUANTITY at the JSON-RPC boundary.
 /// Serialize a verified `eth_getBlockReceipts` result: a JSON array whose
 /// elements are exactly the [`receipt_json`] objects (the Java
 /// `rpcGetBlockReceipts` emits the same per-element shape via
@@ -484,6 +481,9 @@ pub fn fee_history_json(f: &FeeHistory) -> String {
     s
 }
 
+/// Serialize a verified fee suggestion. Both values are decimal-wei strings (the
+/// FFI-neutral form the Java `VerifiedReads.gasPrice()/maxPriorityFeePerGas()`
+/// return); the Java side re-encodes to 0x-QUANTITY at the JSON-RPC boundary.
 pub fn fee_json(f: &FeeEstimate) -> String {
     let mut obj = serde_json::Map::new();
     obj.insert("gasPriceWei".into(), f.gas_price_wei.to_string().into());
