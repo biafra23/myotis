@@ -16,6 +16,7 @@ pub mod pool;
 pub mod reader;
 pub mod receipt;
 pub mod rlpx;
+pub mod sent_tx;
 pub mod served;
 pub mod snap;
 pub mod tx;

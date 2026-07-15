@@ -23,7 +23,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 18; // 18: block-by-number/hash gained fullTransactions
+    static final int EXPECTED_ABI_VERSION = 19; // 19: + nativePendingNonceOverlay (sent-tx slice)
 
     private static final boolean AVAILABLE = load();
 
@@ -242,6 +242,16 @@ final class RustEngineNative {
      * failure.
      */
     static native String nativeGetTransactionReceiptJson(long handle, String txHashHex);
+
+    /**
+     * The "pending" nonce overlay for {@code eth_getTransactionCount(addr, "pending")}:
+     * {@code max(minedNonce, our broadcast nonce + 1)} while the wallet's own tx is
+     * unmined and unexpired, identity otherwise. Negative only for malformed input /
+     * a missing handle — the adapter then serves the plain mined nonce. Only the
+     * pending tag may consult this (the overlay is not proof-backed; it only ever
+     * RAISES above the verified mined floor and self-heals via TTL).
+     */
+    static native long nativePendingNonceOverlay(long handle, String addressHex, long minedNonce);
 
     /**
      * Verified {@code eth_getTransactionByHash} for a running handle.

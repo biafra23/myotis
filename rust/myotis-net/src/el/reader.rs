@@ -316,6 +316,43 @@ pub struct VerifiedTransaction {
 /// `blockHashToNumber` cache's 512).
 const BLOCK_HASH_LRU_MAX: usize = 512;
 
+/// Raw-bytes cache cap for the wallet's own broadcast txs (the Java
+/// `sentTxCache` LRU's 256). Bytes aging out silently end that tx's
+/// rebroadcast (still watched, nothing left to push).
+const SENT_TX_CACHE_MAX: usize = 256;
+
+/// Minimum spacing between rebroadcast sweeps (the Java
+/// `TX_REBROADCAST_INTERVAL_MS`). Java runs it on a warmer thread; here it
+/// piggybacks time-gated on the wallet's poll paths (receipt/tx/nonce reads),
+/// the same pattern as the scan-map TTL sweep — a wallet mid-confirm-loop
+/// polls every few seconds, far below this gate. DIVERGENCE (documented): with
+/// zero RPC traffic nothing rebroadcasts; Java's timer does. Acceptable — a
+/// wallet that stopped polling has abandoned the confirm flow, and peers
+/// dedupe repeats anyway.
+const TX_REBROADCAST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The sent-tx state behind one lock (see the `sent_txs` field doc). The
+/// WATCH itself lives separately in the shared Arc every peer read loop also
+/// holds (gossip sightings) — see `ElReader::sent_tx_watch`.
+struct SentTxState {
+    pending_nonces: crate::el::sent_tx::PendingNonceTracker,
+    /// Raw broadcast bytes by tx hash — what a rebroadcast re-pushes.
+    bytes: myotis_evm::Lru<[u8; 32], Vec<u8>>,
+    last_rebroadcast: std::time::Instant,
+}
+
+/// `eth_getTransactionByHash`'s three verified answers (the Java engine's
+/// mined / own-pending / null trichotomy).
+pub enum TxLookup {
+    /// Located in a verified block.
+    Mined(VerifiedTransaction),
+    /// Not in the scanned chain, but it is OUR broadcast (the sent-tx cache
+    /// holds the bytes): the pending shape — block fields explicitly null.
+    Pending { tx_hash: [u8; 32], tx: TxSummary },
+    /// Verified "not seen" (eth's null; the wallet keeps polling).
+    NotSeen,
+}
+
 /// Where a mined tx was found, cached per tx hash so wallet polls don't rescan
 /// (the Java `TxLocation`). The header/body were verified when this was built;
 /// canonicality is re-confirmed on later polls until the block finalizes.
@@ -439,6 +476,14 @@ pub struct ElReader {
     /// ONLY by blocks this reader itself verified (the receipt/tx scan and the
     /// by-number serve); the shared LRU is the myotis-evm cache one.
     block_hash_numbers: std::sync::Mutex<myotis_evm::Lru<[u8; 32], u64>>,
+    /// The sent-tx watch + pending-nonce overlay + raw-bytes cache (the Java
+    /// `sentTxWatch`/`pendingNonces`/`sentTxCache` trio). One brief-hold lock:
+    /// every access is a map poke; the rebroadcast collects its work under the
+    /// lock and BROADCASTS outside it.
+    sent_txs: std::sync::Mutex<SentTxState>,
+    /// The sent-tx WATCH, shared with every peer's read loop (which marks
+    /// gossip sightings) — the Java TxGossipObserver seam's equivalent.
+    sent_tx_watch: crate::el::sent_tx::SharedSentTxWatch,
 }
 
 /// The scan-cursor map plus its last TTL sweep — one lock covers both, so the
@@ -526,7 +571,18 @@ impl ElReader {
             None => crate::el::peercache::ElPeerCache::disabled(),
         };
         let local_pubkey = key.public_key_bytes();
-        let pool = PeerPool::start(key, local_pubkey, eth_cfg, cfg.pool_config, cache, rx);
+        let sent_tx_watch: crate::el::sent_tx::SharedSentTxWatch = Arc::new(
+            std::sync::Mutex::new(crate::el::sent_tx::SentTxTracker::new()),
+        );
+        let pool = PeerPool::start(
+            key,
+            local_pubkey,
+            eth_cfg,
+            cfg.pool_config,
+            cache,
+            rx,
+            Some(Arc::clone(&sent_tx_watch)),
+        );
         Ok(ElReader {
             discovery,
             pool,
@@ -539,6 +595,12 @@ impl ElReader {
                 last_sweep: std::time::Instant::now(),
             }),
             block_hash_numbers: std::sync::Mutex::new(myotis_evm::Lru::new(BLOCK_HASH_LRU_MAX)),
+            sent_txs: std::sync::Mutex::new(SentTxState {
+                pending_nonces: crate::el::sent_tx::PendingNonceTracker::new(),
+                bytes: myotis_evm::Lru::new(SENT_TX_CACHE_MAX),
+                last_rebroadcast: std::time::Instant::now(),
+            }),
+            sent_tx_watch,
         })
     }
 
@@ -1578,7 +1640,89 @@ impl ElReader {
         if sent == 0 {
             return Err("no peer accepted the transaction broadcast".to_string());
         }
+        // The sent-tx watch (the Java rpcSendRawTransaction tail, mirrored):
+        // cache the bytes for rebroadcast, record the sender's pending nonce
+        // (best-effort — an undecodable/senderless tx is silently skipped),
+        // and start watching with the head recorded AT BROADCAST — the beacon
+        // OPTIMISTIC number (the Java broadcastHead source), which the receipt
+        // scan's reachback uses as its floor for our own txs.
+        let now = std::time::Instant::now();
+        let broadcast_head = match self.anchor.optimistic_block_number() {
+            0 => None,
+            n => Some(n),
+        };
+        {
+            let mut st = self.sent_txs.lock().unwrap();
+            st.bytes.put(hash, raw_tx.to_vec());
+            if let Some(t) = tx::decode_summary(raw_tx) {
+                if let Some(from) = t.from {
+                    st.pending_nonces.record(from, t.nonce, now);
+                }
+            }
+        }
+        self.sent_tx_watch.lock().unwrap().watch(hash, now, broadcast_head);
         Ok(hash)
+    }
+
+    /// The "pending" nonce overlay (the Java `pendingNonceOverlay` twin): raise
+    /// the verified mined count to `our nonce + 1` while our own broadcast is
+    /// unmined and unexpired. Identity for every other caller. Only the
+    /// `pending` tag may consult this — never settled tags.
+    pub fn pending_nonce_overlay(&self, sender: &[u8; 20], mined_count: u64) -> u64 {
+        let mut st = self.sent_txs.lock().unwrap();
+        st.pending_nonces.overlay(sender, mined_count, std::time::Instant::now())
+    }
+
+    /// Time-gated rebroadcast of our own not-yet-seen txs (the Java
+    /// `rebroadcastPendingTxs` behind its 20 s gate). Piggybacks on the
+    /// wallet's poll paths (see [`TX_REBROADCAST_INTERVAL`]); evicts expired
+    /// watches first. The peer writes happen OUTSIDE the state lock.
+    async fn maybe_rebroadcast_sent_txs(&self) {
+        let now = std::time::Instant::now();
+        let unseen = {
+            let mut watch = self.sent_tx_watch.lock().unwrap();
+            if !watch.watching_any() {
+                return;
+            }
+            watch.evict_expired(now);
+            watch.unseen()
+        };
+        let work: Vec<Vec<u8>> = {
+            let mut st = self.sent_txs.lock().unwrap();
+            if now.saturating_duration_since(st.last_rebroadcast) < TX_REBROADCAST_INTERVAL {
+                return;
+            }
+            st.last_rebroadcast = now;
+            unseen
+                .iter()
+                // Bytes aged out of the LRU → nothing to push (Java parity).
+                .filter_map(|h| st.bytes.get(h).cloned())
+                .collect()
+        };
+        if work.is_empty() {
+            return;
+        }
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return;
+        }
+        // DETACHED, like the Java warmer thread: the wallet's receipt poll
+        // carries the trigger but must never wait on the pushes — a wedged
+        // peer (writer lock held, full send buffer) would otherwise freeze
+        // the confirm loop. Bounded per write; peers are owned Arcs.
+        tokio::spawn(async move {
+            let count = work.len();
+            for raw in work {
+                let sends = peers.iter().map(|peer| {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        peer.send_transaction(&raw),
+                    )
+                });
+                futures::future::join_all(sends).await;
+            }
+            tracing::debug!("rebroadcast {} sent tx(s) to {} peer(s)", count, peers.len());
+        });
     }
 
     /// Verified `eth_getTransactionReceipt`. Scans a bounded, incrementally
@@ -1607,6 +1751,9 @@ impl ElReader {
         &self,
         tx_hash: [u8; 32],
     ) -> Result<Option<VerifiedReceipt>, String> {
+        // The wallet's post-send confirm loop polls exactly this — the natural
+        // carrier for the time-gated sent-tx rebroadcast (see the interval doc).
+        self.maybe_rebroadcast_sent_txs().await;
         let (head_num, head_hash) = self.anchored_head()?;
         let Some(loc) = self.locate_mined_tx(tx_hash, head_num, &head_hash).await? else {
             return Ok(None); // verified "not seen" in the scanned coverage → eth null
@@ -1625,6 +1772,9 @@ impl ElReader {
             match self.receipt_from(peer, &loc).await {
                 Ok(vr) => {
                     self.pool.record_snap_served(peer.addr()).await;
+                    // A verified receipt IS inclusion — the watch is done
+                    // (the Java rpcGetTransactionReceipt's confirmMined).
+                    self.sent_tx_watch.lock().unwrap().confirm_mined(&tx_hash);
                     return Ok(Some(vr));
                 }
                 Err(e) => {
@@ -1647,17 +1797,41 @@ impl ElReader {
     /// now, INCLUDING a located tx whose type the decoder doesn't know — the tx
     /// exists, so "can't render it" must never read as "unknown tx" (the Java
     /// buildTxJson-null convention).
-    pub async fn get_transaction_by_hash(
-        &self,
-        tx_hash: [u8; 32],
-    ) -> Result<Option<VerifiedTransaction>, String> {
-        let (head_num, head_hash) = self.anchored_head()?;
-        let Some(loc) = self.locate_mined_tx(tx_hash, head_num, &head_hash).await? else {
-            return Ok(None);
+    pub async fn get_transaction_by_hash(&self, tx_hash: [u8; 32]) -> Result<TxLookup, String> {
+        self.maybe_rebroadcast_sent_txs().await;
+        // Anchor loss must not hide the wallet's OWN broadcast (Java parity:
+        // locateMinedTx answers null on a missing anchor and the sentTxCache
+        // check still runs): a send needs only peers, not an anchor, and the
+        // confirm loop starts polling immediately — serve pending, not -32000.
+        let (head_num, head_hash) = match self.anchored_head() {
+            Ok(v) => v,
+            Err(e) => {
+                let mut st = self.sent_txs.lock().unwrap();
+                if let Some(raw) = st.bytes.get(&tx_hash) {
+                    let tx = tx::decode_summary(raw)
+                        .ok_or("own sent tx cached but cannot be decoded")?;
+                    return Ok(TxLookup::Pending { tx_hash, tx });
+                }
+                return Err(e);
+            }
         };
+        let Some(loc) = self.locate_mined_tx(tx_hash, head_num, &head_hash).await? else {
+            // Not in the scanned chain — but if it is OUR broadcast, answer the
+            // pending shape from the cached bytes (the Java sentTxCache path):
+            // the wallet sees its tx exists while it awaits inclusion.
+            let mut st = self.sent_txs.lock().unwrap();
+            if let Some(raw) = st.bytes.get(&tx_hash) {
+                let tx = tx::decode_summary(raw)
+                    .ok_or("own sent tx cached but cannot be decoded")?;
+                return Ok(TxLookup::Pending { tx_hash, tx });
+            }
+            return Ok(TxLookup::NotSeen);
+        };
+        // Located in a verified block: the watch is done with this tx.
+        self.sent_tx_watch.lock().unwrap().confirm_mined(&tx_hash);
         let tx = tx::decode_summary(&loc.raw_tx)
             .ok_or("transaction located but its type cannot be decoded")?;
-        Ok(Some(VerifiedTransaction {
+        Ok(TxLookup::Mined(VerifiedTransaction {
             tx_hash,
             tx_index: loc.index as u64,
             block_hash: loc.block_hash,
@@ -1863,7 +2037,21 @@ impl ElReader {
                 st.high_scanned = None;
             }
             let mut from = match st.high_scanned {
-                None => head_num.saturating_sub(RECEIPT_INITIAL_LOOKBACK_BLOCKS - 1),
+                None => {
+                    let mut first = head_num.saturating_sub(RECEIPT_INITIAL_LOOKBACK_BLOCKS - 1);
+                    // Own-tx reachback (the Java locateMinedTx twin): the FIRST
+                    // scan for a tx WE broadcast reaches back to the head
+                    // recorded at broadcast time — a tx mined right after a
+                    // slow broadcast can sit below the default lookback. Still
+                    // subject to the per-poll cap below.
+                    if let Some(bc_head) = self.sent_tx_watch.lock().unwrap().broadcast_head(&tx_hash)
+                    {
+                        if bc_head < first {
+                            first = bc_head;
+                        }
+                    }
+                    first
+                }
                 Some(high) => high + 1,
             };
             let cap_floor = head_num.saturating_sub(RECEIPT_MAX_SCAN_BLOCKS_PER_POLL - 1);

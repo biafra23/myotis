@@ -345,24 +345,46 @@ pub fn receipt_json(r: &VerifiedReceipt) -> String {
 
 /// Serialize a verified transaction to the `eth_getTransactionByHash` JSON.
 /// Mirrors the Java `VerifiedRpcBackend.buildTxJson` field set, ordering, and
-/// encoding exactly (the mined shape — the pending shape with null block
-/// coordinates is the Java engine's own-sent-tx path, which needs the sent-tx
-/// cache): minimal-hex QUANTITYs, `chainId` only when the tx carries one (a
-/// pre-155 legacy tx doesn't), `from` only when the sender recovered,
+/// encoding exactly: minimal-hex QUANTITYs, `chainId` only when the tx carries
+/// one (a pre-155 legacy tx doesn't), `from` only when the sender recovered,
 /// `to: null` for a creation, the legacy/1559 fee-field split, `yParity` only
 /// for typed txs, and `r`/`s` as 32-byte left-padded DATA (never QUANTITY).
 pub fn tx_json(t: &VerifiedTransaction) -> String {
-    let tx = &t.tx;
+    tx_json_at(&t.tx_hash, Some((&t.block_hash, t.block_number, t.tx_index)), &t.tx)
+}
+
+/// The PENDING shape (the Java buildTxJson `blockHash == null` branch): the
+/// wallet's own just-broadcast tx, block coordinates explicitly JSON null —
+/// present-but-null, never omitted (clients key on the trio's presence).
+pub fn pending_tx_json(tx_hash: &[u8; 32], tx: &myotis_net::el::tx::TxSummary) -> String {
+    tx_json_at(tx_hash, None, tx)
+}
+
+/// The shared tx serializer behind the mined and pending shapes; `mined` is
+/// the block trio, `None` = pending (explicit nulls).
+fn tx_json_at(
+    tx_hash: &[u8; 32],
+    mined: Option<(&[u8; 32], u64, u64)>,
+    tx: &myotis_net::el::tx::TxSummary,
+) -> String {
     let mut s = String::with_capacity(768);
     s.push_str("{\"hash\":\"");
-    s.push_str(&hex0x(&t.tx_hash));
-    s.push_str("\",\"blockHash\":\"");
-    s.push_str(&hex0x(&t.block_hash));
-    s.push_str("\",\"blockNumber\":\"");
-    s.push_str(&hex_quantity(t.block_number));
-    s.push_str("\",\"transactionIndex\":\"");
-    s.push_str(&hex_quantity(t.tx_index));
-    s.push_str("\",\"type\":\"");
+    s.push_str(&hex0x(tx_hash));
+    match mined {
+        Some((block_hash, block_number, tx_index)) => {
+            s.push_str("\",\"blockHash\":\"");
+            s.push_str(&hex0x(block_hash));
+            s.push_str("\",\"blockNumber\":\"");
+            s.push_str(&hex_quantity(block_number));
+            s.push_str("\",\"transactionIndex\":\"");
+            s.push_str(&hex_quantity(tx_index));
+            s.push_str("\",\"type\":\"");
+        }
+        None => {
+            s.push_str("\",\"blockHash\":null,\"blockNumber\":null,\"transactionIndex\":null");
+            s.push_str(",\"type\":\"");
+        }
+    }
     s.push_str(&hex_quantity(u64::from(tx.ty)));
     s.push('"');
     if let Some(chain_id) = tx.chain_id {
@@ -1297,6 +1319,32 @@ mod tests {
             block_number: 21_000_000,
             tx: sample_tx_summary(),
         }
+    }
+
+    #[test]
+    fn pending_tx_json_block_trio_is_explicit_null() {
+        // The Java buildTxJson pending branch (blockHash == null): the block
+        // trio is PRESENT with JSON null — never omitted (clients key on the
+        // trio's presence to tell pending from mined). Every other field is
+        // exactly the mined shape.
+        let t = sample_transaction();
+        let v: serde_json::Value =
+            serde_json::from_str(&pending_tx_json(&t.tx_hash, &t.tx)).expect("valid json");
+        let obj = v.as_object().unwrap();
+        assert!(obj.contains_key("blockHash"), "blockHash must be present");
+        assert!(obj.contains_key("blockNumber"), "blockNumber must be present");
+        assert!(obj.contains_key("transactionIndex"), "transactionIndex must be present");
+        assert!(v["blockHash"].is_null());
+        assert!(v["blockNumber"].is_null());
+        assert!(v["transactionIndex"].is_null());
+        // The tx body matches the mined serializer's output field-for-field.
+        assert_eq!(v["hash"], hex0x(&[0xa1; 32]));
+        assert_eq!(v["type"], "0x2");
+        assert_eq!(v["nonce"], "0x5");
+        assert_eq!(v["from"], hex0x_var(&[0xcc; 20]));
+        assert_eq!(v["maxFeePerGas"], "0xba43b7400");
+        assert_eq!(v["v"], "0x1");
+        assert_eq!(v["yParity"], "0x1");
     }
 
     #[test]

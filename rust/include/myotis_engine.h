@@ -26,7 +26,7 @@ extern "C" {
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
- * differs from the version this header was written against (18). */
+ * differs from the version this header was written against (19). */
 int32_t myotis_init(void);
 
 /* Up to `max` buffered tracing lines, oldest first, newline-joined; ""
@@ -89,6 +89,11 @@ char *myotis_ens_record_json(int64_t handle, const char *params_json);
  * decoded tx objects over hashes. */
 char *myotis_get_block_by_number_json(int64_t handle, const char *block_tag,
                                       bool full_transactions);
+/* Pending-tag nonce overlay: max(mined_nonce, own broadcast nonce + 1) while
+ * unmined+unexpired, identity otherwise; negative on malformed input (serve
+ * the plain mined nonce). */
+int64_t myotis_pending_nonce_overlay(int64_t handle, const char *address_hex,
+                                     int64_t mined_nonce);
 /* Receipt JSON, the literal "null" (verified not-seen), or {"error"}. */
 char *myotis_get_transaction_receipt_json(int64_t handle,
                                           const char *tx_hash_hex);

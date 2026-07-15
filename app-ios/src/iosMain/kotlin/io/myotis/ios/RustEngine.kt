@@ -19,6 +19,7 @@ import io.myotis.engine.capi.myotis_get_transaction_receipt_json
 import io.myotis.engine.capi.myotis_send_raw_transaction_json
 import io.myotis.engine.capi.myotis_init
 import io.myotis.engine.capi.myotis_pause
+import io.myotis.engine.capi.myotis_pending_nonce_overlay
 import io.myotis.engine.capi.myotis_request_account_json
 import io.myotis.engine.capi.myotis_resume
 import io.myotis.engine.capi.myotis_start
@@ -46,7 +47,7 @@ object RustEngine {
 
     /** Must match `ABI_VERSION` in rust/myotis-engine/src/lib.rs — the same
      *  handshake `RustEngineNative.EXPECTED_ABI_VERSION` performs over JNI. */
-    const val EXPECTED_ABI_VERSION = 18
+    const val EXPECTED_ABI_VERSION = 19
 
     private val abiVersion: Int by lazy { myotis_init() }
 
@@ -168,6 +169,13 @@ object RustEngine {
 
     fun getBlockReceiptsJson(handle: Long, selector: String): String =
         jsonCall { myotis_get_block_receipts_json(handle, selector) }
+
+    /** Pending-tag nonce overlay; negative = malformed/not-running (serve the
+     *  plain mined nonce). Plain long over the FFI — no JSON envelope. */
+    fun pendingNonceOverlay(handle: Long, addressHex: String, minedNonce: Long): Long {
+        requireAbi()
+        return myotis_pending_nonce_overlay(handle, addressHex, minedNonce)
+    }
 
     fun feeEstimateJson(handle: Long): String =
         jsonCall { myotis_fee_estimate_json(handle) }

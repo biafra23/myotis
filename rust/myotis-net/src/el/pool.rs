@@ -108,6 +108,10 @@ struct PoolInner {
     /// EL hunt engaged (serving pool empty past the stall window) — drives the
     /// hosts' status banner and the maintainer's backoff bypass.
     hunting: AtomicBool,
+    /// The reader's sent-tx watch, handed to every spawned peer's read loop so
+    /// gossip sightings of our own broadcasts register (None for pools whose
+    /// host never sends).
+    tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
 }
 
 impl PoolInner {
@@ -186,6 +190,7 @@ impl PoolInner {
                         window: Arc::clone(&self.served),
                         stats: Arc::clone(&self.serve_stats),
                     },
+                    self.tx_watch.clone(),
                 ));
                 // Keep `addr` in `attempted` while connected — dropped by
                 // prune_closed when the peer later closes.
@@ -241,6 +246,7 @@ impl PeerPool {
         pool_cfg: PoolConfig,
         cache: ElPeerCache,
         rx: mpsc::Receiver<TableEntry>,
+        tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
     ) -> PeerPool {
         let inner = Arc::new(PoolInner {
             key,
@@ -255,6 +261,7 @@ impl PeerPool {
             served: Arc::new(ServedHeaders::default()),
             serve_stats: Arc::new(ServeStats::default()),
             hunting: AtomicBool::new(false),
+            tx_watch,
         });
         // Both the discv4 dialer and the maintainer dial through one shared
         // concurrency budget.
@@ -619,6 +626,7 @@ mod tests {
             PoolConfig::default(),
             ElPeerCache::disabled(),
             rx,
+            None,
         );
         assert_eq!(pool.snap_peer_count().await, 0);
         assert!(pool.snap_peer().await.is_none());
@@ -669,6 +677,7 @@ mod tests {
             PoolConfig::default(),
             ElPeerCache::load(path.clone()),
             rx,
+            None,
         );
         // The warm-start branch dials the cached peer, claiming its address.
         // Poll briefly (the silent listener parks the handshake, so the address
@@ -723,6 +732,7 @@ mod tests {
             PoolConfig::default(),
             ElPeerCache::load(path.clone()),
             rx,
+            None,
         );
 
         // A served outcome promotes the cached peer to Confirmed and persists it.

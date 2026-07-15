@@ -383,6 +383,22 @@ Spec: README §5.3, doc 04 §2. Highlights per PR-sized chunk:
      `eth_blobBaseFee` — the blob base-fee update fraction is fork-dependent
      (and BPO forks reschedule it), so a router-side constant would silently go
      stale; it needs an engine-side answer if it's ever wanted.
+   - **Landed (chunk 3): the sent-tx watch + pending overlay** (ABI v19,
+     `nativePendingNonceOverlay` + `myotis_pending_nonce_overlay`): `el/sent_tx.rs`
+     twins the Java `SentTxTracker`/`PendingNonceTracker` exactly (180 s watch TTL,
+     90 s nonce TTL, strict-`>` boundaries, highest-nonce-wins, overlay =
+     `max(mined, nonce+1)`). `send_raw_transaction` caches the raw bytes (256-cap
+     LRU), records the pending nonce, and watches the hash with the beacon
+     OPTIMISTIC head at broadcast; `locate_mined_tx` reaches its first scan back to
+     that head for our own txs (128-cap intact); `eth_getTransactionByHash` serves
+     the wallet's own unmined broadcasts in the PENDING shape (block trio explicit
+     JSON null — `eljson::pending_tx_json`, golden-pinned); a verified receipt or
+     mined lookup confirms the watch. Gossip sightings register in every peer's
+     read loop (`NewPooledTransactionHashes`, both eth/66-68 wire shapes, the Java
+     `TxGossipObserver` twin); unseen txs rebroadcast on a 20 s gate piggybacked on
+     the wallet's poll paths (documented divergence: no warmer thread — a
+     zero-traffic idle doesn't rebroadcast). `getTransactionCount("pending")`
+     applies the overlay on both the JNI and iOS hosts. Milestone B is COMPLETE.
 3. **`sendRawTransaction` + pending overlay.** Gossip raw bytes to all READY peers, return
    `keccak256(rawTx)`, cache own-tx bytes (shows pending until mined), rebroadcast until the
    gossip echo (the EL-A5 hash-observation hook); pending-nonce overlay — only-raises,

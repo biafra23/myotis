@@ -861,6 +861,16 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
      * polling), or throws {@link EngineException} when it can't verify (transport /
      * not-running). {@code txHashHex} is the 0x-hex 32-byte tx hash.
      */
+    /**
+     * The pending-tag nonce overlay: {@code max(minedNonce, our broadcast nonce + 1)}
+     * while unmined+unexpired, identity otherwise. A negative native answer
+     * (malformed input / not running) falls back to the plain mined nonce.
+     */
+    long pendingNonceOverlay(String addressHex, long minedNonce) {
+        long overlaid = RustEngineNative.nativePendingNonceOverlay(handle, addressHex, minedNonce);
+        return overlaid >= 0 ? overlaid : minedNonce;
+    }
+
     String transactionReceiptJson(String txHashHex) {
         return receiptJsonOrThrow(
                 gated(() -> RustEngineNative.nativeGetTransactionReceiptJson(handle, txHashHex)));
