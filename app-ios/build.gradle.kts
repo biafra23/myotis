@@ -49,6 +49,9 @@ kotlin {
         }
         iosMain.dependencies {
             implementation(project(":ui"))
+            // The JSON-RPC listener (Ktor CIO in commonMain; the backend here
+            // adapts its seams over the Rust engine's C ABI).
+            implementation(project(":jsonrpc-server"))
             implementation(compose.runtime)
             implementation(compose.foundation)
             implementation(compose.material3)

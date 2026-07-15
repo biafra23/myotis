@@ -361,13 +361,6 @@ final class RustVerifiedReads implements VerifiedReads {
         return r.verifyMethod() != null;
     }
 
-    /** How far ABOVE the anchored head a number-pin is still served (the head may
-     *  advance a few blocks between eth_blockNumber and the pinned read). */
-    private static final long BLOCK_NUM_TOLERANCE = 16;
-    /** How far BELOW the anchored head a number-pin is still served from the head's
-     *  verified state (a genuinely older block can't be represented). */
-    private static final long BLOCK_NUM_LAG_TOLERANCE = 64;
-
     /**
      * Whether a block selector can be served from the anchored head. Accepts the
      * head tags (latest/pending/safe/finalized/default) AND a specific block NUMBER
@@ -383,29 +376,11 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     /** Package-private, JNI-free: the block-window decision, with the anchored head
-     *  supplied lazily (fetched only when a numeric pin needs validating). */
+     *  supplied lazily (fetched only when a numeric pin needs validating). The
+     *  policy + tolerances live ONCE in jsonrpc-server's RpcBlockWindow, shared
+     *  with the iOS backend so the serving window can never drift between hosts. */
     static boolean blockInWindow(String block, java.util.function.Supplier<Long> head) {
-        if (block == null || block.isBlank()) return true;
-        String b = block.trim();
-        if (b.equalsIgnoreCase("latest") || b.equalsIgnoreCase("pending")
-                || b.equalsIgnoreCase("safe") || b.equalsIgnoreCase("finalized")) {
-            return true;
-        }
-        if (b.equalsIgnoreCase("earliest")) return false;
-        long n;
-        try {
-            // Explicit radix (not Long.decode, which reads a leading-zero decimal as
-            // octal). JSON-RPC block numbers are 0x-hex; decimal is tolerated too.
-            n = (b.startsWith("0x") || b.startsWith("0X"))
-                    ? Long.parseLong(b.substring(2), 16)
-                    : Long.parseLong(b, 10);
-        } catch (NumberFormatException e) {
-            return false;
-        }
-        if (n < 0) return false;
-        Long h = head.get();
-        if (h == null) return false; // not synced enough to validate the pin
-        return n >= h - BLOCK_NUM_LAG_TOLERANCE && n <= h + BLOCK_NUM_TOLERANCE;
+        return io.myotis.jsonrpc.RpcBlockWindow.INSTANCE.blockInWindow(block, head::get);
     }
 
     /** Fixed-width bytes → lowercase 0x-hex (a 20-byte address or a 32-byte

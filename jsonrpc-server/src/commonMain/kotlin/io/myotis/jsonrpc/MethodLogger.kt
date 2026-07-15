@@ -1,11 +1,11 @@
 package io.myotis.jsonrpc
 
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
-import org.slf4j.LoggerFactory
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicLong
+import kotlin.concurrent.Volatile
 
 /**
  * Per-request access log + an in-memory coverage map. Emits one concise line per
@@ -23,10 +23,13 @@ import java.util.concurrent.atomic.AtomicLong
  * errors at WARN, so quieting the log hid exactly the calls you wanted to see).
  * Full request/response bodies are logged separately at DEBUG by [MyotisRpcServer]
  * under the same logger name.
+ *
+ * Multiplatform note: counters were ConcurrentHashMap+AtomicLong on the JVM;
+ * commonMain has neither, so the map is copy-on-write behind a [Mutex] (record
+ * is only ever called from the router's suspend paths) with a [Volatile]
+ * snapshot for the lock-free readers ([coverage]/[logSummary]).
  */
 class MethodLogger {
-
-    private val log = LoggerFactory.getLogger(ACCESS_LOGGER)
 
     companion object {
         /** Dedicated logger name for the RPC access log (concise INFO + full-body DEBUG).
@@ -35,15 +38,18 @@ class MethodLogger {
         const val ACCESS_LOGGER = "io.myotis.jsonrpc.access"
     }
 
-    private class Stat {
-        val count = AtomicLong()
-        val verified = AtomicLong()
-        val proxied = AtomicLong()
-        val error = AtomicLong()
-        val local = AtomicLong()
-    }
+    private data class Stat(
+        val count: Long = 0,
+        val verified: Long = 0,
+        val proxied: Long = 0,
+        val error: Long = 0,
+        val local: Long = 0,
+    )
 
-    private val byMethod = ConcurrentHashMap<String, Stat>()
+    private val mutex = Mutex()
+
+    @Volatile
+    private var byMethod: Map<String, Stat> = emptyMap()
 
     /**
      * Record one answered request: bump the coverage map and emit the access line.
@@ -55,34 +61,36 @@ class MethodLogger {
      * @param latencyMs handling latency in millis (0 when not meaningfully measurable)
      * @param code   the JSON-RPC error code for ERROR outcomes (e.g. -32000), else null
      */
-    fun record(method: String, id: String, path: String, latencyMs: Long, code: Int? = null) {
-        val s = byMethod.computeIfAbsent(method) { Stat() }
-        s.count.incrementAndGet()
-        when (path) {
-            "VERIFIED" -> s.verified.incrementAndGet()
-            "PROXY" -> s.proxied.incrementAndGet()
-            "LOCAL" -> s.local.incrementAndGet()
-            else -> s.error.incrementAndGet()
+    suspend fun record(method: String, id: String, path: String, latencyMs: Long, code: Int? = null) {
+        mutex.withLock {
+            val s = byMethod[method] ?: Stat()
+            byMethod = byMethod + (method to s.copy(
+                count = s.count + 1,
+                verified = s.verified + if (path == "VERIFIED") 1 else 0,
+                proxied = s.proxied + if (path == "PROXY") 1 else 0,
+                local = s.local + if (path == "LOCAL") 1 else 0,
+                error = s.error + if (path != "VERIFIED" && path != "PROXY" && path != "LOCAL") 1 else 0,
+            ))
         }
         val outcome = if (code != null) "$path($code)" else path
-        log.info("[rpc] method={} id={} outcome={} latencyMs={}", method, id, outcome, latencyMs)
+        rpcLogInfo(ACCESS_LOGGER, "[rpc] method=$method id=$id outcome=$outcome latencyMs=$latencyMs")
     }
 
     /** Coverage map as a JSON object: method -> {count, verified, proxied, error, local}. */
     fun coverage(): JsonObject = buildJsonObject {
-        byMethod.toSortedMap().forEach { (method, s) ->
+        byMethod.entries.sortedBy { it.key }.forEach { (method, s) ->
             put(method, buildJsonObject {
-                put("count", s.count.get())
-                put("verified", s.verified.get())
-                put("proxied", s.proxied.get())
-                put("error", s.error.get())
-                put("local", s.local.get())
+                put("count", s.count)
+                put("verified", s.verified)
+                put("proxied", s.proxied)
+                put("error", s.error)
+                put("local", s.local)
             })
         }
     }
 
     /** Dump the coverage summary to the log (call on shutdown). */
     fun logSummary() {
-        log.info("[rpc] coverage summary: {}", coverage().toString())
+        rpcLogInfo(ACCESS_LOGGER, "[rpc] coverage summary: ${coverage()}")
     }
 }
