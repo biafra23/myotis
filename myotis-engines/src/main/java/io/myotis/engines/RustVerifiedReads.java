@@ -117,9 +117,7 @@ final class RustVerifiedReads implements VerifiedReads {
         if (!isServableBlock(block)) return null;
         AccountProofResult r = queryAccount(address);
         if (r == null || !isVerified(r)) return null;
-        // Verified-absent → nonce 0 (r.nonce() is -1 when !exists). No pending
-        // overlay yet: "pending" resolves to the verified head nonce, which is
-        // correct for a wallet sending its first not-yet-mined tx.
+        // Verified-absent → nonce 0 (r.nonce() is -1 when !exists).
         //
         // Nonce freshness: the Java backend (VerifiedRpcBackend) gates nonce
         // serving on a TIGHTER staleness bound than balance, because a stale nonce
@@ -130,7 +128,14 @@ final class RustVerifiedReads implements VerifiedReads {
         // fails verification → null), so staleness is bounded to the peer's current
         // tip (slot-scale seconds). Replicating the Java engine's explicit tighter
         // nonce gate is a follow-up, pending a head-age field in the Rust status.
-        return r.exists() ? r.nonce() : 0L;
+        long mined = r.exists() ? r.nonce() : 0L;
+        // ONLY the pending tag consults the sent-tx overlay (max(mined, ours+1)
+        // while our broadcast is unmined+unexpired) — the Java engine's
+        // getTransactionCount "pending" branch, mirrored.
+        if ("pending".equals(block)) {
+            return handle.pendingNonceOverlay(toHex(address), mined);
+        }
+        return mined;
     }
 
     @Override

@@ -1322,6 +1322,32 @@ mod tests {
     }
 
     #[test]
+    fn pending_tx_json_block_trio_is_explicit_null() {
+        // The Java buildTxJson pending branch (blockHash == null): the block
+        // trio is PRESENT with JSON null — never omitted (clients key on the
+        // trio's presence to tell pending from mined). Every other field is
+        // exactly the mined shape.
+        let t = sample_transaction();
+        let v: serde_json::Value =
+            serde_json::from_str(&pending_tx_json(&t.tx_hash, &t.tx)).expect("valid json");
+        let obj = v.as_object().unwrap();
+        assert!(obj.contains_key("blockHash"), "blockHash must be present");
+        assert!(obj.contains_key("blockNumber"), "blockNumber must be present");
+        assert!(obj.contains_key("transactionIndex"), "transactionIndex must be present");
+        assert!(v["blockHash"].is_null());
+        assert!(v["blockNumber"].is_null());
+        assert!(v["transactionIndex"].is_null());
+        // The tx body matches the mined serializer's output field-for-field.
+        assert_eq!(v["hash"], hex0x(&[0xa1; 32]));
+        assert_eq!(v["type"], "0x2");
+        assert_eq!(v["nonce"], "0x5");
+        assert_eq!(v["from"], hex0x_var(&[0xcc; 20]));
+        assert_eq!(v["maxFeePerGas"], "0xba43b7400");
+        assert_eq!(v["v"], "0x1");
+        assert_eq!(v["yParity"], "0x1");
+    }
+
+    #[test]
     fn tx_json_shape_and_values() {
         // The Java RustVerifiedReadJsonTest replays this shape — the two are the
         // halves of the cross-language golden (mirrors buildTxJson).

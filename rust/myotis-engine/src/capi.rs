@@ -291,6 +291,23 @@ pub unsafe extern "C" fn myotis_get_block_by_number_json(
     ))
 }
 
+/// The pending-tag nonce overlay (`nativePendingNonceOverlay` twin):
+/// `max(mined_nonce, our broadcast nonce + 1)` while the wallet's own tx is
+/// unmined+unexpired, identity otherwise; negative for malformed input (the
+/// host serves the plain mined nonce).
+///
+/// # Safety
+/// `address_hex` must be null or a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_pending_nonce_overlay(
+    handle: i64,
+    address_hex: *const c_char,
+    mined_nonce: i64,
+) -> i64 {
+    let address_hex = read_string(address_hex).unwrap_or_default();
+    crate::host::pending_nonce_overlay(handle, &address_hex, mined_nonce)
+}
+
 /// Verified `eth_getTransactionReceipt` (`nativeGetTransactionReceiptJson`
 /// twin). Returns the receipt JSON, the literal `"null"` (verified "not seen"
 /// — pending/unknown), or `{"error": ...}`.

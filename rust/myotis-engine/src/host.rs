@@ -906,6 +906,30 @@ pub fn get_block_by_number_json(handle: i64, block_tag: &str, full_transactions:
 /// `"null"` for a verified "not seen" (pending/unknown — the wallet keeps
 /// polling), or `{"error": "..."}` when it can't verify right now (the Java side
 /// maps it to a null → -32000).
+/// `nativePendingNonceOverlay`: the "pending" nonce overlay for
+/// `eth_getTransactionCount(addr, "pending")` — `max(minedNonce, our broadcast
+/// nonce + 1)` while the wallet's own tx is unmined and unexpired, identity
+/// otherwise. Returns a NEGATIVE value only for a malformed address / missing
+/// handle (the Java adapter then serves the plain mined nonce). A dedicated
+/// native (not a field bolted onto the golden-pinned account JSON) because
+/// only the pending tag ever consults it.
+pub fn pending_nonce_overlay(handle: i64, address_hex: &str, mined_nonce: i64) -> i64 {
+    if mined_nonce < 0 {
+        return -1;
+    }
+    let Some(address) = parse_address(address_hex) else {
+        return -1;
+    };
+    let Some(engine) = engine() else {
+        return -1;
+    };
+    let Ok((reader, _finalized_period, _wall_period)) = snapshot_reader(engine, handle) else {
+        return -1;
+    };
+    let overlaid = reader.pending_nonce_overlay(&address, mined_nonce as u64);
+    i64::try_from(overlaid).unwrap_or(-1)
+}
+
 pub fn get_transaction_receipt_json(handle: i64, tx_hash_hex: &str) -> String {
     let Some(tx_hash) = parse_word32(tx_hash_hex) else {
         return eljson::error_json("invalid transaction hash (expected 32-byte hex)");

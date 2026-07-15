@@ -46,7 +46,11 @@ pub mod ringlog;
 /// v18: nativeGetBlockByNumberJson + nativeGetBlockByHashJson gained a
 ///      `boolean fullTransactions` parameter (fullTransactions=true blocks now
 ///      served natively: decoded tx objects instead of hashes).
-pub const ABI_VERSION: i32 = 18;
+/// v19: added nativePendingNonceOverlay (the sent-tx slice: pending-tag nonce
+///      overlay); nativeGetTransactionByHashJson may now return the PENDING
+///      shape (block trio explicitly null) for the wallet's own broadcasts —
+///      a payload extension, no signature change there.
+pub const ABI_VERSION: i32 = 19;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
@@ -497,6 +501,22 @@ mod jni_shim {
             Ok(s) => s.into_raw(),
             Err(_) => std::ptr::null_mut(),
         }
+    }
+
+    /// `RustEngineNative.nativePendingNonceOverlay(long handle, String addressHex,
+    /// long minedNonce)` — the pending-tag nonce overlay: `max(minedNonce, our
+    /// broadcast nonce + 1)` while unmined+unexpired, identity otherwise;
+    /// negative for malformed input (the adapter serves the plain mined nonce).
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativePendingNonceOverlay(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        address_hex: JString,
+        mined_nonce: jlong,
+    ) -> jlong {
+        let address_hex = read_string(&mut env, &address_hex).unwrap_or_default();
+        crate::host::pending_nonce_overlay(handle, &address_hex, mined_nonce)
     }
 
     /// `RustEngineNative.nativeGetTransactionReceiptJson(long handle, String txHashHex)`

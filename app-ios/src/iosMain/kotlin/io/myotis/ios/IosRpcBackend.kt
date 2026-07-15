@@ -60,7 +60,15 @@ class IosRpcBackend(
         if (!isServableBlock(block)) return null
         val r = queryAccount(address) ?: return null
         if (!r.verified) return null
-        return if (r.exists) r.nonce else 0L
+        val mined = if (r.exists) r.nonce else 0L
+        // ONLY the pending tag consults the sent-tx overlay (RustVerifiedReads
+        // twin): max(mined, our broadcast nonce + 1) while unmined+unexpired.
+        if (block == "pending") {
+            val handle = handleProvider() ?: return mined
+            val overlaid = RustEngine.pendingNonceOverlay(handle, hex(address), mined)
+            return if (overlaid >= 0) overlaid else mined
+        }
+        return mined
     }
 
     override fun getCode(address: ByteArray, block: String): ByteArray? {
