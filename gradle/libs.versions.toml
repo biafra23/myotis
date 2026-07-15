@@ -49,7 +49,11 @@ kotlinx-serialization = "1.7.3"
 # 0.6.2 = the compatibility release for the kotlin.time.Instant the 2.1.20+ stdlib
 # introduced. The iOS (klib) compile still resolves the experimental stdlib Instant
 # in :ui's formatLogTime — see the local @OptIn there.
-kotlinx-datetime = "0.6.2"
+# 0.7.x: kotlinx.datetime.Instant became a typealias for kotlin.time.Instant (no binary class).
+# Compose material3-desktop already pulls 0.7.1 onto every desktop runtime classpath, so
+# compiling :ui against 0.6.x crashed the desktop Logs tab with NoClassDefFoundError at runtime
+# — keep this in sync with what the Compose BOM ships.
+kotlinx-datetime = "0.7.1"
 # Tiny (~30 KB), dependency-free, Android-safe JSON parser for :myotis-engines'
 # JNI JSON marshalling (hand-JNI decision, docs/reimplementation/05).
 minimal-json = "0.9.5"
