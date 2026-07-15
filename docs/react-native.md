@@ -104,6 +104,43 @@ and `:myotis-engines`' minimal-json layer (JSON decode, error mapping,
   C shim must stay unwrap-free by construction like `jni_shim`/`capi.rs`;
   a panic kills the RN app process.
 
+### Alternative considered: a JS-side engine
+
+Implementing the engine itself in JavaScript inside the RN app was
+evaluated and **rejected**. For the record, since the question recurs:
+
+- **There is no pure-JS variant.** RN's JS runtime (Hermes/JSC) has no
+  TCP/UDP API at all; the only route is native socket-shim modules
+  (`react-native-tcp-socket`, `react-native-udp`). So a "JS engine" still
+  keeps sockets native and instead pays per-packet bridge marshalling in
+  both directions — the bridge's worst-case workload, given how chatty
+  discovery and RLPx framing are.
+- **Crypto cost, with no escape hatch.** ECIES, AES-CTR framing, keccak,
+  secp256k1, and BLS fast-aggregate-verify in pure JS (noble/ethereumjs)
+  run 10–100× slower than blst/native — a sustained battery tax for
+  continuous sync. Hermes has no WebAssembly, so compiling the existing
+  Rust crates to WASM is not available in the default RN engine.
+- **The ecosystem targets Node, not RN.** `@ethereumjs/devp2p`,
+  js-libp2p, Lodestar, and `@ethereumjs/evm` are real building blocks,
+  but they sit on Node's `net`/`dgram`/worker APIs — ports, not
+  drop-ins.
+- **Lifecycle gets worse, not better.** The JS runtime only runs while
+  RN runs: iOS background JS is effectively nonexistent, Android
+  headless-JS is fragile. This doc already rejects headless-JS as the
+  wrong lifetime for sockets even as a *service host*; a JS engine would
+  make it the only mode.
+- **A third verification surface.** The trust model ("peer trusted is
+  never an option") would gain a third independent implementation after
+  Java and Rust — tripling where a verification bug can hide, without
+  the golden-test parity that pins the two existing engines to each
+  other.
+
+What deliberately *does* live on the JS side is everything above the
+`VerifiedReads` line: wallet/account state, transaction construction and
+ABI encoding, signing orchestration, ENS UX, polling orchestration, and
+all UI logic. That split is what the module shape below is designed
+around.
+
 ### RN module shape
 
 One package, `react-native-myotis/`, built as a **New Architecture Turbo
