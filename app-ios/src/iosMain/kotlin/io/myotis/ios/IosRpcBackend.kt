@@ -67,7 +67,10 @@ class IosRpcBackend(
         val o = resultOrNull(RustEngine.getStorageAtJson(handle, hex(address), hex(slot32))) ?: return null
         if (o.engineString("verifyMethod") == null) return null
         // Left-pad to the full 32-byte word (a zero/unset slot → 32 zero bytes).
+        // A value WIDER than a word is engine shape drift — fail closed rather
+        // than crash copyInto with a negative offset (JNI leftPad32 parity).
         val raw = hexToBytes(o.engineString("valueHex")) ?: return null
+        if (raw.size > 32) return null
         return ByteArray(32).also { raw.copyInto(it, 32 - raw.size) }
     }
 
@@ -159,8 +162,19 @@ class IosRpcBackend(
         return resultOrNull(RustEngine.feeEstimateJson(handle))?.engineString("maxPriorityFeePerGasWei")
     }
 
-    override fun feeHistory(blockCount: Long, newestBlock: String, rewardPercentiles: DoubleArray?): String? =
-        null // not served verified (parity with RustVerifiedReads)
+    override fun feeHistory(blockCount: Long, newestBlock: String, rewardPercentiles: DoubleArray?): String? {
+        if (blockCount < 1) return null
+        val handle = handleProvider() ?: return null
+        // Percentiles cross as a JSON number array (compound values cross as
+        // JSON, like every other native); null → empty → no reward matrix.
+        val percentilesJson = rewardPercentiles
+            ?.joinToString(", ", prefix = "[", postfix = "]") ?: ""
+        val tag = newestBlock.ifBlank { "latest" }
+        // The feeHistory JSON object, or an error envelope (→ null → strict
+        // -32000). No "null" literal case for this method (JNI parity).
+        val json = RustEngine.feeHistoryJson(handle, blockCount, tag, percentilesJson)
+        return if (resultOrNull(json) != null) json.trim() else null
+    }
 
     // ---- shared plumbing ----
 

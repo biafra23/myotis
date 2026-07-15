@@ -8,6 +8,7 @@ import io.myotis.engine.capi.myotis_ens_record_json
 import io.myotis.engine.capi.myotis_estimate_gas_json
 import io.myotis.engine.capi.myotis_eth_call_json
 import io.myotis.engine.capi.myotis_fee_estimate_json
+import io.myotis.engine.capi.myotis_fee_history_json
 import io.myotis.engine.capi.myotis_get_block_by_hash_json
 import io.myotis.engine.capi.myotis_get_block_by_number_json
 import io.myotis.engine.capi.myotis_get_code_json
@@ -166,6 +167,9 @@ object RustEngine {
 
     fun feeEstimateJson(handle: Long): String =
         jsonCall { myotis_fee_estimate_json(handle) }
+
+    fun feeHistoryJson(handle: Long, blockCount: Long, newestBlockTag: String, percentilesJson: String): String =
+        jsonCall { myotis_fee_history_json(handle, blockCount, newestBlockTag, percentilesJson) }
 
     fun sendRawTransactionJson(handle: Long, rawTxHex: String): String =
         jsonCall { myotis_send_raw_transaction_json(handle, rawTxHex) }
