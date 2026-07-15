@@ -11,9 +11,18 @@ import kotlinx.serialization.json.JsonObject
  * string, the literal `"null"` (verified not-found, a valid result), or `null`.
  * Wei values cross as decimal strings (the FFI-neutral form).
  */
+/** `io.myotis.api.SyncState`'s pure-Kotlin mirror (same three values, same
+ *  meaning); the jvmMain adapter maps 1:1. */
+enum class RpcSyncState { SYNCING, CATCHING_UP, SYNCED }
+
 interface RpcBackend {
     fun chainId(): Long
     fun headBlockNumber(): Long?
+    /** Non-blocking by contract (`VerifiedReads.syncState` semantics): answers
+     *  from the current status snapshot — it may kick a wake but never holds
+     *  the caller, because wallets probe this to decide whether the node is
+     *  alive. Never null: an unreadable status reads as [RpcSyncState.SYNCING]. */
+    fun syncState(): RpcSyncState
     fun call(from: ByteArray?, to: ByteArray, data: ByteArray, valueWei: String?, block: String): ByteArray?
     fun getBalance(address: ByteArray, block: String): String?
     fun getTransactionCount(address: ByteArray, block: String): Long?

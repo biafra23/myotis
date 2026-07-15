@@ -208,10 +208,10 @@ class RpcRouter(
             // on (and progress-computing ones read 0%, never a false 100%).
             "eth_syncing" -> {
                 // syncState() is non-blocking by contract, but on the Rust engine it
-                // still crosses JNI — keep it off the Ktor event loop like every
-                // other backend read.
-                val synced = withContext(Dispatchers.IO) {
-                    b.syncState() == io.myotis.api.SyncState.SYNCED
+                // still crosses an FFI — keep it off the server's event loop like
+                // every other backend read.
+                val synced = withContext(rpcIoDispatcher) {
+                    b.syncState() == RpcSyncState.SYNCED
                 }
                 if (synced) {
                     resultEnvelope(id, JsonPrimitive(false))

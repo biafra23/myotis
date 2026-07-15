@@ -35,6 +35,18 @@ class IosRpcBackend(
         return if (head > 0) head else null
     }
 
+    override fun syncState(): io.myotis.jsonrpc.RpcSyncState {
+        // Answers from the status snapshot, never holds the caller (the seam's
+        // non-blocking contract). Not running / unreadable status → SYNCING —
+        // "not synced yet", never a crash (RustVerifiedReads' fallback, mirrored).
+        val handle = handleProvider() ?: return io.myotis.jsonrpc.RpcSyncState.SYNCING
+        return when (statusOrNull(handle)?.engineString("beaconState")) {
+            "SYNCED" -> io.myotis.jsonrpc.RpcSyncState.SYNCED
+            "CATCHING_UP" -> io.myotis.jsonrpc.RpcSyncState.CATCHING_UP
+            else -> io.myotis.jsonrpc.RpcSyncState.SYNCING // STARTING / SYNCING / unreadable
+        }
+    }
+
     override fun getBalance(address: ByteArray, block: String): String? {
         if (!isServableBlock(block)) return null
         val r = queryAccount(address) ?: return null
