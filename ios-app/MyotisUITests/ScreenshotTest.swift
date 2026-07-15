@@ -14,9 +14,11 @@ final class ScreenshotTest: XCTestCase {
         shot.name = "device-screenshot"
         shot.lifetime = .keepAlways
         add(shot)
-        // Belt for CLI extraction: also write the PNG into the runner's own
-        // Documents, retrievable with `devicectl device copy from` (result-
-        // bundle attachment export has proven flaky from the command line).
+        // Belt for CLI extraction: also write the PNG into the runner's tmp
+        // dir, for `devicectl device copy from --domain-type appDataContainer`
+        // (result-bundle attachment export has proven flaky from the command
+        // line; note the runner may get an ephemeral container per run, so
+        // this too is best-effort).
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
         try app.screenshot().pngRepresentation.write(to: tmp.appendingPathComponent("shot.png"))
     }

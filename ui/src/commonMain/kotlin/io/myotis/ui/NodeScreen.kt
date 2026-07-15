@@ -680,15 +680,19 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         // vocabulary for both rows, sized for phone-width screens:
         // ✓ confirmed server (CL: proven LC · EL: snap-ok), ✕ confirmed not
         // (nolc / snap-bad), ? untried.
+        // The derived untried bucket can't go negative from ONE CacheFileStats
+        // parse (buckets are mutually exclusive per line), but coerce anyway so
+        // a future host feeding these fields from another source can't render
+        // "?-3".
         StatusRow(
             "CL cache",
             "${s.clCachedPeers} · ✓${s.clCachedProven} ✕${s.clCachedNolc} " +
-                "?${s.clCachedPeers - s.clCachedProven - s.clCachedNolc}",
+                "?${(s.clCachedPeers - s.clCachedProven - s.clCachedNolc).coerceAtLeast(0)}",
         )
         StatusRow(
             "EL cache",
             "${s.elCachedPeers} · ✓${s.elCachedSnapOk} ✕${s.elCachedSnapBad} " +
-                "?${s.elCachedPeers - s.elCachedSnapOk - s.elCachedSnapBad}",
+                "?${(s.elCachedPeers - s.elCachedSnapOk - s.elCachedSnapBad).coerceAtLeast(0)}",
         )
         // What peers ask US for: demand for our served headers/blocks, and how often we
         // could answer. Bodies-served stays 0 (light client; prompt empty replies).
