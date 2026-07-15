@@ -90,6 +90,12 @@ char *myotis_get_block_by_number_json(int64_t handle, const char *block_tag);
 /* Receipt JSON, the literal "null" (verified not-seen), or {"error"}. */
 char *myotis_get_transaction_receipt_json(int64_t handle,
                                           const char *tx_hash_hex);
+/* Tx JSON, the literal "null" (verified not-seen), or {"error"}. */
+char *myotis_get_transaction_by_hash_json(int64_t handle,
+                                          const char *tx_hash_hex);
+/* Block JSON, the literal "null" (never-verified hash), or {"error"}. */
+char *myotis_get_block_by_hash_json(int64_t handle,
+                                    const char *block_hash_hex);
 /* {"gasPriceWei","maxPriorityFeePerGasWei"} or {"error"}. */
 char *myotis_fee_estimate_json(int64_t handle);
 /* {"txHash":"0x..."} or {"error"}. */

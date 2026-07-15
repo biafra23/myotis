@@ -905,6 +905,52 @@ pub fn get_transaction_receipt_json(handle: i64, tx_hash_hex: &str) -> String {
     }
 }
 
+/// `nativeGetTransactionByHashJson`: verified `eth_getTransactionByHash` for a
+/// running handle. `tx_hash_hex` is the 0x-hex 32-byte tx hash. Returns the tx
+/// JSON when found+verified, the literal `"null"` for a verified "not seen"
+/// (unknown/pending tx), or `{"error": "..."}` when it can't verify right now.
+pub fn get_transaction_by_hash_json(handle: i64, tx_hash_hex: &str) -> String {
+    let Some(tx_hash) = parse_word32(tx_hash_hex) else {
+        return eljson::error_json("invalid transaction hash (expected 32-byte hex)");
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    match engine.rt.block_on(async { reader.get_transaction_by_hash(tx_hash).await }) {
+        Ok(Some(tx)) => eljson::tx_json(&tx),
+        Ok(None) => "null".to_string(), // verified "not seen" → eth null
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// `nativeGetBlockByHashJson`: verified `eth_getBlockByHash` (transactions as
+/// hashes) for a running handle. `block_hash_hex` is the 0x-hex 32-byte block
+/// hash. Returns the block JSON, the literal `"null"` for a hash this engine
+/// has never verified (eth's unknown-block null), or `{"error": "..."}`.
+/// `fullTransactions=true` is handled on the Java side (returns null before
+/// this native runs), matching `nativeGetBlockByNumberJson`.
+pub fn get_block_by_hash_json(handle: i64, block_hash_hex: &str) -> String {
+    let Some(block_hash) = parse_word32(block_hash_hex) else {
+        return eljson::error_json("invalid block hash (expected 32-byte hex)");
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    match engine.rt.block_on(async { reader.get_block_by_hash(block_hash).await }) {
+        Ok(Some(block)) => eljson::block_json(&block),
+        Ok(None) => "null".to_string(), // never-verified/reorged-away hash → eth null
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
 /// `nativeSendRawTransactionJson`: gossip a signed raw transaction to peers and
 /// return `{"txHash":"0x…"}` (keccak256 of the raw tx), or `{"error": "..."}` when
 /// no peer could be reached / the input isn't a plausible tx. A WRITE — nothing is

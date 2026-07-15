@@ -301,6 +301,36 @@ pub unsafe extern "C" fn myotis_get_transaction_receipt_json(
     into_c(crate::host::get_transaction_receipt_json(handle, &tx_hash_hex))
 }
 
+/// Verified `eth_getTransactionByHash` (`nativeGetTransactionByHashJson`
+/// twin). Returns the tx JSON, the literal `"null"` (verified "not seen" —
+/// unknown/pending), or `{"error": ...}`.
+///
+/// # Safety
+/// `tx_hash_hex` must be null or a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_get_transaction_by_hash_json(
+    handle: i64,
+    tx_hash_hex: *const c_char,
+) -> *mut c_char {
+    let tx_hash_hex = read_string(tx_hash_hex).unwrap_or_default();
+    into_c(crate::host::get_transaction_by_hash_json(handle, &tx_hash_hex))
+}
+
+/// Verified `eth_getBlockByHash` (`nativeGetBlockByHashJson` twin,
+/// transactions as hashes). Returns the block JSON, the literal `"null"` (a
+/// hash this engine never verified), or `{"error": ...}`.
+///
+/// # Safety
+/// `block_hash_hex` must be null or a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_get_block_by_hash_json(
+    handle: i64,
+    block_hash_hex: *const c_char,
+) -> *mut c_char {
+    let block_hash_hex = read_string(block_hash_hex).unwrap_or_default();
+    into_c(crate::host::get_block_by_hash_json(handle, &block_hash_hex))
+}
+
 /// Verified fee estimate: `{"gasPriceWei","maxPriorityFeePerGasWei"}` or
 /// `{"error": ...}` (`nativeFeeEstimateJson` twin).
 #[no_mangle]

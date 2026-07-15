@@ -10,7 +10,8 @@
 
 use myotis_net::el::evm::{CallOutcome, EnsOutcome, EnsQueryOutcome, EnsRecordValue, GasOutcome};
 use myotis_net::el::reader::{
-    FeeEstimate, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedReceipt, VerifiedStorage,
+    FeeEstimate, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedReceipt,
+    VerifiedStorage, VerifiedTransaction,
 };
 
 /// The header-chain gap cap the ladder enforces (mirrors the Java
@@ -281,7 +282,7 @@ pub fn receipt_json(r: &VerifiedReceipt) -> String {
         }
         if let Some(eff) = r.effective_gas_price {
             s.push_str(",\"effectiveGasPrice\":\"");
-            s.push_str(&format!("0x{eff:x}"));
+            s.push_str(&hex_quantity_u128(eff));
             s.push('"');
         }
     }
@@ -325,6 +326,88 @@ pub fn receipt_json(r: &VerifiedReceipt) -> String {
         s.push_str("\",\"removed\":false}");
     }
     s.push_str("]}");
+    s
+}
+
+/// Serialize a verified transaction to the `eth_getTransactionByHash` JSON.
+/// Mirrors the Java `VerifiedRpcBackend.buildTxJson` field set, ordering, and
+/// encoding exactly (the mined shape — the pending shape with null block
+/// coordinates is the Java engine's own-sent-tx path, which needs the sent-tx
+/// cache): minimal-hex QUANTITYs, `chainId` only when the tx carries one (a
+/// pre-155 legacy tx doesn't), `from` only when the sender recovered,
+/// `to: null` for a creation, the legacy/1559 fee-field split, `yParity` only
+/// for typed txs, and `r`/`s` as 32-byte left-padded DATA (never QUANTITY).
+pub fn tx_json(t: &VerifiedTransaction) -> String {
+    let tx = &t.tx;
+    let mut s = String::with_capacity(768);
+    s.push_str("{\"hash\":\"");
+    s.push_str(&hex0x(&t.tx_hash));
+    s.push_str("\",\"blockHash\":\"");
+    s.push_str(&hex0x(&t.block_hash));
+    s.push_str("\",\"blockNumber\":\"");
+    s.push_str(&hex_quantity(t.block_number));
+    s.push_str("\",\"transactionIndex\":\"");
+    s.push_str(&hex_quantity(t.tx_index));
+    s.push_str("\",\"type\":\"");
+    s.push_str(&hex_quantity(u64::from(tx.ty)));
+    s.push('"');
+    if let Some(chain_id) = tx.chain_id {
+        s.push_str(",\"chainId\":\"");
+        s.push_str(&hex_quantity(chain_id));
+        s.push('"');
+    }
+    s.push_str(",\"nonce\":\"");
+    s.push_str(&hex_quantity(tx.nonce));
+    s.push('"');
+    if let Some(from) = &tx.from {
+        s.push_str(",\"from\":\"");
+        s.push_str(&hex0x_var(from));
+        s.push('"');
+    }
+    match &tx.to {
+        Some(to) => {
+            s.push_str(",\"to\":\"");
+            s.push_str(&hex0x_var(to));
+            s.push('"');
+        }
+        None => s.push_str(",\"to\":null"),
+    }
+    s.push_str(",\"value\":\"");
+    s.push_str(&hex_quantity_scalar(&tx.value));
+    s.push_str("\",\"gas\":\"");
+    s.push_str(&hex_quantity(tx.gas));
+    s.push('"');
+    if let Some(gp) = tx.gas_price {
+        s.push_str(",\"gasPrice\":\"");
+        s.push_str(&hex_quantity_u128(gp));
+        s.push('"');
+    }
+    if let Some(max_fee) = tx.max_fee_per_gas {
+        s.push_str(",\"maxFeePerGas\":\"");
+        s.push_str(&hex_quantity_u128(max_fee));
+        s.push_str("\",\"maxPriorityFeePerGas\":\"");
+        s.push_str(&hex_quantity_u128(tx.max_priority_fee_per_gas.unwrap_or(0)));
+        s.push('"');
+    }
+    s.push_str(",\"input\":\"");
+    s.push_str(&hex0x_var(&tx.input));
+    // v is a QUANTITY (the raw legacy v / the typed yParity); typed txs also
+    // carry yParity explicitly.
+    s.push_str("\",\"v\":\"");
+    s.push_str(&hex_quantity(tx.v));
+    s.push('"');
+    if tx.ty >= 1 {
+        s.push_str(",\"yParity\":\"");
+        s.push_str(&hex_quantity(tx.v));
+        s.push('"');
+    }
+    // r and s are 32-byte DATA — left-padded, never QUANTITY (odd-length /
+    // unpadded breaks clients expecting exactly 32 bytes).
+    s.push_str(",\"r\":\"");
+    s.push_str(&hex0x(&tx.r));
+    s.push_str("\",\"s\":\"");
+    s.push_str(&hex0x(&tx.s));
+    s.push_str("\"}");
     s
 }
 
@@ -487,6 +570,12 @@ pub fn tx_hash_json(hash: &[u8; 32]) -> String {
 
 /// A u64 as a minimal-hex QUANTITY (`0x0` for zero).
 fn hex_quantity(v: u64) -> String {
+    format!("0x{v:x}")
+}
+
+/// The u128 sibling of [`hex_quantity`] (fee fields — per-gas wei exceeds u64):
+/// one place defines QUANTITY encoding for both widths.
+fn hex_quantity_u128(v: u128) -> String {
     format!("0x{v:x}")
 }
 
@@ -966,7 +1055,6 @@ mod tests {
 
     fn sample_receipt() -> VerifiedReceipt {
         use myotis_net::el::receipt::{DecodedReceipt, ReceiptLog};
-        use myotis_net::el::tx::TxSummary;
         VerifiedReceipt {
             tx_hash: [0xa1; 32],
             tx_index: 2,
@@ -986,17 +1074,28 @@ mod tests {
                     data: vec![0xde, 0xad],
                 }],
             },
-            tx: Some(TxSummary {
-                ty: 2,
-                nonce: 5,
-                to: Some([0xbb; 20]),
-                gas_price: None,
-                max_priority_fee_per_gas: Some(2_000_000_000),
-                max_fee_per_gas: Some(50_000_000_000),
-                from: Some([0xcc; 20]),
-            }),
+            tx: Some(sample_tx_summary()),
             effective_gas_price: Some(12_000_000_000),
             contract_address: None,
+        }
+    }
+
+    fn sample_tx_summary() -> myotis_net::el::tx::TxSummary {
+        myotis_net::el::tx::TxSummary {
+            ty: 2,
+            chain_id: Some(1),
+            nonce: 5,
+            to: Some([0xbb; 20]),
+            gas_price: None,
+            max_priority_fee_per_gas: Some(2_000_000_000),
+            max_fee_per_gas: Some(50_000_000_000),
+            gas: 90_000,
+            value: vec![0x0d, 0xe0, 0xb6, 0xb3, 0xa7, 0x64, 0x00, 0x00], // 1 ETH
+            input: vec![0xa9, 0x05, 0x9c, 0xbb],
+            v: 1,
+            r: [0x11; 32],
+            s: [0x22; 32],
+            from: Some([0xcc; 20]),
         }
     }
 
@@ -1077,6 +1176,76 @@ mod tests {
         r.receipt.success = false;
         let v: serde_json::Value = serde_json::from_str(&receipt_json(&r)).unwrap();
         assert_eq!(v["status"], "0x0");
+    }
+
+    fn sample_transaction() -> VerifiedTransaction {
+        VerifiedTransaction {
+            tx_hash: [0xa1; 32],
+            tx_index: 2,
+            block_hash: [0x99; 32],
+            block_number: 21_000_000,
+            tx: sample_tx_summary(),
+        }
+    }
+
+    #[test]
+    fn tx_json_shape_and_values() {
+        // The Java RustVerifiedReadJsonTest replays this shape — the two are the
+        // halves of the cross-language golden (mirrors buildTxJson).
+        let v: serde_json::Value =
+            serde_json::from_str(&tx_json(&sample_transaction())).expect("valid json");
+        assert_eq!(v["hash"], hex0x(&[0xa1; 32]));
+        assert_eq!(v["blockHash"], hex0x(&[0x99; 32]));
+        assert_eq!(v["blockNumber"], "0x1406f40");
+        assert_eq!(v["transactionIndex"], "0x2");
+        assert_eq!(v["type"], "0x2");
+        assert_eq!(v["chainId"], "0x1");
+        assert_eq!(v["nonce"], "0x5");
+        assert_eq!(v["from"], hex0x_var(&[0xcc; 20]));
+        assert_eq!(v["to"], hex0x_var(&[0xbb; 20]));
+        assert_eq!(v["value"], "0xde0b6b3a7640000"); // 1 ETH
+        assert_eq!(v["gas"], "0x15f90"); // 90_000
+        assert!(v.get("gasPrice").is_none()); // 1559 tx: no legacy gasPrice
+        assert_eq!(v["maxFeePerGas"], "0xba43b7400"); // 50 gwei
+        assert_eq!(v["maxPriorityFeePerGas"], "0x77359400"); // 2 gwei
+        assert_eq!(v["input"], "0xa9059cbb");
+        assert_eq!(v["v"], "0x1");
+        assert_eq!(v["yParity"], "0x1"); // typed txs carry yParity == v
+        assert_eq!(v["r"], hex0x(&[0x11; 32]));
+        assert_eq!(v["s"], hex0x(&[0x22; 32]));
+    }
+
+    #[test]
+    fn legacy_pre155_tx_json_omits_chain_id_and_y_parity() {
+        let mut t = sample_transaction();
+        t.tx.ty = 0;
+        t.tx.chain_id = None; // pre-EIP-155
+        t.tx.gas_price = Some(20_000_000_000);
+        t.tx.max_fee_per_gas = None;
+        t.tx.max_priority_fee_per_gas = None;
+        t.tx.v = 28;
+        let v: serde_json::Value = serde_json::from_str(&tx_json(&t)).unwrap();
+        assert_eq!(v["type"], "0x0");
+        assert!(v.get("chainId").is_none());
+        assert_eq!(v["gasPrice"], "0x4a817c800"); // 20 gwei
+        assert!(v.get("maxFeePerGas").is_none());
+        assert!(v.get("maxPriorityFeePerGas").is_none());
+        assert_eq!(v["v"], "0x1c"); // 28
+        assert!(v.get("yParity").is_none()); // legacy: no yParity
+    }
+
+    #[test]
+    fn creation_and_unrecovered_tx_json_uses_nulls_and_omissions() {
+        let mut t = sample_transaction();
+        t.tx.to = None; // creation
+        t.tx.from = None; // unrecoverable signature
+        t.tx.value = Vec::new(); // 0
+        t.tx.input = Vec::new();
+        let v: serde_json::Value = serde_json::from_str(&tx_json(&t)).unwrap();
+        assert_eq!(v["to"], serde_json::Value::Null);
+        assert!(v.get("from").is_none());
+        assert_eq!(v["value"], "0x0");
+        assert_eq!(v["input"], "0x");
     }
 
     #[test]

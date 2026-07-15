@@ -35,7 +35,10 @@ pub mod ringlog;
 ///      RustChainHandle at the same time.
 /// v14: added nativeGetTransactionReceiptJson (verified eth_getTransactionReceipt
 ///      over the incremental beacon-anchored tx scan).
-pub const ABI_VERSION: i32 = 14;
+/// v15: added nativeGetTransactionByHashJson + nativeGetBlockByHashJson (the
+///      wallet's post-receipt confirm loop; the same locate machinery + the
+///      verified block-hash→number map).
+pub const ABI_VERSION: i32 = 15;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
@@ -448,6 +451,43 @@ mod jni_shim {
     ) -> jstring {
         let tx_hash_hex = read_string(&mut env, &tx_hash_hex).unwrap_or_default();
         let json = crate::host::get_transaction_receipt_json(handle, &tx_hash_hex);
+        match env.new_string(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// `RustEngineNative.nativeGetTransactionByHashJson(long handle, String txHashHex)`
+    /// — verified `eth_getTransactionByHash`. Returns the tx JSON, the literal
+    /// `"null"` (verified "not seen" — unknown/pending), or `{"error": "..."}`.
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeGetTransactionByHashJson(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        tx_hash_hex: JString,
+    ) -> jstring {
+        let tx_hash_hex = read_string(&mut env, &tx_hash_hex).unwrap_or_default();
+        let json = crate::host::get_transaction_by_hash_json(handle, &tx_hash_hex);
+        match env.new_string(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// `RustEngineNative.nativeGetBlockByHashJson(long handle, String blockHashHex)`
+    /// — verified `eth_getBlockByHash` (transactions as hashes). Returns the block
+    /// JSON, the literal `"null"` (a hash this engine never verified), or
+    /// `{"error": "..."}`.
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeGetBlockByHashJson(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        block_hash_hex: JString,
+    ) -> jstring {
+        let block_hash_hex = read_string(&mut env, &block_hash_hex).unwrap_or_default();
+        let json = crate::host::get_block_by_hash_json(handle, &block_hash_hex);
         match env.new_string(json) {
             Ok(s) => s.into_raw(),
             Err(_) => std::ptr::null_mut(),

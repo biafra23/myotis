@@ -294,6 +294,23 @@ pub struct VerifiedReceipt {
     pub contract_address: Option<[u8; 20]>,
 }
 
+/// A verified `eth_getTransactionByHash` result: the located tx's block
+/// coordinates plus the fully decoded tx fields. As with [`VerifiedReceipt`],
+/// the location was proven by the `transactionsRoot`-verified body inside a
+/// beacon-anchored header window — returning it IS the verification.
+#[derive(Debug, Clone)]
+pub struct VerifiedTransaction {
+    pub tx_hash: [u8; 32],
+    pub tx_index: u64,
+    pub block_hash: [u8; 32],
+    pub block_number: u64,
+    pub tx: TxSummary,
+}
+
+/// Entry cap for the verified block-hash → number map (the Java
+/// `blockHashToNumber` cache's 512).
+const BLOCK_HASH_LRU_MAX: usize = 512;
+
 /// Where a mined tx was found, cached per tx hash so wallet polls don't rescan
 /// (the Java `TxLocation`). The header/body were verified when this was built;
 /// canonicality is re-confirmed on later polls until the block finalizes.
@@ -311,7 +328,9 @@ struct TxLocation {
 struct TxScanState {
     /// Highest block already scanned (`None` = never scanned).
     high_scanned: Option<u64>,
-    found: Option<TxLocation>,
+    /// `Arc` so a poll hands the cached location out by pointer bump — the
+    /// header + raw-tx bytes aren't re-copied on every wallet confirm poll.
+    found: Option<Arc<TxLocation>>,
     last_touched: std::time::Instant,
 }
 
@@ -351,6 +370,12 @@ pub struct ElReader {
     /// so concurrent polls for the SAME tx don't duplicate fetches while
     /// different txs proceed in parallel.
     tx_scans: std::sync::Mutex<TxScanMap>,
+    /// Recently-VERIFIED block hash → number, so `eth_getBlockByHash` (which
+    /// wallets call right after a receipt to finalize a tx) resolves to the
+    /// verified by-number path (the Java `blockHashToNumber` twin). Populated
+    /// ONLY by blocks this reader itself verified (the receipt/tx scan and the
+    /// by-number serve); the shared LRU is the myotis-evm cache one.
+    block_hash_numbers: std::sync::Mutex<myotis_evm::Lru<[u8; 32], u64>>,
 }
 
 /// The scan-cursor map plus its last TTL sweep — one lock covers both, so the
@@ -450,6 +475,7 @@ impl ElReader {
                 map: std::collections::HashMap::new(),
                 last_sweep: std::time::Instant::now(),
             }),
+            block_hash_numbers: std::sync::Mutex::new(myotis_evm::Lru::new(BLOCK_HASH_LRU_MAX)),
         })
     }
 
@@ -1119,13 +1145,7 @@ impl ElReader {
         &self,
         target: Option<u64>,
     ) -> Result<Option<VerifiedBlock>, String> {
-        let head_num = self.anchor.optimistic_block_number();
-        let Some(head_hash) = self.anchor.optimistic_block_hash() else {
-            return Err("no beacon-anchored head yet".to_string());
-        };
-        if head_num == 0 {
-            return Err("beacon not synced".to_string());
-        }
+        let (head_num, head_hash) = self.anchored_head()?;
         let target_num = target.unwrap_or(head_num);
         // A pin above the verified head is future/unknown, not an error.
         if target_num > head_num {
@@ -1190,6 +1210,9 @@ impl ElReader {
             return Err("block body transactions do not match the header transactionsRoot".to_string());
         }
         let tx_hashes = body.transactions.iter().map(|t| keccak256(t)).collect();
+        // Remember the fully verified hash↔number so eth_getBlockByHash resolves
+        // it (the Java rpcGetBlockByNumber does the same).
+        self.remember_block_number(vh.hash, vh.header.number);
         Ok(VerifiedBlock { hash: vh.hash, header: vh.header.clone(), tx_hashes })
     }
 
@@ -1198,13 +1221,7 @@ impl ElReader {
     /// tip (floored at the network's `min_suggested_tip_wei`) as the priority fee, and next-block
     /// base fee + that tip as the legacy gas price. `Err` when it can't verify.
     pub async fn fee_estimate(&self) -> Result<FeeEstimate, String> {
-        let head_num = self.anchor.optimistic_block_number();
-        let Some(head_hash) = self.anchor.optimistic_block_hash() else {
-            return Err("no beacon-anchored head yet".to_string());
-        };
-        if head_num == 0 {
-            return Err("beacon not synced".to_string());
-        }
+        let (head_num, head_hash) = self.anchored_head()?;
         // Sample [start..head]; never below genesis.
         let count = TIP_SUGGEST_BLOCKS.min(head_num + 1);
         let start = head_num + 1 - count;
@@ -1336,104 +1353,10 @@ impl ElReader {
         &self,
         tx_hash: [u8; 32],
     ) -> Result<Option<VerifiedReceipt>, String> {
-        let head_num = self.anchor.optimistic_block_number();
-        let Some(head_hash) = self.anchor.optimistic_block_hash() else {
-            return Err("no beacon-anchored head yet".to_string());
-        };
-        if head_num == 0 {
-            return Err("beacon not synced".to_string());
-        }
-        let state = self.tx_scan_state(tx_hash)?;
-        // Serialize concurrent polls for the same tx (the Java per-state
-        // synchronized block); held across the network stages below on purpose.
-        let mut st = state.lock().await;
-        st.last_touched = std::time::Instant::now();
-
-        // A cached location below the finalized height is immutable; one still
-        // near the head must be re-confirmed canonical (it can be reorged out).
-        if let Some(loc) = &st.found {
-            let finalized = self.finalized_block_number();
-            let immutable = finalized > 0 && loc.header.number <= finalized;
-            if !immutable && !self.still_canonical(loc, head_num, &head_hash).await {
-                // Proven reorged out: rescan the recent region from scratch.
-                st.found = None;
-                st.high_scanned = None;
-            }
-        }
-
-        if st.found.is_none() {
-            // A short reorg can pull the optimistic head BELOW an
-            // already-scanned height. Clamp the cursor so the replacement
-            // blocks are rescanned as the head re-advances — otherwise
-            // `from = high + 1 > head` skips scanning until the head passes the
-            // stale cursor, and a tx mined in a replacement block would keep
-            // reading as a verified "not seen" in the meantime.
-            if let Some(high) = st.high_scanned {
-                if high > head_num {
-                    st.high_scanned = Some(head_num);
-                }
-            }
-            let mut from = match st.high_scanned {
-                None => head_num.saturating_sub(RECEIPT_INITIAL_LOOKBACK_BLOCKS - 1),
-                Some(high) => high + 1,
-            };
-            let cap_floor = head_num.saturating_sub(RECEIPT_MAX_SCAN_BLOCKS_PER_POLL - 1);
-            if from < cap_floor {
-                tracing::info!(
-                    from,
-                    cap_floor,
-                    "tx scan: catch-up gap, skipping blocks below the per-poll cap"
-                );
-                from = cap_floor;
-            }
-            // from > head_num means the head hasn't advanced since the last
-            // scan — nothing new to look at (the cached "not seen" stands).
-            if from <= head_num {
-                let peers = self.pool.snap_peers().await;
-                if peers.is_empty() {
-                    return Err("no snap peer available".to_string());
-                }
-                let total = peers.len();
-                let mut scanned = false;
-                let mut last_err = String::new();
-                for peer in &peers {
-                    let attempt = tokio::time::timeout(
-                        RECEIPT_SCAN_DEADLINE,
-                        self.scan_blocks_from(peer, from, head_num, &head_hash, &tx_hash),
-                    )
-                    .await
-                    .unwrap_or_else(|_| Err("tx scan timed out".to_string()));
-                    match attempt {
-                        Ok(found) => {
-                            self.pool.record_snap_served(peer.addr()).await;
-                            // Advance the cursor only after a fully verified
-                            // scan of [from..head] (found or not).
-                            st.high_scanned = Some(head_num);
-                            st.found = found;
-                            scanned = true;
-                            break;
-                        }
-                        Err(e) => {
-                            self.pool.record_snap_failure(peer.addr()).await;
-                            last_err = e;
-                        }
-                    }
-                }
-                if !scanned {
-                    return Err(format!(
-                        "all {total} snap peer(s) failed to serve a verifiable tx scan: {last_err}"
-                    ));
-                }
-            }
-        }
-
-        let Some(loc) = st.found.clone() else {
+        let (head_num, head_hash) = self.anchored_head()?;
+        let Some(loc) = self.locate_mined_tx(tx_hash, head_num, &head_hash).await? else {
             return Ok(None); // verified "not seen" in the scanned coverage → eth null
         };
-        // The cursor is settled; release it before the receipt round-trip so
-        // concurrent polls for the SAME tx aren't serialized behind network I/O
-        // (the Java twin's synchronized block also ends at locateMinedTx).
-        drop(st);
 
         // Fetch + verify the block's receipts against the (anchored) header's
         // receiptsRoot, then build the result. Receipts are re-fetched per poll
@@ -1457,6 +1380,193 @@ impl ElReader {
             }
         }
         Err(format!("all {total} snap peer(s) failed to serve verifiable receipts: {last_err}"))
+    }
+
+    /// Verified `eth_getTransactionByHash` — the same beacon-anchored,
+    /// `transactionsRoot`-verified locate as the receipt path, followed by the
+    /// full tx decode (Java `rpcGetTransactionByHash`/`buildTxJson`).
+    ///
+    /// Returns `Ok(Some)` when found+verified; `Ok(None)` for a verified "not
+    /// seen" (an unknown/pending tx — eth's null; the Java engine additionally
+    /// answers "pending" for its OWN just-sent txs from the sent-tx cache,
+    /// which lands with the sent-tx slice); `Err` when it can't verify right
+    /// now, INCLUDING a located tx whose type the decoder doesn't know — the tx
+    /// exists, so "can't render it" must never read as "unknown tx" (the Java
+    /// buildTxJson-null convention).
+    pub async fn get_transaction_by_hash(
+        &self,
+        tx_hash: [u8; 32],
+    ) -> Result<Option<VerifiedTransaction>, String> {
+        let (head_num, head_hash) = self.anchored_head()?;
+        let Some(loc) = self.locate_mined_tx(tx_hash, head_num, &head_hash).await? else {
+            return Ok(None);
+        };
+        let tx = tx::decode_summary(&loc.raw_tx)
+            .ok_or("transaction located but its type cannot be decoded")?;
+        Ok(Some(VerifiedTransaction {
+            tx_hash,
+            tx_index: loc.index as u64,
+            block_hash: loc.block_hash,
+            block_number: loc.header.number,
+            tx,
+        }))
+    }
+
+    /// Verified `eth_getBlockByHash` (transactions as hashes). Wallets call it
+    /// right after a receipt to finalize a tx as confirmed, so the hash is
+    /// resolved from blocks this reader has ALREADY verified (the receipt scan
+    /// and the by-number serve populate the map), then served via the verified
+    /// by-number path, re-confirming the served block still carries the
+    /// requested hash (a reorg can remap the height). A hash never verified →
+    /// `Ok(None)` (eth's unknown-block null) — the confirm flow always
+    /// pre-populates it via the preceding receipt. Twin of the Java
+    /// `rpcGetBlockByHash`.
+    pub async fn get_block_by_hash(
+        &self,
+        block_hash: [u8; 32],
+    ) -> Result<Option<VerifiedBlock>, String> {
+        let Some(number) = self.lookup_block_number(&block_hash) else {
+            return Ok(None); // not a block we've verified — unknown to us
+        };
+        match self.get_block_by_number(Some(number)).await? {
+            Some(block) if block.hash == block_hash => Ok(Some(block)),
+            // The height serves a DIFFERENT canonical block now (reorg) — or the
+            // number sits above the current head: the requested hash is unknown.
+            _ => Ok(None),
+        }
+    }
+
+    /// Look a block hash up in the verified hash→number map (LRU-refreshing).
+    /// `None` = we never verified that hash. Poisoning is unreachable
+    /// (panic="abort"); read as a miss rather than propagate.
+    fn lookup_block_number(&self, block_hash: &[u8; 32]) -> Option<u64> {
+        self.block_hash_numbers.lock().ok()?.get(block_hash).copied()
+    }
+
+    /// Remember a VERIFIED block hash↔number for `eth_getBlockByHash`.
+    fn remember_block_number(&self, block_hash: [u8; 32], number: u64) {
+        if let Ok(mut lru) = self.block_hash_numbers.lock() {
+            lru.put(block_hash, number);
+        }
+    }
+
+    /// The beacon-anchored optimistic head `(number, hash)`, or the standard
+    /// not-ready errors every verified read shares.
+    fn anchored_head(&self) -> Result<(u64, [u8; 32]), String> {
+        let head_num = self.anchor.optimistic_block_number();
+        let Some(head_hash) = self.anchor.optimistic_block_hash() else {
+            return Err("no beacon-anchored head yet".to_string());
+        };
+        if head_num == 0 {
+            return Err("beacon not synced".to_string());
+        }
+        Ok((head_num, head_hash))
+    }
+
+    /// The shared locate stage (the Java `locateMinedTx` twin): resolve the tx
+    /// hash to its verified block location via the per-tx incremental scan
+    /// cursor. Holds the tx's cursor lock for the duration (concurrent polls
+    /// for the SAME tx serialize here and only here); returns a clone of the
+    /// cached/found location.
+    async fn locate_mined_tx(
+        &self,
+        tx_hash: [u8; 32],
+        head_num: u64,
+        head_hash: &[u8; 32],
+    ) -> Result<Option<Arc<TxLocation>>, String> {
+        let state = self.tx_scan_state(tx_hash)?;
+        let mut st = state.lock().await;
+        st.last_touched = std::time::Instant::now();
+
+        // A cached location below the finalized height is immutable; one still
+        // near the head must be re-confirmed canonical (it can be reorged out).
+        if let Some(loc) = &st.found {
+            let finalized = self.finalized_block_number();
+            let immutable = finalized > 0 && loc.header.number <= finalized;
+            if !immutable && !self.still_canonical(loc, head_num, head_hash).await {
+                // Proven reorged out: rescan the recent region from scratch.
+                st.found = None;
+                st.high_scanned = None;
+            }
+        }
+
+        if st.found.is_none() {
+            // A short reorg can pull the optimistic head BELOW an
+            // already-scanned height — everything scanned above the new head
+            // was replaced, and the fork may reach a few blocks deeper. Reset
+            // the cursor for a fresh initial-lookback scan (covers forks up to
+            // that depth past the new head); merely clamping to the new head
+            // would leave `from = head + 1` and never rescan the replacement
+            // head block itself, so a tx mined there would keep reading as a
+            // verified "not seen".
+            if st.high_scanned.is_some_and(|high| high > head_num) {
+                st.high_scanned = None;
+            }
+            let mut from = match st.high_scanned {
+                None => head_num.saturating_sub(RECEIPT_INITIAL_LOOKBACK_BLOCKS - 1),
+                Some(high) => high + 1,
+            };
+            let cap_floor = head_num.saturating_sub(RECEIPT_MAX_SCAN_BLOCKS_PER_POLL - 1);
+            if from < cap_floor {
+                tracing::info!(
+                    from,
+                    cap_floor,
+                    "tx scan: catch-up gap, skipping blocks below the per-poll cap"
+                );
+                from = cap_floor;
+            }
+            // from > head_num means the head hasn't advanced since the last
+            // scan — nothing new to look at (the cached "not seen" stands).
+            if from <= head_num {
+                let found = self.scan_window(from, head_num, head_hash, &tx_hash).await?;
+                // Advance the cursor only after a fully verified scan of
+                // [from..head] (found or not) — an Err above leaves it put.
+                st.high_scanned = Some(head_num);
+                st.found = found.map(Arc::new);
+            }
+        }
+
+        // The cursor is settled; the lock releases at return, BEFORE any
+        // follow-up round-trips (the Java twin's synchronized block also ends
+        // at locateMinedTx).
+        Ok(st.found.clone())
+    }
+
+    /// Run one `[from..head]` scan across the snap pool: try each peer (each
+    /// attempt bounded by [`RECEIPT_SCAN_DEADLINE`]) until one serves a fully
+    /// verified window, recording served/failure reputation per peer.
+    async fn scan_window(
+        &self,
+        from: u64,
+        head_num: u64,
+        head_hash: &[u8; 32],
+        tx_hash: &[u8; 32],
+    ) -> Result<Option<TxLocation>, String> {
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err("no snap peer available".to_string());
+        }
+        let total = peers.len();
+        let mut last_err = String::new();
+        for peer in &peers {
+            let attempt = tokio::time::timeout(
+                RECEIPT_SCAN_DEADLINE,
+                self.scan_blocks_from(peer, from, head_num, head_hash, tx_hash),
+            )
+            .await
+            .unwrap_or_else(|_| Err("tx scan timed out".to_string()));
+            match attempt {
+                Ok(found) => {
+                    self.pool.record_snap_served(peer.addr()).await;
+                    return Ok(found);
+                }
+                Err(e) => {
+                    self.pool.record_snap_failure(peer.addr()).await;
+                    last_err = e;
+                }
+            }
+        }
+        Err(format!("all {total} snap peer(s) failed to serve a verifiable tx scan: {last_err}"))
     }
 
     /// Get-or-create the per-tx scan cursor. The idle-TTL sweep is time-gated
@@ -1572,6 +1682,9 @@ impl ElReader {
             }
             for (i, raw) in body.transactions.iter().enumerate() {
                 if &keccak256(raw) == want {
+                    // Pre-populate for the eth_getBlockByHash the wallet issues
+                    // right after the receipt (the Java locateMinedTx twin).
+                    self.remember_block_number(vh.hash, vh.header.number);
                     return Ok(Some(TxLocation {
                         header: vh.header.clone(),
                         block_hash: vh.hash,
@@ -2095,4 +2208,5 @@ mod tests {
         assert_eq!(cfg.listen_port, 30304);
         assert_eq!(cfg.min_suggested_tip_wei, 1_000_000, "gnosis cheap-chain tip floor");
     }
+
 }

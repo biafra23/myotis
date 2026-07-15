@@ -23,7 +23,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 14; // 14: + nativeGetTransactionReceiptJson
+    static final int EXPECTED_ABI_VERSION = 15; // 15: + nativeGetTransactionByHashJson / nativeGetBlockByHashJson
 
     private static final boolean AVAILABLE = load();
 
@@ -240,4 +240,28 @@ final class RustEngineNative {
      * failure.
      */
     static native String nativeGetTransactionReceiptJson(long handle, String txHashHex);
+
+    /**
+     * Verified {@code eth_getTransactionByHash} for a running handle.
+     * {@code txHashHex} is the 0x-hex 32-byte transaction hash. Returns the tx
+     * JSON object (located via the same beacon-anchored, transactionsRoot-verified
+     * scan as the receipt path, fully decoded incl. the recovered sender), the
+     * literal {@code "null"} for a verified "not seen" (unknown/pending tx), or
+     * an {@code "error"} object for a transport / not-running / can't-verify
+     * failure — including a located tx of an undecodable future type (found but
+     * unrenderable must never read as "unknown").
+     */
+    static native String nativeGetTransactionByHashJson(long handle, String txHashHex);
+
+    /**
+     * Verified {@code eth_getBlockByHash} (transactions as hashes) for a running
+     * handle. {@code blockHashHex} is the 0x-hex 32-byte block hash, resolved
+     * against blocks this engine has ALREADY verified (receipt scans and by-number
+     * serves populate the map) and re-served via the verified by-number path.
+     * Returns the block JSON, the literal {@code "null"} for a hash never
+     * verified / reorged away (eth's unknown-block null), or an {@code "error"}
+     * object. {@code fullTransactions} is handled Java-side (returns null before
+     * this native runs).
+     */
+    static native String nativeGetBlockByHashJson(long handle, String blockHashHex);
 }
