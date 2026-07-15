@@ -926,8 +926,10 @@ pub fn get_transaction_receipt_json(handle: i64, tx_hash_hex: &str) -> String {
 
 /// `nativeGetTransactionByHashJson`: verified `eth_getTransactionByHash` for a
 /// running handle. `tx_hash_hex` is the 0x-hex 32-byte tx hash. Returns the tx
-/// JSON when found+verified, the literal `"null"` for a verified "not seen"
-/// (unknown/pending tx), or `{"error": "..."}` when it can't verify right now.
+/// JSON when found+verified — the MINED shape for a located tx, or the PENDING
+/// shape (block fields explicitly null) for the wallet's own just-broadcast tx
+/// from the sent-tx cache — the literal `"null"` for a verified "not seen"
+/// (unknown tx), or `{"error": "..."}` when it can't verify right now.
 pub fn get_transaction_by_hash_json(handle: i64, tx_hash_hex: &str) -> String {
     let Some(tx_hash) = parse_word32(tx_hash_hex) else {
         return eljson::error_json("invalid transaction hash (expected 32-byte hex)");
@@ -940,8 +942,11 @@ pub fn get_transaction_by_hash_json(handle: i64, tx_hash_hex: &str) -> String {
         Err(msg) => return eljson::error_json(msg),
     };
     match engine.rt.block_on(async { reader.get_transaction_by_hash(tx_hash).await }) {
-        Ok(Some(tx)) => eljson::tx_json(&tx),
-        Ok(None) => "null".to_string(), // verified "not seen" → eth null
+        Ok(myotis_net::el::reader::TxLookup::Mined(tx)) => eljson::tx_json(&tx),
+        Ok(myotis_net::el::reader::TxLookup::Pending { tx_hash, tx }) => {
+            eljson::pending_tx_json(&tx_hash, &tx)
+        }
+        Ok(myotis_net::el::reader::TxLookup::NotSeen) => "null".to_string(), // eth null
         Err(e) => eljson::error_json(&e),
     }
 }
