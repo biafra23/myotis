@@ -41,7 +41,9 @@ pub mod ringlog;
 /// v16: added nativeFeeHistoryJson (verified eth_feeHistory: anchored header
 ///      window + gas-used-weighted reward percentiles from verified bodies and
 ///      receipts).
-pub const ABI_VERSION: i32 = 16;
+/// v17: added nativeGetBlockReceiptsJson (verified eth_getBlockReceipts — one
+///      anchored block's whole receipt list, body + receipts root-verified).
+pub const ABI_VERSION: i32 = 17;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
@@ -436,6 +438,25 @@ mod jni_shim {
         handle: jlong,
     ) -> jstring {
         let json = crate::host::fee_estimate_json(handle);
+        match env.new_string(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// `RustEngineNative.nativeGetBlockReceiptsJson(long handle, String selector)`
+    /// — verified `eth_getBlockReceipts`. Returns the receipts array JSON, the
+    /// literal `"null"` (verified unknown/future block or never-verified hash),
+    /// or `{"error": "..."}`.
+    #[no_mangle]
+    pub extern "system" fn Java_io_myotis_engines_RustEngineNative_nativeGetBlockReceiptsJson(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        selector: JString,
+    ) -> jstring {
+        let selector = read_string(&mut env, &selector).unwrap_or_default();
+        let json = crate::host::get_block_receipts_json(handle, &selector);
         match env.new_string(json) {
             Ok(s) => s.into_raw(),
             Err(_) => std::ptr::null_mut(),

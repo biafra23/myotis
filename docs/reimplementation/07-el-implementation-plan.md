@@ -352,6 +352,14 @@ Spec: README §5.3, doc 04 §2. Highlights per PR-sized chunk:
      (`percentile_rewards`), and the same-signature stale re-serve
      (`lastGoodFeeHistory` twin). Chunk 2 is COMPLETE. Still open: the sent-tx
      broadcast-head reachback + own-tx pending answers + pending overlay (chunk 3).
+   - **Landed (coverage extension): `eth_getBlockReceipts`** (ABI v17,
+     `nativeGetBlockReceiptsJson` + `myotis_get_block_receipts_json`, plus a NEW
+     `VerifiedReads.getBlockReceipts` served by BOTH engines and a router branch):
+     one anchored block's whole receipt list — body + receipts fetched together and
+     root-verified, one-pass batch build (`build_block_receipts`; the Java twin
+     `rpcGetBlockReceipts` reuses `buildReceiptJson` per index). Selector is a tag,
+     0x-number, or 0x-32-byte hash (hash resolves via the verified hash→number map
+     with the reorg re-check, like `getBlockByHash`).
 3. **`sendRawTransaction` + pending overlay.** Gossip raw bytes to all READY peers, return
    `keccak256(rawTx)`, cache own-tx bytes (shows pending until mined), rebroadcast until the
    gossip echo (the EL-A5 hash-observation hook); pending-nonce overlay — only-raises,

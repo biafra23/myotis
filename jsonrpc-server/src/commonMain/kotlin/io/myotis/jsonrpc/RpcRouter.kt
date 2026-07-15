@@ -45,8 +45,8 @@ class RpcRouter(
             "eth_getTransactionCount", "eth_getCode", "eth_getStorageAt",
             "eth_sendRawTransaction", "eth_getTransactionReceipt", "eth_getBlockByNumber",
             "eth_gasPrice", "eth_maxPriorityFeePerGas", "eth_feeHistory", "eth_estimateGas",
-            "eth_getTransactionByHash", "eth_getBlockByHash", "web3_clientVersion",
-            "eth_syncing",
+            "eth_getTransactionByHash", "eth_getBlockByHash", "eth_getBlockReceipts",
+            "web3_clientVersion", "eth_syncing",
         )
     }
 
@@ -334,6 +334,37 @@ class RpcRouter(
                 // null (can't verify) → strict error.
                 val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, fullTx) } ?: return null
                 resultEnvelope(id, json.parseToJsonElement(blockJson))
+            }
+            "eth_getBlockReceipts" -> {
+                val p = root.params()
+                // One selector param: tag | 0x-hex number | 0x-32-byte hash (absent →
+                // "latest" per spec). Validated HERE, strictly, because the two
+                // engines' bare-numeric conventions differ (Java Long.decode reads
+                // decimal, the Rust selector parser hex): only spec-shaped selectors
+                // pass, so the same request can never resolve to different blocks
+                // depending on which engine is behind the router. A JSON-number param
+                // is rejected like the sibling hex helpers reject non-strings.
+                val selParam = p?.getOrNull(0)
+                // Trimmed like both backends trim it, so the gate here never rejects
+                // a selector the engines would have served identically.
+                val selector: String = when {
+                    selParam == null || selParam is JsonNull -> "latest"
+                    else -> (selParam as? JsonPrimitive)
+                        ?.takeIf { it.isString }?.contentOrNull?.trim()?.ifEmpty { "latest" }
+                        ?: return null
+                }
+                // ASCII hex only — Char.isDigit() also accepts Unicode digits, which
+                // the engines' ASCII-only parsers would then reject inconsistently.
+                val specShaped = selector in setOf("latest", "pending", "safe", "finalized", "earliest")
+                    || (selector.length > 2 && selector.length <= 66
+                        && (selector.startsWith("0x") || selector.startsWith("0X"))
+                        && selector.drop(2).all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' })
+                if (!specShaped) return null
+                // Array string when served; "null" for a verified unknown/future
+                // block; Kotlin null (can't verify) → strict error.
+                val receiptsJson =
+                    withContext(rpcIoDispatcher) { b.getBlockReceipts(selector) } ?: return null
+                resultEnvelope(id, json.parseToJsonElement(receiptsJson))
             }
             "eth_gasPrice" -> {
                 val price = withContext(rpcIoDispatcher) { b.gasPrice() } ?: return null

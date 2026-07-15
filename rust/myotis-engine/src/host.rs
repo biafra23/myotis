@@ -1011,6 +1011,51 @@ pub fn fee_estimate_json(handle: i64) -> String {
     }
 }
 
+/// `nativeGetBlockReceiptsJson`: verified `eth_getBlockReceipts` for a running
+/// handle. `selector` is a tag, a 0x-hex block number, or a 0x-32-byte block
+/// hash (unambiguous at 66 chars — a block number is at most 18); a BARE
+/// numeric is rejected — the engines' bare conventions differ (the Java engine
+/// reads decimal, [`parse_block_target`] hex), so the contract is 0x-only for
+/// callers that bypass the router's identical gate. Returns the receipts array
+/// JSON, the literal `"null"` (verified unknown/future block, or a hash this
+/// engine never verified), or `{"error": "..."}`.
+pub fn get_block_receipts_json(handle: i64, selector: &str) -> String {
+    let selector = selector.trim();
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    let outcome = if selector.len() == 66
+        && (selector.starts_with("0x") || selector.starts_with("0X"))
+    {
+        let Some(hash) = parse_word32(selector) else {
+            return eljson::error_json("invalid block hash (expected 32-byte hex)");
+        };
+        engine.rt.block_on(async { reader.get_block_receipts_by_hash(hash).await })
+    } else {
+        let tag = if selector.is_empty() { "latest" } else { selector };
+        let is_tag = matches!(tag, "latest" | "pending" | "safe" | "finalized" | "earliest");
+        if !is_tag && !(tag.starts_with("0x") || tag.starts_with("0X")) {
+            return eljson::error_json(
+                "invalid block selector (expected a tag, 0x-number, or 0x-hash)",
+            );
+        }
+        let target = match parse_block_target(tag) {
+            Ok(t) => t,
+            Err(msg) => return eljson::error_json(msg),
+        };
+        engine.rt.block_on(async { reader.get_block_receipts(target).await })
+    };
+    match outcome {
+        Ok(Some(receipts)) => eljson::block_receipts_json(&receipts),
+        Ok(None) => "null".to_string(),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
 /// `nativeFeeHistoryJson`: verified `eth_feeHistory` for a running handle.
 /// `newest_block_tag` is the RPC block selector; `percentiles_json` is a JSON
 /// array of reward percentiles (e.g. `[25.0,75.0]`), or empty/`"null"` to omit

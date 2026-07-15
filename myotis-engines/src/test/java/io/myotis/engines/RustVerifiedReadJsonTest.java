@@ -431,6 +431,39 @@ class RustVerifiedReadJsonTest {
         assertThrows(EngineException.class, () -> RustChainHandle.receiptJsonOrThrow("not json"));
     }
 
+    // ---- eth_getBlockReceipts (blockReceiptsJsonOrThrow) ----
+
+    @Test
+    void blockReceiptsArrayPassesThrough() {
+        // The SUCCESS shape is a JSON ARRAY (each element the receipt-object
+        // shape the Rust eljson::block_receipts_json test pins).
+        String receipts = "[{\"transactionHash\":\"0x" + "a1".repeat(32)
+                + "\",\"transactionIndex\":\"0x0\",\"status\":\"0x1\"}]";
+        assertEquals(receipts, RustChainHandle.blockReceiptsJsonOrThrow(receipts));
+        assertEquals("[]", RustChainHandle.blockReceiptsJsonOrThrow("[]")); // empty block
+    }
+
+    @Test
+    void blockReceiptsNullLiteralIsVerifiedUnknownBlock() {
+        assertEquals("null", RustChainHandle.blockReceiptsJsonOrThrow("null"));
+    }
+
+    @Test
+    void blockReceiptsErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class, () -> RustChainHandle.blockReceiptsJsonOrThrow(
+                "{\"error\":\"no snap peer available\"}"));
+    }
+
+    @Test
+    void blockReceiptsUnexpectedShapesThrow() {
+        assertThrows(EngineException.class, () -> RustChainHandle.blockReceiptsJsonOrThrow(null));
+        assertThrows(EngineException.class, () -> RustChainHandle.blockReceiptsJsonOrThrow(""));
+        assertThrows(EngineException.class, () -> RustChainHandle.blockReceiptsJsonOrThrow("not json"));
+        // An object WITHOUT an error key is native shape drift, not a result.
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.blockReceiptsJsonOrThrow("{\"transactionHash\":\"0x11\"}"));
+    }
+
     // ---- eth_getTransactionByHash (transactionJsonOrThrow) ----
 
     @Test

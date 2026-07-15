@@ -23,7 +23,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 16; // 16: + nativeFeeHistoryJson
+    static final int EXPECTED_ABI_VERSION = 17; // 17: + nativeGetBlockReceiptsJson
 
     private static final boolean AVAILABLE = load();
 
@@ -264,6 +264,16 @@ final class RustEngineNative {
      * this native runs).
      */
     static native String nativeGetBlockByHashJson(long handle, String blockHashHex);
+
+    /**
+     * Verified {@code eth_getBlockReceipts} for a running handle. {@code selector}
+     * is a tag, a 0x-hex block number, or a 0x-32-byte block hash. Returns the
+     * receipts ARRAY JSON (each element the {@code nativeGetTransactionReceiptJson}
+     * object shape, the whole list verified against the anchored header's
+     * {@code receiptsRoot}), the literal {@code "null"} (verified unknown/future
+     * block or a never-verified hash), or an {@code "error"} object.
+     */
+    static native String nativeGetBlockReceiptsJson(long handle, String selector);
 
     /**
      * Verified {@code eth_feeHistory} for a running handle: base fees and gas-used

@@ -150,6 +150,14 @@ class IosRpcBackend(
         return triStateJson(RustEngine.getTransactionByHashJson(handle, hex(txHash)))
     }
 
+    override fun getBlockReceipts(blockSelector: String): String? {
+        val handle = handleProvider() ?: return null
+        val sel = blockSelector.ifBlank { "latest" }
+        // Same tri-state as the other JSON reads, but the found form is an
+        // ARRAY (the block's whole receipt list) — hence the array-aware check.
+        return triStateArrayJson(RustEngine.getBlockReceiptsJson(handle, sel))
+    }
+
     override fun getBlockByNumber(block: String, fullTransactions: Boolean): String? {
         if (fullTransactions) return null // full tx objects aren't served verified
         val handle = handleProvider() ?: return null
@@ -222,6 +230,16 @@ class IosRpcBackend(
         if (t.isEmpty()) return null
         if (t == "null") return t
         return if (resultOrNull(t) != null) t else null
+    }
+
+    /** [triStateJson]'s array twin (eth_getBlockReceipts): array string |
+     *  literal "null" | null. An `{"error"}` envelope (an object) → null. */
+    private fun triStateArrayJson(json: String): String? {
+        val t = json.trim()
+        if (t.isEmpty()) return null
+        if (t == "null") return t
+        val e = runCatching { engineJson.parseToJsonElement(t) }.getOrNull() ?: return null
+        return if (e is kotlinx.serialization.json.JsonArray) t else null
     }
 
     private fun statusOrNull(handle: Long): JsonObject? =

@@ -1555,7 +1555,7 @@ impl ElReader {
         let total = peers.len();
         let mut last_err = String::new();
         for peer in &peers {
-            match self.receipt_from(peer, &loc, &tx_hash).await {
+            match self.receipt_from(peer, &loc).await {
                 Ok(vr) => {
                     self.pool.record_snap_served(peer.addr()).await;
                     return Ok(Some(vr));
@@ -1621,6 +1621,111 @@ impl ElReader {
             // number sits above the current head: the requested hash is unknown.
             _ => Ok(None),
         }
+    }
+
+    /// Verified `eth_getBlockReceipts` by number/tag (`None` = latest): every
+    /// receipt of the block, each carrying the same verified fields as
+    /// [`Self::get_transaction_receipt`] (the Java `rpcGetBlockReceipts` twin).
+    /// `Ok(None)` = a verified future/unknown block (eth's null).
+    pub async fn get_block_receipts(
+        &self,
+        target: Option<u64>,
+    ) -> Result<Option<Vec<VerifiedReceipt>>, String> {
+        Ok(self.block_receipts_at(target).await?.map(|(_, receipts)| receipts))
+    }
+
+    /// Verified `eth_getBlockReceipts` by block hash: resolves through the
+    /// verified hash→number map (a never-verified hash → `Ok(None)`) and
+    /// re-confirms the block served at that height still carries the requested
+    /// hash (a reorg can remap the number under a stale map entry).
+    pub async fn get_block_receipts_by_hash(
+        &self,
+        block_hash: [u8; 32],
+    ) -> Result<Option<Vec<VerifiedReceipt>>, String> {
+        let Some(number) = self.lookup_block_number(&block_hash) else {
+            return Ok(None); // not a block we've verified — unknown to us
+        };
+        match self.block_receipts_at(Some(number)).await? {
+            Some((served, receipts)) if served == block_hash => Ok(Some(receipts)),
+            _ => Ok(None),
+        }
+    }
+
+    /// The shared block-receipts serve: anchored window → target header, body +
+    /// receipts fetched together (one round of wall-clock) and root-verified,
+    /// then one pass building every receipt. Returns the SERVED block hash so
+    /// the by-hash entry can re-confirm it.
+    async fn block_receipts_at(
+        &self,
+        target: Option<u64>,
+    ) -> Result<Option<([u8; 32], Vec<VerifiedReceipt>)>, String> {
+        let (head_num, head_hash) = self.anchored_head()?;
+        let target_num = target.unwrap_or(head_num);
+        if target_num > head_num {
+            return Ok(None); // future/unknown block → eth null
+        }
+        let back = head_num - target_num;
+        if back >= BLOCK_LOOKBACK_MAX {
+            return Err(format!(
+                "block {target_num} is {back} behind the head — beyond the {BLOCK_LOOKBACK_MAX}-block verify window"
+            ));
+        }
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err("no snap peer available".to_string());
+        }
+        let total = peers.len();
+        let mut last_err = String::new();
+        for peer in &peers {
+            match self.block_receipts_from(peer, target_num, back, &head_hash).await {
+                Ok(served) => {
+                    self.pool.record_snap_served(peer.addr()).await;
+                    return Ok(Some(served));
+                }
+                Err(e) => {
+                    self.pool.record_snap_failure(peer.addr()).await;
+                    last_err = e;
+                }
+            }
+        }
+        Err(format!(
+            "all {total} snap peer(s) failed to serve verifiable block receipts: {last_err}"
+        ))
+    }
+
+    /// One peer's block-receipts serve: anchored window, body + receipts in
+    /// flight together, both roots verified before anything is trusted.
+    async fn block_receipts_from(
+        &self,
+        peer: &ManagedPeer,
+        target_num: u64,
+        back: u64,
+        head_hash: &[u8; 32],
+    ) -> Result<([u8; 32], Vec<VerifiedReceipt>), String> {
+        let window = fetch_anchored_window(peer, target_num, back + 1, head_hash).await?;
+        let vh = &window[0];
+        let (bodies, receipt_blocks) = futures::future::join(
+            peer.get_block_bodies(&[vh.hash]),
+            peer.get_receipts(&[vh.hash]),
+        )
+        .await;
+        let body = bodies?.into_iter().next().ok_or("peer returned no block body")?;
+        verify_body_transactions(&vh.header, &body)?;
+        let receipts = receipt_blocks?.into_iter().next().ok_or("peer returned no receipts")?;
+        if receipts.len() != body.transactions.len() {
+            return Err(format!(
+                "block {} receipt count mismatch ({} receipts for {} txs)",
+                vh.header.number,
+                receipts.len(),
+                body.transactions.len()
+            ));
+        }
+        verify_block_receipts(&vh.header, &receipts)?;
+        // Remember the fully verified hash↔number (feeds getBlockByHash and the
+        // by-hash entry of this method).
+        self.remember_block_number(vh.hash, vh.header.number);
+        let built = build_block_receipts(&vh.header, vh.hash, &body, &receipts)?;
+        Ok((vh.hash, built))
     }
 
     /// Look a block hash up in the verified hash→number map (LRU-refreshing).
@@ -1886,7 +1991,6 @@ impl ElReader {
         &self,
         peer: &ManagedPeer,
         loc: &TxLocation,
-        tx_hash: &[u8; 32],
     ) -> Result<VerifiedReceipt, String> {
         let blocks = peer.get_receipts(&[loc.block_hash]).await?;
         let receipts = blocks.into_iter().next().ok_or("peer returned no receipts")?;
@@ -1897,7 +2001,7 @@ impl ElReader {
         if loc.index >= receipts.len() {
             return Err("tx index out of receipt range".to_string());
         }
-        build_verified_receipt(loc, &receipts, tx_hash)
+        build_verified_receipt(loc, &receipts)
     }
 
     /// `(finalized_block_number, optimistic_block_number, is_synced)` snapshot.
@@ -1923,7 +2027,6 @@ impl ElReader {
 fn build_verified_receipt(
     loc: &TxLocation,
     receipts: &[Vec<u8>],
-    tx_hash: &[u8; 32],
 ) -> Result<VerifiedReceipt, String> {
     let decoded = crate::el::receipt::decode(&receipts[loc.index])?;
     let mut prev_cum = 0u64;
@@ -1934,30 +2037,51 @@ fn build_verified_receipt(
         // The last iteration leaves receipt[index-1]'s cumulative gas here.
         prev_cum = prev.cumulative_gas_used;
     }
-    let gas_used = decoded.cumulative_gas_used.saturating_sub(prev_cum);
-    let tx_summary = tx::decode_summary(&loc.raw_tx);
-    let effective_gas_price = tx_summary
-        .as_ref()
-        .and_then(|t| tx::effective_gas_price(t, header_base_fee(&loc.header)));
-    let contract_address = tx_summary.as_ref().and_then(|t| {
-        // Only a creation tx (empty `to`) with a recovered sender deploys.
-        match (&t.to, &t.from) {
-            (None, Some(from)) => Some(tx::contract_address(from, t.nonce)),
-            _ => None,
-        }
+    Ok(build_one_receipt(
+        &loc.header,
+        loc.block_hash,
+        loc.index as u64,
+        &loc.raw_tx,
+        decoded,
+        prev_cum,
+        log_index_base,
+    ))
+}
+
+/// The per-element construction both receipt paths share: the caller supplies
+/// the ALREADY-DECODED receipt and the running accumulators (previous
+/// cumulative gas, block-global log-index base). The subtle rules live once:
+/// the tx decodes DEFENSIVELY (an unknown future type yields a partial receipt,
+/// never an error), and only a creation tx with a recovered sender carries a
+/// contract address.
+fn build_one_receipt(
+    header: &BlockHeader,
+    block_hash: [u8; 32],
+    tx_index: u64,
+    raw_tx: &[u8],
+    decoded: DecodedReceipt,
+    prev_cum: u64,
+    log_index_base: u64,
+) -> VerifiedReceipt {
+    let tx_summary = tx::decode_summary(raw_tx);
+    let effective_gas_price =
+        tx_summary.as_ref().and_then(|t| tx::effective_gas_price(t, header_base_fee(header)));
+    let contract_address = tx_summary.as_ref().and_then(|t| match (&t.to, &t.from) {
+        (None, Some(from)) => Some(tx::contract_address(from, t.nonce)),
+        _ => None,
     });
-    Ok(VerifiedReceipt {
-        tx_hash: *tx_hash,
-        tx_index: loc.index as u64,
-        block_hash: loc.block_hash,
-        block_number: loc.header.number,
-        gas_used,
+    VerifiedReceipt {
+        tx_hash: keccak256(raw_tx),
+        tx_index,
+        block_hash,
+        block_number: header.number,
+        gas_used: decoded.cumulative_gas_used.saturating_sub(prev_cum),
         log_index_base,
         receipt: decoded,
         tx: tx_summary,
         effective_gas_price,
         contract_address,
-    })
+    }
 }
 
 /// Fetch the contiguous header window `[from ..= from+count-1]` from one peer
@@ -1992,6 +2116,40 @@ async fn fetch_anchored_window(
         }
     }
     Ok(window)
+}
+
+/// Build EVERY receipt of a ROOT-VERIFIED block in one pass — the batch form of
+/// [`build_verified_receipt`]: the running cumulative-gas and the block-global
+/// log-index base accumulate instead of being re-derived per index (the
+/// single-receipt path's preamble would make a full block O(n²)). The caller
+/// has already verified the body against `transactionsRoot`, the receipts
+/// against `receiptsRoot`, and their counts equal.
+fn build_block_receipts(
+    header: &BlockHeader,
+    block_hash: [u8; 32],
+    body: &crate::el::eth::messages::BlockBody,
+    receipts: &[Vec<u8>],
+) -> Result<Vec<VerifiedReceipt>, String> {
+    let mut out = Vec::with_capacity(receipts.len());
+    let mut prev_cum = 0u64;
+    let mut log_index_base = 0u64;
+    for (i, (raw_tx, receipt)) in body.transactions.iter().zip(receipts).enumerate() {
+        let decoded = crate::el::receipt::decode(receipt)?;
+        let log_count = decoded.logs.len() as u64;
+        let cum = decoded.cumulative_gas_used;
+        out.push(build_one_receipt(
+            header,
+            block_hash,
+            i as u64,
+            raw_tx,
+            decoded,
+            prev_cum,
+            log_index_base,
+        ));
+        prev_cum = cum;
+        log_index_base += log_count;
+    }
+    Ok(out)
 }
 
 /// The body half of the per-block trust gate: the fetched transactions must

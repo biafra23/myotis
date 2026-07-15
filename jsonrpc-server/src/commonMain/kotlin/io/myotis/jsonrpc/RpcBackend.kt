@@ -31,6 +31,9 @@ interface RpcBackend {
     fun sendRawTransaction(rawTx: ByteArray): ByteArray?
     fun getTransactionReceipt(txHash: ByteArray): String?
     fun getTransactionByHash(txHash: ByteArray): String?
+    /** Tri-state like the other JSON methods, but the found form is an ARRAY
+     *  string (the block's whole receipt list), not an object. */
+    fun getBlockReceipts(blockSelector: String): String?
     fun getBlockByNumber(block: String, fullTransactions: Boolean): String?
     fun getBlockByHash(blockHash32: ByteArray, fullTransactions: Boolean): String?
     fun gasPrice(): String?

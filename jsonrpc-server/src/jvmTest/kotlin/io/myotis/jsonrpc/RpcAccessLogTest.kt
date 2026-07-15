@@ -37,6 +37,7 @@ class RpcAccessLogTest {
         override fun getTransactionByHash(txHash: ByteArray): String? = null
         override fun getBlockByNumber(block: String, fullTransactions: Boolean): String? = null
         override fun getBlockByHash(blockHash32: ByteArray, fullTransactions: Boolean): String? = null
+        override fun getBlockReceipts(blockSelector: String): String? = null
         override fun gasPrice(): String? = null
         override fun maxPriorityFeePerGas(): String? = null
         override fun feeHistory(blockCount: Long, newestBlock: String, rewardPercentiles: DoubleArray?): String? = null

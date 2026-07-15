@@ -11,6 +11,7 @@ import io.myotis.engine.capi.myotis_fee_estimate_json
 import io.myotis.engine.capi.myotis_fee_history_json
 import io.myotis.engine.capi.myotis_get_block_by_hash_json
 import io.myotis.engine.capi.myotis_get_block_by_number_json
+import io.myotis.engine.capi.myotis_get_block_receipts_json
 import io.myotis.engine.capi.myotis_get_code_json
 import io.myotis.engine.capi.myotis_get_storage_at_json
 import io.myotis.engine.capi.myotis_get_transaction_by_hash_json
@@ -45,7 +46,7 @@ object RustEngine {
 
     /** Must match `ABI_VERSION` in rust/myotis-engine/src/lib.rs — the same
      *  handshake `RustEngineNative.EXPECTED_ABI_VERSION` performs over JNI. */
-    const val EXPECTED_ABI_VERSION = 16
+    const val EXPECTED_ABI_VERSION = 17
 
     private val abiVersion: Int by lazy { myotis_init() }
 
@@ -164,6 +165,9 @@ object RustEngine {
 
     fun getTransactionReceiptJson(handle: Long, txHash32Hex: String): String =
         jsonCall { myotis_get_transaction_receipt_json(handle, txHash32Hex) }
+
+    fun getBlockReceiptsJson(handle: Long, selector: String): String =
+        jsonCall { myotis_get_block_receipts_json(handle, selector) }
 
     fun feeEstimateJson(handle: Long): String =
         jsonCall { myotis_fee_estimate_json(handle) }

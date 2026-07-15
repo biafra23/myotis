@@ -48,6 +48,7 @@ class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBack
     override fun sendRawTransaction(rawTx: ByteArray): ByteArray? = v.sendRawTransaction(rawTx)
     override fun getTransactionReceipt(txHash: ByteArray): String? = v.getTransactionReceipt(txHash)
     override fun getTransactionByHash(txHash: ByteArray): String? = v.getTransactionByHash(txHash)
+    override fun getBlockReceipts(blockSelector: String): String? = v.getBlockReceipts(blockSelector)
     override fun getBlockByNumber(block: String, fullTransactions: Boolean): String? =
         v.getBlockByNumber(block, fullTransactions)
     override fun getBlockByHash(blockHash32: ByteArray, fullTransactions: Boolean): String? =
