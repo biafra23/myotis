@@ -69,24 +69,28 @@ public final class EthTxDecoder {
             BigInteger sigR = toBig(r.readValue());
             BigInteger sigS = toBig(r.readValue());
 
-            // v as a long, not int: legacy v = 2*chainId + 35, and real chain ids
-            // exceed 2^31 (an intValueExact here would fail the whole decode). A v
-            // beyond long is malformed → whole decode fails (the Rust decoder's
-            // u64 bound, mirrored).
-            long vl = v.longValueExact();
+            // Legacy v = 2*chainId + 35: real chain ids exceed 2^31, so no int math.
+            // The Rust decoder reads v as a u64, so the bound is u64 — a wider v is
+            // malformed → whole decode fails (parity). BigInteger arithmetic below
+            // because v itself may not fit a SIGNED long ([2^63, 2^64)), while
+            // chainId = (v - 35) / 2 always does for v < 2^64.
+            if (v.signum() < 0 || v.bitLength() > 64) {
+                throw new ArithmeticException("legacy v out of u64 range");
+            }
             Long chainId = null;
             Bytes signing = null;
             int recId = -1;
-            if (vl == 27 || vl == 28) {
-                recId = (int) (vl - 27);        // pre-155: sign over the 6 tx fields
+            if (v.equals(BigInteger.valueOf(27)) || v.equals(BigInteger.valueOf(28))) {
+                recId = v.intValueExact() - 27; // pre-155: sign over the 6 tx fields
                 signing = RLP.encodeList(w -> {
                     w.writeLong(nonce); w.writeBigInteger(gasPrice); w.writeLong(gas);
                     w.writeValue(to); w.writeBigInteger(value); w.writeValue(input);
                 });
-            } else if (vl >= 35) {
-                long cid = (vl - 35) / 2;       // EIP-155
+            } else if (v.compareTo(BigInteger.valueOf(35)) >= 0) {
+                BigInteger vMinus35 = v.subtract(BigInteger.valueOf(35));
+                long cid = vMinus35.shiftRight(1).longValueExact(); // EIP-155; < 2^63
                 chainId = cid;
-                recId = (int) ((vl - 35) % 2);
+                recId = vMinus35.testBit(0) ? 1 : 0;
                 final long fcid = cid;
                 signing = RLP.encodeList(w -> {
                     w.writeLong(nonce); w.writeBigInteger(gasPrice); w.writeLong(gas);
