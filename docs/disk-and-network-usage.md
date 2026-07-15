@@ -174,7 +174,7 @@ never sleeps (daemon, desktop) runs them 1440×/day.
 (≈ 3–8 GB/day if never asleep). The two big terms scale directly with knobs (§6):
 mempool gossip with the eth peer count, fee warming with whether a wallet-API host is
 running. And per the note at the top: these rates may deliberately *grow* where more
-peers or more parallel fetching is what gets query latency to acceptable. §3.4 explains
+peers or more parallel fetching is what makes query latency acceptable. §3.4 explains
 why always-on hosts currently have to pay this at all — and the plans to stop it.
 
 **Gnosis:** 5 s slots make the CL poll fire 2.4× as often, and periods rotate every
@@ -216,7 +216,7 @@ Two planned paths give other hosts the same escape:
 - **A pause/wake JSON-RPC surface.** The server could expose `myotis_pause` and
   `myotis_wakeup` (alongside the existing `myotis_status`/`myotis_beaconStatus`), so a
   Myotis-aware wallet — even an out-of-process one — can put the node to sleep when its
-  UI goes to background and wake it (and poll status until ready) before the next burst
+  UI goes to the background and wake it (and poll status until ready) before the next burst
   of queries. Not implemented yet; unaware wallets would keep today's always-warm
   behavior.
 
