@@ -49,12 +49,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
-import androidx.compose.ui.input.nestedscroll.NestedScrollSource
-import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
@@ -1088,31 +1085,56 @@ private fun LogsTab(logs: LogSource, filter: String, onFilterChange: (String) ->
     }
 
     val listState = rememberLazyListState()
-    // Tail-follow is explicit intent state, NOT derived from layout. Deriving "at bottom?" from
-    // visibleItemsInfo raced the 250ms poll: one batch of 2+ appended lines made the stale layout
-    // fail the check before the snap ran, silently breaking follow (how often depended on the
+    // Tail-follow is explicit intent state, NOT re-derived from layout on every append: the old
+    // "last visible >= shown.size - 2" check compared a stale layout against the fresh list, so
+    // any poll batch of more than 2 lines silently broke follow (how often depended on each
     // platform's log volume and frame timing). Entering the tab starts following — this
-    // composition is disposed on tab switch, so `remember` resets the flag to true on each visit.
+    // composition is disposed on tab switch, so `remember` resets the flag to true per visit.
     var follow by remember { mutableStateOf(true) }
-    // A user scroll toward older lines stops following. Programmatic scrollToItem bypasses
-    // nested scroll, so the auto-snap below can never cancel itself; the canScrollBackward
-    // guard ignores wheel/drag noise when everything already fits on screen.
-    val followBreaker = remember(listState) {
-        object : NestedScrollConnection {
-            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
-                if (available.y > 0f && listState.canScrollBackward) follow = false
-                return Offset.Zero
-            }
-        }
+    // Guards the auto-snap below so its own scrollToItem can't read as a user scroll.
+    var autoSnapping by remember { mutableStateOf(false) }
+    // "At the tail" with ~1 item of tolerance (trackpad jitter, a stop a hair above the last
+    // line). Index and count come from the SAME layout pass, so a freshly-appended batch that
+    // hasn't been laid out yet can't skew the comparison the way the old shown.size check did.
+    fun nearTail(): Boolean {
+        val info = listState.layoutInfo
+        val last = info.visibleItemsInfo.lastOrNull() ?: return true
+        return last.index >= info.totalItemsCount - 2
     }
-    // Invariant: resting at the very bottom means following. Restores follow when the user
-    // scrolls (or flings) back down to the tail; including `follow` in the expression re-arms
-    // the check even when canScrollForward itself never toggles.
+    // Break: any scroll this composable didn't initiate that leaves the tail stops following.
+    // isScrollInProgress covers every input path uniformly — touch drag/fling, desktop mouse
+    // wheel and trackpad, and accessibility scroll actions (which bypass nested scroll and
+    // pointer input entirely, so a NestedScrollConnection would miss them).
     LaunchedEffect(listState) {
-        snapshotFlow { !listState.canScrollForward && !follow }.collect { if (it) follow = true }
+        snapshotFlow { listState.isScrollInProgress && !autoSnapping && !nearTail() }
+            .collect { if (it) follow = false }
     }
-    LaunchedEffect(shown, follow) {
-        if (follow && shown.isNotEmpty()) listState.scrollToItem(shown.size - 1)
+    // Resume: coming to rest at the tail re-arms following (drag, fling, or the button below).
+    // canScrollBackward keeps a list that merely FITS the viewport from re-arming — without it,
+    // scrolling up to read and then typing a filter that shrinks `shown` onto one screen would
+    // silently flip follow back on, and clearing the filter would yank away the reading
+    // position. Reading `follow` in the expression re-evaluates it when only the flag changed,
+    // so a break-then-return while the layout stays put can't leave follow stuck off.
+    LaunchedEffect(listState) {
+        snapshotFlow { !follow && listState.canScrollBackward && nearTail() }
+            .collect { if (it) follow = true }
+    }
+    // Snap while following, keyed on the tail line's identity — sequence, not size, because at
+    // ring capacity the size stays constant while lines shift. One long-lived collector instead
+    // of an effect restart per 250ms poll (snapshotFlow conflates, and emits nothing at all
+    // while follow is off or the tail is unchanged).
+    LaunchedEffect(listState) {
+        snapshotFlow { if (follow) shown.lastOrNull()?.sequence else null }
+            .collect {
+                if (it != null) {
+                    autoSnapping = true
+                    try {
+                        listState.scrollToItem(shown.size - 1)
+                    } finally {
+                        autoSnapping = false
+                    }
+                }
+            }
     }
 
     Column(Modifier.fillMaxSize()) {
@@ -1133,7 +1155,8 @@ private fun LogsTab(logs: LogSource, filter: String, onFilterChange: (String) ->
                 }
             }) { Text("Copy") }
             Spacer(Modifier.width(4.dp))
-            OutlinedButton(onClick = { logs.clear() }) { Text("Clear") }
+            // Clearing empties the ring — tail-follow the fresh lines that come after.
+            OutlinedButton(onClick = { logs.clear(); follow = true }) { Text("Clear") }
         }
         Spacer(Modifier.height(4.dp))
         // Capture level: lower it (e.g. DEBUG) to surface the chatty wire / peer-churn lines,
@@ -1154,12 +1177,12 @@ private fun LogsTab(logs: LogSource, filter: String, onFilterChange: (String) ->
         }
         Spacer(Modifier.height(8.dp))
         Box(Modifier.weight(1f).fillMaxWidth()) {
-            LazyColumn(state = listState, modifier = Modifier.fillMaxSize().nestedScroll(followBreaker)) {
+            LazyColumn(state = listState, modifier = Modifier.fillMaxSize().testTag("logList")) {
                 items(shown, key = { it.sequence }) { LogLineRow(it, tz) }
             }
             if (!follow && shown.isNotEmpty()) {
                 Button(
-                    // Setting follow restarts the auto-snap effect, which scrolls to the tail.
+                    // Setting follow makes the snap collector emit, which scrolls to the tail.
                     onClick = { follow = true },
                     modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp),
                 ) { Text("↓ Latest") }
