@@ -1,6 +1,7 @@
 package io.myotis.ios
 
 import io.myotis.ui.AccountResult
+import io.myotis.ui.CacheFileStats
 import io.myotis.ui.EnsResult
 import io.myotis.ui.NodeController
 import io.myotis.ui.NodeSnapshot
@@ -303,6 +304,11 @@ class IosNodeController(
     private fun snapshotOf(network: String, handle: Long): NodeSnapshot {
         val o = runCatching { engineJson.parseToJsonElement(RustEngine.statusJson(handle)).jsonObject }
             .getOrElse { JsonObject(emptyMap()) }
+        // Live counts from the cache FILES (mtime-memoized, shared parser in
+        // :ui) — the cross-engine truth the engine writes under dataDir.
+        val suffix = if (network == "mainnet") "" else "-$network"
+        val clCache = CacheFileStats.cl("$dataDir/cl-peers$suffix.cache")
+        val elCache = CacheFileStats.el("$dataDir/peers$suffix.cache")
         val running = o.boolean("running")
         val paused = o.boolean("paused")
         val beaconState = o.string("beaconState") ?: "STARTING"
@@ -348,10 +354,12 @@ class IosNodeController(
             snapServingPeers = snapPeers,                // approximation, as over JNI
             clConnectedPeers = o.int("peerCount"),
             clServedPeersLastMin = o.int("servedPeersLastMinute"),
-            // Cache-file stats (parsed from the peers*.cache files on JVM hosts)
-            // aren't surfaced on iOS yet.
-            clCachedPeers = 0, clCachedProven = 0, clCachedNolc = 0,
-            elCachedPeers = 0, elCachedSnapOk = 0, elCachedSnapBad = 0,
+            clCachedPeers = clCache.total,
+            clCachedProven = clCache.proven,
+            clCachedNolc = clCache.nolc,
+            elCachedPeers = elCache.total,
+            elCachedSnapOk = elCache.snapOk,
+            elCachedSnapBad = elCache.snapBad,
             discoveredPeers = o.int("discoveredPeers"),
             backedOffPeers = o.int("backedOffPeers"),
             blacklistedPeers = o.int("blacklistedPeers"),

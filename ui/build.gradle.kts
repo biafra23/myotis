@@ -18,6 +18,11 @@ kotlin {
     iosArm64()
     iosSimulatorArm64()
 
+    // The custom jvmSharedMain dependsOn edge below would otherwise make KGP
+    // skip the default hierarchy (silently dropping iosMain and its actuals);
+    // applying it explicitly keeps both.
+    applyDefaultHierarchyTemplate()
+
     sourceSets {
         val commonMain by getting {
             dependencies {
@@ -28,6 +33,18 @@ kotlin {
                 implementation(libs.kotlinx.coroutines.core)
                 implementation(libs.kotlinx.datetime)  // local-time formatting in the Logs tab
             }
+        }
+        // CacheFileStats' stat/read actuals are plain java.nio, identical on the
+        // Android and Desktop JVM targets: one shared intermediate source set
+        // instead of two copied actual files.
+        val jvmSharedMain by creating {
+            dependsOn(commonMain)
+        }
+        val desktopMain by getting {
+            dependsOn(jvmSharedMain)
+        }
+        val androidMain by getting {
+            dependsOn(jvmSharedMain)
         }
         // Desktop-JVM UI tests: drive the real composables headless (skiko software
         // rendering — no display needed, CI-safe). Regression tests for screen-level

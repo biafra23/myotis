@@ -14,6 +14,7 @@ import io.myotis.api.NetworkInfo
 import io.myotis.api.ports.EnginePorts
 import io.myotis.engines.Engines
 import io.myotis.ui.AccountResult
+import io.myotis.ui.CacheFileStats
 import io.myotis.ui.EnsResult
 import io.myotis.ui.NetworkStatus
 import io.myotis.ui.NodeController
@@ -336,8 +337,8 @@ class DesktopNodeController(
         // Live counts parsed from the cache FILES (the cross-engine truth; the
         // Rust engine writes them directly). Memoized on (mtime, size).
         val suffix = if (s.network() == "mainnet") "" else "-${s.network()}"
-        val clCache = CacheFileStats.cl(dataDir.resolve("cl-peers$suffix.cache"))
-        val elCache = CacheFileStats.el(dataDir.resolve("peers$suffix.cache"))
+        val clCache = CacheFileStats.cl(dataDir.resolve("cl-peers$suffix.cache").toString())
+        val elCache = CacheFileStats.el(dataDir.resolve("peers$suffix.cache").toString())
         // CL peer counts live on the beacon-status surface (parity with Android's
         // NodeService.snapshotOf, which reads both).
         val bs = handle.beaconStatus()

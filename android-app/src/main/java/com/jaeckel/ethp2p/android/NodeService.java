@@ -27,6 +27,7 @@ import io.myotis.api.NetworkInfo;
 import io.myotis.api.StatusSnapshot;
 import io.myotis.api.ports.EnginePorts;
 import io.myotis.api.ports.NodeKeyStore;
+import io.myotis.ui.CacheFileStats;
 
 import java.net.InetAddress;
 import java.nio.file.Files;
@@ -1762,8 +1763,8 @@ public final class NodeService extends Service {
         // Live counts from the cache FILES (mtime-memoized): the files are the
         // cross-engine truth — the Rust engine writes them directly, so the
         // boot-time cachedElCounts/cachedClCounts maps go stale mid-run.
-        CacheFileStats.ElStats elCache = CacheFileStats.el(netCacheFor(network, "peers", ".cache").toPath());
-        CacheFileStats.ClStats clCache = CacheFileStats.cl(netCacheFor(network, "cl-peers", ".cache").toPath());
+        CacheFileStats.ElStats elCache = CacheFileStats.INSTANCE.el(netCacheFor(network, "peers", ".cache").getAbsolutePath());
+        CacheFileStats.ClStats clCache = CacheFileStats.INSTANCE.cl(netCacheFor(network, "cl-peers", ".cache").getAbsolutePath());
         String beaconState = bs.state() == BeaconState.STARTING ? "STOPPED" : bs.state().name();
         // Catch-up progress: preserve the historical -1-until-known convention (the engine
         // API defaults these to 0 pre-beacon) for the UI's determinate progress bar.
@@ -1775,10 +1776,10 @@ public final class NodeService extends Service {
             // Covers both a stopped stack and a PAUSED one (running=false, warm state
             // retained) — the lifecycle string lets the UI tell them apart.
             return new Snapshot(running, lifecycle, chainStartMs, 0, 0, 0, 0, /*snapServing*/0,
-                    elCache.total(), elCache.snapOk(), elCache.snapBad(), s.attemptedDials(), s.backedOffPeers(),
+                    elCache.getTotal(), elCache.getSnapOk(), elCache.getSnapBad(), s.attemptedDials(), s.backedOffPeers(),
                     s.blacklistedPeers(), s.discv5TableSize(), 0,
                     beaconState, bs.bootstrapped(), bs.connectedPeers(), (int) bs.lightClientPeers(),
-                    bs.servedPeersLastMinute(), clCache.total(), clCache.proven(), clCache.nolc(),
+                    bs.servedPeersLastMinute(), clCache.getTotal(), clCache.getProven(), clCache.getNolc(),
                     bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
                     s.syncStartPeriod(), syncCurrent, syncTarget,
                     Long.MAX_VALUE, List.of(), network,
@@ -1791,10 +1792,10 @@ public final class NodeService extends Service {
         return new Snapshot(true, lifecycle, chainStartMs,
                 s.discoveredPeers(), s.connectedPeers(), s.readyPeers(),
                 s.snapPeers(), s.snapServingPeers(),
-                elCache.total(), elCache.snapOk(), elCache.snapBad(), s.attemptedDials(), s.backedOffPeers(),
+                elCache.getTotal(), elCache.getSnapOk(), elCache.getSnapBad(), s.attemptedDials(), s.backedOffPeers(),
                 s.blacklistedPeers(), s.discv5TableSize(), 0,
                 beaconState, bs.bootstrapped(), bs.connectedPeers(), (int) bs.lightClientPeers(),
-                bs.servedPeersLastMinute(), clCache.total(), clCache.proven(), clCache.nolc(),
+                bs.servedPeersLastMinute(), clCache.getTotal(), clCache.getProven(), clCache.getNolc(),
                 bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
                 s.syncStartPeriod(), syncCurrent, syncTarget,
                 s.verifiedHeadAgeMs(), s.readyPeerList(), network,
