@@ -3,6 +3,7 @@ package io.myotis.jsonrpc
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.jupiter.api.Assertions.assertArrayEquals
@@ -42,7 +43,8 @@ class RpcRouterTest {
         var lastSlot: ByteArray? = null
         override fun chainId() = 1L
         override fun headBlockNumber() = head
-        override fun syncState() = io.myotis.api.SyncState.SYNCED
+        var syncStateValue = io.myotis.api.SyncState.SYNCED
+        override fun syncState() = syncStateValue
         override fun call(from: ByteArray?, to: ByteArray, data: ByteArray,
                           valueWei: String?, block: String): ByteArray? {
             lastFrom = from; lastTo = to; lastData = data
@@ -534,6 +536,30 @@ class RpcRouterTest {
     @Test fun blockNumber_nullHead_fallsThrough() {
         assertTrue(hasError(route(FakeBackend(head = null),
             """{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}""")))
+    }
+
+    @Test fun syncing_synced_isFalse() {
+        // The spec's "not syncing" is the JSON BOOLEAN false — parse the
+        // envelope and check the literal, not a substring.
+        val resp = route(FakeBackend(head = 0x181af48),
+            """{"jsonrpc":"2.0","id":1,"method":"eth_syncing","params":[]}""")
+        val result = json.parseToJsonElement(resp).jsonObject["result"]
+        assertEquals(false, result?.jsonPrimitive?.booleanOrNull, resp)
+    }
+
+    @Test fun syncing_notSynced_reportsTruthyObjectWithZeroBounds() {
+        // The probe must answer promptly from syncState() alone — never a
+        // wake-holding head read — so the object carries zero bounds (no reads
+        // are served before SYNCED anyway); its truthy-ness is the signal.
+        for (state in listOf(io.myotis.api.SyncState.CATCHING_UP, io.myotis.api.SyncState.SYNCING)) {
+            val b = FakeBackend(head = 0x181af48)
+            b.syncStateValue = state
+            val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_syncing","params":[]}""")
+            val result = json.parseToJsonElement(resp).jsonObject["result"]!!.jsonObject
+            assertEquals("0x0", result["startingBlock"]?.jsonPrimitive?.content, resp)
+            assertEquals("0x0", result["currentBlock"]?.jsonPrimitive?.content, resp)
+            assertEquals("0x0", result["highestBlock"]?.jsonPrimitive?.content, resp)
+        }
     }
 
     private fun ByteArray.toHex() = joinToString(prefix = "0x", separator = "") { "%02x".format(it.toInt() and 0xff) }
