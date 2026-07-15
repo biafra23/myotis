@@ -338,6 +338,22 @@ pub extern "C" fn myotis_fee_estimate_json(handle: i64) -> *mut c_char {
     into_c(crate::host::fee_estimate_json(handle))
 }
 
+/// Verified `eth_getBlockReceipts` (`nativeGetBlockReceiptsJson` twin).
+/// `selector` is a tag, a 0x-hex block number, or a 0x-32-byte block hash.
+/// Returns the receipts array JSON, the literal `"null"` (verified
+/// unknown/future block or never-verified hash), or `{"error": ...}`.
+///
+/// # Safety
+/// `selector` must be null or a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_get_block_receipts_json(
+    handle: i64,
+    selector: *const c_char,
+) -> *mut c_char {
+    let selector = read_string(selector).unwrap_or_default();
+    into_c(crate::host::get_block_receipts_json(handle, &selector))
+}
+
 /// Verified `eth_feeHistory` (`nativeFeeHistoryJson` twin). `percentiles_json`
 /// is a JSON array of reward percentiles, or null/empty to omit the reward
 /// matrix. Returns the feeHistory JSON or `{"error": ...}`.

@@ -65,6 +65,16 @@ public interface VerifiedReads {
     /** Block JSON | "null" literal | null. */
     String getBlockByHash(byte[] blockHash32, boolean fullTransactions);
 
+    /**
+     * Every receipt of one block as a JSON array (each element the
+     * {@code getTransactionReceipt} object shape, verified against the anchored
+     * header's {@code receiptsRoot}) | {@code "null"} literal (verified
+     * unknown/future block, or a block hash this engine never verified) |
+     * {@code null}. {@code blockSelector} is a tag, a 0x-hex number, or a
+     * 0x-32-byte block hash.
+     */
+    String getBlockReceipts(String blockSelector);
+
     /** Legacy gas price in decimal wei (base fee + tip heuristics), or null. */
     String gasPrice();
 

@@ -259,6 +259,21 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public String getBlockReceipts(String blockSelector) {
+        try {
+            String sel = (blockSelector == null || blockSelector.isBlank())
+                    ? "latest" : blockSelector;
+            // The receipts array JSON (every element verified vs the anchored
+            // header's receiptsRoot), the "null" literal (verified unknown/future
+            // block or never-verified hash), or throws (→ null → strict -32000).
+            return handle.blockReceiptsJson(sel);
+        } catch (RuntimeException e) {
+            log.debug("[engines] verified blockReceipts read unavailable: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    @Override
     public String gasPrice() {
         // Decimal wei (next-block base fee + suggested tip), or null when unverifiable.
         try {

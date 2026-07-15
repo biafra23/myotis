@@ -846,6 +846,11 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     }
 
     @Override
+    public String getBlockReceipts(String blockSelector) {
+        return rpcGetBlockReceipts(blockSelector);
+    }
+
+    @Override
     public String gasPrice() {
         java.math.BigInteger p = rpcGasPrice();
         return p == null ? null : p.toString();
@@ -2754,6 +2759,116 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         // The verified by-number serve returns the CURRENTLY-canonical block at that height;
         // make sure it's still the one asked for (else a reorg remapped number → hash).
         return json.contains("\"hash\":\"" + key + "\"") ? json : "null";
+    }
+
+    /**
+     * eth_getBlockReceipts — every receipt of one block as a JSON array, verified.
+     * The block resolves through the same anchored path as eth_getBlockByNumber
+     * (a 0x-32-byte hash first resolves via the verified hash→number map, like
+     * eth_getBlockByHash, with the same reorg re-check); the body is verified
+     * against transactionsRoot (the receipts' txHash/from/to/effectiveGasPrice
+     * derive from it) and the receipt list against receiptsRoot before anything
+     * is served. Returns the array JSON, the "null" literal for a verified
+     * unknown/future block or a never-verified hash, or Java null (→ error)
+     * when it can't verify right now.
+     */
+    private String rpcGetBlockReceipts(String blockSelector) {
+        RLPxConnector conn = connector;
+        if (conn == null) return null;
+        String b = (blockSelector == null || blockSelector.isBlank())
+                ? "latest" : blockSelector.trim();
+        // A 32-byte 0x hash (unambiguous: a block NUMBER is at most 18 hex chars)
+        // resolves to its number from blocks we've already verified; unknown → the
+        // eth "null" (mirrors rpcGetBlockByHash).
+        String expectHash = null;
+        if (b.length() == 66 && (b.startsWith("0x") || b.startsWith("0X"))) {
+            String key = b.toLowerCase(java.util.Locale.ROOT);
+            Long number = blockHashToNumber.get(key);
+            if (number == null) return "null";
+            expectHash = key;
+            b = "0x" + Long.toHexString(number);
+        }
+        boolean isTag;
+        switch (b) {
+            case "latest": case "pending": case "safe": case "finalized":
+                isTag = true; break;
+            case "earliest":
+                return null; // genesis not served verified (mirrors getBlockByNumber)
+            default:
+                isTag = false;
+        }
+        long pinned = -1;
+        if (!isTag) {
+            try { pinned = Long.decode(b); } catch (Exception e) { return null; }
+            if (pinned < 0) return null;
+        }
+        try {
+            HeaderAnchor anchor = headerAnchor();
+            if (anchor == null) return null;
+            long headNum = anchor.number();
+            long target = isTag ? headNum : pinned;
+            if (target > headNum) {
+                // Same near-head re-anchor as getBlockByNumber: a pin just past the
+                // preferred anchor is the normal mobile state, and the beacon
+                // OPTIMISTIC payload is itself a verified anchor at/past it.
+                long optimisticNum = beaconSyncState.getOptimisticBlockNumber();
+                byte[] optimisticHash = beaconSyncState.getOptimisticBlockHash();
+                if (optimisticNum >= target && optimisticHash != null) {
+                    anchor = new HeaderAnchor(optimisticNum, null, optimisticHash);
+                    headNum = optimisticNum;
+                } else {
+                    return "null"; // beyond the verified chain tip → eth null
+                }
+            }
+            long back = headNum - target;
+            if (back >= BLOCK_LOOKBACK_MAX) return null; // too far to verify cheaply
+
+            List<BlockHeadersMessage.VerifiedHeader> window = conn
+                    .requestBlockHeadersBatched(target, (int) (back + 1))
+                    .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+            if (!anchor.anchors(window)) return null;
+            BlockHeadersMessage.VerifiedHeader vh = window.get(0);
+            // A hash-form request must still name the block served at that height
+            // (a reorg can remap the number under a stale map entry).
+            if (expectHash != null && !vh.hash().toHexString().equals(expectHash)) return "null";
+            blockHashToNumber.put(vh.hash().toHexString(), vh.header().number);
+
+            // Body + receipts in flight together (one round of wall-clock).
+            CompletableFuture<List<BlockBodiesMessage.BlockBody>> bodiesF =
+                    conn.requestBlockBodies(vh.hash());
+            CompletableFuture<List<List<Bytes>>> rcptF = conn.requestReceipts(vh.hash());
+            List<BlockBodiesMessage.BlockBody> bodies =
+                    bodiesF.get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+            List<List<Bytes>> rcptBlocks = rcptF.get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+            if (bodies.isEmpty() || rcptBlocks.isEmpty()) return null;
+            List<Bytes> txs = bodies.get(0).transactions();
+            List<Bytes> receipts = rcptBlocks.get(0);
+            if (!OrderedTrieRoot.verify(txs, vh.header().transactionsRoot)) return null;
+            if (receipts.size() != txs.size()
+                    || !OrderedTrieRoot.verify(receipts, vh.header().receiptsRoot)) {
+                return null;
+            }
+
+            // buildReceiptJson re-decodes the preceding receipts per index (its
+            // single-receipt contract), making this loop O(n²) in cheap RLP
+            // decodes — tens of ms for a full block, dwarfed by the two network
+            // round-trips above.
+            StringBuilder sb = new StringBuilder(256 * Math.max(1, receipts.size()));
+            sb.append("[");
+            for (int i = 0; i < receipts.size(); i++) {
+                if (i > 0) sb.append(",");
+                Bytes32 txHash = Hash.keccak256(txs.get(i));
+                sb.append(buildReceiptJson(receipts, i, vh.header(), vh.hash(), txHash,
+                        txs.get(i).toArrayUnsafe()));
+            }
+            return sb.append("]").toString();
+        } catch (Exception e) {
+            if (e instanceof InterruptedException || e.getCause() instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            log.info("[rpc] eth_getBlockReceipts failed: " + unwrap(e));
+            return null;
+        }
     }
 
     /** Serve the last-good latest block when a fresh fetch couldn't complete. Returns

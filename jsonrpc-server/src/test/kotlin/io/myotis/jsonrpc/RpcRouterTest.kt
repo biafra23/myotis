@@ -81,6 +81,11 @@ class RpcRouterTest {
         override fun getBlockByHash(blockHash32: ByteArray, fullTransactions: Boolean): String? {
             lastBlockHash = blockHash32; lastFullTx = fullTransactions; return blockByHashJson
         }
+        var lastReceiptsSelector: String? = null
+        var blockReceiptsJson: String? = null
+        override fun getBlockReceipts(blockSelector: String): String? {
+            lastReceiptsSelector = blockSelector; return blockReceiptsJson
+        }
         var gasPriceWei: BigInteger? = null
         override fun gasPrice(): String? = gasPriceWei?.toString()
         var tipWei: BigInteger? = null
@@ -324,6 +329,39 @@ class RpcRouterTest {
         assertEquals("0x7", obj["baseFeePerGas"]!!.jsonPrimitive.content)
         assertEquals("latest", b.lastBlockTag)
         assertEquals(false, b.lastFullTx)
+    }
+
+    @Test fun getBlockReceipts_verified_passesSelectorAndEmbedsArray() {
+        val b = FakeBackend()
+        b.blockReceiptsJson = """[{"transactionHash":"0x11","status":"0x1"}]"""
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":7,"method":"eth_getBlockReceipts","params":["0x1406f40"]}""")
+        assertEquals("0x1406f40", b.lastReceiptsSelector)
+        assertTrue(resp.contains("\"transactionHash\":\"0x11\""), resp)
+        // The result embeds as a JSON ARRAY, not a string.
+        assertTrue(resp.contains("\"result\":[{"), resp)
+    }
+
+    @Test fun getBlockReceipts_absentParam_defaultsLatest() {
+        val b = FakeBackend()
+        b.blockReceiptsJson = "[]"
+        route(b, """{"jsonrpc":"2.0","id":7,"method":"eth_getBlockReceipts","params":[]}""")
+        assertEquals("latest", b.lastReceiptsSelector)
+    }
+
+    @Test fun getBlockReceipts_verifiedUnknownBlock_embedsNull() {
+        val b = FakeBackend()
+        b.blockReceiptsJson = "null"
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":7,"method":"eth_getBlockReceipts","params":["0xfffffff"]}""")
+        assertTrue(resp.contains("\"result\":null"), resp)
+    }
+
+    @Test fun getBlockReceipts_backendNull_isStrictError() {
+        val resp = route(FakeBackend(),
+            """{"jsonrpc":"2.0","id":7,"method":"eth_getBlockReceipts","params":["latest"]}""")
+        assertTrue(hasError(resp), resp)
+        assertEquals(-32000, errorCode(resp))
     }
 
     @Test fun getBlockByHash_verified_decodesHashToBytes_andEmbedsBlock() {

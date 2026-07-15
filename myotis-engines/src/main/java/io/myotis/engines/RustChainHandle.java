@@ -903,6 +903,45 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
         return jsonObjectOrThrow(json, "feeHistory");
     }
 
+    /**
+     * Verified eth_getBlockReceipts: the receipts ARRAY JSON, the literal
+     * {@code "null"} (verified unknown/future block or a never-verified hash),
+     * or throws {@link EngineException} when it can't verify. {@code selector}
+     * is a tag, a 0x-hex block number, or a 0x-32-byte block hash.
+     */
+    String blockReceiptsJson(String selector) {
+        return blockReceiptsJsonOrThrow(
+                gated(() -> RustEngineNative.nativeGetBlockReceiptsJson(handle, selector)));
+    }
+
+    /**
+     * Package-private test seam: native payload → receipts ARRAY | "null" | throw.
+     * Unlike the object seams the SUCCESS shape is a JSON array; an object is
+     * either the error envelope (→ its message) or native shape drift (→ throw).
+     */
+    static String blockReceiptsJsonOrThrow(String json) {
+        if (json == null || json.isBlank()) {
+            throw new EngineException(
+                    "blank blockReceipts JSON from the Rust engine (native failure?)");
+        }
+        if (json.equals("null")) return "null";
+        com.eclipsesource.json.JsonValue v;
+        try {
+            v = Json.parse(json);
+        } catch (RuntimeException e) {
+            throw new EngineException(
+                    "malformed blockReceipts JSON from the Rust engine: " + e.getMessage(), e);
+        }
+        if (v.isArray()) return json; // the verified receipts array
+        if (v.isObject()) {
+            var error = v.asObject().get("error");
+            if (error != null && !error.isNull()) {
+                throw new EngineException(error.isString() ? error.asString() : error.toString());
+            }
+        }
+        throw new EngineException("blockReceipts JSON is neither an array nor an error object");
+    }
+
     /** Package-private test seam: native block payload → block JSON | "null" | throw. */
     static String blockJsonOrThrow(String json) {
         return jsonObjectOrThrow(json, "block");

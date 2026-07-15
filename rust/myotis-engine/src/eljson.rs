@@ -414,6 +414,23 @@ pub fn tx_json(t: &VerifiedTransaction) -> String {
 /// Serialize a verified fee suggestion. Both values are decimal-wei strings (the
 /// FFI-neutral form the Java `VerifiedReads.gasPrice()/maxPriorityFeePerGas()`
 /// return); the Java side re-encodes to 0x-QUANTITY at the JSON-RPC boundary.
+/// Serialize a verified `eth_getBlockReceipts` result: a JSON array whose
+/// elements are exactly the [`receipt_json`] objects (the Java
+/// `rpcGetBlockReceipts` emits the same per-element shape via
+/// `buildReceiptJson`).
+pub fn block_receipts_json(receipts: &[VerifiedReceipt]) -> String {
+    let mut s = String::with_capacity(2 + receipts.len() * 512);
+    s.push('[');
+    for (i, r) in receipts.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&receipt_json(r));
+    }
+    s.push(']');
+    s
+}
+
 /// Serialize a verified `eth_feeHistory` result. Mirrors the Java
 /// `rpcFeeHistory` emission exactly in shape: `oldestBlock` + every base fee /
 /// reward tip as minimal-hex QUANTITYs, `gasUsedRatio` as raw JSON numbers,
@@ -1299,6 +1316,23 @@ mod tests {
         assert!(v.get("from").is_none());
         assert_eq!(v["value"], "0x0");
         assert_eq!(v["input"], "0x");
+    }
+
+    #[test]
+    fn block_receipts_json_is_an_array_of_receipt_objects() {
+        // Element shape == receipt_json (its own golden pins the fields); this
+        // pins the array framing and the per-index positions.
+        let mut second = sample_receipt();
+        second.tx_index = 3;
+        second.log_index_base = 8; // block-global: continues after the first's log
+        let json = block_receipts_json(&[sample_receipt(), second]);
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        let arr = v.as_array().expect("array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["transactionIndex"], "0x2");
+        assert_eq!(arr[1]["transactionIndex"], "0x3");
+        assert_eq!(arr[1]["logs"][0]["logIndex"], "0x8");
+        assert_eq!(block_receipts_json(&[]), "[]"); // empty block
     }
 
     #[test]

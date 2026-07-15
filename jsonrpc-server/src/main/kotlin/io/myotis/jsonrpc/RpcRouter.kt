@@ -45,7 +45,8 @@ class RpcRouter(
             "eth_getTransactionCount", "eth_getCode", "eth_getStorageAt",
             "eth_sendRawTransaction", "eth_getTransactionReceipt", "eth_getBlockByNumber",
             "eth_gasPrice", "eth_maxPriorityFeePerGas", "eth_feeHistory", "eth_estimateGas",
-            "eth_getTransactionByHash", "eth_getBlockByHash", "web3_clientVersion",
+            "eth_getTransactionByHash", "eth_getBlockByHash", "eth_getBlockReceipts",
+            "web3_clientVersion",
         )
     }
 
@@ -307,6 +308,22 @@ class RpcRouter(
                 // null (can't verify) → strict error.
                 val blockJson = withContext(Dispatchers.IO) { b.getBlockByHash(blockHash, fullTx) } ?: return null
                 resultEnvelope(id, json.parseToJsonElement(blockJson))
+            }
+            "eth_getBlockReceipts" -> {
+                val p = root.params()
+                // One selector param: tag | 0x-hex number | 0x-32-byte hash. The
+                // engines disambiguate (a hash is unambiguous at 66 chars), so the
+                // raw string passes through; absent → "latest" per spec default.
+                val selParam = p?.getOrNull(0)
+                val selector: String = when {
+                    selParam == null || selParam is JsonNull -> "latest"
+                    else -> (selParam as? JsonPrimitive)?.contentOrNull ?: return null
+                }
+                // Array string when served; "null" for a verified unknown/future
+                // block; Kotlin null (can't verify) → strict error.
+                val receiptsJson =
+                    withContext(Dispatchers.IO) { b.getBlockReceipts(selector) } ?: return null
+                resultEnvelope(id, json.parseToJsonElement(receiptsJson))
             }
             "eth_gasPrice" -> {
                 val price = withContext(Dispatchers.IO) { b.gasPrice() } ?: return null
