@@ -174,7 +174,8 @@ never sleeps (daemon, desktop) runs them 1440×/day.
 (≈ 3–8 GB/day if never asleep). The two big terms scale directly with knobs (§6):
 mempool gossip with the eth peer count, fee warming with whether a wallet-API host is
 running. And per the note at the top: these rates may deliberately *grow* where more
-peers or more parallel fetching is what gets query latency to acceptable.
+peers or more parallel fetching is what gets query latency to acceptable. §3.4 explains
+why always-on hosts currently have to pay this at all — and the plans to stop it.
 
 **Gnosis:** 5 s slots make the CL poll fire 2.4× as often, and periods rotate every
 ~11.4 h — CL terms scale ×2.4; EL terms are smaller (smaller blocks, fewer peers).
@@ -194,6 +195,33 @@ So a phone wallet's realistic daily profile is:
 - **awake minutes** (app foregrounded, wallet polling): the §3.2 per-minute rate — a
   phone's thinner peer pool trends toward its low end, call it **~1–4 MB/min**;
 - a **cold day-after-vacation open**: §2.1 catch-up — still only a few MB.
+
+### 3.4 Why the desktop/daemon stays expensive — and how that goes away
+
+The desktop/daemon's large steady-state traffic is not inherent to the protocol; it's
+a **knowledge problem**. A standalone RPC daemon serving an *unmodified* wallet has no
+idea when the next query will arrive, so to honor its latency promises (instant fees,
+a fresh verified head) it must keep everything warm **all the time** — that's the
+mempool-gossip and fee/head-warming terms of §3.2 running 1440 minutes a day. Android
+only escapes this because its host *does* know when the wallet is active and idle-pauses
+the stack.
+
+Two planned paths give other hosts the same escape:
+
+- **Bundling.** Once Myotis is embedded as a library inside the application that uses
+  it (rather than running as a free-standing daemon), the host application knows exactly
+  when queries can occur and can pause/resume the engine around its own lifecycle —
+  the Android idle-pause model generalized. The engine API already supports this
+  (`ChainStack.pause()` quiesces every socket and timer; a read wakes it).
+- **A pause/wake JSON-RPC surface.** The server could expose `myotis_pause` and
+  `myotis_wakeup` (alongside the existing `myotis_status`/`myotis_beaconStatus`), so a
+  Myotis-aware wallet — even an out-of-process one — can put the node to sleep when its
+  UI goes to background and wake it (and poll status until ready) before the next burst
+  of queries. Not implemented yet; unaware wallets would keep today's always-warm
+  behavior.
+
+With either in place, the desktop profile converges on the Android one in §3.3:
+per-minute rates only while a wallet is actually active, near-zero otherwise.
 
 iOS runs the same engine (Rust) with the same idle semantics available to the host;
 the desktop app and daemon are always-on (§3.2) unless paused.
