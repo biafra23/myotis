@@ -40,17 +40,18 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
@@ -65,7 +66,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.datetime.Instant
+import kotlin.time.Instant
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
 
@@ -1093,16 +1094,58 @@ private fun LogsTab(logs: LogSource, filter: String, onFilterChange: (String) ->
     }
 
     val listState = rememberLazyListState()
-    // Auto-follow: key on `shown` so the derived state re-reads the current list (not a stale
-    // capture); size-2 tolerates the one-frame lag before a freshly-appended item is laid out.
-    val atBottom by remember(shown) {
-        derivedStateOf {
-            val last = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-            last >= shown.size - 2
-        }
+    // Tail-follow is explicit intent state, NOT re-derived from layout on every append: the old
+    // "last visible >= shown.size - 2" check compared a stale layout against the fresh list, so
+    // any poll batch of more than 2 lines silently broke follow (how often depended on each
+    // platform's log volume and frame timing). Entering the tab starts following — this
+    // composition is disposed on tab switch, so `remember` resets the flag to true per visit.
+    var follow by remember { mutableStateOf(true) }
+    // Guards the auto-snap below so its own scrollToItem can't read as a user scroll.
+    var autoSnapping by remember { mutableStateOf(false) }
+    // "At the tail" with ~1 item of tolerance (trackpad jitter, a stop a hair above the last
+    // line). Index and count come from the SAME layout pass, so a freshly-appended batch that
+    // hasn't been laid out yet can't skew the comparison the way the old shown.size check did.
+    fun nearTail(): Boolean {
+        val info = listState.layoutInfo
+        val last = info.visibleItemsInfo.lastOrNull() ?: return true
+        return last.index >= info.totalItemsCount - 2
     }
-    LaunchedEffect(shown.size) {
-        if (atBottom && shown.isNotEmpty()) listState.scrollToItem(shown.size - 1)
+    // Break: any scroll this composable didn't initiate that leaves the tail stops following.
+    // isScrollInProgress covers every input path uniformly — touch drag/fling, desktop mouse
+    // wheel and trackpad, and accessibility scroll actions (which bypass nested scroll and
+    // pointer input entirely, so a NestedScrollConnection would miss them).
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress && !autoSnapping && !nearTail() }
+            .collect { if (it) follow = false }
+    }
+    // Resume: coming to rest at the tail re-arms following (drag, fling, or the button below).
+    // canScrollBackward keeps a list that merely FITS the viewport from re-arming — without it,
+    // scrolling up to read and then typing a filter that shrinks `shown` onto one screen would
+    // silently flip follow back on, and clearing the filter would yank away the reading
+    // position. Reading `follow` in the expression re-evaluates it when only the flag changed,
+    // so a break-then-return while the layout stays put can't leave follow stuck off.
+    LaunchedEffect(listState) {
+        snapshotFlow { !follow && listState.canScrollBackward && nearTail() }
+            .collect { if (it) follow = true }
+    }
+    // Snap while following, keyed on the tail line's identity — sequence, not size, because at
+    // ring capacity the size stays constant while lines shift. One long-lived collector instead
+    // of an effect restart per 250ms poll (snapshotFlow conflates, and emits nothing at all
+    // while follow is off or the tail is unchanged).
+    LaunchedEffect(listState) {
+        snapshotFlow { if (follow) shown.lastOrNull()?.sequence else null }
+            .collect {
+                if (it != null) {
+                    autoSnapping = true
+                    try {
+                        // Re-check: `shown` can go empty (Clear, filter) between the emission
+                        // and this collect step, and scrollToItem(-1) throws.
+                        if (shown.isNotEmpty()) listState.scrollToItem(shown.size - 1)
+                    } finally {
+                        autoSnapping = false
+                    }
+                }
+            }
     }
 
     Column(Modifier.fillMaxSize()) {
@@ -1123,7 +1166,8 @@ private fun LogsTab(logs: LogSource, filter: String, onFilterChange: (String) ->
                 }
             }) { Text("Copy") }
             Spacer(Modifier.width(4.dp))
-            OutlinedButton(onClick = { logs.clear() }) { Text("Clear") }
+            // Clearing empties the ring — tail-follow the fresh lines that come after.
+            OutlinedButton(onClick = { logs.clear(); follow = true }) { Text("Clear") }
         }
         Spacer(Modifier.height(4.dp))
         // Capture level: lower it (e.g. DEBUG) to surface the chatty wire / peer-churn lines,
@@ -1144,12 +1188,13 @@ private fun LogsTab(logs: LogSource, filter: String, onFilterChange: (String) ->
         }
         Spacer(Modifier.height(8.dp))
         Box(Modifier.weight(1f).fillMaxWidth()) {
-            LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+            LazyColumn(state = listState, modifier = Modifier.fillMaxSize().testTag("logList")) {
                 items(shown, key = { it.sequence }) { LogLineRow(it, tz) }
             }
-            if (!atBottom && shown.isNotEmpty()) {
+            if (!follow && shown.isNotEmpty()) {
                 Button(
-                    onClick = { scope.launch { listState.scrollToItem(shown.size - 1) } },
+                    // Setting follow makes the snap collector emit, which scrolls to the tail.
+                    onClick = { follow = true },
                     modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp),
                 ) { Text("↓ Latest") }
             }
@@ -1207,9 +1252,8 @@ private fun formatDuration(ms: Long): String {
 }
 
 /** HH:mm:ss.SSS in [tz] (matches the logback console/file pattern). */
-// The opt-in is for the iOS (klib) compile, where kotlinx-datetime 0.6.x resolves
-// Instant against the 2.2 stdlib's experimental kotlin.time.Instant; the JVM and
-// Android compiles resolve kotlinx-datetime's own stable Instant and ignore it.
+// kotlin.time.Instant (used by kotlinx-datetime 0.7.x on every target) is still
+// @ExperimentalTime in the 2.2 stdlib.
 @OptIn(kotlin.time.ExperimentalTime::class)
 private fun formatLogTime(ms: Long, tz: TimeZone): String {
     val dt = Instant.fromEpochMilliseconds(ms).toLocalDateTime(tz)
