@@ -75,7 +75,19 @@ struct EngineState {
     rt: tokio::runtime::Runtime,
     handles: Mutex<HashMap<i64, ChainEntry>>,
     next_id: AtomicI64,
+    /// Per-handle last-good `eth_feeHistory`: the EMITTED JSON plus the raw
+    /// request signature it answered, re-servable within
+    /// [`FEE_HISTORY_STALE_MAX`] when a fresh build fails for the SAME
+    /// signature (the Java `lastGoodFeeHistory` twin — identical params ⇒
+    /// identical verified data, just older; fees drift slowly and the wallet
+    /// re-polls). Kept at the JSON layer so a hit costs a String clone, never
+    /// a result rebuild. Entries die with their handle (see `stop`).
+    fee_history_cache: Mutex<HashMap<i64, (String, String, std::time::Instant)>>,
 }
+
+/// How long a last-good `eth_feeHistory` result may be re-served (the Java
+/// `RPC_HEAD_SERVE_STALE_MAX_MS`).
+const FEE_HISTORY_STALE_MAX: std::time::Duration = std::time::Duration::from_secs(64 * 12);
 
 static ENGINE: OnceLock<Option<EngineState>> = OnceLock::new();
 
@@ -94,6 +106,7 @@ fn engine() -> Option<&'static EngineState> {
                     handles: Mutex::new(HashMap::new()),
                     // Start at 1 so a valid id is never confused with the -1 sentinel.
                     next_id: AtomicI64::new(1),
+                    fee_history_cache: Mutex::new(HashMap::new()),
                 }),
                 Err(_) => None,
             }
@@ -467,6 +480,10 @@ pub fn stop(handle: i64) {
         Ok(mut m) => m.remove(&handle),
         Err(_) => return,
     };
+    // The handle's cached feeHistory dies with it.
+    if let Ok(mut cache) = engine.fee_history_cache.lock() {
+        cache.remove(&handle);
+    }
     if let Some(ChainEntry::Running(_, sync, reader)) = entry {
         engine.rt.block_on(async move {
             sync.stop().await;
@@ -1028,11 +1045,37 @@ pub fn fee_history_json(
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
+    // The raw request strings ARE the stale-serve signature (the Java
+    // `blockCount + "|" + newestBlock + "|" + Arrays.toString(percentiles)`).
+    let key = format!("{block_count}|{}|{}", newest_block_tag.trim(), percentiles_json.trim());
     match engine.rt.block_on(async {
         reader.fee_history(block_count as u64, newest, percentiles.as_deref()).await
     }) {
-        Ok(history) => eljson::fee_history_json(&history),
-        Err(e) => eljson::error_json(&e),
+        Ok(history) => {
+            let json = eljson::fee_history_json(&history);
+            if let Ok(mut cache) = engine.fee_history_cache.lock() {
+                cache.insert(handle, (key, json.clone(), std::time::Instant::now()));
+            }
+            json
+        }
+        // A Reject is a bad request against the CURRENT head — answered as the
+        // error (→ -32000), never from a stale snapshot (Java parity: only
+        // BUILD failures reach serveStaleFeeHistory).
+        Err(myotis_net::el::reader::FeeHistoryError::Reject(msg)) => eljson::error_json(&msg),
+        Err(myotis_net::el::reader::FeeHistoryError::Build(msg)) => {
+            if let Ok(cache) = engine.fee_history_cache.lock() {
+                if let Some((last_key, json, at)) = cache.get(&handle) {
+                    if *last_key == key && at.elapsed() < FEE_HISTORY_STALE_MAX {
+                        tracing::info!(
+                            age_secs = at.elapsed().as_secs(),
+                            "eth_feeHistory serving STALE result"
+                        );
+                        return json.clone();
+                    }
+                }
+            }
+            eljson::error_json(&msg)
+        }
     }
 }
 

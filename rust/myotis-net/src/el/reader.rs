@@ -346,10 +346,25 @@ const FEE_HISTORY_MAX_BLOCKS: u64 = 10;
 /// pipelined per-block body/receipt fetches) — the Java stage timeout.
 const FEE_HISTORY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How long a last-good `eth_feeHistory` result may be re-served when a fresh
-/// build fails (the Java `RPC_HEAD_SERVE_STALE_MAX_MS`: same request signature
-/// ⇒ identical verified data, just older — correct-but-stale, never wrong).
-const FEE_HISTORY_STALE_MAX: std::time::Duration = std::time::Duration::from_secs(64 * 12);
+/// Why [`ElReader::fee_history`] failed — the split the Java `rpcFeeHistory`
+/// expresses with `return null` vs `serveStaleFeeHistory(...)`: a `Reject` is a
+/// bad request against the current head (answered -32000, NEVER from a stale
+/// snapshot), a `Build` is a transport/verify failure the host may answer from
+/// its last-good same-signature result.
+#[derive(Debug, Clone)]
+pub enum FeeHistoryError {
+    Reject(String),
+    Build(String),
+}
+
+impl FeeHistoryError {
+    /// The user-facing message, whichever side it is.
+    pub fn message(&self) -> &str {
+        match self {
+            FeeHistoryError::Reject(m) | FeeHistoryError::Build(m) => m,
+        }
+    }
+}
 
 /// A verified `eth_feeHistory` result (the Java `rpcFeeHistory` twin). Every
 /// value comes from the beacon-anchored header window; rewards additionally
@@ -407,11 +422,6 @@ pub struct ElReader {
     /// ONLY by blocks this reader itself verified (the receipt/tx scan and the
     /// by-number serve); the shared LRU is the myotis-evm cache one.
     block_hash_numbers: std::sync::Mutex<myotis_evm::Lru<[u8; 32], u64>>,
-    /// The last successfully built `eth_feeHistory`, re-servable within
-    /// [`FEE_HISTORY_STALE_MAX`] for the SAME request signature when a fresh
-    /// build fails (the Java `lastGoodFeeHistory` twin — fees drift slowly and
-    /// the wallet re-polls, so correct-but-stale beats an error).
-    last_fee_history: std::sync::Mutex<Option<(String, FeeHistory, std::time::Instant)>>,
 }
 
 /// The scan-cursor map plus its last TTL sweep — one lock covers both, so the
@@ -512,7 +522,6 @@ impl ElReader {
                 last_sweep: std::time::Instant::now(),
             }),
             block_hash_numbers: std::sync::Mutex::new(myotis_evm::Lru::new(BLOCK_HASH_LRU_MAX)),
-            last_fee_history: std::sync::Mutex::new(None),
         })
     }
 
@@ -1243,9 +1252,7 @@ impl ElReader {
         // Body: verify its transactions against the (now trusted) transactions_root.
         let bodies = peer.get_block_bodies(&[vh.hash]).await?;
         let body = bodies.into_iter().next().ok_or("peer returned no block body")?;
-        if !triehash::verify(&body.transactions, &vh.header.transactions_root) {
-            return Err("block body transactions do not match the header transactionsRoot".to_string());
-        }
+        verify_body_transactions(&vh.header, &body)?;
         let tx_hashes = body.transactions.iter().map(|t| keccak256(t)).collect();
         // Remember the fully verified hash↔number so eth_getBlockByHash resolves
         // it (the Java rpcGetBlockByNumber does the same).
@@ -1308,9 +1315,7 @@ impl ElReader {
             // which would median over the remaining good blocks — safer here, at a
             // small availability cost. (A wrong header/body pairing from an out-of-
             // order peer response is caught the same way.)
-            if !triehash::verify(&body.transactions, &vh.header.transactions_root) {
-                return Err("block body transactions do not match the header transactionsRoot".to_string());
-            }
+            verify_body_transactions(&vh.header, body)?;
             let base = header_base_fee(&vh.header);
             for raw in &body.transactions {
                 // A tx the minimal fee decoder can't read is skipped (not dropped
@@ -1339,64 +1344,50 @@ impl ElReader {
     /// receipts fetch). `block_count` is clamped to [`FEE_HISTORY_MAX_BLOCKS`];
     /// the result reflects what was served.
     ///
-    /// On a failed fresh build, the last-good result is re-served when it was
-    /// for the SAME request signature and is younger than
-    /// [`FEE_HISTORY_STALE_MAX`] (identical params ⇒ identical verified data,
-    /// just older — fees drift slowly and the wallet re-polls).
+    /// The error carries the Java tri-state split: a [`FeeHistoryError::Reject`]
+    /// is a bad request AGAINST THE CURRENT HEAD (Java answers these -32000,
+    /// never stale); a [`FeeHistoryError::Build`] is a transport/verify failure
+    /// the host may answer from its last-good same-signature snapshot.
     pub async fn fee_history(
         &self,
         block_count: u64,
         newest_block: Option<u64>,
         reward_percentiles: Option<&[f64]>,
-    ) -> Result<FeeHistory, String> {
-        // The exact request signature the stale-serve is keyed by.
-        let key = format!("{block_count}|{newest_block:?}|{reward_percentiles:?}");
-        match self.fee_history_fresh(block_count, newest_block, reward_percentiles).await {
-            Ok(history) => {
-                if let Ok(mut last) = self.last_fee_history.lock() {
-                    *last = Some((key, history.clone(), std::time::Instant::now()));
-                }
-                Ok(history)
-            }
-            Err(e) => {
-                if let Ok(last) = self.last_fee_history.lock() {
-                    if let Some((last_key, history, at)) = last.as_ref() {
-                        if *last_key == key && at.elapsed() < FEE_HISTORY_STALE_MAX {
-                            tracing::info!(
-                                age_secs = at.elapsed().as_secs(),
-                                "eth_feeHistory serving STALE result"
-                            );
-                            return Ok(history.clone());
-                        }
-                    }
-                }
-                Err(e)
-            }
-        }
-    }
-
-    /// One fresh `eth_feeHistory` build (no stale fallback).
-    async fn fee_history_fresh(
-        &self,
-        block_count: u64,
-        newest_block: Option<u64>,
-        reward_percentiles: Option<&[f64]>,
-    ) -> Result<FeeHistory, String> {
+    ) -> Result<FeeHistory, FeeHistoryError> {
         if block_count == 0 {
-            return Err("blockCount must be at least 1".to_string());
+            return Err(FeeHistoryError::Reject("blockCount must be at least 1".to_string()));
         }
-        let (head_num, head_hash) = self.anchored_head()?;
+        // No anchor yet is a BUILD failure (Java's `anchor == null` path also
+        // falls to the stale-serve), unlike the request rejects below.
+        let (head_num, head_hash) = self.anchored_head().map_err(FeeHistoryError::Build)?;
         let newest = newest_block.unwrap_or(head_num);
         if newest > head_num {
-            return Err("newest block is beyond the verified head".to_string());
+            return Err(FeeHistoryError::Reject(
+                "newest block is beyond the verified head".to_string(),
+            ));
         }
         let count = block_count.min(FEE_HISTORY_MAX_BLOCKS).min(newest + 1);
         let oldest = newest + 1 - count;
         if head_num - oldest >= BLOCK_LOOKBACK_MAX {
-            return Err(format!(
+            return Err(FeeHistoryError::Reject(format!(
                 "oldest block {oldest} is beyond the {BLOCK_LOOKBACK_MAX}-block verify window"
-            ));
+            )));
         }
+        self.fee_history_build(oldest, count, head_num, &head_hash, reward_percentiles)
+            .await
+            .map_err(FeeHistoryError::Build)
+    }
+
+    /// The peer-failover build stage of [`Self::fee_history`] (every error here
+    /// is a BUILD failure — the bounds were already accepted).
+    async fn fee_history_build(
+        &self,
+        oldest: u64,
+        count: u64,
+        head_num: u64,
+        head_hash: &[u8; 32],
+        reward_percentiles: Option<&[f64]>,
+    ) -> Result<FeeHistory, String> {
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
@@ -1406,14 +1397,7 @@ impl ElReader {
         for peer in &peers {
             let attempt = tokio::time::timeout(
                 FEE_HISTORY_DEADLINE,
-                self.fee_history_from(
-                    peer,
-                    oldest,
-                    count,
-                    head_num,
-                    &head_hash,
-                    reward_percentiles,
-                ),
+                self.fee_history_from(peer, oldest, count, head_num, head_hash, reward_percentiles),
             )
             .await
             .unwrap_or_else(|_| Err("feeHistory build timed out".to_string()));
@@ -1877,12 +1861,7 @@ impl ElReader {
         .await;
         for (vh, bodies) in window.iter().zip(all_bodies).rev() {
             let body = bodies?.into_iter().next().ok_or("peer returned no block body")?;
-            if !triehash::verify(&body.transactions, &vh.header.transactions_root) {
-                return Err(format!(
-                    "block {} body does not match the header transactionsRoot",
-                    vh.header.number
-                ));
-            }
+            verify_body_transactions(&vh.header, &body)?;
             for (i, raw) in body.transactions.iter().enumerate() {
                 if &keccak256(raw) == want {
                     // Pre-populate for the eth_getBlockByHash the wallet issues
@@ -1914,12 +1893,7 @@ impl ElReader {
         if receipts.is_empty() {
             return Err("peer returned no receipts".to_string());
         }
-        if !triehash::verify(&receipts, &loc.header.receipts_root) {
-            return Err(format!(
-                "block {} receipts do not match the header receiptsRoot",
-                loc.header.number
-            ));
-        }
+        verify_block_receipts(&loc.header, &receipts)?;
         if loc.index >= receipts.len() {
             return Err("tx index out of receipt range".to_string());
         }
@@ -2020,6 +1994,35 @@ async fn fetch_anchored_window(
     Ok(window)
 }
 
+/// The body half of the per-block trust gate: the fetched transactions must
+/// rebuild the (already anchored) header's `transactionsRoot`. One
+/// implementation for every consumer (block serve, fee estimate, tx scan,
+/// fee history), so a hardening never has to be applied in four places.
+fn verify_body_transactions(
+    header: &BlockHeader,
+    body: &crate::el::eth::messages::BlockBody,
+) -> Result<(), String> {
+    if !triehash::verify(&body.transactions, &header.transactions_root) {
+        return Err(format!(
+            "block {} body does not match the header transactionsRoot",
+            header.number
+        ));
+    }
+    Ok(())
+}
+
+/// The receipts half of the per-block trust gate: the fetched receipt list
+/// must rebuild the (already anchored) header's `receiptsRoot`.
+fn verify_block_receipts(header: &BlockHeader, receipts: &[Vec<u8>]) -> Result<(), String> {
+    if !triehash::verify(receipts, &header.receipts_root) {
+        return Err(format!(
+            "block {} receipts do not match the header receiptsRoot",
+            header.number
+        ));
+    }
+    Ok(())
+}
+
 /// One block's per-tx `(effective_tip, gas_used)` list from its FETCHED body +
 /// receipts, verified against the (already anchored) header's
 /// `transactionsRoot` / `receiptsRoot` before anything is trusted (the Java
@@ -2031,26 +2034,20 @@ fn block_tx_tips(
     receipt_blocks: Vec<Vec<Vec<u8>>>,
 ) -> Result<Vec<(u128, u64)>, String> {
     let body = bodies.into_iter().next().ok_or("peer returned no block body")?;
-    if !triehash::verify(&body.transactions, &header.transactions_root) {
-        return Err(format!(
-            "block {} body does not match the header transactionsRoot",
-            header.number
-        ));
-    }
+    verify_body_transactions(header, &body)?;
     if body.transactions.is_empty() {
         return Ok(Vec::new());
     }
     let receipts = receipt_blocks.into_iter().next().ok_or("peer returned no receipts")?;
-    if receipts.len() != body.transactions.len()
-        || !triehash::verify(&receipts, &header.receipts_root)
-    {
+    if receipts.len() != body.transactions.len() {
         return Err(format!(
-            "block {} receipts do not match the header receiptsRoot ({} receipts for {} txs)",
+            "block {} receipt count mismatch ({} receipts for {} txs)",
             header.number,
             receipts.len(),
             body.transactions.len()
         ));
     }
+    verify_block_receipts(header, &receipts)?;
     let base_fee = header_base_fee(header);
     let mut out = Vec::with_capacity(body.transactions.len());
     let mut prev_cum = 0u64;
@@ -2064,9 +2061,13 @@ fn block_tx_tips(
     Ok(out)
 }
 
-/// Gas-used-weighted percentile rewards for one block — geth's algorithm, the
-/// Java `rewardJson` twin: sort txs by tip, walk each percentile's threshold
-/// over cumulative gasUsed, take that tx's tip. Empty block → zeros.
+/// Gas-used-weighted percentile rewards for one block — the Java `rewardJson`
+/// twin (geth-derived: sort txs by tip, walk each percentile's threshold over
+/// cumulative gasUsed, take that tx's tip; like Java the threshold stays a
+/// float where geth truncates it to an integer — an at-most-one-tx boundary
+/// nuance). Percentile ordering/range is the router's validation (ascending,
+/// 0..=100), same as for the Java backend; the walk's index never rewinds.
+/// Empty block → zeros.
 fn percentile_rewards(mut tips: Vec<(u128, u64)>, percentiles: &[f64]) -> Vec<u128> {
     if tips.is_empty() {
         return vec![0; percentiles.len()];
