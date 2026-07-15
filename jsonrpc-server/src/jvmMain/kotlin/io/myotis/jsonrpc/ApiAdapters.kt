@@ -33,6 +33,11 @@ object MyotisRpc {
 class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBackend {
     override fun chainId(): Long = v.chainId()
     override fun headBlockNumber(): Long? = v.headBlockNumber()
+    override fun syncState(): RpcSyncState = when (v.syncState()) {
+        io.myotis.api.SyncState.SYNCED -> RpcSyncState.SYNCED
+        io.myotis.api.SyncState.CATCHING_UP -> RpcSyncState.CATCHING_UP
+        io.myotis.api.SyncState.SYNCING -> RpcSyncState.SYNCING
+    }
     override fun call(from: ByteArray?, to: ByteArray, data: ByteArray, valueWei: String?, block: String): ByteArray? =
         v.call(from, to, data, valueWei, block)
     override fun getBalance(address: ByteArray, block: String): String? = v.getBalance(address, block)
