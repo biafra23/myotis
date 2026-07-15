@@ -2833,7 +2833,13 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         }
         long pinned = -1;
         if (!isTag) {
-            try { pinned = Long.decode(b); } catch (Exception e) { return null; }
+            // The selector contract is tag | 0x-number | 0x-hash (the shape the
+            // router enforces): explicit-radix hex, never Long.decode — its bare
+            // numeric forms are ambiguous across engines (Java decimal, and OCTAL
+            // for a leading zero, vs the Rust parser's hex), so bare numerics are
+            // rejected here too for callers that bypass the router.
+            if (!(b.startsWith("0x") || b.startsWith("0X")) || b.length() <= 2) return null;
+            try { pinned = Long.parseLong(b.substring(2), 16); } catch (Exception e) { return null; }
             // Genesis by number is rejected like the "earliest" tag above (and like
             // the Rust engine's selector parser) — the two engines must answer the
             // same request identically.
