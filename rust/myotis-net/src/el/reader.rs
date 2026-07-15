@@ -237,6 +237,11 @@ pub struct VerifiedBlock {
     pub header: BlockHeader,
     /// keccak256 of each transaction's raw bytes, in block order.
     pub tx_hashes: Vec<[u8; 32]>,
+    /// The fully decoded transactions (the `fullTransactions=true` form), in
+    /// block order; `None` when the caller asked for hashes only. Populated
+    /// only from the `transactionsRoot`-verified body — an undecodable tx
+    /// fails the serve rather than degrade to a hash.
+    pub full_transactions: Option<Vec<VerifiedTransaction>>,
 }
 
 /// How far below the beacon head a block pin may be and still verify cheaply
@@ -364,6 +369,18 @@ impl FeeHistoryError {
             FeeHistoryError::Reject(m) | FeeHistoryError::Build(m) => m,
         }
     }
+}
+
+/// Why a single-peer block serve ([`ElReader::get_block_from`]) failed: a
+/// `Peer` failure (transport / root mismatch / short window) is that peer's
+/// fault — the caller loop counts it against the peer and tries the next one;
+/// `Undecodable` means the body VERIFIED against the header's
+/// `transactionsRoot` but a tx inside it can't be decoded (an unknown future
+/// tx type) — deterministic for every peer, so the loop must stop without
+/// blaming peers that served correct bytes.
+enum BlockFromError {
+    Peer(String),
+    Undecodable(String),
 }
 
 /// A verified `eth_feeHistory` result (the Java `rpcFeeHistory` twin). Every
@@ -1114,7 +1131,7 @@ impl ElReader {
         let Some(fin) = self.anchor.finalized_execution() else {
             return Err(format!("no beacon-finalized execution block for {what}"));
         };
-        let Some(block) = self.get_block_by_number(Some(fin.block_number)).await? else {
+        let Some(block) = self.get_block_by_number(Some(fin.block_number), false).await? else {
             return Err(format!(
                 "finalized block {} not fetchable for {what}",
                 fin.block_number
@@ -1147,7 +1164,7 @@ impl ElReader {
         chain_id: u64,
         what: &str,
     ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
-        let Some(block) = self.get_block_by_number(None).await? else {
+        let Some(block) = self.get_block_by_number(None, false).await? else {
             return Err(format!("no verified head to run {what} against"));
         };
         let ctx = block_context(&block.header, chain_id)?;
@@ -1180,8 +1197,11 @@ impl ElReader {
         Ok((ctx, executor))
     }
 
-    /// Verified `eth_getBlockByNumber` (transactions as hashes). `target` is the
-    /// block number, or `None` for the latest (the beacon optimistic head).
+    /// Verified `eth_getBlockByNumber`. `target` is the block number, or `None`
+    /// for the latest (the beacon optimistic head); `full_transactions` selects
+    /// fully decoded tx objects (incl. the recovered sender) instead of hashes —
+    /// an undecodable tx inside the verified body fails the serve (`Err`), never
+    /// a silent hash fallback.
     ///
     /// Returns `Ok(Some(block))` when a block is fetched and verified; `Ok(None)`
     /// for a number ABOVE the verified head (a future/unknown block → eth `null`);
@@ -1190,6 +1210,7 @@ impl ElReader {
     pub async fn get_block_by_number(
         &self,
         target: Option<u64>,
+        full_transactions: bool,
     ) -> Result<Option<VerifiedBlock>, String> {
         let (head_num, head_hash) = self.anchored_head()?;
         let target_num = target.unwrap_or(head_num);
@@ -1214,12 +1235,22 @@ impl ElReader {
         let total = peers.len();
         let mut last_err = String::new();
         for peer in &peers {
-            match self.get_block_from(peer, target_num, back, &head_hash).await {
+            match self.get_block_from(peer, target_num, back, &head_hash, full_transactions).await
+            {
                 Ok(block) => {
                     self.pool.record_snap_served(peer.addr()).await;
                     return Ok(Some(block));
                 }
-                Err(e) => {
+                // The body root-verified but a tx inside it doesn't decode: the
+                // peer served CORRECT data and every peer would serve the same
+                // bytes — rendering it is our failure. Credit the peer and stop
+                // (retrying the pool would just re-download the block N times
+                // and burn the shared snap reputation on verified-good peers).
+                Err(BlockFromError::Undecodable(e)) => {
+                    self.pool.record_snap_served(peer.addr()).await;
+                    return Err(e);
+                }
+                Err(BlockFromError::Peer(e)) => {
                     self.pool.record_snap_failure(peer.addr()).await;
                     last_err = e;
                 }
@@ -1231,15 +1262,18 @@ impl ElReader {
     /// Fetch + verify one block against a single peer. Fetches the header window
     /// [target..head], checks it hash-links up to the beacon-anchored head hash,
     /// then fetches the target's body and verifies its transactions against the
-    /// header's `transactions_root`. Any mismatch/transport error propagates for
-    /// the caller loop to try the next peer.
+    /// header's `transactions_root`. A [`BlockFromError::Peer`] (mismatch /
+    /// transport) is this peer's failure — the caller loop tries the next one;
+    /// a [`BlockFromError::Undecodable`] is deterministic across peers and must
+    /// short-circuit the loop.
     async fn get_block_from(
         &self,
         peer: &ManagedPeer,
         target_num: u64,
         back: u64,
         head_hash: &[u8; 32],
-    ) -> Result<VerifiedBlock, String> {
+        full_transactions: bool,
+    ) -> Result<VerifiedBlock, BlockFromError> {
         // The contiguous forward window [target .. head] (back + 1 headers), in one
         // request. back < BLOCK_LOOKBACK_MAX (256) bounds this to ~150 KB, within the
         // eth response soft limit; a peer that caps its response below back+1 fails
@@ -1247,17 +1281,50 @@ impl ElReader {
         // tries the next peer), so deep pins carry a slightly higher liveness risk
         // than a batched fetch would. The common case (latest / a few blocks back) is
         // one small response.
-        let window = fetch_anchored_window(peer, target_num, back + 1, head_hash).await?;
+        let window = fetch_anchored_window(peer, target_num, back + 1, head_hash)
+            .await
+            .map_err(BlockFromError::Peer)?;
         let vh = &window[0];
         // Body: verify its transactions against the (now trusted) transactions_root.
-        let bodies = peer.get_block_bodies(&[vh.hash]).await?;
-        let body = bodies.into_iter().next().ok_or("peer returned no block body")?;
-        verify_body_transactions(&vh.header, &body)?;
-        let tx_hashes = body.transactions.iter().map(|t| keccak256(t)).collect();
+        let bodies = peer.get_block_bodies(&[vh.hash]).await.map_err(BlockFromError::Peer)?;
+        let body = bodies
+            .into_iter()
+            .next()
+            .ok_or_else(|| BlockFromError::Peer("peer returned no block body".to_string()))?;
+        verify_body_transactions(&vh.header, &body).map_err(BlockFromError::Peer)?;
+        let tx_hashes: Vec<[u8; 32]> = body.transactions.iter().map(|t| keccak256(t)).collect();
+        // Full mode: decode every tx of the (root-verified) body. Strict, like
+        // the Java buildBlockJson: found-but-unrenderable fails the serve.
+        let full = if full_transactions {
+            let mut out = Vec::with_capacity(body.transactions.len());
+            for (i, raw_tx) in body.transactions.iter().enumerate() {
+                let tx = tx::decode_summary(raw_tx).ok_or_else(|| {
+                    BlockFromError::Undecodable(format!(
+                        "block {} has an undecodable tx at index {i}",
+                        vh.header.number
+                    ))
+                })?;
+                out.push(VerifiedTransaction {
+                    tx_hash: tx_hashes[i],
+                    tx_index: i as u64,
+                    block_hash: vh.hash,
+                    block_number: vh.header.number,
+                    tx,
+                });
+            }
+            Some(out)
+        } else {
+            None
+        };
         // Remember the fully verified hash↔number so eth_getBlockByHash resolves
         // it (the Java rpcGetBlockByNumber does the same).
         self.remember_block_number(vh.hash, vh.header.number);
-        Ok(VerifiedBlock { hash: vh.hash, header: vh.header.clone(), tx_hashes })
+        Ok(VerifiedBlock {
+            hash: vh.hash,
+            header: vh.header.clone(),
+            tx_hashes,
+            full_transactions: full,
+        })
     }
 
     /// Verified fee suggestion (`eth_gasPrice` + `eth_maxPriorityFeePerGas`). Samples
@@ -1611,11 +1678,12 @@ impl ElReader {
     pub async fn get_block_by_hash(
         &self,
         block_hash: [u8; 32],
+        full_transactions: bool,
     ) -> Result<Option<VerifiedBlock>, String> {
         let Some(number) = self.lookup_block_number(&block_hash) else {
             return Ok(None); // not a block we've verified — unknown to us
         };
-        match self.get_block_by_number(Some(number)).await? {
+        match self.get_block_by_number(Some(number), full_transactions).await? {
             Some(block) if block.hash == block_hash => Ok(Some(block)),
             // The height serves a DIFFERENT canonical block now (reorg) — or the
             // number sits above the current head: the requested hash is unknown.

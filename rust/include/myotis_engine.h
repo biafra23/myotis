@@ -26,7 +26,7 @@ extern "C" {
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
- * differs from the version this header was written against (17). */
+ * differs from the version this header was written against (18). */
 int32_t myotis_init(void);
 
 /* Up to `max` buffered tracing lines, oldest first, newline-joined; ""
@@ -85,17 +85,21 @@ char *myotis_estimate_gas_json(int64_t handle, const char *from,
 char *myotis_resolve_ens_json(int64_t handle, const char *name);
 /* Generic ENS record dispatch; method + args travel in params_json. */
 char *myotis_ens_record_json(int64_t handle, const char *params_json);
-/* Block JSON, the literal "null", or {"error"}. */
-char *myotis_get_block_by_number_json(int64_t handle, const char *block_tag);
+/* Block JSON, the literal "null", or {"error"}. full_transactions selects
+ * decoded tx objects over hashes. */
+char *myotis_get_block_by_number_json(int64_t handle, const char *block_tag,
+                                      bool full_transactions);
 /* Receipt JSON, the literal "null" (verified not-seen), or {"error"}. */
 char *myotis_get_transaction_receipt_json(int64_t handle,
                                           const char *tx_hash_hex);
 /* Tx JSON, the literal "null" (verified not-seen), or {"error"}. */
 char *myotis_get_transaction_by_hash_json(int64_t handle,
                                           const char *tx_hash_hex);
-/* Block JSON, the literal "null" (never-verified hash), or {"error"}. */
+/* Block JSON, the literal "null" (never-verified hash), or {"error"}.
+ * full_transactions selects decoded tx objects over hashes. */
 char *myotis_get_block_by_hash_json(int64_t handle,
-                                    const char *block_hash_hex);
+                                    const char *block_hash_hex,
+                                    bool full_transactions);
 /* Receipts array JSON, the literal "null" (unknown/future block or
  * never-verified hash), or {"error"}. selector = tag | 0x-number | 0x-hash. */
 char *myotis_get_block_receipts_json(int64_t handle, const char *selector);

@@ -46,7 +46,7 @@ object RustEngine {
 
     /** Must match `ABI_VERSION` in rust/myotis-engine/src/lib.rs — the same
      *  handshake `RustEngineNative.EXPECTED_ABI_VERSION` performs over JNI. */
-    const val EXPECTED_ABI_VERSION = 17
+    const val EXPECTED_ABI_VERSION = 18
 
     private val abiVersion: Int by lazy { myotis_init() }
 
@@ -154,11 +154,11 @@ object RustEngine {
     fun estimateGasJson(handle: Long, from: String, to: String, data: String, valueDecimal: String): String =
         jsonCall { myotis_estimate_gas_json(handle, from, to, data, valueDecimal) }
 
-    fun getBlockByNumberJson(handle: Long, blockTag: String): String =
-        jsonCall { myotis_get_block_by_number_json(handle, blockTag) }
+    fun getBlockByNumberJson(handle: Long, blockTag: String, fullTransactions: Boolean): String =
+        jsonCall { myotis_get_block_by_number_json(handle, blockTag, fullTransactions) }
 
-    fun getBlockByHashJson(handle: Long, blockHash32Hex: String): String =
-        jsonCall { myotis_get_block_by_hash_json(handle, blockHash32Hex) }
+    fun getBlockByHashJson(handle: Long, blockHash32Hex: String, fullTransactions: Boolean): String =
+        jsonCall { myotis_get_block_by_hash_json(handle, blockHash32Hex, fullTransactions) }
 
     fun getTransactionByHashJson(handle: Long, txHash32Hex: String): String =
         jsonCall { myotis_get_transaction_by_hash_json(handle, txHash32Hex) }

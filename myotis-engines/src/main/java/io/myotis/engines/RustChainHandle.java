@@ -843,14 +843,16 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     }
 
     /**
-     * Verified eth_getBlockByNumber (transactions as hashes): the block JSON object,
-     * the literal {@code "null"} (a verified future/unknown block → eth null), or
-     * throws {@link EngineException} when it can't verify (transport / not-running).
-     * {@code blockTag} is an eth block selector ({@code "latest"} / 0x-hex number).
+     * Verified eth_getBlockByNumber: the block JSON object, the literal
+     * {@code "null"} (a verified future/unknown block → eth null), or throws
+     * {@link EngineException} when it can't verify (transport / not-running).
+     * {@code blockTag} is an eth block selector ({@code "latest"} / 0x-hex number);
+     * {@code fullTransactions} selects decoded tx objects over hashes.
      */
-    String blockByNumberJson(String blockTag) {
+    String blockByNumberJson(String blockTag, boolean fullTransactions) {
         return blockJsonOrThrow(
-                gated(() -> RustEngineNative.nativeGetBlockByNumberJson(handle, blockTag)));
+                gated(() -> RustEngineNative.nativeGetBlockByNumberJson(
+                        handle, blockTag, fullTransactions)));
     }
 
     /**
@@ -876,14 +878,16 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     }
 
     /**
-     * Verified eth_getBlockByHash (transactions as hashes): the block JSON
-     * object, the literal {@code "null"} (a hash this engine never verified /
-     * reorged away — eth's unknown-block null), or throws {@link EngineException}
-     * when it can't verify. {@code blockHashHex} is the 0x-hex 32-byte hash.
+     * Verified eth_getBlockByHash: the block JSON object, the literal
+     * {@code "null"} (a hash this engine never verified / reorged away — eth's
+     * unknown-block null), or throws {@link EngineException} when it can't
+     * verify. {@code blockHashHex} is the 0x-hex 32-byte hash;
+     * {@code fullTransactions} selects decoded tx objects over hashes.
      */
-    String blockByHashJson(String blockHashHex) {
+    String blockByHashJson(String blockHashHex, boolean fullTransactions) {
         return blockJsonOrThrow(
-                gated(() -> RustEngineNative.nativeGetBlockByHashJson(handle, blockHashHex)));
+                gated(() -> RustEngineNative.nativeGetBlockByHashJson(
+                        handle, blockHashHex, fullTransactions)));
     }
 
     /**

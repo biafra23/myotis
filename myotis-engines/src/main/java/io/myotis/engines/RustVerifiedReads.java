@@ -20,10 +20,9 @@ import org.slf4j.LoggerFactory;
  * {@code getBlockByNumber}, {@code getBlockByHash}, {@code getTransactionReceipt},
  * {@code getTransactionByHash}, {@code gasPrice}, {@code maxPriorityFeePerGas},
  * {@code feeHistory}, {@code sendRawTransaction}, plus the EVM-backed {@code call}
- * and {@code estimateGas} (revm over proof-verified state). The one remaining
- * gap — full-transaction blocks ({@code fullTransactions=true}) — returns
- * {@code null} ("cannot answer verified right now", mirroring the Java engine),
- * which the router maps to a strict-mode {@code -32000}.
+ * and {@code estimateGas} (revm over proof-verified state). Block reads serve
+ * both shapes: tx hashes or, with {@code fullTransactions=true}, fully decoded
+ * tx objects (verified against the block's {@code transactionsRoot}).
  *
  * <p><b>Head-anchored.</b> The Rust reader verifies against the peer's fresh head
  * (the CL-anchored latest state), so state reads resolve to that head. A selector
@@ -229,14 +228,12 @@ final class RustVerifiedReads implements VerifiedReads {
 
     @Override
     public String getBlockByNumber(String block, boolean fullTransactions) {
-        // Full tx objects need tx decode + sender recovery — not served verified yet
-        // (mirrors the Java engine); null → strict -32000.
-        if (fullTransactions) return null;
         String tag = (block == null || block.isBlank()) ? "latest" : block;
         try {
-            // Returns the block JSON, the "null" literal (verified future/unknown
+            // Returns the block JSON (tx hashes, or fully decoded tx objects when
+            // fullTransactions), the "null" literal (verified future/unknown
             // block), or throws when it can't verify (→ null → -32000).
-            return handle.blockByNumberJson(tag);
+            return handle.blockByNumberJson(tag, fullTransactions);
         } catch (RuntimeException e) {
             log.debug("[engines] verified block read unavailable: {}", e.getMessage());
             return null;
@@ -245,13 +242,12 @@ final class RustVerifiedReads implements VerifiedReads {
 
     @Override
     public String getBlockByHash(byte[] blockHash32, boolean fullTransactions) {
-        // Full tx objects aren't served verified (mirrors getBlockByNumber).
-        if (fullTransactions) return null;
         if (blockHash32 == null || blockHash32.length != 32) return null;
         try {
-            // The block JSON, the "null" literal (a hash this engine never
+            // The block JSON (tx hashes, or fully decoded tx objects when
+            // fullTransactions), the "null" literal (a hash this engine never
             // verified / reorged away), or throws (→ null → strict -32000).
-            return handle.blockByHashJson(toHex(blockHash32));
+            return handle.blockByHashJson(toHex(blockHash32), fullTransactions);
         } catch (RuntimeException e) {
             log.debug("[engines] verified block-by-hash read unavailable: {}", e.getMessage());
             return null;
