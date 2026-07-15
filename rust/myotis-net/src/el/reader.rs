@@ -1706,17 +1706,23 @@ impl ElReader {
         if peers.is_empty() {
             return;
         }
-        let mut pushed = 0usize;
-        for raw in &work {
-            for peer in &peers {
-                if peer.send_transaction(raw).await.is_ok() {
-                    pushed += 1;
-                }
+        // DETACHED, like the Java warmer thread: the wallet's receipt poll
+        // carries the trigger but must never wait on the pushes — a wedged
+        // peer (writer lock held, full send buffer) would otherwise freeze
+        // the confirm loop. Bounded per write; peers are owned Arcs.
+        tokio::spawn(async move {
+            let count = work.len();
+            for raw in work {
+                let sends = peers.iter().map(|peer| {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        peer.send_transaction(&raw),
+                    )
+                });
+                futures::future::join_all(sends).await;
             }
-        }
-        if pushed > 0 {
-            tracing::debug!("rebroadcast {} sent tx(s) to {} peer(s)", work.len(), peers.len());
-        }
+            tracing::debug!("rebroadcast {} sent tx(s) to {} peer(s)", count, peers.len());
+        });
     }
 
     /// Verified `eth_getTransactionReceipt`. Scans a bounded, incrementally
@@ -1793,7 +1799,22 @@ impl ElReader {
     /// buildTxJson-null convention).
     pub async fn get_transaction_by_hash(&self, tx_hash: [u8; 32]) -> Result<TxLookup, String> {
         self.maybe_rebroadcast_sent_txs().await;
-        let (head_num, head_hash) = self.anchored_head()?;
+        // Anchor loss must not hide the wallet's OWN broadcast (Java parity:
+        // locateMinedTx answers null on a missing anchor and the sentTxCache
+        // check still runs): a send needs only peers, not an anchor, and the
+        // confirm loop starts polling immediately — serve pending, not -32000.
+        let (head_num, head_hash) = match self.anchored_head() {
+            Ok(v) => v,
+            Err(e) => {
+                let mut st = self.sent_txs.lock().unwrap();
+                if let Some(raw) = st.bytes.get(&tx_hash) {
+                    let tx = tx::decode_summary(raw)
+                        .ok_or("own sent tx cached but cannot be decoded")?;
+                    return Ok(TxLookup::Pending { tx_hash, tx });
+                }
+                return Err(e);
+            }
+        };
         let Some(loc) = self.locate_mined_tx(tx_hash, head_num, &head_hash).await? else {
             // Not in the scanned chain — but if it is OUR broadcast, answer the
             // pending shape from the cached bytes (the Java sentTxCache path):

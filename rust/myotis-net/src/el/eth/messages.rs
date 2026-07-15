@@ -7,6 +7,7 @@
 
 use myotis_core::bloom::{accrue, EMPTY_BLOOM};
 use myotis_core::header::{self, BlockHeader};
+use myotis_core::keccak::keccak256;
 use myotis_core::rlp::{self, Item};
 use myotis_core::CoreError;
 
@@ -363,12 +364,19 @@ pub fn encode_transactions(raw_tx: &[u8]) -> Vec<u8> {
     rlp::encode_list_payload(&element)
 }
 
+/// Per-message cap on gossip hashes worth reading (the Java
+/// `MAX_GOSSIP_HASHES_PER_MSG` twin): these feed only the sent-tx watch's
+/// "seen" signal, so an oversized announcement is truncated, never an
+/// asymmetric-cost decode.
+pub const MAX_GOSSIP_HASHES_PER_MSG: usize = 256;
+
 /// Decode a `NewPooledTransactionHashes` announcement into its 32-byte tx
-/// hashes, tolerating BOTH wire shapes: the eth/68 triple
-/// `[types: bytes, sizes: [..], hashes: [h, ..]]` and the eth/66-67 flat list
-/// `[h, ..]`. Tolerant on purpose — this feeds only the sent-tx watch's
-/// "seen in gossip" signal (never a trust surface), so a malformed or
-/// unexpected announcement yields the hashes it can read, or none.
+/// hashes (capped at [`MAX_GOSSIP_HASHES_PER_MSG`]), tolerating BOTH wire
+/// shapes: the eth/68 triple `[types: bytes, sizes: [..], hashes: [h, ..]]`
+/// and the eth/66-67 flat list `[h, ..]`. Tolerant on purpose — this feeds
+/// only the sent-tx watch's "seen in gossip" signal (never a trust surface),
+/// so a malformed or unexpected announcement yields the hashes it can read,
+/// or none.
 pub fn decode_new_pooled_tx_hashes(payload: &[u8]) -> Vec<[u8; 32]> {
     let Ok(top) = rlp::decode(payload) else {
         return Vec::new();
@@ -387,10 +395,33 @@ pub fn decode_new_pooled_tx_hashes(payload: &[u8]) -> Vec<[u8; 32]> {
     collect_hashes(items)
 }
 
-/// The 32-byte items of an RLP hash list; anything else is skipped.
+/// Hash the elements of an inbound `Transactions` (0x12) full-body gossip
+/// frame (capped at [`MAX_GOSSIP_HASHES_PER_MSG`]): a tx's hash is keccak of
+/// its raw wire element — the RLP list bytes for a legacy tx, the byte-string
+/// CONTENT for a typed one (the Java `TransactionsMessage.hashes` twin).
+/// Same tolerance rationale as the announcement decoder.
+pub fn transactions_gossip_hashes(payload: &[u8]) -> Vec<[u8; 32]> {
+    let Ok(raws) = rlp::raw_list_items(payload) else {
+        return Vec::new();
+    };
+    raws.iter()
+        .take(MAX_GOSSIP_HASHES_PER_MSG)
+        .filter_map(|raw| {
+            if rlp::is_list_prefix(raw) {
+                Some(keccak256(raw)) // legacy: the list bytes ARE the tx
+            } else {
+                let typed = rlp::decode(raw).ok()?.as_bytes().ok()?.to_vec();
+                Some(keccak256(&typed)) // typed: hash the byte-string content
+            }
+        })
+        .collect()
+}
+
+/// The 32-byte items of an RLP hash list (capped); anything else is skipped.
 fn collect_hashes(items: &[Item]) -> Vec<[u8; 32]> {
     items
         .iter()
+        .take(MAX_GOSSIP_HASHES_PER_MSG)
         .filter_map(|item| {
             let bytes = item.as_bytes().ok()?;
             <[u8; 32]>::try_from(bytes).ok()
@@ -553,6 +584,29 @@ mod tests {
 
     use super::*;
     use myotis_core::keccak::keccak256;
+
+    #[test]
+    fn transactions_gossip_hashes_match_tx_keccak() {
+        // A legacy tx element is the raw RLP list; a typed element's CONTENT is
+        // the tx — either way the extracted hash must be keccak of the raw tx
+        // (what our own broadcast watches by).
+        let legacy = rlp::encode(&Item::List(vec![Item::Bytes(vec![1]), Item::Bytes(vec![2])]));
+        let typed: Vec<u8> = {
+            let mut t = vec![0x02];
+            t.extend_from_slice(&rlp::encode(&Item::List(vec![Item::Bytes(vec![9])])));
+            t
+        };
+        let frame = rlp::encode(&Item::List(vec![
+            rlp::decode(&legacy).unwrap(),
+            Item::Bytes(typed.clone()),
+        ]));
+        assert_eq!(
+            transactions_gossip_hashes(&frame),
+            vec![keccak256(&legacy), keccak256(&typed)]
+        );
+        // Tolerant on garbage.
+        assert!(transactions_gossip_hashes(&[0xff]).is_empty());
+    }
 
     #[test]
     fn decode_new_pooled_tx_hashes_reads_both_wire_shapes() {

@@ -533,16 +533,30 @@ async fn read_loop(
         };
         let code = frame.message_code;
 
-        // Tx-hash gossip: the sent-tx watch's "the network has it" signal (the
-        // Java TxGossipObserver twin). watching_any() gates the decode — while
-        // nothing is watched (the common state) an announcement costs one
-        // atomic-ish lock poke and no parsing.
-        if code == messages::NEW_POOLED_TRANSACTION_HASHES {
+        // Tx gossip — the sent-tx watch's "the network has it" signal (the
+        // Java TxGossipObserver twin), on BOTH forms devp2p propagates: hash
+        // announcements (0x18) and full-body pushes (0x12). The lock is taken
+        // twice, briefly, never across the decode: first the gate (evicting
+        // expired watches here also self-heals a watch the wallet stopped
+        // polling — the Java warmer's job), then the marks. The decoders cap
+        // at MAX_GOSSIP_HASHES_PER_MSG so an oversized frame can't turn this
+        // into an asymmetric-cost surface.
+        if code == messages::NEW_POOLED_TRANSACTION_HASHES || code == messages::TRANSACTIONS {
             if let Some(watch) = &tx_watch {
-                let mut w = watch.lock().unwrap();
-                if w.watching_any() {
-                    let now = std::time::Instant::now();
-                    for hash in messages::decode_new_pooled_tx_hashes(&frame.payload) {
+                let now = std::time::Instant::now();
+                let watching = {
+                    let mut w = watch.lock().unwrap();
+                    w.evict_expired(now);
+                    w.watching_any()
+                };
+                if watching {
+                    let hashes = if code == messages::TRANSACTIONS {
+                        messages::transactions_gossip_hashes(&frame.payload)
+                    } else {
+                        messages::decode_new_pooled_tx_hashes(&frame.payload)
+                    };
+                    let mut w = watch.lock().unwrap();
+                    for hash in hashes {
                         w.mark_seen(&hash, now);
                     }
                 }
