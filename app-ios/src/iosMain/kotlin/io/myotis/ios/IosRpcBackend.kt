@@ -1,6 +1,7 @@
 package io.myotis.ios
 
 import io.myotis.jsonrpc.RpcBackend
+import io.myotis.jsonrpc.RpcBlockWindow
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -30,7 +31,7 @@ class IosRpcBackend(
     override fun headBlockNumber(): Long? {
         val handle = handleProvider() ?: return null
         val o = statusOrNull(handle) ?: return null
-        val head = o.long("optimisticBlockNumber")
+        val head = o.engineLong("optimisticBlockNumber")
         return if (head > 0) head else null
     }
 
@@ -55,8 +56,8 @@ class IosRpcBackend(
         if (address.size != 20) return null
         val handle = handleProvider() ?: return null
         val o = resultOrNull(RustEngine.getCodeJson(handle, hex(address))) ?: return null
-        if (o.string("verifyMethod") == null) return null // unverified → can't answer
-        return hexToBytes(o.string("codeHex")) // 0x / empty → empty bytecode (verified EOA)
+        if (o.engineString("verifyMethod") == null) return null // unverified → can't answer
+        return hexToBytes(o.engineString("codeHex")) // 0x / empty → empty bytecode (verified EOA)
     }
 
     override fun getStorageAt(address: ByteArray, slot32: ByteArray, block: String): ByteArray? {
@@ -64,9 +65,9 @@ class IosRpcBackend(
         if (address.size != 20 || slot32.size != 32) return null
         val handle = handleProvider() ?: return null
         val o = resultOrNull(RustEngine.getStorageAtJson(handle, hex(address), hex(slot32))) ?: return null
-        if (o.string("verifyMethod") == null) return null
+        if (o.engineString("verifyMethod") == null) return null
         // Left-pad to the full 32-byte word (a zero/unset slot → 32 zero bytes).
-        val raw = hexToBytes(o.string("valueHex")) ?: return null
+        val raw = hexToBytes(o.engineString("valueHex")) ?: return null
         return ByteArray(32).also { raw.copyInto(it, 32 - raw.size) }
     }
 
@@ -85,8 +86,8 @@ class IosRpcBackend(
         )) ?: return null
         // Only "ok" carries a result; a revert or unavailable outcome is "no
         // answer" → null (a reverting eth_call is a JSON-RPC null, not -32000).
-        if (o.string("status") != "ok") return null
-        return hexToBytes(o.string("resultHex"))
+        if (o.engineString("status") != "ok") return null
+        return hexToBytes(o.engineString("resultHex"))
     }
 
     override fun estimateGas(from: ByteArray?, to: ByteArray?, data: ByteArray?, valueWei: String?): Long? {
@@ -107,7 +108,7 @@ class IosRpcBackend(
             data?.let { if (it.isEmpty()) "" else hex(it) } ?: "",
             valueWei ?: "",
         )) ?: return null
-        if (o.string("status") != "ok") return null
+        if (o.engineString("status") != "ok") return null
         return (o["gas"] as? JsonPrimitive)?.longOrNull
     }
 
@@ -115,7 +116,11 @@ class IosRpcBackend(
         if (rawTx.isEmpty()) return null
         val handle = handleProvider() ?: return null
         val o = resultOrNull(RustEngine.sendRawTransactionJson(handle, hex(rawTx))) ?: return null
-        return hexToBytes(o.string("txHash"))
+        // Fail CLOSED on a missing/short hash (JNI parity: txHashFromJson throws,
+        // the adapter maps it to null → strict -32000). A success "0x" here would
+        // tell the wallet a send succeeded with a bogus hash.
+        val hash = o.engineString("txHash")?.let(::hexToBytes) ?: return null
+        return hash.takeIf { it.size == 32 }
     }
 
     override fun getTransactionReceipt(txHash: ByteArray): String? {
@@ -146,12 +151,12 @@ class IosRpcBackend(
 
     override fun gasPrice(): String? {
         val handle = handleProvider() ?: return null
-        return resultOrNull(RustEngine.feeEstimateJson(handle))?.string("gasPriceWei")
+        return resultOrNull(RustEngine.feeEstimateJson(handle))?.engineString("gasPriceWei")
     }
 
     override fun maxPriorityFeePerGas(): String? {
         val handle = handleProvider() ?: return null
-        return resultOrNull(RustEngine.feeEstimateJson(handle))?.string("maxPriorityFeePerGasWei")
+        return resultOrNull(RustEngine.feeEstimateJson(handle))?.engineString("maxPriorityFeePerGasWei")
     }
 
     override fun feeHistory(blockCount: Long, newestBlock: String, rewardPercentiles: DoubleArray?): String? =
@@ -166,30 +171,17 @@ class IosRpcBackend(
         val handle = handleProvider() ?: return null
         val o = resultOrNull(RustEngine.requestAccountJson(handle, hex(address))) ?: return null
         return Account(
-            exists = (o["exists"] as? JsonPrimitive)?.content == "true",
-            nonce = o.long("nonce", -1L),
-            balanceWei = o.string("balanceWei"),
-            verified = o.string("verifyMethod") != null, // a verdict was produced
+            exists = o.engineBoolean("exists"),
+            nonce = o.engineLong("nonce", -1L),
+            balanceWei = o.engineString("balanceWei"),
+            verified = o.engineString("verifyMethod") != null, // a verdict was produced
         )
     }
 
-    /** Number-pinned selectors are served only near the anchored head (JNI parity). */
-    private fun isServableBlock(block: String): Boolean {
-        val b = block.trim()
-        if (b.isEmpty()) return true
-        when (b.lowercase()) {
-            "latest", "pending", "safe", "finalized" -> return true
-            "earliest" -> return false
-        }
-        val n = if (b.startsWith("0x") || b.startsWith("0X")) {
-            b.substring(2).toLongOrNull(16)
-        } else {
-            b.toLongOrNull()
-        } ?: return false
-        if (n < 0) return false
-        val head = headBlockNumber() ?: return false // not synced enough to validate the pin
-        return n >= head - BLOCK_NUM_LAG_TOLERANCE && n <= head + BLOCK_NUM_TOLERANCE
-    }
+    /** Number-pinned selectors are served only near the anchored head — the
+     *  policy lives once in [RpcBlockWindow], shared with the JVM adapter. */
+    private fun isServableBlock(block: String): Boolean =
+        RpcBlockWindow.blockInWindow(block, ::headBlockNumber)
 
     /** Parse an engine reply; null on blank / malformed / an `{"error"}` envelope. */
     private fun resultOrNull(json: String): JsonObject? {
@@ -209,12 +201,6 @@ class IosRpcBackend(
     private fun statusOrNull(handle: Long): JsonObject? =
         runCatching { engineJson.parseToJsonElement(RustEngine.statusJson(handle)).jsonObject }.getOrNull()
 
-    private fun JsonObject.string(key: String): String? =
-        (this[key] as? JsonPrimitive)?.takeIf { it !is JsonNull && it.isString }?.content
-
-    private fun JsonObject.long(key: String, default: Long = 0L): Long =
-        (this[key] as? JsonPrimitive)?.longOrNull ?: default
-
     private fun hex(bytes: ByteArray): String = buildString(bytes.size * 2 + 2) {
         append("0x")
         for (b in bytes) {
@@ -224,26 +210,23 @@ class IosRpcBackend(
         }
     }
 
-    /** 0x-hex → bytes; empty/absent → empty array; malformed → null. */
+    /** 0x-hex → bytes; empty/absent → empty array; malformed INCLUDING odd
+     *  length → null. These are engine-emitted DATA fields (codeHex, resultHex,
+     *  txHash): padding an odd-length value would byte-shift verified data, so
+     *  fail closed exactly like the JNI twin's HexFormat.parseHex. */
     private fun hexToBytes(s: String?): ByteArray? {
         if (s == null) return ByteArray(0)
         val h = if (s.startsWith("0x") || s.startsWith("0X")) s.substring(2) else s
         if (h.isEmpty()) return ByteArray(0)
-        val padded = if (h.length % 2 != 0) "0$h" else h
+        if (h.length % 2 != 0) return null
         return runCatching {
-            ByteArray(padded.length / 2) {
-                ((padded[it * 2].digitToInt(16) shl 4) or padded[it * 2 + 1].digitToInt(16)).toByte()
+            ByteArray(h.length / 2) {
+                ((h[it * 2].digitToInt(16) shl 4) or h[it * 2 + 1].digitToInt(16)).toByte()
             }
         }.getOrNull()
     }
 
     private companion object {
         val HEX_DIGITS = "0123456789abcdef".toCharArray()
-
-        /** How far ABOVE the anchored head a number-pin is still served. */
-        const val BLOCK_NUM_TOLERANCE = 16L
-
-        /** How far BELOW the anchored head a number-pin is still served from head state. */
-        const val BLOCK_NUM_LAG_TOLERANCE = 64L
     }
 }

@@ -180,23 +180,27 @@ class IosNodeController(
      *  Ktor CIO surfaces bind errors asynchronously, so failures land in the log
      *  pump rather than here. Caller holds [bootMutex]. */
     private fun startRpc(net: String) {
-        val port = settings.rpcPortFor(net)
-        if (port <= 0) return
-        val chainId = engineJson.decodeFromString<List<IosNetworkInfo>>(RustEngine.availableNetworksJson())
-            .firstOrNull { it.name == net }?.chainId ?: return
-        val server = MyotisRpcServer(
-            port = port,
-            upstreamUrl = null,          // strict: never serve unverified data
-            host = "127.0.0.1",          // loopback only — unauthenticated endpoint
-            backend = IosRpcBackend(chainId) { locked { handles[net] } },
-            statusReads = IosRpcStatusSource(
-                handleProvider = { locked { handles[net] } },
-                startMarkProvider = { locked { startMarks[net] } },
-            ),
-        )
-        runCatching { server.start() }
-            .onSuccess { locked { rpcServers[net] = server } }
-            .onFailure { logs.append("ERROR failed to start the $net JSON-RPC listener: ${it.message}") }
+        // Everything guarded: an uncaught throw here would escape into the
+        // lifecycleLane coroutine and terminate the Kotlin/Native process —
+        // the listener is best-effort, the node must keep running without it.
+        runCatching {
+            val port = settings.rpcPortFor(net)
+            if (port <= 0) return
+            val chainId = engineJson.decodeFromString<List<IosNetworkInfo>>(RustEngine.availableNetworksJson())
+                .firstOrNull { it.name == net }?.chainId ?: return
+            val server = MyotisRpcServer(
+                port = port,
+                upstreamUrl = null,          // strict: never serve unverified data
+                host = "127.0.0.1",          // loopback only — unauthenticated endpoint
+                backend = IosRpcBackend(chainId) { locked { handles[net] } },
+                statusReads = IosRpcStatusSource(
+                    handleProvider = { locked { handles[net] } },
+                    startMarkProvider = { locked { startMarks[net] } },
+                ),
+            )
+            server.start()
+            locked { rpcServers[net] = server }
+        }.onFailure { logs.append("ERROR failed to start the $net JSON-RPC listener: ${it.message}") }
     }
 
     /** Blocking stop; caller holds [bootMutex] and runs on IO. */
@@ -254,20 +258,20 @@ class IosNodeController(
         val json = withContext(Dispatchers.IO) { RustEngine.requestAccountJson(handle, address) }
         val o = parseOrThrow(json, "account query")
         return AccountResult(
-            address = o.string("address") ?: address,
-            exists = o.boolean("exists"),
-            nonce = o.long("nonce", -1L),
-            balanceWei = o.string("balanceWei"),
-            storageRootHex = o.string("storageRootHex"),
-            codeHashHex = o.string("codeHashHex"),
-            blockNumber = o.long("blockNumber", 0L),
-            peerStateRootHex = o.string("peerStateRootHex"),
-            peerProofValid = o.boolean("peerProofValid"),
-            beaconChainVerified = o.boolean("beaconChainVerified"),
-            blsVerified = o.boolean("blsVerified"),
-            matchedBeaconSlot = o.long("matchedBeaconSlot", -1L),
-            verifyMethod = o.string("verifyMethod"),
-            failReason = o.string("failReason"),
+            address = o.engineString("address") ?: address,
+            exists = o.engineBoolean("exists"),
+            nonce = o.engineLong("nonce", -1L),
+            balanceWei = o.engineString("balanceWei"),
+            storageRootHex = o.engineString("storageRootHex"),
+            codeHashHex = o.engineString("codeHashHex"),
+            blockNumber = o.engineLong("blockNumber", 0L),
+            peerStateRootHex = o.engineString("peerStateRootHex"),
+            peerProofValid = o.engineBoolean("peerProofValid"),
+            beaconChainVerified = o.engineBoolean("beaconChainVerified"),
+            blsVerified = o.engineBoolean("blsVerified"),
+            matchedBeaconSlot = o.engineLong("matchedBeaconSlot", -1L),
+            verifyMethod = o.engineString("verifyMethod"),
+            failReason = o.engineString("failReason"),
         )
     }
 
@@ -287,14 +291,14 @@ class IosNodeController(
         ).toString()
         val json = withContext(Dispatchers.IO) { RustEngine.ensRecordJson(handle, params) }
         val o = parseOrThrow(json, "ENS resolution")
-        val blockNumber = o.long("blockNumber", -1L)
-        val verified = o.boolean("verified")
-        return when (o.string("status")) {
+        val blockNumber = o.engineLong("blockNumber", -1L)
+        val verified = o.engineBoolean("verified")
+        return when (o.engineString("status")) {
             // status ok MUST carry the address — a missing addressHex is shape
             // drift, and mapping it to (address null, error null) would render
             // as the authoritative "no record" answer. Fail closed instead,
             // like RustEnsApi's Parsed.requireString does over JNI.
-            "ok" -> o.string("addressHex")
+            "ok" -> o.engineString("addressHex")
                 ?.let { EnsResult(name, it, blockNumber, verified, null) }
                 ?: EnsResult(name, null, blockNumber, verified, "malformed resolver reply (ok without addressHex)")
             // Successfully determined absent — the API's "no record" convention.
@@ -340,16 +344,16 @@ class IosNodeController(
         val suffix = if (network == "mainnet") "" else "-$network"
         val clCache = CacheFileStats.cl("$dataDir/cl-peers$suffix.cache")
         val elCache = CacheFileStats.el("$dataDir/peers$suffix.cache")
-        val running = o.boolean("running")
-        val paused = o.boolean("paused")
-        val beaconState = o.string("beaconState") ?: "STARTING"
-        val snapPeers = o.int("snapPeers")
-        val currentPeriod = o.long("currentPeriod", 0L)
+        val running = o.engineBoolean("running")
+        val paused = o.engineBoolean("paused")
+        val beaconState = o.engineString("beaconState") ?: "STARTING"
+        val snapPeers = o.engineInt("snapPeers")
+        val currentPeriod = o.engineLong("currentPeriod", 0L)
         // Older-native fallback: a missing targetPeriod parses as 0 — keep the
         // target >= current invariant.
-        val targetPeriod = maxOf(o.long("targetPeriod", 0L), currentPeriod)
-        val optimisticBlock = o.long("optimisticBlockNumber", 0L)
-        val finalizedBlock = o.long("finalizedBlockNumber", 0L)
+        val targetPeriod = maxOf(o.engineLong("targetPeriod", 0L), currentPeriod)
+        val optimisticBlock = o.engineLong("optimisticBlockNumber", 0L)
+        val finalizedBlock = o.engineLong("finalizedBlockNumber", 0L)
 
         // verifiedHeadAgeMs: age since the optimistic head last ADVANCED, reported
         // only while a verified read can actually be served; otherwise the
@@ -379,53 +383,40 @@ class IosNodeController(
             network = network,
             engine = "rust",
             beaconState = beaconState,
-            connectedPeers = o.int("peerCount"),        // CL libp2p peers
+            connectedPeers = o.engineInt("peerCount"),        // CL libp2p peers
             readyPeers = snapPeers,                      // EL pool holds only snap-ready
             snapPeers = snapPeers,
             snapServingPeers = snapPeers,                // approximation, as over JNI
-            clConnectedPeers = o.int("peerCount"),
-            clServedPeersLastMin = o.int("servedPeersLastMinute"),
+            clConnectedPeers = o.engineInt("peerCount"),
+            clServedPeersLastMin = o.engineInt("servedPeersLastMinute"),
             clCachedPeers = clCache.total,
             clCachedProven = clCache.proven,
             clCachedNolc = clCache.nolc,
             elCachedPeers = elCache.total,
             elCachedSnapOk = elCache.snapOk,
             elCachedSnapBad = elCache.snapBad,
-            discoveredPeers = o.int("discoveredPeers"),
-            backedOffPeers = o.int("backedOffPeers"),
-            blacklistedPeers = o.int("blacklistedPeers"),
-            discv5Peers = o.int("discv5TableSize"),
+            discoveredPeers = o.engineInt("discoveredPeers"),
+            backedOffPeers = o.engineInt("backedOffPeers"),
+            blacklistedPeers = o.engineInt("blacklistedPeers"),
+            discv5Peers = o.engineInt("discv5TableSize"),
             executionBlockNumber = finalizedBlock,       // == finalized payload's block
-            finalizedSlot = o.long("finalizedSlot", 0L),
-            syncStartPeriod = o.long("syncStartPeriod", -1L),
+            finalizedSlot = o.engineLong("finalizedSlot", 0L),
+            syncStartPeriod = o.engineLong("syncStartPeriod", -1L),
             syncCurrentPeriod = currentPeriod,
             syncTargetPeriod = targetPeriod,
             verifiedHeadAgeMs = verifiedHeadAgeMs,
             uptimeSeconds = locked { startMarks[network] }
                 ?.elapsedNow()?.inWholeSeconds ?: 0L,
-            peerHeaderRequests = o.long("peerHeaderRequests", 0L),
-            peerHeaderRequestsServed = o.long("peerHeaderRequestsServed", 0L),
-            peerBodyRequests = o.long("peerBodyRequests", 0L),
-            peerBodyRequestsServed = o.long("peerBodyRequestsServed", 0L),
+            peerHeaderRequests = o.engineLong("peerHeaderRequests", 0L),
+            peerHeaderRequestsServed = o.engineLong("peerHeaderRequestsServed", 0L),
+            peerBodyRequests = o.engineLong("peerBodyRequests", 0L),
+            peerBodyRequestsServed = o.engineLong("peerBodyRequestsServed", 0L),
             readyPeerList = emptyList(),                 // not exposed over the FFI yet
             pauseCount = 0, totalPausedMs = 0L,          // idle-sleep isn't wired on iOS yet
             lastPauseEpochMs = 0L, lastResumeEpochMs = 0L, lastWakeReason = null,
-            lcHunting = o.boolean("lcHunting"),
-            elHunting = o.boolean("elHunting"),
+            lcHunting = o.engineBoolean("lcHunting"),
+            elHunting = o.engineBoolean("elHunting"),
         )
     }
 }
 
-// Small null-safe JSON accessors over kotlinx JsonObject (minimal-json getString/
-// getLong/getBoolean twins: absent or JSON-null reads as the default).
-private fun JsonObject.string(key: String): String? =
-    (this[key] as? JsonPrimitive)?.takeIf { it !is JsonNull && it.isString }?.content
-
-private fun JsonObject.boolean(key: String): Boolean =
-    (this[key] as? JsonPrimitive)?.booleanOrNull ?: false
-
-private fun JsonObject.long(key: String, default: Long): Long =
-    (this[key] as? JsonPrimitive)?.longOrNull ?: default
-
-private fun JsonObject.int(key: String): Int =
-    (this[key] as? JsonPrimitive)?.intOrNull ?: 0

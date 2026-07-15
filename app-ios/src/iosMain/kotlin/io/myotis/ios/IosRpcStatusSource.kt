@@ -30,19 +30,19 @@ class IosRpcStatusSource(
 
     override fun statusJson(uptimeSeconds: Long): JsonObject {
         val o = nativeStatus()
-        val running = o.boolean("running")
-        val paused = o.boolean("paused")
-        val snapPeers = o.long("snapPeers")
+        val running = o.engineBoolean("running")
+        val paused = o.engineBoolean("paused")
+        val snapPeers = o.engineLong("snapPeers")
         return buildJsonObject {
             put("ok", true)
             put("state", if (running) "RUNNING" else if (paused) "PAUSED" else "STOPPED")
             put("uptimeSeconds", uptimeSeconds)
-            put("discoveredPeers", o.long("discoveredPeers"))
-            put("connectedPeers", o.long("peerCount"))
+            put("discoveredPeers", o.engineLong("discoveredPeers"))
+            put("connectedPeers", o.engineLong("peerCount"))
             put("readyPeers", snapPeers)
             put("snapPeers", snapPeers)
-            put("backedOffPeers", o.long("backedOffPeers"))
-            put("blacklistedPeers", o.long("blacklistedPeers"))
+            put("backedOffPeers", o.engineLong("backedOffPeers"))
+            put("blacklistedPeers", o.engineLong("blacklistedPeers"))
             // Idle-sleep isn't wired on iOS yet — metrics report the JVM shape's zeros.
             put("pauseCount", 0)
             put("totalPausedMs", 0)
@@ -54,29 +54,31 @@ class IosRpcStatusSource(
 
     override fun beaconStatusJson(uptimeSeconds: Long): JsonObject {
         val o = nativeStatus()
-        val state = o.string("beaconState") ?: "STARTING"
-        val currentPeriod = o.long("currentPeriod")
-        val targetPeriod = maxOf(o.long("targetPeriod"), currentPeriod)
-        val syncing = state == "SYNCING" || state == "STARTING"
+        val rawState = o.engineString("beaconState") ?: "STARTING"
+        val currentPeriod = o.engineLong("currentPeriod")
+        val targetPeriod = maxOf(o.engineLong("targetPeriod"), currentPeriod)
+        val syncing = rawState == "SYNCING" || rawState == "STARTING"
         return buildJsonObject {
             put("ok", true)
-            put("state", state)
+            // The pinned JVM shape never emits STARTING — it normalizes to
+            // SYNCING (StatusJson.beaconStatus does the same).
+            put("state", if (syncing) "SYNCING" else rawState)
             put("currentPeriod", currentPeriod)
             put("targetPeriod", targetPeriod)
             put("uptimeSeconds", uptimeSeconds)
-            put("discoveredPeers", o.long("discv5TableSize"))
-            put("connectedPeers", o.long("peerCount"))
-            put("lightClientPeers", o.long("peerCount"))
-            put("servedPeersLastMinute", o.long("servedPeersLastMinute"))
+            put("discoveredPeers", o.engineLong("discv5TableSize"))
+            put("connectedPeers", o.engineLong("peerCount"))
+            put("lightClientPeers", o.engineLong("peerCount"))
+            put("servedPeersLastMinute", o.engineLong("servedPeersLastMinute"))
             if (syncing) {
                 put("finalizedSlot", 0)
                 put("optimisticSlot", 0)
                 put("executionStateRoot", JsonNull)
                 put("knownStateRoots", 0)
             } else {
-                put("finalizedSlot", o.long("finalizedSlot"))
-                put("optimisticSlot", o.long("optimisticSlot"))
-                put("finalizedPeriod", o.long("finalizedSlot") / 8192L)
+                put("finalizedSlot", o.engineLong("finalizedSlot"))
+                put("optimisticSlot", o.engineLong("optimisticSlot"))
+                put("finalizedPeriod", o.engineLong("finalizedSlot") / 8192L)
                 put("syncCommitteePeriod", currentPeriod)
                 put("wallClockPeriod", targetPeriod)
                 // The Rust engine doesn't expose the EL anchor / state-root cache
@@ -97,12 +99,4 @@ class IosRpcStatusSource(
             .getOrElse { JsonObject(emptyMap()) }
     }
 
-    private fun JsonObject.string(key: String): String? =
-        (this[key] as? JsonPrimitive)?.takeIf { it !is JsonNull && it.isString }?.content
-
-    private fun JsonObject.boolean(key: String): Boolean =
-        (this[key] as? JsonPrimitive)?.content == "true"
-
-    private fun JsonObject.long(key: String): Long =
-        (this[key] as? JsonPrimitive)?.longOrNull ?: 0L
 }

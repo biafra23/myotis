@@ -38,14 +38,17 @@ internal object RpcQuantities {
     fun parseWeiQuantity(s: String): String? {
         if (s.isEmpty() || s.length > 80) return null
         if (s.startsWith("0x") || s.startsWith("0X")) {
-            val h = s.substring(2).ifEmpty { "0" }.lowercase()
+            // BigInteger(_, 16) accepted a leading sign after the prefix; keep
+            // tolerating an explicit '+' (a '-' fails the unsigned check anyway).
+            val h = s.substring(2).removePrefix("+").ifEmpty { "0" }.lowercase()
             if (!h.all { it in '0'..'9' || it in 'a'..'f' }) return null
             val minimal = h.trimStart('0').ifEmpty { "0" }
             if (minimal.length > 64) return null // > 2^256
             return hexToDecimal(minimal)
         }
-        if (!s.all { it in '0'..'9' }) return null // negatives and junk
-        val minimal = s.trimStart('0').ifEmpty { "0" }
+        val d = s.removePrefix("+") // BigInteger(String) parity: explicit '+' allowed
+        if (d.isEmpty() || !d.all { it in '0'..'9' }) return null // negatives and junk
+        val minimal = d.trimStart('0').ifEmpty { "0" }
         // 2^256 is 78 decimal digits; check the exact bound via the hex width.
         if (decimalToHex(minimal).length > 64) return null
         return minimal
