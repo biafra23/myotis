@@ -38,7 +38,12 @@ class IosRpcStatusSource(
             put("state", if (running) "RUNNING" else if (paused) "PAUSED" else "STOPPED")
             put("uptimeSeconds", uptimeSeconds)
             put("discoveredPeers", o.engineLong("discoveredPeers"))
-            put("connectedPeers", o.engineLong("peerCount"))
+            // OMITTED (not zero) when the engine status is unreadable/not running:
+            // net_peerCount answers from this field, and a fabricated 0 would tell
+            // a health probe "node isolated" when the truth is "can't read status"
+            // (→ the router's strict -32000 instead). The zeros below are fine —
+            // nothing answers a JSON-RPC method from them.
+            if (o.containsKey("peerCount")) put("connectedPeers", o.engineLong("peerCount"))
             put("readyPeers", snapPeers)
             put("snapPeers", snapPeers)
             put("backedOffPeers", o.engineLong("backedOffPeers"))
