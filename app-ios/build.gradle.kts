@@ -70,3 +70,26 @@ mapOf(
         dependsOn(rootProject.tasks.named(cargoTask))
     }
 }
+
+// -----------------------------------------------------------------------------
+// Cargo stays STRICTLY OPTIONAL (the root build's contract): the cinterop fails
+// outright when libmyotis_engine.a is missing, so when any target's .a can
+// neither be built now (macOS + cargo + the rustup target — the cargo task's own
+// onlyIf) nor absorbed from an earlier build, this module disables its whole
+// task chain instead. `./gradlew build` then passes on a cargo-less machine —
+// the root build prints one warning per skipped triple naming the missing
+// prerequisites. The verdict is computed once in the root build (single source,
+// beside the cargo probes it derives from). Building the actual iOS app DOES
+// require the full toolchain — against a disabled module the Gradle step
+// reports success with every task SKIPPED, and it is Xcode's subsequent link
+// that fails at the missing framework, with the same warnings explaining why.
+// -----------------------------------------------------------------------------
+if (!(rootProject.extra["myotis.iosFrameworkBuildable"] as Boolean)) {
+    tasks.configureEach {
+        // `clean` keeps working (nothing about a missing toolchain makes deleting
+        // build output wrong), and the help/diagnostic tasks (`tasks`,
+        // `dependencies`, …) stay usable for debugging this module; everything
+        // else is skipped.
+        if (name != "clean" && group != "help") enabled = false
+    }
+}
