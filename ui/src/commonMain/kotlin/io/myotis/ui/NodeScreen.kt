@@ -1129,7 +1129,9 @@ private fun LogsTab(logs: LogSource, filter: String, onFilterChange: (String) ->
                 if (it != null) {
                     autoSnapping = true
                     try {
-                        listState.scrollToItem(shown.size - 1)
+                        // Re-check: `shown` can go empty (Clear, filter) between the emission
+                        // and this collect step, and scrollToItem(-1) throws.
+                        if (shown.isNotEmpty()) listState.scrollToItem(shown.size - 1)
                     } finally {
                         autoSnapping = false
                     }
