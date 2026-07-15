@@ -371,6 +371,18 @@ impl FeeHistoryError {
     }
 }
 
+/// Why a single-peer block serve ([`ElReader::get_block_from`]) failed: a
+/// `Peer` failure (transport / root mismatch / short window) is that peer's
+/// fault — the caller loop counts it against the peer and tries the next one;
+/// `Undecodable` means the body VERIFIED against the header's
+/// `transactionsRoot` but a tx inside it can't be decoded (an unknown future
+/// tx type) — deterministic for every peer, so the loop must stop without
+/// blaming peers that served correct bytes.
+enum BlockFromError {
+    Peer(String),
+    Undecodable(String),
+}
+
 /// A verified `eth_feeHistory` result (the Java `rpcFeeHistory` twin). Every
 /// value comes from the beacon-anchored header window; rewards additionally
 /// from bodies verified against `transactionsRoot` and receipts against
@@ -1229,7 +1241,16 @@ impl ElReader {
                     self.pool.record_snap_served(peer.addr()).await;
                     return Ok(Some(block));
                 }
-                Err(e) => {
+                // The body root-verified but a tx inside it doesn't decode: the
+                // peer served CORRECT data and every peer would serve the same
+                // bytes — rendering it is our failure. Credit the peer and stop
+                // (retrying the pool would just re-download the block N times
+                // and burn the shared snap reputation on verified-good peers).
+                Err(BlockFromError::Undecodable(e)) => {
+                    self.pool.record_snap_served(peer.addr()).await;
+                    return Err(e);
+                }
+                Err(BlockFromError::Peer(e)) => {
                     self.pool.record_snap_failure(peer.addr()).await;
                     last_err = e;
                 }
@@ -1241,8 +1262,10 @@ impl ElReader {
     /// Fetch + verify one block against a single peer. Fetches the header window
     /// [target..head], checks it hash-links up to the beacon-anchored head hash,
     /// then fetches the target's body and verifies its transactions against the
-    /// header's `transactions_root`. Any mismatch/transport error propagates for
-    /// the caller loop to try the next peer.
+    /// header's `transactions_root`. A [`BlockFromError::Peer`] (mismatch /
+    /// transport) is this peer's failure — the caller loop tries the next one;
+    /// a [`BlockFromError::Undecodable`] is deterministic across peers and must
+    /// short-circuit the loop.
     async fn get_block_from(
         &self,
         peer: &ManagedPeer,
@@ -1250,7 +1273,7 @@ impl ElReader {
         back: u64,
         head_hash: &[u8; 32],
         full_transactions: bool,
-    ) -> Result<VerifiedBlock, String> {
+    ) -> Result<VerifiedBlock, BlockFromError> {
         // The contiguous forward window [target .. head] (back + 1 headers), in one
         // request. back < BLOCK_LOOKBACK_MAX (256) bounds this to ~150 KB, within the
         // eth response soft limit; a peer that caps its response below back+1 fails
@@ -1258,12 +1281,17 @@ impl ElReader {
         // tries the next peer), so deep pins carry a slightly higher liveness risk
         // than a batched fetch would. The common case (latest / a few blocks back) is
         // one small response.
-        let window = fetch_anchored_window(peer, target_num, back + 1, head_hash).await?;
+        let window = fetch_anchored_window(peer, target_num, back + 1, head_hash)
+            .await
+            .map_err(BlockFromError::Peer)?;
         let vh = &window[0];
         // Body: verify its transactions against the (now trusted) transactions_root.
-        let bodies = peer.get_block_bodies(&[vh.hash]).await?;
-        let body = bodies.into_iter().next().ok_or("peer returned no block body")?;
-        verify_body_transactions(&vh.header, &body)?;
+        let bodies = peer.get_block_bodies(&[vh.hash]).await.map_err(BlockFromError::Peer)?;
+        let body = bodies
+            .into_iter()
+            .next()
+            .ok_or_else(|| BlockFromError::Peer("peer returned no block body".to_string()))?;
+        verify_body_transactions(&vh.header, &body).map_err(BlockFromError::Peer)?;
         let tx_hashes: Vec<[u8; 32]> = body.transactions.iter().map(|t| keccak256(t)).collect();
         // Full mode: decode every tx of the (root-verified) body. Strict, like
         // the Java buildBlockJson: found-but-unrenderable fails the serve.
@@ -1271,7 +1299,10 @@ impl ElReader {
             let mut out = Vec::with_capacity(body.transactions.len());
             for (i, raw_tx) in body.transactions.iter().enumerate() {
                 let tx = tx::decode_summary(raw_tx).ok_or_else(|| {
-                    format!("block {} has an undecodable tx at index {i}", vh.header.number)
+                    BlockFromError::Undecodable(format!(
+                        "block {} has an undecodable tx at index {i}",
+                        vh.header.number
+                    ))
                 })?;
                 out.push(VerifiedTransaction {
                     tx_hash: tx_hashes[i],

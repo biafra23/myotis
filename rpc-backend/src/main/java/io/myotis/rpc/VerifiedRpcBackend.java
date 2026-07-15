@@ -2762,7 +2762,12 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         if (json == null || "null".equals(json)) return json;
         // The verified by-number serve returns the CURRENTLY-canonical block at that height;
         // make sure it's still the one asked for (else a reorg remapped number → hash).
-        return json.contains("\"hash\":\"" + key + "\"") ? json : "null";
+        // Match the block's OWN "hash" field — its first occurrence (buildBlockJson emits
+        // number, then hash) — not a substring scan: with fullTx, every embedded tx object
+        // carries its own lowercase "hash" key, which a whole-string contains() would
+        // also match (the Rust twin compares block.hash structurally).
+        int i = json.indexOf("\"hash\":\"");
+        return i >= 0 && json.startsWith(key + "\"", i + 8) ? json : "null";
     }
 
     /**

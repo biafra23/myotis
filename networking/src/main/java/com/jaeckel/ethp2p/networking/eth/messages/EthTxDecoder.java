@@ -69,20 +69,24 @@ public final class EthTxDecoder {
             BigInteger sigR = toBig(r.readValue());
             BigInteger sigS = toBig(r.readValue());
 
+            // v as a long, not int: legacy v = 2*chainId + 35, and real chain ids
+            // exceed 2^31 (an intValueExact here would fail the whole decode). A v
+            // beyond long is malformed → whole decode fails (the Rust decoder's
+            // u64 bound, mirrored).
+            long vl = v.longValueExact();
             Long chainId = null;
-            int recId;
-            Bytes signing;
-            int vi = v.intValueExact();
-            if (vi == 27 || vi == 28) {
-                recId = vi - 27;
+            Bytes signing = null;
+            int recId = -1;
+            if (vl == 27 || vl == 28) {
+                recId = (int) (vl - 27);        // pre-155: sign over the 6 tx fields
                 signing = RLP.encodeList(w -> {
                     w.writeLong(nonce); w.writeBigInteger(gasPrice); w.writeLong(gas);
                     w.writeValue(to); w.writeBigInteger(value); w.writeValue(input);
                 });
-            } else {
-                long cid = (vi - 35) / 2;       // EIP-155
+            } else if (vl >= 35) {
+                long cid = (vl - 35) / 2;       // EIP-155
                 chainId = cid;
-                recId = (vi - 35) % 2;
+                recId = (int) ((vl - 35) % 2);
                 final long fcid = cid;
                 signing = RLP.encodeList(w -> {
                     w.writeLong(nonce); w.writeBigInteger(gasPrice); w.writeLong(gas);
@@ -90,7 +94,10 @@ public final class EthTxDecoder {
                     w.writeLong(fcid); w.writeInt(0); w.writeInt(0);
                 });
             }
-            Bytes from = recover(Hash.keccak256(signing), sigR, sigS, recId);
+            // Any other v (< 27 or 29..34) can't map to a recovery id: keep the
+            // decoded summary but drop the sender — never a fabricated (negative)
+            // chainId (the Rust decoder's rule, mirrored for wire parity).
+            Bytes from = signing == null ? null : recover(Hash.keccak256(signing), sigR, sigS, recId);
             return new DecodedTx(0, chainId, nonce, gasPrice, null, null, gas, to, value,
                     input, v, sigR, sigS, from);
         });
