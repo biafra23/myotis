@@ -2036,6 +2036,18 @@ fn block_tx_tips(
     let body = bodies.into_iter().next().ok_or("peer returned no block body")?;
     verify_body_transactions(header, &body)?;
     if body.transactions.is_empty() {
+        // A root-verified EMPTY tx list ⇒ the anchored header must carry
+        // gasUsed 0 (same strictness as the non-empty path's final-sum check).
+        // Receipts are deliberately NOT consulted here — no weights to derive —
+        // matching the Java decodeBlockTips early return, and not making a
+        // quiet chain's feeHistory depend on how peers answer GetReceipts for
+        // zero-tx blocks.
+        if header.gas_used != 0 {
+            return Err(format!(
+                "block {} has no transactions but a non-zero header gasUsed {}",
+                header.number, header.gas_used
+            ));
+        }
         return Ok(Vec::new());
     }
     let receipts = receipt_blocks.into_iter().next().ok_or("peer returned no receipts")?;
@@ -2055,8 +2067,26 @@ fn block_tx_tips(
         let tip = tx::effective_tip(raw, base_fee)
             .ok_or_else(|| format!("block {} has an undecodable tx", header.number))?;
         let cum = crate::el::receipt::decode(receipt)?.cumulative_gas_used;
-        out.push((tip, cum.saturating_sub(prev_cum)));
+        // Strict, like the rest of this path: cumulative gas must be
+        // monotonic (a regression is impossible in a consensus-valid block —
+        // fail the block rather than silently zero a weight), …
+        if cum < prev_cum {
+            return Err(format!(
+                "block {} receipts have non-monotonic cumulative gas",
+                header.number
+            ));
+        }
+        out.push((tip, cum - prev_cum));
         prev_cum = cum;
+    }
+    // …and the last receipt's cumulative must equal the ANCHORED header's
+    // gasUsed (the header field is beacon-anchored; the receipts are
+    // root-verified — consensus ties the two together).
+    if prev_cum != header.gas_used {
+        return Err(format!(
+            "block {} receipts' final cumulative gas {} does not match the header gasUsed {}",
+            header.number, prev_cum, header.gas_used
+        ));
     }
     Ok(out)
 }
