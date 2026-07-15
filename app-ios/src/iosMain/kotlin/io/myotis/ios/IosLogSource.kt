@@ -52,11 +52,17 @@ class IosLogSource : LogSource {
     fun append(rawLine: String) {
         val line = rawLine.trim()
         if (line.isEmpty()) return
-        val levelChar = detectLevel(line)
+        append(detectLevel(line), TAG, line)
+    }
+
+    /** Structured append for sources that know their level + tag (the JSON-RPC
+     *  listener's access log — its lines then filter by tag, e.g. "access"). */
+    fun append(level: Char, tag: String, message: String) {
+        if (message.isEmpty()) return
         val nowMs = (NSDate().timeIntervalSince1970 * 1000).toLong()
         locked {
-            if (rank(levelChar) < minLevel.ordinal) return@locked
-            lines.addLast(LogLine(seq++, nowMs, levelChar, TAG, line))
+            if (rank(level) < minLevel.ordinal) return@locked
+            lines.addLast(LogLine(seq++, nowMs, level, tag, message))
             while (lines.size > CAPACITY) lines.removeFirst()
             version++
         }
