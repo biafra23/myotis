@@ -77,6 +77,24 @@ class UnchainedIndexStoreTest {
     }
 
     @Test
+    fun manifestChunksWithMissingSizesOrBadRangeAreRejected() = runTest {
+        // A zero size would disable the fetch size gate (expectedSize > 0) — the
+        // defense against caching truncated downloads — so such manifests must be
+        // rejected whole, not partially trusted.
+        val noSizes = """
+            {"chunks":[{"range":"000000000-000999999","bloomHash":"QmB","indexHash":"QmI"}]}
+        """.trimIndent().toByteArray()
+        val badRange = """
+            {"chunks":[{"range":"not-a-range","bloomHash":"QmB","bloomSize":10,"indexHash":"QmI","indexSize":10}]}
+        """.trimIndent().toByteArray()
+        for (payload in listOf(noSizes, badRange)) {
+            val store = UnchainedIndexStore(dir, fetcher = { payload })
+            assertTrue(runCatching { store.chunks("QmSuspect") }.isFailure)
+            assertTrue(!Files.exists(dir.resolve("manifests").resolve("QmSuspect.tsv")))
+        }
+    }
+
+    @Test
     fun bloomBytesAreCachedAfterSuccessfulParseAndServedFromDiskAfter() = runTest {
         val bloomBytes = syntheticBloom()
         var fetches = 0

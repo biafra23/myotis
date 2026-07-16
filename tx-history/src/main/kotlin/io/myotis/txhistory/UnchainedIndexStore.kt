@@ -85,8 +85,16 @@ class UnchainedIndexStore(
         return refs
     }
 
-    /** TrueBlocks manifest JSON → chunk refs; null when the shape is wrong/empty. */
+    /**
+     * TrueBlocks manifest JSON → chunk refs; null when the shape is wrong/empty.
+     * Strict per-chunk validation: every entry needs both CIDs, POSITIVE byte sizes,
+     * and a parseable block range. A zero size would silently disable the fetch size
+     * gate (expectedSize > 0) — the very defense against truncated downloads being
+     * cached — and a malformed range breaks ordering/freshness, so a manifest with
+     * any such entry is rejected whole rather than partially trusted.
+     */
     private fun parseManifestJson(bytes: ByteArray): List<ChunkRef>? = try {
+        val rangeRe = Regex("^\\d+-\\d+$")
         val root = Json.parse(String(bytes, Charsets.UTF_8)).asObject()
         val refs = root.get("chunks").asArray().map { it.asObject() }.map {
             ChunkRef(
@@ -97,7 +105,12 @@ class UnchainedIndexStore(
                 indexSize = it.getLong("indexSize", 0),
             )
         }
-        refs.takeIf { list -> list.isNotEmpty() && list.all { it.bloomCid.isNotEmpty() && it.indexCid.isNotEmpty() } }
+        refs.takeIf { list ->
+            list.isNotEmpty() && list.all {
+                it.bloomCid.isNotEmpty() && it.indexCid.isNotEmpty() &&
+                    it.bloomSize > 0 && it.indexSize > 0 && rangeRe.matches(it.range)
+            }
+        }
     } catch (e: Exception) {
         log.warn("Manifest JSON parse failed: {}", e.message)
         null
