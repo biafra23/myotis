@@ -97,6 +97,7 @@ class ManifestCidResolver(
 
     /** Big-endian 32-byte word → Int; null when it doesn't fit (a garbage return). */
     private fun wordToInt(b: ByteArray, at: Int): Int? {
+        if (at < 0 || at + 32 > b.size) return null // self-contained: safe for any caller
         for (i in at until at + 28) if (b[i] != 0.toByte()) return null
         var v = 0L
         for (i in at + 28 until at + 32) v = (v shl 8) or (b[i].toLong() and 0xff)
@@ -113,10 +114,12 @@ class ManifestCidResolver(
 
     private fun writeCache(now: Long, cid: String) {
         try {
-            Files.createDirectories(cacheFile.parent)
+            // Fall back to the working dir when a flat (parent-less) path is supplied.
+            val parent = cacheFile.parent ?: Path.of(".")
+            Files.createDirectories(parent)
             // Unique temp file (not a fixed "<name>.tmp") so a daemon + desktop sharing the
             // cache dir can't interleave writes to the same tmp before the atomic move.
-            val tmp = Files.createTempFile(cacheFile.parent, cacheFile.fileName.toString(), ".tmp")
+            val tmp = Files.createTempFile(parent, cacheFile.fileName.toString(), ".tmp")
             try {
                 Files.writeString(tmp, "$now\t$cid")
                 Files.move(tmp, cacheFile, StandardCopyOption.REPLACE_EXISTING,

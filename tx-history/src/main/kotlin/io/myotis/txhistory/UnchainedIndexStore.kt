@@ -157,8 +157,10 @@ class UnchainedIndexStore(
 
     private inline fun atomicWrite(target: Path, write: (Path) -> Unit) {
         try {
-            Files.createDirectories(target.parent)
-            val tmp = Files.createTempFile(target.parent, target.fileName.toString(), ".tmp")
+            // Fall back to the working dir when a flat (parent-less) path is supplied.
+            val parent = target.parent ?: Path.of(".")
+            Files.createDirectories(parent)
+            val tmp = Files.createTempFile(parent, target.fileName.toString(), ".tmp")
             try {
                 write(tmp)
                 Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING,

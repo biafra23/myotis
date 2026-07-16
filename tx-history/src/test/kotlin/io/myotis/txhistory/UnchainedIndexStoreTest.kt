@@ -36,10 +36,11 @@ class UnchainedIndexStoreTest {
         val tsv = dir.resolve("manifests").resolve("QmBad.tsv")
         Files.createDirectories(tsv.parent)
         Files.write(tsv, listOf("only\ttwo"))
-        var fetched = false
-        val store = UnchainedIndexStore(dir, fetcher = { fetched = true; error("boom") })
-        // The corrupt TSV falls through to a real manifest fetch (which we abort);
-        // the point is that garbage lines never round-trip into ChunkRefs.
+        // A corrupt TSV must NOT round-trip into ChunkRefs; it falls through to a real
+        // manifest fetch. Point that at an unroutable gateway so the fetch fails fast and
+        // deterministically instead of hitting the network (the fetcher lambda only serves
+        // bloom/index fetches, never the manifest — so it can't make this test hermetic).
+        val store = UnchainedIndexStore(dir, gatewayBase = "http://127.0.0.1:1/")
         val failed = runCatching { store.chunks("QmBad") }
         assertTrue(failed.isFailure)
     }
