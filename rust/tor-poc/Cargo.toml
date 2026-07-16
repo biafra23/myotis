@@ -1,0 +1,38 @@
+# Tor integration PROOF OF CONCEPT for docs/privacy-and-tor.md.
+#
+# Standalone crate (its own workspace root, own Cargo.lock) — deliberately NOT a
+# member of ../Cargo.toml's workspace so the Arti dependency tree never lands in
+# the pure-engine build or CI (see the `exclude` note there). It reuses the real
+# RLPx + eth/snap stack from `myotis-net` by path, proving the design's central
+# claim: the existing handshake runs UNMODIFIED over a Tor `DataStream`.
+[package]
+name = "tor-poc"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Own workspace root: keeps this out of the parent workspace entirely.
+[workspace]
+
+[[bin]]
+name = "tor-poc"
+path = "src/main.rs"
+
+[dependencies]
+# The real Myotis EL stack — the whole point is to reuse it verbatim.
+myotis-net = { path = "../myotis-net" }
+myotis-core = { path = "../myotis-core" }
+
+# Arti — the Tor Project's official embeddable Rust client (docs §3). native-tls
+# (macOS Security.framework / system trust store) sidesteps the rustls 0.23
+# process-wide CryptoProvider selection; tokio matches the engine's runtime.
+arti-client = { version = "0.44", default-features = false, features = ["tokio", "native-tls"] }
+tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio", "native-tls"] }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+hex = "0.4"
+getrandom = "0.2"
