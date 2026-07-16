@@ -17,13 +17,19 @@ figures are arithmetic on top of those constants plus a few **chain-level assump
 (marked below) — average mainnet transaction rate, block body size, etc. Treat the
 byte totals as sizing estimates, not measurements.
 
-**Scope: only what a synced, wallet-serving client actually uses today.** Two planned
-features are deliberately **not** counted and must be added here once properly
-implemented: the **historical accumulators** (pre-Merge historical hashes, Bellatrix
-historical roots — today only roadmap items) and the **TrueBlocks Unchained Index**
-transaction-history path (`get-transactions` — currently a debug stream over a stale,
-hardcoded manifest, not production). Both will change the disk *and* network profile
-when they land.
+**Scope: only what a synced, wallet-serving client actually uses today.** Two features
+are deliberately **not** counted in the budget below: the **historical accumulators**
+(pre-Merge historical hashes, Bellatrix historical roots — today only roadmap items),
+and the **TrueBlocks Unchained Index** transaction-history scan (the daemon's
+`get-transactions` stream and the desktop Query tab) — an opt-in, per-request debug
+feature, not part of steady-state operation. Its profile, for sizing: an on-demand
+content-addressed cache under `trueblocks/` (daemon: working-dir-relative; desktop:
+`<dataDir>/trueblocks/`) holding the manifest TSV, every bloom filter the scan has
+tested (~8k chunks × O(100 KB) = **multi-GB after a full-history scan**, immutable, no
+TTL — delete the directory to reclaim), and one index chunk per bloom hit (O(1–25 MB)
+each). First scan downloads what it tests; subsequent scans are disk-only for blooms.
+The manifest CID itself refreshes via one verified eth_call per day (on-chain
+UnchainedIndex_V2 lookup) when the node is synced.
 
 Chain-level assumptions used throughout (2025/26 ballparks):
 

@@ -38,9 +38,11 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -62,6 +64,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
@@ -771,6 +774,64 @@ private fun QueryTab(
     var historyList by remember(network) { mutableStateOf<List<QueryHistoryEntry>>(emptyList()) }
     LaunchedEffect(Unit) { historyList = withContext(Dispatchers.Default) { history.entries() } }
 
+    // --- Transaction-history scan state (TrueBlocks index; desktop-mainnet-only hosts). ---
+    // Keys arrive in stream order (newest chunk first); a null row = placeholder still
+    // resolving. SnapshotStateMap writes recompose only the affected row — that's the
+    // "block number first, parsed tx replaces it in place" mechanic.
+    var scanJob by remember(network) { mutableStateOf<Job?>(null) }
+    var scanRunning by remember(network) { mutableStateOf(false) }
+    var scanInfo by remember(network) { mutableStateOf<TxScanEvent.Started?>(null) }
+    var scanProgress by remember(network) { mutableStateOf<TxScanEvent.Progress?>(null) }
+    var scanDone by remember(network) { mutableStateOf<Int?>(null) }
+    var scanError by remember(network) { mutableStateOf<String?>(null) }
+    val txKeys = remember(network) { mutableStateListOf<Pair<Long, Int>>() }
+    val txRows = remember(network) { mutableStateMapOf<Pair<Long, Int>, TxRowUi?>() }
+    val txErrors = remember(network) { mutableStateMapOf<Pair<Long, Int>, String>() }
+
+    fun startTxScan(address: String) {
+        scanJob?.cancel()
+        txKeys.clear(); txRows.clear(); txErrors.clear()
+        scanInfo = null; scanProgress = null; scanDone = null; scanError = null
+        scanRunning = true
+        scanJob = scope.launch {
+            try {
+                controller.transactionHistory(network, address).collect { ev ->
+                    when (ev) {
+                        is TxScanEvent.Started -> scanInfo = ev
+                        is TxScanEvent.Progress -> scanProgress = ev
+                        is TxScanEvent.Hit -> {
+                            val key = ev.blockNumber to ev.txIndex
+                            if (key !in txRows) {
+                                txKeys.add(key)
+                                txRows[key] = null
+                            }
+                        }
+                        is TxScanEvent.Tx -> txRows[ev.row.blockNumber to ev.row.txIndex] = ev.row
+                        is TxScanEvent.Failed -> txErrors[ev.blockNumber to ev.txIndex] = ev.error
+                        is TxScanEvent.Done -> scanDone = ev.total
+                    }
+                }
+            } catch (c: CancellationException) {
+                throw c  // structured cancellation (Stop button / tab left)
+            } catch (t: Throwable) {
+                scanError = t.message ?: t.toString()
+            } finally {
+                // Only the CURRENT scan may flip the flag off: a cancelled scan's finally
+                // can run after its replacement already set scanRunning = true.
+                if (scanJob === coroutineContext[Job]) scanRunning = false
+            }
+        }
+    }
+
+    // NetworkChips sit above the tab content, so the user can switch chains while a scan
+    // runs. All scan state is remember(network) (so it visually resets), but the coroutine
+    // lives in the tab-scoped `scope` — cancel it when `network` changes, or it keeps
+    // fetching for the old address with no Stop button to reach it. onDispose reads the
+    // now-departing composition's scanJob holder, i.e. the job that was actually running.
+    DisposableEffect(network) {
+        onDispose { scanJob?.cancel() }
+    }
+
     // Takes the query string (not the input state) so a tapped history row runs immediately
     // without waiting for the input state write to settle.
     fun run(raw: String) {
@@ -866,6 +927,86 @@ private fun QueryTab(
             account != null -> AccountResultView(account!!)
         }
 
+        // Transaction-history add-on (TrueBlocks Unchained Index): shown once an account
+        // resolved, on hosts/networks that support the scan (desktop mainnet, Java engine).
+        // supportsTransactionHistory is a cheap registry check — evaluate per composition so
+        // the section appears once the node is up, without a network switch.
+        val currentAccount = account
+        if (!loading && currentAccount != null && running &&
+            controller.supportsTransactionHistory(network)
+        ) {
+            Spacer(Modifier.height(20.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Transactions", style = MaterialTheme.typography.titleSmall)
+                if (scanRunning) {
+                    TextButton(onClick = { scanJob?.cancel() }) { Text("Stop") }
+                } else {
+                    Button(onClick = { startTxScan(currentAccount.address) }) {
+                        Text(if (txKeys.isEmpty()) "Find transactions" else "Rescan")
+                    }
+                }
+            }
+            scanInfo?.let { TxScanInfoCaption(it) }
+            if (scanRunning) {
+                Spacer(Modifier.height(6.dp))
+                val p = scanProgress
+                if (p != null && p.totalChunks > 0) {
+                    LinearProgressIndicator(
+                        progress = { (p.chunksScanned.toFloat() / p.totalChunks).coerceIn(0f, 1f) },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Scanning chunk ${p.chunksScanned + 1}/${p.totalChunks}" +
+                            " (block ~${groupDigits(p.currentRange.substringAfter('-').trimStart('0'))})" +
+                            " — ${p.hits} hit${if (p.hits == 1) "" else "s"}" +
+                            " · ${formatBytes(p.bytesDownloaded)} fetched",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                }
+            }
+            scanError?.let {
+                Spacer(Modifier.height(6.dp))
+                Text("Scan error: $it", color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
+            }
+            scanDone?.let {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "Scan complete — $it transaction${if (it == 1) "" else "s"}.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            if (txKeys.isNotEmpty()) {
+                Spacer(Modifier.height(6.dp))
+                // Plain capped Column, not LazyColumn: QueryTab's root already scrolls
+                // vertically, and a nested unbounded LazyColumn would throw.
+                txKeys.take(TX_ROWS_RENDER_CAP).forEach { key ->
+                    val row = txRows[key]
+                    val err = txErrors[key]
+                    when {
+                        row != null -> TxRowView(row)
+                        err != null -> TxFailedRowView(key.first, key.second, err)
+                        else -> TxHitRow(key.first, key.second, active = scanRunning)
+                    }
+                }
+                if (txKeys.size > TX_ROWS_RENDER_CAP) {
+                    Text(
+                        "Showing the first $TX_ROWS_RENDER_CAP of ${txKeys.size} hits" +
+                            " (newest first) — the counters above keep scanning.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+
         // Recent-query history: tap a row to re-run it (uses the stored input, not the label).
         if (historyList.isNotEmpty()) {
             Spacer(Modifier.height(20.dp))
@@ -911,6 +1052,107 @@ private fun QueryHistoryRow(e: QueryHistoryEntry, enabled: Boolean, onClick: () 
             )
         }
     }
+}
+
+// Rendering cap for the streamed transaction list. The scan itself keeps running past
+// this (the progress line keeps counting); a debug list longer than this isn't readable.
+private const val TX_ROWS_RENDER_CAP = 300
+
+// Index tip trailing the verified head by more than this reads as stale (amber).
+// ~100k mainnet blocks ≈ 14 days — the freshness the feature promises.
+private const val TX_INDEX_STALE_BLOCKS = 100_000L
+
+/** Freshness + trust caption for the scan: which manifest, how it was found, index tip vs head. */
+@Composable
+private fun TxScanInfoCaption(info: TxScanEvent.Started) {
+    val stale = info.cidSource != "contract" ||
+        (info.headBlock != null && info.headBlock - info.latestIndexedBlock > TX_INDEX_STALE_BLOCKS)
+    val cidShort = if (info.manifestCid.length > 12) {
+        "${info.manifestCid.take(8)}…${info.manifestCid.takeLast(4)}"
+    } else info.manifestCid
+    Text(
+        buildString {
+            append("Index $cidShort (").append(info.cidSource).append(")")
+            append(" · indexed to block ").append(groupDigits(info.latestIndexedBlock.toString()))
+            info.headBlock?.let { append(" · head ").append(groupDigits(it.toString())) }
+            append(" · results unverified — debug aid")
+        },
+        style = MaterialTheme.typography.bodySmall,
+        color = if (stale) Color(0xFFF9A825) else MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+/** Placeholder row: the index hit's block number. Shows a spinner + "fetching…" while the
+ *  scan is live; once the scan is stopped, an unresolved hit reads "not fetched (stopped)"
+ *  instead of a forever-spinning row. */
+@Composable
+private fun TxHitRow(blockNumber: Long, txIndex: Int, active: Boolean) {
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (active) {
+            CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp)
+            Spacer(Modifier.width(8.dp))
+        }
+        Text(
+            "#${groupDigits(blockNumber.toString())} · tx $txIndex · " +
+                if (active) "fetching…" else "not fetched (scan stopped)",
+            fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/** Resolved row: succinct headline, block/from/hash beneath; tap to copy the tx hash. */
+@Composable
+private fun TxRowView(row: TxRowUi) {
+    val clipboard = LocalClipboardManager.current
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clickable { clipboard.setText(AnnotatedString(row.hash)) }
+            .padding(vertical = 4.dp),
+    ) {
+        Text(row.headline, style = MaterialTheme.typography.bodyMedium)
+        Text(
+            buildString {
+                append("#").append(groupDigits(row.blockNumber.toString()))
+                row.from?.let { append(" · from ").append(it.take(8)).append('…').append(it.takeLast(4)) }
+                append(" · ").append(row.hash.take(10)).append('…')
+                append(" · tap to copy hash")
+            },
+            fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1, overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+/** A hit whose tx couldn't be fetched/decoded — kept in place so the list stays honest. */
+@Composable
+private fun TxFailedRowView(blockNumber: Long, txIndex: Int, error: String) {
+    Text(
+        "#${groupDigits(blockNumber.toString())} · tx $txIndex — $error",
+        fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+        color = MaterialTheme.colorScheme.error,
+        modifier = Modifier.padding(vertical = 4.dp),
+        maxLines = 1, overflow = TextOverflow.Ellipsis,
+    )
+}
+
+/** "22841000" → "22,841,000" (pure Kotlin; commonMain has no NumberFormat). */
+private fun groupDigits(s: String): String {
+    val digits = s.ifEmpty { "0" }
+    if (digits.length <= 3 || !digits.all { it in '0'..'9' }) return digits
+    return digits.reversed().chunked(3).joinToString(",").reversed()
+}
+
+private fun formatBytes(b: Long): String = when {
+    b >= 1_073_741_824 -> "${(b * 10 / 1_073_741_824).toDouble() / 10} GB"
+    b >= 1_048_576 -> "${b / 1_048_576} MB"
+    b >= 1024 -> "${b / 1024} KB"
+    else -> "$b B"
 }
 
 /**

@@ -13,6 +13,11 @@ import io.myotis.api.MyotisEngine
 import io.myotis.api.NetworkInfo
 import io.myotis.api.ports.EnginePorts
 import io.myotis.engines.Engines
+import io.myotis.engines.SelectorEngine
+import io.myotis.txhistory.TxHistoryEvent
+import io.myotis.txhistory.TxHistoryService
+import io.myotis.txhistory.TxKind
+import io.myotis.txhistory.TxSummary
 import io.myotis.ui.AccountResult
 import io.myotis.ui.CacheFileStats
 import io.myotis.ui.EnsResult
@@ -21,12 +26,15 @@ import io.myotis.ui.NodeController
 import io.myotis.ui.NodeSnapshot
 import io.myotis.ui.PeerRow
 import io.myotis.ui.Settings
+import io.myotis.ui.TxRowUi
+import io.myotis.ui.TxScanEvent
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
@@ -284,6 +292,90 @@ class DesktopNodeController(
         val r = withContext(Dispatchers.IO) { ens.resolveAddress(name.trim(), EnsRoot.AUTO) }
         return EnsResult(r.name(), r.addressHex(), r.blockNumber(), r.verified(), r.error())
     }
+
+    // ------------------------------------------------------------------------------
+    // TrueBlocks transaction history (Query tab add-on) — a documented exemption from
+    // the "hosts consume only io.myotis.api" rule, same category as the daemon's
+    // get-transactions stream: the scan needs the raw RLPxConnector, reached through
+    // the CONCRETE Java engine's debug accessor. Java-engine + mainnet only; a
+    // Rust-hosted mainnet simply reports unsupported and the UI hides the section.
+    // ------------------------------------------------------------------------------
+
+    override fun supportsTransactionHistory(network: String): Boolean {
+        if (engine.canonicalNetworkName(network) != "mainnet") return false
+        val selector = engine as? SelectorEngine ?: return false
+        return runCatching { selector.javaDelegate().debugStack("mainnet") != null }
+            .getOrDefault(false)
+    }
+
+    override fun transactionHistory(network: String, address: String): Flow<TxScanEvent> {
+        val canonical = engine.canonicalNetworkName(network)
+        check(canonical == "mainnet") { "Transaction history is mainnet-only" }
+        val selector = engine as? SelectorEngine
+            ?: throw IllegalStateException("Transaction history requires the engine selector")
+        val stack = selector.javaDelegate().debugStack("mainnet")
+            ?: throw IllegalStateException("Transaction history requires the Java engine (mainnet not Java-hosted or not running)")
+        // Gate on SYNCED (non-blocking check) so the manifest eth_call degrades to
+        // the cached/hardcoded CID instead of parking on the readiness wait.
+        fun syncedReads() = engine.get("mainnet")?.reads()
+            ?.takeIf { it.syncState() == io.myotis.api.SyncState.SYNCED }
+        val service = TxHistoryService(
+            stack.connector(),
+            ::syncedReads,
+            dataDir.resolve("trueblocks"),
+            publisherResolver = {
+                // The index publisher's current wallet via VERIFIED ENS (TrueBlocks
+                // re-points the name on wallet rotation). Null → built-in default.
+                runCatching {
+                    if (syncedReads() == null) null
+                    else engine.get("mainnet")?.ens()?.resolveAddress(
+                        io.myotis.txhistory.ManifestCidResolver.PUBLISHER_ENS_NAME,
+                        io.myotis.api.EnsRoot.AUTO,
+                    )?.addressHex()
+                }.getOrNull()
+            },
+        )
+        return service.scan(address).map { it.toUi() }
+    }
+
+    private fun TxHistoryEvent.toUi(): TxScanEvent = when (this) {
+        is TxHistoryEvent.Started -> TxScanEvent.Started(
+            manifestCid, cidSource, totalChunks, latestIndexedBlock, headBlock)
+        is TxHistoryEvent.Progress -> TxScanEvent.Progress(
+            chunksScanned, totalChunks, currentRange, hits, bytesDownloaded)
+        is TxHistoryEvent.Hit -> TxScanEvent.Hit(blockNumber, txIndex)
+        is TxHistoryEvent.Tx -> TxScanEvent.Tx(summary.toRow())
+        is TxHistoryEvent.TxFailed -> TxScanEvent.Failed(blockNumber, txIndex, error)
+        is TxHistoryEvent.Done -> TxScanEvent.Done(total = txCount)
+    }
+
+    private fun TxSummary.toRow(): TxRowUi = TxRowUi(
+        blockNumber = blockNumber,
+        txIndex = txIndex,
+        hash = hash,
+        from = from,
+        to = to,
+        kind = when (kind) {
+            TxKind.ETH_TRANSFER -> "eth"
+            TxKind.ERC20_TRANSFER -> "erc20"
+            TxKind.CONTRACT_CALL -> "call"
+            TxKind.CONTRACT_CREATION -> "create"
+        },
+        headline = when (kind) {
+            TxKind.ETH_TRANSFER -> "$ethDisplay ETH → ${shortAddr(to)}"
+            TxKind.ERC20_TRANSFER ->
+                "${tokenAmount ?: "?"} ${tokenSymbol ?: "?"} → ${shortAddr(tokenRecipient)}"
+            TxKind.CONTRACT_CALL -> buildString {
+                append("call · ").append(calldataBytes).append(" bytes calldata")
+                selector?.let { append(" · ").append(it) }
+                if (ethWei != "0") append(" · ").append(ethDisplay).append(" ETH")
+            }
+            TxKind.CONTRACT_CREATION -> "contract creation · $calldataBytes bytes"
+        },
+    )
+
+    private fun shortAddr(a: String?): String =
+        if (a == null || a.length < 12) a ?: "?" else "${a.take(8)}…${a.takeLast(4)}"
 
     /** Poll the hosted networks every 2s and emit a per-network snapshot map for the UI.
      *  flowOn(Default): status() walks/sorts peer lists and prunes the backoff map — keep

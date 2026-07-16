@@ -1,6 +1,7 @@
 package io.myotis.ui
 
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
 
 /**
  * The backend operations the shared UI needs, abstracted so each platform supplies its own
@@ -95,6 +96,21 @@ interface NodeController {
      * resolution failures surface as [EnsResult.error].
      */
     suspend fun resolveEns(network: String, name: String): EnsResult
+
+    /**
+     * Whether [transactionHistory] works for [network] on this host. Desktop-mainnet-only
+     * today (the TrueBlocks scan needs the JVM Java engine's internals); the defaults keep
+     * Android/iOS compiling and hide the Query-tab section there.
+     */
+    fun supportsTransactionHistory(network: String): Boolean = false
+
+    /**
+     * Stream the TrueBlocks Unchained Index transaction history for [address] on
+     * [network], newest first — an UNVERIFIED explorer/debug aid, not a wallet feature.
+     * The flow is cold and cancellable: cancelling the collection stops the scan.
+     * Hosts that return true from [supportsTransactionHistory] must override this.
+     */
+    fun transactionHistory(network: String, address: String): Flow<TxScanEvent> = emptyFlow()
 
     // Logs / Settings ops are added with their screens.
 }
