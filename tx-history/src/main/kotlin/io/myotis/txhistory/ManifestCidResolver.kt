@@ -114,10 +114,16 @@ class ManifestCidResolver(
     private fun writeCache(now: Long, cid: String) {
         try {
             Files.createDirectories(cacheFile.parent)
-            val tmp = cacheFile.resolveSibling(cacheFile.fileName.toString() + ".tmp")
-            Files.writeString(tmp, "$now\t$cid")
-            Files.move(tmp, cacheFile, StandardCopyOption.REPLACE_EXISTING,
-                StandardCopyOption.ATOMIC_MOVE)
+            // Unique temp file (not a fixed "<name>.tmp") so a daemon + desktop sharing the
+            // cache dir can't interleave writes to the same tmp before the atomic move.
+            val tmp = Files.createTempFile(cacheFile.parent, cacheFile.fileName.toString(), ".tmp")
+            try {
+                Files.writeString(tmp, "$now\t$cid")
+                Files.move(tmp, cacheFile, StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE)
+            } finally {
+                Files.deleteIfExists(tmp)
+            }
         } catch (e: Exception) {
             log.warn("Could not persist manifest CID cache: {}", e.message)
         }

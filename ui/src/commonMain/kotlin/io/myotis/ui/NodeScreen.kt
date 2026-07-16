@@ -38,6 +38,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -822,6 +823,15 @@ private fun QueryTab(
         }
     }
 
+    // NetworkChips sit above the tab content, so the user can switch chains while a scan
+    // runs. All scan state is remember(network) (so it visually resets), but the coroutine
+    // lives in the tab-scoped `scope` — cancel it when `network` changes, or it keeps
+    // fetching for the old address with no Stop button to reach it. onDispose reads the
+    // now-departing composition's scanJob holder, i.e. the job that was actually running.
+    DisposableEffect(network) {
+        onDispose { scanJob?.cancel() }
+    }
+
     // Takes the query string (not the input state) so a tapped history row runs immediately
     // without waiting for the input state write to settle.
     fun run(raw: String) {
@@ -983,7 +993,7 @@ private fun QueryTab(
                     when {
                         row != null -> TxRowView(row)
                         err != null -> TxFailedRowView(key.first, key.second, err)
-                        else -> TxHitRow(key.first, key.second)
+                        else -> TxHitRow(key.first, key.second, active = scanRunning)
                     }
                 }
                 if (txKeys.size > TX_ROWS_RENDER_CAP) {
@@ -1072,17 +1082,22 @@ private fun TxScanInfoCaption(info: TxScanEvent.Started) {
     )
 }
 
-/** Placeholder row: the index hit's block number while the tx is still being fetched. */
+/** Placeholder row: the index hit's block number. Shows a spinner + "fetching…" while the
+ *  scan is live; once the scan is stopped, an unresolved hit reads "not fetched (stopped)"
+ *  instead of a forever-spinning row. */
 @Composable
-private fun TxHitRow(blockNumber: Long, txIndex: Int) {
+private fun TxHitRow(blockNumber: Long, txIndex: Int, active: Boolean) {
     Row(
         Modifier.fillMaxWidth().padding(vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp)
-        Spacer(Modifier.width(8.dp))
+        if (active) {
+            CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp)
+            Spacer(Modifier.width(8.dp))
+        }
         Text(
-            "#${groupDigits(blockNumber.toString())} · tx $txIndex · fetching…",
+            "#${groupDigits(blockNumber.toString())} · tx $txIndex · " +
+                if (active) "fetching…" else "not fetched (scan stopped)",
             fontFamily = FontFamily.Monospace, fontSize = 12.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

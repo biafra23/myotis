@@ -13,13 +13,21 @@
 
 plugins {
     alias(libs.plugins.kotlin.jvm)
+    // java-library: TxHistoryService's public constructor leaks :networking and
+    // :myotis-api types, so they're `api` deps (see below) — that configuration
+    // comes from java-library, not the bare kotlin-jvm plugin.
+    `java-library`
 }
 
 kotlin { jvmToolchain(21) }
 
 dependencies {
-    implementation(project(":networking"))   // RLPxConnector, EthTxDecoder, block messages
-    implementation(project(":myotis-api"))    // VerifiedReads (manifest eth_call + head block)
+    // api (not implementation): TxHistoryService's PUBLIC constructor exposes
+    // RLPxConnector (:networking) and VerifiedReads (:myotis-api), so a consumer must
+    // see those types transitively — today's consumers (:app, :app-desktop) only happen
+    // to already depend on both.
+    api(project(":networking"))               // RLPxConnector, EthTxDecoder, block messages
+    api(project(":myotis-api"))               // VerifiedReads (manifest eth_call + head block)
 
     implementation(libs.trueblocks.kotlin)    // manifest/bloom/index parsing
     // Compile-time access to org.kethereum.model.Address for Bloom.isMemberBytes —

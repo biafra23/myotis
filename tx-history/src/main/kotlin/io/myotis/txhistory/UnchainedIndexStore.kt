@@ -33,13 +33,19 @@ data class ChunkRef(
 }
 
 /**
- * Content-addressed disk cache over the Unchained Index's IPFS objects.
+ * Disk cache over the Unchained Index's IPFS objects, keyed by CID.
  *
- * Everything here is immutable-by-address (a CID never changes content), so the cache
- * policy is just file existence — no TTL, no invalidation — and concurrent scans
- * (daemon + desktop sharing a dir, or two UI scans) are safe via unique-tmp-file +
- * atomic-rename writes. Bytes are only cached AFTER they parse, so a truncated gateway
- * response can't poison the cache.
+ * CIDs are content addresses, so a given CID's bytes never change and the cache policy
+ * is just file existence — no TTL, no invalidation. Writes are unique-tmp-file +
+ * atomic-rename, so concurrent scans (daemon + desktop sharing a dir, or two UI scans)
+ * never see a half-written file. Two integrity gates apply before bytes are cached:
+ * they must be exactly the manifest's stated size (rejects truncation) AND parse
+ * successfully. NOTE: this does NOT re-derive the multihash and check it against the
+ * CID — a same-length, still-parseable but corrupt object from a buggy/hostile gateway
+ * would be cached and, for a bloom, could yield false negatives that mask appearances.
+ * That residual risk is bounded by TLS to the trusted gateway and by everything on this
+ * path already being unverified (`verified:false`); full CIDv0/dag-pb verification is
+ * intentionally not attempted here.
  *
  * Layout under [cacheDir]: `manifests/<cid>.tsv`, `blooms/<cid>`, `index/<cid>`.
  */
@@ -53,7 +59,13 @@ class UnchainedIndexStore(
     /** Total bytes fetched over HTTP by this store instance (cache misses only). */
     val bytesDownloaded = AtomicLong()
 
-    private val http by lazy { HttpClient(CIO) }
+    // Explicit Lazy holders so close() can tell whether each client was ever created.
+    private val httpLazy = lazy { HttpClient(CIO) }
+    private val http get() = httpLazy.value
+    // One manifest client for the store's lifetime (its OkHttp pool/dispatcher are torn
+    // down in close()); a fresh one per manifest cache-miss would leak those threads.
+    private val ipfsLazy = lazy { IpfsHttpClient(gatewayBase) }
+    private val ipfs get() = ipfsLazy.value
 
     /** Manifest [cid] → its chunk list, newest range last (manifest order preserved). */
     suspend fun chunks(manifestCid: String): List<ChunkRef> {
@@ -64,7 +76,7 @@ class UnchainedIndexStore(
         }
         // The trueblocks-kotlin client already knows the manifest JSON shape; reuse it
         // for the (small, once-per-CID) manifest fetch instead of hand-parsing JSON.
-        val manifest = IpfsHttpClient(gatewayBase).fetchAndParseManifestUrl(manifestCid)
+        val manifest = ipfs.fetchAndParseManifestUrl(manifestCid)
             ?: throw IOException("Manifest $manifestCid not fetchable via $gatewayBase")
         val refs = manifest.chunks.map {
             ChunkRef(it.range, it.bloomHash, it.bloomSize.toLong(), it.indexHash, it.indexSize.toLong())
@@ -120,10 +132,11 @@ class UnchainedIndexStore(
     private suspend fun fetch(cid: String, expectedSize: Long): ByteArray {
         val bytes = fetcher?.invoke(cid) ?: httpGet(cid)
         bytesDownloaded.addAndGet(bytes.size.toLong())
-        // The manifest's per-chunk byte sizes are the integrity gate: the lib's parsers
-        // are lenient (no magic validation, truncation tolerated — verified against the
-        // bytecode), so a short gateway response would otherwise cache as a silently
-        // empty bloom and permanently mask every appearance in that block range.
+        // Size check is the first integrity gate (parse success is the second): the lib's
+        // parsers are lenient (no magic validation, truncation tolerated — verified against
+        // the bytecode), so a short gateway response would otherwise cache as a silently
+        // empty bloom and permanently mask every appearance in that block range. It is NOT
+        // a content check — see the class doc for the residual same-length-corrupt risk.
         if (expectedSize > 0 && bytes.size.toLong() != expectedSize) {
             throw IOException(
                 "$cid: fetched ${bytes.size} bytes but manifest says $expectedSize — truncated response?")
@@ -171,12 +184,14 @@ class UnchainedIndexStore(
     }
 
     override fun close() {
-        // Only tear down the lazy client if it was actually created.
-        if (fetcher == null) {
-            try {
-                http.close()
-            } catch (ignored: Exception) {
-            }
+        // Close the Ktor client we own (bloom/index fetches). The trueblocks-kotlin
+        // manifest client (ipfsLazy) wraps OkHttp, whose types aren't on our compile
+        // classpath to shut down explicitly — but making it a single per-store instance
+        // (was: one per manifest cache-miss) bounds it to one client per scan, and
+        // OkHttp's dispatcher/connection-pool threads are daemons that idle out (~60s),
+        // so there's nothing left to leak past the scan.
+        if (httpLazy.isInitialized()) {
+            try { http.close() } catch (ignored: Exception) {}
         }
     }
 
