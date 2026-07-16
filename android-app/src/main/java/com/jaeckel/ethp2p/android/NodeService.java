@@ -1217,6 +1217,73 @@ public final class NodeService extends Service {
                 () -> toAccountQueryResult(handle.requestAccount(hexAddress)), QUERY_POOL);
     }
 
+    // ---------------------------------------------------------------------
+    // TrueBlocks transaction history (Query tab add-on) — the documented exemption
+    // from the "hosts consume only io.myotis.api" rule, same shape as the daemon's
+    // get-transactions stream and the desktop controller: the scan needs the raw
+    // RLPxConnector, reached through the CONCRETE Java engine's debug accessor at
+    // this composition root. Mainnet + Java-engine only; results are UNVERIFIED.
+    // ---------------------------------------------------------------------
+
+    /** Whether the tx-history scan can run: mainnet, running, and Java-engine-hosted. */
+    public boolean supportsTxHistory(String network) {
+        if (!"mainnet".equals(canonicalNetwork(network))) return false;
+        if (handles.get("mainnet") == null) return false;
+        if (!(ENGINE instanceof io.myotis.engines.SelectorEngine se)) return false;
+        try {
+            return se.javaDelegate().debugStack("mainnet") != null;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * Build the mainnet TrueBlocks scan service, or null when unsupported (not running,
+     * not mainnet-hosted, or Rust-engine-hosted). One instance per scan; the bloom/index
+     * disk cache lives under {@code filesDir/trueblocks} (content-addressed, immutable —
+     * multi-GB after a deep scan; delete the directory to reclaim).
+     */
+    public io.myotis.txhistory.TxHistoryService txHistoryService() {
+        noteUiActivity(); // starting a scan is user activity — don't idle-pause under it
+        ChainHandle handle = handles.get("mainnet");
+        if (handle == null || !(ENGINE instanceof io.myotis.engines.SelectorEngine se)) {
+            return null;
+        }
+        var stack = se.javaDelegate().debugStack("mainnet");
+        if (stack == null) return null;
+        return new io.myotis.txhistory.TxHistoryService(
+                stack.connector(),
+                // Reads gate on SYNCED (non-blocking check) so the manifest eth_call
+                // degrades to the cached/hardcoded CID instead of parking the scan on
+                // GatedVerifiedReads' readiness wait.
+                () -> {
+                    var reads = handle.reads();
+                    return reads != null
+                            && reads.syncState() == io.myotis.api.SyncState.SYNCED
+                            ? reads : null;
+                },
+                new java.io.File(getFilesDir(), "trueblocks").toPath(),
+                // The index publisher's current wallet via VERIFIED ENS (the name is
+                // re-pointed when TrueBlocks rotates wallets). Best-effort: null
+                // (→ built-in default) when unsynced or ENS is unavailable.
+                () -> {
+                    try {
+                        var reads = handle.reads();
+                        if (reads == null
+                                || reads.syncState() != io.myotis.api.SyncState.SYNCED) {
+                            return null;
+                        }
+                        var ens = handle.ens();
+                        if (ens == null) return null;
+                        return ens.resolveAddress(
+                                io.myotis.txhistory.ManifestCidResolver.PUBLISHER_ENS_NAME,
+                                EnsRoot.AUTO).addressHex();
+                    } catch (Exception e) {
+                        return null;
+                    }
+                });
+    }
+
     private static AccountQueryResult toAccountQueryResult(AccountProofResult r) {
         return new AccountQueryResult(
                 r.address(), r.exists(), r.nonce(), r.balanceWei(),

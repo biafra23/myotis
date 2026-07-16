@@ -113,8 +113,9 @@ Key Gradle modules:
   single `Engines.engine()` line at each composition root; the TrueBlocks
   transaction-history scan in `:tx-history` (`TxHistoryService` wraps the raw
   `RLPxConnector`; UNVERIFIED, Java-engine + mainnet only), consumed by the daemon's
-  `get-transactions` debug stream (`DebugCommands`) and the desktop Query tab
-  (`DesktopNodeController.transactionHistory`) — both reach the connector via
+  `get-transactions` debug stream (`DebugCommands`), the desktop Query tab
+  (`DesktopNodeController.transactionHistory`), and the Android Query tab
+  (`NodeService.txHistoryService`) — all reach the connector via
   `SelectorEngine.javaDelegate().debugStack` at their composition roots;
   the Settings toggles for the BLS backend (`BlsBackends`) and the
   engine (`Engines`), the Rust log drain (`Engines.drainRustLogs` —

@@ -598,7 +598,7 @@ Reads `interfaceImplementer(node, interfaceId)` (EIP-1820 over ENS) — the addr
 ./gradlew :app:run -Pargs="get-transactions 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 ```
 
-Returns all transactions for an address (mainnet only) by looking them up in the [TrueBlocks Unchained Index](https://trueblocks.io/). Results are streamed as JSON-Lines, newest first, followed by a summary object. The same scan powers the **desktop app's Query tab** ("Find transactions" under an address lookup): hits appear as block-number placeholders and upgrade in place to parsed rows, with a progress bar and a Stop button.
+Returns all transactions for an address (mainnet only) by looking them up in the [TrueBlocks Unchained Index](https://trueblocks.io/). Results are streamed as JSON-Lines, newest first, followed by a summary object. The same scan powers the **desktop and Android apps' Query tab** ("Find transactions" under an address lookup): hits appear as block-number placeholders and upgrade in place to parsed rows, with a progress bar and a Stop button. (On Android the bloom/index cache lives under `filesDir/trueblocks` and can grow to multi-GB after a deep scan.)
 
 **How it works:**
 

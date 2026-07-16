@@ -1,8 +1,8 @@
 package io.myotis.txhistory
 
+import com.eclipsesource.json.Json
 import com.jaeckel.trueblocks.Bloom
 import com.jaeckel.trueblocks.IndexParser
-import com.jaeckel.trueblocks.IpfsHttpClient
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.request.get
@@ -59,13 +59,9 @@ class UnchainedIndexStore(
     /** Total bytes fetched over HTTP by this store instance (cache misses only). */
     val bytesDownloaded = AtomicLong()
 
-    // Explicit Lazy holders so close() can tell whether each client was ever created.
+    // Explicit Lazy holder so close() can tell whether the client was ever created.
     private val httpLazy = lazy { HttpClient(CIO) }
     private val http get() = httpLazy.value
-    // One manifest client for the store's lifetime (its OkHttp pool/dispatcher are torn
-    // down in close()); a fresh one per manifest cache-miss would leak those threads.
-    private val ipfsLazy = lazy { IpfsHttpClient(gatewayBase) }
-    private val ipfs get() = ipfsLazy.value
 
     /** Manifest [cid] → its chunk list, newest range last (manifest order preserved). */
     suspend fun chunks(manifestCid: String): List<ChunkRef> {
@@ -74,20 +70,37 @@ class UnchainedIndexStore(
             parseManifestTsv(cached)?.let { return it }
             log.warn("Corrupt cached manifest {}; refetching", manifestCid)
         }
-        // The trueblocks-kotlin client already knows the manifest JSON shape; reuse it
-        // for the (small, once-per-CID) manifest fetch instead of hand-parsing JSON.
-        val manifest = ipfs.fetchAndParseManifestUrl(manifestCid)
-            ?: throw IOException("Manifest $manifestCid not fetchable via $gatewayBase")
-        val refs = manifest.chunks.map {
-            ChunkRef(it.range, it.bloomHash, it.bloomSize.toLong(), it.indexHash, it.indexSize.toLong())
-        }
-        if (refs.isEmpty()) throw IOException("Manifest $manifestCid contains no chunks")
+        // Fetched over the same Ktor path as blooms/indexes and parsed with minimal-json.
+        // Deliberately NOT trueblocks-kotlin's IpfsHttpClient: its constructor force-casts
+        // the slf4j factory to logback's LoggerContext, which crashes on hosts whose slf4j
+        // binding isn't logback (Android), and it would drag OkHttp+Moshi into the APK.
+        // Manifest size isn't known in advance → expectedSize 0 (JSON parse is the gate).
+        val refs = parseManifestJson(fetch(manifestCid, 0))
+            ?: throw IOException("Manifest $manifestCid from $gatewayBase is not a valid manifest")
         atomicWrite(cached) { tmp ->
             Files.write(tmp, refs.map {
                 "${it.range}\t${it.bloomCid}\t${it.bloomSize}\t${it.indexCid}\t${it.indexSize}"
             })
         }
         return refs
+    }
+
+    /** TrueBlocks manifest JSON → chunk refs; null when the shape is wrong/empty. */
+    private fun parseManifestJson(bytes: ByteArray): List<ChunkRef>? = try {
+        val root = Json.parse(String(bytes, Charsets.UTF_8)).asObject()
+        val refs = root.get("chunks").asArray().map { it.asObject() }.map {
+            ChunkRef(
+                range = it.getString("range", ""),
+                bloomCid = it.getString("bloomHash", ""),
+                bloomSize = it.getLong("bloomSize", 0),
+                indexCid = it.getString("indexHash", ""),
+                indexSize = it.getLong("indexSize", 0),
+            )
+        }
+        refs.takeIf { list -> list.isNotEmpty() && list.all { it.bloomCid.isNotEmpty() && it.indexCid.isNotEmpty() } }
+    } catch (e: Exception) {
+        log.warn("Manifest JSON parse failed: {}", e.message)
+        null
     }
 
     fun bloomCached(c: ChunkRef): Boolean = Files.exists(bloomFile(c))
@@ -186,12 +199,8 @@ class UnchainedIndexStore(
     }
 
     override fun close() {
-        // Close the Ktor client we own (bloom/index fetches). The trueblocks-kotlin
-        // manifest client (ipfsLazy) wraps OkHttp, whose types aren't on our compile
-        // classpath to shut down explicitly — but making it a single per-store instance
-        // (was: one per manifest cache-miss) bounds it to one client per scan, and
-        // OkHttp's dispatcher/connection-pool threads are daemons that idle out (~60s),
-        // so there's nothing left to leak past the scan.
+        // Close the Ktor client (the only HTTP client — manifests, blooms and indexes
+        // all fetch through it) if it was actually created this run.
         if (httpLazy.isInitialized()) {
             try { http.close() } catch (ignored: Exception) {}
         }

@@ -75,14 +75,17 @@ final class DebugCommands {
                     .append("\",\"chunks\":").append(s.getTotalChunks())
                     .append(",\"latestIndexedBlock\":").append(s.getLatestIndexedBlock());
             if (s.getHeadBlock() != null) {
-                long lag = s.getHeadBlock() - s.getLatestIndexedBlock();
+                // Clamp: a still-syncing node's head can trail the index tip; a negative
+                // "age" in the stream would just be confusing.
+                long lag = Math.max(0L, s.getHeadBlock() - s.getLatestIndexedBlock());
+                long ageDays = lag * 12 / 86_400;
                 b.append(",\"headBlock\":").append(s.getHeadBlock())
                         .append(",\"indexLagBlocks\":").append(lag)
-                        .append(",\"indexAgeDays\":").append(lag * 12 / 86_400);
+                        .append(",\"indexAgeDays\":").append(ageDays);
                 // Make an out-of-date index impossible to miss in the stream: beyond
                 // ~14 days of lag, say explicitly that recent history is absent.
                 if (lag > STALE_LAG_BLOCKS) {
-                    b.append(",\"stale\":true,\"warning\":\"index is ~").append(lag * 12 / 86_400)
+                    b.append(",\"stale\":true,\"warning\":\"index is ~").append(ageDays)
                             .append(" days behind the head — transactions after block ")
                             .append(s.getLatestIndexedBlock())
                             .append(" will NOT appear (newest index the publisher has released)\"");

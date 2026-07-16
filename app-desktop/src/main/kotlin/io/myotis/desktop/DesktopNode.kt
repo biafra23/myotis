@@ -16,8 +16,9 @@ import io.myotis.engines.Engines
 import io.myotis.engines.SelectorEngine
 import io.myotis.txhistory.TxHistoryEvent
 import io.myotis.txhistory.TxHistoryService
-import io.myotis.txhistory.TxKind
 import io.myotis.txhistory.TxSummary
+import io.myotis.txhistory.headline
+import io.myotis.txhistory.uiKind
 import io.myotis.ui.AccountResult
 import io.myotis.ui.CacheFileStats
 import io.myotis.ui.EnsResult
@@ -355,27 +356,9 @@ class DesktopNodeController(
         hash = hash,
         from = from,
         to = to,
-        kind = when (kind) {
-            TxKind.ETH_TRANSFER -> "eth"
-            TxKind.ERC20_TRANSFER -> "erc20"
-            TxKind.CONTRACT_CALL -> "call"
-            TxKind.CONTRACT_CREATION -> "create"
-        },
-        headline = when (kind) {
-            TxKind.ETH_TRANSFER -> "$ethDisplay ETH → ${shortAddr(to)}"
-            TxKind.ERC20_TRANSFER ->
-                "${tokenAmount ?: "?"} ${tokenSymbol ?: "?"} → ${shortAddr(tokenRecipient)}"
-            TxKind.CONTRACT_CALL -> buildString {
-                append("call · ").append(calldataBytes).append(" bytes calldata")
-                selector?.let { append(" · ").append(it) }
-                if (ethWei != "0") append(" · ").append(ethDisplay).append(" ETH")
-            }
-            TxKind.CONTRACT_CREATION -> "contract creation · $calldataBytes bytes"
-        },
+        kind = uiKind(),
+        headline = headline(), // shared with the Android mapper (:tx-history TxSummaryDisplay)
     )
-
-    private fun shortAddr(a: String?): String =
-        if (a == null || a.length < 12) a ?: "?" else "${a.take(8)}…${a.takeLast(4)}"
 
     /** Poll the hosted networks every 2s and emit a per-network snapshot map for the UI.
      *  flowOn(Default): status() walks/sorts peer lists and prunes the backoff map — keep

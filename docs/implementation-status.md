@@ -30,8 +30,8 @@ CL peers are seeded from four sources (in priority order): the persistent `CLPee
 **POC: Implemented**
 
 - Scan/parse service in `:tx-history` (`TxHistoryService`), shared by the daemon's
-  `get-transactions` IPC stream and the desktop Query tab (streaming UI: block-number
-  placeholders upgrade in place to parsed rows, progress + Stop)
+  `get-transactions` IPC stream and the desktop **and Android** Query tabs (streaming
+  UI: block-number placeholders upgrade in place to parsed rows, progress + Stop)
 - **Dynamic manifest CID discovery**: the latest mainnet manifest is read from the
   UnchainedIndex_V2 contract (`manifestHashMap(publisher, "mainnet")`,
   `0x0c316B70…183d`) via myotis' own verified eth_call; the publisher address comes
