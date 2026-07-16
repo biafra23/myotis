@@ -32,6 +32,10 @@ final class DebugCommands {
      *  visits thousands of chunks and the CLI doesn't need one line per chunk. */
     private static final int PROGRESS_EVERY_CHUNKS = 250;
 
+    /** Index lag beyond this (~14 days of mainnet blocks) marks the Started line
+     *  stale + warns. Matches the UI's TX_INDEX_STALE_BLOCKS threshold. */
+    private static final long STALE_LAG_BLOCKS = 100_000L;
+
     private final TxHistoryService service;
 
     DebugCommands(TxHistoryService service) {
@@ -65,12 +69,26 @@ final class DebugCommands {
     /** One succinct JSON line per event; null = suppressed (sampled progress). */
     private static String toJsonLine(TxHistoryEvent event) {
         if (event instanceof TxHistoryEvent.Started s) {
-            return "{\"ok\":true,\"manifestCid\":\"" + escapeJson(s.getManifestCid())
-                    + "\",\"cidSource\":\"" + s.getCidSource()
-                    + "\",\"chunks\":" + s.getTotalChunks()
-                    + ",\"latestIndexedBlock\":" + s.getLatestIndexedBlock()
-                    + (s.getHeadBlock() != null ? ",\"headBlock\":" + s.getHeadBlock() : "")
-                    + "}";
+            StringBuilder b = new StringBuilder(256);
+            b.append("{\"ok\":true,\"manifestCid\":\"").append(escapeJson(s.getManifestCid()))
+                    .append("\",\"cidSource\":\"").append(s.getCidSource())
+                    .append("\",\"chunks\":").append(s.getTotalChunks())
+                    .append(",\"latestIndexedBlock\":").append(s.getLatestIndexedBlock());
+            if (s.getHeadBlock() != null) {
+                long lag = s.getHeadBlock() - s.getLatestIndexedBlock();
+                b.append(",\"headBlock\":").append(s.getHeadBlock())
+                        .append(",\"indexLagBlocks\":").append(lag)
+                        .append(",\"indexAgeDays\":").append(lag * 12 / 86_400);
+                // Make an out-of-date index impossible to miss in the stream: beyond
+                // ~14 days of lag, say explicitly that recent history is absent.
+                if (lag > STALE_LAG_BLOCKS) {
+                    b.append(",\"stale\":true,\"warning\":\"index is ~").append(lag * 12 / 86_400)
+                            .append(" days behind the head — transactions after block ")
+                            .append(s.getLatestIndexedBlock())
+                            .append(" will NOT appear (newest index the publisher has released)\"");
+                }
+            }
+            return b.append('}').toString();
         }
         if (event instanceof TxHistoryEvent.Progress p) {
             if (p.getChunksScanned() % PROGRESS_EVERY_CHUNKS != 0) return null;

@@ -161,6 +161,15 @@ Key Gradle modules:
 
 ## Data sources
 - the only sources for data are devp2p and libp2p calling a local client via http may only be used for debugging purposes it is not an option for production
+- **TrueBlocks Unchained Index mainnet publishing appears stalled.** The designated
+  publisher (`publisher.unchainedindex.eth`) last published a mainnet manifest indexed
+  to ~block 23.0M (mid-2025); as of mid-2026 that is ~a year behind the head, and the
+  only newer on-chain entry is from an undesignated wallet whose content is not
+  retrievable from IPFS. The `:tx-history` scan (debug-only) therefore misses all
+  recent history — both its surfaces warn loudly about the gap. PLAN: the user intends
+  to run their own index (TrueBlocks scraper) and add its IPFS peer address to Myotis;
+  if you find evidence upstream publishing has resumed (a fresh manifest under the
+  ENS-designated publisher), flag it to the user.
 - **Portal Network is effectively dead.** Its reference clients are abandoned:
   the EF's own Trin client README states "THIS PROJECT IS NO LONGER ACTIVELY
   MAINTAINED" (https://github.com/ethereum/trin), and no one is actively
