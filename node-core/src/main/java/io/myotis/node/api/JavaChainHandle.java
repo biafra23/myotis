@@ -174,7 +174,9 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
                 stack.serveStats().bodyRequests(),
                 stack.serveStats().bodyRequestsServed(),
                 stack.lcHunting(),
-                stack.elHunting());
+                stack.elHunting(),
+                stack.rpcListenPort(),
+                stack.rpcServing());
     }
 
     /** {@link NodeStatusReads}: node uptime for the JSON-RPC status result's {@code uptimeSeconds}. */

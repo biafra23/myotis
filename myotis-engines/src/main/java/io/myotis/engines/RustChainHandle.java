@@ -319,6 +319,12 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
      * bind failure is logged and the stack continues without JSON-RPC (mirrors the
      * Java engine): the IPC socket still serves the same verified primitives.
      */
+    /** Live listener state (bound AND no fatal supervisor failure) — ChainStack parity. */
+    private boolean rpcServing() {
+        io.myotis.jsonrpc.MyotisRpcServer s = rpcServer;
+        return s != null && s.isServing();
+    }
+
     private void startRpc() {
         if (rpcPort <= 0) return;        // RPC disabled (test seam / explicit opt-out)
         if (rpcServer != null) return;   // already started — avoid a re-bind / server leak
@@ -533,7 +539,11 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 s.peerBodyRequests(),
                 s.peerBodyRequestsServed(),
                 s.lcHunting(),
-                s.elHunting());
+                s.elHunting(),
+                // Host-side listener truth (the JVM owns the server for Rust-hosted
+                // networks): the configured port, and whether it is live right now.
+                rpcPort > 0 ? rpcPort : 0,
+                rpcServing());
     }
 
     @Override

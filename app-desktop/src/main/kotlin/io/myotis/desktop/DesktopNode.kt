@@ -461,6 +461,8 @@ class DesktopNodeController(
             lastWakeReason = s.lastWakeReason(),
             lcHunting = s.lcHunting(),
             elHunting = s.elHunting(),
+            rpcPort = s.rpcPort(),
+            rpcServing = s.rpcServing(),
         )
     }
 }

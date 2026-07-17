@@ -140,6 +140,9 @@ public final class ChainStack {
     private volatile BeaconLightClient beaconLightClient;
     private volatile io.myotis.rpc.VerifiedRpcBackend rpcBackend;
     private volatile io.myotis.jsonrpc.MyotisRpcServer rpcServer;
+    /** The port startRpc() was configured with (recorded even when the bind fails,
+     *  so the status row can show the failure); 0 until startRpc runs. */
+    private volatile int rpcListenPort;
 
     /** Status source for the JSON-RPC myotis_status / myotis_beaconStatus methods; the
      *  wrapping handle late-binds it (see {@link #setStatusReads}) before start(). */
@@ -517,6 +520,19 @@ public final class ChainStack {
     }
 
     /** EL hunt engaged: snap serving pool empty past the stall window. */
+    /** The JSON-RPC port the listener was configured with (0 = none configured yet). */
+    public int rpcListenPort() {
+        return rpcListenPort;
+    }
+
+    /** Live listener state: bound AND its supervisor hasn't recorded a fatal
+     *  failure. Consults the server (not just the start outcome) so an
+     *  asynchronously-died listener reads false, iOS-controller parity. */
+    public boolean rpcServing() {
+        io.myotis.jsonrpc.MyotisRpcServer s = rpcServer;
+        return s != null && s.isServing();
+    }
+
     public boolean elHunting() {
         return elHunting;
     }
@@ -874,6 +890,7 @@ public final class ChainStack {
 
     private void startRpc() {
         int rpcPort = ports.rpcPort();
+        rpcListenPort = rpcPort;
         try {
             // Deterministic up-front bind probe: Ktor's CIO engine surfaces bind
             // failures asynchronously, which a try/catch around start() can miss.

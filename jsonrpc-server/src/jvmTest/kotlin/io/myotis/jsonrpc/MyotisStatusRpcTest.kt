@@ -69,6 +69,8 @@ class MyotisStatusRpcTest {
         /* peerBodyRequestsServed */ 0L,
         /* lcHunting */ false,
         /* elHunting */ false,
+        /* rpcPort */ 8545,
+        /* rpcServing */ true,
     )
 
     private fun beaconStatus(
