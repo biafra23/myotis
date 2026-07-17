@@ -1142,7 +1142,9 @@ public final class NodeService extends Service {
             long peerBodyRequests,        // inbound GetBlockBodies from peers this run
             long peerBodyRequestsServed,  //   ...answered with >=1 body (always 0 today)
             boolean lcHunting,            // LC hunt engaged (starved of light-client servers)
-            boolean elHunting) {}         // EL hunt engaged (snap serving pool empty past stall)
+            boolean elHunting,            // EL hunt engaged (snap serving pool empty past stall)
+            int rpcPort,                  // configured JSON-RPC port (0 = none)
+            boolean rpcServing) {}        // listener bound and live on 127.0.0.1:rpcPort
 
     /** Result of a get-account query. Mirrors the JVM daemon's JSON response shape. */
     public record AccountQueryResult(
@@ -1854,7 +1856,7 @@ public final class NodeService extends Service {
                     s.lastResumeEpochMs(), s.lastWakeReason(),
                     s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
                     s.peerBodyRequests(), s.peerBodyRequestsServed(),
-                    s.lcHunting(), s.elHunting());
+                    s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing());
         }
         return new Snapshot(true, lifecycle, chainStartMs,
                 s.discoveredPeers(), s.connectedPeers(), s.readyPeers(),
@@ -1870,7 +1872,7 @@ public final class NodeService extends Service {
                 s.lastResumeEpochMs(), s.lastWakeReason(),
                 s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
                 s.peerBodyRequests(), s.peerBodyRequestsServed(),
-                s.lcHunting(), s.elHunting());
+                s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing());
     }
 
     // ---- Failure forensics (see ProcessHealthDiag) ----

@@ -225,6 +225,8 @@ private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
     lastWakeReason = lastWakeReason(),
     lcHunting = lcHunting(),
     elHunting = elHunting(),
+    rpcPort = rpcPort(),
+    rpcServing = rpcServing(),
 )
 
 /** Android actual of [Settings] over the NodeService SharedPreferences statics. */
