@@ -27,10 +27,12 @@ by path.
 [3/3] Verified snap account reads over Tor — one isolated circuit + ephemeral key PER address:
 
   address[0] 0xd8da6bf26964af9d7eed9e03e53415d37aa96045  (isolation token #0, fresh ephemeral key)
-      timing: dial=135ms  +rlpx=273ms  +eth/69=420ms  +snap=985ms
-      peer=... client="Geth/v1.17.3-stable/linux-amd64" head=#25545115 stateRoot=0x2b619530c404…
-      VERIFIED present: nonce=5932 balance=0x5c54eb1980c072b3 wei  codeHash=0xd8ef78646344
+      timing (per phase): dial=109ms  rlpx=137ms  eth/69=102ms  snap=403ms  total=752ms
+      peer=... client="Geth/v1.17.3-stable/linux-amd64" head=#25552520 stateRoot=0x43eaee555a8d…
+      VERIFIED present: nonce=5941 balance=0x5c14e37daf8ef2b4 wei  codeHash=0xd8ef78646344
 ```
+
+(`snap` covers the head-header fetch plus the GetAccountRange round trip.)
 
 ## The one production change this required
 
@@ -48,9 +50,12 @@ Making the RLPx transport stream-generic (`rust/myotis-net`):
 
 ## Empirical findings (feed back into the design)
 
-- **Arti bootstrap:** ~11 s cold. RLPx-over-Tor handshake to an accepting peer:
-  ~0.7–2 s; a full verified snap read: ~1–5 s. In line with the latency budget
-  discussion (§8.5).
+- **Latency is dominated by circuit quality and highly variable.** Arti cold
+  bootstrap ~11–12 s (one-time per app session). RLPx-over-Tor handshake to an
+  accepting peer ~0.7–2.5 s. A full verified snap read (dial + handshake + eth +
+  head + account) ranges from **~0.75 s on a good circuit to ~18 s on a slow /
+  lossy one** — the tail matters for the confirm-screen budget (§8.5) and argues
+  for a serve-stale policy on the Tor path.
 - **Exit-pool health for `:30303` is a real constraint (§2, §8.1).** Some
   circuits fail with "no exit circuit for ports" (reduced exit policy excludes
   30303); others reach the peer but time out.

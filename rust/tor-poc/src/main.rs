@@ -176,7 +176,15 @@ async fn query_over_tor(
         .connect_with_prefs(peer.tor_addr()?, &prefs)
         .await
         .with_context(|| format!("Tor connect to {}", peer.addr))?;
-    let dial_ms = t0.elapsed().as_millis();
+    // Per-phase deltas (each `since` measures only its own phase, not cumulative).
+    // `mark` starts at t0 so the first delta captures the Tor connect/circuit build.
+    let mut mark = t0;
+    let mut since = || {
+        let d = mark.elapsed().as_millis();
+        mark = Instant::now();
+        d
+    };
+    let dial_ms = since();
 
     // Fresh ephemeral RLPx identity for this circuit (docs §6.1).
     let key = ephemeral_key()?;
@@ -190,7 +198,7 @@ async fn query_over_tor(
     .await
     .map_err(|_| anyhow!("RLPx handshake timed out over Tor"))?
     .map_err(|e| anyhow!("RLPx handshake: {e}"))?;
-    let rlpx_ms = t0.elapsed().as_millis();
+    let rlpx_ms = since();
 
     let mut session = EthSession::handshake(conn, &key.public_key_bytes(), eth_cfg, None)
         .await
@@ -198,7 +206,7 @@ async fn query_over_tor(
     if !session.snap {
         bail!("peer negotiated eth/{} but no snap/1", session.eth_version);
     }
-    let eth_ms = t0.elapsed().as_millis();
+    let eth_ms = since();
 
     // A FRESH state root the peer still retains: its own claimed head header.
     // (Production anchors this to the beacon chain — out of scope for the PoC.)
@@ -229,10 +237,13 @@ async fn query_over_tor(
         .snap_get_account(&state_root, address)
         .await
         .map_err(|e| anyhow!("snap GetAccountRange: {e}"))?;
-    let snap_ms = t0.elapsed().as_millis();
+    // `snap` covers the head-header fetch + the GetAccountRange round trip.
+    let snap_ms = since();
+    let total_ms = t0.elapsed().as_millis();
 
     println!(
-        "      timing: dial={dial_ms}ms  +rlpx={rlpx_ms}ms  +eth/{}={eth_ms}ms  +snap={snap_ms}ms",
+        "      timing (per phase): dial={dial_ms}ms  rlpx={rlpx_ms}ms  eth/{}={eth_ms}ms  \
+         snap={snap_ms}ms  total={total_ms}ms",
         session.eth_version
     );
     let _ = advertised;
