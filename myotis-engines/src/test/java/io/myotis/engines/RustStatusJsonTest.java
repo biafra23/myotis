@@ -142,6 +142,11 @@ class RustStatusJsonTest {
         assertFalse(running.rpcServing());
         StatusSnapshot stopped = h.statusFromJsonOnThisHandle(NOT_STARTED_JSON);
         assertEquals(0, stopped.rpcPort(), "stopped handle must hide the RPC row");
+        // PAUSED keeps the row: the listener survives idle sleep — a request on
+        // this very port is what wakes the stack, so hiding it would remove the
+        // one address the user needs while sleeping.
+        StatusSnapshot paused = h.statusFromJsonOnThisHandle(PAUSED_JSON);
+        assertEquals(8545, paused.rpcPort(), "paused handle must keep showing the RPC port");
     }
 
     @Test
