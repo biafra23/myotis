@@ -24,7 +24,9 @@ and the **TrueBlocks Unchained Index** transaction-history scan (the daemon's
 `get-transactions` stream and the desktop Query tab) — an opt-in, per-request debug
 feature, not part of steady-state operation. Its profile, for sizing: an on-demand
 content-addressed cache under `trueblocks/` (daemon: working-dir-relative; desktop:
-`<dataDir>/trueblocks/`) holding the manifest TSV, every bloom filter the scan has
+`<dataDir>/trueblocks/`; Android: `filesDir/trueblocks/` — mind that a deep scan can
+grow it to multi-GB on a phone; delete the directory to reclaim) holding the manifest
+TSV, every bloom filter the scan has
 tested (~8k chunks × O(100 KB) = **multi-GB after a full-history scan**, immutable, no
 TTL — delete the directory to reclaim), and one index chunk per bloom hit (O(1–25 MB)
 each). First scan downloads what it tests; subsequent scans are disk-only for blooms.

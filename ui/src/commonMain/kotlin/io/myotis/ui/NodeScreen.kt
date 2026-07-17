@@ -1058,18 +1058,53 @@ private fun QueryHistoryRow(e: QueryHistoryEntry, enabled: Boolean, onClick: () 
 // this (the progress line keeps counting); a debug list longer than this isn't readable.
 private const val TX_ROWS_RENDER_CAP = 300
 
-// Index tip trailing the verified head by more than this reads as stale (amber).
-// ~100k mainnet blocks ≈ 14 days — the freshness the feature promises.
+// Index tip trailing the verified head by more than this gets the loud staleness
+// banner. ~100k mainnet blocks ≈ 14 days — beyond that, "recent history" is missing.
 private const val TX_INDEX_STALE_BLOCKS = 100_000L
 
-/** Freshness + trust caption for the scan: which manifest, how it was found, index tip vs head. */
+// Mainnet block time, for turning a block gap into a human age.
+private const val SECONDS_PER_BLOCK = 12L
+
+/**
+ * Freshness + trust caption for the scan: which manifest, how it was found, index tip
+ * vs head. When the index trails the verified head badly (upstream TrueBlocks publishing
+ * has stalled for ~a year as of mid-2026), a prominent warning banner spells out the
+ * approximate age and the cutoff block — a small amber caption undersold a gap that
+ * makes ALL recent history silently absent.
+ */
 @Composable
 private fun TxScanInfoCaption(info: TxScanEvent.Started) {
-    val stale = info.cidSource != "contract" ||
-        (info.headBlock != null && info.headBlock - info.latestIndexedBlock > TX_INDEX_STALE_BLOCKS)
+    val lagBlocks = info.headBlock?.let { it - info.latestIndexedBlock } ?: -1L
+    val veryStale = lagBlocks > TX_INDEX_STALE_BLOCKS
+    val degradedSource = info.cidSource != "contract"
     val cidShort = if (info.manifestCid.length > 12) {
         "${info.manifestCid.take(8)}…${info.manifestCid.takeLast(4)}"
     } else info.manifestCid
+
+    if (veryStale) {
+        val ageDays = lagBlocks * SECONDS_PER_BLOCK / 86_400
+        Spacer(Modifier.height(6.dp))
+        Column(
+            Modifier.fillMaxWidth()
+                .background(MaterialTheme.colorScheme.errorContainer)
+                .padding(10.dp),
+        ) {
+            Text(
+                "⚠ Index is ~$ageDays days behind the chain head",
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
+            Text(
+                "Indexed to block ${groupDigits(info.latestIndexedBlock.toString())}, head is " +
+                    "${groupDigits(info.headBlock.toString())} — anything after the indexed block " +
+                    "will NOT appear below. This is the newest index the TrueBlocks publisher " +
+                    "has released, not a sync problem on this node.",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
+        }
+        Spacer(Modifier.height(4.dp))
+    }
     Text(
         buildString {
             append("Index $cidShort (").append(info.cidSource).append(")")
@@ -1078,7 +1113,10 @@ private fun TxScanInfoCaption(info: TxScanEvent.Started) {
             append(" · results unverified — debug aid")
         },
         style = MaterialTheme.typography.bodySmall,
-        color = if (stale) Color(0xFFF9A825) else MaterialTheme.colorScheme.onSurfaceVariant,
+        // Amber when the CID didn't come from the live contract read (cached/hardcoded),
+        // or when staleness can't be judged (no verified head to compare against).
+        color = if (degradedSource || info.headBlock == null) Color(0xFFF9A825)
+        else MaterialTheme.colorScheme.onSurfaceVariant,
     )
 }
 

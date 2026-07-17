@@ -208,6 +208,10 @@ dependencies {
     // Engine selector: NodeService.ENGINE is Engines.engine(); the Settings "Rust
     // engine" toggle drives it via NodeService.applyEngineChoice.
     implementation(project(":myotis-engines"))
+    // TrueBlocks tx-history scan for the Query tab (documented API-boundary exemption:
+    // NodeService reaches the raw connector via SelectorEngine.javaDelegate().debugStack).
+    // Java-21 classfiles like :networking — already dexed fine (see libs.versions.toml).
+    implementation(project(":tx-history"))
 
     // Shared Compose-Multiplatform UI + the NodeController/Settings seam. The Android
     // actuals (AndroidNodeController/AndroidSettings) back it with NodeService, so the

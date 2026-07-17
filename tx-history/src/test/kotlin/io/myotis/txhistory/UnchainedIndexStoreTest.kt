@@ -36,13 +36,62 @@ class UnchainedIndexStoreTest {
         val tsv = dir.resolve("manifests").resolve("QmBad.tsv")
         Files.createDirectories(tsv.parent)
         Files.write(tsv, listOf("only\ttwo"))
-        // A corrupt TSV must NOT round-trip into ChunkRefs; it falls through to a real
-        // manifest fetch. Point that at an unroutable gateway so the fetch fails fast and
-        // deterministically instead of hitting the network (the fetcher lambda only serves
-        // bloom/index fetches, never the manifest — so it can't make this test hermetic).
-        val store = UnchainedIndexStore(dir, gatewayBase = "http://127.0.0.1:1/")
+        // A corrupt TSV must NOT round-trip into ChunkRefs; it falls through to a fresh
+        // manifest fetch — hermetic now that manifests go through the injectable fetcher.
+        var fetched = false
+        val store = UnchainedIndexStore(dir, fetcher = { fetched = true; error("gateway down") })
         val failed = runCatching { store.chunks("QmBad") }
         assertTrue(failed.isFailure)
+        assertTrue(fetched, "corrupt TSV must trigger a refetch, not be trusted")
+    }
+
+    @Test
+    fun manifestJsonFetchParsesCachesAndServesFromDiskAfter() = runTest {
+        val manifestJson = """
+            {"version":"trueblocks-core@v2.0.0-release","chain":"mainnet",
+             "chunks":[
+               {"range":"000000000-000999999","bloomHash":"QmBloomA","bloomSize":1024,"indexHash":"QmIndexA","indexSize":2048},
+               {"range":"001000000-001999999","bloomHash":"QmBloomB","bloomSize":4096,"indexHash":"QmIndexB","indexSize":8192}
+             ]}
+        """.trimIndent().toByteArray()
+        var fetches = 0
+        val store = UnchainedIndexStore(dir, fetcher = { fetches++; manifestJson })
+
+        val chunks = store.chunks("QmFresh")
+        assertEquals(1, fetches)
+        assertEquals(2, chunks.size)
+        assertEquals("QmBloomA", chunks[0].bloomCid)
+        assertEquals(1_999_999L, chunks[1].lastBlock)
+
+        // Second call: served from the cached TSV, no refetch.
+        assertEquals(chunks, store.chunks("QmFresh"))
+        assertEquals(1, fetches)
+    }
+
+    @Test
+    fun nonManifestJsonIsRejected() = runTest {
+        val store = UnchainedIndexStore(dir, fetcher = { """{"unexpected":"shape"}""".toByteArray() })
+        val failed = runCatching { store.chunks("QmNotAManifest") }
+        assertTrue(failed.isFailure)
+        assertTrue(!Files.exists(dir.resolve("manifests").resolve("QmNotAManifest.tsv")))
+    }
+
+    @Test
+    fun manifestChunksWithMissingSizesOrBadRangeAreRejected() = runTest {
+        // A zero size would disable the fetch size gate (expectedSize > 0) — the
+        // defense against caching truncated downloads — so such manifests must be
+        // rejected whole, not partially trusted.
+        val noSizes = """
+            {"chunks":[{"range":"000000000-000999999","bloomHash":"QmB","indexHash":"QmI"}]}
+        """.trimIndent().toByteArray()
+        val badRange = """
+            {"chunks":[{"range":"not-a-range","bloomHash":"QmB","bloomSize":10,"indexHash":"QmI","indexSize":10}]}
+        """.trimIndent().toByteArray()
+        for (payload in listOf(noSizes, badRange)) {
+            val store = UnchainedIndexStore(dir, fetcher = { payload })
+            assertTrue(runCatching { store.chunks("QmSuspect") }.isFailure)
+            assertTrue(!Files.exists(dir.resolve("manifests").resolve("QmSuspect.tsv")))
+        }
     }
 
     @Test

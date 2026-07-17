@@ -73,6 +73,8 @@ class TxScanUiTest {
         awaitText("22,812,345")
         rule.onNodeWithText("fetching…", substring = true).assertIsDisplayed()
         rule.onNodeWithText("indexed to block 22,841,000", substring = true).assertIsDisplayed()
+        // Fresh index (lag 2,511 blocks < the ~14-day threshold): no staleness banner.
+        rule.onAllNodes(hasText("behind the chain head", substring = true)).assertCountEquals(0)
 
         // The Tx event replaces the placeholder row in place.
         controller.events.trySend(TxScanEvent.Tx(TxRowUi(
@@ -85,6 +87,22 @@ class TxScanUiTest {
 
         controller.events.trySend(TxScanEvent.Done(total = 1))
         awaitText("Scan complete — 1 transaction.")
+    }
+
+    @Test
+    fun staleIndexShowsTheWarningBannerWithAge() {
+        val controller = ScriptedController()
+        openQueryTabWithAccount(controller)
+        rule.onNodeWithText("Find transactions").performClick()
+        pumpFrames()
+
+        // ~2.54M blocks behind ≈ 353 days at 12s/block — the mid-2026 upstream reality.
+        controller.events.trySend(TxScanEvent.Started(
+            manifestCid = "QmManifestManifestManifest", cidSource = "contract",
+            totalChunks = 5948, latestIndexedBlock = 22_997_660, headBlock = 25_542_119))
+        awaitText("behind the chain head")
+        rule.onNodeWithText("~353 days behind the chain head", substring = true).assertIsDisplayed()
+        rule.onNodeWithText("will NOT appear", substring = true).assertIsDisplayed()
     }
 
     @Test
