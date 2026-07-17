@@ -541,8 +541,10 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 s.lcHunting(),
                 s.elHunting(),
                 // Host-side listener truth (the JVM owns the server for Rust-hosted
-                // networks): the configured port, and whether it is live right now.
-                rpcPort > 0 ? rpcPort : 0,
+                // networks): the configured port — while the handle runs — and
+                // whether the server is live right now. A stopped handle reports 0
+                // so the status row hides instead of faking a red bind failure.
+                s.running() && rpcPort > 0 ? rpcPort : 0,
                 rpcServing());
     }
 

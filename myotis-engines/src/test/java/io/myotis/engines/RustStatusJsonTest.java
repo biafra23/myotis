@@ -125,6 +125,23 @@ class RustStatusJsonTest {
         // Older natives omit the hunt keys → default to false, never throw.
         assertFalse(s.lcHunting());
         assertFalse(s.elHunting());
+        // No listener configured on the test seam → row-hidden sentinel values.
+        assertEquals(0, s.rpcPort());
+        assertFalse(s.rpcServing());
+    }
+
+    @Test
+    void configuredButUnservedRpcPortSurfacesAsNotServing() {
+        // A handle configured with a port whose server never started (bind
+        // failure shape): the RUNNING status must carry the port with
+        // rpcServing=false — the state the UI renders as the red
+        // "port N unavailable" row. A stopped handle must hide the row (port 0).
+        RustChainHandle h = new RustChainHandle(0L, "mainnet", 1L, 8545, false);
+        StatusSnapshot running = h.statusFromJsonOnThisHandle(CATCHING_UP_JSON);
+        assertEquals(8545, running.rpcPort());
+        assertFalse(running.rpcServing());
+        StatusSnapshot stopped = h.statusFromJsonOnThisHandle(NOT_STARTED_JSON);
+        assertEquals(0, stopped.rpcPort(), "stopped handle must hide the RPC row");
     }
 
     @Test

@@ -341,13 +341,21 @@ public final class ChainStack {
             startDiscV5();                   // non-essential, warn-and-continue
             BeaconLightClient blc = beaconLightClient;
             if (blc != null) blc.resume();
-            if (rpcServer != null) {
+            io.myotis.jsonrpc.MyotisRpcServer liveServer = rpcServer;
+            if (liveServer != null && liveServer.isServing()) {
                 // The listener survived the pause; swap a fresh backend in behind
                 // the gate (the old one died with the previous connector).
                 io.myotis.rpc.VerifiedRpcBackend backend = buildAndStartBackend();
                 this.rpcBackend = backend;
             } else {
-                startRpc(); // first start's bind failed — retry best-effort
+                // Absent (first bind failed) OR dead (crashGuard latched a fatal
+                // failure — previously unrecoverable, the row stayed red forever):
+                // tear down any corpse and retry the full start best-effort.
+                if (liveServer != null) {
+                    try { liveServer.stop(); } catch (Throwable ignored) {}
+                    rpcServer = null;
+                }
+                startRpc();
             }
             if (maintainerEnabled) startPeerMaintainer();
             phase.set(RUNNING);
@@ -416,6 +424,10 @@ public final class ChainStack {
         ScheduledExecutorService pm = peerMaintainer;
         if (pm != null) { pm.shutdownNow(); peerMaintainer = null; }
         if (rpcServer != null) { try { rpcServer.stop(); } catch (Throwable ignored) {} }
+        // A stopped stack has no listener EXPECTATION either — zero the recorded
+        // port so the status row hides instead of misreporting a normal stop as
+        // a red bind failure.
+        rpcListenPort = 0;
         if (rpcBackend != null) { try { rpcBackend.close(); } catch (Throwable ignored) {} }
         if (beaconLightClient != null) { try { beaconLightClient.close(); } catch (Throwable ignored) {} }
         if (connector != null) { try { connector.close(); } catch (Throwable ignored) {} }
@@ -890,7 +902,6 @@ public final class ChainStack {
 
     private void startRpc() {
         int rpcPort = ports.rpcPort();
-        rpcListenPort = rpcPort;
         try {
             // Deterministic up-front bind probe: Ktor's CIO engine surfaces bind
             // failures asynchronously, which a try/catch around start() can miss.
@@ -908,6 +919,7 @@ public final class ChainStack {
                 server.start();
                 this.rpcServer = server;
                 this.rpcBackend = backend;
+                rpcListenPort = rpcPort; // publish AFTER the server: no red flash mid-boot
                 log.info("[{}] JSON-RPC listening on http://127.0.0.1:{} (verified, strict)",
                         network.name(), rpcPort);
             } catch (Throwable serverEx) {
@@ -915,9 +927,11 @@ public final class ChainStack {
                 throw serverEx;
             }
         } catch (java.io.IOException bindEx) {
+            rpcListenPort = rpcPort; // recorded so the status row shows the failure
             log.warn("[{}][rpc] port {} unavailable ({}); continuing without JSON-RPC",
                     network.name(), rpcPort, bindEx.getMessage());
         } catch (Throwable t) {
+            rpcListenPort = rpcPort;
             log.warn("[{}][rpc] failed to start JSON-RPC; continuing without it: {}",
                     network.name(), t.toString());
         }
