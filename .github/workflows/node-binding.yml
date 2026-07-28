@@ -1,0 +1,60 @@
+# Prebuilds for the myotis-node napi-rs binding (Electron/Node hosts).
+# Artifacts: myotis-node.<platform>-<arch>.node per matrix leg, attached to
+# the workflow run; wire into the release workflow once the binding stabilizes.
+#
+# NOTE: authored as part of the Node-binding spike; the windows leg doubles as
+# the first Windows compile check for the whole Rust workspace.
+name: node-binding
+
+on:
+  push:
+    branches: [feat/node-binding]
+    paths: ['rust/**', '.github/workflows/node-binding.yml']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: myotis-node.linux-x64-gnu.node
+            built: rust/target/x86_64-unknown-linux-gnu/release/libmyotis_node.so
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: myotis-node.linux-arm64-gnu.node
+            built: rust/target/aarch64-unknown-linux-gnu/release/libmyotis_node.so
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: myotis-node.darwin-arm64.node
+            built: rust/target/aarch64-apple-darwin/release/libmyotis_node.dylib
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: myotis-node.darwin-x64.node
+            built: rust/target/x86_64-apple-darwin/release/libmyotis_node.dylib
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: myotis-node.win32-x64-msvc.node
+            built: rust/target/x86_64-pc-windows-msvc/release/myotis_node.dll
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build
+        working-directory: rust
+        run: cargo build -p myotis-node --release --target ${{ matrix.target }}
+      - name: Rename to .node
+        shell: bash
+        run: cp "${{ matrix.built }}" "${{ matrix.artifact }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
