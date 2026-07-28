@@ -9,7 +9,10 @@
 //! tokio runtime this crate owns (see `host`). R1 is CL-only + mainnet-only; Gnosis
 //! and the EL surface land later.
 
-mod capi;
+// Public: the plain C ABI doubles as the in-process seam for Rust hosts (the
+// napi-rs Node binding in `myotis-node` calls these by Rust path — linking the
+// rlib does not reliably resolve `extern "C"` imports of no_mangle symbols).
+pub mod capi;
 pub mod catalog;
 mod eljson;
 mod host;
