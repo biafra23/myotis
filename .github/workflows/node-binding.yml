@@ -58,3 +58,42 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
           if-no-files-found: error
+
+  # Full runtime validation on Windows: unit-test the workspace, then run the
+  # real smoke — sync mainnet over devp2p/libp2p from the runner, reach
+  # SYNCED, and serve verified reads (ENS, contenthash, account proof)
+  # through the .node addon. The sync snapshot is cached across runs, so the
+  # first run pays the cold checkpoint catch-up (~30-40 min) and later runs
+  # warm-restart in seconds.
+  smoke-windows:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Unit tests (whole workspace, first run on Windows)
+        working-directory: rust
+        run: cargo test --workspace
+      - uses: actions/download-artifact@v4
+        with:
+          name: myotis-node.win32-x64-msvc.node
+      - name: Restore sync snapshot cache
+        uses: actions/cache@v4
+        with:
+          path: myotis-data
+          key: myotis-smoke-data-win-${{ github.run_id }}
+          restore-keys: myotis-smoke-data-win-
+      - name: Ensure data dir exists
+        # The engine does not create data_dir itself yet (fix pending in a
+        # separate PR); without this, sync works but persistence — and this
+        # job's snapshot cache — silently no-ops.
+        run: New-Item -ItemType Directory -Force -Path "${{ github.workspace }}\myotis-data" | Out-Null
+      - name: Smoke — sync mainnet + verified reads
+        working-directory: rust/myotis-node
+        env:
+          MYOTIS_SMOKE_TIMEOUT_MIN: '55'
+        run: node smoke.mjs ${{ github.workspace }}\myotis-data ${{ github.workspace }}\myotis-node.win32-x64-msvc.node
