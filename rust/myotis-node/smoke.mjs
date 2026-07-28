@@ -10,7 +10,7 @@ const dataDir = process.argv[2] || './.smoke-data';
 const addonPath = process.argv[3] || './target/debug/myotis-node.node';
 const m = require(addonPath);
 
-const SYNC_TIMEOUT_MS = 15 * 60 * 1000;
+const SYNC_TIMEOUT_MS = (Number(process.env.MYOTIS_SMOKE_TIMEOUT_MIN) || 15) * 60 * 1000;
 const VITALIK = '0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045';
 
 const t0 = Date.now();
