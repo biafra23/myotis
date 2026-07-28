@@ -30,7 +30,10 @@ jobs:
             target: aarch64-apple-darwin
             artifact: myotis-node.darwin-arm64.node
             built: rust/target/aarch64-apple-darwin/release/libmyotis_node.dylib
-          - os: macos-13
+          # x64 macOS is cross-compiled from the arm64 runner — GitHub's
+          # Intel-mac (macos-13) runners are scarce enough to starve the
+          # whole matrix (and smoke-windows behind it) in the queue.
+          - os: macos-latest
             target: x86_64-apple-darwin
             artifact: myotis-node.darwin-x64.node
             built: rust/target/x86_64-apple-darwin/release/libmyotis_node.dylib
