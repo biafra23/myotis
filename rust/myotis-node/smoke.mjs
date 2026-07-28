@@ -79,9 +79,14 @@ async function queries(status) {
   }
 
   const acct = await timed('get-account vitalik', m.requestAccountJson(handle, VITALIK));
-  const v = acct.verification || {};
-  log('verification:', JSON.stringify(v));
-  if (!v.beaconChainVerified) { console.error('account NOT beacon-verified'); failures++; }
+  // Rust-engine account JSON carries verification fields FLAT (unlike the
+  // Java daemon's nested `verification` object on the IPC surface).
+  log('verification:', JSON.stringify({
+    beaconChainVerified: acct.beaconChainVerified,
+    blsVerified: acct.blsVerified,
+    failReason: acct.failReason,
+  }));
+  if (!acct.beaconChainVerified) { console.error('account NOT beacon-verified'); failures++; }
 
   const fees = await timed('fee-estimate', m.feeEstimateJson(handle));
   if (fees.error) { console.error('fee estimate failed'); failures++; }
