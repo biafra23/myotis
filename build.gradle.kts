@@ -246,6 +246,32 @@ tasks.register<Exec>("cargoBuildHost") {
     outputs.files(hostLibNames.map { file("$rustReleaseDir/$it") })
 }
 
+// Regenerate the UniFFI Kotlin bindings for the Rust engine into :myotis-engines'
+// source tree. The generated file is COMMITTED (like the Android jniLibs) so
+// cargo-less machines still compile the pure-Java/Kotlin build; re-run this task
+// whenever rust/myotis-engine/src/ffi.rs changes shape. Library mode: bindgen
+// reads the metadata baked into the built .so, so scaffolding and bindings can
+// never disagree silently (UniFFI additionally checksum-verifies at load time).
+tasks.register<Exec>("uniffiGenerateKotlin") {
+    group = "rust"
+    description = "Regenerate the committed UniFFI Kotlin bindings in :myotis-engines (self-skips without cargo)"
+    onlyIf { rustAvailable }
+    dependsOn(tasks.named("cargoBuildHost"))
+    workingDir = file("rust")
+    commandLine(
+        "cargo", "run", "--release", "-p", "uniffi-bindgen", "--",
+        "generate", "--library", "$rustReleaseDir/${hostLibNames.last()}".removePrefix("rust/"),
+        "--language", "kotlin", "--no-format",
+        "--out-dir", project(":myotis-engines").projectDir.resolve("src/main/kotlin").absolutePath,
+    )
+    inputs.files(rustSources).withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.property("cargoVersion", cargoVersion)
+    outputs.files(
+        project(":myotis-engines").projectDir
+            .resolve("src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt")
+    )
+}
+
 val cargoTest = tasks.register<Exec>("cargoTest") {
     group = "rust"
     description = "cargo test --workspace (self-skips when cargo is missing)"

@@ -1,0 +1,21 @@
+[package]
+name = "uniffi-bindgen"
+version = "0.1.0"
+edition = "2021"
+description = "Workspace-local UniFFI bindings generator CLI (cargo run -p uniffi-bindgen)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The standard UniFFI pattern: a tiny workspace-local bin wrapping the bindgen
+# CLI, so binding generation is pinned to the exact uniffi version the engine
+# links against (a version skew between scaffolding and generator is a build
+# error by design). Run via the root Gradle task `uniffiGenerateKotlin`, or:
+#   cargo run -p uniffi-bindgen -- generate \
+#     --library target/release/libmyotis_engine.so --language kotlin --out-dir <dir>
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/main.rs"
+
+[dependencies]
+uniffi = { version = "0.32", features = ["cli"] }

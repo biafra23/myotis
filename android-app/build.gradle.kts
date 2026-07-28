@@ -208,6 +208,11 @@ dependencies {
     // Engine selector: NodeService.ENGINE is Engines.engine(); the Settings "Rust
     // engine" toggle drives it via NodeService.applyEngineChoice.
     implementation(project(":myotis-engines"))
+    // JNA's Android artifact: the UniFFI-generated bindings in :myotis-engines load
+    // libmyotis_engine through JNA, and only the @aar variant packages the
+    // libjnidispatch.so natives the Android runtime needs. Same version as the
+    // catalog's plain-JVM `jna` (Gradle conflict-resolves to this variant here).
+    implementation("net.java.dev.jna:jna:5.17.0@aar")
     // TrueBlocks tx-history scan for the Query tab (documented API-boundary exemption:
     // NodeService reaches the raw connector via SelectorEngine.javaDelegate().debugStack).
     // Java-21 classfiles like :networking — already dexed fine (see libs.versions.toml).

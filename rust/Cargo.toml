@@ -26,7 +26,7 @@
 
 [workspace]
 resolver = "2"
-members = ["myotis-bls", "myotis-consensus", "myotis-core", "myotis-evm", "myotis-engine", "myotis-net"]
+members = ["myotis-bls", "myotis-consensus", "myotis-core", "myotis-evm", "myotis-engine", "myotis-net", "uniffi-bindgen"]
 
 # Release profile is workspace-owned (crate-level [profile.*] is ignored in a
 # workspace): same tuning myotis-bls always shipped with.
