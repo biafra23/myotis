@@ -1,0 +1,10 @@
+# Golden/conformance vectors must be byte-identical on every platform.
+# Without this, git on Windows checks text files out with CRLF and the
+# byte-exact golden comparisons fail (myotis-engine's
+# catalog_matches_committed_golden_sample was the first casualty — the Rust
+# and Java engines pin their serialization to the committed bytes).
+rust/testdata/**/*.json text eol=lf
+rust/testdata/**/*.txt text eol=lf
+rust/testdata/**/*.bin binary
+rust/testdata/**/*.rlp binary
+rust/testdata/**/*.ssz binary
