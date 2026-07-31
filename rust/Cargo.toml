@@ -18,15 +18,18 @@
 #                      state (revm behind a SnapStateOracle trait; sans-I/O). THE
 #                      one heavy EL dep (revm) is gated to this crate. Grows through
 #                      the EL-phase Milestone-C PRs (docs/reimplementation/07).
-#   myotis-engine    — the Rust implementation of the io.myotis.api engine contract,
-#                      exposed to the JVM via hand-JNI (libmyotis_engine).
+#   myotis-engine    — the Rust implementation of the io.myotis.api engine contract
+#                      (libmyotis_engine): UniFFI exports for the JVM hosts (ffi.rs)
+#                      plus the plain C ABI for iOS/Rust hosts (capi.rs).
+#   uniffi-bindgen   — the pinned uniffi-bindgen CLI (Gradle `uniffiGenerateKotlin`
+#                      regenerates :myotis-engines' committed Kotlin bindings with it).
 #
 # Built from Gradle when cargo is available (root build.gradle.kts `cargoBuildHost`
 # etc.); entirely optional — the pure-Java build never needs this workspace.
 
 [workspace]
 resolver = "2"
-members = ["myotis-bls", "myotis-consensus", "myotis-core", "myotis-evm", "myotis-engine", "myotis-net"]
+members = ["myotis-bls", "myotis-consensus", "myotis-core", "myotis-evm", "myotis-engine", "myotis-net", "uniffi-bindgen"]
 
 # Release profile is workspace-owned (crate-level [profile.*] is ignored in a
 # workspace): same tuning myotis-bls always shipped with.

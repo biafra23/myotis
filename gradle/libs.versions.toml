@@ -31,6 +31,9 @@ dnsjava = "3.6.2"
 # docs/besu-extraction.md, AND rebasing the Android ART fork
 # (biafra23/besu, tag <ver>-android.N — android-app substitutes it in).
 besu = "26.4.0"
+# JNA (the UniFFI bindings' loader). 5.18.1 matches Besu's transitive jna so the
+# jar and Android @aar can't drift apart under conflict resolution.
+jna = "5.18.1"
 agp = "8.7.3"
 # Kotlin 2.2.21 is the FLOOR for the iOS target: it's the first release whose
 # Kotlin/Native supports Xcode 26 (required to link against the iOS 26 SDK).
@@ -95,6 +98,10 @@ junit-jupiter       = { module = "org.junit.jupiter:junit-jupiter" }
 milagro             = { module = "org.miracl.milagro.amcl:milagro-crypto-java", version.ref = "milagro" }
 jblst               = { module = "tech.pegasys:jblst",                        version.ref = "jblst" }
 jvm-libp2p          = { module = "io.libp2p:jvm-libp2p",                   version.ref = "jvm-libp2p" }
+# JNA — the FFI layer under the UniFFI-generated Kotlin bindings in :myotis-engines
+# (replaces the old hand-JNI). :android-app additionally pins the @aar variant so
+# the packaged natives come from JNA's Android artifact.
+jna                 = { module = "net.java.dev.jna:jna",                   version.ref = "jna" }
 trueblocks-kotlin   = { module = "com.github.biafra23:trueblocks-kotlin", version.ref = "trueblocks-kotlin" }
 # trueblocks-kotlin's own dependency, made explicit so :tx-history can call
 # Bloom.isMemberBytes(Address) at compile time (the JitPack POM exposes kethereum

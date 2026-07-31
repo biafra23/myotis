@@ -23,9 +23,12 @@ myotis-net = { path = "../myotis-net" }
 # transitively via myotis-net. revm is gated inside myotis-evm.
 myotis-evm = { path = "../myotis-evm" }
 tokio = { version = "=1.52.3", features = ["rt-multi-thread"] }
-jni = { version = "0.21", default-features = false }
-# Compound values cross the JNI boundary as JSON (hand-JNI + JSON decision —
-# docs/reimplementation/05). Schemas are pinned by golden tests on both sides.
+# The JVM boundary: UniFFI proc-macro scaffolding (replaces the old hand-JNI —
+# the generated Kotlin bindings live in :myotis-engines and are pinned to this
+# uniffi version by UniFFI's own per-function API checksums). Compound values
+# still cross as JSON strings (transport swap only; shapes unchanged and pinned
+# by the golden tests on both sides). The iOS C ABI (capi.rs) is untouched.
+uniffi = "0.32"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Global tracing subscriber feeding the drainable ring buffer behind

@@ -1,5 +1,6 @@
 //! Plain C ABI over the same `host` functions the JNI shim wraps — the iOS
-//! (Kotlin/Native cinterop) seam. Mirrors `jni_shim` one-to-one: compound values
+//! (Kotlin/Native cinterop) seam. Mirrors the JVM FFI surface (`ffi`, UniFFI)
+//! one-to-one: compound values
 //! cross as JSON strings with the exact same shapes the golden tests pin, and the
 //! sentinel conventions are identical (negative handle ids, `"{}"` status for an
 //! unknown handle, `{"error": ...}` objects). The header consumed by cinterop is

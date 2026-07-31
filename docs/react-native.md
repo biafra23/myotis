@@ -96,12 +96,13 @@ and `:myotis-engines`' minimal-json layer (JSON decode, error mapping,
   UI and would force the K/N toolchain onto every RN consumer. (A UI-free
   K/N "engine-only" framework shared by `:app-ios` and RN was considered
   and rejected for the same toolchain-weight reason.)
-- **Not** via UniFFI: already rejected for the JVM
-  (docs/reimplementation/05-engine-api-bindings.md §1), and with
+- **Not** via UniFFI-for-RN: the JVM boundary now IS UniFFI (the hand-JNI was
+  swapped out, 2026-07 — see docs/reimplementation/06), but that covers
+  Kotlin/JVM hosts; an RN shim would still need its own C surface, and with
   zero engine→host callbacks in the FFI, UniFFI's main selling point
-  (callback interfaces) buys nothing here.
+  (callback interfaces) buys nothing extra here.
 - Panic policy carries over: the workspace builds `panic = "abort"`, so the
-  C shim must stay unwrap-free by construction like `jni_shim`/`capi.rs`;
+  C shim must stay unwrap-free by construction like `ffi.rs`/`capi.rs`;
   a panic kills the RN app process.
 
 ### Alternative considered: a JS-side engine
