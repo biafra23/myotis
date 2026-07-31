@@ -11,6 +11,7 @@ pub mod discv4;
 pub mod eth;
 pub mod evm;
 pub mod peer;
+pub mod logindex;
 pub mod peercache;
 pub mod pool;
 pub mod reader;
