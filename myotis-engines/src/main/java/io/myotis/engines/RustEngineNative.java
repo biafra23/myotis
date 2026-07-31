@@ -106,9 +106,25 @@ final class RustEngineNative {
      *  attacker-reachable via JSON-RPC string params) to an absent/empty string on
      *  the Rust side (CESU-8 decode failure → {@code unwrap_or_default}). The
      *  generated bindings instead throw {@code MalformedInputException} from their
-     *  UTF-8 lowering; probe first so the pre-UniFFI semantics keep holding. */
+     *  UTF-8 lowering; probe first so the pre-UniFFI semantics keep holding.
+     *
+     *  <p>Hand-rolled surrogate-pairing scan rather than {@code CharsetEncoder.canEncode}:
+     *  this runs on every FFI string argument, and the encoder probe allocates per call.
+     *  The O(n) walk itself is inherent to validating (the bindings' UTF-8 lowering
+     *  re-scans the same chars right after). */
     private static boolean wellFormed(String s) {
-        return java.nio.charset.StandardCharsets.UTF_8.newEncoder().canEncode(s);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (Character.isHighSurrogate(c)) {
+                if (i + 1 >= s.length() || !Character.isLowSurrogate(s.charAt(i + 1))) {
+                    return false;
+                }
+                i++; // consume the low half of a well-formed pair
+            } else if (Character.isLowSurrogate(c)) {
+                return false; // low surrogate with no preceding high
+            }
+        }
+        return true;
     }
 
     /** ABI handshake; returns the library's compiled-in ABI version. */
