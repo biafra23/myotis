@@ -68,6 +68,21 @@ pub fn start_handle(handle: i64) -> bool {
     crate::host::start(handle)
 }
 
+/// Toggle Tor verified-read routing (docs/privacy-and-tor.md). Returns true iff
+/// this build supports Tor (`--features tor`); a Tor-less build returns false and
+/// no-ops. Process-global, not per-handle.
+#[uniffi::export]
+pub fn set_tor_enabled(on: bool) -> bool {
+    crate::host::set_tor_enabled(on)
+}
+
+/// Tor status bitmask for the host Status view: bit0 compiled-in, bit1 enabled,
+/// bit2 bootstrapped. `0` = this build has no Tor support.
+#[uniffi::export]
+pub fn tor_status() -> i32 {
+    crate::host::tor_status()
+}
+
 /// One handle's status as a JSON object, or `"{}"` for an unknown handle.
 #[uniffi::export]
 pub fn status_json(handle: i64) -> String {

@@ -47,6 +47,15 @@ int64_t myotis_create(const char *network, const char *data_dir);
 /* Start the sync loop. False for an unknown/already-running handle. */
 bool myotis_start(int64_t handle);
 
+/* Toggle Tor verified-read routing (docs/privacy-and-tor.md). Returns true iff
+ * this build supports Tor (built with `--features tor`); a Tor-less build
+ * returns false and no-ops. Process-global, not per-handle. */
+bool myotis_set_tor_enabled(bool on);
+
+/* Tor status bitmask: bit0 compiled-in, bit1 enabled, bit2 bootstrapped.
+ * 0 = this build has no Tor support. */
+int32_t myotis_tor_status(void);
+
 /* Status JSON object (camelCase keys), or "{}" for an unknown handle. */
 char *myotis_status_json(int64_t handle);
 

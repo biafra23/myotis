@@ -227,6 +227,15 @@ val rustReleaseDir = if (rustTargetTriple != null) {
 extra["rustReleaseDir"] = rustReleaseDir
 extra["rustEngineLibName"] = hostLibNames.last() // lib?myotis_engine.{dylib,so,dll}
 
+// Opt-in Tor support in the host engine dylib (docs/privacy-and-tor.md): builds
+// myotis-engine with `--features tor`, pulling the Arti tree into the host lib so
+// the desktop/daemon can offer the runtime Settings toggle. OFF by default so CI
+// and the daemon build stay Arti-free. Presence-based, like a typical opt-in flag
+// (a bare `-PtorEngine` sets the property to "", so use hasProperty); build a
+// Tor-capable desktop app with `./gradlew :app-desktop:run -PtorEngine`.
+val torEngine = project.hasProperty("torEngine")
+        && (project.property("torEngine") as? String).let { it.isNullOrBlank() || it.toBoolean() }
+
 tasks.register<Exec>("cargoBuildHost") {
     group = "rust"
     description = "cargo build --release for the host OS (self-skips when cargo is missing)"
@@ -235,6 +244,9 @@ tasks.register<Exec>("cargoBuildHost") {
     commandLine(
         buildList {
             addAll(listOf("cargo", "build", "--release", "--workspace"))
+            // Enable Tor only on the engine crate (package/feature form — a bare
+            // `--features tor` with `--workspace` would try every member).
+            if (torEngine) addAll(listOf("--features", "myotis-engine/tor"))
             rustTargetTriple?.let { addAll(listOf("--target", it)) }
         }
     )
@@ -243,6 +255,8 @@ tasks.register<Exec>("cargoBuildHost") {
     // must rebuild, or stale artifacts survive UP-TO-DATE checks.
     inputs.property("cargoVersion", cargoVersion)
     inputs.property("rustTarget", rustTargetTriple ?: "host")
+    // The Tor feature flips the artifact's contents, so it must key UP-TO-DATE too.
+    inputs.property("torEngine", torEngine)
     outputs.files(hostLibNames.map { file("$rustReleaseDir/$it") })
 }
 

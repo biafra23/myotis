@@ -61,7 +61,11 @@ uniffi::setup_scaffolding!();
 ///      overlay); nativeGetTransactionByHashJson may now return the PENDING
 ///      shape (block trio explicitly null) for the wallet's own broadcasts —
 ///      a payload extension, no signature change there.
-pub const ABI_VERSION: i32 = 19;
+/// v20: added the Tor toggle surface (set_tor_enabled/tor_status, UniFFI +
+///      the iOS C ABI; docs/privacy-and-tor.md). The functions exist in every
+///      build; a dylib compiled without `--features tor` reports "not supported"
+///      (false / 0) rather than being absent.
+pub const ABI_VERSION: i32 = 20;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

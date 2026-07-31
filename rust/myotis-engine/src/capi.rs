@@ -107,6 +107,21 @@ pub extern "C" fn myotis_start(handle: i64) -> bool {
     crate::host::start(handle)
 }
 
+/// Toggle Tor verified-read routing (`set_tor_enabled` twin,
+/// docs/privacy-and-tor.md). Returns true iff this build supports Tor
+/// (`--features tor`); a Tor-less build returns false and no-ops.
+#[no_mangle]
+pub extern "C" fn myotis_set_tor_enabled(on: bool) -> bool {
+    crate::host::set_tor_enabled(on)
+}
+
+/// Tor status bitmask (`tor_status` twin): bit0 compiled-in, bit1 enabled,
+/// bit2 bootstrapped. `0` = this build has no Tor support.
+#[no_mangle]
+pub extern "C" fn myotis_tor_status() -> i32 {
+    crate::host::tor_status()
+}
+
 /// One handle's status as a JSON object, or `"{}"` for an unknown handle
 /// (`nativeStatusJson` twin).
 #[no_mangle]

@@ -380,6 +380,16 @@ struct TxScanState {
 /// (mirrors the Java `TIP_SUGGEST_BLOCKS`).
 const TIP_SUGGEST_BLOCKS: u64 = 3;
 
+/// Tor read fan-out bounds (docs/privacy-and-tor.md): how many clearnet-validated
+/// snap peers a single Tor-routed read may try, and the wall-clock ceiling on the
+/// whole read. Kept small because each Tor dial is slow and many peers reject
+/// Tor-exit inbound — without these a bad-exit walk could hang the FFI call for
+/// minutes. Fail-closed when the deadline is hit.
+#[cfg(feature = "tor")]
+const TOR_MAX_CANDIDATES: usize = 5;
+#[cfg(feature = "tor")]
+const TOR_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// `eth_feeHistory` block-count clamp (the Java `FEE_HISTORY_MAX_BLOCKS`) —
 /// each block with reward percentiles costs a verified body + receipts fetch.
 const FEE_HISTORY_MAX_BLOCKS: u64 = 10;
@@ -453,6 +463,13 @@ pub struct ElReader {
     discovery: Discv4Service,
     pool: PeerPool,
     anchor: Arc<ExecAnchor>,
+    /// Our eth handshake parameters — reused by the Tor read path
+    /// (`docs/privacy-and-tor.md`) to dial a per-address isolated circuit with a
+    /// fresh ephemeral identity, independent of the pool's clearnet connections.
+    /// Only read on the `tor` feature; kept unconditionally so the struct shape
+    /// doesn't depend on the feature.
+    #[cfg_attr(not(feature = "tor"), allow(dead_code))]
+    eth_cfg: Arc<EthConfig>,
     /// Network floor for the suggested tip (from `ElConfig::min_suggested_tip_wei`).
     min_suggested_tip_wei: u128,
     /// Cross-call EVM caches, shared across every `eth_call` on this reader. Both
@@ -577,7 +594,7 @@ impl ElReader {
         let pool = PeerPool::start(
             key,
             local_pubkey,
-            eth_cfg,
+            Arc::clone(&eth_cfg),
             cfg.pool_config,
             cache,
             rx,
@@ -587,6 +604,7 @@ impl ElReader {
             discovery,
             pool,
             anchor,
+            eth_cfg,
             min_suggested_tip_wei: cfg.min_suggested_tip_wei,
             evm_proof_cache: Arc::new(InMemoryStateProofCache::new(EVM_PROOF_CACHE_ENTRIES)),
             evm_bytecode_cache: Arc::new(InMemoryBytecodeCache::new()),
@@ -657,6 +675,13 @@ impl ElReader {
     /// a single hung/dead peer doesn't fail the query. A serving peer is marked
     /// CONFIRMED in the cache, a failing one records a strike (→ deprioritized).
     pub async fn get_account(&self, address: [u8; 20]) -> Result<VerifiedAccount, String> {
+        // Tor mode (docs/privacy-and-tor.md): route this read — the §1 "core
+        // leak" flow — over a per-address isolated Tor circuit instead of the
+        // pool's clearnet connections. Fail-closed if no aged peer is available.
+        #[cfg(feature = "tor")]
+        if crate::el::tor::is_enabled() {
+            return self.get_account_over_tor(address).await;
+        }
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
@@ -707,8 +732,22 @@ impl ElReader {
         let verdict = peer
             .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
             .await;
-        let (fin_num, opt_num, synced) = self.anchor_diagnostics();
+        Ok(self.build_verified_account(address, state_root, block_number, outcome, verdict))
+    }
 
+    /// Assemble a `VerifiedAccount` from the proof-verified outcome + the beacon
+    /// anchor verdict + the reader's live anchor diagnostics. Shared by the
+    /// clearnet ([`get_account_from`]) and Tor read paths so the verdict/trust
+    /// fields are identical regardless of transport.
+    fn build_verified_account(
+        &self,
+        address: [u8; 20],
+        state_root: [u8; 32],
+        block_number: u64,
+        outcome: AccountOutcome,
+        verdict: crate::el::verify::Verdict,
+    ) -> VerifiedAccount {
+        let (fin_num, opt_num, synced) = self.anchor_diagnostics();
         let account_hash = keccak256(&address);
         let mut result = VerifiedAccount {
             address,
@@ -737,7 +776,90 @@ impl ElReader {
             result.storage_root = leaf.storage_root;
             result.code_hash = leaf.code_hash;
         }
-        Ok(result)
+        result
+    }
+
+    /// Tor read path for [`get_account`]: dial a per-address ISOLATED Tor circuit
+    /// with a FRESH ephemeral RLPx identity (docs §3/§6.1) to a peer the pool
+    /// already validated on clearnet, and run the identical fetch + beacon-anchor
+    /// verdict as the clearnet path. Fails CLOSED when no such peer is available
+    /// — never silently falls back to a clearnet dial (docs §5).
+    #[cfg(feature = "tor")]
+    async fn get_account_over_tor(&self, address: [u8; 20]) -> Result<VerifiedAccount, String> {
+        // Candidate identities: peers this reader's pool discovered & validated
+        // over clearnet (addr + enode pubkey), snap-serving-quality first (the
+        // pool orders them). We reuse only their IDENTITY; the dial itself is a
+        // fresh Tor circuit with an ephemeral node key, so the peer never sees our
+        // real IP or our persistent node key. Bound the fan-out: each Tor dial is
+        // slow and many peers reject Tor-exit inbound, so cap the candidates AND
+        // the whole read, or one balance query could hang the FFI call for minutes
+        // (a bad-exit walk); fail-closed on the deadline.
+        let candidates: Vec<(std::net::SocketAddr, [u8; 64])> = self
+            .pool
+            .snap_peers()
+            .await
+            .iter()
+            .take(TOR_MAX_CANDIDATES)
+            .map(|p| (p.addr(), p.peer_pubkey()))
+            .collect();
+        if candidates.is_empty() {
+            return Err("tor: no clearnet-validated snap peer to dial over Tor (fail-closed)".into());
+        }
+        let deadline = tokio::time::Instant::now() + TOR_READ_DEADLINE;
+        let mut fallback: Option<VerifiedAccount> = None;
+        let mut last_err = String::new();
+        for (addr, pubkey) in candidates {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                last_err = "tor read deadline exceeded".to_string();
+                break;
+            }
+            // Bound each candidate's whole dial+read by the remaining budget.
+            let attempt = async {
+                let mut session =
+                    crate::el::tor::open_snap_session(&address, addr, pubkey, &self.eth_cfg).await?;
+                self.account_from_tor_session(&mut session, address).await
+            };
+            match tokio::time::timeout(remaining, attempt).await {
+                Ok(Ok(result)) => {
+                    if result.verify_method.is_some() || is_global_fail(result.fail_reason) {
+                        // Reward the peer that served over Tor (same bookkeeping the
+                        // clearnet path uses to keep good peers at the front).
+                        self.pool.record_snap_served(addr).await;
+                        return Ok(result);
+                    }
+                    self.pool.record_snap_failure(addr).await;
+                    fallback.get_or_insert(result);
+                }
+                Ok(Err(e)) => {
+                    self.pool.record_snap_failure(addr).await;
+                    last_err = e;
+                }
+                Err(_) => {
+                    self.pool.record_snap_failure(addr).await;
+                    last_err = format!("tor dial to {addr} exceeded the read budget");
+                }
+            }
+        }
+        fallback.map(Ok).unwrap_or_else(|| {
+            Err(format!("tor: all snap-peer dials failed to serve a verifiable account: {last_err}"))
+        })
+    }
+
+    /// One account fetch + beacon verdict over an already-connected Tor
+    /// [`EthSession`] (the [`get_account_from`] twin for the one-shot Tor path).
+    #[cfg(feature = "tor")]
+    async fn account_from_tor_session(
+        &self,
+        session: &mut crate::el::eth::session::EthSession<arti_client::DataStream>,
+        address: [u8; 20],
+    ) -> Result<VerifiedAccount, String> {
+        let (state_root, block_number) = fresh_head_session(session).await?;
+        let outcome = session.snap_get_account(&state_root, &address).await?;
+        let verdict = session
+            .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
+            .await;
+        Ok(self.build_verified_account(address, state_root, block_number, outcome, verdict))
     }
 
     /// Fetch + verify one storage slot. `holder` switches the key to the
@@ -2551,6 +2673,28 @@ async fn fresh_head(peer: &ManagedPeer) -> Result<([u8; 32], u64), String> {
     // rejects it as noPeerBlockNumber. Treat it as a failure so the retry loop
     // moves to a peer with a real head (junk/light-client nodes can negotiate
     // snap/1 yet still advertise genesis).
+    if head.header.number == 0 {
+        return Err("peer advertises a genesis head (block 0 — no current state)".to_string());
+    }
+    let state_root = head.header.state_root;
+    if state_root == [0u8; 32] {
+        return Err("peer head has no state root".to_string());
+    }
+    Ok((state_root, head.header.number))
+}
+
+/// Tor twin of [`fresh_head`] over an [`EthSession`] (same head-hash echo check
+/// and genesis-head rejection; the state root is beacon-anchored afterwards).
+#[cfg(feature = "tor")]
+async fn fresh_head_session(
+    session: &mut crate::el::eth::session::EthSession<arti_client::DataStream>,
+) -> Result<([u8; 32], u64), String> {
+    let head_hash = session.peer_status.best_hash;
+    let headers = session.get_block_headers_by_hash(&head_hash, 1).await?;
+    let head = headers.into_iter().next().ok_or("peer returned no head header")?;
+    if head.hash != head_hash {
+        return Err("peer returned a header not matching the requested hash".to_string());
+    }
     if head.header.number == 0 {
         return Err("peer advertises a genesis head (block 0 — no current state)".to_string());
     }

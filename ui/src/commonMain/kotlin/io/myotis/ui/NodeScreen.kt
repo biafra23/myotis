@@ -290,6 +290,7 @@ private fun SettingsTab(
     var strictFreshness by remember { mutableStateOf(settings.strictStateFreshness()) }
     var nativeBls by remember { mutableStateOf(settings.nativeBlsEnabled()) }
     var rustEngine by remember { mutableStateOf(settings.rustEngineEnabled()) }
+    var torRouting by remember { mutableStateOf(settings.torEnabled()) }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
@@ -441,6 +442,32 @@ private fun SettingsTab(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+
+        // Tor routing — Rust-engine-only (Arti is embedded there), so the row is disabled
+        // until the Rust engine is enabled above. Applies on the next network (re)start.
+        SwitchRow(
+            label = "Route reads over Tor (experimental)",
+            checked = torRouting && rustEngine,
+            enabled = rustEngine,
+            onChange = { on -> torRouting = on; settings.setTorEnabled(on); controller.applyTorMode() },
+        )
+        Text(
+            if (!rustEngine) {
+                "Enable the Rust engine first — Tor routing is built into the Rust engine only."
+            } else {
+                "Off (default): reads use the peer pool directly from your IP. On: route " +
+                    "account/balance reads over the Tor network (embedded Arti) so snap peers see " +
+                    "a Tor exit, not your IP — each address gets its own isolated circuit and a " +
+                    "fresh node identity. SCOPE: only account (balance/nonce) reads route over Tor " +
+                    "today; token-balance (storage), contract code, and eth_call/gas-estimation " +
+                    "still use your real IP — full coverage is a follow-up. HEADS-UP: earlier tests " +
+                    "were not very successful — many peers reject Tor exit IPs and :30303 exit " +
+                    "coverage is patchy, so reads can be slow (seconds to tens of seconds) or " +
+                    "fail-closed while this is on. Applies on the next network (re)start."
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         Text(
             "An RPC-port change reboots that chain; the snap-peer target and served-block " +
                 "window apply live to every running chain, and the readiness threshold persists " +
@@ -484,14 +511,22 @@ private fun SettingsTab(
 
 /** A label + right-aligned [Switch] row — the repeated toggle layout in [SettingsTab]. */
 @Composable
-private fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+private fun SwitchRow(
+    label: String,
+    checked: Boolean,
+    enabled: Boolean = true,
+    onChange: (Boolean) -> Unit,
+) {
     Row(
         Modifier.fillMaxWidth().padding(top = 4.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(label)
-        Switch(checked = checked, onCheckedChange = onChange)
+        Text(
+            label,
+            color = if (enabled) Color.Unspecified else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Switch(checked = checked, enabled = enabled, onCheckedChange = onChange)
     }
 }
 
@@ -675,6 +710,20 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         })
         StatusRow("Beacon", s.beaconState)
         StatusRow("EL block", s.executionBlockNumber.toString())
+        // Tor verified-read routing (docs/privacy-and-tor.md) — shown only when it
+        // applies (Rust engine + a Tor-capable build); see NodeSnapshot.tor.
+        s.tor?.let { mode ->
+            StatusRow(
+                "Tor",
+                when (mode) {
+                    "active" -> "routing reads (circuit ready)"
+                    "on" -> "on — circuit bootstrapping…"
+                    "off" -> "off"
+                    else -> mode
+                },
+                color = if (mode == "active") MaterialTheme.colorScheme.primary else null,
+            )
+        }
         StatusRow("CL peers", "served ${s.clServedPeersLastMin}/min, con ${s.clConnectedPeers}")
         // Same total-first shape as the cache rows (the pool holds only ready
         // peers, so the total IS the ready count).

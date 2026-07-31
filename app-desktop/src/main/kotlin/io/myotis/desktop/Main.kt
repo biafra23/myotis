@@ -43,6 +43,13 @@ fun main() {
     if (System.getProperty(io.myotis.engines.Engines.PROP) == null) {
         controller.applyEngineChoice()
     }
+    // Apply the Tor preference (docs/privacy-and-tor.md) after the engine choice so it lands
+    // on the Rust engine it requires. Unlike the engine choice (which SelectorEngine reads
+    // directly), the Rust Tor flag must be PUSHED to the native library — so always call it,
+    // with an explicit -Dmyotis.tor winning over the persisted toggle.
+    System.getProperty(io.myotis.engines.Tor.PROP)?.let {
+        io.myotis.engines.Tor.select(it.toBoolean())
+    } ?: controller.applyTorMode()
     val history = DesktopQueryHistory(dataDir.resolve("query-history.tsv"))
     settings.enabledNetworks().forEach(controller::startNetwork)
 
