@@ -4,9 +4,10 @@
 # Setup (one-time, repo admin):
 #   1. Install the Claude GitHub App on this repo (github.com/apps/claude, or
 #      run /install-github-app from the Claude Code CLI).
-#   2. Add the ANTHROPIC_API_KEY repo secret (or swap the input below for
-#      claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }} to bill
-#      a Claude subscription instead of the API).
+#   2. Add the CLAUDE_CODE_OAUTH_TOKEN repo secret (from `claude setup-token`) —
+#      reviews bill the Claude subscription and share its usage limits. To bill
+#      API credits instead, swap the input below for
+#      anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}.
 #
 # Scope decisions:
 #   - Reviews once per PR (opened / reopened / ready_for_review), NOT on every
@@ -38,7 +39,7 @@ jobs:
 
       - uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
