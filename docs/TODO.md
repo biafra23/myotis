@@ -52,8 +52,9 @@ merge blockers; each should either be fixed or consciously dropped.
   step. Whichever PR merges second sweeps them; if #262 goes first, #261 can
   drop the workflow workaround step entirely.
 
-## From PR #262 — data_dir creation (asked of the author in review; track in
-case they don't land there)
+## From PR #262 — data_dir creation
+
+Asked of the author in review; tracked here in case they don't land there.
 
 - [ ] **Stale `create()` doc contract.** The doc comment on
   `rust/myotis-engine/src/host.rs` `create()` lists `CREATE_FAILED` causes as
