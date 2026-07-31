@@ -28,6 +28,9 @@ uniffi::setup_scaffolding!();
 /// wrapper's availability probe (`engine_init`) additionally compares this coarse
 /// version for its log line. The iOS C ABI (`capi`) still relies on it directly.
 ///
+/// (History below predates the UniFFI swap — the `nativeXxx` names refer to the
+/// deleted hand-JNI natives; today's equivalents live in `ffi.rs`.)
+///
 /// v2: added the hosting surface (nativeCreate/Start/StatusJson/Stop).
 /// v4: added the EL verified-read surface (nativeRequestAccountJson,
 ///     nativeGetStorageProofJson), wired into the Java RustEngineNative /

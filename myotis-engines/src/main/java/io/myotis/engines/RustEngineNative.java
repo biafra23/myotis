@@ -21,9 +21,12 @@ import uniffi.myotis_engine.Myotis_engineKt;
  * <p>Load order: an explicit absolute path in {@code -Dmyotis.engine.lib=...} (how the
  * desktop `run` task injects the dev build) is forwarded to the bindings via UniFFI's
  * {@code uniffi.component.myotis_engine.libraryOverride} property; otherwise JNA
- * resolves {@code myotis_engine} (jna.library.path, system paths, and the
- * System.loadLibrary fallback that honors java.library.path on the daemon; bundled
- * jniLibs on Android).
+ * resolves {@code myotis_engine} from {@code jna.library.path} + system paths — it
+ * does NOT consult {@code java.library.path}, so {@link #load()} mirrors that
+ * property into {@code jna.library.path} when the latter is unset (the daemon's run
+ * task and the module's tests point java.library.path at the cargo build dir). A
+ * host that sets {@code jna.library.path} itself owns the full search path. On
+ * Android JNA resolves the bundled jniLibs on its own.
  *
  * <p>Every method keeps the old hand-JNI null tolerance: null String arguments are
  * normalized to {@code ""} (the Rust side used {@code unwrap_or_default}) — except
@@ -63,17 +66,31 @@ final class RustEngineNative {
             }
         }
         try {
-            // First call into the bindings loads the library AND runs UniFFI's contract
-            // + per-function checksum validation — a stale/mismatched .so throws here
-            // instead of segfaulting on a reshaped symbol at first use.
+            // Run UniFFI's integrity gate FIRST: uniffiEnsureInitialized() loads the
+            // library and validates the bindings-contract version plus a per-function
+            // API checksum against the loaded .so. It must be called explicitly —
+            // plain binding calls like engineInit() register the functions WITHOUT
+            // checksum validation, so skipping this line would let a reshaped symbol
+            // segfault at first use instead of failing loudly here.
+            Myotis_engineKt.uniffiEnsureInitialized();
             int abi = Myotis_engineKt.engineInit();
             if (abi != EXPECTED_ABI_VERSION) {
                 log.warn("[engines] libmyotis_engine ABI {} != expected {} (stale library?); "
                         + "Rust engine unavailable", abi, EXPECTED_ABI_VERSION);
                 return false;
             }
-        } catch (Throwable t) {
+        } catch (UnsatisfiedLinkError e) {
+            // The normal cargo-less case: no library on the search path (or one so old
+            // it predates UniFFI and lacks the uniffi_* symbols entirely).
             log.info("[engines] libmyotis_engine not loaded ({}); Rust engine unavailable",
+                    e.toString());
+            return false;
+        } catch (Throwable t) {
+            // Library FOUND but failed UniFFI's contract/checksum validation (stale or
+            // reshaped .so) — louder than the missing-library case on purpose.
+            log.warn("[engines] libmyotis_engine failed UniFFI validation ({}); "
+                    + "Rust engine unavailable — rebuild the library (cargoBuildHost / "
+                    + "cargoNdkAndroid) or regenerate the bindings (uniffiGenerateKotlin)",
                     t.toString());
             return false;
         }
@@ -82,7 +99,16 @@ final class RustEngineNative {
     }
 
     private static String nz(String s) {
-        return s == null ? "" : s;
+        return s == null || !wellFormed(s) ? "" : s;
+    }
+
+    /** The old hand-JNI surface degraded malformed UTF-16 (unpaired surrogates —
+     *  attacker-reachable via JSON-RPC string params) to an absent/empty string on
+     *  the Rust side (CESU-8 decode failure → {@code unwrap_or_default}). The
+     *  generated bindings instead throw {@code MalformedInputException} from their
+     *  UTF-8 lowering; probe first so the pre-UniFFI semantics keep holding. */
+    private static boolean wellFormed(String s) {
+        return java.nio.charset.StandardCharsets.UTF_8.newEncoder().canEncode(s);
     }
 
     /** ABI handshake; returns the library's compiled-in ABI version. */
@@ -103,7 +129,7 @@ final class RustEngineNative {
     /** Canonical name for a name/alias, or null when unknown. */
     static String nativeCanonicalNetworkName(String nameOrAlias) {
         if (nameOrAlias == null) return null;
-        return Myotis_engineKt.canonicalNetworkName(nameOrAlias);
+        return Myotis_engineKt.canonicalNetworkName(nz(nameOrAlias));
     }
 
     // ---- Hosting surface. See RustChainHandle / RustMyotisEngine. ----
@@ -111,7 +137,9 @@ final class RustEngineNative {
     /** Allocate a not-yet-started handle (id ≥ 1, or a negative failure sentinel). */
     static long nativeCreate(String network, String dataDir) {
         if (network == null) return -1;
-        return Myotis_engineKt.createHandle(network, nz(dataDir));
+        // nz also degrades malformed UTF-16 to "" → unknown network → CREATE_FAILED,
+        // the old shim's behavior.
+        return Myotis_engineKt.createHandle(nz(network), nz(dataDir));
     }
 
     /** Start the sync loop for a created handle. True on success. */
@@ -157,7 +185,9 @@ final class RustEngineNative {
      *  ERC-20 mapping key {@code keccak256(pad32(holder) ‖ uint256(slot))}. */
     static String nativeGetStorageProofJson(
             long handle, String address, long slot, String holderOrNull) {
-        return Myotis_engineKt.getStorageProofJson(handle, nz(address), slot, holderOrNull);
+        // Malformed holder → null, matching the old shim (decode failure → None).
+        String holder = (holderOrNull != null && wellFormed(holderOrNull)) ? holderOrNull : null;
+        return Myotis_engineKt.getStorageProofJson(handle, nz(address), slot, holder);
     }
 
     /** Verified contract-code query (`eth_getCode`) as JSON. */

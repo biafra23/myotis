@@ -175,6 +175,22 @@ kotlin {
     jvmToolchain(21)
 }
 
+// Rewrite every net.java.dev.jna:jna graph edge (transitive jar requests from
+// :myotis-engines and Besu included) to the Android aar variant, so exactly ONE
+// JNA — classes + libjnidispatch.so — lands in the APK. See the jna dependency
+// note below for why neither per-edge nor configuration-wide excludes can do this.
+configurations.all {
+    resolutionStrategy.dependencySubstitution {
+        substitute(module("net.java.dev.jna:jna"))
+            .using(variant(module("net.java.dev.jna:jna:${libs.versions.jna.get()}")) {
+                attributes {
+                    attribute(Attribute.of("artifactType", String::class.java), "aar")
+                }
+            })
+            .because("Android needs the aar variant; jar+aar together fail the duplicate-class check")
+    }
+}
+
 dependencies {
     testImplementation("junit:junit:4.13.2")
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.3")
@@ -208,11 +224,11 @@ dependencies {
     // Engine selector: NodeService.ENGINE is Engines.engine(); the Settings "Rust
     // engine" toggle drives it via NodeService.applyEngineChoice.
     implementation(project(":myotis-engines"))
-    // JNA's Android artifact: the UniFFI-generated bindings in :myotis-engines load
-    // libmyotis_engine through JNA, and only the @aar variant packages the
-    // libjnidispatch.so natives the Android runtime needs. Same version as the
-    // catalog's plain-JVM `jna` (Gradle conflict-resolves to this variant here).
-    implementation("net.java.dev.jna:jna:5.17.0@aar")
+    // JNA (the UniFFI bindings' loader) arrives transitively via :myotis-engines
+    // and Besu; the substitution above turns those jar edges into the Android
+    // aar variant (classes + libjnidispatch.so), so no direct declaration is
+    // needed here — adding an explicit `@aar` artifact would re-introduce a
+    // duplicate of the substituted artifact and fail the duplicate-class check.
     // TrueBlocks tx-history scan for the Query tab (documented API-boundary exemption:
     // NodeService reaches the raw connector via SelectorEngine.javaDelegate().debugStack).
     // Java-21 classfiles like :networking — already dexed fine (see libs.versions.toml).
