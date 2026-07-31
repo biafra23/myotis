@@ -32,6 +32,12 @@ cd "$here"
 # libs load on Android 15+ devices with 16 KB memory pages.
 cargo ndk -t arm64-v8a -t x86_64 -o "$jniLibs" build --release -p myotis-bls -p myotis-engine
 
+# cargo-ndk copies EVERY dynamic library the build graph produces, including
+# hash-named dependency artifacts (e.g. libif_watch-<hash>.so) that
+# libmyotis_engine.so does not link against (its only NEEDED entries are
+# libc/libm/libdl). Keep jniLibs to exactly the libs we ship.
+find "$jniLibs" -name '*.so' ! -name 'libmyotis_*.so' -delete
+
 echo "built:"
 find "$jniLibs" -name 'libmyotis_*.so' -exec ls -la {} \;
 
@@ -43,7 +49,9 @@ echo "checking 16 KB alignment:"
 python3 - "$jniLibs" <<'PY'
 import struct, sys, glob, os
 bad = []
-for f in glob.glob(os.path.join(sys.argv[1], "*", "libmyotis_*.so")):
+# *.so, not libmyotis_*.so: anything that survives the prune above must at
+# least pass the alignment gate rather than ship unchecked.
+for f in glob.glob(os.path.join(sys.argv[1], "*", "*.so")):
     with open(f, "rb") as fh:
         d = fh.read()
     if d[:4] != b"\x7fELF":
