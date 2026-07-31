@@ -790,3 +790,13 @@ DNS resolution is best-effort: on timeout, missing TXT records, or signature mis
 - **BouncyCastle** -- SECP256K1 crypto provider
 - **jvm-libp2p** -- beacon chain P2P networking (consensus module)
 - **dnsjava 3.6** -- TXT-record resolution for EIP-1459 ENR tree walks
+
+## License
+
+Myotis is licensed under the [Apache License, Version 2.0](LICENSE).
+
+Copyright 2026 Dirk Jäckel.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in Myotis shall be licensed under Apache 2.0 as
+above, without any additional terms or conditions.
