@@ -36,7 +36,7 @@ cargo ndk -t arm64-v8a -t x86_64 -o "$jniLibs" build --release -p myotis-bls -p 
 # hash-named dependency artifacts (e.g. libif_watch-<hash>.so) that
 # libmyotis_engine.so does not link against (its only NEEDED entries are
 # libc/libm/libdl). Keep jniLibs to exactly the libs we ship.
-find "$jniLibs" -name '*.so' ! -name 'libmyotis_*.so' -delete
+find "$jniLibs" -name '*.so' ! -name 'libmyotis_*.so' -print -delete
 
 echo "built:"
 find "$jniLibs" -name 'libmyotis_*.so' -exec ls -la {} \;
@@ -51,7 +51,13 @@ import struct, sys, glob, os
 bad = []
 # *.so, not libmyotis_*.so: anything that survives the prune above must at
 # least pass the alignment gate rather than ship unchecked.
-for f in glob.glob(os.path.join(sys.argv[1], "*", "*.so")):
+files = glob.glob(os.path.join(sys.argv[1], "*", "*.so"))
+if not files:
+    # Zero matches means jniLibs is empty/stale (wrong path, or cargo-ndk's
+    # output layout changed) — a vacuous pass here would green-light a build
+    # with no libs at all.
+    sys.exit(f"FAIL: no .so files found under {sys.argv[1]}")
+for f in files:
     with open(f, "rb") as fh:
         d = fh.read()
     if d[:4] != b"\x7fELF":
