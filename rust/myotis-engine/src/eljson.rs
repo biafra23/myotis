@@ -1486,3 +1486,43 @@ mod tests {
         assert_eq!(be_to_decimal(&big), "18446744073709551616");
     }
 }
+
+/// eth_getLogs result: a JSON array whose per-log shape matches the log
+/// objects `receipt_json` emits (address/topics/data/blockNumber/blockHash/
+/// transactionHash/transactionIndex/logIndex/removed) — one shape for logs
+/// everywhere, golden-pinned.
+pub fn get_logs_json(logs: &[myotis_net::el::logindex::StoredLog]) -> String {
+    let mut s = String::with_capacity(2 + logs.len() * 256);
+    s.push('[');
+    for (k, log) in logs.iter().enumerate() {
+        if k > 0 {
+            s.push(',');
+        }
+        s.push_str("{\"address\":\"");
+        s.push_str(&hex0x_var(&log.address));
+        s.push_str("\",\"topics\":[");
+        for (t, topic) in log.topics.iter().enumerate() {
+            if t > 0 {
+                s.push(',');
+            }
+            s.push('"');
+            s.push_str(&hex0x(topic));
+            s.push('"');
+        }
+        s.push_str("],\"data\":\"");
+        s.push_str(&hex0x_var(&log.data));
+        s.push_str("\",\"blockNumber\":\"");
+        s.push_str(&hex_quantity(log.block_number));
+        s.push_str("\",\"blockHash\":\"");
+        s.push_str(&hex0x(&log.block_hash));
+        s.push_str("\",\"transactionHash\":\"");
+        s.push_str(&hex0x(&log.tx_hash));
+        s.push_str("\",\"transactionIndex\":\"");
+        s.push_str(&hex_quantity(u64::from(log.tx_index)));
+        s.push_str("\",\"logIndex\":\"");
+        s.push_str(&hex_quantity(u64::from(log.log_index)));
+        s.push_str("\",\"removed\":false}");
+    }
+    s.push(']');
+    s
+}

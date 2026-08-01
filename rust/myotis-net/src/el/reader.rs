@@ -672,6 +672,12 @@ impl ElReader {
         true
     }
 
+    /// The beacon-anchored head block number, if the anchor is ready — the
+    /// resolution target for `latest`-style tags in eth_getLogs filters.
+    pub fn head_block_number(&self) -> Option<u64> {
+        self.anchored_head().ok().map(|(n, _)| n)
+    }
+
     /// Run `f` against the index if one is configured. The single accessor
     /// for queries and status — callers never touch the lock directly.
     pub fn with_log_index<T>(&self, f: impl FnOnce(&crate::el::logindex::LogIndex) -> T) -> Option<T> {

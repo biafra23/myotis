@@ -1874,3 +1874,191 @@ mod tests {
         assert!(v["error"].as_str().unwrap().contains("invalid holder"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// eth_getLogs (docs/eth-getlogs-design.md): watch-list config install, index
+// status, and the coverage-honest query. All JSON in / JSON out, panic-free.
+// ---------------------------------------------------------------------------
+
+/// Install the watch-list config: `{"enabled":bool,"watch":[{"address":"0x..",
+/// "fromBlock":n,"topic0s":["0x..",..]?}]}`. False on malformed input,
+/// duplicate addresses, or an unavailable reader.
+pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(config_json) else {
+        return false;
+    };
+    let enabled = v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
+    let mut watch = Vec::new();
+    if let Some(entries) = v.get("watch").and_then(|w| w.as_array()) {
+        for e in entries {
+            let Some(address) = e.get("address").and_then(|a| a.as_str()).and_then(parse_address) else {
+                return false;
+            };
+            let Some(from_block) = e.get("fromBlock").and_then(|b| b.as_u64()) else {
+                return false;
+            };
+            let mut topic0s = Vec::new();
+            if let Some(ts) = e.get("topic0s").and_then(|t| t.as_array()) {
+                for t in ts {
+                    let Some(w32) = t.as_str().and_then(parse_word32) else {
+                        return false;
+                    };
+                    topic0s.push(w32);
+                }
+            }
+            watch.push(myotis_net::el::logindex::WatchEntry { address, from_block, topic0s });
+        }
+    }
+    let Some(engine) = engine() else {
+        return false;
+    };
+    let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
+        return false;
+    };
+    reader.set_log_index_config(myotis_net::el::logindex::LogIndexConfig { enabled, watch })
+}
+
+/// Index status for hosts/UI: enabled, log count, backfill cursor, and per
+/// watch entry the covered span (absent while nothing is indexed).
+pub fn log_index_status_json(handle: i64) -> String {
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
+        return eljson::error_json("node is not running");
+    };
+    let status = reader.with_log_index(|ix| {
+        let mut s = String::from("{\"enabled\":");
+        s.push_str(if ix.config().enabled { "true" } else { "false" });
+        s.push_str(",\"logCount\":");
+        s.push_str(&ix.log_count().to_string());
+        if let Some((n, _)) = ix.cursor {
+            s.push_str(",\"backfillCursor\":");
+            s.push_str(&n.to_string());
+        }
+        s.push_str(",\"entries\":[");
+        for (k, (w, c)) in ix.coverage_entries().iter().enumerate() {
+            if k > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"address\":\"0x");
+            for b in &w.address {
+                let _ = std::fmt::Write::write_fmt(&mut s, format_args!("{b:02x}"));
+            }
+            s.push_str("\",\"fromBlock\":");
+            s.push_str(&w.from_block.to_string());
+            if let Some((low, high)) = c.span {
+                s.push_str(",\"coveredLow\":");
+                s.push_str(&low.to_string());
+                s.push_str(",\"coveredHigh\":");
+                s.push_str(&high.to_string());
+            }
+            s.push('}');
+        }
+        s.push_str("]}");
+        s
+    });
+    status.unwrap_or_else(|| "{\"enabled\":false,\"logCount\":0,\"entries\":[]}".to_string())
+}
+
+/// Resolve an eth_getLogs block tag: hex quantity, or latest/pending/safe →
+/// anchored head, finalized → finalized block. None = unresolvable now.
+fn resolve_block_tag(reader: &myotis_net::el::reader::ElReader, tag: Option<&serde_json::Value>, default_head: u64) -> Option<u64> {
+    match tag.and_then(|t| t.as_str()) {
+        None => Some(default_head),
+        Some("latest") | Some("pending") | Some("safe") => Some(default_head),
+        Some("finalized") => Some(reader.finalized_block_number()),
+        Some(hex) => {
+            let stripped = hex.strip_prefix("0x")?;
+            u64::from_str_radix(stripped, 16).ok()
+        }
+    }
+}
+
+/// The eth_getLogs query. Returns the log array ONLY when the requested
+/// range is inside indexed coverage; every other case is `{"error": ...}`
+/// (the router maps it to strict -32000) — never an empty array for an
+/// unindexed range.
+pub fn get_logs_json(handle: i64, filter_json: &str) -> String {
+    use myotis_net::el::logindex::{LogFilter, QueryError};
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(filter_json) else {
+        return eljson::error_json("malformed filter");
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
+        return eljson::error_json("node is not running");
+    };
+    let Some(head) = reader.head_block_number() else {
+        return eljson::error_json("no verified head yet");
+    };
+    let (Some(from_block), Some(to_block)) = (
+        resolve_block_tag(&reader, v.get("fromBlock"), head),
+        resolve_block_tag(&reader, v.get("toBlock"), head),
+    ) else {
+        return eljson::error_json("unresolvable block tag");
+    };
+    // address: single string or array; both are required to be present —
+    // a scoped index cannot serve address-less queries.
+    let mut addresses = Vec::new();
+    match v.get("address") {
+        Some(serde_json::Value::String(a)) => match parse_address(a) {
+            Some(a) => addresses.push(a),
+            None => return eljson::error_json("malformed address"),
+        },
+        Some(serde_json::Value::Array(items)) => {
+            for a in items {
+                match a.as_str().and_then(parse_address) {
+                    Some(a) => addresses.push(a),
+                    None => return eljson::error_json("malformed address"),
+                }
+            }
+        }
+        _ => return eljson::error_json("eth_getLogs without an address is not served by this scoped index"),
+    }
+    // topics: positional array of null | "0x.." | ["0x..",..].
+    let mut topics: Vec<Vec<[u8; 32]>> = Vec::new();
+    if let Some(ts) = v.get("topics").and_then(|t| t.as_array()) {
+        for t in ts {
+            match t {
+                serde_json::Value::Null => topics.push(Vec::new()),
+                serde_json::Value::String(one) => match parse_word32(one) {
+                    Some(w) => topics.push(vec![w]),
+                    None => return eljson::error_json("malformed topic"),
+                },
+                serde_json::Value::Array(alts) => {
+                    let mut ors = Vec::new();
+                    for a in alts {
+                        match a.as_str().and_then(parse_word32) {
+                            Some(w) => ors.push(w),
+                            None => return eljson::error_json("malformed topic"),
+                        }
+                    }
+                    topics.push(ors);
+                }
+                _ => return eljson::error_json("malformed topics"),
+            }
+        }
+    }
+    let filter = LogFilter { from_block, to_block, addresses, topics };
+    let result = reader.with_log_index(|ix| ix.query(&filter));
+    match result {
+        None => eljson::error_json("log index is not configured on this network"),
+        Some(Ok(logs)) => eljson::get_logs_json(&logs),
+        Some(Err(QueryError::Disabled)) => eljson::error_json("log index is disabled on this network"),
+        Some(Err(QueryError::UnwatchedAddress(_))) => {
+            eljson::error_json("address is not on this node's log watch-list")
+        }
+        Some(Err(QueryError::UnindexedTopic(_))) => {
+            eljson::error_json("topic is outside this node's indexed signatures for that address")
+        }
+        Some(Err(QueryError::OutOfCoverage { covered, .. })) => match covered.span {
+            Some((low, high)) => eljson::error_json(&format!(
+                "requested range is not indexed yet (covered: {low}-{high}); retry as the index catches up"
+            )),
+            None => eljson::error_json("log index has not indexed any blocks yet; retry"),
+        },
+        Some(Err(QueryError::Unanswerable)) => eljson::error_json("unanswerable filter (from > to)"),
+    }
+}

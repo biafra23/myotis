@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 20; // 20: + set_tor_enabled/tor_status (Tor)
+    static final int EXPECTED_ABI_VERSION = 21; // 21: + eth_getLogs watch-list index trio
 
     private static final boolean AVAILABLE = load();
 
