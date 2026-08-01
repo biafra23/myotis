@@ -239,6 +239,31 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      *  in flight at once. Each value is a small return blob, so this is low-MB. */
     private static final int CALL_RESULT_CACHE_MAX = 512;
 
+    // Replay-warm of the wallet's recurring eth_call shapes (see HotCallTracker and
+    // replayHotCalls): after each head build, the shapes the wallet keeps sending are
+    // re-executed in the background so its next poll — pinned to the block number WE
+    // handed out — replays from callResultCache instead of paying the full EVM +
+    // snap-fetch cost inside its own deadline (observed live: Kohaku's 67KB Multicall3
+    // sweep at p50≈90s / p90≈114s against the 120s timeout, failing nearly every poll).
+    /** Distinct call shapes remembered (LRU). A wallet cycles through a handful. */
+    private static final int HOT_CALL_MAX_TRACKED = 16;
+    /** Sightings before a shape is warmed — a one-off call is never replayed. */
+    private static final int HOT_CALL_MIN_HITS = 2;
+    /** A shape not seen for this long stops being warmed (wallet moved on / closed). */
+    private static final long HOT_CALL_TTL_MS = 10 * 60_000;
+    /** Warms kicked off per head build. Bounds background EVM/snap load; the heavy
+     *  hitters are what matter and there are only a few of them. */
+    private static final int HOT_CALL_MAX_WARMED_PER_HEAD = 4;
+    /** Per-shape calldata cap for tracking (the observed sweeps are 32-67KB). */
+    private static final int HOT_CALL_MAX_CALLDATA = 256 * 1024;
+    /** An in-flight warm older than this counts as dead (its queue slot was likely
+     *  dropped), so the shape becomes warmable again. Above the RPC call timeout so
+     *  a legitimately-slow warm is never doubled up on. */
+    private static final long HOT_CALL_WARM_TIMEOUT_MS = RPC_CALL_TIMEOUT_SEC * 1000 + 30_000;
+    /** After a FAILED warm, leave the shape alone this long — a call that just
+     *  demonstrated it can't complete must not turn the warmer into a retry storm. */
+    private static final long HOT_CALL_FAILURE_BACKOFF_MS = 30_000;
+
     // EVM pool. Was a single thread ("EVM is CPU-bound, oracle pinned to one
     // peer") — but the oracle rotates across peers now, and an EVM task spends
     // most of its wall-clock BLOCKED on snap fetch waves, not executing. A wallet
@@ -426,6 +451,15 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     private final VerifiedResultCache<byte[]> callResultCache =
             new VerifiedResultCache<>(CALL_RESULT_CACHE_MAX, CALL_RESULT_CACHE_TTL_MS);
 
+    /** The wallet's recurring eth_call shapes, replayed against each fresh head so
+     *  its polls hit {@link #callResultCache} — see the HOT_CALL_* constants and
+     *  {@link #replayHotCalls}. */
+    private final HotCallTracker hotCalls = new HotCallTracker(
+            HOT_CALL_MAX_TRACKED, HOT_CALL_MIN_HITS, HOT_CALL_TTL_MS,
+            HOT_CALL_MAX_CALLDATA, HOT_CALL_WARM_TIMEOUT_MS, HOT_CALL_FAILURE_BACKOFF_MS);
+    /** {@link #REPLAY_WARM_PROP}, read once at construction. */
+    private final boolean replayWarmEnabled;
+
     /** Replayable eth_estimateGas results, keyed by {@code stateRoot:from:to:keccak(data):value}.
      *  Same rationale as {@link #callResultCache}: an estimate is deterministic given the
      *  anchored state, and estimateGas is a gating call on the confirm screen, so a retry
@@ -558,6 +592,11 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      *  before building its stacks). See OPTIMISATIONS_AND_LIMITATIONS.md §2.14. */
     public static final String STRICT_STATE_FRESHNESS_PROP = "myotis.rpc.strictStateFreshness";
 
+    /** System property controlling the hot-call replay-warm (see {@link #replayHotCalls}).
+     *  Default ON; set {@code -Dmyotis.rpc.replayWarm=false} to disable the background
+     *  re-execution of recurring wallet calls after each head build. */
+    public static final String REPLAY_WARM_PROP = "myotis.rpc.replayWarm";
+
     /** Max age a stale-but-anchored head may have and still be served for a STATE-execution
      *  read (eth_call / getBalance / getCode / getStorageAt / estimateGas). STRICT BY DEFAULT
      *  (the tight 2-min {@link #RPC_STATE_HEAD_MAX_STALE_MS} bound) so a read fast-fails when
@@ -601,6 +640,11 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 strictFreshness ? RPC_STATE_HEAD_MAX_STALE_MS : RPC_HEAD_SERVE_STALE_MAX_MS;
         this.log.info("[rpc] state-read head staleness cap = " + (stateHeadStaleCapMs / 1000)
                 + "s (" + (strictFreshness ? "strict" : "relaxed") + ")");
+        this.replayWarmEnabled = Boolean.parseBoolean(
+                System.getProperty(REPLAY_WARM_PROP, "true"));
+        if (!replayWarmEnabled) {
+            this.log.info("[rpc] hot-call replay-warm disabled (" + REPLAY_WARM_PROP + "=false)");
+        }
         final RpcClock clk = this.clock;
         final RpcLogger lg = this.log;
         this.evmPool = task -> {
@@ -1403,6 +1447,9 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         // confirm-critical contracts at this root so a wallet's first
                         // confirm-screen calls start from warm state — see the method doc.
                         primeConfirmContracts(ctx);
+                        // ...then replay the wallet's recurring calls against this head
+                        // (async, heavy lane) so its next poll hits the result cache.
+                        replayHotCalls(ctx);
                     } catch (Throwable t) {
                         f.completeExceptionally(t);
                         synchronized (rpcCallCtxLock) {
@@ -1904,6 +1951,12 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         ? Bytes.wrap(data, 0, 4).toHexString() : "0x")
                 + " dataLen=" + (data == null ? 0 : data.length)
                 + " block=" + block;
+        // Track the shape for the replay-warm BEFORE head resolution: the calls most
+        // worth warming are exactly the ones currently failing ("no verified head",
+        // deadline timeouts) — they must still count as sightings.
+        if (replayWarmEnabled && to != null && to.length == 20) {
+            hotCalls.record(from, to, value, data, clock.elapsedMillis());
+        }
         RpcCallContext h = verifiedHeadFor(block);
         if (h == null || to == null || to.length != 20) {
             log.info("[rpc] eth_call " + desc + " -> no verified head for block tag");
@@ -1925,11 +1978,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         // Key by (stateRoot, from, to, value, calldata): the sender and value are now
         // part of the input — a transfer simulated by vitalik vs by the zero address
         // computes a DIFFERENT verified result, so they must not share an execution.
-        String flightKey = Bytes.wrap(h.blockCtx().stateRoot()).toHexString()
-                + ":" + (from == null ? "0x0" : Bytes.wrap(from).toHexString())
-                + ":" + Bytes.wrap(to).toHexString()
-                + ":" + (value == null ? "0" : value.toString())
-                + ":" + (data == null ? "0x" : Hash.keccak256(Bytes.wrap(data)).toHexString());
+        String flightKey = callFlightKey(h, from, to, value, data);
         // Warm-result replay: a prior execution for this exact (root, target, calldata)
         // already produced a verified answer — possibly one whose original waiter timed
         // out but whose background leader finished and populated the cache. Replay it; the
@@ -2018,6 +2067,95 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      *  distinct concurrent calls a wallet makes (~tens). */
     private final Map<String, CompletableFuture<byte[]>> inflightCalls =
             new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** The eth_call dedup/replay key: (stateRoot, from, to, value, keccak(calldata)).
+     *  Shared by the wallet path ({@code rpcCall}) and the replay-warm
+     *  ({@link #replayHotCalls}) so a warmed result is found by the wallet's
+     *  identical call. Null and empty calldata key identically — they are the same
+     *  execution (callView substitutes an empty array for null). */
+    private String callFlightKey(RpcCallContext h, byte[] from, byte[] to,
+                                 java.math.BigInteger value, byte[] data) {
+        return Bytes.wrap(h.blockCtx().stateRoot()).toHexString()
+                + ":" + (from == null ? "0x0" : Bytes.wrap(from).toHexString())
+                + ":" + Bytes.wrap(to).toHexString()
+                + ":" + (value == null ? "0" : value.toString())
+                + ":" + (data == null || data.length == 0
+                        ? "0x" : Hash.keccak256(Bytes.wrap(data)).toHexString());
+    }
+
+    /**
+     * Replay the wallet's recurring eth_call shapes against a freshly-built head, so
+     * its next poll — pinned to the block number we hand out via eth_blockNumber —
+     * replays from {@link #callResultCache} in microseconds instead of executing
+     * inside its own deadline. Kicked off from the head-build thread right after
+     * {@link #primeConfirmContracts}; the executions themselves run on the heavy EVM
+     * lane (never the reserved interactive lane) and are registered in
+     * {@link #inflightCalls}, so a wallet call arriving mid-warm dedupes onto the
+     * warm execution instead of doubling the snap load. Trust-neutral: this is the
+     * exact verified execution path a wallet-triggered call takes, just earlier.
+     * Best-effort: failures only start the per-shape backoff (see HotCallTracker).
+     */
+    private void replayHotCalls(RpcCallContext ctx) {
+        if (!replayWarmEnabled) return;
+        List<HotCallTracker.HotCall> shapes =
+                hotCalls.beginWarmables(clock.elapsedMillis(), HOT_CALL_MAX_WARMED_PER_HEAD);
+        for (HotCallTracker.HotCall c : shapes) {
+            boolean submitted = false;
+            try {
+                byte[] from = c.from();
+                byte[] to = c.to();
+                byte[] data = c.data();
+                String flightKey = callFlightKey(ctx, from, to, c.value(), data);
+                if (callResultCache.get(flightKey, clock.elapsedMillis()) != null) {
+                    continue;   // already warm at this root
+                }
+                CompletableFuture<byte[]> mine = new CompletableFuture<>();
+                if (inflightCalls.putIfAbsent(flightKey, mine) != null) {
+                    continue;   // a wallet call is already executing this very shape+root
+                }
+                String desc = "to=" + Bytes.wrap(to).toHexString()
+                        + " sel=" + (data.length >= 4 ? Bytes.wrap(data, 0, 4).toHexString() : "0x")
+                        + " dataLen=" + data.length + " block #" + ctx.blockNumber();
+                long t0 = clock.elapsedMillis();
+                final HotCallTracker.HotCall shape = c;
+                ctx.offchainExecutor()
+                        .callView(from == null ? null : io.myotis.evm.Address.of(from),
+                                io.myotis.evm.Address.of(to), data, c.value(), ctx.blockCtx())
+                        // The warm has no waiter to give up on it, so bound it explicitly —
+                        // otherwise a dropped queue slot would leave the inflightCalls entry
+                        // and the per-shape warm flag stuck forever.
+                        .orTimeout(HOT_CALL_WARM_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                        .whenComplete((out, ex) -> {
+                            try {
+                                if (ex != null) {
+                                    mine.completeExceptionally(ex);
+                                    log.info("[rpc] warm eth_call " + desc + " -> error after "
+                                            + (clock.elapsedMillis() - t0) + "ms: "
+                                            + describeEvmError(ex));
+                                } else {
+                                    // Same clone rationale as the rpcCall leader: never cache
+                                    // an array a waiter also received.
+                                    callResultCache.put(flightKey,
+                                            out != null ? out.clone() : null, clock.elapsedMillis());
+                                    mine.complete(out);
+                                    log.info("[rpc] warm eth_call " + desc + " ok in "
+                                            + (clock.elapsedMillis() - t0) + "ms");
+                                }
+                            } finally {
+                                inflightCalls.remove(flightKey, mine);
+                                hotCalls.endWarm(shape, ex == null, clock.elapsedMillis());
+                            }
+                        });
+                submitted = true;
+            } catch (Throwable t) {
+                log.info("[rpc] warm eth_call submit failed: " + unwrap(t));
+            } finally {
+                // Shapes that never started an execution (cache hit / already in flight /
+                // sync throw) must release their warm mark so the next head retries them.
+                if (!submitted) hotCalls.endWarm(c, true, clock.elapsedMillis());
+            }
+        }
+    }
 
     /** Verified account record at the shared anchored head, or null (→ error). The
      *  oracle hash-verifies the account against the anchored stateRoot (storageRoot
