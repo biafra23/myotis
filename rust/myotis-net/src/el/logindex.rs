@@ -99,19 +99,43 @@ impl Coverage {
         matches!(self.span, Some((low, high)) if low <= from && to <= high)
     }
 
-    fn extend_up(&mut self, block: u64) {
-        self.span = Some(match self.span {
-            None => (block, block),
-            Some((low, high)) => (low, high.max(block)),
-        });
+    /// Extend upward — only contiguously. A gap would make `contains` claim
+    /// blocks nobody processed, the exact lie this module exists to prevent.
+    fn extend_up(&mut self, block: u64) -> Result<(), CoverageGap> {
+        match self.span {
+            None => self.span = Some((block, block)),
+            Some((low, high)) => {
+                if block > high.saturating_add(1) {
+                    return Err(CoverageGap { edge: high, block });
+                }
+                self.span = Some((low, high.max(block)));
+            }
+        }
+        Ok(())
     }
 
-    fn extend_down(&mut self, block: u64) {
-        self.span = Some(match self.span {
-            None => (block, block),
-            Some((low, high)) => (low.min(block), high),
-        });
+    /// Extend downward — only contiguously (see [`Self::extend_up`]).
+    fn extend_down(&mut self, block: u64) -> Result<(), CoverageGap> {
+        match self.span {
+            None => self.span = Some((block, block)),
+            Some((low, high)) => {
+                if block.saturating_add(1) < low {
+                    return Err(CoverageGap { edge: low, block });
+                }
+                self.span = Some((low.min(block), high));
+            }
+        }
+        Ok(())
     }
+}
+
+/// A non-contiguous extend was rejected: the caller tried to record `block`
+/// against a span whose nearest edge is `edge` — the blocks between were
+/// never processed, so bridging them would fabricate coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoverageGap {
+    pub edge: u64,
+    pub block: u64,
 }
 
 /// A parsed `eth_getLogs` filter (JSON parsing happens engine-side).
@@ -196,8 +220,9 @@ impl LogIndex {
         self.config
             .watch
             .iter()
-            .position(|w| &w.address == address)
-            .map(|i| self.coverage[i])
+            .zip(self.coverage.iter())
+            .find(|(w, _)| &w.address == address)
+            .map(|(_, c)| *c)
     }
 
     fn watched(&self, log: &StoredLog) -> bool {
@@ -209,39 +234,67 @@ impl LogIndex {
         })
     }
 
-    /// Record a fully processed block at or above the current high edge (the
-    /// head-follow path). `logs` may be empty — coverage still advances,
-    /// which is what makes "no events in this range" a servable answer.
-    pub fn append_block(&mut self, block_number: u64, logs: Vec<StoredLog>) {
+    /// Record a fully processed block adjoining the high edge (the head-follow
+    /// path). `logs` may be empty — coverage still advances, which is what
+    /// makes "no events in this range" a servable answer. All-or-nothing: a
+    /// gap against ANY affected entry rejects the whole call and stores
+    /// nothing — the caller must process the missing blocks first.
+    pub fn append_block(&mut self, block_number: u64, logs: Vec<StoredLog>) -> Result<(), CoverageGap> {
+        for (w, c) in self.config.watch.iter().zip(self.coverage.iter()) {
+            if block_number >= w.from_block {
+                if let Some((_, high)) = c.span {
+                    if block_number > high.saturating_add(1) {
+                        return Err(CoverageGap { edge: high, block: block_number });
+                    }
+                }
+            }
+        }
         for log in logs {
             debug_assert_eq!(log.block_number, block_number);
             if self.watched(&log) {
                 self.logs.insert((log.block_number, log.log_index), log);
             }
         }
-        for (i, w) in self.config.watch.iter().enumerate() {
+        for (w, c) in self.config.watch.iter().zip(self.coverage.iter_mut()) {
             if block_number >= w.from_block {
-                self.coverage[i].extend_up(block_number);
+                // Pre-checked above; a gap here is unreachable.
+                let _ = c.extend_up(block_number);
             }
         }
+        Ok(())
     }
 
-    /// Record a fully processed block below the current low edge (the
-    /// backfill walk). Caller supplies the verified (number, hash) so the
-    /// cursor tracks the trust edge.
-    pub fn backfill_block(&mut self, block_number: u64, block_hash: [u8; 32], logs: Vec<StoredLog>) {
+    /// Record a fully processed block adjoining the low edge (the backfill
+    /// walk). Caller supplies the verified (number, hash) so the cursor tracks
+    /// the trust edge. Same all-or-nothing gap rule as [`Self::append_block`].
+    pub fn backfill_block(
+        &mut self,
+        block_number: u64,
+        block_hash: [u8; 32],
+        logs: Vec<StoredLog>,
+    ) -> Result<(), CoverageGap> {
+        for (w, c) in self.config.watch.iter().zip(self.coverage.iter()) {
+            if block_number >= w.from_block {
+                if let Some((low, _)) = c.span {
+                    if block_number.saturating_add(1) < low {
+                        return Err(CoverageGap { edge: low, block: block_number });
+                    }
+                }
+            }
+        }
         for log in logs {
             debug_assert_eq!(log.block_number, block_number);
             if self.watched(&log) {
                 self.logs.insert((log.block_number, log.log_index), log);
             }
         }
-        for (i, w) in self.config.watch.iter().enumerate() {
+        for (w, c) in self.config.watch.iter().zip(self.coverage.iter_mut()) {
             if block_number >= w.from_block {
-                self.coverage[i].extend_down(block_number);
+                let _ = c.extend_down(block_number);
             }
         }
         self.cursor = Some((block_number, block_hash));
+        Ok(())
     }
 
     /// Drop everything above `fork_point` (exclusive) after a reorg above
@@ -266,10 +319,15 @@ impl LogIndex {
             return Err(QueryError::Unanswerable);
         }
         for addr in &filter.addresses {
-            let Some(i) = self.config.watch.iter().position(|w| &w.address == addr) else {
+            let Some((w, cov)) = self
+                .config
+                .watch
+                .iter()
+                .zip(self.coverage.iter())
+                .find(|(w, _)| &w.address == addr)
+            else {
                 return Err(QueryError::UnwatchedAddress(*addr));
             };
-            let w = &self.config.watch[i];
             if !w.topic0s.is_empty() {
                 // Topic-restricted entry: only queries pinned to a subset of
                 // the indexed topic0s are answerable — a wildcard would
@@ -286,8 +344,8 @@ impl LogIndex {
             // be covered — below it the contract cannot have logs by config,
             // which the config itself asserts (deployment block).
             let need_from = filter.from_block.max(w.from_block);
-            if need_from <= filter.to_block && !self.coverage[i].contains(need_from, filter.to_block) {
-                return Err(QueryError::OutOfCoverage { address: *addr, covered: self.coverage[i] });
+            if need_from <= filter.to_block && !cov.contains(need_from, filter.to_block) {
+                return Err(QueryError::OutOfCoverage { address: *addr, covered: *cov });
             }
         }
         Ok(self
@@ -346,7 +404,7 @@ impl<'a> Cursor<'a> {
     }
 
     fn u32(&mut self) -> Option<u32> {
-        self.take(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        self.take(4).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes)
     }
 
     fn u64(&mut self) -> Option<u64> {
@@ -420,13 +478,13 @@ impl LogIndex {
         }
         let mut coverage = Vec::with_capacity(n_cov);
         for _ in 0..n_cov {
-            coverage.push(match c.take(1)?[0] {
+            coverage.push(match c.take(1)?.first().copied()? {
                 0 => Coverage::default(),
                 1 => Coverage { span: Some((c.u64()?, c.u64()?)) },
                 _ => return None,
             });
         }
-        let cursor = match c.take(1)?[0] {
+        let cursor = match c.take(1)?.first().copied()? {
             0 => None,
             1 => Some((c.u64()?, c.arr::<32>()?)),
             _ => return None,
@@ -520,8 +578,8 @@ mod tests {
     #[test]
     fn query_outside_coverage_errors_never_empty() {
         let mut ix = LogIndex::new(config(vec![watch_all(addr(1), 100)]));
-        ix.append_block(200, vec![]);
-        ix.append_block(201, vec![log(201, 0, addr(1), vec![topic(9)])]);
+        ix.append_block(200, vec![]).unwrap();
+        ix.append_block(201, vec![log(201, 0, addr(1), vec![topic(9)])]).unwrap();
         // Covered range answers (including the empty block).
         assert_eq!(ix.query(&filter(200, 200, addr(1))).unwrap(), vec![]);
         assert_eq!(ix.query(&filter(200, 201, addr(1))).unwrap().len(), 1);
@@ -538,7 +596,7 @@ mod tests {
     #[test]
     fn range_below_from_block_needs_no_coverage() {
         let mut ix = LogIndex::new(config(vec![watch_all(addr(1), 500)]));
-        ix.append_block(500, vec![]);
+        ix.append_block(500, vec![]).unwrap();
         // 100..=500 is fine: below from_block the contract can't have logs.
         assert_eq!(ix.query(&filter(100, 500, addr(1))).unwrap(), vec![]);
         // Entirely below from_block: nothing to cover, empty is honest.
@@ -548,7 +606,7 @@ mod tests {
     #[test]
     fn unwatched_address_and_disabled_error() {
         let mut ix = LogIndex::new(config(vec![watch_all(addr(1), 0)]));
-        ix.append_block(10, vec![]);
+        ix.append_block(10, vec![]).unwrap();
         assert_eq!(ix.query(&filter(0, 10, addr(2))), Err(QueryError::UnwatchedAddress(addr(2))));
         let off = LogIndex::new(LogIndexConfig { enabled: false, watch: vec![watch_all(addr(1), 0)] });
         assert_eq!(off.query(&filter(0, 0, addr(1))), Err(QueryError::Disabled));
@@ -559,7 +617,7 @@ mod tests {
     fn topic_restricted_watch_rejects_wildcard_queries() {
         let w = WatchEntry { address: addr(1), from_block: 0, topic0s: vec![topic(7)] };
         let mut ix = LogIndex::new(config(vec![w]));
-        ix.append_block(5, vec![log(5, 0, addr(1), vec![topic(7)])]);
+        ix.append_block(5, vec![log(5, 0, addr(1), vec![topic(7)])]).unwrap();
         // Wildcard topic0 would deserve unindexed signatures → error.
         assert_eq!(ix.query(&filter(5, 5, addr(1))), Err(QueryError::UnindexedTopic(addr(1))));
         // Pinned to the indexed signature → answers.
@@ -574,7 +632,7 @@ mod tests {
     #[test]
     fn positional_topic_matching() {
         let mut ix = LogIndex::new(config(vec![watch_all(addr(1), 0)]));
-        ix.append_block(1, vec![log(1, 0, addr(1), vec![topic(7), topic(8)])]);
+        ix.append_block(1, vec![log(1, 0, addr(1), vec![topic(7), topic(8)])]).unwrap();
         let mut f = filter(1, 1, addr(1));
         f.topics = vec![vec![], vec![topic(8), topic(9)]]; // wildcard t0, OR at t1
         assert_eq!(ix.query(&f).unwrap().len(), 1);
@@ -587,9 +645,9 @@ mod tests {
     #[test]
     fn backfill_extends_down_and_tracks_cursor() {
         let mut ix = LogIndex::new(config(vec![watch_all(addr(1), 100)]));
-        ix.append_block(300, vec![]);
-        ix.backfill_block(299, [9; 32], vec![log(299, 2, addr(1), vec![])]);
-        ix.backfill_block(298, [8; 32], vec![]);
+        ix.append_block(300, vec![]).unwrap();
+        ix.backfill_block(299, [9; 32], vec![log(299, 2, addr(1), vec![])]).unwrap();
+        ix.backfill_block(298, [8; 32], vec![]).unwrap();
         assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((298, 300)));
         assert_eq!(ix.cursor, Some((298, [8; 32])));
         assert_eq!(ix.query(&filter(298, 300, addr(1))).unwrap().len(), 1);
@@ -599,7 +657,7 @@ mod tests {
     fn rewind_above_drops_logs_and_pulls_coverage_back() {
         let mut ix = LogIndex::new(config(vec![watch_all(addr(1), 0)]));
         for b in 10..=14 {
-            ix.append_block(b, vec![log(b, 0, addr(1), vec![])]);
+            ix.append_block(b, vec![log(b, 0, addr(1), vec![])]).unwrap();
         }
         ix.rewind_above(12);
         assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((10, 12)));
@@ -612,8 +670,8 @@ mod tests {
     fn unwatched_logs_are_not_stored() {
         let mut ix = LogIndex::new(config(vec![watch_all(addr(1), 100)]));
         // Wrong address, and right address but below from_block: both dropped.
-        ix.append_block(200, vec![log(200, 0, addr(2), vec![])]);
-        ix.backfill_block(99, [1; 32], vec![log(99, 0, addr(1), vec![])]);
+        ix.append_block(200, vec![log(200, 0, addr(2), vec![])]).unwrap();
+        ix.backfill_block(99, [1; 32], vec![log(99, 0, addr(1), vec![])]).unwrap();
         assert_eq!(ix.log_count(), 0);
     }
 
@@ -624,8 +682,8 @@ mod tests {
         let path = dir.join("logindex-test.db");
         let cfg = config(vec![watch_all(addr(1), 100), WatchEntry { address: addr(2), from_block: 0, topic0s: vec![topic(7)] }]);
         let mut ix = LogIndex::new(cfg.clone());
-        ix.append_block(200, vec![log(200, 3, addr(1), vec![topic(7), topic(8)])]);
-        ix.backfill_block(199, [7; 32], vec![]);
+        ix.append_block(200, vec![log(200, 3, addr(1), vec![topic(7), topic(8)])]).unwrap();
+        ix.backfill_block(199, [7; 32], vec![]).unwrap();
         ix.persist(&path).unwrap();
 
         let back = LogIndex::load(&cfg, &path).expect("roundtrip");
@@ -641,6 +699,48 @@ mod tests {
         std::fs::write(&path, &data[..data.len() - 1]).unwrap();
         assert!(LogIndex::load(&cfg, &path).is_none());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gaps_are_rejected_not_bridged() {
+        let mut ix = LogIndex::new(config(vec![watch_all(addr(1), 0)]));
+        ix.append_block(200, vec![]).unwrap();
+        // Skipping 201 must fail and store nothing.
+        assert_eq!(ix.append_block(205, vec![log(205, 0, addr(1), vec![])]), Err(CoverageGap { edge: 200, block: 205 }));
+        assert_eq!(ix.log_count(), 0);
+        assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((200, 200)));
+        // Contiguous append still works; downward gap equally rejected.
+        ix.append_block(201, vec![]).unwrap();
+        assert_eq!(ix.backfill_block(150, [1; 32], vec![]), Err(CoverageGap { edge: 200, block: 150 }));
+        ix.backfill_block(199, [2; 32], vec![]).unwrap();
+        assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((199, 201)));
+        // The gap blocks never answer as empty.
+        assert!(matches!(ix.query(&filter(199, 205, addr(1))), Err(QueryError::OutOfCoverage { .. })));
+    }
+
+    #[test]
+    fn deserialize_survives_arbitrary_corruption() {
+        let cfg = config(vec![watch_all(addr(1), 0)]);
+        let mut ix = LogIndex::new(cfg.clone());
+        ix.append_block(7, vec![log(7, 0, addr(1), vec![topic(1), topic(2)])]).unwrap();
+        let good = ix.serialize();
+        assert!(LogIndex::deserialize(&cfg, &good).is_some());
+        // Every single-byte mutation must yield Some-or-None, never panic,
+        // and structural fields must not produce a bogus accepted index.
+        for i in 0..good.len() {
+            let mut bad = good.clone();
+            bad[i] ^= 0xff;
+            let _ = LogIndex::deserialize(&cfg, &bad);
+        }
+        // Every truncation length likewise.
+        for n in 0..good.len() {
+            assert!(LogIndex::deserialize(&cfg, &good[..n]).is_none());
+        }
+        // Huge length prefixes must fail cleanly (no allocation bomb).
+        let mut huge = good.clone();
+        let tail = huge.len() - 4;
+        huge[tail..].copy_from_slice(&u32::MAX.to_le_bytes());
+        let _ = LogIndex::deserialize(&cfg, &huge);
     }
 
     #[test]
