@@ -175,10 +175,13 @@ class IosNodeController(
         }
     }
 
-    /** Blocking create+start; caller holds [bootMutex] and runs on IO. */
     override fun applyLogIndex(network: String) {
         val net = canonical(network)
-        locked { handles[net] }?.let { pushLogIndexConfig(net, it) }
+        // On the lifecycle lane like every other mutating op: the engine-side
+        // install may reload a persisted index from disk.
+        scope.launch(lifecycleLane) {
+            locked { handles[net] }?.let { pushLogIndexConfig(net, it) }
+        }
     }
 
     private fun pushLogIndexConfig(net: String, handle: Long) {
@@ -200,6 +203,7 @@ class IosNodeController(
         else "$count logs \u2014 blocks ${lows.min()}\u2013${highs.max()}"
     }
 
+    /** Blocking create+start; caller holds [bootMutex] and runs on IO. */
     private fun boot(net: String) {
         if (locked { net in handles }) return
         val handle = RustEngine.create(net, dataDir)
@@ -207,9 +211,6 @@ class IosNodeController(
             logs.append("ERROR failed to create the $net stack (sentinel $handle)")
             return
         }
-        // Boot-time apply of the log-index preset (cures restart dormancy:
-        // the persisted index reloads when the fingerprint matches).
-        pushLogIndexConfig(net, handle)
         if (!RustEngine.start(handle)) {
             RustEngine.stop(handle)
             logs.append("ERROR failed to start the $net stack")

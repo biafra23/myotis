@@ -254,22 +254,29 @@ public final class NodeService extends Service {
     /** Push the persisted log-index preset for a RUNNING network's handle. */
     public void applyLogIndex(String network) {
         String net = canonicalNetwork(network);
-        ChainHandle handle;
-        synchronized (handles) {
-            handle = handles.get(net);
-        }
-        if (handle != null) {
-            pushLogIndexConfig(net, handle);
-        }
+        // Off the caller (UI) thread: the engine-side install may reload a
+        // persisted index from disk.
+        Thread t = new Thread(() -> {
+            ChainHandle handle;
+            synchronized (handles) {
+                handle = handles.get(net);
+            }
+            if (handle != null) {
+                pushLogIndexConfig(net, handle);
+            }
+        }, "log-index-apply-" + net);
+        t.setDaemon(true);
+        t.start();
     }
 
     private void pushLogIndexConfig(String net, ChainHandle handle) {
-        String json = io.myotis.ui.KohakuPreset.INSTANCE.configJson(net, logIndexEnabled(this, net));
+        boolean enabled = logIndexEnabled(this, net);
+        String json = io.myotis.ui.KohakuPreset.INSTANCE.configJson(net, enabled);
         if (json == null) {
             return; // no preset for this network — engine stays honestly unconfigured
         }
         boolean ok = handle.setLogIndexConfig(json);
-        if (logIndexEnabled(this, net) && !ok) {
+        if (enabled && !ok) {
             android.util.Log.w(TAG, "log index config rejected for " + net);
         }
     }
@@ -1614,9 +1621,6 @@ public final class NodeService extends Service {
                 // would leave the live window one Save behind the pref.
                 synchronized (handles) {
                     handle.setServedBlockWindow(servedBlockWindow(this));
-                    // Boot-time apply of the log-index preset (re-pushed on every
-                    // (re)start — cures the engine's restart dormancy).
-                    pushLogIndexConfig(n, handle);
                     handles.put(n, handle);
                 }
 
@@ -1626,6 +1630,11 @@ public final class NodeService extends Service {
                     try { ENGINE.stop(n); } catch (Throwable ignored) {}
                     return;
                 }
+                // Boot-time apply of the log-index preset — AFTER start (the
+                // engine only accepts the config on a running handle) and
+                // outside the handles lock (the install can do disk I/O).
+                // Re-pushed on every (re)start — cures restart dormancy.
+                pushLogIndexConfig(n, handle);
                 if (!RUNNING.get() || !isNetworkEnabled(this, n) || stopGen(n) != gen) {
                     LogBuffer.i(TAG, "[" + n + "] stop/disable raced start; tearing down");
                     forgetStack(n);

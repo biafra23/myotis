@@ -443,8 +443,6 @@ private fun SettingsTab(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
-        // Tor routing — Rust-engine-only (Arti is embedded there), so the row is disabled
-        // until the Rust engine is enabled above. Applies on the next network (re)start.
         var logIndexKohaku by remember {
             mutableStateOf(KohakuPreset.byNetwork.keys.any { settings.logIndexEnabled(it) })
         }
@@ -460,6 +458,8 @@ private fun SettingsTab(
                 }
             },
         )
+        // Tor routing — Rust-engine-only (Arti is embedded there), so the row is disabled
+        // until the Rust engine is enabled above. Applies on the next network (re)start.
         SwitchRow(
             label = "Route reads over Tor (experimental)",
             checked = torRouting && rustEngine,

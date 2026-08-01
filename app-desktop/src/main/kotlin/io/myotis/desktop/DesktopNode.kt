@@ -154,11 +154,6 @@ class DesktopNodeController(
                 synchronized(servedWindowApplyLock) {
                     handle.setServedBlockWindow(settings.servedBlockWindow())
                 }
-                // Boot-time apply of the log-index preset (same spot as the
-                // served-window knob). Re-pushed on every (re)start, which is
-                // what cures the engine's restart dormancy: the persisted
-                // index on disk reloads when the fingerprint matches.
-                pushLogIndexConfig(canonical, handle)
                 // start() is fault-isolated: false (resources closed) on failure rather than a
                 // throw. Either way, drop the network so a later enable can retry — leaving a
                 // dead entry would report "running" forever and block retries.
@@ -169,7 +164,15 @@ class DesktopNodeController(
                     throw t
                 }
                 if (!ok) dropNetwork(canonical)
-                else startNsByNetwork[canonical] = System.nanoTime() // uptime anchors to THIS start
+                else {
+                    startNsByNetwork[canonical] = System.nanoTime() // uptime anchors to THIS start
+                    // Boot-time apply of the log-index preset — AFTER start:
+                    // the engine only accepts the config on a running handle
+                    // (its reader owns the index). Re-pushed on every
+                    // (re)start, which cures restart dormancy: the persisted
+                    // index reloads when the fingerprint matches.
+                    pushLogIndexConfig(canonical, handle)
+                }
             }
         }, "desktop-boot-$canonical").apply { isDaemon = true }.start()
     }
@@ -239,7 +242,11 @@ class DesktopNodeController(
     }
 
     override fun applyLogIndex(network: String) {
-        engine.get(network)?.let { pushLogIndexConfig(network, it) }
+        // Off the UI thread: the engine-side install may reload a persisted
+        // index from disk (fingerprint-matched), which can be large.
+        Thread({
+            engine.get(network)?.let { pushLogIndexConfig(network, it) }
+        }, "log-index-apply-$network").apply { isDaemon = true }.start()
     }
 
     private fun pushLogIndexConfig(network: String, handle: ChainHandle) {
