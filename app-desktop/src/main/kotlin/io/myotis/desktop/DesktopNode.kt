@@ -516,6 +516,9 @@ class DesktopNodeController(
             rpcServing = s.rpcServing(),
             tor = torModeFor(Engines.engineKindFor(s.network())),
             logIndex = logIndexStatusFor(s.network()),
+            logIndexJson = if (settings.logIndexEnabled(s.network())) {
+                runCatching { engine.get(s.network())?.logIndexStatusJson() }.getOrNull()
+            } else null,
         )
     }
 

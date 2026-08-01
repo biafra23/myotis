@@ -511,6 +511,9 @@ class IosNodeController(
             rpcServing = (rpcState?.second ?: false) && (rpcServer?.isServing() ?: false),
             lcHunting = o.engineBoolean("lcHunting"),
             logIndex = logIndexStatusFor(network, handle),
+            logIndexJson = if (settings.logIndexEnabled(network)) {
+                RustEngine.logIndexStatusJson(handle)
+            } else null,
             elHunting = o.engineBoolean("elHunting"),
         )
     }

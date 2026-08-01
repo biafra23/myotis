@@ -251,6 +251,28 @@ public final class NodeService extends Service {
         prefs(c).edit().putBoolean("logIndex." + canonicalNetwork(network), on).apply();
     }
 
+    /** Raw log-index status JSON for a RUNNING network, or null when the
+     *  feature is off for it / the network isn't hosted (the Index tab shows
+     *  its waiting state then). */
+    public String logIndexStatusJsonOrNull(String network) {
+        String net = canonicalNetwork(network);
+        if (!logIndexEnabled(this, net)) {
+            return null;
+        }
+        ChainHandle handle;
+        synchronized (handles) {
+            handle = handles.get(net);
+        }
+        if (handle == null) {
+            return null;
+        }
+        try {
+            return handle.logIndexStatusJson();
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
     /** Push the persisted log-index preset for a RUNNING network's handle. */
     public void applyLogIndex(String network) {
         String net = canonicalNetwork(network);

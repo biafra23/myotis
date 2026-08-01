@@ -14,20 +14,20 @@ package io.myotis.ui
  */
 object KohakuPreset {
 
-    data class Watch(val address: String, val fromBlock: Long)
+    data class Watch(val address: String, val fromBlock: Long, val label: String)
 
     val byNetwork: Map<String, List<Watch>> = mapOf(
         "mainnet" to listOf(
-            Watch("0xB20c66C4DE72433F3cE747b58B86830c459CA911", 14_173_395), // tornado instance registry
-            Watch("0x58E8dCC13BE9780fC42E8723D8EaD4CF46943dF2", 14_173_129), // tornado relayer registry
-            Watch("0xFA7093CDD9EE6932B4eb2c9e1cde7CE00B1FA4b9", 14_693_013), // railgun proxy
-            Watch("0x6818809EefCe719E480a7526D76bD3e561526b46", 22_153_713), // privacy-pools entrypoint
+            Watch("0xB20c66C4DE72433F3cE747b58B86830c459CA911", 14_173_395, "Tornado instance registry"), // tornado instance registry
+            Watch("0x58E8dCC13BE9780fC42E8723D8EaD4CF46943dF2", 14_173_129, "Tornado relayer registry"), // tornado relayer registry
+            Watch("0xFA7093CDD9EE6932B4eb2c9e1cde7CE00B1FA4b9", 14_693_013, "Railgun proxy"), // railgun proxy
+            Watch("0x6818809EefCe719E480a7526D76bD3e561526b46", 22_153_713, "Privacy Pools entrypoint"), // privacy-pools entrypoint
         ),
         "sepolia" to listOf(
-            Watch("0x4e69fD587118dFb64957d18654E3894118E9B1BF", 5_594_611), // tornado instance registry
-            Watch("0xD6663593E71e4916eCb6f6606e1A6FbfA1634ffA", 5_594_660), // tornado relayer registry
-            Watch("0xeCFCf3b4eC647c4Ca6D49108b311b7a7C9543fea", 5_784_774), // railgun proxy
-            Watch("0x34A2068192b1297f2a7f85D7D8CdE66F8F0921cB", 8_461_453), // privacy-pools entrypoint
+            Watch("0x4e69fD587118dFb64957d18654E3894118E9B1BF", 5_594_611, "Tornado instance registry"), // tornado instance registry
+            Watch("0xD6663593E71e4916eCb6f6606e1A6FbfA1634ffA", 5_594_660, "Tornado relayer registry"), // tornado relayer registry
+            Watch("0xeCFCf3b4eC647c4Ca6D49108b311b7a7C9543fea", 5_784_774, "Railgun proxy"), // railgun proxy
+            Watch("0x34A2068192b1297f2a7f85D7D8CdE66F8F0921cB", 8_461_453, "Privacy Pools entrypoint"), // privacy-pools entrypoint
         ),
     )
 

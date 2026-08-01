@@ -162,7 +162,8 @@ fun NodeScreen(
                     Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Status") })
                     Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Query") })
                     Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("Logs") })
-                    Tab(selected = tab == 3, onClick = { tab = 3 }, text = { Text("Settings") })
+                    Tab(selected = tab == 3, onClick = { tab = 3 }, text = { Text("Index") })
+                    Tab(selected = tab == 4, onClick = { tab = 4 }, text = { Text("Settings") })
                 }
                 Spacer(Modifier.height(16.dp))
 
@@ -170,7 +171,8 @@ fun NodeScreen(
                     0 -> StatusTab(controller, settings, current, network, online, onOpenNetworkSettings)
                     1 -> QueryTab(controller, settings, current, network, history)
                     2 -> LogsTab(logs, logFilter, onFilterChange = { logFilter = it })
-                    3 -> SettingsTab(controller, settings, snapshots, onEnabledChanged = { enabledRev++ })
+                    3 -> IndexTab(controller, settings, current, network)
+                    4 -> SettingsTab(controller, settings, snapshots, onEnabledChanged = { enabledRev++ })
                 }
             }
         }
@@ -1606,4 +1608,78 @@ private fun formatLogTime(ms: Long, tz: TimeZone): String {
     fun p2(n: Int) = n.toString().padStart(2, '0')
     fun p3(n: Int) = n.toString().padStart(3, '0')
     return "${p2(dt.hour)}:${p2(dt.minute)}:${p2(dt.second)}.${p3(dt.nanosecond / 1_000_000)}"
+}
+
+
+/**
+ * The log-index tab: an explicit per-network trigger for collecting the
+ * Kohaku contracts' logs, plus per-contract backfill progress. Data rides the
+ * snapshot's raw status JSON (2 s cadence, same as everything else).
+ */
+@Composable
+private fun IndexTab(
+    controller: NodeController,
+    settings: Settings,
+    snapshot: NodeSnapshot?,
+    network: String,
+) {
+    val preset = KohakuPreset.byNetwork[network]
+    Column(
+        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        if (preset == null) {
+            Text("No Kohaku contract preset for $network.")
+            return@Column
+        }
+        var collecting by remember(network) { mutableStateOf(settings.logIndexEnabled(network)) }
+        SwitchRow(
+            label = "Collect Kohaku contract logs on $network",
+            checked = collecting,
+            enabled = true,
+            onChange = { on ->
+                collecting = on
+                settings.setLogIndexEnabled(network, on)
+                controller.applyLogIndex(network)
+            },
+        )
+        Text(
+            "Indexes and serves eth_getLogs for the Kohaku privacy contracts — verified " +
+                "against receipt roots, backfilling to each contract's deployment block.",
+        )
+        val parsed = snapshot?.logIndexJson?.let { LogIndexStatus.parse(it) }
+        when {
+            !collecting -> Text("Collection is off.")
+            parsed == null || !parsed.enabled ->
+                Text("Waiting for the engine (start the network with the Rust engine).")
+            else -> {
+                Text("${parsed.logCount} logs collected")
+                preset.forEach { watch ->
+                    val e = parsed.entries.firstOrNull { it.address == watch.address.lowercase() }
+                    val low = e?.coveredLow
+                    val high = e?.coveredHigh
+                    Column {
+                        Text(watch.label)
+                        if (low == null || high == null) {
+                            Text("waiting \u2014 target block ${watch.fromBlock}")
+                            LinearProgressIndicator(progress = { 0f }, modifier = Modifier.fillMaxWidth())
+                        } else {
+                            val total = (high - watch.fromBlock + 1).coerceAtLeast(1)
+                            val done = (high - low + 1).coerceIn(0, total)
+                            val pct = done.toFloat() / total.toFloat()
+                            val complete = low <= watch.fromBlock
+                            Text(
+                                if (complete) "complete \u2014 blocks ${watch.fromBlock}\u2013$high"
+                                else "blocks $low\u2013$high \u00b7 target ${watch.fromBlock} \u00b7 ${(pct * 100).toInt()}%"
+                            )
+                            LinearProgressIndicator(
+                                progress = { if (complete) 1f else pct },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

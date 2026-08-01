@@ -309,6 +309,9 @@ data class NodeSnapshot(
     // null = log index not applicable/configured; otherwise a short progress
     // string, e.g. "12,041 logs · 5,594,611–8,461,900" or "backfilling".
     val logIndex: String? = null,
+    // Raw engine status JSON for the Index tab (null when the feature is off
+    // or the engine is unavailable); parsed via [LogIndexStatus.parse].
+    val logIndexJson: String? = null,
 )
 
 /** One connected READY peer, for the Status peer list. */

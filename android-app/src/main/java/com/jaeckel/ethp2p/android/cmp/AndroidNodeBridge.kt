@@ -56,7 +56,11 @@ class AndroidNodeController(
 
     override fun snapshots(): Flow<Map<String, NodeSnapshot>> = flow {
         while (true) {
-            emit(serviceProvider()?.snapshots()?.mapValues { (_, s) -> s.toModel() } ?: emptyMap())
+            emit(serviceProvider()?.let { svc ->
+                svc.snapshots().mapValues { (net, s) ->
+                    s.toModel().copy(logIndexJson = svc.logIndexStatusJsonOrNull(net))
+                }
+            } ?: emptyMap())
             delay(2000)
         }
         // snapshotOf() prunes the backoff map and walks/sorts the live peer list — keep it off the
