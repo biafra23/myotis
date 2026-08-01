@@ -395,6 +395,10 @@ impl LogIndex {
     /// The next block the head-follow appender should record: one past the
     /// highest covered block across entries, or None when nothing is indexed
     /// yet (the appender then starts fresh at the current head).
+    /// Invariant making `max` safe here: append_block extends every
+    /// at-or-past-from_block entry together and rewind_above pulls highs to
+    /// a common fork point, so all `Some` highs are equal at rest; an entry
+    /// below the max is either pre-from_block or `None` (backfill's job).
     pub fn append_edge(&self) -> Option<u64> {
         self.coverage
             .iter()
