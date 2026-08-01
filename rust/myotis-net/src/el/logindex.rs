@@ -37,6 +37,19 @@ pub struct LogIndexConfig {
 }
 
 impl LogIndexConfig {
+    /// Would any watch entry store this log? (Address match at/past the
+    /// entry's from_block, honoring topic0 restrictions.) Exposed so batch
+    /// fetchers can pre-filter against a captured config snapshot instead of
+    /// buffering every log of every candidate block.
+    pub fn watches(&self, log: &StoredLog) -> bool {
+        self.watch.iter().any(|w| {
+            w.address == log.address
+                && log.block_number >= w.from_block
+                && (w.topic0s.is_empty()
+                    || log.topics.first().is_some_and(|t| w.topic0s.contains(t)))
+        })
+    }
+
     /// Order-insensitive fingerprint of the watch-list. A changed fingerprint
     /// on load invalidates the persisted index (derived data — re-index
     /// rather than risk serving under a stale subscription set).
@@ -244,12 +257,7 @@ impl LogIndex {
     }
 
     fn watched(&self, log: &StoredLog) -> bool {
-        self.config.watch.iter().any(|w| {
-            w.address == log.address
-                && log.block_number >= w.from_block
-                && (w.topic0s.is_empty()
-                    || log.topics.first().is_some_and(|t| w.topic0s.contains(t)))
-        })
+        self.config.watches(log)
     }
 
     /// Record a fully processed block adjoining the high edge (the head-follow

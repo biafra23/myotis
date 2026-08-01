@@ -768,7 +768,7 @@ impl ElReader {
             // Rate-limited: this state persists until the backfill walker
             // exists / catches up, and a warn every 6 s is just noise.
             if ticks % 100 == 0 {
-                tracing::warn!(start, finalized, "log index append edge too far behind; waiting for backfill");
+                tracing::warn!(start, finalized, "log index append edge too far behind (node downtime?); upward bridging is a tracked follow-up — coverage above the edge stays frozen until then");
             }
             return;
         }
@@ -832,22 +832,18 @@ impl ElReader {
     /// before any log is stored. Peer refusal is a stall, never corruption:
     /// coverage simply doesn't extend until some peer serves the range.
     async fn log_index_backfill_step(&self, ticks: u64) {
-        let Some((enabled, target_low, cursor, fingerprint)) = self.with_log_index(|ix| {
-            (
-                ix.config().enabled,
-                ix.config().watch.iter().map(|w| w.from_block).min(),
-                ix.cursor,
-                ix.config().fingerprint(),
-            )
-        }) else {
+        let Some((config, cursor)) = self.with_log_index(|ix| (ix.config().clone(), ix.cursor)) else {
             return;
         };
-        let (Some(target_low), Some((cur_n, cur_hash))) = (target_low, cursor) else {
+        let (Some(target_low), Some((cur_n, cur_hash))) =
+            (config.watch.iter().map(|w| w.from_block).min(), cursor)
+        else {
             return; // no watch entries, or the appender hasn't seeded the edge yet
         };
-        if !enabled || cur_n <= target_low {
+        if !config.enabled || cur_n <= target_low {
             return;
         }
+        let fingerprint = config.fingerprint();
         // count+1 headers are requested (the top one is the cursor block), and
         // honest peers cap header serves at 1024 (our own served.rs agrees) —
         // so the batch is 1023 new blocks, keeping the request exactly at cap.
@@ -860,7 +856,7 @@ impl ElReader {
         }
         for peer in &peers {
             match self
-                .log_index_backfill_batch(peer, from, count, cur_n, cur_hash, fingerprint)
+                .log_index_backfill_batch(peer, count, cur_n, cur_hash, &config, fingerprint)
                 .await
             {
                 Ok(()) => {
@@ -892,40 +888,57 @@ impl ElReader {
     /// headers [from, cur_n] ascending (count+1, so the top one IS the cursor
     /// block), full parent-hash chain check, bloom-filtered candidate
     /// body+receipts fetch verified against both roots, then apply top-down.
+    /// Fetch and apply one descending backfill batch from one peer. The
+    /// request is `reverse=true` starting AT the trusted cursor block, so the
+    /// trust root is the FIRST header of the response — a short serve (peers
+    /// may cap below the 1024 ceiling, or truncate on byte budget) still
+    /// yields a verifiable parent-hash-chained prefix and partial progress,
+    /// instead of failing an exact-length check forever. (`remember_served`
+    /// only tracks ascending shapes, so reverse fetches skip that side
+    /// channel — harmless.) Candidates are bloom-filtered and their logs
+    /// pre-filtered against the captured config, so transient memory is
+    /// proportional to logs that will actually be stored.
     async fn log_index_backfill_batch(
         &self,
         peer: &ManagedPeer,
-        from: u64,
         count: u64,
         cur_n: u64,
         cur_hash: [u8; 32],
+        config: &crate::el::logindex::LogIndexConfig,
         fingerprint: u64,
     ) -> Result<(), String> {
-        let window = peer.get_block_headers_by_number(from, count + 1, 0, false).await?;
-        if window.len() as u64 != count + 1 {
-            return Err(format!("peer returned {} headers, expected {}", window.len(), count + 1));
-        }
-        let top = window.last().ok_or("empty header window")?;
+        let window = peer.get_block_headers_by_number(cur_n, count + 1, 0, true).await?;
+        let Some((top, rest)) = window.split_first() else {
+            return Err("peer returned no headers".to_string());
+        };
         if top.header.number != cur_n || top.hash != cur_hash {
-            return Err("peer window does not end at the trusted cursor block".to_string());
+            return Err("peer window does not start at the trusted cursor block".to_string());
         }
-        if window.first().is_some_and(|h| h.header.number != from) {
-            return Err("peer returned the wrong starting block number".to_string());
+        if rest.is_empty() {
+            return Err("peer served only the cursor block".to_string());
         }
+        // Descending parent-hash chain: each header's parent is the next one.
+        // Only the verified prefix is used, so a mid-response break just
+        // shortens the batch instead of failing it.
+        let mut verified = 0usize;
         for pair in window.windows(2) {
-            let [lower, upper] = pair else {
+            let [upper, lower] = pair else {
                 return Err("header window pairing failed".to_string());
             };
-            if upper.header.parent_hash != lower.hash {
-                return Err("peer header window breaks the parent-hash chain".to_string());
+            if upper.header.parent_hash != lower.hash
+                || lower.header.number != upper.header.number.wrapping_sub(1)
+            {
+                break;
             }
+            verified += 1;
         }
-        // Bloom-filter candidates among the NEW blocks (everything below the
-        // cursor). A miss is a definitive skip; a hit needs verified receipts.
-        let Some((_, new_headers)) = window.split_last() else {
-            return Err("empty header window".to_string());
-        };
-        let candidates: Vec<&crate::el::eth::messages::VerifiedHeader> = new_headers
+        if verified == 0 {
+            return Err("peer response does not chain to the cursor block".to_string());
+        }
+        let new_blocks = rest.get(..verified).ok_or("verified prefix out of range")?;
+        // Bloom-filter candidates among the NEW blocks. A miss is a
+        // definitive skip; a hit needs verified receipts.
+        let candidates: Vec<&crate::el::eth::messages::VerifiedHeader> = new_blocks
             .iter()
             .filter(|h| {
                 let Ok(bloom): Result<&[u8; 256], _> = h.header.logs_bloom.as_slice().try_into() else {
@@ -959,14 +972,22 @@ impl ElReader {
                     ));
                 }
                 verify_block_receipts(&vh.header, receipts)?;
-                let verified = build_block_receipts(&vh.header, vh.hash, body, receipts)?;
-                let stored = stored_logs_for_block(&verified)
+                let built = build_block_receipts(&vh.header, vh.hash, body, receipts)?;
+                let stored = stored_logs_for_block(&built)
                     .ok_or("malformed log field in verified receipts")?;
-                logs_by_block.insert(vh.header.number, stored);
+                // Pre-filter: buffer only logs the captured watch-list will
+                // store (the fingerprint recheck below discards the batch if
+                // the config changed, so filtering against the snapshot is
+                // safe) — transient memory stays proportional to stored logs.
+                let watched: Vec<crate::el::logindex::StoredLog> =
+                    stored.into_iter().filter(|l| config.watches(l)).collect();
+                if !watched.is_empty() {
+                    logs_by_block.insert(vh.header.number, watched);
+                }
             }
         }
-        // Apply top-down so every block adjoins the low edge; the trust edge
-        // (cursor) advances with each applied block.
+        // Apply top-down (the response is already descending) so every block
+        // adjoins the low edge; the trust edge advances with each block.
         match self.log_index.lock() {
             Ok(mut slot) => {
                 let Some(ix) = slot.as_mut() else {
@@ -983,10 +1004,7 @@ impl ElReader {
                 if ix.cursor != Some((cur_n, cur_hash)) || ix.config().fingerprint() != fingerprint {
                     return Err("index changed mid-batch; recomputing next tick".to_string());
                 }
-                let Some((_, new_blocks)) = window.split_last() else {
-                    return Err("empty header window".to_string());
-                };
-                for vh in new_blocks.iter().rev() {
+                for vh in new_blocks {
                     let n = vh.header.number;
                     let logs = logs_by_block.remove(&n).unwrap_or_default();
                     ix.backfill_block(n, vh.hash, logs)

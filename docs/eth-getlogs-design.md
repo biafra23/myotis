@@ -116,6 +116,15 @@ genuinely cannot serve a range, coverage simply never reaches it and getLogs
 for that range keeps erroring — honest by construction. (This is exactly the
 case where a bundled seed becomes the necessary optimization.)
 
+**Tracked follow-up (upward bridging):** after node downtime longer than the
+appender's window guard (~128 blocks), the coverage gap sits ABOVE the walk
+cursor and neither component closes it — the appender waits, the walker only
+descends. Bridge design: anchor a fresh chained window at the new finalized
+head, walk down to the old high edge, then resume appending — absorbable by
+the single-span coverage model without a second cursor as long as the bridge
+completes before the high edge advances. Until it lands, the append-side warn
+says plainly that coverage above the edge stays frozen.
+
 ### 4. Serving (`getLogs`)
 
 Filter support: `fromBlock`/`toBlock` (hex or `latest`/`finalized`),
