@@ -1,10 +1,14 @@
 # Privacy & Tor — design sketch
 
-> **Status: design discussion only. Nothing in this document is implemented.**
-> It captures a proposed architecture for network-level privacy (unlinking wallet
-> addresses from the user's IP) for review. Facts about current Myotis behavior
-> are code-grounded and marked with file pointers; everything about Tor routing,
-> quarantined peer pools, and identity separation is a proposal.
+> **Status: design discussion. The core transport path now has a runnable
+> proof of concept** (`rust/tor-poc`, see [§9](#9-proof-of-concept--what-was-validated)),
+> but no production integration exists. The PoC validates the load-bearing
+> transport claims against live mainnet and its measurements are folded back in
+> below (marked **PoC:**). The quarantined peer pool, multi-source promotion,
+> and request-shape hardening remain unimplemented proposals.
+> Facts about current Myotis behavior are code-grounded and marked with file
+> pointers; everything about Tor routing, quarantined peer pools, and identity
+> separation is a proposal except where a **PoC:** note says it was validated.
 
 Companion docs: [Disk & Network Usage](disk-and-network-usage.md) (traffic volumes
 this design would route), [Optimisations & Limitations](../OPTIMISATIONS_AND_LIMITATIONS.md)
@@ -54,10 +58,26 @@ policy permits the destination port automatically — connections succeed, but f
 a smaller, often more loaded exit pool. This should be measured (see Open
 questions) before committing.
 
+> **PoC:** confirmed real, not just theoretical. A fraction of circuit builds to
+> `:30303` fail with Arti's `Failed to obtain exit circuit for ports` (the reduced
+> policy at work), and others reach the peer but time out at the exit. The port is
+> reachable — most attempts do get a stream — but the exit pool for it is visibly
+> smaller and lossier than for web ports. Quantifying the exact fraction is still
+> open (§8.1); the qualitative answer is "usable with retries, not free."
+
 **Latency.** Per the Optimisations doc, round-trip time — not bandwidth — is what
 makes or breaks the wallet experience, and Tor adds ~0.5–1.5 s per round trip
 plus ~1 s+ per circuit build. This is the strongest argument for routing **only
 the sensitive flows** through Tor and keeping bulk/benign flows direct.
+
+> **PoC:** measured, and the variance is the story. Arti cold bootstrap is a
+> one-time ~11–12 s. Once bootstrapped, a full verified snap account read (Tor
+> connect + RLPx handshake + eth Status + head-header fetch + GetAccountRange)
+> was **~0.75 s on a good circuit but up to ~18 s on a slow/lossy one** — the
+> single account fetch alone hit 14 s through a bad exit. The mean is tolerable;
+> the tail is not, and it lands exactly on the confirm-screen path. This
+> sharpens §8.5: the Tor mode needs its own serve-stale / timeout-and-retry
+> policy, not just the clearnet budget.
 
 ## 3. Tor client library: Arti, in the Rust engine
 
@@ -89,6 +109,30 @@ Two properties to keep in mind:
 - **The guard doesn't change.** Isolation varies middle + exit; the entry guard
   stays pinned (Tor's Sybil defense). Isolated circuits unlink addresses from
   each other at the exit — they are not "completely new paths."
+
+> **PoC:** validated. `arti_client::TorClient` bootstraps and runs entirely
+> in-process (no bundled `tor`, no Orbot), and `StreamPrefs::set_isolation(token)`
+> with one `IsolationToken` per address drives distinct circuits. The PoC dials
+> real mainnet peers on `:30303` and completes RLPx + eth/66-69 + snap/1 through
+> them. **The one production change needed was making the RLPx transport generic
+> over the byte stream** (`RlpxConnection<S = TcpStream>` / `EthSession<S>` +
+> `handshake_over()`); the default type parameter keeps every clearnet caller
+> untouched, so the *same* handshake/frame/eth/snap code drives both a `TcpStream`
+> and an Arti `DataStream`. No protocol logic changed.
+>
+> **Implementation gotcha (cost us the whole path until found):** Arti's
+> `DataStream` **buffers writes and requires an explicit `flush()`** to emit
+> cells onto the circuit, whereas `TcpStream` sends eagerly. Without a flush after
+> writing the auth/frames the peer never sees them and FINs, surfacing as a
+> misleading "early eof" reading the RLPx ack. The production Tor path must flush
+> after every write (a harmless no-op on TCP).
+>
+> **Bound the handshake explicitly.** The clearnet `dial()` wrapped the whole
+> handshake in a timeout; the extracted `handshake_over()` is deliberately
+> unbounded so the caller can pick a Tor-appropriate budget. A Tor peer that
+> accepts the stream but never sends the ack will otherwise hang the task and
+> leak a circuit slot — so every Tor-side caller MUST wrap it in a timeout
+> (retrying on a fresh circuit is the natural response, given exit variance).
 
 ## 4. The proposed split: clearnet background, Tor foreground
 
@@ -159,6 +203,21 @@ Design rules:
   freshly discovered peers, or the property silently evaporates exactly when
   it's under stress. (Same philosophy as the existing verified-reads posture:
   honest error over degraded answer.)
+
+- **Tor-reachability is a first-class selection criterion — this is the PoC's
+  biggest surprise.** The design assumed "reach a good snap peer" was the same
+  problem over Tor as over clearnet. It is not. **Most synced full nodes drop
+  inbound connections from Tor exit IPs** — either an immediate FIN right after
+  our auth, or a `reason=4` "Too Many Peers" disconnect — because they are
+  inbound-saturated and the whole Tor network arrives from a small, busy set of
+  exit IPs. Empirically the peers that *do* accept Tor inbound skew toward
+  *less-busy* nodes, which are disproportionately **poorly-synced or stuck at
+  genesis** (they have free slots precisely because nobody else wants them). A
+  peer that completes the handshake over Tor but advertises head #0 cannot serve
+  a snap query at a fresh retained state root — so "accepts Tor inbound AND is
+  synced" must be an explicit promotion gate for the Tor pool, validated (like
+  snap quality) during the clearnet probe and re-checked over Tor. Selecting on
+  clearnet snap-quality alone is not enough.
 - **Bootstrap via popular peers.** A strict quarantine would mean no private
   queries for days after first install. The escape is the *popularity* property:
   peers on the public EIP-1459 DNS ENR tree (mainnet pins
@@ -229,17 +288,24 @@ and for not shipping a unique clientId on the Tor path.
 | Multi-source / popularity promotion (§6.2) | per-querier poisoned-peer tracking tags |
 | Generic Tor-side request shapes (§6.3) | (partially) client-fingerprint pairing; fully only with adoption |
 | Fail-closed pool (§5) | silent property loss under peer starvation |
+| Tor-reachability + synced gate (§5, PoC) | selecting peers that clearnet-validate but drop Tor inbound / are unsynced → a dry Tor pool at query time |
 
 ## 8. Open questions for review
 
 1. **Exit-pool health for port 30303/9000** — what fraction of exit bandwidth
    permits them in practice, and what does that do to circuit build success and
    latency? Needs measurement before committing.
+   > **PoC:** partially answered — `:30303` is reachable over Tor but from a
+   > visibly smaller/lossier exit pool; some builds fail outright on the reduced
+   > exit policy. The exact usable-bandwidth fraction is still unquantified.
 2. **Delay distribution** — uniform over what range? Per-peer independent draws?
    Is there an analysis that pins how much delay is enough given peer contact
    rates observed from crawlers?
 3. **Pool sizing** — how large must the quarantined pool be to absorb days of
    churn and still hold N healthy snap peers at query time?
+   > **PoC:** the constraint is tighter than churn alone — the pool must hold N
+   > peers that are *both* synced *and* Tor-inbound-accepting (see §5), a
+   > materially smaller fraction of discovered snap peers than expected.
 4. **Should the CL side eventually be proxied too?** Content-benign, but it
    fingerprints wake/sleep timing at the real IP. A later phase could route it
    through the same machinery at low priority.
@@ -247,6 +313,9 @@ and for not shipping a unique clientId on the Tor path.
    fetches (`BATCH_PATHSET_CHUNK`), is a Tor-routed balance read acceptable on
    the confirm-screen path, or does the Tor mode need its own serve-stale
    policy?
+   > **PoC:** measured ~0.75 s (good circuit) to ~18 s (slow/lossy) for a full
+   > verified read — the tail is too slow for a synchronous confirm screen, so
+   > the Tor mode almost certainly needs its own serve-stale + retry policy.
 6. **Tx broadcast fan-out over Tor** — one circuit to a few aged peers, or
    several isolated circuits to disjoint peer subsets (stronger against a
    listening peer, more circuit builds)?
@@ -255,6 +324,49 @@ and for not shipping a unique clientId on the Tor path.
    (probably: Tor client lifecycle == stack awake lifecycle).
 8. **DoH-over-Tor for the ENR tree walk** — which resolver, and does that
    introduce its own linkage?
+9. **Peer-side Tor-exit rejection (new, from the PoC)** — synced full nodes
+   widely drop inbound from Tor exit IPs (immediate FIN or `reason=4`), and the
+   nodes that *do* accept skew toward unsynced ones (§5). How large is the
+   population of synced, snap-serving, Tor-accepting mainnet peers really, and is
+   it stable enough to sustain a fail-closed pool? This gates everything and is
+   the first thing to measure at scale.
+
+## 9. Proof of concept — what was validated
+
+A runnable PoC lives at `rust/tor-poc` (standalone crate, excluded from the Rust
+workspace so Arti's dependency tree never touches the pure-engine build). It
+reuses the real `myotis-net` RLPx + eth/snap stack by path and runs it over Tor
+against live mainnet. See `rust/tor-poc/README.md` for how to run it.
+
+**Validated end-to-end:**
+
+- Arti embeds and bootstraps in-process (§3) — no bundled `tor`, no Orbot.
+- Per-address stream isolation (§3): one `IsolationToken` per address → distinct
+  circuits; the PoC reads two addresses each over its own isolated circuit.
+- Ephemeral Tor-side RLPx keys (§6.1): a fresh random node key per connection.
+- The existing RLPx + eth/66-69 + snap/1 stack runs **unmodified** over an Arti
+  `DataStream` (§4) — the only production change was making the transport
+  generic over the stream type (default `TcpStream`). A clearnet baseline runs
+  the identical code over `TcpStream` for comparison.
+- The §1 "core leak" flow itself: a real `GetAccountRange` for a user address,
+  MPT-verified, returned over Tor with the IP behind three hops (e.g. a verified
+  balance for `d8dA…6045` against a synced peer's head state root).
+
+**Deliberately out of scope (still proposals):** the quarantined peer pool and
+its aging window (§5), the `peers-tor` sidecar, multi-source popularity
+promotion (§6.2), generic request-shape hardening (§6.3), tx-broadcast fan-out
+(§8.6), and — importantly — **the beacon-anchored trust root**: the PoC anchors
+the snap proof to the peer's *own claimed* fresh head, not the sync-committee
+anchor. It proves the transport, not a trust-model change; its `VERIFIED` output
+means "MPT-consistent with a peer-claimed head," which is strictly weaker than
+the wallet's real verified-read guarantee (see the "Trust" section of
+`CLAUDE.md`). Any productionization must anchor to the beacon chain.
+
+**Key learnings folded into the sections above:** the `DataStream` flush
+requirement and mandatory handshake timeout (§3), the measured latency tail
+(§2/§8.5), the reduced-exit-policy reality for `:30303` (§2/§8.1), and the
+dominant blocker — peer-side rejection of Tor exit IPs, which promotes
+"Tor-reachable + synced" to a first-class peer-selection gate (§5/§8.9).
 
 ## Code pointers (current behavior this design touches)
 

@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 19; // 19: + nativePendingNonceOverlay (sent-tx slice)
+    static final int EXPECTED_ABI_VERSION = 20; // 20: + set_tor_enabled/tor_status (Tor)
 
     private static final boolean AVAILABLE = load();
 
@@ -161,6 +161,23 @@ final class RustEngineNative {
     /** Start the sync loop for a created handle. True on success. */
     static boolean nativeStart(long handle) {
         return Myotis_engineKt.startHandle(handle);
+    }
+
+    /**
+     * Toggle Tor verified-read routing (docs/privacy-and-tor.md). Returns true iff
+     * the loaded library was built with Tor support ({@code --features tor}); a
+     * Tor-less library returns false and no-ops. Process-global, not per-handle.
+     */
+    static boolean nativeSetTorEnabled(boolean on) {
+        return Myotis_engineKt.setTorEnabled(on);
+    }
+
+    /**
+     * Tor status bitmask for the Status view: bit0 compiled-in, bit1 enabled,
+     * bit2 bootstrapped (circuit ready). {@code 0} = no Tor support in this build.
+     */
+    static int nativeTorStatus() {
+        return Myotis_engineKt.torStatus();
     }
 
     /** One handle's status as a JSON object, or {@code "{}"} for an unknown handle. */

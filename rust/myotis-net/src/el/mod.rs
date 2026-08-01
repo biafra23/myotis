@@ -16,6 +16,10 @@ pub mod pool;
 pub mod reader;
 pub mod receipt;
 pub mod rlpx;
+/// Tor transport for the verified-read path (docs/privacy-and-tor.md). Only
+/// compiled with `--features tor`; a no-op absence otherwise.
+#[cfg(feature = "tor")]
+pub mod tor;
 pub mod sent_tx;
 pub mod served;
 pub mod snap;

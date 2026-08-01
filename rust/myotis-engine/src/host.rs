@@ -126,6 +126,44 @@ fn config_for(network_name: &str) -> Option<ChainConfig> {
     }
 }
 
+/// `nativeSetTorEnabled`: turn Tor verified-read routing on/off
+/// (docs/privacy-and-tor.md). Returns `true` when this engine build actually
+/// supports Tor (`--features tor`), `false` when it doesn't — so a host can grey
+/// out the toggle rather than pretend it works. A no-op when Tor isn't compiled.
+pub fn set_tor_enabled(on: bool) -> bool {
+    #[cfg(feature = "tor")]
+    {
+        myotis_net::el::tor::set_enabled(on);
+        true
+    }
+    #[cfg(not(feature = "tor"))]
+    {
+        let _ = on;
+        false
+    }
+}
+
+/// `nativeTorStatus`: a small bitmask for the host's Status view —
+/// bit0 compiled-in, bit1 enabled, bit2 bootstrapped (circuit ready). `0` means
+/// this build has no Tor support at all.
+pub fn tor_status() -> i32 {
+    #[cfg(feature = "tor")]
+    {
+        let mut s = 1; // compiled in
+        if myotis_net::el::tor::is_enabled() {
+            s |= 2;
+        }
+        if myotis_net::el::tor::is_bootstrapped() {
+            s |= 4;
+        }
+        s
+    }
+    #[cfg(not(feature = "tor"))]
+    {
+        0
+    }
+}
+
 /// `nativeCreate`: allocate an id for a not-yet-started hosted chain (mainnet or
 /// sepolia). Returns the id (`>= 1`), `UNSUPPORTED_NETWORK` (-2) for a canonical
 /// network this engine doesn't host yet (gnosis), or `CREATE_FAILED` (-1) for an

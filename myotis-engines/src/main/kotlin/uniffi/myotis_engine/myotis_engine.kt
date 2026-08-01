@@ -720,11 +720,15 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_send_raw_transaction_json(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_set_tor_enabled(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_start_handle(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_status_json(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_stop_handle(
+    ): Int
+    external fun uniffi_myotis_engine_checksum_func_tor_status(
     ): Int
     external fun ffi_myotis_engine_uniffi_contract_version(
     ): Int
@@ -787,12 +791,16 @@ internal object UniffiLib {
     ): Byte
     external fun uniffi_myotis_engine_fn_func_send_raw_transaction_json(`handle`: Long,`rawTxHex`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_set_tor_enabled(`on`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
     external fun uniffi_myotis_engine_fn_func_start_handle(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_myotis_engine_fn_func_status_json(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_stop_handle(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_myotis_engine_fn_func_tor_status(uniffi_out_err: UniffiRustCallStatus, 
+    ): Int
     external fun ffi_myotis_engine_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun ffi_myotis_engine_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -984,6 +992,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_myotis_engine_checksum_func_send_raw_transaction_json() != 26871) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_myotis_engine_checksum_func_set_tor_enabled() != 16704) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_myotis_engine_checksum_func_start_handle() != 14110) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -991,6 +1002,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_stop_handle() != 52697) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_myotis_engine_checksum_func_tor_status() != 43413) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1625,6 +1639,22 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
 
         /**
+         * Toggle Tor verified-read routing (docs/privacy-and-tor.md). Returns true iff
+         * this build supports Tor (`--features tor`); a Tor-less build returns false and
+         * no-ops. Process-global, not per-handle.
+         */ fun `setTorEnabled`(`on`: kotlin.Boolean): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_set_tor_enabled(
+    
+        
+        FfiConverterBoolean.lower(`on`),_status)
+}
+    )
+    }
+    
+
+        /**
          * Start the sync loop for a created handle. True on success.
          */ fun `startHandle`(`handle`: kotlin.Long): kotlin.Boolean {
             return FfiConverterBoolean.lift(
@@ -1663,6 +1693,20 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         FfiConverterLong.lower(`handle`),_status)
 }
     
+    
+
+        /**
+         * Tor status bitmask for the host Status view: bit0 compiled-in, bit1 enabled,
+         * bit2 bootstrapped. `0` = this build has no Tor support.
+         */ fun `torStatus`(): kotlin.Int {
+            return FfiConverterInt.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_tor_status(
+    
+        _status)
+}
+    )
+    }
     
 
 

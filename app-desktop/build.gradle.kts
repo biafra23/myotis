@@ -208,6 +208,9 @@ tasks.withType<JavaExec>().matching { it.name == "run" || it.name == "syncSmoke"
     dependsOn(rootProject.tasks.named("cargoBuildHost"))
     // -Pengine=java|rust|auto → -Dmyotis.engine (same knob as :app run).
     (project.findProperty("engine") as String?)?.let { systemProperty("myotis.engine", it) }
+    // -Ptor=true → -Dmyotis.tor (dev knob to force Tor routing on at boot; needs the
+    // engine dylib built with -PtorEngine to actually route — docs/privacy-and-tor.md).
+    (project.findProperty("tor") as String?)?.let { systemProperty("myotis.tor", it) }
     doFirst {
         val os = System.getProperty("os.name").lowercase()
         val lib = when {

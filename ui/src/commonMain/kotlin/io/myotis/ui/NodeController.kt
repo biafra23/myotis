@@ -69,6 +69,15 @@ interface NodeController {
     fun applyEngineChoice()
 
     /**
+     * Re-apply Tor verified-read routing to the process-global selector after
+     * [Settings.setTorEnabled] flips the preference (docs/privacy-and-tor.md). Tor is a
+     * Rust-engine-only, experimental capability, so hosts that don't support it (Android/iOS
+     * for now) keep the default no-op; the desktop actual pushes the flag to `Tor.select`.
+     * Like the engine toggle it is NOT live: it applies to networks (re)started afterwards.
+     */
+    fun applyTorMode() {}
+
+    /**
      * Wipe a network's peer caches — clear the live stack's backoff/blacklist and delete the
      * on-disk EL/CL peer cache files — so discovery starts from a fresh slate. Safe whether or
      * not the network is currently running.
@@ -180,6 +189,15 @@ interface Settings {
     fun setRustEngineEnabled(v: Boolean)
 
     /**
+     * true = route verified reads over Tor (docs/privacy-and-tor.md) — experimental, and
+     * Rust-engine-only (Arti is embedded in the Rust engine). Default false. Hosts that
+     * can't support it keep the default no-op getter/setter so Android/iOS still compile;
+     * the desktop actual persists it and [NodeController.applyTorMode] pushes it down.
+     */
+    fun torEnabled(): Boolean = false
+    fun setTorEnabled(v: Boolean) {}
+
+    /**
      * Minutes of no RPC/UI activity before a running stack is paused into idle sleep
      * (networking off, RPC listening, first request wakes it). 0 disables auto-pause.
      * Defaults keep hosts without an idle controller (desktop) compiling: auto-pause off.
@@ -271,6 +289,11 @@ data class NodeSnapshot(
                                        // aggressively discovering/probing for new ones
     val elHunting: Boolean = false,    // EL hunt engaged: snap serving pool empty past the
                                        // stall window, emergency re-dials running
+    // Tor verified-read routing (docs/privacy-and-tor.md), Status "Tor" row.
+    // null = not applicable (Java engine / build without Tor support); otherwise
+    // "off" (supported, disabled), "on" (enabled, circuit still bootstrapping),
+    // or "active" (enabled AND a Tor circuit is ready — reads route over Tor).
+    val tor: String? = null,
 )
 
 /** One connected READY peer, for the Status peer list. */

@@ -30,6 +30,11 @@
 [workspace]
 resolver = "2"
 members = ["myotis-bls", "myotis-consensus", "myotis-core", "myotis-evm", "myotis-engine", "myotis-net", "uniffi-bindgen"]
+# tor-poc (docs/privacy-and-tor.md §3 proof-of-concept) is a STANDALONE crate,
+# excluded on purpose: it pulls the whole Arti dependency tree, which must never
+# burden the pure-engine build or CI. It depends on myotis-net/myotis-core by
+# path and builds on its own with `cargo run --manifest-path tor-poc/Cargo.toml`.
+exclude = ["tor-poc"]
 
 # Release profile is workspace-owned (crate-level [profile.*] is ignored in a
 # workspace): same tuning myotis-bls always shipped with.

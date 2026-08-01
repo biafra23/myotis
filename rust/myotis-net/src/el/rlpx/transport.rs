@@ -40,20 +40,27 @@ const FRAME_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 /// indeterminate state, so callers must treat it as a fatal connection error.
 const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A live framed RLPx connection: the TCP stream plus the session's stateful
+/// A live framed RLPx connection: the byte stream plus the session's stateful
 /// [`FrameCodec`]. Read/write are serialized through `&mut self` (the codec is
 /// position-dependent), matching the Java single-event-loop contract.
-pub struct RlpxConnection {
-    stream: TcpStream,
+///
+/// Generic over the underlying stream `S`, defaulting to [`TcpStream`] so every
+/// clearnet caller is unchanged. The bound is any tokio byte stream, which lets
+/// the same handshake + framed channel run over a Tor `DataStream` (Arti) — see
+/// [`RlpxConnection::handshake_over`] and `docs/privacy-and-tor.md` §3. The
+/// crypto (`Initiator`/`FrameCodec`) never touched the socket type; only this
+/// dialer did.
+pub struct RlpxConnection<S = TcpStream> {
+    stream: S,
     codec: FrameCodec,
     /// The peer's static public key (its enode id).
     peer_pubkey: [u8; 64],
 }
 
-impl RlpxConnection {
-    /// Dial `addr`, perform the initiator handshake against `peer_pubkey`, and
-    /// return a FRAMED connection. Entropy (handshake + ecies ephemerals,
-    /// nonces, IV, EIP-8 padding) is drawn from the OS here.
+impl RlpxConnection<TcpStream> {
+    /// Dial `addr` over clearnet TCP, perform the initiator handshake against
+    /// `peer_pubkey`, and return a FRAMED connection. Entropy (handshake + ecies
+    /// ephemerals, nonces, IV, EIP-8 padding) is drawn from the OS here.
     pub async fn dial(
         local_key: Arc<NodeKey>,
         addr: std::net::SocketAddr,
@@ -70,11 +77,40 @@ impl RlpxConnection {
         addr: std::net::SocketAddr,
         peer_pubkey: [u8; 64],
     ) -> Result<RlpxConnection, String> {
-        let mut stream = TcpStream::connect(addr)
+        let stream = TcpStream::connect(addr)
             .await
             .map_err(|e| format!("rlpx connect: {e}"))?;
         stream.set_nodelay(true).ok();
+        Self::handshake_over(stream, local_key, peer_pubkey).await
+    }
 
+    /// Split into independent read/write halves for the managed-peer's separate
+    /// tasks (the frame codec's egress/ingress state are independent). TCP-only:
+    /// the managed-peer actor is a clearnet construct; the Tor PoC drives the
+    /// connection through `&mut self` [`send`](Self::send)/[`recv`](Self::recv).
+    pub fn split(self) -> (RlpxReader, RlpxWriter, [u8; 64]) {
+        let (read_half, write_half) = self.stream.into_split();
+        let (encoder, decoder) = self.codec.split();
+        (
+            RlpxReader { read_half, decoder },
+            RlpxWriter { write_half, encoder },
+            self.peer_pubkey,
+        )
+    }
+}
+
+impl<S: AsyncReadExt + AsyncWriteExt + Unpin> RlpxConnection<S> {
+    /// Run the initiator handshake over an ALREADY-CONNECTED stream, returning a
+    /// FRAMED connection. The caller owns transport setup (TCP connect + nodelay
+    /// for [`dial`](RlpxConnection::dial); opening a Tor `DataStream` for the
+    /// privacy path). Not bounded by [`HANDSHAKE_TIMEOUT`] — the caller wraps it
+    /// (Tor's multi-hop build wants a larger budget). Entropy is drawn from the
+    /// OS here.
+    pub async fn handshake_over(
+        mut stream: S,
+        local_key: Arc<NodeKey>,
+        peer_pubkey: [u8; 64],
+    ) -> Result<RlpxConnection<S>, String> {
         // Fresh entropy for this handshake.
         let eph_secret = random32();
         let local_nonce = random32();
@@ -91,6 +127,14 @@ impl RlpxConnection {
             .write_all(&auth_wire)
             .await
             .map_err(|e| format!("rlpx write auth: {e}"))?;
+        // Flush before blocking on the ack: a plain TcpStream sends immediately,
+        // but a buffered stream (Arti's Tor `DataStream`) holds the auth in its
+        // write buffer until flushed — without this the peer never sees our auth
+        // and FINs, surfacing as an "early eof" reading the ack.
+        stream
+            .flush()
+            .await
+            .map_err(|e| format!("rlpx flush auth: {e}"))?;
 
         // Read the EIP-8 ack: 2-byte size prefix, then that many bytes.
         let ack_wire = read_ack(&mut stream).await?;
@@ -107,18 +151,6 @@ impl RlpxConnection {
 
     pub fn peer_pubkey(&self) -> [u8; 64] {
         self.peer_pubkey
-    }
-
-    /// Split into independent read/write halves for the managed-peer's separate
-    /// tasks (the frame codec's egress/ingress state are independent).
-    pub fn split(self) -> (RlpxReader, RlpxWriter, [u8; 64]) {
-        let (read_half, write_half) = self.stream.into_split();
-        let (encoder, decoder) = self.codec.split();
-        (
-            RlpxReader { read_half, decoder },
-            RlpxWriter { write_half, encoder },
-            self.peer_pubkey,
-        )
     }
 
     /// Frame and send one message (bounded by [`FRAME_WRITE_TIMEOUT`]).
@@ -181,10 +213,15 @@ impl RlpxWriter {
 /// egress stream mid-frame (the codec's MAC has already advanced), so it is a
 /// fatal error for the connection — the caller must not reuse the writer.
 async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, frame: &[u8]) -> Result<(), String> {
-    tokio::time::timeout(FRAME_WRITE_TIMEOUT, w.write_all(frame))
-        .await
-        .map_err(|_| "rlpx write frame timed out".to_string())?
-        .map_err(|e| format!("rlpx write frame: {e}"))
+    tokio::time::timeout(FRAME_WRITE_TIMEOUT, async {
+        w.write_all(frame).await?;
+        // Flush so buffered streams (Arti's Tor `DataStream`) actually emit the
+        // frame; a no-op cost on TcpStream, which sends eagerly.
+        w.flush().await
+    })
+    .await
+    .map_err(|_| "rlpx write frame timed out".to_string())?
+    .map_err(|e| format!("rlpx write frame: {e}"))
 }
 
 /// The read half of a split [`RlpxConnection`] — owns the ingress cipher/MAC.
@@ -230,7 +267,7 @@ impl RlpxReader {
 
 /// Read one EIP-8 ack: the 2-byte big-endian size prefix names the encrypted
 /// body length; the full wire (prefix included) seeds the frame MACs.
-async fn read_ack(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+async fn read_ack<S: AsyncReadExt + Unpin>(stream: &mut S) -> Result<Vec<u8>, String> {
     let mut size_prefix = [0u8; 2];
     stream
         .read_exact(&mut size_prefix)

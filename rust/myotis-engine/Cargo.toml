@@ -12,6 +12,14 @@ license = "MIT OR Apache-2.0"
 # list), so host/Android builds don't pay for an archive they never consume.
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Tor verified-read routing (docs/privacy-and-tor.md) — OFF by default. The host
+# dylib build (`cargoBuildHost -PtorEngine`) enables it so the desktop/daemon can
+# offer the Settings toggle; Android/iOS builds do NOT, so the Arti tree never
+# crosses to mobile. The `set_tor_enabled`/`tor_status` FFI functions exist either
+# way (they no-op / report "not compiled" without this feature).
+tor = ["myotis-net/tor"]
+
 [dependencies]
 myotis-consensus = { path = "../myotis-consensus" }
 # The consensus-layer I/O + light-client sync loop. The engine OWNS the tokio

@@ -14,6 +14,7 @@ import io.myotis.api.NetworkInfo
 import io.myotis.api.ports.EnginePorts
 import io.myotis.engines.Engines
 import io.myotis.engines.SelectorEngine
+import io.myotis.engines.Tor
 import io.myotis.txhistory.TxHistoryEvent
 import io.myotis.txhistory.TxHistoryService
 import io.myotis.txhistory.TxSummary
@@ -229,6 +230,21 @@ class DesktopNodeController(
         // Java with a log. Applies to networks (re)started afterwards — live ones keep
         // their engine (reboot the network from Settings to switch it).
         Engines.select(if (settings.rustEngineEnabled()) "auto" else "java")
+    }
+
+    override fun applyTorMode() {
+        // Push the persisted Tor preference to the process-global Rust-engine flag
+        // (docs/privacy-and-tor.md). Tor is Rust-engine-only and experimental: Tor.select
+        // returns whether the loaded engine build actually supports it, which we log so a
+        // silently-unsupported build is visible. Unlike the engine choice, the Tor flag is
+        // LIVE — ElReader checks it per read, so a flip takes effect on the next read of an
+        // already-running Rust-engine network (no restart needed).
+        val on = settings.torEnabled()
+        val supported = Tor.select(on)
+        if (on && !supported) {
+            log.warn("[desktop] Tor routing requested but this engine build has no Tor support "
+                    + "(needs the Rust engine dylib built with --features tor)")
+        }
     }
 
     override fun clearCaches(network: String) {
@@ -463,7 +479,25 @@ class DesktopNodeController(
             elHunting = s.elHunting(),
             rpcPort = s.rpcPort(),
             rpcServing = s.rpcServing(),
+            tor = torModeFor(Engines.engineKindFor(s.network())),
         )
+    }
+
+    /**
+     * Tor routing state for the Status row (docs/privacy-and-tor.md), or null when it
+     * doesn't apply: Tor is a Rust-engine-only capability, and a Rust build without
+     * `--features tor` reports no support (status bit0 clear). Otherwise: "off" (supported
+     * but disabled), "on" (enabled, circuit still bootstrapping), "active" (circuit ready).
+     */
+    private fun torModeFor(engineKind: String?): String? {
+        if (engineKind != "rust") return null
+        val st = Tor.status()
+        if (st and 1 == 0) return null
+        return when {
+            st and 2 == 0 -> "off"
+            st and 4 != 0 -> "active"
+            else -> "on"
+        }
     }
 }
 
@@ -494,6 +528,9 @@ class DesktopSettings(
     private var nativeBls = false
     // The Rust engine is experimental — off by default everywhere.
     private var rustEngine = false
+    // Tor verified-read routing (docs/privacy-and-tor.md) — experimental, Rust-engine-only,
+    // off by default. Persists independently; applyTorMode() pushes it to the Rust engine.
+    private var torRouting = false
 
     /** Serializes file writes, separate from the state lock (`this`) so settings
      *  readers never wait on disk I/O. */
@@ -542,6 +579,8 @@ class DesktopSettings(
     override fun setNativeBlsEnabled(v: Boolean) = mutate { nativeBls = v }
     override fun rustEngineEnabled(): Boolean = synchronized(this) { rustEngine }
     override fun setRustEngineEnabled(v: Boolean) = mutate { rustEngine = v }
+    override fun torEnabled(): Boolean = synchronized(this) { torRouting }
+    override fun setTorEnabled(v: Boolean) = mutate { torRouting = v }
 
     /** Best-effort load; a missing or unreadable file just keeps the defaults. */
     private fun load() {
@@ -567,6 +606,7 @@ class DesktopSettings(
         p.getProperty(K_STRICT)?.toBooleanStrictOrNull()?.let { strict = it }
         p.getProperty(K_NATIVE_BLS)?.toBooleanStrictOrNull()?.let { nativeBls = it }
         p.getProperty(K_RUST_ENGINE)?.toBooleanStrictOrNull()?.let { rustEngine = it }
+        p.getProperty(K_TOR)?.toBooleanStrictOrNull()?.let { torRouting = it }
     }
 
     /**
@@ -605,6 +645,7 @@ class DesktopSettings(
         p.setProperty(K_STRICT, strict.toString())
         p.setProperty(K_NATIVE_BLS, nativeBls.toString())
         p.setProperty(K_RUST_ENGINE, rustEngine.toString())
+        p.setProperty(K_TOR, torRouting.toString())
         return p
     }
 
@@ -640,6 +681,7 @@ class DesktopSettings(
         const val K_STRICT = "strictStateFreshness"
         const val K_NATIVE_BLS = "nativeBls"
         const val K_RUST_ENGINE = "rustEngine"
+        const val K_TOR = "torRouting"
     }
 }
 

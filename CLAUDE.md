@@ -118,8 +118,11 @@ Key Gradle modules:
   (`DesktopNodeController.transactionHistory`), and the Android Query tab
   (`NodeService.txHistoryService`) — all reach the connector via
   `SelectorEngine.javaDelegate().debugStack` at their composition roots;
-  the Settings toggles for the BLS backend (`BlsBackends`) and the
-  engine (`Engines`), the Rust log drain (`Engines.drainRustLogs` —
+  the Settings toggles for the BLS backend (`BlsBackends`), the
+  engine (`Engines`), and Tor verified-read routing (`Tor` —
+  docs/privacy-and-tor.md; Rust-engine-only, gated behind the Rust-engine
+  toggle, and behind the `-PtorEngine` build flag that links Arti into the host
+  dylib), the Rust log drain (`Engines.drainRustLogs` —
   hosts pump the engine's tracing ring into their log pipeline), and the Status
   screen's per-network engine badge (`Engines.engineKindFor`) — internal
   seams, deliberately not on the API; and `:app`'s
