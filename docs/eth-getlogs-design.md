@@ -70,6 +70,13 @@ checkpointed after each backfill batch and periodically at head. Contents:
 Size expectation (kohaku set): tens–hundreds of MB on Sepolia; single-digit GB
 on mainnet (railgun ciphertexts dominate) — acceptable for an opt-in feature.
 
+**Recorded constraint (slice-1 memory model):** the initial store is fully
+resident with whole-buffer snapshots — fine for the dormant slice and for
+Sepolia-scale, but mainnet/railgun scale needs a paged/segmented store (or
+streaming serialization + delta checkpoints) before slice 4 backfills
+mainnet on mobile hosts. Full-rewrite checkpoints across a long backfill are
+also O(n²) write amplification; the segmented store fixes both.
+
 ### 2. Head-follow appender (forward, cheap, always-on while enabled)
 
 A tokio task owned by `ElReader` (so `ElReader::stop`/pause aborts it —

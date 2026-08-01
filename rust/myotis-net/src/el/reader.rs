@@ -621,15 +621,37 @@ impl ElReader {
     /// Install (or replace) the eth_getLogs watch-list config: reload the
     /// persisted index when it matches the config's fingerprint, else start
     /// empty (re-index). See docs/eth-getlogs-design.md.
-    pub fn set_log_index_config(&self, config: crate::el::logindex::LogIndexConfig) {
+    /// Returns false (and installs nothing) for an invalid config
+    /// (duplicate watch addresses). Re-applying a config whose watch-list
+    /// fingerprint matches the installed one only updates the enabled bit —
+    /// in-memory progress survives settings pokes; a genuinely changed
+    /// watch-list checkpoints the old index before replacing it.
+    pub fn set_log_index_config(&self, config: crate::el::logindex::LogIndexConfig) -> bool {
+        let Ok(mut slot) = self.log_index.lock() else {
+            return false;
+        };
+        if let Some(ix) = slot.as_mut() {
+            if ix.config().fingerprint() == config.fingerprint() {
+                ix.set_enabled(config.enabled);
+                return true;
+            }
+            if let Some(p) = self.log_index_path.as_deref() {
+                let _ = ix.persist(p);
+            }
+        }
         let loaded = self
             .log_index_path
             .as_deref()
             .and_then(|p| crate::el::logindex::LogIndex::load(&config, p));
-        let ix = loaded.unwrap_or_else(|| crate::el::logindex::LogIndex::new(config));
-        if let Ok(mut slot) = self.log_index.lock() {
-            *slot = Some(ix);
-        }
+        let ix = match loaded {
+            Some(ix) => ix,
+            None => match crate::el::logindex::LogIndex::new(config) {
+                Ok(ix) => ix,
+                Err(_) => return false,
+            },
+        };
+        *slot = Some(ix);
+        true
     }
 
     /// Run `f` against the index if one is configured. The single accessor

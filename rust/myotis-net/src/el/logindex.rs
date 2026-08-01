@@ -129,6 +129,10 @@ impl Coverage {
     }
 }
 
+/// The config lists the same address twice (see [`LogIndex::new`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DuplicateWatchAddress(pub [u8; 20]);
+
 /// A non-contiguous extend was rejected: the caller tried to record `block`
 /// against a span whose nearest edge is `edge` — the blocks between were
 /// never processed, so bridging them would fabricate coverage.
@@ -207,9 +211,23 @@ pub struct LogIndex {
 }
 
 impl LogIndex {
-    pub fn new(config: LogIndexConfig) -> Self {
+    /// Build an empty index. Rejects configs with duplicate watch addresses:
+    /// query resolution is per-address, and two entries for one address can
+    /// desynchronize storage from coverage (a coverage-honesty hole).
+    pub fn new(config: LogIndexConfig) -> Result<Self, DuplicateWatchAddress> {
+        for (i, w) in config.watch.iter().enumerate() {
+            if config.watch.iter().skip(i + 1).any(|o| o.address == w.address) {
+                return Err(DuplicateWatchAddress(w.address));
+            }
+        }
         let n = config.watch.len();
-        Self { config, coverage: vec![Coverage::default(); n], logs: BTreeMap::new(), cursor: None }
+        Ok(Self { config, coverage: vec![Coverage::default(); n], logs: BTreeMap::new(), cursor: None })
+    }
+
+    /// Flip the enabled bit without touching accumulated state (used when a
+    /// host re-applies a config whose watch-list fingerprint is unchanged).
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.config.enabled = enabled;
     }
 
     pub fn config(&self) -> &LogIndexConfig {
@@ -242,15 +260,20 @@ impl LogIndex {
     pub fn append_block(&mut self, block_number: u64, logs: Vec<StoredLog>) -> Result<(), CoverageGap> {
         for (w, c) in self.config.watch.iter().zip(self.coverage.iter()) {
             if block_number >= w.from_block {
-                if let Some((_, high)) = c.span {
-                    if block_number > high.saturating_add(1) {
+                if let Some((low, high)) = c.span {
+                    if block_number > high.saturating_add(1) || block_number < low {
                         return Err(CoverageGap { edge: high, block: block_number });
                     }
                 }
             }
         }
         for log in logs {
-            debug_assert_eq!(log.block_number, block_number);
+            // Unconditional (not debug_assert): a mislabeled log would be
+            // keyed by its own number, possibly inside covered range it was
+            // never verified for. Drop it instead.
+            if log.block_number != block_number {
+                continue;
+            }
             if self.watched(&log) {
                 self.logs.insert((log.block_number, log.log_index), log);
             }
@@ -275,15 +298,17 @@ impl LogIndex {
     ) -> Result<(), CoverageGap> {
         for (w, c) in self.config.watch.iter().zip(self.coverage.iter()) {
             if block_number >= w.from_block {
-                if let Some((low, _)) = c.span {
-                    if block_number.saturating_add(1) < low {
+                if let Some((low, high)) = c.span {
+                    if block_number.saturating_add(1) < low || block_number > high {
                         return Err(CoverageGap { edge: low, block: block_number });
                     }
                 }
             }
         }
         for log in logs {
-            debug_assert_eq!(log.block_number, block_number);
+            if log.block_number != block_number {
+                continue; // see append_block: unconditional mislabel guard
+            }
             if self.watched(&log) {
                 self.logs.insert((log.block_number, log.log_index), log);
             }
@@ -300,6 +325,12 @@ impl LogIndex {
     /// Drop everything above `fork_point` (exclusive) after a reorg above
     /// finalized. Coverage highs pull back; logs of orphaned blocks go away.
     pub fn rewind_above(&mut self, fork_point: u64) {
+        // The backfill trust edge is a HASH; if the reorg reaches below it,
+        // that hash may name an orphaned block — a resuming walker would
+        // parent-chain into the dead branch. Drop it; the caller re-anchors.
+        if self.cursor.is_some_and(|(n, _)| n > fork_point) {
+            self.cursor = None;
+        }
         self.logs.retain(|(bn, _), _| *bn <= fork_point);
         for c in &mut self.coverage {
             if let Some((low, high)) = c.span {
@@ -377,6 +408,17 @@ impl LogIndex {
 const MAGIC: &[u8; 4] = b"MLIX";
 const VERSION: u32 = 1;
 
+/// FNV-1a (same primitive as the config fingerprint): integrity tag for the
+/// snapshot payload — bit-rot detection, not a security boundary.
+fn fnv64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
@@ -427,6 +469,7 @@ impl LogIndex {
         out.extend_from_slice(MAGIC);
         put_u32(&mut out, VERSION);
         put_u64(&mut out, self.config.fingerprint());
+        put_u64(&mut out, 0); // checksum placeholder, patched below
         // Coverage spans + cursor.
         put_u32(&mut out, self.coverage.len() as u32);
         for c in &self.coverage {
@@ -462,6 +505,14 @@ impl LogIndex {
             }
             put_bytes(&mut out, &log.data);
         }
+        // Payload checksum over everything after the checksum field itself:
+        // structural framing catches truncation, this catches bit-rot inside
+        // otherwise-valid frames — either way a bad load means re-index, never
+        // serving corrupted logs as verified.
+        let sum = fnv64(&out[24..]);
+        if let Some(slot) = out.get_mut(16..24) {
+            slot.copy_from_slice(&sum.to_le_bytes());
+        }
         out
     }
 
@@ -470,6 +521,10 @@ impl LogIndex {
     pub fn deserialize(config: &LogIndexConfig, data: &[u8]) -> Option<Self> {
         let mut c = Cursor { d: data, pos: 0 };
         if c.take(4)? != MAGIC || c.u32()? != VERSION || c.u64()? != config.fingerprint() {
+            return None;
+        }
+        let stored_sum = c.u64()?;
+        if fnv64(data.get(24..)?) != stored_sum {
             return None;
         }
         let n_cov = c.u32()? as usize;
@@ -571,13 +626,18 @@ mod tests {
         LogIndexConfig { enabled: true, watch: entries }
     }
 
+    /// `LogIndex::new(config(...)).unwrap()` shorthand for valid configs.
+    fn config_ok(entries: Vec<WatchEntry>) -> LogIndexConfig {
+        config(entries)
+    }
+
     fn filter(from: u64, to: u64, a: [u8; 20]) -> LogFilter {
         LogFilter { from_block: from, to_block: to, addresses: vec![a], topics: vec![] }
     }
 
     #[test]
     fn query_outside_coverage_errors_never_empty() {
-        let mut ix = LogIndex::new(config(vec![watch_all(addr(1), 100)]));
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 100)])).unwrap();
         ix.append_block(200, vec![]).unwrap();
         ix.append_block(201, vec![log(201, 0, addr(1), vec![topic(9)])]).unwrap();
         // Covered range answers (including the empty block).
@@ -595,7 +655,7 @@ mod tests {
 
     #[test]
     fn range_below_from_block_needs_no_coverage() {
-        let mut ix = LogIndex::new(config(vec![watch_all(addr(1), 500)]));
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 500)])).unwrap();
         ix.append_block(500, vec![]).unwrap();
         // 100..=500 is fine: below from_block the contract can't have logs.
         assert_eq!(ix.query(&filter(100, 500, addr(1))).unwrap(), vec![]);
@@ -605,10 +665,10 @@ mod tests {
 
     #[test]
     fn unwatched_address_and_disabled_error() {
-        let mut ix = LogIndex::new(config(vec![watch_all(addr(1), 0)]));
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
         ix.append_block(10, vec![]).unwrap();
         assert_eq!(ix.query(&filter(0, 10, addr(2))), Err(QueryError::UnwatchedAddress(addr(2))));
-        let off = LogIndex::new(LogIndexConfig { enabled: false, watch: vec![watch_all(addr(1), 0)] });
+        let off = LogIndex::new(LogIndexConfig { enabled: false, watch: vec![watch_all(addr(1), 0)] }).unwrap();
         assert_eq!(off.query(&filter(0, 0, addr(1))), Err(QueryError::Disabled));
         assert_eq!(ix.query(&LogFilter { from_block: 0, to_block: 10, addresses: vec![], topics: vec![] }), Err(QueryError::Unanswerable));
     }
@@ -616,7 +676,7 @@ mod tests {
     #[test]
     fn topic_restricted_watch_rejects_wildcard_queries() {
         let w = WatchEntry { address: addr(1), from_block: 0, topic0s: vec![topic(7)] };
-        let mut ix = LogIndex::new(config(vec![w]));
+        let mut ix = LogIndex::new(config_ok(vec![w])).unwrap();
         ix.append_block(5, vec![log(5, 0, addr(1), vec![topic(7)])]).unwrap();
         // Wildcard topic0 would deserve unindexed signatures → error.
         assert_eq!(ix.query(&filter(5, 5, addr(1))), Err(QueryError::UnindexedTopic(addr(1))));
@@ -631,7 +691,7 @@ mod tests {
 
     #[test]
     fn positional_topic_matching() {
-        let mut ix = LogIndex::new(config(vec![watch_all(addr(1), 0)]));
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
         ix.append_block(1, vec![log(1, 0, addr(1), vec![topic(7), topic(8)])]).unwrap();
         let mut f = filter(1, 1, addr(1));
         f.topics = vec![vec![], vec![topic(8), topic(9)]]; // wildcard t0, OR at t1
@@ -644,7 +704,7 @@ mod tests {
 
     #[test]
     fn backfill_extends_down_and_tracks_cursor() {
-        let mut ix = LogIndex::new(config(vec![watch_all(addr(1), 100)]));
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 100)])).unwrap();
         ix.append_block(300, vec![]).unwrap();
         ix.backfill_block(299, [9; 32], vec![log(299, 2, addr(1), vec![])]).unwrap();
         ix.backfill_block(298, [8; 32], vec![]).unwrap();
@@ -655,7 +715,7 @@ mod tests {
 
     #[test]
     fn rewind_above_drops_logs_and_pulls_coverage_back() {
-        let mut ix = LogIndex::new(config(vec![watch_all(addr(1), 0)]));
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
         for b in 10..=14 {
             ix.append_block(b, vec![log(b, 0, addr(1), vec![])]).unwrap();
         }
@@ -668,7 +728,7 @@ mod tests {
 
     #[test]
     fn unwatched_logs_are_not_stored() {
-        let mut ix = LogIndex::new(config(vec![watch_all(addr(1), 100)]));
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 100)])).unwrap();
         // Wrong address, and right address but below from_block: both dropped.
         ix.append_block(200, vec![log(200, 0, addr(2), vec![])]).unwrap();
         ix.backfill_block(99, [1; 32], vec![log(99, 0, addr(1), vec![])]).unwrap();
@@ -681,7 +741,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("logindex-test.db");
         let cfg = config(vec![watch_all(addr(1), 100), WatchEntry { address: addr(2), from_block: 0, topic0s: vec![topic(7)] }]);
-        let mut ix = LogIndex::new(cfg.clone());
+        let mut ix = LogIndex::new(cfg.clone()).unwrap();
         ix.append_block(200, vec![log(200, 3, addr(1), vec![topic(7), topic(8)])]).unwrap();
         ix.backfill_block(199, [7; 32], vec![]).unwrap();
         ix.persist(&path).unwrap();
@@ -703,7 +763,7 @@ mod tests {
 
     #[test]
     fn gaps_are_rejected_not_bridged() {
-        let mut ix = LogIndex::new(config(vec![watch_all(addr(1), 0)]));
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
         ix.append_block(200, vec![]).unwrap();
         // Skipping 201 must fail and store nothing.
         assert_eq!(ix.append_block(205, vec![log(205, 0, addr(1), vec![])]), Err(CoverageGap { edge: 200, block: 205 }));
@@ -721,7 +781,7 @@ mod tests {
     #[test]
     fn deserialize_survives_arbitrary_corruption() {
         let cfg = config(vec![watch_all(addr(1), 0)]);
-        let mut ix = LogIndex::new(cfg.clone());
+        let mut ix = LogIndex::new(cfg.clone()).unwrap();
         ix.append_block(7, vec![log(7, 0, addr(1), vec![topic(1), topic(2)])]).unwrap();
         let good = ix.serialize();
         assert!(LogIndex::deserialize(&cfg, &good).is_some());
@@ -741,6 +801,56 @@ mod tests {
         let tail = huge.len() - 4;
         huge[tail..].copy_from_slice(&u32::MAX.to_le_bytes());
         let _ = LogIndex::deserialize(&cfg, &huge);
+    }
+
+    #[test]
+    fn duplicate_watch_addresses_are_rejected() {
+        let dup = config(vec![watch_all(addr(1), 0), WatchEntry { address: addr(1), from_block: 50, topic0s: vec![] }]);
+        assert!(matches!(LogIndex::new(dup), Err(DuplicateWatchAddress(a)) if a == addr(1)));
+    }
+
+    #[test]
+    fn rewind_below_backfill_edge_drops_cursor() {
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
+        ix.append_block(200, vec![]).unwrap();
+        ix.backfill_block(199, [9; 32], vec![]).unwrap();
+        // Fork below the walk's edge: the cursor hash may be orphaned.
+        ix.rewind_above(150);
+        assert_eq!(ix.cursor, None);
+        // Fork above the edge leaves the cursor intact.
+        let mut ix2 = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
+        ix2.append_block(200, vec![]).unwrap();
+        ix2.backfill_block(199, [9; 32], vec![]).unwrap();
+        ix2.rewind_above(199);
+        assert_eq!(ix2.cursor, Some((199, [9; 32])));
+    }
+
+    #[test]
+    fn append_below_low_and_backfill_above_high_are_rejected() {
+        let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
+        ix.append_block(200, vec![]).unwrap();
+        ix.backfill_block(199, [1; 32], vec![]).unwrap();
+        assert!(ix.append_block(150, vec![log(150, 0, addr(1), vec![])]).is_err());
+        assert_eq!(ix.log_count(), 0); // nothing stored outside coverage
+        assert!(ix.backfill_block(300, [2; 32], vec![]).is_err());
+        // Re-processing inside the span stays allowed on both paths.
+        ix.append_block(200, vec![]).unwrap();
+        ix.backfill_block(199, [1; 32], vec![]).unwrap();
+    }
+
+    #[test]
+    fn payload_bitflip_is_detected() {
+        let cfg = config(vec![watch_all(addr(1), 0)]);
+        let mut ix = LogIndex::new(cfg.clone()).unwrap();
+        ix.append_block(7, vec![log(7, 0, addr(1), vec![topic(1)])]).unwrap();
+        let good = ix.serialize();
+        // Flip one bit inside every payload byte (past the 24-byte header):
+        // the checksum must reject each one.
+        for i in 24..good.len() {
+            let mut bad = good.clone();
+            bad[i] ^= 0x01;
+            assert!(LogIndex::deserialize(&cfg, &bad).is_none(), "bitflip at {i} accepted");
+        }
     }
 
     #[test]
