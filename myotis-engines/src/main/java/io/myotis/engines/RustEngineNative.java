@@ -298,6 +298,21 @@ final class RustEngineNative {
         return Myotis_engineKt.getBlockReceiptsJson(handle, nz(selector));
     }
 
+    /** {@code eth_getLogs} over the watch-list index (array / {"error":...}). */
+    static String nativeGetLogsJson(long handle, String filterJson) {
+        return Myotis_engineKt.getLogsJson(handle, nz(filterJson));
+    }
+
+    /** Install the log-index watch-list config; false = invalid/unavailable. */
+    static boolean nativeSetLogIndexConfig(long handle, String configJson) {
+        return Myotis_engineKt.setLogIndexConfig(handle, nz(configJson));
+    }
+
+    /** Log-index status JSON (enabled, counts, coverage per entry). */
+    static String nativeLogIndexStatusJson(long handle) {
+        return Myotis_engineKt.logIndexStatusJson(handle);
+    }
+
     /** Verified {@code eth_feeHistory} (feeHistory JSON / error). */
     static String nativeFeeHistoryJson(
             long handle, long blockCount, String newestBlockTag, String percentilesJson) {

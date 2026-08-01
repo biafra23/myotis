@@ -45,7 +45,7 @@ class RpcRouter(
             "eth_getTransactionCount", "eth_getCode", "eth_getStorageAt",
             "eth_sendRawTransaction", "eth_getTransactionReceipt", "eth_getBlockByNumber",
             "eth_gasPrice", "eth_maxPriorityFeePerGas", "eth_feeHistory", "eth_estimateGas",
-            "eth_getTransactionByHash", "eth_getBlockByHash", "eth_getBlockReceipts",
+            "eth_getTransactionByHash", "eth_getBlockByHash", "eth_getBlockReceipts", "eth_getLogs",
             "web3_clientVersion", "eth_syncing",
             "eth_accounts", "net_listening", "net_peerCount", "web3_sha3",
             "eth_getBlockTransactionCountByNumber", "eth_getBlockTransactionCountByHash",
@@ -446,6 +446,24 @@ class RpcRouter(
                 val receiptsJson =
                     withContext(rpcIoDispatcher) { b.getBlockReceipts(selector) } ?: return null
                 resultEnvelope(id, json.parseToJsonElement(receiptsJson))
+            }
+            "eth_getLogs" -> {
+                // One filter-object param. The engine owns filter semantics
+                // (tags, address forms, positional topics) AND the coverage
+                // honesty rule — a range the index hasn't covered comes back
+                // as {"error": ...}, which we surface verbatim at -32000 so
+                // wallets see WHY (e.g. how far the backfill has come)
+                // instead of a bare cannot-serve.
+                val filter = root.params()?.getOrNull(0) as? JsonObject ?: return null
+                val resultJson = withContext(rpcIoDispatcher) { b.getLogs(filter.toString()) } ?: return null
+                val parsed = json.parseToJsonElement(resultJson)
+                val errorMessage = (parsed as? JsonObject)?.get("error")
+                    ?.let { (it as? JsonPrimitive)?.contentOrNull ?: it.toString() }
+                if (errorMessage != null) {
+                    errorEnvelope(id, -32000, errorMessage)
+                } else {
+                    resultEnvelope(id, parsed)
+                }
             }
             "eth_gasPrice" -> {
                 val price = withContext(rpcIoDispatcher) { b.gasPrice() } ?: return null

@@ -75,6 +75,17 @@ public interface VerifiedReads {
      */
     String getBlockReceipts(String blockSelector);
 
+    /**
+     * Verified {@code eth_getLogs} over the engine's opt-in watch-list log
+     * index: the log-array JSON, an {@code {"error": ...}} object carrying
+     * coverage/config detail, or {@code null} when the engine has no index
+     * (the default — the Java engine does not implement the index yet and
+     * answers with the strict retryable error).
+     */
+    default String getLogs(String filterJson) {
+        return null;
+    }
+
     /** Legacy gas price in decimal wei (base fee + tip heuristics), or null. */
     String gasPrice();
 
