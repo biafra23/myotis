@@ -56,9 +56,10 @@ node smoke.mjs ./data-dir ../target/debug/myotis-node.node
 - **Readiness**: serve verified reads only when `statusJson` shows
   `beaconState === 'SYNCED'`, `elReaderAvailable`, and `snapPeers > 0`;
   before that, reads honestly error rather than guess.
-- **data_dir must exist** — the engine currently does not create it, and
-  silently loses snapshot persistence if it's missing (writes retry and fail
-  with ENOENT; sync still works but every restart is a cold start).
+- **data_dir**: the engine creates it on `create()` (an uncreatable path
+  yields a negative handle) as of the data_dir fix; on engine versions
+  without it, create the directory yourself first — otherwise sync works but
+  snapshot writes fail with ENOENT and every restart is a cold start.
 - **CCIP-Read (`status: "offchain"`)**: the engine returns the gateway tuple;
   driving the HTTP round and re-entering via `method: "ccipCallback"` is the
   host's job (not yet wrapped here).

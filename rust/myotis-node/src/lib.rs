@@ -1,12 +1,15 @@
 //! Node.js binding over the myotis-engine **C ABI** (`capi.rs` /
 //! `rust/include/myotis_engine.h`) via napi-rs — the Electron/desktop-host seam.
 //!
-//! Design notes, mirroring the other two consumers of this seam (hand-JNI for
-//! the JVM hosts, Kotlin/Native cinterop for iOS):
+//! Design notes, mirroring the other consumers of this seam (UniFFI for the
+//! JVM hosts, Kotlin/Native cinterop for iOS):
 //!
-//! - We call the exported C symbols rather than engine internals, so this crate
-//!   needs **zero changes** in `myotis-engine` and stays pinned to the same
-//!   JSON shapes the cross-engine golden tests enforce.
+//! - We call the C-ABI entry points (`myotis_engine::capi`) rather than engine
+//!   internals, so the binding stays pinned to the same JSON shapes the
+//!   cross-engine golden tests enforce. The one engine change this required is
+//!   `pub mod capi` — linking the rlib does not reliably resolve `extern "C"`
+//!   imports of its `no_mangle` symbols, so the functions are called by Rust
+//!   path instead (see the note on the module in myotis-engine's lib.rs).
 //! - Compound values cross as JSON strings; parsing is the JS side's job.
 //! - The verified reads BLOCK (up to ~90 s). Every one of them is exposed as an
 //!   `AsyncTask` — napi-rs runs `compute()` on the libuv thread pool, so the

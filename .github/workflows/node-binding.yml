@@ -62,6 +62,34 @@ jobs:
           path: ${{ matrix.artifact }}
           if-no-files-found: error
 
+  # Control experiment for the Windows smoke: same mainnet smoke on a Linux
+  # runner. First Windows attempt discovered 160 peers over UDP but held ZERO
+  # TCP/libp2p connections in 55 min — this job disambiguates "Windows socket
+  # problem in the engine" from "Ethereum peers deprioritize/ban datacenter
+  # (Azure) IPs": if Linux-on-Azure also gets no peers, it's the environment.
+  smoke-linux:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: myotis-node.linux-x64-gnu.node
+      - name: Restore sync snapshot cache
+        uses: actions/cache@v4
+        with:
+          path: myotis-data
+          key: myotis-smoke-data-linux-${{ github.run_id }}
+          restore-keys: myotis-smoke-data-linux-
+      - name: Ensure data dir exists
+        run: mkdir -p "${{ github.workspace }}/myotis-data"
+      - name: Smoke — sync mainnet + verified reads
+        working-directory: rust/myotis-node
+        env:
+          MYOTIS_SMOKE_TIMEOUT_MIN: '55'
+        run: node smoke.mjs "${{ github.workspace }}/myotis-data" "${{ github.workspace }}/myotis-node.linux-x64-gnu.node"
+
   # Full runtime validation on Windows: unit-test the workspace, then run the
   # real smoke — sync mainnet over devp2p/libp2p from the runner, reach
   # SYNCED, and serve verified reads (ENS, contenthash, account proof)
