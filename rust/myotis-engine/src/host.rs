@@ -386,6 +386,7 @@ pub fn pause(handle: i64) -> bool {
     engine.rt.block_on(async move {
         sync.stop().await;
         if let Some(reader) = reader {
+            reader.stop_log_index_appender().await;
             if let Ok(reader) = Arc::try_unwrap(reader) {
                 reader.stop().await;
             }
@@ -405,7 +406,10 @@ fn shutdown(engine: &EngineState, sync: SyncHandle, reader: Option<Arc<ElReader>
         if let Some(reader) = reader {
             // Only our just-started reader holds an Arc here, so unwrapping the
             // Arc to consume `stop(self)` succeeds; if it somehow doesn't, the
-            // reader's Drop still aborts its tasks.
+            // reader's Drop still aborts its tasks. The appender is stopped
+            // (abort + await) FIRST so its per-tick strong Arc can't defeat
+            // the unwrap.
+            reader.stop_log_index_appender().await;
             if let Ok(reader) = Arc::try_unwrap(reader) {
                 reader.stop().await;
             }
@@ -534,6 +538,7 @@ pub fn stop(handle: i64) {
         engine.rt.block_on(async move {
             sync.stop().await;
             if let Some(reader) = reader {
+                reader.stop_log_index_appender().await;
                 if let Ok(reader) = Arc::try_unwrap(reader) {
                     reader.stop().await;
                 }
@@ -1923,10 +1928,8 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
     };
     let installed = reader.set_log_index_config(myotis_net::el::logindex::LogIndexConfig { enabled, watch });
     if installed && enabled {
-        // Spawn (or keep) the head-follow appender inside the engine runtime.
-        let reader = reader.clone();
-        let _guard = engine.rt.enter();
-        reader.ensure_log_index_appender();
+        // Spawn (or keep) the head-follow appender on the engine runtime.
+        reader.ensure_log_index_appender(engine.rt.handle());
     }
     installed
 }

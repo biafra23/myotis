@@ -681,9 +681,25 @@ impl ElReader {
         self.anchored_head().ok().map(|(n, _)| n)
     }
 
+    /// Deterministically stop the appender: abort AND await the task, which
+    /// guarantees its per-tick strong Arc has been dropped — hosts call this
+    /// BEFORE Arc::try_unwrap so teardown never races a long catch-up tick.
+    pub async fn stop_log_index_appender(&self) {
+        let handle = match self.log_index_task.lock() {
+            Ok(mut t) => t.take(),
+            Err(_) => None,
+        };
+        if let Some(h) = handle {
+            h.abort();
+            let _ = h.await; // JoinError::Cancelled — the task's Arc is gone
+        }
+    }
+
     /// Spawn (or keep) the head-follow appender for this reader. Idempotent:
-    /// a live task is left alone. Caller must be inside a tokio runtime.
-    pub fn ensure_log_index_appender(self: &Arc<Self>) {
+    /// a live task is left alone. `rt` makes the runtime-context invariant
+    /// unforgeable (a bare tokio::spawn outside a runtime would abort the
+    /// whole host process under panic="abort").
+    pub fn ensure_log_index_appender(self: &Arc<Self>, rt: &tokio::runtime::Handle) {
         let Ok(mut slot) = self.log_index_task.lock() else {
             return;
         };
@@ -697,7 +713,7 @@ impl ElReader {
         // the task exits on its own once the reader is gone; the abort in
         // stop() is the fast path.
         let weak = Arc::downgrade(self);
-        *slot = Some(tokio::spawn(async move {
+        *slot = Some(rt.spawn(async move {
             // Slice-3 rule: append FINALIZED blocks only. Finalized never
             // reorgs, so coverage stays honest with zero rewind machinery;
             // optimistic-tail appending (with the design doc's rewind rule)
@@ -720,6 +736,16 @@ impl ElReader {
     /// One appender tick: record finalized blocks from the append edge up to
     /// the finalized head (bounded batch per tick).
     async fn log_index_append_tick(&self, since_persist: &mut u32, ticks: u64) {
+        // Checkpoint due from a PREVIOUS tick first: batches that end early
+        // (peer failure mid-catch-up) must not defer persistence forever.
+        if *since_persist >= 64 {
+            if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
+                if let Some(ix) = slot.as_ref() {
+                    let _ = ix.persist(path);
+                }
+            }
+            *since_persist = 0;
+        }
         let enabled = self.with_log_index(|ix| ix.config().enabled).unwrap_or(false);
         if !enabled {
             return;
