@@ -34,6 +34,13 @@ interface RpcBackend {
     /** Tri-state like the other JSON methods, but the found form is an ARRAY
      *  string (the block's whole receipt list), not an object. */
     fun getBlockReceipts(blockSelector: String): String?
+
+    /** Verified eth_getLogs over the opt-in watch-list index: the log-array
+     *  JSON, an {"error": ...} object (coverage/config detail the router
+     *  surfaces at -32000), or null (backend has no index at all). Default
+     *  null so hosts without the index (Java engine, older iOS) stay source-
+     *  compatible and answer with the strict retryable error. */
+    fun getLogs(filterJson: String): String? = null
     fun getBlockByNumber(block: String, fullTransactions: Boolean): String?
     fun getBlockByHash(blockHash32: ByteArray, fullTransactions: Boolean): String?
     fun gasPrice(): String?

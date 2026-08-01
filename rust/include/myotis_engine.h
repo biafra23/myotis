@@ -47,6 +47,15 @@ int64_t myotis_create(const char *network, const char *data_dir);
 /* Start the sync loop. False for an unknown/already-running handle. */
 bool myotis_start(int64_t handle);
 
+/* Toggle Tor verified-read routing (docs/privacy-and-tor.md). Returns true iff
+ * this build supports Tor (built with `--features tor`); a Tor-less build
+ * returns false and no-ops. Process-global, not per-handle. */
+bool myotis_set_tor_enabled(bool on);
+
+/* Tor status bitmask: bit0 compiled-in, bit1 enabled, bit2 bootstrapped.
+ * 0 = this build has no Tor support. */
+int32_t myotis_tor_status(void);
+
 /* Status JSON object (camelCase keys), or "{}" for an unknown handle. */
 char *myotis_status_json(int64_t handle);
 
@@ -121,6 +130,13 @@ char *myotis_send_raw_transaction_json(int64_t handle, const char *raw_tx_hex);
 
 /* Release any char* returned by the functions above. NULL is a no-op. */
 void myotis_string_free(char *s);
+
+/* v21: the opt-in eth_getLogs watch-list index (docs/eth-getlogs-design.md).
+ * get_logs answers only inside indexed coverage; anything else is an
+ * {"error": ...} JSON — never an empty array for unindexed ranges. */
+char *myotis_get_logs_json(int64_t handle, const char *filter_json);
+bool myotis_set_log_index_config(int64_t handle, const char *config_json);
+char *myotis_log_index_status_json(int64_t handle);
 
 #ifdef __cplusplus
 }

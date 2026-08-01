@@ -724,16 +724,38 @@ Myotis is mid-migration from a single Java implementation to a **Rust engine** t
 
 - **The contract** is `:myotis-api` — zero-dependency Java-17 interfaces (`MyotisEngine`/`ChainHandle`, FFI-portable types only). Hosts (Android app, desktop app, daemon) consume *only* this API and never import engine internals.
 - **The Java engine** is the original implementation (`node-core` adapters over the `networking`/`consensus`/`myotis-evm` modules).
-- **The Rust engine** is the `rust/` Cargo workspace (`myotis-core`, `myotis-net`, `myotis-consensus`, `myotis-bls`, `myotis-evm`, `myotis-engine`): discv4 + discv5 discovery, RLPx/eth/snap, the beacon light client with BLS via blst, a revm-based EVM with the same snap-proof state oracle, ENS incl. CCIP-Read, and multichain (mainnet, Sepolia, Gnosis). It reaches the JVM through hand-written JNI; compound values cross as JSON, pinned by golden tests on both sides.
+- **The Rust engine** is the `rust/` Cargo workspace (`myotis-core`, `myotis-net`, `myotis-consensus`, `myotis-bls`, `myotis-evm`, `myotis-engine`): discv4 + discv5 discovery, RLPx/eth/snap, the beacon light client with BLS via blst, a revm-based EVM with the same snap-proof state oracle, ENS incl. CCIP-Read, and multichain (mainnet, Sepolia, Gnosis). It reaches the JVM through UniFFI-generated Kotlin bindings over JNA (the generated bindings are committed in `:myotis-engines`, regenerated via `uniffiGenerateKotlin`); compound values cross as JSON, pinned by golden tests on both sides.
 - **Selection**: the `:myotis-engines` selector (`Engines.engine()`) routes each network to an engine via the `myotis.engine` property — `java` (default), `rust`, or `auto`. On run tasks use `-Pengine=rust`; in the apps it's a Settings toggle (applies on network restart). The Status screen shows which engine hosts each network — "Mainnet (r)" vs "(j)".
 - **Parity** is enforced by shared conformance vectors (BLS fixtures, a captured mainnet light-client corpus, the EL verification-ladder vectors) run against both implementations, plus a benchmark gate for the JNI path.
 
-Rust builds are **optional for the pure-Java dev loop**: without cargo the Gradle tasks self-skip and the committed Android jniLibs act as the fallback. Release artifacts don't rely on that fallback — CI builds the Rust engine from source for the APK (`cargoNdkAndroid`) and bundles it into the packaged desktop apps.
+**rustc/cargo are NOT required to build or run Myotis.** The JVM/Android build is
+pure Java/Kotlin end to end: the UniFFI-generated Kotlin bindings are committed
+source (no bindgen step at build time), JNA comes from Maven Central like any other
+dependency, and every `cargo*` Gradle task self-skips with a single note when cargo
+is missing. On a cargo-less machine the engine selector simply reports the Rust
+engine as unavailable and everything runs on the Java engine (the default,
+`myotis.engine=java`) — there is nothing to configure or disable. The exceptions
+that DO need a Rust toolchain: the packaged desktop installers
+(`packageDmg`/`packageDeb`/`runDistributable` fail loudly without cargo, so an
+installed app can always switch engines) and regenerating the Android jniLibs
+(`cargoNdkAndroid`; the committed jniLibs are the fallback). Release artifacts
+don't rely on committed binaries — CI builds the Rust engine from source for the
+APK and the packaged desktop apps.
+
+To actually build the Rust engine and bundle it, per target:
+
+| Target | Requirements |
+|---|---|
+| Desktop dev loop + packaged installers (`packageDmg`/`packageDeb`) | rustc/cargo **stable ≥ 1.85** (`rust-toolchain.toml` tracks stable; the Gradle probe skips anything older). Builds the host triple; the x64 dmg CI leg additionally passes `-PrustTarget=x86_64-apple-darwin` under Rosetta. |
+| Android jniLibs (`cargoNdkAndroid`) | The same rustc/cargo, plus `rustup target add aarch64-linux-android x86_64-linux-android`, `cargo install cargo-ndk`, and an Android **NDK r28+** (16 KB-aligned LOAD segments for Android 15+; older NDKs work because `.cargo/config.toml` forces the alignment, and the build fails loudly if it slips). Found via `$ANDROID_NDK_HOME` or the newest `<sdk>/ndk/<version>`. |
+| iOS framework (`:app-ios`) | macOS with **Xcode 26+** and `rustup target add --toolchain stable aarch64-apple-ios aarch64-apple-ios-sim`. Without them the framework tasks disable themselves with a warning (a previously built `libmyotis_engine.a` also satisfies them). |
+| Regenerating the committed Kotlin bindings (`uniffiGenerateKotlin`) | Just rustc/cargo — the pinned `rust/uniffi-bindgen` CLI builds from the workspace. Re-run after any `ffi.rs` shape change. |
 
 ```bash
-./gradlew cargoBuildHost    # cargo build --release (auto-runs before :app:run / :consensus:test)
-./gradlew cargoTest         # cargo test --workspace (part of `check`)
-./gradlew cargoNdkAndroid   # Android jniLibs (needs cargo-ndk + NDK)
+./gradlew cargoBuildHost       # cargo build --release (auto-runs before :app:run / :consensus:test)
+./gradlew cargoTest            # cargo test --workspace (part of `check`)
+./gradlew cargoNdkAndroid      # Android jniLibs (needs cargo-ndk + NDK)
+./gradlew uniffiGenerateKotlin # regenerate the committed Kotlin bindings after ffi.rs changes
 ./gradlew :app:run -Pengine=rust          # daemon on the Rust engine
 ./gradlew :app-desktop:run -Pengine=rust  # desktop GUI on the Rust engine
 ```
@@ -743,7 +765,7 @@ Rust builds are **optional for the pure-Java dev loop**: without cargo the Gradl
 Key Gradle modules (plus the `rust/` Cargo workspace):
 
 - **myotis-api** -- the engine contract: zero-dependency interfaces every host consumes exclusively
-- **myotis-engines** -- the engine selector (`Engines.engine()`; `myotis.engine=java|rust|auto`) routing to the Java engine or the Rust one over JNI
+- **myotis-engines** -- the engine selector (`Engines.engine()`; `myotis.engine=java|rust|auto`) routing to the Java engine or the Rust one over UniFFI + JNA
 - **node-core** -- the Java engine's adapters (`JavaMyotisEngine`/`JavaChainHandle`) plus the verification ladder over the modules below
 - **core** -- cryptographic identity (`NodeKey`), data types (`BlockHeader`), ENR decoding
 - **networking** -- protocol layers, all Netty-based:
@@ -790,3 +812,13 @@ DNS resolution is best-effort: on timeout, missing TXT records, or signature mis
 - **BouncyCastle** -- SECP256K1 crypto provider
 - **jvm-libp2p** -- beacon chain P2P networking (consensus module)
 - **dnsjava 3.6** -- TXT-record resolution for EIP-1459 ENR tree walks
+
+## License
+
+Myotis is licensed under the [Apache License, Version 2.0](LICENSE).
+
+Copyright 2026 Dirk Jäckel.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in Myotis shall be licensed under Apache 2.0 as
+above, without any additional terms or conditions.

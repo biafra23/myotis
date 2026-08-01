@@ -46,6 +46,17 @@ sha3 = "=0.10.9"
 # hand-rolled loop risks LLVM lowering it to an early-exit branch).
 subtle = "=2.6.1"
 
+# Tor (docs/privacy-and-tor.md) — OPTIONAL, off by default. Only a host that
+# builds with `--features tor` (today: the desktop engine dylib) pulls the Arti
+# dependency tree; the Android/iOS/daemon builds are byte-for-byte unaffected.
+# native-tls avoids the rustls 0.23 process-wide CryptoProvider dance (macOS
+# Security.framework), matching the tor-poc crate.
+arti-client = { version = "0.44", default-features = false, features = ["tokio", "native-tls"], optional = true }
+tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio", "native-tls"], optional = true }
+
+[features]
+tor = ["dep:arti-client", "dep:tor-rtcompat"]
+
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

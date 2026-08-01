@@ -63,7 +63,8 @@ Key Gradle modules:
 - **myotis-engines** — the engine SELECTOR (`Engines`/`SelectorEngine`/`RustMyotisEngine`):
   hosts' composition roots call `Engines.engine()`; `myotis.engine=java|rust|auto` routes
   each network (re)start to the Java engine or the Rust one (`rust/myotis-engine`,
-  hand-JNI, compound values as JSON pinned by golden tests both sides).
+  UniFFI-generated Kotlin bindings over JNA — committed in this module, regenerated
+  via `uniffiGenerateKotlin`; compound values as JSON pinned by golden tests both sides).
 - **myotis-api** — THE ENGINE CONTRACT: zero-dependency Java-17 interfaces
   (`io.myotis.api` + `io.myotis.api.ports`) every host consumes exclusively.
   FFI-portable types only (byte[], String, long, double[], enums, flat records;
@@ -109,7 +110,7 @@ Key Gradle modules:
   (node-core/networking/consensus types). Composition roots use the `:myotis-engines`
   selector (`Engines.engine()`; `myotis.engine=java|rust|auto`, default java —
   `-Pengine=…` on run tasks), which routes to the Java engine (node-core) or the
-  Rust engine (rust/myotis-engine via hand-JNI + JSON). Documented exemptions: the
+  Rust engine (rust/myotis-engine via UniFFI + JSON). Documented exemptions: the
   single `Engines.engine()` line at each composition root; the TrueBlocks
   transaction-history scan in `:tx-history` (`TxHistoryService` wraps the raw
   `RLPxConnector`; UNVERIFIED, Java-engine + mainnet only), consumed by the daemon's
@@ -117,8 +118,11 @@ Key Gradle modules:
   (`DesktopNodeController.transactionHistory`), and the Android Query tab
   (`NodeService.txHistoryService`) — all reach the connector via
   `SelectorEngine.javaDelegate().debugStack` at their composition roots;
-  the Settings toggles for the BLS backend (`BlsBackends`) and the
-  engine (`Engines`), the Rust log drain (`Engines.drainRustLogs` —
+  the Settings toggles for the BLS backend (`BlsBackends`), the
+  engine (`Engines`), and Tor verified-read routing (`Tor` —
+  docs/privacy-and-tor.md; Rust-engine-only, gated behind the Rust-engine
+  toggle, and behind the `-PtorEngine` build flag that links Arti into the host
+  dylib), the Rust log drain (`Engines.drainRustLogs` —
   hosts pump the engine's tracing ring into their log pipeline), and the Status
   screen's per-network engine badge (`Engines.engineKindFor`) — internal
   seams, deliberately not on the API; and `:app`'s

@@ -71,8 +71,8 @@ class RpcAccessLogTest {
     }
 
     @Test fun unsupportedMethod_logsErrorWithCode_atInfo() {
-        route("""{"jsonrpc":"2.0","id":2,"method":"eth_getLogs","params":[{}]}""")
-        val l = lines().single { it.contains("method=eth_getLogs") }
+        route("""{"jsonrpc":"2.0","id":2,"method":"eth_newFilter","params":[{}]}""")
+        val l = lines().single { it.contains("method=eth_newFilter") }
         assertTrue(l.contains("outcome=ERROR(-32601)"), l)
         // The whole access stream stays INFO — an error must NOT be emitted at WARN,
         // or raising the Logs-tab level would hide it along with the rest.
@@ -89,10 +89,10 @@ class RpcAccessLogTest {
         route(
             """[
                 {"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]},
-                {"jsonrpc":"2.0","id":2,"method":"eth_getLogs","params":[{}]}
+                {"jsonrpc":"2.0","id":2,"method":"eth_newFilter","params":[{}]}
             ]""",
         )
         assertTrue(lines().any { it.contains("method=eth_chainId") && it.contains("id=1") }, lines().toString())
-        assertTrue(lines().any { it.contains("method=eth_getLogs") && it.contains("id=2") }, lines().toString())
+        assertTrue(lines().any { it.contains("method=eth_newFilter") && it.contains("id=2") }, lines().toString())
     }
 }

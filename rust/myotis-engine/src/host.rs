@@ -126,6 +126,44 @@ fn config_for(network_name: &str) -> Option<ChainConfig> {
     }
 }
 
+/// `nativeSetTorEnabled`: turn Tor verified-read routing on/off
+/// (docs/privacy-and-tor.md). Returns `true` when this engine build actually
+/// supports Tor (`--features tor`), `false` when it doesn't — so a host can grey
+/// out the toggle rather than pretend it works. A no-op when Tor isn't compiled.
+pub fn set_tor_enabled(on: bool) -> bool {
+    #[cfg(feature = "tor")]
+    {
+        myotis_net::el::tor::set_enabled(on);
+        true
+    }
+    #[cfg(not(feature = "tor"))]
+    {
+        let _ = on;
+        false
+    }
+}
+
+/// `nativeTorStatus`: a small bitmask for the host's Status view —
+/// bit0 compiled-in, bit1 enabled, bit2 bootstrapped (circuit ready). `0` means
+/// this build has no Tor support at all.
+pub fn tor_status() -> i32 {
+    #[cfg(feature = "tor")]
+    {
+        let mut s = 1; // compiled in
+        if myotis_net::el::tor::is_enabled() {
+            s |= 2;
+        }
+        if myotis_net::el::tor::is_bootstrapped() {
+            s |= 4;
+        }
+        s
+    }
+    #[cfg(not(feature = "tor"))]
+    {
+        0
+    }
+}
+
 /// `nativeCreate`: allocate an id for a not-yet-started hosted chain (mainnet or
 /// sepolia). Returns the id (`>= 1`), `UNSUPPORTED_NETWORK` (-2) for a canonical
 /// network this engine doesn't host yet (gnosis), or `CREATE_FAILED` (-1) for an
@@ -251,6 +289,13 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
         .as_deref()
         .and_then(|p| p.parent())
         .map(|dir| dir.join(format!("peers{el_suffix}.cache")));
+    // The eth_getLogs watch-list index, same dataDir + suffix convention
+    // (docs/eth-getlogs-design.md). None (no dataDir) → memory-only index.
+    let log_index_path = config
+        .snapshot_path
+        .as_deref()
+        .and_then(|p| p.parent())
+        .map(|dir| dir.join(format!("logindex{el_suffix}.db")));
     // Explicit per-network match: a network without an EL config here runs
     // CL-ONLY (EL queries report the reader unavailable, matching the non-fatal
     // EL philosophy) — it must never silently inherit another chain's EL config.
@@ -265,6 +310,7 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
     };
     let reader = match el_config {
         Some(cfg) => match engine.rt.block_on(async {
+            let cfg = myotis_net::el::reader::ElConfig { log_index_path, ..cfg };
             ElReader::start_for(sync.exec_anchor(), el_cache_path, cfg).await
         }) {
             Ok(r) => Some(Arc::new(r)),
@@ -351,6 +397,7 @@ pub fn pause(handle: i64) -> bool {
     engine.rt.block_on(async move {
         sync.stop().await;
         if let Some(reader) = reader {
+            reader.stop_log_index_appender().await;
             if let Ok(reader) = Arc::try_unwrap(reader) {
                 reader.stop().await;
             }
@@ -370,7 +417,10 @@ fn shutdown(engine: &EngineState, sync: SyncHandle, reader: Option<Arc<ElReader>
         if let Some(reader) = reader {
             // Only our just-started reader holds an Arc here, so unwrapping the
             // Arc to consume `stop(self)` succeeds; if it somehow doesn't, the
-            // reader's Drop still aborts its tasks.
+            // reader's Drop still aborts its tasks. The appender is stopped
+            // (abort + await) FIRST so its per-tick strong Arc can't defeat
+            // the unwrap.
+            reader.stop_log_index_appender().await;
             if let Ok(reader) = Arc::try_unwrap(reader) {
                 reader.stop().await;
             }
@@ -499,6 +549,7 @@ pub fn stop(handle: i64) {
         engine.rt.block_on(async move {
             sync.stop().await;
             if let Some(reader) = reader {
+                reader.stop_log_index_appender().await;
                 if let Ok(reader) = Arc::try_unwrap(reader) {
                     reader.stop().await;
                 }
@@ -1865,5 +1916,266 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&get_storage_proof_json(i64::MIN, &addr, 1, Some("0xbad"))).unwrap();
         assert!(v["error"].as_str().unwrap().contains("invalid holder"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// eth_getLogs (docs/eth-getlogs-design.md): watch-list config install, index
+// status, and the coverage-honest query. All JSON in / JSON out, panic-free.
+// ---------------------------------------------------------------------------
+
+/// Install the watch-list config: `{"enabled":bool,"watch":[{"address":"0x..",
+/// "fromBlock":n,"topic0s":["0x..",..]?}]}`. False on malformed input,
+/// duplicate addresses, or an unavailable reader.
+pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(config_json) else {
+        return false;
+    };
+    let enabled = v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
+    let mut watch = Vec::new();
+    if v.get("watch").is_some_and(|w| !w.is_array() && !w.is_null()) {
+        return false;
+    }
+    if let Some(entries) = v.get("watch").and_then(|w| w.as_array()) {
+        for e in entries {
+            let Some(address) = e.get("address").and_then(|a| a.as_str()).and_then(parse_address) else {
+                return false;
+            };
+            let Some(from_block) = e.get("fromBlock").and_then(|b| b.as_u64()) else {
+                return false;
+            };
+            let mut topic0s = Vec::new();
+            if e.get("topic0s").is_some_and(|t| !t.is_array() && !t.is_null()) {
+                return false;
+            }
+            if let Some(ts) = e.get("topic0s").and_then(|t| t.as_array()) {
+                for t in ts {
+                    let Some(w32) = t.as_str().and_then(parse_word32) else {
+                        return false;
+                    };
+                    topic0s.push(w32);
+                }
+            }
+            watch.push(myotis_net::el::logindex::WatchEntry { address, from_block, topic0s });
+        }
+    }
+    let Some(engine) = engine() else {
+        return false;
+    };
+    let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
+        return false;
+    };
+    let installed = reader.set_log_index_config(myotis_net::el::logindex::LogIndexConfig { enabled, watch });
+    if installed && enabled {
+        // Spawn (or keep) the head-follow appender on the engine runtime.
+        reader.ensure_log_index_appender(engine.rt.handle());
+    }
+    installed
+}
+
+/// Index status for hosts/UI: enabled, log count, backfill cursor, and per
+/// watch entry the covered span (absent while nothing is indexed).
+pub fn log_index_status_json(handle: i64) -> String {
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
+        return eljson::error_json("node is not running");
+    };
+    let status = reader.with_log_index(|ix| {
+        let mut s = String::from("{\"enabled\":");
+        s.push_str(if ix.config().enabled { "true" } else { "false" });
+        s.push_str(",\"logCount\":");
+        s.push_str(&ix.log_count().to_string());
+        if let Some((n, _)) = ix.cursor {
+            s.push_str(",\"backfillCursor\":");
+            s.push_str(&n.to_string());
+        }
+        s.push_str(",\"entries\":[");
+        for (k, (w, c)) in ix.coverage_entries().iter().enumerate() {
+            if k > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"address\":\"0x");
+            for b in &w.address {
+                let _ = std::fmt::Write::write_fmt(&mut s, format_args!("{b:02x}"));
+            }
+            s.push_str("\",\"fromBlock\":");
+            s.push_str(&w.from_block.to_string());
+            if let Some((low, high)) = c.span {
+                s.push_str(",\"coveredLow\":");
+                s.push_str(&low.to_string());
+                s.push_str(",\"coveredHigh\":");
+                s.push_str(&high.to_string());
+            }
+            s.push('}');
+        }
+        s.push_str("]}");
+        s
+    });
+    status.unwrap_or_else(|| "{\"enabled\":false,\"logCount\":0,\"entries\":[]}".to_string())
+}
+
+/// Parse an eth_getLogs filter into a typed [`LogFilter`], resolving tags
+/// against the supplied head/finalized numbers. Pure (testable): every
+/// malformed shape is a specific error string; nothing is silently ignored.
+fn parse_get_logs_filter(
+    v: &serde_json::Value,
+    head: u64,
+    finalized: u64,
+) -> Result<myotis_net::el::logindex::LogFilter, String> {
+    if v.get("blockHash").is_some_and(|b| !b.is_null()) {
+        // EIP-234: silently resolving the tags instead would answer with the
+        // HEAD block's logs for a question about a specific other block.
+        return Err("blockHash filters are not supported by this scoped index".to_string());
+    }
+    fn tag(v: Option<&serde_json::Value>, head: u64, finalized: u64) -> Result<u64, String> {
+        match v {
+            None | Some(serde_json::Value::Null) => Ok(head),
+            Some(serde_json::Value::String(s)) => match s.as_str() {
+                "latest" | "pending" | "safe" => Ok(head),
+                "finalized" => Ok(finalized),
+                "earliest" => Ok(0),
+                hex => hex
+                    .strip_prefix("0x")
+                    .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .and_then(|d| u64::from_str_radix(d, 16).ok())
+                    .ok_or_else(|| "unresolvable block tag".to_string()),
+            },
+            Some(_) => Err("block tag must be a string".to_string()),
+        }
+    }
+    let from_block = tag(v.get("fromBlock"), head, finalized)?;
+    let to_block = tag(v.get("toBlock"), head, finalized)?;
+    let mut addresses = Vec::new();
+    match v.get("address") {
+        Some(serde_json::Value::String(a)) => {
+            addresses.push(parse_address(a).ok_or("malformed address")?);
+        }
+        Some(serde_json::Value::Array(items)) if !items.is_empty() => {
+            for a in items {
+                addresses.push(a.as_str().and_then(parse_address).ok_or("malformed address")?);
+            }
+        }
+        _ => return Err("eth_getLogs without an address is not served by this scoped index".to_string()),
+    }
+    let mut topics: Vec<Vec<[u8; 32]>> = Vec::new();
+    match v.get("topics") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Array(ts)) => {
+            for t in ts {
+                match t {
+                    serde_json::Value::Null => topics.push(Vec::new()),
+                    serde_json::Value::String(one) => {
+                        topics.push(vec![parse_word32(one).ok_or("malformed topic")?]);
+                    }
+                    serde_json::Value::Array(alts) => {
+                        let mut ors = Vec::new();
+                        for a in alts {
+                            ors.push(a.as_str().and_then(parse_word32).ok_or("malformed topic")?);
+                        }
+                        topics.push(ors);
+                    }
+                    _ => return Err("malformed topics".to_string()),
+                }
+            }
+        }
+        Some(_) => return Err("malformed topics".to_string()),
+    }
+    Ok(myotis_net::el::logindex::LogFilter { from_block, to_block, addresses, topics })
+}
+
+/// The eth_getLogs query. Returns the log array ONLY when the requested
+/// range is inside indexed coverage; every other case is `{"error": ...}`
+/// (the router maps it to strict -32000) — never an empty array for an
+/// unindexed range.
+pub fn get_logs_json(handle: i64, filter_json: &str) -> String {
+    use myotis_net::el::logindex::QueryError;
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(filter_json) else {
+        return eljson::error_json("malformed filter");
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
+        return eljson::error_json("node is not running");
+    };
+    let Some(head) = reader.head_block_number() else {
+        return eljson::error_json("no verified head yet");
+    };
+    let filter = match parse_get_logs_filter(&v, head, reader.finalized_block_number()) {
+        Ok(f) => f,
+        Err(msg) => return eljson::error_json(&msg),
+    };
+    let result = reader.with_log_index(|ix| ix.query(&filter));
+    match result {
+        None => eljson::error_json("log index is not configured on this network"),
+        Some(Ok(logs)) => eljson::get_logs_json(&logs),
+        Some(Err(QueryError::Disabled)) => eljson::error_json("log index is disabled on this network"),
+        Some(Err(QueryError::UnwatchedAddress(_))) => {
+            eljson::error_json("address is not on this node's log watch-list")
+        }
+        Some(Err(QueryError::UnindexedTopic(_))) => {
+            eljson::error_json("topic is outside this node's indexed signatures for that address")
+        }
+        Some(Err(QueryError::OutOfCoverage { covered, .. })) => match covered.span {
+            Some((low, high)) => eljson::error_json(&format!(
+                "requested range is not indexed yet (covered: {low}-{high}); retry as the index catches up"
+            )),
+            None => eljson::error_json("log index has not indexed any blocks yet; retry"),
+        },
+        Some(Err(QueryError::Unanswerable)) => eljson::error_json("unanswerable filter (fromBlock > toBlock)"),
+    }
+}
+
+#[cfg(test)]
+mod get_logs_filter_tests {
+    use super::parse_get_logs_filter;
+
+    fn f(json: &str) -> Result<myotis_net::el::logindex::LogFilter, String> {
+        parse_get_logs_filter(&serde_json::from_str(json).unwrap(), 1000, 900)
+    }
+
+    #[test]
+    fn tags_resolve_and_malformed_tags_error() {
+        let addr = format!("\"address\":\"0x{}\"", "11".repeat(20));
+        let ok = f(&format!("{{{addr}}}")).unwrap();
+        assert_eq!((ok.from_block, ok.to_block), (1000, 1000)); // absent → head
+        let ok = f(&format!("{{{addr},\"fromBlock\":\"earliest\",\"toBlock\":\"finalized\"}}")).unwrap();
+        assert_eq!((ok.from_block, ok.to_block), (0, 900));
+        let ok = f(&format!("{{{addr},\"fromBlock\":\"0x64\"}}")).unwrap();
+        assert_eq!(ok.from_block, 100);
+        for bad in ["\"0x\"", "\"0x+5\"", "\"nope\"", "5", "{}"] {
+            assert!(f(&format!("{{{addr},\"fromBlock\":{bad}}}")).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn block_hash_filters_are_rejected() {
+        let addr = format!("\"address\":\"0x{}\"", "11".repeat(20));
+        let bh = format!("\"blockHash\":\"0x{}\"", "cc".repeat(32));
+        assert!(f(&format!("{{{addr},{bh}}}")).unwrap_err().contains("blockHash"));
+        // Explicit null blockHash is treated as absent, per JSON-RPC habits.
+        assert!(f(&format!("{{{addr},\"blockHash\":null}}")).is_ok());
+    }
+
+    #[test]
+    fn address_forms_and_empty_array_error() {
+        assert!(f("{}").is_err());
+        assert!(f("{\"address\":[]}").unwrap_err().contains("without an address"));
+        assert!(f(&format!("{{\"address\":[\"0x{}\",\"0x{}\"]}}", "11".repeat(20), "22".repeat(20))).unwrap().addresses.len() == 2);
+        assert!(f("{\"address\":\"0xzz\"}").is_err());
+    }
+
+    #[test]
+    fn topics_forms_and_malformed_topics_error() {
+        let addr = format!("\"address\":\"0x{}\"", "11".repeat(20));
+        let t = format!("0x{}", "aa".repeat(32));
+        let ok = f(&format!("{{{addr},\"topics\":[null,\"{t}\",[\"{t}\"]]}}")).unwrap();
+        assert_eq!(ok.topics.len(), 3);
+        assert!(ok.topics.first().is_some_and(|w| w.is_empty()));
+        // A non-array topics value must ERROR, not silently widen the query.
+        assert!(f(&format!("{{{addr},\"topics\":\"{t}\"}}")).unwrap_err().contains("malformed topics"));
+        assert!(f(&format!("{{{addr},\"topics\":[5]}}")).is_err());
     }
 }

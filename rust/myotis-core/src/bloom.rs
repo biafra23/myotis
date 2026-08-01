@@ -23,6 +23,23 @@ pub fn accrue(bloom: &mut LogsBloom, item: &[u8]) {
     }
 }
 
+/// Probe: could `item` have been accrued into `bloom`? The dual of
+/// [`accrue`], with bloom semantics — `false` is definitive ("this address/
+/// topic emitted nothing here", a safe skip), `true` is only "maybe" and
+/// must be confirmed against receiptsRoot-verified receipts. Used by the
+/// eth_getLogs indexer to skip blocks whose header bloom cannot contain any
+/// watched address (docs/eth-getlogs-design.md).
+pub fn may_contain(bloom: &LogsBloom, item: &[u8]) -> bool {
+    let h = keccak256(item);
+    for i in (0..6).step_by(2) {
+        let bit = ((usize::from(h[i]) << 8) | usize::from(h[i + 1])) & 0x7ff;
+        if bloom[255 - bit / 8] & (1 << (bit % 8)) == 0 {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,5 +67,22 @@ mod tests {
         for (x, y) in after_a.iter().zip(bloom.iter()) {
             assert_eq!(x & y, *x);
         }
+    }
+}
+
+#[cfg(test)]
+mod may_contain_tests {
+    use super::*;
+
+    #[test]
+    fn accrued_items_probe_true_absent_items_probe_false() {
+        let mut bloom = EMPTY_BLOOM;
+        accrue(&mut bloom, b"present");
+        assert!(may_contain(&bloom, b"present"));
+        assert!(!may_contain(&bloom, b"absent-item"));
+        assert!(!may_contain(&EMPTY_BLOOM, b"present"));
+        // A saturated bloom answers maybe for everything — probe semantics.
+        let full = [0xffu8; 256];
+        assert!(may_contain(&full, b"anything"));
     }
 }

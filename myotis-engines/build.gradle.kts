@@ -6,7 +6,13 @@
 
 plugins {
     `java-library`
+    // Kotlin hosts the COMMITTED UniFFI-generated bindings for the Rust engine
+    // (src/main/kotlin/uniffi/myotis_engine/ — regenerate via the root
+    // `uniffiGenerateKotlin` task); RustEngineNative delegates to them.
+    alias(libs.plugins.kotlin.jvm)
 }
+
+kotlin { jvmToolchain(21) }
 
 // JVM 21 class files, not the project's preferred 17: the :node-core dependency (the
 // Java engine) publishes a JVM-21 floor (transitively forced by :networking's discv5),
@@ -24,6 +30,9 @@ dependencies {
     implementation(project(":jsonrpc-server"))
     implementation(libs.minimal.json)
     implementation(libs.slf4j.api)
+    // The FFI layer under the UniFFI-generated Kotlin bindings (replaces hand-JNI).
+    // Plain JVM artifact here; :android-app pins the @aar variant for its natives.
+    implementation(libs.jna)
 
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)

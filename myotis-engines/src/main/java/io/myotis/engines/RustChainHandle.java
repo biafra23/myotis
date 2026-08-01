@@ -932,6 +932,30 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     }
 
     /**
+     * eth_getLogs over the opt-in watch-list index. Returns the native payload
+     * VERBATIM — the log ARRAY on success, or the {@code {"error": ...}}
+     * envelope (coverage / config detail) for the router to surface at -32000.
+     * Only the lifecycle gate throws (not running / paused).
+     */
+    String getLogsJson(String filterJson) {
+        return gated(() -> RustEngineNative.nativeGetLogsJson(handle, filterJson));
+    }
+
+    /** Install the log-index config; false = invalid config or gate down. */
+    boolean setLogIndexConfig(String configJson) {
+        try {
+            return gated(() -> RustEngineNative.nativeSetLogIndexConfig(handle, configJson));
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** Log-index status JSON ({"error":...} when the gate is down). */
+    String logIndexStatusJson() {
+        return gated(() -> RustEngineNative.nativeLogIndexStatusJson(handle));
+    }
+
+    /**
      * Verified eth_getBlockReceipts: the receipts ARRAY JSON, the literal
      * {@code "null"} (verified unknown/future block or a never-verified hash),
      * or throws {@link EngineException} when it can't verify. {@code selector}

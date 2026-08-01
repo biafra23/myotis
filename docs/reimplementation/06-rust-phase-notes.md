@@ -38,9 +38,16 @@ starts per that plan's entry criteria (see also "EL-phase entry" below).
 - **Month-old-checkpoint catch-up is a MUST.** Never "fix" slow catch-up by
   refreshing the embedded checkpoint — the wallet must sync from a stale trust
   anchor in the field.
-- Binding choice: **hand-JNI + JSON marshalling**, not UniFFI (user decision;
-  doc [05](05-engine-api-bindings.md) describes the UniFFI mapping as the
-  eventual multi-platform path — revisit when iOS/extension shells land).
+- Binding choice (REVISED): the JVM boundary is **UniFFI + JSON marshalling** —
+  the original hand-JNI decision was reversed (user decision, 2026-07) as a
+  transport swap only: `#[uniffi::export]` fns in `rust/myotis-engine/src/ffi.rs`,
+  generated Kotlin bindings committed in `:myotis-engines`
+  (`uniffiGenerateKotlin` regenerates), `RustEngineNative` reduced to a static
+  delegator. Compound values STILL cross as JSON strings with the golden-test-
+  pinned shapes; UniFFI's per-function API checksums replace the hand-rolled
+  stale-.so ABI probe. The iOS plain C ABI (`capi.rs`) is unchanged — doc
+  [05](05-engine-api-bindings.md)'s typed-record mapping remains the eventual
+  full-UniFFI path if the JSON transport is ever retired.
 
 ## Phone-failure diagnosis (reframes the Rust justification)
 
