@@ -260,11 +260,11 @@ class DesktopNodeController(
         }
     }
 
-    /** Short status-tab line for the log index, or null when off/unavailable. */
-    private fun logIndexStatusFor(network: String): String? {
+    /** Raw log-index status JSON, fetched ONCE per snapshot (both the status
+     *  line and the Index tab derive from it), or null when off/unavailable. */
+    private fun logIndexRawFor(network: String): String? {
         if (!settings.logIndexEnabled(network)) return null
-        val json = runCatching { engine.get(network)?.logIndexStatusJson() }.getOrNull() ?: return null
-        return io.myotis.ui.LogIndexStatus.format(json)
+        return runCatching { engine.get(network)?.logIndexStatusJson() }.getOrNull()
     }
 
     override fun applyTorMode() {
@@ -468,6 +468,7 @@ class DesktopNodeController(
         // CL peer counts live on the beacon-status surface (parity with Android's
         // NodeService.snapshotOf, which reads both).
         val bs = handle.beaconStatus()
+        val logIndexRaw = logIndexRawFor(s.network())
         return NodeSnapshot(
             running = s.running(),
             lifecycle = s.lifecycle().name,
@@ -515,10 +516,8 @@ class DesktopNodeController(
             rpcPort = s.rpcPort(),
             rpcServing = s.rpcServing(),
             tor = torModeFor(Engines.engineKindFor(s.network())),
-            logIndex = logIndexStatusFor(s.network()),
-            logIndexJson = if (settings.logIndexEnabled(s.network())) {
-                runCatching { engine.get(s.network())?.logIndexStatusJson() }.getOrNull()
-            } else null,
+            logIndex = logIndexRaw?.let(io.myotis.ui.LogIndexStatus::format),
+            logIndexJson = logIndexRaw,
         )
     }
 

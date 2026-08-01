@@ -191,11 +191,6 @@ class IosNodeController(
         }
     }
 
-    /** Short status line for the log index, or null when off. */
-    private fun logIndexStatusFor(net: String, handle: Long): String? {
-        if (!settings.logIndexEnabled(net)) return null
-        return io.myotis.ui.LogIndexStatus.format(RustEngine.logIndexStatusJson(handle))
-    }
 
     /** Blocking create+start; caller holds [bootMutex] and runs on IO. */
     private fun boot(net: String) {
@@ -467,6 +462,7 @@ class IosNodeController(
             }
         }
 
+        val logIndexRaw = if (settings.logIndexEnabled(network)) RustEngine.logIndexStatusJson(handle) else null
         return NodeSnapshot(
             running = running,
             lifecycle = if (running) "RUNNING" else if (paused) "PAUSED" else "STOPPED",
@@ -510,10 +506,8 @@ class IosNodeController(
             // recorded start outcome.
             rpcServing = (rpcState?.second ?: false) && (rpcServer?.isServing() ?: false),
             lcHunting = o.engineBoolean("lcHunting"),
-            logIndex = logIndexStatusFor(network, handle),
-            logIndexJson = if (settings.logIndexEnabled(network)) {
-                RustEngine.logIndexStatusJson(handle)
-            } else null,
+            logIndex = logIndexRaw?.let(io.myotis.ui.LogIndexStatus::format),
+            logIndexJson = logIndexRaw,
             elHunting = o.engineBoolean("elHunting"),
         )
     }
