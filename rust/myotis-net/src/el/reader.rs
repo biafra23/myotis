@@ -728,6 +728,7 @@ impl ElReader {
                     return; // reader torn down; the appender dies with it
                 };
                 reader.log_index_append_tick(&mut since_persist, ticks).await;
+                reader.log_index_backfill_step(ticks).await;
                 ticks = ticks.wrapping_add(1);
             }
         }));
@@ -773,7 +774,7 @@ impl ElReader {
         }
         let last = finalized.min(start.saturating_add(15));
         for n in start..=last {
-            let receipts = match self.get_block_receipts(Some(n)).await {
+            let (block_hash, receipts) = match self.block_receipts_at(Some(n)).await {
                 Ok(Some(r)) => r,
                 Ok(None) => return, // future/unknown under this anchor — retry next tick
                 Err(e) => {
@@ -792,7 +793,7 @@ impl ElReader {
             };
             let appended = match self.log_index.lock() {
                 Ok(mut slot) => match slot.as_mut() {
-                    Some(ix) => match ix.append_block(n, logs) {
+                    Some(ix) => match ix.append_block(n, block_hash, logs) {
                         Ok(()) => true,
                         Err(gap) => {
                             // Transient (config replaced / rewind raced this
@@ -819,6 +820,151 @@ impl ElReader {
                 }
             }
             *since_persist = 0;
+        }
+    }
+
+    /// One backfill step: walk the verified header chain DOWNWARD from the
+    /// index's trust cursor toward the lowest watched from_block, one batch
+    /// per tick (docs/eth-getlogs-design.md §backfill). Every header is
+    /// trusted only through parent-hash linkage into the cursor (whose own
+    /// trust chains back to a beacon-anchored append); candidate blocks
+    /// (bloom hit) get body+receipts fetched and verified against both roots
+    /// before any log is stored. Peer refusal is a stall, never corruption:
+    /// coverage simply doesn't extend until some peer serves the range.
+    async fn log_index_backfill_step(&self, ticks: u64) {
+        let Some((enabled, target_low, cursor)) = self.with_log_index(|ix| {
+            (
+                ix.config().enabled,
+                ix.config().watch.iter().map(|w| w.from_block).min(),
+                ix.cursor,
+            )
+        }) else {
+            return;
+        };
+        let (Some(target_low), Some((cur_n, cur_hash))) = (target_low, cursor) else {
+            return; // no watch entries, or the appender hasn't seeded the edge yet
+        };
+        if !enabled || cur_n <= target_low {
+            return;
+        }
+        const BATCH: u64 = 1024;
+        let count = (cur_n - target_low).min(BATCH);
+        let from = cur_n - count;
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return;
+        }
+        for peer in &peers {
+            match self.log_index_backfill_batch(peer, from, count, cur_n, cur_hash).await {
+                Ok(()) => {
+                    // Checkpoint after every applied batch: the store is
+                    // small at Sepolia scale and a crash then costs at most
+                    // one batch (paged store before mainnet — design doc).
+                    if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
+                        if let Some(ix) = slot.as_ref() {
+                            let _ = ix.persist(path);
+                        }
+                    }
+                    return;
+                }
+                Err(e) => {
+                    tracing::debug!(from, count, error = %e, "log index backfill batch failed; trying next peer");
+                }
+            }
+        }
+        if ticks % 100 == 0 {
+            tracing::warn!(
+                cursor = cur_n,
+                target = target_low,
+                "log index backfill: no peer served the range this round (history depth?); will keep retrying"
+            );
+        }
+    }
+
+    /// Fetch and apply one descending backfill batch from one peer:
+    /// headers [from, cur_n] ascending (count+1, so the top one IS the cursor
+    /// block), full parent-hash chain check, bloom-filtered candidate
+    /// body+receipts fetch verified against both roots, then apply top-down.
+    async fn log_index_backfill_batch(
+        &self,
+        peer: &ManagedPeer,
+        from: u64,
+        count: u64,
+        cur_n: u64,
+        cur_hash: [u8; 32],
+    ) -> Result<(), String> {
+        let window = peer.get_block_headers_by_number(from, count + 1, 0, false).await?;
+        if window.len() as u64 != count + 1 {
+            return Err(format!("peer returned {} headers, expected {}", window.len(), count + 1));
+        }
+        let top = window.last().ok_or("empty header window")?;
+        if top.header.number != cur_n || top.hash != cur_hash {
+            return Err("peer window does not end at the trusted cursor block".to_string());
+        }
+        if window.first().is_some_and(|h| h.header.number != from) {
+            return Err("peer returned the wrong starting block number".to_string());
+        }
+        for pair in window.windows(2) {
+            let (lower, upper) = (&pair[0], &pair[1]);
+            if upper.header.parent_hash != lower.hash {
+                return Err("peer header window breaks the parent-hash chain".to_string());
+            }
+        }
+        // Bloom-filter candidates among the NEW blocks (everything below the
+        // cursor). A miss is a definitive skip; a hit needs verified receipts.
+        let candidates: Vec<&crate::el::eth::messages::VerifiedHeader> = window[..window.len() - 1]
+            .iter()
+            .filter(|h| {
+                let Ok(bloom): Result<&[u8; 256], _> = h.header.logs_bloom.as_slice().try_into() else {
+                    return true; // odd bloom width: treat as maybe, verify via receipts
+                };
+                self.with_log_index(|ix| ix.bloom_may_match(h.header.number, bloom)).unwrap_or(false)
+            })
+            .collect();
+        let mut logs_by_block: std::collections::HashMap<u64, Vec<crate::el::logindex::StoredLog>> =
+            std::collections::HashMap::new();
+        if !candidates.is_empty() {
+            let hashes: Vec<[u8; 32]> = candidates.iter().map(|h| h.hash).collect();
+            let (bodies, receipt_blocks) =
+                futures::future::join(peer.get_block_bodies(&hashes), peer.get_receipts(&hashes)).await;
+            let bodies = bodies?;
+            let receipt_blocks = receipt_blocks?;
+            if bodies.len() != candidates.len() || receipt_blocks.len() != candidates.len() {
+                return Err("peer returned a short bodies/receipts response".to_string());
+            }
+            for ((vh, body), receipts) in candidates.iter().zip(&bodies).zip(&receipt_blocks) {
+                verify_body_transactions(&vh.header, body)?;
+                if receipts.len() != body.transactions.len() {
+                    return Err(format!(
+                        "block {}: {} receipts for {} transactions",
+                        vh.header.number,
+                        receipts.len(),
+                        body.transactions.len()
+                    ));
+                }
+                verify_block_receipts(&vh.header, receipts)?;
+                let verified = build_block_receipts(&vh.header, vh.hash, body, receipts)?;
+                let stored = stored_logs_for_block(&verified)
+                    .ok_or("malformed log field in verified receipts")?;
+                logs_by_block.insert(vh.header.number, stored);
+            }
+        }
+        // Apply top-down so every block adjoins the low edge; the trust edge
+        // (cursor) advances with each applied block.
+        match self.log_index.lock() {
+            Ok(mut slot) => {
+                let Some(ix) = slot.as_mut() else {
+                    return Err("log index uninstalled mid-batch".to_string());
+                };
+                for vh in window[..window.len() - 1].iter().rev() {
+                    let n = vh.header.number;
+                    let logs = logs_by_block.remove(&n).unwrap_or_default();
+                    ix.backfill_block(n, vh.hash, logs)
+                        .map_err(|g| format!("backfill gap at {} (edge {})", g.block, g.edge))?;
+                }
+                Ok(())
+            }
+            Err(_) => Err("log index lock poisoned".to_string()),
         }
     }
 
