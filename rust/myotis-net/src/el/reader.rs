@@ -728,6 +728,7 @@ impl ElReader {
                     return; // reader torn down; the appender dies with it
                 };
                 reader.log_index_append_tick(&mut since_persist, ticks).await;
+                reader.log_index_backfill_step(ticks).await;
                 ticks = ticks.wrapping_add(1);
             }
         }));
@@ -767,13 +768,13 @@ impl ElReader {
             // Rate-limited: this state persists until the backfill walker
             // exists / catches up, and a warn every 6 s is just noise.
             if ticks % 100 == 0 {
-                tracing::warn!(start, finalized, "log index append edge too far behind; waiting for backfill");
+                tracing::warn!(start, finalized, "log index append edge too far behind (node downtime?); upward bridging is a tracked follow-up — coverage above the edge stays frozen until then");
             }
             return;
         }
         let last = finalized.min(start.saturating_add(15));
         for n in start..=last {
-            let receipts = match self.get_block_receipts(Some(n)).await {
+            let (block_hash, receipts) = match self.block_receipts_at(Some(n)).await {
                 Ok(Some(r)) => r,
                 Ok(None) => return, // future/unknown under this anchor — retry next tick
                 Err(e) => {
@@ -792,7 +793,7 @@ impl ElReader {
             };
             let appended = match self.log_index.lock() {
                 Ok(mut slot) => match slot.as_mut() {
-                    Some(ix) => match ix.append_block(n, logs) {
+                    Some(ix) => match ix.append_block(n, block_hash, logs) {
                         Ok(()) => true,
                         Err(gap) => {
                             // Transient (config replaced / rewind raced this
@@ -819,6 +820,199 @@ impl ElReader {
                 }
             }
             *since_persist = 0;
+        }
+    }
+
+    /// One backfill step: walk the verified header chain DOWNWARD from the
+    /// index's trust cursor toward the lowest watched from_block, one batch
+    /// per tick (docs/eth-getlogs-design.md §backfill). Every header is
+    /// trusted only through parent-hash linkage into the cursor (whose own
+    /// trust chains back to a beacon-anchored append); candidate blocks
+    /// (bloom hit) get body+receipts fetched and verified against both roots
+    /// before any log is stored. Peer refusal is a stall, never corruption:
+    /// coverage simply doesn't extend until some peer serves the range.
+    async fn log_index_backfill_step(&self, ticks: u64) {
+        let Some((config, cursor)) = self.with_log_index(|ix| (ix.config().clone(), ix.cursor)) else {
+            return;
+        };
+        let (Some(target_low), Some((cur_n, cur_hash))) =
+            (config.watch.iter().map(|w| w.from_block).min(), cursor)
+        else {
+            return; // no watch entries, or the appender hasn't seeded the edge yet
+        };
+        if !config.enabled || cur_n <= target_low {
+            return;
+        }
+        let fingerprint = config.fingerprint();
+        // count+1 headers are requested (the top one is the cursor block), and
+        // honest peers cap header serves at 1024 (our own served.rs agrees) —
+        // so the batch is 1023 new blocks, keeping the request exactly at cap.
+        const BATCH: u64 = 1023;
+        let count = (cur_n - target_low).min(BATCH);
+        let from = cur_n - count;
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return;
+        }
+        for peer in &peers {
+            match self
+                .log_index_backfill_batch(peer, count, cur_n, cur_hash, &config, fingerprint)
+                .await
+            {
+                Ok(()) => {
+                    // Checkpoint after every applied batch: the store is
+                    // small at Sepolia scale and a crash then costs at most
+                    // one batch (paged store before mainnet — design doc).
+                    if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
+                        if let Some(ix) = slot.as_ref() {
+                            let _ = ix.persist(path);
+                        }
+                    }
+                    return;
+                }
+                Err(e) => {
+                    tracing::debug!(from, count, error = %e, "log index backfill batch failed; trying next peer");
+                }
+            }
+        }
+        if ticks % 100 == 0 {
+            tracing::warn!(
+                cursor = cur_n,
+                target = target_low,
+                "log index backfill: no peer served the range this round (history depth?); will keep retrying"
+            );
+        }
+    }
+
+    /// Fetch and apply one descending backfill batch from one peer:
+    /// headers [from, cur_n] ascending (count+1, so the top one IS the cursor
+    /// block), full parent-hash chain check, bloom-filtered candidate
+    /// body+receipts fetch verified against both roots, then apply top-down.
+    /// Fetch and apply one descending backfill batch from one peer. The
+    /// request is `reverse=true` starting AT the trusted cursor block, so the
+    /// trust root is the FIRST header of the response — a short serve (peers
+    /// may cap below the 1024 ceiling, or truncate on byte budget) still
+    /// yields a verifiable parent-hash-chained prefix and partial progress,
+    /// instead of failing an exact-length check forever. (`remember_served`
+    /// only tracks ascending shapes, so reverse fetches skip that side
+    /// channel — harmless.) Candidates are bloom-filtered and their logs
+    /// pre-filtered against the captured config, so transient memory is
+    /// proportional to logs that will actually be stored.
+    async fn log_index_backfill_batch(
+        &self,
+        peer: &ManagedPeer,
+        count: u64,
+        cur_n: u64,
+        cur_hash: [u8; 32],
+        config: &crate::el::logindex::LogIndexConfig,
+        fingerprint: u64,
+    ) -> Result<(), String> {
+        let window = peer.get_block_headers_by_number(cur_n, count + 1, 0, true).await?;
+        let Some((top, rest)) = window.split_first() else {
+            return Err("peer returned no headers".to_string());
+        };
+        if top.header.number != cur_n || top.hash != cur_hash {
+            return Err("peer window does not start at the trusted cursor block".to_string());
+        }
+        if rest.is_empty() {
+            return Err("peer served only the cursor block".to_string());
+        }
+        // Descending parent-hash chain: each header's parent is the next one.
+        // Only the verified prefix is used, so a mid-response break just
+        // shortens the batch instead of failing it.
+        let mut verified = 0usize;
+        for pair in window.windows(2) {
+            let [upper, lower] = pair else {
+                return Err("header window pairing failed".to_string());
+            };
+            if upper.header.parent_hash != lower.hash
+                || lower.header.number != upper.header.number.wrapping_sub(1)
+            {
+                break;
+            }
+            verified += 1;
+        }
+        if verified == 0 {
+            return Err("peer response does not chain to the cursor block".to_string());
+        }
+        let new_blocks = rest.get(..verified).ok_or("verified prefix out of range")?;
+        // Bloom-filter candidates among the NEW blocks. A miss is a
+        // definitive skip; a hit needs verified receipts.
+        let candidates: Vec<&crate::el::eth::messages::VerifiedHeader> = new_blocks
+            .iter()
+            .filter(|h| {
+                let Ok(bloom): Result<&[u8; 256], _> = h.header.logs_bloom.as_slice().try_into() else {
+                    return true; // odd bloom width: treat as maybe, verify via receipts
+                };
+                self.with_log_index(|ix| ix.bloom_may_match(h.header.number, bloom)).unwrap_or(false)
+            })
+            .collect();
+        let mut logs_by_block: std::collections::HashMap<u64, Vec<crate::el::logindex::StoredLog>> =
+            std::collections::HashMap::new();
+        // Chunked: one request for ~1023 candidate blocks would blow through
+        // peer soft response limits (~2 MiB) and permanently stall a
+        // candidate-dense range on the exact-length check below.
+        for chunk in candidates.chunks(64) {
+            let hashes: Vec<[u8; 32]> = chunk.iter().map(|h| h.hash).collect();
+            let (bodies, receipt_blocks) =
+                futures::future::join(peer.get_block_bodies(&hashes), peer.get_receipts(&hashes)).await;
+            let bodies = bodies?;
+            let receipt_blocks = receipt_blocks?;
+            if bodies.len() != chunk.len() || receipt_blocks.len() != chunk.len() {
+                return Err("peer returned a short bodies/receipts response".to_string());
+            }
+            for ((vh, body), receipts) in chunk.iter().zip(&bodies).zip(&receipt_blocks) {
+                verify_body_transactions(&vh.header, body)?;
+                if receipts.len() != body.transactions.len() {
+                    return Err(format!(
+                        "block {}: {} receipts for {} transactions",
+                        vh.header.number,
+                        receipts.len(),
+                        body.transactions.len()
+                    ));
+                }
+                verify_block_receipts(&vh.header, receipts)?;
+                let built = build_block_receipts(&vh.header, vh.hash, body, receipts)?;
+                let stored = stored_logs_for_block(&built)
+                    .ok_or("malformed log field in verified receipts")?;
+                // Pre-filter: buffer only logs the captured watch-list will
+                // store (the fingerprint recheck below discards the batch if
+                // the config changed, so filtering against the snapshot is
+                // safe) — transient memory stays proportional to stored logs.
+                let watched: Vec<crate::el::logindex::StoredLog> =
+                    stored.into_iter().filter(|l| config.watches(l)).collect();
+                if !watched.is_empty() {
+                    logs_by_block.insert(vh.header.number, watched);
+                }
+            }
+        }
+        // Apply top-down (the response is already descending) so every block
+        // adjoins the low edge; the trust edge advances with each block.
+        match self.log_index.lock() {
+            Ok(mut slot) => {
+                let Some(ix) = slot.as_mut() else {
+                    return Err("log index uninstalled mid-batch".to_string());
+                };
+                // The batch ran across several awaits; a concurrent
+                // set_log_index_config may have replaced the index (fresh
+                // cursor None, empty spans that would accept ANY block). Our
+                // candidates were bloom-selected against the OLD watch-list —
+                // applying them to a new one would claim coverage for blocks
+                // whose new-address logs were "definitively" skipped. Bail
+                // unless both the trust edge and the config are the ones this
+                // batch was computed against.
+                if ix.cursor != Some((cur_n, cur_hash)) || ix.config().fingerprint() != fingerprint {
+                    return Err("index changed mid-batch; recomputing next tick".to_string());
+                }
+                for vh in new_blocks {
+                    let n = vh.header.number;
+                    let logs = logs_by_block.remove(&n).unwrap_or_default();
+                    ix.backfill_block(n, vh.hash, logs)
+                        .map_err(|g| format!("backfill gap at {} (edge {})", g.block, g.edge))?;
+                }
+                Ok(())
+            }
+            Err(_) => Err("log index lock poisoned".to_string()),
         }
     }
 
