@@ -1526,3 +1526,36 @@ pub fn get_logs_json(logs: &[myotis_net::el::logindex::StoredLog]) -> String {
     s.push(']');
     s
 }
+
+#[cfg(test)]
+mod get_logs_json_tests {
+    use myotis_net::el::logindex::StoredLog;
+
+    /// Golden pin: the per-log shape is byte-identical to the log objects
+    /// receipt_json emits (same field order, same hex forms, removed:false).
+    #[test]
+    fn get_logs_json_shape_is_pinned() {
+        let log = StoredLog {
+            block_number: 0x64,
+            block_hash: [0x22; 32],
+            tx_hash: [0x33; 32],
+            tx_index: 1,
+            log_index: 5,
+            address: [0x11; 20],
+            topics: vec![[0xaa; 32], [0xbb; 32]],
+            data: vec![0xde, 0xad],
+        };
+        let expected = format!(
+            "[{{\"address\":\"0x{}\",\"topics\":[\"0x{}\",\"0x{}\"],\"data\":\"0xdead\",\
+\"blockNumber\":\"0x64\",\"blockHash\":\"0x{}\",\"transactionHash\":\"0x{}\",\
+\"transactionIndex\":\"0x1\",\"logIndex\":\"0x5\",\"removed\":false}}]",
+            "11".repeat(20),
+            "aa".repeat(32),
+            "bb".repeat(32),
+            "22".repeat(32),
+            "33".repeat(32),
+        );
+        assert_eq!(super::get_logs_json(&[log]), expected);
+        assert_eq!(super::get_logs_json(&[]), "[]");
+    }
+}

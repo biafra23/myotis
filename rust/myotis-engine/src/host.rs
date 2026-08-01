@@ -1889,6 +1889,9 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
     };
     let enabled = v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
     let mut watch = Vec::new();
+    if v.get("watch").is_some_and(|w| !w.is_array() && !w.is_null()) {
+        return false;
+    }
     if let Some(entries) = v.get("watch").and_then(|w| w.as_array()) {
         for e in entries {
             let Some(address) = e.get("address").and_then(|a| a.as_str()).and_then(parse_address) else {
@@ -1961,18 +1964,68 @@ pub fn log_index_status_json(handle: i64) -> String {
     status.unwrap_or_else(|| "{\"enabled\":false,\"logCount\":0,\"entries\":[]}".to_string())
 }
 
-/// Resolve an eth_getLogs block tag: hex quantity, or latest/pending/safe →
-/// anchored head, finalized → finalized block. None = unresolvable now.
-fn resolve_block_tag(reader: &myotis_net::el::reader::ElReader, tag: Option<&serde_json::Value>, default_head: u64) -> Option<u64> {
-    match tag.and_then(|t| t.as_str()) {
-        None => Some(default_head),
-        Some("latest") | Some("pending") | Some("safe") => Some(default_head),
-        Some("finalized") => Some(reader.finalized_block_number()),
-        Some(hex) => {
-            let stripped = hex.strip_prefix("0x")?;
-            u64::from_str_radix(stripped, 16).ok()
+/// Parse an eth_getLogs filter into a typed [`LogFilter`], resolving tags
+/// against the supplied head/finalized numbers. Pure (testable): every
+/// malformed shape is a specific error string; nothing is silently ignored.
+fn parse_get_logs_filter(
+    v: &serde_json::Value,
+    head: u64,
+    finalized: u64,
+) -> Result<myotis_net::el::logindex::LogFilter, String> {
+    fn tag(v: Option<&serde_json::Value>, head: u64, finalized: u64) -> Result<u64, String> {
+        match v {
+            None | Some(serde_json::Value::Null) => Ok(head),
+            Some(serde_json::Value::String(s)) => match s.as_str() {
+                "latest" | "pending" | "safe" => Ok(head),
+                "finalized" => Ok(finalized),
+                "earliest" => Ok(0),
+                hex => hex
+                    .strip_prefix("0x")
+                    .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .and_then(|d| u64::from_str_radix(d, 16).ok())
+                    .ok_or_else(|| "unresolvable block tag".to_string()),
+            },
+            Some(_) => Err("block tag must be a string".to_string()),
         }
     }
+    let from_block = tag(v.get("fromBlock"), head, finalized)?;
+    let to_block = tag(v.get("toBlock"), head, finalized)?;
+    let mut addresses = Vec::new();
+    match v.get("address") {
+        Some(serde_json::Value::String(a)) => {
+            addresses.push(parse_address(a).ok_or("malformed address")?);
+        }
+        Some(serde_json::Value::Array(items)) if !items.is_empty() => {
+            for a in items {
+                addresses.push(a.as_str().and_then(parse_address).ok_or("malformed address")?);
+            }
+        }
+        _ => return Err("eth_getLogs without an address is not served by this scoped index".to_string()),
+    }
+    let mut topics: Vec<Vec<[u8; 32]>> = Vec::new();
+    match v.get("topics") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Array(ts)) => {
+            for t in ts {
+                match t {
+                    serde_json::Value::Null => topics.push(Vec::new()),
+                    serde_json::Value::String(one) => {
+                        topics.push(vec![parse_word32(one).ok_or("malformed topic")?]);
+                    }
+                    serde_json::Value::Array(alts) => {
+                        let mut ors = Vec::new();
+                        for a in alts {
+                            ors.push(a.as_str().and_then(parse_word32).ok_or("malformed topic")?);
+                        }
+                        topics.push(ors);
+                    }
+                    _ => return Err("malformed topics".to_string()),
+                }
+            }
+        }
+        Some(_) => return Err("malformed topics".to_string()),
+    }
+    Ok(myotis_net::el::logindex::LogFilter { from_block, to_block, addresses, topics })
 }
 
 /// The eth_getLogs query. Returns the log array ONLY when the requested
@@ -1980,7 +2033,7 @@ fn resolve_block_tag(reader: &myotis_net::el::reader::ElReader, tag: Option<&ser
 /// (the router maps it to strict -32000) — never an empty array for an
 /// unindexed range.
 pub fn get_logs_json(handle: i64, filter_json: &str) -> String {
-    use myotis_net::el::logindex::{LogFilter, QueryError};
+    use myotis_net::el::logindex::QueryError;
     let Ok(v) = serde_json::from_str::<serde_json::Value>(filter_json) else {
         return eljson::error_json("malformed filter");
     };
@@ -1993,55 +2046,10 @@ pub fn get_logs_json(handle: i64, filter_json: &str) -> String {
     let Some(head) = reader.head_block_number() else {
         return eljson::error_json("no verified head yet");
     };
-    let (Some(from_block), Some(to_block)) = (
-        resolve_block_tag(&reader, v.get("fromBlock"), head),
-        resolve_block_tag(&reader, v.get("toBlock"), head),
-    ) else {
-        return eljson::error_json("unresolvable block tag");
+    let filter = match parse_get_logs_filter(&v, head, reader.finalized_block_number()) {
+        Ok(f) => f,
+        Err(msg) => return eljson::error_json(&msg),
     };
-    // address: single string or array; both are required to be present —
-    // a scoped index cannot serve address-less queries.
-    let mut addresses = Vec::new();
-    match v.get("address") {
-        Some(serde_json::Value::String(a)) => match parse_address(a) {
-            Some(a) => addresses.push(a),
-            None => return eljson::error_json("malformed address"),
-        },
-        Some(serde_json::Value::Array(items)) => {
-            for a in items {
-                match a.as_str().and_then(parse_address) {
-                    Some(a) => addresses.push(a),
-                    None => return eljson::error_json("malformed address"),
-                }
-            }
-        }
-        _ => return eljson::error_json("eth_getLogs without an address is not served by this scoped index"),
-    }
-    // topics: positional array of null | "0x.." | ["0x..",..].
-    let mut topics: Vec<Vec<[u8; 32]>> = Vec::new();
-    if let Some(ts) = v.get("topics").and_then(|t| t.as_array()) {
-        for t in ts {
-            match t {
-                serde_json::Value::Null => topics.push(Vec::new()),
-                serde_json::Value::String(one) => match parse_word32(one) {
-                    Some(w) => topics.push(vec![w]),
-                    None => return eljson::error_json("malformed topic"),
-                },
-                serde_json::Value::Array(alts) => {
-                    let mut ors = Vec::new();
-                    for a in alts {
-                        match a.as_str().and_then(parse_word32) {
-                            Some(w) => ors.push(w),
-                            None => return eljson::error_json("malformed topic"),
-                        }
-                    }
-                    topics.push(ors);
-                }
-                _ => return eljson::error_json("malformed topics"),
-            }
-        }
-    }
-    let filter = LogFilter { from_block, to_block, addresses, topics };
     let result = reader.with_log_index(|ix| ix.query(&filter));
     match result {
         None => eljson::error_json("log index is not configured on this network"),
@@ -2059,6 +2067,49 @@ pub fn get_logs_json(handle: i64, filter_json: &str) -> String {
             )),
             None => eljson::error_json("log index has not indexed any blocks yet; retry"),
         },
-        Some(Err(QueryError::Unanswerable)) => eljson::error_json("unanswerable filter (from > to)"),
+        Some(Err(QueryError::Unanswerable)) => eljson::error_json("unanswerable filter (fromBlock > toBlock)"),
+    }
+}
+
+#[cfg(test)]
+mod get_logs_filter_tests {
+    use super::parse_get_logs_filter;
+
+    fn f(json: &str) -> Result<myotis_net::el::logindex::LogFilter, String> {
+        parse_get_logs_filter(&serde_json::from_str(json).unwrap(), 1000, 900)
+    }
+
+    #[test]
+    fn tags_resolve_and_malformed_tags_error() {
+        let addr = format!("\"address\":\"0x{}\"", "11".repeat(20));
+        let ok = f(&format!("{{{addr}}}")).unwrap();
+        assert_eq!((ok.from_block, ok.to_block), (1000, 1000)); // absent → head
+        let ok = f(&format!("{{{addr},\"fromBlock\":\"earliest\",\"toBlock\":\"finalized\"}}")).unwrap();
+        assert_eq!((ok.from_block, ok.to_block), (0, 900));
+        let ok = f(&format!("{{{addr},\"fromBlock\":\"0x64\"}}")).unwrap();
+        assert_eq!(ok.from_block, 100);
+        for bad in ["\"0x\"", "\"0x+5\"", "\"nope\"", "5", "{}"] {
+            assert!(f(&format!("{{{addr},\"fromBlock\":{bad}}}")).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn address_forms_and_empty_array_error() {
+        assert!(f("{}").is_err());
+        assert!(f("{\"address\":[]}").unwrap_err().contains("without an address"));
+        assert!(f(&format!("{{\"address\":[\"0x{}\",\"0x{}\"]}}", "11".repeat(20), "22".repeat(20))).unwrap().addresses.len() == 2);
+        assert!(f("{\"address\":\"0xzz\"}").is_err());
+    }
+
+    #[test]
+    fn topics_forms_and_malformed_topics_error() {
+        let addr = format!("\"address\":\"0x{}\"", "11".repeat(20));
+        let t = format!("0x{}", "aa".repeat(32));
+        let ok = f(&format!("{{{addr},\"topics\":[null,\"{t}\",[\"{t}\"]]}}")).unwrap();
+        assert_eq!(ok.topics.len(), 3);
+        assert!(ok.topics.first().is_some_and(|w| w.is_empty()));
+        // A non-array topics value must ERROR, not silently widen the query.
+        assert!(f(&format!("{{{addr},\"topics\":\"{t}\"}}")).unwrap_err().contains("malformed topics"));
+        assert!(f(&format!("{{{addr},\"topics\":[5]}}")).is_err());
     }
 }
