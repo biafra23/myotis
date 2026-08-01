@@ -513,6 +513,8 @@ pub struct ElReader {
     /// stop, never under a network await.
     log_index: std::sync::Mutex<Option<crate::el::logindex::LogIndex>>,
     log_index_path: Option<std::path::PathBuf>,
+    /// The head-follow appender task (spawned on enable, aborted on stop).
+    log_index_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// The scan-cursor map plus its last TTL sweep — one lock covers both, so the
@@ -633,6 +635,7 @@ impl ElReader {
             sent_tx_watch,
             log_index: std::sync::Mutex::new(None),
             log_index_path: cfg.log_index_path,
+            log_index_task: std::sync::Mutex::new(None),
         })
     }
 
@@ -676,6 +679,147 @@ impl ElReader {
     /// resolution target for `latest`-style tags in eth_getLogs filters.
     pub fn head_block_number(&self) -> Option<u64> {
         self.anchored_head().ok().map(|(n, _)| n)
+    }
+
+    /// Deterministically stop the appender: abort AND await the task, which
+    /// guarantees its per-tick strong Arc has been dropped — hosts call this
+    /// BEFORE Arc::try_unwrap so teardown never races a long catch-up tick.
+    pub async fn stop_log_index_appender(&self) {
+        let handle = match self.log_index_task.lock() {
+            Ok(mut t) => t.take(),
+            Err(_) => None,
+        };
+        if let Some(h) = handle {
+            h.abort();
+            let _ = h.await; // JoinError::Cancelled — the task's Arc is gone
+        }
+    }
+
+    /// Spawn (or keep) the head-follow appender for this reader. Idempotent:
+    /// a live task is left alone. `rt` makes the runtime-context invariant
+    /// unforgeable (a bare tokio::spawn outside a runtime would abort the
+    /// whole host process under panic="abort").
+    pub fn ensure_log_index_appender(self: &Arc<Self>, rt: &tokio::runtime::Handle) {
+        let Ok(mut slot) = self.log_index_task.lock() else {
+            return;
+        };
+        if slot.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        // The task holds only a WEAK reference: a strong Arc here would keep
+        // the reader's strong count above 1 forever, making the host's
+        // Arc::try_unwrap → ElReader::stop teardown unreachable (leaked
+        // networking on stop/pause). Each tick upgrades for its duration and
+        // the task exits on its own once the reader is gone; the abort in
+        // stop() is the fast path.
+        let weak = Arc::downgrade(self);
+        *slot = Some(rt.spawn(async move {
+            // Slice-3 rule: append FINALIZED blocks only. Finalized never
+            // reorgs, so coverage stays honest with zero rewind machinery;
+            // optimistic-tail appending (with the design doc's rewind rule)
+            // and deep-gap bridging both belong to the backfill slice.
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(6));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut since_persist = 0u32;
+            let mut ticks = 0u64;
+            loop {
+                tick.tick().await;
+                let Some(reader) = weak.upgrade() else {
+                    return; // reader torn down; the appender dies with it
+                };
+                reader.log_index_append_tick(&mut since_persist, ticks).await;
+                ticks = ticks.wrapping_add(1);
+            }
+        }));
+    }
+
+    /// One appender tick: record finalized blocks from the append edge up to
+    /// the finalized head (bounded batch per tick).
+    async fn log_index_append_tick(&self, since_persist: &mut u32, ticks: u64) {
+        // Checkpoint due from a PREVIOUS tick first: batches that end early
+        // (peer failure mid-catch-up) must not defer persistence forever.
+        if *since_persist >= 64 {
+            if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
+                if let Some(ix) = slot.as_ref() {
+                    let _ = ix.persist(path);
+                }
+            }
+            *since_persist = 0;
+        }
+        let enabled = self.with_log_index(|ix| ix.config().enabled).unwrap_or(false);
+        if !enabled {
+            return;
+        }
+        let finalized = self.finalized_block_number();
+        if finalized == 0 {
+            return;
+        }
+        let edge = self.with_log_index(|ix| ix.append_edge()).flatten();
+        let start = match edge {
+            None => finalized, // fresh index: start at the finalized head
+            Some(e) if e <= finalized => e,
+            Some(_) => return, // caught up
+        };
+        // The verified whole-block path anchors a window from the target to
+        // the optimistic head; stay well inside its lookback cap. A deeper
+        // lag is the backfill walker's job — say so once per tick.
+        if finalized.saturating_sub(start) > 128 {
+            // Rate-limited: this state persists until the backfill walker
+            // exists / catches up, and a warn every 6 s is just noise.
+            if ticks % 100 == 0 {
+                tracing::warn!(start, finalized, "log index append edge too far behind; waiting for backfill");
+            }
+            return;
+        }
+        let last = finalized.min(start.saturating_add(15));
+        for n in start..=last {
+            let receipts = match self.get_block_receipts(Some(n)).await {
+                Ok(Some(r)) => r,
+                Ok(None) => return, // future/unknown under this anchor — retry next tick
+                Err(e) => {
+                    tracing::debug!(block = n, error = %e, "log index append: receipts unavailable");
+                    return;
+                }
+            };
+            // Strict conversion: any malformed field (wrong-length address or
+            // topic, index overflow) aborts THIS block's append rather than
+            // silently storing an altered shape under advancing coverage — a
+            // dropped topic0 would shift the rest and change what
+            // filter/watch matching sees for verified data.
+            let Some(logs) = stored_logs_for_block(&receipts) else {
+                tracing::warn!(block = n, "log index append: malformed log field in verified receipts; will retry");
+                return;
+            };
+            let appended = match self.log_index.lock() {
+                Ok(mut slot) => match slot.as_mut() {
+                    Some(ix) => match ix.append_block(n, logs) {
+                        Ok(()) => true,
+                        Err(gap) => {
+                            // Transient (config replaced / rewind raced this
+                            // tick) → retrying next tick is right; if it ever
+                            // became persistent this warn is the telemetry.
+                            tracing::warn!(block = n, edge = gap.edge, "log index append rejected (coverage gap); retrying");
+                            false
+                        }
+                    },
+                    None => false,
+                },
+                Err(_) => false,
+            };
+            if !appended {
+                return;
+            }
+            *since_persist += 1;
+        }
+        // Checkpoint roughly every 64 appended blocks (best-effort).
+        if *since_persist >= 64 {
+            if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
+                if let Some(ix) = slot.as_ref() {
+                    let _ = ix.persist(path);
+                }
+            }
+            *since_persist = 0;
+        }
     }
 
     /// Run `f` against the index if one is configured. The single accessor
@@ -2460,6 +2604,11 @@ impl ElReader {
 
     /// Stop discovery + the pool.
     pub async fn stop(self) {
+        if let Ok(mut t) = self.log_index_task.lock() {
+            if let Some(h) = t.take() {
+                h.abort();
+            }
+        }
         // Best-effort index checkpoint before teardown: a failed write only
         // costs a re-index of the uncheckpointed tail, never correctness.
         if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
@@ -3181,4 +3330,30 @@ mod tests {
         let tips = vec![(7u128, 0u64), (3, 0)];
         assert_eq!(percentile_rewards(tips, &[50.0, 99.0]), vec![3, 3]);
     }
+}
+
+/// Convert one block's [`VerifiedReceipt`]s into stored logs — strictly:
+/// `None` on any field that does not have its canonical width, so a caller
+/// never records a block whose stored shape differs from what was verified.
+fn stored_logs_for_block(receipts: &[VerifiedReceipt]) -> Option<Vec<crate::el::logindex::StoredLog>> {
+    let mut out = Vec::new();
+    for r in receipts {
+        for (k, l) in r.receipt.logs.iter().enumerate() {
+            let mut topics = Vec::with_capacity(l.topics.len());
+            for t in &l.topics {
+                topics.push(t.as_slice().try_into().ok()?);
+            }
+            out.push(crate::el::logindex::StoredLog {
+                block_number: r.block_number,
+                block_hash: r.block_hash,
+                tx_hash: r.tx_hash,
+                tx_index: u32::try_from(r.tx_index).ok()?,
+                log_index: u32::try_from(r.log_index_base).ok()?.checked_add(u32::try_from(k).ok()?)?,
+                address: l.address.as_slice().try_into().ok()?,
+                topics,
+                data: l.data.clone(),
+            });
+        }
+    }
+    Some(out)
 }

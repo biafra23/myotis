@@ -392,6 +392,35 @@ impl LogIndex {
         self.logs.len()
     }
 
+    /// The next block the head-follow appender should record: one past the
+    /// highest covered block across entries, or None when nothing is indexed
+    /// yet (the appender then starts fresh at the current head).
+    /// Invariant making `max` safe here: append_block extends every
+    /// at-or-past-from_block entry together and rewind_above pulls highs to
+    /// a common fork point, so all `Some` highs are equal at rest; an entry
+    /// below the max is either pre-from_block or `None` (backfill's job).
+    pub fn append_edge(&self) -> Option<u64> {
+        self.coverage
+            .iter()
+            .filter_map(|c| c.span.map(|(_, high)| high))
+            .max()
+            .map(|h| h.saturating_add(1))
+    }
+
+    /// Bloom pre-filter for one block: could its header bloom contain a log
+    /// any watch entry would store? `false` is a definitive skip (blooms
+    /// have no false negatives); `true` still requires verified receipts.
+    /// Entries whose `from_block` is above `block_number` are ignored, and
+    /// a topic0-restricted entry requires address AND one of its topic0s.
+    pub fn bloom_may_match(&self, block_number: u64, bloom: &myotis_core::bloom::LogsBloom) -> bool {
+        self.config.watch.iter().any(|w| {
+            block_number >= w.from_block
+                && myotis_core::bloom::may_contain(bloom, &w.address)
+                && (w.topic0s.is_empty()
+                    || w.topic0s.iter().any(|t| myotis_core::bloom::may_contain(bloom, t)))
+        })
+    }
+
     /// Watch entries paired with their coverage — the status surface.
     pub fn coverage_entries(&self) -> Vec<(WatchEntry, Coverage)> {
         self.config.watch.iter().cloned().zip(self.coverage.iter().copied()).collect()
@@ -864,5 +893,29 @@ mod tests {
         assert_eq!(c1.fingerprint(), c2.fingerprint());
         let c3 = config(vec![a, WatchEntry { address: addr(2), from_block: 10, topic0s: vec![topic(3), topic(4)] }]);
         assert_ne!(c1.fingerprint(), c3.fingerprint());
+    }
+}
+
+#[cfg(test)]
+mod bloom_match_tests {
+    use super::*;
+    use myotis_core::bloom::{accrue, EMPTY_BLOOM};
+
+    #[test]
+    fn bloom_prefilter_respects_from_block_and_topics() {
+        fn addr(b: u8) -> [u8; 20] {
+            [b; 20]
+        }
+        let watch = WatchEntry { address: addr(1), from_block: 100, topic0s: vec![[7; 32]] };
+        let ix = LogIndex::new(LogIndexConfig { enabled: true, watch: vec![watch] }).unwrap();
+        let mut hit = EMPTY_BLOOM;
+        accrue(&mut hit, &addr(1));
+        accrue(&mut hit, &[7u8; 32]);
+        assert!(ix.bloom_may_match(100, &hit));
+        assert!(!ix.bloom_may_match(99, &hit)); // below from_block
+        let mut addr_only = EMPTY_BLOOM;
+        accrue(&mut addr_only, &addr(1));
+        assert!(!ix.bloom_may_match(100, &addr_only)); // topic0-restricted entry needs a topic hit
+        assert!(!ix.bloom_may_match(100, &EMPTY_BLOOM));
     }
 }
