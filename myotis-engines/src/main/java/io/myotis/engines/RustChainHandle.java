@@ -942,7 +942,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     }
 
     /** Install the log-index config; false = invalid config or gate down. */
-    boolean setLogIndexConfig(String configJson) {
+    @Override
+    public boolean setLogIndexConfig(String configJson) {
         try {
             return gated(() -> RustEngineNative.nativeSetLogIndexConfig(handle, configJson));
         } catch (RuntimeException e) {
@@ -951,7 +952,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     }
 
     /** Log-index status JSON ({"error":...} when the gate is down). */
-    String logIndexStatusJson() {
+    @Override
+    public String logIndexStatusJson() {
         return gated(() -> RustEngineNative.nativeLogIndexStatusJson(handle));
     }
 

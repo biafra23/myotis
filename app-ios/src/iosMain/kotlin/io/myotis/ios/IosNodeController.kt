@@ -176,6 +176,30 @@ class IosNodeController(
     }
 
     /** Blocking create+start; caller holds [bootMutex] and runs on IO. */
+    override fun applyLogIndex(network: String) {
+        val net = canonical(network)
+        locked { handles[net] }?.let { pushLogIndexConfig(net, it) }
+    }
+
+    private fun pushLogIndexConfig(net: String, handle: Long) {
+        val json = io.myotis.ui.KohakuPreset.configJson(net, settings.logIndexEnabled(net)) ?: return
+        if (!RustEngine.setLogIndexConfig(handle, json) && settings.logIndexEnabled(net)) {
+            logs.append("WARN log index config rejected for $net")
+        }
+    }
+
+    /** Short status line for the log index, or null when off. */
+    private fun logIndexStatusFor(net: String, handle: Long): String? {
+        if (!settings.logIndexEnabled(net)) return null
+        val json = RustEngine.logIndexStatusJson(handle)
+        if (!json.contains("\"enabled\":true")) return "enabled \u2014 waiting for engine"
+        val count = Regex("\"logCount\":(\\d+)").find(json)?.groupValues?.get(1) ?: "0"
+        val lows = Regex("\"coveredLow\":(\\d+)").findAll(json).map { it.groupValues[1].toLong() }.toList()
+        val highs = Regex("\"coveredHigh\":(\\d+)").findAll(json).map { it.groupValues[1].toLong() }.toList()
+        return if (lows.isEmpty()) "$count logs \u2014 backfill starting"
+        else "$count logs \u2014 blocks ${lows.min()}\u2013${highs.max()}"
+    }
+
     private fun boot(net: String) {
         if (locked { net in handles }) return
         val handle = RustEngine.create(net, dataDir)
@@ -183,6 +207,9 @@ class IosNodeController(
             logs.append("ERROR failed to create the $net stack (sentinel $handle)")
             return
         }
+        // Boot-time apply of the log-index preset (cures restart dormancy:
+        // the persisted index reloads when the fingerprint matches).
+        pushLogIndexConfig(net, handle)
         if (!RustEngine.start(handle)) {
             RustEngine.stop(handle)
             logs.append("ERROR failed to start the $net stack")
@@ -484,6 +511,7 @@ class IosNodeController(
             // recorded start outcome.
             rpcServing = (rpcState?.second ?: false) && (rpcServer?.isServing() ?: false),
             lcHunting = o.engineBoolean("lcHunting"),
+            logIndex = logIndexStatusFor(network, handle),
             elHunting = o.engineBoolean("elHunting"),
         )
     }

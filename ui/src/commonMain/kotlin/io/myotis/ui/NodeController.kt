@@ -77,6 +77,11 @@ interface NodeController {
      */
     fun applyTorMode() {}
 
+    /** Push the (persisted) log-index preference for [network] down to the
+     *  engine — called from the settings toggle and at network (re)start.
+     *  Default no-op for hosts without the Rust engine's log index. */
+    fun applyLogIndex(network: String) {}
+
     /**
      * Wipe a network's peer caches — clear the live stack's backoff/blacklist and delete the
      * on-disk EL/CL peer cache files — so discovery starts from a fresh slate. Safe whether or
@@ -197,6 +202,13 @@ interface Settings {
     fun torEnabled(): Boolean = false
     fun setTorEnabled(v: Boolean) {}
 
+    /** Opt-in eth_getLogs watch-list index (the shipped Kohaku preset), per
+     *  network. Defaults keep hosts without the feature compiling; the
+     *  desktop/iOS actuals persist it and [NodeController.applyLogIndex]
+     *  pushes the preset config down to the Rust engine. */
+    fun logIndexEnabled(network: String): Boolean = false
+    fun setLogIndexEnabled(network: String, on: Boolean) {}
+
     /**
      * Minutes of no RPC/UI activity before a running stack is paused into idle sleep
      * (networking off, RPC listening, first request wakes it). 0 disables auto-pause.
@@ -294,6 +306,9 @@ data class NodeSnapshot(
     // "off" (supported, disabled), "on" (enabled, circuit still bootstrapping),
     // or "active" (enabled AND a Tor circuit is ready — reads route over Tor).
     val tor: String? = null,
+    // null = log index not applicable/configured; otherwise a short progress
+    // string, e.g. "12,041 logs · 5,594,611–8,461,900" or "backfilling".
+    val logIndex: String? = null,
 )
 
 /** One connected READY peer, for the Status peer list. */

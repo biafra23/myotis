@@ -13,6 +13,7 @@ import io.myotis.api.MyotisEngine
 import io.myotis.api.NetworkInfo
 import io.myotis.api.ports.EnginePorts
 import io.myotis.engines.Engines
+import io.myotis.ui.KohakuPreset
 import io.myotis.engines.SelectorEngine
 import io.myotis.engines.Tor
 import io.myotis.txhistory.TxHistoryEvent
@@ -153,6 +154,11 @@ class DesktopNodeController(
                 synchronized(servedWindowApplyLock) {
                     handle.setServedBlockWindow(settings.servedBlockWindow())
                 }
+                // Boot-time apply of the log-index preset (same spot as the
+                // served-window knob). Re-pushed on every (re)start, which is
+                // what cures the engine's restart dormancy: the persisted
+                // index on disk reloads when the fingerprint matches.
+                pushLogIndexConfig(canonical, handle)
                 // start() is fault-isolated: false (resources closed) on failure rather than a
                 // throw. Either way, drop the network so a later enable can retry — leaving a
                 // dead entry would report "running" forever and block retries.
@@ -230,6 +236,33 @@ class DesktopNodeController(
         // Java with a log. Applies to networks (re)started afterwards — live ones keep
         // their engine (reboot the network from Settings to switch it).
         Engines.select(if (settings.rustEngineEnabled()) "auto" else "java")
+    }
+
+    override fun applyLogIndex(network: String) {
+        engine.get(network)?.let { pushLogIndexConfig(network, it) }
+    }
+
+    private fun pushLogIndexConfig(network: String, handle: ChainHandle) {
+        val enabled = settings.logIndexEnabled(network)
+        // No preset for this network -> never push; the engine keeps
+        // eth_getLogs in its honest not-configured state.
+        val json = KohakuPreset.configJson(network, enabled) ?: return
+        val ok = handle.setLogIndexConfig(json)
+        if (enabled && !ok) {
+            log.warn("[desktop] log index config rejected for {} (Java engine, or engine gate down)", network)
+        }
+    }
+
+    /** Short status-tab line for the log index, or null when off/unavailable. */
+    private fun logIndexStatusFor(network: String): String? {
+        if (!settings.logIndexEnabled(network)) return null
+        val json = runCatching { engine.get(network)?.logIndexStatusJson() }.getOrNull() ?: return null
+        if (!json.contains("\"enabled\":true")) return "enabled — waiting for the Rust engine"
+        val count = Regex("\"logCount\":(\\d+)").find(json)?.groupValues?.get(1) ?: "0"
+        val lows = Regex("\"coveredLow\":(\\d+)").findAll(json).map { it.groupValues[1].toLong() }.toList()
+        val highs = Regex("\"coveredHigh\":(\\d+)").findAll(json).map { it.groupValues[1].toLong() }.toList()
+        return if (lows.isEmpty()) "$count logs — backfill starting"
+        else "$count logs — blocks ${lows.min()}\u2013${highs.max()}"
     }
 
     override fun applyTorMode() {
@@ -480,6 +513,7 @@ class DesktopNodeController(
             rpcPort = s.rpcPort(),
             rpcServing = s.rpcServing(),
             tor = torModeFor(Engines.engineKindFor(s.network())),
+            logIndex = logIndexStatusFor(s.network()),
         )
     }
 
@@ -531,6 +565,8 @@ class DesktopSettings(
     // Tor verified-read routing (docs/privacy-and-tor.md) — experimental, Rust-engine-only,
     // off by default. Persists independently; applyTorMode() pushes it to the Rust engine.
     private var torRouting = false
+    // Per-network opt-in for the eth_getLogs Kohaku-preset index (Rust engine only).
+    private val logIndexOn = HashMap<String, Boolean>()
 
     /** Serializes file writes, separate from the state lock (`this`) so settings
      *  readers never wait on disk I/O. */
@@ -566,6 +602,9 @@ class DesktopSettings(
     override fun servedBlockWindow(): Int = synchronized(this) { servedWindow }
     // Clamp like ChainStack.setServedBlockWindow (1..4096) so live and reloaded values agree.
     override fun setServedBlockWindow(v: Int) = mutate { servedWindow = v.coerceIn(1, 4096) }
+    override fun logIndexEnabled(network: String): Boolean =
+        synchronized(this) { logIndexOn[network] ?: false }
+    override fun setLogIndexEnabled(network: String, on: Boolean) = mutate { logIndexOn[network] = on }
 
     override fun displayName(network: String): String = info(network)?.displayName() ?: network
     override fun defaultRpcPort(network: String): Int = info(network)?.defaultRpcPort() ?: 8545
@@ -607,6 +646,10 @@ class DesktopSettings(
         p.getProperty(K_NATIVE_BLS)?.toBooleanStrictOrNull()?.let { nativeBls = it }
         p.getProperty(K_RUST_ENGINE)?.toBooleanStrictOrNull()?.let { rustEngine = it }
         p.getProperty(K_TOR)?.toBooleanStrictOrNull()?.let { torRouting = it }
+        p.stringPropertyNames().filter { it.startsWith(K_LOG_INDEX_PREFIX) }.forEach { k ->
+            p.getProperty(k)?.toBooleanStrictOrNull()
+                ?.let { logIndexOn[k.removePrefix(K_LOG_INDEX_PREFIX)] = it }
+        }
     }
 
     /**
@@ -646,6 +689,7 @@ class DesktopSettings(
         p.setProperty(K_NATIVE_BLS, nativeBls.toString())
         p.setProperty(K_RUST_ENGINE, rustEngine.toString())
         p.setProperty(K_TOR, torRouting.toString())
+        logIndexOn.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_PREFIX$net", on.toString()) }
         return p
     }
 
@@ -682,6 +726,7 @@ class DesktopSettings(
         const val K_NATIVE_BLS = "nativeBls"
         const val K_RUST_ENGINE = "rustEngine"
         const val K_TOR = "torRouting"
+        const val K_LOG_INDEX_PREFIX = "logIndex."
     }
 }
 

@@ -445,6 +445,21 @@ private fun SettingsTab(
 
         // Tor routing — Rust-engine-only (Arti is embedded there), so the row is disabled
         // until the Rust engine is enabled above. Applies on the next network (re)start.
+        var logIndexKohaku by remember {
+            mutableStateOf(KohakuPreset.byNetwork.keys.any { settings.logIndexEnabled(it) })
+        }
+        SwitchRow(
+            label = "Log index \u2014 Kohaku contracts (experimental)",
+            checked = logIndexKohaku && rustEngine,
+            enabled = rustEngine,
+            onChange = { on ->
+                logIndexKohaku = on
+                KohakuPreset.byNetwork.keys.forEach { net ->
+                    settings.setLogIndexEnabled(net, on)
+                    controller.applyLogIndex(net)
+                }
+            },
+        )
         SwitchRow(
             label = "Route reads over Tor (experimental)",
             checked = torRouting && rustEngine,
@@ -713,6 +728,7 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         StatusRow("EL block", s.executionBlockNumber.toString())
         // Tor verified-read routing (docs/privacy-and-tor.md) — shown only when it
         // applies (Rust engine + a Tor-capable build); see NodeSnapshot.tor.
+        s.logIndex?.let { StatusRow("Log index", it) }
         s.tor?.let { mode ->
             StatusRow(
                 "Tor",

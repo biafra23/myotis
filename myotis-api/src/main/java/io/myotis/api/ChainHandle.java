@@ -154,6 +154,24 @@ public interface ChainHandle {
     BlockResult getBlockVerified(long blockNumber);
 
     /**
+     * Install (or replace) the opt-in eth_getLogs watch-list config as JSON
+     * ({@code {"enabled":bool,"watch":[{"address","fromBlock","topic0s"?}]}}).
+     * Default false: the Java engine has no log index (its verified getLogs
+     * answers the strict cannot-serve), so hosts may call this unconditionally.
+     */
+    default boolean setLogIndexConfig(String configJson) {
+        return false;
+    }
+
+    /**
+     * Log-index status JSON (enabled flag, log count, backfill cursor,
+     * per-entry covered spans). Default: a stable "no index" object.
+     */
+    default String logIndexStatusJson() {
+        return "{\"enabled\":false,\"logCount\":0,\"entries\":[]}";
+    }
+
+    /**
      * Dial one specific EL peer by endpoint + secp256k1 public key (operator
      * debugging). Returns immediately after the connect is initiated.
      *

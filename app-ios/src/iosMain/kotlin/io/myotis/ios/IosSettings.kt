@@ -89,6 +89,11 @@ class IosSettings : Settings {
     override fun strictStateFreshness(): Boolean = getBool(K_STRICT, true)
     override fun setStrictStateFreshness(v: Boolean) = defaults.setBool(v, K_STRICT)
 
+    override fun logIndexEnabled(network: String): Boolean =
+        getBool("$K_LOG_INDEX_PREFIX$network", false)
+    override fun setLogIndexEnabled(network: String, on: Boolean) =
+        defaults.setBool(on, "$K_LOG_INDEX_PREFIX$network")
+
     // blst is statically linked into the engine — there is nothing to toggle.
     override fun nativeBlsEnabled(): Boolean = true
     override fun setNativeBlsEnabled(v: Boolean) {}
@@ -100,6 +105,7 @@ class IosSettings : Settings {
     private companion object {
         const val K_ENABLED = "networks.enabled"
         const val K_RPC_PORT_PREFIX = "rpcPort."
+        const val K_LOG_INDEX_PREFIX = "logIndex."
         const val K_SNAP = "snapTarget"
         const val K_SERVED_WINDOW = "servedBlockWindow"
         const val K_DEEP = "deepPool"

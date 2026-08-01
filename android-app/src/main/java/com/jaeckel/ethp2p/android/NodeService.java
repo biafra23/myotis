@@ -242,6 +242,38 @@ public final class NodeService extends Service {
         return rpcPortFor(c, primaryNetwork(c));
     }
     /** Persist the JSON-RPC port for a specific network (ports are per-network — see {@link #rpcPortKey}). */
+    /** Opt-in eth_getLogs Kohaku-preset index for one network (Rust engine only). */
+    public static boolean logIndexEnabled(android.content.Context c, String network) {
+        return prefs(c).getBoolean("logIndex." + canonicalNetwork(network), false);
+    }
+
+    public static void setLogIndexEnabled(android.content.Context c, String network, boolean on) {
+        prefs(c).edit().putBoolean("logIndex." + canonicalNetwork(network), on).apply();
+    }
+
+    /** Push the persisted log-index preset for a RUNNING network's handle. */
+    public void applyLogIndex(String network) {
+        String net = canonicalNetwork(network);
+        ChainHandle handle;
+        synchronized (handles) {
+            handle = handles.get(net);
+        }
+        if (handle != null) {
+            pushLogIndexConfig(net, handle);
+        }
+    }
+
+    private void pushLogIndexConfig(String net, ChainHandle handle) {
+        String json = io.myotis.ui.KohakuPreset.INSTANCE.configJson(net, logIndexEnabled(this, net));
+        if (json == null) {
+            return; // no preset for this network — engine stays honestly unconfigured
+        }
+        boolean ok = handle.setLogIndexConfig(json);
+        if (logIndexEnabled(this, net) && !ok) {
+            android.util.Log.w(TAG, "log index config rejected for " + net);
+        }
+    }
+
     public static void setRpcPort(android.content.Context c, String network, int p) {
         String net = canonicalNetwork(network);
         int dflt = defaultRpcPort(net);
@@ -1582,8 +1614,12 @@ public final class NodeService extends Service {
                 // would leave the live window one Save behind the pref.
                 synchronized (handles) {
                     handle.setServedBlockWindow(servedBlockWindow(this));
+                    // Boot-time apply of the log-index preset (re-pushed on every
+                    // (re)start — cures the engine's restart dormancy).
+                    pushLogIndexConfig(n, handle);
                     handles.put(n, handle);
                 }
+
                 if (!handle.start()) {
                     LogBuffer.e(TAG, "[" + n + "] node stack failed to start");
                     forgetStack(n);
