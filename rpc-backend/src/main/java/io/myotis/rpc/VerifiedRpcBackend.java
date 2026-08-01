@@ -217,12 +217,15 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     /** keccak256("") — an account with this codeHash is an EOA (no contract code). */
     private static final byte[] EMPTY_CODE_HASH = Hash.keccak256(Bytes.EMPTY).toArrayUnsafe();
 
-    // Cross-call cache of proof-verified account/storage state, keyed by stateRoot.
-    // Shared across every head-context oracle so a wallet's repeated retries of a
-    // heavy eth_call (MetaMask's ~1000-token BalanceChecker sweep / Multicall3
-    // simulation) reuse already-fetched slots instead of re-proving hundreds each
-    // time — turning a 30s-timeout retry-storm into a couple of converging attempts.
-    // Bounded LRU per kind; ~64k storage slots ≈ a few MB.
+    // Cross-call cache of proof-verified account/storage state — accounts keyed by
+    // world stateRoot, storage slots by their account's storageRoot (see
+    // StateProofCache). Shared across every head-context oracle so a wallet's
+    // repeated retries of a heavy eth_call (MetaMask's ~1000-token BalanceChecker
+    // sweep / Multicall3 simulation) reuse already-fetched slots instead of
+    // re-proving hundreds each time, and so slots of unchanged contracts carry
+    // over across head advances (only the per-block account proof is re-paid).
+    // Bounded LRU per kind; ~64k storage slots ≈ a few MB. Slot entries now
+    // outlive their roots, so the LRU bound (not root churn) is what ages them out.
     private static final int STATE_PROOF_CACHE_MAX = 65_536;
 
     /** How long a verified eth_call / estimateGas RESULT stays replayable (see
@@ -382,13 +385,18 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      * Frozen anchored context per pinned block NUMBER. A wallet (MetaMask) pins a
      * confirm to one block and retries the same heavy calls against it for minutes.
      * Serving each retry against the <em>current</em> head — which the warmer rebuilds
-     * to a new stateRoot every ~12-15s — reset the stateRoot-keyed StateProofCache on
-     * every rebuild, so a 1000-slot BalanceChecker / Multicall3 simulation re-fetched
-     * from scratch each retry and never converged (the persistent confirm-screen hang,
-     * uptime-independent). Freezing the context — and thus its stateRoot — per pinned
-     * number makes all retries hit one stable root, so the cache accumulates and the
-     * call converges in a couple of tries. Bounded LRU (wallets pin a few recent
-     * blocks); each entry ages out at {@link #RPC_HEAD_SERVE_STALE_MAX_MS}.
+     * to a new stateRoot every ~12-15s — pointed every retry at a different root, so
+     * everything root-keyed (the account side of StateProofCache, callResultCache,
+     * the in-flight call dedup) reset each rebuild and a 1000-slot BalanceChecker /
+     * Multicall3 simulation re-fetched from scratch each retry and never converged
+     * (the persistent confirm-screen hang, uptime-independent). Freezing the context
+     * — and thus its stateRoot — per pinned number makes all retries hit one stable
+     * root, so those caches accumulate and the call converges in a couple of tries.
+     * (Storage slots are now keyed by their account's storageRoot and survive root
+     * changes on their own — see StateProofCache — but the pin still matters for the
+     * account records, the result replay, and execution dedup.) Bounded LRU (wallets
+     * pin a few recent blocks); each entry ages out at
+     * {@link #RPC_HEAD_SERVE_STALE_MAX_MS}.
      */
     private final Map<Long, HeadWithTimestamp> pinnedHeadByNumber =
             java.util.Collections.synchronizedMap(
@@ -1208,8 +1216,9 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             }
         }
         // Pinned-number fast path: reuse the context already frozen to this number so
-        // its (fixed) stateRoot lets the StateProofCache accumulate across the wallet's
-        // minutes-long retries instead of resetting every time the head rebuilds.
+        // its (fixed) stateRoot lets the root-keyed caches (account proofs, call
+        // results, execution dedup) accumulate across the wallet's minutes-long
+        // retries instead of resetting every time the head rebuilds.
         if (requestedNum >= 0) {
             HeadWithTimestamp frozen = pinnedHeadByNumber.get(requestedNum);
             // State-read reuse bound: a frozen root older than a few slots is pruned by
@@ -1250,7 +1259,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             // On a concurrent first-read race the putIfAbsent loser must serve the
             // WINNER's context, not its own — otherwise two contexts with different
             // stateRoots briefly serve the same pinned number, splitting the
-            // StateProofCache across roots for that block.
+            // root-keyed caches (account proofs, call results) across roots for
+            // that block.
             HeadWithTimestamp existing = pinnedHeadByNumber.putIfAbsent(requestedNum,
                     new HeadWithTimestamp(ctx, clock.elapsedMillis()));
             if (existing != null) {

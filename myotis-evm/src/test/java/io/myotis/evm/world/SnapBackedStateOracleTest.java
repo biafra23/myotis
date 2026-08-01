@@ -590,14 +590,21 @@ class SnapBackedStateOracleTest {
         FixturePeer warmPeer = new FixturePeer();
         warmPeer.addAccountProof(worldA.root, worldA.proof);
         warmPeer.addStorageProof(worldA.root, storageTrie.proof);
-        warmPeer.addAccountProof(worldB.root, worldB.proof);
 
         StateProofCache shared = StateProofCache.inMemory(1024);
         var oracle = new SnapBackedStateOracle(() -> warmPeer, BytecodeCache.inMemory(),
                 SnapBackedStateOracle.DEFAULT_MAX_ATTEMPTS, shared);
-        // Warm: slot at root A (banks it under storageRoot), account at root B.
+        // Warm: slot at root A (banks it under storageRoot). fetchStorage banks the
+        // slot before its future completes, so this is race-free.
         assertEquals(value, oracle.fetchStorage(worldA.root.toArrayUnsafe(), addr, slot).get());
-        oracle.fetchAccount(worldB.root.toArrayUnsafe(), addr).get();
+        // Bank the account at root B directly (what the head-build priming does).
+        // Going through fetchAccount here would be racy: its promotion to the shared
+        // cache runs async after the future completes.
+        shared.putAccount(worldB.root.toArrayUnsafe(), addr.toByteArray(),
+                new StateProofCache.AccountEntry(
+                        new AccountState(addr, 2L, BigInteger.TEN,
+                                Hash.keccak256(Bytes.EMPTY).toArrayUnsafe()),
+                        storageTrie.root.toArrayUnsafe()));
 
         AtomicInteger calls = new AtomicInteger();
         SnapPeer countingDead = new SnapPeer() {

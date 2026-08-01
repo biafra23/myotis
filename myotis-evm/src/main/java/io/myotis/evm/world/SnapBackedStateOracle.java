@@ -143,7 +143,10 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
             // the slots and only the account proof above cost a fetch — this is
             // what lets a wallet's ~20s-cadence Multicall3 sweep converge
             // instead of re-proving hundreds of slots every block.
-            byte[] storageRootBytes = storageRoot.toArrayUnsafe();
+            // toArray (a copy), NOT toArrayUnsafe: StateProofCache is a public
+            // interface, and an implementation that mutated or retained the array
+            // must not be able to corrupt the Bytes32 verification anchor below.
+            byte[] storageRootBytes = storageRoot.toArray();
             Optional<BigInteger> cached = stateCache.getStorage(storageRootBytes, slot);
             if (cached.isPresent()) return CompletableFuture.completedFuture(cached.get());
             return tryWithRetries(peer -> peer
@@ -258,7 +261,7 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
             if (MerklePatriciaProofVerifier.EMPTY_TRIE_ROOT.equals(storageRoot)) {
                 continue;   // every slot is a verified zero; the account record implies it
             }
-            byte[] storageRootBytes = storageRoot.toArrayUnsafe();
+            byte[] storageRootBytes = storageRoot.toArray();   // copy — see fetchStorage
             for (int s = 0; s < it.slots().size(); s++) {
                 BigInteger slot = it.slots().get(s);
                 if (stateCache.getStorage(storageRootBytes, slot).isPresent()) continue;
