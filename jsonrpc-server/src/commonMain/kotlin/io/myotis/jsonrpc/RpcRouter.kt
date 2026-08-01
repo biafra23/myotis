@@ -454,7 +454,11 @@ class RpcRouter(
                 // as {"error": ...}, which we surface verbatim at -32000 so
                 // wallets see WHY (e.g. how far the backfill has come)
                 // instead of a bare cannot-serve.
-                val filter = root.params()?.getOrNull(0) as? JsonObject ?: return null
+                // A missing/non-object param is PERMANENTLY malformed — answer
+                // -32602 instead of the retryable -32000 a null would produce
+                // (wallets would retry a request that can never succeed).
+                val filter = root.params()?.getOrNull(0) as? JsonObject
+                    ?: return errorEnvelope(id, -32602, "eth_getLogs expects one filter object param")
                 val resultJson = withContext(rpcIoDispatcher) { b.getLogs(filter.toString()) } ?: return null
                 val parsed = json.parseToJsonElement(resultJson)
                 val errorMessage = (parsed as? JsonObject)?.get("error")

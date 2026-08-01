@@ -1901,6 +1901,9 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
                 return false;
             };
             let mut topic0s = Vec::new();
+            if e.get("topic0s").is_some_and(|t| !t.is_array() && !t.is_null()) {
+                return false;
+            }
             if let Some(ts) = e.get("topic0s").and_then(|t| t.as_array()) {
                 for t in ts {
                     let Some(w32) = t.as_str().and_then(parse_word32) else {
@@ -1972,6 +1975,11 @@ fn parse_get_logs_filter(
     head: u64,
     finalized: u64,
 ) -> Result<myotis_net::el::logindex::LogFilter, String> {
+    if v.get("blockHash").is_some_and(|b| !b.is_null()) {
+        // EIP-234: silently resolving the tags instead would answer with the
+        // HEAD block's logs for a question about a specific other block.
+        return Err("blockHash filters are not supported by this scoped index".to_string());
+    }
     fn tag(v: Option<&serde_json::Value>, head: u64, finalized: u64) -> Result<u64, String> {
         match v {
             None | Some(serde_json::Value::Null) => Ok(head),
@@ -2091,6 +2099,15 @@ mod get_logs_filter_tests {
         for bad in ["\"0x\"", "\"0x+5\"", "\"nope\"", "5", "{}"] {
             assert!(f(&format!("{{{addr},\"fromBlock\":{bad}}}")).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn block_hash_filters_are_rejected() {
+        let addr = format!("\"address\":\"0x{}\"", "11".repeat(20));
+        let bh = format!("\"blockHash\":\"0x{}\"", "cc".repeat(32));
+        assert!(f(&format!("{{{addr},{bh}}}")).unwrap_err().contains("blockHash"));
+        // Explicit null blockHash is treated as absent, per JSON-RPC habits.
+        assert!(f(&format!("{{{addr},\"blockHash\":null}}")).is_ok());
     }
 
     #[test]

@@ -334,11 +334,11 @@ class RpcRouterTest {
         assertTrue(resp.contains("\"logIndex\":\"0x0\""))
     }
 
-    @Test fun getLogs_missingFilterObject_isStrictError() {
+    @Test fun getLogs_missingFilterObject_isInvalidParams() {
         val resp = route(FakeBackend(),
             """{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[]}""")
         assertTrue(hasError(resp))
-        assertEquals(-32000, errorCode(resp))
+        assertEquals(-32602, errorCode(resp))                    // permanent, not retryable
     }
 
     @Test fun strict_implementedButUnavailable_errorsServerError() {
