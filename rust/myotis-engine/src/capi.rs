@@ -495,3 +495,35 @@ mod tests {
         unsafe { myotis_string_free(std::ptr::null_mut()) };
     }
 }
+
+/// eth_getLogs over the watch-list index (see ffi::get_logs_json).
+/// Returned string must be freed with `myotis_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_get_logs_json(
+    handle: i64,
+    filter_json: *const std::os::raw::c_char,
+) -> *mut std::os::raw::c_char {
+    match read_string(filter_json) {
+        Some(f) => into_c(crate::host::get_logs_json(handle, &f)),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Install the log-index watch-list config (see ffi::set_log_index_config).
+#[no_mangle]
+pub unsafe extern "C" fn myotis_set_log_index_config(
+    handle: i64,
+    config_json: *const std::os::raw::c_char,
+) -> bool {
+    match read_string(config_json) {
+        Some(c) => crate::host::set_log_index_config_json(handle, &c),
+        None => false,
+    }
+}
+
+/// Log-index status JSON (see ffi::log_index_status_json).
+/// Returned string must be freed with `myotis_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_log_index_status_json(handle: i64) -> *mut std::os::raw::c_char {
+    into_c(crate::host::log_index_status_json(handle))
+}

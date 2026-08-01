@@ -1486,3 +1486,76 @@ mod tests {
         assert_eq!(be_to_decimal(&big), "18446744073709551616");
     }
 }
+
+/// eth_getLogs result: a JSON array whose per-log shape matches the log
+/// objects `receipt_json` emits (address/topics/data/blockNumber/blockHash/
+/// transactionHash/transactionIndex/logIndex/removed) — one shape for logs
+/// everywhere, golden-pinned.
+pub fn get_logs_json(logs: &[myotis_net::el::logindex::StoredLog]) -> String {
+    let mut s = String::with_capacity(2 + logs.len() * 256);
+    s.push('[');
+    for (k, log) in logs.iter().enumerate() {
+        if k > 0 {
+            s.push(',');
+        }
+        s.push_str("{\"address\":\"");
+        s.push_str(&hex0x_var(&log.address));
+        s.push_str("\",\"topics\":[");
+        for (t, topic) in log.topics.iter().enumerate() {
+            if t > 0 {
+                s.push(',');
+            }
+            s.push('"');
+            s.push_str(&hex0x(topic));
+            s.push('"');
+        }
+        s.push_str("],\"data\":\"");
+        s.push_str(&hex0x_var(&log.data));
+        s.push_str("\",\"blockNumber\":\"");
+        s.push_str(&hex_quantity(log.block_number));
+        s.push_str("\",\"blockHash\":\"");
+        s.push_str(&hex0x(&log.block_hash));
+        s.push_str("\",\"transactionHash\":\"");
+        s.push_str(&hex0x(&log.tx_hash));
+        s.push_str("\",\"transactionIndex\":\"");
+        s.push_str(&hex_quantity(u64::from(log.tx_index)));
+        s.push_str("\",\"logIndex\":\"");
+        s.push_str(&hex_quantity(u64::from(log.log_index)));
+        s.push_str("\",\"removed\":false}");
+    }
+    s.push(']');
+    s
+}
+
+#[cfg(test)]
+mod get_logs_json_tests {
+    use myotis_net::el::logindex::StoredLog;
+
+    /// Golden pin: the per-log shape is byte-identical to the log objects
+    /// receipt_json emits (same field order, same hex forms, removed:false).
+    #[test]
+    fn get_logs_json_shape_is_pinned() {
+        let log = StoredLog {
+            block_number: 0x64,
+            block_hash: [0x22; 32],
+            tx_hash: [0x33; 32],
+            tx_index: 1,
+            log_index: 5,
+            address: [0x11; 20],
+            topics: vec![[0xaa; 32], [0xbb; 32]],
+            data: vec![0xde, 0xad],
+        };
+        let expected = format!(
+            "[{{\"address\":\"0x{}\",\"topics\":[\"0x{}\",\"0x{}\"],\"data\":\"0xdead\",\
+\"blockNumber\":\"0x64\",\"blockHash\":\"0x{}\",\"transactionHash\":\"0x{}\",\
+\"transactionIndex\":\"0x1\",\"logIndex\":\"0x5\",\"removed\":false}}]",
+            "11".repeat(20),
+            "aa".repeat(32),
+            "bb".repeat(32),
+            "22".repeat(32),
+            "33".repeat(32),
+        );
+        assert_eq!(super::get_logs_json(&[log]), expected);
+        assert_eq!(super::get_logs_json(&[]), "[]");
+    }
+}

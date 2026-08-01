@@ -260,6 +260,19 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public String getLogs(String filterJson) {
+        try {
+            // Array or {"error": ...} — passed through verbatim; the router
+            // turns the error envelope into a -32000 with the engine's
+            // message (coverage progress, unwatched address, ...).
+            return handle.getLogsJson(filterJson);
+        } catch (RuntimeException e) {
+            log.debug("[engines] getLogs unavailable: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    @Override
     public String getBlockReceipts(String blockSelector) {
         try {
             String sel = (blockSelector == null || blockSelector.isBlank())

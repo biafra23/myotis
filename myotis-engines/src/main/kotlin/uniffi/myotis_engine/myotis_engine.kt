@@ -700,6 +700,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_get_code_json(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_get_logs_json(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_get_storage_at_json(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_get_storage_proof_json(
@@ -707,6 +709,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_myotis_engine_checksum_func_get_transaction_by_hash_json(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_get_transaction_receipt_json(
+    ): Int
+    external fun uniffi_myotis_engine_checksum_func_log_index_status_json(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_pause_handle(
     ): Int
@@ -719,6 +723,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_myotis_engine_checksum_func_resume_handle(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_send_raw_transaction_json(
+    ): Int
+    external fun uniffi_myotis_engine_checksum_func_set_log_index_config(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_set_tor_enabled(
     ): Int
@@ -771,6 +777,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_get_code_json(`handle`: Long,`address`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_get_logs_json(`handle`: Long,`filterJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_get_storage_at_json(`handle`: Long,`address`: RustBuffer.ByValue,`position`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_get_storage_proof_json(`handle`: Long,`address`: RustBuffer.ByValue,`slot`: Long,`holder`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -778,6 +786,8 @@ internal object UniffiLib {
     external fun uniffi_myotis_engine_fn_func_get_transaction_by_hash_json(`handle`: Long,`txHashHex`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_get_transaction_receipt_json(`handle`: Long,`txHashHex`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_log_index_status_json(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_pause_handle(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
@@ -791,6 +801,8 @@ internal object UniffiLib {
     ): Byte
     external fun uniffi_myotis_engine_fn_func_send_raw_transaction_json(`handle`: Long,`rawTxHex`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_set_log_index_config(`handle`: Long,`configJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
     external fun uniffi_myotis_engine_fn_func_set_tor_enabled(`on`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_myotis_engine_fn_func_start_handle(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -962,6 +974,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_myotis_engine_checksum_func_get_code_json() != 40825) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_myotis_engine_checksum_func_get_logs_json() != 29899) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_myotis_engine_checksum_func_get_storage_at_json() != 24299) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -972,6 +987,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_get_transaction_receipt_json() != 56168) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_myotis_engine_checksum_func_log_index_status_json() != 7764) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_pause_handle() != 51434) {
@@ -990,6 +1008,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_send_raw_transaction_json() != 26871) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_myotis_engine_checksum_func_set_log_index_config() != 49994) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_set_tor_enabled() != 16704) {
@@ -1482,6 +1503,23 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
 
         /**
+         * eth_getLogs over the opt-in watch-list index: the log array on success,
+         * `{"error": ...}` otherwise — including for any range outside indexed
+         * coverage (never an empty array for unindexed blocks).
+         */ fun `getLogsJson`(`handle`: kotlin.Long, `filterJson`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_get_logs_json(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterString.lower(`filterJson`),_status)
+}
+    )
+    }
+    
+
+        /**
          * Verified RAW-32-byte-position storage query (`eth_getStorageAt`).
          */ fun `getStorageAtJson`(`handle`: kotlin.Long, `address`: kotlin.String, `position`: kotlin.String): kotlin.String {
             return FfiConverterString.lift(
@@ -1542,6 +1580,21 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         
         FfiConverterLong.lower(`handle`),
         FfiConverterString.lower(`txHashHex`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Log-index status JSON: enabled flag, log count, backfill cursor, and per
+         * watch entry its covered span.
+         */ fun `logIndexStatusJson`(`handle`: kotlin.Long): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_log_index_status_json(
+    
+        
+        FfiConverterLong.lower(`handle`),_status)
 }
     )
     }
@@ -1633,6 +1686,22 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         
         FfiConverterLong.lower(`handle`),
         FfiConverterString.lower(`rawTxHex`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Install the log-index watch-list config (JSON; see host docs). False on
+         * malformed config, duplicate addresses, or an unavailable reader.
+         */ fun `setLogIndexConfig`(`handle`: kotlin.Long, `configJson`: kotlin.String): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_set_log_index_config(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterString.lower(`configJson`),_status)
 }
     )
     }

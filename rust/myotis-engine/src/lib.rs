@@ -65,7 +65,9 @@ uniffi::setup_scaffolding!();
 ///      the iOS C ABI; docs/privacy-and-tor.md). The functions exist in every
 ///      build; a dylib compiled without `--features tor` reports "not supported"
 ///      (false / 0) rather than being absent.
-pub const ABI_VERSION: i32 = 20;
+/// v21: added get_logs_json / set_log_index_config / log_index_status_json
+///      (the opt-in eth_getLogs watch-list index, docs/eth-getlogs-design.md).
+pub const ABI_VERSION: i32 = 21;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

@@ -131,6 +131,13 @@ char *myotis_send_raw_transaction_json(int64_t handle, const char *raw_tx_hex);
 /* Release any char* returned by the functions above. NULL is a no-op. */
 void myotis_string_free(char *s);
 
+/* v21: the opt-in eth_getLogs watch-list index (docs/eth-getlogs-design.md).
+ * get_logs answers only inside indexed coverage; anything else is an
+ * {"error": ...} JSON — never an empty array for unindexed ranges. */
+char *myotis_get_logs_json(int64_t handle, const char *filter_json);
+bool myotis_set_log_index_config(int64_t handle, const char *config_json);
+char *myotis_log_index_status_json(int64_t handle);
+
 #ifdef __cplusplus
 }
 #endif

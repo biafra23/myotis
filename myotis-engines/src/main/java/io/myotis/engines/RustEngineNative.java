@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 20; // 20: + set_tor_enabled/tor_status (Tor)
+    static final int EXPECTED_ABI_VERSION = 21; // 21: + eth_getLogs watch-list index trio
 
     private static final boolean AVAILABLE = load();
 
@@ -296,6 +296,21 @@ final class RustEngineNative {
     /** Verified {@code eth_getBlockReceipts} (receipts array JSON / "null" / error). */
     static String nativeGetBlockReceiptsJson(long handle, String selector) {
         return Myotis_engineKt.getBlockReceiptsJson(handle, nz(selector));
+    }
+
+    /** {@code eth_getLogs} over the watch-list index (array / {"error":...}). */
+    static String nativeGetLogsJson(long handle, String filterJson) {
+        return Myotis_engineKt.getLogsJson(handle, nz(filterJson));
+    }
+
+    /** Install the log-index watch-list config; false = invalid/unavailable. */
+    static boolean nativeSetLogIndexConfig(long handle, String configJson) {
+        return Myotis_engineKt.setLogIndexConfig(handle, nz(configJson));
+    }
+
+    /** Log-index status JSON (enabled, counts, coverage per entry). */
+    static String nativeLogIndexStatusJson(long handle) {
+        return Myotis_engineKt.logIndexStatusJson(handle);
     }
 
     /** Verified {@code eth_feeHistory} (feeHistory JSON / error). */

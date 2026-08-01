@@ -246,3 +246,25 @@ pub fn fee_history_json(
 ) -> String {
     crate::host::fee_history_json(handle, block_count, &newest_block_tag, &percentiles_json)
 }
+
+/// eth_getLogs over the opt-in watch-list index: the log array on success,
+/// `{"error": ...}` otherwise — including for any range outside indexed
+/// coverage (never an empty array for unindexed blocks).
+#[uniffi::export]
+pub fn get_logs_json(handle: i64, filter_json: String) -> String {
+    crate::host::get_logs_json(handle, &filter_json)
+}
+
+/// Install the log-index watch-list config (JSON; see host docs). False on
+/// malformed config, duplicate addresses, or an unavailable reader.
+#[uniffi::export]
+pub fn set_log_index_config(handle: i64, config_json: String) -> bool {
+    crate::host::set_log_index_config_json(handle, &config_json)
+}
+
+/// Log-index status JSON: enabled flag, log count, backfill cursor, and per
+/// watch entry its covered span.
+#[uniffi::export]
+pub fn log_index_status_json(handle: i64) -> String {
+    crate::host::log_index_status_json(handle)
+}
