@@ -124,8 +124,8 @@ public final class RustMyotisEngine implements MyotisEngine {
                     "the Rust engine does not host " + canonical + " yet");
         }
         if (id < 0) {
-            throw new EngineException("the Rust engine could not initialize the runtime for "
-                    + canonical);
+            throw new EngineException("the Rust engine could not initialize the runtime"
+                    + " or create the dataDir for " + canonical);
         }
         // Mirror JavaMyotisEngine: honour a host-supplied RPC port, else the
         // network's catalog default (mainnet 8545, sepolia 8547, ...).

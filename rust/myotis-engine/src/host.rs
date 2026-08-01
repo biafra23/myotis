@@ -167,7 +167,7 @@ pub fn tor_status() -> i32 {
 /// `nativeCreate`: allocate an id for a not-yet-started hosted chain (mainnet or
 /// sepolia). Returns the id (`>= 1`), `UNSUPPORTED_NETWORK` (-2) for a canonical
 /// network this engine doesn't host yet (gnosis), or `CREATE_FAILED` (-1) for an
-/// unknown name / unavailable runtime.
+/// unknown name, an unavailable runtime, or an uncreatable dataDir.
 pub fn create(network_name: &str, data_dir: &str) -> i64 {
     let Some(engine) = engine() else {
         return CREATE_FAILED;
