@@ -2126,6 +2126,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 hotCalls.beginWarmables(clock.elapsedMillis(), slots);
         for (HotCallTracker.HotCall c : shapes) {
             boolean submitted = false;
+            boolean failedSync = false;
             String flightKey = null;
             CompletableFuture<byte[]> mine = null;
             try {
@@ -2151,10 +2152,15 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         .callView(from == null ? null : io.myotis.evm.Address.of(from),
                                 io.myotis.evm.Address.of(to), data, c.value(), ctx.blockCtx());
                 warmsInFlight.incrementAndGet();
-                // A warm that finishes LATE (past the bookkeeping timeout below) still
-                // banks its verified result — same rationale as the wallet leader whose
-                // waiter timed out: the execution was paid for, the next poll should
-                // find it. Populated from the RAW future so the timeout can't drop it.
+                // The ONE authoritative cache put, on the RAW future so it also covers
+                // a warm that finishes LATE (past the bookkeeping timeout below) —
+                // same rationale as the wallet leader whose waiter timed out: the
+                // execution was paid for, the next poll should find it. Ordering
+                // caveat vs the bookkeeping chain: CompletableFuture dependents run
+                // LIFO, so the inflight entry can be removed just before this put
+                // lands — the worst case is one redundant execution by a call that
+                // slips into that gap (it re-derives the same verified result), never
+                // a stale or missing answer. Clone: never hand waiters the cached array.
                 exec.thenAccept(out -> callResultCache.put(key,
                         out != null ? out.clone() : null, clock.elapsedMillis()));
                 // The warm has no waiter to give up on it, so bound the BOOKKEEPING
@@ -2169,9 +2175,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                                             + (clock.elapsedMillis() - t0) + "ms: "
                                             + describeEvmError(ex));
                                 } else {
-                                    // Clone: never hand waiters the cached array.
-                                    callResultCache.put(key,
-                                            out != null ? out.clone() : null, clock.elapsedMillis());
+                                    // Cache put lives on the raw exec future above.
                                     flight.complete(out);
                                     log.info("[rpc] warm eth_call " + desc + " ok in "
                                             + (clock.elapsedMillis() - t0) + "ms");
@@ -2192,11 +2196,18 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                     inflightCalls.remove(flightKey, mine);
                     mine.completeExceptionally(t);
                 }
+                // A sync submit throw (most likely RejectedExecutionException from a
+                // saturated/shutting-down pool) tends to persist — give it the SAME
+                // failure backoff as an async failure, or the shape would be
+                // re-submitted and re-logged on every ~12s head build.
+                failedSync = true;
+                hotCalls.endWarm(c, false, clock.elapsedMillis());
                 log.info("[rpc] warm eth_call submit failed: " + unwrap(t));
             } finally {
-                // Shapes that never started an execution (cache hit / already in flight /
-                // sync throw) must release their warm mark so the next head retries them.
-                if (!submitted) hotCalls.endWarm(c, true, clock.elapsedMillis());
+                // Shapes that never started an execution (cache hit / already in
+                // flight) must release their warm mark so the next head retries
+                // them; the sync-throw case released above WITH backoff.
+                if (!submitted && !failedSync) hotCalls.endWarm(c, true, clock.elapsedMillis());
             }
         }
     }
