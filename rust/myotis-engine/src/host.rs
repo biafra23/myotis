@@ -240,6 +240,13 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
         .as_deref()
         .and_then(|p| p.parent())
         .map(|dir| dir.join(format!("peers{el_suffix}.cache")));
+    // The eth_getLogs watch-list index, same dataDir + suffix convention
+    // (docs/eth-getlogs-design.md). None (no dataDir) → memory-only index.
+    let log_index_path = config
+        .snapshot_path
+        .as_deref()
+        .and_then(|p| p.parent())
+        .map(|dir| dir.join(format!("logindex{el_suffix}.db")));
     // Explicit per-network match: a network without an EL config here runs
     // CL-ONLY (EL queries report the reader unavailable, matching the non-fatal
     // EL philosophy) — it must never silently inherit another chain's EL config.
@@ -254,6 +261,7 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
     };
     let reader = match el_config {
         Some(cfg) => match engine.rt.block_on(async {
+            let cfg = myotis_net::el::reader::ElConfig { log_index_path, ..cfg };
             ElReader::start_for(sync.exec_anchor(), el_cache_path, cfg).await
         }) {
             Ok(r) => Some(Arc::new(r)),

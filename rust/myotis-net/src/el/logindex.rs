@@ -302,6 +302,11 @@ impl LogIndex {
     pub fn log_count(&self) -> usize {
         self.logs.len()
     }
+
+    /// Watch entries paired with their coverage — the status surface.
+    pub fn coverage_entries(&self) -> Vec<(WatchEntry, Coverage)> {
+        self.config.watch.iter().cloned().zip(self.coverage.iter().copied()).collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
