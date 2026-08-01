@@ -463,7 +463,8 @@ private fun SettingsTab(
                     "still use your real IP — full coverage is a follow-up. HEADS-UP: earlier tests " +
                     "were not very successful — many peers reject Tor exit IPs and :30303 exit " +
                     "coverage is patchy, so reads can be slow (seconds to tens of seconds) or " +
-                    "fail-closed while this is on. Applies on the next network (re)start."
+                    "fail-closed while this is on. Takes effect immediately — the next read on a " +
+                    "running Rust-engine network routes over Tor (no restart needed)."
             },
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,

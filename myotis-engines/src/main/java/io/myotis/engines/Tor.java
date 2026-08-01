@@ -28,6 +28,14 @@ public final class Tor {
     private static volatile boolean enabled =
             Boolean.parseBoolean(System.getProperty(PROP, "false"));
 
+    /**
+     * Whether we've ever pushed an ON to the native engine (which loads the Rust
+     * library). Turning OFF only needs to reach the engine if we previously turned
+     * it ON — otherwise the Rust flag is already at its disabled default and
+     * probing would pointlessly force-load the library on the pure-Java path.
+     */
+    private static volatile boolean pushedOn = false;
+
     private Tor() {}
 
     /** Whether the host has asked for Tor routing (independent of support). */
@@ -44,22 +52,27 @@ public final class Tor {
     public static synchronized boolean select(boolean on) {
         enabled = on;
         System.setProperty(PROP, Boolean.toString(on));
-        // Turning OFF must be side-effect-free: the Rust flag defaults to disabled,
-        // so there is nothing to push, and probing availability here would map the
-        // native library on the pure-Java default path (rustEngine off, Tor never
-        // touched) at every startup. Only when turning ON do we probe + push — and
-        // by then the caller has opted into the Rust engine (the toggle is gated on
-        // it). If the Rust engine isn't loaded/available, Tor can't route.
-        if (!on) {
+        // Turning OFF when we never turned it ON is a genuine no-op: the Rust flag
+        // is already at its disabled default, so there is nothing to push, and
+        // probing availability would pointlessly force-load the native library on
+        // the pure-Java default path (rustEngine off, Tor never touched) at every
+        // startup. But once we HAVE pushed an ON, the engine is holding an enabled
+        // flag — turning off MUST reach it (else reads keep routing over Tor until
+        // process restart), and the library is already loaded so the probe is free.
+        if (!on && !pushedOn) {
             log.info("[tor] verified-read routing disabled");
             return false;
         }
         if (!RustMyotisEngine.isAvailable()) {
-            log.info("[tor] requested on but the Rust engine is unavailable — Tor cannot route");
+            log.info("[tor] requested {} but the Rust engine is unavailable — Tor cannot route",
+                    on ? "on" : "off");
             return false;
         }
         try {
             boolean supported = RustEngineNative.nativeSetTorEnabled(on);
+            // Remember we reached the engine so a later OFF is delivered; clearing
+            // on a successful OFF lets a subsequent OFF short-circuit again.
+            pushedOn = on;
             log.info("[tor] verified-read routing {} (supported by this build: {})",
                     on ? "ENABLED" : "disabled", supported);
             return supported;

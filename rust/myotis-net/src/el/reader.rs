@@ -790,7 +790,17 @@ impl ElReader {
         // over clearnet (addr + enode pubkey), snap-serving-quality first (the
         // pool orders them). We reuse only their IDENTITY; the dial itself is a
         // fresh Tor circuit with an ephemeral node key, so the peer never sees our
-        // real IP or our persistent node key. Bound the fan-out: each Tor dial is
+        // real IP or our persistent node key.
+        //
+        // KNOWN LIMITATION (docs §5): `snap_peers()` returns peers we hold a LIVE
+        // clearnet connection to right now, so the Tor circuit reaches a node that
+        // simultaneously sees our real IP — a peer could pair the two by timing +
+        // the (rare) client fingerprint (§6.3). The design's fix is the quarantined,
+        // AGED, multi-source-promoted Tor pool (§5) that dials only peers we are NOT
+        // currently clearnet-connected to; that sidecar is out of scope for this
+        // experimental v1 and tracked as the follow-up.
+        //
+        // Bound the fan-out: each Tor dial is
         // slow and many peers reject Tor-exit inbound, so cap the candidates AND
         // the whole read, or one balance query could hang the FFI call for minutes
         // (a bad-exit walk); fail-closed on the deadline.
@@ -820,25 +830,20 @@ impl ElReader {
                     crate::el::tor::open_snap_session(&address, addr, pubkey, &self.eth_cfg).await?;
                 self.account_from_tor_session(&mut session, address).await
             };
+            // NB deliberately NO record_snap_served/record_snap_failure here: those
+            // feed the SHARED, persisted clearnet peer-quality cache, and a peer
+            // that rejects Tor-exit inbound (a Tor property) is not a bad CLEARNET
+            // snap peer — striking it would poison clearnet dialing on the next run.
+            // Tor-side peer quality belongs in the Tor sidecar (docs §5), a follow-up.
             match tokio::time::timeout(remaining, attempt).await {
                 Ok(Ok(result)) => {
                     if result.verify_method.is_some() || is_global_fail(result.fail_reason) {
-                        // Reward the peer that served over Tor (same bookkeeping the
-                        // clearnet path uses to keep good peers at the front).
-                        self.pool.record_snap_served(addr).await;
                         return Ok(result);
                     }
-                    self.pool.record_snap_failure(addr).await;
                     fallback.get_or_insert(result);
                 }
-                Ok(Err(e)) => {
-                    self.pool.record_snap_failure(addr).await;
-                    last_err = e;
-                }
-                Err(_) => {
-                    self.pool.record_snap_failure(addr).await;
-                    last_err = format!("tor dial to {addr} exceeded the read budget");
-                }
+                Ok(Err(e)) => last_err = e,
+                Err(_) => last_err = format!("tor dial to {addr} exceeded the read budget"),
             }
         }
         fallback.map(Ok).unwrap_or_else(|| {

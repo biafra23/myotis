@@ -236,8 +236,9 @@ class DesktopNodeController(
         // Push the persisted Tor preference to the process-global Rust-engine flag
         // (docs/privacy-and-tor.md). Tor is Rust-engine-only and experimental: Tor.select
         // returns whether the loaded engine build actually supports it, which we log so a
-        // silently-unsupported build is visible. Like the engine toggle, it takes effect on
-        // networks (re)started afterwards, not live.
+        // silently-unsupported build is visible. Unlike the engine choice, the Tor flag is
+        // LIVE — ElReader checks it per read, so a flip takes effect on the next read of an
+        // already-running Rust-engine network (no restart needed).
         val on = settings.torEnabled()
         val supported = Tor.select(on)
         if (on && !supported) {
