@@ -277,7 +277,9 @@ public final class NodeService extends Service {
         }
         boolean ok = handle.setLogIndexConfig(json);
         if (enabled && !ok) {
-            android.util.Log.w(TAG, "log index config rejected for " + net);
+            // LogBuffer so the rejection shows in the in-app log view like
+            // every other boot-path message.
+            LogBuffer.e(TAG, "log index config rejected for " + net);
         }
     }
 
@@ -1630,17 +1632,17 @@ public final class NodeService extends Service {
                     try { ENGINE.stop(n); } catch (Throwable ignored) {}
                     return;
                 }
-                // Boot-time apply of the log-index preset — AFTER start (the
-                // engine only accepts the config on a running handle) and
-                // outside the handles lock (the install can do disk I/O).
-                // Re-pushed on every (re)start — cures restart dormancy.
-                pushLogIndexConfig(n, handle);
                 if (!RUNNING.get() || !isNetworkEnabled(this, n) || stopGen(n) != gen) {
                     LogBuffer.i(TAG, "[" + n + "] stop/disable raced start; tearing down");
                     forgetStack(n);
                     try { ENGINE.stop(n); } catch (Throwable ignored) {}
                     return;
                 }
+                // Boot-time apply of the log-index preset — AFTER start (the
+                // engine only accepts config on a running handle) and after
+                // the raced-stop guard, so a condemned stack never pays for
+                // the index install / appender spin-up.
+                pushLogIndexConfig(n, handle);
                 // A freshly-booted stack gets a full idle window before the controller
                 // may pause it (its engine activity clock starts at 0). Stamped INSIDE the
                 // bootLock: written outside it, a racing stopNetwork's forgetStack could

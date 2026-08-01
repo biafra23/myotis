@@ -264,12 +264,7 @@ class DesktopNodeController(
     private fun logIndexStatusFor(network: String): String? {
         if (!settings.logIndexEnabled(network)) return null
         val json = runCatching { engine.get(network)?.logIndexStatusJson() }.getOrNull() ?: return null
-        if (!json.contains("\"enabled\":true")) return "enabled — waiting for the Rust engine"
-        val count = Regex("\"logCount\":(\\d+)").find(json)?.groupValues?.get(1) ?: "0"
-        val lows = Regex("\"coveredLow\":(\\d+)").findAll(json).map { it.groupValues[1].toLong() }.toList()
-        val highs = Regex("\"coveredHigh\":(\\d+)").findAll(json).map { it.groupValues[1].toLong() }.toList()
-        return if (lows.isEmpty()) "$count logs — backfill starting"
-        else "$count logs — blocks ${lows.min()}\u2013${highs.max()}"
+        return io.myotis.ui.LogIndexStatus.format(json)
     }
 
     override fun applyTorMode() {

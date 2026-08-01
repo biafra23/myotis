@@ -194,13 +194,7 @@ class IosNodeController(
     /** Short status line for the log index, or null when off. */
     private fun logIndexStatusFor(net: String, handle: Long): String? {
         if (!settings.logIndexEnabled(net)) return null
-        val json = RustEngine.logIndexStatusJson(handle)
-        if (!json.contains("\"enabled\":true")) return "enabled \u2014 waiting for engine"
-        val count = Regex("\"logCount\":(\\d+)").find(json)?.groupValues?.get(1) ?: "0"
-        val lows = Regex("\"coveredLow\":(\\d+)").findAll(json).map { it.groupValues[1].toLong() }.toList()
-        val highs = Regex("\"coveredHigh\":(\\d+)").findAll(json).map { it.groupValues[1].toLong() }.toList()
-        return if (lows.isEmpty()) "$count logs \u2014 backfill starting"
-        else "$count logs \u2014 blocks ${lows.min()}\u2013${highs.max()}"
+        return io.myotis.ui.LogIndexStatus.format(RustEngine.logIndexStatusJson(handle))
     }
 
     /** Blocking create+start; caller holds [bootMutex] and runs on IO. */
@@ -220,6 +214,10 @@ class IosNodeController(
             handles[net] = handle
             startMarks[net] = TimeSource.Monotonic.markNow()
         }
+        // Boot-time apply of the log-index preset — AFTER start (the engine
+        // only accepts config on a running handle). Cures restart dormancy;
+        // boot() already runs on the lifecycle lane under bootMutex.
+        pushLogIndexConfig(net, handle)
         startRpc(net)
     }
 
