@@ -486,6 +486,141 @@ class SnapBackedStateOracleTest {
     }
 
     @Test
+    void storageCacheReusedAcrossBlocksWhenStorageRootUnchanged() throws Exception {
+        // The cross-BLOCK reuse the storageRoot keying buys: a slot verified at world
+        // root A must be served from cache at world root B — zero storage round-trips —
+        // when the account's storageRoot is unchanged (the per-block account proof is
+        // the freshness check). This is what turns a wallet's per-poll 67KB Multicall3
+        // sweep from re-proving hundreds of slots every block into one account proof
+        // per contract per block.
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        BigInteger slot = BigInteger.valueOf(7);
+        BigInteger value = new BigInteger("1234567890123456789");
+
+        Bytes32 slotHash = Bytes32.wrap(Hash.keccak256(paddedSlot(slot)).toArrayUnsafe());
+        Bytes valueRlp = RLP.encode(w -> w.writeBigInteger(value));
+        var storageTrie = TrieFixture.singleLeaf(slotHash, valueRlp);
+
+        // Two world roots ("block N" / "block N+1"): the account's nonce differs, its
+        // storageRoot is the SAME trie.
+        Bytes accountAtA = encodeAccount(1L, BigInteger.TEN, storageTrie.root,
+                Bytes32.wrap(Hash.keccak256(Bytes.EMPTY).toArrayUnsafe()));
+        Bytes accountAtB = encodeAccount(2L, BigInteger.TEN, storageTrie.root,
+                Bytes32.wrap(Hash.keccak256(Bytes.EMPTY).toArrayUnsafe()));
+        var worldA = TrieFixture.singleLeaf(keccak(addr.toByteArray()), accountAtA);
+        var worldB = TrieFixture.singleLeaf(keccak(addr.toByteArray()), accountAtB);
+
+        FixturePeer peer = new FixturePeer();
+        peer.addAccountProof(worldA.root, worldA.proof);
+        peer.addStorageProof(worldA.root, storageTrie.proof);
+        // Root B's peer serves ONLY the account proof — a storage request at B
+        // would come back empty and fail the verify, so a pass proves the slot
+        // was replayed from cache, not re-fetched.
+        peer.addAccountProof(worldB.root, worldB.proof);
+
+        StateProofCache shared = StateProofCache.inMemory(1024);
+        var oracleA = new SnapBackedStateOracle(() -> peer, BytecodeCache.inMemory(),
+                SnapBackedStateOracle.DEFAULT_MAX_ATTEMPTS, shared);
+        assertEquals(value, oracleA.fetchStorage(worldA.root.toArrayUnsafe(), addr, slot).get());
+
+        var oracleB = new SnapBackedStateOracle(() -> peer, BytecodeCache.inMemory(),
+                SnapBackedStateOracle.DEFAULT_MAX_ATTEMPTS, shared);
+        assertEquals(value, oracleB.fetchStorage(worldB.root.toArrayUnsafe(), addr, slot).get(),
+                "unchanged storageRoot at the new world root must replay the cached slot");
+    }
+
+    @Test
+    void storageCacheNotReusedWhenStorageRootChanges() throws Exception {
+        // Safety control for the reuse above: when the contract's storage DID change
+        // between blocks (different storageRoot in the new account leaf), the cached
+        // value from the old root must NOT be served — the slot re-proves against the
+        // new storage trie and returns the new value.
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        BigInteger slot = BigInteger.valueOf(7);
+        BigInteger oldValue = new BigInteger("1234567890123456789");
+        BigInteger newValue = new BigInteger("987654321");
+
+        Bytes32 slotHash = Bytes32.wrap(Hash.keccak256(paddedSlot(slot)).toArrayUnsafe());
+        var oldStorage = TrieFixture.singleLeaf(slotHash, RLP.encode(w -> w.writeBigInteger(oldValue)));
+        var newStorage = TrieFixture.singleLeaf(slotHash, RLP.encode(w -> w.writeBigInteger(newValue)));
+
+        Bytes accountAtA = encodeAccount(1L, BigInteger.TEN, oldStorage.root,
+                Bytes32.wrap(Hash.keccak256(Bytes.EMPTY).toArrayUnsafe()));
+        Bytes accountAtB = encodeAccount(1L, BigInteger.TEN, newStorage.root,
+                Bytes32.wrap(Hash.keccak256(Bytes.EMPTY).toArrayUnsafe()));
+        var worldA = TrieFixture.singleLeaf(keccak(addr.toByteArray()), accountAtA);
+        var worldB = TrieFixture.singleLeaf(keccak(addr.toByteArray()), accountAtB);
+
+        FixturePeer peer = new FixturePeer();
+        peer.addAccountProof(worldA.root, worldA.proof);
+        peer.addStorageProof(worldA.root, oldStorage.proof);
+        peer.addAccountProof(worldB.root, worldB.proof);
+        peer.addStorageProof(worldB.root, newStorage.proof);
+
+        StateProofCache shared = StateProofCache.inMemory(1024);
+        var oracleA = new SnapBackedStateOracle(() -> peer, BytecodeCache.inMemory(),
+                SnapBackedStateOracle.DEFAULT_MAX_ATTEMPTS, shared);
+        assertEquals(oldValue, oracleA.fetchStorage(worldA.root.toArrayUnsafe(), addr, slot).get());
+
+        var oracleB = new SnapBackedStateOracle(() -> peer, BytecodeCache.inMemory(),
+                SnapBackedStateOracle.DEFAULT_MAX_ATTEMPTS, shared);
+        assertEquals(newValue, oracleB.fetchStorage(worldB.root.toArrayUnsafe(), addr, slot).get(),
+                "a changed storageRoot must re-prove the slot, never replay the stale value");
+    }
+
+    @Test
+    void fetchBatchPrefiltersSlotsCachedUnderKnownStorageRoot() throws Exception {
+        // fetchBatch at a NEW world root, where the account record is already cached
+        // at that root (as the head-build priming does) and the slots were verified at
+        // the PREVIOUS root under the same storageRoot: nothing is left to fetch, so
+        // the batch must issue ZERO GetTrieNodes requests.
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        BigInteger slot = BigInteger.valueOf(7);
+        BigInteger value = new BigInteger("1234567890123456789");
+
+        Bytes32 slotHash = Bytes32.wrap(Hash.keccak256(paddedSlot(slot)).toArrayUnsafe());
+        var storageTrie = TrieFixture.singleLeaf(slotHash, RLP.encode(w -> w.writeBigInteger(value)));
+        Bytes accountAtA = encodeAccount(1L, BigInteger.TEN, storageTrie.root,
+                Bytes32.wrap(Hash.keccak256(Bytes.EMPTY).toArrayUnsafe()));
+        Bytes accountAtB = encodeAccount(2L, BigInteger.TEN, storageTrie.root,
+                Bytes32.wrap(Hash.keccak256(Bytes.EMPTY).toArrayUnsafe()));
+        var worldA = TrieFixture.singleLeaf(keccak(addr.toByteArray()), accountAtA);
+        var worldB = TrieFixture.singleLeaf(keccak(addr.toByteArray()), accountAtB);
+
+        FixturePeer warmPeer = new FixturePeer();
+        warmPeer.addAccountProof(worldA.root, worldA.proof);
+        warmPeer.addStorageProof(worldA.root, storageTrie.proof);
+        warmPeer.addAccountProof(worldB.root, worldB.proof);
+
+        StateProofCache shared = StateProofCache.inMemory(1024);
+        var oracle = new SnapBackedStateOracle(() -> warmPeer, BytecodeCache.inMemory(),
+                SnapBackedStateOracle.DEFAULT_MAX_ATTEMPTS, shared);
+        // Warm: slot at root A (banks it under storageRoot), account at root B.
+        assertEquals(value, oracle.fetchStorage(worldA.root.toArrayUnsafe(), addr, slot).get());
+        oracle.fetchAccount(worldB.root.toArrayUnsafe(), addr).get();
+
+        AtomicInteger calls = new AtomicInteger();
+        SnapPeer countingDead = new SnapPeer() {
+            @Override public CompletableFuture<List<Bytes>> getTrieNodes(Bytes32 r, List<PathSet> p) {
+                calls.incrementAndGet();
+                return CompletableFuture.failedFuture(new java.io.IOException("should not be called"));
+            }
+            @Override public CompletableFuture<List<Bytes>> getByteCodes(List<Bytes32> h) {
+                return CompletableFuture.failedFuture(new java.io.IOException("should not be called"));
+            }
+        };
+        var oracleB = new SnapBackedStateOracle(() -> countingDead, BytecodeCache.inMemory(),
+                SnapBackedStateOracle.DEFAULT_MAX_ATTEMPTS, shared);
+        Map<Address, Set<BigInteger>> req = new HashMap<>();
+        req.put(addr, Set.of(slot));
+        oracleB.fetchBatch(worldB.root.toArrayUnsafe(), req).get();
+        assertEquals(0, calls.get(),
+                "a fully carried-over account (cached record + slots under its storageRoot) "
+                        + "must add no batch work");
+        assertEquals(value, oracleB.fetchStorage(worldB.root.toArrayUnsafe(), addr, slot).get());
+    }
+
+    @Test
     void noopStateCacheStillRefetchesAcrossOracles() throws Exception {
         // Control for the test above: with the default noop cache, a fresh oracle has
         // no memory, so a dead peer DOES fail — confirming the pass above is the cache
