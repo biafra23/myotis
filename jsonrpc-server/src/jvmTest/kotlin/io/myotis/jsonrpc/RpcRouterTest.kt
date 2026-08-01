@@ -1,5 +1,6 @@
 package io.myotis.jsonrpc
 
+import io.myotis.api.VerifiedReads
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
@@ -296,9 +297,48 @@ class RpcRouterTest {
 
     @Test fun strict_unimplementedMethod_errorsMethodNotSupported() {
         val resp = route(FakeBackend(),                          // no proxy → strict
-            """{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{}]}""")
+            """{"jsonrpc":"2.0","id":1,"method":"eth_newFilter","params":[{}]}""")
         assertTrue(hasError(resp))
         assertEquals(-32601, errorCode(resp))                    // not served by this permissionless node
+    }
+
+    // ---- eth_getLogs (opt-in watch-list index) ---------------------------------------
+
+    @Test fun getLogs_backendWithoutIndex_errorsRetryable() {
+        val resp = route(FakeBackend(),                          // default getLogs = null
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{"address":"0x${"11".repeat(20)}"}]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32000, errorCode(resp))                    // verified method, can't serve now
+    }
+
+    @Test fun getLogs_engineErrorEnvelope_surfacesMessageAt32000() {
+        val backend = object : VerifiedReads by FakeBackend() {
+            override fun getLogs(filterJson: String?): String =
+                """{"error":"requested range is not indexed yet (covered: 100-200); retry as the index catches up"}"""
+        }
+        val resp = route(backend,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{"address":"0x${"11".repeat(20)}"}]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32000, errorCode(resp))
+        assertTrue(resp.contains("covered: 100-200"))
+    }
+
+    @Test fun getLogs_arrayPassthrough_isResult() {
+        val logs = """[{"address":"0x${"11".repeat(20)}","topics":[],"data":"0x","blockNumber":"0x64","blockHash":"0x${"22".repeat(32)}","transactionHash":"0x${"33".repeat(32)}","transactionIndex":"0x0","logIndex":"0x0","removed":false}]"""
+        val backend = object : VerifiedReads by FakeBackend() {
+            override fun getLogs(filterJson: String?): String = logs
+        }
+        val resp = route(backend,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{"address":"0x${"11".repeat(20)}"}]}""")
+        assertTrue(!hasError(resp))
+        assertTrue(resp.contains("\"logIndex\":\"0x0\""))
+    }
+
+    @Test fun getLogs_missingFilterObject_isInvalidParams() {
+        val resp = route(FakeBackend(),
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32602, errorCode(resp))                    // permanent, not retryable
     }
 
     @Test fun strict_implementedButUnavailable_errorsServerError() {
@@ -521,7 +561,7 @@ class RpcRouterTest {
         val b = FakeBackend(head = 0x123)
         val resp = route(b, """[
             {"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]},
-            {"jsonrpc":"2.0","id":2,"method":"eth_getLogs","params":[{}]}
+            {"jsonrpc":"2.0","id":2,"method":"eth_newFilter","params":[{}]}
         ]""")
         val arr = json.parseToJsonElement(resp).jsonArray
         assertEquals(2, arr.size)

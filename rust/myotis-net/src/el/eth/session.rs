@@ -11,6 +11,9 @@
 
 use std::time::Duration;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
 use myotis_core::rlp::{self, Item};
 
 use crate::el::rlpx::transport::{
@@ -41,8 +44,12 @@ pub struct EthConfig {
 }
 
 /// A negotiated, READY eth session over one peer connection.
-pub struct EthSession {
-    conn: RlpxConnection,
+///
+/// Generic over the RLPx stream `S` (default [`TcpStream`]) so the clearnet
+/// managed-peer path is unchanged while the Tor PoC can run the identical eth +
+/// snap flow over a Tor `DataStream` — see `docs/privacy-and-tor.md` §3/§4.
+pub struct EthSession<S = TcpStream> {
+    conn: RlpxConnection<S>,
     /// Negotiated eth version (66-69).
     pub eth_version: u64,
     /// Whether the peer also advertised snap/1 (drives EL-A6).
@@ -54,16 +61,16 @@ pub struct EthSession {
     next_request_id: u64,
 }
 
-impl EthSession {
+impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
     /// Drive `HANDSHAKE → READY`: exchange Hello, negotiate the eth version,
     /// exchange Status, and gate on network id + genesis. `local_pubkey` is our
     /// node id (64-byte). The whole handshake is bounded by a 30 s timeout.
     pub async fn handshake(
-        mut conn: RlpxConnection,
+        mut conn: RlpxConnection<S>,
         local_pubkey: &[u8; 64],
         cfg: &EthConfig,
         served_range: Option<(u64, u64, [u8; 32])>,
-    ) -> Result<EthSession, String> {
+    ) -> Result<EthSession<S>, String> {
         let fut = async {
             // Send our Hello first (Java sends on RLPX_READY).
             conn.send(P2P_HELLO, &encode_hello(local_pubkey, cfg.listen_port))
@@ -261,7 +268,7 @@ impl EthSession {
     /// Consume the negotiated session, handing the framed connection and the
     /// negotiated metadata to the [`ManagedPeer`](crate::el::peer::ManagedPeer)
     /// actor, which drives it from a background read loop.
-    pub fn into_parts(self) -> (RlpxConnection, u64, bool, Status, Hello) {
+    pub fn into_parts(self) -> (RlpxConnection<S>, u64, bool, Status, Hello) {
         (self.conn, self.eth_version, self.snap, self.peer_status, self.peer_hello)
     }
 
@@ -478,8 +485,8 @@ fn negotiate(hello: &Hello) -> Option<(u64, bool)> {
 }
 
 /// Receive the next frame, transparently answering a p2p Ping with a Pong.
-async fn recv_answering_ping(
-    conn: &mut RlpxConnection,
+async fn recv_answering_ping<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    conn: &mut RlpxConnection<S>,
 ) -> Result<crate::el::rlpx::frame::DecodedFrame, String> {
     loop {
         let frame = conn.recv().await?;

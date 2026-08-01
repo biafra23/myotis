@@ -64,6 +64,9 @@ pub struct ElConfig {
     /// Path to the EL peer cache (`dataDir/peers.cache`) for warm-start; `None`
     /// runs without persistence.
     pub cache_path: Option<std::path::PathBuf>,
+    /// Path to the eth_getLogs watch-list index (`dataDir/logindex[-net].db`);
+    /// `None` keeps the index memory-only (docs/eth-getlogs-design.md).
+    pub log_index_path: Option<std::path::PathBuf>,
     /// Network floor for the suggested priority fee (wei) — the Java
     /// `NetworkConfig.minSuggestedTipWei` (mainnet/sepolia 0.1 gwei; gnosis 0.001).
     pub min_suggested_tip_wei: u128,
@@ -90,6 +93,7 @@ impl ElConfig {
             listen_port: 30303,
             pool_config: PoolConfig::default(),
             cache_path: None,
+            log_index_path: None,
             min_suggested_tip_wei: 100_000_000, // 0.1 gwei
         }
     }
@@ -117,6 +121,7 @@ impl ElConfig {
             listen_port: 30305,
             pool_config: PoolConfig::default(),
             cache_path: None,
+            log_index_path: None,
             min_suggested_tip_wei: 100_000_000, // 0.1 gwei
         }
     }
@@ -141,6 +146,7 @@ impl ElConfig {
             listen_port: 30304, // gnosis conventional EL port (Java defaultElPort)
             pool_config: PoolConfig::default(),
             cache_path: None,
+            log_index_path: None,
             min_suggested_tip_wei: 1_000_000, // 0.001 gwei — cheap-chain floor
         }
     }
@@ -380,6 +386,16 @@ struct TxScanState {
 /// (mirrors the Java `TIP_SUGGEST_BLOCKS`).
 const TIP_SUGGEST_BLOCKS: u64 = 3;
 
+/// Tor read fan-out bounds (docs/privacy-and-tor.md): how many clearnet-validated
+/// snap peers a single Tor-routed read may try, and the wall-clock ceiling on the
+/// whole read. Kept small because each Tor dial is slow and many peers reject
+/// Tor-exit inbound — without these a bad-exit walk could hang the FFI call for
+/// minutes. Fail-closed when the deadline is hit.
+#[cfg(feature = "tor")]
+const TOR_MAX_CANDIDATES: usize = 5;
+#[cfg(feature = "tor")]
+const TOR_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// `eth_feeHistory` block-count clamp (the Java `FEE_HISTORY_MAX_BLOCKS`) —
 /// each block with reward percentiles costs a verified body + receipts fetch.
 const FEE_HISTORY_MAX_BLOCKS: u64 = 10;
@@ -453,6 +469,13 @@ pub struct ElReader {
     discovery: Discv4Service,
     pool: PeerPool,
     anchor: Arc<ExecAnchor>,
+    /// Our eth handshake parameters — reused by the Tor read path
+    /// (`docs/privacy-and-tor.md`) to dial a per-address isolated circuit with a
+    /// fresh ephemeral identity, independent of the pool's clearnet connections.
+    /// Only read on the `tor` feature; kept unconditionally so the struct shape
+    /// doesn't depend on the feature.
+    #[cfg_attr(not(feature = "tor"), allow(dead_code))]
+    eth_cfg: Arc<EthConfig>,
     /// Network floor for the suggested tip (from `ElConfig::min_suggested_tip_wei`).
     min_suggested_tip_wei: u128,
     /// Cross-call EVM caches, shared across every `eth_call` on this reader. Both
@@ -484,6 +507,14 @@ pub struct ElReader {
     /// The sent-tx WATCH, shared with every peer's read loop (which marks
     /// gossip sightings) — the Java TxGossipObserver seam's equivalent.
     sent_tx_watch: crate::el::sent_tx::SharedSentTxWatch,
+    /// The opt-in eth_getLogs watch-list index (docs/eth-getlogs-design.md).
+    /// `None` until the host supplies a config. Brief-hold lock: appends and
+    /// queries are in-memory work; persistence happens on checkpoints and
+    /// stop, never under a network await.
+    log_index: std::sync::Mutex<Option<crate::el::logindex::LogIndex>>,
+    log_index_path: Option<std::path::PathBuf>,
+    /// The head-follow appender task (spawned on enable, aborted on stop).
+    log_index_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// The scan-cursor map plus its last TTL sweep — one lock covers both, so the
@@ -577,7 +608,7 @@ impl ElReader {
         let pool = PeerPool::start(
             key,
             local_pubkey,
-            eth_cfg,
+            Arc::clone(&eth_cfg),
             cfg.pool_config,
             cache,
             rx,
@@ -587,6 +618,7 @@ impl ElReader {
             discovery,
             pool,
             anchor,
+            eth_cfg,
             min_suggested_tip_wei: cfg.min_suggested_tip_wei,
             evm_proof_cache: Arc::new(InMemoryStateProofCache::new(EVM_PROOF_CACHE_ENTRIES)),
             evm_bytecode_cache: Arc::new(InMemoryBytecodeCache::new()),
@@ -601,7 +633,396 @@ impl ElReader {
                 last_rebroadcast: std::time::Instant::now(),
             }),
             sent_tx_watch,
+            log_index: std::sync::Mutex::new(None),
+            log_index_path: cfg.log_index_path,
+            log_index_task: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Install (or replace) the eth_getLogs watch-list config: reload the
+    /// persisted index when it matches the config's fingerprint, else start
+    /// empty (re-index). See docs/eth-getlogs-design.md.
+    /// Returns false (and installs nothing) for an invalid config
+    /// (duplicate watch addresses). Re-applying a config whose watch-list
+    /// fingerprint matches the installed one only updates the enabled bit —
+    /// in-memory progress survives settings pokes; a genuinely changed
+    /// watch-list checkpoints the old index before replacing it.
+    pub fn set_log_index_config(&self, config: crate::el::logindex::LogIndexConfig) -> bool {
+        let Ok(mut slot) = self.log_index.lock() else {
+            return false;
+        };
+        if let Some(ix) = slot.as_mut() {
+            if ix.config().fingerprint() == config.fingerprint() {
+                ix.set_enabled(config.enabled);
+                return true;
+            }
+            if let Some(p) = self.log_index_path.as_deref() {
+                let _ = ix.persist(p);
+            }
+        }
+        let loaded = self
+            .log_index_path
+            .as_deref()
+            .and_then(|p| crate::el::logindex::LogIndex::load(&config, p));
+        let ix = match loaded {
+            Some(ix) => ix,
+            None => match crate::el::logindex::LogIndex::new(config) {
+                Ok(ix) => ix,
+                Err(_) => return false,
+            },
+        };
+        *slot = Some(ix);
+        true
+    }
+
+    /// The beacon-anchored head block number, if the anchor is ready — the
+    /// resolution target for `latest`-style tags in eth_getLogs filters.
+    pub fn head_block_number(&self) -> Option<u64> {
+        self.anchored_head().ok().map(|(n, _)| n)
+    }
+
+    /// Deterministically stop the appender: abort AND await the task, which
+    /// guarantees its per-tick strong Arc has been dropped — hosts call this
+    /// BEFORE Arc::try_unwrap so teardown never races a long catch-up tick.
+    pub async fn stop_log_index_appender(&self) {
+        let handle = match self.log_index_task.lock() {
+            Ok(mut t) => t.take(),
+            Err(_) => None,
+        };
+        if let Some(h) = handle {
+            h.abort();
+            let _ = h.await; // JoinError::Cancelled — the task's Arc is gone
+        }
+    }
+
+    /// Spawn (or keep) the head-follow appender for this reader. Idempotent:
+    /// a live task is left alone. `rt` makes the runtime-context invariant
+    /// unforgeable (a bare tokio::spawn outside a runtime would abort the
+    /// whole host process under panic="abort").
+    pub fn ensure_log_index_appender(self: &Arc<Self>, rt: &tokio::runtime::Handle) {
+        let Ok(mut slot) = self.log_index_task.lock() else {
+            return;
+        };
+        if slot.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        // The task holds only a WEAK reference: a strong Arc here would keep
+        // the reader's strong count above 1 forever, making the host's
+        // Arc::try_unwrap → ElReader::stop teardown unreachable (leaked
+        // networking on stop/pause). Each tick upgrades for its duration and
+        // the task exits on its own once the reader is gone; the abort in
+        // stop() is the fast path.
+        let weak = Arc::downgrade(self);
+        *slot = Some(rt.spawn(async move {
+            // Slice-3 rule: append FINALIZED blocks only. Finalized never
+            // reorgs, so coverage stays honest with zero rewind machinery;
+            // optimistic-tail appending (with the design doc's rewind rule)
+            // and deep-gap bridging both belong to the backfill slice.
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(6));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut since_persist = 0u32;
+            let mut ticks = 0u64;
+            loop {
+                tick.tick().await;
+                let Some(reader) = weak.upgrade() else {
+                    return; // reader torn down; the appender dies with it
+                };
+                reader.log_index_append_tick(&mut since_persist, ticks).await;
+                reader.log_index_backfill_step(ticks).await;
+                ticks = ticks.wrapping_add(1);
+            }
+        }));
+    }
+
+    /// One appender tick: record finalized blocks from the append edge up to
+    /// the finalized head (bounded batch per tick).
+    async fn log_index_append_tick(&self, since_persist: &mut u32, ticks: u64) {
+        // Checkpoint due from a PREVIOUS tick first: batches that end early
+        // (peer failure mid-catch-up) must not defer persistence forever.
+        if *since_persist >= 64 {
+            if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
+                if let Some(ix) = slot.as_ref() {
+                    let _ = ix.persist(path);
+                }
+            }
+            *since_persist = 0;
+        }
+        let enabled = self.with_log_index(|ix| ix.config().enabled).unwrap_or(false);
+        if !enabled {
+            return;
+        }
+        let finalized = self.finalized_block_number();
+        if finalized == 0 {
+            return;
+        }
+        let edge = self.with_log_index(|ix| ix.append_edge()).flatten();
+        let start = match edge {
+            None => finalized, // fresh index: start at the finalized head
+            Some(e) if e <= finalized => e,
+            Some(_) => return, // caught up
+        };
+        // The verified whole-block path anchors a window from the target to
+        // the optimistic head; stay well inside its lookback cap. A deeper
+        // lag is the backfill walker's job — say so once per tick.
+        if finalized.saturating_sub(start) > 128 {
+            // Rate-limited: this state persists until the backfill walker
+            // exists / catches up, and a warn every 6 s is just noise.
+            if ticks % 100 == 0 {
+                tracing::warn!(start, finalized, "log index append edge too far behind (node downtime?); upward bridging is a tracked follow-up — coverage above the edge stays frozen until then");
+            }
+            return;
+        }
+        let last = finalized.min(start.saturating_add(15));
+        for n in start..=last {
+            let (block_hash, receipts) = match self.block_receipts_at(Some(n)).await {
+                Ok(Some(r)) => r,
+                Ok(None) => return, // future/unknown under this anchor — retry next tick
+                Err(e) => {
+                    tracing::debug!(block = n, error = %e, "log index append: receipts unavailable");
+                    return;
+                }
+            };
+            // Strict conversion: any malformed field (wrong-length address or
+            // topic, index overflow) aborts THIS block's append rather than
+            // silently storing an altered shape under advancing coverage — a
+            // dropped topic0 would shift the rest and change what
+            // filter/watch matching sees for verified data.
+            let Some(logs) = stored_logs_for_block(&receipts) else {
+                tracing::warn!(block = n, "log index append: malformed log field in verified receipts; will retry");
+                return;
+            };
+            let appended = match self.log_index.lock() {
+                Ok(mut slot) => match slot.as_mut() {
+                    Some(ix) => match ix.append_block(n, block_hash, logs) {
+                        Ok(()) => true,
+                        Err(gap) => {
+                            // Transient (config replaced / rewind raced this
+                            // tick) → retrying next tick is right; if it ever
+                            // became persistent this warn is the telemetry.
+                            tracing::warn!(block = n, edge = gap.edge, "log index append rejected (coverage gap); retrying");
+                            false
+                        }
+                    },
+                    None => false,
+                },
+                Err(_) => false,
+            };
+            if !appended {
+                return;
+            }
+            *since_persist += 1;
+        }
+        // Checkpoint roughly every 64 appended blocks (best-effort).
+        if *since_persist >= 64 {
+            if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
+                if let Some(ix) = slot.as_ref() {
+                    let _ = ix.persist(path);
+                }
+            }
+            *since_persist = 0;
+        }
+    }
+
+    /// One backfill step: walk the verified header chain DOWNWARD from the
+    /// index's trust cursor toward the lowest watched from_block, one batch
+    /// per tick (docs/eth-getlogs-design.md §backfill). Every header is
+    /// trusted only through parent-hash linkage into the cursor (whose own
+    /// trust chains back to a beacon-anchored append); candidate blocks
+    /// (bloom hit) get body+receipts fetched and verified against both roots
+    /// before any log is stored. Peer refusal is a stall, never corruption:
+    /// coverage simply doesn't extend until some peer serves the range.
+    async fn log_index_backfill_step(&self, ticks: u64) {
+        let Some((config, cursor)) = self.with_log_index(|ix| (ix.config().clone(), ix.cursor)) else {
+            return;
+        };
+        let (Some(target_low), Some((cur_n, cur_hash))) =
+            (config.watch.iter().map(|w| w.from_block).min(), cursor)
+        else {
+            return; // no watch entries, or the appender hasn't seeded the edge yet
+        };
+        if !config.enabled || cur_n <= target_low {
+            return;
+        }
+        let fingerprint = config.fingerprint();
+        // count+1 headers are requested (the top one is the cursor block), and
+        // honest peers cap header serves at 1024 (our own served.rs agrees) —
+        // so the batch is 1023 new blocks, keeping the request exactly at cap.
+        const BATCH: u64 = 1023;
+        let count = (cur_n - target_low).min(BATCH);
+        let from = cur_n - count;
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return;
+        }
+        for peer in &peers {
+            match self
+                .log_index_backfill_batch(peer, count, cur_n, cur_hash, &config, fingerprint)
+                .await
+            {
+                Ok(()) => {
+                    // Checkpoint after every applied batch: the store is
+                    // small at Sepolia scale and a crash then costs at most
+                    // one batch (paged store before mainnet — design doc).
+                    if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
+                        if let Some(ix) = slot.as_ref() {
+                            let _ = ix.persist(path);
+                        }
+                    }
+                    return;
+                }
+                Err(e) => {
+                    tracing::debug!(from, count, error = %e, "log index backfill batch failed; trying next peer");
+                }
+            }
+        }
+        if ticks % 100 == 0 {
+            tracing::warn!(
+                cursor = cur_n,
+                target = target_low,
+                "log index backfill: no peer served the range this round (history depth?); will keep retrying"
+            );
+        }
+    }
+
+    /// Fetch and apply one descending backfill batch from one peer:
+    /// headers [from, cur_n] ascending (count+1, so the top one IS the cursor
+    /// block), full parent-hash chain check, bloom-filtered candidate
+    /// body+receipts fetch verified against both roots, then apply top-down.
+    /// Fetch and apply one descending backfill batch from one peer. The
+    /// request is `reverse=true` starting AT the trusted cursor block, so the
+    /// trust root is the FIRST header of the response — a short serve (peers
+    /// may cap below the 1024 ceiling, or truncate on byte budget) still
+    /// yields a verifiable parent-hash-chained prefix and partial progress,
+    /// instead of failing an exact-length check forever. (`remember_served`
+    /// only tracks ascending shapes, so reverse fetches skip that side
+    /// channel — harmless.) Candidates are bloom-filtered and their logs
+    /// pre-filtered against the captured config, so transient memory is
+    /// proportional to logs that will actually be stored.
+    async fn log_index_backfill_batch(
+        &self,
+        peer: &ManagedPeer,
+        count: u64,
+        cur_n: u64,
+        cur_hash: [u8; 32],
+        config: &crate::el::logindex::LogIndexConfig,
+        fingerprint: u64,
+    ) -> Result<(), String> {
+        let window = peer.get_block_headers_by_number(cur_n, count + 1, 0, true).await?;
+        let Some((top, rest)) = window.split_first() else {
+            return Err("peer returned no headers".to_string());
+        };
+        if top.header.number != cur_n || top.hash != cur_hash {
+            return Err("peer window does not start at the trusted cursor block".to_string());
+        }
+        if rest.is_empty() {
+            return Err("peer served only the cursor block".to_string());
+        }
+        // Descending parent-hash chain: each header's parent is the next one.
+        // Only the verified prefix is used, so a mid-response break just
+        // shortens the batch instead of failing it.
+        let mut verified = 0usize;
+        for pair in window.windows(2) {
+            let [upper, lower] = pair else {
+                return Err("header window pairing failed".to_string());
+            };
+            if upper.header.parent_hash != lower.hash
+                || lower.header.number != upper.header.number.wrapping_sub(1)
+            {
+                break;
+            }
+            verified += 1;
+        }
+        if verified == 0 {
+            return Err("peer response does not chain to the cursor block".to_string());
+        }
+        let new_blocks = rest.get(..verified).ok_or("verified prefix out of range")?;
+        // Bloom-filter candidates among the NEW blocks. A miss is a
+        // definitive skip; a hit needs verified receipts.
+        let candidates: Vec<&crate::el::eth::messages::VerifiedHeader> = new_blocks
+            .iter()
+            .filter(|h| {
+                let Ok(bloom): Result<&[u8; 256], _> = h.header.logs_bloom.as_slice().try_into() else {
+                    return true; // odd bloom width: treat as maybe, verify via receipts
+                };
+                self.with_log_index(|ix| ix.bloom_may_match(h.header.number, bloom)).unwrap_or(false)
+            })
+            .collect();
+        let mut logs_by_block: std::collections::HashMap<u64, Vec<crate::el::logindex::StoredLog>> =
+            std::collections::HashMap::new();
+        // Chunked: one request for ~1023 candidate blocks would blow through
+        // peer soft response limits (~2 MiB) and permanently stall a
+        // candidate-dense range on the exact-length check below.
+        for chunk in candidates.chunks(64) {
+            let hashes: Vec<[u8; 32]> = chunk.iter().map(|h| h.hash).collect();
+            let (bodies, receipt_blocks) =
+                futures::future::join(peer.get_block_bodies(&hashes), peer.get_receipts(&hashes)).await;
+            let bodies = bodies?;
+            let receipt_blocks = receipt_blocks?;
+            if bodies.len() != chunk.len() || receipt_blocks.len() != chunk.len() {
+                return Err("peer returned a short bodies/receipts response".to_string());
+            }
+            for ((vh, body), receipts) in chunk.iter().zip(&bodies).zip(&receipt_blocks) {
+                verify_body_transactions(&vh.header, body)?;
+                if receipts.len() != body.transactions.len() {
+                    return Err(format!(
+                        "block {}: {} receipts for {} transactions",
+                        vh.header.number,
+                        receipts.len(),
+                        body.transactions.len()
+                    ));
+                }
+                verify_block_receipts(&vh.header, receipts)?;
+                let built = build_block_receipts(&vh.header, vh.hash, body, receipts)?;
+                let stored = stored_logs_for_block(&built)
+                    .ok_or("malformed log field in verified receipts")?;
+                // Pre-filter: buffer only logs the captured watch-list will
+                // store (the fingerprint recheck below discards the batch if
+                // the config changed, so filtering against the snapshot is
+                // safe) — transient memory stays proportional to stored logs.
+                let watched: Vec<crate::el::logindex::StoredLog> =
+                    stored.into_iter().filter(|l| config.watches(l)).collect();
+                if !watched.is_empty() {
+                    logs_by_block.insert(vh.header.number, watched);
+                }
+            }
+        }
+        // Apply top-down (the response is already descending) so every block
+        // adjoins the low edge; the trust edge advances with each block.
+        match self.log_index.lock() {
+            Ok(mut slot) => {
+                let Some(ix) = slot.as_mut() else {
+                    return Err("log index uninstalled mid-batch".to_string());
+                };
+                // The batch ran across several awaits; a concurrent
+                // set_log_index_config may have replaced the index (fresh
+                // cursor None, empty spans that would accept ANY block). Our
+                // candidates were bloom-selected against the OLD watch-list —
+                // applying them to a new one would claim coverage for blocks
+                // whose new-address logs were "definitively" skipped. Bail
+                // unless both the trust edge and the config are the ones this
+                // batch was computed against.
+                if ix.cursor != Some((cur_n, cur_hash)) || ix.config().fingerprint() != fingerprint {
+                    return Err("index changed mid-batch; recomputing next tick".to_string());
+                }
+                for vh in new_blocks {
+                    let n = vh.header.number;
+                    let logs = logs_by_block.remove(&n).unwrap_or_default();
+                    ix.backfill_block(n, vh.hash, logs)
+                        .map_err(|g| format!("backfill gap at {} (edge {})", g.block, g.edge))?;
+                }
+                Ok(())
+            }
+            Err(_) => Err("log index lock poisoned".to_string()),
+        }
+    }
+
+    /// Run `f` against the index if one is configured. The single accessor
+    /// for queries and status — callers never touch the lock directly.
+    pub fn with_log_index<T>(&self, f: impl FnOnce(&crate::el::logindex::LogIndex) -> T) -> Option<T> {
+        match self.log_index.lock() {
+            Ok(slot) => slot.as_ref().map(f),
+            Err(_) => None,
+        }
     }
 
     /// Count of live snap peers (for host status).
@@ -657,6 +1078,13 @@ impl ElReader {
     /// a single hung/dead peer doesn't fail the query. A serving peer is marked
     /// CONFIRMED in the cache, a failing one records a strike (→ deprioritized).
     pub async fn get_account(&self, address: [u8; 20]) -> Result<VerifiedAccount, String> {
+        // Tor mode (docs/privacy-and-tor.md): route this read — the §1 "core
+        // leak" flow — over a per-address isolated Tor circuit instead of the
+        // pool's clearnet connections. Fail-closed if no aged peer is available.
+        #[cfg(feature = "tor")]
+        if crate::el::tor::is_enabled() {
+            return self.get_account_over_tor(address).await;
+        }
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
@@ -707,8 +1135,22 @@ impl ElReader {
         let verdict = peer
             .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
             .await;
-        let (fin_num, opt_num, synced) = self.anchor_diagnostics();
+        Ok(self.build_verified_account(address, state_root, block_number, outcome, verdict))
+    }
 
+    /// Assemble a `VerifiedAccount` from the proof-verified outcome + the beacon
+    /// anchor verdict + the reader's live anchor diagnostics. Shared by the
+    /// clearnet ([`get_account_from`]) and Tor read paths so the verdict/trust
+    /// fields are identical regardless of transport.
+    fn build_verified_account(
+        &self,
+        address: [u8; 20],
+        state_root: [u8; 32],
+        block_number: u64,
+        outcome: AccountOutcome,
+        verdict: crate::el::verify::Verdict,
+    ) -> VerifiedAccount {
+        let (fin_num, opt_num, synced) = self.anchor_diagnostics();
         let account_hash = keccak256(&address);
         let mut result = VerifiedAccount {
             address,
@@ -737,7 +1179,95 @@ impl ElReader {
             result.storage_root = leaf.storage_root;
             result.code_hash = leaf.code_hash;
         }
-        Ok(result)
+        result
+    }
+
+    /// Tor read path for [`get_account`]: dial a per-address ISOLATED Tor circuit
+    /// with a FRESH ephemeral RLPx identity (docs §3/§6.1) to a peer the pool
+    /// already validated on clearnet, and run the identical fetch + beacon-anchor
+    /// verdict as the clearnet path. Fails CLOSED when no such peer is available
+    /// — never silently falls back to a clearnet dial (docs §5).
+    #[cfg(feature = "tor")]
+    async fn get_account_over_tor(&self, address: [u8; 20]) -> Result<VerifiedAccount, String> {
+        // Candidate identities: peers this reader's pool discovered & validated
+        // over clearnet (addr + enode pubkey), snap-serving-quality first (the
+        // pool orders them). We reuse only their IDENTITY; the dial itself is a
+        // fresh Tor circuit with an ephemeral node key, so the peer never sees our
+        // real IP or our persistent node key.
+        //
+        // KNOWN LIMITATION (docs §5): `snap_peers()` returns peers we hold a LIVE
+        // clearnet connection to right now, so the Tor circuit reaches a node that
+        // simultaneously sees our real IP — a peer could pair the two by timing +
+        // the (rare) client fingerprint (§6.3). The design's fix is the quarantined,
+        // AGED, multi-source-promoted Tor pool (§5) that dials only peers we are NOT
+        // currently clearnet-connected to; that sidecar is out of scope for this
+        // experimental v1 and tracked as the follow-up.
+        //
+        // Bound the fan-out: each Tor dial is
+        // slow and many peers reject Tor-exit inbound, so cap the candidates AND
+        // the whole read, or one balance query could hang the FFI call for minutes
+        // (a bad-exit walk); fail-closed on the deadline.
+        let candidates: Vec<(std::net::SocketAddr, [u8; 64])> = self
+            .pool
+            .snap_peers()
+            .await
+            .iter()
+            .take(TOR_MAX_CANDIDATES)
+            .map(|p| (p.addr(), p.peer_pubkey()))
+            .collect();
+        if candidates.is_empty() {
+            return Err("tor: no clearnet-validated snap peer to dial over Tor (fail-closed)".into());
+        }
+        let deadline = tokio::time::Instant::now() + TOR_READ_DEADLINE;
+        let mut fallback: Option<VerifiedAccount> = None;
+        let mut last_err = String::new();
+        for (addr, pubkey) in candidates {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                last_err = "tor read deadline exceeded".to_string();
+                break;
+            }
+            // Bound each candidate's whole dial+read by the remaining budget.
+            let attempt = async {
+                let mut session =
+                    crate::el::tor::open_snap_session(&address, addr, pubkey, &self.eth_cfg).await?;
+                self.account_from_tor_session(&mut session, address).await
+            };
+            // NB deliberately NO record_snap_served/record_snap_failure here: those
+            // feed the SHARED, persisted clearnet peer-quality cache, and a peer
+            // that rejects Tor-exit inbound (a Tor property) is not a bad CLEARNET
+            // snap peer — striking it would poison clearnet dialing on the next run.
+            // Tor-side peer quality belongs in the Tor sidecar (docs §5), a follow-up.
+            match tokio::time::timeout(remaining, attempt).await {
+                Ok(Ok(result)) => {
+                    if result.verify_method.is_some() || is_global_fail(result.fail_reason) {
+                        return Ok(result);
+                    }
+                    fallback.get_or_insert(result);
+                }
+                Ok(Err(e)) => last_err = e,
+                Err(_) => last_err = format!("tor dial to {addr} exceeded the read budget"),
+            }
+        }
+        fallback.map(Ok).unwrap_or_else(|| {
+            Err(format!("tor: all snap-peer dials failed to serve a verifiable account: {last_err}"))
+        })
+    }
+
+    /// One account fetch + beacon verdict over an already-connected Tor
+    /// [`EthSession`] (the [`get_account_from`] twin for the one-shot Tor path).
+    #[cfg(feature = "tor")]
+    async fn account_from_tor_session(
+        &self,
+        session: &mut crate::el::eth::session::EthSession<arti_client::DataStream>,
+        address: [u8; 20],
+    ) -> Result<VerifiedAccount, String> {
+        let (state_root, block_number) = fresh_head_session(session).await?;
+        let outcome = session.snap_get_account(&state_root, &address).await?;
+        let verdict = session
+            .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
+            .await;
+        Ok(self.build_verified_account(address, state_root, block_number, outcome, verdict))
     }
 
     /// Fetch + verify one storage slot. `holder` switches the key to the
@@ -2268,6 +2798,18 @@ impl ElReader {
 
     /// Stop discovery + the pool.
     pub async fn stop(self) {
+        if let Ok(mut t) = self.log_index_task.lock() {
+            if let Some(h) = t.take() {
+                h.abort();
+            }
+        }
+        // Best-effort index checkpoint before teardown: a failed write only
+        // costs a re-index of the uncheckpointed tail, never correctness.
+        if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
+            if let Some(ix) = slot.as_ref() {
+                let _ = ix.persist(path);
+            }
+        }
         self.pool.stop().await;
         self.discovery.stop().await;
     }
@@ -2551,6 +3093,28 @@ async fn fresh_head(peer: &ManagedPeer) -> Result<([u8; 32], u64), String> {
     // rejects it as noPeerBlockNumber. Treat it as a failure so the retry loop
     // moves to a peer with a real head (junk/light-client nodes can negotiate
     // snap/1 yet still advertise genesis).
+    if head.header.number == 0 {
+        return Err("peer advertises a genesis head (block 0 — no current state)".to_string());
+    }
+    let state_root = head.header.state_root;
+    if state_root == [0u8; 32] {
+        return Err("peer head has no state root".to_string());
+    }
+    Ok((state_root, head.header.number))
+}
+
+/// Tor twin of [`fresh_head`] over an [`EthSession`] (same head-hash echo check
+/// and genesis-head rejection; the state root is beacon-anchored afterwards).
+#[cfg(feature = "tor")]
+async fn fresh_head_session(
+    session: &mut crate::el::eth::session::EthSession<arti_client::DataStream>,
+) -> Result<([u8; 32], u64), String> {
+    let head_hash = session.peer_status.best_hash;
+    let headers = session.get_block_headers_by_hash(&head_hash, 1).await?;
+    let head = headers.into_iter().next().ok_or("peer returned no head header")?;
+    if head.hash != head_hash {
+        return Err("peer returned a header not matching the requested hash".to_string());
+    }
     if head.header.number == 0 {
         return Err("peer advertises a genesis head (block 0 — no current state)".to_string());
     }
@@ -2960,4 +3524,30 @@ mod tests {
         let tips = vec![(7u128, 0u64), (3, 0)];
         assert_eq!(percentile_rewards(tips, &[50.0, 99.0]), vec![3, 3]);
     }
+}
+
+/// Convert one block's [`VerifiedReceipt`]s into stored logs — strictly:
+/// `None` on any field that does not have its canonical width, so a caller
+/// never records a block whose stored shape differs from what was verified.
+fn stored_logs_for_block(receipts: &[VerifiedReceipt]) -> Option<Vec<crate::el::logindex::StoredLog>> {
+    let mut out = Vec::new();
+    for r in receipts {
+        for (k, l) in r.receipt.logs.iter().enumerate() {
+            let mut topics = Vec::with_capacity(l.topics.len());
+            for t in &l.topics {
+                topics.push(t.as_slice().try_into().ok()?);
+            }
+            out.push(crate::el::logindex::StoredLog {
+                block_number: r.block_number,
+                block_hash: r.block_hash,
+                tx_hash: r.tx_hash,
+                tx_index: u32::try_from(r.tx_index).ok()?,
+                log_index: u32::try_from(r.log_index_base).ok()?.checked_add(u32::try_from(k).ok()?)?,
+                address: l.address.as_slice().try_into().ok()?,
+                topics,
+                data: l.data.clone(),
+            });
+        }
+    }
+    Some(out)
 }

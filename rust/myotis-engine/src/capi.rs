@@ -1,5 +1,6 @@
 //! Plain C ABI over the same `host` functions the JNI shim wraps — the iOS
-//! (Kotlin/Native cinterop) seam. Mirrors `jni_shim` one-to-one: compound values
+//! (Kotlin/Native cinterop) seam. Mirrors the JVM FFI surface (`ffi`, UniFFI)
+//! one-to-one: compound values
 //! cross as JSON strings with the exact same shapes the golden tests pin, and the
 //! sentinel conventions are identical (negative handle ids, `"{}"` status for an
 //! unknown handle, `{"error": ...}` objects). The header consumed by cinterop is
@@ -104,6 +105,21 @@ pub unsafe extern "C" fn myotis_create(
 #[no_mangle]
 pub extern "C" fn myotis_start(handle: i64) -> bool {
     crate::host::start(handle)
+}
+
+/// Toggle Tor verified-read routing (`set_tor_enabled` twin,
+/// docs/privacy-and-tor.md). Returns true iff this build supports Tor
+/// (`--features tor`); a Tor-less build returns false and no-ops.
+#[no_mangle]
+pub extern "C" fn myotis_set_tor_enabled(on: bool) -> bool {
+    crate::host::set_tor_enabled(on)
+}
+
+/// Tor status bitmask (`tor_status` twin): bit0 compiled-in, bit1 enabled,
+/// bit2 bootstrapped. `0` = this build has no Tor support.
+#[no_mangle]
+pub extern "C" fn myotis_tor_status() -> i32 {
+    crate::host::tor_status()
 }
 
 /// One handle's status as a JSON object, or `"{}"` for an unknown handle
@@ -478,4 +494,36 @@ mod tests {
         myotis_stop(0); // unknown id: must be a silent no-op
         unsafe { myotis_string_free(std::ptr::null_mut()) };
     }
+}
+
+/// eth_getLogs over the watch-list index (see ffi::get_logs_json).
+/// Returned string must be freed with `myotis_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_get_logs_json(
+    handle: i64,
+    filter_json: *const std::os::raw::c_char,
+) -> *mut std::os::raw::c_char {
+    match read_string(filter_json) {
+        Some(f) => into_c(crate::host::get_logs_json(handle, &f)),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Install the log-index watch-list config (see ffi::set_log_index_config).
+#[no_mangle]
+pub unsafe extern "C" fn myotis_set_log_index_config(
+    handle: i64,
+    config_json: *const std::os::raw::c_char,
+) -> bool {
+    match read_string(config_json) {
+        Some(c) => crate::host::set_log_index_config_json(handle, &c),
+        None => false,
+    }
+}
+
+/// Log-index status JSON (see ffi::log_index_status_json).
+/// Returned string must be freed with `myotis_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_log_index_status_json(handle: i64) -> *mut std::os::raw::c_char {
+    into_c(crate::host::log_index_status_json(handle))
 }

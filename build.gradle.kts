@@ -227,6 +227,15 @@ val rustReleaseDir = if (rustTargetTriple != null) {
 extra["rustReleaseDir"] = rustReleaseDir
 extra["rustEngineLibName"] = hostLibNames.last() // lib?myotis_engine.{dylib,so,dll}
 
+// Opt-in Tor support in the host engine dylib (docs/privacy-and-tor.md): builds
+// myotis-engine with `--features tor`, pulling the Arti tree into the host lib so
+// the desktop/daemon can offer the runtime Settings toggle. OFF by default so CI
+// and the daemon build stay Arti-free. Presence-based, like a typical opt-in flag
+// (a bare `-PtorEngine` sets the property to "", so use hasProperty); build a
+// Tor-capable desktop app with `./gradlew :app-desktop:run -PtorEngine`.
+val torEngine = project.hasProperty("torEngine")
+        && (project.property("torEngine") as? String).let { it.isNullOrBlank() || it.toBoolean() }
+
 tasks.register<Exec>("cargoBuildHost") {
     group = "rust"
     description = "cargo build --release for the host OS (self-skips when cargo is missing)"
@@ -235,6 +244,9 @@ tasks.register<Exec>("cargoBuildHost") {
     commandLine(
         buildList {
             addAll(listOf("cargo", "build", "--release", "--workspace"))
+            // Enable Tor only on the engine crate (package/feature form — a bare
+            // `--features tor` with `--workspace` would try every member).
+            if (torEngine) addAll(listOf("--features", "myotis-engine/tor"))
             rustTargetTriple?.let { addAll(listOf("--target", it)) }
         }
     )
@@ -243,7 +255,35 @@ tasks.register<Exec>("cargoBuildHost") {
     // must rebuild, or stale artifacts survive UP-TO-DATE checks.
     inputs.property("cargoVersion", cargoVersion)
     inputs.property("rustTarget", rustTargetTriple ?: "host")
+    // The Tor feature flips the artifact's contents, so it must key UP-TO-DATE too.
+    inputs.property("torEngine", torEngine)
     outputs.files(hostLibNames.map { file("$rustReleaseDir/$it") })
+}
+
+// Regenerate the UniFFI Kotlin bindings for the Rust engine into :myotis-engines'
+// source tree. The generated file is COMMITTED (like the Android jniLibs) so
+// cargo-less machines still compile the pure-Java/Kotlin build; re-run this task
+// whenever rust/myotis-engine/src/ffi.rs changes shape. Library mode: bindgen
+// reads the metadata baked into the built .so, so scaffolding and bindings can
+// never disagree silently (UniFFI additionally checksum-verifies at load time).
+tasks.register<Exec>("uniffiGenerateKotlin") {
+    group = "rust"
+    description = "Regenerate the committed UniFFI Kotlin bindings in :myotis-engines (self-skips without cargo)"
+    onlyIf { rustAvailable }
+    dependsOn(tasks.named("cargoBuildHost"))
+    workingDir = file("rust")
+    commandLine(
+        "cargo", "run", "--release", "-p", "uniffi-bindgen", "--",
+        "generate", "--library", "$rustReleaseDir/${hostLibNames.last()}".removePrefix("rust/"),
+        "--language", "kotlin", "--no-format",
+        "--out-dir", project(":myotis-engines").projectDir.resolve("src/main/kotlin").absolutePath,
+    )
+    inputs.files(rustSources).withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.property("cargoVersion", cargoVersion)
+    outputs.files(
+        project(":myotis-engines").projectDir
+            .resolve("src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt")
+    )
 }
 
 val cargoTest = tasks.register<Exec>("cargoTest") {
