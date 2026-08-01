@@ -832,11 +832,12 @@ impl ElReader {
     /// before any log is stored. Peer refusal is a stall, never corruption:
     /// coverage simply doesn't extend until some peer serves the range.
     async fn log_index_backfill_step(&self, ticks: u64) {
-        let Some((enabled, target_low, cursor)) = self.with_log_index(|ix| {
+        let Some((enabled, target_low, cursor, fingerprint)) = self.with_log_index(|ix| {
             (
                 ix.config().enabled,
                 ix.config().watch.iter().map(|w| w.from_block).min(),
                 ix.cursor,
+                ix.config().fingerprint(),
             )
         }) else {
             return;
@@ -847,7 +848,10 @@ impl ElReader {
         if !enabled || cur_n <= target_low {
             return;
         }
-        const BATCH: u64 = 1024;
+        // count+1 headers are requested (the top one is the cursor block), and
+        // honest peers cap header serves at 1024 (our own served.rs agrees) —
+        // so the batch is 1023 new blocks, keeping the request exactly at cap.
+        const BATCH: u64 = 1023;
         let count = (cur_n - target_low).min(BATCH);
         let from = cur_n - count;
         let peers = self.pool.snap_peers().await;
@@ -855,7 +859,10 @@ impl ElReader {
             return;
         }
         for peer in &peers {
-            match self.log_index_backfill_batch(peer, from, count, cur_n, cur_hash).await {
+            match self
+                .log_index_backfill_batch(peer, from, count, cur_n, cur_hash, fingerprint)
+                .await
+            {
                 Ok(()) => {
                     // Checkpoint after every applied batch: the store is
                     // small at Sepolia scale and a crash then costs at most
@@ -892,6 +899,7 @@ impl ElReader {
         count: u64,
         cur_n: u64,
         cur_hash: [u8; 32],
+        fingerprint: u64,
     ) -> Result<(), String> {
         let window = peer.get_block_headers_by_number(from, count + 1, 0, false).await?;
         if window.len() as u64 != count + 1 {
@@ -905,14 +913,19 @@ impl ElReader {
             return Err("peer returned the wrong starting block number".to_string());
         }
         for pair in window.windows(2) {
-            let (lower, upper) = (&pair[0], &pair[1]);
+            let [lower, upper] = pair else {
+                return Err("header window pairing failed".to_string());
+            };
             if upper.header.parent_hash != lower.hash {
                 return Err("peer header window breaks the parent-hash chain".to_string());
             }
         }
         // Bloom-filter candidates among the NEW blocks (everything below the
         // cursor). A miss is a definitive skip; a hit needs verified receipts.
-        let candidates: Vec<&crate::el::eth::messages::VerifiedHeader> = window[..window.len() - 1]
+        let Some((_, new_headers)) = window.split_last() else {
+            return Err("empty header window".to_string());
+        };
+        let candidates: Vec<&crate::el::eth::messages::VerifiedHeader> = new_headers
             .iter()
             .filter(|h| {
                 let Ok(bloom): Result<&[u8; 256], _> = h.header.logs_bloom.as_slice().try_into() else {
@@ -923,16 +936,19 @@ impl ElReader {
             .collect();
         let mut logs_by_block: std::collections::HashMap<u64, Vec<crate::el::logindex::StoredLog>> =
             std::collections::HashMap::new();
-        if !candidates.is_empty() {
-            let hashes: Vec<[u8; 32]> = candidates.iter().map(|h| h.hash).collect();
+        // Chunked: one request for ~1023 candidate blocks would blow through
+        // peer soft response limits (~2 MiB) and permanently stall a
+        // candidate-dense range on the exact-length check below.
+        for chunk in candidates.chunks(64) {
+            let hashes: Vec<[u8; 32]> = chunk.iter().map(|h| h.hash).collect();
             let (bodies, receipt_blocks) =
                 futures::future::join(peer.get_block_bodies(&hashes), peer.get_receipts(&hashes)).await;
             let bodies = bodies?;
             let receipt_blocks = receipt_blocks?;
-            if bodies.len() != candidates.len() || receipt_blocks.len() != candidates.len() {
+            if bodies.len() != chunk.len() || receipt_blocks.len() != chunk.len() {
                 return Err("peer returned a short bodies/receipts response".to_string());
             }
-            for ((vh, body), receipts) in candidates.iter().zip(&bodies).zip(&receipt_blocks) {
+            for ((vh, body), receipts) in chunk.iter().zip(&bodies).zip(&receipt_blocks) {
                 verify_body_transactions(&vh.header, body)?;
                 if receipts.len() != body.transactions.len() {
                     return Err(format!(
@@ -956,7 +972,21 @@ impl ElReader {
                 let Some(ix) = slot.as_mut() else {
                     return Err("log index uninstalled mid-batch".to_string());
                 };
-                for vh in window[..window.len() - 1].iter().rev() {
+                // The batch ran across several awaits; a concurrent
+                // set_log_index_config may have replaced the index (fresh
+                // cursor None, empty spans that would accept ANY block). Our
+                // candidates were bloom-selected against the OLD watch-list —
+                // applying them to a new one would claim coverage for blocks
+                // whose new-address logs were "definitively" skipped. Bail
+                // unless both the trust edge and the config are the ones this
+                // batch was computed against.
+                if ix.cursor != Some((cur_n, cur_hash)) || ix.config().fingerprint() != fingerprint {
+                    return Err("index changed mid-batch; recomputing next tick".to_string());
+                }
+                let Some((_, new_blocks)) = window.split_last() else {
+                    return Err("empty header window".to_string());
+                };
+                for vh in new_blocks.iter().rev() {
                     let n = vh.header.number;
                     let logs = logs_by_block.remove(&n).unwrap_or_default();
                     ix.backfill_block(n, vh.hash, logs)
