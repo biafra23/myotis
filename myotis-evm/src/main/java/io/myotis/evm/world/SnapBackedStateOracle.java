@@ -42,8 +42,11 @@ import java.util.function.Supplier;
  * </ol>
  *
  * <p>Bytecode is cached via the supplied {@link BytecodeCache}; the cache is
- * checked before issuing any request. State is not cached here — the
- * per-call cache lives in {@link SyncStateView}.
+ * checked before issuing any request. Verified account/storage state is cached
+ * in the node-level {@link StateProofCache} this oracle is constructed with —
+ * across calls, oracle instances, and (for storage slots, keyed by their
+ * account's storageRoot) across head advances. The per-call view cache lives
+ * in {@link SyncStateView}.
  *
  * <p>The peer abstraction lets tests substitute a fixture peer and lets the
  * wallet integration provide an {@code EthHandler}-backed implementation
@@ -185,6 +188,17 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
         // an unchanged contract's slots carry over from the previous block); for
         // uncached accounts every slot rides along and verifyAndCacheChunk skips
         // the cache hits after the account proof reveals the storageRoot.
+        //
+        // FOLLOW-UP (deferred): a ride-along slot is real peer work — the peer
+        // assembles (and we download) a storage proof the verify step then discards
+        // as a cache hit. The dominant sweep flow dodges this because the
+        // PrefetchingEvmExecutor's sentinel waves discover an account one wave
+        // before its slots, so the account is cached at the root by the time slots
+        // batch. Flows where a new account and its slots land in the SAME wave
+        // (real-mode iterations, proxy -> impl reads) still pay it. If residual
+        // latency shows up on proxy-heavy calls, split the batch in two phases:
+        // account proofs for uncached accounts first, then only the still-missing
+        // slots — making "N account proofs per poll" hold in every flow.
         List<BatchItem> items = new ArrayList<>();
         for (Map.Entry<Address, ? extends Set<BigInteger>> entry : request.entrySet()) {
             Address address = entry.getKey();
