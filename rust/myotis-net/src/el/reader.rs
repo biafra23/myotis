@@ -64,6 +64,9 @@ pub struct ElConfig {
     /// Path to the EL peer cache (`dataDir/peers.cache`) for warm-start; `None`
     /// runs without persistence.
     pub cache_path: Option<std::path::PathBuf>,
+    /// Path to the eth_getLogs watch-list index (`dataDir/logindex[-net].db`);
+    /// `None` keeps the index memory-only (docs/eth-getlogs-design.md).
+    pub log_index_path: Option<std::path::PathBuf>,
     /// Network floor for the suggested priority fee (wei) — the Java
     /// `NetworkConfig.minSuggestedTipWei` (mainnet/sepolia 0.1 gwei; gnosis 0.001).
     pub min_suggested_tip_wei: u128,
@@ -90,6 +93,7 @@ impl ElConfig {
             listen_port: 30303,
             pool_config: PoolConfig::default(),
             cache_path: None,
+            log_index_path: None,
             min_suggested_tip_wei: 100_000_000, // 0.1 gwei
         }
     }
@@ -117,6 +121,7 @@ impl ElConfig {
             listen_port: 30305,
             pool_config: PoolConfig::default(),
             cache_path: None,
+            log_index_path: None,
             min_suggested_tip_wei: 100_000_000, // 0.1 gwei
         }
     }
@@ -141,6 +146,7 @@ impl ElConfig {
             listen_port: 30304, // gnosis conventional EL port (Java defaultElPort)
             pool_config: PoolConfig::default(),
             cache_path: None,
+            log_index_path: None,
             min_suggested_tip_wei: 1_000_000, // 0.001 gwei — cheap-chain floor
         }
     }
@@ -501,6 +507,12 @@ pub struct ElReader {
     /// The sent-tx WATCH, shared with every peer's read loop (which marks
     /// gossip sightings) — the Java TxGossipObserver seam's equivalent.
     sent_tx_watch: crate::el::sent_tx::SharedSentTxWatch,
+    /// The opt-in eth_getLogs watch-list index (docs/eth-getlogs-design.md).
+    /// `None` until the host supplies a config. Brief-hold lock: appends and
+    /// queries are in-memory work; persistence happens on checkpoints and
+    /// stop, never under a network await.
+    log_index: std::sync::Mutex<Option<crate::el::logindex::LogIndex>>,
+    log_index_path: Option<std::path::PathBuf>,
 }
 
 /// The scan-cursor map plus its last TTL sweep — one lock covers both, so the
@@ -619,7 +631,54 @@ impl ElReader {
                 last_rebroadcast: std::time::Instant::now(),
             }),
             sent_tx_watch,
+            log_index: std::sync::Mutex::new(None),
+            log_index_path: cfg.log_index_path,
         })
+    }
+
+    /// Install (or replace) the eth_getLogs watch-list config: reload the
+    /// persisted index when it matches the config's fingerprint, else start
+    /// empty (re-index). See docs/eth-getlogs-design.md.
+    /// Returns false (and installs nothing) for an invalid config
+    /// (duplicate watch addresses). Re-applying a config whose watch-list
+    /// fingerprint matches the installed one only updates the enabled bit —
+    /// in-memory progress survives settings pokes; a genuinely changed
+    /// watch-list checkpoints the old index before replacing it.
+    pub fn set_log_index_config(&self, config: crate::el::logindex::LogIndexConfig) -> bool {
+        let Ok(mut slot) = self.log_index.lock() else {
+            return false;
+        };
+        if let Some(ix) = slot.as_mut() {
+            if ix.config().fingerprint() == config.fingerprint() {
+                ix.set_enabled(config.enabled);
+                return true;
+            }
+            if let Some(p) = self.log_index_path.as_deref() {
+                let _ = ix.persist(p);
+            }
+        }
+        let loaded = self
+            .log_index_path
+            .as_deref()
+            .and_then(|p| crate::el::logindex::LogIndex::load(&config, p));
+        let ix = match loaded {
+            Some(ix) => ix,
+            None => match crate::el::logindex::LogIndex::new(config) {
+                Ok(ix) => ix,
+                Err(_) => return false,
+            },
+        };
+        *slot = Some(ix);
+        true
+    }
+
+    /// Run `f` against the index if one is configured. The single accessor
+    /// for queries and status — callers never touch the lock directly.
+    pub fn with_log_index<T>(&self, f: impl FnOnce(&crate::el::logindex::LogIndex) -> T) -> Option<T> {
+        match self.log_index.lock() {
+            Ok(slot) => slot.as_ref().map(f),
+            Err(_) => None,
+        }
     }
 
     /// Count of live snap peers (for host status).
@@ -2395,6 +2454,13 @@ impl ElReader {
 
     /// Stop discovery + the pool.
     pub async fn stop(self) {
+        // Best-effort index checkpoint before teardown: a failed write only
+        // costs a re-index of the uncheckpointed tail, never correctness.
+        if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
+            if let Some(ix) = slot.as_ref() {
+                let _ = ix.persist(path);
+            }
+        }
         self.pool.stop().await;
         self.discovery.stop().await;
     }
