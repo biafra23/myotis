@@ -1921,7 +1921,14 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
     let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
         return false;
     };
-    reader.set_log_index_config(myotis_net::el::logindex::LogIndexConfig { enabled, watch })
+    let installed = reader.set_log_index_config(myotis_net::el::logindex::LogIndexConfig { enabled, watch });
+    if installed && enabled {
+        // Spawn (or keep) the head-follow appender inside the engine runtime.
+        let reader = reader.clone();
+        let _guard = engine.rt.enter();
+        reader.ensure_log_index_appender();
+    }
+    installed
 }
 
 /// Index status for hosts/UI: enabled, log count, backfill cursor, and per

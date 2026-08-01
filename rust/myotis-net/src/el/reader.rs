@@ -513,6 +513,8 @@ pub struct ElReader {
     /// stop, never under a network await.
     log_index: std::sync::Mutex<Option<crate::el::logindex::LogIndex>>,
     log_index_path: Option<std::path::PathBuf>,
+    /// The head-follow appender task (spawned on enable, aborted on stop).
+    log_index_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// The scan-cursor map plus its last TTL sweep — one lock covers both, so the
@@ -633,6 +635,7 @@ impl ElReader {
             sent_tx_watch,
             log_index: std::sync::Mutex::new(None),
             log_index_path: cfg.log_index_path,
+            log_index_task: std::sync::Mutex::new(None),
         })
     }
 
@@ -676,6 +679,108 @@ impl ElReader {
     /// resolution target for `latest`-style tags in eth_getLogs filters.
     pub fn head_block_number(&self) -> Option<u64> {
         self.anchored_head().ok().map(|(n, _)| n)
+    }
+
+    /// Spawn (or keep) the head-follow appender for this reader. Idempotent:
+    /// a live task is left alone. Caller must be inside a tokio runtime.
+    pub fn ensure_log_index_appender(self: &Arc<Self>) {
+        let Ok(mut slot) = self.log_index_task.lock() else {
+            return;
+        };
+        if slot.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        let reader = Arc::clone(self);
+        *slot = Some(tokio::spawn(async move {
+            // Slice-3 rule: append FINALIZED blocks only. Finalized never
+            // reorgs, so coverage stays honest with zero rewind machinery;
+            // optimistic-tail appending (with the design doc's rewind rule)
+            // and deep-gap bridging both belong to the backfill slice.
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(6));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut since_persist = 0u32;
+            loop {
+                tick.tick().await;
+                reader.log_index_append_tick(&mut since_persist).await;
+            }
+        }));
+    }
+
+    /// One appender tick: record finalized blocks from the append edge up to
+    /// the finalized head (bounded batch per tick).
+    async fn log_index_append_tick(&self, since_persist: &mut u32) {
+        let enabled = self.with_log_index(|ix| ix.config().enabled).unwrap_or(false);
+        if !enabled {
+            return;
+        }
+        let finalized = self.finalized_block_number();
+        if finalized == 0 {
+            return;
+        }
+        let edge = self.with_log_index(|ix| ix.append_edge()).flatten();
+        let start = match edge {
+            None => finalized, // fresh index: start at the finalized head
+            Some(e) if e <= finalized => e,
+            Some(_) => return, // caught up
+        };
+        // The verified whole-block path anchors a window from the target to
+        // the optimistic head; stay well inside its lookback cap. A deeper
+        // lag is the backfill walker's job — say so once per tick.
+        if finalized.saturating_sub(start) > 128 {
+            tracing::warn!(start, finalized, "log index append edge too far behind; waiting for backfill");
+            return;
+        }
+        let last = finalized.min(start.saturating_add(15));
+        for n in start..=last {
+            let receipts = match self.get_block_receipts(Some(n)).await {
+                Ok(Some(r)) => r,
+                Ok(None) => return, // future/unknown under this anchor — retry next tick
+                Err(e) => {
+                    tracing::debug!(block = n, error = %e, "log index append: receipts unavailable");
+                    return;
+                }
+            };
+            let logs: Vec<crate::el::logindex::StoredLog> = receipts
+                .iter()
+                .flat_map(|r| {
+                    r.receipt.logs.iter().enumerate().filter_map(move |(k, l)| {
+                        Some(crate::el::logindex::StoredLog {
+                            block_number: r.block_number,
+                            block_hash: r.block_hash,
+                            tx_hash: r.tx_hash,
+                            tx_index: u32::try_from(r.tx_index).ok()?,
+                            log_index: u32::try_from(r.log_index_base).ok()?.checked_add(u32::try_from(k).ok()?)?,
+                            address: l.address.as_slice().try_into().ok()?,
+                            topics: l.topics.iter().filter_map(|t| t.as_slice().try_into().ok()).collect(),
+                            data: l.data.clone(),
+                        })
+                    })
+                })
+                .collect();
+            let appended = self
+                .with_log_index(|_| ())
+                .is_some()
+                && match self.log_index.lock() {
+                    Ok(mut slot) => match slot.as_mut() {
+                        Some(ix) => ix.append_block(n, logs).is_ok(),
+                        None => false,
+                    },
+                    Err(_) => false,
+                };
+            if !appended {
+                return;
+            }
+            *since_persist += 1;
+        }
+        // Checkpoint roughly every 64 appended blocks (best-effort).
+        if *since_persist >= 64 {
+            if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
+                if let Some(ix) = slot.as_ref() {
+                    let _ = ix.persist(path);
+                }
+            }
+            *since_persist = 0;
+        }
     }
 
     /// Run `f` against the index if one is configured. The single accessor
@@ -2460,6 +2565,11 @@ impl ElReader {
 
     /// Stop discovery + the pool.
     pub async fn stop(self) {
+        if let Ok(mut t) = self.log_index_task.lock() {
+            if let Some(h) = t.take() {
+                h.abort();
+            }
+        }
         // Best-effort index checkpoint before teardown: a failed write only
         // costs a re-index of the uncheckpointed tail, never correctness.
         if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
