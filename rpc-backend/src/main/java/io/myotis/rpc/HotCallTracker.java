@@ -114,6 +114,9 @@ final class HotCallTracker {
      *  (nothing real is that big; the cap bounds tracker memory). */
     synchronized void record(byte[] from, byte[] to, BigInteger value, byte[] data, long nowMs) {
         if (to == null || to.length != 20) return;
+        // A malformed from would make Address.of throw during EVERY replay of this
+        // shape — reject it here so a bad shape can never enter the tracker.
+        if (from != null && from.length != 20) return;
         if (data != null && data.length > maxCalldataBytes) return;
         String key = shapeKey(from, to, value, data);
         Entry e = shapes.get(key);
@@ -172,6 +175,12 @@ final class HotCallTracker {
         if (e == null) return;   // aged out of the LRU while warming
         e.warmInFlight = false;
         if (!success) e.lastWarmFailedMs = nowMs;
+    }
+
+    /** Drop every tracked shape (purge-cache): the recorded calldata profile is
+     *  cleared and warming only resumes once the wallet re-qualifies its shapes. */
+    synchronized void clear() {
+        shapes.clear();
     }
 
     /** Number of tracked shapes (test hook). */

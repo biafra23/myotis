@@ -760,6 +760,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         pinnedHeadByNumber.clear();
         callResultCache.clear();
         estimateCache.clear();
+        hotCalls.clear();   // drop the recorded calldata profile along with the results
         lastGoodLatestBlock = null;
         lastGoodFeeHistory = null;
     }
@@ -1449,7 +1450,13 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         primeConfirmContracts(ctx);
                         // ...then replay the wallet's recurring calls against this head
                         // (async, heavy lane) so its next poll hits the result cache.
-                        replayHotCalls(ctx);
+                        // Guarded: an escaping throw here would land in the build's
+                        // catch and null out rpcCallCtx even though the head is good.
+                        try {
+                            replayHotCalls(ctx);
+                        } catch (Throwable t) {
+                            log.info("[rpc] hot-call replay skipped: " + unwrap(t));
+                        }
                     } catch (Throwable t) {
                         f.completeExceptionally(t);
                         synchronized (rpcCallCtxLock) {
@@ -1951,10 +1958,22 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         ? Bytes.wrap(data, 0, 4).toHexString() : "0x")
                 + " dataLen=" + (data == null ? 0 : data.length)
                 + " block=" + block;
-        // Track the shape for the replay-warm BEFORE head resolution: the calls most
-        // worth warming are exactly the ones currently failing ("no verified head",
-        // deadline timeouts) — they must still count as sightings.
-        if (replayWarmEnabled && to != null && to.length == 20) {
+        // Track the shape for the replay-warm BEFORE head resolution AND before the
+        // single-flight dedup: the calls most worth warming are exactly the ones
+        // currently failing ("no verified head", deadline timeouts), which never
+        // reach a completed execution — they must still count as sightings. (A
+        // consequence, accepted: a wallet firing N concurrent copies of one call
+        // records N sightings in one cycle — a call duplicated that hard is worth
+        // warming anyway.) Only HEAVY shapes are tracked: small calls execute in
+        // ms on the reserved interactive lane, and warming one would let a wallet
+        // call dedupe onto a heavy-lane warm — queued behind sweep warms — where
+        // untracked it would have been leader on the small lane. Only head-intent
+        // block tags: a shape pinned to a genuinely historical block would warm
+        // against every fresh head yet never be asked at that head's root.
+        if (replayWarmEnabled && to != null && to.length == 20
+                && (from == null || from.length == 20)
+                && data != null && data.length > EVM_SMALL_CALLDATA_MAX
+                && isHeadIntentTag(block)) {
             hotCalls.record(from, to, value, data, clock.elapsedMillis());
         }
         RpcCallContext h = verifiedHeadFor(block);
@@ -2097,19 +2116,27 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      */
     private void replayHotCalls(RpcCallContext ctx) {
         if (!replayWarmEnabled) return;
+        // Global in-flight cap, not just the per-head budget: heads rebuild every
+        // ~12s but a warm may run up to HOT_CALL_WARM_TIMEOUT_MS, so without this
+        // successive heads could stack up to maxTracked warms on the 2-thread heavy
+        // lane and starve non-hot wallet calls into queue-age skips.
+        int slots = HOT_CALL_MAX_WARMED_PER_HEAD - warmsInFlight.get();
+        if (slots <= 0) return;
         List<HotCallTracker.HotCall> shapes =
-                hotCalls.beginWarmables(clock.elapsedMillis(), HOT_CALL_MAX_WARMED_PER_HEAD);
+                hotCalls.beginWarmables(clock.elapsedMillis(), slots);
         for (HotCallTracker.HotCall c : shapes) {
             boolean submitted = false;
+            String flightKey = null;
+            CompletableFuture<byte[]> mine = null;
             try {
                 byte[] from = c.from();
                 byte[] to = c.to();
                 byte[] data = c.data();
-                String flightKey = callFlightKey(ctx, from, to, c.value(), data);
+                flightKey = callFlightKey(ctx, from, to, c.value(), data);
                 if (callResultCache.get(flightKey, clock.elapsedMillis()) != null) {
                     continue;   // already warm at this root
                 }
-                CompletableFuture<byte[]> mine = new CompletableFuture<>();
+                mine = new CompletableFuture<>();
                 if (inflightCalls.putIfAbsent(flightKey, mine) != null) {
                     continue;   // a wallet call is already executing this very shape+root
                 }
@@ -2118,42 +2145,80 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         + " dataLen=" + data.length + " block #" + ctx.blockNumber();
                 long t0 = clock.elapsedMillis();
                 final HotCallTracker.HotCall shape = c;
-                ctx.offchainExecutor()
+                final String key = flightKey;
+                final CompletableFuture<byte[]> flight = mine;
+                CompletableFuture<byte[]> exec = ctx.offchainExecutor()
                         .callView(from == null ? null : io.myotis.evm.Address.of(from),
-                                io.myotis.evm.Address.of(to), data, c.value(), ctx.blockCtx())
-                        // The warm has no waiter to give up on it, so bound it explicitly —
-                        // otherwise a dropped queue slot would leave the inflightCalls entry
-                        // and the per-shape warm flag stuck forever.
-                        .orTimeout(HOT_CALL_WARM_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                                io.myotis.evm.Address.of(to), data, c.value(), ctx.blockCtx());
+                warmsInFlight.incrementAndGet();
+                // A warm that finishes LATE (past the bookkeeping timeout below) still
+                // banks its verified result — same rationale as the wallet leader whose
+                // waiter timed out: the execution was paid for, the next poll should
+                // find it. Populated from the RAW future so the timeout can't drop it.
+                exec.thenAccept(out -> callResultCache.put(key,
+                        out != null ? out.clone() : null, clock.elapsedMillis()));
+                // The warm has no waiter to give up on it, so bound the BOOKKEEPING
+                // explicitly — otherwise a dropped queue slot would leave the
+                // inflightCalls entry and the per-shape warm flag stuck forever.
+                exec.orTimeout(HOT_CALL_WARM_TIMEOUT_MS, TimeUnit.MILLISECONDS)
                         .whenComplete((out, ex) -> {
                             try {
                                 if (ex != null) {
-                                    mine.completeExceptionally(ex);
+                                    flight.completeExceptionally(ex);
                                     log.info("[rpc] warm eth_call " + desc + " -> error after "
                                             + (clock.elapsedMillis() - t0) + "ms: "
                                             + describeEvmError(ex));
                                 } else {
-                                    // Same clone rationale as the rpcCall leader: never cache
-                                    // an array a waiter also received.
-                                    callResultCache.put(flightKey,
+                                    // Clone: never hand waiters the cached array.
+                                    callResultCache.put(key,
                                             out != null ? out.clone() : null, clock.elapsedMillis());
-                                    mine.complete(out);
+                                    flight.complete(out);
                                     log.info("[rpc] warm eth_call " + desc + " ok in "
                                             + (clock.elapsedMillis() - t0) + "ms");
                                 }
                             } finally {
-                                inflightCalls.remove(flightKey, mine);
+                                warmsInFlight.decrementAndGet();
+                                inflightCalls.remove(key, flight);
                                 hotCalls.endWarm(shape, ex == null, clock.elapsedMillis());
                             }
                         });
                 submitted = true;
             } catch (Throwable t) {
+                // Mirror the wallet-leader's sync-throw guard: if callView (or Address
+                // decoding, or the pool submit) threw AFTER this warm registered in
+                // inflightCalls, the never-completing future would stay registered and
+                // poison every later identical call into a guaranteed timeout.
+                if (mine != null && flightKey != null) {
+                    inflightCalls.remove(flightKey, mine);
+                    mine.completeExceptionally(t);
+                }
                 log.info("[rpc] warm eth_call submit failed: " + unwrap(t));
             } finally {
                 // Shapes that never started an execution (cache hit / already in flight /
                 // sync throw) must release their warm mark so the next head retries them.
                 if (!submitted) hotCalls.endWarm(c, true, clock.elapsedMillis());
             }
+        }
+    }
+
+    /** Warm executions currently in flight across ALL heads (see replayHotCalls). */
+    private final java.util.concurrent.atomic.AtomicInteger warmsInFlight =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    /** True when a call's block tag means "the head as the wallet sees it" — a
+     *  latest-ish tag, or a number pin at/near the optimistic head (wallets pin the
+     *  number they just fetched from us). Only these shapes are worth replay-warming:
+     *  a genuinely historical pin would re-execute against every fresh head yet never
+     *  be asked at that head's root. Lenient when the optimistic head is unknown. */
+    private boolean isHeadIntentTag(String block) {
+        if (isLatestTag(block) || "safe".equals(block) || "finalized".equals(block)) return true;
+        try {
+            long n = Long.decode(block);
+            BeaconSyncState bss = beaconSyncState;
+            long optimistic = bss != null ? bss.getOptimisticBlockNumber() : 0;
+            return optimistic <= 0 || n >= optimistic - RPC_BLOCK_NUM_LAG_TOLERANCE;
+        } catch (Exception e) {
+            return false;
         }
     }
 
