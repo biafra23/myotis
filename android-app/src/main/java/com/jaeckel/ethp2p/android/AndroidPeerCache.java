@@ -211,10 +211,15 @@ public final class AndroidPeerCache implements Closeable {
             rewriteAsync();
             LogBuffer.i(TAG, "evicted unreachable peer after " + count
                     + " consecutive connect failures: " + key);
-        } else if (count == CONNECT_FAILURE_DEMOTE) {
-            rewriteAsync(); // persist the crossing so a restart resumes the streak
-            LogBuffer.i(TAG, "deprioritized unreachable peer after " + count
-                    + " consecutive connect failures: " + key);
+        } else if (count % CONNECT_FAILURE_DEMOTE == 0) {
+            // Persist every 5th failure (not just the demote crossing) so a
+            // restart resumes the streak with at most 4 counts lost — keeping
+            // eviction genuinely cumulative across restarts.
+            rewriteAsync();
+            if (count == CONNECT_FAILURE_DEMOTE) {
+                LogBuffer.i(TAG, "deprioritized unreachable peer after " + count
+                        + " consecutive connect failures: " + key);
+            }
         }
     }
 

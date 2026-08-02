@@ -218,10 +218,15 @@ public final class PeerCache implements Closeable {
             rewriteAsync();
             log.info("[cache] evicted unreachable peer after {} consecutive connect failures: {}",
                     count, key.replace(SEP, ':'));
-        } else if (count == CONNECT_FAILURE_DEMOTE) {
-            rewriteAsync(); // persist the crossing so a restart resumes the streak
-            log.info("[cache] deprioritized unreachable peer after {} consecutive connect failures: {}",
-                    count, key.replace(SEP, ':'));
+        } else if (count % CONNECT_FAILURE_DEMOTE == 0) {
+            // Persist every 5th failure (not just the demote crossing) so a
+            // restart resumes the streak with at most 4 counts lost — keeping
+            // eviction genuinely cumulative across restarts.
+            rewriteAsync();
+            if (count == CONNECT_FAILURE_DEMOTE) {
+                log.info("[cache] deprioritized unreachable peer after {} consecutive connect failures: {}",
+                        count, key.replace(SEP, ':'));
+            }
         }
     }
 

@@ -430,7 +430,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 // divergent Status shape (e.g. Polygon's bor keeps the TD field
                 // eth/69 removed). Classify as incompatible so the dial callback
                 // blacklists the node id and applies the long backoff instead of
-                // re-dialing every transient window.
+                // re-dialing every transient window. Trade-off: if a future fork
+                // changes the Status shape and OUR decoder lags, healthy peers
+                // would be blacklisted for the rest of the run — the ERROR log
+                // above (with address + client id) is the tell for that case.
                 incompatibleNetwork = true;
                 ctx.close();
                 return;

@@ -70,10 +70,15 @@ class PeerCacheTest {
         assertTrue(body.contains("\tsnapok\tfails=" + PeerCache.CONNECT_FAILURE_DEMOTE),
                 "streak must be persisted alongside the verdict, got: " + body);
 
-        // A fresh instance resumes the streak (still demoted) and one more
-        // failure keeps counting from where the file left off.
+        // A fresh instance resumes the streak (still demoted), and further
+        // failures count on from where the file left off — eviction is
+        // cumulative across restarts.
         PeerCache reloaded = new PeerCache(file);
         assertEquals(PeerCache.SnapQuality.DENIED, only(reloaded).snapQuality());
+        for (int i = PeerCache.CONNECT_FAILURE_DEMOTE; i < PeerCache.CONNECT_FAILURE_EVICT; i++) {
+            reloaded.recordConnectFailure(A);
+        }
+        assertTrue(reloaded.load().isEmpty(), "resumed streak should reach eviction");
         reloaded.close();
     }
 

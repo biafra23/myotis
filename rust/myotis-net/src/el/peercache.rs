@@ -312,10 +312,14 @@ impl ElPeerCache {
             self.failures.remove(&k);
             self.dirty = true;
             tracing::info!(%addr, fails, "evicted unreachable peer from EL cache");
-        } else if e.fails == CONNECT_FAILURE_DEMOTE {
-            // Persist the crossing so a restart resumes the streak.
+        } else if e.fails % CONNECT_FAILURE_DEMOTE == 0 {
+            // Persist every 5th failure (not just the demote crossing) so a
+            // restart resumes the streak with at most 4 counts lost — keeping
+            // eviction genuinely cumulative across restarts (Java parity).
             self.dirty = true;
-            tracing::info!(%addr, fails = e.fails, "deprioritized unreachable EL cache peer");
+            if e.fails == CONNECT_FAILURE_DEMOTE {
+                tracing::info!(%addr, fails = e.fails, "deprioritized unreachable EL cache peer");
+            }
         }
     }
 

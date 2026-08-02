@@ -83,8 +83,12 @@ public final class ChainStack {
     private static final long DNS_REFRESH_HUNT_INTERVAL_MS = 60_000L;
 
     /** How recent a successful DNS ENR-tree resolve still counts as an
-     *  online signal for {@link #reportConnectFailure}. */
-    private static final long ONLINE_SIGNAL_MAX_AGE_MS = 10 * 60 * 1000L;
+     *  online signal for {@link #reportConnectFailure}. Deliberately short: a
+     *  device that drops offline right after a resolve must stop counting
+     *  failures before it can demote healthy cached peers (at the ~40s re-dial
+     *  cadence a 2-min window allows ~3 counts — under the demote threshold).
+     *  Undercounting while online merely slows demotion, which is fine. */
+    private static final long ONLINE_SIGNAL_MAX_AGE_MS = 2 * 60 * 1000L;
 
     /** Max time a verified read arriving on a paused stack is held while the wake completes. */
     public static final long WAKE_WAIT_CAP_MS = 90_000L;
@@ -1252,7 +1256,13 @@ public final class ChainStack {
      *  eventually evict long-dead peers) — but only while demonstrably online:
      *  a recent successful DNS ENR-tree resolve or any live RLPx connection.
      *  Without the guard, a machine that lost its network would count a failure
-     *  against every cached peer each maintainer cycle and decimate the cache. */
+     *  against every cached peer each maintainer cycle and decimate the cache.
+     *  Known divergence from the Rust twin: Rust also counts ECIES handshake
+     *  failures (a cached entry with a rotated node key can never handshake
+     *  again), while here the Netty connect future only surfaces pre-handshake
+     *  TCP failures — post-TCP failures land in the close callback, which can't
+     *  distinguish a stale-key peer from a healthy one disconnecting, so they
+     *  are deliberately not counted. */
     private void reportConnectFailure(InetSocketAddress address) {
         try {
             RLPxConnector conn = connector;
