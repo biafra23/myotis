@@ -52,6 +52,13 @@ const BACKOFF_BUSY: Duration = Duration::from_secs(60);
 /// matching cannot be steered by peer-controlled content. 0x04 says nothing
 /// about the peer's CHAIN (full wrong-chain nodes send it too), so busy only
 /// selects a backoff class — never a verified/known-good promotion.
+///
+/// Known divergences from the Java twin (deliberate, scope): (1) Java also
+/// flags 0x04 on a READY peer's disconnect; here a serving peer's close
+/// reason isn't plumbed through `ManagedPeer`, so its address is simply
+/// freed by `prune_closed` with no backoff. (2) The Java hunt log reports a
+/// rolling distinct-busy-peer count; the Rust hunt log doesn't (the per-dial
+/// `busy` debug field is the Rust-side signal).
 fn is_busy_disconnect(e: &str) -> bool {
     e.starts_with("peer disconnected") && e.ends_with("reason=4")
 }

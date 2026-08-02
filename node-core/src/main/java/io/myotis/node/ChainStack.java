@@ -464,6 +464,7 @@ public final class ChainStack {
         try { clPeerCache.close(); } catch (Throwable ignored) {}
         attempted.clear();
         backoff.clear();
+        busySeen.clear();
         blacklistedNodeIds.clear();
     }
 
@@ -1080,11 +1081,15 @@ public final class ChainStack {
                 try {
                     // Hunting: free a CONFIRMED snap server's TRANSIENT backoff so
                     // this pass dials it NOW. Confirmed = it served chain-verified
-                    // snap data. The backoff map holds transient (30s) and
-                    // incompatible (10min) entries under the same key, so only clear
-                    // entries within the transient window — a peer re-marked
+                    // snap data. The backoff map holds transient (30s), busy (60s),
+                    // and incompatible (10min) entries under the same key, so only
+                    // clear entries within the transient window — a peer re-marked
                     // incompatible after its confirm (post-fork lag) keeps its
                     // 10-min timer instead of being re-dialed every 10s tick.
+                    // A confirmed-but-BUSY server's 60s entry enters the clearable
+                    // window once ≤30s remain — intentional: in emergency mode an
+                    // eager re-dial of a known-good, merely-full server is exactly
+                    // the slot-farming we want.
                     if (hunting && p.snapQuality() == SnapQuality.CONFIRMED) {
                         String key = p.address().getHostString() + ":" + p.address().getPort();
                         backoff.computeIfPresent(key,
@@ -1293,6 +1298,17 @@ public final class ChainStack {
         busySeen.put(peerKey, now);
         if (busySeen.size() > 256) {
             busySeen.values().removeIf(t -> now - t > BUSY_SEEN_WINDOW_MS);
+            // Hard bound even when >256 are genuinely inside the window: drop
+            // oldest first — the counter is diagnostics, not bookkeeping.
+            while (busySeen.size() > 256) {
+                String oldest = null;
+                long oldestTs = Long.MAX_VALUE;
+                for (Map.Entry<String, Long> e : busySeen.entrySet()) {
+                    if (e.getValue() < oldestTs) { oldestTs = e.getValue(); oldest = e.getKey(); }
+                }
+                if (oldest == null) break;
+                busySeen.remove(oldest);
+            }
         }
     }
 
