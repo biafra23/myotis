@@ -715,7 +715,22 @@ public final class ChainStack {
             if (!headers.isEmpty()) {
                 log.debug("[{}] {} block header(s) received", network.name(), headers.size());
             }
-        }, (address, publicKeyHex, snap) -> peerCache.add(address, publicKeyHex, snap), serveStats);
+        }, (address, publicKeyHex, snap) -> {
+            peerCache.add(address, publicKeyHex, snap);
+            // Nudge discovery toward this PROVEN peer's neighbourhood: peers
+            // reached via the DNS pool or cache may never enter the discv4
+            // table on their own, so the random walk would never ask them for
+            // neighbours. UDP port is a guess (= TCP port, the devp2p default);
+            // a wrong guess just means no pong, which is harmless.
+            DiscV4Service d4 = discV4;
+            if (d4 != null) {
+                try {
+                    d4.probeEndpoint(new InetSocketAddress(address.getHostString(), address.getPort()));
+                } catch (Throwable ignored) {
+                    // discovery nudge must never break the READY path
+                }
+            }
+        }, serveStats);
         // Apply a window size set before start(): setServedBlockWindow may have run while
         // connector was still null (hosts read Settings before booting the stack).
         conn.servedWindow().setMaxWindow(servedBlockWindow);

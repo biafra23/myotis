@@ -39,6 +39,11 @@ public final class DiscV4Service implements AutoCloseable {
     private ScheduledExecutorService scheduler;
     private final Consumer<KademliaTable.Entry> onPeerDiscovered;
 
+    /** Endpoint ("ip:port") → last probe millis (see {@link #probeEndpoint}). */
+    private final ConcurrentHashMap<String, Long> probedEndpoints = new ConcurrentHashMap<>();
+    private static final long PROBE_MIN_INTERVAL_MS = 60 * 60 * 1000L; // 1h per endpoint
+    private static final int PROBE_MAP_MAX = 1024;
+
     public DiscV4Service(NodeKey nodeKey, List<InetSocketAddress> bootnodes,
                          Consumer<KademliaTable.Entry> onPeerDiscovered) {
         this.nodeKey = nodeKey;
@@ -91,6 +96,34 @@ public final class DiscV4Service implements AutoCloseable {
     public void findNode(InetSocketAddress target, Bytes nodeId) {
         Bytes packet = Packet.encodeFindNode(nodeKey, nodeId);
         sendRaw(packet, target);
+    }
+
+    /**
+     * Bond with a specific UDP endpoint so its neighbourhood enters the walk —
+     * used for peers PROVEN over TCP (reached eth READY) whose UDP side the
+     * table may never have seen (e.g. DNS-ENR-pool peers): the periodic refresh
+     * only FindNodes peers already in the table, so without this nudge a proven
+     * peer's neighbours are never asked for. The ping establishes the bond and
+     * (on pong) lands the peer in the table, where {@link #refreshTable} then
+     * samples it; the immediate FindNode is a best-effort head start (peers may
+     * ignore it until the bond completes — the refresh loop retries later).
+     * Per-address rate limit so repeated READY events don't re-probe.
+     */
+    public void probeEndpoint(InetSocketAddress udpAddr) {
+        if (channel == null || !channel.isActive()) return;
+        long now = System.currentTimeMillis();
+        String key = udpAddr.getHostString() + ":" + udpAddr.getPort();
+        // Bounded, coarse dedup: drop everything when oversized (probes are a
+        // nudge, not bookkeeping — losing history just allows a re-probe).
+        if (probedEndpoints.size() > PROBE_MAP_MAX) probedEndpoints.clear();
+        Long last = probedEndpoints.putIfAbsent(key, now);
+        if (last != null) {
+            if (now - last < PROBE_MIN_INTERVAL_MS) return;
+            probedEndpoints.put(key, now);
+        }
+        log.debug("[discv4] probing proven peer endpoint {}", udpAddr);
+        sendPing((InetSocketAddress) channel.localAddress(), udpAddr);
+        findNode(udpAddr, nodeKey.publicKeyBytes());
     }
 
     public KademliaTable table() {

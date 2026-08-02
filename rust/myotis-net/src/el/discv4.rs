@@ -385,6 +385,8 @@ pub struct Discv4Service {
     table: Arc<Mutex<KademliaTable>>,
     local_port: u16,
     stop_tx: tokio::sync::watch::Sender<bool>,
+    /// Probe requests into the service loop (see [`Discv4Service::probe_sender`]).
+    probe_tx: tokio::sync::mpsc::Sender<SocketAddr>,
     /// `Option` so `stop(self)` can take the handle while `Drop` (the
     /// forgot-to-stop path) leaves it `None`.
     task: Option<tokio::task::JoinHandle<()>>,
@@ -406,6 +408,7 @@ impl Discv4Service {
             .port();
         let table = Arc::new(Mutex::new(KademliaTable::new(key.node_id())));
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let (probe_tx, probe_rx) = tokio::sync::mpsc::channel(64);
         let loop_state = ServiceLoop {
             key,
             socket,
@@ -416,14 +419,27 @@ impl Discv4Service {
             events,
             pending_pings: HashMap::new(),
             limiter: PingRateLimiter::default(),
+            probe_rx,
+            probed: HashMap::new(),
         };
         let task = tokio::spawn(loop_state.run(stop_rx));
         Ok(Discv4Service {
             table,
             local_port,
             stop_tx,
+            probe_tx,
             task: Some(task),
         })
+    }
+
+    /// A clonable sender for probe requests: bond with a specific UDP endpoint
+    /// (the UDP-port guess for a peer PROVEN over TCP) so its neighbourhood
+    /// enters the walk — the refresh loop only FindNodes peers already in the
+    /// table, so a cache-/DNS-sourced peer's neighbours are otherwise never
+    /// asked for. Sends are best-effort (`try_send`; a full queue drops the
+    /// probe — it's a nudge, not bookkeeping).
+    pub fn probe_sender(&self) -> tokio::sync::mpsc::Sender<SocketAddr> {
+        self.probe_tx.clone()
     }
 
     pub fn table_size(&self) -> usize {
@@ -522,6 +538,10 @@ struct ServiceLoop {
     /// ping target → expected echo hash (the bond in flight).
     pending_pings: HashMap<SocketAddr, [u8; 32]>,
     limiter: PingRateLimiter,
+    /// Probe requests from the pool (proven-peer UDP endpoints to bond with).
+    probe_rx: tokio::sync::mpsc::Receiver<SocketAddr>,
+    /// Endpoint → last probe instant (1 h per-endpoint dedup, bounded).
+    probed: HashMap<SocketAddr, tokio::time::Instant>,
 }
 
 impl ServiceLoop {
@@ -546,6 +566,9 @@ impl ServiceLoop {
                     return;
                 }
                 _ = refresh.tick() => self.refresh().await,
+                // `Some(addr) =` disables this branch once all senders drop
+                // (recv() → None fails the pattern) — no busy-loop at shutdown.
+                Some(addr) = self.probe_rx.recv() => self.probe(addr).await,
                 recv = self.socket.recv_from(&mut buf) => {
                     let (n, sender) = match recv {
                         Ok(v) => v,
@@ -669,6 +692,31 @@ impl ServiceLoop {
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
         }
+    }
+
+    /// Bond with a proven peer's UDP endpoint (see [`Discv4Service::probe_sender`]):
+    /// ping (the pong lands it in the table, where `refresh` samples it) plus a
+    /// best-effort FindNode-self head start — the same ping-then-FindNode shape
+    /// `refresh` uses (Java `DiscV4Service.probeEndpoint` twin). Deduped per
+    /// endpoint (1 h) and bounded.
+    async fn probe(&mut self, addr: SocketAddr) {
+        const PROBE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+        const PROBE_MAP_MAX: usize = 1024;
+        let now = tokio::time::Instant::now();
+        // Coarse bound: losing history just allows a re-probe.
+        if self.probed.len() > PROBE_MAP_MAX {
+            self.probed.clear();
+        }
+        if let Some(last) = self.probed.get(&addr) {
+            if now.duration_since(*last) < PROBE_MIN_INTERVAL {
+                return;
+            }
+        }
+        self.probed.insert(addr, now);
+        tracing::debug!(%addr, "probing proven peer endpoint");
+        self.send_ping(addr).await;
+        let self_target = self.key.public_key_bytes().to_vec();
+        self.send_find_node(addr, &self_target).await;
     }
 
     /// 15 s refresh: empty table → re-ping bootnodes; else FindNode-self to
