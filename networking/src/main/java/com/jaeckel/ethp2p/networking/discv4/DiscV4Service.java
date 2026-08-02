@@ -111,19 +111,25 @@ public final class DiscV4Service implements AutoCloseable {
      */
     public void probeEndpoint(InetSocketAddress udpAddr) {
         if (channel == null || !channel.isActive()) return;
-        long now = System.currentTimeMillis();
         String key = udpAddr.getHostString() + ":" + udpAddr.getPort();
-        // Bounded, coarse dedup: drop everything when oversized (probes are a
-        // nudge, not bookkeeping — losing history just allows a re-probe).
-        if (probedEndpoints.size() > PROBE_MAP_MAX) probedEndpoints.clear();
-        Long last = probedEndpoints.putIfAbsent(key, now);
-        if (last != null) {
-            if (now - last < PROBE_MIN_INTERVAL_MS) return;
-            probedEndpoints.put(key, now);
-        }
+        if (!shouldProbe(key, System.currentTimeMillis())) return;
         log.debug("[discv4] probing proven peer endpoint {}", udpAddr);
         sendPing((InetSocketAddress) channel.localAddress(), udpAddr);
         findNode(udpAddr, nodeKey.publicKeyBytes());
+    }
+
+    /** Dedup/rate-limit decision for {@link #probeEndpoint} (package-private for
+     *  tests). Bounded, coarse: the map is dropped wholesale when oversized —
+     *  probes are a nudge, not bookkeeping, so losing history just allows an
+     *  early re-probe. Races between concurrent READY events are benign for the
+     *  same reason (worst case one duplicate ping+FindNode). */
+    boolean shouldProbe(String key, long now) {
+        if (probedEndpoints.size() > PROBE_MAP_MAX) probedEndpoints.clear();
+        Long last = probedEndpoints.putIfAbsent(key, now);
+        if (last == null) return true;
+        if (now - last < PROBE_MIN_INTERVAL_MS) return false;
+        probedEndpoints.put(key, now);
+        return true;
     }
 
     public KademliaTable table() {

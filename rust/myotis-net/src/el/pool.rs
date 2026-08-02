@@ -181,6 +181,17 @@ impl PoolInner {
         .await;
 
         let now = Instant::now();
+        // Any COMPATIBLE completed session (snap or not) proves the peer is on
+        // our network — nudge discovery toward its neighbourhood (UDP port
+        // guessed = TCP port, the devp2p default; a wrong guess just means no
+        // pong). The service dedups per endpoint. Same semantics as the Java
+        // twin, which probes on every eth-READY peer: a fork-verified plain-eth
+        // peer's neighbours may well serve snap.
+        if result.is_ok() {
+            if let Some(probe) = &self.probe {
+                let _ = probe.try_send(addr);
+            }
+        }
         match result {
             Ok(session) if session.snap => {
                 // INFO: the operator-visible signal that the EL found a usable
@@ -200,12 +211,6 @@ impl PoolInner {
                 // Keep `addr` in `attempted` while connected — dropped by
                 // prune_closed when the peer later closes.
                 self.peers.lock().await.push(PooledPeer { addr, peer });
-                // Nudge discovery toward this proven peer's neighbourhood (UDP
-                // port guessed = TCP port, the devp2p default; a wrong guess
-                // just means no pong). The service dedups per endpoint.
-                if let Some(probe) = &self.probe {
-                    let _ = probe.try_send(addr);
-                }
                 // Persist this proven snap-capable peer for warm-start next run.
                 // `add` only marks the cache dirty for a genuinely new peer, so
                 // `flush` no-ops on a re-connect.

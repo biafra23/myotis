@@ -725,7 +725,11 @@ public final class ChainStack {
             DiscV4Service d4 = discV4;
             if (d4 != null) {
                 try {
-                    d4.probeEndpoint(new InetSocketAddress(address.getHostString(), address.getPort()));
+                    // Pass the dial address through as-is (same host:port) —
+                    // constructing a fresh InetSocketAddress from a host string
+                    // could do a blocking DNS lookup on this Netty event-loop
+                    // thread if a dial source ever supplies hostnames.
+                    d4.probeEndpoint(address);
                 } catch (Throwable ignored) {
                     // discovery nudge must never break the READY path
                 }
