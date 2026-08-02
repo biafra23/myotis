@@ -167,7 +167,7 @@ pub fn tor_status() -> i32 {
 /// `nativeCreate`: allocate an id for a not-yet-started hosted chain (mainnet or
 /// sepolia). Returns the id (`>= 1`), `UNSUPPORTED_NETWORK` (-2) for a canonical
 /// network this engine doesn't host yet (gnosis), or `CREATE_FAILED` (-1) for an
-/// unknown name / unavailable runtime.
+/// unknown name, an unavailable runtime, or an uncreatable dataDir.
 pub fn create(network_name: &str, data_dir: &str) -> i64 {
     let Some(engine) = engine() else {
         return CREATE_FAILED;
@@ -185,6 +185,17 @@ pub fn create(network_name: &str, data_dir: &str) -> i64 {
     // `cl-peers[-net].cache`, mainnet keeping the bare name — so verified sync
     // state and proven LC servers survive restarts AND engine switches.
     if !data_dir.is_empty() {
+        // The dir may not exist yet (fresh host profile) — create it now.
+        // Without this, sync runs fine but every snapshot/cache write fails
+        // with ENOENT ("retrying on the next period advance", forever), so
+        // persistence is silently lost and every restart bootstraps cold.
+        // An uncreatable dataDir is a runtime-init failure the caller must
+        // see (honest error over silent degradation), hence CREATE_FAILED
+        // rather than warn-and-continue.
+        if let Err(e) = std::fs::create_dir_all(data_dir) {
+            tracing::warn!(data_dir, error = %e, "dataDir cannot be created");
+            return CREATE_FAILED;
+        }
         let suffix = if config.name == "mainnet" {
             String::new()
         } else {
@@ -1588,6 +1599,34 @@ const NOT_STARTED_FALLBACK: &str = concat!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_makes_the_data_dir() {
+        // A nested, not-yet-existing dataDir (fresh host profile) must exist
+        // after create — otherwise the sync loop's snapshot/cache writes fail
+        // with ENOENT forever and persistence is silently lost.
+        let dir = std::env::temp_dir()
+            .join(format!("myotis-create-dir-test-{}", std::process::id()))
+            .join("nested");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        let id = create("mainnet", dir.to_str().unwrap());
+        assert!(id >= 1, "create failed: {id}");
+        assert!(dir.is_dir(), "dataDir was not created");
+        stop(id);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn create_fails_loudly_on_uncreatable_data_dir() {
+        // A dataDir that cannot exist (path through a regular file) is a
+        // runtime-init failure the caller must see, not a warn-and-continue.
+        let file = std::env::temp_dir()
+            .join(format!("myotis-create-file-test-{}", std::process::id()));
+        std::fs::write(&file, b"not a dir").unwrap();
+        let id = create("mainnet", file.join("sub").to_str().unwrap());
+        assert_eq!(id, CREATE_FAILED);
+        let _ = std::fs::remove_file(&file);
+    }
 
     #[test]
     fn parse_ens_query_maps_every_method_correctly() {
