@@ -1,0 +1,20 @@
+[package]
+name = "myotis-node"
+version = "0.1.2"
+edition = "2021"
+description = "Node.js (napi-rs) binding over the myotis-engine C ABI — for Electron/Node hosts"
+license = "MIT OR Apache-2.0"
+
+[lib]
+# myotis-node.node — loaded by Node's process.dlopen via a thin JS loader.
+crate-type = ["cdylib"]
+
+[dependencies]
+# Linked for its exported C-ABI symbols (capi.rs) — the same seam the iOS
+# cinterop consumes, JSON shapes pinned by the cross-engine golden tests.
+myotis-engine = { path = "../myotis-engine" }
+napi = { version = "3", default-features = false, features = ["napi8"] }
+napi-derive = "3"
+
+[build-dependencies]
+napi-build = "2"

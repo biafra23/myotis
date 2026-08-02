@@ -1,0 +1,130 @@
+# Prebuilds for the myotis-node napi-rs binding (Electron/Node hosts).
+# Artifacts: myotis-node.<platform>-<arch>.node per matrix leg, attached to
+# the workflow run; wire into the release workflow once the binding stabilizes.
+#
+# NOTE: authored as part of the Node-binding spike; the windows leg doubles as
+# the first Windows compile check for the whole Rust workspace.
+name: node-binding
+
+on:
+  push:
+    branches: [feat/node-binding]
+    paths: ['rust/**', '.github/workflows/node-binding.yml']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: myotis-node.linux-x64-gnu.node
+            built: rust/target/x86_64-unknown-linux-gnu/release/libmyotis_node.so
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: myotis-node.linux-arm64-gnu.node
+            built: rust/target/aarch64-unknown-linux-gnu/release/libmyotis_node.so
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: myotis-node.darwin-arm64.node
+            built: rust/target/aarch64-apple-darwin/release/libmyotis_node.dylib
+          # x64 macOS is cross-compiled from the arm64 runner — GitHub's
+          # Intel-mac (macos-13) runners are scarce enough to starve the
+          # whole matrix (and smoke-windows behind it) in the queue.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: myotis-node.darwin-x64.node
+            built: rust/target/x86_64-apple-darwin/release/libmyotis_node.dylib
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: myotis-node.win32-x64-msvc.node
+            built: rust/target/x86_64-pc-windows-msvc/release/myotis_node.dll
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build
+        working-directory: rust
+        run: cargo build -p myotis-node --release --target ${{ matrix.target }}
+      - name: Rename to .node
+        shell: bash
+        run: cp "${{ matrix.built }}" "${{ matrix.artifact }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+  # Control experiment for the Windows smoke: same mainnet smoke on a Linux
+  # runner. First Windows attempt discovered 160 peers over UDP but held ZERO
+  # TCP/libp2p connections in 55 min — this job disambiguates "Windows socket
+  # problem in the engine" from "Ethereum peers deprioritize/ban datacenter
+  # (Azure) IPs": if Linux-on-Azure also gets no peers, it's the environment.
+  smoke-linux:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: myotis-node.linux-x64-gnu.node
+      - name: Restore sync snapshot cache
+        uses: actions/cache@v4
+        with:
+          path: myotis-data
+          key: myotis-smoke-data-linux-${{ github.run_id }}
+          restore-keys: myotis-smoke-data-linux-
+      - name: Ensure data dir exists
+        run: mkdir -p "${{ github.workspace }}/myotis-data"
+      - name: Smoke — sync mainnet + verified reads
+        working-directory: rust/myotis-node
+        env:
+          MYOTIS_SMOKE_TIMEOUT_MIN: '55'
+        run: node smoke.mjs "${{ github.workspace }}/myotis-data" "${{ github.workspace }}/myotis-node.linux-x64-gnu.node"
+
+  # Full runtime validation on Windows: unit-test the workspace, then run the
+  # real smoke — sync mainnet over devp2p/libp2p from the runner, reach
+  # SYNCED, and serve verified reads (ENS, contenthash, account proof)
+  # through the .node addon. The sync snapshot is cached across runs, so the
+  # first run pays the cold checkpoint catch-up (~30-40 min) and later runs
+  # warm-restart in seconds.
+  smoke-windows:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Unit tests (whole workspace, first run on Windows)
+        working-directory: rust
+        run: cargo test --workspace
+      - uses: actions/download-artifact@v4
+        with:
+          name: myotis-node.win32-x64-msvc.node
+      - name: Restore sync snapshot cache
+        uses: actions/cache@v4
+        with:
+          path: myotis-data
+          key: myotis-smoke-data-win-${{ github.run_id }}
+          restore-keys: myotis-smoke-data-win-
+      - name: Ensure data dir exists
+        # The engine does not create data_dir itself yet (fix pending in a
+        # separate PR); without this, sync works but persistence — and this
+        # job's snapshot cache — silently no-ops.
+        run: New-Item -ItemType Directory -Force -Path "${{ github.workspace }}\myotis-data" | Out-Null
+      - name: Smoke — sync mainnet + verified reads
+        working-directory: rust/myotis-node
+        env:
+          MYOTIS_SMOKE_TIMEOUT_MIN: '55'
+        run: node smoke.mjs ${{ github.workspace }}\myotis-data ${{ github.workspace }}\myotis-node.win32-x64-msvc.node

@@ -29,7 +29,7 @@
 
 [workspace]
 resolver = "2"
-members = ["myotis-bls", "myotis-consensus", "myotis-core", "myotis-evm", "myotis-engine", "myotis-net", "uniffi-bindgen"]
+members = ["myotis-bls", "myotis-consensus", "myotis-core", "myotis-evm", "myotis-engine", "myotis-net", "myotis-node", "uniffi-bindgen"]
 # tor-poc (docs/privacy-and-tor.md §3 proof-of-concept) is a STANDALONE crate,
 # excluded on purpose: it pulls the whole Arti dependency tree, which must never
 # burden the pure-engine build or CI. It depends on myotis-net/myotis-core by
