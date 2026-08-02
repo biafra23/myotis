@@ -124,6 +124,14 @@ public final class ChainStack {
     private volatile List<Enr> dnsElPool = List.of();
     private final AtomicBoolean dnsResolving = new AtomicBoolean(false);
     private volatile long lastDnsResolveMs = 0L;
+    /** Last DNS ENR-tree walk that returned at least one ENR. Distinct from
+     *  {@link #lastDnsResolveMs}: the resolver swallows per-tree failures and
+     *  returns an empty list offline, and the walk itself is throttled by
+     *  {@code lastDnsResolveMs} — so a FAILED walk must still count for the
+     *  refresh cadence but must NOT count as an online signal, or an offline
+     *  hunting machine (60s re-walks < the 2-min window) would keep the
+     *  connect-failure gate permanently open and decimate its own cache. */
+    private volatile long lastDnsSuccessMs = 0L;
     private volatile long dnsDialWindowStartMs = 0L;
     private final AtomicInteger dnsDialsInWindow = new AtomicInteger(0);
     private volatile ScheduledExecutorService peerMaintainer;
@@ -1120,6 +1128,7 @@ public final class ChainStack {
             // drop the result instead of merging into / writing the pool of a dead stack.
             if (phase.get() != RUNNING) return;
             lastDnsResolveMs = System.currentTimeMillis();
+            if (!resolved.isEmpty()) lastDnsSuccessMs = lastDnsResolveMs;
 
             byte[] ourFork = network.forkIdHash();
             LinkedHashMap<String, Enr> merged = new LinkedHashMap<>();
@@ -1160,7 +1169,8 @@ public final class ChainStack {
 
     /** Dial rank for a DNS-pool ENR: 0 = carries an eth forkid (fork-verified on
      *  merge — mismatches never enter the pool), 1 = no forkid (unverifiable until
-     *  the Status handshake). A malformed entry ranks last. */
+     *  the Status handshake). A malformed entry shares rank 1 — both are
+     *  "unverifiable until dialed", so they compete equally behind verified ones. */
     private static int enrForkRank(Enr e) {
         try {
             return e.ethForkIdHash().isPresent() ? 0 : 1;
@@ -1266,7 +1276,7 @@ public final class ChainStack {
     private void reportConnectFailure(InetSocketAddress address) {
         try {
             RLPxConnector conn = connector;
-            boolean online = System.currentTimeMillis() - lastDnsResolveMs < ONLINE_SIGNAL_MAX_AGE_MS
+            boolean online = System.currentTimeMillis() - lastDnsSuccessMs < ONLINE_SIGNAL_MAX_AGE_MS
                     || (conn != null && !conn.getActivePeers().isEmpty());
             if (online) peerCache.recordConnectFailure(address);
         } catch (Throwable t) {

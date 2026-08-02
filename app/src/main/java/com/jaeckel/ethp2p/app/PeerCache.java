@@ -145,8 +145,10 @@ public final class PeerCache implements Closeable {
         String key = keyOf(address);
         if (entries.containsKey(key)) {
             // Re-handshake of a known peer: it's reachable — clear the connect
-            // failure streak (persisted lazily, on the next rewrite).
-            connectFailures.remove(key);
+            // failure streak. If a streak was persisted, rewrite the file too:
+            // a memory-only reset would be resurrected by the next restart and
+            // re-demote an actually reachable peer.
+            if (connectFailures.remove(key) != null) rewriteAsync();
             return;
         }
         entries.put(key, new PeerRec(publicKeyHex, snap));
@@ -168,8 +170,10 @@ public final class PeerCache implements Closeable {
     public synchronized void recordSnapServed(InetSocketAddress address) {
         String key = keyOf(address);
         snapFailures.remove(key);
-        connectFailures.remove(key);
-        boolean changed = snapConfirmed.add(key);
+        // A cleared persisted streak counts as a change: without the rewrite,
+        // fails=N would survive on disk and re-demote the peer after a restart.
+        boolean changed = connectFailures.remove(key) != null;
+        changed |= snapConfirmed.add(key);
         changed |= snapDenied.remove(key);
         if (changed) rewriteAsync();
     }

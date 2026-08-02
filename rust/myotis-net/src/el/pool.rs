@@ -133,9 +133,15 @@ impl PoolInner {
         // the sole server usually means WE asked for a root outside its
         // snapshot window (stale local head), not that the peer is bad — and
         // three such strikes would persist a snapbad verdict against the one
-        // peer still serving us (twin of the Java benchUnlessLastServing).
-        if !served && self.peers.lock().await.len() <= 1 {
-            tracing::debug!(%addr, "skipping snap-failure verdict — sole serving peer");
+        // peer still serving us. Twin of the Java benchUnlessLastServing scan
+        // (`h != failed`): the guard keys on whether any OTHER peer is live,
+        // not on pool size — a lone pooled peer at a DIFFERENT address means
+        // the failing one isn't our last resort and the strike must count.
+        // (Deliberate asymmetry with Java: this skips a PERSISTED verdict
+        // step, Java skips a transient 30s bench — same trigger, harsher
+        // consequence here, hence the same protection.)
+        if !served && !self.peers.lock().await.iter().any(|p| p.addr != addr) {
+            tracing::debug!(%addr, "skipping snap-failure verdict — no other serving peer");
             return;
         }
         let mut cache = self.cache.lock().await;
@@ -268,7 +274,13 @@ impl PoolInner {
                 // address off and free it from `attempted`. Still proof the
                 // address is alive: clear any connect-failure streak.
                 tracing::debug!(%addr, eth = session.eth_version, "el dial: connected but no snap/1");
-                self.cache.lock().await.record_connect_success(addr);
+                {
+                    // Flush so a cleared persisted streak lands on disk now —
+                    // this path may be the only cache event the peer ever gets.
+                    let mut cache = self.cache.lock().await;
+                    cache.record_connect_success(addr);
+                    cache.flush();
+                }
                 self.record_backoff(addr, false, now).await;
                 self.attempted.lock().await.remove(&addr);
             }

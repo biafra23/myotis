@@ -83,6 +83,24 @@ class PeerCacheTest {
     }
 
     @Test
+    void clearingAPersistedStreakRewritesTheFile(@TempDir Path dir) throws Exception {
+        Path file = dir.resolve("peers.cache");
+        Files.writeString(file, "1.2.3.4\t30303\t" + PK + "\t1\tsnapok\tfails=7\n");
+        PeerCache cache = new PeerCache(file);
+        assertEquals(PeerCache.SnapQuality.DENIED, only(cache).snapQuality());
+
+        // The peer re-handshakes: the reset must reach the FILE, or the next
+        // restart resurrects fails=7 and re-demotes a reachable peer.
+        cache.add(A, PK, true);
+        assertEquals(PeerCache.SnapQuality.CONFIRMED, only(cache).snapQuality());
+        cache.close();
+
+        PeerCache reloaded = new PeerCache(file);
+        assertEquals(PeerCache.SnapQuality.CONFIRMED, only(reloaded).snapQuality());
+        reloaded.close();
+    }
+
+    @Test
     void parsesLinesWithUnknownTokensAndBadFailsCount(@TempDir Path dir) throws Exception {
         Path file = dir.resolve("peers.cache");
         Files.writeString(file,

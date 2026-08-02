@@ -261,9 +261,14 @@ impl ElPeerCache {
                     e.snap = snap;
                     self.dirty = true;
                 }
-                // Reachable again — clear the connect-failure streak (persisted
-                // lazily, on the next dirty flush; Java parity).
-                e.fails = 0;
+                // Reachable again — clear the connect-failure streak. A cleared
+                // PERSISTED streak must dirty the cache: a memory-only reset
+                // would be resurrected on restart and re-demote a reachable
+                // peer (Java parity).
+                if e.fails != 0 {
+                    e.fails = 0;
+                    self.dirty = true;
+                }
             }
             None => {
                 self.entries.insert(
@@ -287,7 +292,12 @@ impl ElPeerCache {
             return;
         }
         if let Some(e) = self.entries.get_mut(&addr_key(addr)) {
-            e.fails = 0;
+            // Dirty on a real clear so a persisted fails=N can't be
+            // resurrected by the next restart.
+            if e.fails != 0 {
+                e.fails = 0;
+                self.dirty = true;
+            }
         }
     }
 
@@ -332,7 +342,12 @@ impl ElPeerCache {
         let k = addr_key(addr);
         self.failures.remove(&k);
         if let Some(e) = self.entries.get_mut(&k) {
-            e.fails = 0;
+            // Dirty on a real clear so a persisted fails=N can't be
+            // resurrected by the next restart.
+            if e.fails != 0 {
+                e.fails = 0;
+                self.dirty = true;
+            }
             if e.quality != SnapQuality::Confirmed {
                 e.quality = SnapQuality::Confirmed;
                 self.dirty = true;
@@ -544,6 +559,25 @@ mod tests {
         // Unknown addresses never create entries.
         c.record_connect_failure("9.9.9.9:1".parse().unwrap());
         assert!(c.is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clearing_a_persisted_streak_flushes_the_file() {
+        let hex = format!("0x{}", "ab".repeat(64));
+        let text = format!("1.2.3.4\t30303\t{hex}\t1\tsnapok\tfails=7\n");
+        let path = std::env::temp_dir().join("myotis-elcache-streakclear.cache");
+        fs::write(&path, text).unwrap();
+        let mut c = ElPeerCache::load(path.clone());
+        assert_eq!(c.peers()[0].quality, SnapQuality::Denied);
+
+        // The peer re-handshakes: the reset must reach the FILE, or the next
+        // restart resurrects fails=7 and re-demotes a reachable peer.
+        c.add("1.2.3.4:30303".parse().unwrap(), &[0xab; 64], true);
+        c.flush();
+        let reloaded = ElPeerCache::load(path.clone());
+        assert_eq!(reloaded.peers()[0].quality, SnapQuality::Confirmed);
+        assert!(!fs::read_to_string(&path).unwrap().contains("fails="));
         let _ = fs::remove_file(&path);
     }
 
