@@ -79,6 +79,17 @@ public final class ChainStack {
      *  the DNS dial budget, and shortens the DNS re-walk interval. The Rust
      *  engine's pool maintainer applies the same trigger (EL_HUNT_STALL). */
     static final long EL_HUNT_STALL_MS = 60_000L;
+
+    /** Backoff for peers that rejected us with TooManyPeers (0x04): alive, just
+     *  full. Longer than transient (halves the dial burn on saturated networks)
+     *  but short enough to keep farming freed slots. */
+    static final long BACKOFF_BUSY_MS = 60_000L;
+
+    /** Distinct peers that rejected us with TooManyPeers recently (rolling
+     *  window) — hunt diagnostics: distinguishes "the network is full" from
+     *  "the network is dead" when the serving pool is empty. */
+    private final Map<String, Long> busySeen = new ConcurrentHashMap<>();
+    private static final long BUSY_SEEN_WINDOW_MS = 10 * 60 * 1000L;
     /** DNS ENR re-walk interval while the EL hunt is engaged (vs 4 min normally). */
     private static final long DNS_REFRESH_HUNT_INTERVAL_MS = 60_000L;
 
@@ -686,10 +697,12 @@ public final class ChainStack {
             dialed++;
             final String key = peerKey;
             try {
-                connector.connect(pe.address(), pe.pubkey(), (incompatible, nodeIdHex) -> {
+                connector.connect(pe.address(), pe.pubkey(), (incompatible, busy, nodeIdHex) -> {
                             if (incompatible) blacklistedNodeIds.add(nodeIdHex);
+                            if (busy) noteBusy(key);
                             backoff.putIfAbsent(key, System.currentTimeMillis()
-                                    + (incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS));
+                                    + (incompatible ? BACKOFF_INCOMPATIBLE_MS
+                                       : busy ? BACKOFF_BUSY_MS : BACKOFF_TRANSIENT_MS));
                             attempted.remove(key);
                         })
                         .addListener(future -> { if (!future.isSuccess()) attempted.remove(key); });
@@ -749,9 +762,11 @@ public final class ChainStack {
             try {
                 SECP256K1.PublicKey pubKey = SECP256K1.PublicKey.fromBytes(
                         Bytes.fromHexString(peer.publicKeyHex()));
-                connector.connect(peer.address(), pubKey, (incompatible, nodeIdHex) -> {
+                connector.connect(peer.address(), pubKey, (incompatible, busy, nodeIdHex) -> {
                             if (incompatible) blacklistedNodeIds.add(nodeIdHex);
-                            long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
+                            if (busy) noteBusy(peerKey);
+                            long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS
+                                    : busy ? BACKOFF_BUSY_MS : BACKOFF_TRANSIENT_MS;
                             backoff.putIfAbsent(peerKey, System.currentTimeMillis() + backoffMs);
                             attempted.remove(peerKey);
                         })
@@ -777,9 +792,11 @@ public final class ChainStack {
                 if (!attempted.add(peerKey)) continue;
                 directDialed++;
                 final String key = peerKey;
-                connector.connect(peerTcp, pub.get(), (incompatible, nodeIdHex) -> {
+                connector.connect(peerTcp, pub.get(), (incompatible, busy, nodeIdHex) -> {
                             if (incompatible) blacklistedNodeIds.add(nodeIdHex);
-                            long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
+                            if (busy) noteBusy(key);
+                            long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS
+                                    : busy ? BACKOFF_BUSY_MS : BACKOFF_TRANSIENT_MS;
                             backoff.putIfAbsent(key, System.currentTimeMillis() + backoffMs);
                             attempted.remove(key);
                         })
@@ -958,9 +975,11 @@ public final class ChainStack {
             Bytes nodeId = entry.nodeId();
             if (nodeId.size() != 64) { attempted.remove(peerKey); return; }
             SECP256K1.PublicKey peerPubkey = SECP256K1.PublicKey.fromBytes(nodeId);
-            connector.connect(peerTcp, peerPubkey, (incompatible, nodeIdHex) -> {
+            connector.connect(peerTcp, peerPubkey, (incompatible, busy, nodeIdHex) -> {
                         if (incompatible) blacklistedNodeIds.add(nodeIdHex);
-                        long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
+                        if (busy) noteBusy(peerKey);
+                        long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS
+                                    : busy ? BACKOFF_BUSY_MS : BACKOFF_TRANSIENT_MS;
                         backoff.putIfAbsent(peerKey, System.currentTimeMillis() + backoffMs);
                         attempted.remove(peerKey);
                     })
@@ -1043,7 +1062,9 @@ public final class ChainStack {
                 elHunting = true;
                 log.info("[{}][peers] EL hunt engaged — snap serving pool empty {}s "
                         + "(bypassing transient backoffs for confirmed snap servers, "
-                        + "boosted DNS budget)", network.name(), EL_HUNT_STALL_MS / 1000);
+                        + "boosted DNS budget; {} distinct busy peer(s) in the last {} min "
+                        + "— busy means full-not-dead)", network.name(), EL_HUNT_STALL_MS / 1000,
+                        busySeenCount(), BUSY_SEEN_WINDOW_MS / 60_000);
             }
             if (snapPeers >= targetSnapPeers) return;
             log.info("[{}][peers] {} snap peer(s) < target {}; re-dialing cached + DNS pool",
@@ -1211,9 +1232,11 @@ public final class ChainStack {
             }
             if (attempted.size() >= MAX_ATTEMPTED || !attempted.add(peerKey)) return false;
             final String key = peerKey;
-            conn.connect(peerTcp, pub.get(), (incompatible, idHex) -> {
+            conn.connect(peerTcp, pub.get(), (incompatible, busy, idHex) -> {
                 if (incompatible) blacklistedNodeIds.add(idHex);
-                long ms = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
+                if (busy) noteBusy(key);
+                long ms = incompatible ? BACKOFF_INCOMPATIBLE_MS
+                        : busy ? BACKOFF_BUSY_MS : BACKOFF_TRANSIENT_MS;
                 backoff.putIfAbsent(key, System.currentTimeMillis() + ms);
                 attempted.remove(key);
             }).addListener(future -> {
@@ -1242,9 +1265,11 @@ public final class ChainStack {
         if (attempted.size() >= MAX_ATTEMPTED || !attempted.add(peerKey)) return;
         try {
             SECP256K1.PublicKey pubKey = SECP256K1.PublicKey.fromBytes(Bytes.fromHexString(p.publicKeyHex()));
-            conn.connect(p.address(), pubKey, (incompatible, idHex) -> {
+            conn.connect(p.address(), pubKey, (incompatible, busy, idHex) -> {
                 if (incompatible) blacklistedNodeIds.add(idHex);
-                long ms = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
+                if (busy) noteBusy(peerKey);
+                long ms = incompatible ? BACKOFF_INCOMPATIBLE_MS
+                        : busy ? BACKOFF_BUSY_MS : BACKOFF_TRANSIENT_MS;
                 backoff.putIfAbsent(peerKey, System.currentTimeMillis() + ms);
                 attempted.remove(peerKey);
             }).addListener(future -> {
@@ -1260,6 +1285,22 @@ public final class ChainStack {
         } catch (Exception e) {
             attempted.remove(peerKey);
         }
+    }
+
+    /** Note a TooManyPeers rejection for hunt diagnostics (bounded, rolling). */
+    private void noteBusy(String peerKey) {
+        long now = System.currentTimeMillis();
+        busySeen.put(peerKey, now);
+        if (busySeen.size() > 256) {
+            busySeen.values().removeIf(t -> now - t > BUSY_SEEN_WINDOW_MS);
+        }
+    }
+
+    /** Distinct busy peers seen inside the rolling window (prunes as it counts). */
+    private int busySeenCount() {
+        long now = System.currentTimeMillis();
+        busySeen.values().removeIf(t -> now - t > BUSY_SEEN_WINDOW_MS);
+        return busySeen.size();
     }
 
     /** Report a TCP-level dial failure to the peer cache (streaks demote and

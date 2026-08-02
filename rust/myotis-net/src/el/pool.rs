@@ -41,6 +41,20 @@ const BACKOFF_INCOMPATIBLE: Duration = Duration::from_secs(10 * 60);
 /// Transient failures / not-snap peers: a short cool-off (Java's
 /// `BACKOFF_TRANSIENT_MS`).
 const BACKOFF_TRANSIENT: Duration = Duration::from_secs(30);
+/// TooManyPeers (Disconnect 0x04) rejections: the peer is ALIVE, just full —
+/// retry patiently enough to halve the dial burn, often enough to keep
+/// farming freed slots (Java's `BACKOFF_BUSY_MS`).
+const BACKOFF_BUSY: Duration = Duration::from_secs(60);
+
+/// True when a dial error is a TooManyPeers rejection. The session's
+/// disconnect errors are fixed-format ("peer disconnected[ during
+/// handshake]: reason=N" — see `describe_disconnect`), so prefix+suffix
+/// matching cannot be steered by peer-controlled content. 0x04 says nothing
+/// about the peer's CHAIN (full wrong-chain nodes send it too), so busy only
+/// selects a backoff class — never a verified/known-good promotion.
+fn is_busy_disconnect(e: &str) -> bool {
+    e.starts_with("peer disconnected") && e.ends_with("reason=4")
+}
 /// How often the maintainer checks the pool and tops it back up to target
 /// (Java's `maintainSnapPeers` fixed delay).
 const MAINTAINER_INTERVAL: Duration = Duration::from_secs(10);
@@ -193,10 +207,8 @@ impl PoolInner {
         peers.len()
     }
 
-    /// Record an address backoff. `long` selects the wrong-chain (10 min) vs the
-    /// transient (30 s) window.
-    async fn record_backoff(&self, addr: SocketAddr, long: bool, now: Instant) {
-        let window = if long { BACKOFF_INCOMPATIBLE } else { BACKOFF_TRANSIENT };
+    /// Record an address backoff for `window` (one of the BACKOFF_* consts).
+    async fn record_backoff(&self, addr: SocketAddr, window: Duration, now: Instant) {
         let mut backoff = self.backoff.lock().await;
         // Entries are normally dropped when their address resurfaces as a
         // candidate, but an address that never comes back would linger forever.
@@ -228,7 +240,7 @@ impl PoolInner {
                     cache.record_connect_failure(addr);
                     cache.flush();
                 }
-                self.record_backoff(addr, false, Instant::now()).await;
+                self.record_backoff(addr, BACKOFF_TRANSIENT, Instant::now()).await;
                 self.attempted.lock().await.remove(&addr);
                 return;
             }
@@ -281,7 +293,7 @@ impl PoolInner {
                     cache.record_connect_success(addr);
                     cache.flush();
                 }
-                self.record_backoff(addr, false, now).await;
+                self.record_backoff(addr, BACKOFF_TRANSIENT, now).await;
                 self.attempted.lock().await.remove(&addr);
             }
             Err(e) => {
@@ -296,11 +308,19 @@ impl PoolInner {
                 // steered by a hostile peer.
                 let incompatible =
                     e.starts_with("incompatible peer") || e.starts_with("peer Status decode");
-                tracing::debug!(%addr, incompatible, error = %e, "el dial: failed");
+                let busy = is_busy_disconnect(&e);
+                tracing::debug!(%addr, incompatible, busy, error = %e, "el dial: failed");
                 if incompatible {
                     self.blacklist.lock().await.insert(pubkey);
                 }
-                self.record_backoff(addr, incompatible, now).await;
+                let window = if incompatible {
+                    BACKOFF_INCOMPATIBLE
+                } else if busy {
+                    BACKOFF_BUSY
+                } else {
+                    BACKOFF_TRANSIENT
+                };
+                self.record_backoff(addr, window, now).await;
                 self.attempted.lock().await.remove(&addr);
             }
         }
@@ -830,6 +850,18 @@ mod tests {
 
         pool.stop().await;
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn busy_disconnect_classification_is_prefix_and_suffix_bound() {
+        assert!(is_busy_disconnect("peer disconnected: reason=4"));
+        assert!(is_busy_disconnect("peer disconnected during handshake: reason=4"));
+        // Other reasons and other error shapes are NOT busy.
+        assert!(!is_busy_disconnect("peer disconnected: reason=3"));
+        assert!(!is_busy_disconnect("peer disconnected: reason=42"));
+        assert!(!is_busy_disconnect("incompatible peer: networkId=137 genesis=..."));
+        // A peer-controlled client id echoed mid-string can't fake the prefix.
+        assert!(!is_busy_disconnect("expected Status, got code 0x04 from peer disconnected: reason=4x"));
     }
 
     #[test]

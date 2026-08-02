@@ -87,6 +87,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private volatile org.apache.tuweni.bytes.Bytes32 peerBestBlockHash; // full hash for queries
     private volatile String ourBestHash;  // what we claimed in Status
     private volatile boolean incompatibleNetwork; // confirmed wrong chain
+    /** Peer sent Disconnect(0x04 TooManyPeers): a healthy node on our network
+     *  with no free slots — worth patient retries, NOT a dead/bad peer. */
+    private volatile boolean peerBusy;
+    private static final int DISC_TOO_MANY_PEERS = 0x04;
     private volatile boolean snapNegotiated = false;
     private volatile String clientId;
     /** How long an empty snap response benches a peer from the serving pool. NOT permanent:
@@ -402,6 +406,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             sendStatus(ctx);
         } else if (msg.code() == P2P_DISCONNECT) {
             int reason = decodeDisconnectReason(msg.payload());
+            if (reason == DISC_TOO_MANY_PEERS) peerBusy = true;
             log.info("[eth] Peer {} disconnected during Hello (reason={}/{})",
                 remoteAddress, reason, disconnectReasonName(reason));
             ctx.close();
@@ -476,6 +481,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             sendPong(ctx);
         } else if (msg.code() == P2P_DISCONNECT) {
             int reason = decodeDisconnectReason(msg.payload());
+            if (reason == DISC_TOO_MANY_PEERS) peerBusy = true;
             log.info("[eth] Peer {} ({}) disconnected during Status exchange (reason={}/{}, eth/{})",
                 remoteAddress, clientId != null ? clientId : "unknown",
                 reason, disconnectReasonName(reason), negotiatedEthVersion);
@@ -708,6 +714,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             case P2P_PING -> sendPong(ctx);
             case P2P_DISCONNECT -> {
                 int reason = decodeDisconnectReason(msg.payload());
+                if (reason == DISC_TOO_MANY_PEERS) peerBusy = true;
                 log.info("[eth] Peer {} ({}) disconnected in READY (reason={}/{})",
                     remoteAddress, clientId != null ? clientId : "unknown",
                     reason, disconnectReasonName(reason));
@@ -1570,6 +1577,11 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     /** Returns true if this peer was confirmed on an incompatible network. */
     public boolean isIncompatibleNetwork() {
         return incompatibleNetwork;
+    }
+
+    /** Returns true if this peer rejected/dropped us with TooManyPeers (0x04). */
+    public boolean isPeerBusy() {
+        return peerBusy;
     }
 
     /** Returns true if this handler has completed the eth handshake. */
