@@ -242,6 +242,69 @@ public final class NodeService extends Service {
         return rpcPortFor(c, primaryNetwork(c));
     }
     /** Persist the JSON-RPC port for a specific network (ports are per-network — see {@link #rpcPortKey}). */
+    /** Opt-in eth_getLogs Kohaku-preset index for one network (Rust engine only). */
+    public static boolean logIndexEnabled(android.content.Context c, String network) {
+        return prefs(c).getBoolean("logIndex." + canonicalNetwork(network), false);
+    }
+
+    public static void setLogIndexEnabled(android.content.Context c, String network, boolean on) {
+        prefs(c).edit().putBoolean("logIndex." + canonicalNetwork(network), on).apply();
+    }
+
+    /** Raw log-index status JSON for a RUNNING network, or null when the
+     *  feature is off for it / the network isn't hosted (the Index tab shows
+     *  its waiting state then). */
+    public String logIndexStatusJsonOrNull(String network) {
+        String net = canonicalNetwork(network);
+        if (!logIndexEnabled(this, net)) {
+            return null;
+        }
+        ChainHandle handle;
+        synchronized (handles) {
+            handle = handles.get(net);
+        }
+        if (handle == null) {
+            return null;
+        }
+        try {
+            return handle.logIndexStatusJson();
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** Push the persisted log-index preset for a RUNNING network's handle. */
+    public void applyLogIndex(String network) {
+        String net = canonicalNetwork(network);
+        // Off the caller (UI) thread: the engine-side install may reload a
+        // persisted index from disk.
+        Thread t = new Thread(() -> {
+            ChainHandle handle;
+            synchronized (handles) {
+                handle = handles.get(net);
+            }
+            if (handle != null) {
+                pushLogIndexConfig(net, handle);
+            }
+        }, "log-index-apply-" + net);
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void pushLogIndexConfig(String net, ChainHandle handle) {
+        boolean enabled = logIndexEnabled(this, net);
+        String json = io.myotis.ui.KohakuPreset.INSTANCE.configJson(net, enabled);
+        if (json == null) {
+            return; // no preset for this network — engine stays honestly unconfigured
+        }
+        boolean ok = handle.setLogIndexConfig(json);
+        if (enabled && !ok) {
+            // LogBuffer so the rejection shows in the in-app log view like
+            // every other boot-path message.
+            LogBuffer.e(TAG, "log index config rejected for " + net);
+        }
+    }
+
     public static void setRpcPort(android.content.Context c, String network, int p) {
         String net = canonicalNetwork(network);
         int dflt = defaultRpcPort(net);
@@ -1584,6 +1647,7 @@ public final class NodeService extends Service {
                     handle.setServedBlockWindow(servedBlockWindow(this));
                     handles.put(n, handle);
                 }
+
                 if (!handle.start()) {
                     LogBuffer.e(TAG, "[" + n + "] node stack failed to start");
                     forgetStack(n);
@@ -1596,6 +1660,11 @@ public final class NodeService extends Service {
                     try { ENGINE.stop(n); } catch (Throwable ignored) {}
                     return;
                 }
+                // Boot-time apply of the log-index preset — AFTER start (the
+                // engine only accepts config on a running handle) and after
+                // the raced-stop guard, so a condemned stack never pays for
+                // the index install / appender spin-up.
+                pushLogIndexConfig(n, handle);
                 // A freshly-booted stack gets a full idle window before the controller
                 // may pause it (its engine activity clock starts at 0). Stamped INSIDE the
                 // bootLock: written outside it, a racing stopNetwork's forgetStack could

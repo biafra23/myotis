@@ -164,7 +164,7 @@ post-create call rather than a `create_handle` signature break:
 
 | Contract | Mainnet from | Sepolia from |
 |---|---|---|
-| tornado-cash (registry + relayer registry) | 14,173,129 / 14,173,395 | 5,594,611 / 5,594,660 |
+| tornado-cash (instance registry / relayer registry) | 14,173,395 / 14,173,129 | 5,594,611 / 5,594,660 |
 | railgun proxy | 14,693,013 | 5,784,774 |
 | privacy-pools entrypoint | 22,153,713 | 8,461,453 |
 

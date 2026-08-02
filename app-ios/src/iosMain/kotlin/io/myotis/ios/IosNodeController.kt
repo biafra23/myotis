@@ -175,6 +175,23 @@ class IosNodeController(
         }
     }
 
+    override fun applyLogIndex(network: String) {
+        val net = canonical(network)
+        // On the lifecycle lane like every other mutating op: the engine-side
+        // install may reload a persisted index from disk.
+        scope.launch(lifecycleLane) {
+            locked { handles[net] }?.let { pushLogIndexConfig(net, it) }
+        }
+    }
+
+    private fun pushLogIndexConfig(net: String, handle: Long) {
+        val json = io.myotis.ui.KohakuPreset.configJson(net, settings.logIndexEnabled(net)) ?: return
+        if (!RustEngine.setLogIndexConfig(handle, json) && settings.logIndexEnabled(net)) {
+            logs.append("WARN log index config rejected for $net")
+        }
+    }
+
+
     /** Blocking create+start; caller holds [bootMutex] and runs on IO. */
     private fun boot(net: String) {
         if (locked { net in handles }) return
@@ -192,6 +209,10 @@ class IosNodeController(
             handles[net] = handle
             startMarks[net] = TimeSource.Monotonic.markNow()
         }
+        // Boot-time apply of the log-index preset — AFTER start (the engine
+        // only accepts config on a running handle). Cures restart dormancy;
+        // boot() already runs on the lifecycle lane under bootMutex.
+        pushLogIndexConfig(net, handle)
         startRpc(net)
     }
 
@@ -441,6 +462,7 @@ class IosNodeController(
             }
         }
 
+        val logIndexRaw = if (settings.logIndexEnabled(network)) RustEngine.logIndexStatusJson(handle) else null
         return NodeSnapshot(
             running = running,
             lifecycle = if (running) "RUNNING" else if (paused) "PAUSED" else "STOPPED",
@@ -484,6 +506,8 @@ class IosNodeController(
             // recorded start outcome.
             rpcServing = (rpcState?.second ?: false) && (rpcServer?.isServing() ?: false),
             lcHunting = o.engineBoolean("lcHunting"),
+            logIndex = logIndexRaw?.let(io.myotis.ui.LogIndexStatus::format),
+            logIndexJson = logIndexRaw,
             elHunting = o.engineBoolean("elHunting"),
         )
     }

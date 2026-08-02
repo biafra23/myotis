@@ -56,7 +56,11 @@ class AndroidNodeController(
 
     override fun snapshots(): Flow<Map<String, NodeSnapshot>> = flow {
         while (true) {
-            emit(serviceProvider()?.snapshots()?.mapValues { (_, s) -> s.toModel() } ?: emptyMap())
+            emit(serviceProvider()?.let { svc ->
+                svc.snapshots().mapValues { (net, s) ->
+                    s.toModel().copy(logIndexJson = svc.logIndexStatusJsonOrNull(net))
+                }
+            } ?: emptyMap())
             delay(2000)
         }
         // snapshotOf() prunes the backoff map and walks/sorts the live peer list — keep it off the
@@ -96,6 +100,7 @@ class AndroidNodeController(
     override fun shutdown() { serviceProvider()?.shutdown() }
     override fun setTargetSnapPeers(target: Int) { serviceProvider()?.setTargetSnapPeers(target) }
     override fun setServedBlockWindow(blocks: Int) { serviceProvider()?.setServedBlockWindow(blocks) }
+    override fun applyLogIndex(network: String) { serviceProvider()?.applyLogIndex(network) }
     override fun applyBlsBackend() { NodeService.applyBlsBackend(appContext) }
     override fun applyEngineChoice() { NodeService.applyEngineChoice(appContext) }
     override fun clearCaches(network: String) { serviceProvider()?.clearCaches(network) }
@@ -238,6 +243,8 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun setNetworkEnabled(name: String, on: Boolean) = NodeService.setNetworkEnabled(ctx, name, on)
     override fun rpcPortFor(network: String): Int = NodeService.rpcPortFor(ctx, network)
     override fun setRpcPort(network: String, port: Int) = NodeService.setRpcPort(ctx, network, port)
+    override fun logIndexEnabled(network: String): Boolean = NodeService.logIndexEnabled(ctx, network)
+    override fun setLogIndexEnabled(network: String, on: Boolean) = NodeService.setLogIndexEnabled(ctx, network, on)
     override fun snapTarget(): Int = NodeService.snapTarget(ctx)
     override fun setSnapTarget(v: Int) = NodeService.setSnapTargetPref(ctx, v)
     override fun servedBlockWindow(): Int = NodeService.servedBlockWindow(ctx)

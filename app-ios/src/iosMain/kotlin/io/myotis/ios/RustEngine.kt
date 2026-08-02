@@ -16,6 +16,8 @@ import io.myotis.engine.capi.myotis_get_code_json
 import io.myotis.engine.capi.myotis_get_storage_at_json
 import io.myotis.engine.capi.myotis_get_transaction_by_hash_json
 import io.myotis.engine.capi.myotis_get_transaction_receipt_json
+import io.myotis.engine.capi.myotis_log_index_status_json
+import io.myotis.engine.capi.myotis_set_log_index_config
 import io.myotis.engine.capi.myotis_send_raw_transaction_json
 import io.myotis.engine.capi.myotis_init
 import io.myotis.engine.capi.myotis_pause
@@ -119,6 +121,18 @@ object RustEngine {
     }
 
     /** Status JSON object; `"{}"` for an unknown handle. */
+    /** Install the eth_getLogs watch-list config; false = invalid/unavailable. */
+    fun setLogIndexConfig(handle: Long, configJson: String): Boolean {
+        requireAbi()
+        return myotis_set_log_index_config(handle, configJson)
+    }
+
+    /** Log-index status JSON (enabled, counts, per-entry coverage). */
+    fun logIndexStatusJson(handle: Long): String {
+        requireAbi()
+        return take(myotis_log_index_status_json(handle)) ?: """{"enabled":false}"""
+    }
+
     fun statusJson(handle: Long): String {
         requireAbi()
         return take(myotis_status_json(handle)) ?: "{}"
