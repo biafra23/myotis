@@ -6,7 +6,7 @@
 //! (the same cross-engine sharing the CL [`crate::clcache`] gives).
 //!
 //! **Record format** (tab-separated, UTF-8), one peer per line:
-//! `ip \t port \t publicKeyHex \t {1|0} [\t snapok|snapbad]`
+//! `ip \t port \t publicKeyHex \t {1|0} [\t snapok|snapbad] [\t fails=N]`
 //! — the trailing `{1|0}` is snap/1 CAPABILITY; the optional `snapok`/`snapbad`
 //! token records learned snap-serving QUALITY. `publicKeyHex` is the peer's
 //! 64-byte node id as `0x`-prefixed hex (Java `Bytes.toHexString()`). Tabs
@@ -20,8 +20,15 @@
 //! [`record_snap_failure`](ElPeerCache::record_snap_failure) layer a learned
 //! verdict on top — a peer needs [`FAILURE_THRESHOLD`] consecutive failures (no
 //! intervening serve) to be marked DENIED, and any serve re-confirms it. Denied
-//! peers are DEPRIORITIZED, never evicted (a peer that couldn't serve an old
+//! peers are DEPRIORITIZED, not evicted (a peer that couldn't serve an old
 //! pivot may serve the current one, and is a fine plain-eth peer regardless).
+//!
+//! **Reachability** (Java parity): [`record_connect_failure`](ElPeerCache::record_connect_failure)
+//! tracks consecutive TCP-level dial failures as a persisted `fails=N` token.
+//! Past [`CONNECT_FAILURE_DEMOTE`] the peer reports DENIED from
+//! [`peers`](ElPeerCache::peers); past [`CONNECT_FAILURE_EVICT`] it is dropped
+//! from the cache — the only eviction path. Any successful connect or serve
+//! resets the streak.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -31,6 +38,16 @@ use std::path::PathBuf;
 /// Consecutive snap-serve failures before a peer is marked DENIED (Java
 /// `PeerCache.SNAP_FAILURE_THRESHOLD`).
 const FAILURE_THRESHOLD: u32 = 3;
+
+/// Consecutive TCP connect failures before a peer reports DENIED from
+/// [`ElPeerCache::peers`] — a currently-unreachable CONFIRMED peer must not
+/// outrank reachable candidates (Java `PeerCache.CONNECT_FAILURE_DEMOTE`).
+const CONNECT_FAILURE_DEMOTE: u32 = 5;
+
+/// Consecutive TCP connect failures before a peer is evicted from the cache —
+/// the only eviction path; re-discovery re-adds a peer that comes back (Java
+/// `PeerCache.CONNECT_FAILURE_EVICT`).
+const CONNECT_FAILURE_EVICT: u32 = 50;
 
 /// Learned snap-serving quality — the dial-priority verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +90,9 @@ struct Entry {
     pubkey_hex: String,
     snap: bool,
     quality: SnapQuality,
+    /// Consecutive TCP connect failures (persisted as `fails=N`, shared with
+    /// the Java caches). Reset by any successful connect or serve.
+    fails: u32,
 }
 
 /// The EL peer cache. In-memory maps are authoritative; [`flush`](Self::flush)
@@ -146,16 +166,22 @@ impl ElPeerCache {
         }
         let snap = parts.get(3).map_or(false, |f| *f == "1");
         let mut quality = SnapQuality::Unknown;
+        let mut fails = 0u32;
         for token in &parts[4.min(parts.len())..] {
             match *token {
                 "snapok" => quality = SnapQuality::Confirmed,
                 "snapbad" => quality = SnapQuality::Denied,
-                _ => {}
+                t => {
+                    if let Some(n) = t.strip_prefix("fails=") {
+                        // Unreadable count → streak starts over at 0 (Java parity).
+                        fails = n.parse().unwrap_or(0);
+                    }
+                }
             }
         }
         self.entries.insert(
             key(&ip.to_string(), port),
-            Entry { pubkey_hex: pubkey_hex.to_string(), snap, quality },
+            Entry { pubkey_hex: pubkey_hex.to_string(), snap, quality, fails },
         );
     }
 
@@ -183,7 +209,12 @@ impl ElPeerCache {
         }
         self.entries.insert(
             key(&ip.to_string(), port),
-            Entry { pubkey_hex: pubkey_hex.to_string(), snap, quality: SnapQuality::Unknown },
+            Entry {
+                pubkey_hex: pubkey_hex.to_string(),
+                snap,
+                quality: SnapQuality::Unknown,
+                fails: 0,
+            },
         );
     }
 
@@ -197,7 +228,18 @@ impl ElPeerCache {
             .filter_map(|(k, e)| {
                 let addr = parse_key(k)?;
                 let pubkey = parse_pubkey(&e.pubkey_hex)?;
-                Some(CachedElPeer { addr, pubkey, snap: e.snap, quality: e.quality })
+                // A peer past the connect-failure demote threshold reports
+                // Denied regardless of its learned serve quality: a
+                // currently-unreachable Confirmed peer must not outrank
+                // reachable candidates (or get the hunt's eager backoff
+                // bypass). The stored verdict is kept — one successful
+                // connect clears the streak and restores it (Java parity).
+                let quality = if e.fails >= CONNECT_FAILURE_DEMOTE {
+                    SnapQuality::Denied
+                } else {
+                    e.quality
+                };
+                Some(CachedElPeer { addr, pubkey, snap: e.snap, quality })
             })
             .collect();
         // Snap peers first (by quality), then non-snap. Stable within a rank.
@@ -219,14 +261,61 @@ impl ElPeerCache {
                     e.snap = snap;
                     self.dirty = true;
                 }
+                // Reachable again — clear the connect-failure streak (persisted
+                // lazily, on the next dirty flush; Java parity).
+                e.fails = 0;
             }
             None => {
                 self.entries.insert(
                     k,
-                    Entry { pubkey_hex: pubkey_hex(pubkey), snap, quality: SnapQuality::Unknown },
+                    Entry {
+                        pubkey_hex: pubkey_hex(pubkey),
+                        snap,
+                        quality: SnapQuality::Unknown,
+                        fails: 0,
+                    },
                 );
                 self.dirty = true;
             }
+        }
+    }
+
+    /// A dial to this peer completed a session without snap — still proof the
+    /// address is alive, so clear its connect-failure streak (persisted lazily).
+    pub fn record_connect_success(&mut self, addr: SocketAddr) {
+        if self.path.is_none() {
+            return;
+        }
+        if let Some(e) = self.entries.get_mut(&addr_key(addr)) {
+            e.fails = 0;
+        }
+    }
+
+    /// A TCP-level dial failure (refused/timeout/unreachable) against a cached
+    /// peer. No-op for unknown addresses. Crossing [`CONNECT_FAILURE_DEMOTE`]
+    /// persists the streak and demotes the peer's reported quality; crossing
+    /// [`CONNECT_FAILURE_EVICT`] evicts it — callers must only report while
+    /// demonstrably online (e.g. some other pooled peer is live), so an offline
+    /// device can't decimate its own cache.
+    pub fn record_connect_failure(&mut self, addr: SocketAddr) {
+        if self.path.is_none() {
+            return;
+        }
+        let k = addr_key(addr);
+        let Some(e) = self.entries.get_mut(&k) else {
+            return;
+        };
+        e.fails = e.fails.saturating_add(1);
+        if e.fails >= CONNECT_FAILURE_EVICT {
+            let fails = e.fails;
+            self.entries.remove(&k);
+            self.failures.remove(&k);
+            self.dirty = true;
+            tracing::info!(%addr, fails, "evicted unreachable peer from EL cache");
+        } else if e.fails == CONNECT_FAILURE_DEMOTE {
+            // Persist the crossing so a restart resumes the streak.
+            self.dirty = true;
+            tracing::info!(%addr, fails = e.fails, "deprioritized unreachable EL cache peer");
         }
     }
 
@@ -239,6 +328,7 @@ impl ElPeerCache {
         let k = addr_key(addr);
         self.failures.remove(&k);
         if let Some(e) = self.entries.get_mut(&k) {
+            e.fails = 0;
             if e.quality != SnapQuality::Confirmed {
                 e.quality = SnapQuality::Confirmed;
                 self.dirty = true;
@@ -297,6 +387,10 @@ impl ElPeerCache {
                     body.push_str("snapbad");
                 }
                 SnapQuality::Unknown => {}
+            }
+            if e.fails > 0 {
+                body.push(SEP_CH);
+                body.push_str(&format!("fails={}", e.fails));
             }
             body.push('\n');
         }
@@ -411,6 +505,62 @@ mod tests {
         assert_eq!(c.peers()[0].quality, SnapQuality::Denied); // 3rd → denied
         c.record_snap_served(a);
         assert_eq!(c.peers()[0].quality, SnapQuality::Confirmed); // serve reconfirms
+    }
+
+    #[test]
+    fn connect_failures_demote_evict_and_reset() {
+        let path = std::env::temp_dir().join("myotis-elcache-connfail.cache");
+        let _ = fs::remove_file(&path);
+        let mut c = ElPeerCache::load(path.clone());
+        let a: SocketAddr = "1.2.3.4:30303".parse().unwrap();
+        c.add(a, &pk(1), true);
+        c.record_snap_served(a); // Confirmed
+
+        // Below the demote threshold the learned verdict shows through.
+        for _ in 0..CONNECT_FAILURE_DEMOTE - 1 {
+            c.record_connect_failure(a);
+        }
+        assert_eq!(c.peers()[0].quality, SnapQuality::Confirmed);
+        // Crossing it reports Denied — and persists.
+        c.record_connect_failure(a);
+        assert_eq!(c.peers()[0].quality, SnapQuality::Denied);
+        c.flush();
+        let reloaded = ElPeerCache::load(path.clone());
+        assert_eq!(reloaded.peers()[0].quality, SnapQuality::Denied);
+
+        // A successful re-connect clears the streak and restores the verdict.
+        c.add(a, &pk(1), true);
+        assert_eq!(c.peers()[0].quality, SnapQuality::Confirmed);
+
+        // Sustained unreachability evicts.
+        for _ in 0..CONNECT_FAILURE_EVICT {
+            c.record_connect_failure(a);
+        }
+        assert!(c.is_empty());
+        // Unknown addresses never create entries.
+        c.record_connect_failure("9.9.9.9:1".parse().unwrap());
+        assert!(c.is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parses_and_rewrites_fails_token() {
+        let hex = format!("0x{}", "ab".repeat(64));
+        // A streak resumed from disk: 4 = one below the demote threshold.
+        let text = format!("1.2.3.4\t30303\t{hex}\t1\tsnapok\tfails=4\n");
+        let path = std::env::temp_dir().join("myotis-elcache-failstok.cache");
+        fs::write(&path, text).unwrap();
+        let mut c = ElPeerCache::load(path.clone());
+        // Below the threshold the learned verdict still shows through.
+        assert_eq!(c.peers()[0].quality, SnapQuality::Confirmed);
+        // One more failure crosses the demote threshold → persisted, and the
+        // stored snapok verdict is kept alongside the streak.
+        c.record_connect_failure("1.2.3.4:30303".parse().unwrap());
+        c.flush();
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains("\tsnapok\tfails=5\n"), "got: {body}");
+        assert_eq!(c.peers()[0].quality, SnapQuality::Denied);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

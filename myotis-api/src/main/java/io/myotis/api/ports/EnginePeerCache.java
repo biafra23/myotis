@@ -17,6 +17,11 @@ public interface EnginePeerCache {
     /** {@code host:port} failed to serve snap (demote toward DENIED). */
     void recordSnapFailure(String host, int port);
 
+    /** {@code host:port} failed at the TCP level (refused/timeout). Sustained
+     *  streaks demote and eventually evict the peer. Default no-op so existing
+     *  host implementations keep compiling. */
+    default void recordConnectFailure(String host, int port) {}
+
     /** Cached peers to re-dial on startup, in stored order. */
     List<CachedPeerInfo> load();
 

@@ -82,6 +82,10 @@ public final class ChainStack {
     /** DNS ENR re-walk interval while the EL hunt is engaged (vs 4 min normally). */
     private static final long DNS_REFRESH_HUNT_INTERVAL_MS = 60_000L;
 
+    /** How recent a successful DNS ENR-tree resolve still counts as an
+     *  online signal for {@link #reportConnectFailure}. */
+    private static final long ONLINE_SIGNAL_MAX_AGE_MS = 10 * 60 * 1000L;
+
     /** Max time a verified read arriving on a paused stack is held while the wake completes. */
     public static final long WAKE_WAIT_CAP_MS = 90_000L;
     /** Wake-wait poll interval. */
@@ -1132,13 +1136,32 @@ public final class ChainStack {
                     dropped++; // malformed ENR — skip, don't abort the refresh
                 }
             }
-            dnsElPool = new ArrayList<>(merged.values());
-            log.info("[{}] DNS EL pool: +{} new, {} dropped (off-fork/malformed), {} total",
-                    network.name(), added, dropped, dnsElPool.size());
+            // Stable partition: fork-id-verified entries dial before entries with
+            // no eth forkid at all. The latter can't be pre-filtered (wrong-chain
+            // ones only reveal themselves at the Status handshake), so they must
+            // not compete equally for the per-cycle dial budget.
+            List<Enr> ranked = new ArrayList<>(merged.values());
+            ranked.sort(Comparator.comparingInt(ChainStack::enrForkRank));
+            dnsElPool = ranked;
+            log.info("[{}] DNS EL pool: +{} new, {} dropped (off-fork/malformed), {} total "
+                    + "({} forkid-verified ranked first)",
+                    network.name(), added, dropped, ranked.size(),
+                    ranked.stream().filter(e -> enrForkRank(e) == 0).count());
         } catch (Exception e) {
             log.warn("[{}] DNS EL pool refresh failed: {}", network.name(), e.getMessage());
         } finally {
             dnsResolving.set(false);
+        }
+    }
+
+    /** Dial rank for a DNS-pool ENR: 0 = carries an eth forkid (fork-verified on
+     *  merge — mismatches never enter the pool), 1 = no forkid (unverifiable until
+     *  the Status handshake). A malformed entry ranks last. */
+    private static int enrForkRank(Enr e) {
+        try {
+            return e.ethForkIdHash().isPresent() ? 0 : 1;
+        } catch (Exception ex) {
+            return 1;
         }
     }
 
@@ -1183,6 +1206,7 @@ public final class ChainStack {
                 if (!future.isSuccess()) {
                     backoff.putIfAbsent(key, System.currentTimeMillis() + BACKOFF_TRANSIENT_MS);
                     attempted.remove(key);
+                    reportConnectFailure(peerTcp);
                 }
             });
             return true;
@@ -1216,10 +1240,27 @@ public final class ChainStack {
                 if (!future.isSuccess()) {
                     backoff.putIfAbsent(peerKey, System.currentTimeMillis() + BACKOFF_TRANSIENT_MS);
                     attempted.remove(peerKey);
+                    reportConnectFailure(p.address());
                 }
             });
         } catch (Exception e) {
             attempted.remove(peerKey);
+        }
+    }
+
+    /** Report a TCP-level dial failure to the peer cache (streaks demote and
+     *  eventually evict long-dead peers) — but only while demonstrably online:
+     *  a recent successful DNS ENR-tree resolve or any live RLPx connection.
+     *  Without the guard, a machine that lost its network would count a failure
+     *  against every cached peer each maintainer cycle and decimate the cache. */
+    private void reportConnectFailure(InetSocketAddress address) {
+        try {
+            RLPxConnector conn = connector;
+            boolean online = System.currentTimeMillis() - lastDnsResolveMs < ONLINE_SIGNAL_MAX_AGE_MS
+                    || (conn != null && !conn.getActivePeers().isEmpty());
+            if (online) peerCache.recordConnectFailure(address);
+        } catch (Throwable t) {
+            // Cache bookkeeping must never break the dial path.
         }
     }
 }

@@ -421,9 +421,17 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     ? StatusMessage.decode69(msg.payload())
                     : StatusMessage.decode(msg.payload());
             } catch (Exception e) {
-                log.error("[eth] Failed to decode Status from peer: {} | payload[{}]={}", e.getMessage(),
+                log.error("[eth] Failed to decode Status from peer {} ({}): {} | payload[{}]={}",
+                    remoteAddress, clientId != null ? clientId : "unknown", e.getMessage(),
                     msg.payload().length,
                     bytesToHex(msg.payload(), msg.payload().length));
+                // A spec-conformant peer on our network always produces a decodable
+                // Status; in practice these are foreign-chain clients with a
+                // divergent Status shape (e.g. Polygon's bor keeps the TD field
+                // eth/69 removed). Classify as incompatible so the dial callback
+                // blacklists the node id and applies the long backoff instead of
+                // re-dialing every transient window.
+                incompatibleNetwork = true;
                 ctx.close();
                 return;
             }

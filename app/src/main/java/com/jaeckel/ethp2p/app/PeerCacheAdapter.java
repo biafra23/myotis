@@ -35,6 +35,10 @@ public final class PeerCacheAdapter implements EnginePeerCache {
         delegate.recordSnapFailure(InetSocketAddress.createUnresolved(host, port));
     }
 
+    @Override public void recordConnectFailure(String host, int port) {
+        delegate.recordConnectFailure(InetSocketAddress.createUnresolved(host, port));
+    }
+
     @Override public List<CachedPeerInfo> load() {
         List<PeerCache.CachedPeer> src = delegate.load();
         List<CachedPeerInfo> out = new ArrayList<>(src.size());

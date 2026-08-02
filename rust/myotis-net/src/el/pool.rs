@@ -167,13 +167,31 @@ impl PoolInner {
     /// Dial one candidate through the full eth+snap handshake, updating the
     /// bookkeeping by outcome. `addr` is already in `attempted`.
     async fn dial_one(self: &Arc<PoolInner>, addr: SocketAddr, pubkey: [u8; 64]) {
-        let result = async {
-            let conn = RlpxConnection::dial(Arc::clone(&self.key), addr, pubkey).await?;
-            // eth/69 Status advertises only the window's held range (None → the
-            // honest genesis-only [0, 0]); see ServedHeaders::advertise.
-            EthSession::handshake(conn, &self.local_pubkey, &self.cfg, self.served.advertise()).await
-        }
-        .await;
+        let conn = match RlpxConnection::dial(Arc::clone(&self.key), addr, pubkey).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                // Transport-level failure (refused/timeout/ECIES) — the peer is
+                // GONE, not incompatible. Streaks of these demote and eventually
+                // evict it from the warm-start cache. Guarded on another pooled
+                // peer being live: an offline device would otherwise count a
+                // failure against every cached peer per cycle and decimate its
+                // own cache.
+                tracing::debug!(%addr, error = %e, "el dial: transport failed");
+                if !self.peers.lock().await.is_empty() {
+                    let mut cache = self.cache.lock().await;
+                    cache.record_connect_failure(addr);
+                    cache.flush();
+                }
+                self.record_backoff(addr, false, Instant::now()).await;
+                self.attempted.lock().await.remove(&addr);
+                return;
+            }
+        };
+        // eth/69 Status advertises only the window's held range (None → the
+        // honest genesis-only [0, 0]); see ServedHeaders::advertise.
+        let result =
+            EthSession::handshake(conn, &self.local_pubkey, &self.cfg, self.served.advertise())
+                .await;
 
         let now = Instant::now();
         match result {
@@ -204,17 +222,25 @@ impl PoolInner {
             }
             Ok(session) => {
                 // Compatible but no snap/1 — useless for verified reads. Cool the
-                // address off and free it from `attempted`.
+                // address off and free it from `attempted`. Still proof the
+                // address is alive: clear any connect-failure streak.
                 tracing::debug!(%addr, eth = session.eth_version, "el dial: connected but no snap/1");
+                self.cache.lock().await.record_connect_success(addr);
                 self.record_backoff(addr, false, now).await;
                 self.attempted.lock().await.remove(&addr);
             }
             Err(e) => {
-                // Only the network-id/genesis mismatch error starts with this
-                // prefix (see EthSession::handshake). Match the PREFIX, not a
-                // substring: a peer's client id is echoed into other error
-                // strings, so `contains` could be steered by a hostile peer.
-                let incompatible = e.starts_with("incompatible peer");
+                // Only the network-id/genesis mismatch and Status-decode errors
+                // start with these prefixes (see EthSession::handshake). An
+                // undecodable Status is a foreign-chain client with a divergent
+                // Status shape (e.g. Polygon's bor keeps the TD field eth/69
+                // removed) — treat it as incompatible so it gets the long
+                // backoff + blacklist instead of a re-dial every transient
+                // window. Match the PREFIX, not a substring: a peer's client id
+                // is echoed into other error strings, so `contains` could be
+                // steered by a hostile peer.
+                let incompatible =
+                    e.starts_with("incompatible peer") || e.starts_with("peer Status decode");
                 tracing::debug!(%addr, incompatible, error = %e, "el dial: failed");
                 if incompatible {
                     self.blacklist.lock().await.insert(pubkey);
