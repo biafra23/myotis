@@ -657,7 +657,7 @@ enum BatchAnchor {
 fn backfill_plan(
     anchored: (u64, [u8; 32]),
     cap: u64,
-    run: Option<(u64, u64)>,
+    run: Option<(u64, u64, [u8; 32])>,
     earliest_parent: Option<[u8; 32]>,
 ) -> Option<(u64, u64, BatchAnchor)> {
     let (head, head_hash) = anchored;
@@ -666,8 +666,13 @@ fn backfill_plan(
     }
     let floor = head.saturating_sub(cap.saturating_sub(1)).max(1);
     match run {
-        // Run reaches (or passes) the anchored head: fill DOWN below it.
-        Some((earliest, latest)) if latest >= head => {
+        // Run reaches the anchored head AND its top is the beacon-verified head
+        // hash: fill DOWN below it. The hash equality is load-bearing — without
+        // it, one spoofed organic entry at/above the head number would become
+        // the down-fill anchor and "verify" whole fabricated batches against
+        // itself. A mismatched (or head-passing) top falls through to the
+        // head-anchored restart arm, which overwrites the junk.
+        Some((earliest, latest, latest_hash)) if latest == head && latest_hash == head_hash => {
             if earliest <= floor {
                 return None; // window full
             }
@@ -676,8 +681,8 @@ fn backfill_plan(
         }
         // Run below the head and adjacent-reachable in one batch: extend UP to
         // the head (top anchored by the beacon hash; the internal chain check
-        // plus a same-batch-contiguity rule keeps the middle honest).
-        Some((_, latest)) if head - latest <= BACKFILL_BATCH => {
+        // plus the top anchor transitively pins every element).
+        Some((_, latest, _)) if latest < head && head - latest <= BACKFILL_BATCH => {
             let from = (latest + 1).max(floor);
             Some((from, head - from + 1, BatchAnchor::Head(head_hash)))
         }
@@ -722,8 +727,8 @@ async fn backfill_served_headers(inner: &Arc<PoolInner>) {
     let Some(head_source) = &inner.head_source else { return };
     let Some(anchored) = head_source() else { return };
     let cap = inner.served.window();
-    let run = inner.served.advertise().map(|(e, l, _)| (e, l));
-    let earliest_parent = run.and_then(|(e, _)| inner.served.parent_hash_of(e));
+    let run = inner.served.advertise();
+    let earliest_parent = run.and_then(|(e, _, _)| inner.served.parent_hash_of(e));
     let Some((from, count, anchor)) = backfill_plan(anchored, cap, run, earliest_parent) else {
         return;
     };
@@ -752,6 +757,16 @@ async fn backfill_served_headers(inner: &Arc<PoolInner>) {
             );
             return;
         }
+        // Reorg splice repair: if the held entry just below this verified batch
+        // isn't the batch's parent, everything below is a stale fork — evict it
+        // so the window never serves a spliced non-chain.
+        if let (Some(first), Some(below_hash)) =
+            (headers.first(), inner2.served.hash_of(from.saturating_sub(1)))
+        {
+            if first.header.parent_hash != below_hash {
+                inner2.served.evict_below(from);
+            }
+        }
         for vh in &headers {
             inner2.served.put(vh.header.number, vh.hash, vh.header.parent_hash, vh.raw_rlp.clone());
         }
@@ -776,8 +791,14 @@ async fn broadcast_range_if_changed(inner: &Arc<PoolInner>) {
     }
     let peers: Vec<Arc<ManagedPeer>> =
         inner.peers.lock().await.iter().map(|p| Arc::clone(&p.peer)).collect();
+    // Concurrent sends: each is bounded by the frame-write timeout, but awaited
+    // SEQUENTIALLY a few stalled peers would sum to minutes and starve the
+    // maintainer's prune/re-dial work. Spawned, the tick is bounded by nothing —
+    // a failed write closes its own peer (send_block_range_update fail_alls).
     for peer in peers {
-        peer.send_block_range_update(earliest, latest, latest_hash).await;
+        tokio::spawn(async move {
+            peer.send_block_range_update(earliest, latest, latest_hash).await;
+        });
     }
 }
 
@@ -970,25 +991,32 @@ mod tests {
         );
         // Run below the head within one batch: extend UP to and including the head.
         assert_eq!(
-            backfill_plan((1_000_000, hh), 4096, Some((999_000, 999_980)), Some(pp)),
+            backfill_plan((1_000_000, hh), 4096, Some((999_000, 999_980, hh)), Some(pp)),
             Some((999_981, 20, BatchAnchor::Head(hh)))
         );
         // Run too far behind: restart near the head (still head-anchored).
         assert_eq!(
-            backfill_plan((1_000_000, hh), 4096, Some((900_000, 900_010)), Some(pp)),
+            backfill_plan((1_000_000, hh), 4096, Some((900_000, 900_010, hh)), Some(pp)),
             Some((999_809, BACKFILL_BATCH, BatchAnchor::Head(hh)))
         );
-        // Run includes the head, floor not reached: fill DOWN, anchored by the
-        // held run's earliest parent hash — repairs organic-put stranding too.
+        // Run includes the head WITH the beacon-verified top hash: fill DOWN,
+        // anchored by the held run's earliest parent hash.
         assert_eq!(
-            backfill_plan((1_000_000, hh), 4096, Some((999_900, 1_000_000)), Some(pp)),
+            backfill_plan((1_000_000, hh), 4096, Some((999_900, 1_000_000, hh)), Some(pp)),
             Some((999_708, 192, BatchAnchor::ChildParent(pp)))
         );
+        // N1 guard: a run top at the head number whose hash is NOT the beacon
+        // hash (spoofed organic entry) must NOT become the down-fill anchor —
+        // the plan restarts head-anchored, overwriting the junk.
+        assert_eq!(
+            backfill_plan((1_000_000, hh), 4096, Some((999_900, 1_000_000, [0xbb; 32])), Some(pp)),
+            Some((999_809, BACKFILL_BATCH, BatchAnchor::Head(hh)))
+        );
         // Down-fill without a known earliest parent (shouldn't happen) → no plan.
-        assert_eq!(backfill_plan((1_000_000, hh), 4096, Some((999_900, 1_000_000)), None), None);
+        assert_eq!(backfill_plan((1_000_000, hh), 4096, Some((999_900, 1_000_000, hh)), None), None);
         // Window full → done.
         assert_eq!(
-            backfill_plan((1_000_000, hh), 32, Some((999_969, 1_000_000)), Some(pp)),
+            backfill_plan((1_000_000, hh), 32, Some((999_969, 1_000_000, hh)), Some(pp)),
             None
         );
         // cap=1: only the head itself.

@@ -228,6 +228,33 @@ impl ServedHeaders {
         out
     }
 
+    /// The stored hash of a held header, if held.
+    pub fn hash_of(&self, number: u64) -> Option<[u8; 32]> {
+        let g = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        g.by_number.get(&number).map(|(h, _, _)| *h)
+    }
+
+    /// Evict every held header BELOW `number` (reorg splice repair: a verified
+    /// batch whose parent disagrees with the held entry below it proves the
+    /// entries below are a stale fork).
+    pub fn evict_below(&self, number: u64) {
+        let mut g = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while let Some((&n, _)) = g.by_number.first_key_value() {
+            if n >= number {
+                break;
+            }
+            if let Some((h, _, _)) = g.by_number.remove(&n) {
+                g.by_hash.remove(&h);
+            }
+        }
+    }
+
     /// The stored parent hash of a held header (the backfill's downward anchor).
     pub fn parent_hash_of(&self, number: u64) -> Option<[u8; 32]> {
         let g = match self.inner.lock() {

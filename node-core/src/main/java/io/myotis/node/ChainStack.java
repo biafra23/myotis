@@ -1070,6 +1070,7 @@ public final class ChainStack {
             boolean empty = r.latest() == 0;
             BackfillPlan plan = backfillPlan(head, headHash, window.maxWindow(),
                     empty ? -1 : r.earliest(), empty ? -1 : r.latest(),
+                    empty ? null : r.latestHash(),
                     empty ? null : window.parentHashOf(r.earliest()));
             if (plan == null) return;
             var future = conn.backfillHeaders(plan.from(), plan.count());
@@ -1084,6 +1085,13 @@ public final class ChainStack {
                     log.debug("[{}] header backfill: batch [{}..{}) failed anchoring — dropped",
                             network.name(), plan.from(), plan.from() + plan.count());
                     return;
+                }
+                // Reorg splice repair: if the held entry just below this verified
+                // batch isn't the batch's parent, everything below is a stale
+                // fork — evict it so the window never serves a spliced non-chain.
+                org.apache.tuweni.bytes.Bytes32 below = window.hashOf(plan.from() - 1);
+                if (below != null && !headers.get(0).header().parentHash.equals(below)) {
+                    window.evictBelow(plan.from());
                 }
                 for (var vh : headers) {
                     window.put(vh.header().number, vh.hash(), vh.header().parentHash,
@@ -1103,17 +1111,23 @@ public final class ChainStack {
      */
     static BackfillPlan backfillPlan(long head, org.apache.tuweni.bytes.Bytes32 headHash,
             long cap, long runEarliest, long runLatest,
+            org.apache.tuweni.bytes.Bytes32 runTopHash,
             org.apache.tuweni.bytes.Bytes32 earliestParent) {
         if (head <= 0) return null;
         long floor = Math.max(1, head - Math.max(0, cap - 1));
-        if (runLatest >= head) {
-            // Run reaches the anchored head: fill DOWN below it.
+        if (runLatest == head && headHash.equals(runTopHash)) {
+            // Run reaches the anchored head AND its top is the beacon-verified
+            // hash: fill DOWN below it. The hash equality is load-bearing —
+            // without it, one spoofed organic entry at the head number would
+            // become the down-fill anchor and "verify" fabricated batches
+            // against itself. A mismatched (or head-passing) top falls through
+            // to the head-anchored restart, which overwrites the junk.
             if (runEarliest <= floor) return null; // window full
             long from = Math.max(floor, runEarliest - BACKFILL_BATCH);
             if (earliestParent == null) return null;
             return new BackfillPlan(from, (int) (runEarliest - from), new BatchAnchor(earliestParent));
         }
-        if (runLatest >= 0 && head - runLatest <= BACKFILL_BATCH) {
+        if (runLatest >= 0 && runLatest < head && head - runLatest <= BACKFILL_BATCH) {
             // Extend UP to and including the head (one anchored batch).
             long from = Math.max(floor, runLatest + 1);
             return new BackfillPlan(from, (int) (head - from + 1), new BatchAnchor(headHash));

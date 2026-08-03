@@ -90,6 +90,24 @@ public final class ServedHeaderWindow {
         return parentByNumber.get(number);
     }
 
+    /** The stored hash of a held header, or null when the block isn't held. */
+    public synchronized Bytes32 hashOf(long number) {
+        return hashByNumber.get(number);
+    }
+
+    /** Evict every held header BELOW {@code number} (reorg splice repair: a
+     *  verified batch whose parent disagrees with the held entry below it proves
+     *  the entries below are a stale fork). */
+    public synchronized void evictBelow(long number) {
+        while (!byNumber.isEmpty() && byNumber.firstKey() < number) {
+            long n = byNumber.firstKey();
+            byNumber.remove(n);
+            parentByNumber.remove(n);
+            Bytes32 h = hashByNumber.remove(n);
+            if (h != null) byHash.remove(h.toHexString());
+        }
+    }
+
     /** Serve a header by block number, or null if we don't hold it. */
     public synchronized byte[] getByNumber(long number) {
         if (number == 0 && genesisRlp != null) return genesisRlp;
