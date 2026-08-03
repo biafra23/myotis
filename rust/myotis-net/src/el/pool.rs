@@ -624,8 +624,14 @@ async fn broadcast_range_if_changed(inner: &Arc<PoolInner>) {
     }
     let peers: Vec<Arc<ManagedPeer>> =
         inner.peers.lock().await.iter().map(|p| Arc::clone(&p.peer)).collect();
+    // Concurrent sends: each is bounded by the frame-write timeout, but awaited
+    // SEQUENTIALLY a few stalled peers would sum to minutes and starve the
+    // maintainer's prune/re-dial work. Spawned, the tick is bounded by nothing —
+    // a failed write closes its own peer (send_block_range_update fail_alls).
     for peer in peers {
-        peer.send_block_range_update(earliest, latest, latest_hash).await;
+        tokio::spawn(async move {
+            peer.send_block_range_update(earliest, latest, latest_hash).await;
+        });
     }
 }
 
