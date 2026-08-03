@@ -506,7 +506,10 @@ fn response_request_id(payload: &[u8]) -> Option<u64> {
 }
 
 /// A p2p Disconnect body is `[reason]`; decode the reason code for logging.
-fn describe_disconnect(payload: &[u8]) -> String {
+/// `pub(crate)` so the pool's busy-classification test can pin the classifier
+/// against THIS producer — a format change here must break that test instead
+/// of silently degrading busy classification to transient.
+pub(crate) fn describe_disconnect(payload: &[u8]) -> String {
     let reason = rlp::decode(payload)
         .ok()
         .and_then(|it| match it {

@@ -869,6 +869,20 @@ mod tests {
         assert!(!is_busy_disconnect("incompatible peer: networkId=137 genesis=..."));
         // A peer-controlled client id echoed mid-string can't fake the prefix.
         assert!(!is_busy_disconnect("expected Status, got code 0x04 from peer disconnected: reason=4x"));
+        // Producer-coupled: build the string through the REAL session
+        // formatter (RLP [0x04] = TooManyPeers) so a future format change in
+        // describe_disconnect breaks this test instead of silently degrading
+        // busy classification to transient.
+        let produced = format!(
+            "peer disconnected: {}",
+            crate::el::eth::session::describe_disconnect(&[0xc1, 0x04])
+        );
+        assert!(is_busy_disconnect(&produced), "producer drifted: {produced}");
+        let produced_other = format!(
+            "peer disconnected: {}",
+            crate::el::eth::session::describe_disconnect(&[0xc1, 0x03])
+        );
+        assert!(!is_busy_disconnect(&produced_other));
     }
 
     #[test]
