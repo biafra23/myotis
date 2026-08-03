@@ -55,9 +55,14 @@ public final class RLPxConnector implements AutoCloseable {
         void onPeerReady(InetSocketAddress address, String publicKeyHex, boolean snapSupported);
     }
 
-    /** Callback when a peer connection closes, with incompatibility info and node identity. */
+    /** Callback when a peer connection closes, with incompatibility info and node identity.
+     *  {@code busy} = the peer sent Disconnect(0x04 TooManyPeers) at any phase: an
+     *  ALIVE node with no free slots — callers should back off patiently instead of
+     *  treating it like a generic transient failure. (0x04 says nothing about the
+     *  peer's chain — full wrong-chain nodes send it too, so busy alone must never
+     *  promote a peer to any verified/known-good tier.) */
     public interface PeerCloseCallback {
-        void onPeerClose(boolean incompatibleNetwork, String nodeIdHex);
+        void onPeerClose(boolean incompatibleNetwork, boolean busy, String nodeIdHex);
     }
 
     private final NodeKey localKey;
@@ -203,7 +208,8 @@ public final class RLPxConnector implements AutoCloseable {
                     ch.closeFuture().addListener(f -> {
                         activeHandlers.remove(ethHandler);
                         if (closeCallback != null) {
-                            closeCallback.onPeerClose(ethHandler.isIncompatibleNetwork(), pubKeyHex);
+                            closeCallback.onPeerClose(ethHandler.isIncompatibleNetwork(),
+                                ethHandler.isPeerBusy(), pubKeyHex);
                         }
                     });
                 }
