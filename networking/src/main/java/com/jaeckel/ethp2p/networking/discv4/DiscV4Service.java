@@ -39,6 +39,17 @@ public final class DiscV4Service implements AutoCloseable {
     private ScheduledExecutorService scheduler;
     private final Consumer<KademliaTable.Entry> onPeerDiscovered;
 
+    /** Endpoint ("ip:port") → last probe millis (see {@link #probeEndpoint}). */
+    private final ConcurrentHashMap<String, Long> probedEndpoints = new ConcurrentHashMap<>();
+    /** Re-probe window for endpoints whose bond SUCCEEDED (they're in the table,
+     *  the refresh walk samples them — the probe is just a periodic top-up). */
+    private static final long PROBE_MIN_INTERVAL_MS = 60 * 60 * 1000L; // 1h per endpoint
+    /** Re-probe window for endpoints that never bonded: a single lost UDP
+     *  datagram must not black out a proven peer's neighbourhood for an hour —
+     *  the peer isn't in the table, so nothing else will ever re-ping it. */
+    private static final long PROBE_RETRY_UNBONDED_MS = 10 * 60 * 1000L; // 10 min
+    private static final int PROBE_MAP_MAX = 1024;
+
     public DiscV4Service(NodeKey nodeKey, List<InetSocketAddress> bootnodes,
                          Consumer<KademliaTable.Entry> onPeerDiscovered) {
         this.nodeKey = nodeKey;
@@ -91,6 +102,50 @@ public final class DiscV4Service implements AutoCloseable {
     public void findNode(InetSocketAddress target, Bytes nodeId) {
         Bytes packet = Packet.encodeFindNode(nodeKey, nodeId);
         sendRaw(packet, target);
+    }
+
+    /**
+     * Bond with a specific UDP endpoint so its neighbourhood enters the walk —
+     * used for peers PROVEN over TCP (reached eth READY) whose UDP side the
+     * table may never have seen (e.g. DNS-ENR-pool peers): the periodic refresh
+     * only FindNodes peers already in the table, so without this nudge a proven
+     * peer's neighbours are never asked for. The ping establishes the bond and
+     * (on pong) lands the peer in the table, where {@link #refreshTable} then
+     * samples it; the immediate FindNode is a best-effort head start (peers may
+     * ignore it until the bond completes — the refresh loop retries later).
+     * Per-address rate limit so repeated READY events don't re-probe.
+     */
+    public void probeEndpoint(InetSocketAddress udpAddr) {
+        if (channel == null || !channel.isActive()) return;
+        String key = udpAddr.getHostString() + ":" + udpAddr.getPort();
+        // Bond state picks the retry window: table membership means the pong
+        // verified (the handler adds peers to the table only on that path).
+        boolean bonded = false;
+        for (KademliaTable.Entry e : table.allPeers()) {
+            if (e.udpAddr().equals(udpAddr)) { bonded = true; break; }
+        }
+        if (!shouldProbe(key, System.currentTimeMillis(), bonded)) return;
+        log.debug("[discv4] probing proven peer endpoint {}", udpAddr);
+        sendPing((InetSocketAddress) channel.localAddress(), udpAddr);
+        findNode(udpAddr, nodeKey.publicKeyBytes());
+    }
+
+    /** Dedup/rate-limit decision for {@link #probeEndpoint} (package-private for
+     *  tests). {@code bonded} selects the window: 1h for endpoints already in
+     *  the table, 10min for endpoints whose earlier probe never produced a
+     *  verified pong (lost datagram / UDP filtered — retry sooner). Bounded,
+     *  coarse: the map is dropped wholesale when oversized — probes are a
+     *  nudge, not bookkeeping, so losing history just allows an early
+     *  re-probe. Races between concurrent READY events are benign for the
+     *  same reason (worst case one duplicate ping+FindNode). */
+    boolean shouldProbe(String key, long now, boolean bonded) {
+        if (probedEndpoints.size() > PROBE_MAP_MAX) probedEndpoints.clear();
+        long window = bonded ? PROBE_MIN_INTERVAL_MS : PROBE_RETRY_UNBONDED_MS;
+        Long last = probedEndpoints.putIfAbsent(key, now);
+        if (last == null) return true;
+        if (now - last < window) return false;
+        probedEndpoints.put(key, now);
+        return true;
     }
 
     public KademliaTable table() {

@@ -123,6 +123,11 @@ struct PoolInner {
     /// gossip sightings of our own broadcasts register (None for pools whose
     /// host never sends).
     tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
+    /// Probe requests toward discovery: when a snap peer connects, its address
+    /// is nudged into the discv4 walk so its neighbourhood gets explored (a
+    /// cache-/warm-start peer may never enter the table on its own). Best-effort
+    /// `try_send`; `None` for pools without discovery (tests).
+    probe: Option<mpsc::Sender<SocketAddr>>,
 }
 
 impl PoolInner {
@@ -243,6 +248,17 @@ impl PoolInner {
                 .await;
 
         let now = Instant::now();
+        // Any COMPATIBLE completed session (snap or not) proves the peer is on
+        // our network — nudge discovery toward its neighbourhood (UDP port
+        // guessed = TCP port, the devp2p default; a wrong guess just means no
+        // pong). The service dedups per endpoint. Same semantics as the Java
+        // twin, which probes on every eth-READY peer: a fork-verified plain-eth
+        // peer's neighbours may well serve snap.
+        if result.is_ok() {
+            if let Some(probe) = &self.probe {
+                let _ = probe.try_send(addr);
+            }
+        }
         match result {
             Ok(session) if session.snap => {
                 // INFO: the operator-visible signal that the EL found a usable
@@ -328,6 +344,7 @@ impl PeerPool {
         cache: ElPeerCache,
         rx: mpsc::Receiver<TableEntry>,
         tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
+        probe: Option<mpsc::Sender<SocketAddr>>,
     ) -> PeerPool {
         let inner = Arc::new(PoolInner {
             key,
@@ -344,6 +361,7 @@ impl PeerPool {
             hunting: AtomicBool::new(false),
             online_signal: Mutex::new(None),
             tx_watch,
+            probe,
         });
         // Both the discv4 dialer and the maintainer dial through one shared
         // concurrency budget.
@@ -713,6 +731,7 @@ mod tests {
             ElPeerCache::disabled(),
             rx,
             None,
+            None,
         );
         assert_eq!(pool.snap_peer_count().await, 0);
         assert!(pool.snap_peer().await.is_none());
@@ -763,6 +782,7 @@ mod tests {
             PoolConfig::default(),
             ElPeerCache::load(path.clone()),
             rx,
+            None,
             None,
         );
         // The warm-start branch dials the cached peer, claiming its address.
@@ -818,6 +838,7 @@ mod tests {
             PoolConfig::default(),
             ElPeerCache::load(path.clone()),
             rx,
+            None,
             None,
         );
 

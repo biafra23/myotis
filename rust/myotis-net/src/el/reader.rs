@@ -613,6 +613,7 @@ impl ElReader {
             cache,
             rx,
             Some(Arc::clone(&sent_tx_watch)),
+            Some(discovery.probe_sender()),
         );
         Ok(ElReader {
             discovery,
