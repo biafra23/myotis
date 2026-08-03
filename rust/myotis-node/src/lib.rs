@@ -29,9 +29,10 @@ use napi::bindgen_prelude::AsyncTask;
 use napi::{Env, Result, Task};
 use napi_derive::napi;
 
-// The C ABI of myotis-engine (capi.rs / rust/include/myotis_engine.h, written
-// against ABI version 19), called by Rust path — linking the rlib does not
-// reliably resolve `extern "C"` imports of its no_mangle symbols.
+// The C ABI of myotis-engine (capi.rs / rust/include/myotis_engine.h; the
+// addon is built from the same tree, so init() reports the tree's current
+// ABI_VERSION), called by Rust path — linking the rlib does not reliably
+// resolve `extern "C"` imports of its no_mangle symbols.
 use myotis_engine::capi::{
     myotis_available_networks_json, myotis_canonical_network_name, myotis_create,
     myotis_drain_logs, myotis_ens_record_json, myotis_estimate_gas_json, myotis_eth_call_json,

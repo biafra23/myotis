@@ -57,6 +57,8 @@ jobs:
             artifact: myotis-node.win32-x64-msvc.node
             built: rust/target/x86_64-pc-windows-msvc/release/myotis_node.dll
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -89,6 +91,11 @@ jobs:
   release:
     name: Publish addons to release
     needs: build
+    # Deliberately gated on the REF, not the event: a workflow_dispatch
+    # targeting a tag ref (gh workflow run node-binding.yml --ref vX.Y.Z) is
+    # the manual republish path — the job is idempotent (--clobber uploads,
+    # marker-guarded notes append), and the smoke jobs below exclude tag refs
+    # so a republish never drags the 100-minute smokes along.
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -198,8 +205,12 @@ jobs:
   # whether Ethereum peers accept connections from Azure datacenter IPs, and
   # releases must never gate on it (the release job needs only `build`).
   smoke-linux:
-    if: github.event_name == 'workflow_dispatch'
+    # Tag refs excluded: dispatching on a tag is the release-republish path
+    # and must not launch the smokes alongside it.
+    if: github.event_name == 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/')
     needs: build
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 100
     steps:
@@ -227,8 +238,11 @@ jobs:
   # the cold checkpoint catch-up (~30-40 min) and later runs warm-restart in
   # seconds. Manual-only — see the smoke-linux comment.
   smoke-windows:
-    if: github.event_name == 'workflow_dispatch'
+    # Tag refs excluded — see smoke-linux.
+    if: github.event_name == 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/')
     needs: build
+    permissions:
+      contents: read
     runs-on: windows-latest
     timeout-minutes: 100
     steps:
