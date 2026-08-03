@@ -1,16 +1,31 @@
 # Prebuilds for the myotis-node napi-rs binding (Electron/Node hosts).
 # Artifacts: myotis-node.<platform>-<arch>.node per matrix leg, attached to
-# the workflow run; wire into the release workflow once the binding stabilizes.
-#
-# NOTE: authored as part of the Node-binding spike; the windows leg doubles as
-# the first Windows compile check for the whole Rust workspace.
+# the workflow run — and, on `v*` tags, published as GitHub Release assets
+# together with a myotis-node.SHA256SUMS checksum file and the engine ABI
+# version pinned in the release notes (downstream loaders download pinned
+# version + checksum and gate on the ABI).
 name: node-binding
 
 on:
+  # Scope push to main + release tags, matching the other asset workflows
+  # (android-apk/desktop-dmg/desktop-linux-deb): prebuilds stay green on main,
+  # `v*` tags publish the release assets. The paths filter only trims branch
+  # pushes — GitHub does not evaluate paths filters for tag pushes, so `v*`
+  # release runs always fire regardless of what the tagged commit touched.
   push:
-    branches: [feat/node-binding]
+    branches: [ "main" ]
+    tags: [ "v*" ]
     paths: ['rust/**', '.github/workflows/node-binding.yml']
   workflow_dispatch:
+
+# Cancel a superseded run when new commits land on the same branch/PR. The
+# event name is part of the group so a push to main can never cancel an
+# in-flight dispatched smoke run (or a dispatch cancel a tag's release run) —
+# unlike the sibling workflows, this one has a workflow_dispatch trigger
+# sharing refs with push runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -42,6 +57,8 @@ jobs:
             artifact: myotis-node.win32-x64-msvc.node
             built: rust/target/x86_64-pc-windows-msvc/release/myotis_node.dll
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -61,14 +78,139 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
           if-no-files-found: error
+          # Artifacts are immutable per run; without this, "re-run all jobs"
+          # on a tag 409s in every build leg and the release job never runs.
+          overwrite: true
+
+  # Attach the five prebuilt addons plus a SHA-256 checksum file to the GitHub
+  # Release for the pushed tag, and pin the engine ABI version in the release
+  # notes so downstream loaders can gate on it. Runs ONLY on `v*` tags. The
+  # android/desktop workflows publish to the SAME release for the same tag;
+  # whichever job runs first creates it and the others just add their assets —
+  # the create step below tolerates that race.
+  release:
+    name: Publish addons to release
+    needs: build
+    # Deliberately gated on the REF, not the event: a workflow_dispatch
+    # targeting a tag ref (gh workflow run node-binding.yml --ref vX.Y.Z) is
+    # the manual republish path — the job is idempotent (--clobber uploads,
+    # marker-guarded notes append), and the smoke jobs below exclude tag refs
+    # so a republish never drags the 100-minute smokes along.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      # gh release create/upload/edit needs write access to Releases.
+      contents: write
+    steps:
+      # Checked out (unlike the android release job) because the ABI version
+      # is read from its source of truth in myotis-engine; this also gives gh
+      # its repo context.
+      - uses: actions/checkout@v4
+      - name: Download addon artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: 'myotis-node.*.node'
+          merge-multiple: true
+          path: addons
+      - name: Write myotis-node.SHA256SUMS
+        run: |
+          set -eu
+          cd addons
+          # Glob into an array and assert exactly five addons — a missing (or
+          # stray extra) build leg should fail here, not silently ship an
+          # incomplete release.
+          shopt -s nullglob
+          addons=(myotis-node.*.node)
+          [ "${#addons[@]}" -eq 5 ] \
+            || { echo "::error::expected exactly 5 addons, found ${#addons[@]}: ${addons[*]}"; exit 1; }
+          sha256sum "${addons[@]}" > myotis-node.SHA256SUMS
+          cat myotis-node.SHA256SUMS
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          # Engine ABI version from its source of truth (the crate constant) —
+          # loaders must refuse an addon whose init() returns anything else,
+          # so the notes state it explicitly.
+          abi=$(sed -n 's/^pub const ABI_VERSION: i32 = \([0-9][0-9]*\);.*$/\1/p' \
+            rust/myotis-engine/src/lib.rs)
+          [ -n "$abi" ] || { echo "::error::could not extract ABI_VERSION"; exit 1; }
+          # The addon section for the notes. Quoted heredoc keeps the markdown
+          # literal; the __ABI__ placeholder dodges backtick substitution.
+          section=$(mktemp)
+          cat > "$section" <<'SECTION'
+          **Node.js addon (`myotis-node.<platform>-<arch>.node`)** — prebuilt napi-rs
+          binding for Electron/Node hosts (linux-x64-gnu, linux-arm64-gnu, darwin-x64,
+          darwin-arm64, win32-x64-msvc). Verify downloads against
+          `myotis-node.SHA256SUMS`. Engine ABI version: **__ABI__** — loaders must
+          gate on `init()` returning exactly __ABI__.
+          SECTION
+          sed -i "s/__ABI__/$abi/g" "$section"
+          # Master notes for the case where THIS job creates the release (same
+          # text the android/desktop workflows carry), plus the addon section.
+          notes=$(mktemp)
+          cat > "$notes" <<'NOTES'
+          Pre-release build of the Myotis wallet apps.
+
+          **Android (`*-android-debug.apk`)** — unsigned *debug* build. Install via
+          "Install unknown apps". Not a signed release build.
+
+          **Desktop macOS (`Myotis-<arch>.dmg`)** — unsigned; download the dmg matching
+          your Mac (arm64 for Apple Silicon, x64 for Intel). First launch:
+          right-click → Open to get past Gatekeeper (not notarized yet).
+
+          **Desktop Linux (`Myotis-<arch>.deb`)** — install with
+          `sudo apt install ./Myotis-<arch>.deb` (x64 for Intel/AMD, arm64 for
+          Raspberry Pi 5 / ARM machines).
+          NOTES
+          printf '\n' >> "$notes"
+          cat "$section" >> "$notes"
+          # Create the release if it doesn't exist yet. Another workflow may
+          # win this race for the same tag: if `create` fails, re-check with
+          # `view` — success there means the other job already created it
+          # (fine), while a genuine failure still surfaces because `view` also
+          # fails.
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --prerelease \
+              --title "Myotis $tag" \
+              --notes-file "$notes" \
+              --target "${GITHUB_SHA}" \
+            || gh release view "$tag" >/dev/null 2>&1
+          fi
+          # Whether we created the release or another workflow did: make sure
+          # the notes carry the addon/ABI section exactly once (idempotent
+          # across re-runs, appends when the android/desktop notes won the
+          # create race).
+          body=$(mktemp)
+          gh release view "$tag" --json body --jq .body > "$body"
+          if ! grep -q 'Node.js addon' "$body"; then
+            printf '\n' >> "$body"
+            cat "$section" >> "$body"
+            gh release edit "$tag" --notes-file "$body"
+          fi
+          gh release upload "$tag" \
+            addons/myotis-node.*.node addons/myotis-node.SHA256SUMS --clobber
 
   # Control experiment for the Windows smoke: same mainnet smoke on a Linux
   # runner. First Windows attempt discovered 160 peers over UDP but held ZERO
   # TCP/libp2p connections in 55 min — this job disambiguates "Windows socket
   # problem in the engine" from "Ethereum peers deprioritize/ban datacenter
   # (Azure) IPs": if Linux-on-Azure also gets no peers, it's the environment.
+  #
+  # Both smoke jobs are manual-only (workflow_dispatch): a 100-minute
+  # live-network job is too heavy for every main push, its outcome depends on
+  # whether Ethereum peers accept connections from Azure datacenter IPs, and
+  # releases must never gate on it (the release job needs only `build`).
   smoke-linux:
+    # Tag refs excluded: dispatching on a tag is the release-republish path
+    # and must not launch the smokes alongside it.
+    if: github.event_name == 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/')
     needs: build
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 100
     steps:
@@ -82,22 +224,25 @@ jobs:
           path: myotis-data
           key: myotis-smoke-data-linux-${{ github.run_id }}
           restore-keys: myotis-smoke-data-linux-
-      - name: Ensure data dir exists
-        run: mkdir -p "${{ github.workspace }}/myotis-data"
       - name: Smoke — sync mainnet + verified reads
         working-directory: rust/myotis-node
         env:
           MYOTIS_SMOKE_TIMEOUT_MIN: '55'
         run: node smoke.mjs "${{ github.workspace }}/myotis-data" "${{ github.workspace }}/myotis-node.linux-x64-gnu.node"
 
-  # Full runtime validation on Windows: unit-test the workspace, then run the
-  # real smoke — sync mainnet over devp2p/libp2p from the runner, reach
-  # SYNCED, and serve verified reads (ENS, contenthash, account proof)
-  # through the .node addon. The sync snapshot is cached across runs, so the
-  # first run pays the cold checkpoint catch-up (~30-40 min) and later runs
-  # warm-restart in seconds.
+  # Full runtime validation on Windows: unit-test the workspace (green since
+  # the .gitattributes LF pin for the golden vectors), then run the real smoke
+  # — sync mainnet over devp2p/libp2p from the runner, reach SYNCED, and serve
+  # verified reads (ENS, contenthash, account proof) through the .node addon.
+  # The sync snapshot is cached across runs, so the first successful run pays
+  # the cold checkpoint catch-up (~30-40 min) and later runs warm-restart in
+  # seconds. Manual-only — see the smoke-linux comment.
   smoke-windows:
+    # Tag refs excluded — see smoke-linux.
+    if: github.event_name == 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/')
     needs: build
+    permissions:
+      contents: read
     runs-on: windows-latest
     timeout-minutes: 100
     steps:
@@ -106,7 +251,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      - name: Unit tests (whole workspace, first run on Windows)
+      - name: Unit tests (whole workspace)
         working-directory: rust
         run: cargo test --workspace
       - uses: actions/download-artifact@v4
@@ -118,11 +263,6 @@ jobs:
           path: myotis-data
           key: myotis-smoke-data-win-${{ github.run_id }}
           restore-keys: myotis-smoke-data-win-
-      - name: Ensure data dir exists
-        # The engine does not create data_dir itself yet (fix pending in a
-        # separate PR); without this, sync works but persistence — and this
-        # job's snapshot cache — silently no-ops.
-        run: New-Item -ItemType Directory -Force -Path "${{ github.workspace }}\myotis-data" | Out-Null
       - name: Smoke — sync mainnet + verified reads
         working-directory: rust/myotis-node
         env:

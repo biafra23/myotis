@@ -16,11 +16,12 @@ merge blockers; each should either be fixed or consciously dropped.
     complete via a napi threadsafe function, taking the libuv pool out of
     the picture entirely.
 
-- [ ] **`node-binding.yml` goes dead on merge.** The workflow triggers on
-  `push: branches: [feat/node-binding]` — after the PR merges only
-  `workflow_dispatch` remains. If the prebuilds should keep running, retarget
-  the trigger to `main` with the same `rust/**` paths filter (or add a
-  `pull_request` trigger).
+- [x] **`node-binding.yml` goes dead on merge.** Done: push trigger retargeted
+  to `main` + `v*` tags, keeping the `rust/**` paths filter for branch pushes
+  (GitHub doesn't evaluate paths filters on tag pushes, so release runs
+  always fire), and a release job now publishes the five addons plus
+  `myotis-node.SHA256SUMS` to the tag's GitHub Release with the engine ABI
+  version pinned in the notes.
 
 - [ ] **`panic = "abort"` now aborts a browser.** Workspace-wide release
   profile choice (`rust/Cargo.toml`), same exposure as the JNI seam — but the
@@ -29,12 +30,14 @@ merge blockers; each should either be fixed or consciously dropped.
   "panic-free by construction" discipline in `host.rs` is carrying more
   weight now.
 
-- [ ] **`smoke-windows` is network-flaky by construction.** Live devp2p/libp2p
-  sync from a GitHub runner; `actions/cache` saves only on job success, so
-  until one run reaches SYNCED within the 55-min budget every run repeats the
-  ~30–40 min cold catch-up — and the 100-min job timeout also covers the
-  first-ever `cargo test --workspace` on Windows plus the build. Keep it a
-  non-required canary and expect to tune the budgets.
+- [x] **`smoke-windows` is network-flaky by construction.** Resolved as
+  predicted: `cargo test --workspace` is green on Windows (after the
+  `.gitattributes` LF pin for the golden vectors), but the smoke discovers
+  peers over UDP yet holds no TCP/libp2p connections — possibly Windows,
+  possibly Ethereum peers deprioritizing Azure datacenter IPs (a Linux
+  control job disambiguates; real-Windows-box validation pending downstream).
+  Both smoke jobs are now manual-only (`workflow_dispatch`) and releases
+  never gate on them.
 
 - [ ] **Pin the flat-vs-nested verification-field divergence.** The Rust
   engine's account JSON carries `beaconChainVerified`/`blsVerified`/
@@ -45,25 +48,18 @@ merge blockers; each should either be fixed or consciously dropped.
 
 ## Interplay #261 ↔ #262
 
-- [ ] **Sweep the stale "data_dir must exist" notes** once PR #262 (engine
-  creates `data_dir` in `host::create`) lands. Three spots in #261 document
-  the old behavior: the README "data_dir must exist" note, the usage
-  comment (`// dir must exist`), and the workflow's "Ensure data dir exists"
-  step. Whichever PR merges second sweeps them; if #262 goes first, #261 can
-  drop the workflow workaround step entirely.
+- [x] **Sweep the stale "data_dir must exist" notes** once PR #262 (engine
+  creates `data_dir` in `host::create`) lands. Done: the README usage comment
+  and the workflow's "Ensure data dir exists" steps are gone (the README
+  Notes bullet had already been dropped at merge time).
 
 ## From PR #262 — data_dir creation
 
 Asked of the author in review; tracked here in case they don't land there.
 
-- [ ] **Stale `create()` doc contract.** The doc comment on
-  `rust/myotis-engine/src/host.rs` `create()` lists `CREATE_FAILED` causes as
-  "unknown name / unavailable runtime" — an uncreatable dataDir is now a
-  third cause and belongs in the list.
+- [x] **Stale `create()` doc contract.** Landed with #262: the doc comment now
+  lists "an unknown name, an unavailable runtime, or an uncreatable dataDir".
 
-- [ ] **Misleading Java-side error message.** `RustMyotisEngine.java` maps
-  every `id < 0` to "the Rust engine could not initialize the runtime for
-  <network>", which points debugging in the wrong direction when the actual
-  cause is an uncreatable dataDir (the Rust warn log is then the only clue).
-  Broaden the message ("… or create the dataDir for …") or introduce a
-  distinct sentinel.
+- [x] **Misleading Java-side error message.** Landed with #262:
+  `RustMyotisEngine.java` now throws "could not initialize the runtime or
+  create the dataDir for <network>".
