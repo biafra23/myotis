@@ -700,15 +700,34 @@ impl ServiceLoop {
     /// `refresh` uses (Java `DiscV4Service.probeEndpoint` twin). Deduped per
     /// endpoint (1 h) and bounded.
     async fn probe(&mut self, addr: SocketAddr) {
+        // Bonded endpoints (in the table — pong verified) re-probe hourly; an
+        // endpoint whose earlier probe never bonded retries sooner, so one
+        // lost datagram can't black out a proven peer's neighbourhood for an
+        // hour (Java `shouldProbe` twin).
         const PROBE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+        const PROBE_RETRY_UNBONDED: std::time::Duration = std::time::Duration::from_secs(10 * 60);
         const PROBE_MAP_MAX: usize = 1024;
         let now = tokio::time::Instant::now();
         // Coarse bound: losing history just allows a re-probe.
         if self.probed.len() > PROBE_MAP_MAX {
             self.probed.clear();
         }
+        let bonded = self
+            .table
+            .lock()
+            .map(|t| {
+                t.all_peers().iter().any(|e| {
+                    e.udp_port == addr.port()
+                        && match addr.ip() {
+                            IpAddr::V4(v4) => e.ip == v4.octets(),
+                            IpAddr::V6(v6) => e.ip == v6.octets(),
+                        }
+                })
+            })
+            .unwrap_or(false);
+        let window = if bonded { PROBE_MIN_INTERVAL } else { PROBE_RETRY_UNBONDED };
         if let Some(last) = self.probed.get(&addr) {
-            if now.duration_since(*last) < PROBE_MIN_INTERVAL {
+            if now.duration_since(*last) < window {
                 return;
             }
         }

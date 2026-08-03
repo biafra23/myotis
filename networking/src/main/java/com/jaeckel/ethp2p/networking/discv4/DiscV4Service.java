@@ -41,7 +41,13 @@ public final class DiscV4Service implements AutoCloseable {
 
     /** Endpoint ("ip:port") → last probe millis (see {@link #probeEndpoint}). */
     private final ConcurrentHashMap<String, Long> probedEndpoints = new ConcurrentHashMap<>();
+    /** Re-probe window for endpoints whose bond SUCCEEDED (they're in the table,
+     *  the refresh walk samples them — the probe is just a periodic top-up). */
     private static final long PROBE_MIN_INTERVAL_MS = 60 * 60 * 1000L; // 1h per endpoint
+    /** Re-probe window for endpoints that never bonded: a single lost UDP
+     *  datagram must not black out a proven peer's neighbourhood for an hour —
+     *  the peer isn't in the table, so nothing else will ever re-ping it. */
+    private static final long PROBE_RETRY_UNBONDED_MS = 10 * 60 * 1000L; // 10 min
     private static final int PROBE_MAP_MAX = 1024;
 
     public DiscV4Service(NodeKey nodeKey, List<InetSocketAddress> bootnodes,
@@ -112,22 +118,32 @@ public final class DiscV4Service implements AutoCloseable {
     public void probeEndpoint(InetSocketAddress udpAddr) {
         if (channel == null || !channel.isActive()) return;
         String key = udpAddr.getHostString() + ":" + udpAddr.getPort();
-        if (!shouldProbe(key, System.currentTimeMillis())) return;
+        // Bond state picks the retry window: table membership means the pong
+        // verified (the handler adds peers to the table only on that path).
+        boolean bonded = false;
+        for (KademliaTable.Entry e : table.allPeers()) {
+            if (e.udpAddr().equals(udpAddr)) { bonded = true; break; }
+        }
+        if (!shouldProbe(key, System.currentTimeMillis(), bonded)) return;
         log.debug("[discv4] probing proven peer endpoint {}", udpAddr);
         sendPing((InetSocketAddress) channel.localAddress(), udpAddr);
         findNode(udpAddr, nodeKey.publicKeyBytes());
     }
 
     /** Dedup/rate-limit decision for {@link #probeEndpoint} (package-private for
-     *  tests). Bounded, coarse: the map is dropped wholesale when oversized —
-     *  probes are a nudge, not bookkeeping, so losing history just allows an
-     *  early re-probe. Races between concurrent READY events are benign for the
+     *  tests). {@code bonded} selects the window: 1h for endpoints already in
+     *  the table, 10min for endpoints whose earlier probe never produced a
+     *  verified pong (lost datagram / UDP filtered — retry sooner). Bounded,
+     *  coarse: the map is dropped wholesale when oversized — probes are a
+     *  nudge, not bookkeeping, so losing history just allows an early
+     *  re-probe. Races between concurrent READY events are benign for the
      *  same reason (worst case one duplicate ping+FindNode). */
-    boolean shouldProbe(String key, long now) {
+    boolean shouldProbe(String key, long now, boolean bonded) {
         if (probedEndpoints.size() > PROBE_MAP_MAX) probedEndpoints.clear();
+        long window = bonded ? PROBE_MIN_INTERVAL_MS : PROBE_RETRY_UNBONDED_MS;
         Long last = probedEndpoints.putIfAbsent(key, now);
         if (last == null) return true;
-        if (now - last < PROBE_MIN_INTERVAL_MS) return false;
+        if (now - last < window) return false;
         probedEndpoints.put(key, now);
         return true;
     }
