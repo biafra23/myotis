@@ -62,6 +62,7 @@ async fn pool_dials_from_discovery_and_serves_a_verified_account() {
         head_hash: genesis,
         head_number: 0,
         listen_port: 30303,
+        genesis_header_rlp: None,
     });
 
     // Wire discovery straight into the pool — no per-peer orchestration here.
@@ -72,6 +73,7 @@ async fn pool_dials_from_discovery_and_serves_a_verified_account() {
         PoolConfig::default(),
         myotis_net::el::peercache::ElPeerCache::disabled(),
         rx,
+        None,
         None,
         None,
     );

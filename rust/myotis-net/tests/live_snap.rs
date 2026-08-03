@@ -63,6 +63,7 @@ async fn fetches_a_verified_account_on_live_mainnet() {
         head_hash: genesis,
         head_number: 0,
         listen_port: 30303,
+        genesis_header_rlp: None,
     });
 
     let mut probe = [0u8; 20];

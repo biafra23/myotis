@@ -606,7 +606,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                         headerCache.put(vh.header().number, raw);
                         hashCache.put(vh.hash().toHexString(), raw);
                         // Make it servable to peers via the shared window + advertised range.
-                        servedWindow.put(vh.header().number, vh.hash(), raw);
+                        servedWindow.put(vh.header().number, vh.hash(), vh.header().parentHash, raw);
                         log.debug("[eth] Cached header for block #{} hash={}",
                                 vh.header().number, vh.hash().toShortHexString());
                         chainHead.update(vh.header().number, vh.hash());
@@ -990,6 +990,27 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         pendingHeaderReqs.put(reqId, HeaderReq.byNumber(blockNumber, count));
         byte[] payload = GetBlockHeadersMessage.encodeByNumber(reqId, blockNumber, count, 0, false);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
+    }
+
+    /**
+     * As {@link #requestBlockHeadersAsync} but WITHOUT recording the request spec —
+     * the response is NOT auto-admitted into the serve caches (an unknown reqId
+     * admits nothing). The header backfill uses this and admits headers itself only
+     * after anchoring the whole batch to the beacon head by parent-hash
+     * (ChainStack.backfillServedHeaders) — stronger than the range-only filter.
+     *
+     * @return a future, or null if this handler is not in READY state
+     */
+    public CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> requestBlockHeadersRawAsync(
+            long blockNumber, int count) {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) return null;
+        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future = new CompletableFuture<>();
+        long reqId = requestId.getAndIncrement();
+        pendingRequests.put(reqId, future);
+        byte[] payload = GetBlockHeadersMessage.encodeByNumber(reqId, blockNumber, count, 0, false);
+        rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
+        return future;
     }
 
     /**

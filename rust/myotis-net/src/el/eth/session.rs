@@ -41,6 +41,9 @@ pub struct EthConfig {
     pub head_hash: [u8; 32],
     pub head_number: u64,
     pub listen_port: u16,
+    /// Raw genesis header RLP for serve-window seeding (mainnet only today);
+    /// verified against `genesis_hash` before use. None → no genesis serving.
+    pub genesis_header_rlp: Option<Vec<u8>>,
 }
 
 /// A negotiated, READY eth session over one peer connection.

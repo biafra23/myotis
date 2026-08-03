@@ -595,6 +595,12 @@ impl ElReader {
             head_hash: cfg.genesis_hash,
             head_number: 0,
             listen_port: cfg.listen_port,
+            // Seed the serve window's genesis where the embedded RLP matches this
+            // network's genesis hash (mainnet today; the helper self-verifies via
+            // keccak, so a non-mainnet config simply gets None).
+            genesis_header_rlp: crate::el::served::mainnet_genesis()
+                .filter(|(h, _)| *h == cfg.genesis_hash)
+                .map(|(_, rlp)| rlp),
         });
         // Load the EL peer cache for warm-start (disabled if no path).
         let cache = match &cfg.cache_path {
@@ -614,6 +620,15 @@ impl ElReader {
             rx,
             Some(Arc::clone(&sent_tx_watch)),
             Some(discovery.probe_sender()),
+            // Header-backfill head source: the beacon-anchored optimistic head —
+            // number AND hash, because every backfill batch must hash-chain to it.
+            Some(Box::new({
+                let anchor = Arc::clone(&anchor);
+                move || {
+                    let n = anchor.optimistic_block_number();
+                    anchor.optimistic_block_hash().filter(|_| n > 0).map(|h| (n, h))
+                }
+            })),
         );
         Ok(ElReader {
             discovery,

@@ -131,10 +131,16 @@ struct PoolInner {
     cache: Mutex<ElPeerCache>,
     /// Recent headers we can serve to peers + the eth/69 advertised range source.
     served: Arc<ServedHeaders>,
+    /// The beacon-anchored head (number, hash) to backfill toward — the batch
+    /// anchor. None (or a None result) → no backfill (fixtures; pre-sync). A
+    /// closure, not the anchor itself — the pool stays anchor-free.
+    head_source: Option<Box<dyn Fn() -> Option<(u64, [u8; 32])> + Send + Sync>>,
+    /// Round-robin cursor for backfill peer selection.
+    backfill_rr: std::sync::atomic::AtomicUsize,
     /// Last (earliest, latest, latestHash) broadcast via BlockRangeUpdate and
     /// WHEN, to suppress duplicate sends and rate-limit changed ones: the spec
-    /// recommends an update "about once every two minutes", and once the window
-    /// tracks the head the triple would otherwise change on nearly every tick.
+    /// recommends an update "about once every two minutes", and the backfill
+    /// makes the triple track the head, changing on nearly every tick.
     /// The hash is part of the key so a same-height reorg re-broadcasts (when due).
     last_broadcast_range: Mutex<Option<((u64, u64, [u8; 32]), Instant)>>,
     /// Inbound peer-demand counters for the status page.
@@ -387,7 +393,18 @@ impl PeerPool {
         rx: mpsc::Receiver<TableEntry>,
         tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
         probe: Option<mpsc::Sender<SocketAddr>>,
+        head_source: Option<Box<dyn Fn() -> Option<(u64, [u8; 32])> + Send + Sync>>,
     ) -> PeerPool {
+        // Built before the struct literal (cfg is moved into it below).
+        let served = Arc::new(ServedHeaders::with_genesis(
+            crate::el::served::DEFAULT_SERVED_BLOCK_WINDOW,
+            // Belt-and-braces: re-verify the RLP against the network's genesis
+            // hash before seeding (the config path already did — see reader).
+            cfg.genesis_header_rlp.as_ref().and_then(|rlp| {
+                let h = myotis_core::keccak::keccak256(rlp);
+                (h == cfg.genesis_hash).then(|| (h, rlp.clone()))
+            }),
+        ));
         let inner = Arc::new(PoolInner {
             key,
             local_pubkey,
@@ -398,7 +415,9 @@ impl PeerPool {
             backoff: Mutex::new(HashMap::new()),
             blacklist: Mutex::new(HashSet::new()),
             cache: Mutex::new(cache),
-            served: Arc::new(ServedHeaders::default()),
+            served,
+            head_source,
+            backfill_rr: std::sync::atomic::AtomicUsize::new(0),
             last_broadcast_range: Mutex::new(None),
             serve_stats: Arc::new(ServeStats::default()),
             hunting: AtomicBool::new(false),
@@ -606,6 +625,139 @@ async fn try_dial(
     true
 }
 
+/// Max headers requested per backfill tick — converges a full 4096-cap window
+/// in a few minutes without hammering any one peer. Twin of the Java
+/// `ChainStack.BACKFILL_BATCH`.
+const BACKFILL_BATCH: u64 = 192;
+
+/// What a backfill batch must anchor its TOP header's hash against before any
+/// of it may enter the window. Every batch is chained: internally by parent
+/// hashes, and at the top either to the beacon-anchored head hash or to the
+/// parent hash of the held header just above it — so only content
+/// cryptographically linked to the verified head is ever served.
+#[derive(Debug, PartialEq, Eq)]
+enum BatchAnchor {
+    /// The batch ends at the anchored head: top hash must equal this.
+    Head([u8; 32]),
+    /// The batch fills below the held run: top hash must equal the held run's
+    /// earliest header's parent hash.
+    ChildParent([u8; 32]),
+}
+
+/// The pure per-tick backfill plan. `run` is the window's contiguous newest run
+/// (earliest, latest); `earliest_parent` its earliest header's stored parent
+/// hash. Two shapes, both fully anchored:
+///  - the run doesn't include the anchored head → fetch up to and INCLUDING the
+///    head (in one batch; too-far-behind runs restart near the head), anchored
+///    by the beacon head hash;
+///  - the run includes the head but not the floor → fill downward below the
+///    run, anchored by the run's earliest parent hash. This also repairs the
+///    "organic put ahead of the run strands the gap" case: filling is always
+///    relative to the newest run.
+fn backfill_plan(
+    anchored: (u64, [u8; 32]),
+    cap: u64,
+    run: Option<(u64, u64)>,
+    earliest_parent: Option<[u8; 32]>,
+) -> Option<(u64, u64, BatchAnchor)> {
+    let (head, head_hash) = anchored;
+    if head == 0 {
+        return None;
+    }
+    let floor = head.saturating_sub(cap.saturating_sub(1)).max(1);
+    match run {
+        // Run reaches (or passes) the anchored head: fill DOWN below it.
+        Some((earliest, latest)) if latest >= head => {
+            if earliest <= floor {
+                return None; // window full
+            }
+            let from = earliest.saturating_sub(BACKFILL_BATCH).max(floor);
+            Some((from, earliest - from, BatchAnchor::ChildParent(earliest_parent?)))
+        }
+        // Run below the head and adjacent-reachable in one batch: extend UP to
+        // the head (top anchored by the beacon hash; the internal chain check
+        // plus a same-batch-contiguity rule keeps the middle honest).
+        Some((_, latest)) if head - latest <= BACKFILL_BATCH => {
+            let from = (latest + 1).max(floor);
+            Some((from, head - from + 1, BatchAnchor::Head(head_hash)))
+        }
+        // Too far behind (or empty): restart at the head window.
+        _ => {
+            let from = head.saturating_sub(BACKFILL_BATCH - 1).max(floor);
+            Some((from, head - from + 1, BatchAnchor::Head(head_hash)))
+        }
+    }
+}
+
+/// Validate an ascending backfill batch before admission: exact numbering
+/// `[from..from+len)`, internal parent-hash chain, and the top anchored per
+/// [`BatchAnchor`]. Any failure rejects the WHOLE batch.
+fn batch_anchored(
+    headers: &[crate::el::eth::messages::VerifiedHeader],
+    from: u64,
+    anchor: &BatchAnchor,
+) -> bool {
+    let Some(top) = headers.last() else { return false };
+    for (i, h) in headers.iter().enumerate() {
+        if h.header.number != from + i as u64 {
+            return false;
+        }
+        if i > 0 && h.header.parent_hash != headers[i - 1].hash {
+            return false;
+        }
+    }
+    match anchor {
+        BatchAnchor::Head(h) => top.hash == *h,
+        BatchAnchor::ChildParent(p) => top.hash == *p,
+    }
+}
+
+/// One bounded, ANCHORED backfill request per tick: plan the next missing chunk
+/// of `[head-cap+1 ..= head]`, fetch it raw (no side-channel admission), verify
+/// the batch parent-chains to the beacon anchor, and only then admit it into
+/// the window. Runs in a spawned task so a hung peer (15 s request timeout >
+/// the 10 s tick) can never stall the maintainer. Failures drop the batch; the
+/// next tick retries.
+async fn backfill_served_headers(inner: &Arc<PoolInner>) {
+    let Some(head_source) = &inner.head_source else { return };
+    let Some(anchored) = head_source() else { return };
+    let cap = inner.served.window();
+    let run = inner.served.advertise().map(|(e, l, _)| (e, l));
+    let earliest_parent = run.and_then(|(e, _)| inner.served.parent_hash_of(e));
+    let Some((from, count, anchor)) = backfill_plan(anchored, cap, run, earliest_parent) else {
+        return;
+    };
+    // Rotate across the pool so one peer neither monopolizes nor poisons the
+    // fill; snapshot the pick outside the lock.
+    let peer = {
+        let peers = inner.peers.lock().await;
+        if peers.is_empty() {
+            return;
+        }
+        let i = inner.backfill_rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Arc::clone(&peers[i % peers.len()].peer)
+    };
+    let inner2 = Arc::clone(inner);
+    tokio::spawn(async move {
+        tracing::debug!(from, count, head = anchored.0, "header backfill: anchored fetch");
+        let Ok(headers) = peer.get_block_headers_by_number_raw(from, count).await else {
+            return;
+        };
+        if headers.len() as u64 != count || !batch_anchored(&headers, from, &anchor) {
+            tracing::debug!(
+                from,
+                count,
+                got = headers.len(),
+                "header backfill: batch failed anchoring — dropped"
+            );
+            return;
+        }
+        for vh in &headers {
+            inner2.served.put(vh.header.number, vh.hash, vh.header.parent_hash, vh.raw_rlp.clone());
+        }
+    });
+}
+
 /// Send BlockRangeUpdate to all live eth/69 peers when our servable range has
 /// changed since the last broadcast (deduped on the (earliest, latest, hash)
 /// triple — a same-height reorg re-broadcasts too). Peers are snapshotted, then
@@ -665,6 +817,11 @@ async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
     let mut zero_since: Option<Instant> = None;
     loop {
         tokio::time::sleep(MAINTAINER_INTERVAL).await;
+        // Serving is only real if we HOLD the recent headers peers ask for — a
+        // light client fetches almost none organically. Top the window up toward
+        // the anchored head (one bounded request per tick), then broadcast the
+        // (possibly grown) range.
+        backfill_served_headers(&inner).await;
         // Keep the eth/69 advertised range honest over a connection's lifetime:
         // a peer told a narrow range at handshake would otherwise get empty
         // answers once the window slides forward. Broadcast on change (deduped).
@@ -796,6 +953,93 @@ impl SnapQualitySink {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn backfill_plan_is_always_anchored() {
+        use super::{backfill_plan, BatchAnchor, BACKFILL_BATCH};
+        let hh = [7u8; 32]; // anchored head hash
+        let pp = [9u8; 32]; // held run's earliest parent hash
+        // No head yet → nothing.
+        assert_eq!(backfill_plan((0, hh), 32, None, None), None);
+        // Empty window: restart at the head window, anchored by the head hash.
+        assert_eq!(
+            backfill_plan((1_000_000, hh), 32, None, None),
+            Some((999_969, 32, BatchAnchor::Head(hh)))
+        );
+        assert_eq!(
+            backfill_plan((1_000_000, hh), 4096, None, None),
+            Some((999_809, BACKFILL_BATCH, BatchAnchor::Head(hh)))
+        );
+        // Run below the head within one batch: extend UP to and including the head.
+        assert_eq!(
+            backfill_plan((1_000_000, hh), 4096, Some((999_000, 999_980)), Some(pp)),
+            Some((999_981, 20, BatchAnchor::Head(hh)))
+        );
+        // Run too far behind: restart near the head (still head-anchored).
+        assert_eq!(
+            backfill_plan((1_000_000, hh), 4096, Some((900_000, 900_010)), Some(pp)),
+            Some((999_809, BACKFILL_BATCH, BatchAnchor::Head(hh)))
+        );
+        // Run includes the head, floor not reached: fill DOWN, anchored by the
+        // held run's earliest parent hash — repairs organic-put stranding too.
+        assert_eq!(
+            backfill_plan((1_000_000, hh), 4096, Some((999_900, 1_000_000)), Some(pp)),
+            Some((999_708, 192, BatchAnchor::ChildParent(pp)))
+        );
+        // Down-fill without a known earliest parent (shouldn't happen) → no plan.
+        assert_eq!(backfill_plan((1_000_000, hh), 4096, Some((999_900, 1_000_000)), None), None);
+        // Window full → done.
+        assert_eq!(
+            backfill_plan((1_000_000, hh), 32, Some((999_969, 1_000_000)), Some(pp)),
+            None
+        );
+        // cap=1: only the head itself.
+        assert_eq!(
+            backfill_plan((1_000_000, hh), 1, None, None),
+            Some((1_000_000, 1, BatchAnchor::Head(hh)))
+        );
+    }
+
+    #[test]
+    fn batch_anchoring_rejects_unchained_and_misnumbered() {
+        use super::{batch_anchored, BatchAnchor};
+        use crate::el::eth::messages::VerifiedHeader;
+        use myotis_core::header::BlockHeader;
+        // Build a 3-header parent-chained batch [100..102] from real RLP.
+        fn mk(number: u64, parent: [u8; 32]) -> VerifiedHeader {
+            // A minimal-but-decodable header: reuse the pinned genesis fields via
+            // decode of a synthetic header is heavy — instead fabricate the struct
+            // directly (batch_anchored only reads number/parent_hash/hash).
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&number.to_be_bytes());
+            VerifiedHeader {
+                hash,
+                raw_rlp: vec![0xc0],
+                header: BlockHeader { number, parent_hash: parent, ..synthetic_header() },
+            }
+        }
+        fn synthetic_header() -> BlockHeader {
+            // decode the embedded genesis for a fully-populated template
+            let (_, rlp) = crate::el::served::mainnet_genesis().unwrap();
+            BlockHeader::decode(&rlp).unwrap()
+        }
+        let h100 = mk(100, [1u8; 32]);
+        let h101 = mk(101, h100.hash);
+        let h102 = mk(102, h101.hash);
+        let top_hash = h102.hash;
+        let batch = vec![h100.clone(), h101.clone(), h102.clone()];
+        assert!(batch_anchored(&batch, 100, &BatchAnchor::Head(top_hash)));
+        assert!(batch_anchored(&batch, 100, &BatchAnchor::ChildParent(top_hash)));
+        // Wrong anchor hash → rejected.
+        assert!(!batch_anchored(&batch, 100, &BatchAnchor::Head([0xee; 32])));
+        // Broken internal chain → rejected.
+        let broken = vec![h100.clone(), mk(101, [0xdd; 32]), h102.clone()];
+        assert!(!batch_anchored(&broken, 100, &BatchAnchor::Head(top_hash)));
+        // Misnumbered → rejected.
+        assert!(!batch_anchored(&batch, 99, &BatchAnchor::Head(top_hash)));
+        // Empty → rejected.
+        assert!(!batch_anchored(&[], 100, &BatchAnchor::Head(top_hash)));
+    }
+
+    #[test]
     fn range_broadcast_dedup_and_rate_limit() {
         use super::{range_broadcast_due, MIN_REBROADCAST_INTERVAL};
         use tokio::time::Instant; // pool.rs's Instant is tokio's re-export
@@ -848,6 +1092,7 @@ mod tests {
             head_hash: [0u8; 32],
             head_number: 0,
             listen_port: 30303,
+            genesis_header_rlp: None,
         });
         let (_tx, rx) = mpsc::channel(4);
         let pool = PeerPool::start(
@@ -857,6 +1102,7 @@ mod tests {
             PoolConfig::default(),
             ElPeerCache::disabled(),
             rx,
+            None,
             None,
             None,
         );
@@ -900,6 +1146,7 @@ mod tests {
             head_hash: [0u8; 32],
             head_number: 0,
             listen_port: 30303,
+            genesis_header_rlp: None,
         });
         let (_tx, rx) = mpsc::channel(4);
         let pool = PeerPool::start(
@@ -909,6 +1156,7 @@ mod tests {
             PoolConfig::default(),
             ElPeerCache::load(path.clone()),
             rx,
+            None,
             None,
             None,
         );
@@ -956,6 +1204,7 @@ mod tests {
             head_hash: [0u8; 32],
             head_number: 0,
             listen_port: 30303,
+            genesis_header_rlp: None,
         });
         let (_tx, rx) = mpsc::channel(4);
         let pool = PeerPool::start(
@@ -965,6 +1214,7 @@ mod tests {
             PoolConfig::default(),
             ElPeerCache::load(path.clone()),
             rx,
+            None,
             None,
             None,
         );
