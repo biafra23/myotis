@@ -131,9 +131,10 @@ struct PoolInner {
     cache: Mutex<ElPeerCache>,
     /// Recent headers we can serve to peers + the eth/69 advertised range source.
     served: Arc<ServedHeaders>,
-    /// Last (earliest, latest) we broadcast via BlockRangeUpdate, to suppress
-    /// duplicate sends when the maintainer tick finds an unchanged range.
-    last_broadcast_range: Mutex<Option<(u64, u64)>>,
+    /// Last (earliest, latest, latestHash) we broadcast via BlockRangeUpdate, to
+    /// suppress duplicate sends when the maintainer tick finds an unchanged
+    /// range. The hash is part of the key so a same-height reorg re-broadcasts.
+    last_broadcast_range: Mutex<Option<(u64, u64, [u8; 32])>>,
     /// Inbound peer-demand counters for the status page.
     serve_stats: Arc<ServeStats>,
     /// EL hunt engaged (serving pool empty past the stall window) — drives the
@@ -603,24 +604,17 @@ async fn try_dial(
     true
 }
 
-/// The snap-peer maintainer: on a timer, if the live snap count has dropped
-/// below `target_snap_peers`, re-dial cached snap peers (snap-quality first) to
-/// top back up. Twin of the Java `ChainStack.maintainSnapPeers` loop — the
-/// discv4 dialer alone can starve on a long-running daemon once its stream goes
-/// quiet and pooled peers die, so this keeps the pool healed from the cache.
 /// Send BlockRangeUpdate to all live eth/69 peers when our servable range has
-/// changed since the last broadcast. Peers snapshot-then-send outside the peers
-/// lock so a slow writer can't stall the maintainer.
+/// changed since the last broadcast (deduped on the (earliest, latest, hash)
+/// triple — a same-height reorg re-broadcasts too). Peers are snapshotted, then
+/// sent to outside the peers lock; each send is bounded by the frame-write
+/// timeout, and a failed write closes that peer (see send_block_range_update).
 async fn broadcast_range_if_changed(inner: &Arc<PoolInner>) {
     let Some((earliest, latest, latest_hash)) = inner.served.advertise() else {
         return; // empty window — nothing new to promise
     };
-    {
-        let mut last = inner.last_broadcast_range.lock().await;
-        if *last == Some((earliest, latest)) {
-            return;
-        }
-        *last = Some((earliest, latest));
+    if !range_broadcast_due(&mut *inner.last_broadcast_range.lock().await, (earliest, latest, latest_hash)) {
+        return;
     }
     let peers: Vec<Arc<ManagedPeer>> =
         inner.peers.lock().await.iter().map(|p| Arc::clone(&p.peer)).collect();
@@ -629,6 +623,21 @@ async fn broadcast_range_if_changed(inner: &Arc<PoolInner>) {
     }
 }
 
+/// The pure dedup decision for BlockRangeUpdate: record + broadcast only when
+/// the (earliest, latest, latestHash) triple changed since the last broadcast.
+fn range_broadcast_due(last: &mut Option<(u64, u64, [u8; 32])>, range: (u64, u64, [u8; 32])) -> bool {
+    if *last == Some(range) {
+        return false;
+    }
+    *last = Some(range);
+    true
+}
+
+/// The snap-peer maintainer: on a timer, if the live snap count has dropped
+/// below `target_snap_peers`, re-dial cached snap peers (snap-quality first) to
+/// top back up. Twin of the Java `ChainStack.maintainSnapPeers` loop — the
+/// discv4 dialer alone can starve on a long-running daemon once its stream goes
+/// quiet and pooled peers die, so this keeps the pool healed from the cache.
 async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
     // EL-hunt stall clock: Some(t) while the pool has been continuously empty
     // since t. Maintainer-task-local — nothing else needs it.
@@ -765,6 +774,18 @@ impl SnapQualitySink {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn range_broadcast_dedup_fires_on_any_component_change() {
+        let mut last = None;
+        let h1 = [1u8; 32];
+        let h2 = [2u8; 32];
+        assert!(super::range_broadcast_due(&mut last, (10, 20, h1)), "first range broadcasts");
+        assert!(!super::range_broadcast_due(&mut last, (10, 20, h1)), "unchanged is deduped");
+        assert!(super::range_broadcast_due(&mut last, (11, 20, h1)), "earliest change fires");
+        assert!(super::range_broadcast_due(&mut last, (11, 21, h1)), "latest change fires");
+        assert!(super::range_broadcast_due(&mut last, (11, 21, h2)), "same-height reorg (hash) fires");
+    }
+
     use super::*;
 
     #[test]

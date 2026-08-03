@@ -203,11 +203,12 @@ final class RustEngineNative {
     }
 
     /**
-     * Live-set the eth/69 served-block window (Settings knob). Silently a no-op
-     * on a not-started / paused / CL-only handle — the engine fn absorbs it.
+     * Live-set the eth/69 served-block window (Settings knob). Applied live on a
+     * RUNNING handle; stashed and applied at the next start otherwise. False
+     * only for an unknown handle.
      */
-    static void nativeSetServedBlockWindow(long handle, int blocks) {
-        Myotis_engineKt.setServedBlockWindow(handle, blocks);
+    static boolean nativeSetServedBlockWindow(long handle, int blocks) {
+        return Myotis_engineKt.setServedBlockWindow(handle, blocks);
     }
 
     /** Up to {@code max} buffered engine tracing lines (oldest first, newline-joined). */

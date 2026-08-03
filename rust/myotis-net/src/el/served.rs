@@ -65,12 +65,13 @@ impl ServedHeaders {
     /// Live-adjust the window (Settings). Clamped ≥ 1; shrinking evicts the tail
     /// immediately so the advertised range can never exceed the new cap.
     pub fn set_window(&self, window: u64) {
-        self.window.store(window.max(1), Ordering::Relaxed);
+        let clamped = window.max(1);
+        self.window.store(clamped, Ordering::Relaxed);
         let mut g = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        Self::evict_locked(&mut g, self.window.load(Ordering::Relaxed));
+        Self::evict_locked(&mut g, clamped);
     }
 
     /// Evict everything below the newest-window band. Caller holds the lock.

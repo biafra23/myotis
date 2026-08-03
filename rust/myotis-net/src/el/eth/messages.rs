@@ -67,12 +67,6 @@ pub fn encode_status(
     ]))
 }
 
-/// Encode our Status for eth/69: `[version, networkId, genesis, [forkHash,
-/// forkNext], earliestBlock, latestBlock, latestBlockHash]` (no td).
-///
-/// The eth/69 (EIP-7642) block range is a promise of what we can SERVE — the
-/// Java twin advertises only its held header window (never `[0, head]`), and
-/// callers here must do the same.
 /// eth/69 BlockRangeUpdate body `[earliestBlock, latestBlock, latestBlockHash]`.
 /// Sent to already-connected peers when our servable range changes.
 pub fn encode_block_range_update(earliest: u64, latest: u64, latest_hash: &[u8; 32]) -> Vec<u8> {
@@ -83,6 +77,12 @@ pub fn encode_block_range_update(earliest: u64, latest: u64, latest_hash: &[u8; 
     ]))
 }
 
+/// Encode our Status for eth/69: `[version, networkId, genesis, [forkHash,
+/// forkNext], earliestBlock, latestBlock, latestBlockHash]` (no td).
+///
+/// The eth/69 (EIP-7642) block range is a promise of what we can SERVE — the
+/// Java twin advertises only its held header window (never `[0, head]`), and
+/// callers here must do the same.
 pub fn encode_status69(
     eth_version: u64,
     network_id: u64,
