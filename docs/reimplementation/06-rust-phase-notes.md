@@ -38,9 +38,16 @@ starts per that plan's entry criteria (see also "EL-phase entry" below).
 - **Month-old-checkpoint catch-up is a MUST.** Never "fix" slow catch-up by
   refreshing the embedded checkpoint — the wallet must sync from a stale trust
   anchor in the field.
-- Binding choice: **hand-JNI + JSON marshalling**, not UniFFI (user decision;
-  doc [05](05-engine-api-bindings.md) describes the UniFFI mapping as the
-  eventual multi-platform path — revisit when iOS/extension shells land).
+- Binding choice (REVISED): the JVM boundary is **UniFFI + JSON marshalling** —
+  the original hand-JNI decision was reversed (user decision, 2026-07) as a
+  transport swap only: `#[uniffi::export]` fns in `rust/myotis-engine/src/ffi.rs`,
+  generated Kotlin bindings committed in `:myotis-engines`
+  (`uniffiGenerateKotlin` regenerates), `RustEngineNative` reduced to a static
+  delegator. Compound values STILL cross as JSON strings with the golden-test-
+  pinned shapes; UniFFI's per-function API checksums replace the hand-rolled
+  stale-.so ABI probe. The iOS plain C ABI (`capi.rs`) is unchanged — doc
+  [05](05-engine-api-bindings.md)'s typed-record mapping remains the eventual
+  full-UniFFI path if the JSON transport is ever retired.
 
 ## Phone-failure diagnosis (reframes the Rust justification)
 
@@ -96,6 +103,17 @@ a Pixel re-test of the fixed Java build.
   failure, so a half-created Rust chain would double-host.
 - `RustMyotisEngine`'s "Supported: mainnet, sepolia, gnosis" error text is a
   hand-copy of `NetworkConfig.byName`'s — keep in sync when networks change.
+- **Rust EL parity gap: storage-proof cache keying.** The Java engine's
+  `StateProofCache` keys verified storage slots by the account's
+  **storageRoot** (accounts stay keyed by world stateRoot), so slots of
+  unchanged contracts replay across head advances and a wallet's per-poll
+  Multicall3 sweep costs one account proof per contract per block instead of
+  re-proving every slot (the Kohaku eth_call-timeout fix, PR for
+  feat/storage-cache-by-storage-root). The Rust engine's twin cache
+  (`rust/myotis-evm/src/cache.rs`) still keys storage by
+  `(state_root, address, slot)` — mirror the storageRoot keying (and the
+  hot-call replay-warm in `VerifiedRpcBackend`, feat/hot-call-replay-warm)
+  when the Rust EL reaches per-poll eth_call serving.
 - **OPEN (user decision pending): extraData-offset leniency.** Both the Java
   and Rust `ExecutionPayloadHeader` decoders tolerate out-of-range extraData
   offsets (decode as empty) instead of rejecting — declined in #129 for Java

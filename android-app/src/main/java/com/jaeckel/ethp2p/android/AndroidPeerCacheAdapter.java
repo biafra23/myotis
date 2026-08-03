@@ -31,6 +31,10 @@ public final class AndroidPeerCacheAdapter implements EnginePeerCache {
         delegate.recordSnapServed(InetSocketAddress.createUnresolved(host, port));
     }
 
+    @Override public void recordConnectFailure(String host, int port) {
+        delegate.recordConnectFailure(InetSocketAddress.createUnresolved(host, port));
+    }
+
     @Override public void recordSnapFailure(String host, int port) {
         delegate.recordSnapFailure(InetSocketAddress.createUnresolved(host, port));
     }

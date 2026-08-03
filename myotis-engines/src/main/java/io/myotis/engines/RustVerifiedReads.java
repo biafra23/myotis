@@ -17,11 +17,12 @@ import org.slf4j.LoggerFactory;
  * <p>It answers the reads a wallet needs for an ETH send, from the beacon-anchored,
  * proof-verified queries: {@code chainId}, {@code headBlockNumber}, {@code syncState},
  * {@code getBalance}, {@code getTransactionCount}, {@code getCode}, {@code getStorageAt},
- * {@code getBlockByNumber}, {@code gasPrice}, {@code maxPriorityFeePerGas},
- * {@code sendRawTransaction}, and a 21000 {@code estimateGas} shortcut for plain
- * transfers. The EVM-backed reads — {@code call}, and {@code estimateGas} for a
- * contract/calldata target — return {@code null} ("cannot answer verified right
- * now"), which the router maps to a strict-mode {@code -32000}, until EL-C (revm).
+ * {@code getBlockByNumber}, {@code getBlockByHash}, {@code getTransactionReceipt},
+ * {@code getTransactionByHash}, {@code gasPrice}, {@code maxPriorityFeePerGas},
+ * {@code feeHistory}, {@code sendRawTransaction}, plus the EVM-backed {@code call}
+ * and {@code estimateGas} (revm over proof-verified state). Block reads serve
+ * both shapes: tx hashes or, with {@code fullTransactions=true}, fully decoded
+ * tx objects (verified against the block's {@code transactionsRoot}).
  *
  * <p><b>Head-anchored.</b> The Rust reader verifies against the peer's fresh head
  * (the CL-anchored latest state), so state reads resolve to that head. A selector
@@ -116,9 +117,7 @@ final class RustVerifiedReads implements VerifiedReads {
         if (!isServableBlock(block)) return null;
         AccountProofResult r = queryAccount(address);
         if (r == null || !isVerified(r)) return null;
-        // Verified-absent → nonce 0 (r.nonce() is -1 when !exists). No pending
-        // overlay yet: "pending" resolves to the verified head nonce, which is
-        // correct for a wallet sending its first not-yet-mined tx.
+        // Verified-absent → nonce 0 (r.nonce() is -1 when !exists).
         //
         // Nonce freshness: the Java backend (VerifiedRpcBackend) gates nonce
         // serving on a TIGHTER staleness bound than balance, because a stale nonce
@@ -129,7 +128,14 @@ final class RustVerifiedReads implements VerifiedReads {
         // fails verification → null), so staleness is bounded to the peer's current
         // tip (slot-scale seconds). Replicating the Java engine's explicit tighter
         // nonce gate is a follow-up, pending a head-age field in the Rust status.
-        return r.exists() ? r.nonce() : 0L;
+        long mined = r.exists() ? r.nonce() : 0L;
+        // ONLY the pending tag consults the sent-tx overlay (max(mined, ours+1)
+        // while our broadcast is unmined+unexpired) — the Java engine's
+        // getTransactionCount "pending" branch, mirrored.
+        if ("pending".equals(block)) {
+            return handle.pendingNonceOverlay(toHex(address), mined);
+        }
+        return mined;
     }
 
     @Override
@@ -180,8 +186,6 @@ final class RustVerifiedReads implements VerifiedReads {
         }
     }
 
-    // ---- not yet served verified on the Rust engine (later EL-C slices) ----
-
     @Override
     public byte[] sendRawTransaction(byte[] rawTx) {
         if (rawTx == null || rawTx.length == 0) return null;
@@ -194,26 +198,95 @@ final class RustVerifiedReads implements VerifiedReads {
             return null;
         }
     }
-    @Override public String getTransactionReceipt(byte[] txHash) { return null; }
-    @Override public String getTransactionByHash(byte[] txHash) { return null; }
+
+    @Override
+    public String getTransactionReceipt(byte[] txHash) {
+        // A tx hash is exactly 32 bytes; anything else can't be answered.
+        if (txHash == null || txHash.length != 32) return null;
+        try {
+            // The receipt JSON (verified vs the anchored header's receiptsRoot), the
+            // "null" literal (verified "not seen" — pending/unknown, the wallet keeps
+            // polling), or throws when it can't verify (→ null → strict -32000).
+            return handle.transactionReceiptJson(toHex(txHash));
+        } catch (RuntimeException e) {
+            log.debug("[engines] verified receipt read unavailable: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    @Override
+    public String getTransactionByHash(byte[] txHash) {
+        // A tx hash is exactly 32 bytes; anything else can't be answered.
+        if (txHash == null || txHash.length != 32) return null;
+        try {
+            // The tx JSON (located via the transactionsRoot-verified scan, fully
+            // decoded incl. the recovered sender), the "null" literal (verified
+            // "not seen" — unknown/pending), or throws when it can't verify
+            // (→ null → strict -32000). Unlike the Java engine there is no
+            // own-sent-tx pending answer yet (needs the sent-tx cache).
+            return handle.transactionByHashJson(toHex(txHash));
+        } catch (RuntimeException e) {
+            log.debug("[engines] verified tx read unavailable: {}", e.getMessage());
+            return null;
+        }
+    }
 
     @Override
     public String getBlockByNumber(String block, boolean fullTransactions) {
-        // Full tx objects need tx decode + sender recovery — not served verified yet
-        // (mirrors the Java engine); null → strict -32000.
-        if (fullTransactions) return null;
         String tag = (block == null || block.isBlank()) ? "latest" : block;
         try {
-            // Returns the block JSON, the "null" literal (verified future/unknown
+            // Returns the block JSON (tx hashes, or fully decoded tx objects when
+            // fullTransactions), the "null" literal (verified future/unknown
             // block), or throws when it can't verify (→ null → -32000).
-            return handle.blockByNumberJson(tag);
+            return handle.blockByNumberJson(tag, fullTransactions);
         } catch (RuntimeException e) {
             log.debug("[engines] verified block read unavailable: {}", e.getMessage());
             return null;
         }
     }
 
-    @Override public String getBlockByHash(byte[] blockHash32, boolean fullTransactions) { return null; }
+    @Override
+    public String getBlockByHash(byte[] blockHash32, boolean fullTransactions) {
+        if (blockHash32 == null || blockHash32.length != 32) return null;
+        try {
+            // The block JSON (tx hashes, or fully decoded tx objects when
+            // fullTransactions), the "null" literal (a hash this engine never
+            // verified / reorged away), or throws (→ null → strict -32000).
+            return handle.blockByHashJson(toHex(blockHash32), fullTransactions);
+        } catch (RuntimeException e) {
+            log.debug("[engines] verified block-by-hash read unavailable: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    @Override
+    public String getLogs(String filterJson) {
+        try {
+            // Array or {"error": ...} — passed through verbatim; the router
+            // turns the error envelope into a -32000 with the engine's
+            // message (coverage progress, unwatched address, ...).
+            return handle.getLogsJson(filterJson);
+        } catch (RuntimeException e) {
+            log.debug("[engines] getLogs unavailable: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    @Override
+    public String getBlockReceipts(String blockSelector) {
+        try {
+            String sel = (blockSelector == null || blockSelector.isBlank())
+                    ? "latest" : blockSelector;
+            // The receipts array JSON (every element verified vs the anchored
+            // header's receiptsRoot), the "null" literal (verified unknown/future
+            // block or never-verified hash), or throws (→ null → strict -32000).
+            return handle.blockReceiptsJson(sel);
+        } catch (RuntimeException e) {
+            log.debug("[engines] verified blockReceipts read unavailable: {}", e.getMessage());
+            return null;
+        }
+    }
+
     @Override
     public String gasPrice() {
         // Decimal wei (next-block base fee + suggested tip), or null when unverifiable.
@@ -236,7 +309,24 @@ final class RustVerifiedReads implements VerifiedReads {
         }
     }
 
-    @Override public String feeHistory(long blockCount, String newestBlock, double[] rewardPercentiles) { return null; }
+    @Override
+    public String feeHistory(long blockCount, String newestBlock, double[] rewardPercentiles) {
+        if (blockCount < 1) return null;
+        try {
+            // Percentiles cross as a JSON number array (compound values cross as
+            // JSON, like every other native); null → empty → no reward matrix.
+            // Arrays.toString emits "[25.0, 75.0]" — valid JSON.
+            String percentilesJson = rewardPercentiles == null
+                    ? "" : java.util.Arrays.toString(rewardPercentiles);
+            String tag = (newestBlock == null || newestBlock.isBlank()) ? "latest" : newestBlock;
+            // The feeHistory JSON object, or throws when it can't verify
+            // (→ null → strict -32000). No "null" literal case for this method.
+            return handle.feeHistoryJson(blockCount, tag, percentilesJson);
+        } catch (RuntimeException e) {
+            log.debug("[engines] verified feeHistory unavailable: {}", e.getMessage());
+            return null;
+        }
+    }
     @Override
     public Long estimateGas(byte[] from, byte[] to, byte[] data, String valueWei) {
         // Contract creation (to == null) isn't handled.
@@ -289,13 +379,6 @@ final class RustVerifiedReads implements VerifiedReads {
         return r.verifyMethod() != null;
     }
 
-    /** How far ABOVE the anchored head a number-pin is still served (the head may
-     *  advance a few blocks between eth_blockNumber and the pinned read). */
-    private static final long BLOCK_NUM_TOLERANCE = 16;
-    /** How far BELOW the anchored head a number-pin is still served from the head's
-     *  verified state (a genuinely older block can't be represented). */
-    private static final long BLOCK_NUM_LAG_TOLERANCE = 64;
-
     /**
      * Whether a block selector can be served from the anchored head. Accepts the
      * head tags (latest/pending/safe/finalized/default) AND a specific block NUMBER
@@ -311,29 +394,11 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     /** Package-private, JNI-free: the block-window decision, with the anchored head
-     *  supplied lazily (fetched only when a numeric pin needs validating). */
+     *  supplied lazily (fetched only when a numeric pin needs validating). The
+     *  policy + tolerances live ONCE in jsonrpc-server's RpcBlockWindow, shared
+     *  with the iOS backend so the serving window can never drift between hosts. */
     static boolean blockInWindow(String block, java.util.function.Supplier<Long> head) {
-        if (block == null || block.isBlank()) return true;
-        String b = block.trim();
-        if (b.equalsIgnoreCase("latest") || b.equalsIgnoreCase("pending")
-                || b.equalsIgnoreCase("safe") || b.equalsIgnoreCase("finalized")) {
-            return true;
-        }
-        if (b.equalsIgnoreCase("earliest")) return false;
-        long n;
-        try {
-            // Explicit radix (not Long.decode, which reads a leading-zero decimal as
-            // octal). JSON-RPC block numbers are 0x-hex; decimal is tolerated too.
-            n = (b.startsWith("0x") || b.startsWith("0X"))
-                    ? Long.parseLong(b.substring(2), 16)
-                    : Long.parseLong(b, 10);
-        } catch (NumberFormatException e) {
-            return false;
-        }
-        if (n < 0) return false;
-        Long h = head.get();
-        if (h == null) return false; // not synced enough to validate the pin
-        return n >= h - BLOCK_NUM_LAG_TOLERANCE && n <= h + BLOCK_NUM_TOLERANCE;
+        return io.myotis.jsonrpc.RpcBlockWindow.INSTANCE.blockInWindow(block, head::get);
     }
 
     /** Fixed-width bytes → lowercase 0x-hex (a 20-byte address or a 32-byte

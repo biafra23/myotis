@@ -49,7 +49,7 @@ pub use revm::primitives::U256;
 
 pub use block::BlockContext;
 pub use cache::{
-    BytecodeCache, InMemoryBytecodeCache, InMemoryStateProofCache, NoopBytecodeCache,
+    BytecodeCache, InMemoryBytecodeCache, InMemoryStateProofCache, Lru, NoopBytecodeCache,
     NoopStateProofCache, StateProofCache,
 };
 pub use database::OracleDatabase;

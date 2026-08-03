@@ -217,12 +217,15 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     /** keccak256("") — an account with this codeHash is an EOA (no contract code). */
     private static final byte[] EMPTY_CODE_HASH = Hash.keccak256(Bytes.EMPTY).toArrayUnsafe();
 
-    // Cross-call cache of proof-verified account/storage state, keyed by stateRoot.
-    // Shared across every head-context oracle so a wallet's repeated retries of a
-    // heavy eth_call (MetaMask's ~1000-token BalanceChecker sweep / Multicall3
-    // simulation) reuse already-fetched slots instead of re-proving hundreds each
-    // time — turning a 30s-timeout retry-storm into a couple of converging attempts.
-    // Bounded LRU per kind; ~64k storage slots ≈ a few MB.
+    // Cross-call cache of proof-verified account/storage state — accounts keyed by
+    // world stateRoot, storage slots by their account's storageRoot (see
+    // StateProofCache). Shared across every head-context oracle so a wallet's
+    // repeated retries of a heavy eth_call (MetaMask's ~1000-token BalanceChecker
+    // sweep / Multicall3 simulation) reuse already-fetched slots instead of
+    // re-proving hundreds each time, and so slots of unchanged contracts carry
+    // over across head advances (only the per-block account proof is re-paid).
+    // Bounded LRU per kind; ~64k storage slots ≈ a few MB. Slot entries now
+    // outlive their roots, so the LRU bound (not root churn) is what ages them out.
     private static final int STATE_PROOF_CACHE_MAX = 65_536;
 
     /** How long a verified eth_call / estimateGas RESULT stays replayable (see
@@ -238,6 +241,31 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      *  sweep + token list is a few hundred distinct calls; 512 covers a couple of those
      *  in flight at once. Each value is a small return blob, so this is low-MB. */
     private static final int CALL_RESULT_CACHE_MAX = 512;
+
+    // Replay-warm of the wallet's recurring eth_call shapes (see HotCallTracker and
+    // replayHotCalls): after each head build, the shapes the wallet keeps sending are
+    // re-executed in the background so its next poll — pinned to the block number WE
+    // handed out — replays from callResultCache instead of paying the full EVM +
+    // snap-fetch cost inside its own deadline (observed live: Kohaku's 67KB Multicall3
+    // sweep at p50≈90s / p90≈114s against the 120s timeout, failing nearly every poll).
+    /** Distinct call shapes remembered (LRU). A wallet cycles through a handful. */
+    private static final int HOT_CALL_MAX_TRACKED = 16;
+    /** Sightings before a shape is warmed — a one-off call is never replayed. */
+    private static final int HOT_CALL_MIN_HITS = 2;
+    /** A shape not seen for this long stops being warmed (wallet moved on / closed). */
+    private static final long HOT_CALL_TTL_MS = 10 * 60_000;
+    /** Warms kicked off per head build. Bounds background EVM/snap load; the heavy
+     *  hitters are what matter and there are only a few of them. */
+    private static final int HOT_CALL_MAX_WARMED_PER_HEAD = 4;
+    /** Per-shape calldata cap for tracking (the observed sweeps are 32-67KB). */
+    private static final int HOT_CALL_MAX_CALLDATA = 256 * 1024;
+    /** An in-flight warm older than this counts as dead (its queue slot was likely
+     *  dropped), so the shape becomes warmable again. Above the RPC call timeout so
+     *  a legitimately-slow warm is never doubled up on. */
+    private static final long HOT_CALL_WARM_TIMEOUT_MS = RPC_CALL_TIMEOUT_SEC * 1000 + 30_000;
+    /** After a FAILED warm, leave the shape alone this long — a call that just
+     *  demonstrated it can't complete must not turn the warmer into a retry storm. */
+    private static final long HOT_CALL_FAILURE_BACKOFF_MS = 30_000;
 
     // EVM pool. Was a single thread ("EVM is CPU-bound, oracle pinned to one
     // peer") — but the oracle rotates across peers now, and an EVM task spends
@@ -382,13 +410,18 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      * Frozen anchored context per pinned block NUMBER. A wallet (MetaMask) pins a
      * confirm to one block and retries the same heavy calls against it for minutes.
      * Serving each retry against the <em>current</em> head — which the warmer rebuilds
-     * to a new stateRoot every ~12-15s — reset the stateRoot-keyed StateProofCache on
-     * every rebuild, so a 1000-slot BalanceChecker / Multicall3 simulation re-fetched
-     * from scratch each retry and never converged (the persistent confirm-screen hang,
-     * uptime-independent). Freezing the context — and thus its stateRoot — per pinned
-     * number makes all retries hit one stable root, so the cache accumulates and the
-     * call converges in a couple of tries. Bounded LRU (wallets pin a few recent
-     * blocks); each entry ages out at {@link #RPC_HEAD_SERVE_STALE_MAX_MS}.
+     * to a new stateRoot every ~12-15s — pointed every retry at a different root, so
+     * everything root-keyed (the account side of StateProofCache, callResultCache,
+     * the in-flight call dedup) reset each rebuild and a 1000-slot BalanceChecker /
+     * Multicall3 simulation re-fetched from scratch each retry and never converged
+     * (the persistent confirm-screen hang, uptime-independent). Freezing the context
+     * — and thus its stateRoot — per pinned number makes all retries hit one stable
+     * root, so those caches accumulate and the call converges in a couple of tries.
+     * (Storage slots are now keyed by their account's storageRoot and survive root
+     * changes on their own — see StateProofCache — but the pin still matters for the
+     * account records, the result replay, and execution dedup.) Bounded LRU (wallets
+     * pin a few recent blocks); each entry ages out at
+     * {@link #RPC_HEAD_SERVE_STALE_MAX_MS}.
      */
     private final Map<Long, HeadWithTimestamp> pinnedHeadByNumber =
             java.util.Collections.synchronizedMap(
@@ -425,6 +458,15 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      *  served bytes are bit-identical to re-executing. */
     private final VerifiedResultCache<byte[]> callResultCache =
             new VerifiedResultCache<>(CALL_RESULT_CACHE_MAX, CALL_RESULT_CACHE_TTL_MS);
+
+    /** The wallet's recurring eth_call shapes, replayed against each fresh head so
+     *  its polls hit {@link #callResultCache} — see the HOT_CALL_* constants and
+     *  {@link #replayHotCalls}. */
+    private final HotCallTracker hotCalls = new HotCallTracker(
+            HOT_CALL_MAX_TRACKED, HOT_CALL_MIN_HITS, HOT_CALL_TTL_MS,
+            HOT_CALL_MAX_CALLDATA, HOT_CALL_WARM_TIMEOUT_MS, HOT_CALL_FAILURE_BACKOFF_MS);
+    /** {@link #REPLAY_WARM_PROP}, read once at construction. */
+    private final boolean replayWarmEnabled;
 
     /** Replayable eth_estimateGas results, keyed by {@code stateRoot:from:to:keccak(data):value}.
      *  Same rationale as {@link #callResultCache}: an estimate is deterministic given the
@@ -558,6 +600,11 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      *  before building its stacks). See OPTIMISATIONS_AND_LIMITATIONS.md §2.14. */
     public static final String STRICT_STATE_FRESHNESS_PROP = "myotis.rpc.strictStateFreshness";
 
+    /** System property controlling the hot-call replay-warm (see {@link #replayHotCalls}).
+     *  Default ON; set {@code -Dmyotis.rpc.replayWarm=false} to disable the background
+     *  re-execution of recurring wallet calls after each head build. */
+    public static final String REPLAY_WARM_PROP = "myotis.rpc.replayWarm";
+
     /** Max age a stale-but-anchored head may have and still be served for a STATE-execution
      *  read (eth_call / getBalance / getCode / getStorageAt / estimateGas). STRICT BY DEFAULT
      *  (the tight 2-min {@link #RPC_STATE_HEAD_MAX_STALE_MS} bound) so a read fast-fails when
@@ -601,6 +648,11 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 strictFreshness ? RPC_STATE_HEAD_MAX_STALE_MS : RPC_HEAD_SERVE_STALE_MAX_MS;
         this.log.info("[rpc] state-read head staleness cap = " + (stateHeadStaleCapMs / 1000)
                 + "s (" + (strictFreshness ? "strict" : "relaxed") + ")");
+        this.replayWarmEnabled = Boolean.parseBoolean(
+                System.getProperty(REPLAY_WARM_PROP, "true"));
+        if (!replayWarmEnabled) {
+            this.log.info("[rpc] hot-call replay-warm disabled (" + REPLAY_WARM_PROP + "=false)");
+        }
         final RpcClock clk = this.clock;
         final RpcLogger lg = this.log;
         this.evmPool = task -> {
@@ -716,6 +768,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         pinnedHeadByNumber.clear();
         callResultCache.clear();
         estimateCache.clear();
+        hotCalls.clear();   // drop the recorded calldata profile along with the results
         lastGoodLatestBlock = null;
         lastGoodFeeHistory = null;
     }
@@ -843,6 +896,11 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         if (blockHash32 == null || blockHash32.length != 32) return null;
         return rpcGetBlockByHash("0x" + org.apache.tuweni.bytes.Bytes.wrap(blockHash32).toUnprefixedHexString(),
                 fullTransactions);
+    }
+
+    @Override
+    public String getBlockReceipts(String blockSelector) {
+        return rpcGetBlockReceipts(blockSelector);
     }
 
     @Override
@@ -1203,8 +1261,9 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             }
         }
         // Pinned-number fast path: reuse the context already frozen to this number so
-        // its (fixed) stateRoot lets the StateProofCache accumulate across the wallet's
-        // minutes-long retries instead of resetting every time the head rebuilds.
+        // its (fixed) stateRoot lets the root-keyed caches (account proofs, call
+        // results, execution dedup) accumulate across the wallet's minutes-long
+        // retries instead of resetting every time the head rebuilds.
         if (requestedNum >= 0) {
             HeadWithTimestamp frozen = pinnedHeadByNumber.get(requestedNum);
             // State-read reuse bound: a frozen root older than a few slots is pruned by
@@ -1245,7 +1304,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             // On a concurrent first-read race the putIfAbsent loser must serve the
             // WINNER's context, not its own — otherwise two contexts with different
             // stateRoots briefly serve the same pinned number, splitting the
-            // StateProofCache across roots for that block.
+            // root-keyed caches (account proofs, call results) across roots for
+            // that block.
             HeadWithTimestamp existing = pinnedHeadByNumber.putIfAbsent(requestedNum,
                     new HeadWithTimestamp(ctx, clock.elapsedMillis()));
             if (existing != null) {
@@ -1398,6 +1458,15 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         // confirm-critical contracts at this root so a wallet's first
                         // confirm-screen calls start from warm state — see the method doc.
                         primeConfirmContracts(ctx);
+                        // ...then replay the wallet's recurring calls against this head
+                        // (async, heavy lane) so its next poll hits the result cache.
+                        // Guarded: an escaping throw here would land in the build's
+                        // catch and null out rpcCallCtx even though the head is good.
+                        try {
+                            replayHotCalls(ctx);
+                        } catch (Throwable t) {
+                            log.info("[rpc] hot-call replay skipped: " + unwrap(t));
+                        }
                     } catch (Throwable t) {
                         f.completeExceptionally(t);
                         synchronized (rpcCallCtxLock) {
@@ -1899,6 +1968,24 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         ? Bytes.wrap(data, 0, 4).toHexString() : "0x")
                 + " dataLen=" + (data == null ? 0 : data.length)
                 + " block=" + block;
+        // Track the shape for the replay-warm BEFORE head resolution AND before the
+        // single-flight dedup: the calls most worth warming are exactly the ones
+        // currently failing ("no verified head", deadline timeouts), which never
+        // reach a completed execution — they must still count as sightings. (A
+        // consequence, accepted: a wallet firing N concurrent copies of one call
+        // records N sightings in one cycle — a call duplicated that hard is worth
+        // warming anyway.) Only HEAVY shapes are tracked: small calls execute in
+        // ms on the reserved interactive lane, and warming one would let a wallet
+        // call dedupe onto a heavy-lane warm — queued behind sweep warms — where
+        // untracked it would have been leader on the small lane. Only head-intent
+        // block tags: a shape pinned to a genuinely historical block would warm
+        // against every fresh head yet never be asked at that head's root.
+        if (replayWarmEnabled && to != null && to.length == 20
+                && (from == null || from.length == 20)
+                && data != null && data.length > EVM_SMALL_CALLDATA_MAX
+                && isHeadIntentTag(block)) {
+            hotCalls.record(from, to, value, data, clock.elapsedMillis());
+        }
         RpcCallContext h = verifiedHeadFor(block);
         if (h == null || to == null || to.length != 20) {
             log.info("[rpc] eth_call " + desc + " -> no verified head for block tag");
@@ -1920,11 +2007,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         // Key by (stateRoot, from, to, value, calldata): the sender and value are now
         // part of the input — a transfer simulated by vitalik vs by the zero address
         // computes a DIFFERENT verified result, so they must not share an execution.
-        String flightKey = Bytes.wrap(h.blockCtx().stateRoot()).toHexString()
-                + ":" + (from == null ? "0x0" : Bytes.wrap(from).toHexString())
-                + ":" + Bytes.wrap(to).toHexString()
-                + ":" + (value == null ? "0" : value.toString())
-                + ":" + (data == null ? "0x" : Hash.keccak256(Bytes.wrap(data)).toHexString());
+        String flightKey = callFlightKey(h, from, to, value, data);
         // Warm-result replay: a prior execution for this exact (root, target, calldata)
         // already produced a verified answer — possibly one whose original waiter timed
         // out but whose background leader finished and populated the cache. Replay it; the
@@ -2013,6 +2096,152 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      *  distinct concurrent calls a wallet makes (~tens). */
     private final Map<String, CompletableFuture<byte[]>> inflightCalls =
             new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** The eth_call dedup/replay key: (stateRoot, from, to, value, keccak(calldata)).
+     *  Shared by the wallet path ({@code rpcCall}) and the replay-warm
+     *  ({@link #replayHotCalls}) so a warmed result is found by the wallet's
+     *  identical call. Null and empty calldata key identically — they are the same
+     *  execution (callView substitutes an empty array for null). */
+    private String callFlightKey(RpcCallContext h, byte[] from, byte[] to,
+                                 java.math.BigInteger value, byte[] data) {
+        return Bytes.wrap(h.blockCtx().stateRoot()).toHexString()
+                + ":" + (from == null ? "0x0" : Bytes.wrap(from).toHexString())
+                + ":" + Bytes.wrap(to).toHexString()
+                + ":" + (value == null ? "0" : value.toString())
+                + ":" + (data == null || data.length == 0
+                        ? "0x" : Hash.keccak256(Bytes.wrap(data)).toHexString());
+    }
+
+    /**
+     * Replay the wallet's recurring eth_call shapes against a freshly-built head, so
+     * its next poll — pinned to the block number we hand out via eth_blockNumber —
+     * replays from {@link #callResultCache} in microseconds instead of executing
+     * inside its own deadline. Kicked off from the head-build thread right after
+     * {@link #primeConfirmContracts}; the executions themselves run on the heavy EVM
+     * lane (never the reserved interactive lane) and are registered in
+     * {@link #inflightCalls}, so a wallet call arriving mid-warm dedupes onto the
+     * warm execution instead of doubling the snap load. Trust-neutral: this is the
+     * exact verified execution path a wallet-triggered call takes, just earlier.
+     * Best-effort: failures only start the per-shape backoff (see HotCallTracker).
+     */
+    private void replayHotCalls(RpcCallContext ctx) {
+        if (!replayWarmEnabled) return;
+        // Global in-flight cap, not just the per-head budget: heads rebuild every
+        // ~12s but a warm may run up to HOT_CALL_WARM_TIMEOUT_MS, so without this
+        // successive heads could stack up to maxTracked warms on the 2-thread heavy
+        // lane and starve non-hot wallet calls into queue-age skips.
+        int slots = HOT_CALL_MAX_WARMED_PER_HEAD - warmsInFlight.get();
+        if (slots <= 0) return;
+        List<HotCallTracker.HotCall> shapes =
+                hotCalls.beginWarmables(clock.elapsedMillis(), slots);
+        for (HotCallTracker.HotCall c : shapes) {
+            boolean submitted = false;
+            boolean failedSync = false;
+            String flightKey = null;
+            CompletableFuture<byte[]> mine = null;
+            try {
+                byte[] from = c.from();
+                byte[] to = c.to();
+                byte[] data = c.data();
+                flightKey = callFlightKey(ctx, from, to, c.value(), data);
+                if (callResultCache.get(flightKey, clock.elapsedMillis()) != null) {
+                    continue;   // already warm at this root
+                }
+                mine = new CompletableFuture<>();
+                if (inflightCalls.putIfAbsent(flightKey, mine) != null) {
+                    continue;   // a wallet call is already executing this very shape+root
+                }
+                String desc = "to=" + Bytes.wrap(to).toHexString()
+                        + " sel=" + (data.length >= 4 ? Bytes.wrap(data, 0, 4).toHexString() : "0x")
+                        + " dataLen=" + data.length + " block #" + ctx.blockNumber();
+                long t0 = clock.elapsedMillis();
+                final HotCallTracker.HotCall shape = c;
+                final String key = flightKey;
+                final CompletableFuture<byte[]> flight = mine;
+                CompletableFuture<byte[]> exec = ctx.offchainExecutor()
+                        .callView(from == null ? null : io.myotis.evm.Address.of(from),
+                                io.myotis.evm.Address.of(to), data, c.value(), ctx.blockCtx());
+                warmsInFlight.incrementAndGet();
+                // The ONE authoritative cache put, on the RAW future so it also covers
+                // a warm that finishes LATE (past the bookkeeping timeout below) —
+                // same rationale as the wallet leader whose waiter timed out: the
+                // execution was paid for, the next poll should find it. Ordering
+                // caveat vs the bookkeeping chain: CompletableFuture dependents run
+                // LIFO, so the inflight entry can be removed just before this put
+                // lands — the worst case is one redundant execution by a call that
+                // slips into that gap (it re-derives the same verified result), never
+                // a stale or missing answer. Clone: never hand waiters the cached array.
+                exec.thenAccept(out -> callResultCache.put(key,
+                        out != null ? out.clone() : null, clock.elapsedMillis()));
+                // The warm has no waiter to give up on it, so bound the BOOKKEEPING
+                // explicitly — otherwise a dropped queue slot would leave the
+                // inflightCalls entry and the per-shape warm flag stuck forever.
+                exec.orTimeout(HOT_CALL_WARM_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                        .whenComplete((out, ex) -> {
+                            try {
+                                if (ex != null) {
+                                    flight.completeExceptionally(ex);
+                                    log.info("[rpc] warm eth_call " + desc + " -> error after "
+                                            + (clock.elapsedMillis() - t0) + "ms: "
+                                            + describeEvmError(ex));
+                                } else {
+                                    // Cache put lives on the raw exec future above.
+                                    flight.complete(out);
+                                    log.info("[rpc] warm eth_call " + desc + " ok in "
+                                            + (clock.elapsedMillis() - t0) + "ms");
+                                }
+                            } finally {
+                                warmsInFlight.decrementAndGet();
+                                inflightCalls.remove(key, flight);
+                                hotCalls.endWarm(shape, ex == null, clock.elapsedMillis());
+                            }
+                        });
+                submitted = true;
+            } catch (Throwable t) {
+                // Mirror the wallet-leader's sync-throw guard: if callView (or Address
+                // decoding, or the pool submit) threw AFTER this warm registered in
+                // inflightCalls, the never-completing future would stay registered and
+                // poison every later identical call into a guaranteed timeout.
+                if (mine != null && flightKey != null) {
+                    inflightCalls.remove(flightKey, mine);
+                    mine.completeExceptionally(t);
+                }
+                // A sync submit throw (most likely RejectedExecutionException from a
+                // saturated/shutting-down pool) tends to persist — give it the SAME
+                // failure backoff as an async failure, or the shape would be
+                // re-submitted and re-logged on every ~12s head build.
+                failedSync = true;
+                hotCalls.endWarm(c, false, clock.elapsedMillis());
+                log.info("[rpc] warm eth_call submit failed: " + unwrap(t));
+            } finally {
+                // Shapes that never started an execution (cache hit / already in
+                // flight) must release their warm mark so the next head retries
+                // them; the sync-throw case released above WITH backoff.
+                if (!submitted && !failedSync) hotCalls.endWarm(c, true, clock.elapsedMillis());
+            }
+        }
+    }
+
+    /** Warm executions currently in flight across ALL heads (see replayHotCalls). */
+    private final java.util.concurrent.atomic.AtomicInteger warmsInFlight =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    /** True when a call's block tag means "the head as the wallet sees it" — a
+     *  latest-ish tag, or a number pin at/near the optimistic head (wallets pin the
+     *  number they just fetched from us). Only these shapes are worth replay-warming:
+     *  a genuinely historical pin would re-execute against every fresh head yet never
+     *  be asked at that head's root. Lenient when the optimistic head is unknown. */
+    private boolean isHeadIntentTag(String block) {
+        if (isLatestTag(block) || "safe".equals(block) || "finalized".equals(block)) return true;
+        try {
+            long n = Long.decode(block);
+            BeaconSyncState bss = beaconSyncState;
+            long optimistic = bss != null ? bss.getOptimisticBlockNumber() : 0;
+            return optimistic <= 0 || n >= optimistic - RPC_BLOCK_NUM_LAG_TOLERANCE;
+        } catch (Exception e) {
+            return false;
+        }
+    }
 
     /** Verified account record at the shared anchored head, or null (→ error). The
      *  oracle hash-verifies the account against the anchored stateRoot (storageRoot
@@ -2558,11 +2787,33 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     }
 
     /** Build the eth_getTransactionReceipt JSON object from VERIFIED receipt bytes.
-     *  {@code txHash} is the body's tx hash (already confirmed == the requested hash). */
+     *  {@code txHash} is the body's tx hash (already confirmed == the requested hash).
+     *  This single-receipt entry computes the running accumulators with a one-shot
+     *  pass over the preceding receipts; the batch path (eth_getBlockReceipts)
+     *  accumulates them across its loop instead, calling the shared
+     *  {@link #buildReceiptJsonAt} so a full block stays O(n). */
     private static String buildReceiptJson(List<Bytes> receipts, int idx,
                                            BlockHeader h, Bytes32 blockHash, Bytes32 txHash,
                                            byte[] rawTx) {
-        Receipt r = Receipt.decode(receipts.get(idx));
+        // Single pass over the preceding receipts: gasUsed needs receipt[idx-1]'s
+        // cumulative, logIndex needs the running log count — decode each only once.
+        long prevCum = 0L;
+        int logBase = 0;
+        for (int j = 0; j < idx; j++) {
+            Receipt prev = Receipt.decode(receipts.get(j));
+            logBase += prev.logs().size();
+            if (j == idx - 1) prevCum = prev.cumulativeGasUsed();
+        }
+        return buildReceiptJsonAt(Receipt.decode(receipts.get(idx)), idx, h, blockHash, txHash,
+                rawTx, prevCum, logBase);
+    }
+
+    /** The per-element receipt serializer both entries share: the caller supplies
+     *  the ALREADY-DECODED receipt and the running accumulators (previous
+     *  cumulative gas, block-global log-index base). */
+    private static String buildReceiptJsonAt(Receipt r, int idx,
+                                             BlockHeader h, Bytes32 blockHash, Bytes32 txHash,
+                                             byte[] rawTx, long prevCum, int logBase) {
         // Decode the (block-verified) tx so the receipt can carry from / to / contractAddress /
         // effectiveGasPrice. Without these MetaMask won't reconcile the receipt with its pending
         // tx and leaves it stuck "pending/submitted" even though we verified its inclusion.
@@ -2576,15 +2827,6 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             } catch (Exception decodeEx) {
                 tx = null;
             }
-        }
-        // Single pass over the preceding receipts: gasUsed needs receipt[idx-1]'s
-        // cumulative, logIndex needs the running log count — decode each only once.
-        long prevCum = 0L;
-        int logBase = 0;
-        for (int j = 0; j < idx; j++) {
-            Receipt prev = Receipt.decode(receipts.get(j));
-            logBase += prev.logs().size();
-            if (j == idx - 1) prevCum = prev.cumulativeGasUsed();
         }
         long gasUsed = r.cumulativeGasUsed() - prevCum;
 
@@ -2645,19 +2887,23 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
 
     /**
      * eth_getBlockByNumber, verified. Serves the block header fields from a
-     * beacon-anchored verified header plus the tx hashes from a body checked against
+     * beacon-anchored verified header plus the tx list from a body checked against
      * transactionsRoot — no snap state needed (so it works even where eth_call can't).
+     * {@code fullTx} selects full tx objects (decoded incl. the recovered sender,
+     * the buildTxJson shape) instead of hashes; an undecodable tx inside a verified
+     * body fails the serve (found-but-unrenderable is never "not found").
      * Returns the block JSON when verified; the literal "null" for a non-existent
      * (future) block (eth's standard); Java null when it can't verify (not synced)
-     * → router errors. fullTransactions=true (full tx objects, needs tx decode + sender
-     * recovery) is a follow-up — returns Java null for now.
+     * → router errors.
      */
     private String rpcGetBlockByNumber(String block, boolean fullTx) {
         RLPxConnector conn = connector;
-        if (conn == null || fullTx) return null;
+        if (conn == null) return null;
         // Classify the request up front so a fetch failure can decide whether stale-
         // serving is safe: only LATEST-ish tags (the wallet's block tracker) may fall
         // back to the cached head block; a number-pin must stay exact (see serveStaleBlock).
+        // The stale snapshot stores the HASHES form only, so a fullTx request never
+        // reads or writes it (a hashes-form block must not answer a fullTx request).
         String b = (block == null) ? "latest" : block;
         boolean isTag;
         switch (b) {
@@ -2678,32 +2924,17 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             // exec payload otherwise — block serving must survive snap-peer outages
             // (MetaMask's block tracker polls this and hangs the UI without it).
             HeaderAnchor anchor = headerAnchor();
-            if (anchor == null) return serveStaleBlock(isTag, pinned);
+            if (anchor == null) return fullTx ? null : serveStaleBlock(isTag, pinned);
             long headNum = anchor.number();
 
             long target = isTag ? headNum : pinned;
             if (target > headNum) {
-                // The pin is AHEAD of the preferred anchor. This is the NORMAL state on
-                // mobile, not an unknown block: eth_blockNumber advertises the CL
-                // optimistic number (advances every slot), while the snap-built /
-                // lastGood anchor trails it by the head build time (30-60s on a phone,
-                // i.e. several blocks). MetaMask pins reads to the number we just
-                // advertised, so denying it wedges the wallet's block tracker — observed
-                // live as eth_getBlockByNumber returning the "null" literal for 96% of
-                // polls (778 of 806), stalling tx tracking and the confirm screen.
-                // The beacon OPTIMISTIC payload is itself a light-client-verified anchor
-                // at/past the pin — re-anchor on it (its exec blockHash, via
-                // windowAnchoredToHash) and serve the block fully verified. Only a pin
-                // past even the optimistic number is genuinely future/unknown → "null".
-                // beaconSyncState is non-null (constructor requireNonNull), so read directly.
-                long optimisticNum = beaconSyncState.getOptimisticBlockNumber();
-                byte[] optimisticHash = beaconSyncState.getOptimisticBlockHash();
-                if (optimisticNum >= target && optimisticHash != null) {
-                    anchor = new HeaderAnchor(optimisticNum, null, optimisticHash);
-                    headNum = optimisticNum;
-                } else {
+                HeaderAnchor reanchored = reAnchorForPin(target);
+                if (reanchored == null) {
                     return "null";          // beyond the verified chain tip → eth null
                 }
+                anchor = reanchored;
+                headNum = reanchored.number();
             }
             long back = headNum - target;
             if (back >= BLOCK_LOOKBACK_MAX) return null;     // too far to verify cheaply → error
@@ -2711,7 +2942,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             List<BlockHeadersMessage.VerifiedHeader> window = conn
                     .requestBlockHeadersBatched(target, (int) (back + 1))
                     .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
-            if (!anchor.anchors(window)) return serveStaleBlock(isTag, pinned);
+            if (!anchor.anchors(window)) return fullTx ? null : serveStaleBlock(isTag, pinned);
             BlockHeadersMessage.VerifiedHeader vh = window.get(0); // target is first in [target..head]
             // Remember this verified hash↔number so eth_getBlockByHash can resolve it.
             blockHashToNumber.put(vh.hash().toHexString(), vh.header().number);
@@ -2719,21 +2950,23 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             List<BlockBodiesMessage.BlockBody> bodies = conn
                     .requestBlockBodies(vh.hash())
                     .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
-            if (bodies.isEmpty()) return serveStaleBlock(isTag, pinned);
+            if (bodies.isEmpty()) return fullTx ? null : serveStaleBlock(isTag, pinned);
             List<Bytes> txs = bodies.get(0).transactions();
-            if (!OrderedTrieRoot.verify(txs, vh.header().transactionsRoot)) return serveStaleBlock(isTag, pinned);
+            if (!OrderedTrieRoot.verify(txs, vh.header().transactionsRoot)) return fullTx ? null : serveStaleBlock(isTag, pinned);
 
-            String json = buildBlockJson(vh, txs);
+            String json = buildBlockJson(vh, txs, fullTx);
+            if (json == null) return null; // an undecodable tx in a verified body → can't render
             // Cache the head block (target == headNum) as the last-good latest; a fetch
             // failure on a later "latest" poll then serves this verified block bounded-stale
-            // instead of erroring. Historical pins aren't cached (they aren't "latest").
-            if (target == headNum) {
+            // instead of erroring. Historical pins aren't cached (they aren't "latest"),
+            // and only the HASHES form enters the snapshot (see above).
+            if (!fullTx && target == headNum) {
                 lastGoodLatestBlock = new BlockSnapshot(json, target, clock.elapsedMillis());
             }
             return json;
         } catch (Exception e) {
             log.info("[rpc] eth_getBlockByNumber failed: " + unwrap(e));
-            return serveStaleBlock(isTag, pinned);
+            return fullTx ? null : serveStaleBlock(isTag, pinned);
         }
     }
 
@@ -2745,15 +2978,168 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      *  → "null" (eth's unknown-block); the live confirm flow always pre-populates it via the
      *  preceding eth_getTransactionReceipt. */
     private String rpcGetBlockByHash(String blockHash, boolean fullTx) {
-        if (blockHash == null || fullTx) return null; // fullTx not served verified (mirrors by-number)
+        if (blockHash == null) return null;
         String key = blockHash.toLowerCase(java.util.Locale.ROOT);
         Long number = blockHashToNumber.get(key);
         if (number == null) return "null"; // not a block we've verified — unknown to us
-        String json = rpcGetBlockByNumber("0x" + Long.toHexString(number), false);
+        String json = rpcGetBlockByNumber("0x" + Long.toHexString(number), fullTx);
         if (json == null || "null".equals(json)) return json;
         // The verified by-number serve returns the CURRENTLY-canonical block at that height;
         // make sure it's still the one asked for (else a reorg remapped number → hash).
-        return json.contains("\"hash\":\"" + key + "\"") ? json : "null";
+        // Match the block's OWN "hash" field — its first occurrence (buildBlockJson emits
+        // number, then hash) — not a substring scan: with fullTx, every embedded tx object
+        // carries its own lowercase "hash" key, which a whole-string contains() would
+        // also match (the Rust twin compares block.hash structurally).
+        int i = json.indexOf("\"hash\":\"");
+        return i >= 0 && json.startsWith(key + "\"", i + 8) ? json : "null";
+    }
+
+    /**
+     * Re-anchor for a number pin AHEAD of the preferred (snap-built) anchor. This is
+     * the NORMAL state on mobile, not an unknown block: eth_blockNumber advertises the
+     * CL optimistic number (advances every slot), while the snap-built / lastGood
+     * anchor trails it by the head build time (30-60s on a phone, i.e. several
+     * blocks). MetaMask pins reads to the number we just advertised, so denying it
+     * wedges the wallet's block tracker — observed live as eth_getBlockByNumber
+     * returning the "null" literal for 96% of polls (778 of 806), stalling tx
+     * tracking and the confirm screen. The beacon OPTIMISTIC payload is itself a
+     * light-client-verified anchor at/past the pin — re-anchor on it (its exec
+     * blockHash, via windowAnchoredToHash) and serve fully verified. Returns null
+     * only when the pin is past even the optimistic number — genuinely
+     * future/unknown, the caller's eth "null". Shared by every by-number serve
+     * (blocks, block receipts) so the tuned rule can never diverge between them.
+     * beaconSyncState is non-null (constructor requireNonNull).
+     */
+    private HeaderAnchor reAnchorForPin(long target) {
+        long optimisticNum = beaconSyncState.getOptimisticBlockNumber();
+        byte[] optimisticHash = beaconSyncState.getOptimisticBlockHash();
+        if (optimisticNum >= target && optimisticHash != null) {
+            return new HeaderAnchor(optimisticNum, null, optimisticHash);
+        }
+        return null;
+    }
+
+    /**
+     * eth_getBlockReceipts — every receipt of one block as a JSON array, verified.
+     * The block resolves through the same anchored path as eth_getBlockByNumber
+     * (a 0x-32-byte hash first resolves via the verified hash→number map, like
+     * eth_getBlockByHash, with the same reorg re-check); the body is verified
+     * against transactionsRoot (the receipts' txHash/from/to/effectiveGasPrice
+     * derive from it) and the receipt list against receiptsRoot before anything
+     * is served. Returns the array JSON, the "null" literal for a verified
+     * unknown/future block or a never-verified hash, or Java null (→ error)
+     * when it can't verify right now.
+     */
+    private String rpcGetBlockReceipts(String blockSelector) {
+        RLPxConnector conn = connector;
+        if (conn == null) return null;
+        String b = (blockSelector == null || blockSelector.isBlank())
+                ? "latest" : blockSelector.trim();
+        // A 32-byte 0x hash (unambiguous: a block NUMBER is at most 18 hex chars)
+        // resolves to its number from blocks we've already verified; unknown → the
+        // eth "null" (mirrors rpcGetBlockByHash).
+        String expectHash = null;
+        if (b.length() == 66 && (b.startsWith("0x") || b.startsWith("0X"))) {
+            String key = b.toLowerCase(java.util.Locale.ROOT);
+            Long number = blockHashToNumber.get(key);
+            if (number == null) return "null";
+            expectHash = key;
+            b = "0x" + Long.toHexString(number);
+        }
+        boolean isTag;
+        switch (b) {
+            case "latest": case "pending": case "safe": case "finalized":
+                isTag = true; break;
+            case "earliest":
+                return null; // genesis not served verified (mirrors getBlockByNumber)
+            default:
+                isTag = false;
+        }
+        long pinned = -1;
+        if (!isTag) {
+            // The selector contract is tag | 0x-number | 0x-hash (the shape the
+            // router enforces): explicit-radix hex, never Long.decode — its bare
+            // numeric forms are ambiguous across engines (Java decimal, and OCTAL
+            // for a leading zero, vs the Rust parser's hex), so bare numerics are
+            // rejected here too for callers that bypass the router.
+            if (!(b.startsWith("0x") || b.startsWith("0X")) || b.length() <= 2) return null;
+            try { pinned = Long.parseLong(b.substring(2), 16); } catch (Exception e) { return null; }
+            // Genesis by number is rejected like the "earliest" tag above (and like
+            // the Rust engine's selector parser) — the two engines must answer the
+            // same request identically.
+            if (pinned <= 0) return null;
+        }
+        try {
+            HeaderAnchor anchor = headerAnchor();
+            if (anchor == null) return null;
+            long headNum = anchor.number();
+            long target = isTag ? headNum : pinned;
+            if (target > headNum) {
+                // Same near-head re-anchor as getBlockByNumber: a pin just past the
+                // preferred anchor is the normal mobile state, and the beacon
+                // OPTIMISTIC payload is itself a verified anchor at/past it.
+                HeaderAnchor reanchored = reAnchorForPin(target);
+                if (reanchored == null) {
+                    return "null"; // beyond the verified chain tip → eth null
+                }
+                anchor = reanchored;
+                headNum = reanchored.number();
+            }
+            long back = headNum - target;
+            if (back >= BLOCK_LOOKBACK_MAX) return null; // too far to verify cheaply
+
+            List<BlockHeadersMessage.VerifiedHeader> window = conn
+                    .requestBlockHeadersBatched(target, (int) (back + 1))
+                    .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+            if (!anchor.anchors(window)) return null;
+            BlockHeadersMessage.VerifiedHeader vh = window.get(0);
+            // A hash-form request must still name the block served at that height
+            // (a reorg can remap the number under a stale map entry).
+            if (expectHash != null && !vh.hash().toHexString().equals(expectHash)) return "null";
+            blockHashToNumber.put(vh.hash().toHexString(), vh.header().number);
+
+            // Body + receipts in flight together, ONE shared deadline for the pair
+            // (sequential .get calls would each start a fresh timeout — worst case
+            // twice the budget, not the "one round of wall-clock" this is for).
+            CompletableFuture<List<BlockBodiesMessage.BlockBody>> bodiesF =
+                    conn.requestBlockBodies(vh.hash());
+            CompletableFuture<List<List<Bytes>>> rcptF = conn.requestReceipts(vh.hash());
+            CompletableFuture.allOf(bodiesF, rcptF).get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+            List<BlockBodiesMessage.BlockBody> bodies = bodiesF.join();
+            List<List<Bytes>> rcptBlocks = rcptF.join();
+            if (bodies.isEmpty() || rcptBlocks.isEmpty()) return null;
+            List<Bytes> txs = bodies.get(0).transactions();
+            List<Bytes> receipts = rcptBlocks.get(0);
+            if (!OrderedTrieRoot.verify(txs, vh.header().transactionsRoot)) return null;
+            if (receipts.size() != txs.size()
+                    || !OrderedTrieRoot.verify(receipts, vh.header().receiptsRoot)) {
+                return null;
+            }
+
+            // One O(n) pass: each receipt decodes exactly once, the previous
+            // cumulative gas and the block-global log-index base accumulate
+            // across the loop (the Rust build_block_receipts twin).
+            StringBuilder sb = new StringBuilder(256 * Math.max(1, receipts.size()));
+            sb.append("[");
+            long prevCum = 0L;
+            int logBase = 0;
+            for (int i = 0; i < receipts.size(); i++) {
+                if (i > 0) sb.append(",");
+                Receipt r = Receipt.decode(receipts.get(i));
+                Bytes32 txHash = Hash.keccak256(txs.get(i));
+                sb.append(buildReceiptJsonAt(r, i, vh.header(), vh.hash(), txHash,
+                        txs.get(i).toArrayUnsafe(), prevCum, logBase));
+                prevCum = r.cumulativeGasUsed();
+                logBase += r.logs().size();
+            }
+            return sb.append("]").toString();
+        } catch (Exception e) {
+            if (e instanceof InterruptedException || e.getCause() instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            log.info("[rpc] eth_getBlockReceipts failed: " + unwrap(e));
+            return null;
+        }
     }
 
     /** Serve the last-good latest block when a fresh fetch couldn't complete. Returns
@@ -2773,9 +3159,13 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         return null;
     }
 
-    /** Build the eth_getBlockByNumber JSON from a VERIFIED header + verified tx list
-     *  (transactions as hashes; fullTransactions=true is handled upstream as a follow-up). */
-    private static String buildBlockJson(BlockHeadersMessage.VerifiedHeader vh, List<Bytes> txs) {
+    /** Build the eth_getBlockByNumber JSON from a VERIFIED header + verified tx list.
+     *  {@code fullTx} emits full tx objects (the buildTxJson shape, decoded incl. the
+     *  recovered sender) instead of hashes. Returns Java null only in fullTx mode when
+     *  a tx inside the VERIFIED body can't be decoded — found-but-unrenderable is a
+     *  can't-serve, never a hash silently standing in for a requested object. */
+    private static String buildBlockJson(BlockHeadersMessage.VerifiedHeader vh, List<Bytes> txs,
+                                         boolean fullTx) {
         BlockHeader h = vh.header();
         StringBuilder sb = new StringBuilder(1024);
         sb.append("{\"number\":\"").append(hexQuantity(h.number)).append("\"");
@@ -2812,7 +3202,15 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         sb.append(",\"transactions\":[");
         for (int i = 0; i < txs.size(); i++) {
             if (i > 0) sb.append(",");
-            sb.append("\"").append(Hash.keccak256(txs.get(i)).toHexString()).append("\"");
+            Bytes32 txHash = Hash.keccak256(txs.get(i));
+            if (fullTx) {
+                String txJson = buildTxJson(txs.get(i).toArrayUnsafe(), txHash,
+                        vh.hash(), h.number, i);
+                if (txJson == null) return null; // undecodable tx in a verified body
+                sb.append(txJson);
+            } else {
+                sb.append("\"").append(txHash.toHexString()).append("\"");
+            }
         }
         sb.append("],\"uncles\":[]}");
         return sb.toString();

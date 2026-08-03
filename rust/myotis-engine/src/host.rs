@@ -75,7 +75,19 @@ struct EngineState {
     rt: tokio::runtime::Runtime,
     handles: Mutex<HashMap<i64, ChainEntry>>,
     next_id: AtomicI64,
+    /// Per-handle last-good `eth_feeHistory`: the EMITTED JSON plus the raw
+    /// request signature it answered, re-servable within
+    /// [`FEE_HISTORY_STALE_MAX`] when a fresh build fails for the SAME
+    /// signature (the Java `lastGoodFeeHistory` twin — identical params ⇒
+    /// identical verified data, just older; fees drift slowly and the wallet
+    /// re-polls). Kept at the JSON layer so a hit costs a String clone, never
+    /// a result rebuild. Entries die with their handle (see `stop`).
+    fee_history_cache: Mutex<HashMap<i64, (String, String, std::time::Instant)>>,
 }
+
+/// How long a last-good `eth_feeHistory` result may be re-served (the Java
+/// `RPC_HEAD_SERVE_STALE_MAX_MS`).
+const FEE_HISTORY_STALE_MAX: std::time::Duration = std::time::Duration::from_secs(64 * 12);
 
 static ENGINE: OnceLock<Option<EngineState>> = OnceLock::new();
 
@@ -94,6 +106,7 @@ fn engine() -> Option<&'static EngineState> {
                     handles: Mutex::new(HashMap::new()),
                     // Start at 1 so a valid id is never confused with the -1 sentinel.
                     next_id: AtomicI64::new(1),
+                    fee_history_cache: Mutex::new(HashMap::new()),
                 }),
                 Err(_) => None,
             }
@@ -113,10 +126,48 @@ fn config_for(network_name: &str) -> Option<ChainConfig> {
     }
 }
 
+/// `nativeSetTorEnabled`: turn Tor verified-read routing on/off
+/// (docs/privacy-and-tor.md). Returns `true` when this engine build actually
+/// supports Tor (`--features tor`), `false` when it doesn't — so a host can grey
+/// out the toggle rather than pretend it works. A no-op when Tor isn't compiled.
+pub fn set_tor_enabled(on: bool) -> bool {
+    #[cfg(feature = "tor")]
+    {
+        myotis_net::el::tor::set_enabled(on);
+        true
+    }
+    #[cfg(not(feature = "tor"))]
+    {
+        let _ = on;
+        false
+    }
+}
+
+/// `nativeTorStatus`: a small bitmask for the host's Status view —
+/// bit0 compiled-in, bit1 enabled, bit2 bootstrapped (circuit ready). `0` means
+/// this build has no Tor support at all.
+pub fn tor_status() -> i32 {
+    #[cfg(feature = "tor")]
+    {
+        let mut s = 1; // compiled in
+        if myotis_net::el::tor::is_enabled() {
+            s |= 2;
+        }
+        if myotis_net::el::tor::is_bootstrapped() {
+            s |= 4;
+        }
+        s
+    }
+    #[cfg(not(feature = "tor"))]
+    {
+        0
+    }
+}
+
 /// `nativeCreate`: allocate an id for a not-yet-started hosted chain (mainnet or
 /// sepolia). Returns the id (`>= 1`), `UNSUPPORTED_NETWORK` (-2) for a canonical
 /// network this engine doesn't host yet (gnosis), or `CREATE_FAILED` (-1) for an
-/// unknown name / unavailable runtime.
+/// unknown name, an unavailable runtime, or an uncreatable dataDir.
 pub fn create(network_name: &str, data_dir: &str) -> i64 {
     let Some(engine) = engine() else {
         return CREATE_FAILED;
@@ -134,6 +185,17 @@ pub fn create(network_name: &str, data_dir: &str) -> i64 {
     // `cl-peers[-net].cache`, mainnet keeping the bare name — so verified sync
     // state and proven LC servers survive restarts AND engine switches.
     if !data_dir.is_empty() {
+        // The dir may not exist yet (fresh host profile) — create it now.
+        // Without this, sync runs fine but every snapshot/cache write fails
+        // with ENOENT ("retrying on the next period advance", forever), so
+        // persistence is silently lost and every restart bootstraps cold.
+        // An uncreatable dataDir is a runtime-init failure the caller must
+        // see (honest error over silent degradation), hence CREATE_FAILED
+        // rather than warn-and-continue.
+        if let Err(e) = std::fs::create_dir_all(data_dir) {
+            tracing::warn!(data_dir, error = %e, "dataDir cannot be created");
+            return CREATE_FAILED;
+        }
         let suffix = if config.name == "mainnet" {
             String::new()
         } else {
@@ -227,6 +289,13 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
         .as_deref()
         .and_then(|p| p.parent())
         .map(|dir| dir.join(format!("peers{el_suffix}.cache")));
+    // The eth_getLogs watch-list index, same dataDir + suffix convention
+    // (docs/eth-getlogs-design.md). None (no dataDir) → memory-only index.
+    let log_index_path = config
+        .snapshot_path
+        .as_deref()
+        .and_then(|p| p.parent())
+        .map(|dir| dir.join(format!("logindex{el_suffix}.db")));
     // Explicit per-network match: a network without an EL config here runs
     // CL-ONLY (EL queries report the reader unavailable, matching the non-fatal
     // EL philosophy) — it must never silently inherit another chain's EL config.
@@ -241,6 +310,7 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
     };
     let reader = match el_config {
         Some(cfg) => match engine.rt.block_on(async {
+            let cfg = myotis_net::el::reader::ElConfig { log_index_path, ..cfg };
             ElReader::start_for(sync.exec_anchor(), el_cache_path, cfg).await
         }) {
             Ok(r) => Some(Arc::new(r)),
@@ -327,6 +397,7 @@ pub fn pause(handle: i64) -> bool {
     engine.rt.block_on(async move {
         sync.stop().await;
         if let Some(reader) = reader {
+            reader.stop_log_index_appender().await;
             if let Ok(reader) = Arc::try_unwrap(reader) {
                 reader.stop().await;
             }
@@ -346,7 +417,10 @@ fn shutdown(engine: &EngineState, sync: SyncHandle, reader: Option<Arc<ElReader>
         if let Some(reader) = reader {
             // Only our just-started reader holds an Arc here, so unwrapping the
             // Arc to consume `stop(self)` succeeds; if it somehow doesn't, the
-            // reader's Drop still aborts its tasks.
+            // reader's Drop still aborts its tasks. The appender is stopped
+            // (abort + await) FIRST so its per-tick strong Arc can't defeat
+            // the unwrap.
+            reader.stop_log_index_appender().await;
             if let Ok(reader) = Arc::try_unwrap(reader) {
                 reader.stop().await;
             }
@@ -410,6 +484,7 @@ pub fn status_json(handle: i64) -> String {
                             header_requests_served: h_served,
                             body_requests: b_asked,
                             body_requests_served: b_served,
+                            el_hunting: r.el_hunting(),
                         }
                     }
                 }),
@@ -449,6 +524,9 @@ struct ElCounts {
     header_requests_served: u64,
     body_requests: u64,
     body_requests_served: u64,
+    /// EL hunt engaged: the snap serving pool has been empty past the stall
+    /// window and the pool maintainer is in emergency re-dial mode.
+    el_hunting: bool,
 }
 
 /// `nativeStop`: remove + shut down a handle's sync loop. No-op for unknown id.
@@ -463,10 +541,15 @@ pub fn stop(handle: i64) {
         Ok(mut m) => m.remove(&handle),
         Err(_) => return,
     };
+    // The handle's cached feeHistory dies with it.
+    if let Ok(mut cache) = engine.fee_history_cache.lock() {
+        cache.remove(&handle);
+    }
     if let Some(ChainEntry::Running(_, sync, reader)) = entry {
         engine.rt.block_on(async move {
             sync.stop().await;
             if let Some(reader) = reader {
+                reader.stop_log_index_appender().await;
                 if let Ok(reader) = Arc::try_unwrap(reader) {
                     reader.stop().await;
                 }
@@ -870,13 +953,12 @@ pub fn estimate_gas_json(
     }
 }
 
-/// `nativeGetBlockByNumberJson`: verified `eth_getBlockByNumber` (transactions as
-/// hashes) for a running handle. Returns the block JSON when found+verified, the
-/// literal `"null"` for a future/unknown block (eth's null), or `{"error": "..."}`
-/// when it can't verify right now (which the Java side maps to a null → -32000).
-/// `fullTransactions=true` is handled on the Java side (returns null before this
-/// native runs), so this always serves the hashes-only shape.
-pub fn get_block_by_number_json(handle: i64, block_tag: &str) -> String {
+/// `nativeGetBlockByNumberJson`: verified `eth_getBlockByNumber` for a running
+/// handle. `full_transactions` selects fully decoded tx objects instead of
+/// hashes. Returns the block JSON when found+verified, the literal `"null"` for
+/// a future/unknown block (eth's null), or `{"error": "..."}` when it can't
+/// verify right now (which the Java side maps to a null → -32000).
+pub fn get_block_by_number_json(handle: i64, block_tag: &str, full_transactions: bool) -> String {
     let target = match parse_block_target(block_tag) {
         Ok(t) => t,
         Err(msg) => return eljson::error_json(msg),
@@ -888,9 +970,117 @@ pub fn get_block_by_number_json(handle: i64, block_tag: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(async { reader.get_block_by_number(target).await }) {
+    match engine
+        .rt
+        .block_on(async { reader.get_block_by_number(target, full_transactions).await })
+    {
         Ok(Some(block)) => eljson::block_json(&block),
         Ok(None) => "null".to_string(), // verified future/unknown block → eth null
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// `nativeGetTransactionReceiptJson`: verified `eth_getTransactionReceipt` for a
+/// running handle. `tx_hash_hex` is the 0x-hex 32-byte tx hash. Returns the
+/// receipt JSON when the tx is found+verified in the scanned window, the literal
+/// `"null"` for a verified "not seen" (pending/unknown — the wallet keeps
+/// polling), or `{"error": "..."}` when it can't verify right now (the Java side
+/// maps it to a null → -32000).
+/// `nativePendingNonceOverlay`: the "pending" nonce overlay for
+/// `eth_getTransactionCount(addr, "pending")` — `max(minedNonce, our broadcast
+/// nonce + 1)` while the wallet's own tx is unmined and unexpired, identity
+/// otherwise. Returns a NEGATIVE value only for a malformed address / missing
+/// handle (the Java adapter then serves the plain mined nonce). A dedicated
+/// native (not a field bolted onto the golden-pinned account JSON) because
+/// only the pending tag ever consults it.
+pub fn pending_nonce_overlay(handle: i64, address_hex: &str, mined_nonce: i64) -> i64 {
+    if mined_nonce < 0 {
+        return -1;
+    }
+    let Some(address) = parse_address(address_hex) else {
+        return -1;
+    };
+    let Some(engine) = engine() else {
+        return -1;
+    };
+    let Ok((reader, _finalized_period, _wall_period)) = snapshot_reader(engine, handle) else {
+        return -1;
+    };
+    let overlaid = reader.pending_nonce_overlay(&address, mined_nonce as u64);
+    i64::try_from(overlaid).unwrap_or(-1)
+}
+
+pub fn get_transaction_receipt_json(handle: i64, tx_hash_hex: &str) -> String {
+    let Some(tx_hash) = parse_word32(tx_hash_hex) else {
+        return eljson::error_json("invalid transaction hash (expected 32-byte hex)");
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    match engine.rt.block_on(async { reader.get_transaction_receipt(tx_hash).await }) {
+        Ok(Some(receipt)) => eljson::receipt_json(&receipt),
+        Ok(None) => "null".to_string(), // verified "not seen" → eth null
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// `nativeGetTransactionByHashJson`: verified `eth_getTransactionByHash` for a
+/// running handle. `tx_hash_hex` is the 0x-hex 32-byte tx hash. Returns the tx
+/// JSON when found+verified — the MINED shape for a located tx, or the PENDING
+/// shape (block fields explicitly null) for the wallet's own just-broadcast tx
+/// from the sent-tx cache — the literal `"null"` for a verified "not seen"
+/// (unknown tx), or `{"error": "..."}` when it can't verify right now.
+pub fn get_transaction_by_hash_json(handle: i64, tx_hash_hex: &str) -> String {
+    let Some(tx_hash) = parse_word32(tx_hash_hex) else {
+        return eljson::error_json("invalid transaction hash (expected 32-byte hex)");
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    match engine.rt.block_on(async { reader.get_transaction_by_hash(tx_hash).await }) {
+        Ok(myotis_net::el::reader::TxLookup::Mined(tx)) => eljson::tx_json(&tx),
+        Ok(myotis_net::el::reader::TxLookup::Pending { tx_hash, tx }) => {
+            eljson::pending_tx_json(&tx_hash, &tx)
+        }
+        Ok(myotis_net::el::reader::TxLookup::NotSeen) => "null".to_string(), // eth null
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// `nativeGetBlockByHashJson`: verified `eth_getBlockByHash` for a running
+/// handle. `block_hash_hex` is the 0x-hex 32-byte block hash;
+/// `full_transactions` selects fully decoded tx objects instead of hashes.
+/// Returns the block JSON, the literal `"null"` for a hash this engine has
+/// never verified (eth's unknown-block null), or `{"error": "..."}`.
+pub fn get_block_by_hash_json(
+    handle: i64,
+    block_hash_hex: &str,
+    full_transactions: bool,
+) -> String {
+    let Some(block_hash) = parse_word32(block_hash_hex) else {
+        return eljson::error_json("invalid block hash (expected 32-byte hex)");
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    match engine
+        .rt
+        .block_on(async { reader.get_block_by_hash(block_hash, full_transactions).await })
+    {
+        Ok(Some(block)) => eljson::block_json(&block),
+        Ok(None) => "null".to_string(), // never-verified/reorged-away hash → eth null
         Err(e) => eljson::error_json(&e),
     }
 }
@@ -936,6 +1126,145 @@ pub fn fee_estimate_json(handle: i64) -> String {
         Ok(est) => eljson::fee_json(&est),
         Err(e) => eljson::error_json(&e),
     }
+}
+
+/// `nativeGetBlockReceiptsJson`: verified `eth_getBlockReceipts` for a running
+/// handle. `selector` is a tag, a 0x-hex block number, or a 0x-32-byte block
+/// hash (unambiguous at 66 chars — a block number is at most 18); a BARE
+/// numeric is rejected — the engines' bare conventions differ (the Java engine
+/// reads decimal, [`parse_block_target`] hex), so the contract is 0x-only for
+/// callers that bypass the router's identical gate. Returns the receipts array
+/// JSON, the literal `"null"` (verified unknown/future block, or a hash this
+/// engine never verified), or `{"error": "..."}`.
+pub fn get_block_receipts_json(handle: i64, selector: &str) -> String {
+    let selector = selector.trim();
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    let outcome = if selector.len() == 66
+        && (selector.starts_with("0x") || selector.starts_with("0X"))
+    {
+        let Some(hash) = parse_word32(selector) else {
+            return eljson::error_json("invalid block hash (expected 32-byte hex)");
+        };
+        engine.rt.block_on(async { reader.get_block_receipts_by_hash(hash).await })
+    } else {
+        let tag = if selector.is_empty() { "latest" } else { selector };
+        let is_tag = matches!(tag, "latest" | "pending" | "safe" | "finalized" | "earliest");
+        if !is_tag && !(tag.starts_with("0x") || tag.starts_with("0X")) {
+            return eljson::error_json(
+                "invalid block selector (expected a tag, 0x-number, or 0x-hash)",
+            );
+        }
+        let target = match parse_block_target(tag) {
+            Ok(t) => t,
+            Err(msg) => return eljson::error_json(msg),
+        };
+        engine.rt.block_on(async { reader.get_block_receipts(target).await })
+    };
+    match outcome {
+        Ok(Some(receipts)) => eljson::block_receipts_json(&receipts),
+        Ok(None) => "null".to_string(),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// `nativeFeeHistoryJson`: verified `eth_feeHistory` for a running handle.
+/// `newest_block_tag` is the RPC block selector; `percentiles_json` is a JSON
+/// array of reward percentiles (e.g. `[25.0,75.0]`), or empty/`"null"` to omit
+/// the reward matrix. Returns the feeHistory JSON
+/// (`{"oldestBlock","baseFeePerGas","gasUsedRatio"[,"reward"]}`) or
+/// `{"error": "..."}` — the Java engine's null/JSON two-state, no `"null"`
+/// literal case.
+pub fn fee_history_json(
+    handle: i64,
+    block_count: i64,
+    newest_block_tag: &str,
+    percentiles_json: &str,
+) -> String {
+    if block_count < 1 {
+        return eljson::error_json("blockCount must be at least 1");
+    }
+    // The feeHistory newest-block selector: head tags → latest (None); a number
+    // must be servable AT ALL (existence is re-checked against the head inside
+    // the reader); earliest/malformed are not served — mirrors rpcFeeHistory.
+    let newest = match parse_block_target(newest_block_tag.trim()) {
+        Ok(t) => t,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    let percentiles = match parse_percentiles(percentiles_json) {
+        Ok(p) => p,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    // The raw request strings ARE the stale-serve signature (the Java
+    // `blockCount + "|" + newestBlock + "|" + Arrays.toString(percentiles)`).
+    let key = format!("{block_count}|{}|{}", newest_block_tag.trim(), percentiles_json.trim());
+    match engine.rt.block_on(async {
+        reader.fee_history(block_count as u64, newest, percentiles.as_deref()).await
+    }) {
+        Ok(history) => {
+            let json = eljson::fee_history_json(&history);
+            if let Ok(mut cache) = engine.fee_history_cache.lock() {
+                cache.insert(handle, (key, json.clone(), std::time::Instant::now()));
+            }
+            json
+        }
+        // A Reject is a bad request against the CURRENT head — answered as the
+        // error (→ -32000), never from a stale snapshot (Java parity: only
+        // BUILD failures reach serveStaleFeeHistory).
+        Err(myotis_net::el::reader::FeeHistoryError::Reject(msg)) => eljson::error_json(&msg),
+        Err(myotis_net::el::reader::FeeHistoryError::Build(msg)) => {
+            if let Ok(cache) = engine.fee_history_cache.lock() {
+                if let Some((last_key, json, at)) = cache.get(&handle) {
+                    // saturating + read once: explicit panic-free style (the
+                    // workspace convention under panic="abort"), and the gate
+                    // and the log line report the same age.
+                    let age = std::time::Instant::now().saturating_duration_since(*at);
+                    if *last_key == key && age < FEE_HISTORY_STALE_MAX {
+                        tracing::info!(
+                            age_secs = age.as_secs(),
+                            "eth_feeHistory serving STALE result"
+                        );
+                        return json.clone();
+                    }
+                }
+            }
+            eljson::error_json(&msg)
+        }
+    }
+}
+
+/// Parse the reward-percentiles JSON: absent (empty / `"null"`) → `None` (no
+/// reward matrix); else a JSON array of numbers. Bounded like the other JSON
+/// natives; the VALUES are not range-checked (the router owns RPC validation —
+/// this is the same pass-through the Java backend gets).
+fn parse_percentiles(json: &str) -> Result<Option<Vec<f64>>, &'static str> {
+    let json = json.trim();
+    if json.is_empty() || json == "null" {
+        return Ok(None);
+    }
+    if json.len() > 4096 {
+        return Err("percentiles JSON too long");
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(json).map_err(|_| "malformed percentiles JSON")?;
+    let arr = parsed.as_array().ok_or("percentiles must be a JSON array")?;
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        out.push(v.as_f64().ok_or("percentiles must be numbers")?);
+    }
+    Ok(Some(out))
 }
 
 /// Parse an eth block selector to a target number: `None` = latest (the head).
@@ -1261,6 +1590,8 @@ fn status_object(
     obj.insert("peerBodyRequests".into(), el.body_requests.into());
     obj.insert("peerBodyRequestsServed".into(), el.body_requests_served.into());
     obj.insert("executionBlockNumber".into(), el.finalized_block.into());
+    // EL hunt flag (snap serving pool empty past the stall window).
+    obj.insert("elHunting".into(), el.el_hunting.into());
     // A hand-built object of primitives always serializes; fall back to the
     // literal not-started shape rather than panic on the (impossible) error.
     serde_json::to_string(&serde_json::Value::Object(obj))
@@ -1278,7 +1609,7 @@ const NOT_STARTED_FALLBACK: &str = concat!(
     r#""elReaderAvailable":false,"#,
     r#""snapPeers":0,"readyPeers":0,"discoveredPeers":0,"attemptedDials":0,"#,
     r#""backedOffPeers":0,"blacklistedPeers":0,"optimisticBlockNumber":0,"#,
-    r#""finalizedBlockNumber":0,"executionBlockNumber":0,"#,
+    r#""finalizedBlockNumber":0,"executionBlockNumber":0,"elHunting":false,"#,
     r#""peerHeaderRequests":0,"peerHeaderRequestsServed":0,"#,
     r#""peerBodyRequests":0,"peerBodyRequestsServed":0}"#,
 );
@@ -1286,6 +1617,34 @@ const NOT_STARTED_FALLBACK: &str = concat!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_makes_the_data_dir() {
+        // A nested, not-yet-existing dataDir (fresh host profile) must exist
+        // after create — otherwise the sync loop's snapshot/cache writes fail
+        // with ENOENT forever and persistence is silently lost.
+        let dir = std::env::temp_dir()
+            .join(format!("myotis-create-dir-test-{}", std::process::id()))
+            .join("nested");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        let id = create("mainnet", dir.to_str().unwrap());
+        assert!(id >= 1, "create failed: {id}");
+        assert!(dir.is_dir(), "dataDir was not created");
+        stop(id);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn create_fails_loudly_on_uncreatable_data_dir() {
+        // A dataDir that cannot exist (path through a regular file) is a
+        // runtime-init failure the caller must see, not a warn-and-continue.
+        let file = std::env::temp_dir()
+            .join(format!("myotis-create-file-test-{}", std::process::id()));
+        std::fs::write(&file, b"not a dir").unwrap();
+        let id = create("mainnet", file.join("sub").to_str().unwrap());
+        assert_eq!(id, CREATE_FAILED);
+        let _ = std::fs::remove_file(&file);
+    }
 
     #[test]
     fn parse_ens_query_maps_every_method_correctly() {
@@ -1382,6 +1741,7 @@ mod tests {
             header_requests_served: 2,
             body_requests: 1,
             body_requests_served: 0,
+            el_hunting: false,
         };
         let synced: serde_json::Value = serde_json::from_str(&status_object(
             Lifecycle::Running,
@@ -1574,5 +1934,266 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&get_storage_proof_json(i64::MIN, &addr, 1, Some("0xbad"))).unwrap();
         assert!(v["error"].as_str().unwrap().contains("invalid holder"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// eth_getLogs (docs/eth-getlogs-design.md): watch-list config install, index
+// status, and the coverage-honest query. All JSON in / JSON out, panic-free.
+// ---------------------------------------------------------------------------
+
+/// Install the watch-list config: `{"enabled":bool,"watch":[{"address":"0x..",
+/// "fromBlock":n,"topic0s":["0x..",..]?}]}`. False on malformed input,
+/// duplicate addresses, or an unavailable reader.
+pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(config_json) else {
+        return false;
+    };
+    let enabled = v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
+    let mut watch = Vec::new();
+    if v.get("watch").is_some_and(|w| !w.is_array() && !w.is_null()) {
+        return false;
+    }
+    if let Some(entries) = v.get("watch").and_then(|w| w.as_array()) {
+        for e in entries {
+            let Some(address) = e.get("address").and_then(|a| a.as_str()).and_then(parse_address) else {
+                return false;
+            };
+            let Some(from_block) = e.get("fromBlock").and_then(|b| b.as_u64()) else {
+                return false;
+            };
+            let mut topic0s = Vec::new();
+            if e.get("topic0s").is_some_and(|t| !t.is_array() && !t.is_null()) {
+                return false;
+            }
+            if let Some(ts) = e.get("topic0s").and_then(|t| t.as_array()) {
+                for t in ts {
+                    let Some(w32) = t.as_str().and_then(parse_word32) else {
+                        return false;
+                    };
+                    topic0s.push(w32);
+                }
+            }
+            watch.push(myotis_net::el::logindex::WatchEntry { address, from_block, topic0s });
+        }
+    }
+    let Some(engine) = engine() else {
+        return false;
+    };
+    let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
+        return false;
+    };
+    let installed = reader.set_log_index_config(myotis_net::el::logindex::LogIndexConfig { enabled, watch });
+    if installed && enabled {
+        // Spawn (or keep) the head-follow appender on the engine runtime.
+        reader.ensure_log_index_appender(engine.rt.handle());
+    }
+    installed
+}
+
+/// Index status for hosts/UI: enabled, log count, backfill cursor, and per
+/// watch entry the covered span (absent while nothing is indexed).
+pub fn log_index_status_json(handle: i64) -> String {
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
+        return eljson::error_json("node is not running");
+    };
+    let status = reader.with_log_index(|ix| {
+        let mut s = String::from("{\"enabled\":");
+        s.push_str(if ix.config().enabled { "true" } else { "false" });
+        s.push_str(",\"logCount\":");
+        s.push_str(&ix.log_count().to_string());
+        if let Some((n, _)) = ix.cursor {
+            s.push_str(",\"backfillCursor\":");
+            s.push_str(&n.to_string());
+        }
+        s.push_str(",\"entries\":[");
+        for (k, (w, c)) in ix.coverage_entries().iter().enumerate() {
+            if k > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"address\":\"0x");
+            for b in &w.address {
+                let _ = std::fmt::Write::write_fmt(&mut s, format_args!("{b:02x}"));
+            }
+            s.push_str("\",\"fromBlock\":");
+            s.push_str(&w.from_block.to_string());
+            if let Some((low, high)) = c.span {
+                s.push_str(",\"coveredLow\":");
+                s.push_str(&low.to_string());
+                s.push_str(",\"coveredHigh\":");
+                s.push_str(&high.to_string());
+            }
+            s.push('}');
+        }
+        s.push_str("]}");
+        s
+    });
+    status.unwrap_or_else(|| "{\"enabled\":false,\"logCount\":0,\"entries\":[]}".to_string())
+}
+
+/// Parse an eth_getLogs filter into a typed [`LogFilter`], resolving tags
+/// against the supplied head/finalized numbers. Pure (testable): every
+/// malformed shape is a specific error string; nothing is silently ignored.
+fn parse_get_logs_filter(
+    v: &serde_json::Value,
+    head: u64,
+    finalized: u64,
+) -> Result<myotis_net::el::logindex::LogFilter, String> {
+    if v.get("blockHash").is_some_and(|b| !b.is_null()) {
+        // EIP-234: silently resolving the tags instead would answer with the
+        // HEAD block's logs for a question about a specific other block.
+        return Err("blockHash filters are not supported by this scoped index".to_string());
+    }
+    fn tag(v: Option<&serde_json::Value>, head: u64, finalized: u64) -> Result<u64, String> {
+        match v {
+            None | Some(serde_json::Value::Null) => Ok(head),
+            Some(serde_json::Value::String(s)) => match s.as_str() {
+                "latest" | "pending" | "safe" => Ok(head),
+                "finalized" => Ok(finalized),
+                "earliest" => Ok(0),
+                hex => hex
+                    .strip_prefix("0x")
+                    .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .and_then(|d| u64::from_str_radix(d, 16).ok())
+                    .ok_or_else(|| "unresolvable block tag".to_string()),
+            },
+            Some(_) => Err("block tag must be a string".to_string()),
+        }
+    }
+    let from_block = tag(v.get("fromBlock"), head, finalized)?;
+    let to_block = tag(v.get("toBlock"), head, finalized)?;
+    let mut addresses = Vec::new();
+    match v.get("address") {
+        Some(serde_json::Value::String(a)) => {
+            addresses.push(parse_address(a).ok_or("malformed address")?);
+        }
+        Some(serde_json::Value::Array(items)) if !items.is_empty() => {
+            for a in items {
+                addresses.push(a.as_str().and_then(parse_address).ok_or("malformed address")?);
+            }
+        }
+        _ => return Err("eth_getLogs without an address is not served by this scoped index".to_string()),
+    }
+    let mut topics: Vec<Vec<[u8; 32]>> = Vec::new();
+    match v.get("topics") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Array(ts)) => {
+            for t in ts {
+                match t {
+                    serde_json::Value::Null => topics.push(Vec::new()),
+                    serde_json::Value::String(one) => {
+                        topics.push(vec![parse_word32(one).ok_or("malformed topic")?]);
+                    }
+                    serde_json::Value::Array(alts) => {
+                        let mut ors = Vec::new();
+                        for a in alts {
+                            ors.push(a.as_str().and_then(parse_word32).ok_or("malformed topic")?);
+                        }
+                        topics.push(ors);
+                    }
+                    _ => return Err("malformed topics".to_string()),
+                }
+            }
+        }
+        Some(_) => return Err("malformed topics".to_string()),
+    }
+    Ok(myotis_net::el::logindex::LogFilter { from_block, to_block, addresses, topics })
+}
+
+/// The eth_getLogs query. Returns the log array ONLY when the requested
+/// range is inside indexed coverage; every other case is `{"error": ...}`
+/// (the router maps it to strict -32000) — never an empty array for an
+/// unindexed range.
+pub fn get_logs_json(handle: i64, filter_json: &str) -> String {
+    use myotis_net::el::logindex::QueryError;
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(filter_json) else {
+        return eljson::error_json("malformed filter");
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
+        return eljson::error_json("node is not running");
+    };
+    let Some(head) = reader.head_block_number() else {
+        return eljson::error_json("no verified head yet");
+    };
+    let filter = match parse_get_logs_filter(&v, head, reader.finalized_block_number()) {
+        Ok(f) => f,
+        Err(msg) => return eljson::error_json(&msg),
+    };
+    let result = reader.with_log_index(|ix| ix.query(&filter));
+    match result {
+        None => eljson::error_json("log index is not configured on this network"),
+        Some(Ok(logs)) => eljson::get_logs_json(&logs),
+        Some(Err(QueryError::Disabled)) => eljson::error_json("log index is disabled on this network"),
+        Some(Err(QueryError::UnwatchedAddress(_))) => {
+            eljson::error_json("address is not on this node's log watch-list")
+        }
+        Some(Err(QueryError::UnindexedTopic(_))) => {
+            eljson::error_json("topic is outside this node's indexed signatures for that address")
+        }
+        Some(Err(QueryError::OutOfCoverage { covered, .. })) => match covered.span {
+            Some((low, high)) => eljson::error_json(&format!(
+                "requested range is not indexed yet (covered: {low}-{high}); retry as the index catches up"
+            )),
+            None => eljson::error_json("log index has not indexed any blocks yet; retry"),
+        },
+        Some(Err(QueryError::Unanswerable)) => eljson::error_json("unanswerable filter (fromBlock > toBlock)"),
+    }
+}
+
+#[cfg(test)]
+mod get_logs_filter_tests {
+    use super::parse_get_logs_filter;
+
+    fn f(json: &str) -> Result<myotis_net::el::logindex::LogFilter, String> {
+        parse_get_logs_filter(&serde_json::from_str(json).unwrap(), 1000, 900)
+    }
+
+    #[test]
+    fn tags_resolve_and_malformed_tags_error() {
+        let addr = format!("\"address\":\"0x{}\"", "11".repeat(20));
+        let ok = f(&format!("{{{addr}}}")).unwrap();
+        assert_eq!((ok.from_block, ok.to_block), (1000, 1000)); // absent → head
+        let ok = f(&format!("{{{addr},\"fromBlock\":\"earliest\",\"toBlock\":\"finalized\"}}")).unwrap();
+        assert_eq!((ok.from_block, ok.to_block), (0, 900));
+        let ok = f(&format!("{{{addr},\"fromBlock\":\"0x64\"}}")).unwrap();
+        assert_eq!(ok.from_block, 100);
+        for bad in ["\"0x\"", "\"0x+5\"", "\"nope\"", "5", "{}"] {
+            assert!(f(&format!("{{{addr},\"fromBlock\":{bad}}}")).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn block_hash_filters_are_rejected() {
+        let addr = format!("\"address\":\"0x{}\"", "11".repeat(20));
+        let bh = format!("\"blockHash\":\"0x{}\"", "cc".repeat(32));
+        assert!(f(&format!("{{{addr},{bh}}}")).unwrap_err().contains("blockHash"));
+        // Explicit null blockHash is treated as absent, per JSON-RPC habits.
+        assert!(f(&format!("{{{addr},\"blockHash\":null}}")).is_ok());
+    }
+
+    #[test]
+    fn address_forms_and_empty_array_error() {
+        assert!(f("{}").is_err());
+        assert!(f("{\"address\":[]}").unwrap_err().contains("without an address"));
+        assert!(f(&format!("{{\"address\":[\"0x{}\",\"0x{}\"]}}", "11".repeat(20), "22".repeat(20))).unwrap().addresses.len() == 2);
+        assert!(f("{\"address\":\"0xzz\"}").is_err());
+    }
+
+    #[test]
+    fn topics_forms_and_malformed_topics_error() {
+        let addr = format!("\"address\":\"0x{}\"", "11".repeat(20));
+        let t = format!("0x{}", "aa".repeat(32));
+        let ok = f(&format!("{{{addr},\"topics\":[null,\"{t}\",[\"{t}\"]]}}")).unwrap();
+        assert_eq!(ok.topics.len(), 3);
+        assert!(ok.topics.first().is_some_and(|w| w.is_empty()));
+        // A non-array topics value must ERROR, not silently widen the query.
+        assert!(f(&format!("{{{addr},\"topics\":\"{t}\"}}")).unwrap_err().contains("malformed topics"));
+        assert!(f(&format!("{{{addr},\"topics\":[5]}}")).is_err());
     }
 }

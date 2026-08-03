@@ -31,12 +31,17 @@ dnsjava = "3.6.2"
 # docs/besu-extraction.md, AND rebasing the Android ART fork
 # (biafra23/besu, tag <ver>-android.N — android-app substitutes it in).
 besu = "26.4.0"
+# JNA (the UniFFI bindings' loader). 5.18.1 matches Besu's transitive jna so the
+# jar and Android @aar can't drift apart under conflict resolution.
+jna = "5.18.1"
 agp = "8.7.3"
-kotlin = "2.0.21"
+# Kotlin 2.2.21 is the FLOOR for the iOS target: it's the first release whose
+# Kotlin/Native supports Xcode 26 (required to link against the iOS 26 SDK).
+kotlin = "2.2.21"
 compose-bom = "2024.11.00"
-# Compose Multiplatform (shared UI for Android + Desktop, iOS later). 1.7.x pairs with
-# Kotlin 2.0.20+. Uses the Kotlin-2.0 compose-compiler plugin (already present).
-compose-multiplatform = "1.7.1"
+# Compose Multiplatform (shared UI for Android + Desktop + iOS). 1.9.x pairs with
+# Kotlin 2.2.20+. Uses the bundled compose-compiler plugin.
+compose-multiplatform = "1.9.3"
 activity-compose = "1.9.3"
 # JSON-RPC server (:jsonrpc-server). Ktor server+client + kotlinx are chosen for
 # Android compatibility (no java.net.http / com.sun.net.httpserver) and to match
@@ -44,7 +49,14 @@ activity-compose = "1.9.3"
 ktor = "3.0.3"
 kotlinx-coroutines = "1.9.0"
 kotlinx-serialization = "1.7.3"
-kotlinx-datetime = "0.6.1"
+# 0.6.2 = the compatibility release for the kotlin.time.Instant the 2.1.20+ stdlib
+# introduced. The iOS (klib) compile still resolves the experimental stdlib Instant
+# in :ui's formatLogTime — see the local @OptIn there.
+# 0.7.x: kotlinx.datetime.Instant became a typealias for kotlin.time.Instant (no binary class).
+# Compose material3-desktop already pulls 0.7.1 onto every desktop runtime classpath, so
+# compiling :ui against 0.6.x crashed the desktop Logs tab with NoClassDefFoundError at runtime
+# — keep this in sync with what the Compose BOM ships.
+kotlinx-datetime = "0.7.1"
 # Tiny (~30 KB), dependency-free, Android-safe JSON parser for :myotis-engines'
 # JNI JSON marshalling (hand-JNI decision, docs/reimplementation/05).
 minimal-json = "0.9.5"
@@ -86,7 +98,16 @@ junit-jupiter       = { module = "org.junit.jupiter:junit-jupiter" }
 milagro             = { module = "org.miracl.milagro.amcl:milagro-crypto-java", version.ref = "milagro" }
 jblst               = { module = "tech.pegasys:jblst",                        version.ref = "jblst" }
 jvm-libp2p          = { module = "io.libp2p:jvm-libp2p",                   version.ref = "jvm-libp2p" }
+# JNA — the FFI layer under the UniFFI-generated Kotlin bindings in :myotis-engines
+# (replaces the old hand-JNI). :android-app additionally pins the @aar variant so
+# the packaged natives come from JNA's Android artifact.
+jna                 = { module = "net.java.dev.jna:jna",                   version.ref = "jna" }
 trueblocks-kotlin   = { module = "com.github.biafra23:trueblocks-kotlin", version.ref = "trueblocks-kotlin" }
+# trueblocks-kotlin's own dependency, made explicit so :tx-history can call
+# Bloom.isMemberBytes(Address) at compile time (the JitPack POM exposes kethereum
+# only at runtime scope). Keep the version in lockstep with what trueblocks-kotlin
+# resolves transitively (0.86.0 today).
+kethereum-model     = { module = "com.github.komputing.kethereum:model",   version = "0.86.0" }
 dnsjava             = { module = "dnsjava:dnsjava",                       version.ref = "dnsjava" }
 discovery           = { module = "io.consensys.protocols:discovery",       version.ref = "discovery" }
 besu-evm            = { module = "org.hyperledger.besu:besu-evm",         version.ref = "besu" }
@@ -111,4 +132,5 @@ ktor-client-core           = { module = "io.ktor:ktor-client-core",  version.ref
 ktor-client-cio            = { module = "io.ktor:ktor-client-cio",   version.ref = "ktor" }
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinx-serialization" }
 kotlinx-coroutines-core    = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core",    version.ref = "kotlinx-coroutines" }
+kotlinx-coroutines-test    = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test",    version.ref = "kotlinx-coroutines" }
 kotlinx-datetime           = { module = "org.jetbrains.kotlinx:kotlinx-datetime",           version.ref = "kotlinx-datetime" }

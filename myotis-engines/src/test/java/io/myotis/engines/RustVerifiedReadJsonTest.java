@@ -385,6 +385,156 @@ class RustVerifiedReadJsonTest {
         assertThrows(EngineException.class, () -> RustChainHandle.blockJsonOrThrow("not json"));
     }
 
+    // ---- eth_getTransactionReceipt (receiptJsonOrThrow) ----
+
+    @Test
+    void receiptJsonPassesThroughObject() {
+        // The exact shape the Rust eljson::receipt_json emits (its
+        // receipt_json_shape_and_values test pins the other half of this golden):
+        // buildReceiptJson field order, minimal-hex QUANTITYs, block-global logIndex.
+        String receipt = "{\"transactionHash\":\"0x" + "a1".repeat(32) + "\""
+                + ",\"transactionIndex\":\"0x2\""
+                + ",\"blockHash\":\"0x" + "99".repeat(32) + "\""
+                + ",\"blockNumber\":\"0x1406f40\""
+                + ",\"cumulativeGasUsed\":\"0xf4240\""
+                + ",\"gasUsed\":\"0xc738\""
+                + ",\"from\":\"0x" + "cc".repeat(20) + "\""
+                + ",\"to\":\"0x" + "bb".repeat(20) + "\",\"contractAddress\":null"
+                + ",\"effectiveGasPrice\":\"0x2cb417800\""
+                + ",\"status\":\"0x1\",\"type\":\"0x2\""
+                + ",\"logsBloom\":\"0x" + "00".repeat(256) + "\""
+                + ",\"logs\":[{\"address\":\"0x" + "aa".repeat(20) + "\""
+                + ",\"topics\":[\"0x" + "11".repeat(32) + "\"],\"data\":\"0xdead\""
+                + ",\"blockNumber\":\"0x1406f40\",\"blockHash\":\"0x" + "99".repeat(32) + "\""
+                + ",\"transactionHash\":\"0x" + "a1".repeat(32) + "\""
+                + ",\"transactionIndex\":\"0x2\",\"logIndex\":\"0x7\",\"removed\":false}]}";
+        assertEquals(receipt, RustChainHandle.receiptJsonOrThrow(receipt));
+    }
+
+    @Test
+    void receiptNullLiteralIsVerifiedNotSeen() {
+        // "null" (a verified pending/unknown tx) passes through → the router emits
+        // a JSON null result (eth's receipt-not-available convention), not an error.
+        assertEquals("null", RustChainHandle.receiptJsonOrThrow("null"));
+    }
+
+    @Test
+    void receiptErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.receiptJsonOrThrow("{\"error\":\"no snap peer available\"}"));
+    }
+
+    @Test
+    void receiptBlankOrMalformedPayloadThrows() {
+        assertThrows(EngineException.class, () -> RustChainHandle.receiptJsonOrThrow(null));
+        assertThrows(EngineException.class, () -> RustChainHandle.receiptJsonOrThrow(""));
+        assertThrows(EngineException.class, () -> RustChainHandle.receiptJsonOrThrow("not json"));
+    }
+
+    // ---- eth_getBlockReceipts (blockReceiptsJsonOrThrow) ----
+
+    @Test
+    void blockReceiptsArrayPassesThrough() {
+        // The SUCCESS shape is a JSON ARRAY (each element the receipt-object
+        // shape the Rust eljson::block_receipts_json test pins).
+        String receipts = "[{\"transactionHash\":\"0x" + "a1".repeat(32)
+                + "\",\"transactionIndex\":\"0x0\",\"status\":\"0x1\"}]";
+        assertEquals(receipts, RustChainHandle.blockReceiptsJsonOrThrow(receipts));
+        assertEquals("[]", RustChainHandle.blockReceiptsJsonOrThrow("[]")); // empty block
+    }
+
+    @Test
+    void blockReceiptsNullLiteralIsVerifiedUnknownBlock() {
+        assertEquals("null", RustChainHandle.blockReceiptsJsonOrThrow("null"));
+    }
+
+    @Test
+    void blockReceiptsErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class, () -> RustChainHandle.blockReceiptsJsonOrThrow(
+                "{\"error\":\"no snap peer available\"}"));
+    }
+
+    @Test
+    void blockReceiptsUnexpectedShapesThrow() {
+        assertThrows(EngineException.class, () -> RustChainHandle.blockReceiptsJsonOrThrow(null));
+        assertThrows(EngineException.class, () -> RustChainHandle.blockReceiptsJsonOrThrow(""));
+        assertThrows(EngineException.class, () -> RustChainHandle.blockReceiptsJsonOrThrow("not json"));
+        // An object WITHOUT an error key is native shape drift, not a result.
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.blockReceiptsJsonOrThrow("{\"transactionHash\":\"0x11\"}"));
+    }
+
+    // ---- eth_getTransactionByHash (transactionJsonOrThrow) ----
+
+    @Test
+    void transactionJsonPassesThroughObject() {
+        // The exact shape the Rust eljson::tx_json emits (its
+        // tx_json_shape_and_values test pins the other half of this golden):
+        // buildTxJson field order, minimal-hex QUANTITYs, 32-byte DATA r/s.
+        String tx = "{\"hash\":\"0x" + "a1".repeat(32) + "\""
+                + ",\"blockHash\":\"0x" + "99".repeat(32) + "\""
+                + ",\"blockNumber\":\"0x1406f40\",\"transactionIndex\":\"0x2\""
+                + ",\"type\":\"0x2\",\"chainId\":\"0x1\",\"nonce\":\"0x5\""
+                + ",\"from\":\"0x" + "cc".repeat(20) + "\""
+                + ",\"to\":\"0x" + "bb".repeat(20) + "\""
+                + ",\"value\":\"0xde0b6b3a7640000\",\"gas\":\"0x15f90\""
+                + ",\"maxFeePerGas\":\"0xba43b7400\",\"maxPriorityFeePerGas\":\"0x77359400\""
+                + ",\"input\":\"0xa9059cbb\",\"v\":\"0x1\",\"yParity\":\"0x1\""
+                + ",\"r\":\"0x" + "11".repeat(32) + "\",\"s\":\"0x" + "22".repeat(32) + "\"}";
+        assertEquals(tx, RustChainHandle.transactionJsonOrThrow(tx));
+    }
+
+    @Test
+    void transactionNullLiteralIsVerifiedNotSeen() {
+        // "null" (a verified unknown/pending tx) passes through → the router
+        // emits a JSON null result, not an error.
+        assertEquals("null", RustChainHandle.transactionJsonOrThrow("null"));
+    }
+
+    @Test
+    void transactionErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class, () -> RustChainHandle.transactionJsonOrThrow(
+                "{\"error\":\"transaction located but its type cannot be decoded\"}"));
+    }
+
+    @Test
+    void transactionBlankOrMalformedPayloadThrows() {
+        assertThrows(EngineException.class, () -> RustChainHandle.transactionJsonOrThrow(null));
+        assertThrows(EngineException.class, () -> RustChainHandle.transactionJsonOrThrow(""));
+        assertThrows(EngineException.class, () -> RustChainHandle.transactionJsonOrThrow("not json"));
+    }
+
+    // ---- eth_feeHistory (feeHistoryJsonOrThrow) ----
+
+    @Test
+    void feeHistoryJsonPassesThroughObject() {
+        // The exact shape the Rust eljson::fee_history_json emits (its
+        // fee_history_json_shape_and_values test pins the other half of this
+        // golden): oldestBlock + hex QUANTITYs, raw JSON doubles, reward rows.
+        String feeHistory = "{\"oldestBlock\":\"0x1406f40\""
+                + ",\"baseFeePerGas\":[\"0x2540be400\",\"0x28fa6ae00\",\"0x2dfdc1c35\"]"
+                + ",\"gasUsedRatio\":[0.5,0.9932]"
+                + ",\"reward\":[[\"0x3b9aca00\",\"0x77359400\"],[\"0x0\",\"0xb2d05e00\"]]}";
+        assertEquals(feeHistory, RustChainHandle.feeHistoryJsonOrThrow(feeHistory));
+        // Without percentiles the reward key is absent — still a plain pass-through.
+        String noReward = "{\"oldestBlock\":\"0x1\",\"baseFeePerGas\":[\"0x0\",\"0x0\"]"
+                + ",\"gasUsedRatio\":[0.0,1.0]}";
+        assertEquals(noReward, RustChainHandle.feeHistoryJsonOrThrow(noReward));
+    }
+
+    @Test
+    void feeHistoryErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class, () -> RustChainHandle.feeHistoryJsonOrThrow(
+                "{\"error\":\"oldest block 20 is beyond the 256-block verify window\"}"));
+    }
+
+    @Test
+    void feeHistoryBlankOrMalformedPayloadThrows() {
+        assertThrows(EngineException.class, () -> RustChainHandle.feeHistoryJsonOrThrow(null));
+        assertThrows(EngineException.class, () -> RustChainHandle.feeHistoryJsonOrThrow(""));
+        assertThrows(EngineException.class, () -> RustChainHandle.feeHistoryJsonOrThrow("not json"));
+    }
+
     // ---- eth_gasPrice / eth_maxPriorityFeePerGas (feeFromJson) ----
 
     @Test

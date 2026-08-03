@@ -20,6 +20,12 @@ public interface PeerCachePort {
     /** Mark that {@code address} failed to serve snap (demotes it toward DENIED). */
     void recordSnapFailure(InetSocketAddress address);
 
+    /** Mark a TCP-level connect failure against {@code address} (demotes toward
+     *  eviction after sustained unreachability). Default no-op so existing
+     *  implementations keep compiling; callers must only report while
+     *  demonstrably online. */
+    default void recordConnectFailure(InetSocketAddress address) {}
+
     /** Cached peers to re-dial on startup, in the cache's stored order. */
     List<CachedPeer> load();
 

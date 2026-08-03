@@ -12,9 +12,14 @@ import io.myotis.ui.NetworkStatus
 import io.myotis.ui.NodeController
 import io.myotis.ui.NodeSnapshot
 import io.myotis.ui.PeerRow
+import io.myotis.txhistory.TxHistoryEvent
+import io.myotis.txhistory.headline
+import io.myotis.txhistory.uiKind
 import io.myotis.ui.QueryHistory
 import io.myotis.ui.QueryHistoryEntry
 import io.myotis.ui.Settings
+import io.myotis.ui.TxRowUi
+import io.myotis.ui.TxScanEvent
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
@@ -24,6 +29,8 @@ import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.future.await
 
 /**
@@ -49,7 +56,11 @@ class AndroidNodeController(
 
     override fun snapshots(): Flow<Map<String, NodeSnapshot>> = flow {
         while (true) {
-            emit(serviceProvider()?.snapshots()?.mapValues { (_, s) -> s.toModel() } ?: emptyMap())
+            emit(serviceProvider()?.let { svc ->
+                svc.snapshots().mapValues { (net, s) ->
+                    s.toModel().copy(logIndexJson = svc.logIndexStatusJsonOrNull(net))
+                }
+            } ?: emptyMap())
             delay(2000)
         }
         // snapshotOf() prunes the backoff map and walks/sorts the live peer list — keep it off the
@@ -89,6 +100,7 @@ class AndroidNodeController(
     override fun shutdown() { serviceProvider()?.shutdown() }
     override fun setTargetSnapPeers(target: Int) { serviceProvider()?.setTargetSnapPeers(target) }
     override fun setServedBlockWindow(blocks: Int) { serviceProvider()?.setServedBlockWindow(blocks) }
+    override fun applyLogIndex(network: String) { serviceProvider()?.applyLogIndex(network) }
     override fun applyBlsBackend() { NodeService.applyBlsBackend(appContext) }
     override fun applyEngineChoice() { NodeService.applyEngineChoice(appContext) }
     override fun clearCaches(network: String) { serviceProvider()?.clearCaches(network) }
@@ -111,6 +123,42 @@ class AndroidNodeController(
         return svc.resolveEns(network, name).await().let { r ->
             EnsResult(r.name(), r.addressHex(), r.blockNumber(), r.beaconVerified(), r.error())
         }
+    }
+
+    // TrueBlocks transaction history (Query tab add-on). The service builds the scan at
+    // its composition root (NodeService.txHistoryService(), mainnet + Java engine only);
+    // this bridge only maps events into the shared UI's models.
+    override fun supportsTransactionHistory(network: String): Boolean =
+        serviceProvider()?.supportsTxHistory(network) == true
+
+    override fun transactionHistory(network: String, address: String): Flow<TxScanEvent> {
+        val svc = serviceProvider() ?: throw IllegalStateException("Node is not running")
+        val service = svc.txHistoryService()
+            ?: throw IllegalStateException("Transaction history requires mainnet on the Java engine")
+        return service.scan(address)
+            // Every scan event counts as UI activity: a deep scan (bloom downloads +
+            // devp2p fetches) must not be idle-paused out from under itself.
+            .onEach { svc.noteUiActivity() }
+            .map { it.toUi() }
+    }
+
+    private fun TxHistoryEvent.toUi(): TxScanEvent = when (this) {
+        is TxHistoryEvent.Started -> TxScanEvent.Started(
+            manifestCid, cidSource, totalChunks, latestIndexedBlock, headBlock)
+        is TxHistoryEvent.Progress -> TxScanEvent.Progress(
+            chunksScanned, totalChunks, currentRange, hits, bytesDownloaded)
+        is TxHistoryEvent.Hit -> TxScanEvent.Hit(blockNumber, txIndex)
+        is TxHistoryEvent.Tx -> TxScanEvent.Tx(TxRowUi(
+            blockNumber = summary.blockNumber,
+            txIndex = summary.txIndex,
+            hash = summary.hash,
+            from = summary.from,
+            to = summary.to,
+            kind = summary.uiKind(),
+            headline = summary.headline(), // shared with desktop (:tx-history TxSummaryDisplay)
+        ))
+        is TxHistoryEvent.TxFailed -> TxScanEvent.Failed(blockNumber, txIndex, error)
+        is TxHistoryEvent.Done -> TxScanEvent.Done(total = txCount)
     }
 }
 
@@ -181,6 +229,9 @@ private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
     lastResumeEpochMs = lastResumeEpochMs(),
     lastWakeReason = lastWakeReason(),
     lcHunting = lcHunting(),
+    elHunting = elHunting(),
+    rpcPort = rpcPort(),
+    rpcServing = rpcServing(),
 )
 
 /** Android actual of [Settings] over the NodeService SharedPreferences statics. */
@@ -192,6 +243,8 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun setNetworkEnabled(name: String, on: Boolean) = NodeService.setNetworkEnabled(ctx, name, on)
     override fun rpcPortFor(network: String): Int = NodeService.rpcPortFor(ctx, network)
     override fun setRpcPort(network: String, port: Int) = NodeService.setRpcPort(ctx, network, port)
+    override fun logIndexEnabled(network: String): Boolean = NodeService.logIndexEnabled(ctx, network)
+    override fun setLogIndexEnabled(network: String, on: Boolean) = NodeService.setLogIndexEnabled(ctx, network, on)
     override fun snapTarget(): Int = NodeService.snapTarget(ctx)
     override fun setSnapTarget(v: Int) = NodeService.setSnapTargetPref(ctx, v)
     override fun servedBlockWindow(): Int = NodeService.servedBlockWindow(ctx)

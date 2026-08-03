@@ -55,9 +55,14 @@ public final class RLPxConnector implements AutoCloseable {
         void onPeerReady(InetSocketAddress address, String publicKeyHex, boolean snapSupported);
     }
 
-    /** Callback when a peer connection closes, with incompatibility info and node identity. */
+    /** Callback when a peer connection closes, with incompatibility info and node identity.
+     *  {@code busy} = the peer sent Disconnect(0x04 TooManyPeers) at any phase: an
+     *  ALIVE node with no free slots — callers should back off patiently instead of
+     *  treating it like a generic transient failure. (0x04 says nothing about the
+     *  peer's chain — full wrong-chain nodes send it too, so busy alone must never
+     *  promote a peer to any verified/known-good tier.) */
     public interface PeerCloseCallback {
-        void onPeerClose(boolean incompatibleNetwork, String nodeIdHex);
+        void onPeerClose(boolean incompatibleNetwork, boolean busy, String nodeIdHex);
     }
 
     private final NodeKey localKey;
@@ -203,7 +208,8 @@ public final class RLPxConnector implements AutoCloseable {
                     ch.closeFuture().addListener(f -> {
                         activeHandlers.remove(ethHandler);
                         if (closeCallback != null) {
-                            closeCallback.onPeerClose(ethHandler.isIncompatibleNetwork(), pubKeyHex);
+                            closeCallback.onPeerClose(ethHandler.isIncompatibleNetwork(),
+                                ethHandler.isPeerBusy(), pubKeyHex);
                         }
                     });
                 }
@@ -483,7 +489,7 @@ public final class RLPxConnector implements AutoCloseable {
             if (result.slots().isEmpty() && result.proof().isEmpty()) {
                 log.warn("[rlpx] Peer {} returned empty storage response, trying next peer",
                     handler.getRemoteAddress());
-                handler.markSnapServingFailed();
+                benchUnlessLastServing(handler);
                 return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
             }
             return CompletableFuture.completedFuture(result);
@@ -492,6 +498,25 @@ public final class RLPxConnector implements AutoCloseable {
                 handler.getRemoteAddress(), ex.getMessage());
             return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
         });
+    }
+
+    /** Bench a peer that failed to serve — unless it is the last un-benched serving
+     *  snap peer. An empty snap response usually means WE asked for a state root
+     *  outside the peer's ~128-block snapshot window (stale local head), not that
+     *  the peer is broken; benching the sole server empties the serving pool and
+     *  flaps the status (and the EL hunt) between 0 and 1 until the bench expires.
+     *  Synchronized so two concurrent failures on the last two serving peers
+     *  can't each see the other as still serving and both bench — the scan and
+     *  the mark must be atomic against other benchers. */
+    private synchronized void benchUnlessLastServing(EthHandler failed) {
+        for (EthHandler h : activeHandlers) {
+            if (h != failed && h.isReady() && h.isSnapNegotiated() && !h.isSnapServingFailed()) {
+                failed.markSnapServingFailed();
+                return;
+            }
+        }
+        log.info("[rlpx] Not benching {} — last serving snap peer (empty response likely "
+            + "a stale-root request)", failed.getRemoteAddress());
     }
 
     public record PeerInfo(String remoteAddress, String state, boolean snapSupported, String clientId) {}

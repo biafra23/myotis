@@ -7,6 +7,7 @@
 
 use myotis_core::bloom::{accrue, EMPTY_BLOOM};
 use myotis_core::header::{self, BlockHeader};
+use myotis_core::keccak::keccak256;
 use myotis_core::rlp::{self, Item};
 use myotis_core::CoreError;
 
@@ -376,6 +377,71 @@ pub fn encode_transactions(raw_tx: &[u8]) -> Vec<u8> {
     rlp::encode_list_payload(&element)
 }
 
+/// Per-message cap on gossip hashes worth reading (the Java
+/// `MAX_GOSSIP_HASHES_PER_MSG` twin): these feed only the sent-tx watch's
+/// "seen" signal, so an oversized announcement is truncated, never an
+/// asymmetric-cost decode.
+pub const MAX_GOSSIP_HASHES_PER_MSG: usize = 256;
+
+/// Decode a `NewPooledTransactionHashes` announcement into its 32-byte tx
+/// hashes (capped at [`MAX_GOSSIP_HASHES_PER_MSG`]), tolerating BOTH wire
+/// shapes: the eth/68 triple `[types: bytes, sizes: [..], hashes: [h, ..]]`
+/// and the eth/66-67 flat list `[h, ..]`. Tolerant on purpose — this feeds
+/// only the sent-tx watch's "seen in gossip" signal (never a trust surface),
+/// so a malformed or unexpected announcement yields the hashes it can read,
+/// or none.
+pub fn decode_new_pooled_tx_hashes(payload: &[u8]) -> Vec<[u8; 32]> {
+    let Ok(top) = rlp::decode(payload) else {
+        return Vec::new();
+    };
+    let Ok(items) = top.as_list() else {
+        return Vec::new();
+    };
+    // eth/68: exactly [types, sizes, hashes] where the LAST item is the hash
+    // list. A flat eth/66 list of 3 hashes would ALSO be length 3 — the two
+    // are distinguished by the last item's kind (list vs 32-byte string).
+    if items.len() == 3 {
+        if let Ok(hashes) = items[2].as_list() {
+            return collect_hashes(hashes);
+        }
+    }
+    collect_hashes(items)
+}
+
+/// Hash the elements of an inbound `Transactions` (0x12) full-body gossip
+/// frame (capped at [`MAX_GOSSIP_HASHES_PER_MSG`]): a tx's hash is keccak of
+/// its raw wire element — the RLP list bytes for a legacy tx, the byte-string
+/// CONTENT for a typed one (the Java `TransactionsMessage.hashes` twin).
+/// Same tolerance rationale as the announcement decoder.
+pub fn transactions_gossip_hashes(payload: &[u8]) -> Vec<[u8; 32]> {
+    let Ok(raws) = rlp::raw_list_items(payload) else {
+        return Vec::new();
+    };
+    raws.iter()
+        .take(MAX_GOSSIP_HASHES_PER_MSG)
+        .filter_map(|raw| {
+            if rlp::is_list_prefix(raw) {
+                Some(keccak256(raw)) // legacy: the list bytes ARE the tx
+            } else {
+                let typed = rlp::decode(raw).ok()?.as_bytes().ok()?.to_vec();
+                Some(keccak256(&typed)) // typed: hash the byte-string content
+            }
+        })
+        .collect()
+}
+
+/// The 32-byte items of an RLP hash list (capped); anything else is skipped.
+fn collect_hashes(items: &[Item]) -> Vec<[u8; 32]> {
+    items
+        .iter()
+        .take(MAX_GOSSIP_HASHES_PER_MSG)
+        .filter_map(|item| {
+            let bytes = item.as_bytes().ok()?;
+            <[u8; 32]>::try_from(bytes).ok()
+        })
+        .collect()
+}
+
 /// Decode a Receipts response into RAW consensus receipt bytes per block (the
 /// trie values). eth/66-68 form. Returns `(request_id, per_block_receipts)`.
 pub fn decode_receipts(rlp_bytes: &[u8]) -> Result<(u64, Vec<Vec<Vec<u8>>>), CoreError> {
@@ -542,6 +608,63 @@ mod tests {
 
     use super::*;
     use myotis_core::keccak::keccak256;
+
+    #[test]
+    fn transactions_gossip_hashes_match_tx_keccak() {
+        // A legacy tx element is the raw RLP list; a typed element's CONTENT is
+        // the tx — either way the extracted hash must be keccak of the raw tx
+        // (what our own broadcast watches by).
+        let legacy = rlp::encode(&Item::List(vec![Item::Bytes(vec![1]), Item::Bytes(vec![2])]));
+        let typed: Vec<u8> = {
+            let mut t = vec![0x02];
+            t.extend_from_slice(&rlp::encode(&Item::List(vec![Item::Bytes(vec![9])])));
+            t
+        };
+        let frame = rlp::encode(&Item::List(vec![
+            rlp::decode(&legacy).unwrap(),
+            Item::Bytes(typed.clone()),
+        ]));
+        assert_eq!(
+            transactions_gossip_hashes(&frame),
+            vec![keccak256(&legacy), keccak256(&typed)]
+        );
+        // Tolerant on garbage.
+        assert!(transactions_gossip_hashes(&[0xff]).is_empty());
+    }
+
+    #[test]
+    fn decode_new_pooled_tx_hashes_reads_both_wire_shapes() {
+        let h1 = [0xaa; 32];
+        let h2 = [0xbb; 32];
+        // eth/66-67: a flat list of 32-byte hash strings.
+        let flat = rlp::encode(&Item::List(vec![
+            Item::Bytes(h1.to_vec()),
+            Item::Bytes(h2.to_vec()),
+        ]));
+        assert_eq!(decode_new_pooled_tx_hashes(&flat), vec![h1, h2]);
+
+        // eth/68: [types, sizes, hashes] — the hashes ride in the THIRD item.
+        let eth68 = rlp::encode(&Item::List(vec![
+            Item::Bytes(vec![0x02, 0x00]),
+            Item::List(vec![Item::Bytes(vec![0x80]), Item::Bytes(vec![0x70])]),
+            Item::List(vec![Item::Bytes(h1.to_vec()), Item::Bytes(h2.to_vec())]),
+        ]));
+        assert_eq!(decode_new_pooled_tx_hashes(&eth68), vec![h1, h2]);
+
+        // A flat list of exactly THREE hashes must not be mistaken for eth/68
+        // (its third item is a hash string, not a list).
+        let three = rlp::encode(&Item::List(vec![
+            Item::Bytes(h1.to_vec()),
+            Item::Bytes(h2.to_vec()),
+            Item::Bytes([0xcc; 32].to_vec()),
+        ]));
+        assert_eq!(decode_new_pooled_tx_hashes(&three).len(), 3);
+
+        // Tolerant: garbage and wrong-width items yield nothing/skip, no error.
+        assert!(decode_new_pooled_tx_hashes(&[0xff, 0x00]).is_empty());
+        let short = rlp::encode(&Item::List(vec![Item::Bytes(vec![1, 2, 3])]));
+        assert!(decode_new_pooled_tx_hashes(&short).is_empty());
+    }
 
     #[test]
     fn encode_transactions_wraps_legacy_and_typed() {

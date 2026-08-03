@@ -49,7 +49,7 @@ class RustStatusJsonTest {
             "{\"running\":true,\"network\":\"mainnet\",\"beaconState\":\"CATCHING_UP\","
             + "\"bootstrapped\":true,\"finalizedSlot\":14560000,\"optimisticSlot\":14560032,"
             + "\"currentPeriod\":1777,\"targetPeriod\":1795,\"peerCount\":5,\"servedPeersLastMinute\":2,"
-            + "\"discv5TableSize\":7,\"syncStartPeriod\":1777,\"lcHunting\":true,"
+            + "\"discv5TableSize\":7,\"syncStartPeriod\":1777,\"lcHunting\":true,\"elHunting\":true,"
             + "\"finalizedRootHex\":\"58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e\","
             + "\"elReaderAvailable\":true,"
             + "\"snapPeers\":6,\"readyPeers\":6,\"discoveredPeers\":240,\"attemptedDials\":14,"
@@ -122,8 +122,31 @@ class RustStatusJsonTest {
         assertEquals(0L, s.optimisticBlockNumber());
         assertEquals(0, s.snapPeers());
         assertEquals(Long.MAX_VALUE, s.verifiedHeadAgeMs());
-        // Older natives omit lcHunting → defaults to false, never throws.
+        // Older natives omit the hunt keys → default to false, never throw.
         assertFalse(s.lcHunting());
+        assertFalse(s.elHunting());
+        // No listener configured on the test seam → row-hidden sentinel values.
+        assertEquals(0, s.rpcPort());
+        assertFalse(s.rpcServing());
+    }
+
+    @Test
+    void configuredButUnservedRpcPortSurfacesAsNotServing() {
+        // A handle configured with a port whose server never started (bind
+        // failure shape): the RUNNING status must carry the port with
+        // rpcServing=false — the state the UI renders as the red
+        // "port N unavailable" row. A stopped handle must hide the row (port 0).
+        RustChainHandle h = new RustChainHandle(0L, "mainnet", 1L, 8545, false);
+        StatusSnapshot running = h.statusFromJsonOnThisHandle(CATCHING_UP_JSON);
+        assertEquals(8545, running.rpcPort());
+        assertFalse(running.rpcServing());
+        StatusSnapshot stopped = h.statusFromJsonOnThisHandle(NOT_STARTED_JSON);
+        assertEquals(0, stopped.rpcPort(), "stopped handle must hide the RPC row");
+        // PAUSED keeps the row: the listener survives idle sleep — a request on
+        // this very port is what wakes the stack, so hiding it would remove the
+        // one address the user needs while sleeping.
+        StatusSnapshot paused = h.statusFromJsonOnThisHandle(PAUSED_JSON);
+        assertEquals(8545, paused.rpcPort(), "paused handle must keep showing the RPC port");
     }
 
     @Test
@@ -145,6 +168,7 @@ class RustStatusJsonTest {
         assertEquals(1777L, s.syncStartPeriod());
         assertEquals(14560000L / 8192L, s.finalizedPeriod());
         assertTrue(s.lcHunting());
+        assertTrue(s.elHunting());
         // EL pool/discovery counts now flow through (not hardcoded 0). The pool
         // holds only snap-capable READY peers, so readyPeers == snapPeers.
         assertEquals(6, s.snapPeers());

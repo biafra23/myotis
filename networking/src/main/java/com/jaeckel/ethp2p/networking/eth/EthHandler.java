@@ -87,6 +87,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private volatile org.apache.tuweni.bytes.Bytes32 peerBestBlockHash; // full hash for queries
     private volatile String ourBestHash;  // what we claimed in Status
     private volatile boolean incompatibleNetwork; // confirmed wrong chain
+    /** Peer sent Disconnect(0x04 TooManyPeers): a healthy node on our network
+     *  with no free slots — worth patient retries, NOT a dead/bad peer. */
+    private volatile boolean peerBusy;
+    private static final int DISC_TOO_MANY_PEERS = 0x04;
     private volatile boolean snapNegotiated = false;
     private volatile String clientId;
     /** How long an empty snap response benches a peer from the serving pool. NOT permanent:
@@ -114,6 +118,39 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private final AtomicLong requestId = new AtomicLong(1);
     private final ConcurrentMap<Long, CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>>>
             pendingRequests = new ConcurrentHashMap<>();
+    /**
+     * What each OUTBOUND GetBlockHeaders request asked for, keyed by reqId. The
+     * ETH_BLOCK_HEADERS handler admits into the serve caches / {@link #chainHead}
+     * ONLY the headers matching the request we sent — a dialed peer answering with
+     * fabricated far-future numbers (or headers we never asked for) could otherwise
+     * pin the served window's eviction floor and inflate the announced head. Twin of
+     * the Rust EL's remember_served guard (PR #229). Bounded (fire-and-forget probes
+     * whose responses never arrive would otherwise leak entries); an evicted spec
+     * just means a late response isn't admitted to the serve surface — fail-closed,
+     * which is safe (the response is still returned to the verifying caller).
+     */
+    private static final int MAX_PENDING_HEADER_REQS = 256;
+    private final Map<Long, HeaderReq> pendingHeaderReqs = Collections.synchronizedMap(
+            new LinkedHashMap<>(16, 0.75f, false) {  // insertion-order: evict the oldest outstanding request
+                @Override protected boolean removeEldestEntry(Map.Entry<Long, HeaderReq> e) {
+                    return size() > MAX_PENDING_HEADER_REQS;
+                }
+            });
+
+    /** The block range or hash an outbound GetBlockHeaders asked for. All of our
+     *  requests use skip=0/ascending, so a by-number request admits exactly
+     *  {@code [start, start+count)} and a by-hash request admits only that hash.
+     *  Package-private for {@code HeaderReqTest}. */
+    record HeaderReq(org.apache.tuweni.bytes.Bytes32 hash, long start, int count) {
+        static HeaderReq byNumber(long start, int count) { return new HeaderReq(null, start, count); }
+        static HeaderReq byHash(org.apache.tuweni.bytes.Bytes32 hash) { return new HeaderReq(hash, 0, 0); }
+        boolean admits(org.apache.tuweni.bytes.Bytes32 headerHash, long number) {
+            if (hash != null) return hash.equals(headerHash);
+            // number - start (never overflows given number >= start) < count, so a huge
+            // start + count can't wrap negative and admit everything.
+            return number >= start && number - start < count;
+        }
+    }
     private final ConcurrentMap<Long, CompletableFuture<List<BlockBodiesMessage.BlockBody>>>
             pendingBodyRequests = new ConcurrentHashMap<>();
     private final ConcurrentMap<Long, CompletableFuture<List<List<org.apache.tuweni.bytes.Bytes>>>>
@@ -285,6 +322,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             pendingRequests.values().forEach(f -> f.completeExceptionally(cause));
             pendingRequests.clear();
         }
+        pendingHeaderReqs.clear();
         if (!pendingBodyRequests.isEmpty()) {
             pendingBodyRequests.values().forEach(f -> f.completeExceptionally(cause));
             pendingBodyRequests.clear();
@@ -368,6 +406,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             sendStatus(ctx);
         } else if (msg.code() == P2P_DISCONNECT) {
             int reason = decodeDisconnectReason(msg.payload());
+            if (reason == DISC_TOO_MANY_PEERS) peerBusy = true;
             log.info("[eth] Peer {} disconnected during Hello (reason={}/{})",
                 remoteAddress, reason, disconnectReasonName(reason));
             ctx.close();
@@ -387,9 +426,20 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     ? StatusMessage.decode69(msg.payload())
                     : StatusMessage.decode(msg.payload());
             } catch (Exception e) {
-                log.error("[eth] Failed to decode Status from peer: {} | payload[{}]={}", e.getMessage(),
+                log.error("[eth] Failed to decode Status from peer {} ({}): {} | payload[{}]={}",
+                    remoteAddress, clientId != null ? clientId : "unknown", e.getMessage(),
                     msg.payload().length,
                     bytesToHex(msg.payload(), msg.payload().length));
+                // A spec-conformant peer on our network always produces a decodable
+                // Status; in practice these are foreign-chain clients with a
+                // divergent Status shape (e.g. Polygon's bor keeps the TD field
+                // eth/69 removed). Classify as incompatible so the dial callback
+                // blacklists the node id and applies the long backoff instead of
+                // re-dialing every transient window. Trade-off: if a future fork
+                // changes the Status shape and OUR decoder lags, healthy peers
+                // would be blacklisted for the rest of the run — the ERROR log
+                // above (with address + client id) is the tell for that case.
+                incompatibleNetwork = true;
                 ctx.close();
                 return;
             }
@@ -431,6 +481,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             sendPong(ctx);
         } else if (msg.code() == P2P_DISCONNECT) {
             int reason = decodeDisconnectReason(msg.payload());
+            if (reason == DISC_TOO_MANY_PEERS) peerBusy = true;
             log.info("[eth] Peer {} ({}) disconnected during Status exchange (reason={}/{}, eth/{})",
                 remoteAddress, clientId != null ? clientId : "unknown",
                 reason, disconnectReasonName(reason), negotiatedEthVersion);
@@ -538,7 +589,14 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                         BlockHeadersMessage.decodeWithRequestId(msg.payload());
                     log.info("[eth] Received {} block headers (reqId={})",
                             decoded.headers().size(), decoded.requestId());
+                    // Window-poisoning guard: admit into the serve caches / chainHead ONLY
+                    // the headers matching what we actually requested (a response for an
+                    // unknown reqId admits nothing). The FULL response still flows to the
+                    // pending future / onHeaders below — verification checks hashes itself.
+                    HeaderReq req = pendingHeaderReqs.remove(decoded.requestId());
+                    boolean admittedAny = false;
                     for (BlockHeadersMessage.VerifiedHeader vh : decoded.headers()) {
+                        if (req == null || !req.admits(vh.hash(), vh.header().number)) continue;
                         byte[] raw = vh.rawRlp().toArrayUnsafe();
                         headerCache.put(vh.header().number, raw);
                         hashCache.put(vh.hash().toHexString(), raw);
@@ -547,6 +605,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                         log.debug("[eth] Cached header for block #{} hash={}",
                                 vh.header().number, vh.hash().toShortHexString());
                         chainHead.update(vh.header().number, vh.hash());
+                        admittedAny = true;
                         if (vh.header().number > latestStateRootBlockNumber) {
                             latestStateRootBlockNumber = vh.header().number;
                             latestStateRoot = vh.header().stateRoot;
@@ -554,7 +613,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     }
                     // Our servable range may have grown — let the connector push a
                     // BlockRangeUpdate to eth/69 peers who were told a narrower range.
-                    if (!decoded.headers().isEmpty()) {
+                    if (admittedAny) {
                         Runnable w = onWindowUpdated;
                         if (w != null) w.run();
                     }
@@ -655,6 +714,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             case P2P_PING -> sendPong(ctx);
             case P2P_DISCONNECT -> {
                 int reason = decodeDisconnectReason(msg.payload());
+                if (reason == DISC_TOO_MANY_PEERS) peerBusy = true;
                 log.info("[eth] Peer {} ({}) disconnected in READY (reason={}/{})",
                     remoteAddress, clientId != null ? clientId : "unknown",
                     reason, disconnectReasonName(reason));
@@ -917,6 +977,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     public void requestBlockHeadersByHash(ChannelHandlerContext ctx, org.apache.tuweni.bytes.Bytes32 hash) {
         long reqId = requestId.getAndIncrement();
         log.info("[eth] GetBlockHeaders by hash={} reqId={}", hash.toShortHexString(), reqId);
+        pendingHeaderReqs.put(reqId, HeaderReq.byHash(hash));
         byte[] payload = GetBlockHeadersMessage.encodeByHash(reqId, hash, 1, 0, false);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
     }
@@ -924,6 +985,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     public void requestBlockHeaders(ChannelHandlerContext ctx, long blockNumber, int count) {
         long reqId = requestId.getAndIncrement();
         log.debug("[eth] GetBlockHeaders block={} count={} reqId={}", blockNumber, count, reqId);
+        pendingHeaderReqs.put(reqId, HeaderReq.byNumber(blockNumber, count));
         byte[] payload = GetBlockHeadersMessage.encodeByNumber(reqId, blockNumber, count, 0, false);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
     }
@@ -942,6 +1004,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future = new CompletableFuture<>();
         long reqId = requestId.getAndIncrement();
         pendingRequests.put(reqId, future);
+        pendingHeaderReqs.put(reqId, HeaderReq.byNumber(blockNumber, count));
         log.debug("[eth] GetBlockHeaders (async) block={} count={} reqId={}", blockNumber, count, reqId);
         byte[] payload = GetBlockHeadersMessage.encodeByNumber(reqId, blockNumber, count, 0, false);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
@@ -977,6 +1040,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         long reqId = requestId.getAndIncrement();
         CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> headerFut = new CompletableFuture<>();
         pendingRequests.put(reqId, headerFut);
+        pendingHeaderReqs.put(reqId, HeaderReq.byHash(hash));
         byte[] payload = GetBlockHeadersMessage.encodeByHash(reqId, hash, 1, 0, false);
         log.debug("[eth] GetBlockHeaders (fresh head, hash={}) reqId={}",
             hash.toShortHexString(), reqId);
@@ -1020,6 +1084,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         long reqId = requestId.getAndIncrement();
         CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> headerFut = new CompletableFuture<>();
         pendingRequests.put(reqId, headerFut);
+        pendingHeaderReqs.put(reqId, HeaderReq.byNumber(fromNumber, window));
         byte[] payload = GetBlockHeadersMessage.encodeByNumber(reqId, fromNumber, window, 0, false);
         log.debug("[eth] GetBlockHeaders (live head probe from #{} window={}) reqId={}",
             fromNumber, window, reqId);
@@ -1173,6 +1238,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             return CompletableFuture.failedFuture(
                 new IllegalStateException("No best block hash from peer"));
         }
+        pendingHeaderReqs.put(reqId, HeaderReq.byHash(hash));
         byte[] headerPayload = GetBlockHeadersMessage.encodeByHash(reqId, hash, 1, 0, false);
         log.info("[snap] Fetching fresh header (hash={}) from peer {} before snap query",
             hash.toShortHexString(), remoteAddress);
@@ -1285,6 +1351,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             return CompletableFuture.failedFuture(
                 new IllegalStateException("No best block hash from peer"));
         }
+        pendingHeaderReqs.put(reqId, HeaderReq.byHash(hash));
         byte[] headerPayload = GetBlockHeadersMessage.encodeByHash(reqId, hash, 1, 0, false);
         log.info("[snap] Fetching fresh header for storage query from peer {}", remoteAddress);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, headerPayload);
@@ -1510,6 +1577,11 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     /** Returns true if this peer was confirmed on an incompatible network. */
     public boolean isIncompatibleNetwork() {
         return incompatibleNetwork;
+    }
+
+    /** Returns true if this peer rejected/dropped us with TooManyPeers (0x04). */
+    public boolean isPeerBusy() {
+        return peerBusy;
     }
 
     /** Returns true if this handler has completed the eth handshake. */

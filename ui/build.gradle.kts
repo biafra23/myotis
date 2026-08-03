@@ -1,7 +1,7 @@
 // :ui — the shared Compose-Multiplatform UI + the pure-Kotlin NodeController/Settings seam.
-// commonMain holds the screens + seam interfaces (no backend dependency); the Android and
-// Desktop hosts each supply the actuals. Targets: Android + Desktop JVM now (iOS later, once
-// the backend has a native/KMP path — see docs/bls-rust-acceleration.md for the on-ramp).
+// commonMain holds the screens + seam interfaces (no backend dependency); the Android,
+// Desktop, and iOS hosts each supply the actuals. Targets: Android + Desktop JVM + iOS
+// (arm64 device + arm64 simulator — :app-ios supplies the actuals over the Rust engine).
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
@@ -15,6 +15,13 @@ kotlin {
 
     androidTarget()
     jvm("desktop")
+    iosArm64()
+    iosSimulatorArm64()
+
+    // The custom jvmSharedMain dependsOn edge below would otherwise make KGP
+    // skip the default hierarchy (silently dropping iosMain and its actuals);
+    // applying it explicitly keeps both.
+    applyDefaultHierarchyTemplate()
 
     sourceSets {
         val commonMain by getting {
@@ -26,6 +33,18 @@ kotlin {
                 implementation(libs.kotlinx.coroutines.core)
                 implementation(libs.kotlinx.datetime)  // local-time formatting in the Logs tab
             }
+        }
+        // CacheFileStats' stat/read actuals are plain java.nio, identical on the
+        // Android and Desktop JVM targets: one shared intermediate source set
+        // instead of two copied actual files.
+        val jvmSharedMain by creating {
+            dependsOn(commonMain)
+        }
+        val desktopMain by getting {
+            dependsOn(jvmSharedMain)
+        }
+        val androidMain by getting {
+            dependsOn(jvmSharedMain)
         }
         // Desktop-JVM UI tests: drive the real composables headless (skiko software
         // rendering — no display needed, CI-safe). Regression tests for screen-level
@@ -41,7 +60,7 @@ kotlin {
 
 android {
     namespace = "io.myotis.ui"
-    compileSdk = 34
+    compileSdk = 35
     defaultConfig {
         minSdk = 29
     }

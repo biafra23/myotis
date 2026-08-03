@@ -8,39 +8,53 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * Cross-call cache of proof-<em>verified</em> state, keyed by world {@code stateRoot}.
+ * Cross-call cache of proof-<em>verified</em> state.
  *
- * <p><b>Why this exists.</b> A wallet confirm screen fires huge {@code eth_call}s —
- * a ~1000-token balance sweep (MetaMask's BalanceChecker) and Multicall3
- * simulations — and, when they exceed the per-call timeout, MetaMask <em>retries
- * the identical call</em> many times. {@link SnapBackedStateOracle}'s account
- * memo is per-instance (rebuilt with each head context) and storage slots were
- * not cached across calls at all, so every retry re-fetched hundreds of storage
- * proofs from scratch — a retry-storm that saturated the few snap peers, starved
- * cheap reads, and never converged. Caching the verified results at the node
- * level lets each retry reuse what the last one fetched, so the call converges in
- * a couple of attempts instead of looping forever.
+ * <p><b>Why this exists.</b> A wallet fires huge {@code eth_call}s —
+ * ~1000-token balance sweeps (MetaMask's BalanceChecker), 67KB Multicall3
+ * batches (Kohaku's per-poll state sync) — and re-issues them every poll
+ * cycle. {@link SnapBackedStateOracle}'s account memo is per-instance
+ * (rebuilt with each head context), so without a node-level cache every
+ * poll re-fetched hundreds of storage proofs from scratch — a storm that
+ * saturated the few snap peers, starved cheap reads, and never converged.
  *
- * <p><b>Why it's safe.</b> Entries are keyed by {@code stateRoot} and stored only
- * after the MPT proof has been verified against that root (see
- * {@code verifyAndDecode*} in {@link SnapBackedStateOracle}). State at a fixed
- * {@code stateRoot} is immutable, so a cached {@code (stateRoot, address, slot) ->
- * value} mapping is a cryptographic fact, not peer-trusted data — reusing it
- * across any call pinned to that root is sound. MetaMask number-pins its confirm
- * reads to a block, so the retries share a {@code stateRoot} and hit the cache.
+ * <p><b>Keying.</b> The two kinds are keyed by what their proofs anchor to:
+ * <ul>
+ *   <li><b>Accounts</b> are keyed by world {@code stateRoot}: the account
+ *       leaf is proven against the world trie, and a new block means a new
+ *       world root, so the (cheap, one-proof) account record must be
+ *       re-proven per block.
+ *   <li><b>Storage slots</b> are keyed by the account's {@code storageRoot}:
+ *       a slot proof anchors at the storage trie root, not the world root,
+ *       so a verified {@code (storageRoot, slot) -> value} mapping is a
+ *       cryptographic fact independent of which block it was fetched at.
+ *       Since most contracts' storage doesn't change every block, this lets
+ *       a per-poll sweep reuse all slots of every unchanged contract across
+ *       head advances — the per-block account proof (whose leaf carries the
+ *       storageRoot) is exactly the freshness check that makes reuse sound.
+ * </ul>
  *
- * <p>Bounded (LRU, per kind) so a long-lived node doesn't grow without limit as
- * the head advances and old roots fall out of use.
+ * <p><b>Why it's safe.</b> Entries are stored only after the MPT proof has
+ * been verified against the respective root (see {@code verifyAndDecode*} in
+ * {@link SnapBackedStateOracle}). State under a fixed root is immutable, so a
+ * cached mapping is a cryptographic fact, not peer-trusted data — reusing it
+ * for any call whose account resolves to that root is sound.
+ *
+ * <p>Bounded (LRU, per kind) so a long-lived node doesn't grow without limit
+ * as the head advances and old roots fall out of use.
  */
 public interface StateProofCache {
 
-    /** Verified value of {@code slot} for {@code address} at {@code stateRoot}, if cached. */
-    Optional<BigInteger> getStorage(byte[] stateRoot, byte[] address, BigInteger slot);
+    /** Verified value of {@code slot} in the storage trie rooted at
+     *  {@code storageRoot}, if cached. NOTE: keyed by the account's storage
+     *  trie root (from its proven account leaf), NOT the world stateRoot. */
+    Optional<BigInteger> getStorage(byte[] storageRoot, BigInteger slot);
 
-    /** Cache a verified storage value. */
-    void putStorage(byte[] stateRoot, byte[] address, BigInteger slot, BigInteger value);
+    /** Cache a verified storage value under its storage trie root. */
+    void putStorage(byte[] storageRoot, BigInteger slot, BigInteger value);
 
-    /** Verified account record (+ storage root) for {@code address} at {@code stateRoot}, if cached. */
+    /** Verified account record (+ storage root) for {@code address} at world
+     *  {@code stateRoot}, if cached. */
     Optional<AccountEntry> getAccount(byte[] stateRoot, byte[] address);
 
     /** Cache a verified account record. */
@@ -69,8 +83,8 @@ public interface StateProofCache {
 
     enum Noop implements StateProofCache {
         INSTANCE;
-        @Override public Optional<BigInteger> getStorage(byte[] r, byte[] a, BigInteger s) { return Optional.empty(); }
-        @Override public void putStorage(byte[] r, byte[] a, BigInteger s, BigInteger v) {}
+        @Override public Optional<BigInteger> getStorage(byte[] r, BigInteger s) { return Optional.empty(); }
+        @Override public void putStorage(byte[] r, BigInteger s, BigInteger v) {}
         @Override public Optional<AccountEntry> getAccount(byte[] r, byte[] a) { return Optional.empty(); }
         @Override public void putAccount(byte[] r, byte[] a, AccountEntry e) {}
     }
@@ -98,16 +112,16 @@ public interface StateProofCache {
             return hex(root) + ':' + hex(addr);
         }
 
-        private static String storageKey(byte[] root, byte[] addr, BigInteger slot) {
-            return hex(root) + ':' + hex(addr) + ':' + slot.toString(16);
+        private static String storageKey(byte[] storageRoot, BigInteger slot) {
+            return hex(storageRoot) + ':' + slot.toString(16);
         }
 
-        @Override public Optional<BigInteger> getStorage(byte[] root, byte[] addr, BigInteger slot) {
-            return Optional.ofNullable(storage.get(storageKey(root, addr, slot)));
+        @Override public Optional<BigInteger> getStorage(byte[] storageRoot, BigInteger slot) {
+            return Optional.ofNullable(storage.get(storageKey(storageRoot, slot)));
         }
 
-        @Override public void putStorage(byte[] root, byte[] addr, BigInteger slot, BigInteger value) {
-            storage.put(storageKey(root, addr, slot), value);   // BigInteger is immutable
+        @Override public void putStorage(byte[] storageRoot, BigInteger slot, BigInteger value) {
+            storage.put(storageKey(storageRoot, slot), value);   // BigInteger is immutable
         }
 
         @Override public Optional<AccountEntry> getAccount(byte[] root, byte[] addr) {

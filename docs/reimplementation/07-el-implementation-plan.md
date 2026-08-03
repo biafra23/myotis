@@ -328,6 +328,77 @@ Spec: README §5.3, doc 04 §2. Highlights per PR-sized chunk:
    `transactionsRoot`/`receiptsRoot` (eth/69 bloomless handled by EL-A2's recompute);
    `gasPrice`/`maxPriorityFeePerGas`/`feeHistory` from verified headers + bodies + receipts
    (gas-used-weighted percentiles).
+   - **Landed (receipt slice): `eth_getTransactionReceipt`** (ABI v14,
+     `nativeGetTransactionReceiptJson`): per-tx incremental scan cursor (`locateMinedTx`
+     twin — 8-block initial lookback, 128/poll catch-up cap, 10-min TTL, finalized-immutable
+     cache + `stillCanonical` reorg re-check), bodies vs `transactionsRoot` to locate the tx,
+     receipts vs `receiptsRoot` (`ManagedPeer::get_receipts`, eth/69 re-canonicalized),
+     receipt decode (`el/receipt.rs`), tx summary + sender recovery for
+     `from`/`to`/`contractAddress`/`effectiveGasPrice` (`el/tx.rs` `decode_summary`), and the
+     `buildReceiptJson`-pinned JSON (`eljson::receipt_json`, block-global `logIndex`).
+   - **Landed (confirm-loop slice): `eth_getTransactionByHash` + `eth_getBlockByHash`**
+     (ABI v15, `nativeGetTransactionByHashJson` / `nativeGetBlockByHashJson`): the shared
+     `locate_mined_tx` cursor + the full tx decode (`TxSummary` extended to the
+     `buildTxJson` field set — chainId/gas/value/input/v/r/s), and the verified
+     block-hash→number LRU (`blockHashToNumber` twin, populated by the receipt scan and
+     the by-number serve) resolving `getBlockByHash` through the verified by-number path
+     with the reorg re-check.
+   - **Landed (fees slice): `eth_feeHistory`** (ABI v16, `nativeFeeHistoryJson` +
+     `myotis_fee_history_json`): base fees / gas-used ratios from one anchored header
+     window `[oldest..head]` (the span past `newest` anchors it and gives the actual
+     next-block base fee), reward percentiles from bodies + receipts verified per block
+     against `transactionsRoot`/`receiptsRoot`, fetched concurrently (the Java
+     `verifiedBlockTipsAsync` pipelining), geth's gas-used-weighted percentile walk
+     (`percentile_rewards`), and the same-signature stale re-serve
+     (`lastGoodFeeHistory` twin). Chunk 2 is COMPLETE. Still open: the sent-tx
+     broadcast-head reachback + own-tx pending answers + pending overlay (chunk 3).
+   - **Landed (coverage extension): `eth_getBlockReceipts`** (ABI v17,
+     `nativeGetBlockReceiptsJson` + `myotis_get_block_receipts_json`, plus a NEW
+     `VerifiedReads.getBlockReceipts` served by BOTH engines and a router branch):
+     one anchored block's whole receipt list — body + receipts fetched together and
+     root-verified, one-pass batch build (`build_block_receipts`; the Java twin
+     `rpcGetBlockReceipts` reuses `buildReceiptJson` per index). Selector is a tag,
+     0x-number, or 0x-32-byte hash (hash resolves via the verified hash→number map
+     with the reorg re-check, like `getBlockByHash`).
+   - **Landed (coverage extension): `fullTransactions=true` blocks** (ABI v18,
+     `nativeGetBlockByNumberJson`/`nativeGetBlockByHashJson` gained a
+     `boolean fullTransactions`): both engines now serve `eth_getBlockByNumber`/
+     `ByHash` with fully decoded tx objects — every element the
+     `eth_getTransactionByHash` shape (`decode_summary` incl. recovered sender /
+     `buildTxJson`), decoded from the same `transactionsRoot`-verified body the
+     hashes form already fetched. An undecodable tx fails the whole block
+     (found-but-unrenderable must never serve a partial list); the Java stale
+     re-serve (`lastGoodLatestBlock`) stays hashes-only.
+   - **Landed (compat batch, router-only — both engines for free):**
+     `eth_accounts` (exactly `[]` — the node holds no keys), `net_listening`
+     (true — the discovery UDP listener), `net_peerCount` (from the
+     `myotis_status` snapshot's `connectedPeers`), `web3_sha3` (pure-Kotlin
+     Keccak-256 in commonMain, vector-pinned + Tuweni-cross-checked),
+     `eth_getBlockTransactionCountByNumber/ByHash` and
+     `eth_getUncleCountByBlockNumber/ByHash` (array sizes read out of the
+     verified block serve), `eth_getTransactionByBlockNumberAndIndex/
+     ByBlockHashAndIndex` (`transactions[i]` of a fullTransactions serve), and
+     `eth_getUncleByBlockNumberAndIndex/ByBlockHashAndIndex` (post-merge window
+     → always eth-null once the block resolves). Deliberately NOT included:
+     `eth_blobBaseFee` — the blob base-fee update fraction is fork-dependent
+     (and BPO forks reschedule it), so a router-side constant would silently go
+     stale; it needs an engine-side answer if it's ever wanted.
+   - **Landed (chunk 3): the sent-tx watch + pending overlay** (ABI v19,
+     `nativePendingNonceOverlay` + `myotis_pending_nonce_overlay`): `el/sent_tx.rs`
+     twins the Java `SentTxTracker`/`PendingNonceTracker` exactly (180 s watch TTL,
+     90 s nonce TTL, strict-`>` boundaries, highest-nonce-wins, overlay =
+     `max(mined, nonce+1)`). `send_raw_transaction` caches the raw bytes (256-cap
+     LRU), records the pending nonce, and watches the hash with the beacon
+     OPTIMISTIC head at broadcast; `locate_mined_tx` reaches its first scan back to
+     that head for our own txs (128-cap intact); `eth_getTransactionByHash` serves
+     the wallet's own unmined broadcasts in the PENDING shape (block trio explicit
+     JSON null — `eljson::pending_tx_json`, golden-pinned); a verified receipt or
+     mined lookup confirms the watch. Gossip sightings register in every peer's
+     read loop (`NewPooledTransactionHashes`, both eth/66-68 wire shapes, the Java
+     `TxGossipObserver` twin); unseen txs rebroadcast on a 20 s gate piggybacked on
+     the wallet's poll paths (documented divergence: no warmer thread — a
+     zero-traffic idle doesn't rebroadcast). `getTransactionCount("pending")`
+     applies the overlay on both the JNI and iOS hosts. Milestone B is COMPLETE.
 3. **`sendRawTransaction` + pending overlay.** Gossip raw bytes to all READY peers, return
    `keccak256(rawTx)`, cache own-tx bytes (shows pending until mined), rebroadcast until the
    gossip echo (the EL-A5 hash-observation hook); pending-nonce overlay — only-raises,

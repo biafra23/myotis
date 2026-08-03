@@ -42,8 +42,11 @@ import java.util.function.Supplier;
  * </ol>
  *
  * <p>Bytecode is cached via the supplied {@link BytecodeCache}; the cache is
- * checked before issuing any request. State is not cached here — the
- * per-call cache lives in {@link SyncStateView}.
+ * checked before issuing any request. Verified account/storage state is cached
+ * in the node-level {@link StateProofCache} this oracle is constructed with —
+ * across calls, oracle instances, and (for storage slots, keyed by their
+ * account's storageRoot) across head advances. The per-call view cache lives
+ * in {@link SyncStateView}.
  *
  * <p>The peer abstraction lets tests substitute a fixture peer and lets the
  * wallet integration provide an {@code EthHandler}-backed implementation
@@ -65,9 +68,11 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
     private final Supplier<SnapPeer> peerSupplier;
     private final BytecodeCache bytecodeCache;
     private final int maxAttempts;
-    /** Cross-call, node-level cache of verified account/storage state keyed by
-     *  stateRoot — survives head-context rebuilds so a wallet's repeated retries of
-     *  the same heavy call reuse fetched slots instead of re-proving them. */
+    /** Cross-call, node-level cache of verified state — accounts keyed by world
+     *  stateRoot, storage slots by their account's storageRoot (see
+     *  {@link StateProofCache}). Survives head-context rebuilds AND head advances:
+     *  a contract whose storage is unchanged re-proves only its account record per
+     *  block, its slots replay from cache. */
     private final StateProofCache stateCache;
 
     /**
@@ -116,36 +121,42 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
 
     @Override
     public CompletableFuture<BigInteger> fetchStorage(byte[] stateRoot, Address address, BigInteger slot) {
-        byte[] addr = address.toByteArray();
-        // Cross-call cache hit: the verified value at this (stateRoot, addr, slot)
-        // is returned with zero round-trips. This is what lets a wallet's repeated
-        // retries of a 1000-slot balance sweep converge instead of re-proving every
-        // slot each time.
-        Optional<BigInteger> cached = stateCache.getStorage(stateRoot, addr, slot);
-        if (cached.isPresent()) return CompletableFuture.completedFuture(cached.get());
-
         Bytes32 root = Bytes32.wrap(stateRoot.clone());
-        Bytes addressBytes = Bytes.wrap(addr);
-        Bytes32 accountHash = Bytes32.wrap(Hash.keccak256(addressBytes).toArrayUnsafe());
+        Bytes32 accountHash = Bytes32.wrap(
+                Hash.keccak256(Bytes.wrap(address.toByteArray())).toArrayUnsafe());
         Bytes32 slotKey = paddedSlotKey(slot);
         Bytes32 slotHash = Bytes32.wrap(Hash.keccak256(slotKey).toArrayUnsafe());
 
         // Storage proofs anchor at the account's storageRoot, not the world
-        // stateRoot — so we need the account record first. The per-call
+        // stateRoot — so we need the account record first (a cache hit at this
+        // world root, or one proof per contract per block). The per-call
         // SyncStateView cache means this account fetch happens only once
         // even when the EVM does many SLOADs against the same contract.
         return fetchAccountWithRoot(stateRoot, address).thenCompose(awr -> {
             Bytes32 storageRoot = awr.storageRoot();
             if (MerklePatriciaProofVerifier.EMPTY_TRIE_ROOT.equals(storageRoot)) {
-                // Account has no storage at all; every slot is zero.
-                stateCache.putStorage(stateRoot, addr, slot, BigInteger.ZERO);
+                // Account has no storage at all; every slot is zero. Nothing to
+                // cache — the (cached) account record alone implies it.
                 return CompletableFuture.completedFuture(BigInteger.ZERO);
             }
+            // Cross-call, cross-BLOCK cache hit: the verified value at this
+            // (storageRoot, slot) is returned with zero further round-trips.
+            // Keyed by the storage trie root the proof anchors at, so as long
+            // as the contract's storage is unchanged, every head advance reuses
+            // the slots and only the account proof above cost a fetch — this is
+            // what lets a wallet's ~20s-cadence Multicall3 sweep converge
+            // instead of re-proving hundreds of slots every block.
+            // toArray (a copy), NOT toArrayUnsafe: StateProofCache is a public
+            // interface, and an implementation that mutated or retained the array
+            // must not be able to corrupt the Bytes32 verification anchor below.
+            byte[] storageRootBytes = storageRoot.toArray();
+            Optional<BigInteger> cached = stateCache.getStorage(storageRootBytes, slot);
+            if (cached.isPresent()) return CompletableFuture.completedFuture(cached.get());
             return tryWithRetries(peer -> peer
                     .getTrieNodes(root, List.of(SnapPeer.PathSet.storageSlot(accountHash, slotHash)))
                     .thenApply(nodes -> verifyAndDecodeStorage(storageRoot, slotHash, address, nodes)))
                     .thenApply(value -> {
-                        stateCache.putStorage(stateRoot, addr, slot, value);
+                        stateCache.putStorage(storageRootBytes, slot, value);
                         return value;
                     });
         });
@@ -171,21 +182,42 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
         }
         Bytes32 root = Bytes32.wrap(stateRoot.clone());
         // Build per-account work, skipping anything already in the proof cache so a
-        // partially-warm sweep only fetches the misses.
+        // partially-warm sweep only fetches the misses. The storage cache is keyed
+        // by the account's storageRoot, so slots can only be pre-filtered for
+        // accounts whose record is already cached at this world root (which is how
+        // an unchanged contract's slots carry over from the previous block); for
+        // uncached accounts every slot rides along and verifyAndCacheChunk skips
+        // the cache hits after the account proof reveals the storageRoot.
+        //
+        // FOLLOW-UP (deferred): a ride-along slot is real peer work — the peer
+        // assembles (and we download) a storage proof the verify step then discards
+        // as a cache hit. The dominant sweep flow dodges this because the
+        // PrefetchingEvmExecutor's sentinel waves discover an account one wave
+        // before its slots, so the account is cached at the root by the time slots
+        // batch. Flows where a new account and its slots land in the SAME wave
+        // (real-mode iterations, proxy -> impl reads) still pay it. If residual
+        // latency shows up on proxy-heavy calls, split the batch in two phases:
+        // account proofs for uncached accounts first, then only the still-missing
+        // slots — making "N account proofs per poll" hold in every flow.
         List<BatchItem> items = new ArrayList<>();
         for (Map.Entry<Address, ? extends Set<BigInteger>> entry : request.entrySet()) {
             Address address = entry.getKey();
             byte[] addr = address.toByteArray();
             Bytes32 accountHash = Bytes32.wrap(Hash.keccak256(Bytes.wrap(addr)).toArrayUnsafe());
-            boolean accountCached = stateCache.getAccount(stateRoot, addr).isPresent();
+            Optional<StateProofCache.AccountEntry> cachedAccount = stateCache.getAccount(stateRoot, addr);
+            byte[] knownStorageRoot = cachedAccount.map(StateProofCache.AccountEntry::storageRoot).orElse(null);
+            boolean emptyStorage = knownStorageRoot != null && MerklePatriciaProofVerifier
+                    .EMPTY_TRIE_ROOT.equals(Bytes32.wrap(knownStorageRoot));
             List<BigInteger> slots = new ArrayList<>();
             List<Bytes32> slotHashes = new ArrayList<>();
             for (BigInteger slot : entry.getValue()) {
-                if (stateCache.getStorage(stateRoot, addr, slot).isPresent()) continue;
+                if (emptyStorage) continue;   // every slot is a verified zero
+                if (knownStorageRoot != null
+                        && stateCache.getStorage(knownStorageRoot, slot).isPresent()) continue;
                 slots.add(slot);
                 slotHashes.add(Bytes32.wrap(Hash.keccak256(paddedSlotKey(slot)).toArrayUnsafe()));
             }
-            if (accountCached && slots.isEmpty()) continue;  // fully cached → nothing to do
+            if (cachedAccount.isPresent() && slots.isEmpty()) continue;  // fully cached → nothing to do
             items.add(new BatchItem(address, addr, accountHash, slots, slotHashes));
         }
         if (items.isEmpty()) return CompletableFuture.completedFuture(null);
@@ -240,13 +272,16 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
                         new StateProofCache.AccountEntry(awr.account(), awr.storageRoot().toArrayUnsafe()));
             }
             Bytes32 storageRoot = awr.storageRoot();
-            boolean emptyStorage = MerklePatriciaProofVerifier.EMPTY_TRIE_ROOT.equals(storageRoot);
+            if (MerklePatriciaProofVerifier.EMPTY_TRIE_ROOT.equals(storageRoot)) {
+                continue;   // every slot is a verified zero; the account record implies it
+            }
+            byte[] storageRootBytes = storageRoot.toArray();   // copy — see fetchStorage
             for (int s = 0; s < it.slots().size(); s++) {
                 BigInteger slot = it.slots().get(s);
-                if (stateCache.getStorage(stateRoot, it.addr(), slot).isPresent()) continue;
-                BigInteger value = emptyStorage ? BigInteger.ZERO
-                        : verifyAndDecodeStorage(storageRoot, it.slotHashes().get(s), it.address(), nodes);
-                stateCache.putStorage(stateRoot, it.addr(), slot, value);
+                if (stateCache.getStorage(storageRootBytes, slot).isPresent()) continue;
+                BigInteger value = verifyAndDecodeStorage(
+                        storageRoot, it.slotHashes().get(s), it.address(), nodes);
+                stateCache.putStorage(storageRootBytes, slot, value);
             }
         }
     }

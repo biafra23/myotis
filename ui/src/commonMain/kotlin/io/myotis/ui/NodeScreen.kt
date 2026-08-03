@@ -3,6 +3,7 @@ package io.myotis.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,25 +29,31 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
@@ -57,11 +64,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.datetime.Instant
+import kotlin.time.Instant
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
 
@@ -124,35 +132,48 @@ fun NodeScreen(
     val network = selected?.takeIf { it in chains } ?: chains.firstOrNull() ?: settings.primaryNetwork()
     val current = snapshots[network]
 
-    MaterialTheme {
-        Column(Modifier.fillMaxSize().padding(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Myotis", style = MaterialTheme.typography.headlineSmall)
-                if (chains.isNotEmpty()) {
-                    Spacer(Modifier.width(12.dp))
-                    NetworkChips(chains, network, engineOf = { snapshots[it]?.engine },
-                        onSelect = { selected = it })
+    // Follow the platform's light/dark appearance, and paint the scheme's own
+    // background behind everything. The Surface is load-bearing twice over:
+    // without it Compose draws over the host window's background (black in iOS
+    // dark mode) while the default MaterialTheme stays light — near-black text
+    // on black — and it is also what sets LocalContentColor to onBackground, so
+    // unspecified Text colors adapt. Every color in the screens below is a
+    // scheme token (the few literals are saturated status colors that read on
+    // both), so the two stock schemes are all it takes.
+    val colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()
+    MaterialTheme(colorScheme = colorScheme) {
+        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+            Column(Modifier.fillMaxSize().padding(16.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Myotis", style = MaterialTheme.typography.headlineSmall)
+                    if (chains.isNotEmpty()) {
+                        Spacer(Modifier.width(12.dp))
+                        NetworkChips(chains, network, engineOf = { snapshots[it]?.engine },
+                            onSelect = { selected = it })
+                    }
                 }
-            }
-            Spacer(Modifier.height(8.dp))
-            // Readiness traffic-light strip: the wallet's "safe to transact" signal for the
-            // selected chain. Uses the configurable deep-pool threshold from Settings.
-            ReadinessStrip(current, settings.deepPoolThreshold())
-            Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(8.dp))
+                // Readiness traffic-light strip: the wallet's "safe to transact" signal for the
+                // selected chain. Uses the configurable deep-pool threshold from Settings.
+                ReadinessStrip(current, settings.deepPoolThreshold())
+                Spacer(Modifier.height(12.dp))
 
-            TabRow(selectedTabIndex = tab) {
-                Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Status") })
-                Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Query") })
-                Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("Logs") })
-                Tab(selected = tab == 3, onClick = { tab = 3 }, text = { Text("Settings") })
-            }
-            Spacer(Modifier.height(16.dp))
+                TabRow(selectedTabIndex = tab) {
+                    Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Status") })
+                    Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Query") })
+                    Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("Logs") })
+                    Tab(selected = tab == 3, onClick = { tab = 3 }, text = { Text("Index") })
+                    Tab(selected = tab == 4, onClick = { tab = 4 }, text = { Text("Settings") })
+                }
+                Spacer(Modifier.height(16.dp))
 
-            when (tab) {
-                0 -> StatusTab(controller, settings, current, network, online, onOpenNetworkSettings)
-                1 -> QueryTab(controller, settings, current, network, history)
-                2 -> LogsTab(logs, logFilter, onFilterChange = { logFilter = it })
-                3 -> SettingsTab(controller, settings, snapshots, onEnabledChanged = { enabledRev++ })
+                when (tab) {
+                    0 -> StatusTab(controller, settings, current, network, online, onOpenNetworkSettings)
+                    1 -> QueryTab(controller, settings, current, network, history)
+                    2 -> LogsTab(logs, logFilter, onFilterChange = { logFilter = it })
+                    3 -> IndexTab(controller, settings, current, network)
+                    4 -> SettingsTab(controller, settings, snapshots, onEnabledChanged = { enabledRev++ })
+                }
             }
         }
     }
@@ -271,6 +292,7 @@ private fun SettingsTab(
     var strictFreshness by remember { mutableStateOf(settings.strictStateFreshness()) }
     var nativeBls by remember { mutableStateOf(settings.nativeBlsEnabled()) }
     var rustEngine by remember { mutableStateOf(settings.rustEngineEnabled()) }
+    var torRouting by remember { mutableStateOf(settings.torEnabled()) }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
@@ -422,6 +444,48 @@ private fun SettingsTab(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+
+        var logIndexKohaku by remember {
+            mutableStateOf(KohakuPreset.byNetwork.keys.any { settings.logIndexEnabled(it) })
+        }
+        SwitchRow(
+            label = "Log index \u2014 Kohaku contracts (experimental)",
+            checked = logIndexKohaku && rustEngine,
+            enabled = rustEngine,
+            onChange = { on ->
+                logIndexKohaku = on
+                KohakuPreset.byNetwork.keys.forEach { net ->
+                    settings.setLogIndexEnabled(net, on)
+                    controller.applyLogIndex(net)
+                }
+            },
+        )
+        // Tor routing — Rust-engine-only (Arti is embedded there), so the row is disabled
+        // until the Rust engine is enabled above. Applies on the next network (re)start.
+        SwitchRow(
+            label = "Route reads over Tor (experimental)",
+            checked = torRouting && rustEngine,
+            enabled = rustEngine,
+            onChange = { on -> torRouting = on; settings.setTorEnabled(on); controller.applyTorMode() },
+        )
+        Text(
+            if (!rustEngine) {
+                "Enable the Rust engine first — Tor routing is built into the Rust engine only."
+            } else {
+                "Off (default): reads use the peer pool directly from your IP. On: route " +
+                    "account/balance reads over the Tor network (embedded Arti) so snap peers see " +
+                    "a Tor exit, not your IP — each address gets its own isolated circuit and a " +
+                    "fresh node identity. SCOPE: only account (balance/nonce) reads route over Tor " +
+                    "today; token-balance (storage), contract code, and eth_call/gas-estimation " +
+                    "still use your real IP — full coverage is a follow-up. HEADS-UP: earlier tests " +
+                    "were not very successful — many peers reject Tor exit IPs and :30303 exit " +
+                    "coverage is patchy, so reads can be slow (seconds to tens of seconds) or " +
+                    "fail-closed while this is on. Takes effect immediately — the next read on a " +
+                    "running Rust-engine network routes over Tor (no restart needed)."
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         Text(
             "An RPC-port change reboots that chain; the snap-peer target and served-block " +
                 "window apply live to every running chain, and the readiness threshold persists " +
@@ -465,14 +529,22 @@ private fun SettingsTab(
 
 /** A label + right-aligned [Switch] row — the repeated toggle layout in [SettingsTab]. */
 @Composable
-private fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+private fun SwitchRow(
+    label: String,
+    checked: Boolean,
+    enabled: Boolean = true,
+    onChange: (Boolean) -> Unit,
+) {
     Row(
         Modifier.fillMaxWidth().padding(top = 4.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(label)
-        Switch(checked = checked, onCheckedChange = onChange)
+        Text(
+            label,
+            color = if (enabled) Color.Unspecified else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Switch(checked = checked, enabled = enabled, onCheckedChange = onChange)
     }
 }
 
@@ -553,9 +625,14 @@ private fun StatusTab(
  *  starvation while the state still reads SYNCED on the Java engine). */
 @Composable
 private fun HuntBanner(s: NodeSnapshot) {
-    if (!s.running || !s.lcHunting) return
+    if (!s.running) return
+    val targets = buildList {
+        if (s.lcHunting) add("light-client servers")
+        if (s.elHunting) add("snap peers")
+    }
+    if (targets.isEmpty()) return
     Text(
-        "Hunting for light-client servers…",
+        "Hunting for ${targets.joinToString(" and ")}…",
         style = MaterialTheme.typography.bodySmall,
         color = Color(0xFFF9A825), // amber — same signal family as "warming up"
         modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)
@@ -651,28 +728,65 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         })
         StatusRow("Beacon", s.beaconState)
         StatusRow("EL block", s.executionBlockNumber.toString())
+        // Tor verified-read routing (docs/privacy-and-tor.md) — shown only when it
+        // applies (Rust engine + a Tor-capable build); see NodeSnapshot.tor.
+        s.logIndex?.let { StatusRow("Log index", it) }
+        s.tor?.let { mode ->
+            StatusRow(
+                "Tor",
+                when (mode) {
+                    "active" -> "routing reads (circuit ready)"
+                    "on" -> "on — circuit bootstrapping…"
+                    "off" -> "off"
+                    else -> mode
+                },
+                color = if (mode == "active") MaterialTheme.colorScheme.primary else null,
+            )
+        }
         StatusRow("CL peers", "served ${s.clServedPeersLastMin}/min, con ${s.clConnectedPeers}")
-        StatusRow("EL peers", "ready ${s.readyPeers}, snap ${s.snapPeers}, serving ${s.snapServingPeers}")
-        // Cache rows: "proven" (CL) / "snap-ok" (EL) predict how fast the NEXT
-        // cold start finds servers — the cache learning is visible live.
+        // Same total-first shape as the cache rows (the pool holds only ready
+        // peers, so the total IS the ready count).
+        StatusRow("EL peers", "${s.readyPeers} · snap ${s.snapPeers} · serving ${s.snapServingPeers}")
+        // Cache rows: confirmed-server counts predict how fast the NEXT cold
+        // start finds servers — the cache learning is visible live. One icon
+        // vocabulary for both rows, sized for phone-width screens:
+        // ✓ confirmed server (CL: proven LC · EL: snap-ok), ✕ confirmed not
+        // (nolc / snap-bad), ? untried.
+        // The derived untried bucket can't go negative from ONE CacheFileStats
+        // parse (buckets are mutually exclusive per line), but coerce anyway so
+        // a future host feeding these fields from another source can't render
+        // "?-3".
         StatusRow(
             "CL cache",
-            "${s.clCachedPeers} (lc ${s.clCachedProven}, nolc ${s.clCachedNolc}, " +
-                "untried ${s.clCachedPeers - s.clCachedProven - s.clCachedNolc})",
+            "${s.clCachedPeers} · ✓${s.clCachedProven} ✕${s.clCachedNolc} " +
+                "?${(s.clCachedPeers - s.clCachedProven - s.clCachedNolc).coerceAtLeast(0)}",
         )
-        StatusRow("EL cache", "${s.elCachedPeers} (snap-ok ${s.elCachedSnapOk}, snap-bad ${s.elCachedSnapBad})")
+        StatusRow(
+            "EL cache",
+            "${s.elCachedPeers} · ✓${s.elCachedSnapOk} ✕${s.elCachedSnapBad} " +
+                "?${(s.elCachedPeers - s.elCachedSnapOk - s.elCachedSnapBad).coerceAtLeast(0)}",
+        )
         // What peers ask US for: demand for our served headers/blocks, and how often we
         // could answer. Bodies-served stays 0 (light client; prompt empty replies).
-        StatusRow("Peer asks · headers", "${s.peerHeaderRequests} asked, ${s.peerHeaderRequestsServed} served")
-        StatusRow("Peer asks · blocks", "${s.peerBodyRequests} asked, ${s.peerBodyRequestsServed} served")
+        StatusRow("Hdr asks", "${s.peerHeaderRequests} · served ${s.peerHeaderRequestsServed}")
+        StatusRow("Blk asks", "${s.peerBodyRequests} · served ${s.peerBodyRequestsServed}")
         StatusRow("Discovered", s.discoveredPeers.toString())
         StatusRow("Discv5 peers", s.discv5Peers.toString())
         StatusRow("In backoff", s.backedOffPeers.toString())
         StatusRow("Blacklisted", s.blacklistedPeers.toString())
+        // JSON-RPC listener: where a same-device client reaches this network's
+        // verified endpoint — or why it can't (port squatted / bind failed).
+        if (s.rpcPort > 0) {
+            if (s.rpcServing) {
+                StatusRow("RPC", "127.0.0.1:${s.rpcPort}")
+            } else {
+                StatusRow("RPC", "port ${s.rpcPort} unavailable", color = MaterialTheme.colorScheme.error)
+            }
+        }
         StatusRow("Sync period", "${s.syncCurrentPeriod} / ${s.syncTargetPeriod}")
         // verifiedHeadAgeMs == Long.MAX_VALUE is the "no verified head yet" sentinel — show a
         // dash instead of the raw ~9.2e18 ms, which would read as a nonsensical age.
-        StatusRow("Verified head age", if (s.verifiedHeadAgeMs == Long.MAX_VALUE) "—" else "${s.verifiedHeadAgeMs} ms")
+        StatusRow("Head age", if (s.verifiedHeadAgeMs == Long.MAX_VALUE) "—" else "${s.verifiedHeadAgeMs} ms")
         StatusRow("Uptime", "${s.uptimeSeconds}s")
         // Pseudo-sleep observability: how much the node has idle-slept, and when/why it
         // last woke. Foreground (opening the app) is excluded from the "last woke" reason,
@@ -684,7 +798,7 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         StatusRow(
             "Sleep",
             when {
-                !hostSleeps -> "always on — no idle-sleep controller on this host"
+                !hostSleeps -> "always on"
                 s.pauseCount == 0 -> "never slept"
                 else -> "${formatDuration(s.totalPausedMs)} over ${s.pauseCount} " +
                     "${if (s.pauseCount == 1) "pause" else "pauses"}"
@@ -727,6 +841,64 @@ private fun QueryTab(
     // and load off the main thread (entries() reads a file) so composition never blocks on disk.
     var historyList by remember(network) { mutableStateOf<List<QueryHistoryEntry>>(emptyList()) }
     LaunchedEffect(Unit) { historyList = withContext(Dispatchers.Default) { history.entries() } }
+
+    // --- Transaction-history scan state (TrueBlocks index; desktop-mainnet-only hosts). ---
+    // Keys arrive in stream order (newest chunk first); a null row = placeholder still
+    // resolving. SnapshotStateMap writes recompose only the affected row — that's the
+    // "block number first, parsed tx replaces it in place" mechanic.
+    var scanJob by remember(network) { mutableStateOf<Job?>(null) }
+    var scanRunning by remember(network) { mutableStateOf(false) }
+    var scanInfo by remember(network) { mutableStateOf<TxScanEvent.Started?>(null) }
+    var scanProgress by remember(network) { mutableStateOf<TxScanEvent.Progress?>(null) }
+    var scanDone by remember(network) { mutableStateOf<Int?>(null) }
+    var scanError by remember(network) { mutableStateOf<String?>(null) }
+    val txKeys = remember(network) { mutableStateListOf<Pair<Long, Int>>() }
+    val txRows = remember(network) { mutableStateMapOf<Pair<Long, Int>, TxRowUi?>() }
+    val txErrors = remember(network) { mutableStateMapOf<Pair<Long, Int>, String>() }
+
+    fun startTxScan(address: String) {
+        scanJob?.cancel()
+        txKeys.clear(); txRows.clear(); txErrors.clear()
+        scanInfo = null; scanProgress = null; scanDone = null; scanError = null
+        scanRunning = true
+        scanJob = scope.launch {
+            try {
+                controller.transactionHistory(network, address).collect { ev ->
+                    when (ev) {
+                        is TxScanEvent.Started -> scanInfo = ev
+                        is TxScanEvent.Progress -> scanProgress = ev
+                        is TxScanEvent.Hit -> {
+                            val key = ev.blockNumber to ev.txIndex
+                            if (key !in txRows) {
+                                txKeys.add(key)
+                                txRows[key] = null
+                            }
+                        }
+                        is TxScanEvent.Tx -> txRows[ev.row.blockNumber to ev.row.txIndex] = ev.row
+                        is TxScanEvent.Failed -> txErrors[ev.blockNumber to ev.txIndex] = ev.error
+                        is TxScanEvent.Done -> scanDone = ev.total
+                    }
+                }
+            } catch (c: CancellationException) {
+                throw c  // structured cancellation (Stop button / tab left)
+            } catch (t: Throwable) {
+                scanError = t.message ?: t.toString()
+            } finally {
+                // Only the CURRENT scan may flip the flag off: a cancelled scan's finally
+                // can run after its replacement already set scanRunning = true.
+                if (scanJob === coroutineContext[Job]) scanRunning = false
+            }
+        }
+    }
+
+    // NetworkChips sit above the tab content, so the user can switch chains while a scan
+    // runs. All scan state is remember(network) (so it visually resets), but the coroutine
+    // lives in the tab-scoped `scope` — cancel it when `network` changes, or it keeps
+    // fetching for the old address with no Stop button to reach it. onDispose reads the
+    // now-departing composition's scanJob holder, i.e. the job that was actually running.
+    DisposableEffect(network) {
+        onDispose { scanJob?.cancel() }
+    }
 
     // Takes the query string (not the input state) so a tapped history row runs immediately
     // without waiting for the input state write to settle.
@@ -823,6 +995,86 @@ private fun QueryTab(
             account != null -> AccountResultView(account!!)
         }
 
+        // Transaction-history add-on (TrueBlocks Unchained Index): shown once an account
+        // resolved, on hosts/networks that support the scan (desktop mainnet, Java engine).
+        // supportsTransactionHistory is a cheap registry check — evaluate per composition so
+        // the section appears once the node is up, without a network switch.
+        val currentAccount = account
+        if (!loading && currentAccount != null && running &&
+            controller.supportsTransactionHistory(network)
+        ) {
+            Spacer(Modifier.height(20.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Transactions", style = MaterialTheme.typography.titleSmall)
+                if (scanRunning) {
+                    TextButton(onClick = { scanJob?.cancel() }) { Text("Stop") }
+                } else {
+                    Button(onClick = { startTxScan(currentAccount.address) }) {
+                        Text(if (txKeys.isEmpty()) "Find transactions" else "Rescan")
+                    }
+                }
+            }
+            scanInfo?.let { TxScanInfoCaption(it) }
+            if (scanRunning) {
+                Spacer(Modifier.height(6.dp))
+                val p = scanProgress
+                if (p != null && p.totalChunks > 0) {
+                    LinearProgressIndicator(
+                        progress = { (p.chunksScanned.toFloat() / p.totalChunks).coerceIn(0f, 1f) },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Scanning chunk ${p.chunksScanned + 1}/${p.totalChunks}" +
+                            " (block ~${groupDigits(p.currentRange.substringAfter('-').trimStart('0'))})" +
+                            " — ${p.hits} hit${if (p.hits == 1) "" else "s"}" +
+                            " · ${formatBytes(p.bytesDownloaded)} fetched",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                }
+            }
+            scanError?.let {
+                Spacer(Modifier.height(6.dp))
+                Text("Scan error: $it", color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
+            }
+            scanDone?.let {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "Scan complete — $it transaction${if (it == 1) "" else "s"}.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            if (txKeys.isNotEmpty()) {
+                Spacer(Modifier.height(6.dp))
+                // Plain capped Column, not LazyColumn: QueryTab's root already scrolls
+                // vertically, and a nested unbounded LazyColumn would throw.
+                txKeys.take(TX_ROWS_RENDER_CAP).forEach { key ->
+                    val row = txRows[key]
+                    val err = txErrors[key]
+                    when {
+                        row != null -> TxRowView(row)
+                        err != null -> TxFailedRowView(key.first, key.second, err)
+                        else -> TxHitRow(key.first, key.second, active = scanRunning)
+                    }
+                }
+                if (txKeys.size > TX_ROWS_RENDER_CAP) {
+                    Text(
+                        "Showing the first $TX_ROWS_RENDER_CAP of ${txKeys.size} hits" +
+                            " (newest first) — the counters above keep scanning.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+
         // Recent-query history: tap a row to re-run it (uses the stored input, not the label).
         if (historyList.isNotEmpty()) {
             Spacer(Modifier.height(20.dp))
@@ -868,6 +1120,145 @@ private fun QueryHistoryRow(e: QueryHistoryEntry, enabled: Boolean, onClick: () 
             )
         }
     }
+}
+
+// Rendering cap for the streamed transaction list. The scan itself keeps running past
+// this (the progress line keeps counting); a debug list longer than this isn't readable.
+private const val TX_ROWS_RENDER_CAP = 300
+
+// Index tip trailing the verified head by more than this gets the loud staleness
+// banner. ~100k mainnet blocks ≈ 14 days — beyond that, "recent history" is missing.
+private const val TX_INDEX_STALE_BLOCKS = 100_000L
+
+// Mainnet block time, for turning a block gap into a human age.
+private const val SECONDS_PER_BLOCK = 12L
+
+/**
+ * Freshness + trust caption for the scan: which manifest, how it was found, index tip
+ * vs head. When the index trails the verified head badly (upstream TrueBlocks publishing
+ * has stalled for ~a year as of mid-2026), a prominent warning banner spells out the
+ * approximate age and the cutoff block — a small amber caption undersold a gap that
+ * makes ALL recent history silently absent.
+ */
+@Composable
+private fun TxScanInfoCaption(info: TxScanEvent.Started) {
+    val lagBlocks = info.headBlock?.let { it - info.latestIndexedBlock } ?: -1L
+    val veryStale = lagBlocks > TX_INDEX_STALE_BLOCKS
+    val degradedSource = info.cidSource != "contract"
+    val cidShort = if (info.manifestCid.length > 12) {
+        "${info.manifestCid.take(8)}…${info.manifestCid.takeLast(4)}"
+    } else info.manifestCid
+
+    if (veryStale) {
+        val ageDays = lagBlocks * SECONDS_PER_BLOCK / 86_400
+        Spacer(Modifier.height(6.dp))
+        Column(
+            Modifier.fillMaxWidth()
+                .background(MaterialTheme.colorScheme.errorContainer)
+                .padding(10.dp),
+        ) {
+            Text(
+                "⚠ Index is ~$ageDays days behind the chain head",
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
+            Text(
+                "Indexed to block ${groupDigits(info.latestIndexedBlock.toString())}, head is " +
+                    "${groupDigits(info.headBlock.toString())} — anything after the indexed block " +
+                    "will NOT appear below. This is the newest index the TrueBlocks publisher " +
+                    "has released, not a sync problem on this node.",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
+        }
+        Spacer(Modifier.height(4.dp))
+    }
+    Text(
+        buildString {
+            append("Index $cidShort (").append(info.cidSource).append(")")
+            append(" · indexed to block ").append(groupDigits(info.latestIndexedBlock.toString()))
+            info.headBlock?.let { append(" · head ").append(groupDigits(it.toString())) }
+            append(" · results unverified — debug aid")
+        },
+        style = MaterialTheme.typography.bodySmall,
+        // Amber when the CID didn't come from the live contract read (cached/hardcoded),
+        // or when staleness can't be judged (no verified head to compare against).
+        color = if (degradedSource || info.headBlock == null) Color(0xFFF9A825)
+        else MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+/** Placeholder row: the index hit's block number. Shows a spinner + "fetching…" while the
+ *  scan is live; once the scan is stopped, an unresolved hit reads "not fetched (stopped)"
+ *  instead of a forever-spinning row. */
+@Composable
+private fun TxHitRow(blockNumber: Long, txIndex: Int, active: Boolean) {
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (active) {
+            CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp)
+            Spacer(Modifier.width(8.dp))
+        }
+        Text(
+            "#${groupDigits(blockNumber.toString())} · tx $txIndex · " +
+                if (active) "fetching…" else "not fetched (scan stopped)",
+            fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/** Resolved row: succinct headline, block/from/hash beneath; tap to copy the tx hash. */
+@Composable
+private fun TxRowView(row: TxRowUi) {
+    val clipboard = LocalClipboardManager.current
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clickable { clipboard.setText(AnnotatedString(row.hash)) }
+            .padding(vertical = 4.dp),
+    ) {
+        Text(row.headline, style = MaterialTheme.typography.bodyMedium)
+        Text(
+            buildString {
+                append("#").append(groupDigits(row.blockNumber.toString()))
+                row.from?.let { append(" · from ").append(it.take(8)).append('…').append(it.takeLast(4)) }
+                append(" · ").append(row.hash.take(10)).append('…')
+                append(" · tap to copy hash")
+            },
+            fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1, overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+/** A hit whose tx couldn't be fetched/decoded — kept in place so the list stays honest. */
+@Composable
+private fun TxFailedRowView(blockNumber: Long, txIndex: Int, error: String) {
+    Text(
+        "#${groupDigits(blockNumber.toString())} · tx $txIndex — $error",
+        fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+        color = MaterialTheme.colorScheme.error,
+        modifier = Modifier.padding(vertical = 4.dp),
+        maxLines = 1, overflow = TextOverflow.Ellipsis,
+    )
+}
+
+/** "22841000" → "22,841,000" (pure Kotlin; commonMain has no NumberFormat). */
+private fun groupDigits(s: String): String {
+    val digits = s.ifEmpty { "0" }
+    if (digits.length <= 3 || !digits.all { it in '0'..'9' }) return digits
+    return digits.reversed().chunked(3).joinToString(",").reversed()
+}
+
+private fun formatBytes(b: Long): String = when {
+    b >= 1_073_741_824 -> "${(b * 10 / 1_073_741_824).toDouble() / 10} GB"
+    b >= 1_048_576 -> "${b / 1_048_576} MB"
+    b >= 1024 -> "${b / 1024} KB"
+    else -> "$b B"
 }
 
 /**
@@ -1051,16 +1442,58 @@ private fun LogsTab(logs: LogSource, filter: String, onFilterChange: (String) ->
     }
 
     val listState = rememberLazyListState()
-    // Auto-follow: key on `shown` so the derived state re-reads the current list (not a stale
-    // capture); size-2 tolerates the one-frame lag before a freshly-appended item is laid out.
-    val atBottom by remember(shown) {
-        derivedStateOf {
-            val last = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-            last >= shown.size - 2
-        }
+    // Tail-follow is explicit intent state, NOT re-derived from layout on every append: the old
+    // "last visible >= shown.size - 2" check compared a stale layout against the fresh list, so
+    // any poll batch of more than 2 lines silently broke follow (how often depended on each
+    // platform's log volume and frame timing). Entering the tab starts following — this
+    // composition is disposed on tab switch, so `remember` resets the flag to true per visit.
+    var follow by remember { mutableStateOf(true) }
+    // Guards the auto-snap below so its own scrollToItem can't read as a user scroll.
+    var autoSnapping by remember { mutableStateOf(false) }
+    // "At the tail" with ~1 item of tolerance (trackpad jitter, a stop a hair above the last
+    // line). Index and count come from the SAME layout pass, so a freshly-appended batch that
+    // hasn't been laid out yet can't skew the comparison the way the old shown.size check did.
+    fun nearTail(): Boolean {
+        val info = listState.layoutInfo
+        val last = info.visibleItemsInfo.lastOrNull() ?: return true
+        return last.index >= info.totalItemsCount - 2
     }
-    LaunchedEffect(shown.size) {
-        if (atBottom && shown.isNotEmpty()) listState.scrollToItem(shown.size - 1)
+    // Break: any scroll this composable didn't initiate that leaves the tail stops following.
+    // isScrollInProgress covers every input path uniformly — touch drag/fling, desktop mouse
+    // wheel and trackpad, and accessibility scroll actions (which bypass nested scroll and
+    // pointer input entirely, so a NestedScrollConnection would miss them).
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress && !autoSnapping && !nearTail() }
+            .collect { if (it) follow = false }
+    }
+    // Resume: coming to rest at the tail re-arms following (drag, fling, or the button below).
+    // canScrollBackward keeps a list that merely FITS the viewport from re-arming — without it,
+    // scrolling up to read and then typing a filter that shrinks `shown` onto one screen would
+    // silently flip follow back on, and clearing the filter would yank away the reading
+    // position. Reading `follow` in the expression re-evaluates it when only the flag changed,
+    // so a break-then-return while the layout stays put can't leave follow stuck off.
+    LaunchedEffect(listState) {
+        snapshotFlow { !follow && listState.canScrollBackward && nearTail() }
+            .collect { if (it) follow = true }
+    }
+    // Snap while following, keyed on the tail line's identity — sequence, not size, because at
+    // ring capacity the size stays constant while lines shift. One long-lived collector instead
+    // of an effect restart per 250ms poll (snapshotFlow conflates, and emits nothing at all
+    // while follow is off or the tail is unchanged).
+    LaunchedEffect(listState) {
+        snapshotFlow { if (follow) shown.lastOrNull()?.sequence else null }
+            .collect {
+                if (it != null) {
+                    autoSnapping = true
+                    try {
+                        // Re-check: `shown` can go empty (Clear, filter) between the emission
+                        // and this collect step, and scrollToItem(-1) throws.
+                        if (shown.isNotEmpty()) listState.scrollToItem(shown.size - 1)
+                    } finally {
+                        autoSnapping = false
+                    }
+                }
+            }
     }
 
     Column(Modifier.fillMaxSize()) {
@@ -1081,7 +1514,8 @@ private fun LogsTab(logs: LogSource, filter: String, onFilterChange: (String) ->
                 }
             }) { Text("Copy") }
             Spacer(Modifier.width(4.dp))
-            OutlinedButton(onClick = { logs.clear() }) { Text("Clear") }
+            // Clearing empties the ring — tail-follow the fresh lines that come after.
+            OutlinedButton(onClick = { logs.clear(); follow = true }) { Text("Clear") }
         }
         Spacer(Modifier.height(4.dp))
         // Capture level: lower it (e.g. DEBUG) to surface the chatty wire / peer-churn lines,
@@ -1102,12 +1536,13 @@ private fun LogsTab(logs: LogSource, filter: String, onFilterChange: (String) ->
         }
         Spacer(Modifier.height(8.dp))
         Box(Modifier.weight(1f).fillMaxWidth()) {
-            LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+            LazyColumn(state = listState, modifier = Modifier.fillMaxSize().testTag("logList")) {
                 items(shown, key = { it.sequence }) { LogLineRow(it, tz) }
             }
-            if (!atBottom && shown.isNotEmpty()) {
+            if (!follow && shown.isNotEmpty()) {
                 Button(
-                    onClick = { scope.launch { listState.scrollToItem(shown.size - 1) } },
+                    // Setting follow makes the snap collector emit, which scrolls to the tail.
+                    onClick = { follow = true },
                     modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp),
                 ) { Text("↓ Latest") }
             }
@@ -1165,9 +1600,86 @@ private fun formatDuration(ms: Long): String {
 }
 
 /** HH:mm:ss.SSS in [tz] (matches the logback console/file pattern). */
+// kotlin.time.Instant (used by kotlinx-datetime 0.7.x on every target) is still
+// @ExperimentalTime in the 2.2 stdlib.
+@OptIn(kotlin.time.ExperimentalTime::class)
 private fun formatLogTime(ms: Long, tz: TimeZone): String {
     val dt = Instant.fromEpochMilliseconds(ms).toLocalDateTime(tz)
     fun p2(n: Int) = n.toString().padStart(2, '0')
     fun p3(n: Int) = n.toString().padStart(3, '0')
     return "${p2(dt.hour)}:${p2(dt.minute)}:${p2(dt.second)}.${p3(dt.nanosecond / 1_000_000)}"
+}
+
+
+/**
+ * The log-index tab: an explicit per-network trigger for collecting the
+ * Kohaku contracts' logs, plus per-contract backfill progress. Data rides the
+ * snapshot's raw status JSON (2 s cadence, same as everything else).
+ */
+@Composable
+private fun IndexTab(
+    controller: NodeController,
+    settings: Settings,
+    snapshot: NodeSnapshot?,
+    network: String,
+) {
+    val preset = KohakuPreset.byNetwork[network]
+    Column(
+        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        if (preset == null) {
+            Text("No Kohaku contract preset for $network.")
+            return@Column
+        }
+        var collecting by remember(network) { mutableStateOf(settings.logIndexEnabled(network)) }
+        SwitchRow(
+            label = "Collect Kohaku contract logs on $network",
+            checked = collecting,
+            enabled = true,
+            onChange = { on ->
+                collecting = on
+                settings.setLogIndexEnabled(network, on)
+                controller.applyLogIndex(network)
+            },
+        )
+        Text(
+            "Indexes and serves eth_getLogs for the Kohaku privacy contracts — verified " +
+                "against receipt roots, backfilling to each contract's deployment block.",
+        )
+        val parsed = snapshot?.logIndexJson?.let { LogIndexStatus.parse(it) }
+        when {
+            !collecting -> Text("Collection is off.")
+            parsed == null || !parsed.enabled ->
+                Text("Waiting for the engine (start the network with the Rust engine).")
+            else -> {
+                Text("${parsed.logCount} logs collected")
+                preset.forEach { watch ->
+                    val e = parsed.entries.firstOrNull { it.address == watch.address.lowercase() }
+                    val low = e?.coveredLow
+                    val high = e?.coveredHigh
+                    Column {
+                        Text(watch.label)
+                        if (low == null || high == null) {
+                            Text("waiting \u2014 target block ${watch.fromBlock}")
+                            LinearProgressIndicator(progress = { 0f }, modifier = Modifier.fillMaxWidth())
+                        } else {
+                            val total = (high - watch.fromBlock + 1).coerceAtLeast(1)
+                            val done = (high - low + 1).coerceIn(0, total)
+                            val pct = done.toFloat() / total.toFloat()
+                            val complete = low <= watch.fromBlock
+                            Text(
+                                if (complete) "complete \u2014 blocks ${watch.fromBlock}\u2013$high"
+                                else "blocks $low\u2013$high \u00b7 target ${watch.fromBlock} \u00b7 ${(pct * 100).toInt()}%"
+                            )
+                            LinearProgressIndicator(
+                                progress = { if (complete) 1f else pct },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

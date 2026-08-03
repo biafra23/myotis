@@ -13,19 +13,31 @@ import io.myotis.api.MyotisEngine
 import io.myotis.api.NetworkInfo
 import io.myotis.api.ports.EnginePorts
 import io.myotis.engines.Engines
+import io.myotis.ui.KohakuPreset
+import io.myotis.engines.SelectorEngine
+import io.myotis.engines.Tor
+import io.myotis.txhistory.TxHistoryEvent
+import io.myotis.txhistory.TxHistoryService
+import io.myotis.txhistory.TxSummary
+import io.myotis.txhistory.headline
+import io.myotis.txhistory.uiKind
 import io.myotis.ui.AccountResult
+import io.myotis.ui.CacheFileStats
 import io.myotis.ui.EnsResult
 import io.myotis.ui.NetworkStatus
 import io.myotis.ui.NodeController
 import io.myotis.ui.NodeSnapshot
 import io.myotis.ui.PeerRow
 import io.myotis.ui.Settings
+import io.myotis.ui.TxRowUi
+import io.myotis.ui.TxScanEvent
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
@@ -152,7 +164,15 @@ class DesktopNodeController(
                     throw t
                 }
                 if (!ok) dropNetwork(canonical)
-                else startNsByNetwork[canonical] = System.nanoTime() // uptime anchors to THIS start
+                else {
+                    startNsByNetwork[canonical] = System.nanoTime() // uptime anchors to THIS start
+                    // Boot-time apply of the log-index preset — AFTER start:
+                    // the engine only accepts the config on a running handle
+                    // (its reader owns the index). Re-pushed on every
+                    // (re)start, which cures restart dormancy: the persisted
+                    // index reloads when the fingerprint matches.
+                    pushLogIndexConfig(canonical, handle)
+                }
             }
         }, "desktop-boot-$canonical").apply { isDaemon = true }.start()
     }
@@ -221,6 +241,47 @@ class DesktopNodeController(
         Engines.select(if (settings.rustEngineEnabled()) "auto" else "java")
     }
 
+    override fun applyLogIndex(network: String) {
+        // Off the UI thread: the engine-side install may reload a persisted
+        // index from disk (fingerprint-matched), which can be large.
+        Thread({
+            engine.get(network)?.let { pushLogIndexConfig(network, it) }
+        }, "log-index-apply-$network").apply { isDaemon = true }.start()
+    }
+
+    private fun pushLogIndexConfig(network: String, handle: ChainHandle) {
+        val enabled = settings.logIndexEnabled(network)
+        // No preset for this network -> never push; the engine keeps
+        // eth_getLogs in its honest not-configured state.
+        val json = KohakuPreset.configJson(network, enabled) ?: return
+        val ok = handle.setLogIndexConfig(json)
+        if (enabled && !ok) {
+            log.warn("[desktop] log index config rejected for {} (Java engine, or engine gate down)", network)
+        }
+    }
+
+    /** Raw log-index status JSON, fetched ONCE per snapshot (both the status
+     *  line and the Index tab derive from it), or null when off/unavailable. */
+    private fun logIndexRawFor(network: String): String? {
+        if (!settings.logIndexEnabled(network)) return null
+        return runCatching { engine.get(network)?.logIndexStatusJson() }.getOrNull()
+    }
+
+    override fun applyTorMode() {
+        // Push the persisted Tor preference to the process-global Rust-engine flag
+        // (docs/privacy-and-tor.md). Tor is Rust-engine-only and experimental: Tor.select
+        // returns whether the loaded engine build actually supports it, which we log so a
+        // silently-unsupported build is visible. Unlike the engine choice, the Tor flag is
+        // LIVE — ElReader checks it per read, so a flip takes effect on the next read of an
+        // already-running Rust-engine network (no restart needed).
+        val on = settings.torEnabled()
+        val supported = Tor.select(on)
+        if (on && !supported) {
+            log.warn("[desktop] Tor routing requested but this engine build has no Tor support "
+                    + "(needs the Rust engine dylib built with --features tor)")
+        }
+    }
+
     override fun clearCaches(network: String) {
         val canonical = engine.canonicalNetworkName(network)
         // File deletes are IO — never on the Compose UI thread. Serialize with enable/disable
@@ -284,6 +345,72 @@ class DesktopNodeController(
         return EnsResult(r.name(), r.addressHex(), r.blockNumber(), r.verified(), r.error())
     }
 
+    // ------------------------------------------------------------------------------
+    // TrueBlocks transaction history (Query tab add-on) — a documented exemption from
+    // the "hosts consume only io.myotis.api" rule, same category as the daemon's
+    // get-transactions stream: the scan needs the raw RLPxConnector, reached through
+    // the CONCRETE Java engine's debug accessor. Java-engine + mainnet only; a
+    // Rust-hosted mainnet simply reports unsupported and the UI hides the section.
+    // ------------------------------------------------------------------------------
+
+    override fun supportsTransactionHistory(network: String): Boolean {
+        if (engine.canonicalNetworkName(network) != "mainnet") return false
+        val selector = engine as? SelectorEngine ?: return false
+        return runCatching { selector.javaDelegate().debugStack("mainnet") != null }
+            .getOrDefault(false)
+    }
+
+    override fun transactionHistory(network: String, address: String): Flow<TxScanEvent> {
+        val canonical = engine.canonicalNetworkName(network)
+        check(canonical == "mainnet") { "Transaction history is mainnet-only" }
+        val selector = engine as? SelectorEngine
+            ?: throw IllegalStateException("Transaction history requires the engine selector")
+        val stack = selector.javaDelegate().debugStack("mainnet")
+            ?: throw IllegalStateException("Transaction history requires the Java engine (mainnet not Java-hosted or not running)")
+        // Gate on SYNCED (non-blocking check) so the manifest eth_call degrades to
+        // the cached/hardcoded CID instead of parking on the readiness wait.
+        fun syncedReads() = engine.get("mainnet")?.reads()
+            ?.takeIf { it.syncState() == io.myotis.api.SyncState.SYNCED }
+        val service = TxHistoryService(
+            stack.connector(),
+            ::syncedReads,
+            dataDir.resolve("trueblocks"),
+            publisherResolver = {
+                // The index publisher's current wallet via VERIFIED ENS (TrueBlocks
+                // re-points the name on wallet rotation). Null → built-in default.
+                runCatching {
+                    if (syncedReads() == null) null
+                    else engine.get("mainnet")?.ens()?.resolveAddress(
+                        io.myotis.txhistory.ManifestCidResolver.PUBLISHER_ENS_NAME,
+                        io.myotis.api.EnsRoot.AUTO,
+                    )?.addressHex()
+                }.getOrNull()
+            },
+        )
+        return service.scan(address).map { it.toUi() }
+    }
+
+    private fun TxHistoryEvent.toUi(): TxScanEvent = when (this) {
+        is TxHistoryEvent.Started -> TxScanEvent.Started(
+            manifestCid, cidSource, totalChunks, latestIndexedBlock, headBlock)
+        is TxHistoryEvent.Progress -> TxScanEvent.Progress(
+            chunksScanned, totalChunks, currentRange, hits, bytesDownloaded)
+        is TxHistoryEvent.Hit -> TxScanEvent.Hit(blockNumber, txIndex)
+        is TxHistoryEvent.Tx -> TxScanEvent.Tx(summary.toRow())
+        is TxHistoryEvent.TxFailed -> TxScanEvent.Failed(blockNumber, txIndex, error)
+        is TxHistoryEvent.Done -> TxScanEvent.Done(total = txCount)
+    }
+
+    private fun TxSummary.toRow(): TxRowUi = TxRowUi(
+        blockNumber = blockNumber,
+        txIndex = txIndex,
+        hash = hash,
+        from = from,
+        to = to,
+        kind = uiKind(),
+        headline = headline(), // shared with the Android mapper (:tx-history TxSummaryDisplay)
+    )
+
     /** Poll the hosted networks every 2s and emit a per-network snapshot map for the UI.
      *  flowOn(Default): status() walks/sorts peer lists and prunes the backoff map — keep
      *  that off the Compose UI thread (parity with Android's bridge, which does the same). */
@@ -336,11 +463,12 @@ class DesktopNodeController(
         // Live counts parsed from the cache FILES (the cross-engine truth; the
         // Rust engine writes them directly). Memoized on (mtime, size).
         val suffix = if (s.network() == "mainnet") "" else "-${s.network()}"
-        val clCache = CacheFileStats.cl(dataDir.resolve("cl-peers$suffix.cache"))
-        val elCache = CacheFileStats.el(dataDir.resolve("peers$suffix.cache"))
+        val clCache = CacheFileStats.cl(dataDir.resolve("cl-peers$suffix.cache").toString())
+        val elCache = CacheFileStats.el(dataDir.resolve("peers$suffix.cache").toString())
         // CL peer counts live on the beacon-status surface (parity with Android's
         // NodeService.snapshotOf, which reads both).
         val bs = handle.beaconStatus()
+        val logIndexRaw = logIndexRawFor(s.network())
         return NodeSnapshot(
             running = s.running(),
             lifecycle = s.lifecycle().name,
@@ -384,7 +512,30 @@ class DesktopNodeController(
             lastResumeEpochMs = s.lastResumeEpochMs(),
             lastWakeReason = s.lastWakeReason(),
             lcHunting = s.lcHunting(),
+            elHunting = s.elHunting(),
+            rpcPort = s.rpcPort(),
+            rpcServing = s.rpcServing(),
+            tor = torModeFor(Engines.engineKindFor(s.network())),
+            logIndex = logIndexRaw?.let(io.myotis.ui.LogIndexStatus::format),
+            logIndexJson = logIndexRaw,
         )
+    }
+
+    /**
+     * Tor routing state for the Status row (docs/privacy-and-tor.md), or null when it
+     * doesn't apply: Tor is a Rust-engine-only capability, and a Rust build without
+     * `--features tor` reports no support (status bit0 clear). Otherwise: "off" (supported
+     * but disabled), "on" (enabled, circuit still bootstrapping), "active" (circuit ready).
+     */
+    private fun torModeFor(engineKind: String?): String? {
+        if (engineKind != "rust") return null
+        val st = Tor.status()
+        if (st and 1 == 0) return null
+        return when {
+            st and 2 == 0 -> "off"
+            st and 4 != 0 -> "active"
+            else -> "on"
+        }
     }
 }
 
@@ -415,6 +566,11 @@ class DesktopSettings(
     private var nativeBls = false
     // The Rust engine is experimental — off by default everywhere.
     private var rustEngine = false
+    // Tor verified-read routing (docs/privacy-and-tor.md) — experimental, Rust-engine-only,
+    // off by default. Persists independently; applyTorMode() pushes it to the Rust engine.
+    private var torRouting = false
+    // Per-network opt-in for the eth_getLogs Kohaku-preset index (Rust engine only).
+    private val logIndexOn = HashMap<String, Boolean>()
 
     /** Serializes file writes, separate from the state lock (`this`) so settings
      *  readers never wait on disk I/O. */
@@ -450,6 +606,9 @@ class DesktopSettings(
     override fun servedBlockWindow(): Int = synchronized(this) { servedWindow }
     // Clamp like ChainStack.setServedBlockWindow (1..4096) so live and reloaded values agree.
     override fun setServedBlockWindow(v: Int) = mutate { servedWindow = v.coerceIn(1, 4096) }
+    override fun logIndexEnabled(network: String): Boolean =
+        synchronized(this) { logIndexOn[network] ?: false }
+    override fun setLogIndexEnabled(network: String, on: Boolean) = mutate { logIndexOn[network] = on }
 
     override fun displayName(network: String): String = info(network)?.displayName() ?: network
     override fun defaultRpcPort(network: String): Int = info(network)?.defaultRpcPort() ?: 8545
@@ -463,6 +622,8 @@ class DesktopSettings(
     override fun setNativeBlsEnabled(v: Boolean) = mutate { nativeBls = v }
     override fun rustEngineEnabled(): Boolean = synchronized(this) { rustEngine }
     override fun setRustEngineEnabled(v: Boolean) = mutate { rustEngine = v }
+    override fun torEnabled(): Boolean = synchronized(this) { torRouting }
+    override fun setTorEnabled(v: Boolean) = mutate { torRouting = v }
 
     /** Best-effort load; a missing or unreadable file just keeps the defaults. */
     private fun load() {
@@ -488,6 +649,11 @@ class DesktopSettings(
         p.getProperty(K_STRICT)?.toBooleanStrictOrNull()?.let { strict = it }
         p.getProperty(K_NATIVE_BLS)?.toBooleanStrictOrNull()?.let { nativeBls = it }
         p.getProperty(K_RUST_ENGINE)?.toBooleanStrictOrNull()?.let { rustEngine = it }
+        p.getProperty(K_TOR)?.toBooleanStrictOrNull()?.let { torRouting = it }
+        p.stringPropertyNames().filter { it.startsWith(K_LOG_INDEX_PREFIX) }.forEach { k ->
+            p.getProperty(k)?.toBooleanStrictOrNull()
+                ?.let { logIndexOn[k.removePrefix(K_LOG_INDEX_PREFIX)] = it }
+        }
     }
 
     /**
@@ -526,6 +692,8 @@ class DesktopSettings(
         p.setProperty(K_STRICT, strict.toString())
         p.setProperty(K_NATIVE_BLS, nativeBls.toString())
         p.setProperty(K_RUST_ENGINE, rustEngine.toString())
+        p.setProperty(K_TOR, torRouting.toString())
+        logIndexOn.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_PREFIX$net", on.toString()) }
         return p
     }
 
@@ -561,6 +729,8 @@ class DesktopSettings(
         const val K_STRICT = "strictStateFreshness"
         const val K_NATIVE_BLS = "nativeBls"
         const val K_RUST_ENGINE = "rustEngine"
+        const val K_TOR = "torRouting"
+        const val K_LOG_INDEX_PREFIX = "logIndex."
     }
 }
 

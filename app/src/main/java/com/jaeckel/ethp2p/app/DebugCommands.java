@@ -1,47 +1,165 @@
 package com.jaeckel.ethp2p.app;
 
-import com.jaeckel.ethp2p.networking.eth.messages.BlockBodiesMessage;
-import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
-import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
-import com.jaeckel.trueblocks.AppearanceRecord;
-import com.jaeckel.trueblocks.Bloom;
-import com.jaeckel.trueblocks.Chunk;
-import com.jaeckel.trueblocks.IndexParser;
-import com.jaeckel.trueblocks.IpfsHttpClient;
-import com.jaeckel.trueblocks.ManifestResponse;
-import org.apache.tuweni.bytes.Bytes;
-import org.apache.tuweni.bytes.Bytes32;
-import org.apache.tuweni.rlp.RLP;
+import io.myotis.txhistory.TxHistoryEvent;
+import io.myotis.txhistory.TxHistoryService;
+import io.myotis.txhistory.TxKind;
+import io.myotis.txhistory.TxSummary;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
-import java.lang.reflect.Constructor;
-import java.lang.reflect.Method;
-import java.util.Comparator;
-import java.util.List;
-import java.util.concurrent.TimeUnit;
 
 /**
  * DEBUG-ONLY IPC commands that deliberately sit OUTSIDE the engine API boundary.
  *
  * <p>{@code get-transactions} streams address appearances from the TrueBlocks/IPFS
  * index — an explorer/debugging aid that is UNVERIFIED on this path (each returned
- * tx says {@code "verified":false}) and depends on engine internals
- * ({@link RLPxConnector} header/body fetches). It is a documented exemption from the
- * "hosts consume only {@code io.myotis.api}" rule (see docs/reimplementation): not
- * part of the engine contract, not required of a re-implementation, and constructed
- * at the composition root where the internals are still in reach.
+ * tx says {@code "verified":false}) and depends on engine internals (the raw
+ * RLPxConnector inside {@link TxHistoryService}). It is a documented exemption from
+ * the "hosts consume only {@code io.myotis.api}" rule (see docs/reimplementation):
+ * not part of the engine contract, not required of a re-implementation, and
+ * constructed at the composition root where the internals are still in reach.
+ *
+ * <p>The scan/parse logic lives in {@code :tx-history} (shared with the desktop
+ * Query tab); this class only maps events to succinct JSON-Lines.
  */
 final class DebugCommands {
 
     private static final Logger log = LoggerFactory.getLogger(DebugCommands.class);
 
-    private final RLPxConnector connector;
+    /** Only every Nth chunk emits a progress heartbeat line — a full mainnet scan
+     *  visits thousands of chunks and the CLI doesn't need one line per chunk. */
+    private static final int PROGRESS_EVERY_CHUNKS = 250;
 
-    DebugCommands(RLPxConnector connector) {
-        this.connector = connector;
+    /** Index lag beyond this (~14 days of mainnet blocks) marks the Started line
+     *  stale + warns. Matches the UI's TX_INDEX_STALE_BLOCKS threshold. */
+    private static final long STALE_LAG_BLOCKS = 100_000L;
+
+    private final TxHistoryService service;
+
+    DebugCommands(TxHistoryService service) {
+        this.service = service;
+    }
+
+    void handleGetTransactions(String jsonLine, BufferedWriter writer) throws IOException {
+        String addr = CommandHandler.extractString(jsonLine, "address");
+        String hex = (addr.startsWith("0x") || addr.startsWith("0X")) ? addr.substring(2) : addr;
+        if (hex.length() != 40) {
+            writeLine(writer, jsonError("address must be a 20-byte hex string (40 hex chars)"));
+            return;
+        }
+
+        try {
+            // An IOException from the sink (client hung up) propagates out of the
+            // collect and cancels the scan — no orphaned scans on disconnect.
+            service.scanBlocking("0x" + hex.toLowerCase(), event -> {
+                String line = toJsonLine(event);
+                if (line != null) writeLine(writer, line);
+            });
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
+            writeLine(writer, jsonError("get-transactions failed: " + msg));
+        }
+    }
+
+    /** One succinct JSON line per event; null = suppressed (sampled progress). */
+    private static String toJsonLine(TxHistoryEvent event) {
+        if (event instanceof TxHistoryEvent.Started s) {
+            StringBuilder b = new StringBuilder(256);
+            b.append("{\"ok\":true,\"manifestCid\":\"").append(escapeJson(s.getManifestCid()))
+                    .append("\",\"cidSource\":\"").append(s.getCidSource())
+                    .append("\",\"chunks\":").append(s.getTotalChunks())
+                    .append(",\"latestIndexedBlock\":").append(s.getLatestIndexedBlock());
+            if (s.getHeadBlock() != null) {
+                // Clamp: a still-syncing node's head can trail the index tip; a negative
+                // "age" in the stream would just be confusing.
+                long lag = Math.max(0L, s.getHeadBlock() - s.getLatestIndexedBlock());
+                long ageDays = lag * 12 / 86_400;
+                b.append(",\"headBlock\":").append(s.getHeadBlock())
+                        .append(",\"indexLagBlocks\":").append(lag)
+                        .append(",\"indexAgeDays\":").append(ageDays);
+                // Make an out-of-date index impossible to miss in the stream: beyond
+                // ~14 days of lag, say explicitly that recent history is absent.
+                if (lag > STALE_LAG_BLOCKS) {
+                    b.append(",\"stale\":true,\"warning\":\"index is ~").append(ageDays)
+                            .append(" days behind the head — transactions after block ")
+                            .append(s.getLatestIndexedBlock())
+                            .append(" will NOT appear (newest index the publisher has released)\"");
+                }
+            }
+            return b.append('}').toString();
+        }
+        if (event instanceof TxHistoryEvent.Progress p) {
+            if (p.getChunksScanned() % PROGRESS_EVERY_CHUNKS != 0) return null;
+            return "{\"ok\":true,\"progress\":{\"chunksScanned\":" + p.getChunksScanned()
+                    + ",\"totalChunks\":" + p.getTotalChunks()
+                    + ",\"range\":\"" + escapeJson(p.getCurrentRange())
+                    + "\",\"hits\":" + p.getHits()
+                    + ",\"bytesDownloaded\":" + p.getBytesDownloaded() + "}}";
+        }
+        if (event instanceof TxHistoryEvent.Hit) {
+            // The CLI stream stays line-per-result; placeholder hits are a UI affordance.
+            return null;
+        }
+        if (event instanceof TxHistoryEvent.Tx tx) {
+            return txJson(tx.getSummary());
+        }
+        if (event instanceof TxHistoryEvent.TxFailed f) {
+            return "{\"ok\":false,\"blockNumber\":" + f.getBlockNumber()
+                    + ",\"transactionIndex\":" + f.getTxIndex()
+                    + ",\"error\":\"" + escapeJson(f.getError()) + "\"}";
+        }
+        if (event instanceof TxHistoryEvent.Done d) {
+            return "{\"ok\":true,\"done\":true,\"totalTransactions\":" + d.getTxCount() + "}";
+        }
+        return null;
+    }
+
+    private static String txJson(TxSummary s) {
+        StringBuilder b = new StringBuilder(256);
+        b.append("{\"ok\":true,\"blockNumber\":").append(s.getBlockNumber());
+        b.append(",\"transactionIndex\":").append(s.getTxIndex());
+        b.append(",\"hash\":\"").append(s.getHash()).append('"');
+        if (s.getFrom() != null) b.append(",\"from\":\"").append(s.getFrom()).append('"');
+        if (s.getTo() != null) b.append(",\"to\":\"").append(s.getTo()).append('"');
+        TxKind kind = s.getKind();
+        switch (kind) {
+            case ETH_TRANSFER -> b.append(",\"kind\":\"eth\",\"eth\":\"")
+                    .append(s.getEthDisplay()).append("\",\"wei\":\"")
+                    .append(s.getEthWei()).append('"');
+            case ERC20_TRANSFER -> {
+                b.append(",\"kind\":\"erc20\",\"token\":\"").append(s.getTokenSymbol()).append('"');
+                if (s.getTokenAmount() != null) {
+                    b.append(",\"amount\":\"").append(s.getTokenAmount()).append('"');
+                }
+                if (s.getTokenRecipient() != null) {
+                    b.append(",\"recipient\":\"").append(s.getTokenRecipient()).append('"');
+                }
+            }
+            case CONTRACT_CREATION -> b.append(",\"kind\":\"create\",\"calldataBytes\":")
+                    .append(s.getCalldataBytes());
+            case CONTRACT_CALL -> {
+                b.append(",\"kind\":\"call\",\"calldataBytes\":").append(s.getCalldataBytes());
+                if (s.getSelector() != null) {
+                    b.append(",\"selector\":\"").append(s.getSelector()).append('"');
+                }
+                if (!"0".equals(s.getEthWei())) {
+                    b.append(",\"eth\":\"").append(s.getEthDisplay()).append('"');
+                }
+            }
+        }
+        b.append(",\"verified\":false}");
+        return b.toString();
+    }
+
+    private static void writeLine(BufferedWriter writer, String line) throws IOException {
+        writer.write(line);
+        writer.newLine();
+        writer.flush();
     }
 
     private static String jsonError(String message) {
@@ -50,332 +168,23 @@ final class DebugCommands {
 
     private static String escapeJson(String s) {
         if (s == null) return "";
-        return s.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r");
-    }
-
-    /** Reflective access to Kotlin UInt-typed getters on AppearanceRecord. */
-    private static final Method GET_BLOCK_NUMBER;
-    private static final Method GET_TX_INDEX;
-    static {
-        try {
-            GET_BLOCK_NUMBER = AppearanceRecord.class.getMethod("getBlockNumber-pVg5ArA");
-            GET_TX_INDEX = AppearanceRecord.class.getMethod("getTxIndex-pVg5ArA");
-        } catch (NoSuchMethodException e) {
-            throw new ExceptionInInitializerError(e);
-        }
-    }
-
-    private static int appearanceBlockNumber(AppearanceRecord rec) {
-        try { return (int) GET_BLOCK_NUMBER.invoke(rec); }
-        catch (Exception e) { throw new RuntimeException(e); }
-    }
-
-    private static int appearanceTxIndex(AppearanceRecord rec) {
-        try { return (int) GET_TX_INDEX.invoke(rec); }
-        catch (Exception e) { throw new RuntimeException(e); }
-    }
-
-    void handleGetTransactions(String jsonLine, BufferedWriter writer) throws IOException {
-        String addr = CommandHandler.extractString(jsonLine, "address");
-        String hex = (addr.startsWith("0x") || addr.startsWith("0X")) ? addr.substring(2) : addr;
-        if (hex.length() != 40) {
-            writer.write(jsonError("address must be a 20-byte hex string (40 hex chars)"));
-            writer.newLine();
-            writer.flush();
-            return;
-        }
-        String checksumAddr = "0x" + hex.toLowerCase();
-
-        try {
-            IpfsHttpClient ipfs = new IpfsHttpClient();
-            String manifestCID = "QmUBS83qjRmXmSgEvZADVv2ch47137jkgNbqfVVxQep5Y1";
-
-            log.info("[get-transactions] Fetching manifest for address {}", checksumAddr);
-            ManifestResponse manifest = ipfs.fetchAndParseManifestUrl(manifestCID);
-
-            // Construct kethereum Address via reflection (avoids compile-time dependency
-            // on kethereum multiplatform module)
-            Class<?> addressClass = Class.forName("org.kethereum.model.Address");
-            Constructor<?> addressCtor = addressClass.getConstructor(String.class);
-            Object tbAddress = addressCtor.newInstance(checksumAddr);
-            Method isMemberBytes = Bloom.class.getMethod("isMemberBytes", addressClass);
-            List<Chunk> chunks = manifest.getChunks();
-            int totalChunks = chunks.size();
-            int successCount = 0;
-
-            // Scan from highest block number to lowest so recent txs appear first.
-            // Stream results per-chunk: fetch tx data immediately when appearances are found.
-            for (int ci = totalChunks - 1; ci >= 0; ci--) {
-                Chunk chunk = chunks.get(ci);
-                try {
-                    Bloom bloom = ipfs.fetchBloom(chunk.getBloomHash(), chunk.getRange());
-                    if ((boolean) isMemberBytes.invoke(bloom, tbAddress)) {
-                        log.debug("[get-transactions] Bloom hit for chunk {} ({}/{})",
-                                chunk.getRange(), totalChunks - ci, totalChunks);
-                        IndexParser index = ipfs.fetchIndex(chunk.getIndexHash(), false);
-                        List<AppearanceRecord> appearances = index.findAppearances(checksumAddr);
-                        if (appearances.isEmpty()) continue;
-
-                        log.info("[get-transactions] Found {} appearances in chunk {}",
-                                appearances.size(), chunk.getRange());
-
-                        // Sort appearances within chunk descending by block number
-                        appearances.sort(Comparator.comparingInt(
-                                DebugCommands::appearanceBlockNumber).reversed());
-
-                        // Fetch and stream each transaction immediately
-                        for (AppearanceRecord appearance : appearances) {
-                            long blockNumber = Integer.toUnsignedLong(appearanceBlockNumber(appearance));
-                            int txIndex = appearanceTxIndex(appearance);
-                            try {
-                                List<BlockHeadersMessage.VerifiedHeader> headers =
-                                        connector.requestBlockHeadersBatched(blockNumber, 1)
-                                                .get(30, TimeUnit.SECONDS);
-                                if (headers.isEmpty()) {
-                                    writer.write("{\"ok\":false,\"blockNumber\":" + blockNumber
-                                            + ",\"error\":\"No header returned\"}");
-                                    writer.newLine();
-                                    writer.flush();
-                                    continue;
-                                }
-                                BlockHeadersMessage.VerifiedHeader vh = headers.get(0);
-                                Bytes32 blockHash = vh.hash();
-
-                                List<BlockBodiesMessage.BlockBody> bodies =
-                                        connector.requestBlockBodies(blockHash)
-                                                .get(30, TimeUnit.SECONDS);
-                                if (bodies.isEmpty()) {
-                                    writer.write("{\"ok\":false,\"blockNumber\":" + blockNumber
-                                            + ",\"error\":\"No body returned\"}");
-                                    writer.newLine();
-                                    writer.flush();
-                                    continue;
-                                }
-                                BlockBodiesMessage.BlockBody body = bodies.get(0);
-
-                                List<Bytes> txList = body.transactions();
-                                if (txIndex >= txList.size()) {
-                                    writer.write("{\"ok\":false,\"blockNumber\":" + blockNumber
-                                            + ",\"transactionIndex\":" + txIndex
-                                            + ",\"error\":\"Transaction index out of range\"}");
-                                    writer.newLine();
-                                    writer.flush();
-                                    continue;
-                                }
-                                Bytes rawTx = txList.get(txIndex);
-                                String parsedFields = parseTxToJson(rawTx);
-
-                                StringBuilder txJson = new StringBuilder();
-                                txJson.append("{\"ok\":true,\"blockNumber\":").append(blockNumber);
-                                txJson.append(",\"transactionIndex\":").append(txIndex);
-                                if (!parsedFields.isEmpty()) {
-                                    txJson.append(",").append(parsedFields);
-                                }
-                                txJson.append(",\"rawTx\":\"0x").append(rawTx.toUnprefixedHexString()).append("\"");
-                                txJson.append(",\"verified\":false}");
-                                writer.write(txJson.toString());
-                                writer.newLine();
-                                writer.flush();
-                                successCount++;
-
-                            } catch (Exception e) {
-                                // The blocking .get() calls above can throw InterruptedException
-                                // directly (not wrapped) — restore the flag so a cancelled stream
-                                // stops promptly instead of swallowing the interrupt per-tx.
-                                if (e instanceof InterruptedException) Thread.currentThread().interrupt();
-                                Throwable cause = e.getCause() != null ? e.getCause() : e;
-                                String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
-                                writer.write("{\"ok\":false,\"blockNumber\":" + blockNumber
-                                        + ",\"transactionIndex\":" + txIndex
-                                        + ",\"error\":\"" + escapeJson(msg) + "\"}");
-                                writer.newLine();
-                                writer.flush();
-                            }
-                        }
-                    }
-                } catch (Exception e) {
-                    log.warn("[get-transactions] Error processing chunk {}: {}",
-                            chunk.getRange(), e.getMessage());
+        StringBuilder b = new StringBuilder(s.length() + 8);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '\\' -> b.append("\\\\");
+                case '"' -> b.append("\\\"");
+                case '\n' -> b.append("\\n");
+                case '\r' -> b.append("\\r");
+                case '\t' -> b.append("\\t");
+                default -> {
+                    // Escape the remaining C0 controls (e.g. from an exception message)
+                    // as a JSON \\uXXXX sequence so the IPC line stays valid JSON.
+                    if (c < 0x20) b.append(String.format("\\u%04x", (int) c));
+                    else b.append(c);
                 }
             }
-
-            log.info("[get-transactions] Scan complete. {} transactions streamed for {}",
-                    successCount, checksumAddr);
-            writer.write("{\"ok\":true,\"done\":true,\"totalTransactions\":" + successCount + "}");
-            writer.newLine();
-            writer.flush();
-
-        } catch (Exception e) {
-            Throwable cause = e.getCause() != null ? e.getCause() : e;
-            String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
-            writer.write(jsonError("get-transactions failed: " + msg));
-            writer.newLine();
-            writer.flush();
         }
-    }
-
-    // -------------------------------------------------------------------------
-    // Transaction parsing
-    // -------------------------------------------------------------------------
-
-    /**
-     * Parse raw transaction bytes into JSON fields.
-     * Supports legacy, EIP-2930 (type 1), EIP-1559 (type 2), and EIP-4844 (type 3).
-     */
-    private static String parseTxToJson(Bytes rawTx) {
-        if (rawTx == null || rawTx.isEmpty()) return "";
-        try {
-            int firstByte = rawTx.get(0) & 0xFF;
-            if (firstByte >= 0xc0) {
-                // Legacy transaction (RLP list)
-                return parseLegacyTx(rawTx);
-            } else if (firstByte <= 0x03) {
-                // Typed transaction (EIP-2718): type byte + RLP payload
-                int type = firstByte;
-                Bytes payload = rawTx.slice(1);
-                return switch (type) {
-                    case 1 -> parseEip2930Tx(payload);
-                    case 2 -> parseEip1559Tx(payload);
-                    case 3 -> parseEip4844Tx(payload);
-                    default -> "\"type\":" + type;
-                };
-            }
-            return "";
-        } catch (Exception e) {
-            return "\"parseError\":\"" + escapeJson(e.getMessage()) + "\"";
-        }
-    }
-
-    /** Legacy tx: [nonce, gasPrice, gasLimit, to, value, data, v, r, s] */
-    private static String parseLegacyTx(Bytes rlp) {
-        StringBuilder sb = new StringBuilder();
-        RLP.decodeList(rlp, reader -> {
-            Bytes nonce = reader.readValue();
-            Bytes gasPrice = reader.readValue();
-            Bytes gasLimit = reader.readValue();
-            Bytes to = reader.readValue();
-            Bytes value = reader.readValue();
-            Bytes data = reader.readValue();
-            sb.append("\"type\":0");
-            sb.append(",\"nonce\":").append(toLong(nonce));
-            sb.append(",\"gasPrice\":\"0x").append(toMinHex(gasPrice)).append("\"");
-            sb.append(",\"gasLimit\":").append(toLong(gasLimit));
-            if (!to.isEmpty()) {
-                sb.append(",\"to\":\"0x").append(to.toUnprefixedHexString()).append("\"");
-            }
-            sb.append(",\"value\":\"0x").append(toMinHex(value)).append("\"");
-            if (!data.isEmpty()) {
-                sb.append(",\"data\":\"0x").append(data.toUnprefixedHexString()).append("\"");
-            }
-            return null;
-        });
-        return sb.toString();
-    }
-
-    /** EIP-2930 tx: [chainId, nonce, gasPrice, gasLimit, to, value, data, accessList, yParity, r, s] */
-    private static String parseEip2930Tx(Bytes rlp) {
-        StringBuilder sb = new StringBuilder();
-        RLP.decodeList(rlp, reader -> {
-            Bytes chainId = reader.readValue();
-            Bytes nonce = reader.readValue();
-            Bytes gasPrice = reader.readValue();
-            Bytes gasLimit = reader.readValue();
-            Bytes to = reader.readValue();
-            Bytes value = reader.readValue();
-            Bytes data = reader.readValue();
-            sb.append("\"type\":1");
-            sb.append(",\"chainId\":").append(toLong(chainId));
-            sb.append(",\"nonce\":").append(toLong(nonce));
-            sb.append(",\"gasPrice\":\"0x").append(toMinHex(gasPrice)).append("\"");
-            sb.append(",\"gasLimit\":").append(toLong(gasLimit));
-            if (!to.isEmpty()) {
-                sb.append(",\"to\":\"0x").append(to.toUnprefixedHexString()).append("\"");
-            }
-            sb.append(",\"value\":\"0x").append(toMinHex(value)).append("\"");
-            if (!data.isEmpty()) {
-                sb.append(",\"data\":\"0x").append(data.toUnprefixedHexString()).append("\"");
-            }
-            return null;
-        });
-        return sb.toString();
-    }
-
-    /** EIP-1559 tx: [chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList, yParity, r, s] */
-    private static String parseEip1559Tx(Bytes rlp) {
-        StringBuilder sb = new StringBuilder();
-        RLP.decodeList(rlp, reader -> {
-            Bytes chainId = reader.readValue();
-            Bytes nonce = reader.readValue();
-            Bytes maxPriorityFee = reader.readValue();
-            Bytes maxFee = reader.readValue();
-            Bytes gasLimit = reader.readValue();
-            Bytes to = reader.readValue();
-            Bytes value = reader.readValue();
-            Bytes data = reader.readValue();
-            sb.append("\"type\":2");
-            sb.append(",\"chainId\":").append(toLong(chainId));
-            sb.append(",\"nonce\":").append(toLong(nonce));
-            sb.append(",\"maxPriorityFeePerGas\":\"0x").append(toMinHex(maxPriorityFee)).append("\"");
-            sb.append(",\"maxFeePerGas\":\"0x").append(toMinHex(maxFee)).append("\"");
-            sb.append(",\"gasLimit\":").append(toLong(gasLimit));
-            if (!to.isEmpty()) {
-                sb.append(",\"to\":\"0x").append(to.toUnprefixedHexString()).append("\"");
-            }
-            sb.append(",\"value\":\"0x").append(toMinHex(value)).append("\"");
-            if (!data.isEmpty()) {
-                sb.append(",\"data\":\"0x").append(data.toUnprefixedHexString()).append("\"");
-            }
-            return null;
-        });
-        return sb.toString();
-    }
-
-    /** EIP-4844 tx: [chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList, maxFeePerBlobGas, blobVersionedHashes, yParity, r, s] */
-    private static String parseEip4844Tx(Bytes rlp) {
-        StringBuilder sb = new StringBuilder();
-        RLP.decodeList(rlp, reader -> {
-            Bytes chainId = reader.readValue();
-            Bytes nonce = reader.readValue();
-            Bytes maxPriorityFee = reader.readValue();
-            Bytes maxFee = reader.readValue();
-            Bytes gasLimit = reader.readValue();
-            Bytes to = reader.readValue();
-            Bytes value = reader.readValue();
-            Bytes data = reader.readValue();
-            reader.readList(r -> { r.readRemaining(); return null; }); // accessList
-            Bytes maxFeePerBlobGas = reader.readValue();
-            sb.append("\"type\":3");
-            sb.append(",\"chainId\":").append(toLong(chainId));
-            sb.append(",\"nonce\":").append(toLong(nonce));
-            sb.append(",\"maxPriorityFeePerGas\":\"0x").append(toMinHex(maxPriorityFee)).append("\"");
-            sb.append(",\"maxFeePerGas\":\"0x").append(toMinHex(maxFee)).append("\"");
-            sb.append(",\"gasLimit\":").append(toLong(gasLimit));
-            if (!to.isEmpty()) {
-                sb.append(",\"to\":\"0x").append(to.toUnprefixedHexString()).append("\"");
-            }
-            sb.append(",\"value\":\"0x").append(toMinHex(value)).append("\"");
-            sb.append(",\"maxFeePerBlobGas\":\"0x").append(toMinHex(maxFeePerBlobGas)).append("\"");
-            if (!data.isEmpty()) {
-                sb.append(",\"data\":\"0x").append(data.toUnprefixedHexString()).append("\"");
-            }
-            return null;
-        });
-        return sb.toString();
-    }
-
-    /** Convert RLP-encoded integer bytes to long. Empty bytes = 0. */
-    private static long toLong(Bytes b) {
-        if (b.isEmpty()) return 0;
-        return b.toLong();
-    }
-
-    /** Minimal hex representation (no leading zeros), or "0" for empty/zero. */
-    private static String toMinHex(Bytes b) {
-        if (b.isEmpty()) return "0";
-        String hex = b.toUnprefixedHexString().replaceFirst("^0+", "");
-        return hex.isEmpty() ? "0" : hex;
+        return b.toString();
     }
 }

@@ -121,6 +121,11 @@ final class GatedVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public String getBlockReceipts(String blockSelector) {
+        return guarded(d -> d.getBlockReceipts(blockSelector));
+    }
+
+    @Override
     public String gasPrice() {
         return guarded(VerifiedReads::gasPrice);
     }

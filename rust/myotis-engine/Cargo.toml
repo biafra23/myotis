@@ -7,7 +7,18 @@ license = "MIT OR Apache-2.0"
 
 [lib]
 # libmyotis_engine.{so,dylib,dll} — loaded by :myotis-engines' RustEngineNative.
+# The iOS static archive is NOT listed here: the cargoBuildIos* Gradle tasks
+# build it with `cargo rustc --crate-type staticlib` (which overrides this
+# list), so host/Android builds don't pay for an archive they never consume.
 crate-type = ["cdylib", "rlib"]
+
+[features]
+# Tor verified-read routing (docs/privacy-and-tor.md) — OFF by default. The host
+# dylib build (`cargoBuildHost -PtorEngine`) enables it so the desktop/daemon can
+# offer the Settings toggle; Android/iOS builds do NOT, so the Arti tree never
+# crosses to mobile. The `set_tor_enabled`/`tor_status` FFI functions exist either
+# way (they no-op / report "not compiled" without this feature).
+tor = ["myotis-net/tor"]
 
 [dependencies]
 myotis-consensus = { path = "../myotis-consensus" }
@@ -20,9 +31,12 @@ myotis-net = { path = "../myotis-net" }
 # transitively via myotis-net. revm is gated inside myotis-evm.
 myotis-evm = { path = "../myotis-evm" }
 tokio = { version = "=1.52.3", features = ["rt-multi-thread"] }
-jni = { version = "0.21", default-features = false }
-# Compound values cross the JNI boundary as JSON (hand-JNI + JSON decision —
-# docs/reimplementation/05). Schemas are pinned by golden tests on both sides.
+# The JVM boundary: UniFFI proc-macro scaffolding (replaces the old hand-JNI —
+# the generated Kotlin bindings live in :myotis-engines and are pinned to this
+# uniffi version by UniFFI's own per-function API checksums). Compound values
+# still cross as JSON strings (transport swap only; shapes unchanged and pinned
+# by the golden tests on both sides). The iOS C ABI (capi.rs) is untouched.
+uniffi = "0.32"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Global tracing subscriber feeding the drainable ring buffer behind

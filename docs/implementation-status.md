@@ -29,15 +29,31 @@ CL peers are seeded from four sources (in priority order): the persistent `CLPee
 ## 3. Transaction History — TrueBlocks via IPFS
 **POC: Implemented**
 
-- TrueBlocks manifest fetched from IPFS (hardcoded CID)
-- Bloom filter + index chunk download per address
-- Block bodies fetched from devp2p peers, transactions extracted and RLP-parsed
-- Supports legacy, EIP-2930, EIP-1559, EIP-4844 tx types
+- Scan/parse service in `:tx-history` (`TxHistoryService`), shared by the daemon's
+  `get-transactions` IPC stream and the desktop **and Android** Query tabs (streaming
+  UI: block-number placeholders upgrade in place to parsed rows, progress + Stop)
+- **Dynamic manifest CID discovery**: the latest mainnet manifest is read from the
+  UnchainedIndex_V2 contract (`manifestHashMap(publisher, "mainnet")`,
+  `0x0c316B70…183d`) via myotis' own verified eth_call; the publisher address comes
+  from verified ENS (`publisher.unchainedindex.eth`, chifra's preferred publisher —
+  the map is permissionless, so only that slot is trusted). Fallbacks when the node
+  isn't synced: 24h-cached CID, then a hardcoded known-good manifest
+- Blooms + index chunks disk-cached content-addressed under `trueblocks/`
+  (immutable, no TTL; truncated gateway responses rejected against manifest sizes)
+- Block bodies fetched from devp2p peers; txs decoded via `EthTxDecoder` (legacy,
+  EIP-2930, EIP-1559, EIP-4844, EIP-7702, sender recovered from the signature) and
+  classified (ETH transfer / ERC-20 transfer of well-known tokens / call / creation)
 
 **Not implemented:**
 - Transaction verification against `transactionsRoot` **on the TrueBlocks `get-transactions` path** (the `verified` field is always `false` there). Per-tx verification against `transactionsRoot` *does* now exist on the JSON-RPC path (`eth_getTransactionByHash`, Section 10) and for receipts (`eth_getTransactionReceipt`); wiring it into the TrueBlocks history scan is still pending.
-- Dynamic manifest CID discovery (hardcoded, stale)
 - Balance reconciliation for completeness checking
+- Non-mainnet indexes (the scan is mainnet-only; the daemon disables it on other networks)
+- **A fresh index.** Upstream publishing appears stalled: the designated publisher's
+  newest mainnet manifest is indexed to ~block 23.0M (~a year behind head as of
+  mid-2026), so recent history is absent. Both surfaces warn loudly (UI banner;
+  `stale`/`indexAgeDays`/`warning` fields on the IPC `Started` line). Planned remedy:
+  a self-published index (run the TrueBlocks scraper, pin the chunks, add the IPFS
+  peer address to Myotis).
 
 ## 4. Fetching and Verifying Block Data — devp2p
 **POC: Implemented**

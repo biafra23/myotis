@@ -27,6 +27,7 @@ import io.myotis.api.NetworkInfo;
 import io.myotis.api.StatusSnapshot;
 import io.myotis.api.ports.EnginePorts;
 import io.myotis.api.ports.NodeKeyStore;
+import io.myotis.ui.CacheFileStats;
 
 import java.net.InetAddress;
 import java.nio.file.Files;
@@ -241,6 +242,69 @@ public final class NodeService extends Service {
         return rpcPortFor(c, primaryNetwork(c));
     }
     /** Persist the JSON-RPC port for a specific network (ports are per-network — see {@link #rpcPortKey}). */
+    /** Opt-in eth_getLogs Kohaku-preset index for one network (Rust engine only). */
+    public static boolean logIndexEnabled(android.content.Context c, String network) {
+        return prefs(c).getBoolean("logIndex." + canonicalNetwork(network), false);
+    }
+
+    public static void setLogIndexEnabled(android.content.Context c, String network, boolean on) {
+        prefs(c).edit().putBoolean("logIndex." + canonicalNetwork(network), on).apply();
+    }
+
+    /** Raw log-index status JSON for a RUNNING network, or null when the
+     *  feature is off for it / the network isn't hosted (the Index tab shows
+     *  its waiting state then). */
+    public String logIndexStatusJsonOrNull(String network) {
+        String net = canonicalNetwork(network);
+        if (!logIndexEnabled(this, net)) {
+            return null;
+        }
+        ChainHandle handle;
+        synchronized (handles) {
+            handle = handles.get(net);
+        }
+        if (handle == null) {
+            return null;
+        }
+        try {
+            return handle.logIndexStatusJson();
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** Push the persisted log-index preset for a RUNNING network's handle. */
+    public void applyLogIndex(String network) {
+        String net = canonicalNetwork(network);
+        // Off the caller (UI) thread: the engine-side install may reload a
+        // persisted index from disk.
+        Thread t = new Thread(() -> {
+            ChainHandle handle;
+            synchronized (handles) {
+                handle = handles.get(net);
+            }
+            if (handle != null) {
+                pushLogIndexConfig(net, handle);
+            }
+        }, "log-index-apply-" + net);
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void pushLogIndexConfig(String net, ChainHandle handle) {
+        boolean enabled = logIndexEnabled(this, net);
+        String json = io.myotis.ui.KohakuPreset.INSTANCE.configJson(net, enabled);
+        if (json == null) {
+            return; // no preset for this network — engine stays honestly unconfigured
+        }
+        boolean ok = handle.setLogIndexConfig(json);
+        if (enabled && !ok) {
+            // LogBuffer so the rejection shows in the in-app log view like
+            // every other boot-path message.
+            LogBuffer.e(TAG, "log index config rejected for " + net);
+        }
+    }
+
     public static void setRpcPort(android.content.Context c, String network, int p) {
         String net = canonicalNetwork(network);
         int dflt = defaultRpcPort(net);
@@ -1140,7 +1204,10 @@ public final class NodeService extends Service {
             long peerHeaderRequestsServed,//   ...answered with >=1 header
             long peerBodyRequests,        // inbound GetBlockBodies from peers this run
             long peerBodyRequestsServed,  //   ...answered with >=1 body (always 0 today)
-            boolean lcHunting) {}         // LC hunt engaged (starved of light-client servers)
+            boolean lcHunting,            // LC hunt engaged (starved of light-client servers)
+            boolean elHunting,            // EL hunt engaged (snap serving pool empty past stall)
+            int rpcPort,                  // configured JSON-RPC port (0 = none)
+            boolean rpcServing) {}        // listener bound and live on 127.0.0.1:rpcPort
 
     /** Result of a get-account query. Mirrors the JVM daemon's JSON response shape. */
     public record AccountQueryResult(
@@ -1213,6 +1280,73 @@ public final class NodeService extends Service {
         // timeout-bounded) — run it on the query pool and expose the future the UI expects.
         return CompletableFuture.supplyAsync(
                 () -> toAccountQueryResult(handle.requestAccount(hexAddress)), QUERY_POOL);
+    }
+
+    // ---------------------------------------------------------------------
+    // TrueBlocks transaction history (Query tab add-on) — the documented exemption
+    // from the "hosts consume only io.myotis.api" rule, same shape as the daemon's
+    // get-transactions stream and the desktop controller: the scan needs the raw
+    // RLPxConnector, reached through the CONCRETE Java engine's debug accessor at
+    // this composition root. Mainnet + Java-engine only; results are UNVERIFIED.
+    // ---------------------------------------------------------------------
+
+    /** Whether the tx-history scan can run: mainnet, running, and Java-engine-hosted. */
+    public boolean supportsTxHistory(String network) {
+        if (!"mainnet".equals(canonicalNetwork(network))) return false;
+        if (handles.get("mainnet") == null) return false;
+        if (!(ENGINE instanceof io.myotis.engines.SelectorEngine se)) return false;
+        try {
+            return se.javaDelegate().debugStack("mainnet") != null;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * Build the mainnet TrueBlocks scan service, or null when unsupported (not running,
+     * not mainnet-hosted, or Rust-engine-hosted). One instance per scan; the bloom/index
+     * disk cache lives under {@code filesDir/trueblocks} (content-addressed, immutable —
+     * multi-GB after a deep scan; delete the directory to reclaim).
+     */
+    public io.myotis.txhistory.TxHistoryService txHistoryService() {
+        noteUiActivity(); // starting a scan is user activity — don't idle-pause under it
+        ChainHandle handle = handles.get("mainnet");
+        if (handle == null || !(ENGINE instanceof io.myotis.engines.SelectorEngine se)) {
+            return null;
+        }
+        var stack = se.javaDelegate().debugStack("mainnet");
+        if (stack == null) return null;
+        return new io.myotis.txhistory.TxHistoryService(
+                stack.connector(),
+                // Reads gate on SYNCED (non-blocking check) so the manifest eth_call
+                // degrades to the cached/hardcoded CID instead of parking the scan on
+                // GatedVerifiedReads' readiness wait.
+                () -> {
+                    var reads = handle.reads();
+                    return reads != null
+                            && reads.syncState() == io.myotis.api.SyncState.SYNCED
+                            ? reads : null;
+                },
+                new java.io.File(getFilesDir(), "trueblocks").toPath(),
+                // The index publisher's current wallet via VERIFIED ENS (the name is
+                // re-pointed when TrueBlocks rotates wallets). Best-effort: null
+                // (→ built-in default) when unsynced or ENS is unavailable.
+                () -> {
+                    try {
+                        var reads = handle.reads();
+                        if (reads == null
+                                || reads.syncState() != io.myotis.api.SyncState.SYNCED) {
+                            return null;
+                        }
+                        var ens = handle.ens();
+                        if (ens == null) return null;
+                        return ens.resolveAddress(
+                                io.myotis.txhistory.ManifestCidResolver.PUBLISHER_ENS_NAME,
+                                EnsRoot.AUTO).addressHex();
+                    } catch (Exception e) {
+                        return null;
+                    }
+                });
     }
 
     private static AccountQueryResult toAccountQueryResult(AccountProofResult r) {
@@ -1513,6 +1647,7 @@ public final class NodeService extends Service {
                     handle.setServedBlockWindow(servedBlockWindow(this));
                     handles.put(n, handle);
                 }
+
                 if (!handle.start()) {
                     LogBuffer.e(TAG, "[" + n + "] node stack failed to start");
                     forgetStack(n);
@@ -1525,6 +1660,11 @@ public final class NodeService extends Service {
                     try { ENGINE.stop(n); } catch (Throwable ignored) {}
                     return;
                 }
+                // Boot-time apply of the log-index preset — AFTER start (the
+                // engine only accepts config on a running handle) and after
+                // the raced-stop guard, so a condemned stack never pays for
+                // the index install / appender spin-up.
+                pushLogIndexConfig(n, handle);
                 // A freshly-booted stack gets a full idle window before the controller
                 // may pause it (its engine activity clock starts at 0). Stamped INSIDE the
                 // bootLock: written outside it, a racing stopNetwork's forgetStack could
@@ -1761,8 +1901,8 @@ public final class NodeService extends Service {
         // Live counts from the cache FILES (mtime-memoized): the files are the
         // cross-engine truth — the Rust engine writes them directly, so the
         // boot-time cachedElCounts/cachedClCounts maps go stale mid-run.
-        CacheFileStats.ElStats elCache = CacheFileStats.el(netCacheFor(network, "peers", ".cache").toPath());
-        CacheFileStats.ClStats clCache = CacheFileStats.cl(netCacheFor(network, "cl-peers", ".cache").toPath());
+        CacheFileStats.ElStats elCache = CacheFileStats.INSTANCE.el(netCacheFor(network, "peers", ".cache").getAbsolutePath());
+        CacheFileStats.ClStats clCache = CacheFileStats.INSTANCE.cl(netCacheFor(network, "cl-peers", ".cache").getAbsolutePath());
         String beaconState = bs.state() == BeaconState.STARTING ? "STOPPED" : bs.state().name();
         // Catch-up progress: preserve the historical -1-until-known convention (the engine
         // API defaults these to 0 pre-beacon) for the UI's determinate progress bar.
@@ -1774,32 +1914,34 @@ public final class NodeService extends Service {
             // Covers both a stopped stack and a PAUSED one (running=false, warm state
             // retained) — the lifecycle string lets the UI tell them apart.
             return new Snapshot(running, lifecycle, chainStartMs, 0, 0, 0, 0, /*snapServing*/0,
-                    elCache.total(), elCache.snapOk(), elCache.snapBad(), s.attemptedDials(), s.backedOffPeers(),
+                    elCache.getTotal(), elCache.getSnapOk(), elCache.getSnapBad(), s.attemptedDials(), s.backedOffPeers(),
                     s.blacklistedPeers(), s.discv5TableSize(), 0,
                     beaconState, bs.bootstrapped(), bs.connectedPeers(), (int) bs.lightClientPeers(),
-                    bs.servedPeersLastMinute(), clCache.total(), clCache.proven(), clCache.nolc(),
+                    bs.servedPeersLastMinute(), clCache.getTotal(), clCache.getProven(), clCache.getNolc(),
                     bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
                     s.syncStartPeriod(), syncCurrent, syncTarget,
                     Long.MAX_VALUE, List.of(), network,
                     s.pauseCount(), s.totalPausedMs(), s.lastPauseEpochMs(),
                     s.lastResumeEpochMs(), s.lastWakeReason(),
                     s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
-                    s.peerBodyRequests(), s.peerBodyRequestsServed(), s.lcHunting());
+                    s.peerBodyRequests(), s.peerBodyRequestsServed(),
+                    s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing());
         }
         return new Snapshot(true, lifecycle, chainStartMs,
                 s.discoveredPeers(), s.connectedPeers(), s.readyPeers(),
                 s.snapPeers(), s.snapServingPeers(),
-                elCache.total(), elCache.snapOk(), elCache.snapBad(), s.attemptedDials(), s.backedOffPeers(),
+                elCache.getTotal(), elCache.getSnapOk(), elCache.getSnapBad(), s.attemptedDials(), s.backedOffPeers(),
                 s.blacklistedPeers(), s.discv5TableSize(), 0,
                 beaconState, bs.bootstrapped(), bs.connectedPeers(), (int) bs.lightClientPeers(),
-                bs.servedPeersLastMinute(), clCache.total(), clCache.proven(), clCache.nolc(),
+                bs.servedPeersLastMinute(), clCache.getTotal(), clCache.getProven(), clCache.getNolc(),
                 bs.finalizedSlot(), bs.executionBlockNumber(), bs.executionBlockHashHex(),
                 s.syncStartPeriod(), syncCurrent, syncTarget,
                 s.verifiedHeadAgeMs(), s.readyPeerList(), network,
                 s.pauseCount(), s.totalPausedMs(), s.lastPauseEpochMs(),
                 s.lastResumeEpochMs(), s.lastWakeReason(),
                 s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
-                s.peerBodyRequests(), s.peerBodyRequestsServed(), s.lcHunting());
+                s.peerBodyRequests(), s.peerBodyRequestsServed(),
+                s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing());
     }
 
     // ---- Failure forensics (see ProcessHealthDiag) ----

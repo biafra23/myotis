@@ -1,60 +1,80 @@
-// :jsonrpc-server — a JSON-RPC HTTP endpoint on top of Myotis, hosted by BOTH
-// the Android app and the CLI daemon. Measurement-driven: starts as a logging
-// proxy and progressively serves verified light-client data (see the plan).
+// :jsonrpc-server — a JSON-RPC HTTP endpoint on top of Myotis, hosted by the
+// Android app, the CLI daemon, AND the iOS app. Measurement-driven: starts as a
+// logging proxy and progressively serves verified light-client data (see the plan).
 //
-// MUST run on Android (ART): no java.net.http, no com.sun.net.httpserver. The
-// HTTP server is Ktor CIO and the upstream proxy client is Ktor Client CIO —
-// pure Kotlin, matching the project's Ktor/Compose-Multiplatform direction.
-// Targets JVM 17 bytecode so :android-app can consume + dex it (CLAUDE.md
-// default for new modules), even though the root toolchain runs on JDK 21.
+// Kotlin MULTIPLATFORM since the iOS listener landed: commonMain holds the
+// router/server/logger against this module's own pure-Kotlin seams (RpcBackend /
+// RpcStatusSource); jvmMain adapts them from the io.myotis.api contracts for the
+// JVM hosts, iosMain supplies the platform actuals (the iOS host adapts the seams
+// over the Rust engine's C ABI in :app-ios). The HTTP server is Ktor CIO and the
+// upstream proxy client is Ktor Client CIO — pure Kotlin, multiplatform, and
+// Android-safe (no java.net.http, no com.sun.net.httpserver).
 
 plugins {
-    alias(libs.plugins.kotlin.jvm)
+    alias(libs.plugins.kotlin.multiplatform)
     alias(libs.plugins.kotlin.serialization)
 }
 
-// JVM 21 bytecode: this module depends on :networking (discv5) and :myotis-evm
-// (Besu), both of which publish JVM-21 metadata, so Gradle variant resolution
-// requires a 21 consumer. CLAUDE.md's 17 default explicitly yields when a
-// transitive forces 21 — same situation as those modules — and AGP 8.7's D8
-// dexes 21 class files for :android-app (already proven for :networking).
-// compileJava inherits the root's JDK-21 toolchain; match Kotlin to it.
 kotlin {
-    compilerOptions {
-        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21
+    jvmToolchain(21)
+
+    // JVM 21 bytecode: this module depends on :networking (discv5) and :myotis-evm
+    // (Besu) on the JVM side, both of which publish JVM-21 metadata, so Gradle
+    // variant resolution requires a 21 consumer. CLAUDE.md's 17 default explicitly
+    // yields when a transitive forces 21 — and AGP 8.7's D8 dexes 21 class files
+    // for :android-app (already proven for :networking).
+    jvm {
+        compilerOptions {
+            jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21
+        }
+    }
+    iosArm64()
+    iosSimulatorArm64()
+
+    sourceSets {
+        commonMain.dependencies {
+            // HTTP server (endpoint) + client (upstream proxy).
+            implementation(libs.ktor.server.core)
+            implementation(libs.ktor.server.cio)
+            implementation(libs.ktor.server.cors)
+            implementation(libs.ktor.client.core)
+            implementation(libs.ktor.client.cio)
+
+            implementation(libs.kotlinx.serialization.json)
+            implementation(libs.kotlinx.coroutines.core)
+        }
+        jvmMain.dependencies {
+            // The verified-read contract the JVM adapters wrap (io.myotis.api.VerifiedReads).
+            api(project(":myotis-api"))
+            // Shared verified-read primitives — the same modules :android-app and :app use.
+            implementation(project(":core"))
+            implementation(project(":networking"))
+            implementation(project(":consensus"))
+            implementation(project(":myotis-evm"))
+
+            implementation(libs.slf4j.api)
+        }
+        jvmTest.dependencies {
+            implementation(project.dependencies.platform(libs.junit.bom))
+            implementation(libs.junit.jupiter)
+            // Cross-check the commonMain Keccak-256 against Tuweni's (KeccakTest) —
+            // test-only; the seam itself must stay dependency-free for iOS.
+            // Tuweni's keccak256 resolves via JCA, so BouncyCastle registers as
+            // the provider in the test.
+            implementation(libs.tuweni.bytes)
+            implementation(libs.tuweni.crypto)
+            implementation(libs.bouncycastle)
+            // logback on the test COMPILE classpath (not just runtime): RpcAccessLogTest attaches a
+            // ListAppender to the io.myotis.jsonrpc.access logger to assert the access-log lines.
+            implementation(libs.logback.classic)
+            // Besu's BOM pins junit-platform 1.13 onto any classpath that sees :myotis-evm;
+            // an unaligned launcher fails discovery. The root build adds this for plain-JVM
+            // modules, but this module left that block when it went multiplatform.
+            runtimeOnly("org.junit.platform:junit-platform-launcher")
+        }
     }
 }
 
-dependencies {
-    // The verified-read contract the router serves (io.myotis.api.VerifiedReads).
-    implementation(project(":myotis-api"))
-    // Shared verified-read primitives — the same modules :android-app and :app use.
-    implementation(project(":core"))
-    implementation(project(":networking"))
-    implementation(project(":consensus"))
-    implementation(project(":myotis-evm"))
-
-    // HTTP server (endpoint) + client (upstream proxy) — Android-safe.
-    implementation(libs.ktor.server.core)
-    implementation(libs.ktor.server.cio)
-    implementation(libs.ktor.server.cors)
-    implementation(libs.ktor.client.core)
-    implementation(libs.ktor.client.cio)
-
-    implementation(libs.kotlinx.serialization.json)
-    implementation(libs.kotlinx.coroutines.core)
-
-    implementation(libs.tuweni.bytes)
-    implementation(libs.tuweni.crypto)
-    implementation(libs.slf4j.api)
-
-    testImplementation(platform(libs.junit.bom))
-    testImplementation(libs.junit.jupiter)
-    // logback on the test COMPILE classpath (not just runtime): RpcAccessLogTest attaches a
-    // ListAppender to the io.myotis.jsonrpc.access logger to assert the access-log lines.
-    testImplementation(libs.logback.classic)
-}
-
-tasks.test {
+tasks.withType<Test>().configureEach {
     useJUnitPlatform()
 }

@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,7 +32,7 @@ use crate::el::discv4::TableEntry;
 use crate::el::eth::session::{EthConfig, EthSession};
 use crate::el::peer::ManagedPeer;
 use crate::el::served::{ServeContext, ServeStats, ServedHeaders};
-use crate::el::peercache::ElPeerCache;
+use crate::el::peercache::{ElPeerCache, SnapQuality};
 use crate::el::rlpx::transport::RlpxConnection;
 
 /// Wrong-chain peers: don't retry the address for a long while (Java's
@@ -40,9 +41,52 @@ const BACKOFF_INCOMPATIBLE: Duration = Duration::from_secs(10 * 60);
 /// Transient failures / not-snap peers: a short cool-off (Java's
 /// `BACKOFF_TRANSIENT_MS`).
 const BACKOFF_TRANSIENT: Duration = Duration::from_secs(30);
+/// TooManyPeers (Disconnect 0x04) rejections: the peer is ALIVE, just full —
+/// retry patiently enough to halve the dial burn, often enough to keep
+/// farming freed slots (Java's `BACKOFF_BUSY_MS`). While the EL hunt is
+/// engaged the transient window applies instead (see the dial Err arm).
+const BACKOFF_BUSY: Duration = Duration::from_secs(60);
+
+/// True when a dial error is a TooManyPeers rejection. The session's
+/// disconnect errors are fixed-format ("peer disconnected[ during
+/// handshake]: reason=N" — see `describe_disconnect`), so prefix+suffix
+/// matching cannot be steered by peer-controlled content. 0x04 says nothing
+/// about the peer's CHAIN (full wrong-chain nodes send it too), so busy only
+/// selects a backoff class — never a verified/known-good promotion.
+///
+/// Known divergences from the Java twin (deliberate, scope): (1) Java also
+/// flags 0x04 on a READY peer's disconnect; here a serving peer's close
+/// reason isn't plumbed through `ManagedPeer`, so its address is simply
+/// freed by `prune_closed` with no backoff. (2) The Java hunt log reports a
+/// rolling distinct-busy-peer count; the Rust hunt log doesn't (the per-dial
+/// `busy` debug field is the Rust-side signal).
+fn is_busy_disconnect(e: &str) -> bool {
+    e.starts_with("peer disconnected") && e.ends_with("reason=4")
+}
 /// How often the maintainer checks the pool and tops it back up to target
 /// (Java's `maintainSnapPeers` fixed delay).
 const MAINTAINER_INTERVAL: Duration = Duration::from_secs(10);
+
+/// EL hunt: the serving pool has been EMPTY this long → emergency mode. Not
+/// "below target" — on snap-scarce chains (gnosis) the target is simply
+/// unreachable and hunting forever would burn network for nothing; zero
+/// serving is the state where verified reads are actually impossible. The
+/// hunt bypasses TRANSIENT backoffs for cache-CONFIRMED snap servers (they
+/// served chain-verified snap data — wrong-chain is impossible, so an eager
+/// re-dial is safe). Blacklist and incompatible entries stay respected.
+const EL_HUNT_STALL: Duration = Duration::from_secs(60);
+
+/// How recent an online signal (discv4 delivery / completed session) still
+/// gates connect-failure counting. Short on purpose: a device that drops
+/// offline must stop counting before it can demote healthy cached peers
+/// (Java `ChainStack.ONLINE_SIGNAL_MAX_AGE_MS`).
+const ONLINE_SIGNAL_MAX_AGE: Duration = Duration::from_secs(2 * 60);
+
+/// Pure trigger: pool empty AND it has been empty past the stall window.
+fn el_hunt_due(live: usize, zero_since: Option<Instant>, now: Instant) -> bool {
+    live == 0
+        && zero_since.is_some_and(|t| now.saturating_duration_since(t) >= EL_HUNT_STALL)
+}
 
 /// Pool tunables.
 #[derive(Debug, Clone, Copy)]
@@ -92,12 +136,44 @@ struct PoolInner {
     last_broadcast_range: Mutex<Option<(u64, u64)>>,
     /// Inbound peer-demand counters for the status page.
     serve_stats: Arc<ServeStats>,
+    /// EL hunt engaged (serving pool empty past the stall window) — drives the
+    /// hosts' status banner and the maintainer's backoff bypass.
+    hunting: AtomicBool,
+    /// Last proof we're online: a discv4 candidate arrived or a dial completed
+    /// a session. Gates connect-failure counting (with the live-peer check) so
+    /// a warm start whose cached peers are ALL dead can still clean them up,
+    /// while an offline device (no discovery, no sessions) counts nothing.
+    online_signal: Mutex<Option<Instant>>,
+    /// The reader's sent-tx watch, handed to every spawned peer's read loop so
+    /// gossip sightings of our own broadcasts register (None for pools whose
+    /// host never sends).
+    tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
+    /// Probe requests toward discovery: when a snap peer connects, its address
+    /// is nudged into the discv4 walk so its neighbourhood gets explored (a
+    /// cache-/warm-start peer may never enter the table on its own). Best-effort
+    /// `try_send`; `None` for pools without discovery (tests).
+    probe: Option<mpsc::Sender<SocketAddr>>,
 }
 
 impl PoolInner {
     /// The single quality-recording path (dirty-gated flush inside) — shared by
     /// the pool's public sinks and [`SnapQualitySink`] so behavior can't drift.
     async fn record_quality(&self, addr: SocketAddr, served: bool) {
+        // Never demote the LAST live snap peer: an empty/failed fetch against
+        // the sole server usually means WE asked for a root outside its
+        // snapshot window (stale local head), not that the peer is bad — and
+        // three such strikes would persist a snapbad verdict against the one
+        // peer still serving us. Twin of the Java benchUnlessLastServing scan
+        // (`h != failed`): the guard keys on whether any OTHER peer is live,
+        // not on pool size — a lone pooled peer at a DIFFERENT address means
+        // the failing one isn't our last resort and the strike must count.
+        // (Deliberate asymmetry with Java: this skips a PERSISTED verdict
+        // step, Java skips a transient 30s bench — same trigger, harsher
+        // consequence here, hence the same protection.)
+        if !served && !self.peers.lock().await.iter().any(|p| p.addr != addr) {
+            tracing::debug!(%addr, "skipping snap-failure verdict — no other serving peer");
+            return;
+        }
         let mut cache = self.cache.lock().await;
         if served {
             cache.record_snap_served(addr);
@@ -105,6 +181,23 @@ impl PoolInner {
             cache.record_snap_failure(addr);
         }
         cache.flush();
+    }
+
+    /// Stamp the online signal (see `online_signal` field docs).
+    async fn note_online(&self) {
+        *self.online_signal.lock().await = Some(Instant::now());
+    }
+
+    /// True if we have live proof of connectivity: a pooled peer, or an online
+    /// signal within [`ONLINE_SIGNAL_MAX_AGE`].
+    async fn likely_online(&self) -> bool {
+        if !self.peers.lock().await.is_empty() {
+            return true;
+        }
+        self.online_signal
+            .lock()
+            .await
+            .is_some_and(|t| t.elapsed() < ONLINE_SIGNAL_MAX_AGE)
     }
 
     /// Drop closed peers, freeing their addresses for a future re-dial. Returns
@@ -130,10 +223,8 @@ impl PoolInner {
         peers.len()
     }
 
-    /// Record an address backoff. `long` selects the wrong-chain (10 min) vs the
-    /// transient (30 s) window.
-    async fn record_backoff(&self, addr: SocketAddr, long: bool, now: Instant) {
-        let window = if long { BACKOFF_INCOMPATIBLE } else { BACKOFF_TRANSIENT };
+    /// Record an address backoff for `window` (one of the BACKOFF_* consts).
+    async fn record_backoff(&self, addr: SocketAddr, window: Duration, now: Instant) {
         let mut backoff = self.backoff.lock().await;
         // Entries are normally dropped when their address resurfaces as a
         // candidate, but an address that never comes back would linger forever.
@@ -147,15 +238,50 @@ impl PoolInner {
     /// Dial one candidate through the full eth+snap handshake, updating the
     /// bookkeeping by outcome. `addr` is already in `attempted`.
     async fn dial_one(self: &Arc<PoolInner>, addr: SocketAddr, pubkey: [u8; 64]) {
-        let result = async {
-            let conn = RlpxConnection::dial(Arc::clone(&self.key), addr, pubkey).await?;
-            // eth/69 Status advertises only the window's held range (None → the
-            // honest genesis-only [0, 0]); see ServedHeaders::advertise.
-            EthSession::handshake(conn, &self.local_pubkey, &self.cfg, self.served.advertise()).await
-        }
-        .await;
+        let conn = match RlpxConnection::dial(Arc::clone(&self.key), addr, pubkey).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                // Transport-level failure (refused/timeout/ECIES) — the peer is
+                // GONE, not incompatible. Streaks of these demote and eventually
+                // evict it from the warm-start cache. (Deliberately broader than
+                // the Java twin, which only sees pre-handshake TCP failures: an
+                // ECIES failure against a cached entry means its stored node key
+                // is stale — the entry can never handshake again and deserves
+                // the same eviction path.) Gated on an online signal so an
+                // offline device can't count a failure against every cached
+                // peer per cycle and decimate its own cache.
+                tracing::debug!(%addr, error = %e, "el dial: transport failed");
+                if self.likely_online().await {
+                    let mut cache = self.cache.lock().await;
+                    cache.record_connect_failure(addr);
+                    cache.flush();
+                }
+                self.record_backoff(addr, BACKOFF_TRANSIENT, Instant::now()).await;
+                self.attempted.lock().await.remove(&addr);
+                return;
+            }
+        };
+        // TCP + ECIES succeeded — proof of connectivity regardless of how the
+        // eth handshake goes.
+        self.note_online().await;
+        // eth/69 Status advertises only the window's held range (None → the
+        // honest genesis-only [0, 0]); see ServedHeaders::advertise.
+        let result =
+            EthSession::handshake(conn, &self.local_pubkey, &self.cfg, self.served.advertise())
+                .await;
 
         let now = Instant::now();
+        // Any COMPATIBLE completed session (snap or not) proves the peer is on
+        // our network — nudge discovery toward its neighbourhood (UDP port
+        // guessed = TCP port, the devp2p default; a wrong guess just means no
+        // pong). The service dedups per endpoint. Same semantics as the Java
+        // twin, which probes on every eth-READY peer: a fork-verified plain-eth
+        // peer's neighbours may well serve snap.
+        if result.is_ok() {
+            if let Some(probe) = &self.probe {
+                let _ = probe.try_send(addr);
+            }
+        }
         match result {
             Ok(session) if session.snap => {
                 // INFO: the operator-visible signal that the EL found a usable
@@ -170,6 +296,7 @@ impl PoolInner {
                         window: Arc::clone(&self.served),
                         stats: Arc::clone(&self.serve_stats),
                     },
+                    self.tx_watch.clone(),
                 ));
                 // Keep `addr` in `attempted` while connected — dropped by
                 // prune_closed when the peer later closes.
@@ -183,22 +310,52 @@ impl PoolInner {
             }
             Ok(session) => {
                 // Compatible but no snap/1 — useless for verified reads. Cool the
-                // address off and free it from `attempted`.
+                // address off and free it from `attempted`. Still proof the
+                // address is alive: clear any connect-failure streak.
                 tracing::debug!(%addr, eth = session.eth_version, "el dial: connected but no snap/1");
-                self.record_backoff(addr, false, now).await;
+                {
+                    // Flush so a cleared persisted streak lands on disk now —
+                    // this path may be the only cache event the peer ever gets.
+                    let mut cache = self.cache.lock().await;
+                    cache.record_connect_success(addr);
+                    cache.flush();
+                }
+                self.record_backoff(addr, BACKOFF_TRANSIENT, now).await;
                 self.attempted.lock().await.remove(&addr);
             }
             Err(e) => {
-                // Only the network-id/genesis mismatch error starts with this
-                // prefix (see EthSession::handshake). Match the PREFIX, not a
-                // substring: a peer's client id is echoed into other error
-                // strings, so `contains` could be steered by a hostile peer.
-                let incompatible = e.starts_with("incompatible peer");
-                tracing::debug!(%addr, incompatible, error = %e, "el dial: failed");
+                // Only the network-id/genesis mismatch and Status-decode errors
+                // start with these prefixes (see EthSession::handshake). An
+                // undecodable Status is a foreign-chain client with a divergent
+                // Status shape (e.g. Polygon's bor keeps the TD field eth/69
+                // removed) — treat it as incompatible so it gets the long
+                // backoff + blacklist instead of a re-dial every transient
+                // window. Match the PREFIX, not a substring: a peer's client id
+                // is echoed into other error strings, so `contains` could be
+                // steered by a hostile peer.
+                let incompatible =
+                    e.starts_with("incompatible peer") || e.starts_with("peer Status decode");
+                let busy = is_busy_disconnect(&e);
+                tracing::debug!(%addr, incompatible, busy, error = %e, "el dial: failed");
                 if incompatible {
                     self.blacklist.lock().await.insert(pubkey);
                 }
-                self.record_backoff(addr, incompatible, now).await;
+                let window = if incompatible {
+                    BACKOFF_INCOMPATIBLE
+                } else if busy {
+                    // While the EL hunt is engaged, busy peers retry on the
+                    // transient cadence: with the serving pool empty they are
+                    // the only realistic source of a freed slot, and slots
+                    // are won by fast retries (Java busyBackoffMs twin).
+                    if self.hunting.load(Ordering::Relaxed) {
+                        BACKOFF_TRANSIENT
+                    } else {
+                        BACKOFF_BUSY
+                    }
+                } else {
+                    BACKOFF_TRANSIENT
+                };
+                self.record_backoff(addr, window, now).await;
                 self.attempted.lock().await.remove(&addr);
             }
         }
@@ -225,6 +382,8 @@ impl PeerPool {
         pool_cfg: PoolConfig,
         cache: ElPeerCache,
         rx: mpsc::Receiver<TableEntry>,
+        tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
+        probe: Option<mpsc::Sender<SocketAddr>>,
     ) -> PeerPool {
         let inner = Arc::new(PoolInner {
             key,
@@ -239,6 +398,10 @@ impl PeerPool {
             served: Arc::new(ServedHeaders::default()),
             last_broadcast_range: Mutex::new(None),
             serve_stats: Arc::new(ServeStats::default()),
+            hunting: AtomicBool::new(false),
+            online_signal: Mutex::new(None),
+            tx_watch,
+            probe,
         });
         // Both the discv4 dialer and the maintainer dial through one shared
         // concurrency budget.
@@ -331,6 +494,12 @@ impl PeerPool {
         SnapQualitySink { inner: Arc::clone(&self.inner) }
     }
 
+    /// EL hunt engaged: the serving pool has been empty past the stall window
+    /// and the maintainer is in emergency mode (see EL_HUNT_STALL).
+    pub fn el_hunting(&self) -> bool {
+        self.inner.hunting.load(Ordering::Relaxed)
+    }
+
     /// Stop the pool: flush the peer cache, abort the background tasks, and drop
     /// all held peers (closing them).
     pub async fn stop(self) {
@@ -373,6 +542,10 @@ async fn dialer_loop(
 
     // Then top up from live discovery.
     while let Some(entry) = rx.recv().await {
+        // A candidate arriving proves discv4 round-trips are working — that's
+        // the online signal that lets connect-failure counting clean up a
+        // warm-started cache whose peers are ALL dead.
+        inner.note_online().await;
         if inner.prune_closed().await >= inner.pool_cfg.target_snap_peers {
             continue;
         }
@@ -457,6 +630,9 @@ async fn broadcast_range_if_changed(inner: &Arc<PoolInner>) {
 }
 
 async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
+    // EL-hunt stall clock: Some(t) while the pool has been continuously empty
+    // since t. Maintainer-task-local — nothing else needs it.
+    let mut zero_since: Option<Instant> = None;
     loop {
         tokio::time::sleep(MAINTAINER_INTERVAL).await;
         // Keep the eth/69 advertised range honest over a connection's lifetime:
@@ -465,6 +641,27 @@ async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
         broadcast_range_if_changed(&inner).await;
         // prune_closed frees dead peers' addresses so try_dial can re-dial them.
         let live = inner.prune_closed().await;
+        // target == 0 = maintainer deliberately idle: an empty pool is the
+        // EXPECTED state — never engage the hunt (Java maintainSnapPeers twin).
+        if inner.pool_cfg.target_snap_peers == 0 {
+            zero_since = None;
+            inner.hunting.store(false, Ordering::Relaxed);
+            continue;
+        }
+        if live > 0 {
+            zero_since = None;
+            if inner.hunting.swap(false, Ordering::Relaxed) {
+                tracing::info!(live, "EL hunt disengaged — snap peer serving again");
+            }
+        } else {
+            zero_since.get_or_insert_with(Instant::now);
+        }
+        let hunting = el_hunt_due(live, zero_since, Instant::now());
+        if hunting && !inner.hunting.swap(true, Ordering::Relaxed) {
+            tracing::info!(stall_secs = EL_HUNT_STALL.as_secs(),
+                "EL hunt engaged — serving pool empty past the stall window \
+                 (bypassing transient backoffs for cache-confirmed snap servers)");
+        }
         if live >= inner.pool_cfg.target_snap_peers {
             continue;
         }
@@ -474,10 +671,35 @@ async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
         if cached.is_empty() {
             continue;
         }
+        if hunting {
+            // Emergency: free the TRANSIENT backoffs of CONFIRMED snap servers
+            // so the dial loop below reaches them NOW instead of after the
+            // standard cool-off. Confirmed = served us chain-verified snap
+            // data. Entries whose remaining window exceeds the transient
+            // length are INCOMPATIBLE (10 min) or a not-yet-elapsed 60s busy
+            // entry — keep those: the timer must stay honest (and for
+            // incompatible, try_dial's blacklist would block the dial anyway).
+            // Hunt-time BUSY entries are written at the transient window, so a
+            // confirmed-but-busy server is clearable immediately and re-dials
+            // roughly every maintainer tick while the pool is empty —
+            // intentional, bounded slot-farming (Java maintainSnapPeers twin
+            // documents the same trade-off). Non-confirmed peers keep timers.
+            let now = Instant::now();
+            let mut backoff = inner.backoff.lock().await;
+            for c in cached.iter().filter(|c| c.quality == SnapQuality::Confirmed) {
+                if backoff
+                    .get(&c.addr)
+                    .is_some_and(|exp| exp.saturating_duration_since(now) <= BACKOFF_TRANSIENT)
+                {
+                    backoff.remove(&c.addr);
+                }
+            }
+        }
         tracing::debug!(
             live,
             target = inner.pool_cfg.target_snap_peers,
             cached = cached.len(),
+            hunting,
             "EL pool below target — maintainer re-dialing cached snap peers"
         );
         for c in cached {
@@ -584,6 +806,8 @@ mod tests {
             PoolConfig::default(),
             ElPeerCache::disabled(),
             rx,
+            None,
+            None,
         );
         assert_eq!(pool.snap_peer_count().await, 0);
         assert!(pool.snap_peer().await.is_none());
@@ -634,6 +858,8 @@ mod tests {
             PoolConfig::default(),
             ElPeerCache::load(path.clone()),
             rx,
+            None,
+            None,
         );
         // The warm-start branch dials the cached peer, claiming its address.
         // Poll briefly (the silent listener parks the handshake, so the address
@@ -688,6 +914,8 @@ mod tests {
             PoolConfig::default(),
             ElPeerCache::load(path.clone()),
             rx,
+            None,
+            None,
         );
 
         // A served outcome promotes the cached peer to Confirmed and persists it.
@@ -699,6 +927,45 @@ mod tests {
 
         pool.stop().await;
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn busy_disconnect_classification_is_prefix_and_suffix_bound() {
+        assert!(is_busy_disconnect("peer disconnected: reason=4"));
+        assert!(is_busy_disconnect("peer disconnected during handshake: reason=4"));
+        // Other reasons and other error shapes are NOT busy.
+        assert!(!is_busy_disconnect("peer disconnected: reason=3"));
+        assert!(!is_busy_disconnect("peer disconnected: reason=42"));
+        assert!(!is_busy_disconnect("incompatible peer: networkId=137 genesis=..."));
+        // A peer-controlled client id echoed mid-string can't fake the prefix.
+        assert!(!is_busy_disconnect("expected Status, got code 0x04 from peer disconnected: reason=4x"));
+        // Producer-coupled: build the string through the REAL session
+        // formatter (RLP [0x04] = TooManyPeers) so a future format change in
+        // describe_disconnect breaks this test instead of silently degrading
+        // busy classification to transient.
+        let produced = format!(
+            "peer disconnected: {}",
+            crate::el::eth::session::describe_disconnect(&[0xc1, 0x04])
+        );
+        assert!(is_busy_disconnect(&produced), "producer drifted: {produced}");
+        let produced_other = format!(
+            "peer disconnected: {}",
+            crate::el::eth::session::describe_disconnect(&[0xc1, 0x03])
+        );
+        assert!(!is_busy_disconnect(&produced_other));
+    }
+
+    #[test]
+    fn el_hunt_due_triggers_only_on_sustained_empty_pool() {
+        let now = Instant::now();
+        // Any live peer → never hunt, regardless of how long the pool WAS empty.
+        assert!(!el_hunt_due(1, Some(now - EL_HUNT_STALL * 2), now));
+        // Empty but not yet past the stall window → no hunt (fresh starts and
+        // brief blips must not trip emergency mode).
+        assert!(!el_hunt_due(0, Some(now - Duration::from_secs(5)), now));
+        assert!(!el_hunt_due(0, None, now));
+        // Empty past the window → hunt.
+        assert!(el_hunt_due(0, Some(now - EL_HUNT_STALL), now));
     }
 }
 

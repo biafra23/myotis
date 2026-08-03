@@ -23,6 +23,7 @@ There are now **two interchangeable engines** behind the same zero-dependency AP
 - [Benefits](docs/benefits-doc.md) — Explains why a trustless wallet matters and what risks centralized RPC providers pose to users.
 - [Implementation Status](docs/implementation-status.md) — Current implementation progress and what remains to be done.
 - [Readiness & Verified Head Age](docs/readiness-and-verified-head-age.md) — When the node counts as synced and ready to answer queries, and what the "verified head age" on the Status screen means.
+- [Disk & Network Usage](docs/disk-and-network-usage.md) — Storage footprint of a fully synced client (peer caches, light-client snapshot — there is no on-disk block/header database) and bandwidth: initial sync, the daily cost of staying synced, and what sending a transaction costs.
 - [Re-Implementation Specification](docs/reimplementation/README.md) — A language-agnostic spec for rebuilding Myotis (everything except the Android-specific host) as a cross-platform engine in Go or Rust, consumable from Desktop, Android, and iOS apps.
 
 ## Wallet API — verified JSON-RPC over HTTP
@@ -597,45 +598,37 @@ Reads `interfaceImplementer(node, interfaceId)` (EIP-1820 over ENS) — the addr
 ./gradlew :app:run -Pargs="get-transactions 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 ```
 
-Returns all transactions for an address by looking them up in the [TrueBlocks Unchained Index](https://trueblocks.io/). Results are streamed as JSON-Lines (one JSON object per transaction), followed by a summary object.
+Returns all transactions for an address (mainnet only) by looking them up in the [TrueBlocks Unchained Index](https://trueblocks.io/). Results are streamed as JSON-Lines, newest first, followed by a summary object. The same scan powers the **desktop and Android apps' Query tab** ("Find transactions" under an address lookup): hits appear as block-number placeholders and upgrade in place to parsed rows, with a progress bar and a Stop button. (On Android the bloom/index cache lives under `filesDir/trueblocks` and can grow to multi-GB after a deep scan.)
 
 **How it works:**
 
-1. Fetches the TrueBlocks manifest from IPFS (hardcoded CID: "[QmUBS83qjRmXmSgEvZADVv2ch47137jkgNbqfVVxQep5Y1](https://ipfs.unchainedindex.io/ipfs/QmUBS83qjRmXmSgEvZADVv2ch47137jkgNbqfVVxQep5Y1)")
+1. Resolves the **latest** manifest CID from the UnchainedIndex_V2 contract on mainnet (`manifestHashMap(publisher, "mainnet")` at [`0x0c316B70…183d`](https://etherscan.io/address/0x0c316b7042b419d07d343f2f4f5bd54ff731183d)) using myotis' own **verified eth_call** — no external RPC. The publisher is `publisher.unchainedindex.eth` (chifra's preferred publisher, resolved via myotis' verified ENS; the manifest map is permissionless, so only the ENS-designated publisher's slot is trusted — even trueblocks.eth's own slot holds a junk placeholder). The result is cached for 24h; when the node isn't synced the cached (or, as a last resort, a hardcoded known-good) CID is used and the output says so via `cidSource`.
 2. For each chunk in the manifest (scanned from newest to oldest blocks):
-   - Downloads the Bloom filter and checks if the address appears
-   - On a Bloom hit, downloads the index chunk and extracts appearance records (block number + transaction index)
+   - Downloads the Bloom filter (disk-cached under `trueblocks/`, content-addressed, immutable) and checks if the address appears
+   - On a Bloom hit, downloads the index chunk (also cached) and extracts appearance records (block number + transaction index)
 3. For each appearance, fetches the block header and body from devp2p peers and extracts the raw transaction
-4. Parses the transaction RLP into human-readable fields (supports legacy, EIP-2930, EIP-1559, and EIP-4844 transaction types)
+4. Decodes the transaction (legacy, EIP-2930, EIP-1559, EIP-4844, EIP-7702; sender recovered from the signature) and classifies it: plain ETH transfer, ERC-20 `transfer`/`transferFrom` of a well-known token (USDC, USDT, DAI, WETH, WBTC, …), generic contract call, or contract creation
 
-**Transaction fields:**
+**Stream shape** (succinct — one line per transaction, no raw tx hex):
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `blockNumber` | long | Block containing the transaction |
-| `transactionIndex` | int | Position within the block |
-| `type` | int | Transaction type (0=legacy, 1=EIP-2930, 2=EIP-1559, 3=EIP-4844) |
-| `nonce` | long | Sender's transaction count |
-| `to` | string | Recipient address (absent for contract creation) |
-| `value` | string | Value transferred in wei (hex) |
-| `gasLimit` | long | Gas limit |
-| `gasPrice` | string | Gas price in wei (type 0-1, hex) |
-| `maxPriorityFeePerGas` | string | Priority fee (type 2-3, hex) |
-| `maxFeePerGas` | string | Max fee (type 2-3, hex) |
-| `maxFeePerBlobGas` | string | Max blob fee (type 3, hex) |
-| `chainId` | long | Chain ID (type 1-3) |
-| `data` | string | Input data (hex, absent if empty) |
-| `rawTx` | string | Full raw transaction bytes (hex) |
-| `verified` | boolean | Always `false` (see limitations below) |
+```
+{"ok":true,"manifestCid":"Qm…","cidSource":"contract","chunks":8123,"latestIndexedBlock":22841000,"headBlock":22843511}
+{"ok":true,"blockNumber":22812345,"transactionIndex":41,"hash":"0x…","from":"0x…","to":"0xa0b86991…","kind":"erc20","token":"USDC","amount":"1250.50","recipient":"0x…","verified":false}
+{"ok":true,"blockNumber":22711000,"transactionIndex":3,"hash":"0x…","from":"0x…","to":"0x…","kind":"eth","eth":"1.25","wei":"1250000000000000000","verified":false}
+{"ok":true,"blockNumber":22600000,"transactionIndex":97,"hash":"0x…","from":"0x…","to":"0x…","kind":"call","calldataBytes":132,"selector":"0x38ed1739","verified":false}
+{"ok":true,"progress":{"chunksScanned":250,"totalChunks":8123,"range":"022300000-022310000","hits":3,"bytesDownloaded":31457280}}
+{"ok":true,"done":true,"totalTransactions":3}
+```
 
-The stream ends with `{"ok":true,"done":true,"totalTransactions":N}`.
+`kind` is one of `eth` (plain transfer; `eth` = amount in ETH, `wei` = exact), `erc20` (well-known-token transfer; decimals-adjusted `amount` + decoded `recipient`), `call` (generic call; `calldataBytes` + 4-byte `selector`, plus `eth` when value is attached), or `create` (contract creation). Failed resolutions stream as `{"ok":false,"blockNumber":…,"error":"…"}` and the scan continues. A progress heartbeat line appears every 250 chunks.
 
 **Limitations:**
 
 - **Blocks are not verified.** Individual transactions are not yet verified against the block's `transactionsRoot`. The `verified` field is always `false`. This means a malicious peer could serve tampered transaction data. Verification against the transactions trie is planned but not implemented.
-- **The Unchained Index is stale.** The manifest CID is hardcoded and points to a snapshot of the TrueBlocks index that is not kept up to date. Transactions in recent blocks will not be found. There is currently no mechanism to dynamically update the manifest CID.
+- **Index freshness depends on the publisher — and upstream publishing appears stalled.** The manifest CID tracks the on-chain publication, so the index is only as fresh as the designated publisher's latest publish. As of mid-2026 that is ~block 23.0M (**roughly a year behind the head**): `publisher.unchainedindex.eth` has not published a newer mainnet manifest, and the only newer-looking on-chain entry comes from an undesignated wallet whose content isn't retrievable from IPFS at all. Transactions above `latestIndexedBlock` will not be found. Both surfaces now make this loud: the `Started` IPC line carries `indexLagBlocks`/`indexAgeDays` plus `stale:true` + a `warning` beyond ~14 days of lag, and the desktop Query tab shows a warning banner with the approximate age and cutoff block. The planned remedy is a self-published index (running the TrueBlocks scraper and pinning/serving the chunks ourselves).
+- **First full-history scan is heavy.** Every chunk's bloom filter is downloaded once (multi-GB across the whole chain history, kept forever in the `trueblocks/` cache); subsequent scans read blooms from disk. Newest chunks stream first, so recent history appears long before the scan completes — and the scan can be stopped at any point.
 - **Completeness is not guaranteed.** IPFS content-addressing guarantees the index data has not been tampered with, but it does not guarantee all appearances for an address are present. If the TrueBlocks index has missing entries (due to indexing gaps or incomplete coverage), transactions will be silently missed. A future mitigation is balance reconciliation -- computing the expected balance from fetched transactions and comparing it against the on-chain balance via snap proofs.
-- **Signature and access list data not returned.** The parsed JSON omits signature fields (v, r, s), access list details (type 1-2), and blob versioned hashes (type 3).
+- **Signature and access list data not returned.** The succinct JSON omits signature fields (v, r, s), access lists, blob hashes, and the raw transaction bytes; use `eth_getTransactionByHash` (verified JSON-RPC) with the returned `hash` for full detail on recent transactions.
 
 ### Dial a specific peer
 
@@ -731,16 +724,38 @@ Myotis is mid-migration from a single Java implementation to a **Rust engine** t
 
 - **The contract** is `:myotis-api` — zero-dependency Java-17 interfaces (`MyotisEngine`/`ChainHandle`, FFI-portable types only). Hosts (Android app, desktop app, daemon) consume *only* this API and never import engine internals.
 - **The Java engine** is the original implementation (`node-core` adapters over the `networking`/`consensus`/`myotis-evm` modules).
-- **The Rust engine** is the `rust/` Cargo workspace (`myotis-core`, `myotis-net`, `myotis-consensus`, `myotis-bls`, `myotis-evm`, `myotis-engine`): discv4 + discv5 discovery, RLPx/eth/snap, the beacon light client with BLS via blst, a revm-based EVM with the same snap-proof state oracle, ENS incl. CCIP-Read, and multichain (mainnet, Sepolia, Gnosis). It reaches the JVM through hand-written JNI; compound values cross as JSON, pinned by golden tests on both sides.
+- **The Rust engine** is the `rust/` Cargo workspace (`myotis-core`, `myotis-net`, `myotis-consensus`, `myotis-bls`, `myotis-evm`, `myotis-engine`): discv4 + discv5 discovery, RLPx/eth/snap, the beacon light client with BLS via blst, a revm-based EVM with the same snap-proof state oracle, ENS incl. CCIP-Read, and multichain (mainnet, Sepolia, Gnosis). It reaches the JVM through UniFFI-generated Kotlin bindings over JNA (the generated bindings are committed in `:myotis-engines`, regenerated via `uniffiGenerateKotlin`); compound values cross as JSON, pinned by golden tests on both sides.
 - **Selection**: the `:myotis-engines` selector (`Engines.engine()`) routes each network to an engine via the `myotis.engine` property — `java` (default), `rust`, or `auto`. On run tasks use `-Pengine=rust`; in the apps it's a Settings toggle (applies on network restart). The Status screen shows which engine hosts each network — "Mainnet (r)" vs "(j)".
 - **Parity** is enforced by shared conformance vectors (BLS fixtures, a captured mainnet light-client corpus, the EL verification-ladder vectors) run against both implementations, plus a benchmark gate for the JNI path.
 
-Rust builds are **optional for the pure-Java dev loop**: without cargo the Gradle tasks self-skip and the committed Android jniLibs act as the fallback. Release artifacts don't rely on that fallback — CI builds the Rust engine from source for the APK (`cargoNdkAndroid`) and bundles it into the packaged desktop apps.
+**rustc/cargo are NOT required to build or run Myotis.** The JVM/Android build is
+pure Java/Kotlin end to end: the UniFFI-generated Kotlin bindings are committed
+source (no bindgen step at build time), JNA comes from Maven Central like any other
+dependency, and every `cargo*` Gradle task self-skips with a single note when cargo
+is missing. On a cargo-less machine the engine selector simply reports the Rust
+engine as unavailable and everything runs on the Java engine (the default,
+`myotis.engine=java`) — there is nothing to configure or disable. The exceptions
+that DO need a Rust toolchain: the packaged desktop installers
+(`packageDmg`/`packageDeb`/`runDistributable` fail loudly without cargo, so an
+installed app can always switch engines) and regenerating the Android jniLibs
+(`cargoNdkAndroid`; the committed jniLibs are the fallback). Release artifacts
+don't rely on committed binaries — CI builds the Rust engine from source for the
+APK and the packaged desktop apps.
+
+To actually build the Rust engine and bundle it, per target:
+
+| Target | Requirements |
+|---|---|
+| Desktop dev loop + packaged installers (`packageDmg`/`packageDeb`) | rustc/cargo **stable ≥ 1.85** (`rust-toolchain.toml` tracks stable; the Gradle probe skips anything older). Builds the host triple; the x64 dmg CI leg additionally passes `-PrustTarget=x86_64-apple-darwin` under Rosetta. |
+| Android jniLibs (`cargoNdkAndroid`) | The same rustc/cargo, plus `rustup target add aarch64-linux-android x86_64-linux-android`, `cargo install cargo-ndk`, and an Android **NDK r28+** (16 KB-aligned LOAD segments for Android 15+; older NDKs work because `.cargo/config.toml` forces the alignment, and the build fails loudly if it slips). Found via `$ANDROID_NDK_HOME` or the newest `<sdk>/ndk/<version>`. |
+| iOS framework (`:app-ios`) | macOS with **Xcode 26+** and `rustup target add --toolchain stable aarch64-apple-ios aarch64-apple-ios-sim`. Without them the framework tasks disable themselves with a warning (a previously built `libmyotis_engine.a` also satisfies them). |
+| Regenerating the committed Kotlin bindings (`uniffiGenerateKotlin`) | Just rustc/cargo — the pinned `rust/uniffi-bindgen` CLI builds from the workspace. Re-run after any `ffi.rs` shape change. |
 
 ```bash
-./gradlew cargoBuildHost    # cargo build --release (auto-runs before :app:run / :consensus:test)
-./gradlew cargoTest         # cargo test --workspace (part of `check`)
-./gradlew cargoNdkAndroid   # Android jniLibs (needs cargo-ndk + NDK)
+./gradlew cargoBuildHost       # cargo build --release (auto-runs before :app:run / :consensus:test)
+./gradlew cargoTest            # cargo test --workspace (part of `check`)
+./gradlew cargoNdkAndroid      # Android jniLibs (needs cargo-ndk + NDK)
+./gradlew uniffiGenerateKotlin # regenerate the committed Kotlin bindings after ffi.rs changes
 ./gradlew :app:run -Pengine=rust          # daemon on the Rust engine
 ./gradlew :app-desktop:run -Pengine=rust  # desktop GUI on the Rust engine
 ```
@@ -750,7 +765,7 @@ Rust builds are **optional for the pure-Java dev loop**: without cargo the Gradl
 Key Gradle modules (plus the `rust/` Cargo workspace):
 
 - **myotis-api** -- the engine contract: zero-dependency interfaces every host consumes exclusively
-- **myotis-engines** -- the engine selector (`Engines.engine()`; `myotis.engine=java|rust|auto`) routing to the Java engine or the Rust one over JNI
+- **myotis-engines** -- the engine selector (`Engines.engine()`; `myotis.engine=java|rust|auto`) routing to the Java engine or the Rust one over UniFFI + JNA
 - **node-core** -- the Java engine's adapters (`JavaMyotisEngine`/`JavaChainHandle`) plus the verification ladder over the modules below
 - **core** -- cryptographic identity (`NodeKey`), data types (`BlockHeader`), ENR decoding
 - **networking** -- protocol layers, all Netty-based:
@@ -797,3 +812,13 @@ DNS resolution is best-effort: on timeout, missing TXT records, or signature mis
 - **BouncyCastle** -- SECP256K1 crypto provider
 - **jvm-libp2p** -- beacon chain P2P networking (consensus module)
 - **dnsjava 3.6** -- TXT-record resolution for EIP-1459 ENR tree walks
+
+## License
+
+Myotis is licensed under the [Apache License, Version 2.0](LICENSE).
+
+Copyright 2026 Dirk Jäckel.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in Myotis shall be licensed under Apache 2.0 as
+above, without any additional terms or conditions.

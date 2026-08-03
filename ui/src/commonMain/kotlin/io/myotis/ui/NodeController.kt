@@ -1,6 +1,7 @@
 package io.myotis.ui
 
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
 
 /**
  * The backend operations the shared UI needs, abstracted so each platform supplies its own
@@ -68,6 +69,20 @@ interface NodeController {
     fun applyEngineChoice()
 
     /**
+     * Re-apply Tor verified-read routing to the process-global selector after
+     * [Settings.setTorEnabled] flips the preference (docs/privacy-and-tor.md). Tor is a
+     * Rust-engine-only, experimental capability, so hosts that don't support it (Android/iOS
+     * for now) keep the default no-op; the desktop actual pushes the flag to `Tor.select`.
+     * Like the engine toggle it is NOT live: it applies to networks (re)started afterwards.
+     */
+    fun applyTorMode() {}
+
+    /** Push the (persisted) log-index preference for [network] down to the
+     *  engine — called from the settings toggle and at network (re)start.
+     *  Default no-op for hosts without the Rust engine's log index. */
+    fun applyLogIndex(network: String) {}
+
+    /**
      * Wipe a network's peer caches — clear the live stack's backoff/blacklist and delete the
      * on-disk EL/CL peer cache files — so discovery starts from a fresh slate. Safe whether or
      * not the network is currently running.
@@ -95,6 +110,21 @@ interface NodeController {
      * resolution failures surface as [EnsResult.error].
      */
     suspend fun resolveEns(network: String, name: String): EnsResult
+
+    /**
+     * Whether [transactionHistory] works for [network] on this host. Desktop-mainnet-only
+     * today (the TrueBlocks scan needs the JVM Java engine's internals); the defaults keep
+     * Android/iOS compiling and hide the Query-tab section there.
+     */
+    fun supportsTransactionHistory(network: String): Boolean = false
+
+    /**
+     * Stream the TrueBlocks Unchained Index transaction history for [address] on
+     * [network], newest first — an UNVERIFIED explorer/debug aid, not a wallet feature.
+     * The flow is cold and cancellable: cancelling the collection stops the scan.
+     * Hosts that return true from [supportsTransactionHistory] must override this.
+     */
+    fun transactionHistory(network: String, address: String): Flow<TxScanEvent> = emptyFlow()
 
     // Logs / Settings ops are added with their screens.
 }
@@ -162,6 +192,22 @@ interface Settings {
     /** true = prefer the (experimental) Rust engine for newly started networks; default false. */
     fun rustEngineEnabled(): Boolean
     fun setRustEngineEnabled(v: Boolean)
+
+    /**
+     * true = route verified reads over Tor (docs/privacy-and-tor.md) — experimental, and
+     * Rust-engine-only (Arti is embedded in the Rust engine). Default false. Hosts that
+     * can't support it keep the default no-op getter/setter so Android/iOS still compile;
+     * the desktop actual persists it and [NodeController.applyTorMode] pushes it down.
+     */
+    fun torEnabled(): Boolean = false
+    fun setTorEnabled(v: Boolean) {}
+
+    /** Opt-in eth_getLogs watch-list index (the shipped Kohaku preset), per
+     *  network. Defaults keep hosts without the feature compiling; the
+     *  desktop/iOS actuals persist it and [NodeController.applyLogIndex]
+     *  pushes the preset config down to the Rust engine. */
+    fun logIndexEnabled(network: String): Boolean = false
+    fun setLogIndexEnabled(network: String, on: Boolean) {}
 
     /**
      * Minutes of no RPC/UI activity before a running stack is paused into idle sleep
@@ -245,8 +291,27 @@ data class NodeSnapshot(
     val lastPauseEpochMs: Long,        // wall-clock ms of the last pause; 0 if never
     val lastResumeEpochMs: Long,       // wall-clock ms of the last DEMAND wake; 0 if none
     val lastWakeReason: String?,       // reason of the last demand wake; null if none
+    // JSON-RPC listener state, for the Status "RPC" row. rpcPort 0 = the host
+    // doesn't run/report a listener (row hidden — desktop/Android default until
+    // their hosts wire it); rpcServing = bound and serving on 127.0.0.1:rpcPort,
+    // false = the port was taken / the bind failed (the row says so).
+    val rpcPort: Int = 0,
+    val rpcServing: Boolean = false,
     val lcHunting: Boolean = false,    // LC hunt engaged: starved of light-client servers,
                                        // aggressively discovering/probing for new ones
+    val elHunting: Boolean = false,    // EL hunt engaged: snap serving pool empty past the
+                                       // stall window, emergency re-dials running
+    // Tor verified-read routing (docs/privacy-and-tor.md), Status "Tor" row.
+    // null = not applicable (Java engine / build without Tor support); otherwise
+    // "off" (supported, disabled), "on" (enabled, circuit still bootstrapping),
+    // or "active" (enabled AND a Tor circuit is ready — reads route over Tor).
+    val tor: String? = null,
+    // null = log index not applicable/configured; otherwise a short progress
+    // string, e.g. "12,041 logs · 5,594,611–8,461,900" or "backfilling".
+    val logIndex: String? = null,
+    // Raw engine status JSON for the Index tab (null when the feature is off
+    // or the engine is unavailable); parsed via [LogIndexStatus.parse].
+    val logIndexJson: String? = null,
 )
 
 /** One connected READY peer, for the Status peer list. */

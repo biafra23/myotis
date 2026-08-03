@@ -70,6 +70,38 @@ public final class ChainStack {
     private static final int DNS_DIALS_PER_MIN = 60;         // rolling-minute rate cap
     private static final int DNS_POOL_MAX = 600;             // candidate-pool size cap
     private static final long DNS_REFRESH_INTERVAL_MS = 4 * 60 * 1000L;
+    /** EL hunt: the snap SERVING pool has been empty this long → emergency mode.
+     *  Deliberately zero-based, not target-based — on snap-scarce chains (gnosis)
+     *  the target is unreachable and a below-target trigger would hunt forever;
+     *  zero serving is the state where verified reads are actually impossible.
+     *  The hunt bypasses transient backoffs for cache-CONFIRMED snap servers
+     *  (they served chain-verified snap data — wrong-chain impossible), doubles
+     *  the DNS dial budget, and shortens the DNS re-walk interval. The Rust
+     *  engine's pool maintainer applies the same trigger (EL_HUNT_STALL). */
+    static final long EL_HUNT_STALL_MS = 60_000L;
+
+    /** Backoff for peers that rejected us with TooManyPeers (0x04): alive, just
+     *  full. Longer than transient (halves the dial burn on saturated networks)
+     *  but short enough to keep farming freed slots. While the EL hunt is
+     *  engaged the transient window applies instead — see {@link #busyBackoffMs}. */
+    static final long BACKOFF_BUSY_MS = 60_000L;
+
+    /** Distinct peers that rejected us with TooManyPeers recently (rolling
+     *  window) — hunt diagnostics: distinguishes "the network is full" from
+     *  "the network is dead" when the serving pool is empty. */
+    private final Map<String, Long> busySeen = new ConcurrentHashMap<>();
+    private static final long BUSY_SEEN_WINDOW_MS = 10 * 60 * 1000L;
+    /** DNS ENR re-walk interval while the EL hunt is engaged (vs 4 min normally). */
+    private static final long DNS_REFRESH_HUNT_INTERVAL_MS = 60_000L;
+
+    /** How recent a successful DNS ENR-tree resolve still counts as an
+     *  online signal for {@link #reportConnectFailure}. Deliberately short: a
+     *  device that drops offline right after a resolve must stop counting
+     *  failures before it can demote healthy cached peers (at the ~40s re-dial
+     *  cadence a 2-min window allows ~3 counts — under the demote threshold).
+     *  Undercounting while online merely slows demotion, which is fine. */
+    private static final long ONLINE_SIGNAL_MAX_AGE_MS = 2 * 60 * 1000L;
+
     /** Max time a verified read arriving on a paused stack is held while the wake completes. */
     public static final long WAKE_WAIT_CAP_MS = 90_000L;
     /** Wake-wait poll interval. */
@@ -104,9 +136,26 @@ public final class ChainStack {
     private volatile List<Enr> dnsElPool = List.of();
     private final AtomicBoolean dnsResolving = new AtomicBoolean(false);
     private volatile long lastDnsResolveMs = 0L;
+    /** Last DNS ENR-tree walk that returned at least one ENR. Distinct from
+     *  {@link #lastDnsResolveMs}: the resolver swallows per-tree failures and
+     *  returns an empty list offline, and the walk itself is throttled by
+     *  {@code lastDnsResolveMs} — so a FAILED walk must still count for the
+     *  refresh cadence but must NOT count as an online signal, or an offline
+     *  hunting machine (60s re-walks < the 2-min window) would keep the
+     *  connect-failure gate permanently open and decimate its own cache. */
+    private volatile long lastDnsSuccessMs = 0L;
     private volatile long dnsDialWindowStartMs = 0L;
     private final AtomicInteger dnsDialsInWindow = new AtomicInteger(0);
     private volatile ScheduledExecutorService peerMaintainer;
+    /** Monotonic ms (nanoTime-derived) when the snap serving pool went empty. Only
+     *  meaningful while {@link #snapZeroActive}; nanoTime's origin is arbitrary (can
+     *  be ≤ 0), so an explicit flag marks validity instead of a 0 sentinel. Written
+     *  by the maintainer tick, read by {@link #elHunting()} / the status snapshot. */
+    private volatile long snapZeroSinceMs = 0L;
+    /** True while the serving pool is empty and {@link #snapZeroSinceMs} is valid. */
+    private volatile boolean snapZeroActive = false;
+    /** EL hunt engaged (see EL_HUNT_STALL_MS). Maintainer-tick-updated. */
+    private volatile boolean elHunting = false;
 
     // -- live components (built in start()) ------------------------------------
     /** Inbound-serve counters (peers asking US for headers/bodies). Stack-owned so the
@@ -119,6 +168,9 @@ public final class ChainStack {
     private volatile BeaconLightClient beaconLightClient;
     private volatile io.myotis.rpc.VerifiedRpcBackend rpcBackend;
     private volatile io.myotis.jsonrpc.MyotisRpcServer rpcServer;
+    /** The port startRpc() was configured with (recorded even when the bind fails,
+     *  so the status row can show the failure); 0 until startRpc runs. */
+    private volatile int rpcListenPort;
 
     /** Status source for the JSON-RPC myotis_status / myotis_beaconStatus methods; the
      *  wrapping handle late-binds it (see {@link #setStatusReads}) before start(). */
@@ -317,13 +369,21 @@ public final class ChainStack {
             startDiscV5();                   // non-essential, warn-and-continue
             BeaconLightClient blc = beaconLightClient;
             if (blc != null) blc.resume();
-            if (rpcServer != null) {
+            io.myotis.jsonrpc.MyotisRpcServer liveServer = rpcServer;
+            if (liveServer != null && liveServer.isServing()) {
                 // The listener survived the pause; swap a fresh backend in behind
                 // the gate (the old one died with the previous connector).
                 io.myotis.rpc.VerifiedRpcBackend backend = buildAndStartBackend();
                 this.rpcBackend = backend;
             } else {
-                startRpc(); // first start's bind failed — retry best-effort
+                // Absent (first bind failed) OR dead (crashGuard latched a fatal
+                // failure — previously unrecoverable, the row stayed red forever):
+                // tear down any corpse and retry the full start best-effort.
+                if (liveServer != null) {
+                    try { liveServer.stop(); } catch (Throwable ignored) {}
+                    rpcServer = null;
+                }
+                startRpc();
             }
             if (maintainerEnabled) startPeerMaintainer();
             phase.set(RUNNING);
@@ -348,6 +408,14 @@ public final class ChainStack {
      * would block re-dials on resume.
      */
     private void closeNetworkingComponents() {
+        // EL hunt state must not leak across a pause: the wall time spent
+        // paused would otherwise count toward the stall window and the first
+        // maintainer tick after resume would trip emergency mode instantly
+        // (the Rust engine rebuilds its pool with fresh state on resume —
+        // keep the engines' behavior aligned).
+        snapZeroSinceMs = 0L;
+        snapZeroActive = false;
+        elHunting = false;
         ScheduledExecutorService pm = peerMaintainer;
         if (pm != null) { pm.shutdownNow(); peerMaintainer = null; }
         io.myotis.rpc.VerifiedRpcBackend backend = rpcBackend;
@@ -384,6 +452,10 @@ public final class ChainStack {
         ScheduledExecutorService pm = peerMaintainer;
         if (pm != null) { pm.shutdownNow(); peerMaintainer = null; }
         if (rpcServer != null) { try { rpcServer.stop(); } catch (Throwable ignored) {} }
+        // A stopped stack has no listener EXPECTATION either — zero the recorded
+        // port so the status row hides instead of misreporting a normal stop as
+        // a red bind failure.
+        rpcListenPort = 0;
         if (rpcBackend != null) { try { rpcBackend.close(); } catch (Throwable ignored) {} }
         if (beaconLightClient != null) { try { beaconLightClient.close(); } catch (Throwable ignored) {} }
         if (connector != null) { try { connector.close(); } catch (Throwable ignored) {} }
@@ -393,6 +465,7 @@ public final class ChainStack {
         try { clPeerCache.close(); } catch (Throwable ignored) {}
         attempted.clear();
         backoff.clear();
+        busySeen.clear();
         blacklistedNodeIds.clear();
     }
 
@@ -485,6 +558,32 @@ public final class ChainStack {
     public boolean lcHunting() {
         BeaconLightClient b = beaconLightClient;
         return b != null && b.isHunting();
+    }
+
+    /** EL hunt engaged: snap serving pool empty past the stall window. */
+    /** The JSON-RPC port the listener was configured with (0 = none configured yet). */
+    public int rpcListenPort() {
+        return rpcListenPort;
+    }
+
+    /** Live listener state: bound AND its supervisor hasn't recorded a fatal
+     *  failure. Consults the server (not just the start outcome) so an
+     *  asynchronously-died listener reads false, iOS-controller parity. */
+    public boolean rpcServing() {
+        io.myotis.jsonrpc.MyotisRpcServer s = rpcServer;
+        return s != null && s.isServing();
+    }
+
+    public boolean elHunting() {
+        return elHunting;
+    }
+
+    /** Pure trigger for the EL hunt (unit-tested; the Rust pool's el_hunt_due twin):
+     *  serving pool empty AND it has been empty past the stall window. The explicit
+     *  {@code zeroActive} flag (not a timestamp sentinel) keeps this correct on
+     *  platforms where nanoTime readings are zero or negative. */
+    static boolean elHuntDue(int servingPeers, boolean zeroActive, long zeroSinceMs, long nowMs) {
+        return servingPeers == 0 && zeroActive && nowMs - zeroSinceMs >= EL_HUNT_STALL_MS;
     }
     public LifecycleState lifecycle() { return phase.get(); }
     public RLPxConnector connector() { return connector; }
@@ -600,10 +699,12 @@ public final class ChainStack {
             dialed++;
             final String key = peerKey;
             try {
-                connector.connect(pe.address(), pe.pubkey(), (incompatible, nodeIdHex) -> {
+                connector.connect(pe.address(), pe.pubkey(), (incompatible, busy, nodeIdHex) -> {
                             if (incompatible) blacklistedNodeIds.add(nodeIdHex);
+                            if (busy) noteBusy(key);
                             backoff.putIfAbsent(key, System.currentTimeMillis()
-                                    + (incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS));
+                                    + (incompatible ? BACKOFF_INCOMPATIBLE_MS
+                                       : busy ? busyBackoffMs() : BACKOFF_TRANSIENT_MS));
                             attempted.remove(key);
                         })
                         .addListener(future -> { if (!future.isSuccess()) attempted.remove(key); });
@@ -645,7 +746,26 @@ public final class ChainStack {
             if (!headers.isEmpty()) {
                 log.debug("[{}] {} block header(s) received", network.name(), headers.size());
             }
-        }, (address, publicKeyHex, snap) -> peerCache.add(address, publicKeyHex, snap), serveStats);
+        }, (address, publicKeyHex, snap) -> {
+            peerCache.add(address, publicKeyHex, snap);
+            // Nudge discovery toward this PROVEN peer's neighbourhood: peers
+            // reached via the DNS pool or cache may never enter the discv4
+            // table on their own, so the random walk would never ask them for
+            // neighbours. UDP port is a guess (= TCP port, the devp2p default);
+            // a wrong guess just means no pong, which is harmless.
+            DiscV4Service d4 = discV4;
+            if (d4 != null) {
+                try {
+                    // Pass the dial address through as-is (same host:port) —
+                    // constructing a fresh InetSocketAddress from a host string
+                    // could do a blocking DNS lookup on this Netty event-loop
+                    // thread if a dial source ever supplies hostnames.
+                    d4.probeEndpoint(address);
+                } catch (Throwable ignored) {
+                    // discovery nudge must never break the READY path
+                }
+            }
+        }, serveStats);
         // Apply a window size set before start(): setServedBlockWindow may have run while
         // connector was still null (hosts read Settings before booting the stack).
         conn.servedWindow().setMaxWindow(servedBlockWindow);
@@ -663,9 +783,11 @@ public final class ChainStack {
             try {
                 SECP256K1.PublicKey pubKey = SECP256K1.PublicKey.fromBytes(
                         Bytes.fromHexString(peer.publicKeyHex()));
-                connector.connect(peer.address(), pubKey, (incompatible, nodeIdHex) -> {
+                connector.connect(peer.address(), pubKey, (incompatible, busy, nodeIdHex) -> {
                             if (incompatible) blacklistedNodeIds.add(nodeIdHex);
-                            long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
+                            if (busy) noteBusy(peerKey);
+                            long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS
+                                    : busy ? busyBackoffMs() : BACKOFF_TRANSIENT_MS;
                             backoff.putIfAbsent(peerKey, System.currentTimeMillis() + backoffMs);
                             attempted.remove(peerKey);
                         })
@@ -691,9 +813,11 @@ public final class ChainStack {
                 if (!attempted.add(peerKey)) continue;
                 directDialed++;
                 final String key = peerKey;
-                connector.connect(peerTcp, pub.get(), (incompatible, nodeIdHex) -> {
+                connector.connect(peerTcp, pub.get(), (incompatible, busy, nodeIdHex) -> {
                             if (incompatible) blacklistedNodeIds.add(nodeIdHex);
-                            long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
+                            if (busy) noteBusy(key);
+                            long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS
+                                    : busy ? busyBackoffMs() : BACKOFF_TRANSIENT_MS;
                             backoff.putIfAbsent(key, System.currentTimeMillis() + backoffMs);
                             attempted.remove(key);
                         })
@@ -845,10 +969,11 @@ public final class ChainStack {
                 // it survives pause() (keeps listening) while the backend underneath
                 // is torn down and rebuilt, and a request on a paused stack wakes it.
                 io.myotis.jsonrpc.MyotisRpcServer server =
-                        new io.myotis.jsonrpc.MyotisRpcServer(rpcPort, null, "127.0.0.1", gatedReads, statusReads);
+                        io.myotis.jsonrpc.MyotisRpc.server(rpcPort, null, "127.0.0.1", gatedReads, statusReads);
                 server.start();
                 this.rpcServer = server;
                 this.rpcBackend = backend;
+                rpcListenPort = rpcPort; // publish AFTER the server: no red flash mid-boot
                 log.info("[{}] JSON-RPC listening on http://127.0.0.1:{} (verified, strict)",
                         network.name(), rpcPort);
             } catch (Throwable serverEx) {
@@ -856,9 +981,11 @@ public final class ChainStack {
                 throw serverEx;
             }
         } catch (java.io.IOException bindEx) {
+            rpcListenPort = rpcPort; // recorded so the status row shows the failure
             log.warn("[{}][rpc] port {} unavailable ({}); continuing without JSON-RPC",
                     network.name(), rpcPort, bindEx.getMessage());
         } catch (Throwable t) {
+            rpcListenPort = rpcPort;
             log.warn("[{}][rpc] failed to start JSON-RPC; continuing without it: {}",
                     network.name(), t.toString());
         }
@@ -869,9 +996,11 @@ public final class ChainStack {
             Bytes nodeId = entry.nodeId();
             if (nodeId.size() != 64) { attempted.remove(peerKey); return; }
             SECP256K1.PublicKey peerPubkey = SECP256K1.PublicKey.fromBytes(nodeId);
-            connector.connect(peerTcp, peerPubkey, (incompatible, nodeIdHex) -> {
+            connector.connect(peerTcp, peerPubkey, (incompatible, busy, nodeIdHex) -> {
                         if (incompatible) blacklistedNodeIds.add(nodeIdHex);
-                        long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
+                        if (busy) noteBusy(peerKey);
+                        long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS
+                                    : busy ? busyBackoffMs() : BACKOFF_TRANSIENT_MS;
                         backoff.putIfAbsent(peerKey, System.currentTimeMillis() + backoffMs);
                         attempted.remove(peerKey);
                     })
@@ -921,9 +1050,44 @@ public final class ChainStack {
         try {
             RLPxConnector conn = connector;
             if (conn == null) return;
+            // target <= 0 = maintainer deliberately idle: an empty pool is the
+            // EXPECTED state, not starvation — never engage (or advertise) the
+            // hunt, and clear any state left from a previous target.
+            if (targetSnapPeers <= 0) {
+                snapZeroActive = false;
+                if (elHunting) {
+                    elHunting = false;
+                    log.info("[{}][peers] EL hunt disengaged — snap target set to 0", network.name());
+                }
+                return;
+            }
             int snapPeers = conn.activeSnapHandlers().size();
-            if (snapPeers >= targetSnapPeers) return;
             long now = System.currentTimeMillis();
+            // EL hunt bookkeeping: stall clock while the SERVING pool is empty,
+            // trigger + transition logs (Rust maintainer_loop twin).
+            long monotonicNowMs = System.nanoTime() / 1_000_000L;
+            if (snapPeers > 0) {
+                snapZeroActive = false;
+                if (elHunting) {
+                    elHunting = false;
+                    log.info("[{}][peers] EL hunt disengaged — snap peer serving again", network.name());
+                }
+            } else if (!snapZeroActive) {
+                snapZeroActive = true;
+                snapZeroSinceMs = monotonicNowMs;
+            }
+            // Monotonic clock: an NTP jump during a momentary outage must not
+            // fake a 60s stall (same rule as verifiedHeadAgeMs).
+            boolean hunting = elHuntDue(snapPeers, snapZeroActive, snapZeroSinceMs, monotonicNowMs);
+            if (hunting && !elHunting) {
+                elHunting = true;
+                log.info("[{}][peers] EL hunt engaged — snap serving pool empty {}s "
+                        + "(bypassing transient backoffs for confirmed snap servers, "
+                        + "boosted DNS budget; {} distinct busy peer(s) in the last {} min "
+                        + "— busy means full-not-dead)", network.name(), EL_HUNT_STALL_MS / 1000,
+                        busySeenCount(), BUSY_SEEN_WINDOW_MS / 60_000);
+            }
+            if (snapPeers >= targetSnapPeers) return;
             log.info("[{}][peers] {} snap peer(s) < target {}; re-dialing cached + DNS pool",
                     network.name(), snapPeers, targetSnapPeers);
             // 1) Re-dial known snap peers from the cache, proven snap-servers first.
@@ -935,6 +1099,29 @@ public final class ChainStack {
             for (CachedPeer p : snapCached) {
                 if (conn.activeSnapHandlers().size() >= targetSnapPeers) break;
                 try {
+                    // Hunting: free a CONFIRMED snap server's TRANSIENT backoff so
+                    // this pass dials it NOW. Confirmed = it served chain-verified
+                    // snap data. The backoff map holds transient (30s), busy (60s),
+                    // and incompatible (10min) entries under the same key, so only
+                    // clear entries within the transient window — a peer re-marked
+                    // incompatible after its confirm (post-fork lag) keeps its
+                    // 10-min timer instead of being re-dialed every 10s tick.
+                    // Busy entries: outside the hunt they're 60s and enter the
+                    // clearable window once ≤30s remain; DURING the hunt they're
+                    // written at 30s (busyBackoffMs) and are therefore clearable
+                    // immediately — a CONFIRMED-but-busy server gets re-dialed
+                    // roughly every maintainer tick (~10s) while the pool is
+                    // empty. Intentional, eyes open: it's bounded to the few
+                    // confirmed servers, only runs in emergency mode, and each
+                    // extra attempt is a cheap fast-refusal (geth-class nodes
+                    // throttle repeat inbound within ~30s anyway) — maximal
+                    // slot-farming pressure exactly when a freed slot is the
+                    // only way back to verified reads.
+                    if (hunting && p.snapQuality() == SnapQuality.CONFIRMED) {
+                        String key = p.address().getHostString() + ":" + p.address().getPort();
+                        backoff.computeIfPresent(key,
+                                (k, exp) -> exp - now > BACKOFF_TRANSIENT_MS ? exp : null);
+                    }
                     dialCachedSnapPeer(conn, p, now);
                 } catch (Exception e) {
                     log.warn("[{}][peers] skipping cached peer: {}", network.name(), e.getMessage());
@@ -944,7 +1131,9 @@ public final class ChainStack {
             //    bounded by a per-cycle batch and a rolling-minute rate cap.
             List<Enr> pool = dnsElPool;
             if (!pool.isEmpty() && conn.activeSnapHandlers().size() < targetSnapPeers) {
-                int budget = Math.min(DNS_MAINTAIN_DIAL_BATCH, dnsDialBudget());
+                // Hunting doubles both the per-cycle batch and the rolling-minute cap.
+                int batchCap = hunting ? DNS_MAINTAIN_DIAL_BATCH * 2 : DNS_MAINTAIN_DIAL_BATCH;
+                int budget = Math.min(batchCap, dnsDialBudget(hunting));
                 int dialed = 0;
                 for (Enr enr : pool) {
                     if (dialed >= budget || attempted.size() >= MAX_ATTEMPTED) break;
@@ -960,9 +1149,10 @@ public final class ChainStack {
             }
             // 3) Grow/refresh the candidate pool — only while still below target and no
             //    more often than DNS_REFRESH_INTERVAL_MS.
+            long refreshInterval = hunting ? DNS_REFRESH_HUNT_INTERVAL_MS : DNS_REFRESH_INTERVAL_MS;
             if (conn.activeSnapHandlers().size() < targetSnapPeers
                     && !dnsResolving.get()
-                    && System.currentTimeMillis() - lastDnsResolveMs > DNS_REFRESH_INTERVAL_MS) {
+                    && System.currentTimeMillis() - lastDnsResolveMs > refreshInterval) {
                 Thread t = new Thread(this::refreshDnsPool, "dns-el-refresh-" + network.name());
                 t.setDaemon(true);
                 t.start();
@@ -991,6 +1181,7 @@ public final class ChainStack {
             // drop the result instead of merging into / writing the pool of a dead stack.
             if (phase.get() != RUNNING) return;
             lastDnsResolveMs = System.currentTimeMillis();
+            if (!resolved.isEmpty()) lastDnsSuccessMs = lastDnsResolveMs;
 
             byte[] ourFork = network.forkIdHash();
             LinkedHashMap<String, Enr> merged = new LinkedHashMap<>();
@@ -1011,9 +1202,17 @@ public final class ChainStack {
                     dropped++; // malformed ENR — skip, don't abort the refresh
                 }
             }
-            dnsElPool = new ArrayList<>(merged.values());
-            log.info("[{}] DNS EL pool: +{} new, {} dropped (off-fork/malformed), {} total",
-                    network.name(), added, dropped, dnsElPool.size());
+            // Stable partition: fork-id-verified entries dial before entries with
+            // no eth forkid at all. The latter can't be pre-filtered (wrong-chain
+            // ones only reveal themselves at the Status handshake), so they must
+            // not compete equally for the per-cycle dial budget.
+            List<Enr> ranked = new ArrayList<>(merged.values());
+            ranked.sort(Comparator.comparingInt(ChainStack::enrForkRank));
+            dnsElPool = ranked;
+            log.info("[{}] DNS EL pool: +{} new, {} dropped (off-fork/malformed), {} total "
+                    + "({} forkid-verified ranked first)",
+                    network.name(), added, dropped, ranked.size(),
+                    ranked.stream().filter(e -> enrForkRank(e) == 0).count());
         } catch (Exception e) {
             log.warn("[{}] DNS EL pool refresh failed: {}", network.name(), e.getMessage());
         } finally {
@@ -1021,14 +1220,31 @@ public final class ChainStack {
         }
     }
 
+    /** Dial rank for a DNS-pool ENR: 0 = carries an eth forkid (fork-verified on
+     *  merge — mismatches never enter the pool), 1 = no forkid (unverifiable until
+     *  the Status handshake). A malformed entry shares rank 1 — both are
+     *  "unverifiable until dialed", so they compete equally behind verified ones. */
+    private static int enrForkRank(Enr e) {
+        try {
+            return e.ethForkIdHash().isPresent() ? 0 : 1;
+        } catch (Exception ex) {
+            return 1;
+        }
+    }
+
     /** Remaining DNS-pool dials allowed in the current rolling minute (see DNS_DIALS_PER_MIN). */
-    private int dnsDialBudget() {
+    private int dnsDialBudget(boolean hunting) {
+        int cap = hunting ? DNS_DIALS_PER_MIN * 2 : DNS_DIALS_PER_MIN;
+        return Math.max(0, cap - dnsDialsInWindowCount());
+    }
+
+    private int dnsDialsInWindowCount() {
         long now = System.currentTimeMillis();
         if (now - dnsDialWindowStartMs >= 60_000L) {
             dnsDialWindowStartMs = now;
             dnsDialsInWindow.set(0);
         }
-        return Math.max(0, DNS_DIALS_PER_MIN - dnsDialsInWindow.get());
+        return dnsDialsInWindow.get();
     }
 
     /** Dial one DNS-resolved (EIP-1459) EL enode over RLPx — same attempted/backoff/blacklist
@@ -1048,15 +1264,18 @@ public final class ChainStack {
             }
             if (attempted.size() >= MAX_ATTEMPTED || !attempted.add(peerKey)) return false;
             final String key = peerKey;
-            conn.connect(peerTcp, pub.get(), (incompatible, idHex) -> {
+            conn.connect(peerTcp, pub.get(), (incompatible, busy, idHex) -> {
                 if (incompatible) blacklistedNodeIds.add(idHex);
-                long ms = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
+                if (busy) noteBusy(key);
+                long ms = incompatible ? BACKOFF_INCOMPATIBLE_MS
+                        : busy ? busyBackoffMs() : BACKOFF_TRANSIENT_MS;
                 backoff.putIfAbsent(key, System.currentTimeMillis() + ms);
                 attempted.remove(key);
             }).addListener(future -> {
                 if (!future.isSuccess()) {
                     backoff.putIfAbsent(key, System.currentTimeMillis() + BACKOFF_TRANSIENT_MS);
                     attempted.remove(key);
+                    reportConnectFailure(peerTcp);
                 }
             });
             return true;
@@ -1078,9 +1297,11 @@ public final class ChainStack {
         if (attempted.size() >= MAX_ATTEMPTED || !attempted.add(peerKey)) return;
         try {
             SECP256K1.PublicKey pubKey = SECP256K1.PublicKey.fromBytes(Bytes.fromHexString(p.publicKeyHex()));
-            conn.connect(p.address(), pubKey, (incompatible, idHex) -> {
+            conn.connect(p.address(), pubKey, (incompatible, busy, idHex) -> {
                 if (incompatible) blacklistedNodeIds.add(idHex);
-                long ms = incompatible ? BACKOFF_INCOMPATIBLE_MS : BACKOFF_TRANSIENT_MS;
+                if (busy) noteBusy(peerKey);
+                long ms = incompatible ? BACKOFF_INCOMPATIBLE_MS
+                        : busy ? busyBackoffMs() : BACKOFF_TRANSIENT_MS;
                 backoff.putIfAbsent(peerKey, System.currentTimeMillis() + ms);
                 attempted.remove(peerKey);
             }).addListener(future -> {
@@ -1090,10 +1311,68 @@ public final class ChainStack {
                 if (!future.isSuccess()) {
                     backoff.putIfAbsent(peerKey, System.currentTimeMillis() + BACKOFF_TRANSIENT_MS);
                     attempted.remove(peerKey);
+                    reportConnectFailure(p.address());
                 }
             });
         } catch (Exception e) {
             attempted.remove(peerKey);
+        }
+    }
+
+    /** Busy peers wait {@link #BACKOFF_BUSY_MS} normally — but while the EL
+     *  hunt is engaged they retry on the transient cadence instead: when the
+     *  serving pool is empty, proven-alive-but-full nodes are the only
+     *  realistic source of a freed slot, and slots are won by fast retries. */
+    private long busyBackoffMs() {
+        return elHunting ? BACKOFF_TRANSIENT_MS : BACKOFF_BUSY_MS;
+    }
+
+    /** Note a TooManyPeers rejection for hunt diagnostics (bounded, rolling). */
+    private void noteBusy(String peerKey) {
+        long now = System.currentTimeMillis();
+        busySeen.put(peerKey, now);
+        if (busySeen.size() > 256) {
+            busySeen.values().removeIf(t -> now - t > BUSY_SEEN_WINDOW_MS);
+            // Hard bound even when >256 are genuinely inside the window: drop
+            // oldest first — the counter is diagnostics, not bookkeeping.
+            while (busySeen.size() > 256) {
+                String oldest = null;
+                long oldestTs = Long.MAX_VALUE;
+                for (Map.Entry<String, Long> e : busySeen.entrySet()) {
+                    if (e.getValue() < oldestTs) { oldestTs = e.getValue(); oldest = e.getKey(); }
+                }
+                if (oldest == null) break;
+                busySeen.remove(oldest);
+            }
+        }
+    }
+
+    /** Distinct busy peers seen inside the rolling window (prunes as it counts). */
+    private int busySeenCount() {
+        long now = System.currentTimeMillis();
+        busySeen.values().removeIf(t -> now - t > BUSY_SEEN_WINDOW_MS);
+        return busySeen.size();
+    }
+
+    /** Report a TCP-level dial failure to the peer cache (streaks demote and
+     *  eventually evict long-dead peers) — but only while demonstrably online:
+     *  a recent successful DNS ENR-tree resolve or any live RLPx connection.
+     *  Without the guard, a machine that lost its network would count a failure
+     *  against every cached peer each maintainer cycle and decimate the cache.
+     *  Known divergence from the Rust twin: Rust also counts ECIES handshake
+     *  failures (a cached entry with a rotated node key can never handshake
+     *  again), while here the Netty connect future only surfaces pre-handshake
+     *  TCP failures — post-TCP failures land in the close callback, which can't
+     *  distinguish a stale-key peer from a healthy one disconnecting, so they
+     *  are deliberately not counted. */
+    private void reportConnectFailure(InetSocketAddress address) {
+        try {
+            RLPxConnector conn = connector;
+            boolean online = System.currentTimeMillis() - lastDnsSuccessMs < ONLINE_SIGNAL_MAX_AGE_MS
+                    || (conn != null && !conn.getActivePeers().isEmpty());
+            if (online) peerCache.recordConnectFailure(address);
+        } catch (Throwable t) {
+            // Cache bookkeeping must never break the dial path.
         }
     }
 }

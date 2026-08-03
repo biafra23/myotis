@@ -40,6 +40,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ./gradlew cargoBuildHost   # cargo build --release (auto-runs before :app:run / :consensus:test)
 ./gradlew cargoTest        # cargo test --workspace (part of `check`)
 ./gradlew cargoNdkAndroid  # Android jniLibs (needs cargo-ndk + NDK; committed jniLibs are the fallback)
+
+# iOS (macOS only; needs Xcode 26+ and the rustup targets on the toolchain the
+# workspace's rust-toolchain.toml selects — i.e.
+# `rustup target add --toolchain stable aarch64-apple-ios aarch64-apple-ios-sim`).
+# Cargo stays optional here too: without the toolchain (and with no previously
+# built libmyotis_engine.a) :app-ios disables its framework tasks with a warning
+# instead of failing the build — the full toolchain is required only to actually
+# build the iOS app.
+./gradlew cargoBuildIosSim                              # libmyotis_engine.a for the arm64 simulator
+./gradlew cargoBuildIosDevice                           # libmyotis_engine.a for arm64 devices
+./gradlew :app-ios:linkDebugFrameworkIosSimulatorArm64  # MyotisKit.framework (runs cargo first)
+# The app itself builds from ios-app/ (Xcode project, regenerable with `xcodegen generate`):
+#   cd ios-app && xcodebuild -project Myotis.xcodeproj -scheme Myotis \
+#     -destination 'platform=iOS Simulator,name=<device>' build
 ```
 
 ## Architecture
@@ -49,7 +63,8 @@ Key Gradle modules:
 - **myotis-engines** — the engine SELECTOR (`Engines`/`SelectorEngine`/`RustMyotisEngine`):
   hosts' composition roots call `Engines.engine()`; `myotis.engine=java|rust|auto` routes
   each network (re)start to the Java engine or the Rust one (`rust/myotis-engine`,
-  hand-JNI, compound values as JSON pinned by golden tests both sides).
+  UniFFI-generated Kotlin bindings over JNA — committed in this module, regenerated
+  via `uniffiGenerateKotlin`; compound values as JSON pinned by golden tests both sides).
 - **myotis-api** — THE ENGINE CONTRACT: zero-dependency Java-17 interfaces
   (`io.myotis.api` + `io.myotis.api.ports`) every host consumes exclusively.
   FFI-portable types only (byte[], String, long, double[], enums, flat records;
@@ -64,6 +79,14 @@ Key Gradle modules:
 - **consensus** — Sync-committee light client (libp2p, BLS, SSZ)
 - **app** — Daemon/CLI entry point, Unix domain socket IPC server, peer caching
 - **myotis-evm** — Local EVM execution (Besu) against SNAP-verified state for view calls and gas estimation
+- **ui** — Shared Compose Multiplatform screens + the pure-Kotlin seams
+  (`NodeController`/`Settings`/`LogSource`/`NetworkStatus`/`QueryHistory`);
+  targets Android + Desktop JVM + iOS. Hosts supply the seam actuals.
+- **app-ios** — The iOS host: Kotlin/Native framework (`MyotisKit`) bundling `:ui`
+  with iOS seam actuals over the RUST engine's plain C ABI
+  (`rust/include/myotis_engine.h`, cinterop; libmyotis_engine.a is absorbed into
+  the framework). The JVM engine never runs on iOS. The Xcode shell lives in
+  `ios-app/` (regenerate with `xcodegen generate`).
 
 **Protocol flow**: `DiscV4Service` discovers peers → `Main` dials them via `RLPxConnector.connect()` → `RLPxHandler` performs ECIES handshake (state machine: HANDSHAKE_WRITE → HANDSHAKE_READ → FRAMED) → fires `RLPX_READY` event → `EthHandler` runs eth handshake (AWAITING_HELLO → AWAITING_STATUS → READY) → block header requests available.
 
@@ -87,15 +110,27 @@ Key Gradle modules:
   (node-core/networking/consensus types). Composition roots use the `:myotis-engines`
   selector (`Engines.engine()`; `myotis.engine=java|rust|auto`, default java —
   `-Pengine=…` on run tasks), which routes to the Java engine (node-core) or the
-  Rust engine (rust/myotis-engine via hand-JNI + JSON). Documented exemptions: the
-  single `Engines.engine()` line at each composition root; the daemon's
-  `get-transactions` debug stream (`DebugCommands` via `SelectorEngine.javaDelegate()
-  .debugStack`); the Settings toggles for the BLS backend (`BlsBackends`) and the
-  engine (`Engines`), the Rust log drain (`Engines.drainRustLogs` —
+  Rust engine (rust/myotis-engine via UniFFI + JSON). Documented exemptions: the
+  single `Engines.engine()` line at each composition root; the TrueBlocks
+  transaction-history scan in `:tx-history` (`TxHistoryService` wraps the raw
+  `RLPxConnector`; UNVERIFIED, Java-engine + mainnet only), consumed by the daemon's
+  `get-transactions` debug stream (`DebugCommands`), the desktop Query tab
+  (`DesktopNodeController.transactionHistory`), and the Android Query tab
+  (`NodeService.txHistoryService`) — all reach the connector via
+  `SelectorEngine.javaDelegate().debugStack` at their composition roots;
+  the Settings toggles for the BLS backend (`BlsBackends`), the
+  engine (`Engines`), and Tor verified-read routing (`Tor` —
+  docs/privacy-and-tor.md; Rust-engine-only, gated behind the Rust-engine
+  toggle, and behind the `-PtorEngine` build flag that links Arti into the host
+  dylib), the Rust log drain (`Engines.drainRustLogs` —
   hosts pump the engine's tracing ring into their log pipeline), and the Status
   screen's per-network engine badge (`Engines.engineKindFor`) — internal
   seams, deliberately not on the API; and `:app`'s
   `testing/MainnetPeerBootstrap` (an integration-test fixture).
+  The iOS host (`:app-ios`) is the JVM-free analogue: it consumes the same
+  engine contract over the Rust engine's plain C ABI (`RustEngine.kt` mirrors
+  `RustEngineNative`; same JSON shapes, pinned by the same golden tests) and
+  never touches engine internals either.
 
 ## Platform & language direction
 
@@ -131,6 +166,15 @@ Key Gradle modules:
 
 ## Data sources
 - the only sources for data are devp2p and libp2p calling a local client via http may only be used for debugging purposes it is not an option for production
+- **TrueBlocks Unchained Index mainnet publishing appears stalled.** The designated
+  publisher (`publisher.unchainedindex.eth`) last published a mainnet manifest indexed
+  to ~block 23.0M (mid-2025); as of mid-2026 that is ~a year behind the head, and the
+  only newer on-chain entry is from an undesignated wallet whose content is not
+  retrievable from IPFS. The `:tx-history` scan (debug-only) therefore misses all
+  recent history — both its surfaces warn loudly about the gap. PLAN: the user intends
+  to run their own index (TrueBlocks scraper) and add its IPFS peer address to Myotis;
+  if you find evidence upstream publishing has resumed (a fresh manifest under the
+  ENS-designated publisher), flag it to the user.
 - **Portal Network is effectively dead.** Its reference clients are abandoned:
   the EF's own Trin client README states "THIS PROJECT IS NO LONGER ACTIVELY
   MAINTAINED" (https://github.com/ethereum/trin), and no one is actively

@@ -319,6 +319,12 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
      * bind failure is logged and the stack continues without JSON-RPC (mirrors the
      * Java engine): the IPC socket still serves the same verified primitives.
      */
+    /** Live listener state (bound AND no fatal supervisor failure) — ChainStack parity. */
+    private boolean rpcServing() {
+        io.myotis.jsonrpc.MyotisRpcServer s = rpcServer;
+        return s != null && s.isServing();
+    }
+
     private void startRpc() {
         if (rpcPort <= 0) return;        // RPC disabled (test seam / explicit opt-out)
         if (rpcServer != null) return;   // already started — avoid a re-bind / server leak
@@ -330,7 +336,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 probe.bind(new java.net.InetSocketAddress("127.0.0.1", rpcPort));
             }
             io.myotis.jsonrpc.MyotisRpcServer server =
-                    new io.myotis.jsonrpc.MyotisRpcServer(rpcPort, null, "127.0.0.1", verifiedReads, this);
+                    io.myotis.jsonrpc.MyotisRpc.server(rpcPort, null, "127.0.0.1", verifiedReads, this);
             server.start();
             this.rpcServer = server;
             log.info("[{}] JSON-RPC listening on http://127.0.0.1:{} (verified, strict)",
@@ -382,7 +388,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
             long peerHeaderRequestsServed,
             long peerBodyRequests,
             long peerBodyRequestsServed,
-            boolean lcHunting) {
+            boolean lcHunting,
+            boolean elHunting) {
 
         static ParsedStatus parse(String json) {
             if (json == null || json.isBlank()) return notRunning();
@@ -414,7 +421,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                         o.getLong("peerHeaderRequestsServed", 0L),
                         o.getLong("peerBodyRequests", 0L),
                         o.getLong("peerBodyRequestsServed", 0L),
-                        o.getBoolean("lcHunting", false));
+                        o.getBoolean("lcHunting", false),
+                        o.getBoolean("elHunting", false));
             } catch (RuntimeException e) {
                 throw new EngineException(
                         "malformed status JSON from the Rust engine: " + e.getMessage(), e);
@@ -423,7 +431,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
 
         static ParsedStatus notRunning() {
             return new ParsedStatus(false, false, false, BeaconState.STARTING, false, 0L, 0L, 0L,
-                    0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, false);
+                    0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, false, false);
         }
     }
 
@@ -530,7 +538,16 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 s.peerHeaderRequestsServed(),
                 s.peerBodyRequests(),
                 s.peerBodyRequestsServed(),
-                s.lcHunting());
+                s.lcHunting(),
+                s.elHunting(),
+                // Host-side listener truth (the JVM owns the server for Rust-hosted
+                // networks): the configured port — while the handle runs OR is
+                // idle-paused (the listener deliberately survives pause: a request
+                // on 127.0.0.1:rpcPort is what WAKES the stack) — and whether the
+                // server is live right now. Only a STOPPED handle reports 0, hiding
+                // the row instead of faking a red bind failure.
+                (s.running() || s.paused()) && rpcPort > 0 ? rpcPort : 0,
+                rpcServing());
     }
 
     @Override
@@ -841,35 +858,183 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     }
 
     /**
-     * Verified eth_getBlockByNumber (transactions as hashes): the block JSON object,
-     * the literal {@code "null"} (a verified future/unknown block → eth null), or
-     * throws {@link EngineException} when it can't verify (transport / not-running).
-     * {@code blockTag} is an eth block selector ({@code "latest"} / 0x-hex number).
+     * Verified eth_getBlockByNumber: the block JSON object, the literal
+     * {@code "null"} (a verified future/unknown block → eth null), or throws
+     * {@link EngineException} when it can't verify (transport / not-running).
+     * {@code blockTag} is an eth block selector ({@code "latest"} / 0x-hex number);
+     * {@code fullTransactions} selects decoded tx objects over hashes.
      */
-    String blockByNumberJson(String blockTag) {
+    String blockByNumberJson(String blockTag, boolean fullTransactions) {
         return blockJsonOrThrow(
-                gated(() -> RustEngineNative.nativeGetBlockByNumberJson(handle, blockTag)));
+                gated(() -> RustEngineNative.nativeGetBlockByNumberJson(
+                        handle, blockTag, fullTransactions)));
+    }
+
+    /**
+     * Verified eth_getTransactionReceipt: the receipt JSON object, the literal
+     * {@code "null"} (a verified "not seen" — pending/unknown tx, the wallet keeps
+     * polling), or throws {@link EngineException} when it can't verify (transport /
+     * not-running). {@code txHashHex} is the 0x-hex 32-byte tx hash.
+     */
+    /**
+     * The pending-tag nonce overlay: {@code max(minedNonce, our broadcast nonce + 1)}
+     * while unmined+unexpired, identity otherwise. A negative native answer
+     * (malformed input / not running) falls back to the plain mined nonce.
+     */
+    long pendingNonceOverlay(String addressHex, long minedNonce) {
+        long overlaid = RustEngineNative.nativePendingNonceOverlay(handle, addressHex, minedNonce);
+        return overlaid >= 0 ? overlaid : minedNonce;
+    }
+
+    String transactionReceiptJson(String txHashHex) {
+        return receiptJsonOrThrow(
+                gated(() -> RustEngineNative.nativeGetTransactionReceiptJson(handle, txHashHex)));
+    }
+
+    /**
+     * Verified eth_getTransactionByHash: the tx JSON object, the literal
+     * {@code "null"} (a verified "not seen" — unknown/pending tx), or throws
+     * {@link EngineException} when it can't verify (transport / not-running /
+     * an undecodable located tx). {@code txHashHex} is the 0x-hex 32-byte hash.
+     */
+    String transactionByHashJson(String txHashHex) {
+        return transactionJsonOrThrow(
+                gated(() -> RustEngineNative.nativeGetTransactionByHashJson(handle, txHashHex)));
+    }
+
+    /**
+     * Verified eth_getBlockByHash: the block JSON object, the literal
+     * {@code "null"} (a hash this engine never verified / reorged away — eth's
+     * unknown-block null), or throws {@link EngineException} when it can't
+     * verify. {@code blockHashHex} is the 0x-hex 32-byte hash;
+     * {@code fullTransactions} selects decoded tx objects over hashes.
+     */
+    String blockByHashJson(String blockHashHex, boolean fullTransactions) {
+        return blockJsonOrThrow(
+                gated(() -> RustEngineNative.nativeGetBlockByHashJson(
+                        handle, blockHashHex, fullTransactions)));
+    }
+
+    /**
+     * Verified eth_feeHistory: the result JSON object, or throws
+     * {@link EngineException} when it can't verify (transport / not-running /
+     * bad selector) — this method has no {@code "null"} literal case, but the
+     * shared tri-state parse tolerates one harmlessly. {@code percentilesJson}
+     * is a JSON array of reward percentiles, or empty to omit the reward matrix.
+     */
+    String feeHistoryJson(long blockCount, String newestBlockTag, String percentilesJson) {
+        return feeHistoryJsonOrThrow(gated(() -> RustEngineNative.nativeFeeHistoryJson(
+                handle, blockCount, newestBlockTag, percentilesJson)));
+    }
+
+    /** Package-private test seam: native feeHistory payload → JSON | throw. */
+    static String feeHistoryJsonOrThrow(String json) {
+        return jsonObjectOrThrow(json, "feeHistory");
+    }
+
+    /**
+     * eth_getLogs over the opt-in watch-list index. Returns the native payload
+     * VERBATIM — the log ARRAY on success, or the {@code {"error": ...}}
+     * envelope (coverage / config detail) for the router to surface at -32000.
+     * Only the lifecycle gate throws (not running / paused).
+     */
+    String getLogsJson(String filterJson) {
+        return gated(() -> RustEngineNative.nativeGetLogsJson(handle, filterJson));
+    }
+
+    /** Install the log-index config; false = invalid config or gate down. */
+    @Override
+    public boolean setLogIndexConfig(String configJson) {
+        try {
+            return gated(() -> RustEngineNative.nativeSetLogIndexConfig(handle, configJson));
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** Log-index status JSON ({"error":...} when the gate is down). */
+    @Override
+    public String logIndexStatusJson() {
+        return gated(() -> RustEngineNative.nativeLogIndexStatusJson(handle));
+    }
+
+    /**
+     * Verified eth_getBlockReceipts: the receipts ARRAY JSON, the literal
+     * {@code "null"} (verified unknown/future block or a never-verified hash),
+     * or throws {@link EngineException} when it can't verify. {@code selector}
+     * is a tag, a 0x-hex block number, or a 0x-32-byte block hash.
+     */
+    String blockReceiptsJson(String selector) {
+        return blockReceiptsJsonOrThrow(
+                gated(() -> RustEngineNative.nativeGetBlockReceiptsJson(handle, selector)));
+    }
+
+    /**
+     * Package-private test seam: native payload → receipts ARRAY | "null" | throw.
+     * Unlike the object seams the SUCCESS shape is a JSON array; an object is
+     * either the error envelope (→ its message) or native shape drift (→ throw).
+     */
+    static String blockReceiptsJsonOrThrow(String json) {
+        if (json == null || json.isBlank()) {
+            throw new EngineException(
+                    "blank blockReceipts JSON from the Rust engine (native failure?)");
+        }
+        if (json.equals("null")) return "null";
+        com.eclipsesource.json.JsonValue v;
+        try {
+            v = Json.parse(json);
+        } catch (RuntimeException e) {
+            throw new EngineException(
+                    "malformed blockReceipts JSON from the Rust engine: " + e.getMessage(), e);
+        }
+        if (v.isArray()) return json; // the verified receipts array
+        if (v.isObject()) {
+            var error = v.asObject().get("error");
+            if (error != null && !error.isNull()) {
+                throw new EngineException(error.isString() ? error.asString() : error.toString());
+            }
+        }
+        throw new EngineException("blockReceipts JSON is neither an array nor an error object");
     }
 
     /** Package-private test seam: native block payload → block JSON | "null" | throw. */
     static String blockJsonOrThrow(String json) {
+        return jsonObjectOrThrow(json, "block");
+    }
+
+    /** Package-private test seam: native tx payload → tx JSON | "null" | throw. */
+    static String transactionJsonOrThrow(String json) {
+        return jsonObjectOrThrow(json, "transaction");
+    }
+
+    /** Package-private test seam: native receipt payload → receipt JSON | "null" | throw. */
+    static String receiptJsonOrThrow(String json) {
+        return jsonObjectOrThrow(json, "receipt");
+    }
+
+    /** The shared tri-state native payload parse: a JSON object passes through, the
+     *  {@code "null"} literal (a VERIFIED eth-null) passes through, an {@code error}
+     *  object / blank / malformed payload throws {@link EngineException}. */
+    private static String jsonObjectOrThrow(String json, String what) {
         if (json == null || json.isBlank()) {
-            throw new EngineException("blank block JSON from the Rust engine (native failure?)");
+            throw new EngineException(
+                    "blank " + what + " JSON from the Rust engine (native failure?)");
         }
-        // The eth-null literal (verified future/unknown block) is not a JSON object;
-        // return it before parsing so the router can emit a JSON null result.
+        // The eth-null literal (a verified negative) is not a JSON object; return it
+        // before parsing so the router can emit a JSON null result.
         if (json.equals("null")) return "null";
         JsonObject o;
         try {
             o = Json.parse(json).asObject();
         } catch (RuntimeException e) {
-            throw new EngineException("malformed block JSON from the Rust engine: " + e.getMessage(), e);
+            throw new EngineException(
+                    "malformed " + what + " JSON from the Rust engine: " + e.getMessage(), e);
         }
         var error = o.get("error");
         if (error != null && !error.isNull()) {
             throw new EngineException(error.isString() ? error.asString() : error.toString());
         }
-        return json; // the verified block object
+        return json; // the verified object
     }
 
     /** A verified fee suggestion — both values decimal-wei strings. */

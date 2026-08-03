@@ -28,7 +28,8 @@ import java.util.concurrent.TimeUnit;
  * Mirrors {@code AndroidPeerCache} in the :android-app module (which went
  * through review) but logs via slf4j instead of the in-app {@code LogBuffer}.
  *
- * <p>Record format: {@code ip\tport\tpublicKeyHex[\tsnap][\tsnapok|\tsnapbad]\n}
+ * <p>Record format:
+ * {@code ip\tport\tpublicKeyHex[\tsnap][\tsnapok|\tsnapbad][\tfails=N]\n}
  * (tab-separated, UTF-8). Tabs can't appear in
  * {@link java.net.InetAddress#getHostAddress()} output, so the format stays
  * unambiguous for IPv6 literals. The trailing {@code snap} flag ("1"/"0")
@@ -50,9 +51,20 @@ import java.util.concurrent.TimeUnit;
  * re-discovering the bad ones one timeout at a time. A peer needs
  * {@link #SNAP_FAILURE_THRESHOLD} consecutive failures (no intervening serve)
  * to be marked {@code DENIED}; any successful serve re-confirms it. Denied peers
- * are deprioritized, never evicted — state roots change, and a peer that
- * couldn't serve an old pivot may serve the current one (and is still a fine
- * plain-eth peer for headers/blocks).
+ * are deprioritized, never evicted for serve failures — state roots change, and
+ * a peer that couldn't serve an old pivot may serve the current one (and is
+ * still a fine plain-eth peer for headers/blocks).
+ *
+ * <p><b>Reachability.</b> {@link #recordConnectFailure} tracks consecutive
+ * TCP-level dial failures (refused/timeout — the peer is <em>gone</em>, not
+ * merely unhelpful), persisted as a {@code fails=N} token. A peer past
+ * {@link #CONNECT_FAILURE_DEMOTE} reports {@code DENIED} from {@link #load()}
+ * so the dial loop stops leading with long-dead peers; past
+ * {@link #CONNECT_FAILURE_EVICT} it is dropped from the cache entirely (the
+ * only eviction path — re-discovery re-adds it if it ever comes back). Any
+ * successful handshake ({@link #add} on a known peer) or serve resets the
+ * streak. Callers should only report failures while demonstrably online, so an
+ * offline laptop can't decimate its own cache.
  *
  * <p><b>Threading.</b> The in-memory maps are the authoritative copy and are
  * mutated only under {@code synchronized(this)}. Disk writes are offloaded to a
@@ -73,6 +85,15 @@ public final class PeerCache implements Closeable {
     /** Consecutive snap-serve failures before a peer is marked {@code DENIED}. */
     public static final int SNAP_FAILURE_THRESHOLD = 3;
 
+    /** Consecutive TCP connect failures before a peer reports {@code DENIED}
+     *  from {@link #load()} (≈3 min of unreachability at the maintainer's
+     *  re-dial cadence — dead peers stop hogging the head of the dial order). */
+    public static final int CONNECT_FAILURE_DEMOTE = 5;
+
+    /** Consecutive TCP connect failures before a peer is evicted from the cache
+     *  (≈35 min of continuous unreachability, cumulative across restarts). */
+    public static final int CONNECT_FAILURE_EVICT = 50;
+
     /** Learned snap-serving verdict, persisted across restarts. */
     public enum SnapQuality { CONFIRMED, UNKNOWN, DENIED }
 
@@ -89,6 +110,10 @@ public final class PeerCache implements Closeable {
     private final Set<String> snapConfirmed = ConcurrentHashMap.newKeySet();
     private final Set<String> snapDenied = ConcurrentHashMap.newKeySet();
     private final Map<String, Integer> snapFailures = new ConcurrentHashMap<>();
+    /** Consecutive TCP connect failures per key. Persisted (as {@code fails=N})
+     *  only when a rewrite happens anyway or a threshold is crossed, so a dead
+     *  peer doesn't cost one disk write per failed dial. */
+    private final Map<String, Integer> connectFailures = new ConcurrentHashMap<>();
     /** True once the on-disk file has been read into {@link #entries} (or shown
      *  absent), after which {@link #load()} serves from memory without disk I/O. */
     private boolean loaded = false;
@@ -118,7 +143,14 @@ public final class PeerCache implements Closeable {
      */
     public synchronized void add(InetSocketAddress address, String publicKeyHex, boolean snap) {
         String key = keyOf(address);
-        if (entries.containsKey(key)) return;
+        if (entries.containsKey(key)) {
+            // Re-handshake of a known peer: it's reachable — clear the connect
+            // failure streak. If a streak was persisted, rewrite the file too:
+            // a memory-only reset would be resurrected by the next restart and
+            // re-demote an actually reachable peer.
+            if (connectFailures.remove(key) != null) rewriteAsync();
+            return;
+        }
         entries.put(key, new PeerRec(publicKeyHex, snap));
         // Append fast path: a single new line (UNKNOWN quality) rather than
         // rewriting the whole file on every newly-handshaked peer.
@@ -138,7 +170,10 @@ public final class PeerCache implements Closeable {
     public synchronized void recordSnapServed(InetSocketAddress address) {
         String key = keyOf(address);
         snapFailures.remove(key);
-        boolean changed = snapConfirmed.add(key);
+        // A cleared persisted streak counts as a change: without the rewrite,
+        // fails=N would survive on disk and re-demote the peer after a restart.
+        boolean changed = connectFailures.remove(key) != null;
+        changed |= snapConfirmed.add(key);
         changed |= snapDenied.remove(key);
         if (changed) rewriteAsync();
     }
@@ -166,6 +201,40 @@ public final class PeerCache implements Closeable {
     }
 
     /**
+     * Record a TCP-level connect failure (refused/timeout/unreachable) against a
+     * cached peer. No-op for unknown addresses, so the counter map can't grow
+     * from DNS-pool/discv4 dials that were never cached. Crossing
+     * {@link #CONNECT_FAILURE_DEMOTE} persists the streak and demotes the peer's
+     * reported quality; crossing {@link #CONNECT_FAILURE_EVICT} evicts it.
+     * Callers must only report while demonstrably online (some other peer or a
+     * DNS resolve succeeded recently) — see class javadoc.
+     */
+    public synchronized void recordConnectFailure(InetSocketAddress address) {
+        String key = keyOf(address);
+        if (!entries.containsKey(key)) return;
+        int count = connectFailures.merge(key, 1, Integer::sum);
+        if (count >= CONNECT_FAILURE_EVICT) {
+            entries.remove(key);
+            snapConfirmed.remove(key);
+            snapDenied.remove(key);
+            snapFailures.remove(key);
+            connectFailures.remove(key);
+            rewriteAsync();
+            log.info("[cache] evicted unreachable peer after {} consecutive connect failures: {}",
+                    count, key.replace(SEP, ':'));
+        } else if (count % CONNECT_FAILURE_DEMOTE == 0) {
+            // Persist every 5th failure (not just the demote crossing) so a
+            // restart resumes the streak with at most 4 counts lost — keeping
+            // eviction genuinely cumulative across restarts.
+            rewriteAsync();
+            if (count == CONNECT_FAILURE_DEMOTE) {
+                log.info("[cache] deprioritized unreachable peer after {} consecutive connect failures: {}",
+                        count, key.replace(SEP, ':'));
+            }
+        }
+    }
+
+    /**
      * Return all cached peers. Reads and parses the file on the first call, then
      * serves from the in-memory copy — so periodic callers don't re-read/parse
      * the file every few seconds.
@@ -185,7 +254,14 @@ public final class PeerCache implements Closeable {
                 continue;
             }
             PeerRec rec = e.getValue();
-            SnapQuality quality = snapConfirmed.contains(key) ? SnapQuality.CONFIRMED
+            // A peer past the connect-failure demote threshold reports DENIED
+            // regardless of its learned serve quality: a currently-unreachable
+            // CONFIRMED peer must not outrank reachable candidates (or get the
+            // hunt's eager backoff bypass). The underlying verdict is kept — one
+            // successful handshake clears the streak and restores it.
+            SnapQuality quality =
+                    connectFailures.getOrDefault(key, 0) >= CONNECT_FAILURE_DEMOTE ? SnapQuality.DENIED
+                    : snapConfirmed.contains(key) ? SnapQuality.CONFIRMED
                     : snapDenied.contains(key) ? SnapQuality.DENIED
                     : SnapQuality.UNKNOWN;
             result.add(new CachedPeer(
@@ -226,12 +302,21 @@ public final class PeerCache implements Closeable {
                     // them parse as snap=false / UNKNOWN.
                     boolean snap = parts.length > 3 && "1".equals(parts[3]);
                     SnapQuality quality = SnapQuality.UNKNOWN;
+                    int fails = 0;
                     for (int i = 4; i < parts.length; i++) {
                         if ("snapok".equals(parts[i])) quality = SnapQuality.CONFIRMED;
                         else if ("snapbad".equals(parts[i])) quality = SnapQuality.DENIED;
+                        else if (parts[i].startsWith("fails=")) {
+                            try {
+                                fails = Integer.parseInt(parts[i].substring("fails=".length()));
+                            } catch (NumberFormatException ignore) {
+                                // unreadable token → streak starts over at 0
+                            }
+                        }
                     }
                     String key = ip + SEP + port;
                     entries.put(key, new PeerRec(pubKeyHex, snap));
+                    if (fails > 0) connectFailures.put(key, fails);
                     if (quality == SnapQuality.CONFIRMED) { snapConfirmed.add(key); conf++; }
                     else if (quality == SnapQuality.DENIED) { snapDenied.add(key); den++; }
                     count++;
@@ -288,6 +373,8 @@ public final class PeerCache implements Closeable {
               .append(SEP).append(rec.snap() ? "1" : "0");
             if (snapConfirmed.contains(key)) sb.append(SEP).append("snapok");
             else if (snapDenied.contains(key)) sb.append(SEP).append("snapbad");
+            int fails = connectFailures.getOrDefault(key, 0);
+            if (fails > 0) sb.append(SEP).append("fails=").append(fails);
             sb.append('\n');
         }
         byte[] data = sb.toString().getBytes(StandardCharsets.UTF_8);
@@ -337,6 +424,7 @@ public final class PeerCache implements Closeable {
         snapConfirmed.clear();
         snapDenied.clear();
         snapFailures.clear();
+        connectFailures.clear();
         loaded = true;  // memory is now the (empty) authority; don't re-read the file we're deleting
         submitWrite(() -> {
             if (!cacheFile.toFile().delete() && cacheFile.toFile().exists()) {

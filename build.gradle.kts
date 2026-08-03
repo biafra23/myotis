@@ -39,6 +39,8 @@ subprojects {
     //   android-app  → com.android.application
     //   ui           → kotlin-multiplatform + com.android.library + compose
     //   app-desktop  → kotlin.jvm + compose (desktop)
+    //   app-ios      → kotlin-multiplatform + compose (iOS framework)
+    //   jsonrpc-server → kotlin-multiplatform (JVM hosts + the iOS RPC listener)
     // Excludes shared by EVERY module (Android plugin modules included):
     // - native Netty transports, for Android compatibility;
     // - Besu 26.4's log4j: it drags log4j-slf4j2-impl — a SECOND slf4j
@@ -61,7 +63,7 @@ subprojects {
         exclude(group = "org.apache.logging.log4j", module = "log4j-core")
     }
 
-    if (name in setOf("android-app", "ui", "app-desktop")) {
+    if (name in setOf("android-app", "ui", "app-desktop", "app-ios", "jsonrpc-server")) {
         return@subprojects
     }
 
@@ -225,6 +227,15 @@ val rustReleaseDir = if (rustTargetTriple != null) {
 extra["rustReleaseDir"] = rustReleaseDir
 extra["rustEngineLibName"] = hostLibNames.last() // lib?myotis_engine.{dylib,so,dll}
 
+// Opt-in Tor support in the host engine dylib (docs/privacy-and-tor.md): builds
+// myotis-engine with `--features tor`, pulling the Arti tree into the host lib so
+// the desktop/daemon can offer the runtime Settings toggle. OFF by default so CI
+// and the daemon build stay Arti-free. Presence-based, like a typical opt-in flag
+// (a bare `-PtorEngine` sets the property to "", so use hasProperty); build a
+// Tor-capable desktop app with `./gradlew :app-desktop:run -PtorEngine`.
+val torEngine = project.hasProperty("torEngine")
+        && (project.property("torEngine") as? String).let { it.isNullOrBlank() || it.toBoolean() }
+
 tasks.register<Exec>("cargoBuildHost") {
     group = "rust"
     description = "cargo build --release for the host OS (self-skips when cargo is missing)"
@@ -233,6 +244,9 @@ tasks.register<Exec>("cargoBuildHost") {
     commandLine(
         buildList {
             addAll(listOf("cargo", "build", "--release", "--workspace"))
+            // Enable Tor only on the engine crate (package/feature form — a bare
+            // `--features tor` with `--workspace` would try every member).
+            if (torEngine) addAll(listOf("--features", "myotis-engine/tor"))
             rustTargetTriple?.let { addAll(listOf("--target", it)) }
         }
     )
@@ -241,7 +255,35 @@ tasks.register<Exec>("cargoBuildHost") {
     // must rebuild, or stale artifacts survive UP-TO-DATE checks.
     inputs.property("cargoVersion", cargoVersion)
     inputs.property("rustTarget", rustTargetTriple ?: "host")
+    // The Tor feature flips the artifact's contents, so it must key UP-TO-DATE too.
+    inputs.property("torEngine", torEngine)
     outputs.files(hostLibNames.map { file("$rustReleaseDir/$it") })
+}
+
+// Regenerate the UniFFI Kotlin bindings for the Rust engine into :myotis-engines'
+// source tree. The generated file is COMMITTED (like the Android jniLibs) so
+// cargo-less machines still compile the pure-Java/Kotlin build; re-run this task
+// whenever rust/myotis-engine/src/ffi.rs changes shape. Library mode: bindgen
+// reads the metadata baked into the built .so, so scaffolding and bindings can
+// never disagree silently (UniFFI additionally checksum-verifies at load time).
+tasks.register<Exec>("uniffiGenerateKotlin") {
+    group = "rust"
+    description = "Regenerate the committed UniFFI Kotlin bindings in :myotis-engines (self-skips without cargo)"
+    onlyIf { rustAvailable }
+    dependsOn(tasks.named("cargoBuildHost"))
+    workingDir = file("rust")
+    commandLine(
+        "cargo", "run", "--release", "-p", "uniffi-bindgen", "--",
+        "generate", "--library", "$rustReleaseDir/${hostLibNames.last()}".removePrefix("rust/"),
+        "--language", "kotlin", "--no-format",
+        "--out-dir", project(":myotis-engines").projectDir.resolve("src/main/kotlin").absolutePath,
+    )
+    inputs.files(rustSources).withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.property("cargoVersion", cargoVersion)
+    outputs.files(
+        project(":myotis-engines").projectDir
+            .resolve("src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt")
+    )
 }
 
 val cargoTest = tasks.register<Exec>("cargoTest") {
@@ -262,9 +304,13 @@ tasks.named("check") { dependsOn(cargoTest) }
 // tripwire. Needs BOTH the rustup target installed AND clang on PATH (blst
 // compiles its C sources with clang for wasm); self-skips otherwise with one
 // lifecycle note, like every other cargo* task.
-val wasmTargetInstalled = rustAvailable &&
+val installedRustupTargets: Set<String> = if (rustAvailable) {
     probeTool("rustup", "target", "list", "--installed")
-        .lineSequence().any { it.trim() == "wasm32-unknown-unknown" }
+        .lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+} else {
+    emptySet()
+}
+val wasmTargetInstalled = "wasm32-unknown-unknown" in installedRustupTargets
 val clangAvailable = rustAvailable && probeTool("clang", "--version").isNotEmpty()
 val cargoCheckWasm = tasks.register<Exec>("cargoCheckWasm") {
     group = "rust"
@@ -308,6 +354,49 @@ tasks.register<Exec>("cargoNdkAndroid") {
     )
 }
 
+// iOS static libs (libmyotis_engine.a) for the :app-ios Kotlin/Native framework —
+// cinterop absorbs them into the framework over the plain C ABI (rust/include/
+// myotis_engine.h). One task per Apple triple; :app-ios wires each Kotlin/Native
+// target's cinterop to the matching task. Self-skips off-macOS or without the
+// rustup target (rustup target add aarch64-apple-ios aarch64-apple-ios-sim).
+val isMacHost = System.getProperty("os.name").lowercase().contains("mac")
+fun registerCargoBuildIos(taskName: String, triple: String) =
+    tasks.register<Exec>(taskName) {
+        group = "rust"
+        description = "cargo build --release -p myotis-engine for $triple (self-skips without cargo + the rustup target on macOS)"
+        onlyIf { rustAvailable && isMacHost && triple in installedRustupTargets }
+        workingDir = file("rust")
+        // `cargo rustc --crate-type staticlib` (not `cargo build`): only the .a is
+        // consumed on iOS, and building the crate's cdylib type too would fail the
+        // device link — rustc doesn't link compiler-rt builtins for iOS dylibs, so
+        // blst's ___chkstk_darwin stays undefined there. In the staticlib the symbol
+        // simply stays unresolved until the app link, where Xcode's clang provides it.
+        commandLine(
+            "cargo", "rustc", "--release", "--target", triple, "-p", "myotis-engine",
+            "--crate-type", "staticlib",
+        )
+        inputs.files(rustSources).withPathSensitivity(PathSensitivity.RELATIVE)
+        inputs.property("cargoVersion", cargoVersion)
+        outputs.files(file("rust/target/$triple/release/libmyotis_engine.a"))
+    }
+registerCargoBuildIos("cargoBuildIosDevice", "aarch64-apple-ios")
+registerCargoBuildIos("cargoBuildIosSim", "aarch64-apple-ios-sim")
+
+// Whether the :app-ios framework chain can run at all: EVERY triple's
+// libmyotis_engine.a can either be built now (the cargo task's own onlyIf) or
+// absorbed from an earlier build. When false, :app-ios disables its whole task
+// chain (see its build file — it reads this single-sourced verdict) instead of
+// failing at the cinterop, keeping "cargo strictly optional" true build-wide.
+// All-or-nothing across the triples: the shared-source metadata/commonizer
+// tasks span both targets, so a half-enabled module would just move the
+// missing-input failure.
+val iosTriples = listOf("aarch64-apple-ios", "aarch64-apple-ios-sim")
+val iosFrameworkBuildable = iosTriples.all { triple ->
+    (rustAvailable && isMacHost && triple in installedRustupTargets) ||
+        file("rust/target/$triple/release/libmyotis_engine.a").exists()
+}
+extra["myotis.iosFrameworkBuildable"] = iosFrameworkBuildable
+
 // Exactly ONE note when Rust work was requested but is being skipped — enough
 // to explain the SKIPPED tasks without spamming every unrelated invocation.
 // (taskGraph.whenReady isn't configuration-cache-safe; this build doesn't
@@ -332,6 +421,27 @@ gradle.taskGraph.whenReady {
     ) {
         logger.lifecycle("[rust] wasm32 canary skipped — needs rustup target wasm32-unknown-unknown + clang")
     }
+    // The iOS skips get a WARNING, not a note: unlike the other cargo tasks there
+    // is no committed fallback. With a previously built libmyotis_engine.a in
+    // rust/target the cinterop absorbs it (possibly STALE — only the runtime ABI
+    // handshake would catch the drift); with no .a at all, :app-ios disables its
+    // whole framework chain (see app-ios/build.gradle.kts) so a cargo-less build
+    // still passes.
+    listOf("cargoBuildIosDevice" to "aarch64-apple-ios", "cargoBuildIosSim" to "aarch64-apple-ios-sim")
+        .forEach { (task, triple) ->
+            if (allTasks.any { it.name == task } && (!isMacHost || rustSkipNote != null || triple !in installedRustupTargets)) {
+                val prereqs = "needs macOS + cargo + `rustup target add --toolchain stable $triple`"
+                logger.warn(
+                    if (iosFrameworkBuildable)
+                        "[rust] $task skipped ($prereqs) — the iOS framework will embed the EXISTING " +
+                            "rust/target/$triple/release/libmyotis_engine.a, which may be stale"
+                    else
+                        "[rust] $task skipped ($prereqs) — the :app-ios framework tasks are disabled " +
+                            "(not every triple has a previously built libmyotis_engine.a to embed); " +
+                            "the rest of the build is unaffected"
+                )
+            }
+        }
 }
 
 // -------------------------------------------------------------------------

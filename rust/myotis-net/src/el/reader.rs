@@ -41,8 +41,10 @@ use crate::el::evm::{
 };
 use crate::el::peer::ManagedPeer;
 use crate::el::pool::{PeerPool, PoolConfig};
+use crate::el::receipt::DecodedReceipt;
 use crate::el::snap::fetch::AccountOutcome;
 use crate::el::tx;
+use crate::el::tx::TxSummary;
 
 /// EL network parameters for the reader's discv4 + eth handshake.
 #[derive(Debug, Clone)]
@@ -62,6 +64,9 @@ pub struct ElConfig {
     /// Path to the EL peer cache (`dataDir/peers.cache`) for warm-start; `None`
     /// runs without persistence.
     pub cache_path: Option<std::path::PathBuf>,
+    /// Path to the eth_getLogs watch-list index (`dataDir/logindex[-net].db`);
+    /// `None` keeps the index memory-only (docs/eth-getlogs-design.md).
+    pub log_index_path: Option<std::path::PathBuf>,
     /// Network floor for the suggested priority fee (wei) — the Java
     /// `NetworkConfig.minSuggestedTipWei` (mainnet/sepolia 0.1 gwei; gnosis 0.001).
     pub min_suggested_tip_wei: u128,
@@ -88,6 +93,7 @@ impl ElConfig {
             listen_port: 30303,
             pool_config: PoolConfig::default(),
             cache_path: None,
+            log_index_path: None,
             min_suggested_tip_wei: 100_000_000, // 0.1 gwei
         }
     }
@@ -115,6 +121,7 @@ impl ElConfig {
             listen_port: 30305,
             pool_config: PoolConfig::default(),
             cache_path: None,
+            log_index_path: None,
             min_suggested_tip_wei: 100_000_000, // 0.1 gwei
         }
     }
@@ -139,6 +146,7 @@ impl ElConfig {
             listen_port: 30304, // gnosis conventional EL port (Java defaultElPort)
             pool_config: PoolConfig::default(),
             cache_path: None,
+            log_index_path: None,
             min_suggested_tip_wei: 1_000_000, // 0.001 gwei — cheap-chain floor
         }
     }
@@ -235,6 +243,11 @@ pub struct VerifiedBlock {
     pub header: BlockHeader,
     /// keccak256 of each transaction's raw bytes, in block order.
     pub tx_hashes: Vec<[u8; 32]>,
+    /// The fully decoded transactions (the `fullTransactions=true` form), in
+    /// block order; `None` when the caller asked for hashes only. Populated
+    /// only from the `transactionsRoot`-verified body — an undecodable tx
+    /// fails the serve rather than degrade to a hash.
+    pub full_transactions: Option<Vec<VerifiedTransaction>>,
 }
 
 /// How far below the beacon head a block pin may be and still verify cheaply
@@ -242,9 +255,204 @@ pub struct VerifiedBlock {
 /// [target..head] is fetched in one request, so this bounds its size.
 const BLOCK_LOOKBACK_MAX: u64 = 256;
 
+/// First-ever receipt scan for a tx hash looks back this many blocks below the
+/// head (the Java `RECEIPT_INITIAL_LOOKBACK_BLOCKS`); the per-tx cursor then
+/// grows coverage forward as the wallet polls.
+const RECEIPT_INITIAL_LOOKBACK_BLOCKS: u64 = 8;
+
+/// Catch-up cap per receipt poll (the Java `RECEIPT_MAX_SCAN_BLOCKS_PER_POLL`):
+/// after a long polling gap only the newest this-many blocks are scanned, so one
+/// poll can't trigger a huge fetch.
+const RECEIPT_MAX_SCAN_BLOCKS_PER_POLL: u64 = 128;
+
+/// Idle TTL for a per-tx receipt scan cursor (the Java `RECEIPT_SCAN_TTL_MS`):
+/// an entry untouched this long is dropped by the next sweep.
+const RECEIPT_SCAN_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How often the cursor map's TTL sweep may run (piggybacked on lookups; the
+/// Java twin uses a background warmer tick). Well under the TTL, so eviction
+/// lags it by at most a small fraction.
+const RECEIPT_SCAN_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Per-peer deadline for one receipt scan attempt (window fetch + per-block
+/// bodies) — the Java stage timeout (`HEADER_CHAIN_TIMEOUT_SEC`); on expiry the
+/// next peer is tried.
+const RECEIPT_SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A verified `eth_getTransactionReceipt` result. The containing block header is
+/// anchored to the beacon optimistic head via a hash-linked header window, the
+/// body verified against `transactionsRoot` (locating the tx + its index), and
+/// the receipt list against `receiptsRoot` — so, as with [`VerifiedBlock`],
+/// returning it at all IS the verification.
+#[derive(Debug, Clone)]
+pub struct VerifiedReceipt {
+    pub tx_hash: [u8; 32],
+    pub tx_index: u64,
+    pub block_hash: [u8; 32],
+    pub block_number: u64,
+    /// This tx's own gas: `cumulative - previous receipt's cumulative`.
+    pub gas_used: u64,
+    /// Logs emitted by receipts BEFORE this one in the block — the base the
+    /// block-global `logIndex` of each log adds its position to.
+    pub log_index_base: u64,
+    pub receipt: DecodedReceipt,
+    /// The verified tx's summary (`None` when the tx couldn't be decoded — the
+    /// receipt is then served without the tx-derived fields, like Java).
+    pub tx: Option<TxSummary>,
+    /// The effective gas price paid (receipt convention); `None` iff `tx` is.
+    pub effective_gas_price: Option<u128>,
+    /// The deployed address for a creation tx with a recovered sender.
+    pub contract_address: Option<[u8; 20]>,
+}
+
+/// A verified `eth_getTransactionByHash` result: the located tx's block
+/// coordinates plus the fully decoded tx fields. As with [`VerifiedReceipt`],
+/// the location was proven by the `transactionsRoot`-verified body inside a
+/// beacon-anchored header window — returning it IS the verification.
+#[derive(Debug, Clone)]
+pub struct VerifiedTransaction {
+    pub tx_hash: [u8; 32],
+    pub tx_index: u64,
+    pub block_hash: [u8; 32],
+    pub block_number: u64,
+    pub tx: TxSummary,
+}
+
+/// Entry cap for the verified block-hash → number map (the Java
+/// `blockHashToNumber` cache's 512).
+const BLOCK_HASH_LRU_MAX: usize = 512;
+
+/// Raw-bytes cache cap for the wallet's own broadcast txs (the Java
+/// `sentTxCache` LRU's 256). Bytes aging out silently end that tx's
+/// rebroadcast (still watched, nothing left to push).
+const SENT_TX_CACHE_MAX: usize = 256;
+
+/// Minimum spacing between rebroadcast sweeps (the Java
+/// `TX_REBROADCAST_INTERVAL_MS`). Java runs it on a warmer thread; here it
+/// piggybacks time-gated on the wallet's poll paths (receipt/tx/nonce reads),
+/// the same pattern as the scan-map TTL sweep — a wallet mid-confirm-loop
+/// polls every few seconds, far below this gate. DIVERGENCE (documented): with
+/// zero RPC traffic nothing rebroadcasts; Java's timer does. Acceptable — a
+/// wallet that stopped polling has abandoned the confirm flow, and peers
+/// dedupe repeats anyway.
+const TX_REBROADCAST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The sent-tx state behind one lock (see the `sent_txs` field doc). The
+/// WATCH itself lives separately in the shared Arc every peer read loop also
+/// holds (gossip sightings) — see `ElReader::sent_tx_watch`.
+struct SentTxState {
+    pending_nonces: crate::el::sent_tx::PendingNonceTracker,
+    /// Raw broadcast bytes by tx hash — what a rebroadcast re-pushes.
+    bytes: myotis_evm::Lru<[u8; 32], Vec<u8>>,
+    last_rebroadcast: std::time::Instant,
+}
+
+/// `eth_getTransactionByHash`'s three verified answers (the Java engine's
+/// mined / own-pending / null trichotomy).
+pub enum TxLookup {
+    /// Located in a verified block.
+    Mined(VerifiedTransaction),
+    /// Not in the scanned chain, but it is OUR broadcast (the sent-tx cache
+    /// holds the bytes): the pending shape — block fields explicitly null.
+    Pending { tx_hash: [u8; 32], tx: TxSummary },
+    /// Verified "not seen" (eth's null; the wallet keeps polling).
+    NotSeen,
+}
+
+/// Where a mined tx was found, cached per tx hash so wallet polls don't rescan
+/// (the Java `TxLocation`). The header/body were verified when this was built;
+/// canonicality is re-confirmed on later polls until the block finalizes.
+#[derive(Debug, Clone)]
+struct TxLocation {
+    header: BlockHeader,
+    block_hash: [u8; 32],
+    index: usize,
+    raw_tx: Vec<u8>,
+}
+
+/// Per-tx incremental scan cursor (the Java `TxScanState`): coverage grows
+/// forward from the first poll's small lookback, so per-poll cost is roughly the
+/// number of NEW blocks.
+struct TxScanState {
+    /// Highest block already scanned (`None` = never scanned).
+    high_scanned: Option<u64>,
+    /// `Arc` so a poll hands the cached location out by pointer bump — the
+    /// header + raw-tx bytes aren't re-copied on every wallet confirm poll.
+    found: Option<Arc<TxLocation>>,
+    last_touched: std::time::Instant,
+}
+
 /// Recent blocks sampled for the `eth_maxPriorityFeePerGas` tip suggestion
 /// (mirrors the Java `TIP_SUGGEST_BLOCKS`).
 const TIP_SUGGEST_BLOCKS: u64 = 3;
+
+/// Tor read fan-out bounds (docs/privacy-and-tor.md): how many clearnet-validated
+/// snap peers a single Tor-routed read may try, and the wall-clock ceiling on the
+/// whole read. Kept small because each Tor dial is slow and many peers reject
+/// Tor-exit inbound — without these a bad-exit walk could hang the FFI call for
+/// minutes. Fail-closed when the deadline is hit.
+#[cfg(feature = "tor")]
+const TOR_MAX_CANDIDATES: usize = 5;
+#[cfg(feature = "tor")]
+const TOR_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// `eth_feeHistory` block-count clamp (the Java `FEE_HISTORY_MAX_BLOCKS`) —
+/// each block with reward percentiles costs a verified body + receipts fetch.
+const FEE_HISTORY_MAX_BLOCKS: u64 = 10;
+
+/// Per-peer deadline for one `eth_feeHistory` build (header window + the
+/// pipelined per-block body/receipt fetches) — the Java stage timeout.
+const FEE_HISTORY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Why [`ElReader::fee_history`] failed — the split the Java `rpcFeeHistory`
+/// expresses with `return null` vs `serveStaleFeeHistory(...)`: a `Reject` is a
+/// bad request against the current head (answered -32000, NEVER from a stale
+/// snapshot), a `Build` is a transport/verify failure the host may answer from
+/// its last-good same-signature result.
+#[derive(Debug, Clone)]
+pub enum FeeHistoryError {
+    Reject(String),
+    Build(String),
+}
+
+impl FeeHistoryError {
+    /// The user-facing message, whichever side it is.
+    pub fn message(&self) -> &str {
+        match self {
+            FeeHistoryError::Reject(m) | FeeHistoryError::Build(m) => m,
+        }
+    }
+}
+
+/// Why a single-peer block serve ([`ElReader::get_block_from`]) failed: a
+/// `Peer` failure (transport / root mismatch / short window) is that peer's
+/// fault — the caller loop counts it against the peer and tries the next one;
+/// `Undecodable` means the body VERIFIED against the header's
+/// `transactionsRoot` but a tx inside it can't be decoded (an unknown future
+/// tx type) — deterministic for every peer, so the loop must stop without
+/// blaming peers that served correct bytes.
+enum BlockFromError {
+    Peer(String),
+    Undecodable(String),
+}
+
+/// A verified `eth_feeHistory` result (the Java `rpcFeeHistory` twin). Every
+/// value comes from the beacon-anchored header window; rewards additionally
+/// from bodies verified against `transactionsRoot` and receipts against
+/// `receiptsRoot` (gas-used-weighted percentile walk, geth's algorithm).
+#[derive(Debug, Clone)]
+pub struct FeeHistory {
+    pub oldest_block: u64,
+    /// `count + 1` entries: the requested blocks' base fees plus the NEXT
+    /// block's — its actual base fee when the anchored window extends past
+    /// `newest`, else the EIP-1559 prediction from `newest`.
+    pub base_fee_per_gas: Vec<u128>,
+    /// `count` entries: `gasUsed / gasLimit` (0.0 for a zero gasLimit).
+    pub gas_used_ratio: Vec<f64>,
+    /// `count` rows of one effective tip per requested percentile; `None` when
+    /// no percentiles were requested (the `reward` key is then omitted).
+    pub reward: Option<Vec<Vec<u128>>>,
+}
 
 /// A verified fee suggestion (`eth_gasPrice` + `eth_maxPriorityFeePerGas`), both
 /// in wei. The tip is the median effective priority fee over the last
@@ -261,6 +469,13 @@ pub struct ElReader {
     discovery: Discv4Service,
     pool: PeerPool,
     anchor: Arc<ExecAnchor>,
+    /// Our eth handshake parameters — reused by the Tor read path
+    /// (`docs/privacy-and-tor.md`) to dial a per-address isolated circuit with a
+    /// fresh ephemeral identity, independent of the pool's clearnet connections.
+    /// Only read on the `tor` feature; kept unconditionally so the struct shape
+    /// doesn't depend on the feature.
+    #[cfg_attr(not(feature = "tor"), allow(dead_code))]
+    eth_cfg: Arc<EthConfig>,
     /// Network floor for the suggested tip (from `ElConfig::min_suggested_tip_wei`).
     min_suggested_tip_wei: u128,
     /// Cross-call EVM caches, shared across every `eth_call` on this reader. Both
@@ -272,6 +487,41 @@ pub struct ElReader {
     /// the cache is a later dispatch-fairness refinement (EL-C-3).
     evm_proof_cache: Arc<InMemoryStateProofCache>,
     evm_bytecode_cache: Arc<InMemoryBytecodeCache>,
+    /// Per-tx receipt scan cursors (`eth_getTransactionReceipt` /
+    /// `locateMinedTx`). Outer std Mutex guards only the map (held briefly);
+    /// each entry's tokio Mutex serializes the (network-slow) scan per tx hash,
+    /// so concurrent polls for the SAME tx don't duplicate fetches while
+    /// different txs proceed in parallel.
+    tx_scans: std::sync::Mutex<TxScanMap>,
+    /// Recently-VERIFIED block hash → number, so `eth_getBlockByHash` (which
+    /// wallets call right after a receipt to finalize a tx) resolves to the
+    /// verified by-number path (the Java `blockHashToNumber` twin). Populated
+    /// ONLY by blocks this reader itself verified (the receipt/tx scan and the
+    /// by-number serve); the shared LRU is the myotis-evm cache one.
+    block_hash_numbers: std::sync::Mutex<myotis_evm::Lru<[u8; 32], u64>>,
+    /// The sent-tx watch + pending-nonce overlay + raw-bytes cache (the Java
+    /// `sentTxWatch`/`pendingNonces`/`sentTxCache` trio). One brief-hold lock:
+    /// every access is a map poke; the rebroadcast collects its work under the
+    /// lock and BROADCASTS outside it.
+    sent_txs: std::sync::Mutex<SentTxState>,
+    /// The sent-tx WATCH, shared with every peer's read loop (which marks
+    /// gossip sightings) — the Java TxGossipObserver seam's equivalent.
+    sent_tx_watch: crate::el::sent_tx::SharedSentTxWatch,
+    /// The opt-in eth_getLogs watch-list index (docs/eth-getlogs-design.md).
+    /// `None` until the host supplies a config. Brief-hold lock: appends and
+    /// queries are in-memory work; persistence happens on checkpoints and
+    /// stop, never under a network await.
+    log_index: std::sync::Mutex<Option<crate::el::logindex::LogIndex>>,
+    log_index_path: Option<std::path::PathBuf>,
+    /// The head-follow appender task (spawned on enable, aborted on stop).
+    log_index_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// The scan-cursor map plus its last TTL sweep — one lock covers both, so the
+/// sweep can be time-gated without a second synchronization point.
+struct TxScanMap {
+    map: std::collections::HashMap<[u8; 32], Arc<tokio::sync::Mutex<TxScanState>>>,
+    last_sweep: std::time::Instant,
 }
 
 /// Per-kind bound for the cross-call state-proof cache (accounts and storage
@@ -352,15 +602,428 @@ impl ElReader {
             None => crate::el::peercache::ElPeerCache::disabled(),
         };
         let local_pubkey = key.public_key_bytes();
-        let pool = PeerPool::start(key, local_pubkey, eth_cfg, cfg.pool_config, cache, rx);
+        let sent_tx_watch: crate::el::sent_tx::SharedSentTxWatch = Arc::new(
+            std::sync::Mutex::new(crate::el::sent_tx::SentTxTracker::new()),
+        );
+        let pool = PeerPool::start(
+            key,
+            local_pubkey,
+            Arc::clone(&eth_cfg),
+            cfg.pool_config,
+            cache,
+            rx,
+            Some(Arc::clone(&sent_tx_watch)),
+            Some(discovery.probe_sender()),
+        );
         Ok(ElReader {
             discovery,
             pool,
             anchor,
+            eth_cfg,
             min_suggested_tip_wei: cfg.min_suggested_tip_wei,
             evm_proof_cache: Arc::new(InMemoryStateProofCache::new(EVM_PROOF_CACHE_ENTRIES)),
             evm_bytecode_cache: Arc::new(InMemoryBytecodeCache::new()),
+            tx_scans: std::sync::Mutex::new(TxScanMap {
+                map: std::collections::HashMap::new(),
+                last_sweep: std::time::Instant::now(),
+            }),
+            block_hash_numbers: std::sync::Mutex::new(myotis_evm::Lru::new(BLOCK_HASH_LRU_MAX)),
+            sent_txs: std::sync::Mutex::new(SentTxState {
+                pending_nonces: crate::el::sent_tx::PendingNonceTracker::new(),
+                bytes: myotis_evm::Lru::new(SENT_TX_CACHE_MAX),
+                last_rebroadcast: std::time::Instant::now(),
+            }),
+            sent_tx_watch,
+            log_index: std::sync::Mutex::new(None),
+            log_index_path: cfg.log_index_path,
+            log_index_task: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Install (or replace) the eth_getLogs watch-list config: reload the
+    /// persisted index when it matches the config's fingerprint, else start
+    /// empty (re-index). See docs/eth-getlogs-design.md.
+    /// Returns false (and installs nothing) for an invalid config
+    /// (duplicate watch addresses). Re-applying a config whose watch-list
+    /// fingerprint matches the installed one only updates the enabled bit —
+    /// in-memory progress survives settings pokes; a genuinely changed
+    /// watch-list checkpoints the old index before replacing it.
+    pub fn set_log_index_config(&self, config: crate::el::logindex::LogIndexConfig) -> bool {
+        let Ok(mut slot) = self.log_index.lock() else {
+            return false;
+        };
+        if let Some(ix) = slot.as_mut() {
+            if ix.config().fingerprint() == config.fingerprint() {
+                ix.set_enabled(config.enabled);
+                return true;
+            }
+            if let Some(p) = self.log_index_path.as_deref() {
+                let _ = ix.persist(p);
+            }
+        }
+        let loaded = self
+            .log_index_path
+            .as_deref()
+            .and_then(|p| crate::el::logindex::LogIndex::load(&config, p));
+        let ix = match loaded {
+            Some(ix) => ix,
+            None => match crate::el::logindex::LogIndex::new(config) {
+                Ok(ix) => ix,
+                Err(_) => return false,
+            },
+        };
+        *slot = Some(ix);
+        true
+    }
+
+    /// The beacon-anchored head block number, if the anchor is ready — the
+    /// resolution target for `latest`-style tags in eth_getLogs filters.
+    pub fn head_block_number(&self) -> Option<u64> {
+        self.anchored_head().ok().map(|(n, _)| n)
+    }
+
+    /// Deterministically stop the appender: abort AND await the task, which
+    /// guarantees its per-tick strong Arc has been dropped — hosts call this
+    /// BEFORE Arc::try_unwrap so teardown never races a long catch-up tick.
+    pub async fn stop_log_index_appender(&self) {
+        let handle = match self.log_index_task.lock() {
+            Ok(mut t) => t.take(),
+            Err(_) => None,
+        };
+        if let Some(h) = handle {
+            h.abort();
+            let _ = h.await; // JoinError::Cancelled — the task's Arc is gone
+        }
+    }
+
+    /// Spawn (or keep) the head-follow appender for this reader. Idempotent:
+    /// a live task is left alone. `rt` makes the runtime-context invariant
+    /// unforgeable (a bare tokio::spawn outside a runtime would abort the
+    /// whole host process under panic="abort").
+    pub fn ensure_log_index_appender(self: &Arc<Self>, rt: &tokio::runtime::Handle) {
+        let Ok(mut slot) = self.log_index_task.lock() else {
+            return;
+        };
+        if slot.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        // The task holds only a WEAK reference: a strong Arc here would keep
+        // the reader's strong count above 1 forever, making the host's
+        // Arc::try_unwrap → ElReader::stop teardown unreachable (leaked
+        // networking on stop/pause). Each tick upgrades for its duration and
+        // the task exits on its own once the reader is gone; the abort in
+        // stop() is the fast path.
+        let weak = Arc::downgrade(self);
+        *slot = Some(rt.spawn(async move {
+            // Slice-3 rule: append FINALIZED blocks only. Finalized never
+            // reorgs, so coverage stays honest with zero rewind machinery;
+            // optimistic-tail appending (with the design doc's rewind rule)
+            // and deep-gap bridging both belong to the backfill slice.
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(6));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut since_persist = 0u32;
+            let mut ticks = 0u64;
+            loop {
+                tick.tick().await;
+                let Some(reader) = weak.upgrade() else {
+                    return; // reader torn down; the appender dies with it
+                };
+                reader.log_index_append_tick(&mut since_persist, ticks).await;
+                reader.log_index_backfill_step(ticks).await;
+                ticks = ticks.wrapping_add(1);
+            }
+        }));
+    }
+
+    /// One appender tick: record finalized blocks from the append edge up to
+    /// the finalized head (bounded batch per tick).
+    async fn log_index_append_tick(&self, since_persist: &mut u32, ticks: u64) {
+        // Checkpoint due from a PREVIOUS tick first: batches that end early
+        // (peer failure mid-catch-up) must not defer persistence forever.
+        if *since_persist >= 64 {
+            if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
+                if let Some(ix) = slot.as_ref() {
+                    let _ = ix.persist(path);
+                }
+            }
+            *since_persist = 0;
+        }
+        let enabled = self.with_log_index(|ix| ix.config().enabled).unwrap_or(false);
+        if !enabled {
+            return;
+        }
+        let finalized = self.finalized_block_number();
+        if finalized == 0 {
+            return;
+        }
+        let edge = self.with_log_index(|ix| ix.append_edge()).flatten();
+        let start = match edge {
+            None => finalized, // fresh index: start at the finalized head
+            Some(e) if e <= finalized => e,
+            Some(_) => return, // caught up
+        };
+        // The verified whole-block path anchors a window from the target to
+        // the optimistic head; stay well inside its lookback cap. A deeper
+        // lag is the backfill walker's job — say so once per tick.
+        if finalized.saturating_sub(start) > 128 {
+            // Rate-limited: this state persists until the backfill walker
+            // exists / catches up, and a warn every 6 s is just noise.
+            if ticks % 100 == 0 {
+                tracing::warn!(start, finalized, "log index append edge too far behind (node downtime?); upward bridging is a tracked follow-up — coverage above the edge stays frozen until then");
+            }
+            return;
+        }
+        let last = finalized.min(start.saturating_add(15));
+        for n in start..=last {
+            let (block_hash, receipts) = match self.block_receipts_at(Some(n)).await {
+                Ok(Some(r)) => r,
+                Ok(None) => return, // future/unknown under this anchor — retry next tick
+                Err(e) => {
+                    tracing::debug!(block = n, error = %e, "log index append: receipts unavailable");
+                    return;
+                }
+            };
+            // Strict conversion: any malformed field (wrong-length address or
+            // topic, index overflow) aborts THIS block's append rather than
+            // silently storing an altered shape under advancing coverage — a
+            // dropped topic0 would shift the rest and change what
+            // filter/watch matching sees for verified data.
+            let Some(logs) = stored_logs_for_block(&receipts) else {
+                tracing::warn!(block = n, "log index append: malformed log field in verified receipts; will retry");
+                return;
+            };
+            let appended = match self.log_index.lock() {
+                Ok(mut slot) => match slot.as_mut() {
+                    Some(ix) => match ix.append_block(n, block_hash, logs) {
+                        Ok(()) => true,
+                        Err(gap) => {
+                            // Transient (config replaced / rewind raced this
+                            // tick) → retrying next tick is right; if it ever
+                            // became persistent this warn is the telemetry.
+                            tracing::warn!(block = n, edge = gap.edge, "log index append rejected (coverage gap); retrying");
+                            false
+                        }
+                    },
+                    None => false,
+                },
+                Err(_) => false,
+            };
+            if !appended {
+                return;
+            }
+            *since_persist += 1;
+        }
+        // Checkpoint roughly every 64 appended blocks (best-effort).
+        if *since_persist >= 64 {
+            if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
+                if let Some(ix) = slot.as_ref() {
+                    let _ = ix.persist(path);
+                }
+            }
+            *since_persist = 0;
+        }
+    }
+
+    /// One backfill step: walk the verified header chain DOWNWARD from the
+    /// index's trust cursor toward the lowest watched from_block, one batch
+    /// per tick (docs/eth-getlogs-design.md §backfill). Every header is
+    /// trusted only through parent-hash linkage into the cursor (whose own
+    /// trust chains back to a beacon-anchored append); candidate blocks
+    /// (bloom hit) get body+receipts fetched and verified against both roots
+    /// before any log is stored. Peer refusal is a stall, never corruption:
+    /// coverage simply doesn't extend until some peer serves the range.
+    async fn log_index_backfill_step(&self, ticks: u64) {
+        let Some((config, cursor)) = self.with_log_index(|ix| (ix.config().clone(), ix.cursor)) else {
+            return;
+        };
+        let (Some(target_low), Some((cur_n, cur_hash))) =
+            (config.watch.iter().map(|w| w.from_block).min(), cursor)
+        else {
+            return; // no watch entries, or the appender hasn't seeded the edge yet
+        };
+        if !config.enabled || cur_n <= target_low {
+            return;
+        }
+        let fingerprint = config.fingerprint();
+        // count+1 headers are requested (the top one is the cursor block), and
+        // honest peers cap header serves at 1024 (our own served.rs agrees) —
+        // so the batch is 1023 new blocks, keeping the request exactly at cap.
+        const BATCH: u64 = 1023;
+        let count = (cur_n - target_low).min(BATCH);
+        let from = cur_n - count;
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return;
+        }
+        for peer in &peers {
+            match self
+                .log_index_backfill_batch(peer, count, cur_n, cur_hash, &config, fingerprint)
+                .await
+            {
+                Ok(()) => {
+                    // Checkpoint after every applied batch: the store is
+                    // small at Sepolia scale and a crash then costs at most
+                    // one batch (paged store before mainnet — design doc).
+                    if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
+                        if let Some(ix) = slot.as_ref() {
+                            let _ = ix.persist(path);
+                        }
+                    }
+                    return;
+                }
+                Err(e) => {
+                    tracing::debug!(from, count, error = %e, "log index backfill batch failed; trying next peer");
+                }
+            }
+        }
+        if ticks % 100 == 0 {
+            tracing::warn!(
+                cursor = cur_n,
+                target = target_low,
+                "log index backfill: no peer served the range this round (history depth?); will keep retrying"
+            );
+        }
+    }
+
+    /// Fetch and apply one descending backfill batch from one peer:
+    /// headers [from, cur_n] ascending (count+1, so the top one IS the cursor
+    /// block), full parent-hash chain check, bloom-filtered candidate
+    /// body+receipts fetch verified against both roots, then apply top-down.
+    /// Fetch and apply one descending backfill batch from one peer. The
+    /// request is `reverse=true` starting AT the trusted cursor block, so the
+    /// trust root is the FIRST header of the response — a short serve (peers
+    /// may cap below the 1024 ceiling, or truncate on byte budget) still
+    /// yields a verifiable parent-hash-chained prefix and partial progress,
+    /// instead of failing an exact-length check forever. (`remember_served`
+    /// only tracks ascending shapes, so reverse fetches skip that side
+    /// channel — harmless.) Candidates are bloom-filtered and their logs
+    /// pre-filtered against the captured config, so transient memory is
+    /// proportional to logs that will actually be stored.
+    async fn log_index_backfill_batch(
+        &self,
+        peer: &ManagedPeer,
+        count: u64,
+        cur_n: u64,
+        cur_hash: [u8; 32],
+        config: &crate::el::logindex::LogIndexConfig,
+        fingerprint: u64,
+    ) -> Result<(), String> {
+        let window = peer.get_block_headers_by_number(cur_n, count + 1, 0, true).await?;
+        let Some((top, rest)) = window.split_first() else {
+            return Err("peer returned no headers".to_string());
+        };
+        if top.header.number != cur_n || top.hash != cur_hash {
+            return Err("peer window does not start at the trusted cursor block".to_string());
+        }
+        if rest.is_empty() {
+            return Err("peer served only the cursor block".to_string());
+        }
+        // Descending parent-hash chain: each header's parent is the next one.
+        // Only the verified prefix is used, so a mid-response break just
+        // shortens the batch instead of failing it.
+        let mut verified = 0usize;
+        for pair in window.windows(2) {
+            let [upper, lower] = pair else {
+                return Err("header window pairing failed".to_string());
+            };
+            if upper.header.parent_hash != lower.hash
+                || lower.header.number != upper.header.number.wrapping_sub(1)
+            {
+                break;
+            }
+            verified += 1;
+        }
+        if verified == 0 {
+            return Err("peer response does not chain to the cursor block".to_string());
+        }
+        let new_blocks = rest.get(..verified).ok_or("verified prefix out of range")?;
+        // Bloom-filter candidates among the NEW blocks. A miss is a
+        // definitive skip; a hit needs verified receipts.
+        let candidates: Vec<&crate::el::eth::messages::VerifiedHeader> = new_blocks
+            .iter()
+            .filter(|h| {
+                let Ok(bloom): Result<&[u8; 256], _> = h.header.logs_bloom.as_slice().try_into() else {
+                    return true; // odd bloom width: treat as maybe, verify via receipts
+                };
+                self.with_log_index(|ix| ix.bloom_may_match(h.header.number, bloom)).unwrap_or(false)
+            })
+            .collect();
+        let mut logs_by_block: std::collections::HashMap<u64, Vec<crate::el::logindex::StoredLog>> =
+            std::collections::HashMap::new();
+        // Chunked: one request for ~1023 candidate blocks would blow through
+        // peer soft response limits (~2 MiB) and permanently stall a
+        // candidate-dense range on the exact-length check below.
+        for chunk in candidates.chunks(64) {
+            let hashes: Vec<[u8; 32]> = chunk.iter().map(|h| h.hash).collect();
+            let (bodies, receipt_blocks) =
+                futures::future::join(peer.get_block_bodies(&hashes), peer.get_receipts(&hashes)).await;
+            let bodies = bodies?;
+            let receipt_blocks = receipt_blocks?;
+            if bodies.len() != chunk.len() || receipt_blocks.len() != chunk.len() {
+                return Err("peer returned a short bodies/receipts response".to_string());
+            }
+            for ((vh, body), receipts) in chunk.iter().zip(&bodies).zip(&receipt_blocks) {
+                verify_body_transactions(&vh.header, body)?;
+                if receipts.len() != body.transactions.len() {
+                    return Err(format!(
+                        "block {}: {} receipts for {} transactions",
+                        vh.header.number,
+                        receipts.len(),
+                        body.transactions.len()
+                    ));
+                }
+                verify_block_receipts(&vh.header, receipts)?;
+                let built = build_block_receipts(&vh.header, vh.hash, body, receipts)?;
+                let stored = stored_logs_for_block(&built)
+                    .ok_or("malformed log field in verified receipts")?;
+                // Pre-filter: buffer only logs the captured watch-list will
+                // store (the fingerprint recheck below discards the batch if
+                // the config changed, so filtering against the snapshot is
+                // safe) — transient memory stays proportional to stored logs.
+                let watched: Vec<crate::el::logindex::StoredLog> =
+                    stored.into_iter().filter(|l| config.watches(l)).collect();
+                if !watched.is_empty() {
+                    logs_by_block.insert(vh.header.number, watched);
+                }
+            }
+        }
+        // Apply top-down (the response is already descending) so every block
+        // adjoins the low edge; the trust edge advances with each block.
+        match self.log_index.lock() {
+            Ok(mut slot) => {
+                let Some(ix) = slot.as_mut() else {
+                    return Err("log index uninstalled mid-batch".to_string());
+                };
+                // The batch ran across several awaits; a concurrent
+                // set_log_index_config may have replaced the index (fresh
+                // cursor None, empty spans that would accept ANY block). Our
+                // candidates were bloom-selected against the OLD watch-list —
+                // applying them to a new one would claim coverage for blocks
+                // whose new-address logs were "definitively" skipped. Bail
+                // unless both the trust edge and the config are the ones this
+                // batch was computed against.
+                if ix.cursor != Some((cur_n, cur_hash)) || ix.config().fingerprint() != fingerprint {
+                    return Err("index changed mid-batch; recomputing next tick".to_string());
+                }
+                for vh in new_blocks {
+                    let n = vh.header.number;
+                    let logs = logs_by_block.remove(&n).unwrap_or_default();
+                    ix.backfill_block(n, vh.hash, logs)
+                        .map_err(|g| format!("backfill gap at {} (edge {})", g.block, g.edge))?;
+                }
+                Ok(())
+            }
+            Err(_) => Err("log index lock poisoned".to_string()),
+        }
+    }
+
+    /// Run `f` against the index if one is configured. The single accessor
+    /// for queries and status — callers never touch the lock directly.
+    pub fn with_log_index<T>(&self, f: impl FnOnce(&crate::el::logindex::LogIndex) -> T) -> Option<T> {
+        match self.log_index.lock() {
+            Ok(slot) => slot.as_ref().map(f),
+            Err(_) => None,
+        }
     }
 
     /// Count of live snap peers (for host status).
@@ -382,6 +1045,11 @@ impl ElReader {
     /// Live-adjust the eth/69 served-block window (Settings knob).
     pub fn set_served_block_window(&self, blocks: u64) {
         self.pool.set_served_block_window(blocks);
+    }
+
+    /// EL hunt engaged on the pool (serving pool empty past the stall window).
+    pub fn el_hunting(&self) -> bool {
+        self.pool.el_hunting()
     }
 
     pub async fn blacklist_count(&self) -> usize {
@@ -416,6 +1084,13 @@ impl ElReader {
     /// a single hung/dead peer doesn't fail the query. A serving peer is marked
     /// CONFIRMED in the cache, a failing one records a strike (→ deprioritized).
     pub async fn get_account(&self, address: [u8; 20]) -> Result<VerifiedAccount, String> {
+        // Tor mode (docs/privacy-and-tor.md): route this read — the §1 "core
+        // leak" flow — over a per-address isolated Tor circuit instead of the
+        // pool's clearnet connections. Fail-closed if no aged peer is available.
+        #[cfg(feature = "tor")]
+        if crate::el::tor::is_enabled() {
+            return self.get_account_over_tor(address).await;
+        }
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
@@ -466,8 +1141,22 @@ impl ElReader {
         let verdict = peer
             .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
             .await;
-        let (fin_num, opt_num, synced) = self.anchor_diagnostics();
+        Ok(self.build_verified_account(address, state_root, block_number, outcome, verdict))
+    }
 
+    /// Assemble a `VerifiedAccount` from the proof-verified outcome + the beacon
+    /// anchor verdict + the reader's live anchor diagnostics. Shared by the
+    /// clearnet ([`get_account_from`]) and Tor read paths so the verdict/trust
+    /// fields are identical regardless of transport.
+    fn build_verified_account(
+        &self,
+        address: [u8; 20],
+        state_root: [u8; 32],
+        block_number: u64,
+        outcome: AccountOutcome,
+        verdict: crate::el::verify::Verdict,
+    ) -> VerifiedAccount {
+        let (fin_num, opt_num, synced) = self.anchor_diagnostics();
         let account_hash = keccak256(&address);
         let mut result = VerifiedAccount {
             address,
@@ -496,7 +1185,95 @@ impl ElReader {
             result.storage_root = leaf.storage_root;
             result.code_hash = leaf.code_hash;
         }
-        Ok(result)
+        result
+    }
+
+    /// Tor read path for [`get_account`]: dial a per-address ISOLATED Tor circuit
+    /// with a FRESH ephemeral RLPx identity (docs §3/§6.1) to a peer the pool
+    /// already validated on clearnet, and run the identical fetch + beacon-anchor
+    /// verdict as the clearnet path. Fails CLOSED when no such peer is available
+    /// — never silently falls back to a clearnet dial (docs §5).
+    #[cfg(feature = "tor")]
+    async fn get_account_over_tor(&self, address: [u8; 20]) -> Result<VerifiedAccount, String> {
+        // Candidate identities: peers this reader's pool discovered & validated
+        // over clearnet (addr + enode pubkey), snap-serving-quality first (the
+        // pool orders them). We reuse only their IDENTITY; the dial itself is a
+        // fresh Tor circuit with an ephemeral node key, so the peer never sees our
+        // real IP or our persistent node key.
+        //
+        // KNOWN LIMITATION (docs §5): `snap_peers()` returns peers we hold a LIVE
+        // clearnet connection to right now, so the Tor circuit reaches a node that
+        // simultaneously sees our real IP — a peer could pair the two by timing +
+        // the (rare) client fingerprint (§6.3). The design's fix is the quarantined,
+        // AGED, multi-source-promoted Tor pool (§5) that dials only peers we are NOT
+        // currently clearnet-connected to; that sidecar is out of scope for this
+        // experimental v1 and tracked as the follow-up.
+        //
+        // Bound the fan-out: each Tor dial is
+        // slow and many peers reject Tor-exit inbound, so cap the candidates AND
+        // the whole read, or one balance query could hang the FFI call for minutes
+        // (a bad-exit walk); fail-closed on the deadline.
+        let candidates: Vec<(std::net::SocketAddr, [u8; 64])> = self
+            .pool
+            .snap_peers()
+            .await
+            .iter()
+            .take(TOR_MAX_CANDIDATES)
+            .map(|p| (p.addr(), p.peer_pubkey()))
+            .collect();
+        if candidates.is_empty() {
+            return Err("tor: no clearnet-validated snap peer to dial over Tor (fail-closed)".into());
+        }
+        let deadline = tokio::time::Instant::now() + TOR_READ_DEADLINE;
+        let mut fallback: Option<VerifiedAccount> = None;
+        let mut last_err = String::new();
+        for (addr, pubkey) in candidates {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                last_err = "tor read deadline exceeded".to_string();
+                break;
+            }
+            // Bound each candidate's whole dial+read by the remaining budget.
+            let attempt = async {
+                let mut session =
+                    crate::el::tor::open_snap_session(&address, addr, pubkey, &self.eth_cfg).await?;
+                self.account_from_tor_session(&mut session, address).await
+            };
+            // NB deliberately NO record_snap_served/record_snap_failure here: those
+            // feed the SHARED, persisted clearnet peer-quality cache, and a peer
+            // that rejects Tor-exit inbound (a Tor property) is not a bad CLEARNET
+            // snap peer — striking it would poison clearnet dialing on the next run.
+            // Tor-side peer quality belongs in the Tor sidecar (docs §5), a follow-up.
+            match tokio::time::timeout(remaining, attempt).await {
+                Ok(Ok(result)) => {
+                    if result.verify_method.is_some() || is_global_fail(result.fail_reason) {
+                        return Ok(result);
+                    }
+                    fallback.get_or_insert(result);
+                }
+                Ok(Err(e)) => last_err = e,
+                Err(_) => last_err = format!("tor dial to {addr} exceeded the read budget"),
+            }
+        }
+        fallback.map(Ok).unwrap_or_else(|| {
+            Err(format!("tor: all snap-peer dials failed to serve a verifiable account: {last_err}"))
+        })
+    }
+
+    /// One account fetch + beacon verdict over an already-connected Tor
+    /// [`EthSession`] (the [`get_account_from`] twin for the one-shot Tor path).
+    #[cfg(feature = "tor")]
+    async fn account_from_tor_session(
+        &self,
+        session: &mut crate::el::eth::session::EthSession<arti_client::DataStream>,
+        address: [u8; 20],
+    ) -> Result<VerifiedAccount, String> {
+        let (state_root, block_number) = fresh_head_session(session).await?;
+        let outcome = session.snap_get_account(&state_root, &address).await?;
+        let verdict = session
+            .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
+            .await;
+        Ok(self.build_verified_account(address, state_root, block_number, outcome, verdict))
     }
 
     /// Fetch + verify one storage slot. `holder` switches the key to the
@@ -952,7 +1729,7 @@ impl ElReader {
         let Some(fin) = self.anchor.finalized_execution() else {
             return Err(format!("no beacon-finalized execution block for {what}"));
         };
-        let Some(block) = self.get_block_by_number(Some(fin.block_number)).await? else {
+        let Some(block) = self.get_block_by_number(Some(fin.block_number), false).await? else {
             return Err(format!(
                 "finalized block {} not fetchable for {what}",
                 fin.block_number
@@ -985,7 +1762,7 @@ impl ElReader {
         chain_id: u64,
         what: &str,
     ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
-        let Some(block) = self.get_block_by_number(None).await? else {
+        let Some(block) = self.get_block_by_number(None, false).await? else {
             return Err(format!("no verified head to run {what} against"));
         };
         let ctx = block_context(&block.header, chain_id)?;
@@ -1018,8 +1795,11 @@ impl ElReader {
         Ok((ctx, executor))
     }
 
-    /// Verified `eth_getBlockByNumber` (transactions as hashes). `target` is the
-    /// block number, or `None` for the latest (the beacon optimistic head).
+    /// Verified `eth_getBlockByNumber`. `target` is the block number, or `None`
+    /// for the latest (the beacon optimistic head); `full_transactions` selects
+    /// fully decoded tx objects (incl. the recovered sender) instead of hashes —
+    /// an undecodable tx inside the verified body fails the serve (`Err`), never
+    /// a silent hash fallback.
     ///
     /// Returns `Ok(Some(block))` when a block is fetched and verified; `Ok(None)`
     /// for a number ABOVE the verified head (a future/unknown block → eth `null`);
@@ -1028,14 +1808,9 @@ impl ElReader {
     pub async fn get_block_by_number(
         &self,
         target: Option<u64>,
+        full_transactions: bool,
     ) -> Result<Option<VerifiedBlock>, String> {
-        let head_num = self.anchor.optimistic_block_number();
-        let Some(head_hash) = self.anchor.optimistic_block_hash() else {
-            return Err("no beacon-anchored head yet".to_string());
-        };
-        if head_num == 0 {
-            return Err("beacon not synced".to_string());
-        }
+        let (head_num, head_hash) = self.anchored_head()?;
         let target_num = target.unwrap_or(head_num);
         // A pin above the verified head is future/unknown, not an error.
         if target_num > head_num {
@@ -1058,12 +1833,22 @@ impl ElReader {
         let total = peers.len();
         let mut last_err = String::new();
         for peer in &peers {
-            match self.get_block_from(peer, target_num, back, &head_hash).await {
+            match self.get_block_from(peer, target_num, back, &head_hash, full_transactions).await
+            {
                 Ok(block) => {
                     self.pool.record_snap_served(peer.addr()).await;
                     return Ok(Some(block));
                 }
-                Err(e) => {
+                // The body root-verified but a tx inside it doesn't decode: the
+                // peer served CORRECT data and every peer would serve the same
+                // bytes — rendering it is our failure. Credit the peer and stop
+                // (retrying the pool would just re-download the block N times
+                // and burn the shared snap reputation on verified-good peers).
+                Err(BlockFromError::Undecodable(e)) => {
+                    self.pool.record_snap_served(peer.addr()).await;
+                    return Err(e);
+                }
+                Err(BlockFromError::Peer(e)) => {
                     self.pool.record_snap_failure(peer.addr()).await;
                     last_err = e;
                 }
@@ -1075,49 +1860,69 @@ impl ElReader {
     /// Fetch + verify one block against a single peer. Fetches the header window
     /// [target..head], checks it hash-links up to the beacon-anchored head hash,
     /// then fetches the target's body and verifies its transactions against the
-    /// header's `transactions_root`. Any mismatch/transport error propagates for
-    /// the caller loop to try the next peer.
+    /// header's `transactions_root`. A [`BlockFromError::Peer`] (mismatch /
+    /// transport) is this peer's failure — the caller loop tries the next one;
+    /// a [`BlockFromError::Undecodable`] is deterministic across peers and must
+    /// short-circuit the loop.
     async fn get_block_from(
         &self,
         peer: &ManagedPeer,
         target_num: u64,
         back: u64,
         head_hash: &[u8; 32],
-    ) -> Result<VerifiedBlock, String> {
+        full_transactions: bool,
+    ) -> Result<VerifiedBlock, BlockFromError> {
         // The contiguous forward window [target .. head] (back + 1 headers), in one
         // request. back < BLOCK_LOOKBACK_MAX (256) bounds this to ~150 KB, within the
         // eth response soft limit; a peer that caps its response below back+1 fails
-        // the length check below and is skipped (fails closed — the caller tries the
-        // next peer), so deep pins carry a slightly higher liveness risk than a
-        // batched fetch would. The common case (latest / a few blocks back) is one
-        // small response.
-        let window = peer.get_block_headers_by_number(target_num, back + 1, 0, false).await?;
-        if window.len() as u64 != back + 1 {
-            return Err(format!("peer returned {} headers, expected {}", window.len(), back + 1));
-        }
-        // The window's head must BE the beacon-anchored head, and each header must
-        // hash-link to the next — proving the target header chains to the verified
-        // head (the trust gate: head_hash is the light-client-attested exec hash).
-        if &window[window.len() - 1].hash != head_hash {
-            return Err("window head does not match the beacon-anchored head hash".to_string());
-        }
-        for i in 0..window.len() - 1 {
-            if window[i + 1].header.parent_hash != window[i].hash {
-                return Err("header window is not hash-linked".to_string());
-            }
-        }
+        // the anchored-window length check and is skipped (fails closed — the caller
+        // tries the next peer), so deep pins carry a slightly higher liveness risk
+        // than a batched fetch would. The common case (latest / a few blocks back) is
+        // one small response.
+        let window = fetch_anchored_window(peer, target_num, back + 1, head_hash)
+            .await
+            .map_err(BlockFromError::Peer)?;
         let vh = &window[0];
-        if vh.header.number != target_num {
-            return Err("peer returned the wrong target block number".to_string());
-        }
         // Body: verify its transactions against the (now trusted) transactions_root.
-        let bodies = peer.get_block_bodies(&[vh.hash]).await?;
-        let body = bodies.into_iter().next().ok_or("peer returned no block body")?;
-        if !triehash::verify(&body.transactions, &vh.header.transactions_root) {
-            return Err("block body transactions do not match the header transactionsRoot".to_string());
-        }
-        let tx_hashes = body.transactions.iter().map(|t| keccak256(t)).collect();
-        Ok(VerifiedBlock { hash: vh.hash, header: vh.header.clone(), tx_hashes })
+        let bodies = peer.get_block_bodies(&[vh.hash]).await.map_err(BlockFromError::Peer)?;
+        let body = bodies
+            .into_iter()
+            .next()
+            .ok_or_else(|| BlockFromError::Peer("peer returned no block body".to_string()))?;
+        verify_body_transactions(&vh.header, &body).map_err(BlockFromError::Peer)?;
+        let tx_hashes: Vec<[u8; 32]> = body.transactions.iter().map(|t| keccak256(t)).collect();
+        // Full mode: decode every tx of the (root-verified) body. Strict, like
+        // the Java buildBlockJson: found-but-unrenderable fails the serve.
+        let full = if full_transactions {
+            let mut out = Vec::with_capacity(body.transactions.len());
+            for (i, raw_tx) in body.transactions.iter().enumerate() {
+                let tx = tx::decode_summary(raw_tx).ok_or_else(|| {
+                    BlockFromError::Undecodable(format!(
+                        "block {} has an undecodable tx at index {i}",
+                        vh.header.number
+                    ))
+                })?;
+                out.push(VerifiedTransaction {
+                    tx_hash: tx_hashes[i],
+                    tx_index: i as u64,
+                    block_hash: vh.hash,
+                    block_number: vh.header.number,
+                    tx,
+                });
+            }
+            Some(out)
+        } else {
+            None
+        };
+        // Remember the fully verified hash↔number so eth_getBlockByHash resolves
+        // it (the Java rpcGetBlockByNumber does the same).
+        self.remember_block_number(vh.hash, vh.header.number);
+        Ok(VerifiedBlock {
+            hash: vh.hash,
+            header: vh.header.clone(),
+            tx_hashes,
+            full_transactions: full,
+        })
     }
 
     /// Verified fee suggestion (`eth_gasPrice` + `eth_maxPriorityFeePerGas`). Samples
@@ -1125,13 +1930,7 @@ impl ElReader {
     /// tip (floored at the network's `min_suggested_tip_wei`) as the priority fee, and next-block
     /// base fee + that tip as the legacy gas price. `Err` when it can't verify.
     pub async fn fee_estimate(&self) -> Result<FeeEstimate, String> {
-        let head_num = self.anchor.optimistic_block_number();
-        let Some(head_hash) = self.anchor.optimistic_block_hash() else {
-            return Err("no beacon-anchored head yet".to_string());
-        };
-        if head_num == 0 {
-            return Err("beacon not synced".to_string());
-        }
+        let (head_num, head_hash) = self.anchored_head()?;
         // Sample [start..head]; never below genesis.
         let count = TIP_SUGGEST_BLOCKS.min(head_num + 1);
         let start = head_num + 1 - count;
@@ -1167,18 +1966,7 @@ impl ElReader {
         count: u64,
         head_hash: &[u8; 32],
     ) -> Result<FeeEstimate, String> {
-        let window = peer.get_block_headers_by_number(start, count, 0, false).await?;
-        if window.len() as u64 != count {
-            return Err(format!("peer returned {} headers, expected {}", window.len(), count));
-        }
-        if &window[window.len() - 1].hash != head_hash {
-            return Err("window head does not match the beacon-anchored head hash".to_string());
-        }
-        for i in 0..window.len() - 1 {
-            if window[i + 1].header.parent_hash != window[i].hash {
-                return Err("header window is not hash-linked".to_string());
-            }
-        }
+        let window = fetch_anchored_window(peer, start, count, head_hash).await?;
         let hashes: Vec<[u8; 32]> = window.iter().map(|vh| vh.hash).collect();
         let bodies = peer.get_block_bodies(&hashes).await?;
         if bodies.len() != window.len() {
@@ -1192,9 +1980,7 @@ impl ElReader {
             // which would median over the remaining good blocks — safer here, at a
             // small availability cost. (A wrong header/body pairing from an out-of-
             // order peer response is caught the same way.)
-            if !triehash::verify(&body.transactions, &vh.header.transactions_root) {
-                return Err("block body transactions do not match the header transactionsRoot".to_string());
-            }
+            verify_body_transactions(&vh.header, body)?;
             let base = header_base_fee(&vh.header);
             for raw in &body.transactions {
                 // A tx the minimal fee decoder can't read is skipped (not dropped
@@ -1215,6 +2001,151 @@ impl ElReader {
         let head_header = &window[window.len() - 1].header;
         let gas_price = next_base_fee(head_header).saturating_add(tip);
         Ok(FeeEstimate { max_priority_fee_wei: tip, gas_price_wei: gas_price })
+    }
+
+    /// Verified `eth_feeHistory` (the Java `rpcFeeHistory` twin). `newest_block`
+    /// `None` = the latest tag (the beacon-anchored head); `reward_percentiles`
+    /// `None` omits the reward matrix (its per-block cost is a verified body +
+    /// receipts fetch). `block_count` is clamped to [`FEE_HISTORY_MAX_BLOCKS`];
+    /// the result reflects what was served.
+    ///
+    /// The error carries the Java tri-state split: a [`FeeHistoryError::Reject`]
+    /// is a bad request AGAINST THE CURRENT HEAD (Java answers these -32000,
+    /// never stale); a [`FeeHistoryError::Build`] is a transport/verify failure
+    /// the host may answer from its last-good same-signature snapshot.
+    pub async fn fee_history(
+        &self,
+        block_count: u64,
+        newest_block: Option<u64>,
+        reward_percentiles: Option<&[f64]>,
+    ) -> Result<FeeHistory, FeeHistoryError> {
+        if block_count == 0 {
+            return Err(FeeHistoryError::Reject("blockCount must be at least 1".to_string()));
+        }
+        // No anchor yet is a BUILD failure (Java's `anchor == null` path also
+        // falls to the stale-serve), unlike the request rejects below.
+        let (head_num, head_hash) = self.anchored_head().map_err(FeeHistoryError::Build)?;
+        let newest = newest_block.unwrap_or(head_num);
+        if newest > head_num {
+            return Err(FeeHistoryError::Reject(
+                "newest block is beyond the verified head".to_string(),
+            ));
+        }
+        let count = block_count.min(FEE_HISTORY_MAX_BLOCKS).min(newest + 1);
+        let oldest = newest + 1 - count;
+        if head_num - oldest >= BLOCK_LOOKBACK_MAX {
+            return Err(FeeHistoryError::Reject(format!(
+                "oldest block {oldest} is beyond the {BLOCK_LOOKBACK_MAX}-block verify window"
+            )));
+        }
+        self.fee_history_build(oldest, count, head_num, &head_hash, reward_percentiles)
+            .await
+            .map_err(FeeHistoryError::Build)
+    }
+
+    /// The peer-failover build stage of [`Self::fee_history`] (every error here
+    /// is a BUILD failure — the bounds were already accepted).
+    async fn fee_history_build(
+        &self,
+        oldest: u64,
+        count: u64,
+        head_num: u64,
+        head_hash: &[u8; 32],
+        reward_percentiles: Option<&[f64]>,
+    ) -> Result<FeeHistory, String> {
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err("no snap peer available".to_string());
+        }
+        let total = peers.len();
+        let mut last_err = String::new();
+        for peer in &peers {
+            let attempt = tokio::time::timeout(
+                FEE_HISTORY_DEADLINE,
+                self.fee_history_from(peer, oldest, count, head_num, head_hash, reward_percentiles),
+            )
+            .await
+            .unwrap_or_else(|_| Err("feeHistory build timed out".to_string()));
+            match attempt {
+                Ok(history) => {
+                    self.pool.record_snap_served(peer.addr()).await;
+                    return Ok(history);
+                }
+                Err(e) => {
+                    self.pool.record_snap_failure(peer.addr()).await;
+                    last_err = e;
+                }
+            }
+        }
+        Err(format!("all {total} snap peer(s) failed to serve a verifiable feeHistory: {last_err}"))
+    }
+
+    /// Build the fee history against one peer: one anchored window
+    /// `[oldest..head]` (the span past `newest` is what anchors it — and gives
+    /// the ACTUAL next-block base fee), then, when percentiles were requested,
+    /// every block's body + receipts fetched CONCURRENTLY (the Java pipelined
+    /// `verifiedBlockTipsAsync` — sequential per-block round-trips blew the
+    /// wallet's fee-poll timeout) and verified against `transactionsRoot` /
+    /// `receiptsRoot` before any tip is trusted.
+    async fn fee_history_from(
+        &self,
+        peer: &ManagedPeer,
+        oldest: u64,
+        count: u64,
+        head_num: u64,
+        head_hash: &[u8; 32],
+        reward_percentiles: Option<&[f64]>,
+    ) -> Result<FeeHistory, String> {
+        let window_len = head_num - oldest + 1;
+        let window = fetch_anchored_window(peer, oldest, window_len, head_hash).await?;
+        let count = count as usize;
+
+        let mut base_fee_per_gas: Vec<u128> =
+            window[..count].iter().map(|vh| header_base_fee(&vh.header)).collect();
+        // Entry count+1: the next block after `newest` — its actual base fee
+        // when the window extends past newest, else the EIP-1559 prediction.
+        base_fee_per_gas.push(if count < window.len() {
+            header_base_fee(&window[count].header)
+        } else {
+            next_base_fee(&window[count - 1].header)
+        });
+
+        let gas_used_ratio: Vec<f64> = window[..count]
+            .iter()
+            .map(|vh| {
+                let h = &vh.header;
+                if h.gas_limit > 0 { h.gas_used as f64 / h.gas_limit as f64 } else { 0.0 }
+            })
+            .collect();
+
+        let reward = match reward_percentiles {
+            None => None,
+            Some(percentiles) => {
+                // All bodies + receipts in flight at once on this peer's
+                // multiplexed connection; one slowest-block round-trip of
+                // wall-clock instead of 2×count sequential ones.
+                let per_block = futures::future::join_all(window[..count].iter().map(|vh| {
+                    let hash = [vh.hash];
+                    async move {
+                        let (bodies, receipts) = futures::future::join(
+                            peer.get_block_bodies(&hash),
+                            peer.get_receipts(&hash),
+                        )
+                        .await;
+                        (bodies, receipts)
+                    }
+                }))
+                .await;
+                let mut rows = Vec::with_capacity(count);
+                for (vh, (bodies, receipts)) in window[..count].iter().zip(per_block) {
+                    let tips = block_tx_tips(&vh.header, bodies?, receipts?)?;
+                    rows.push(percentile_rewards(tips, percentiles));
+                }
+                Some(rows)
+            }
+        };
+
+        Ok(FeeHistory { oldest_block: oldest, base_fee_per_gas, gas_used_ratio, reward })
     }
 
     /// Gossip a signed raw transaction to peers (the engine never signs) and return
@@ -1245,7 +2176,624 @@ impl ElReader {
         if sent == 0 {
             return Err("no peer accepted the transaction broadcast".to_string());
         }
+        // The sent-tx watch (the Java rpcSendRawTransaction tail, mirrored):
+        // cache the bytes for rebroadcast, record the sender's pending nonce
+        // (best-effort — an undecodable/senderless tx is silently skipped),
+        // and start watching with the head recorded AT BROADCAST — the beacon
+        // OPTIMISTIC number (the Java broadcastHead source), which the receipt
+        // scan's reachback uses as its floor for our own txs.
+        let now = std::time::Instant::now();
+        let broadcast_head = match self.anchor.optimistic_block_number() {
+            0 => None,
+            n => Some(n),
+        };
+        {
+            let mut st = self.sent_txs.lock().unwrap();
+            st.bytes.put(hash, raw_tx.to_vec());
+            if let Some(t) = tx::decode_summary(raw_tx) {
+                if let Some(from) = t.from {
+                    st.pending_nonces.record(from, t.nonce, now);
+                }
+            }
+        }
+        self.sent_tx_watch.lock().unwrap().watch(hash, now, broadcast_head);
         Ok(hash)
+    }
+
+    /// The "pending" nonce overlay (the Java `pendingNonceOverlay` twin): raise
+    /// the verified mined count to `our nonce + 1` while our own broadcast is
+    /// unmined and unexpired. Identity for every other caller. Only the
+    /// `pending` tag may consult this — never settled tags.
+    pub fn pending_nonce_overlay(&self, sender: &[u8; 20], mined_count: u64) -> u64 {
+        let mut st = self.sent_txs.lock().unwrap();
+        st.pending_nonces.overlay(sender, mined_count, std::time::Instant::now())
+    }
+
+    /// Time-gated rebroadcast of our own not-yet-seen txs (the Java
+    /// `rebroadcastPendingTxs` behind its 20 s gate). Piggybacks on the
+    /// wallet's poll paths (see [`TX_REBROADCAST_INTERVAL`]); evicts expired
+    /// watches first. The peer writes happen OUTSIDE the state lock.
+    async fn maybe_rebroadcast_sent_txs(&self) {
+        let now = std::time::Instant::now();
+        let unseen = {
+            let mut watch = self.sent_tx_watch.lock().unwrap();
+            if !watch.watching_any() {
+                return;
+            }
+            watch.evict_expired(now);
+            watch.unseen()
+        };
+        let work: Vec<Vec<u8>> = {
+            let mut st = self.sent_txs.lock().unwrap();
+            if now.saturating_duration_since(st.last_rebroadcast) < TX_REBROADCAST_INTERVAL {
+                return;
+            }
+            st.last_rebroadcast = now;
+            unseen
+                .iter()
+                // Bytes aged out of the LRU → nothing to push (Java parity).
+                .filter_map(|h| st.bytes.get(h).cloned())
+                .collect()
+        };
+        if work.is_empty() {
+            return;
+        }
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return;
+        }
+        // DETACHED, like the Java warmer thread: the wallet's receipt poll
+        // carries the trigger but must never wait on the pushes — a wedged
+        // peer (writer lock held, full send buffer) would otherwise freeze
+        // the confirm loop. Bounded per write; peers are owned Arcs.
+        tokio::spawn(async move {
+            let count = work.len();
+            for raw in work {
+                let sends = peers.iter().map(|peer| {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        peer.send_transaction(&raw),
+                    )
+                });
+                futures::future::join_all(sends).await;
+            }
+            tracing::debug!("rebroadcast {} sent tx(s) to {} peer(s)", count, peers.len());
+        });
+    }
+
+    /// Verified `eth_getTransactionReceipt`. Scans a bounded, incrementally
+    /// growing window of recent blocks below the beacon-anchored head: bodies
+    /// verify against `transactionsRoot` (locating the tx + its index), then the
+    /// block's receipts against `receiptsRoot`, before anything is served. Twin
+    /// of the Java `VerifiedRpcBackend.rpcGetTransactionReceipt`/`locateMinedTx`.
+    ///
+    /// Returns `Ok(Some)` for a verified receipt; `Ok(None)` for a VERIFIED
+    /// "not seen" (scanned coverage doesn't contain the tx — eth's null, the
+    /// wallet keeps polling); `Err` when it can't verify right now (no anchor /
+    /// every peer failed → the host maps it to -32000). One deliberate
+    /// divergence from Java: a scan the peers couldn't serve is `Err` here
+    /// (Java's anchor-failure path answers "null"), and a block whose body
+    /// fetch fails aborts that peer's scan instead of being silently skipped —
+    /// stricter, so a skipped block can never masquerade as "not seen".
+    ///
+    /// COVERAGE CAVEAT (Java parity): "not seen" means not seen in the SCANNED
+    /// coverage. A tx mined more than [`RECEIPT_INITIAL_LOOKBACK_BLOCKS`] below
+    /// the head before its FIRST poll, or inside a catch-up gap the
+    /// [`RECEIPT_MAX_SCAN_BLOCKS_PER_POLL`] cap skipped, keeps reading as null.
+    /// The Java engine narrows this for the wallet's own txs via the sent-tx
+    /// watch's broadcast-head reachback — that lands with the sent-tx slice
+    /// (milestone B chunk 3).
+    pub async fn get_transaction_receipt(
+        &self,
+        tx_hash: [u8; 32],
+    ) -> Result<Option<VerifiedReceipt>, String> {
+        // The wallet's post-send confirm loop polls exactly this — the natural
+        // carrier for the time-gated sent-tx rebroadcast (see the interval doc).
+        self.maybe_rebroadcast_sent_txs().await;
+        let (head_num, head_hash) = self.anchored_head()?;
+        let Some(loc) = self.locate_mined_tx(tx_hash, head_num, &head_hash).await? else {
+            return Ok(None); // verified "not seen" in the scanned coverage → eth null
+        };
+
+        // Fetch + verify the block's receipts against the (anchored) header's
+        // receiptsRoot, then build the result. Receipts are re-fetched per poll
+        // (only the LOCATION is cached), matching Java.
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err("no snap peer available".to_string());
+        }
+        let total = peers.len();
+        let mut last_err = String::new();
+        for peer in &peers {
+            match self.receipt_from(peer, &loc).await {
+                Ok(vr) => {
+                    self.pool.record_snap_served(peer.addr()).await;
+                    // A verified receipt IS inclusion — the watch is done
+                    // (the Java rpcGetTransactionReceipt's confirmMined).
+                    self.sent_tx_watch.lock().unwrap().confirm_mined(&tx_hash);
+                    return Ok(Some(vr));
+                }
+                Err(e) => {
+                    self.pool.record_snap_failure(peer.addr()).await;
+                    last_err = e;
+                }
+            }
+        }
+        Err(format!("all {total} snap peer(s) failed to serve verifiable receipts: {last_err}"))
+    }
+
+    /// Verified `eth_getTransactionByHash` — the same beacon-anchored,
+    /// `transactionsRoot`-verified locate as the receipt path, followed by the
+    /// full tx decode (Java `rpcGetTransactionByHash`/`buildTxJson`).
+    ///
+    /// Returns `Ok(Some)` when found+verified; `Ok(None)` for a verified "not
+    /// seen" (an unknown/pending tx — eth's null; the Java engine additionally
+    /// answers "pending" for its OWN just-sent txs from the sent-tx cache,
+    /// which lands with the sent-tx slice); `Err` when it can't verify right
+    /// now, INCLUDING a located tx whose type the decoder doesn't know — the tx
+    /// exists, so "can't render it" must never read as "unknown tx" (the Java
+    /// buildTxJson-null convention).
+    pub async fn get_transaction_by_hash(&self, tx_hash: [u8; 32]) -> Result<TxLookup, String> {
+        self.maybe_rebroadcast_sent_txs().await;
+        // Anchor loss must not hide the wallet's OWN broadcast (Java parity:
+        // locateMinedTx answers null on a missing anchor and the sentTxCache
+        // check still runs): a send needs only peers, not an anchor, and the
+        // confirm loop starts polling immediately — serve pending, not -32000.
+        let (head_num, head_hash) = match self.anchored_head() {
+            Ok(v) => v,
+            Err(e) => {
+                let mut st = self.sent_txs.lock().unwrap();
+                if let Some(raw) = st.bytes.get(&tx_hash) {
+                    let tx = tx::decode_summary(raw)
+                        .ok_or("own sent tx cached but cannot be decoded")?;
+                    return Ok(TxLookup::Pending { tx_hash, tx });
+                }
+                return Err(e);
+            }
+        };
+        let Some(loc) = self.locate_mined_tx(tx_hash, head_num, &head_hash).await? else {
+            // Not in the scanned chain — but if it is OUR broadcast, answer the
+            // pending shape from the cached bytes (the Java sentTxCache path):
+            // the wallet sees its tx exists while it awaits inclusion.
+            let mut st = self.sent_txs.lock().unwrap();
+            if let Some(raw) = st.bytes.get(&tx_hash) {
+                let tx = tx::decode_summary(raw)
+                    .ok_or("own sent tx cached but cannot be decoded")?;
+                return Ok(TxLookup::Pending { tx_hash, tx });
+            }
+            return Ok(TxLookup::NotSeen);
+        };
+        // Located in a verified block: the watch is done with this tx.
+        self.sent_tx_watch.lock().unwrap().confirm_mined(&tx_hash);
+        let tx = tx::decode_summary(&loc.raw_tx)
+            .ok_or("transaction located but its type cannot be decoded")?;
+        Ok(TxLookup::Mined(VerifiedTransaction {
+            tx_hash,
+            tx_index: loc.index as u64,
+            block_hash: loc.block_hash,
+            block_number: loc.header.number,
+            tx,
+        }))
+    }
+
+    /// Verified `eth_getBlockByHash` (transactions as hashes). Wallets call it
+    /// right after a receipt to finalize a tx as confirmed, so the hash is
+    /// resolved from blocks this reader has ALREADY verified (the receipt scan
+    /// and the by-number serve populate the map), then served via the verified
+    /// by-number path, re-confirming the served block still carries the
+    /// requested hash (a reorg can remap the height). A hash never verified →
+    /// `Ok(None)` (eth's unknown-block null) — the confirm flow always
+    /// pre-populates it via the preceding receipt. Twin of the Java
+    /// `rpcGetBlockByHash`.
+    pub async fn get_block_by_hash(
+        &self,
+        block_hash: [u8; 32],
+        full_transactions: bool,
+    ) -> Result<Option<VerifiedBlock>, String> {
+        let Some(number) = self.lookup_block_number(&block_hash) else {
+            return Ok(None); // not a block we've verified — unknown to us
+        };
+        match self.get_block_by_number(Some(number), full_transactions).await? {
+            Some(block) if block.hash == block_hash => Ok(Some(block)),
+            // The height serves a DIFFERENT canonical block now (reorg) — or the
+            // number sits above the current head: the requested hash is unknown.
+            _ => Ok(None),
+        }
+    }
+
+    /// Verified `eth_getBlockReceipts` by number/tag (`None` = latest): every
+    /// receipt of the block, each carrying the same verified fields as
+    /// [`Self::get_transaction_receipt`] (the Java `rpcGetBlockReceipts` twin).
+    /// `Ok(None)` = a verified future/unknown block (eth's null).
+    pub async fn get_block_receipts(
+        &self,
+        target: Option<u64>,
+    ) -> Result<Option<Vec<VerifiedReceipt>>, String> {
+        Ok(self.block_receipts_at(target).await?.map(|(_, receipts)| receipts))
+    }
+
+    /// Verified `eth_getBlockReceipts` by block hash: resolves through the
+    /// verified hash→number map (a never-verified hash → `Ok(None)`) and
+    /// re-confirms the block served at that height still carries the requested
+    /// hash (a reorg can remap the number under a stale map entry).
+    pub async fn get_block_receipts_by_hash(
+        &self,
+        block_hash: [u8; 32],
+    ) -> Result<Option<Vec<VerifiedReceipt>>, String> {
+        let Some(number) = self.lookup_block_number(&block_hash) else {
+            return Ok(None); // not a block we've verified — unknown to us
+        };
+        match self.block_receipts_at(Some(number)).await? {
+            Some((served, receipts)) if served == block_hash => Ok(Some(receipts)),
+            _ => Ok(None),
+        }
+    }
+
+    /// The shared block-receipts serve: anchored window → target header, body +
+    /// receipts fetched together (one round of wall-clock) and root-verified,
+    /// then one pass building every receipt. Returns the SERVED block hash so
+    /// the by-hash entry can re-confirm it.
+    async fn block_receipts_at(
+        &self,
+        target: Option<u64>,
+    ) -> Result<Option<([u8; 32], Vec<VerifiedReceipt>)>, String> {
+        let (head_num, head_hash) = self.anchored_head()?;
+        let target_num = target.unwrap_or(head_num);
+        if target_num > head_num {
+            return Ok(None); // future/unknown block → eth null
+        }
+        let back = head_num - target_num;
+        if back >= BLOCK_LOOKBACK_MAX {
+            return Err(format!(
+                "block {target_num} is {back} behind the head — beyond the {BLOCK_LOOKBACK_MAX}-block verify window"
+            ));
+        }
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err("no snap peer available".to_string());
+        }
+        let total = peers.len();
+        let mut last_err = String::new();
+        for peer in &peers {
+            match self.block_receipts_from(peer, target_num, back, &head_hash).await {
+                Ok(served) => {
+                    self.pool.record_snap_served(peer.addr()).await;
+                    return Ok(Some(served));
+                }
+                Err(e) => {
+                    self.pool.record_snap_failure(peer.addr()).await;
+                    last_err = e;
+                }
+            }
+        }
+        Err(format!(
+            "all {total} snap peer(s) failed to serve verifiable block receipts: {last_err}"
+        ))
+    }
+
+    /// One peer's block-receipts serve: anchored window, body + receipts in
+    /// flight together, both roots verified before anything is trusted.
+    async fn block_receipts_from(
+        &self,
+        peer: &ManagedPeer,
+        target_num: u64,
+        back: u64,
+        head_hash: &[u8; 32],
+    ) -> Result<([u8; 32], Vec<VerifiedReceipt>), String> {
+        let window = fetch_anchored_window(peer, target_num, back + 1, head_hash).await?;
+        let vh = &window[0];
+        let (bodies, receipt_blocks) = futures::future::join(
+            peer.get_block_bodies(&[vh.hash]),
+            peer.get_receipts(&[vh.hash]),
+        )
+        .await;
+        let body = bodies?.into_iter().next().ok_or("peer returned no block body")?;
+        verify_body_transactions(&vh.header, &body)?;
+        let receipts = receipt_blocks?.into_iter().next().ok_or("peer returned no receipts")?;
+        if receipts.len() != body.transactions.len() {
+            return Err(format!(
+                "block {} receipt count mismatch ({} receipts for {} txs)",
+                vh.header.number,
+                receipts.len(),
+                body.transactions.len()
+            ));
+        }
+        verify_block_receipts(&vh.header, &receipts)?;
+        // Remember the fully verified hash↔number (feeds getBlockByHash and the
+        // by-hash entry of this method).
+        self.remember_block_number(vh.hash, vh.header.number);
+        let built = build_block_receipts(&vh.header, vh.hash, &body, &receipts)?;
+        Ok((vh.hash, built))
+    }
+
+    /// Look a block hash up in the verified hash→number map (LRU-refreshing).
+    /// `None` = we never verified that hash. Poisoning is unreachable
+    /// (panic="abort"); read as a miss rather than propagate.
+    fn lookup_block_number(&self, block_hash: &[u8; 32]) -> Option<u64> {
+        self.block_hash_numbers.lock().ok()?.get(block_hash).copied()
+    }
+
+    /// Remember a VERIFIED block hash↔number for `eth_getBlockByHash`.
+    fn remember_block_number(&self, block_hash: [u8; 32], number: u64) {
+        if let Ok(mut lru) = self.block_hash_numbers.lock() {
+            lru.put(block_hash, number);
+        }
+    }
+
+    /// The beacon-anchored optimistic head `(number, hash)`, or the standard
+    /// not-ready errors every verified read shares.
+    fn anchored_head(&self) -> Result<(u64, [u8; 32]), String> {
+        let head_num = self.anchor.optimistic_block_number();
+        let Some(head_hash) = self.anchor.optimistic_block_hash() else {
+            return Err("no beacon-anchored head yet".to_string());
+        };
+        if head_num == 0 {
+            return Err("beacon not synced".to_string());
+        }
+        Ok((head_num, head_hash))
+    }
+
+    /// The shared locate stage (the Java `locateMinedTx` twin): resolve the tx
+    /// hash to its verified block location via the per-tx incremental scan
+    /// cursor. Holds the tx's cursor lock for the duration (concurrent polls
+    /// for the SAME tx serialize here and only here); returns a clone of the
+    /// cached/found location.
+    async fn locate_mined_tx(
+        &self,
+        tx_hash: [u8; 32],
+        head_num: u64,
+        head_hash: &[u8; 32],
+    ) -> Result<Option<Arc<TxLocation>>, String> {
+        let state = self.tx_scan_state(tx_hash)?;
+        let mut st = state.lock().await;
+        st.last_touched = std::time::Instant::now();
+
+        // A cached location below the finalized height is immutable; one still
+        // near the head must be re-confirmed canonical (it can be reorged out).
+        if let Some(loc) = &st.found {
+            let finalized = self.finalized_block_number();
+            let immutable = finalized > 0 && loc.header.number <= finalized;
+            if !immutable && !self.still_canonical(loc, head_num, head_hash).await {
+                // Proven reorged out: rescan the recent region from scratch.
+                st.found = None;
+                st.high_scanned = None;
+            }
+        }
+
+        if st.found.is_none() {
+            // A short reorg can pull the optimistic head BELOW an
+            // already-scanned height — everything scanned above the new head
+            // was replaced, and the fork may reach a few blocks deeper. Reset
+            // the cursor for a fresh initial-lookback scan (covers forks up to
+            // that depth past the new head); merely clamping to the new head
+            // would leave `from = head + 1` and never rescan the replacement
+            // head block itself, so a tx mined there would keep reading as a
+            // verified "not seen".
+            if st.high_scanned.is_some_and(|high| high > head_num) {
+                st.high_scanned = None;
+            }
+            let mut from = match st.high_scanned {
+                None => {
+                    let mut first = head_num.saturating_sub(RECEIPT_INITIAL_LOOKBACK_BLOCKS - 1);
+                    // Own-tx reachback (the Java locateMinedTx twin): the FIRST
+                    // scan for a tx WE broadcast reaches back to the head
+                    // recorded at broadcast time — a tx mined right after a
+                    // slow broadcast can sit below the default lookback. Still
+                    // subject to the per-poll cap below.
+                    if let Some(bc_head) = self.sent_tx_watch.lock().unwrap().broadcast_head(&tx_hash)
+                    {
+                        if bc_head < first {
+                            first = bc_head;
+                        }
+                    }
+                    first
+                }
+                Some(high) => high + 1,
+            };
+            let cap_floor = head_num.saturating_sub(RECEIPT_MAX_SCAN_BLOCKS_PER_POLL - 1);
+            if from < cap_floor {
+                tracing::info!(
+                    from,
+                    cap_floor,
+                    "tx scan: catch-up gap, skipping blocks below the per-poll cap"
+                );
+                from = cap_floor;
+            }
+            // from > head_num means the head hasn't advanced since the last
+            // scan — nothing new to look at (the cached "not seen" stands).
+            if from <= head_num {
+                let found = self.scan_window(from, head_num, head_hash, &tx_hash).await?;
+                // Advance the cursor only after a fully verified scan of
+                // [from..head] (found or not) — an Err above leaves it put.
+                st.high_scanned = Some(head_num);
+                st.found = found.map(Arc::new);
+            }
+        }
+
+        // The cursor is settled; the lock releases at return, BEFORE any
+        // follow-up round-trips (the Java twin's synchronized block also ends
+        // at locateMinedTx).
+        Ok(st.found.clone())
+    }
+
+    /// Run one `[from..head]` scan across the snap pool: try each peer (each
+    /// attempt bounded by [`RECEIPT_SCAN_DEADLINE`]) until one serves a fully
+    /// verified window, recording served/failure reputation per peer.
+    async fn scan_window(
+        &self,
+        from: u64,
+        head_num: u64,
+        head_hash: &[u8; 32],
+        tx_hash: &[u8; 32],
+    ) -> Result<Option<TxLocation>, String> {
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err("no snap peer available".to_string());
+        }
+        let total = peers.len();
+        let mut last_err = String::new();
+        for peer in &peers {
+            let attempt = tokio::time::timeout(
+                RECEIPT_SCAN_DEADLINE,
+                self.scan_blocks_from(peer, from, head_num, head_hash, tx_hash),
+            )
+            .await
+            .unwrap_or_else(|_| Err("tx scan timed out".to_string()));
+            match attempt {
+                Ok(found) => {
+                    self.pool.record_snap_served(peer.addr()).await;
+                    return Ok(found);
+                }
+                Err(e) => {
+                    self.pool.record_snap_failure(peer.addr()).await;
+                    last_err = e;
+                }
+            }
+        }
+        Err(format!("all {total} snap peer(s) failed to serve a verifiable tx scan: {last_err}"))
+    }
+
+    /// Get-or-create the per-tx scan cursor. The idle-TTL sweep is time-gated
+    /// (at most once per [`RECEIPT_SCAN_SWEEP_INTERVAL`]) so a burst of
+    /// distinct hashes — the map key is attacker-suppliable via the public RPC
+    /// — costs O(1) per lookup, not an O(n) walk each time (the Java twin
+    /// evicts on a background warmer tick). `Err` only on a poisoned lock
+    /// (can't happen under panic="abort", but never panic here).
+    fn tx_scan_state(
+        &self,
+        tx_hash: [u8; 32],
+    ) -> Result<Arc<tokio::sync::Mutex<TxScanState>>, String> {
+        let mut scans = self.tx_scans.lock().map_err(|_| "engine lock poisoned".to_string())?;
+        let now = std::time::Instant::now();
+        if now.duration_since(scans.last_sweep) >= RECEIPT_SCAN_SWEEP_INTERVAL {
+            scans.last_sweep = now;
+            // An entry whose tokio lock is HELD is in use — keep it regardless.
+            // saturating: a concurrent poll can stamp last_touched AFTER `now`
+            // was captured; that reads as zero idle (kept), never a panic. (On
+            // Rust >= 1.60 plain duration_since saturates too — this just says
+            // so explicitly, matching the workspace's panic-free-by-construction
+            // policy under panic="abort".)
+            scans.map.retain(|_, st| match st.try_lock() {
+                Ok(guard) => now.saturating_duration_since(guard.last_touched) < RECEIPT_SCAN_TTL,
+                Err(_) => true,
+            });
+        }
+        Ok(Arc::clone(scans.map.entry(tx_hash).or_insert_with(|| {
+            Arc::new(tokio::sync::Mutex::new(TxScanState {
+                high_scanned: None,
+                found: None,
+                last_touched: now,
+            }))
+        })))
+    }
+
+    /// Whether a cached tx location is still on the canonical chain: re-fetch
+    /// headers `[loc.block .. head]`, anchor them to the beacon head hash, and
+    /// compare the hash at loc's height. Conservatively `true` when it can't
+    /// DISPROVE canonicality (peer hiccup, implausibly large range) so a glitch
+    /// never flips a real receipt to "unknown"; `false` only on a proven hash
+    /// mismatch / the head dropping below the block (the Java `stillCanonical`).
+    async fn still_canonical(
+        &self,
+        loc: &TxLocation,
+        head_num: u64,
+        head_hash: &[u8; 32],
+    ) -> bool {
+        if loc.header.number > head_num {
+            return false; // head sits below it — deep reorg
+        }
+        let count = head_num - loc.header.number + 1;
+        if count > RECEIPT_MAX_SCAN_BLOCKS_PER_POLL {
+            return true; // too far to recheck cheaply
+        }
+        let peers = self.pool.snap_peers().await;
+        for peer in &peers {
+            match self.confirm_canonical_from(peer, loc, count, head_hash).await {
+                Ok(canonical) => return canonical,
+                Err(_) => continue, // transport/anchor failure — can't disprove
+            }
+        }
+        true
+    }
+
+    /// One peer's canonicality check: fetch `[loc.block .. head]`, require the
+    /// anchored + hash-linked window, and compare `window[0]` to the cached
+    /// block hash. `Err` = couldn't verify either way (caller tries next peer).
+    async fn confirm_canonical_from(
+        &self,
+        peer: &ManagedPeer,
+        loc: &TxLocation,
+        count: u64,
+        head_hash: &[u8; 32],
+    ) -> Result<bool, String> {
+        let window = fetch_anchored_window(peer, loc.header.number, count, head_hash).await?;
+        Ok(window[0].hash == loc.block_hash)
+    }
+
+    /// Scan `[from..head]` against one peer for the tx hash: fetch the header
+    /// window, anchor it to the beacon head + hash-link it, then check the
+    /// blocks NEWEST-first (a just-mined tx is found on the first body
+    /// checked), each body verified against its header's `transactionsRoot`
+    /// before its tx hashes are trusted. Bodies are requested concurrently (the
+    /// Java twin's bodyFutures — one pipelined round instead of up-to-128
+    /// serial RTTs). Any fetch/verify failure fails the WHOLE scan for this
+    /// peer (→ next peer) — a skipped block could otherwise read as a verified
+    /// "not seen".
+    async fn scan_blocks_from(
+        &self,
+        peer: &ManagedPeer,
+        from: u64,
+        head_num: u64,
+        head_hash: &[u8; 32],
+        want: &[u8; 32],
+    ) -> Result<Option<TxLocation>, String> {
+        let count = head_num - from + 1;
+        let window = fetch_anchored_window(peer, from, count, head_hash).await?;
+        // One single-hash request per block (bounded per-response size), all in
+        // flight at once on this peer's multiplexed connection.
+        let all_bodies = futures::future::join_all(window.iter().map(|vh| {
+            let hash = [vh.hash]; // owned by the future (the request outlives this closure)
+            async move { peer.get_block_bodies(&hash).await }
+        }))
+        .await;
+        for (vh, bodies) in window.iter().zip(all_bodies).rev() {
+            let body = bodies?.into_iter().next().ok_or("peer returned no block body")?;
+            verify_body_transactions(&vh.header, &body)?;
+            for (i, raw) in body.transactions.iter().enumerate() {
+                if &keccak256(raw) == want {
+                    // Pre-populate for the eth_getBlockByHash the wallet issues
+                    // right after the receipt (the Java locateMinedTx twin).
+                    self.remember_block_number(vh.hash, vh.header.number);
+                    return Ok(Some(TxLocation {
+                        header: vh.header.clone(),
+                        block_hash: vh.hash,
+                        index: i,
+                        raw_tx: raw.clone(),
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Fetch one block's receipts from one peer, verify them against the
+    /// (anchored) header's `receiptsRoot`, and build the [`VerifiedReceipt`]
+    /// for the located tx.
+    async fn receipt_from(
+        &self,
+        peer: &ManagedPeer,
+        loc: &TxLocation,
+    ) -> Result<VerifiedReceipt, String> {
+        let blocks = peer.get_receipts(&[loc.block_hash]).await?;
+        let receipts = blocks.into_iter().next().ok_or("peer returned no receipts")?;
+        if receipts.is_empty() {
+            return Err("peer returned no receipts".to_string());
+        }
+        verify_block_receipts(&loc.header, &receipts)?;
+        if loc.index >= receipts.len() {
+            return Err("tx index out of receipt range".to_string());
+        }
+        build_verified_receipt(loc, &receipts)
     }
 
     /// `(finalized_block_number, optimistic_block_number, is_synced)` snapshot.
@@ -1256,9 +2804,280 @@ impl ElReader {
 
     /// Stop discovery + the pool.
     pub async fn stop(self) {
+        if let Ok(mut t) = self.log_index_task.lock() {
+            if let Some(h) = t.take() {
+                h.abort();
+            }
+        }
+        // Best-effort index checkpoint before teardown: a failed write only
+        // costs a re-index of the uncheckpointed tail, never correctness.
+        if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
+            if let Some(ix) = slot.as_ref() {
+                let _ = ix.persist(path);
+            }
+        }
         self.pool.stop().await;
         self.discovery.stop().await;
     }
+}
+
+/// Build the [`VerifiedReceipt`] from a block's ROOT-VERIFIED receipt list and
+/// the located tx. Pure: decodes the target receipt, one pass over the
+/// preceding receipts for `gas_used` (previous cumulative) and the block-global
+/// log-index base (the Java `buildReceiptJson` preamble), then derives the
+/// tx-side fields (sender, effective gas price, created contract address) from
+/// the transactionsRoot-verified raw tx — decoded defensively: an unknown
+/// future tx type yields a receipt without those fields, never an error.
+fn build_verified_receipt(
+    loc: &TxLocation,
+    receipts: &[Vec<u8>],
+) -> Result<VerifiedReceipt, String> {
+    let decoded = crate::el::receipt::decode(&receipts[loc.index])?;
+    let mut prev_cum = 0u64;
+    let mut log_index_base = 0u64;
+    for prior in &receipts[..loc.index] {
+        let prev = crate::el::receipt::decode(prior)?;
+        log_index_base += prev.logs.len() as u64;
+        // The last iteration leaves receipt[index-1]'s cumulative gas here.
+        prev_cum = prev.cumulative_gas_used;
+    }
+    Ok(build_one_receipt(
+        &loc.header,
+        loc.block_hash,
+        loc.index as u64,
+        &loc.raw_tx,
+        decoded,
+        prev_cum,
+        log_index_base,
+    ))
+}
+
+/// The per-element construction both receipt paths share: the caller supplies
+/// the ALREADY-DECODED receipt and the running accumulators (previous
+/// cumulative gas, block-global log-index base). The subtle rules live once:
+/// the tx decodes DEFENSIVELY (an unknown future type yields a partial receipt,
+/// never an error), and only a creation tx with a recovered sender carries a
+/// contract address.
+fn build_one_receipt(
+    header: &BlockHeader,
+    block_hash: [u8; 32],
+    tx_index: u64,
+    raw_tx: &[u8],
+    decoded: DecodedReceipt,
+    prev_cum: u64,
+    log_index_base: u64,
+) -> VerifiedReceipt {
+    let tx_summary = tx::decode_summary(raw_tx);
+    let effective_gas_price =
+        tx_summary.as_ref().and_then(|t| tx::effective_gas_price(t, header_base_fee(header)));
+    let contract_address = tx_summary.as_ref().and_then(|t| match (&t.to, &t.from) {
+        (None, Some(from)) => Some(tx::contract_address(from, t.nonce)),
+        _ => None,
+    });
+    VerifiedReceipt {
+        tx_hash: keccak256(raw_tx),
+        tx_index,
+        block_hash,
+        block_number: header.number,
+        gas_used: decoded.cumulative_gas_used.saturating_sub(prev_cum),
+        log_index_base,
+        receipt: decoded,
+        tx: tx_summary,
+        effective_gas_price,
+        contract_address,
+    }
+}
+
+/// Fetch the contiguous header window `[from ..= from+count-1]` from one peer
+/// and run the trust gate every anchored read shares: exact length, the right
+/// starting number, the window head IS the beacon-anchored head hash, and every
+/// header hash-links to the next. This is the sole gate that turns
+/// peer-supplied headers into trusted ones — one implementation, four callers
+/// (block serve, fee estimate, receipt scan, canonicality re-check), so a
+/// hardening never has to be applied in four places.
+async fn fetch_anchored_window(
+    peer: &ManagedPeer,
+    from: u64,
+    count: u64,
+    head_hash: &[u8; 32],
+) -> Result<Vec<crate::el::eth::messages::VerifiedHeader>, String> {
+    let window = peer.get_block_headers_by_number(from, count, 0, false).await?;
+    if window.len() as u64 != count {
+        return Err(format!("peer returned {} headers, expected {count}", window.len()));
+    }
+    if window[0].header.number != from {
+        return Err("peer returned the wrong starting block number".to_string());
+    }
+    // The window's head must BE the beacon-anchored head, and each header must
+    // hash-link to the next — proving every header in it chains to the verified
+    // head (the trust gate: head_hash is the light-client-attested exec hash).
+    if &window[window.len() - 1].hash != head_hash {
+        return Err("window head does not match the beacon-anchored head hash".to_string());
+    }
+    for i in 0..window.len() - 1 {
+        if window[i + 1].header.parent_hash != window[i].hash {
+            return Err("header window is not hash-linked".to_string());
+        }
+    }
+    Ok(window)
+}
+
+/// Build EVERY receipt of a ROOT-VERIFIED block in one pass — the batch form of
+/// [`build_verified_receipt`]: the running cumulative-gas and the block-global
+/// log-index base accumulate instead of being re-derived per index (the
+/// single-receipt path's preamble would make a full block O(n²)). The caller
+/// has already verified the body against `transactionsRoot`, the receipts
+/// against `receiptsRoot`, and their counts equal.
+fn build_block_receipts(
+    header: &BlockHeader,
+    block_hash: [u8; 32],
+    body: &crate::el::eth::messages::BlockBody,
+    receipts: &[Vec<u8>],
+) -> Result<Vec<VerifiedReceipt>, String> {
+    let mut out = Vec::with_capacity(receipts.len());
+    let mut prev_cum = 0u64;
+    let mut log_index_base = 0u64;
+    for (i, (raw_tx, receipt)) in body.transactions.iter().zip(receipts).enumerate() {
+        let decoded = crate::el::receipt::decode(receipt)?;
+        let log_count = decoded.logs.len() as u64;
+        let cum = decoded.cumulative_gas_used;
+        out.push(build_one_receipt(
+            header,
+            block_hash,
+            i as u64,
+            raw_tx,
+            decoded,
+            prev_cum,
+            log_index_base,
+        ));
+        prev_cum = cum;
+        log_index_base += log_count;
+    }
+    Ok(out)
+}
+
+/// The body half of the per-block trust gate: the fetched transactions must
+/// rebuild the (already anchored) header's `transactionsRoot`. One
+/// implementation for every consumer (block serve, fee estimate, tx scan,
+/// fee history), so a hardening never has to be applied in four places.
+fn verify_body_transactions(
+    header: &BlockHeader,
+    body: &crate::el::eth::messages::BlockBody,
+) -> Result<(), String> {
+    if !triehash::verify(&body.transactions, &header.transactions_root) {
+        return Err(format!(
+            "block {} body does not match the header transactionsRoot",
+            header.number
+        ));
+    }
+    Ok(())
+}
+
+/// The receipts half of the per-block trust gate: the fetched receipt list
+/// must rebuild the (already anchored) header's `receiptsRoot`.
+fn verify_block_receipts(header: &BlockHeader, receipts: &[Vec<u8>]) -> Result<(), String> {
+    if !triehash::verify(receipts, &header.receipts_root) {
+        return Err(format!(
+            "block {} receipts do not match the header receiptsRoot",
+            header.number
+        ));
+    }
+    Ok(())
+}
+
+/// One block's per-tx `(effective_tip, gas_used)` list from its FETCHED body +
+/// receipts, verified against the (already anchored) header's
+/// `transactionsRoot` / `receiptsRoot` before anything is trusted (the Java
+/// `decodeBlockTips` twin). Strict like Java: an undecodable tx inside a
+/// verified body, a receipt-count mismatch, or a failed root fails the block.
+fn block_tx_tips(
+    header: &BlockHeader,
+    bodies: Vec<crate::el::eth::messages::BlockBody>,
+    receipt_blocks: Vec<Vec<Vec<u8>>>,
+) -> Result<Vec<(u128, u64)>, String> {
+    let body = bodies.into_iter().next().ok_or("peer returned no block body")?;
+    verify_body_transactions(header, &body)?;
+    if body.transactions.is_empty() {
+        // A root-verified EMPTY tx list ⇒ the anchored header must carry
+        // gasUsed 0 (same strictness as the non-empty path's final-sum check).
+        // Receipts are deliberately NOT consulted here — no weights to derive —
+        // matching the Java decodeBlockTips early return, and not making a
+        // quiet chain's feeHistory depend on how peers answer GetReceipts for
+        // zero-tx blocks.
+        if header.gas_used != 0 {
+            return Err(format!(
+                "block {} has no transactions but a non-zero header gasUsed {}",
+                header.number, header.gas_used
+            ));
+        }
+        return Ok(Vec::new());
+    }
+    let receipts = receipt_blocks.into_iter().next().ok_or("peer returned no receipts")?;
+    if receipts.len() != body.transactions.len() {
+        return Err(format!(
+            "block {} receipt count mismatch ({} receipts for {} txs)",
+            header.number,
+            receipts.len(),
+            body.transactions.len()
+        ));
+    }
+    verify_block_receipts(header, &receipts)?;
+    let base_fee = header_base_fee(header);
+    let mut out = Vec::with_capacity(body.transactions.len());
+    let mut prev_cum = 0u64;
+    for (raw, receipt) in body.transactions.iter().zip(&receipts) {
+        let tip = tx::effective_tip(raw, base_fee)
+            .ok_or_else(|| format!("block {} has an undecodable tx", header.number))?;
+        let cum = crate::el::receipt::decode(receipt)?.cumulative_gas_used;
+        // Strict, like the rest of this path: cumulative gas must be
+        // monotonic (a regression is impossible in a consensus-valid block —
+        // fail the block rather than silently zero a weight), …
+        if cum < prev_cum {
+            return Err(format!(
+                "block {} receipts have non-monotonic cumulative gas",
+                header.number
+            ));
+        }
+        out.push((tip, cum - prev_cum));
+        prev_cum = cum;
+    }
+    // …and the last receipt's cumulative must equal the ANCHORED header's
+    // gasUsed (the header field is beacon-anchored; the receipts are
+    // root-verified — consensus ties the two together).
+    if prev_cum != header.gas_used {
+        return Err(format!(
+            "block {} receipts' final cumulative gas {} does not match the header gasUsed {}",
+            header.number, prev_cum, header.gas_used
+        ));
+    }
+    Ok(out)
+}
+
+/// Gas-used-weighted percentile rewards for one block — the Java `rewardJson`
+/// twin (geth-derived: sort txs by tip, walk each percentile's threshold over
+/// cumulative gasUsed, take that tx's tip; like Java the threshold stays a
+/// float where geth truncates it to an integer — an at-most-one-tx boundary
+/// nuance). Percentile ordering/range is the router's validation (ascending,
+/// 0..=100), same as for the Java backend; the walk's index never rewinds.
+/// Empty block → zeros.
+fn percentile_rewards(mut tips: Vec<(u128, u64)>, percentiles: &[f64]) -> Vec<u128> {
+    if tips.is_empty() {
+        return vec![0; percentiles.len()];
+    }
+    tips.sort_unstable_by_key(|&(tip, _)| tip);
+    let total_gas: u64 = tips.iter().map(|&(_, gas)| gas).sum();
+    let mut out = Vec::with_capacity(percentiles.len());
+    let mut idx = 0usize;
+    let mut cum_gas = tips[0].1;
+    for &p in percentiles {
+        let threshold = total_gas as f64 * p / 100.0;
+        while (cum_gas as f64) < threshold && idx < tips.len() - 1 {
+            idx += 1;
+            cum_gas += tips[idx].1;
+        }
+        out.push(tips[idx].0);
+    }
+    out
 }
 
 /// Fetch a peer's fresh head header and return `(state_root, block_number)`.
@@ -1280,6 +3099,28 @@ async fn fresh_head(peer: &ManagedPeer) -> Result<([u8; 32], u64), String> {
     // rejects it as noPeerBlockNumber. Treat it as a failure so the retry loop
     // moves to a peer with a real head (junk/light-client nodes can negotiate
     // snap/1 yet still advertise genesis).
+    if head.header.number == 0 {
+        return Err("peer advertises a genesis head (block 0 — no current state)".to_string());
+    }
+    let state_root = head.header.state_root;
+    if state_root == [0u8; 32] {
+        return Err("peer head has no state root".to_string());
+    }
+    Ok((state_root, head.header.number))
+}
+
+/// Tor twin of [`fresh_head`] over an [`EthSession`] (same head-hash echo check
+/// and genesis-head rejection; the state root is beacon-anchored afterwards).
+#[cfg(feature = "tor")]
+async fn fresh_head_session(
+    session: &mut crate::el::eth::session::EthSession<arti_client::DataStream>,
+) -> Result<([u8; 32], u64), String> {
+    let head_hash = session.peer_status.best_hash;
+    let headers = session.get_block_headers_by_hash(&head_hash, 1).await?;
+    let head = headers.into_iter().next().ok_or("peer returned no head header")?;
+    if head.hash != head_hash {
+        return Err("peer returned a header not matching the requested hash".to_string());
+    }
     if head.header.number == 0 {
         return Err("peer advertises a genesis head (block 0 — no current state)".to_string());
     }
@@ -1652,4 +3493,67 @@ mod tests {
         assert_eq!(cfg.listen_port, 30304);
         assert_eq!(cfg.min_suggested_tip_wei, 1_000_000, "gnosis cheap-chain tip floor");
     }
+
+    #[test]
+    fn percentile_rewards_walks_gas_weighted_thresholds() {
+        // Three txs, tips 1/5/10 gwei with gas weights 10k/70k/20k (total 100k).
+        // Sorted by tip the cumulative gas is 10k, 80k, 100k:
+        //   p10 → threshold 10k → cum 10k not < 10k → tip 1
+        //   p25 → threshold 25k → advance to cum 80k → tip 5
+        //   p90 → threshold 90k → advance to cum 100k → tip 10
+        let tips = vec![
+            (5_000_000_000u128, 70_000u64),
+            (1_000_000_000, 10_000),
+            (10_000_000_000, 20_000),
+        ];
+        assert_eq!(
+            percentile_rewards(tips.clone(), &[10.0, 25.0, 90.0]),
+            vec![1_000_000_000, 5_000_000_000, 10_000_000_000]
+        );
+        // 100th percentile lands on the last (highest-tip) tx.
+        assert_eq!(percentile_rewards(tips.clone(), &[100.0]), vec![10_000_000_000]);
+        // 0th percentile takes the cheapest tx (threshold 0 never advances).
+        assert_eq!(percentile_rewards(tips, &[0.0]), vec![1_000_000_000]);
+    }
+
+    #[test]
+    fn percentile_rewards_empty_block_is_zeros() {
+        assert_eq!(percentile_rewards(Vec::new(), &[25.0, 75.0]), vec![0, 0]);
+        assert!(percentile_rewards(Vec::new(), &[]).is_empty());
+    }
+
+    #[test]
+    fn percentile_rewards_zero_gas_weights_serve_the_cheapest_tip() {
+        // All-zero gas weights: every threshold is 0, the walk never advances →
+        // the cheapest tip for every percentile (mirrors the Java loop's
+        // `cumGas < threshold` never firing).
+        let tips = vec![(7u128, 0u64), (3, 0)];
+        assert_eq!(percentile_rewards(tips, &[50.0, 99.0]), vec![3, 3]);
+    }
+}
+
+/// Convert one block's [`VerifiedReceipt`]s into stored logs — strictly:
+/// `None` on any field that does not have its canonical width, so a caller
+/// never records a block whose stored shape differs from what was verified.
+fn stored_logs_for_block(receipts: &[VerifiedReceipt]) -> Option<Vec<crate::el::logindex::StoredLog>> {
+    let mut out = Vec::new();
+    for r in receipts {
+        for (k, l) in r.receipt.logs.iter().enumerate() {
+            let mut topics = Vec::with_capacity(l.topics.len());
+            for t in &l.topics {
+                topics.push(t.as_slice().try_into().ok()?);
+            }
+            out.push(crate::el::logindex::StoredLog {
+                block_number: r.block_number,
+                block_hash: r.block_hash,
+                tx_hash: r.tx_hash,
+                tx_index: u32::try_from(r.tx_index).ok()?,
+                log_index: u32::try_from(r.log_index_base).ok()?.checked_add(u32::try_from(k).ok()?)?,
+                address: l.address.as_slice().try_into().ok()?,
+                topics,
+                data: l.data.clone(),
+            });
+        }
+    }
+    Some(out)
 }
