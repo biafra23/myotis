@@ -79,11 +79,19 @@ sudo chown -R geth:geth /data/geth && sudo chown -R nimbus:nimbus /data/nimbus
 
 ## 3. Build the patched Geth ("myotis never busy")
 
-The patch: after the devp2p protocol handshake, if the remote Hello client-ID
-contains `myotis` (or `ethp2p`, the pre-rename Java id), mark the connection
-trusted. Trusted connections are exempt from `MaxPeers` and the inbound cap in
-Geth's `postHandshakeChecks`, so a myotis wallet can **never** be turned away
-with `DiscTooManyPeers` (0x04) by this node.
+The idea: once the remote's Hello client-ID is known, connections whose name
+contains `myotis` (or `ethp2p`, the pre-rename Java id) are marked trusted.
+Trusted connections are exempt from `MaxPeers` and the inbound cap, so a
+myotis wallet is never turned away with `DiscTooManyPeers` (0x04).
+
+The catch (and why this is a 3-part patch, not one line): stock Geth enforces
+the capacity checks at the **post-encryption-handshake checkpoint**, *before*
+the protocol handshake — i.e. before the Hello client name exists. So the
+capacity checks must be **deferred** to the add-peer checkpoint (which re-runs
+them anyway, via `addPeerChecks`), where the name is known. Identity checks
+(already-connected / self) stay at the early checkpoint. The transient
+overshoot between the two checkpoints is bounded by `MaxPendingPeers`
+(default 50).
 
 ```bash
 git clone --depth 1 --branch $(curl -s https://api.github.com/repos/ethereum/go-ethereum/releases/latest | grep -oP '"tag_name": "\K[^"]+') \
@@ -91,9 +99,51 @@ git clone --depth 1 --branch $(curl -s https://api.github.com/repos/ethereum/go-
 cd go-ethereum
 ```
 
-Apply this change in `p2p/server.go`, inside `setupConn()`, immediately after
-the line that stores the protocol-handshake results
-(`c.caps, c.name = phs.Caps, phs.Name` — around line 946 as of mid-2026):
+All three edits are in `p2p/server.go` (line numbers as of mid-2026; the
+anchors are stable function/case names):
+
+**(a)** Add `"strings"` to the import block (it is *not* already imported).
+
+**(b)** In `run()`, the `case c := <-srv.checkpointPostHandshake:` handler
+calls `srv.postHandshakeChecks(peers, inboundCount, c)`. Replace that call so
+only identity is checked at this stage:
+
+```go
+	case c := <-srv.checkpointPostHandshake:
+		// A connection has passed the encryption handshake so
+		// the remote identity is known (but hasn't been verified yet).
+		if trusted[c.node.ID()] {
+			// Ensure that the trusted flag is set before checking against MaxPeers.
+			c.flags |= trustedConn
+		}
+		// myotis patch: capacity (MaxPeers / inbound) is NOT checked here —
+		// the Hello client name isn't known yet. addPeerChecks re-runs the
+		// full postHandshakeChecks at checkpointAddPeer, after the myotis
+		// name-bypass below has had a chance to set trustedConn. Transient
+		// overshoot between the checkpoints is bounded by MaxPendingPeers.
+		c.cont <- srv.postIdentityChecks(peers, c)
+```
+
+and add the helper next to `postHandshakeChecks`:
+
+```go
+// postIdentityChecks is the identity-only subset of postHandshakeChecks,
+// used at the post-encryption checkpoint where the Hello name is unknown.
+func (srv *Server) postIdentityChecks(peers map[enode.ID]*Peer, c *conn) error {
+	switch {
+	case peers[c.node.ID()] != nil:
+		return DiscAlreadyConnected
+	case c.node.ID() == srv.localnode.ID():
+		return DiscSelf
+	default:
+		return nil
+	}
+}
+```
+
+**(c)** In `setupConn()`, immediately after the protocol-handshake results are
+stored (`c.caps, c.name = phs.Caps, phs.Name`) and **before**
+`checkpointAddPeer`:
 
 ```go
 	c.caps, c.name = phs.Caps, phs.Name
@@ -109,19 +159,24 @@ the line that stores the protocol-handshake results
 	}
 ```
 
-(`strings` is already imported in `p2p/server.go`; if the surrounding code has
-moved, the anchor is wherever `phs.Name` lands on the conn — the flag must be
-set **before** `checkpointAddPeer`.)
+Net effect: stock peers now get their `DiscTooManyPeers` after the Hello
+exchange instead of before it (same disconnect code — myotis's busy
+classifier reads it at that phase anyway), myotis peers pass the cap, and
+nothing else moves.
 
 Notes and accepted trade-offs:
 
 - The name is self-declared: anyone can send "myotis" and bypass the cap.
   Acceptable on a testnet server. If abused, add a counter capping the number
-  of name-bypassed connections at the same spot.
+  of name-bypassed connections in edit (c).
 - Because the flag mutates on the conn (not the static trusted set), it
   applies to inbound and outbound alike — exactly what we want.
 - Keep a normal `--maxpeers` so the node still serves the wider network and
   keeps itself well-synced; myotis peers ride on top of the cap.
+- Residual limit: Geth's pre-handshake per-IP inbound throttle
+  (`checkInboundConn`, one attempt per ~30 s per IP, trust-exempt only for
+  the static trusted set) still applies. A wallet reconnect-looping from one
+  IP can hit it; a normally behaving wallet won't.
 
 Build and install:
 
@@ -136,13 +191,12 @@ release (keep it as a commit on a `myotis-serving` branch and
 
 ## 4. Run Geth
 
-Persist the node key first so the **enode URL never changes** (it will later
-be pinned in myotis's `NetworkConfig`):
+The node key is auto-generated at `/data/geth/geth/nodekey` on first start
+and reused for as long as the datadir persists, so the **enode URL is stable**
+(it will later be pinned in myotis's `NetworkConfig`). After the first start
+(below), back it up:
 
 ```bash
-sudo -u geth bash -c 'geth-myotis --sepolia --datadir /data/geth account list >/dev/null 2>&1; true'
-# The nodekey is auto-generated at /data/geth/geth/nodekey on first start and
-# reused as long as the datadir persists. Back it up:
 sudo cp -a /data/geth/geth/nodekey /data/geth/nodekey.backup
 ```
 
@@ -248,11 +302,12 @@ Notes:
   `./gradlew refreshSepoliaCheckpoint`), which is typically days-to-weeks old
   (a sync-committee period is ~27 h) — with `only-new` the node could not
   serve bootstraps older than its own start.
-- Belt-and-braces: after the node is up, run `./gradlew
-  refreshSepoliaCheckpoint` in the myotis repo so the shipped pin is newer
-  than the node's earliest light-client data. If wallets must bootstrap from
-  pins older than the trustedNodeSync point, re-run trustedNodeSync without
-  `--backfill=false`.
+- Hard limit either way: Nimbus can only produce light-client data for slots
+  it processed with state — i.e. from its trustedNodeSync point forward
+  (block backfill doesn't help; bootstraps need the sync committee from
+  state). So after the node is up, run `./gradlew refreshSepoliaCheckpoint`
+  in the myotis repo so the shipped pin is **newer than the node's sync
+  point** — that is the mitigation that actually works.
 - The libp2p **network key persists** in the data dir, so the peer-id — and
   therefore the multiaddr — is stable across restarts. Back up
   `/data/nimbus/` early. Record the multiaddr from the startup log line
@@ -294,16 +349,24 @@ head.
    ./gradlew :app:run -Pnetwork=sepolia -Pargs="get-account 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
    ```
 
-4. **CL serving.** Seed the wallet with the node's multiaddr (dev-only local
-   peer seeding — see README §"Local beacon node"), and confirm the peer ends
-   up serving `light_client_bootstrap` / `light_client_updates_by_range`
-   (it should join `provenBootstrapPeers` and rank Tier 1 in the
-   `BeaconLightClient` peer-tier logs).
+4. **CL serving.** There is no runtime mechanism to seed a CL multiaddr, so
+   test with a local build: temporarily add
+   `/ip4/<PUBLIC_IP>/tcp/9000/p2p/<peerId>` at the front of
+   `clPeerMultiaddrs` in `NetworkConfig.SEPOLIA` (there is a
+   `prependLocal(...)` helper), rebuild, run the wallet, and confirm the peer
+   ends up serving `light_client_bootstrap` /
+   `light_client_updates_by_range` (it should join `provenBootstrapPeers`
+   and rank Tier 1 in the `BeaconLightClient` peer-tier logs). This edit is
+   the same one that ships permanently as a follow-up (§7).
 
 ## 7. Follow-ups (deliberately not done yet)
 
-- **Pin the node in myotis** once it is stable: add the enode to
-  `NetworkConfig.SEPOLIA.elBootEnodes()` (Java) and `ElConfig::sepolia()`
+- **Pin the node in myotis** once it is stable: teach
+  `NetworkConfig.elBootEnodes()` to return the enode for sepolia — today it
+  is a hard-coded accessor that returns `GNOSIS_EL_ENODES` for chain 100 and
+  an empty list otherwise, and `NetworkConfigGnosisTest` asserts sepolia is
+  empty, so this is an accessor restructure plus a test update, not a list
+  append. Mirror it in the Rust `ElConfig::sepolia()`
   (`rust/myotis-net/src/el/reader.rs`), and prepend the CL multiaddr via
   `prependLocal(...)` in `clPeerMultiaddrs` — every wallet then direct-dials
   the dedicated pair at startup, no discovery needed.
