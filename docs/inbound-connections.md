@@ -29,11 +29,17 @@ Myotis is dial-only today. Field evidence from the sepolia desktop stack
   the moment a slot frees.
 
 **The payoff asymmetry is what makes inbound worth the effort**: an inbound
-connection arrives from a node that is filling its *outbound* slots — i.e. a
-full node, snap-capable by construction, exactly the peer class we starve
-for. Reciprocally, NAT'd peers (invisible to our dialer forever) can reach us
-if we are reachable. Even modest reachability disproportionately fixes the
-"everyone is full" failure mode.
+connection arrives from a node that is filling its *outbound* slots. Dialers
+are not full nodes *by construction* — light clients (Myotis itself), crawlers,
+and attackers dial too — but the active-dialer population on the EL is
+dominated by full nodes, so inbound peers are **disproportionately likely** to
+be snap-capable: statistically the peer class we starve for. (Design
+consequence in Gap E: inbound peers must be *classified* — Status + capability
+check — before they count toward the serving pool or disengage the hunt; a
+handful of crawler connections must not silence the emergency mode while
+providing nothing.) Reciprocally, NAT'd peers (invisible to our dialer
+forever) can reach us if we are reachable. Even modest reachability
+disproportionately fixes the "everyone is full" failure mode.
 
 **The trust model is unaffected.** Peers are never trusted (CLAUDE.md: the
 only trust anchors are sync-committee signatures and the embedded
@@ -142,9 +148,22 @@ What already exists and is reusable:
 - `FrameCodec` (both engines) is role-agnostic given correctly-swapped
   secrets; comments are labelled `[initiator]` and need updating, not logic.
 
-New work: parse auth (EIP-8, with the pre-EIP-8 fallback dialers still send),
-ecrecover the ephemeral key, build auth-ack, derive recipient-side secrets,
-and a `Responder`/`RecipientHandshake` type per engine.
+New work: parse auth (EIP-8; also accept the pre-EIP-8 format because the
+spec requires receivers to — modern clients all *send* EIP-8, so this is
+compliance, not observed traffic), ecrecover the ephemeral key, build
+auth-ack, derive recipient-side secrets, and a `Responder`/
+`RecipientHandshake` type per engine.
+
+**Hard requirement (Rust): the responder parse path must be panic-free by
+construction.** It is the one place in the system that parses fully
+attacker-controlled bytes *before any authentication*, and the workspace
+builds with `panic = "abort"` (`rust/Cargo.toml`) — a single reachable panic
+in auth parsing (slice indexing, fixed-size reads on short input, RLP depth
+assumptions, allocations from an attacker-supplied length prefix) is a remote
+process-kill for the whole engine. Fallible parsing end-to-end, allocations
+bounded by the size prefix, and a fuzz target on the auth parser are part of
+Gap A's definition of done (the Java side shares the parsing requirements;
+the JVM merely fails softer). Cross-referenced from the §5 DoS bullet.
 
 ### Gap B — a TCP listener
 
@@ -171,12 +190,33 @@ from"). Java `Packet.decodePongPingHash` literally `skipNext()`s it; Rust
 `decode_pong_ping_hash` reads only the ping hash. Java even has an unused
 `decodePingDestination` decoder (inbound pings carry the same hint).
 
-Design: a small **reflected-address voter** — collect the reflected
-IP:port from recent pongs (and inbound pings), take the majority over a
-sliding window, expose it as "our external address, confidence N/M". This
-feeds the discv4 `from` endpoint (Gap D) and, later, our ENR. It also detects
-CGNAT for free: a reflected address in 100.64.0.0/10 means unreachable-v4
-regardless of any UPnP mapping.
+Design: a small **reflected-address voter** — collect the reflected IP:port
+from recent pongs, take the majority over a sliding window, expose it as
+"our external address, confidence N/M". This feeds the discv4 `from`
+endpoint (Gap D) and, later, our ENR. It also detects CGNAT for free: a
+reflected address in 100.64.0.0/10 means unreachable-v4 regardless of any
+UPnP mapping.
+
+**The voter consumes attacker-chosen, unauthenticated content — a plain
+majority is poisonable.** The pong is signed, but the reflected endpoint
+inside it is arbitrary bytes chosen by the responder, and sybil identities
+are free: an attacker who steers enough of our ping targets (e.g. via
+flooded Neighbors) could make us advertise an arbitrary IP:port — silently
+breaking our reachability, or pointing other peers' dials at a victim while
+lending the address our node's signature once it lands in a signed ENR.
+Constraints that shape the voter's interface, recorded now:
+
+- count only reflections from pongs answering pings *we initiated* toward
+  peers *we selected*; inbound-ping hints are corroboration at best, never
+  votes (they are free to send);
+- require topological diversity in the sample (distinct /24s / /48s), not
+  just a raw N/M count;
+- never advertise an address that isn't globally routable, and once Gap G
+  exists, never one that contradicts a successful self-dial / port-mapping
+  verification;
+- treated as an *integrity* issue in §5, not merely availability. geth's
+  endpoint predictor shares this structural weakness — a reason to design
+  past it, not inherit it.
 
 ### Gap D — advertising ourselves honestly
 
@@ -260,7 +300,12 @@ No UPnP/NAT-PMP/PCP code or dependency exists in the repo. Design:
 1. **Listener + recipient handshake + truthful discv4 `from`** — desktop,
    Java engine first. Reflected-address voter, inbound slot policy, status
    reachability indicator ("N inbound peers / reachable: yes-v4 / yes-v6 /
-   no").
+   no"). Possible early win worth verifying against current geth: go-ethereum
+   derives a peer's endpoint from the **UDP source address** of its ping plus
+   the `from` TCP port (largely ignoring the declared `from` IP) — and we
+   already send a truthful `elPort` there. If that holds, binding the
+   listener (Gap B) alone could yield first inbound connections from
+   geth-lineage peers before Gaps C/D land (given a NAT mapping).
 2. **Rust engine twin** — `Responder` type, listener in the pool/reader
    composition, same voter; reuses `handshake_over`.
 3. **Port mapping** — UPnP/NAT-PMP/PCP attempt + verification + status
@@ -291,4 +336,10 @@ like `rust/myotis-net/tests/live_pool.rs`.
   routing are mutually exclusive modes, chosen in Settings; default TBD.
 - **DoS surface**: accept-rate limiting, handshake timeouts on accepted
   sockets, and memory bounds for half-open inbound handshakes need explicit
-  budgets before phase 1 ships.
+  budgets before phase 1 ships — and the responder parse path must meet Gap
+  A's panic-free hard requirement (in a `panic = "abort"` workspace, a parse
+  panic is a remote engine-kill, cheaper than any socket exhaustion).
+- **Advertised-address integrity**: the reflected-address voter's
+  sybil-resistance constraints (Gap C) are part of the security posture, not
+  a robustness nicety — a poisoned vote inside a signed ENR lends our
+  signature to a victim address.
