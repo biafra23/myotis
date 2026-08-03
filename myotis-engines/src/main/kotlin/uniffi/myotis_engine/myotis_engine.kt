@@ -1017,7 +1017,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_myotis_engine_checksum_func_set_log_index_config() != 49994) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_set_served_block_window() != 61951) {
+    if (lib.uniffi_myotis_engine_checksum_func_set_served_block_window() != 15483) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_set_tor_enabled() != 16704) {
@@ -1715,9 +1715,10 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
 
         /**
-         * Live-set the eth/69 served-block window on a RUNNING handle's EL reader
-         * (the Settings knob). False (no-op) for a not-started / paused / EL-less
-         * handle — the Java wrapper treats that as "nothing to apply".
+         * Live-set the eth/69 served-block window (the Settings knob). Clamped to
+         * [1, 4096]; applied immediately on a RUNNING handle's EL reader, stashed for
+         * the next spin_up when the handle isn't running. False only for an unknown
+         * handle.
          */ fun `setServedBlockWindow`(`handle`: kotlin.Long, `blocks`: kotlin.Int): kotlin.Boolean {
             return FfiConverterBoolean.lift(
     uniffiRustCall() { _status ->

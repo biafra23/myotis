@@ -14,9 +14,13 @@ use myotis_core::CoreError;
 // Absolute eth message codes (p2p base 0x10).
 pub const STATUS: u64 = 0x10;
 pub const NEW_BLOCK_HASHES: u64 = 0x11;
-/// eth/69 (EIP-7642) BlockRangeUpdate — same id 0x11 as the obsolete
-/// NewBlockHashes, so senders MUST gate on the negotiated version.
-pub const BLOCK_RANGE_UPDATE: u64 = 0x11;
+/// eth/69 (EIP-7642) BlockRangeUpdate. The spec id is RELATIVE 0x11 — this file
+/// uses absolute wire codes (eth base 0x10), so 0x21: the new slot after
+/// Receipts (0x20) that grows the eth/69 protocol length 17 → 18 (which is why
+/// the snap base moves 0x21 → 0x22, see snap::SnapCodes). Senders MUST still
+/// gate on the negotiated version: on eth/68 absolute 0x21 is the SNAP base
+/// (GetAccountRange), not a free slot.
+pub const BLOCK_RANGE_UPDATE: u64 = 0x21;
 pub const TRANSACTIONS: u64 = 0x12;
 pub const GET_BLOCK_HEADERS: u64 = 0x13;
 pub const BLOCK_HEADERS: u64 = 0x14;

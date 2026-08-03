@@ -578,9 +578,6 @@ pub fn stop(handle: i64) {
     }
 }
 
-/// `nativeRequestAccountJson`: run a verified account query for a running
-/// handle, returning the `AccountProofResult` JSON, or `{"error": "..."}` for a
-/// transport / not-running / bad-input failure.
 /// Live-set the eth/69 served-block window (ChainHandle.setServedBlockWindow).
 /// Clamped to [1, 4096] per the API contract (0 would disable serving; an
 /// unbounded window is an archive-node promise a light client cannot keep).

@@ -131,10 +131,12 @@ struct PoolInner {
     cache: Mutex<ElPeerCache>,
     /// Recent headers we can serve to peers + the eth/69 advertised range source.
     served: Arc<ServedHeaders>,
-    /// Last (earliest, latest, latestHash) we broadcast via BlockRangeUpdate, to
-    /// suppress duplicate sends when the maintainer tick finds an unchanged
-    /// range. The hash is part of the key so a same-height reorg re-broadcasts.
-    last_broadcast_range: Mutex<Option<(u64, u64, [u8; 32])>>,
+    /// Last (earliest, latest, latestHash) broadcast via BlockRangeUpdate and
+    /// WHEN, to suppress duplicate sends and rate-limit changed ones: the spec
+    /// recommends an update "about once every two minutes", and once the window
+    /// tracks the head the triple would otherwise change on nearly every tick.
+    /// The hash is part of the key so a same-height reorg re-broadcasts (when due).
+    last_broadcast_range: Mutex<Option<((u64, u64, [u8; 32]), Instant)>>,
     /// Inbound peer-demand counters for the status page.
     serve_stats: Arc<ServeStats>,
     /// EL hunt engaged (serving pool empty past the stall window) — drives the
@@ -613,7 +615,11 @@ async fn broadcast_range_if_changed(inner: &Arc<PoolInner>) {
     let Some((earliest, latest, latest_hash)) = inner.served.advertise() else {
         return; // empty window — nothing new to promise
     };
-    if !range_broadcast_due(&mut *inner.last_broadcast_range.lock().await, (earliest, latest, latest_hash)) {
+    if !range_broadcast_due(
+        &mut *inner.last_broadcast_range.lock().await,
+        (earliest, latest, latest_hash),
+        Instant::now(),
+    ) {
         return;
     }
     let peers: Vec<Arc<ManagedPeer>> =
@@ -623,14 +629,29 @@ async fn broadcast_range_if_changed(inner: &Arc<PoolInner>) {
     }
 }
 
-/// The pure dedup decision for BlockRangeUpdate: record + broadcast only when
-/// the (earliest, latest, latestHash) triple changed since the last broadcast.
-fn range_broadcast_due(last: &mut Option<(u64, u64, [u8; 32])>, range: (u64, u64, [u8; 32])) -> bool {
-    if *last == Some(range) {
-        return false;
+/// Spec guidance: "It is recommended to send an update about once every two
+/// minutes" (devp2p eth.md, BlockRangeUpdate).
+const MIN_REBROADCAST_INTERVAL: Duration = Duration::from_secs(120);
+
+/// The pure dedup + rate-limit decision for BlockRangeUpdate: broadcast (and
+/// record) only when the (earliest, latest, latestHash) triple changed AND the
+/// spec's recommended interval has passed since the last broadcast. The very
+/// first broadcast is immediate — new peers get the range in their handshake
+/// Status anyway, so nothing depends on it.
+fn range_broadcast_due(
+    last: &mut Option<((u64, u64, [u8; 32]), Instant)>,
+    range: (u64, u64, [u8; 32]),
+    now: Instant,
+) -> bool {
+    match last {
+        Some((prev, at)) if *prev == range || now.duration_since(*at) < MIN_REBROADCAST_INTERVAL => {
+            false
+        }
+        _ => {
+            *last = Some((range, now));
+            true
+        }
     }
-    *last = Some(range);
-    true
 }
 
 /// The snap-peer maintainer: on a timer, if the live snap count has dropped
@@ -775,15 +796,24 @@ impl SnapQualitySink {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn range_broadcast_dedup_fires_on_any_component_change() {
+    fn range_broadcast_dedup_and_rate_limit() {
+        use super::{range_broadcast_due, MIN_REBROADCAST_INTERVAL};
+        use tokio::time::Instant; // pool.rs's Instant is tokio's re-export
         let mut last = None;
         let h1 = [1u8; 32];
         let h2 = [2u8; 32];
-        assert!(super::range_broadcast_due(&mut last, (10, 20, h1)), "first range broadcasts");
-        assert!(!super::range_broadcast_due(&mut last, (10, 20, h1)), "unchanged is deduped");
-        assert!(super::range_broadcast_due(&mut last, (11, 20, h1)), "earliest change fires");
-        assert!(super::range_broadcast_due(&mut last, (11, 21, h1)), "latest change fires");
-        assert!(super::range_broadcast_due(&mut last, (11, 21, h2)), "same-height reorg (hash) fires");
+        let t0 = Instant::now();
+        assert!(range_broadcast_due(&mut last, (10, 20, h1), t0), "first range broadcasts");
+        assert!(!range_broadcast_due(&mut last, (10, 20, h1), t0), "unchanged is deduped");
+        // Changed but inside the spec interval: suppressed (and NOT recorded).
+        let early = t0 + MIN_REBROADCAST_INTERVAL / 2;
+        assert!(!range_broadcast_due(&mut last, (11, 21, h1), early), "rate-limited");
+        // Past the interval, the latest change fires.
+        let due = t0 + MIN_REBROADCAST_INTERVAL;
+        assert!(range_broadcast_due(&mut last, (11, 21, h1), due), "due change fires");
+        // Same-height reorg (hash-only change) also fires once due.
+        let due2 = due + MIN_REBROADCAST_INTERVAL;
+        assert!(range_broadcast_due(&mut last, (11, 21, h2), due2), "reorg hash fires");
     }
 
     use super::*;

@@ -211,7 +211,12 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private volatile int negotiatedEthVersion = 68; // default, updated during Hello negotiation
     // eth/69 (EIP-7642) BlockRangeUpdate, message id 0x11 within the eth capability.
     // On eth/68 the same id is the obsolete NewBlockHashes, so this is version-gated.
-    private static final int ETH_BLOCK_RANGE_UPDATE = 0x11;
+    // Absolute wire id: the spec's RELATIVE 0x11 + eth base 0x10 = 0x21 — the new
+    // slot after Receipts (0x20) that grows eth/69's protocol length 17 → 18 (and
+    // moves the snap base to 0x22). NB on eth/68 absolute 0x21 IS the snap base
+    // (GetAccountRange), so 0x21 must be dispatched per-version — see handleReady's
+    // default branch, deliberately NOT a switch case (a case would shadow eth/68 snap).
+    private static final int ETH_BLOCK_RANGE_UPDATE = 0x21;
 
     /** Optional sink for mempool-gossip tx hashes, set by the connector. When present
      *  AND {@link TxGossipObserver#watchingAny()} is true, inbound Transactions (0x12)
@@ -695,22 +700,6 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     log.debug("[eth] Failed to answer GetBlockBodies from peer: {}", e.getMessage());
                 }
             }
-            case ETH_BLOCK_RANGE_UPDATE -> {
-                // eth/69: a peer telling us its servable range changed. We don't yet route
-                // requests by peer range, so just log it. On eth/68 id 0x11 is the obsolete
-                // NewBlockHashes — the version guard drops it here (a light client ignores
-                // NewBlockHashes regardless), so it deliberately never reaches `default`.
-                if (negotiatedEthVersion >= 69) {
-                    try {
-                        BlockRangeUpdateMessage.Decoded u = BlockRangeUpdateMessage.decode(msg.payload());
-                        log.debug("[eth] Peer BlockRangeUpdate: range=[{},{}] from {}",
-                                u.earliestBlock(), u.latestBlock(),
-                                clientId != null ? clientId : remoteAddress);
-                    } catch (Exception e) {
-                        log.debug("[eth] Malformed BlockRangeUpdate ignored: {}", e.getMessage());
-                    }
-                }
-            }
             case P2P_PING -> sendPong(ctx);
             case P2P_DISCONNECT -> {
                 int reason = decodeDisconnectReason(msg.payload());
@@ -721,7 +710,20 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 ctx.close();
             }
             default -> {
-                if (msg.code() == snapAccountRange) {
+                if (negotiatedEthVersion >= 69 && msg.code() == ETH_BLOCK_RANGE_UPDATE) {
+                    // eth/69: a peer telling us its servable range changed. We don't yet
+                    // route requests by peer range, so just log it. Handled HERE (not as
+                    // a switch case) because on eth/68 absolute 0x21 is snap
+                    // GetAccountRange — a constant case would shadow it.
+                    try {
+                        BlockRangeUpdateMessage.Decoded u = BlockRangeUpdateMessage.decode(msg.payload());
+                        log.debug("[eth] Peer BlockRangeUpdate: range=[{},{}] from {}",
+                                u.earliestBlock(), u.latestBlock(),
+                                clientId != null ? clientId : remoteAddress);
+                    } catch (Exception e) {
+                        log.debug("[eth] Malformed BlockRangeUpdate ignored: {}", e.getMessage());
+                    }
+                } else if (msg.code() == snapAccountRange) {
                     handleSnapAccountRange(msg);
                 } else if (msg.code() == snapGetAccountRange) {
                     handleSnapGetAccountRange(ctx, msg);

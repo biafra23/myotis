@@ -218,7 +218,8 @@ impl ManagedPeer {
     }
 
     /// Push an eth/69 BlockRangeUpdate advertising our current servable range.
-    /// No-op on eth/68- peers (id 0x11 is NewBlockHashes there) or a closed peer.
+    /// No-op on eth/68- peers (absolute 0x21 is their SNAP base, not a free
+    /// slot) or a closed peer.
     pub async fn send_block_range_update(&self, earliest: u64, latest: u64, latest_hash: [u8; 32]) {
         if self.eth_version < 69 || self.is_closed() {
             return;
