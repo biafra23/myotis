@@ -43,7 +43,8 @@ const BACKOFF_INCOMPATIBLE: Duration = Duration::from_secs(10 * 60);
 const BACKOFF_TRANSIENT: Duration = Duration::from_secs(30);
 /// TooManyPeers (Disconnect 0x04) rejections: the peer is ALIVE, just full —
 /// retry patiently enough to halve the dial burn, often enough to keep
-/// farming freed slots (Java's `BACKOFF_BUSY_MS`).
+/// farming freed slots (Java's `BACKOFF_BUSY_MS`). While the EL hunt is
+/// engaged the transient window applies instead (see the dial Err arm).
 const BACKOFF_BUSY: Duration = Duration::from_secs(60);
 
 /// True when a dial error is a TooManyPeers rejection. The session's
@@ -339,7 +340,15 @@ impl PoolInner {
                 let window = if incompatible {
                     BACKOFF_INCOMPATIBLE
                 } else if busy {
-                    BACKOFF_BUSY
+                    // While the EL hunt is engaged, busy peers retry on the
+                    // transient cadence: with the serving pool empty they are
+                    // the only realistic source of a freed slot, and slots
+                    // are won by fast retries (Java busyBackoffMs twin).
+                    if self.hunting.load(Ordering::Relaxed) {
+                        BACKOFF_TRANSIENT
+                    } else {
+                        BACKOFF_BUSY
+                    }
                 } else {
                     BACKOFF_TRANSIENT
                 };
@@ -632,9 +641,14 @@ async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
             // so the dial loop below reaches them NOW instead of after the
             // standard cool-off. Confirmed = served us chain-verified snap
             // data. Entries whose remaining window exceeds the transient
-            // length are INCOMPATIBLE (10 min) — keep those: try_dial's
-            // blacklist check would block the dial anyway, but the timer
-            // must stay honest too. Non-confirmed peers keep their timers.
+            // length are INCOMPATIBLE (10 min) or a not-yet-elapsed 60s busy
+            // entry — keep those: the timer must stay honest (and for
+            // incompatible, try_dial's blacklist would block the dial anyway).
+            // Hunt-time BUSY entries are written at the transient window, so a
+            // confirmed-but-busy server is clearable immediately and re-dials
+            // roughly every maintainer tick while the pool is empty —
+            // intentional, bounded slot-farming (Java maintainSnapPeers twin
+            // documents the same trade-off). Non-confirmed peers keep timers.
             let now = Instant::now();
             let mut backoff = inner.backoff.lock().await;
             for c in cached.iter().filter(|c| c.quality == SnapQuality::Confirmed) {
