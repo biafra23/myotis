@@ -23,7 +23,9 @@ cp ../target/release/libmyotis_node.so myotis-node.node   # .dylib on macOS, .dl
 ```js
 const myotis = require('./myotis-node.node');
 
-myotis.init();                                   // must return 19 (ABI handshake)
+myotis.init();   // ABI handshake — returns the engine ABI version; gate on
+                 // the value pinned in the notes of the release you built or
+                 // downloaded against
 const h = myotis.create('mainnet', '/path/to/data-dir');  // dir is created if missing
 myotis.start(h);
 

@@ -17,9 +17,13 @@ const t0 = Date.now();
 const elapsed = () => ((Date.now() - t0) / 1000).toFixed(1) + 's';
 const log = (...a) => console.log(`[${elapsed()}]`, ...a);
 
+// The addon is built from this same tree, so init() always returns the
+// current crate ABI_VERSION — assert it's sane and log it. Hosts loading
+// PREBUILT addons instead gate on the exact value pinned in the release
+// notes of the release they downloaded from.
 const abi = m.init();
-if (abi !== 19) {
-  console.error(`ABI mismatch: engine ${abi}, binding written against 19`);
+if (!Number.isInteger(abi) || abi < 19) {
+  console.error(`unexpected engine ABI: ${abi}`);
   process.exit(1);
 }
 log('abi ok:', abi);

@@ -17,8 +17,9 @@ merge blockers; each should either be fixed or consciously dropped.
     the picture entirely.
 
 - [x] **`node-binding.yml` goes dead on merge.** Done: push trigger retargeted
-  to `main` + `v*` tags (no paths filter — tag pushes and paths filters
-  interact badly), and a release job now publishes the five addons plus
+  to `main` + `v*` tags, keeping the `rust/**` paths filter for branch pushes
+  (GitHub doesn't evaluate paths filters on tag pushes, so release runs
+  always fire), and a release job now publishes the five addons plus
   `myotis-node.SHA256SUMS` to the tag's GitHub Release with the engine ABI
   version pinned in the notes.
 

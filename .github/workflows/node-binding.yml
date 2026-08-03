@@ -9,17 +9,22 @@ name: node-binding
 on:
   # Scope push to main + release tags, matching the other asset workflows
   # (android-apk/desktop-dmg/desktop-linux-deb): prebuilds stay green on main,
-  # `v*` tags publish the release assets. Deliberately no paths filter — tag
-  # pushes interact badly with paths filters (a tag push may carry no diff, so
-  # the release run could be skipped entirely).
+  # `v*` tags publish the release assets. The paths filter only trims branch
+  # pushes — GitHub does not evaluate paths filters for tag pushes, so `v*`
+  # release runs always fire regardless of what the tagged commit touched.
   push:
     branches: [ "main" ]
     tags: [ "v*" ]
+    paths: ['rust/**', '.github/workflows/node-binding.yml']
   workflow_dispatch:
 
-# Cancel a superseded run when new commits land on the same branch/PR.
+# Cancel a superseded run when new commits land on the same branch/PR. The
+# event name is part of the group so a push to main can never cancel an
+# in-flight dispatched smoke run (or a dispatch cancel a tag's release run) —
+# unlike the sibling workflows, this one has a workflow_dispatch trigger
+# sharing refs with push runs.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -71,6 +76,9 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
           if-no-files-found: error
+          # Artifacts are immutable per run; without this, "re-run all jobs"
+          # on a tag 409s in every build leg and the release job never runs.
+          overwrite: true
 
   # Attach the five prebuilt addons plus a SHA-256 checksum file to the GitHub
   # Release for the pushed tag, and pin the engine ABI version in the release
@@ -116,9 +124,9 @@ jobs:
         run: |
           set -eu
           tag="${GITHUB_REF_NAME}"
-          # Engine ABI version from its source of truth (the crate constant,
-          # currently 19) — loaders must refuse an addon whose init() returns
-          # anything else, so the notes state it explicitly.
+          # Engine ABI version from its source of truth (the crate constant) —
+          # loaders must refuse an addon whose init() returns anything else,
+          # so the notes state it explicitly.
           abi=$(sed -n 's/^pub const ABI_VERSION: i32 = \([0-9][0-9]*\);.*$/\1/p' \
             rust/myotis-engine/src/lib.rs)
           [ -n "$abi" ] || { echo "::error::could not extract ABI_VERSION"; exit 1; }
