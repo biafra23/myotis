@@ -47,6 +47,9 @@ public final class PortBridges {
             @Override public void recordSnapFailure(InetSocketAddress address) {
                 cache.recordSnapFailure(address.getHostString(), address.getPort());
             }
+            @Override public void recordConnectFailure(InetSocketAddress address) {
+                cache.recordConnectFailure(address.getHostString(), address.getPort());
+            }
             @Override public List<CachedPeer> load() {
                 List<CachedPeerInfo> cached = cache.load();
                 List<CachedPeer> out = new ArrayList<>(cached.size());

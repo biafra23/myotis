@@ -54,6 +54,12 @@ const MAINTAINER_INTERVAL: Duration = Duration::from_secs(10);
 /// re-dial is safe). Blacklist and incompatible entries stay respected.
 const EL_HUNT_STALL: Duration = Duration::from_secs(60);
 
+/// How recent an online signal (discv4 delivery / completed session) still
+/// gates connect-failure counting. Short on purpose: a device that drops
+/// offline must stop counting before it can demote healthy cached peers
+/// (Java `ChainStack.ONLINE_SIGNAL_MAX_AGE_MS`).
+const ONLINE_SIGNAL_MAX_AGE: Duration = Duration::from_secs(2 * 60);
+
 /// Pure trigger: pool empty AND it has been empty past the stall window.
 fn el_hunt_due(live: usize, zero_since: Option<Instant>, now: Instant) -> bool {
     live == 0
@@ -108,6 +114,11 @@ struct PoolInner {
     /// EL hunt engaged (serving pool empty past the stall window) — drives the
     /// hosts' status banner and the maintainer's backoff bypass.
     hunting: AtomicBool,
+    /// Last proof we're online: a discv4 candidate arrived or a dial completed
+    /// a session. Gates connect-failure counting (with the live-peer check) so
+    /// a warm start whose cached peers are ALL dead can still clean them up,
+    /// while an offline device (no discovery, no sessions) counts nothing.
+    online_signal: Mutex<Option<Instant>>,
     /// The reader's sent-tx watch, handed to every spawned peer's read loop so
     /// gossip sightings of our own broadcasts register (None for pools whose
     /// host never sends).
@@ -118,6 +129,21 @@ impl PoolInner {
     /// The single quality-recording path (dirty-gated flush inside) — shared by
     /// the pool's public sinks and [`SnapQualitySink`] so behavior can't drift.
     async fn record_quality(&self, addr: SocketAddr, served: bool) {
+        // Never demote the LAST live snap peer: an empty/failed fetch against
+        // the sole server usually means WE asked for a root outside its
+        // snapshot window (stale local head), not that the peer is bad — and
+        // three such strikes would persist a snapbad verdict against the one
+        // peer still serving us. Twin of the Java benchUnlessLastServing scan
+        // (`h != failed`): the guard keys on whether any OTHER peer is live,
+        // not on pool size — a lone pooled peer at a DIFFERENT address means
+        // the failing one isn't our last resort and the strike must count.
+        // (Deliberate asymmetry with Java: this skips a PERSISTED verdict
+        // step, Java skips a transient 30s bench — same trigger, harsher
+        // consequence here, hence the same protection.)
+        if !served && !self.peers.lock().await.iter().any(|p| p.addr != addr) {
+            tracing::debug!(%addr, "skipping snap-failure verdict — no other serving peer");
+            return;
+        }
         let mut cache = self.cache.lock().await;
         if served {
             cache.record_snap_served(addr);
@@ -125,6 +151,23 @@ impl PoolInner {
             cache.record_snap_failure(addr);
         }
         cache.flush();
+    }
+
+    /// Stamp the online signal (see `online_signal` field docs).
+    async fn note_online(&self) {
+        *self.online_signal.lock().await = Some(Instant::now());
+    }
+
+    /// True if we have live proof of connectivity: a pooled peer, or an online
+    /// signal within [`ONLINE_SIGNAL_MAX_AGE`].
+    async fn likely_online(&self) -> bool {
+        if !self.peers.lock().await.is_empty() {
+            return true;
+        }
+        self.online_signal
+            .lock()
+            .await
+            .is_some_and(|t| t.elapsed() < ONLINE_SIGNAL_MAX_AGE)
     }
 
     /// Drop closed peers, freeing their addresses for a future re-dial. Returns
@@ -167,13 +210,37 @@ impl PoolInner {
     /// Dial one candidate through the full eth+snap handshake, updating the
     /// bookkeeping by outcome. `addr` is already in `attempted`.
     async fn dial_one(self: &Arc<PoolInner>, addr: SocketAddr, pubkey: [u8; 64]) {
-        let result = async {
-            let conn = RlpxConnection::dial(Arc::clone(&self.key), addr, pubkey).await?;
-            // eth/69 Status advertises only the window's held range (None → the
-            // honest genesis-only [0, 0]); see ServedHeaders::advertise.
-            EthSession::handshake(conn, &self.local_pubkey, &self.cfg, self.served.advertise()).await
-        }
-        .await;
+        let conn = match RlpxConnection::dial(Arc::clone(&self.key), addr, pubkey).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                // Transport-level failure (refused/timeout/ECIES) — the peer is
+                // GONE, not incompatible. Streaks of these demote and eventually
+                // evict it from the warm-start cache. (Deliberately broader than
+                // the Java twin, which only sees pre-handshake TCP failures: an
+                // ECIES failure against a cached entry means its stored node key
+                // is stale — the entry can never handshake again and deserves
+                // the same eviction path.) Gated on an online signal so an
+                // offline device can't count a failure against every cached
+                // peer per cycle and decimate its own cache.
+                tracing::debug!(%addr, error = %e, "el dial: transport failed");
+                if self.likely_online().await {
+                    let mut cache = self.cache.lock().await;
+                    cache.record_connect_failure(addr);
+                    cache.flush();
+                }
+                self.record_backoff(addr, false, Instant::now()).await;
+                self.attempted.lock().await.remove(&addr);
+                return;
+            }
+        };
+        // TCP + ECIES succeeded — proof of connectivity regardless of how the
+        // eth handshake goes.
+        self.note_online().await;
+        // eth/69 Status advertises only the window's held range (None → the
+        // honest genesis-only [0, 0]); see ServedHeaders::advertise.
+        let result =
+            EthSession::handshake(conn, &self.local_pubkey, &self.cfg, self.served.advertise())
+                .await;
 
         let now = Instant::now();
         match result {
@@ -204,17 +271,31 @@ impl PoolInner {
             }
             Ok(session) => {
                 // Compatible but no snap/1 — useless for verified reads. Cool the
-                // address off and free it from `attempted`.
+                // address off and free it from `attempted`. Still proof the
+                // address is alive: clear any connect-failure streak.
                 tracing::debug!(%addr, eth = session.eth_version, "el dial: connected but no snap/1");
+                {
+                    // Flush so a cleared persisted streak lands on disk now —
+                    // this path may be the only cache event the peer ever gets.
+                    let mut cache = self.cache.lock().await;
+                    cache.record_connect_success(addr);
+                    cache.flush();
+                }
                 self.record_backoff(addr, false, now).await;
                 self.attempted.lock().await.remove(&addr);
             }
             Err(e) => {
-                // Only the network-id/genesis mismatch error starts with this
-                // prefix (see EthSession::handshake). Match the PREFIX, not a
-                // substring: a peer's client id is echoed into other error
-                // strings, so `contains` could be steered by a hostile peer.
-                let incompatible = e.starts_with("incompatible peer");
+                // Only the network-id/genesis mismatch and Status-decode errors
+                // start with these prefixes (see EthSession::handshake). An
+                // undecodable Status is a foreign-chain client with a divergent
+                // Status shape (e.g. Polygon's bor keeps the TD field eth/69
+                // removed) — treat it as incompatible so it gets the long
+                // backoff + blacklist instead of a re-dial every transient
+                // window. Match the PREFIX, not a substring: a peer's client id
+                // is echoed into other error strings, so `contains` could be
+                // steered by a hostile peer.
+                let incompatible =
+                    e.starts_with("incompatible peer") || e.starts_with("peer Status decode");
                 tracing::debug!(%addr, incompatible, error = %e, "el dial: failed");
                 if incompatible {
                     self.blacklist.lock().await.insert(pubkey);
@@ -261,6 +342,7 @@ impl PeerPool {
             served: Arc::new(ServedHeaders::default()),
             serve_stats: Arc::new(ServeStats::default()),
             hunting: AtomicBool::new(false),
+            online_signal: Mutex::new(None),
             tx_watch,
         });
         // Both the discv4 dialer and the maintainer dial through one shared
@@ -396,6 +478,10 @@ async fn dialer_loop(
 
     // Then top up from live discovery.
     while let Some(entry) = rx.recv().await {
+        // A candidate arriving proves discv4 round-trips are working — that's
+        // the online signal that lets connect-failure counting clean up a
+        // warm-started cache whose peers are ALL dead.
+        inner.note_online().await;
         if inner.prune_closed().await >= inner.pool_cfg.target_snap_peers {
             continue;
         }

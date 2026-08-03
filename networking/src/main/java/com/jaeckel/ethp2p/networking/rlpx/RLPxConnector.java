@@ -483,7 +483,7 @@ public final class RLPxConnector implements AutoCloseable {
             if (result.slots().isEmpty() && result.proof().isEmpty()) {
                 log.warn("[rlpx] Peer {} returned empty storage response, trying next peer",
                     handler.getRemoteAddress());
-                handler.markSnapServingFailed();
+                benchUnlessLastServing(handler);
                 return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
             }
             return CompletableFuture.completedFuture(result);
@@ -492,6 +492,25 @@ public final class RLPxConnector implements AutoCloseable {
                 handler.getRemoteAddress(), ex.getMessage());
             return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
         });
+    }
+
+    /** Bench a peer that failed to serve — unless it is the last un-benched serving
+     *  snap peer. An empty snap response usually means WE asked for a state root
+     *  outside the peer's ~128-block snapshot window (stale local head), not that
+     *  the peer is broken; benching the sole server empties the serving pool and
+     *  flaps the status (and the EL hunt) between 0 and 1 until the bench expires.
+     *  Synchronized so two concurrent failures on the last two serving peers
+     *  can't each see the other as still serving and both bench — the scan and
+     *  the mark must be atomic against other benchers. */
+    private synchronized void benchUnlessLastServing(EthHandler failed) {
+        for (EthHandler h : activeHandlers) {
+            if (h != failed && h.isReady() && h.isSnapNegotiated() && !h.isSnapServingFailed()) {
+                failed.markSnapServingFailed();
+                return;
+            }
+        }
+        log.info("[rlpx] Not benching {} — last serving snap peer (empty response likely "
+            + "a stale-root request)", failed.getRemoteAddress());
     }
 
     public record PeerInfo(String remoteAddress, String state, boolean snapSupported, String clientId) {}
