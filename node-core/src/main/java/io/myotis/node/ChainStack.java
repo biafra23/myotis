@@ -82,7 +82,8 @@ public final class ChainStack {
 
     /** Backoff for peers that rejected us with TooManyPeers (0x04): alive, just
      *  full. Longer than transient (halves the dial burn on saturated networks)
-     *  but short enough to keep farming freed slots. */
+     *  but short enough to keep farming freed slots. While the EL hunt is
+     *  engaged the transient window applies instead — see {@link #busyBackoffMs}. */
     static final long BACKOFF_BUSY_MS = 60_000L;
 
     /** Distinct peers that rejected us with TooManyPeers recently (rolling
@@ -1105,10 +1106,17 @@ public final class ChainStack {
                     // clear entries within the transient window — a peer re-marked
                     // incompatible after its confirm (post-fork lag) keeps its
                     // 10-min timer instead of being re-dialed every 10s tick.
-                    // A confirmed-but-BUSY server's 60s entry enters the clearable
-                    // window once ≤30s remain — intentional: in emergency mode an
-                    // eager re-dial of a known-good, merely-full server is exactly
-                    // the slot-farming we want.
+                    // Busy entries: outside the hunt they're 60s and enter the
+                    // clearable window once ≤30s remain; DURING the hunt they're
+                    // written at 30s (busyBackoffMs) and are therefore clearable
+                    // immediately — a CONFIRMED-but-busy server gets re-dialed
+                    // roughly every maintainer tick (~10s) while the pool is
+                    // empty. Intentional, eyes open: it's bounded to the few
+                    // confirmed servers, only runs in emergency mode, and each
+                    // extra attempt is a cheap fast-refusal (geth-class nodes
+                    // throttle repeat inbound within ~30s anyway) — maximal
+                    // slot-farming pressure exactly when a freed slot is the
+                    // only way back to verified reads.
                     if (hunting && p.snapQuality() == SnapQuality.CONFIRMED) {
                         String key = p.address().getHostString() + ":" + p.address().getPort();
                         backoff.computeIfPresent(key,

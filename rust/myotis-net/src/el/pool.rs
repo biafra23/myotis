@@ -641,9 +641,14 @@ async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
             // so the dial loop below reaches them NOW instead of after the
             // standard cool-off. Confirmed = served us chain-verified snap
             // data. Entries whose remaining window exceeds the transient
-            // length are INCOMPATIBLE (10 min) — keep those: try_dial's
-            // blacklist check would block the dial anyway, but the timer
-            // must stay honest too. Non-confirmed peers keep their timers.
+            // length are INCOMPATIBLE (10 min) or a not-yet-elapsed 60s busy
+            // entry — keep those: the timer must stay honest (and for
+            // incompatible, try_dial's blacklist would block the dial anyway).
+            // Hunt-time BUSY entries are written at the transient window, so a
+            // confirmed-but-busy server is clearable immediately and re-dials
+            // roughly every maintainer tick while the pool is empty —
+            // intentional, bounded slot-farming (Java maintainSnapPeers twin
+            // documents the same trade-off). Non-confirmed peers keep timers.
             let now = Instant::now();
             let mut backoff = inner.backoff.lock().await;
             for c in cached.iter().filter(|c| c.quality == SnapQuality::Confirmed) {
