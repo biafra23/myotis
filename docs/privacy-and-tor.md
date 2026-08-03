@@ -268,7 +268,7 @@ handles membership.
 
 ### 6.3 Client fingerprinting — anonymity bounded by the user base
 
-The Hello advertises `ethp2p/0.1.2` (`HelloMessage.java`), and even with a
+The Hello advertises `myotis/0.1.2` (`HelloMessage.java`), and even with a
 spoofed clientId the request shape is distinctive (single-account ranges with
 full-range limit and the 4 KiB response cap, the characteristic header probe).
 A peer can plausibly tag both the clearnet prober and the Tor-side client as "a

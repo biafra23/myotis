@@ -36,7 +36,10 @@ public final class HelloMessage {
     public static byte[] encode(Bytes nodePublicKey, int tcpPort) {
         return RLP.encodeList(writer -> {
             writer.writeInt(PROTOCOL_VERSION);
-            writer.writeString("ethp2p/0.1.2");
+            // Keep in sync with the Rust engine's Hello client id
+            // (rust/myotis-net/src/el/rlpx/transport.rs) — dedicated
+            // myotis-serving nodes admit peers by matching "myotis" here.
+            writer.writeString("myotis/0.1.2");
             writer.writeList(capWriter -> {
                 // Capabilities must be ascending (name, then version). eth/66 is the
                 // floor: it has request-IDs (which our GetBlockHeaders/snap requests
