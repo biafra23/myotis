@@ -703,7 +703,7 @@ public final class ChainStack {
                             if (busy) noteBusy(key);
                             backoff.putIfAbsent(key, System.currentTimeMillis()
                                     + (incompatible ? BACKOFF_INCOMPATIBLE_MS
-                                       : busy ? BACKOFF_BUSY_MS : BACKOFF_TRANSIENT_MS));
+                                       : busy ? busyBackoffMs() : BACKOFF_TRANSIENT_MS));
                             attempted.remove(key);
                         })
                         .addListener(future -> { if (!future.isSuccess()) attempted.remove(key); });
@@ -786,7 +786,7 @@ public final class ChainStack {
                             if (incompatible) blacklistedNodeIds.add(nodeIdHex);
                             if (busy) noteBusy(peerKey);
                             long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS
-                                    : busy ? BACKOFF_BUSY_MS : BACKOFF_TRANSIENT_MS;
+                                    : busy ? busyBackoffMs() : BACKOFF_TRANSIENT_MS;
                             backoff.putIfAbsent(peerKey, System.currentTimeMillis() + backoffMs);
                             attempted.remove(peerKey);
                         })
@@ -816,7 +816,7 @@ public final class ChainStack {
                             if (incompatible) blacklistedNodeIds.add(nodeIdHex);
                             if (busy) noteBusy(key);
                             long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS
-                                    : busy ? BACKOFF_BUSY_MS : BACKOFF_TRANSIENT_MS;
+                                    : busy ? busyBackoffMs() : BACKOFF_TRANSIENT_MS;
                             backoff.putIfAbsent(key, System.currentTimeMillis() + backoffMs);
                             attempted.remove(key);
                         })
@@ -999,7 +999,7 @@ public final class ChainStack {
                         if (incompatible) blacklistedNodeIds.add(nodeIdHex);
                         if (busy) noteBusy(peerKey);
                         long backoffMs = incompatible ? BACKOFF_INCOMPATIBLE_MS
-                                    : busy ? BACKOFF_BUSY_MS : BACKOFF_TRANSIENT_MS;
+                                    : busy ? busyBackoffMs() : BACKOFF_TRANSIENT_MS;
                         backoff.putIfAbsent(peerKey, System.currentTimeMillis() + backoffMs);
                         attempted.remove(peerKey);
                     })
@@ -1260,7 +1260,7 @@ public final class ChainStack {
                 if (incompatible) blacklistedNodeIds.add(idHex);
                 if (busy) noteBusy(key);
                 long ms = incompatible ? BACKOFF_INCOMPATIBLE_MS
-                        : busy ? BACKOFF_BUSY_MS : BACKOFF_TRANSIENT_MS;
+                        : busy ? busyBackoffMs() : BACKOFF_TRANSIENT_MS;
                 backoff.putIfAbsent(key, System.currentTimeMillis() + ms);
                 attempted.remove(key);
             }).addListener(future -> {
@@ -1293,7 +1293,7 @@ public final class ChainStack {
                 if (incompatible) blacklistedNodeIds.add(idHex);
                 if (busy) noteBusy(peerKey);
                 long ms = incompatible ? BACKOFF_INCOMPATIBLE_MS
-                        : busy ? BACKOFF_BUSY_MS : BACKOFF_TRANSIENT_MS;
+                        : busy ? busyBackoffMs() : BACKOFF_TRANSIENT_MS;
                 backoff.putIfAbsent(peerKey, System.currentTimeMillis() + ms);
                 attempted.remove(peerKey);
             }).addListener(future -> {
@@ -1309,6 +1309,14 @@ public final class ChainStack {
         } catch (Exception e) {
             attempted.remove(peerKey);
         }
+    }
+
+    /** Busy peers wait {@link #BACKOFF_BUSY_MS} normally — but while the EL
+     *  hunt is engaged they retry on the transient cadence instead: when the
+     *  serving pool is empty, proven-alive-but-full nodes are the only
+     *  realistic source of a freed slot, and slots are won by fast retries. */
+    private long busyBackoffMs() {
+        return elHunting ? BACKOFF_TRANSIENT_MS : BACKOFF_BUSY_MS;
     }
 
     /** Note a TooManyPeers rejection for hunt diagnostics (bounded, rolling). */

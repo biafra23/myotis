@@ -43,7 +43,8 @@ const BACKOFF_INCOMPATIBLE: Duration = Duration::from_secs(10 * 60);
 const BACKOFF_TRANSIENT: Duration = Duration::from_secs(30);
 /// TooManyPeers (Disconnect 0x04) rejections: the peer is ALIVE, just full —
 /// retry patiently enough to halve the dial burn, often enough to keep
-/// farming freed slots (Java's `BACKOFF_BUSY_MS`).
+/// farming freed slots (Java's `BACKOFF_BUSY_MS`). While the EL hunt is
+/// engaged the transient window applies instead (see the dial Err arm).
 const BACKOFF_BUSY: Duration = Duration::from_secs(60);
 
 /// True when a dial error is a TooManyPeers rejection. The session's
@@ -339,7 +340,15 @@ impl PoolInner {
                 let window = if incompatible {
                     BACKOFF_INCOMPATIBLE
                 } else if busy {
-                    BACKOFF_BUSY
+                    // While the EL hunt is engaged, busy peers retry on the
+                    // transient cadence: with the serving pool empty they are
+                    // the only realistic source of a freed slot, and slots
+                    // are won by fast retries (Java busyBackoffMs twin).
+                    if self.hunting.load(Ordering::Relaxed) {
+                        BACKOFF_TRANSIENT
+                    } else {
+                        BACKOFF_BUSY
+                    }
                 } else {
                     BACKOFF_TRANSIENT
                 };
