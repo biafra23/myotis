@@ -1008,6 +1008,11 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future = new CompletableFuture<>();
         long reqId = requestId.getAndIncrement();
         pendingRequests.put(reqId, future);
+        // Self-cleaning: the timeout lives at the call site (backfill's orTimeout
+        // completes this future exceptionally), so remove the map entry on ANY
+        // completion — otherwise a live-but-silent peer leaks one dead entry per
+        // round-robin visit for the connection lifetime.
+        future.whenComplete((r, ex) -> pendingRequests.remove(reqId));
         byte[] payload = GetBlockHeadersMessage.encodeByNumber(reqId, blockNumber, count, 0, false);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
         return future;

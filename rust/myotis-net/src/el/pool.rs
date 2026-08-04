@@ -137,6 +137,12 @@ struct PoolInner {
     head_source: Option<Box<dyn Fn() -> Option<(u64, [u8; 32])> + Send + Sync>>,
     /// Round-robin cursor for backfill peer selection.
     backfill_rr: std::sync::atomic::AtomicUsize,
+    /// True while a spawned backfill fetch is in flight: the 10 s tick is
+    /// shorter than the 15 s request timeout, so without this a slow peer's
+    /// batch would be re-requested from the next peer while still pending
+    /// (harmless but wasteful — Java avoids it by construction, 15 s tick
+    /// > 10 s timeout).
+    backfill_inflight: std::sync::atomic::AtomicBool,
     /// Last (earliest, latest, latestHash) broadcast via BlockRangeUpdate and
     /// WHEN, to suppress duplicate sends and rate-limit changed ones: the spec
     /// recommends an update "about once every two minutes", and the backfill
@@ -418,6 +424,7 @@ impl PeerPool {
             served,
             head_source,
             backfill_rr: std::sync::atomic::AtomicUsize::new(0),
+            backfill_inflight: std::sync::atomic::AtomicBool::new(false),
             last_broadcast_range: Mutex::new(None),
             serve_stats: Arc::new(ServeStats::default()),
             hunting: AtomicBool::new(false),
@@ -742,11 +749,24 @@ async fn backfill_served_headers(inner: &Arc<PoolInner>) {
         let i = inner.backfill_rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Arc::clone(&peers[i % peers.len()].peer)
     };
+    // One fetch at a time (see backfill_inflight).
+    if inner
+        .backfill_inflight
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
     let inner2 = Arc::clone(inner);
     tokio::spawn(async move {
         tracing::debug!(from, count, head = anchored.0, "header backfill: anchored fetch");
-        let Ok(headers) = peer.get_block_headers_by_number_raw(from, count).await else {
-            return;
+        let result = peer.get_block_headers_by_number_raw(from, count).await;
+        inner2.backfill_inflight.store(false, std::sync::atomic::Ordering::Release);
+        let headers = match result {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::debug!(from, count, error = %e, "header backfill: fetch failed");
+                return;
+            }
         };
         if headers.len() as u64 != count || !batch_anchored(&headers, from, &anchor) {
             tracing::debug!(

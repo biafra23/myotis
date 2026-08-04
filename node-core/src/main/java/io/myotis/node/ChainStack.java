@@ -1066,8 +1066,15 @@ public final class ChainStack {
             com.jaeckel.ethp2p.networking.eth.ServedHeaderWindow window = conn.servedWindow();
             com.jaeckel.ethp2p.networking.eth.ServedHeaderWindow.Range r =
                     window.advertise(head, headHash);
-            // advertise()'s empty-window shape is the genesis-only [0, 0]: treat as no run.
-            boolean empty = r.latest() == 0;
+            // advertise() has TWO empty-window shapes: the genesis-only [0, 0]
+            // (mainnet, genesis seeded) and the bootstrap claim [head, head]
+            // (non-mainnet, no genesis RLP embedded). Both denote "nothing
+            // actually held", and both — plus only them — have no stored parent
+            // hash at the claimed top, so that is the robust emptiness test
+            // (a latest()==0 check alone left Gnosis/Sepolia unable to ever
+            // start: the bootstrap shape matched the down-fill arm and died on
+            // the missing earliest parent every tick).
+            boolean empty = window.parentHashOf(r.latest()) == null;
             BackfillPlan plan = backfillPlan(head, headHash, window.maxWindow(),
                     empty ? -1 : r.earliest(), empty ? -1 : r.latest(),
                     empty ? null : r.latestHash(),
