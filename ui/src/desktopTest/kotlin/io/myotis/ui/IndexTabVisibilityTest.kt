@@ -1,6 +1,7 @@
 package io.myotis.ui
 
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isSelectable
 import androidx.compose.ui.test.isToggleable
@@ -72,8 +73,18 @@ class IndexTabVisibilityTest {
 
         toggle("Collect Kohaku contract logs on mainnet")
         tab("Index").assertDoesNotExist()
-        // The vanished selection falls back to the Status tab's content.
-        rule.onNode(isSelectable() and hasText("Status")).assertIsDisplayed()
+        // The vanished selection falls back to the Status tab (selected, not merely present).
+        tab("Status").assertIsSelected()
+    }
+
+    @Test
+    fun togglingRustEngineOffInSettingsHidesTheIndexTabImmediately() {
+        show(IndexSettings(rust = true, kohakuOn = setOf("mainnet")))
+        tab("Index").assertIsDisplayed()
+
+        tab("Settings").performClick()
+        toggle("Rust engine (experimental)")
+        tab("Index").assertDoesNotExist()
     }
 
     private fun show(settings: Settings) {
