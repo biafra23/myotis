@@ -14,6 +14,13 @@ use myotis_core::CoreError;
 // Absolute eth message codes (p2p base 0x10).
 pub const STATUS: u64 = 0x10;
 pub const NEW_BLOCK_HASHES: u64 = 0x11;
+/// eth/69 (EIP-7642) BlockRangeUpdate. The spec id is RELATIVE 0x11 — this file
+/// uses absolute wire codes (eth base 0x10), so 0x21: the new slot after
+/// Receipts (0x20) that grows the eth/69 protocol length 17 → 18 (which is why
+/// the snap base moves 0x21 → 0x22, see snap::SnapCodes). Senders MUST still
+/// gate on the negotiated version: on eth/68 absolute 0x21 is the SNAP base
+/// (GetAccountRange), not a free slot.
+pub const BLOCK_RANGE_UPDATE: u64 = 0x21;
 pub const TRANSACTIONS: u64 = 0x12;
 pub const GET_BLOCK_HEADERS: u64 = 0x13;
 pub const BLOCK_HEADERS: u64 = 0x14;
@@ -61,6 +68,16 @@ pub fn encode_status(
         Item::Bytes(best_hash.to_vec()),
         Item::Bytes(genesis_hash.to_vec()),
         fork_id_item(fork_id_hash, fork_next),
+    ]))
+}
+
+/// eth/69 BlockRangeUpdate body `[earliestBlock, latestBlock, latestBlockHash]`.
+/// Sent to already-connected peers when our servable range changes.
+pub fn encode_block_range_update(earliest: u64, latest: u64, latest_hash: &[u8; 32]) -> Vec<u8> {
+    rlp::encode(&Item::List(vec![
+        Item::Bytes(rlp::u64_to_minimal_be(earliest)),
+        Item::Bytes(rlp::u64_to_minimal_be(latest)),
+        Item::Bytes(latest_hash.to_vec()),
     ]))
 }
 
@@ -569,6 +586,17 @@ mod tests {
         assert!(matches!(origin, HeadersOrigin::Hash(x) if x == h));
 
         assert!(decode_get_block_headers(b"junk").is_err());
+    }
+
+    #[test]
+    fn block_range_update_round_trips() {
+        let h = [0xab_u8; 32];
+        let enc = encode_block_range_update(20_999_968, 21_000_000, &h);
+        let items = rlp::raw_list_items(&enc).unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(rlp::decode(items[0]).unwrap().as_u64().unwrap(), 20_999_968);
+        assert_eq!(rlp::decode(items[1]).unwrap().as_u64().unwrap(), 21_000_000);
+        assert_eq!(rlp::decode(items[2]).unwrap().as_bytes().unwrap(), &h[..]);
     }
 
     #[test]

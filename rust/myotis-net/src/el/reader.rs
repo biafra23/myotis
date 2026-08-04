@@ -1042,6 +1042,11 @@ impl ElReader {
         self.pool.serve_stats()
     }
 
+    /// Live-adjust the eth/69 served-block window (Settings knob).
+    pub fn set_served_block_window(&self, blocks: u64) {
+        self.pool.set_served_block_window(blocks);
+    }
+
     /// EL hunt engaged on the pool (serving pool empty past the stall window).
     pub fn el_hunting(&self) -> bool {
         self.pool.el_hunting()

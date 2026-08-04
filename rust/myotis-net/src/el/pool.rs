@@ -131,6 +131,12 @@ struct PoolInner {
     cache: Mutex<ElPeerCache>,
     /// Recent headers we can serve to peers + the eth/69 advertised range source.
     served: Arc<ServedHeaders>,
+    /// Last (earliest, latest, latestHash) broadcast via BlockRangeUpdate and
+    /// WHEN, to suppress duplicate sends and rate-limit changed ones: the spec
+    /// recommends an update "about once every two minutes", and once the window
+    /// tracks the head the triple would otherwise change on nearly every tick.
+    /// The hash is part of the key so a same-height reorg re-broadcasts (when due).
+    last_broadcast_range: Mutex<Option<((u64, u64, [u8; 32]), Instant)>>,
     /// Inbound peer-demand counters for the status page.
     serve_stats: Arc<ServeStats>,
     /// EL hunt engaged (serving pool empty past the stall window) — drives the
@@ -393,6 +399,7 @@ impl PeerPool {
             blacklist: Mutex::new(HashSet::new()),
             cache: Mutex::new(cache),
             served: Arc::new(ServedHeaders::default()),
+            last_broadcast_range: Mutex::new(None),
             serve_stats: Arc::new(ServeStats::default()),
             hunting: AtomicBool::new(false),
             online_signal: Mutex::new(None),
@@ -445,6 +452,12 @@ impl PeerPool {
     /// body_served)` for the status page. Lock-free.
     pub fn serve_stats(&self) -> (u64, u64, u64, u64) {
         self.inner.serve_stats.snapshot()
+    }
+
+    /// Live-adjust the eth/69 served-block window (Settings knob). Shrinking
+    /// evicts immediately; the next maintainer tick broadcasts the new range.
+    pub fn set_served_block_window(&self, blocks: u64) {
+        self.inner.served.set_window(blocks);
     }
 
     /// Node ids blacklisted as wrong-chain this run.
@@ -593,6 +606,60 @@ async fn try_dial(
     true
 }
 
+/// Send BlockRangeUpdate to all live eth/69 peers when our servable range has
+/// changed since the last broadcast (deduped on the (earliest, latest, hash)
+/// triple — a same-height reorg re-broadcasts too). Peers are snapshotted, then
+/// sent to outside the peers lock; each send is bounded by the frame-write
+/// timeout, and a failed write closes that peer (see send_block_range_update).
+async fn broadcast_range_if_changed(inner: &Arc<PoolInner>) {
+    let Some((earliest, latest, latest_hash)) = inner.served.advertise() else {
+        return; // empty window — nothing new to promise
+    };
+    if !range_broadcast_due(
+        &mut *inner.last_broadcast_range.lock().await,
+        (earliest, latest, latest_hash),
+        Instant::now(),
+    ) {
+        return;
+    }
+    let peers: Vec<Arc<ManagedPeer>> =
+        inner.peers.lock().await.iter().map(|p| Arc::clone(&p.peer)).collect();
+    // Concurrent sends: each is bounded by the frame-write timeout, but awaited
+    // SEQUENTIALLY a few stalled peers would sum to minutes and starve the
+    // maintainer's prune/re-dial work. Spawned, the tick is bounded by nothing —
+    // a failed write closes its own peer (send_block_range_update fail_alls).
+    for peer in peers {
+        tokio::spawn(async move {
+            peer.send_block_range_update(earliest, latest, latest_hash).await;
+        });
+    }
+}
+
+/// Spec guidance: "It is recommended to send an update about once every two
+/// minutes" (devp2p eth.md, BlockRangeUpdate).
+const MIN_REBROADCAST_INTERVAL: Duration = Duration::from_secs(120);
+
+/// The pure dedup + rate-limit decision for BlockRangeUpdate: broadcast (and
+/// record) only when the (earliest, latest, latestHash) triple changed AND the
+/// spec's recommended interval has passed since the last broadcast. The very
+/// first broadcast is immediate — new peers get the range in their handshake
+/// Status anyway, so nothing depends on it.
+fn range_broadcast_due(
+    last: &mut Option<((u64, u64, [u8; 32]), Instant)>,
+    range: (u64, u64, [u8; 32]),
+    now: Instant,
+) -> bool {
+    match last {
+        Some((prev, at)) if *prev == range || now.duration_since(*at) < MIN_REBROADCAST_INTERVAL => {
+            false
+        }
+        _ => {
+            *last = Some((range, now));
+            true
+        }
+    }
+}
+
 /// The snap-peer maintainer: on a timer, if the live snap count has dropped
 /// below `target_snap_peers`, re-dial cached snap peers (snap-quality first) to
 /// top back up. Twin of the Java `ChainStack.maintainSnapPeers` loop — the
@@ -604,6 +671,10 @@ async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
     let mut zero_since: Option<Instant> = None;
     loop {
         tokio::time::sleep(MAINTAINER_INTERVAL).await;
+        // Keep the eth/69 advertised range honest over a connection's lifetime:
+        // a peer told a narrow range at handshake would otherwise get empty
+        // answers once the window slides forward. Broadcast on change (deduped).
+        broadcast_range_if_changed(&inner).await;
         // prune_closed frees dead peers' addresses so try_dial can re-dial them.
         let live = inner.prune_closed().await;
         // target == 0 = maintainer deliberately idle: an empty pool is the
@@ -730,6 +801,27 @@ impl SnapQualitySink {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn range_broadcast_dedup_and_rate_limit() {
+        use super::{range_broadcast_due, MIN_REBROADCAST_INTERVAL};
+        use tokio::time::Instant; // pool.rs's Instant is tokio's re-export
+        let mut last = None;
+        let h1 = [1u8; 32];
+        let h2 = [2u8; 32];
+        let t0 = Instant::now();
+        assert!(range_broadcast_due(&mut last, (10, 20, h1), t0), "first range broadcasts");
+        assert!(!range_broadcast_due(&mut last, (10, 20, h1), t0), "unchanged is deduped");
+        // Changed but inside the spec interval: suppressed (and NOT recorded).
+        let early = t0 + MIN_REBROADCAST_INTERVAL / 2;
+        assert!(!range_broadcast_due(&mut last, (11, 21, h1), early), "rate-limited");
+        // Past the interval, the latest change fires.
+        let due = t0 + MIN_REBROADCAST_INTERVAL;
+        assert!(range_broadcast_due(&mut last, (11, 21, h1), due), "due change fires");
+        // Same-height reorg (hash-only change) also fires once due.
+        let due2 = due + MIN_REBROADCAST_INTERVAL;
+        assert!(range_broadcast_due(&mut last, (11, 21, h2), due2), "reorg hash fires");
+    }
+
     use super::*;
 
     #[test]

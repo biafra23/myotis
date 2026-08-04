@@ -66,6 +66,10 @@ void myotis_stop(int64_t handle);
  * True only on an actual transition. */
 bool myotis_pause(int64_t handle);
 
+/* Live-set the eth/69 served-block window (clamped [1,4096]; stashed for
+ * spin_up when the handle isn't running). False only for an unknown handle. */
+bool myotis_set_served_block_window(int64_t handle, int32_t blocks);
+
 /* Paused->Running warm restart. False when the rebuild failed (still PAUSED,
  * retryable) or the handle isn't paused. */
 bool myotis_resume(int64_t handle);

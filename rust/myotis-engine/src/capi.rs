@@ -142,6 +142,14 @@ pub extern "C" fn myotis_pause(handle: i64) -> bool {
     crate::host::pause(handle)
 }
 
+/// Live-set the eth/69 served-block window (`nativeSetServedBlockWindow` twin).
+/// Clamped to [1, 4096]; stashed for spin_up when the handle isn't running.
+/// False only for an unknown handle.
+#[no_mangle]
+pub extern "C" fn myotis_set_served_block_window(handle: i64, blocks: i32) -> bool {
+    crate::host::set_served_block_window(handle, blocks)
+}
+
 /// Rebuild networking for a paused handle (`nativeResume` twin). False when the
 /// rebuild failed (handle stays PAUSED, retryable) or the handle isn't paused.
 #[no_mangle]

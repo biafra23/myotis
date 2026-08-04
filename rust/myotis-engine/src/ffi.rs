@@ -101,6 +101,15 @@ pub fn pause_handle(handle: i64) -> bool {
     crate::host::pause(handle)
 }
 
+/// Live-set the eth/69 served-block window (the Settings knob). Clamped to
+/// [1, 4096]; applied immediately on a RUNNING handle's EL reader, stashed for
+/// the next spin_up when the handle isn't running. False only for an unknown
+/// handle.
+#[uniffi::export]
+pub fn set_served_block_window(handle: i64, blocks: i32) -> bool {
+    crate::host::set_served_block_window(handle, blocks)
+}
+
 /// Rebuild networking for a PAUSED handle (warm start). True ONLY on an actual
 /// PAUSED→RUNNING transition.
 #[uniffi::export]
