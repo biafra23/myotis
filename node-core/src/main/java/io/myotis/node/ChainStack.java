@@ -1031,6 +1031,134 @@ public final class ChainStack {
     // Snap-peer maintainer (ported from NodeService; optional per-stack)
     // -------------------------------------------------------------------------
 
+    /** Max headers requested per backfill tick — twin of the Rust
+     *  {@code pool::BACKFILL_BATCH}. */
+    private static final int BACKFILL_BATCH = 192;
+
+    /** What a backfill batch must anchor its TOP header's hash against (twin of
+     *  the Rust {@code BatchAnchor}): the beacon-anchored head hash, or — for a
+     *  downward fill — the held run's earliest header's parent hash. */
+    record BatchAnchor(org.apache.tuweni.bytes.Bytes32 topHash) {}
+
+    /** A planned backfill request: {@code [from, from+count)} anchored by {@code anchor}. */
+    record BackfillPlan(long from, int count, BatchAnchor anchor) {}
+
+    /**
+     * Keep the served-header window topped up toward the BEACON-anchored head, so
+     * the eth/69 advertised range (and actual serving) reflects a real contiguous
+     * recent run. Every batch is fetched RAW (no side-channel admission), then
+     * verified — exact numbering, internal parent-hash chain, top anchored to the
+     * beacon head hash or the held run's earliest parent hash — before any of it
+     * enters the window. Only content cryptographically linked to the verified
+     * head is ever served. One bounded request per tick; failures drop the batch
+     * and the next tick retries.
+     */
+    private void backfillServedHeaders() {
+        try {
+            RLPxConnector conn = connector;
+            BeaconSyncState bss = beaconSyncState;
+            if (conn == null || bss == null) return;
+            long head = bss.getOptimisticBlockNumber();
+            byte[] headHashBytes = bss.getOptimisticBlockHash();
+            if (head <= 0 || headHashBytes == null || headHashBytes.length != 32) return;
+            org.apache.tuweni.bytes.Bytes32 headHash =
+                    org.apache.tuweni.bytes.Bytes32.wrap(headHashBytes);
+            com.jaeckel.ethp2p.networking.eth.ServedHeaderWindow window = conn.servedWindow();
+            com.jaeckel.ethp2p.networking.eth.ServedHeaderWindow.Range r =
+                    window.advertise(head, headHash);
+            // advertise() has TWO empty-window shapes: the genesis-only [0, 0]
+            // (mainnet, genesis seeded) and the bootstrap claim [head, head]
+            // (non-mainnet, no genesis RLP embedded). Both denote "nothing
+            // actually held", and both — plus only them — have no stored parent
+            // hash at the claimed top, so that is the robust emptiness test
+            // (a latest()==0 check alone left Gnosis/Sepolia unable to ever
+            // start: the bootstrap shape matched the down-fill arm and died on
+            // the missing earliest parent every tick).
+            boolean empty = window.parentHashOf(r.latest()) == null;
+            BackfillPlan plan = backfillPlan(head, headHash, window.maxWindow(),
+                    empty ? -1 : r.earliest(), empty ? -1 : r.latest(),
+                    empty ? null : r.latestHash(),
+                    empty ? null : window.parentHashOf(r.earliest()));
+            if (plan == null) return;
+            var future = conn.backfillHeaders(plan.from(), plan.count());
+            if (future == null) return; // no ready peer this tick
+            future.orTimeout(10, TimeUnit.SECONDS).whenComplete((headers, ex) -> {
+                if (ex != null || headers == null) {
+                    log.debug("[{}] header backfill fetch failed: {}", network.name(),
+                            ex != null ? ex.toString() : "null");
+                    return;
+                }
+                if (!batchAnchored(headers, plan.from(), plan.count(), plan.anchor())) {
+                    log.debug("[{}] header backfill: batch [{}..{}) failed anchoring — dropped",
+                            network.name(), plan.from(), plan.from() + plan.count());
+                    return;
+                }
+                // Reorg splice repair: if the held entry just below this verified
+                // batch isn't the batch's parent, everything below is a stale
+                // fork — evict it so the window never serves a spliced non-chain.
+                org.apache.tuweni.bytes.Bytes32 below = window.hashOf(plan.from() - 1);
+                if (below != null && !headers.get(0).header().parentHash.equals(below)) {
+                    window.evictBelow(plan.from());
+                }
+                for (var vh : headers) {
+                    window.put(vh.header().number, vh.hash(), vh.header().parentHash,
+                            vh.rawRlp().toArrayUnsafe());
+                }
+            });
+        } catch (Throwable t) {
+            log.debug("[{}] header backfill tick failed: {}", network.name(), t.toString());
+        }
+    }
+
+    /**
+     * The pure per-tick backfill plan (twin of the Rust {@code backfill_plan};
+     * kept case-identical with its tests). {@code runEarliest/runLatest} are -1
+     * for an empty window; {@code earliestParent} is the held run's earliest
+     * header's stored parent hash (null when unknown → no downward plan).
+     */
+    static BackfillPlan backfillPlan(long head, org.apache.tuweni.bytes.Bytes32 headHash,
+            long cap, long runEarliest, long runLatest,
+            org.apache.tuweni.bytes.Bytes32 runTopHash,
+            org.apache.tuweni.bytes.Bytes32 earliestParent) {
+        if (head <= 0) return null;
+        long floor = Math.max(1, head - Math.max(0, cap - 1));
+        if (runLatest == head && headHash.equals(runTopHash)) {
+            // Run reaches the anchored head AND its top is the beacon-verified
+            // hash: fill DOWN below it. The hash equality is load-bearing —
+            // without it, one spoofed organic entry at the head number would
+            // become the down-fill anchor and "verify" fabricated batches
+            // against itself. A mismatched (or head-passing) top falls through
+            // to the head-anchored restart, which overwrites the junk.
+            if (runEarliest <= floor) return null; // window full
+            long from = Math.max(floor, runEarliest - BACKFILL_BATCH);
+            if (earliestParent == null) return null;
+            return new BackfillPlan(from, (int) (runEarliest - from), new BatchAnchor(earliestParent));
+        }
+        if (runLatest >= 0 && runLatest < head && head - runLatest <= BACKFILL_BATCH) {
+            // Extend UP to and including the head (one anchored batch).
+            long from = Math.max(floor, runLatest + 1);
+            return new BackfillPlan(from, (int) (head - from + 1), new BatchAnchor(headHash));
+        }
+        // Too far behind (or empty): restart at the head window.
+        long from = Math.max(floor, head - (BACKFILL_BATCH - 1));
+        return new BackfillPlan(from, (int) (head - from + 1), new BatchAnchor(headHash));
+    }
+
+    /** Validate an ascending backfill batch before admission (twin of the Rust
+     *  {@code batch_anchored}): exact numbering, internal parent-hash chain, top
+     *  anchored. Any failure rejects the WHOLE batch. */
+    static boolean batchAnchored(
+            java.util.List<com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage.VerifiedHeader> headers,
+            long from, int count, BatchAnchor anchor) {
+        if (headers.size() != count || headers.isEmpty()) return false;
+        for (int i = 0; i < headers.size(); i++) {
+            var h = headers.get(i);
+            if (h.header().number != from + i) return false;
+            if (i > 0 && !h.header().parentHash.equals(headers.get(i - 1).hash())) return false;
+        }
+        return headers.get(headers.size() - 1).hash().equals(anchor.topHash());
+    }
+
     private void startPeerMaintainer() {
         if (peerMaintainer != null) return;
         peerMaintainer = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -1039,6 +1167,11 @@ public final class ChainStack {
             return t;
         });
         peerMaintainer.scheduleWithFixedDelay(this::maintainSnapPeers, 5, 10, TimeUnit.SECONDS);
+        // Header backfill rides the same executor: serving is only real if we HOLD
+        // the recent headers peers ask for, and a light client fetches almost none
+        // organically (a couple of probes + query walks). Top the served window up
+        // toward the announced head, bounded per tick.
+        peerMaintainer.scheduleWithFixedDelay(this::backfillServedHeaders, 7, 15, TimeUnit.SECONDS);
     }
 
     /** Keep {@code activeSnapHandlers() >= targetSnapPeers}: re-dial cached snap peers,

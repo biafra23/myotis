@@ -35,10 +35,75 @@ pub const MAX_SERVED_HEADERS: u64 = 1024;
 /// RLPx frame bound).
 pub const MAX_SERVED_HEADER_BYTES: usize = 16 * 1024;
 
+/// The mainnet genesis header RLP (535 bytes), byte-identical to the Java
+/// `NetworkConfig.MAINNET_GENESIS_HEADER_RLP` (dumped from it; the test below
+/// pins `keccak256(rlp) == the mainnet genesis hash`). Seeded into the served
+/// window so genesis fork-probes get a real answer — the last residual
+/// over-claim of the `[0, 0]` empty-window advertisement.
+pub const MAINNET_GENESIS_HEADER_RLP_HEX: &str = concat!(
+    "f90214a000000000000000000000000000000000000000000000000000000000",
+    "00000000a01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142",
+    "fd40d49347940000000000000000000000000000000000000000a0d7f8974fb5",
+    "ac78d9ac099b9ad5018bedc2ce0a72dad1827a1709da30580f0544a056e81f17",
+    "1bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a056e81f",
+    "171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421b90100",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "850400000000808213888080a011bbe8db4e347b4e8c937c1c8370e4b5ed33ad",
+    "b3db69cbdb7a38e1e50b1b82faa0000000000000000000000000000000000000",
+    "0000000000000000000000000000880000000000000042"
+);
+
+
+/// Decode the embedded genesis constant and self-check `keccak256(rlp)` against
+/// the mainnet genesis hash. Returns `None` (no seeding, fail-safe) rather than
+/// panicking on any mismatch — the test below asserts it is `Some`.
+pub fn mainnet_genesis() -> Option<([u8; 32], Vec<u8>)> {
+    let rlp = decode_hex(MAINNET_GENESIS_HEADER_RLP_HEX)?;
+    let hash = myotis_core::keccak::keccak256(&rlp);
+    let expected: [u8; 32] = decode_hex(
+        "d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3",
+    )?
+    .try_into()
+    .ok()?;
+    if hash != expected {
+        return None;
+    }
+    Some((hash, rlp))
+}
+
+/// Panic-free lowercase-hex decode (even length only).
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let nib = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            _ => None,
+        }
+    };
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len() / 2);
+    for pair in b.chunks_exact(2) {
+        out.push(nib(pair[0])? << 4 | nib(pair[1])?);
+    }
+    Some(out)
+}
+
 #[derive(Default)]
 struct Inner {
-    /// number → (hash, raw header RLP), bounded to the newest window.
-    by_number: BTreeMap<u64, ([u8; 32], Vec<u8>)>,
+    /// number → (hash, parentHash, raw header RLP), bounded to the newest window.
+    /// The parent hash lets the backfill anchor a downward batch to the held run
+    /// without re-decoding the stored RLP.
+    by_number: BTreeMap<u64, ([u8; 32], [u8; 32], Vec<u8>)>,
     /// hash → number, kept in lockstep with `by_number` (fork probes ask by hash).
     by_hash: BTreeMap<[u8; 32], u64>,
 }
@@ -49,6 +114,11 @@ pub struct ServedHeaders {
     /// Live-settable window size (the Settings knob adjusts it, mirroring the
     /// Java `ServedHeaderWindow.setMaxWindow`). Read on every put.
     window: AtomicU64,
+    /// Genesis header (hash, raw RLP) — always servable for fork probes, held
+    /// OUTSIDE the sliding window and never part of the advertised range
+    /// (mirrors the Java window's genesis seeding). None where we embed no
+    /// genesis bytes (non-mainnet, tests).
+    genesis: Option<([u8; 32], Vec<u8>)>,
 }
 
 impl Default for ServedHeaders {
@@ -59,7 +129,23 @@ impl Default for ServedHeaders {
 
 impl ServedHeaders {
     pub fn new(window: u64) -> ServedHeaders {
-        ServedHeaders { inner: Mutex::new(Inner::default()), window: AtomicU64::new(window.max(1)) }
+        Self::with_genesis(window, None)
+    }
+
+    /// As [`new`](Self::new), seeding an always-servable genesis header
+    /// (hash + raw RLP). The caller vouches for the pair; production wiring
+    /// verifies `keccak256(rlp) == hash` before seeding (see the pool).
+    pub fn with_genesis(window: u64, genesis: Option<([u8; 32], Vec<u8>)>) -> ServedHeaders {
+        ServedHeaders {
+            inner: Mutex::new(Inner::default()),
+            window: AtomicU64::new(window.max(1)),
+            genesis,
+        }
+    }
+
+    /// The current window cap.
+    pub fn window(&self) -> u64 {
+        self.window.load(Ordering::Relaxed)
     }
 
     /// Live-adjust the window (Settings). Clamped ≥ 1; shrinking evicts the tail
@@ -85,7 +171,7 @@ impl ServedHeaders {
             if n >= floor {
                 break;
             }
-            if let Some((h, _)) = g.by_number.remove(&n) {
+            if let Some((h, _, _)) = g.by_number.remove(&n) {
                 g.by_hash.remove(&h);
             }
         }
@@ -94,7 +180,7 @@ impl ServedHeaders {
     /// Record a header we hold (raw wire RLP, hash recomputed at decode).
     /// Genesis (number 0) is not tracked — the range never claims it and the
     /// Rust EL has no embedded genesis header to serve.
-    pub fn put(&self, number: u64, hash: [u8; 32], raw_rlp: Vec<u8>) {
+    pub fn put(&self, number: u64, hash: [u8; 32], parent_hash: [u8; 32], raw_rlp: Vec<u8>) {
         if number == 0 || raw_rlp.len() > MAX_SERVED_HEADER_BYTES {
             return;
         }
@@ -102,7 +188,7 @@ impl ServedHeaders {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some((old_hash, _)) = g.by_number.insert(number, (hash, raw_rlp)) {
+        if let Some((old_hash, _, _)) = g.by_number.insert(number, (hash, parent_hash, raw_rlp)) {
             if old_hash != hash {
                 g.by_hash.remove(&old_hash); // reorg: drop the stale hash key
             }
@@ -114,6 +200,16 @@ impl ServedHeaders {
     /// The contiguous run of held headers starting at `start` (ascending, no
     /// skip), capped at `count` — the simple GetBlockHeaders shape peers use.
     pub fn run_from(&self, start: u64, count: u64) -> Vec<Vec<u8>> {
+        // Genesis is servable by number but deliberately not part of the sliding
+        // window: a run STARTING at 0 serves just the genesis header (the fork
+        // probe shape — count is typically 1, and the window can never be
+        // contiguous with block 0 anyway).
+        if start == 0 {
+            return match &self.genesis {
+                Some((_, rlp)) if count >= 1 => vec![rlp.clone()],
+                _ => Vec::new(),
+            };
+        }
         let g = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -125,21 +221,62 @@ impl ServedHeaders {
             // number bounds in another crate (peer-supplied start can be u64::MAX).
             let Some(n) = start.checked_add(i) else { break };
             match g.by_number.get(&n) {
-                Some((_, raw)) => out.push(raw.clone()),
+                Some((_, _, raw)) => out.push(raw.clone()),
                 None => break,
             }
         }
         out
     }
 
+    /// The stored hash of a held header, if held.
+    pub fn hash_of(&self, number: u64) -> Option<[u8; 32]> {
+        let g = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        g.by_number.get(&number).map(|(h, _, _)| *h)
+    }
+
+    /// Evict every held header BELOW `number` (reorg splice repair: a verified
+    /// batch whose parent disagrees with the held entry below it proves the
+    /// entries below are a stale fork).
+    pub fn evict_below(&self, number: u64) {
+        let mut g = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while let Some((&n, _)) = g.by_number.first_key_value() {
+            if n >= number {
+                break;
+            }
+            if let Some((h, _, _)) = g.by_number.remove(&n) {
+                g.by_hash.remove(&h);
+            }
+        }
+    }
+
+    /// The stored parent hash of a held header (the backfill's downward anchor).
+    pub fn parent_hash_of(&self, number: u64) -> Option<[u8; 32]> {
+        let g = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        g.by_number.get(&number).map(|(_, p, _)| *p)
+    }
+
     /// One header by hash, if held.
     pub fn by_hash(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
+        if let Some((gh, rlp)) = &self.genesis {
+            if gh == hash {
+                return Some(rlp.clone());
+            }
+        }
         let g = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
         let n = g.by_hash.get(hash)?;
-        g.by_number.get(n).map(|(_, raw)| raw.clone())
+        g.by_number.get(n).map(|(_, _, raw)| raw.clone())
     }
 
     /// The eth/69 range to advertise: the contiguous run of held headers ending
@@ -151,7 +288,7 @@ impl ServedHeaders {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let (&top, (top_hash, _)) = g.by_number.last_key_value()?;
+        let (&top, (top_hash, _, _)) = g.by_number.last_key_value()?;
         let mut earliest = top;
         while earliest > 0 && g.by_number.contains_key(&(earliest - 1)) {
             earliest -= 1;
@@ -225,7 +362,7 @@ mod tests {
     fn advertises_only_the_contiguous_held_run() {
         let w = ServedHeaders::new(32);
         for n in 100..=110 {
-            w.put(n, hash(n), raw(n));
+            w.put(n, hash(n), hash(n - 1), raw(n));
         }
         assert_eq!(w.advertise(), Some((100, 110, hash(110))));
         // A hole breaks the run at the top.
@@ -234,7 +371,7 @@ mod tests {
             if n == 107 {
                 continue;
             }
-            w.put(n, hash(n), raw(n));
+            w.put(n, hash(n), hash(n - 1), raw(n));
         }
         assert_eq!(w.advertise(), Some((108, 110, hash(110))));
     }
@@ -248,7 +385,7 @@ mod tests {
     fn window_cap_evicts_and_bounds_the_claim() {
         let w = ServedHeaders::new(5);
         for n in 100..=120 {
-            w.put(n, hash(n), raw(n));
+            w.put(n, hash(n), hash(n - 1), raw(n));
         }
         assert_eq!(w.advertise(), Some((116, 120, hash(120))));
         assert!(w.run_from(115, 1).is_empty(), "evicted below the cap");
@@ -259,7 +396,7 @@ mod tests {
     fn serves_runs_and_by_hash_and_stops_at_holes() {
         let w = ServedHeaders::new(32);
         for n in [5u64, 6, 7, 9] {
-            w.put(n, hash(n), raw(n));
+            w.put(n, hash(n), hash(n - 1), raw(n));
         }
         assert_eq!(w.run_from(5, 10), vec![raw(5), raw(6), raw(7)]); // stops at the 8 hole
         assert_eq!(w.run_from(8, 2), Vec::<Vec<u8>>::new());
@@ -270,8 +407,8 @@ mod tests {
     #[test]
     fn reorg_replaces_the_hash_index() {
         let w = ServedHeaders::new(32);
-        w.put(50, hash(1), raw(1));
-        w.put(50, hash(2), raw(2)); // same number, new hash
+        w.put(50, hash(1), hash(1 - 1), raw(1));
+        w.put(50, hash(2), hash(2 - 1), raw(2)); // same number, new hash
         assert_eq!(w.by_hash(&hash(1)), None, "stale hash dropped");
         assert_eq!(w.by_hash(&hash(2)), Some(raw(2)));
         assert_eq!(w.advertise(), Some((50, 50, hash(2))));
@@ -281,17 +418,30 @@ mod tests {
     fn set_window_shrinks_and_grows_live() {
         let w = ServedHeaders::new(10);
         for n in 100..=109 {
-            w.put(n, hash(n), raw(n));
+            w.put(n, hash(n), hash(n - 1), raw(n));
         }
         w.set_window(3);
         assert_eq!(w.advertise(), Some((107, 109, hash(109))));
         assert!(w.run_from(106, 1).is_empty(), "shrink evicts below the new cap");
         w.set_window(5);
         for n in 110..=111 {
-            w.put(n, hash(n), raw(n));
+            w.put(n, hash(n), hash(n - 1), raw(n));
         }
         // survivors (107..109) + new (110,111) all within the 5-cap band [107,111]
         assert_eq!(w.advertise(), Some((107, 111, hash(111))));
+    }
+
+    #[test]
+    fn embedded_mainnet_genesis_hashes_correctly_and_serves() {
+        let (hash, rlp) = mainnet_genesis().expect("embedded genesis must self-verify");
+        assert_eq!(rlp.len(), 535, "byte-identical to the Java constant");
+        let w = ServedHeaders::with_genesis(32, Some((hash, rlp.clone())));
+        // Servable by number-0 run and by hash; never advertised.
+        assert_eq!(w.run_from(0, 1), vec![rlp.clone()]);
+        assert_eq!(w.by_hash(&hash), Some(rlp));
+        assert_eq!(w.advertise(), None, "genesis never enters the advertised range");
+        // Without seeding, block 0 stays unservable.
+        assert!(ServedHeaders::new(32).run_from(0, 1).is_empty());
     }
 
     #[test]

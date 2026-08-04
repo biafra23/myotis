@@ -72,6 +72,7 @@ async fn fetches_and_verifies_headers_on_live_mainnet() {
         head_hash: genesis,
         head_number: 0,
         listen_port: 30303,
+        genesis_header_rlp: None,
     };
 
     // Dial peers CONCURRENTLY: mainnet peers are frequently full (Disconnect

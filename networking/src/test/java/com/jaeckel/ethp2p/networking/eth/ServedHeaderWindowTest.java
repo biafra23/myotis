@@ -25,7 +25,7 @@ class ServedHeaderWindowTest {
     @Test
     void advertisesOnlyTheContiguousRunItHolds() {
         ServedHeaderWindow w = new ServedHeaderWindow(32, hash(0), rlp(0));
-        for (long n = 100; n <= 110; n++) w.put(n, hash(n), rlp(n));
+        for (long n = 100; n <= 110; n++) w.put(n, hash(n), hash(n - 1), rlp(n));
 
         // Head is 110; we hold 100..110 contiguously → advertise [100, 110].
         ServedHeaderWindow.Range r = w.advertise(110, hash(110));
@@ -39,7 +39,7 @@ class ServedHeaderWindowTest {
         ServedHeaderWindow w = new ServedHeaderWindow(32, hash(0), rlp(0));
         for (long n = 100; n <= 110; n++) {
             if (n == 107) continue; // hole
-            w.put(n, hash(n), rlp(n));
+            w.put(n, hash(n), hash(n - 1), rlp(n));
         }
         // Contiguous run ending at 110 is 108..110 — the hole at 107 stops it.
         ServedHeaderWindow.Range r = w.advertise(110, hash(110));
@@ -62,7 +62,7 @@ class ServedHeaderWindowTest {
         // probe), which a light client does not hold. advertise() must clamp latest to the
         // highest header we actually have — never the head.
         ServedHeaderWindow w = new ServedHeaderWindow(32, hash(0), rlp(0));
-        for (long n = 20_000_000L; n <= 20_000_010L; n++) w.put(n, hash(n), rlp(n));
+        for (long n = 20_000_000L; n <= 20_000_010L; n++) w.put(n, hash(n), hash(n - 1), rlp(n));
 
         ServedHeaderWindow.Range r = w.advertise(25_000_000L, hash(25_000_000L));
         assertEquals(20_000_010L, r.latest(), "latest must be the highest HELD block, not the head");
@@ -75,7 +75,7 @@ class ServedHeaderWindowTest {
     @Test
     void windowCapBoundsHowFarBackWeClaim() {
         ServedHeaderWindow w = new ServedHeaderWindow(5, hash(0), rlp(0));
-        for (long n = 100; n <= 120; n++) w.put(n, hash(n), rlp(n));
+        for (long n = 100; n <= 120; n++) w.put(n, hash(n), hash(n - 1), rlp(n));
         // Only the last 5 numbers are retained → advertise [116, 120].
         ServedHeaderWindow.Range r = w.advertise(120, hash(120));
         assertEquals(116, r.earliest());
@@ -89,7 +89,7 @@ class ServedHeaderWindowTest {
         // tail immediately (the advertised range must never exceed the new cap), growing
         // widens the cap and the window refills as new headers arrive.
         ServedHeaderWindow w = new ServedHeaderWindow(10, hash(0), rlp(0));
-        for (long n = 100; n <= 109; n++) w.put(n, hash(n), rlp(n));
+        for (long n = 100; n <= 109; n++) w.put(n, hash(n), hash(n - 1), rlp(n));
 
         w.setMaxWindow(3);
         ServedHeaderWindow.Range shrunk = w.advertise(109, hash(109));
@@ -98,7 +98,7 @@ class ServedHeaderWindowTest {
         assertNull(w.getByNumber(106), "shrink evicts below the new cap");
 
         w.setMaxWindow(5);
-        for (long n = 110; n <= 111; n++) w.put(n, hash(n), rlp(n));
+        for (long n = 110; n <= 111; n++) w.put(n, hash(n), hash(n - 1), rlp(n));
         ServedHeaderWindow.Range grown = w.advertise(111, hash(111));
         assertEquals(107, grown.earliest(), "grow keeps survivors and refills forward");
         assertEquals(111, grown.latest());
@@ -107,7 +107,7 @@ class ServedHeaderWindowTest {
     @Test
     void servesHeldHeadersByNumberAndHashAndAlwaysGenesis() {
         ServedHeaderWindow w = new ServedHeaderWindow(32, hash(0), rlp(0));
-        w.put(105, hash(105), rlp(105));
+        w.put(105, hash(105), hash(105 - 1), rlp(105));
 
         assertArrayEquals(rlp(105), w.getByNumber(105));
         assertArrayEquals(rlp(105), w.getByHash(hash(105).toHexString()));

@@ -287,6 +287,26 @@ impl ManagedPeer {
         Ok(headers)
     }
 
+    /// As [`get_block_headers_by_number`](Self::get_block_headers_by_number) but
+    /// WITHOUT populating the served window: the backfill uses this and admits
+    /// headers itself only after anchoring the whole batch to the beacon head
+    /// by parent-hash (see `pool::backfill_served_headers`) — stronger than the
+    /// range-only filter that guards the organic fetch paths.
+    pub async fn get_block_headers_by_number_raw(
+        &self,
+        block_number: u64,
+        max_headers: u64,
+    ) -> Result<Vec<VerifiedHeader>, String> {
+        let payload = self
+            .request(messages::GET_BLOCK_HEADERS, messages::BLOCK_HEADERS, |id| {
+                messages::encode_get_block_headers_by_number(id, block_number, max_headers, 0, false)
+            })
+            .await?;
+        let (_rid, headers) = messages::decode_block_headers(&payload)
+            .map_err(|e| format!("BlockHeaders decode: {}", e.0))?;
+        Ok(headers)
+    }
+
     /// Request headers starting at a block HASH (fetch a peer's fresh head).
     pub async fn get_block_headers_by_hash(
         &self,
@@ -314,7 +334,7 @@ impl ManagedPeer {
     fn remember_served<'a>(&self, headers: impl Iterator<Item = &'a messages::VerifiedHeader>) {
         if let Some(ctx) = &self.serve {
             for vh in headers {
-                ctx.window.put(vh.header.number, vh.hash, vh.raw_rlp.clone());
+                ctx.window.put(vh.header.number, vh.hash, vh.header.parent_hash, vh.raw_rlp.clone());
             }
         }
     }
@@ -761,7 +781,7 @@ mod tests {
             h
         };
         for n in 100..=105u64 {
-            w.put(n, hash(n), raw(n));
+            w.put(n, hash(n), hash(n - 1), raw(n));
         }
         let ctx = serve_ctx(w);
 
