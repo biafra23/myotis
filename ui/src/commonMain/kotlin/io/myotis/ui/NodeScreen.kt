@@ -126,6 +126,11 @@ fun NodeScreen(
     // appears/disappears. A selection whose tab just vanished falls back to Status.
     var tabLabel by remember { mutableStateOf("Status") }
     val tab = tabs.indexOf(tabLabel).coerceAtLeast(0)
+    // The fallback also RESETS the stale label: without this, a selection stuck on a
+    // vanished tab would silently jump back to it if a future change ever flipped the
+    // visibility inputs without a tab click in between (today every re-show path goes
+    // through a click on another tab, but nothing should rest on that).
+    LaunchedEffect(tabs) { if (tabLabel !in tabs) tabLabel = "Status" }
     // Logs-tab text filter, hoisted HERE deliberately: the `when` below disposes a
     // tab's composition on switch, so any `remember` inside LogsTab dies with it. Living
     // beside `tabLabel` gives the filter the same lifetime as the tab selection itself (the
