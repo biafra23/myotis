@@ -110,10 +110,30 @@ fun NodeScreen(
     val snapshots by snapshotsFlow.collectAsState(initial = emptyMap())
     val onlineFlow = remember(netStatus) { netStatus.online() }
     val online by onlineFlow.collectAsState(initial = true)
-    var tab by remember { mutableStateOf(0) }
-    // Logs-tab text filter, hoisted HERE deliberately: the `when (tab)` below disposes a
+    // The Index tab only exists while the Kohaku log index reads as enabled in Settings —
+    // which is what its switch displays: the persisted per-network flags AND the Rust
+    // engine (without it the switch shows off/disabled and no engine serves the index).
+    // Both are plain settings reads, so the toggles that change them bump logIndexRev.
+    var logIndexRev by remember { mutableStateOf(0) }
+    val showIndexTab = remember(logIndexRev) {
+        settings.rustEngineEnabled() && KohakuPreset.byNetwork.keys.any { settings.logIndexEnabled(it) }
+    }
+    val tabs = remember(showIndexTab) {
+        if (showIndexTab) listOf("Status", "Query", "Logs", "Index", "Settings")
+        else listOf("Status", "Query", "Logs", "Settings")
+    }
+    // Selection is the tab's LABEL, not its position — positions shift when Index
+    // appears/disappears. A selection whose tab just vanished falls back to Status.
+    var tabLabel by remember { mutableStateOf("Status") }
+    val tab = tabs.indexOf(tabLabel).coerceAtLeast(0)
+    // The fallback also RESETS the stale label: without this, a selection stuck on a
+    // vanished tab would silently jump back to it if a future change ever flipped the
+    // visibility inputs without a tab click in between (today every re-show path goes
+    // through a click on another tab, but nothing should rest on that).
+    LaunchedEffect(tabs) { if (tabLabel !in tabs) tabLabel = "Status" }
+    // Logs-tab text filter, hoisted HERE deliberately: the `when` below disposes a
     // tab's composition on switch, so any `remember` inside LogsTab dies with it. Living
-    // beside `tab` gives the filter the same lifetime as the tab selection itself (the
+    // beside `tabLabel` gives the filter the same lifetime as the tab selection itself (the
     // level filter needs no hoisting — it write-throughs to logs.setLevel and is re-read).
     var logFilter by remember { mutableStateOf("") }
 
@@ -159,20 +179,20 @@ fun NodeScreen(
                 Spacer(Modifier.height(12.dp))
 
                 TabRow(selectedTabIndex = tab) {
-                    Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Status") })
-                    Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Query") })
-                    Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("Logs") })
-                    Tab(selected = tab == 3, onClick = { tab = 3 }, text = { Text("Index") })
-                    Tab(selected = tab == 4, onClick = { tab = 4 }, text = { Text("Settings") })
+                    tabs.forEachIndexed { i, label ->
+                        Tab(selected = tab == i, onClick = { tabLabel = label }, text = { Text(label) })
+                    }
                 }
                 Spacer(Modifier.height(16.dp))
 
-                when (tab) {
-                    0 -> StatusTab(controller, settings, current, network, online, onOpenNetworkSettings)
-                    1 -> QueryTab(controller, settings, current, network, history)
-                    2 -> LogsTab(logs, logFilter, onFilterChange = { logFilter = it })
-                    3 -> IndexTab(controller, settings, current, network)
-                    4 -> SettingsTab(controller, settings, snapshots, onEnabledChanged = { enabledRev++ })
+                when (tabs[tab]) {
+                    "Status" -> StatusTab(controller, settings, current, network, online, onOpenNetworkSettings)
+                    "Query" -> QueryTab(controller, settings, current, network, history)
+                    "Logs" -> LogsTab(logs, logFilter, onFilterChange = { logFilter = it })
+                    "Index" -> IndexTab(controller, settings, current, network,
+                        onLogIndexChanged = { logIndexRev++ })
+                    "Settings" -> SettingsTab(controller, settings, snapshots,
+                        onEnabledChanged = { enabledRev++ }, onLogIndexChanged = { logIndexRev++ })
                 }
             }
         }
@@ -270,6 +290,10 @@ private fun SettingsTab(
     // Notifies the screen that the persisted enabled set changed, so the network
     // chips (derived from settings, not snapshot state) re-derive immediately.
     onEnabledChanged: () -> Unit = {},
+    // Notifies the screen that the Kohaku log-index effective state changed (the
+    // per-network flags or the Rust engine it depends on), so the Index tab's
+    // visibility re-derives immediately.
+    onLogIndexChanged: () -> Unit = {},
 ) {
     val networks = remember { settings.allNetworks() }
     // Per-network enabled toggle + RPC-port text, seeded from persisted settings. Toggling a
@@ -432,7 +456,10 @@ private fun SettingsTab(
         SwitchRow(
             label = "Rust engine (experimental)",
             checked = rustEngine,
-            onChange = { on -> rustEngine = on; settings.setRustEngineEnabled(on); controller.applyEngineChoice() },
+            onChange = { on ->
+                rustEngine = on; settings.setRustEngineEnabled(on); controller.applyEngineChoice()
+                onLogIndexChanged()
+            },
         )
         Text(
             "Off (default): the proven Java engine runs every network. On: prefer the " +
@@ -458,6 +485,7 @@ private fun SettingsTab(
                     settings.setLogIndexEnabled(net, on)
                     controller.applyLogIndex(net)
                 }
+                onLogIndexChanged()
             },
         )
         // Tor routing — Rust-engine-only (Arti is embedded there), so the row is disabled
@@ -1622,6 +1650,9 @@ private fun IndexTab(
     settings: Settings,
     snapshot: NodeSnapshot?,
     network: String,
+    // Turning collection off for the last enabled network hides this tab (the screen
+    // falls back to Status), so the screen needs to hear about flag changes.
+    onLogIndexChanged: () -> Unit = {},
 ) {
     val preset = KohakuPreset.byNetwork[network]
     Column(
@@ -1641,6 +1672,7 @@ private fun IndexTab(
                 collecting = on
                 settings.setLogIndexEnabled(network, on)
                 controller.applyLogIndex(network)
+                onLogIndexChanged()
             },
         )
         Text(
