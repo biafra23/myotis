@@ -1156,7 +1156,10 @@ impl ElReader {
         // ordering lives in the consumer (`buffered`, not `buffer_unordered`).
         // On truncation/failure the stream is dropped, cancelling in-flight
         // fetches (their late responses are discarded by the peer read loop;
-        // worst case a few response budgets of wasted bandwidth past the cut).
+        // worst case a few response budgets of wasted bandwidth past the cut —
+        // or, if a cancellation lands mid-frame-write, the connection itself:
+        // the writer's torn marker then fails the peer at its next send
+        // rather than let it write MAC-garbage; see peer.rs `GuardedWriter`).
         const CHUNK_PIPELINE: usize = 4;
         const CHUNK_LEN: usize = 64;
         // ADAPTIVE depth: pipelining only pays where chunks come back FULL

@@ -77,7 +77,11 @@ async fn send_frame(writer: &SharedWriter, code: u64, body: &[u8]) -> Result<(),
     }
     w.torn = true;
     let result = w.inner.send(code, body).await;
-    w.torn = false;
+    // A completed-Err send (write error / frame-write timeout) leaves the
+    // stream just as mid-frame-corrupt as a cancelled one — keep the marker
+    // set so a request already queued on the writer lock (racing `fail_all`'s
+    // closed-store) can't write onto the corrupt stream.
+    w.torn = result.is_err();
     result
 }
 
