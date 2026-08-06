@@ -185,9 +185,9 @@ public record NetworkConfig(
             // genesis_validators_root (sepolia)
             Bytes.fromHexString("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078").toArrayUnsafe(),
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshSepoliaCheckpoint`
-            // trusted checkpoint: recent finalized sepolia block root (slot 10657440, 2026-07-09, period 1300)
-            Bytes.fromHexString("8c3bc10ed8e1567dbdb60da360091c9af38e6b64e7de553a1ba2b0a5ffdfa5f6").toArrayUnsafe(),
-            10657440L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized sepolia block root (slot 10851360, 2026-08-05, period 1324)
+            Bytes.fromHexString("a064b99bb711d152efbc88674dcba50d4e6c1b9151dae0a2e5bfbb7c40bc7cb9").toArrayUnsafe(),
+            10851360L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:sepolia:end
             // current fork version: Fulu on sepolia (0x90000075) — activated at epoch 272640 (2025-10-14)
             new byte[]{(byte) 0x90, 0x00, 0x00, 0x75},
@@ -198,10 +198,18 @@ public record NetworkConfig(
             // No prior-fork fallback (same rationale as mainnet: stale digests
             // wouldn't help us sync to the current head anyway).
             null,
-            // CL peer multiaddrs for sepolia
-            List.of(
-                    "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS"
-            ),
+            // CL peer multiaddrs for sepolia. First entry is the dedicated
+            // myotis-serving Nimbus (docs/dedicated-sepolia-node.md): it serves
+            // light_client_bootstrap / updates_by_range default-on, and being
+            // first means the light client tries it before the discovered pool.
+            // Its peer-id is stable only because the node pins --netkey-file;
+            // Nimbus otherwise mints a new one per restart, which invalidates
+            // this entry with InvalidRemotePubKey (see the doc's §5 note).
+            prependLocal(
+                    "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
+                    List.of(
+                            "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS"
+                    )),
             null,
             1655733600L, // sepolia beacon genesis: 2022-06-20 14:00:00 UTC
             // EL: Ethereum Foundation canonical sepolia tree (same EF signing key
@@ -441,8 +449,27 @@ public record NetworkConfig(
      * <p>Source: gnosischain / Nethermind {@code gnosis.json} chainspec {@code nodes} list.
      */
     public List<String> elBootEnodes() {
-        return (int) networkId == 100 ? GNOSIS_EL_ENODES : List.of();
+        return switch ((int) networkId) {
+            case 100 -> GNOSIS_EL_ENODES;
+            case 11155111 -> SEPOLIA_EL_ENODES;
+            default -> List.of();
+        };
     }
+
+    /** Sepolia EL enodes: the dedicated myotis-serving node (docs/dedicated-sepolia-node.md).
+     *
+     *  <p>Unlike Gnosis's entries this is NOT a discovery gap-filler — sepolia has an
+     *  enrtree. It is pinned because discovery is a lottery we lose exactly when it
+     *  matters: on a saturated testnet most peers answer {@code DiscTooManyPeers}, and
+     *  this node runs the name-based cap bypass so a myotis wallet is admitted even when
+     *  it is full. Direct-dialing it removes the wait for discovery to surface it.
+     *
+     *  <p>Operational caveat: the key is stable (persisted nodekey), the IP is a
+     *  residential address — if it rotates this entry goes stale and discovery carries
+     *  the load until it is refreshed. */
+    private static final List<String> SEPOLIA_EL_ENODES = List.of(
+            "enode://cfd3572bd7691fe03baf52106b873e01d9b5dca1714a74b316cb94151127dfd20adae3be559e3e6b44b78a5af1ed6f92ecc8676a2555fc7cdb2d29a0c37e1b2c@87.154.209.161:30405"
+    );
 
     /** Gnosis EL enodes (chainspec {@code nodes}) — Gnosis publishes no EL enrtree, so these
      *  are the direct-dial discovery seed (see {@link #elBootEnodes()}). */

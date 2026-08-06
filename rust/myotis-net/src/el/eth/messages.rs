@@ -21,6 +21,14 @@ pub const NEW_BLOCK_HASHES: u64 = 0x11;
 /// gate on the negotiated version: on eth/68 absolute 0x21 is the SNAP base
 /// (GetAccountRange), not a free slot.
 pub const BLOCK_RANGE_UPDATE: u64 = 0x21;
+
+/// GOLDEN VECTOR shared with the Java engine: `encode_block_range_update(100,
+/// 131, [0x11; 32])`. The Java `BlockRangeUpdateMessageTest` pins the identical
+/// hex, so neither engine can change the wire shape without failing a test on
+/// the other side.
+#[cfg(test)]
+pub(crate) const BLOCK_RANGE_UPDATE_GOLDEN_HEX: &str =
+    "e4648183a01111111111111111111111111111111111111111111111111111111111111111";
 pub const TRANSACTIONS: u64 = 0x12;
 pub const GET_BLOCK_HEADERS: u64 = 0x13;
 pub const BLOCK_HEADERS: u64 = 0x14;
@@ -586,6 +594,16 @@ mod tests {
         assert!(matches!(origin, HeadersOrigin::Hash(x) if x == h));
 
         assert!(decode_get_block_headers(b"junk").is_err());
+    }
+
+    #[test]
+    /// Cross-engine parity: byte-identical to the Java
+    /// `BlockRangeUpdateMessageTest.matchesTheCrossEngineGoldenVector`.
+    /// earliest=100, latest=131 (a 32-block window), hash=0x11..11.
+    fn block_range_update_matches_the_java_golden_vector() {
+        let encoded = encode_block_range_update(100, 131, &[0x11u8; 32]);
+        let hex: String = encoded.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, BLOCK_RANGE_UPDATE_GOLDEN_HEX);
     }
 
     #[test]

@@ -19,4 +19,25 @@ class BlockRangeUpdateMessageTest {
         assertEquals(21_000_000L, d.latestBlock());
         assertEquals(latestHash, d.latestBlockHash());
     }
+
+    /**
+     * GOLDEN VECTOR shared with the Rust engine. The same hex is pinned in
+     * {@code rust/myotis-net/src/el/eth/messages.rs}
+     * ({@code BLOCK_RANGE_UPDATE_GOLDEN_HEX}, asserted by
+     * {@code block_range_update_matches_the_java_golden_vector}), so neither
+     * engine can change the wire shape without failing a test on one side.
+     *
+     * <p>Inputs: earliest=100, latest=131 (a 32-block window — the default
+     * served window size), latestBlockHash=0x11…11.
+     */
+    @Test
+    void matchesTheCrossEngineGoldenVector() {
+        Bytes32 latestHash = Bytes32.repeat((byte) 0x11);
+        byte[] rlp = BlockRangeUpdateMessage.encode(100L, 131L, latestHash);
+
+        assertEquals(
+                "0xe4648183a01111111111111111111111111111111111111111111111111111111111111111",
+                Bytes.wrap(rlp).toHexString(),
+                "wire shape must stay byte-identical to the Rust engine's encode_block_range_update");
+    }
 }

@@ -131,13 +131,17 @@ impl ChainConfig {
             blob_params_epoch: 275_712,
             blob_params_max_blobs: 21,
             // Copied verbatim from the @checkpoint:sepolia:begin/end region of
-            // NetworkConfig.java (slot 10657440, 2026-07-09, period 1300). Like
+            // NetworkConfig.java (slot 10851360, 2026-08-05, period 1324). Like
             // mainnet, `./gradlew refreshSepoliaCheckpoint` rewrites only the Java
             // region — a refresh must be mirrored here by hand until plan PR7.
+            //
+            // This pin must also stay NEWER than the dedicated serving node's
+            // trustedNodeSync point, or that node cannot answer the bootstrap for
+            // it (docs/dedicated-sepolia-node.md §5).
             checkpoint_root: hex32(
-                "8c3bc10ed8e1567dbdb60da360091c9af38e6b64e7de553a1ba2b0a5ffdfa5f6",
+                "a064b99bb711d152efbc88674dcba50d4e6c1b9151dae0a2e5bfbb7c40bc7cb9",
             ),
-            checkpoint_slot: 10_657_440,
+            checkpoint_slot: 10_851_360,
             static_peers: SEPOLIA_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: SEPOLIA_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
@@ -231,8 +235,16 @@ fn hex32(s: &str) -> [u8; 32] {
     out
 }
 
-/// Pinned sepolia LC-serving peer multiaddrs (Java `NetworkConfig.SEPOLIA.clPeerMultiaddrs`).
+/// Pinned sepolia LC-serving peer multiaddrs (Java `NetworkConfig.SEPOLIA.clPeerMultiaddrs`
+/// — keep the two lists and their ORDER in step).
+///
+/// First is the dedicated myotis-serving Nimbus (docs/dedicated-sepolia-node.md): it
+/// serves `light_client_bootstrap` / `updates_by_range` default-on, and being first
+/// means the light client tries it before the discovered pool. Its peer-id is stable
+/// only because that node pins `--netkey-file`; Nimbus otherwise mints a new one per
+/// restart, which invalidates this entry with `InvalidRemotePubKey`.
 const SEPOLIA_STATIC_PEERS: &[&str] = &[
+    "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
     "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS",
 ];
 
@@ -2254,10 +2266,10 @@ mod tests {
         let c = ChainConfig::sepolia();
         assert_eq!(c.chain_id, 11_155_111);
         assert_eq!(c.fork_version, [0x90, 0x00, 0x00, 0x75]); // Fulu on sepolia
-        assert_eq!(c.checkpoint_slot, 10_657_440);
+        assert_eq!(c.checkpoint_slot, 10_851_360);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "8c3bc10ed8e1567dbdb60da360091c9af38e6b64e7de553a1ba2b0a5ffdfa5f6"
+            "a064b99bb711d152efbc88674dcba50d4e6c1b9151dae0a2e5bfbb7c40bc7cb9"
         );
         assert_eq!(
             hex_str(&c.genesis_validators_root),
@@ -2267,13 +2279,18 @@ mod tests {
         assert_eq!(c.seconds_per_slot, 12);
         assert_eq!(c.slots_per_epoch, 32);
         assert_eq!((c.blob_params_epoch, c.blob_params_max_blobs), (275_712, 21));
-        // Checkpoint period 1300 (slot / 8192) — matches the Java region comment.
-        assert_eq!(spec::compute_sync_committee_period(c.checkpoint_slot), 1300);
+        // Checkpoint period 1324 (slot / 8192) — matches the Java region comment.
+        assert_eq!(spec::compute_sync_committee_period(c.checkpoint_slot), 1324);
         // The live digest the Java computes (verified by running
         // NetworkConfig.SEPOLIA.currentForkDigest() — BPO2 folded in).
         assert_eq!(c.current_fork_digest(), [0x74, 0xD0, 0x14, 0x59]);
         assert_eq!(c.accepted_fork_digests(), vec![[0x74, 0xD0, 0x14, 0x59]]);
-        assert_eq!(c.static_peers.len(), 1);
+        // Two pinned LC peers, the dedicated serving node FIRST — same list and
+        // order as the Java NetworkConfig.SEPOLIA.clPeerMultiaddrs.
+        assert_eq!(c.static_peers.len(), 2);
+        assert!(c.static_peers[0].ends_with(
+            "/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6"
+        ));
         assert_eq!(c.bootstrap_enrs.len(), 9);
     }
 

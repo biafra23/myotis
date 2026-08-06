@@ -70,6 +70,49 @@ pub struct ElConfig {
     /// Network floor for the suggested priority fee (wei) — the Java
     /// `NetworkConfig.minSuggestedTipWei` (mainnet/sepolia 0.1 gwei; gnosis 0.001).
     pub min_suggested_tip_wei: u128,
+    /// Pinned EL peers to direct-dial, as `(address, 64-byte secp256k1 pubkey)`.
+    /// Twin of the Java `NetworkConfig.elBootEnodes()`. Unlike `bootnodes`
+    /// (discv4 UDP endpoints, no key) these carry the pubkey the ECIES
+    /// handshake needs, so they are dialed over RLPx directly instead of
+    /// waiting for discovery to surface them.
+    pub boot_enodes: Vec<(std::net::SocketAddr, [u8; 64])>,
+}
+
+/// The dedicated myotis-serving sepolia node (docs/dedicated-sepolia-node.md).
+/// Key stable (persisted nodekey); the IP is residential, so a rotation makes
+/// this entry stale and discovery carries the load until it is refreshed.
+const SEPOLIA_MYOTIS_ENODE: &str =
+    "enode://cfd3572bd7691fe03baf52106b873e01d9b5dca1714a74b316cb94151127dfd20adae3be559e3e6b44b78a5af1ed6f92ecc8676a2555fc7cdb2d29a0c37e1b2c@87.154.209.161:30405";
+
+/// Parse `enode://<128 hex pubkey>@host:port` entries into dialable
+/// `(addr, pubkey)` pairs, skipping anything malformed — a bad pin must not
+/// panic a wallet at startup, it just leaves discovery to do the work. Twin of
+/// the Java `ChainStack.parseBootEnodes`.
+fn parse_boot_enodes(enodes: &[&str]) -> Vec<(std::net::SocketAddr, [u8; 64])> {
+    let mut out = Vec::new();
+    for e in enodes {
+        let Some(body) = e.strip_prefix("enode://") else { continue };
+        let Some((pubkey_hex, host_port)) = body.split_once('@') else { continue };
+        // is_ascii() is load-bearing, not belt-and-braces: len() counts BYTES,
+        // so 64 multi-byte chars (e.g. "é" × 64 = 128 bytes) pass the length
+        // check and then panic in the slicing below at a non-char boundary —
+        // an abort, since the workspace builds panic = "abort". This parser
+        // exists to be lenient with untrusted-ish input, so it must not.
+        if pubkey_hex.len() != 128 || !pubkey_hex.is_ascii() {
+            continue;
+        }
+        let Ok(bytes) = (0..64)
+            .map(|i| u8::from_str_radix(&pubkey_hex[i * 2..i * 2 + 2], 16))
+            .collect::<Result<Vec<u8>, _>>()
+        else {
+            continue;
+        };
+        let Ok(addr) = host_port.parse::<std::net::SocketAddr>() else { continue };
+        let mut pubkey = [0u8; 64];
+        pubkey.copy_from_slice(&bytes);
+        out.push((addr, pubkey));
+    }
+    out
 }
 
 impl ElConfig {
@@ -95,6 +138,7 @@ impl ElConfig {
             cache_path: None,
             log_index_path: None,
             min_suggested_tip_wei: 100_000_000, // 0.1 gwei
+            boot_enodes: Vec::new(),
         }
     }
 
@@ -123,6 +167,11 @@ impl ElConfig {
             cache_path: None,
             log_index_path: None,
             min_suggested_tip_wei: 100_000_000, // 0.1 gwei
+            // The dedicated myotis-serving node (docs/dedicated-sepolia-node.md):
+            // it admits wallets past its peer cap by RLPx Hello client-id, so
+            // direct-dialing it beats waiting for discovery on a saturated
+            // testnet. Mirrors the Java `NetworkConfig.SEPOLIA_EL_ENODES`.
+            boot_enodes: parse_boot_enodes(&[SEPOLIA_MYOTIS_ENODE]),
         }
     }
     /// Gnosis EL parameters — verbatim from the Java `NetworkConfig.GNOSIS`. The
@@ -148,6 +197,7 @@ impl ElConfig {
             cache_path: None,
             log_index_path: None,
             min_suggested_tip_wei: 1_000_000, // 0.001 gwei — cheap-chain floor
+            boot_enodes: Vec::new(),
         }
     }
 }
@@ -602,7 +652,10 @@ impl ElReader {
                 .filter(|(h, _)| *h == cfg.genesis_hash)
                 .map(|(_, rlp)| rlp),
         });
-        // Load the EL peer cache for warm-start (disabled if no path).
+        // Load the EL peer cache for warm-start (disabled if no path). The
+        // network's pinned boot enodes are NOT seeded here — they go to the pool
+        // directly, so they survive a disabled cache and never overwrite a snap
+        // flag the peer earned in an earlier run (see PeerPool's warm start).
         let cache = match &cfg.cache_path {
             Some(path) => crate::el::peercache::ElPeerCache::load(path.clone()),
             None => crate::el::peercache::ElPeerCache::disabled(),
@@ -617,6 +670,7 @@ impl ElReader {
             Arc::clone(&eth_cfg),
             cfg.pool_config,
             cache,
+            cfg.boot_enodes.clone(),
             rx,
             Some(Arc::clone(&sent_tx_watch)),
             Some(discovery.probe_sender()),
@@ -3480,6 +3534,33 @@ mod tests {
     }
 
     #[test]
+    fn sepolia_pins_the_dedicated_serving_node_enode() {
+        // Twin of the Java NetworkConfigGnosisTest#sepoliaPinsTheDedicatedServingNodeOnBothLayers.
+        let cfg = ElConfig::sepolia();
+        assert_eq!(cfg.boot_enodes.len(), 1, "sepolia pins the dedicated serving node");
+        let (addr, pubkey) = cfg.boot_enodes[0];
+        assert_eq!(addr.to_string(), "87.154.209.161:30405");
+        assert_eq!(pubkey[0], 0xcf);
+        assert_eq!(pubkey[63], 0x2c);
+        // The other networks ship none (mainnet/gnosis reach peers via discovery).
+        assert!(ElConfig::mainnet().boot_enodes.is_empty());
+        assert!(ElConfig::gnosis().boot_enodes.is_empty());
+    }
+
+    #[test]
+    fn malformed_boot_enodes_are_skipped_not_fatal() {
+        assert!(parse_boot_enodes(&["not-an-enode"]).is_empty());
+        assert!(parse_boot_enodes(&["enode://short@1.2.3.4:30303"]).is_empty());
+        assert!(parse_boot_enodes(&[&format!("enode://{}@nonsense", "ab".repeat(64))]).is_empty());
+        // Non-hex in an otherwise well-shaped key.
+        assert!(parse_boot_enodes(&[&format!("enode://{}@1.2.3.4:30303", "zz".repeat(64))]).is_empty());
+        // Non-ASCII: 64 x "é" is EXACTLY 128 bytes, so it passes a naive length
+        // check and would panic (→ abort) when sliced at a non-char boundary.
+        assert!(parse_boot_enodes(&[&format!("enode://{}@1.2.3.4:30303", "\u{00e9}".repeat(64))]).is_empty());
+        assert_eq!(parse_boot_enodes(&[SEPOLIA_MYOTIS_ENODE]).len(), 1);
+    }
+
+#[test]
     fn sepolia_config_pins_known_values() {
         let cfg = ElConfig::sepolia();
         assert_eq!(cfg.network_id, 11_155_111);
