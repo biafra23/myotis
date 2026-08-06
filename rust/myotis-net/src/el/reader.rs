@@ -922,6 +922,11 @@ impl ElReader {
         let from = cur_n - count;
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
+            // Visible (rate-limited): a silently empty pool looked identical
+            // to a hung walker during the 2026-08-06 stall investigation.
+            if ticks % 100 == 0 {
+                tracing::info!(cursor = cur_n, "log index backfill idle: no snap peers this tick");
+            }
             return;
         }
         for peer in &peers {
@@ -930,6 +935,14 @@ impl ElReader {
                 .await
             {
                 Ok(()) => {
+                    if ticks % 50 == 0 {
+                        let new_cursor = self.with_log_index(|ix| ix.cursor).flatten();
+                        tracing::info!(
+                            cursor = new_cursor.map(|(n, _)| n).unwrap_or(cur_n),
+                            target = target_low,
+                            "log index backfill progress"
+                        );
+                    }
                     // Checkpoint after every applied batch: the store is
                     // small at Sepolia scale and a crash then costs at most
                     // one batch (paged store before mainnet — design doc).
@@ -1022,16 +1035,32 @@ impl ElReader {
         // Chunked: one request for ~1023 candidate blocks would blow through
         // peer soft response limits (~2 MiB) and permanently stall a
         // candidate-dense range on the exact-length check below.
-        for chunk in candidates.chunks(64) {
+        // First candidate the peer did NOT serve this round (honest byte-budget
+        // truncation): the batch is applied only ABOVE it, so coverage never
+        // claims a block whose receipts we didn't verify, and the next tick's
+        // batch resumes right at it. Never a hard error — geth-class peers cap
+        // bodies/receipts responses by a soft byte budget, so on candidate-dense
+        // ranges a short response is the EXPECTED shape, and treating it as
+        // peer failure permanently stalled the walk (observed on sepolia at
+        // ~#11.43M: 64 requested → 41 bodies / 23 receipt sets served).
+        let mut stop_below: Option<u64> = None;
+        'chunks: for chunk in candidates.chunks(64) {
             let hashes: Vec<[u8; 32]> = chunk.iter().map(|h| h.hash).collect();
             let (bodies, receipt_blocks) =
                 futures::future::join(peer.get_block_bodies(&hashes), peer.get_receipts(&hashes)).await;
             let bodies = bodies?;
             let receipt_blocks = receipt_blocks?;
-            if bodies.len() != chunk.len() || receipt_blocks.len() != chunk.len() {
-                return Err("peer returned a short bodies/receipts response".to_string());
+            // Served items are an in-order prefix of the request (the per-block
+            // root verification below catches any peer that violates that).
+            let usable = bodies.len().min(receipt_blocks.len()).min(chunk.len());
+            if usable == 0 {
+                // Nothing served at all — a single block's receipts always fit
+                // a response budget, so this peer genuinely can't (or won't)
+                // serve the range; let the caller rotate to the next peer.
+                return Err("peer served no bodies/receipts for candidate chunk".to_string());
             }
-            for ((vh, body), receipts) in chunk.iter().zip(&bodies).zip(&receipt_blocks) {
+            for ((vh, body), receipts) in
+                chunk[..usable].iter().zip(&bodies[..usable]).zip(&receipt_blocks[..usable]) {
                 verify_body_transactions(&vh.header, body)?;
                 if receipts.len() != body.transactions.len() {
                     return Err(format!(
@@ -1055,9 +1084,21 @@ impl ElReader {
                     logs_by_block.insert(vh.header.number, watched);
                 }
             }
+            if usable < chunk.len() {
+                stop_below = Some(chunk[usable].header.number);
+                tracing::debug!(
+                    served = usable,
+                    requested = chunk.len(),
+                    resume_at = chunk[usable].header.number,
+                    "backfill chunk truncated by peer response budget; applying partial batch"
+                );
+                break 'chunks;
+            }
         }
         // Apply top-down (the response is already descending) so every block
-        // adjoins the low edge; the trust edge advances with each block.
+        // adjoins the low edge; the trust edge advances with each block. A
+        // truncated chunk caps the applied span ABOVE the first unprocessed
+        // candidate — partial progress, never a lying coverage claim.
         match self.log_index.lock() {
             Ok(mut slot) => {
                 let Some(ix) = slot.as_mut() else {
@@ -1076,6 +1117,9 @@ impl ElReader {
                 }
                 for vh in new_blocks {
                     let n = vh.header.number;
+                    if stop_below.is_some_and(|stop| n <= stop) {
+                        break; // unprocessed candidate — resume here next tick
+                    }
                     let logs = logs_by_block.remove(&n).unwrap_or_default();
                     ix.backfill_block(n, vh.hash, logs)
                         .map_err(|g| format!("backfill gap at {} (edge {})", g.block, g.edge))?;

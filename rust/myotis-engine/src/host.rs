@@ -2168,6 +2168,20 @@ fn parse_get_logs_filter(
 /// (the router maps it to strict -32000) — never an empty array for an
 /// unindexed range.
 pub fn get_logs_json(handle: i64, filter_json: &str) -> String {
+    let out = get_logs_json_impl(handle, filter_json);
+    // Observability for wallet integration (requested during the Kohaku
+    // bring-up): refusals log the exact filter at info so hosts can see what
+    // the wallet asked for without a proxy; successes stay at debug.
+    if let Some(reason) = out.strip_prefix("{\"error\":") {
+        tracing::info!(filter = %filter_json, refusal = %reason.trim_end_matches('}'),
+            "eth_getLogs refused");
+    } else {
+        tracing::debug!(filter = %filter_json, "eth_getLogs served");
+    }
+    out
+}
+
+fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
     use myotis_net::el::logindex::QueryError;
     let Ok(v) = serde_json::from_str::<serde_json::Value>(filter_json) else {
         return eljson::error_json("malformed filter");
