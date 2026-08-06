@@ -158,8 +158,12 @@ tasks.configureEach {
         // explicit input makes any dylib change dirty the image and every
         // installer built from it. Fingerprinting happens at execution time,
         // after prepareRustAppResources (dependsOn above) has created the dir.
-        inputs.dir(layout.buildDirectory.dir("rustAppResources"))
-            .withPropertyName("rustEngineAppResources")
+        // The uber-jar packagers match the name predicate but bundle no app
+        // resources — skip them so a Rust-only change doesn't re-zip the jar.
+        if (!name.contains("UberJar")) {
+            inputs.dir(layout.buildDirectory.dir("rustAppResources"))
+                .withPropertyName("rustEngineAppResources")
+        }
     }
 }
 
