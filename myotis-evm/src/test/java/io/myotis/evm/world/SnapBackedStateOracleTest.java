@@ -128,10 +128,50 @@ class SnapBackedStateOracleTest {
         // the same peer (the 30s zombie-call fix). The supplier is consulted once
         // for the real attempt plus a short I/O-free skim (bounded per attempt
         // slot) that discovers there is nothing untried.
-        assertEquals(1 + 4, attempts.get());
+        assertEquals(1 + SnapBackedStateOracle.FAIL_FAST_CONSULTS_PER_ATTEMPT, attempts.get());
         // The one real attempt reports the peer so a routing supplier rotates
         // away from it for the rest of this head context.
         assertEquals(1, peer.rootUnavailableCalls.get());
+    }
+
+    @Test
+    void maxAttemptsStillCapsRotationAcrossDistinctPeers() {
+        // Three DISTINCT refusing peers with maxAttempts=2: the budget branch (not
+        // fail-fast) must end the operation — two real attempts, the third peer
+        // never asked, and the LAST real attempt's error surfaces.
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        Bytes32 root = Bytes32.fromHexString(
+                "0x7777777777777777777777777777777777777777777777777777777777777777");
+        Bytes garbage = RLP.encodeList(w -> {
+            w.writeValue(Bytes.fromHexString("0x20"));
+            w.writeValue(Bytes.fromHexString("0xdead"));
+        });
+        List<FixturePeer> peers = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            FixturePeer fp = new FixturePeer();
+            fp.addTrieNodes(root, List.of(garbage));
+            peers.add(fp);
+        }
+        AtomicInteger consults = new AtomicInteger();
+        Supplier<SnapPeer> supplier = () -> peers.get(consults.getAndIncrement() % peers.size());
+
+        var oracle = new SnapBackedStateOracle(supplier, BytecodeCache.inMemory(), 2);
+        try {
+            oracle.fetchAccount(root.toArrayUnsafe(), addr).get();
+            fail("expected fetchAccount to fail");
+        } catch (Exception e) {
+            Throwable cause = e instanceof ExecutionException ? e.getCause() : e;
+            var eee = assertInstanceOf(EvmExecutionException.class, cause);
+            assertInstanceOf(EvmExecutionError.InvalidProof.class, eee.error(),
+                    "the exhaustion branch surfaces the last real attempt's error");
+        }
+        // Budget branch, not fail-fast: exactly maxAttempts consults (each found an
+        // untried peer on the first try), and the third peer was never asked.
+        assertEquals(2, consults.get());
+        assertEquals(1, peers.get(0).rootUnavailableCalls.get());
+        assertEquals(1, peers.get(1).rootUnavailableCalls.get());
+        assertEquals(0, peers.get(2).rootUnavailableCalls.get(),
+                "the peer beyond the budget must never be asked");
     }
 
     @Test
@@ -178,7 +218,7 @@ class SnapBackedStateOracleTest {
         // One real attempt + the bounded skim — NOT maxAttempts real attempts.
         // Without identity()-keyed dedup this would be 3 real attempts and the
         // report counter would read 3.
-        assertEquals(1 + 4, consults.get());
+        assertEquals(1 + SnapBackedStateOracle.FAIL_FAST_CONSULTS_PER_ATTEMPT, consults.get());
         assertEquals(1, underlying.rootUnavailableCalls.get());
     }
 
@@ -213,7 +253,7 @@ class SnapBackedStateOracleTest {
         }
         // a tried, b tried, then the bounded skim finds only repeats → fail fast
         // with most of the 5-attempt budget unused (2 real attempts, not 5).
-        assertEquals(2 + 4, consults.get(),
+        assertEquals(2 + SnapBackedStateOracle.FAIL_FAST_CONSULTS_PER_ATTEMPT, consults.get(),
                 "one consult per real attempt plus the bounded fail-fast skim");
         assertEquals(1, a.rootUnavailableCalls.get());
         assertEquals(1, b.rootUnavailableCalls.get());

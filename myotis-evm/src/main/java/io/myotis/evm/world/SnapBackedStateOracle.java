@@ -390,7 +390,7 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
      *  rotation counter across concurrent operations, so a repeat does not by
      *  itself prove exhaustion — a couple of extra (cheap, I/O-free) consults
      *  skim past interleaving; a one-peer pool still fails in microseconds. */
-    private static final int FAIL_FAST_CONSULTS_PER_ATTEMPT = 4;
+    static final int FAIL_FAST_CONSULTS_PER_ATTEMPT = 4; // package-visible for tests
 
     private <T> void attempt(
             java.util.function.Function<SnapPeer, CompletableFuture<T>> op,

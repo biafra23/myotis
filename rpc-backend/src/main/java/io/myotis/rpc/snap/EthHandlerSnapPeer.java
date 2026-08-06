@@ -54,7 +54,9 @@ public final class EthHandlerSnapPeer implements SnapPeer {
 
     /**
      * @param onRootUnavailable run when the oracle reports this peer can't serve the
-     *  current state root (deprioritize it for this head).
+     *  current state root (deprioritize it for this head). Runs SYNCHRONOUSLY on
+     *  the reporting thread (often the Netty event loop): keep it to lock-free
+     *  routing mutations and offload anything that can block.
      * @param onRootServed run when this peer returns a usable (non-empty) proof, so
      *  the EL peer cache can record it as a proven snap-serving peer to dial first
      *  on a restart. The two callbacks are mutually exclusive per fetch: a non-empty
@@ -81,14 +83,16 @@ public final class EthHandlerSnapPeer implements SnapPeer {
 
     @Override
     public void reportRootUnavailable() {
-        // The oracle reports this from a future-completion handler that runs on the
-        // Netty event loop; a host's deny callback may block (lock contention, sync
-        // persistence), so offload like onRootServed — a shared adapter must not let
-        // a host callback stall network processing.
+        // SYNCHRONOUS on purpose: the oracle's fail-fast skim consults the peer
+        // supplier immediately after this returns, and the supplier's routing
+        // state (rootDenied/rootServed in VerifiedRpcBackend) must already
+        // reflect the deny — an async offload here loses that race and the
+        // skim sees the pre-failure world, failing operations fast while
+        // untried peers exist. The callback contract is therefore: routing
+        // mutations only (lock-free sets); any potentially blocking work
+        // (quality sinks, persistence) must be offloaded BY THE CALLBACK.
         if (onRootUnavailable != null) {
-            CompletableFuture.runAsync(() -> {
-                try { onRootUnavailable.run(); } catch (RuntimeException ignore) {}
-            });
+            try { onRootUnavailable.run(); } catch (RuntimeException ignore) {}
         }
     }
 
@@ -143,14 +147,13 @@ public final class EthHandlerSnapPeer implements SnapPeer {
                 // A non-empty proof means this peer actually retains the trie for
                 // this root — the durable "snap-serving" signal the EL cache wants.
                 // Empty proofs fall through to the oracle's no-state path, which
-                // calls reportRootUnavailable instead. Offloaded: this completion
-                // chain runs on the Netty event loop, and a host's quality sink may
-                // block (lock contention, sync persistence) — a shared adapter must
-                // not let a host callback stall network processing.
+                // calls reportRootUnavailable instead. Synchronous, mirroring
+                // reportRootUnavailable: the supplier's rootServed preference
+                // should see the serve before the next consult, and the callback
+                // contract requires callbacks to offload their own blocking work
+                // (see reportRootUnavailable).
                 if (!all.isEmpty() && onRootServed != null) {
-                    CompletableFuture.runAsync(() -> {
-                        try { onRootServed.run(); } catch (RuntimeException ignore) {}
-                    });
+                    try { onRootServed.run(); } catch (RuntimeException ignore) {}
                 }
                 return all;
             });
