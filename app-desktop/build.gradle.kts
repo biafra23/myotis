@@ -148,6 +148,18 @@ tasks.configureEach {
         || name.startsWith("runDistributable") || name.startsWith("runRelease")
     ) {
         dependsOn(prepareRustAppResources)
+        // Compose's jpackage tasks do NOT track the app-resources CONTENT as
+        // an input: after a Rust-only change, prepareRustAppResources and
+        // Compose's own prepareAppResources both re-run, yet
+        // createDistributable/packageDmg still report UP-TO-DATE and ship the
+        // previous image — i.e. a stale engine dylib with no error anywhere
+        // (reproduced 2026-08-06: staged+prepared dirs carried a new exported
+        // symbol, the packaged .app didn't). Declaring the staged dir as an
+        // explicit input makes any dylib change dirty the image and every
+        // installer built from it. Fingerprinting happens at execution time,
+        // after prepareRustAppResources (dependsOn above) has created the dir.
+        inputs.dir(layout.buildDirectory.dir("rustAppResources"))
+            .withPropertyName("rustEngineAppResources")
     }
 }
 
