@@ -1,15 +1,14 @@
 name: Desktop DEB (Linux)
 
 on:
-  # Scope push to main + release tags so a branch push that also has an open PR
-  # doesn't build twice (the PR is covered by pull_request below). Tags still
-  # build the release .deb.
+  # Deliberately NO pull_request trigger: Linux installers are release/main
+  # artifacts, not per-push PR feedback. Building them on every PR push queued
+  # 4+ installer jobs ahead of the fast, decision-relevant checks (review,
+  # Build and Test) and starved them on busy days — the .deb result never
+  # changes a PR decision anyway (Build and Test compiles the same code).
   push:
     branches: [ "main" ]
     tags: [ "v*" ]
-  # pull_request stays unscoped (any base branch) — the double-run is already
-  # killed by narrowing push above, and this keeps CI on PRs that don't target main.
-  pull_request:
   # Manual publish path: attach debs built from the CURRENT ref to an existing
   # release (added so Linux builds could join v0.1.0, which was tagged before
   # this workflow existed, without moving the tag). Note the assets then come
