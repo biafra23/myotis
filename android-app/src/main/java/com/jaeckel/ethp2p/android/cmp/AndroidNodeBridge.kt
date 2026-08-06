@@ -245,6 +245,8 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun setRpcPort(network: String, port: Int) = NodeService.setRpcPort(ctx, network, port)
     override fun logIndexEnabled(network: String): Boolean = NodeService.logIndexEnabled(ctx, network)
     override fun setLogIndexEnabled(network: String, on: Boolean) = NodeService.setLogIndexEnabled(ctx, network, on)
+    override fun logIndexMaxSpeed(network: String): Boolean = NodeService.logIndexMaxSpeed(ctx, network)
+    override fun setLogIndexMaxSpeed(network: String, on: Boolean) = NodeService.setLogIndexMaxSpeed(ctx, network, on)
     override fun snapTarget(): Int = NodeService.snapTarget(ctx)
     override fun setSnapTarget(v: Int) = NodeService.setSnapTargetPref(ctx, v)
     override fun servedBlockWindow(): Int = NodeService.servedBlockWindow(ctx)

@@ -93,6 +93,10 @@ class IosSettings : Settings {
         getBool("$K_LOG_INDEX_PREFIX$network", false)
     override fun setLogIndexEnabled(network: String, on: Boolean) =
         defaults.setBool(on, "$K_LOG_INDEX_PREFIX$network")
+    override fun logIndexMaxSpeed(network: String): Boolean =
+        getBool("$K_LOG_INDEX_SPEED_PREFIX$network", false)
+    override fun setLogIndexMaxSpeed(network: String, on: Boolean) =
+        defaults.setBool(on, "$K_LOG_INDEX_SPEED_PREFIX$network")
 
     // blst is statically linked into the engine — there is nothing to toggle.
     override fun nativeBlsEnabled(): Boolean = true
@@ -106,6 +110,7 @@ class IosSettings : Settings {
         const val K_ENABLED = "networks.enabled"
         const val K_RPC_PORT_PREFIX = "rpcPort."
         const val K_LOG_INDEX_PREFIX = "logIndex."
+        const val K_LOG_INDEX_SPEED_PREFIX = "logIndex.maxSpeed."
         const val K_SNAP = "snapTarget"
         const val K_SERVED_WINDOW = "servedBlockWindow"
         const val K_DEEP = "deepPool"

@@ -562,6 +562,8 @@ pub struct ElReader {
     /// queries are in-memory work; persistence happens on checkpoints and
     /// stop, never under a network await.
     log_index: std::sync::Mutex<Option<crate::el::logindex::LogIndex>>,
+    /// Rolling backfill throughput (blocks/s EMA) — see [`Self::log_index_rate_bps`].
+    log_index_rate: std::sync::Mutex<Option<f64>>,
     log_index_path: Option<std::path::PathBuf>,
     /// The head-follow appender task (spawned on enable, aborted on stop).
     log_index_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -704,6 +706,7 @@ impl ElReader {
             }),
             sent_tx_watch,
             log_index: std::sync::Mutex::new(None),
+            log_index_rate: std::sync::Mutex::new(None),
             log_index_path: cfg.log_index_path,
             log_index_task: std::sync::Mutex::new(None),
         })
@@ -724,6 +727,7 @@ impl ElReader {
         if let Some(ix) = slot.as_mut() {
             if ix.config().fingerprint() == config.fingerprint() {
                 ix.set_enabled(config.enabled);
+                ix.set_max_speed(config.max_speed);
                 return true;
             }
             if let Some(p) = self.log_index_path.as_deref() {
@@ -903,16 +907,61 @@ impl ElReader {
     /// before any log is stored. Peer refusal is a stall, never corruption:
     /// coverage simply doesn't extend until some peer serves the range.
     async fn log_index_backfill_step(&self, ticks: u64, backfill_ok: &mut u64) {
+        // Pacing: "nice" works ONE batch per 6s tick (background politeness);
+        // "max speed" keeps working batches until a per-tick time budget is
+        // spent — the difference between ~55 blocks/6s and peer-limited
+        // throughput on dense ranges. The budget leaves the tail of each tick
+        // for the appender and for RPC traffic on the shared pool.
+        const MAX_SPEED_TICK_BUDGET: std::time::Duration = std::time::Duration::from_millis(4500);
+        let started = std::time::Instant::now();
+        let cursor_before = self.with_log_index(|ix| ix.cursor).flatten().map(|(n, _)| n);
+        let mut rounds = 0u32;
+        loop {
+            let (progressed, max_speed) = self.log_index_backfill_round(ticks, backfill_ok).await;
+            rounds += 1;
+            if !progressed || !max_speed || started.elapsed() >= MAX_SPEED_TICK_BUDGET {
+                break;
+            }
+            // Yield between rounds so this task never monopolizes the runtime.
+            tokio::task::yield_now().await;
+        }
+        // Rolling throughput for the status ETA — measured across the whole
+        // step (however many rounds it ran) so both pacing modes report
+        // honestly. Only samples where the cursor moved update the rate.
+        if let (Some(before), Some((after, _))) =
+            (cursor_before, self.with_log_index(|ix| ix.cursor).flatten())
+        {
+            if after < before {
+                let blocks = (before - after) as f64;
+                let secs = started.elapsed().as_secs_f64().max(0.001);
+                let inst = blocks / secs;
+                if let Ok(mut rate) = self.log_index_rate.lock() {
+                    // Blend per-STEP samples; ~6s cadence → a few minutes of memory.
+                    let ema = match *rate {
+                        Some(prev) => prev * 0.9 + inst * 0.1,
+                        None => inst,
+                    };
+                    *rate = Some(ema);
+                }
+            }
+        }
+        let _ = rounds;
+    }
+
+    /// One backfill round: try every pooled peer for one batch at the current
+    /// cursor. Returns (progressed, max_speed_configured).
+    async fn log_index_backfill_round(&self, ticks: u64, backfill_ok: &mut u64) -> (bool, bool) {
         let Some((config, cursor)) = self.with_log_index(|ix| (ix.config().clone(), ix.cursor)) else {
-            return;
+            return (false, false);
         };
+        let max_speed = config.max_speed;
         let (Some(target_low), Some((cur_n, cur_hash))) =
             (config.watch.iter().map(|w| w.from_block).min(), cursor)
         else {
-            return; // no watch entries, or the appender hasn't seeded the edge yet
+            return (false, max_speed); // no watch entries, or the edge isn't seeded yet
         };
         if !config.enabled || cur_n <= target_low {
-            return;
+            return (false, max_speed);
         }
         let fingerprint = config.fingerprint();
         // count+1 headers are requested (the top one is the cursor block), and
@@ -928,7 +977,7 @@ impl ElReader {
             if ticks % 100 == 0 {
                 tracing::info!(cursor = cur_n, "log index backfill idle: no snap peers this tick");
             }
-            return;
+            return (false, max_speed);
         }
         for peer in &peers {
             match self
@@ -958,7 +1007,7 @@ impl ElReader {
                             let _ = ix.persist(path);
                         }
                     }
-                    return;
+                    return (true, max_speed);
                 }
                 Err(e) => {
                     tracing::debug!(from, count, error = %e, "log index backfill batch failed; trying next peer");
@@ -972,6 +1021,7 @@ impl ElReader {
                 "log index backfill: no peer served the range this round (history depth?); will keep retrying"
             );
         }
+        (false, max_speed)
     }
 
     /// Fetch and apply one descending backfill batch from one peer:
@@ -1147,6 +1197,13 @@ impl ElReader {
             }
             Err(_) => Err("log index lock poisoned".to_string()),
         }
+    }
+
+    /// Rolling backfill throughput in blocks/second (EMA over recent steps),
+    /// `None` until the walker has made measurable progress this run. Feeds
+    /// the status JSON's ETA; diagnostic only — never used for control flow.
+    pub fn log_index_rate_bps(&self) -> Option<f64> {
+        self.log_index_rate.lock().ok().and_then(|r| *r)
     }
 
     /// Run `f` against the index if one is configured. The single accessor

@@ -2010,6 +2010,9 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
         return false;
     };
     let enabled = v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
+    // Backfill pacing (optional; absent = nice/background). Fingerprint-neutral:
+    // flipping it re-applies onto the live index without resetting coverage.
+    let max_speed = v.get("maxSpeed").and_then(|e| e.as_bool()).unwrap_or(false);
     let mut watch = Vec::new();
     if v.get("watch").is_some_and(|w| !w.is_array() && !w.is_null()) {
         return false;
@@ -2043,7 +2046,8 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
     let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
         return false;
     };
-    let installed = reader.set_log_index_config(myotis_net::el::logindex::LogIndexConfig { enabled, watch });
+    let installed = reader.set_log_index_config(
+        myotis_net::el::logindex::LogIndexConfig { enabled, max_speed, watch });
     if installed && enabled {
         // Spawn (or keep) the head-follow appender on the engine runtime.
         reader.ensure_log_index_appender(engine.rt.handle());
@@ -2060,6 +2064,7 @@ pub fn log_index_status_json(handle: i64) -> String {
     let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
         return eljson::error_json("node is not running");
     };
+    let rate_bps = reader.log_index_rate_bps();
     let status = reader.with_log_index(|ix| {
         let mut s = String::from("{\"enabled\":");
         s.push_str(if ix.config().enabled { "true" } else { "false" });
@@ -2068,6 +2073,30 @@ pub fn log_index_status_json(handle: i64) -> String {
         if let Some((n, _)) = ix.cursor {
             s.push_str(",\"backfillCursor\":");
             s.push_str(&n.to_string());
+        }
+        s.push_str(",\"maxSpeed\":");
+        s.push_str(if ix.config().max_speed { "true" } else { "false" });
+        // Backfill progress for the hosts' Index tab: the walk target, blocks
+        // remaining to it, and — once the walker has a measured rate — an ETA.
+        // All optional-by-context so the shape stays honest: no cursor yet →
+        // no remaining; no rate yet → no ETA (hosts then show x/y instead).
+        if let Some(target_low) = ix.config().watch.iter().map(|w| w.from_block).min() {
+            s.push_str(",\"targetLow\":");
+            s.push_str(&target_low.to_string());
+            if let Some((n, _)) = ix.cursor {
+                let remaining = n.saturating_sub(target_low);
+                s.push_str(",\"blocksRemaining\":");
+                s.push_str(&remaining.to_string());
+                if let Some(bps) = rate_bps {
+                    if bps > 0.05 {
+                        s.push_str(",\"blocksPerSec\":");
+                        s.push_str(&format!("{:.1}", bps));
+                        let eta = (remaining as f64 / bps).round() as u64;
+                        s.push_str(",\"etaSeconds\":");
+                        s.push_str(&eta.to_string());
+                    }
+                }
+            }
         }
         s.push_str(",\"entries\":[");
         for (k, (w, c)) in ix.coverage_entries().iter().enumerate() {

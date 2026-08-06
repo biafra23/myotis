@@ -36,11 +36,13 @@ object KohakuPreset {
      * entries for it (the caller then skips the push entirely — an engine
      * without a config keeps eth_getLogs in its honest not-configured state).
      */
-    fun configJson(network: String, enabled: Boolean): String? {
+    @JvmStatic
+    @JvmOverloads
+    fun configJson(network: String, enabled: Boolean, maxSpeed: Boolean = false): String? {
         val watch = byNetwork[network] ?: return null
         val entries = watch.joinToString(",") {
             """{"address":"${it.address}","fromBlock":${it.fromBlock}}"""
         }
-        return """{"enabled":$enabled,"watch":[$entries]}"""
+        return """{"enabled":$enabled,"maxSpeed":$maxSpeed,"watch":[$entries]}"""
     }
 }
