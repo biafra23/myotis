@@ -715,12 +715,9 @@ impl PeerPool {
         if out.is_empty() {
             // Never starve the batch on the SOFT filters (Java: `if
             // (capable.isEmpty()) capable = peers`) — a no-lc/cooled peer may
-            // still serve. But keep honoring `skip`: those peers are provably
-            // incapable of the needed period, so asking them wastes a whole
-            // round and ratchets the empty-round backoff. If skip leaves
-            // nothing, return [] and let catch_up bounce to rediscovery.
-            // Sweep the fallback too, so consecutive drought rounds spread the
-            // retries across the pool instead of re-hammering the first few.
+            // still serve. Sweep the fallback too, so consecutive drought
+            // rounds spread the retries across the pool instead of
+            // re-hammering the first few.
             let start = self.sweep % self.peers.len();
             self.sweep = self.sweep.wrapping_add(n);
             for i in 0..self.peers.len() {
@@ -731,6 +728,32 @@ impl PeerPool {
                 if !skip.contains(&p.id) {
                     out.push(p.clone());
                 }
+            }
+        }
+        if out.is_empty() {
+            // LAST RESORT: `skip` too. It used to be honored even here, on the
+            // theory that a too-shallow peer is "provably incapable" of the
+            // needed period — but the evidence behind it is weaker than that
+            // (issue #291). `skip` is built from `earliest_available_slot`,
+            // which is the peer's BLOCK/data-availability floor, not its
+            // light-client-update floor: LC updates are a separate, tiny store
+            // (one best update per period), and a checkpoint-synced node that
+            // pruned blocks below its checkpoint still answers
+            // `light_client_updates_by_range` well beneath that floor. On a
+            // pool where nearly every node is checkpoint-synced (Gnosis), the
+            // filter condemned the WHOLE pool once the auto-Status replies had
+            // landed — including Tier-1 peers that had just served us — and
+            // catch_up bounced to rediscovery forever while the data was
+            // plainly available network-wide. Java never had this failure mode
+            // because its guard drops every filter. Asking a maybe-incapable
+            // peer costs one round; returning [] costs the whole sync.
+            let start = self.sweep % self.peers.len();
+            self.sweep = self.sweep.wrapping_add(n);
+            for i in 0..self.peers.len() {
+                if out.len() >= n {
+                    break;
+                }
+                out.push(self.peers[(start + i) % self.peers.len()].clone());
             }
         }
         out
@@ -1535,9 +1558,12 @@ async fn catch_up(
         // committee_period can still serve that period's update, so only skip
         // when its earliest period is strictly greater. Peers not yet
         // status-exchanged (absent from the map) are unknown and kept; v1 peers
-        // report 0 (genesis history) and are never skipped. candidates() still
-        // returns [] rather than a too-shallow-only batch, so an all-shallow
-        // pool bounces to the outer loop for rediscovery instead of thrashing.
+        // report 0 (genesis history) and are never skipped. This is a STRONG
+        // PREFERENCE, not a veto: candidates() falls back to the shallow peers
+        // when they are all that is left, because earliest_available_slot is a
+        // block floor rather than an LC-update floor and an all-shallow pool is
+        // not proof that nobody serves the period (issue #291). Only a
+        // genuinely empty pool bounces to rediscovery.
         let too_shallow: HashSet<PeerId> = earliest_slots
             .into_iter()
             .filter(|&(_, earliest)| {
@@ -2375,11 +2401,20 @@ mod tests {
         }
         assert!(!pool.candidates(2, true, false, &HashSet::new(), &HashSet::new()).is_empty());
 
-        // But the HARD skip is honored even by the never-starve fallback:
-        // a fully-skipped pool returns [] (provably-incapable peers are worse
-        // than none — catch_up bounces to rediscovery instead of thrashing).
+        // `skip` is preferred-against but NOT fatal: a fully-skipped pool
+        // still returns candidates (issue #291 — earliest_available_slot is a
+        // block floor, not an LC-update floor, so a fully-skipped pool is not
+        // proof that nobody can serve; returning [] stalled catch-up forever).
         let all_skip: HashSet<PeerId> = ids.iter().copied().collect();
-        assert!(pool.candidates(4, true, false, &HashSet::new(), &all_skip).is_empty());
+        assert!(!pool.candidates(4, true, false, &HashSet::new(), &all_skip).is_empty());
+
+        // The preference still holds while ANY non-skipped peer remains: with
+        // only ids[3] skipped, it must not be chosen over the other three.
+        let mut one_skip = HashSet::new();
+        one_skip.insert(ids[3]);
+        let c = pool.candidates(3, true, false, &HashSet::new(), &one_skip);
+        assert_eq!(c.len(), 3);
+        assert!(c.iter().all(|p| p.id != ids[3]));
     }
 
     #[test]
