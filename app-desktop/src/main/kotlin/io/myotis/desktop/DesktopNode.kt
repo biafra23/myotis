@@ -251,9 +251,10 @@ class DesktopNodeController(
 
     private fun pushLogIndexConfig(network: String, handle: ChainHandle) {
         val enabled = settings.logIndexEnabled(network)
+        val maxSpeed = settings.logIndexMaxSpeed(network)
         // No preset for this network -> never push; the engine keeps
         // eth_getLogs in its honest not-configured state.
-        val json = KohakuPreset.configJson(network, enabled) ?: return
+        val json = KohakuPreset.configJson(network, enabled, maxSpeed) ?: return
         val ok = handle.setLogIndexConfig(json)
         if (enabled && !ok) {
             log.warn("[desktop] log index config rejected for {} (Java engine, or engine gate down)", network)
@@ -571,6 +572,8 @@ class DesktopSettings(
     private var torRouting = false
     // Per-network opt-in for the eth_getLogs Kohaku-preset index (Rust engine only).
     private val logIndexOn = HashMap<String, Boolean>()
+    // Per-network backfill pacing (true = max download speed); see Settings.logIndexMaxSpeed.
+    private val logIndexMax = HashMap<String, Boolean>()
 
     /** Serializes file writes, separate from the state lock (`this`) so settings
      *  readers never wait on disk I/O. */
@@ -609,6 +612,9 @@ class DesktopSettings(
     override fun logIndexEnabled(network: String): Boolean =
         synchronized(this) { logIndexOn[network] ?: false }
     override fun setLogIndexEnabled(network: String, on: Boolean) = mutate { logIndexOn[network] = on }
+    override fun logIndexMaxSpeed(network: String): Boolean =
+        synchronized(this) { logIndexMax[network] ?: false }
+    override fun setLogIndexMaxSpeed(network: String, on: Boolean) = mutate { logIndexMax[network] = on }
 
     override fun displayName(network: String): String = info(network)?.displayName() ?: network
     override fun defaultRpcPort(network: String): Int = info(network)?.defaultRpcPort() ?: 8545
@@ -650,7 +656,13 @@ class DesktopSettings(
         p.getProperty(K_NATIVE_BLS)?.toBooleanStrictOrNull()?.let { nativeBls = it }
         p.getProperty(K_RUST_ENGINE)?.toBooleanStrictOrNull()?.let { rustEngine = it }
         p.getProperty(K_TOR)?.toBooleanStrictOrNull()?.let { torRouting = it }
-        p.stringPropertyNames().filter { it.startsWith(K_LOG_INDEX_PREFIX) }.forEach { k ->
+        p.stringPropertyNames().filter { it.startsWith(K_LOG_INDEX_SPEED_PREFIX) }.forEach { k ->
+            p.getProperty(k)?.toBooleanStrictOrNull()
+                ?.let { logIndexMax[k.removePrefix(K_LOG_INDEX_SPEED_PREFIX)] = it }
+        }
+        p.stringPropertyNames()
+            .filter { it.startsWith(K_LOG_INDEX_PREFIX) && !it.startsWith(K_LOG_INDEX_SPEED_PREFIX) }
+            .forEach { k ->
             p.getProperty(k)?.toBooleanStrictOrNull()
                 ?.let { logIndexOn[k.removePrefix(K_LOG_INDEX_PREFIX)] = it }
         }
@@ -694,6 +706,7 @@ class DesktopSettings(
         p.setProperty(K_RUST_ENGINE, rustEngine.toString())
         p.setProperty(K_TOR, torRouting.toString())
         logIndexOn.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_PREFIX$net", on.toString()) }
+        logIndexMax.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_SPEED_PREFIX$net", on.toString()) }
         return p
     }
 
@@ -731,6 +744,9 @@ class DesktopSettings(
         const val K_RUST_ENGINE = "rustEngine"
         const val K_TOR = "torRouting"
         const val K_LOG_INDEX_PREFIX = "logIndex."
+        // Distinct prefix nested under logIndex.* so the enable-loader's
+        // startsWith filter must exclude it (see load()).
+        const val K_LOG_INDEX_SPEED_PREFIX = "logIndex.maxSpeed."
     }
 }
 

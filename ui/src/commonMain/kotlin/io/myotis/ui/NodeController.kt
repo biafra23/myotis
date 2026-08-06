@@ -209,6 +209,13 @@ interface Settings {
     fun logIndexEnabled(network: String): Boolean = false
     fun setLogIndexEnabled(network: String, on: Boolean) {}
 
+    /** Backfill pacing for the log index, per network: true = max download
+     *  speed (multi-batch ticks), false = nice background pace (one batch
+     *  per tick). Fingerprint-neutral engine-side — flipping never resets
+     *  accumulated coverage. Defaults keep hosts compiling. */
+    fun logIndexMaxSpeed(network: String): Boolean = false
+    fun setLogIndexMaxSpeed(network: String, on: Boolean) {}
+
     /**
      * Minutes of no RPC/UI activity before a running stack is paused into idle sleep
      * (networking off, RPC listening, first request wakes it). 0 disables auto-pause.

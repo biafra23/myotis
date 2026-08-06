@@ -247,6 +247,15 @@ public final class NodeService extends Service {
         return prefs(c).getBoolean("logIndex." + canonicalNetwork(network), false);
     }
 
+    /** Backfill pacing (true = max download speed); same key scheme as the desktop. */
+    public static boolean logIndexMaxSpeed(android.content.Context c, String network) {
+        return prefs(c).getBoolean("logIndex.maxSpeed." + canonicalNetwork(network), false);
+    }
+
+    public static void setLogIndexMaxSpeed(android.content.Context c, String network, boolean on) {
+        prefs(c).edit().putBoolean("logIndex.maxSpeed." + canonicalNetwork(network), on).apply();
+    }
+
     public static void setLogIndexEnabled(android.content.Context c, String network, boolean on) {
         prefs(c).edit().putBoolean("logIndex." + canonicalNetwork(network), on).apply();
     }
@@ -293,7 +302,7 @@ public final class NodeService extends Service {
 
     private void pushLogIndexConfig(String net, ChainHandle handle) {
         boolean enabled = logIndexEnabled(this, net);
-        String json = io.myotis.ui.KohakuPreset.INSTANCE.configJson(net, enabled);
+        String json = io.myotis.ui.KohakuPreset.INSTANCE.configJson(net, enabled, logIndexMaxSpeed(this, net));
         if (json == null) {
             return; // no preset for this network — engine stays honestly unconfigured
         }

@@ -33,6 +33,11 @@ pub struct WatchEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogIndexConfig {
     pub enabled: bool,
+    /// Backfill pacing: `true` = the walker works a multi-batch time budget
+    /// per tick (max download speed); `false` = one batch per tick (nice,
+    /// background). Deliberately NOT part of the fingerprint — flipping it
+    /// must never invalidate accumulated coverage.
+    pub max_speed: bool,
     pub watch: Vec<WatchEntry>,
 }
 
@@ -241,6 +246,12 @@ impl LogIndex {
     /// host re-applies a config whose watch-list fingerprint is unchanged).
     pub fn set_enabled(&mut self, enabled: bool) {
         self.config.enabled = enabled;
+    }
+
+    /// Flip the backfill pacing bit without touching accumulated state (same
+    /// fingerprint-unchanged re-apply path as [`Self::set_enabled`]).
+    pub fn set_max_speed(&mut self, max_speed: bool) {
+        self.config.max_speed = max_speed;
     }
 
     pub fn config(&self) -> &LogIndexConfig {
@@ -642,6 +653,20 @@ impl LogIndex {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn max_speed_is_fingerprint_neutral_and_flippable() {
+        let w = WatchEntry { address: [7u8; 20], from_block: 5, topic0s: vec![] };
+        let a = LogIndexConfig { enabled: true, max_speed: false, watch: vec![w.clone()] };
+        let b = LogIndexConfig { enabled: true, max_speed: true, watch: vec![w] };
+        // Flipping pacing must never invalidate accumulated coverage.
+        assert_eq!(a.fingerprint(), b.fingerprint());
+        let mut ix = LogIndex::new(a).unwrap();
+        assert!(!ix.config().max_speed);
+        ix.set_max_speed(true);
+        assert!(ix.config().max_speed);
+    }
+
     use super::*;
 
     fn addr(b: u8) -> [u8; 20] {
@@ -670,7 +695,7 @@ mod tests {
     }
 
     fn config(entries: Vec<WatchEntry>) -> LogIndexConfig {
-        LogIndexConfig { enabled: true, watch: entries }
+        LogIndexConfig { enabled: true, max_speed: false, watch: entries }
     }
 
     /// `LogIndex::new(config(...)).unwrap()` shorthand for valid configs.
@@ -715,7 +740,7 @@ mod tests {
         let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
         ix.append_block(10, [0xbb; 32], vec![]).unwrap();
         assert_eq!(ix.query(&filter(0, 10, addr(2))), Err(QueryError::UnwatchedAddress(addr(2))));
-        let off = LogIndex::new(LogIndexConfig { enabled: false, watch: vec![watch_all(addr(1), 0)] }).unwrap();
+        let off = LogIndex::new(LogIndexConfig { enabled: false, max_speed: false, watch: vec![watch_all(addr(1), 0)] }).unwrap();
         assert_eq!(off.query(&filter(0, 0, addr(1))), Err(QueryError::Disabled));
         assert_eq!(ix.query(&LogFilter { from_block: 0, to_block: 10, addresses: vec![], topics: vec![] }), Err(QueryError::Unanswerable));
     }
@@ -938,7 +963,7 @@ mod bloom_match_tests {
             [b; 20]
         }
         let watch = WatchEntry { address: addr(1), from_block: 100, topic0s: vec![[7; 32]] };
-        let ix = LogIndex::new(LogIndexConfig { enabled: true, watch: vec![watch] }).unwrap();
+        let ix = LogIndex::new(LogIndexConfig { enabled: true, max_speed: false, watch: vec![watch] }).unwrap();
         let mut hit = EMPTY_BLOOM;
         accrue(&mut hit, &addr(1));
         accrue(&mut hit, &[7u8; 32]);

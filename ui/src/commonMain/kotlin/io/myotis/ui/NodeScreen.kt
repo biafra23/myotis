@@ -1679,6 +1679,25 @@ private fun IndexTab(
             "Indexes and serves eth_getLogs for the Kohaku privacy contracts — verified " +
                 "against receipt roots, backfilling to each contract's deployment block.",
         )
+        if (collecting) {
+            var maxSpeed by remember(network) { mutableStateOf(settings.logIndexMaxSpeed(network)) }
+            SwitchRow(
+                label = "Max download speed on $network",
+                checked = maxSpeed,
+                enabled = true,
+                onChange = { on ->
+                    maxSpeed = on
+                    settings.setLogIndexMaxSpeed(network, on)
+                    // Re-push the config; pacing is fingerprint-neutral, so
+                    // accumulated coverage survives the flip.
+                    controller.applyLogIndex(network)
+                },
+            )
+            Text(
+                if (maxSpeed) "Backfills as fast as peers serve — heavier on network and battery."
+                else "Nice background pace — one small batch every few seconds.",
+            )
+        }
         val parsed = snapshot?.logIndexJson?.let { LogIndexStatus.parse(it) }
         when {
             !collecting -> Text("Collection is off.")
@@ -1686,6 +1705,7 @@ private fun IndexTab(
                 Text("Waiting for the engine (start the network with the Rust engine).")
             else -> {
                 Text("${parsed.logCount} logs collected")
+                LogIndexStatus.progressLine(parsed)?.let { Text("Backfill: $it") }
                 preset.forEach { watch ->
                     val e = parsed.entries.firstOrNull { it.address == watch.address.lowercase() }
                     val low = e?.coveredLow

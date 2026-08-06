@@ -2009,46 +2009,55 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(config_json) else {
         return false;
     };
-    let enabled = v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
-    let mut watch = Vec::new();
-    if v.get("watch").is_some_and(|w| !w.is_array() && !w.is_null()) {
+    let Some(config) = parse_log_index_config(&v) else {
         return false;
-    }
-    if let Some(entries) = v.get("watch").and_then(|w| w.as_array()) {
-        for e in entries {
-            let Some(address) = e.get("address").and_then(|a| a.as_str()).and_then(parse_address) else {
-                return false;
-            };
-            let Some(from_block) = e.get("fromBlock").and_then(|b| b.as_u64()) else {
-                return false;
-            };
-            let mut topic0s = Vec::new();
-            if e.get("topic0s").is_some_and(|t| !t.is_array() && !t.is_null()) {
-                return false;
-            }
-            if let Some(ts) = e.get("topic0s").and_then(|t| t.as_array()) {
-                for t in ts {
-                    let Some(w32) = t.as_str().and_then(parse_word32) else {
-                        return false;
-                    };
-                    topic0s.push(w32);
-                }
-            }
-            watch.push(myotis_net::el::logindex::WatchEntry { address, from_block, topic0s });
-        }
-    }
+    };
+    let enabled = config.enabled;
     let Some(engine) = engine() else {
         return false;
     };
     let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
         return false;
     };
-    let installed = reader.set_log_index_config(myotis_net::el::logindex::LogIndexConfig { enabled, watch });
+    let installed = reader.set_log_index_config(config);
     if installed && enabled {
         // Spawn (or keep) the head-follow appender on the engine runtime.
         reader.ensure_log_index_appender(engine.rt.handle());
     }
     installed
+}
+
+/// Pure config-JSON → typed config (unit-tested; the FFI wrapper above only
+/// adds engine plumbing). `None` = malformed (wrong types); unknown keys are
+/// ignored for forward compatibility.
+fn parse_log_index_config(
+    v: &serde_json::Value,
+) -> Option<myotis_net::el::logindex::LogIndexConfig> {
+    let enabled = v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
+    // Backfill pacing (optional; absent = nice/background). Fingerprint-neutral:
+    // flipping it re-applies onto the live index without resetting coverage.
+    let max_speed = v.get("maxSpeed").and_then(|e| e.as_bool()).unwrap_or(false);
+    let mut watch = Vec::new();
+    if v.get("watch").is_some_and(|w| !w.is_array() && !w.is_null()) {
+        return None;
+    }
+    if let Some(entries) = v.get("watch").and_then(|w| w.as_array()) {
+        for e in entries {
+            let address = e.get("address").and_then(|a| a.as_str()).and_then(parse_address)?;
+            let from_block = e.get("fromBlock").and_then(|b| b.as_u64())?;
+            let mut topic0s = Vec::new();
+            if e.get("topic0s").is_some_and(|t| !t.is_array() && !t.is_null()) {
+                return None;
+            }
+            if let Some(ts) = e.get("topic0s").and_then(|t| t.as_array()) {
+                for t in ts {
+                    topic0s.push(t.as_str().and_then(parse_word32)?);
+                }
+            }
+            watch.push(myotis_net::el::logindex::WatchEntry { address, from_block, topic0s });
+        }
+    }
+    Some(myotis_net::el::logindex::LogIndexConfig { enabled, max_speed, watch })
 }
 
 /// Index status for hosts/UI: enabled, log count, backfill cursor, and per
@@ -2060,7 +2069,18 @@ pub fn log_index_status_json(handle: i64) -> String {
     let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
         return eljson::error_json("node is not running");
     };
-    let status = reader.with_log_index(|ix| {
+    let rate_bps = reader.log_index_rate_bps();
+    let status = reader.with_log_index(|ix| build_log_index_status(ix, rate_bps));
+    status.unwrap_or_else(|| "{\"enabled\":false,\"logCount\":0,\"entries\":[]}".to_string())
+}
+
+/// Pure status serializer (unit-tested): fixed key order, no whitespace —
+/// the Kotlin LogIndexStatus parser and its golden test pin this shape.
+fn build_log_index_status(
+    ix: &myotis_net::el::logindex::LogIndex,
+    rate_bps: Option<f64>,
+) -> String {
+    {
         let mut s = String::from("{\"enabled\":");
         s.push_str(if ix.config().enabled { "true" } else { "false" });
         s.push_str(",\"logCount\":");
@@ -2068,6 +2088,30 @@ pub fn log_index_status_json(handle: i64) -> String {
         if let Some((n, _)) = ix.cursor {
             s.push_str(",\"backfillCursor\":");
             s.push_str(&n.to_string());
+        }
+        s.push_str(",\"maxSpeed\":");
+        s.push_str(if ix.config().max_speed { "true" } else { "false" });
+        // Backfill progress for the hosts' Index tab: the walk target, blocks
+        // remaining to it, and — once the walker has a measured rate — an ETA.
+        // All optional-by-context so the shape stays honest: no cursor yet →
+        // no remaining; no rate yet → no ETA (hosts then show x/y instead).
+        if let Some(target_low) = ix.config().watch.iter().map(|w| w.from_block).min() {
+            s.push_str(",\"targetLow\":");
+            s.push_str(&target_low.to_string());
+            if let Some((n, _)) = ix.cursor {
+                let remaining = n.saturating_sub(target_low);
+                s.push_str(",\"blocksRemaining\":");
+                s.push_str(&remaining.to_string());
+                if let Some(bps) = rate_bps {
+                    if bps > 0.05 {
+                        s.push_str(",\"blocksPerSec\":");
+                        s.push_str(&format!("{:.1}", bps));
+                        let eta = (remaining as f64 / bps).round() as u64;
+                        s.push_str(",\"etaSeconds\":");
+                        s.push_str(&eta.to_string());
+                    }
+                }
+            }
         }
         s.push_str(",\"entries\":[");
         for (k, (w, c)) in ix.coverage_entries().iter().enumerate() {
@@ -2090,8 +2134,7 @@ pub fn log_index_status_json(handle: i64) -> String {
         }
         s.push_str("]}");
         s
-    });
-    status.unwrap_or_else(|| "{\"enabled\":false,\"logCount\":0,\"entries\":[]}".to_string())
+    }
 }
 
 /// Parse an eth_getLogs filter into a typed [`LogFilter`], resolving tags
@@ -2260,6 +2303,55 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
             None => eljson::error_json("log index has not indexed any blocks yet; retry"),
         },
         Some(Err(QueryError::Unanswerable)) => eljson::error_json("unanswerable filter (fromBlock > toBlock)"),
+    }
+}
+
+#[cfg(test)]
+mod log_index_json_tests {
+    use super::{build_log_index_status, parse_log_index_config};
+
+    fn cfg(json: &str) -> Option<myotis_net::el::logindex::LogIndexConfig> {
+        parse_log_index_config(&serde_json::from_str(json).unwrap())
+    }
+
+    #[test]
+    fn parses_max_speed_default_and_explicit() {
+        let base = r#"{"enabled":true,"watch":[{"address":"0x4e69fD587118dFb64957d18654E3894118E9b1BF","fromBlock":5}]}"#;
+        let c = cfg(base).unwrap();
+        assert!(c.enabled);
+        assert!(!c.max_speed, "absent maxSpeed must default to nice");
+        let fast = cfg(r#"{"enabled":true,"maxSpeed":true,"watch":[]}"#).unwrap();
+        assert!(fast.max_speed);
+        // Wrong type on watch is malformed, unknown keys are tolerated.
+        assert!(cfg(r#"{"enabled":true,"watch":7}"#).is_none());
+        assert!(cfg(r#"{"enabled":true,"futureKey":1,"watch":[]}"#).is_some());
+    }
+
+    #[test]
+    fn status_json_carries_progress_keys() {
+        let w = myotis_net::el::logindex::WatchEntry {
+            address: [0x11; 20],
+            from_block: 100,
+            topic0s: vec![],
+        };
+        let cfg = myotis_net::el::logindex::LogIndexConfig {
+            enabled: true,
+            max_speed: true,
+            watch: vec![w],
+        };
+        let mut ix = myotis_net::el::logindex::LogIndex::new(cfg).unwrap();
+        ix.cursor = Some((600, [0u8; 32]));
+        let s = build_log_index_status(&ix, Some(9.44));
+        assert!(s.contains("\"maxSpeed\":true"), "{s}");
+        assert!(s.contains("\"targetLow\":100"), "{s}");
+        assert!(s.contains("\"blocksRemaining\":500"), "{s}");
+        assert!(s.contains("\"blocksPerSec\":9.4"), "{s}");
+        // eta = 500 / 9.44 = 52.966 -> 53
+        assert!(s.contains("\"etaSeconds\":53"), "{s}");
+        // No rate -> no ETA keys, remaining still present.
+        let s2 = build_log_index_status(&ix, None);
+        assert!(s2.contains("\"blocksRemaining\":500"), "{s2}");
+        assert!(!s2.contains("etaSeconds"), "{s2}");
     }
 }
 

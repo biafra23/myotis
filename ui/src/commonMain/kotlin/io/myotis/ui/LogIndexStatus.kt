@@ -15,7 +15,19 @@ object LogIndexStatus {
         val coveredHigh: Long?,
     )
 
-    data class Parsed(val enabled: Boolean, val logCount: Long, val entries: List<Entry>)
+    data class Parsed(
+        val enabled: Boolean,
+        val logCount: Long,
+        val entries: List<Entry>,
+        /** Lowest watched fromBlock — the backfill's walk target. */
+        val targetLow: Long? = null,
+        /** Blocks between the walk cursor and the target (null before the walker seeds). */
+        val blocksRemaining: Long? = null,
+        /** Rolling backfill throughput; null until the walker has measured progress. */
+        val blocksPerSec: Double? = null,
+        /** remaining/rate, engine-computed; null whenever the rate is unknown. */
+        val etaSeconds: Long? = null,
+    )
 
     /** Structured parse of the engine's status JSON (regex over the fixed
      *  serializer shape — the same shape [format] reads). */
@@ -33,7 +45,62 @@ object LogIndexStatus {
                 coveredHigh = m.groupValues[4].takeIf { it.isNotEmpty() }?.toLongOrNull(),
             )
         }.toList()
-        return Parsed(enabled, logCount, entries)
+        val targetLow = Regex("\"targetLow\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
+        val remaining = Regex("\"blocksRemaining\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
+        val bps = Regex("\"blocksPerSec\":([0-9.]+)").find(json)?.groupValues?.get(1)?.toDoubleOrNull()
+        val eta = Regex("\"etaSeconds\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
+        return Parsed(enabled, logCount, entries, targetLow, remaining, bps, eta)
+    }
+
+    /** Human progress line for the Index tab: an ETA when the engine has a
+     *  measured rate, otherwise x/y blocks (or a waiting note). Pure Kotlin —
+     *  commonMain compiles for Kotlin/Native too, so no String.format. */
+    fun progressLine(p: Parsed): String? {
+        val remaining = p.blocksRemaining ?: return null
+        if (remaining == 0L) return "backfill complete"
+        val eta = p.etaSeconds
+        if (eta != null && p.blocksPerSec != null) {
+            return "~${formatDuration(eta)} remaining " +
+                "(${grouped(remaining)} blocks, ${formatRate(p.blocksPerSec)} blk/s)"
+        }
+        // No rate yet — x/y anchored on the TARGET-DEFINING entry's covered
+        // high edge (the entry whose fromBlock is the walk target), so the
+        // fraction reflects one coherent span rather than a blend of entries
+        // at different depths. The high edge still creeps upward as the
+        // appender follows the head (a slow drift of the total, ~32 blocks
+        // per epoch, dwarfed by backfill strides) — acceptable for a display
+        // that is replaced by the ETA as soon as a rate exists.
+        val target = p.targetLow
+        val high = p.entries.firstOrNull { it.fromBlock == target }?.coveredHigh
+        if (high != null && target != null && high > target) {
+            val total = high - target
+            val done = (total - remaining).coerceAtLeast(0)
+            return "${grouped(done)} / ${grouped(total)} blocks"
+        }
+        return "${grouped(remaining)} blocks remaining"
+    }
+
+    /** One decimal below 10 (a slow walk must not read as "0 blk/s"),
+     *  rounded integer above (multiplatform-safe — no String.format). */
+    private fun formatRate(bps: Double): String {
+        val tenths = kotlin.math.round(bps * 10).toLong()
+        return if (tenths < 100) "${tenths / 10}.${tenths % 10}" else (tenths / 10).toString()
+    }
+
+    /** Thousands-grouped decimal (multiplatform-safe). */
+    private fun grouped(n: Long): String =
+        n.toString().reversed().chunked(3).joinToString(",").reversed()
+
+    private fun formatDuration(secs: Long): String {
+        val d = secs / 86_400
+        val h = (secs % 86_400) / 3600
+        val m = (secs % 3600) / 60
+        return when {
+            d > 0 -> "${d}d ${h}h"
+            h > 0 -> "${h}h ${m}m"
+            m > 0 -> "${m}m"
+            else -> "<1m"
+        }
     }
 
     /** Short status line, or a waiting note when the engine has no index yet. */
