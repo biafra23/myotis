@@ -5,6 +5,7 @@ import org.apache.tuweni.bytes.Bytes32;
 import org.junit.jupiter.api.Test;
 
 import java.util.HexFormat;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -105,29 +106,51 @@ class NetworkConfigGnosisTest {
     }
 
     @Test
-    void elBootEnodesAreDialableForGnosisOnly() {
-        // Gnosis publishes no EL enrtree, so it ships full enode://<pubkey>@host:port seeds for
-        // direct RLPx dialing. Networks that have an enrtree return an empty list.
+    void elBootEnodesAreDialableWhereShipped() {
+        // Gnosis publishes no EL enrtree, so it ships full enode://<pubkey>@host:port seeds
+        // for direct RLPx dialing. Sepolia HAS an enrtree but pins one entry anyway: the
+        // dedicated myotis-serving node, which admits wallets past its peer cap
+        // (docs/dedicated-sepolia-node.md) — direct-dialing it beats waiting for discovery
+        // to surface it on a saturated testnet. Mainnet ships none.
         assertTrue(NetworkConfig.MAINNET.elBootEnodes().isEmpty(), "mainnet has an enrtree");
-        assertTrue(NetworkConfig.SEPOLIA.elBootEnodes().isEmpty(), "sepolia has an enrtree");
 
-        var enodes = G.elBootEnodes();
-        assertFalse(enodes.isEmpty(), "Gnosis must ship static EL enode seeds");
-        assertEquals(16, enodes.size());
-        for (String enode : enodes) {
-            // Parse exactly as ChainStack does — proves each entry yields a valid pubkey + addr.
-            assertTrue(enode.startsWith("enode://"), enode);
-            String b = enode.substring(enode.indexOf("//") + 2);
-            int at = b.indexOf('@');
-            assertTrue(at > 0, "missing @ in " + enode);
-            // 64-byte uncompressed secp256k1 pubkey (128 hex chars), must decode to a key.
-            assertEquals(128, at, "pubkey must be 128 hex chars in " + enode);
-            assertNotNull(org.apache.tuweni.crypto.SECP256K1.PublicKey.fromBytes(
-                    Bytes.fromHexString(b.substring(0, at))), enode);
-            String hostPort = b.substring(at + 1);
-            int colon = hostPort.lastIndexOf(':');
-            assertTrue(colon > 0, "missing host:port in " + enode);
-            assertTrue(Integer.parseInt(hostPort.substring(colon + 1)) > 0, enode);
+        assertEquals(16, G.elBootEnodes().size(), "Gnosis must ship static EL enode seeds");
+        assertEquals(1, NetworkConfig.SEPOLIA.elBootEnodes().size(),
+                "sepolia pins the dedicated serving node");
+
+        for (NetworkConfig net : List.of(G, NetworkConfig.SEPOLIA)) {
+            for (String enode : net.elBootEnodes()) {
+                // Parse exactly as ChainStack does — proves each entry yields a valid
+                // pubkey + addr.
+                assertTrue(enode.startsWith("enode://"), enode);
+                String b = enode.substring(enode.indexOf("//") + 2);
+                int at = b.indexOf('@');
+                assertTrue(at > 0, "missing @ in " + enode);
+                // 64-byte uncompressed secp256k1 pubkey (128 hex chars), must decode to a key.
+                assertEquals(128, at, "pubkey must be 128 hex chars in " + enode);
+                assertNotNull(org.apache.tuweni.crypto.SECP256K1.PublicKey.fromBytes(
+                        Bytes.fromHexString(b.substring(0, at))), enode);
+                String hostPort = b.substring(at + 1);
+                int colon = hostPort.lastIndexOf(':');
+                assertTrue(colon > 0, "missing host:port in " + enode);
+                assertTrue(Integer.parseInt(hostPort.substring(colon + 1)) > 0, enode);
+            }
         }
+    }
+
+    @Test
+    void sepoliaPinsTheDedicatedServingNodeOnBothLayers() {
+        // Both halves of the dedicated pair are pinned so a wallet reaches them without
+        // waiting on discovery. The CL entry must come FIRST: the light client walks
+        // clPeerMultiaddrs in order, and this is the peer we know serves bootstraps.
+        String enode = NetworkConfig.SEPOLIA.elBootEnodes().get(0);
+        assertTrue(enode.endsWith("@87.154.209.161:30405"), enode);
+
+        String cl = NetworkConfig.SEPOLIA.clPeerMultiaddrs().get(0);
+        assertEquals("/ip4/87.154.209.161/tcp/9104/p2p/"
+                        + "16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6", cl,
+                "the dedicated Nimbus must be the first CL peer tried");
+        assertTrue(NetworkConfig.SEPOLIA.clPeerMultiaddrs().size() > 1,
+                "pinning must not drop the existing CL peers");
     }
 }
