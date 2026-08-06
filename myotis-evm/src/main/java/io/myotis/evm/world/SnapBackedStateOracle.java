@@ -366,18 +366,38 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
      * {@link #maxAttempts}. {@link EvmExecutionError.InvalidProof} and
      * generic IO failures both trigger retries with the next peer; the last
      * failure surfaces if every attempt fails.
+     *
+     * <p><b>Fail-fast:</b> a peer that already failed within THIS operation is
+     * never retried — its refusal is deterministic on the timescale of one
+     * read (an empty proof for a root it doesn't retain won't materialize ten
+     * seconds later, and a hung peer costs a full request timeout per retry).
+     * When the supplier has no peer we haven't already tried, the last failure
+     * surfaces immediately. On a healthy multi-peer pool this changes nothing
+     * (the routing supplier rotates anyway); on a one-peer pool it collapses
+     * the worst case from {@code maxAttempts × request-timeout} (~30s of
+     * zombie latency, longer than wallet client timeouts) to a single attempt.
      */
     private <T> CompletableFuture<T> tryWithRetries(java.util.function.Function<SnapPeer, CompletableFuture<T>> op) {
         CompletableFuture<T> result = new CompletableFuture<>();
-        attempt(op, 0, null, result);
+        // Keys are SnapPeer.identity() tokens, compared by reference.
+        attempt(op, 0, null, result,
+                java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()));
         return result;
     }
+
+    /** How many supplier consults one attempt slot may spend skimming for an
+     *  UNTRIED peer before concluding there is none. Routing suppliers share a
+     *  rotation counter across concurrent operations, so a repeat does not by
+     *  itself prove exhaustion — a couple of extra (cheap, I/O-free) consults
+     *  skim past interleaving; a one-peer pool still fails in microseconds. */
+    private static final int FAIL_FAST_CONSULTS_PER_ATTEMPT = 4;
 
     private <T> void attempt(
             java.util.function.Function<SnapPeer, CompletableFuture<T>> op,
             int attemptIdx,
             Throwable lastError,
-            CompletableFuture<T> sink) {
+            CompletableFuture<T> sink,
+            java.util.Set<Object> triedPeers) {
         if (attemptIdx >= maxAttempts) {
             sink.completeExceptionally(lastError != null ? lastError
                     : new EvmExecutionException(new EvmExecutionError.InvalidProof(
@@ -385,8 +405,36 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
                             "exhausted " + maxAttempts + " peer attempts")));
             return;
         }
-        SnapPeer peer = peerSupplier.get();
+        // Find a peer this operation hasn't tried yet. Dedup keys on
+        // SnapPeer.identity() — production suppliers wrap the long-lived
+        // connection in a fresh adapter per call, so the adapter's own
+        // object identity would never repeat and the dedup would be inert.
+        SnapPeer untried = null;
+        for (int consult = 0; consult < FAIL_FAST_CONSULTS_PER_ATTEMPT; consult++) {
+            SnapPeer candidate = peerSupplier.get();
+            if (candidate == null) {
+                sink.completeExceptionally(lastError != null ? lastError
+                        : new EvmExecutionException(new EvmExecutionError.StateUnavailable(
+                                new byte[32], Address.ZERO, null)));
+                return;
+            }
+            if (triedPeers.add(candidate.identity())) {
+                untried = candidate;
+                break;
+            }
+        }
+        final SnapPeer peer = untried;
         if (peer == null) {
+            // Every consult returned a peer this operation already tried — the
+            // pool has nothing new. Surface the last failure NOW instead of
+            // burning another identical attempt (fail-fast): a refusal is
+            // deterministic on the timescale of one read, and a hung peer
+            // costs a full request timeout per re-ask. lastError is always
+            // non-null here (attempt 0 can't collide with an empty tried-set),
+            // but keep the synthetic fallback rather than an NPE if that
+            // invariant ever shifts.
+            log.warn("[snap-oracle] no untried peer left after {} attempt(s) — failing fast: {}",
+                    attemptIdx, lastError == null ? "?" : String.valueOf(unwrap(lastError)));
             sink.completeExceptionally(lastError != null ? lastError
                     : new EvmExecutionException(new EvmExecutionError.StateUnavailable(
                             new byte[32], Address.ZERO, null)));
@@ -396,8 +444,9 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
         try {
             future = op.apply(peer);
         } catch (Throwable t) {
-            log.warn("[snap-oracle] attempt {} threw synchronously: {}", attemptIdx, t.getMessage());
-            attempt(op, attemptIdx + 1, t, sink);
+            log.warn("[snap-oracle] attempt {} via {} threw synchronously: {}",
+                    attemptIdx, peer.describe(), t.getMessage());
+            attempt(op, attemptIdx + 1, t, sink, triedPeers);
             return;
         }
         future.whenComplete((value, error) -> {
@@ -425,8 +474,9 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
             if (cantServe) {
                 try { peer.reportRootUnavailable(); } catch (RuntimeException ignore) {}
             }
-            log.warn("[snap-oracle] attempt {} failed: {}", attemptIdx, error.getMessage());
-            attempt(op, attemptIdx + 1, cause, sink);
+            log.warn("[snap-oracle] attempt {} via {} failed: {}",
+                    attemptIdx, peer.describe(), String.valueOf(cause));
+            attempt(op, attemptIdx + 1, cause, sink, triedPeers);
         });
     }
 

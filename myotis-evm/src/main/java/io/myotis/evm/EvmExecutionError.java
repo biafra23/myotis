@@ -27,6 +27,11 @@ public sealed interface EvmExecutionError {
         }
         @Override public byte[] stateRoot() { return stateRoot.clone(); }
         @Override public byte[] slot() { return slot == null ? null : slot.clone(); }
+        // Records render byte[] by identity — useless in logs; see InvalidProof.
+        @Override public String toString() {
+            return "StateUnavailable[stateRoot=" + toHex(stateRoot)
+                    + ", address=" + address + ", slot=" + toHex(slot) + "]";
+        }
     }
 
     /** Bytecode fetch failed after retries. */
@@ -62,6 +67,12 @@ public sealed interface EvmExecutionError {
     record InvalidProof(byte[] stateRoot, Address address, String detail) implements EvmExecutionError {
         public InvalidProof { stateRoot = stateRoot.clone(); }
         @Override public byte[] stateRoot() { return stateRoot.clone(); }
+        // Records render byte[] by identity ("[B@6e8e2cf3") — useless in logs.
+        // Every diagnostic surface prints this record, so render the root as hex.
+        @Override public String toString() {
+            return "InvalidProof[stateRoot=" + toHex(stateRoot)
+                    + ", address=" + address + ", detail=" + detail + "]";
+        }
     }
 
     /** Content-aware hex formatter for error log lines. */

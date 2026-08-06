@@ -76,4 +76,25 @@ public interface SnapPeer {
      * serve a later head. Default no-op for fixture/test implementations.
      */
     default void reportRootUnavailable() {}
+
+    /**
+     * Short human-readable identity for logs ("ip:port" for network-backed
+     * implementations). Purely diagnostic — never used for routing decisions.
+     */
+    default String describe() {
+        String simple = getClass().getSimpleName();
+        return simple.isEmpty() ? getClass().getName() : simple;
+    }
+
+    /**
+     * Stable identity of the underlying peer, used to recognize "same peer
+     * again" across supplier calls within one oracle operation (the fail-fast
+     * dedup). Implementations that wrap a per-call adapter around a long-lived
+     * connection MUST return the underlying connection object — otherwise
+     * every supplier call looks like a fresh peer and the dedup never fires.
+     * Compared by object identity, never by equals.
+     */
+    default Object identity() {
+        return this;
+    }
 }

@@ -70,6 +70,16 @@ public final class EthHandlerSnapPeer implements SnapPeer {
     }
 
     @Override
+    public Object identity() {
+        return handler;
+    }
+
+    @Override
+    public String describe() {
+        return handler.getRemoteAddress();
+    }
+
+    @Override
     public void reportRootUnavailable() {
         // The oracle reports this from a future-completion handler that runs on the
         // Netty event loop; a host's deny callback may block (lock contention, sync

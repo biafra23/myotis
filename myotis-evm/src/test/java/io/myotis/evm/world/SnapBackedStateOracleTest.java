@@ -123,11 +123,100 @@ class SnapBackedStateOracleTest {
             var eee = assertInstanceOf(EvmExecutionException.class, cause);
             assertInstanceOf(EvmExecutionError.InvalidProof.class, eee.error());
         }
-        // Supplier was consulted once per attempt.
-        assertEquals(3, attempts.get());
-        // Each InvalidProof tells the peer it can't serve this root, so a routing
-        // supplier can rotate away from it (the fix for empty-proof churn).
-        assertEquals(3, peer.rootUnavailableCalls.get());
+        // Fail-fast: the refusal is deterministic, so the operation ends after ONE
+        // real attempt instead of burning the rest of the retry budget re-asking
+        // the same peer (the 30s zombie-call fix). The supplier is consulted once
+        // for the real attempt plus a short I/O-free skim (bounded per attempt
+        // slot) that discovers there is nothing untried.
+        assertEquals(1 + 4, attempts.get());
+        // The one real attempt reports the peer so a routing supplier rotates
+        // away from it for the rest of this head context.
+        assertEquals(1, peer.rootUnavailableCalls.get());
+    }
+
+    @Test
+    void failFastSeesThroughFreshAdapterWrappers() {
+        // Production suppliers (VerifiedRpcBackend) wrap the long-lived connection
+        // in a NEW adapter object on every supplier call. The dedup must key on
+        // SnapPeer.identity() — the underlying connection — or it never fires in
+        // production (each wrapper would look like a fresh peer).
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        Bytes32 root = Bytes32.fromHexString(
+                "0x6666666666666666666666666666666666666666666666666666666666666666");
+        Bytes garbage = RLP.encodeList(w -> {
+            w.writeValue(Bytes.fromHexString("0x20"));
+            w.writeValue(Bytes.fromHexString("0xdead"));
+        });
+        FixturePeer underlying = new FixturePeer();
+        underlying.addTrieNodes(root, List.of(garbage));
+
+        record Wrapper(FixturePeer delegate) implements SnapPeer {
+            @Override public CompletableFuture<List<Bytes>> getTrieNodes(Bytes32 sr, List<PathSet> p) {
+                return delegate.getTrieNodes(sr, p);
+            }
+            @Override public CompletableFuture<List<Bytes>> getByteCodes(List<Bytes32> h) {
+                return delegate.getByteCodes(h);
+            }
+            @Override public void reportRootUnavailable() { delegate.reportRootUnavailable(); }
+            @Override public Object identity() { return delegate; }
+        }
+        AtomicInteger consults = new AtomicInteger();
+        Supplier<SnapPeer> freshWrapperPerCall = () -> {
+            consults.incrementAndGet();
+            return new Wrapper(underlying); // new object identity every call
+        };
+
+        var oracle = new SnapBackedStateOracle(freshWrapperPerCall, BytecodeCache.inMemory(), 3);
+        try {
+            oracle.fetchAccount(root.toArrayUnsafe(), addr).get();
+            fail("expected fetchAccount to fail");
+        } catch (Exception e) {
+            Throwable cause = e instanceof ExecutionException ? e.getCause() : e;
+            var eee = assertInstanceOf(EvmExecutionException.class, cause);
+            assertInstanceOf(EvmExecutionError.InvalidProof.class, eee.error());
+        }
+        // One real attempt + the bounded skim — NOT maxAttempts real attempts.
+        // Without identity()-keyed dedup this would be 3 real attempts and the
+        // report counter would read 3.
+        assertEquals(1 + 4, consults.get());
+        assertEquals(1, underlying.rootUnavailableCalls.get());
+    }
+
+    @Test
+    void failFastEndsAfterBothDistinctPeersRefuse() {
+        // Two refusing peers, supplier alternating between them, budget of 5: the
+        // operation must try each exactly once, then fail fast when the supplier
+        // has nothing it hasn't already tried — never re-asking either peer.
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        Bytes32 root = Bytes32.fromHexString(
+                "0x5555555555555555555555555555555555555555555555555555555555555555");
+        Bytes garbage = RLP.encodeList(w -> {
+            w.writeValue(Bytes.fromHexString("0x20"));
+            w.writeValue(Bytes.fromHexString("0xdead"));
+        });
+        FixturePeer a = new FixturePeer();
+        FixturePeer b = new FixturePeer();
+        a.addTrieNodes(root, List.of(garbage));
+        b.addTrieNodes(root, List.of(garbage));
+        AtomicInteger consults = new AtomicInteger();
+        Supplier<SnapPeer> alternating = () -> consults.getAndIncrement() % 2 == 0 ? a : b;
+
+        var oracle = new SnapBackedStateOracle(alternating, BytecodeCache.inMemory(), 5);
+        try {
+            oracle.fetchAccount(root.toArrayUnsafe(), addr).get();
+            fail("expected fetchAccount to fail");
+        } catch (Exception e) {
+            Throwable cause = e instanceof ExecutionException ? e.getCause() : e;
+            var eee = assertInstanceOf(EvmExecutionException.class, cause);
+            assertInstanceOf(EvmExecutionError.InvalidProof.class, eee.error(),
+                    "the surfaced failure is the last real attempt's, not a synthetic one");
+        }
+        // a tried, b tried, then the bounded skim finds only repeats → fail fast
+        // with most of the 5-attempt budget unused (2 real attempts, not 5).
+        assertEquals(2 + 4, consults.get(),
+                "one consult per real attempt plus the bounded fail-fast skim");
+        assertEquals(1, a.rootUnavailableCalls.get());
+        assertEquals(1, b.rootUnavailableCalls.get());
     }
 
     @Test
@@ -177,7 +266,10 @@ class SnapBackedStateOracleTest {
             Thread.currentThread().interrupt();
             fail("interrupted");
         }
-        assertEquals(3, reported.get(), "each timeout must report the peer root-unavailable");
+        // One report, not maxAttempts: after the first timeout the fail-fast path
+        // refuses to re-ask the only peer (each extra ask would cost a full request
+        // timeout for a peer already flagged useless for this head).
+        assertEquals(1, reported.get(), "the timeout must report the peer root-unavailable");
     }
 
     @Test
@@ -207,7 +299,7 @@ class SnapBackedStateOracleTest {
             Thread.currentThread().interrupt();
             fail("interrupted");
         }
-        assertEquals(2, reported.get());
+        assertEquals(1, reported.get(), "one report — fail-fast skips the identical re-ask");
     }
 
     @Test
@@ -247,7 +339,7 @@ class SnapBackedStateOracleTest {
             Thread.currentThread().interrupt();
             fail("interrupted");
         }
-        assertEquals(2, reported.get(),
+        assertEquals(1, reported.get(),
                 "a multiply-wrapped timeout must still be unwrapped and denied");
     }
 
@@ -413,21 +505,27 @@ class SnapBackedStateOracleTest {
                 Bytes32.wrap(Hash.keccak256(Bytes.EMPTY).toArrayUnsafe()));
         var accountTrie = TrieFixture.singleLeaf(keccak(addr.toByteArray()), accountValue);
 
+        // Two DISTINCT peers (fail-fast never re-asks a peer that failed within one
+        // operation, so the rotation must be real): the first serves only the account
+        // proof, the second only the storage proof.
         AtomicInteger attempt = new AtomicInteger();
-        SnapPeer rotating = new SnapPeer() {
+        record HalfPeer(java.util.function.Supplier<List<Bytes>> proof, AtomicInteger counter)
+                implements SnapPeer {
             @Override public CompletableFuture<List<Bytes>> getTrieNodes(Bytes32 sr, List<PathSet> p) {
-                // 1st: account proof only (slot fails → chunk retries).
-                // 2nd+: storage proof only (account must come from the warm cache).
-                int n = attempt.incrementAndGet();
-                return CompletableFuture.completedFuture(n == 1 ? accountTrie.proof : storageTrie.proof);
+                counter.incrementAndGet();
+                return CompletableFuture.completedFuture(proof.get());
             }
             @Override public CompletableFuture<List<Bytes>> getByteCodes(List<Bytes32> h) {
                 return CompletableFuture.completedFuture(List.of());
             }
-            @Override public void reportRootUnavailable() { }
-        };
+        }
+        SnapPeer accountOnly = new HalfPeer(() -> accountTrie.proof, attempt);
+        SnapPeer storageOnly = new HalfPeer(() -> storageTrie.proof, attempt);
+        AtomicInteger consults = new AtomicInteger();
+        Supplier<SnapPeer> rotation = () ->
+                consults.getAndIncrement() == 0 ? accountOnly : storageOnly;
         var oracle = new SnapBackedStateOracle(
-                () -> rotating, BytecodeCache.inMemory(), 8, StateProofCache.inMemory(1024));
+                rotation, BytecodeCache.inMemory(), 8, StateProofCache.inMemory(1024));
         byte[] root = accountTrie.root.toArrayUnsafe();
 
         Map<Address, Set<BigInteger>> req = new HashMap<>();
