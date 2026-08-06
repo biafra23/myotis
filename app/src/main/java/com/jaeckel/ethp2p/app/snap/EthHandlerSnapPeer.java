@@ -55,6 +55,16 @@ public final class EthHandlerSnapPeer implements SnapPeer {
     }
 
     @Override
+    public Object identity() {
+        return handler;
+    }
+
+    @Override
+    public String describe() {
+        return handler.getRemoteAddress();
+    }
+
+    @Override
     public void reportRootUnavailable() {
         if (onRootUnavailable != null) onRootUnavailable.run();
     }

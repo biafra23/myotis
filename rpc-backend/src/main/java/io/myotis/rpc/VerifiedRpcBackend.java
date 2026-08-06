@@ -1767,8 +1767,9 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                                 return new EthHandlerSnapPeer(
                                         chosen,
                                         () -> { rootDenied.add(chosen); rootServed.remove(chosen);
-                                                recordSnapQuality(chosen, false); },
-                                        () -> { rootServed.add(chosen); recordSnapQuality(chosen, true); },
+                                                recordSnapQualityAsync(chosen, false); },
+                                        () -> { rootServed.add(chosen);
+                                                recordSnapQualityAsync(chosen, true); },
                                         snapLaneGate);
                             }
                             // Discovery phase (none proven yet): probed peer first (known to
@@ -1779,8 +1780,9 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                                 return new EthHandlerSnapPeer(
                                         pp,
                                         () -> { rootDenied.add(pp); rootServed.remove(pp);
-                                                recordSnapQuality(pp, false); },
-                                        () -> { rootServed.add(pp); recordSnapQuality(pp, true); },
+                                                recordSnapQualityAsync(pp, false); },
+                                        () -> { rootServed.add(pp);
+                                                recordSnapQualityAsync(pp, true); },
                                         snapLaneGate);
                             }
                             // activeSnapHandlers() already returns only ready, snap-negotiated,
@@ -1795,8 +1797,9 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                             return new EthHandlerSnapPeer(
                                     chosen,
                                     () -> { rootDenied.add(chosen); rootServed.remove(chosen);
-                                            recordSnapQuality(chosen, false); },
-                                    () -> { rootServed.add(chosen); recordSnapQuality(chosen, true); });
+                                            recordSnapQualityAsync(chosen, false); },
+                                    () -> { rootServed.add(chosen);
+                                            recordSnapQualityAsync(chosen, true); });
                         },
                         bytecodeCache,
                         SNAP_ORACLE_MAX_ATTEMPTS,
@@ -3841,6 +3844,14 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      * on a usable proof, {@code false} on a root-unavailable (empty/invalid proof,
      * timeout, IO). No-op if the handler's remote address can't be parsed.
      */
+    /** Offloaded quality recording for the snap-peer routing callbacks: those run
+     *  SYNCHRONOUSLY on the reporting thread (the adapter needs the routing sets
+     *  updated before the oracle's fail-fast skim re-consults the supplier), so
+     *  the potentially blocking sink call moves off-thread here instead. */
+    private void recordSnapQualityAsync(EthHandler peer, boolean served) {
+        java.util.concurrent.CompletableFuture.runAsync(() -> recordSnapQuality(peer, served));
+    }
+
     private void recordSnapQuality(EthHandler peer, boolean served) {
         if (peer == null) return;
         InetSocketAddress addr = remoteAddressOf(peer);
