@@ -121,7 +121,8 @@ async fn dedicated_node_serves_backfill_shapes() {
             i
         );
     }
-    eprintln!("[dedicated] prefix consistent — node serves the backfill shapes");
+    eprintln!("[dedicated] prefix count-consistent — node serves the backfill shapes \
+         (counts only; the walker itself verifies tx/receipt roots)");
     drop(peer);
 }
 

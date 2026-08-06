@@ -2171,10 +2171,36 @@ pub fn get_logs_json(handle: i64, filter_json: &str) -> String {
     let out = get_logs_json_impl(handle, filter_json);
     // Observability for wallet integration (requested during the Kohaku
     // bring-up): refusals log the exact filter at info so hosts can see what
-    // the wallet asked for without a proxy; successes stay at debug.
+    // the wallet asked for without a proxy; successes stay at debug. A
+    // polling wallet repeats the identical refused filter every few seconds
+    // for the whole backfill, so identical refusals are debounced to one
+    // line per minute. (Filter content is addresses/topics/ranges — the
+    // watched contract set — no secrets, but it IS the wallet's query
+    // surface, hence info not warn.)
     if let Some(reason) = out.strip_prefix("{\"error\":") {
-        tracing::info!(filter = %filter_json, refusal = %reason.trim_end_matches('}'),
-            "eth_getLogs refused");
+        let reason = reason.strip_suffix('}').unwrap_or(reason);
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        filter_json.hash(&mut h);
+        reason.hash(&mut h);
+        let key = h.finish();
+        static LAST_REFUSAL: std::sync::Mutex<Option<(u64, std::time::Instant)>> =
+            std::sync::Mutex::new(None);
+        let log_it = match LAST_REFUSAL.lock() {
+            Ok(mut slot) => match *slot {
+                Some((k, at)) if k == key && at.elapsed() < std::time::Duration::from_secs(60) => {
+                    false
+                }
+                _ => {
+                    *slot = Some((key, std::time::Instant::now()));
+                    true
+                }
+            },
+            Err(_) => true,
+        };
+        if log_it {
+            tracing::info!(filter = %filter_json, refusal = %reason, "eth_getLogs refused");
+        }
     } else {
         tracing::debug!(filter = %filter_json, "eth_getLogs served");
     }

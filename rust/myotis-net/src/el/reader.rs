@@ -792,13 +792,14 @@ impl ElReader {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut since_persist = 0u32;
             let mut ticks = 0u64;
+            let mut backfill_ok = 0u64;
             loop {
                 tick.tick().await;
                 let Some(reader) = weak.upgrade() else {
                     return; // reader torn down; the appender dies with it
                 };
                 reader.log_index_append_tick(&mut since_persist, ticks).await;
-                reader.log_index_backfill_step(ticks).await;
+                reader.log_index_backfill_step(ticks, &mut backfill_ok).await;
                 ticks = ticks.wrapping_add(1);
             }
         }));
@@ -901,7 +902,7 @@ impl ElReader {
     /// (bloom hit) get body+receipts fetched and verified against both roots
     /// before any log is stored. Peer refusal is a stall, never corruption:
     /// coverage simply doesn't extend until some peer serves the range.
-    async fn log_index_backfill_step(&self, ticks: u64) {
+    async fn log_index_backfill_step(&self, ticks: u64, backfill_ok: &mut u64) {
         let Some((config, cursor)) = self.with_log_index(|ix| (ix.config().clone(), ix.cursor)) else {
             return;
         };
@@ -935,11 +936,17 @@ impl ElReader {
                 .await
             {
                 Ok(()) => {
-                    if ticks % 50 == 0 {
+                    // Count SUCCESSES, not ticks: with intermittent failures a
+                    // ticks-modulo log can systematically miss the successful
+                    // ticks and stay silent while progressing. First success
+                    // logs immediately, then every 50th (~5 min when healthy).
+                    *backfill_ok += 1;
+                    if *backfill_ok % 50 == 1 {
                         let new_cursor = self.with_log_index(|ix| ix.cursor).flatten();
                         tracing::info!(
                             cursor = new_cursor.map(|(n, _)| n).unwrap_or(cur_n),
                             target = target_low,
+                            batches_applied = *backfill_ok,
                             "log index backfill progress"
                         );
                     }
@@ -1035,6 +1042,8 @@ impl ElReader {
         // Chunked: one request for ~1023 candidate blocks would blow through
         // peer soft response limits (~2 MiB) and permanently stall a
         // candidate-dense range on the exact-length check below.
+        // (Truncation arithmetic lives in `truncation_plan`/`should_apply` —
+        // pure and unit-tested; see backfill_truncation_tests.)
         // First candidate the peer did NOT serve this round (honest byte-budget
         // truncation): the batch is applied only ABOVE it, so coverage never
         // claims a block whose receipts we didn't verify, and the next tick's
@@ -1052,13 +1061,15 @@ impl ElReader {
             let receipt_blocks = receipt_blocks?;
             // Served items are an in-order prefix of the request (the per-block
             // root verification below catches any peer that violates that).
-            let usable = bodies.len().min(receipt_blocks.len()).min(chunk.len());
-            if usable == 0 {
+            let chunk_numbers: Vec<u64> = chunk.iter().map(|h| h.header.number).collect();
+            let Some((usable, chunk_stop)) =
+                truncation_plan(&chunk_numbers, bodies.len(), receipt_blocks.len())
+            else {
                 // Nothing served at all — a single block's receipts always fit
                 // a response budget, so this peer genuinely can't (or won't)
                 // serve the range; let the caller rotate to the next peer.
                 return Err("peer served no bodies/receipts for candidate chunk".to_string());
-            }
+            };
             for ((vh, body), receipts) in
                 chunk[..usable].iter().zip(&bodies[..usable]).zip(&receipt_blocks[..usable]) {
                 verify_body_transactions(&vh.header, body)?;
@@ -1084,12 +1095,12 @@ impl ElReader {
                     logs_by_block.insert(vh.header.number, watched);
                 }
             }
-            if usable < chunk.len() {
-                stop_below = Some(chunk[usable].header.number);
+            if let Some(stop) = chunk_stop {
+                stop_below = Some(stop);
                 tracing::debug!(
                     served = usable,
                     requested = chunk.len(),
-                    resume_at = chunk[usable].header.number,
+                    resume_at = stop,
                     "backfill chunk truncated by peer response budget; applying partial batch"
                 );
                 break 'chunks;
@@ -1117,7 +1128,7 @@ impl ElReader {
                 }
                 for vh in new_blocks {
                     let n = vh.header.number;
-                    if stop_below.is_some_and(|stop| n <= stop) {
+                    if !should_apply(n, stop_below) {
                         break; // unprocessed candidate — resume here next tick
                     }
                     let logs = logs_by_block.remove(&n).unwrap_or_default();
@@ -3697,3 +3708,71 @@ fn stored_logs_for_block(receipts: &[VerifiedReceipt]) -> Option<Vec<crate::el::
     }
     Some(out)
 }
+
+/// Pure truncation arithmetic for one backfill candidate chunk: given the
+/// chunk's block numbers (descending) and how many bodies/receipts the peer
+/// actually served, return `(usable, stop_below)` — the verified-prefix
+/// length and, when the peer's byte budget truncated the response, the block
+/// number of the FIRST unserved candidate (the batch must apply only above
+/// it). `None` = the peer served nothing usable (caller rotates peers).
+fn truncation_plan(
+    chunk_numbers_desc: &[u64],
+    bodies_served: usize,
+    receipts_served: usize,
+) -> Option<(usize, Option<u64>)> {
+    let usable = bodies_served.min(receipts_served).min(chunk_numbers_desc.len());
+    if usable == 0 {
+        return None;
+    }
+    let stop = chunk_numbers_desc.get(usable).copied();
+    Some((usable, stop))
+}
+
+/// Whether block `n` may be applied given the truncation cut: everything at
+/// or below the first unprocessed candidate is excluded — coverage must never
+/// claim a block whose candidate receipts were not verified.
+fn should_apply(n: u64, stop_below: Option<u64>) -> bool {
+    !stop_below.is_some_and(|stop| n <= stop)
+}
+
+#[cfg(test)]
+mod backfill_truncation_tests {
+    use super::{should_apply, truncation_plan};
+
+    #[test]
+    fn full_serve_has_no_cut() {
+        assert_eq!(truncation_plan(&[90, 80, 70], 3, 3), Some((3, None)));
+        // Over-serve (peer sent more than asked) still caps at the chunk.
+        assert_eq!(truncation_plan(&[90, 80], 5, 9), Some((2, None)));
+    }
+
+    #[test]
+    fn short_serve_cuts_at_first_unserved_candidate() {
+        // 3 candidates, only 2 receipt sets served → cut at the 3rd (70).
+        assert_eq!(truncation_plan(&[90, 80, 70], 3, 2), Some((2, Some(70))));
+        // The boundary block itself must NOT be applied; blocks above must.
+        assert!(should_apply(71, Some(70)));
+        assert!(!should_apply(70, Some(70)));
+        assert!(!should_apply(69, Some(70)));
+        assert!(should_apply(70, None));
+    }
+
+    #[test]
+    fn empty_serve_is_peer_failure() {
+        assert_eq!(truncation_plan(&[90, 80], 0, 5), None);
+        assert_eq!(truncation_plan(&[90, 80], 5, 0), None);
+        assert_eq!(truncation_plan(&[], 5, 5), None);
+    }
+
+    #[test]
+    fn first_candidate_only_still_makes_progress() {
+        // Only the first candidate served: the cut is the SECOND candidate,
+        // so the batch still applies at least every block above it — the
+        // cursor strictly descends (no same-cursor livelock).
+        let plan = truncation_plan(&[100, 99, 98], 1, 1);
+        assert_eq!(plan, Some((1, Some(99))));
+        assert!(should_apply(100, Some(99)));
+        assert!(!should_apply(99, Some(99)));
+    }
+}
+
