@@ -1067,8 +1067,16 @@ impl ElReader {
             else {
                 // Nothing served at all — a single block's receipts always fit
                 // a response budget, so this peer genuinely can't (or won't)
-                // serve the range; let the caller rotate to the next peer.
-                return Err("peer served no bodies/receipts for candidate chunk".to_string());
+                // serve the range (pruned history, not a byte budget); let the
+                // caller rotate to the next peer. DELIBERATE on later chunks
+                // too: this discards the batch's earlier verified chunks, but
+                // an empty serve is a data-availability signal, and retrying
+                // the whole batch against a peer that HAS the range beats
+                // committing a shortened batch sourced from one that doesn't.
+                return Err(format!(
+                    "peer served no bodies/receipts for candidate chunk starting at block {}",
+                    chunk_numbers.first().copied().unwrap_or_default()
+                ));
             };
             for ((vh, body), receipts) in
                 chunk[..usable].iter().zip(&bodies[..usable]).zip(&receipt_blocks[..usable]) {

@@ -2178,24 +2178,41 @@ pub fn get_logs_json(handle: i64, filter_json: &str) -> String {
     // watched contract set — no secrets, but it IS the wallet's query
     // surface, hence info not warn.)
     if let Some(reason) = out.strip_prefix("{\"error\":") {
-        let reason = reason.strip_suffix('}').unwrap_or(reason);
+        // Strip the JSON wrapping (trailing brace and the value's quotes) so
+        // the log line reads as prose, not nested JSON.
+        let reason = reason
+            .strip_suffix('}')
+            .unwrap_or(reason)
+            .trim_matches('"');
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
+        handle.hash(&mut h); // distinct networks debounce independently
         filter_json.hash(&mut h);
         reason.hash(&mut h);
         let key = h.finish();
-        static LAST_REFUSAL: std::sync::Mutex<Option<(u64, std::time::Instant)>> =
-            std::sync::Mutex::new(None);
-        let log_it = match LAST_REFUSAL.lock() {
-            Ok(mut slot) => match *slot {
-                Some((k, at)) if k == key && at.elapsed() < std::time::Duration::from_secs(60) => {
-                    false
+        // Per-key debounce map, NOT a single slot: wallets poll several
+        // distinct filters (one per watched contract), and alternating
+        // refusals would evict a single slot every call — logging everything
+        // during exactly the catch-up window the debounce targets. Bounded:
+        // swept of expired entries whenever it grows past a handful.
+        static RECENT_REFUSALS: std::sync::Mutex<
+            Option<std::collections::HashMap<u64, std::time::Instant>>,
+        > = std::sync::Mutex::new(None);
+        const DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(60);
+        let log_it = match RECENT_REFUSALS.lock() {
+            Ok(mut slot) => {
+                let map = slot.get_or_insert_with(std::collections::HashMap::new);
+                if map.len() > 64 {
+                    map.retain(|_, at| at.elapsed() < DEBOUNCE);
                 }
-                _ => {
-                    *slot = Some((key, std::time::Instant::now()));
-                    true
+                match map.get(&key) {
+                    Some(at) if at.elapsed() < DEBOUNCE => false,
+                    _ => {
+                        map.insert(key, std::time::Instant::now());
+                        true
+                    }
                 }
-            },
+            }
             Err(_) => true,
         };
         if log_it {
