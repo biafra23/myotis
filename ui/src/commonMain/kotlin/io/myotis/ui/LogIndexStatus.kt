@@ -63,9 +63,15 @@ object LogIndexStatus {
             return "~${formatDuration(eta)} remaining " +
                 "(${grouped(remaining)} blocks, ${p.blocksPerSec.toInt()} blk/s)"
         }
-        // No rate yet — show x/y from the widest covered high edge.
-        val high = p.entries.mapNotNull { it.coveredHigh }.maxOrNull()
+        // No rate yet — x/y anchored on the TARGET-DEFINING entry's covered
+        // high edge (the entry whose fromBlock is the walk target), so the
+        // fraction reflects one coherent span rather than a blend of entries
+        // at different depths. The high edge still creeps upward as the
+        // appender follows the head (a slow drift of the total, ~32 blocks
+        // per epoch, dwarfed by backfill strides) — acceptable for a display
+        // that is replaced by the ETA as soon as a rate exists.
         val target = p.targetLow
+        val high = p.entries.firstOrNull { it.fromBlock == target }?.coveredHigh
         if (high != null && target != null && high > target) {
             val total = high - target
             val done = (total - remaining).coerceAtLeast(0)

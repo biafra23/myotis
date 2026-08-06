@@ -562,8 +562,12 @@ pub struct ElReader {
     /// queries are in-memory work; persistence happens on checkpoints and
     /// stop, never under a network await.
     log_index: std::sync::Mutex<Option<crate::el::logindex::LogIndex>>,
-    /// Rolling backfill throughput (blocks/s EMA) — see [`Self::log_index_rate_bps`].
-    log_index_rate: std::sync::Mutex<Option<f64>>,
+    /// Rolling backfill throughput — see [`Self::log_index_rate_bps`]. The
+    /// sample anchor is (instant, cursor) at the last PROGRESS observation, so
+    /// the rate is measured against WALL CLOCK between progress points (idle
+    /// tick tails count; a busy-time denominator overstated nice-mode rates
+    /// ~6x). Reset on any config (re)apply and on cursor regression.
+    log_index_rate: std::sync::Mutex<Option<(std::time::Instant, u64, f64)>>,
     log_index_path: Option<std::path::PathBuf>,
     /// The head-follow appender task (spawned on enable, aborted on stop).
     log_index_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -721,6 +725,12 @@ impl ElReader {
     /// in-memory progress survives settings pokes; a genuinely changed
     /// watch-list checkpoints the old index before replacing it.
     pub fn set_log_index_config(&self, config: crate::el::logindex::LogIndexConfig) -> bool {
+        // Any config poke invalidates the rate anchor: a pacing flip changes
+        // the true rate (stale EMA → bogus ETA for minutes), and a watch-list
+        // change starts a new walk entirely.
+        if let Ok(mut rate) = self.log_index_rate.lock() {
+            *rate = None;
+        }
         let Ok(mut slot) = self.log_index.lock() else {
             return false;
         };
@@ -914,38 +924,51 @@ impl ElReader {
         // for the appender and for RPC traffic on the shared pool.
         const MAX_SPEED_TICK_BUDGET: std::time::Duration = std::time::Duration::from_millis(4500);
         let started = std::time::Instant::now();
-        let cursor_before = self.with_log_index(|ix| ix.cursor).flatten().map(|(n, _)| n);
-        let mut rounds = 0u32;
+        let mut any_progress = false;
         loop {
             let (progressed, max_speed) = self.log_index_backfill_round(ticks, backfill_ok).await;
-            rounds += 1;
+            any_progress |= progressed;
             if !progressed || !max_speed || started.elapsed() >= MAX_SPEED_TICK_BUDGET {
                 break;
             }
             // Yield between rounds so this task never monopolizes the runtime.
             tokio::task::yield_now().await;
         }
-        // Rolling throughput for the status ETA — measured across the whole
-        // step (however many rounds it ran) so both pacing modes report
-        // honestly. Only samples where the cursor moved update the rate.
-        if let (Some(before), Some((after, _))) =
-            (cursor_before, self.with_log_index(|ix| ix.cursor).flatten())
-        {
-            if after < before {
-                let blocks = (before - after) as f64;
-                let secs = started.elapsed().as_secs_f64().max(0.001);
-                let inst = blocks / secs;
-                if let Ok(mut rate) = self.log_index_rate.lock() {
-                    // Blend per-STEP samples; ~6s cadence → a few minutes of memory.
-                    let ema = match *rate {
-                        Some(prev) => prev * 0.9 + inst * 0.1,
-                        None => inst,
-                    };
-                    *rate = Some(ema);
+        // Checkpoint once per STEP (not per batch): max-speed runs many
+        // batches per tick and a per-batch full-index persist would burn the
+        // budget on fsyncs; a crash now costs at most one step's batches.
+        if any_progress {
+            if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
+                if let Some(ix) = slot.as_ref() {
+                    let _ = ix.persist(path);
                 }
             }
         }
-        let _ = rounds;
+        // Rolling throughput for the status ETA, measured against WALL CLOCK
+        // between progress observations (the anchor persists across idle
+        // ticks, so nice mode's 6s cadence divides honestly). Cursor
+        // regression (fresh walk) resets the anchor without emitting a sample.
+        if let Some((cursor_now, _)) = self.with_log_index(|ix| ix.cursor).flatten() {
+            let now = std::time::Instant::now();
+            if let Ok(mut rate) = self.log_index_rate.lock() {
+                *rate = match *rate {
+                    Some((anchor_t, anchor_cursor, ema)) if cursor_now < anchor_cursor => {
+                        let blocks = (anchor_cursor - cursor_now) as f64;
+                        let secs = now.duration_since(anchor_t).as_secs_f64().max(0.001);
+                        let inst = blocks / secs;
+                        let blended = ema * 0.8 + inst * 0.2;
+                        Some((now, cursor_now, blended))
+                    }
+                    Some((anchor_t, anchor_cursor, ema)) if cursor_now == anchor_cursor => {
+                        // No progress this step: keep the anchor so the next
+                        // sample's denominator includes this idle time.
+                        Some((anchor_t, anchor_cursor, ema))
+                    }
+                    // First observation, or cursor regressed (new walk).
+                    _ => Some((now, cursor_now, 0.0)),
+                };
+            }
+        }
     }
 
     /// One backfill round: try every pooled peer for one batch at the current
@@ -999,14 +1022,8 @@ impl ElReader {
                             "log index backfill progress"
                         );
                     }
-                    // Checkpoint after every applied batch: the store is
-                    // small at Sepolia scale and a crash then costs at most
-                    // one batch (paged store before mainnet — design doc).
-                    if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
-                        if let Some(ix) = slot.as_ref() {
-                            let _ = ix.persist(path);
-                        }
-                    }
+                    // Persistence happens once per step (see the caller) —
+                    // per-batch fsyncs would eat the max-speed budget.
                     return (true, max_speed);
                 }
                 Err(e) => {
@@ -1203,7 +1220,11 @@ impl ElReader {
     /// `None` until the walker has made measurable progress this run. Feeds
     /// the status JSON's ETA; diagnostic only — never used for control flow.
     pub fn log_index_rate_bps(&self) -> Option<f64> {
-        self.log_index_rate.lock().ok().and_then(|r| *r)
+        self.log_index_rate
+            .lock()
+            .ok()
+            .and_then(|r| r.map(|(_, _, ema)| ema))
+            .filter(|ema| *ema > 0.0)
     }
 
     /// Run `f` against the index if one is configured. The single accessor
