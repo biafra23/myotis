@@ -277,6 +277,10 @@ ExecStart=/usr/bin/nimbus_beacon_node \
   --jwt-secret=/data/jwt.hex \
   --tcp-port=9000 --udp-port=9000 \
   --nat=extip:<PUBLIC_IP> \
+  --netkey-file=/data/nimbus/netkey \
+  --insecure-netkey-password=true \
+  --max-peers=500 \
+  --hard-max-peers=800 \
   --light-client-data-serve=true \
   --light-client-data-import-mode=full
 Restart=on-failure
@@ -308,11 +312,22 @@ Notes:
   state). So after the node is up, run `./gradlew refreshSepoliaCheckpoint`
   in the myotis repo so the shipped pin is **newer than the node's sync
   point** — that is the mitigation that actually works.
-- The libp2p **network key persists** in the data dir, so the peer-id — and
-  therefore the multiaddr — is stable across restarts. Back up
-  `/data/nimbus/` early. Record the multiaddr from the startup log line
-  ("Starting discovery" / "Local node identity"):
-  `/ip4/<PUBLIC_IP>/tcp/9000/p2p/<peerId>`.
+- **`--netkey-file` is REQUIRED for a stable peer-id.** It defaults to
+  `random`, i.e. Nimbus mints a **new** network key — and therefore a new
+  peer-id and multiaddr — on *every start*, silently invalidating any pinned
+  multiaddr (verified the hard way: a restart changed the peer-id and myotis
+  then failed every dial with `InvalidRemotePubKey`). The flags above pin it to
+  `/data/nimbus/netkey` (`--insecure-netkey-password=true` keeps startup
+  unattended). Back up `/data/nimbus/` early. Record the multiaddr from the
+  startup log line ("Starting discovery" / "Local node identity"):
+  `/ip4/<PUBLIC_IP>/tcp/<port>/p2p/<peerId>`.
+- **Raise the peer limits on a serving node.** Nimbus's default
+  `--max-peers=160` fills up with ordinary network peers and then stops
+  accepting: new inbound connections pile up unaccepted in the kernel backlog
+  (observed: 800 queued, 600 CLOSE-WAIT), so a wallet's TCP connect succeeds
+  but the libp2p handshake never happens and it times out. There is no
+  CL-side equivalent of the EL's name-based cap bypass, so headroom
+  (`--max-peers=500 --hard-max-peers=800`) is the only lever.
 
 ## 6. Verify end-to-end with myotis
 

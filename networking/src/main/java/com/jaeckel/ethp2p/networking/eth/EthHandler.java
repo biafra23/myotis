@@ -209,9 +209,11 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     // cross-thread from the connector's BlockRangeUpdate broadcast (which iterates all
     // connections' handlers).
     private volatile int negotiatedEthVersion = 68; // default, updated during Hello negotiation
-    // eth/69 (EIP-7642) BlockRangeUpdate, message id 0x11 within the eth capability.
-    // On eth/68 the same id is the obsolete NewBlockHashes, so this is version-gated.
-    private static final int ETH_BLOCK_RANGE_UPDATE = 0x11;
+    // eth/69 (EIP-7642) BlockRangeUpdate, message id 0x11 within the eth capability —
+    // wire code 0x10 + 0x11 = 0x21. Like the snap ids this is version-dependent: on
+    // eth/67-68 wire 0x21 is snap's GetAccountRange, so it stays -1 (never matches)
+    // and the obsolete NewBlockHashes at wire 0x11 falls through ignored.
+    private int ethBlockRangeUpdate = -1; // updated after Hello negotiation
 
     /** Optional sink for mempool-gossip tx hashes, set by the connector. When present
      *  AND {@link TxGossipObserver#watchingAny()} is true, inbound Transactions (0x12)
@@ -276,7 +278,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         // Advertise only held blocks — both ends of the Range, not the chain head.
         ServedHeaderWindow.Range r = servedWindow.advertise(head.blockNumber(), head.blockHash());
         byte[] payload = BlockRangeUpdateMessage.encode(r.earliest(), r.latest(), r.latestHash());
-        rlpxHandler.sendMessage(ctx, ETH_BLOCK_RANGE_UPDATE, payload);
+        rlpxHandler.sendMessage(ctx, ethBlockRangeUpdate, payload);
         log.debug("[eth] Sent BlockRangeUpdate range=[{},{}] to {}",
                 r.earliest(), r.latest(), clientId != null ? clientId : remoteAddress);
     }
@@ -389,6 +391,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             // eth/69 adds BlockRangeUpdate (0x11), making protocol length 18 instead of 17
             int ethProtocolLength = negotiatedEthVersion >= 69 ? 18 : 17;
             int snapBase = 0x10 + ethProtocolLength; // p2p base (16) + eth length
+            ethBlockRangeUpdate = negotiatedEthVersion >= 69 ? 0x10 + 0x11 : -1;
             snapGetAccountRange  = snapBase;
             snapAccountRange     = snapBase + 1;
             snapGetStorageRanges = snapBase + 2;
@@ -695,22 +698,6 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     log.debug("[eth] Failed to answer GetBlockBodies from peer: {}", e.getMessage());
                 }
             }
-            case ETH_BLOCK_RANGE_UPDATE -> {
-                // eth/69: a peer telling us its servable range changed. We don't yet route
-                // requests by peer range, so just log it. On eth/68 id 0x11 is the obsolete
-                // NewBlockHashes — the version guard drops it here (a light client ignores
-                // NewBlockHashes regardless), so it deliberately never reaches `default`.
-                if (negotiatedEthVersion >= 69) {
-                    try {
-                        BlockRangeUpdateMessage.Decoded u = BlockRangeUpdateMessage.decode(msg.payload());
-                        log.debug("[eth] Peer BlockRangeUpdate: range=[{},{}] from {}",
-                                u.earliestBlock(), u.latestBlock(),
-                                clientId != null ? clientId : remoteAddress);
-                    } catch (Exception e) {
-                        log.debug("[eth] Malformed BlockRangeUpdate ignored: {}", e.getMessage());
-                    }
-                }
-            }
             case P2P_PING -> sendPong(ctx);
             case P2P_DISCONNECT -> {
                 int reason = decodeDisconnectReason(msg.payload());
@@ -721,7 +708,18 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 ctx.close();
             }
             default -> {
-                if (msg.code() == snapAccountRange) {
+                if (ethBlockRangeUpdate > 0 && msg.code() == ethBlockRangeUpdate) {
+                    // eth/69: a peer telling us its servable range changed. We don't yet
+                    // route requests by peer range, so just log it.
+                    try {
+                        BlockRangeUpdateMessage.Decoded u = BlockRangeUpdateMessage.decode(msg.payload());
+                        log.debug("[eth] Peer BlockRangeUpdate: range=[{},{}] from {}",
+                                u.earliestBlock(), u.latestBlock(),
+                                clientId != null ? clientId : remoteAddress);
+                    } catch (Exception e) {
+                        log.debug("[eth] Malformed BlockRangeUpdate ignored: {}", e.getMessage());
+                    }
+                } else if (msg.code() == snapAccountRange) {
                     handleSnapAccountRange(msg);
                 } else if (msg.code() == snapGetAccountRange) {
                     handleSnapGetAccountRange(ctx, msg);
