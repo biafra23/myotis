@@ -61,7 +61,7 @@ object LogIndexStatus {
         val eta = p.etaSeconds
         if (eta != null && p.blocksPerSec != null) {
             return "~${formatDuration(eta)} remaining " +
-                "(${grouped(remaining)} blocks, ${p.blocksPerSec.toInt()} blk/s)"
+                "(${grouped(remaining)} blocks, ${formatRate(p.blocksPerSec)} blk/s)"
         }
         // No rate yet — x/y anchored on the TARGET-DEFINING entry's covered
         // high edge (the entry whose fromBlock is the walk target), so the
@@ -78,6 +78,13 @@ object LogIndexStatus {
             return "${grouped(done)} / ${grouped(total)} blocks"
         }
         return "${grouped(remaining)} blocks remaining"
+    }
+
+    /** One decimal below 10 (a slow walk must not read as "0 blk/s"),
+     *  rounded integer above (multiplatform-safe — no String.format). */
+    private fun formatRate(bps: Double): String {
+        val tenths = kotlin.math.round(bps * 10).toLong()
+        return if (tenths < 100) "${tenths / 10}.${tenths % 10}" else (tenths / 10).toString()
     }
 
     /** Thousands-grouped decimal (multiplatform-safe). */
