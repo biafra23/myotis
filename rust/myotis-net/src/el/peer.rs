@@ -53,9 +53,37 @@ struct Pending {
 
 type PendingMap = Arc<Mutex<HashMap<u64, Pending>>>;
 
+/// The egress writer plus a torn-write marker. A frame write whose future is
+/// DROPPED mid-await (request futures are cancelled routinely — e.g. the
+/// backfill pipeline dropping its in-flight stream on truncation) may have put
+/// a partial frame on the wire with the egress MAC already advanced; nothing
+/// runs afterwards to notice. `torn` is set before every send and cleared only
+/// when the send completes, so the next lock holder observes the tear and
+/// refuses the corrupt stream instead of writing MAC-garbage after it.
+struct GuardedWriter {
+    inner: RlpxWriter,
+    torn: bool,
+}
+
+type SharedWriter = Arc<Mutex<GuardedWriter>>;
+
+/// Send one frame under the writer lock, cancel-safely: a previous send that
+/// was cancelled mid-frame leaves `torn` set, which this surfaces as a write
+/// error — every call site already treats that as fatal (`fail_all` + close).
+async fn send_frame(writer: &SharedWriter, code: u64, body: &[u8]) -> Result<(), String> {
+    let mut w = writer.lock().await;
+    if w.torn {
+        return Err("egress stream torn by a cancelled frame write".to_string());
+    }
+    w.torn = true;
+    let result = w.inner.send(code, body).await;
+    w.torn = false;
+    result
+}
+
 /// A negotiated eth/snap peer, driven by a background read loop.
 pub struct ManagedPeer {
-    writer: Arc<Mutex<RlpxWriter>>,
+    writer: SharedWriter,
     pending: PendingMap,
     next_id: AtomicU64,
     /// Set once the read loop terminates (disconnect / read error); requests
@@ -125,7 +153,7 @@ impl ManagedPeer {
     ) -> ManagedPeer {
         let (reader, writer, peer_pubkey) = conn.split();
         let snap_codes = snap.then(|| snap::SnapCodes::for_eth_version(eth_version));
-        let writer = Arc::new(Mutex::new(writer));
+        let writer = Arc::new(Mutex::new(GuardedWriter { inner: writer, torn: false }));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
 
@@ -201,7 +229,11 @@ impl ManagedPeer {
         // stream in an indeterminate state (a partial frame may be on the wire),
         // so fail EVERY in-flight request — not just this one, which would leave
         // the others hanging until their own timeouts on a dead connection.
-        if let Err(e) = self.writer.lock().await.send(send_code, &body).await {
+        // (If THIS future is cancelled inside the send, the torn marker in
+        // `send_frame` makes the next writer fail here instead; the pending
+        // entry inserted above is then drained by that `fail_all`, or by the
+        // discarded late response — either way it stays bounded.)
+        if let Err(e) = send_frame(&self.writer, send_code, &body).await {
             fail_all(&self.pending, &self.closed, format!("peer write failure: {e}")).await;
             return Err(e);
         }
@@ -229,7 +261,7 @@ impl ManagedPeer {
         // frame-write timeout leaves the egress stream mid-frame with the MAC
         // advanced (see write_frame), so the writer must not be reused — close
         // the peer like every other send path does.
-        if let Err(e) = self.writer.lock().await.send(messages::BLOCK_RANGE_UPDATE, &body).await {
+        if let Err(e) = send_frame(&self.writer, messages::BLOCK_RANGE_UPDATE, &body).await {
             fail_all(&self.pending, &self.closed, format!("peer write failure: {e}")).await;
         }
     }
@@ -241,7 +273,7 @@ impl ManagedPeer {
     /// [`Self::request`].
     pub async fn send_transaction(&self, raw_tx: &[u8]) -> Result<(), String> {
         let body = messages::encode_transactions(raw_tx);
-        if let Err(e) = self.writer.lock().await.send(messages::TRANSACTIONS, &body).await {
+        if let Err(e) = send_frame(&self.writer, messages::TRANSACTIONS, &body).await {
             fail_all(&self.pending, &self.closed, format!("peer write failure: {e}")).await;
             return Err(e);
         }
@@ -553,7 +585,7 @@ impl Drop for ManagedPeer {
 /// error or a peer Disconnect, failing every in-flight request on the way out.
 async fn read_loop(
     mut reader: RlpxReader,
-    writer: Arc<Mutex<RlpxWriter>>,
+    writer: SharedWriter,
     pending: PendingMap,
     closed: Arc<AtomicBool>,
     snap_codes: Option<snap::SnapCodes>,
@@ -605,7 +637,7 @@ async fn read_loop(
             // Pong body is an empty RLP list. A write failure (e.g. a half-closed
             // connection where reads still succeed) means the peer is dead — fail
             // in-flight requests and stop, rather than spin on a zombie.
-            if let Err(e) = writer.lock().await.send(P2P_PONG, &[0xc0]).await {
+            if let Err(e) = send_frame(&writer, P2P_PONG, &[0xc0]).await {
                 fail_all(&pending, &closed, format!("peer write failure on Pong: {e}")).await;
                 break;
             }
@@ -628,7 +660,7 @@ async fn read_loop(
             if code == messages::GET_BLOCK_HEADERS {
                 ctx.stats.header_asked();
                 if let Some(resp) = serve_headers(ctx, &frame.payload) {
-                    if let Err(e) = writer.lock().await.send(messages::BLOCK_HEADERS, &resp).await {
+                    if let Err(e) = send_frame(&writer, messages::BLOCK_HEADERS, &resp).await {
                         fail_all(&pending, &closed, format!("peer write failure on served headers: {e}"))
                             .await;
                         break;
@@ -644,7 +676,7 @@ async fn read_loop(
 
         // An inbound Get* request we answer with an empty response.
         if let Some((resp_code, empty)) = empty_answer(code, &snap_codes, &frame.payload) {
-            if let Err(e) = writer.lock().await.send(resp_code, &empty).await {
+            if let Err(e) = send_frame(&writer, resp_code, &empty).await {
                 fail_all(&pending, &closed, format!("peer write failure on empty response: {e}"))
                     .await;
                 break;

@@ -1261,9 +1261,10 @@ impl ElReader {
                 break 'chunks;
             }
         }
-        if stop_below.is_none() {
+        if stop_below.is_none() && !candidates.is_empty() {
             // Whole candidate set served untruncated — this range rewards
-            // pipelining; restore full depth for the next batch.
+            // pipelining; restore full depth for the next batch. (A bloom-empty
+            // batch is no evidence either way and leaves the depth alone.)
             self.log_index_pipeline_full
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
