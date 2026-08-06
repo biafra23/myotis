@@ -23,6 +23,29 @@ pub const NEW_POOLED_TRANSACTION_HASHES: u64 = 0x18;
 pub const GET_RECEIPTS: u64 = 0x1f;
 pub const RECEIPTS: u64 = 0x20;
 
+/// eth/69 (EIP-7642) `BlockRangeUpdate`: protocol-relative id 0x11, so the
+/// ABSOLUTE code is `0x10 + 0x11 = 0x21`.
+///
+/// Deliberately NOT a plain constant: on eth/67-68 the eth capability is 17
+/// messages long, which puts snap/1's `GetAccountRange` at 0x21 (see
+/// [`snap::SnapCodes::for_eth_version`]). Sending or matching 0x21 on those
+/// versions would collide with snap traffic. `None` = this version has no
+/// BlockRangeUpdate.
+///
+/// The Java twin resolves the same code at Hello negotiation
+/// (`EthHandler.ethBlockRangeUpdate`); `EthWireCodeTest` pins the arithmetic.
+pub fn block_range_update_code(eth_version: u64) -> Option<u64> {
+    (eth_version >= 69).then_some(0x21)
+}
+
+/// GOLDEN VECTOR shared with the Java engine: `encode_block_range_update(100,
+/// 131, [0x11; 32])`. Pinned identically in the Java
+/// `BlockRangeUpdateMessageTest` so the two engines cannot drift apart on the
+/// wire shape without a test failing on one side.
+#[cfg(test)]
+pub(crate) const BLOCK_RANGE_UPDATE_GOLDEN_HEX: &str =
+    "e4648183a01111111111111111111111111111111111111111111111111111111111111111";
+
 // ---------------------------------------------------------------------------
 // Status (0x10).
 // ---------------------------------------------------------------------------
@@ -89,6 +112,59 @@ pub fn encode_status69(
         Item::Bytes(rlp::u64_to_minimal_be(latest_block)),
         Item::Bytes(latest_block_hash.to_vec()),
     ]))
+}
+
+// ---------------------------------------------------------------------------
+// BlockRangeUpdate (0x21 on eth/69).
+// ---------------------------------------------------------------------------
+
+/// Encode an eth/69 `BlockRangeUpdate`: `[earliestBlock, latestBlock,
+/// latestBlockHash]`.
+///
+/// The range advertised in Status is a PROMISE about what we can serve, and our
+/// served window is a rolling band that slides forward and evicts behind it.
+/// Without this message the promise silently rots: peers keep asking for blocks
+/// we dropped, we answer empty, and they score us down and drop us — the exact
+/// failure `session.rs` avoids at handshake time. Same shape and semantics as
+/// the Java `BlockRangeUpdateMessage`.
+pub fn encode_block_range_update(
+    earliest_block: u64,
+    latest_block: u64,
+    latest_block_hash: &[u8; 32],
+) -> Vec<u8> {
+    rlp::encode(&Item::List(vec![
+        Item::Bytes(rlp::u64_to_minimal_be(earliest_block)),
+        Item::Bytes(rlp::u64_to_minimal_be(latest_block)),
+        Item::Bytes(latest_block_hash.to_vec()),
+    ]))
+}
+
+/// Decode a peer's `BlockRangeUpdate` → `(earliest, latest, latest_hash)`.
+///
+/// We don't route requests by peer range yet, so callers only log it; decoding
+/// exists so a malformed announcement is a recognised no-op rather than an
+/// unknown code.
+pub fn decode_block_range_update(payload: &[u8]) -> Result<(u64, u64, [u8; 32]), CoreError> {
+    let item = rlp::decode(payload)?;
+    let items = match &item {
+        Item::List(v) => v,
+        _ => return Err(CoreError("BlockRangeUpdate: not a list".into())),
+    };
+    if items.len() < 3 {
+        return Err(CoreError("BlockRangeUpdate: short list".into()));
+    }
+    let earliest = items[0].as_u64()?;
+    let latest = items[1].as_u64()?;
+    let hash_bytes = match &items[2] {
+        Item::Bytes(b) => b,
+        _ => return Err(CoreError("BlockRangeUpdate: hash not bytes".into())),
+    };
+    if hash_bytes.len() != 32 {
+        return Err(CoreError("BlockRangeUpdate: hash not 32 bytes".into()));
+    }
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(hash_bytes);
+    Ok((earliest, latest, hash))
 }
 
 fn fork_id_item(fork_id_hash: &[u8; 4], fork_next: u64) -> Item {
@@ -782,5 +858,58 @@ mod tests {
         let payload = rlp::decode(&canonical[1..]).unwrap();
         let rf = payload.as_list().unwrap();
         assert_eq!(rf[2].as_bytes().unwrap(), &expect[..]);
+    }
+
+    // -----------------------------------------------------------------------
+    // BlockRangeUpdate (eth/69) — cross-engine parity.
+    // -----------------------------------------------------------------------
+
+    /// The wire code is the p2p base plus the protocol-relative id, and it must
+    /// stay version-gated: on eth/67-68 the same 0x21 is snap's GetAccountRange.
+    /// Java twin: `EthWireCodeTest`.
+    #[test]
+    fn block_range_update_code_is_version_gated() {
+        assert_eq!(block_range_update_code(69), Some(0x21));
+        assert_eq!(block_range_update_code(70), Some(0x21));
+        assert_eq!(block_range_update_code(68), None);
+        assert_eq!(block_range_update_code(66), None);
+        // The eth/68 collision this gate exists for.
+        assert_eq!(crate::el::snap::messages::SnapCodes::for_eth_version(68).get_account_range, 0x21);
+        assert_eq!(crate::el::snap::messages::SnapCodes::for_eth_version(69).get_account_range, 0x22);
+    }
+
+    /// GOLDEN VECTOR — byte-for-byte identical to the Java
+    /// `BlockRangeUpdateMessage.encode` for the same inputs. Both engines pin
+    /// this exact hex; if either side changes shape, one of the two tests
+    /// fails. Inputs: earliest=100, latest=131 (a 32-block window), hash=0x11..11.
+    #[test]
+    fn block_range_update_matches_the_java_golden_vector() {
+        let hash = [0x11u8; 32];
+        let encoded = encode_block_range_update(100, 131, &hash);
+        let hex: String = encoded.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, BLOCK_RANGE_UPDATE_GOLDEN_HEX);
+    }
+
+    #[test]
+    fn block_range_update_round_trips() {
+        let hash = [0xabu8; 32];
+        let encoded = encode_block_range_update(11_425_918, 11_425_949, &hash);
+        let (earliest, latest, got) = decode_block_range_update(&encoded).unwrap();
+        assert_eq!(earliest, 11_425_918);
+        assert_eq!(latest, 11_425_949);
+        assert_eq!(got, hash);
+    }
+
+    #[test]
+    fn malformed_block_range_update_is_an_error_not_a_panic() {
+        assert!(decode_block_range_update(&[0xc0]).is_err()); // empty list
+        assert!(decode_block_range_update(&[0x80]).is_err()); // not a list
+        // 3 items but a short hash.
+        let bad = rlp::encode(&Item::List(vec![
+            Item::Bytes(vec![1]),
+            Item::Bytes(vec![2]),
+            Item::Bytes(vec![3; 31]),
+        ]));
+        assert!(decode_block_range_update(&bad).is_err());
     }
 }

@@ -200,6 +200,34 @@ impl PoolInner {
     /// Drop closed peers, freeing their addresses for a future re-dial. Returns
     /// the number of remaining live peers (so callers avoid a second `peers`
     /// lock just to read the count).
+    /// Re-announce the served block range to every eth/69 peer when it has
+    /// moved since the last announcement, and report the range we broadcast.
+    ///
+    /// The Status range is a promise and the window is a rolling band, so
+    /// without this the promise rots: peers keep asking for blocks we evicted
+    /// and get empty answers, which is what gets a peer scored down and
+    /// dropped. Twin of the Java `RLPxConnector.broadcastRangeIfChanged` —
+    /// including the dedup on BOTH ends, so a window that slid (not just grew)
+    /// still re-announces. Best-effort per peer: a write failure means that
+    /// connection is dying and its own read loop will tear it down.
+    async fn broadcast_range_if_changed(
+        &self,
+        last: Option<(u64, u64)>,
+    ) -> Option<(u64, u64)> {
+        let (earliest, latest, _) = self.served.advertise()?;
+        if last == Some((earliest, latest)) {
+            return last;
+        }
+        let peers: Vec<_> =
+            self.peers.lock().await.iter().map(|p| Arc::clone(&p.peer)).collect();
+        for peer in peers {
+            if let Err(e) = peer.send_block_range_update().await {
+                tracing::debug!(err = %e, "BlockRangeUpdate send failed");
+            }
+        }
+        Some((earliest, latest))
+    }
+
     async fn prune_closed(&self) -> usize {
         let mut peers = self.peers.lock().await;
         let mut freed = Vec::new();
@@ -602,10 +630,18 @@ async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
     // EL-hunt stall clock: Some(t) while the pool has been continuously empty
     // since t. Maintainer-task-local — nothing else needs it.
     let mut zero_since: Option<Instant> = None;
+    // Last (earliest, latest) announced via BlockRangeUpdate — maintainer-local,
+    // like zero_since. None = nothing announced since startup.
+    let mut last_range: Option<(u64, u64)> = None;
     loop {
         tokio::time::sleep(MAINTAINER_INTERVAL).await;
         // prune_closed frees dead peers' addresses so try_dial can re-dial them.
         let live = inner.prune_closed().await;
+        // Keep the eth/69 range promise honest as the served window rolls. Runs
+        // after the prune so dead peers are already gone, and on every tick
+        // (~1 per block at MAINTAINER_INTERVAL) regardless of the hunt/target
+        // logic below, which can `continue` past this point.
+        last_range = inner.broadcast_range_if_changed(last_range).await;
         // target == 0 = maintainer deliberately idle: an empty pool is the
         // EXPECTED state — never engage the hunt (Java maintainSnapPeers twin).
         if inner.pool_cfg.target_snap_peers == 0 {
