@@ -134,7 +134,6 @@ impl ManagedPeer {
             Arc::clone(&writer),
             Arc::clone(&pending),
             Arc::clone(&closed),
-            eth_version,
             snap_codes,
             serve.clone(),
             tx_watch,
@@ -218,6 +217,23 @@ impl ManagedPeer {
         }
     }
 
+    /// Push an eth/69 BlockRangeUpdate advertising our current servable range.
+    /// No-op on eth/68- peers (absolute 0x21 is their SNAP base, not a free
+    /// slot) or a closed peer.
+    pub async fn send_block_range_update(&self, earliest: u64, latest: u64, latest_hash: [u8; 32]) {
+        if self.eth_version < 69 || self.is_closed() {
+            return;
+        }
+        let body = messages::encode_block_range_update(earliest, latest, &latest_hash);
+        // The update itself is fire-and-forget, but a WRITE failure is not: a
+        // frame-write timeout leaves the egress stream mid-frame with the MAC
+        // advanced (see write_frame), so the writer must not be reused — close
+        // the peer like every other send path does.
+        if let Err(e) = self.writer.lock().await.send(messages::BLOCK_RANGE_UPDATE, &body).await {
+            fail_all(&self.pending, &self.closed, format!("peer write failure: {e}")).await;
+        }
+    }
+
     /// Broadcast a single raw transaction to this peer via the eth `Transactions`
     /// message (fire-and-forget — no request id, no response). `raw_tx` is the
     /// consensus encoding. On a write failure the connection is dead, so fail every
@@ -271,6 +287,26 @@ impl ManagedPeer {
         Ok(headers)
     }
 
+    /// As [`get_block_headers_by_number`](Self::get_block_headers_by_number) but
+    /// WITHOUT populating the served window: the backfill uses this and admits
+    /// headers itself only after anchoring the whole batch to the beacon head
+    /// by parent-hash (see `pool::backfill_served_headers`) — stronger than the
+    /// range-only filter that guards the organic fetch paths.
+    pub async fn get_block_headers_by_number_raw(
+        &self,
+        block_number: u64,
+        max_headers: u64,
+    ) -> Result<Vec<VerifiedHeader>, String> {
+        let payload = self
+            .request(messages::GET_BLOCK_HEADERS, messages::BLOCK_HEADERS, |id| {
+                messages::encode_get_block_headers_by_number(id, block_number, max_headers, 0, false)
+            })
+            .await?;
+        let (_rid, headers) = messages::decode_block_headers(&payload)
+            .map_err(|e| format!("BlockHeaders decode: {}", e.0))?;
+        Ok(headers)
+    }
+
     /// Request headers starting at a block HASH (fetch a peer's fresh head).
     pub async fn get_block_headers_by_hash(
         &self,
@@ -298,36 +334,9 @@ impl ManagedPeer {
     fn remember_served<'a>(&self, headers: impl Iterator<Item = &'a messages::VerifiedHeader>) {
         if let Some(ctx) = &self.serve {
             for vh in headers {
-                ctx.window.put(vh.header.number, vh.hash, vh.raw_rlp.clone());
+                ctx.window.put(vh.header.number, vh.hash, vh.header.parent_hash, vh.raw_rlp.clone());
             }
         }
-    }
-
-    /// Announce our current served block range to this peer (eth/69
-    /// `BlockRangeUpdate`, fire-and-forget — no request id, no response).
-    ///
-    /// The range we sent in Status is a promise, and the served window is a
-    /// rolling band: it slides forward and evicts behind it. Re-announcing on
-    /// change keeps the promise true, so peers stop asking for blocks we
-    /// dropped (empty answers get us scored down and dropped). Twin of the Java
-    /// `EthHandler.sendBlockRangeUpdate`; the pool's maintainer calls this when
-    /// the shared window's range changes.
-    ///
-    /// No-op on eth/67-68 (no such message; 0x21 is snap's GetAccountRange
-    /// there) and while the window is empty — in that state the handshake
-    /// already advertised the honest genesis-only range and nothing has moved.
-    /// Unlike [`Self::request`] a write failure only reports; the read loop
-    /// notices the dead connection and fails in-flight requests itself.
-    pub async fn send_block_range_update(&self) -> Result<(), String> {
-        let Some(code) = messages::block_range_update_code(self.eth_version) else {
-            return Ok(());
-        };
-        let Some(ctx) = &self.serve else { return Ok(()) };
-        let Some((earliest, latest, latest_hash)) = ctx.window.advertise() else {
-            return Ok(());
-        };
-        let body = messages::encode_block_range_update(earliest, latest, &latest_hash);
-        self.writer.lock().await.send(code, &body).await
     }
 
     /// Request block bodies by hash.
@@ -547,7 +556,6 @@ async fn read_loop(
     writer: Arc<Mutex<RlpxWriter>>,
     pending: PendingMap,
     closed: Arc<AtomicBool>,
-    eth_version: u64,
     snap_codes: Option<snap::SnapCodes>,
     serve: Option<ServeContext>,
     tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
@@ -632,22 +640,6 @@ async fn read_loop(
                 ctx.stats.body_asked();
                 // No bodies to serve (light client) — the empty answer below replies.
             }
-        }
-
-        // eth/69: the peer telling us its own servable range moved. We don't
-        // route requests by peer range yet, so this is log-only — but it is
-        // recognised rather than falling through to the request correlator,
-        // which would otherwise read its leading field as a request id. Gated
-        // on the negotiated version because on eth/67-68 the same code is
-        // snap's GetAccountRange (handled above).
-        if messages::block_range_update_code(eth_version) == Some(code) {
-            match messages::decode_block_range_update(&frame.payload) {
-                Ok((earliest, latest, _)) => {
-                    tracing::debug!(earliest, latest, "peer BlockRangeUpdate")
-                }
-                Err(e) => tracing::debug!(err = %e.0, "malformed BlockRangeUpdate ignored"),
-            }
-            continue;
         }
 
         // An inbound Get* request we answer with an empty response.
@@ -789,7 +781,7 @@ mod tests {
             h
         };
         for n in 100..=105u64 {
-            w.put(n, hash(n), raw(n));
+            w.put(n, hash(n), hash(n - 1), raw(n));
         }
         let ctx = serve_ctx(w);
 

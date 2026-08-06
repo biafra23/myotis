@@ -16,10 +16,12 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
  * and disconnects with DiscSubprotocolError. That silently cut us off from every
  * eth/69 peer, i.e. every modern Geth.
  *
- * <p>The correct wire code is 0x21, and it must stay version-dependent: on
- * eth/67-68 the eth capability is 17 messages long, so 0x21 is snap/1's
- * {@code GetAccountRange}. Only on eth/69 (length 18, snap base 0x22) is 0x21
- * free for BlockRangeUpdate.
+ * <p>The correct wire code is 0x21, and it must stay version-GATED at
+ * every send/match site: on eth/67-68 the eth capability is 17 messages long,
+ * so absolute 0x21 is snap/1's {@code GetAccountRange}. Only on eth/69
+ * (length 18, snap base 0x22) is 0x21 free for BlockRangeUpdate — which is why
+ * {@code EthHandler} dispatches it in the {@code default} branch behind a
+ * version check rather than as a {@code switch} case.
  */
 class EthWireCodeTest {
 

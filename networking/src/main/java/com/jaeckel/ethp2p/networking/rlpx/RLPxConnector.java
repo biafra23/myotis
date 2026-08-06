@@ -232,6 +232,37 @@ public final class RLPxConnector implements AutoCloseable {
         return connectFuture;
     }
 
+    /** Round-robin cursor for backfill peer selection (fairness + no single peer
+     *  both hammered and trusted with every fill). */
+    private final java.util.concurrent.atomic.AtomicInteger backfillRr =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    /**
+     * Backfill fetch: request headers RAW (no auto-admission — the caller
+     * validates the batch against the beacon anchor before putting it into the
+     * served window) from a ROTATING ready peer. Null when no peer is ready.
+     */
+    public CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> backfillHeaders(
+            long blockNumber, int count) {
+        List<EthHandler> ready = new java.util.ArrayList<>();
+        for (EthHandler h : activeHandlers) {
+            if (h.isReady()) ready.add(h);
+        }
+        if (ready.isEmpty()) return null;
+        int start = Math.floorMod(backfillRr.getAndIncrement(), ready.size());
+        for (int i = 0; i < ready.size(); i++) {
+            EthHandler h = ready.get((start + i) % ready.size());
+            CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> f =
+                    h.requestBlockHeadersRawAsync(blockNumber, count);
+            if (f != null) {
+                log.debug("[rlpx] backfill GetBlockHeaders(block={}, count={}) via {}",
+                        blockNumber, count, h.getRemoteAddress());
+                return f;
+            }
+        }
+        return null;
+    }
+
     /**
      * Request block headers from any active READY peer.
      *

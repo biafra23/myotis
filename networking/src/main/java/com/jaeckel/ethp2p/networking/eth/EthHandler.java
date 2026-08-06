@@ -209,11 +209,14 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     // cross-thread from the connector's BlockRangeUpdate broadcast (which iterates all
     // connections' handlers).
     private volatile int negotiatedEthVersion = 68; // default, updated during Hello negotiation
-    // eth/69 (EIP-7642) BlockRangeUpdate, message id 0x11 within the eth capability —
-    // wire code 0x10 + 0x11 = 0x21. Like the snap ids this is version-dependent: on
-    // eth/67-68 wire 0x21 is snap's GetAccountRange, so it stays -1 (never matches)
-    // and the obsolete NewBlockHashes at wire 0x11 falls through ignored.
-    private int ethBlockRangeUpdate = -1; // updated after Hello negotiation
+    // eth/69 (EIP-7642) BlockRangeUpdate, message id 0x11 within the eth capability.
+    // On eth/68 the same id is the obsolete NewBlockHashes, so this is version-gated.
+    // Absolute wire id: the spec's RELATIVE 0x11 + eth base 0x10 = 0x21 — the new
+    // slot after Receipts (0x20) that grows eth/69's protocol length 17 → 18 (and
+    // moves the snap base to 0x22). NB on eth/68 absolute 0x21 IS the snap base
+    // (GetAccountRange), so 0x21 must be dispatched per-version — see handleReady's
+    // default branch, deliberately NOT a switch case (a case would shadow eth/68 snap).
+    private static final int ETH_BLOCK_RANGE_UPDATE = 0x21;
 
     /** Optional sink for mempool-gossip tx hashes, set by the connector. When present
      *  AND {@link TxGossipObserver#watchingAny()} is true, inbound Transactions (0x12)
@@ -278,7 +281,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         // Advertise only held blocks — both ends of the Range, not the chain head.
         ServedHeaderWindow.Range r = servedWindow.advertise(head.blockNumber(), head.blockHash());
         byte[] payload = BlockRangeUpdateMessage.encode(r.earliest(), r.latest(), r.latestHash());
-        rlpxHandler.sendMessage(ctx, ethBlockRangeUpdate, payload);
+        rlpxHandler.sendMessage(ctx, ETH_BLOCK_RANGE_UPDATE, payload);
         log.debug("[eth] Sent BlockRangeUpdate range=[{},{}] to {}",
                 r.earliest(), r.latest(), clientId != null ? clientId : remoteAddress);
     }
@@ -391,7 +394,6 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             // eth/69 adds BlockRangeUpdate (0x11), making protocol length 18 instead of 17
             int ethProtocolLength = negotiatedEthVersion >= 69 ? 18 : 17;
             int snapBase = 0x10 + ethProtocolLength; // p2p base (16) + eth length
-            ethBlockRangeUpdate = negotiatedEthVersion >= 69 ? 0x10 + 0x11 : -1;
             snapGetAccountRange  = snapBase;
             snapAccountRange     = snapBase + 1;
             snapGetStorageRanges = snapBase + 2;
@@ -604,7 +606,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                         headerCache.put(vh.header().number, raw);
                         hashCache.put(vh.hash().toHexString(), raw);
                         // Make it servable to peers via the shared window + advertised range.
-                        servedWindow.put(vh.header().number, vh.hash(), raw);
+                        servedWindow.put(vh.header().number, vh.hash(), vh.header().parentHash, raw);
                         log.debug("[eth] Cached header for block #{} hash={}",
                                 vh.header().number, vh.hash().toShortHexString());
                         chainHead.update(vh.header().number, vh.hash());
@@ -708,9 +710,11 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 ctx.close();
             }
             default -> {
-                if (ethBlockRangeUpdate > 0 && msg.code() == ethBlockRangeUpdate) {
+                if (negotiatedEthVersion >= 69 && msg.code() == ETH_BLOCK_RANGE_UPDATE) {
                     // eth/69: a peer telling us its servable range changed. We don't yet
-                    // route requests by peer range, so just log it.
+                    // route requests by peer range, so just log it. Handled HERE (not as
+                    // a switch case) because on eth/68 absolute 0x21 is snap
+                    // GetAccountRange — a constant case would shadow it.
                     try {
                         BlockRangeUpdateMessage.Decoded u = BlockRangeUpdateMessage.decode(msg.payload());
                         log.debug("[eth] Peer BlockRangeUpdate: range=[{},{}] from {}",
@@ -986,6 +990,32 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         pendingHeaderReqs.put(reqId, HeaderReq.byNumber(blockNumber, count));
         byte[] payload = GetBlockHeadersMessage.encodeByNumber(reqId, blockNumber, count, 0, false);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
+    }
+
+    /**
+     * As {@link #requestBlockHeadersAsync} but WITHOUT recording the request spec —
+     * the response is NOT auto-admitted into the serve caches (an unknown reqId
+     * admits nothing). The header backfill uses this and admits headers itself only
+     * after anchoring the whole batch to the beacon head by parent-hash
+     * (ChainStack.backfillServedHeaders) — stronger than the range-only filter.
+     *
+     * @return a future, or null if this handler is not in READY state
+     */
+    public CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> requestBlockHeadersRawAsync(
+            long blockNumber, int count) {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) return null;
+        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future = new CompletableFuture<>();
+        long reqId = requestId.getAndIncrement();
+        pendingRequests.put(reqId, future);
+        // Self-cleaning: the timeout lives at the call site (backfill's orTimeout
+        // completes this future exceptionally), so remove the map entry on ANY
+        // completion — otherwise a live-but-silent peer leaks one dead entry per
+        // round-robin visit for the connection lifetime.
+        future.whenComplete((r, ex) -> pendingRequests.remove(reqId));
+        byte[] payload = GetBlockHeadersMessage.encodeByNumber(reqId, blockNumber, count, 0, false);
+        rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
+        return future;
     }
 
     /**

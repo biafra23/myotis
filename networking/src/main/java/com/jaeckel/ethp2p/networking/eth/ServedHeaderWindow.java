@@ -39,9 +39,12 @@ public final class ServedHeaderWindow {
     private volatile int maxWindow;
 
     // Recent headers by block number (ascending). Bounded to the most recent maxWindow
-    // block numbers seen. hashByNumber/byHash are kept in lockstep. Guarded by `this`.
+    // block numbers seen. hashByNumber/parentByNumber/byHash are kept in lockstep.
+    // The parent hash lets the backfill anchor a downward batch to the held run
+    // without re-decoding stored RLP. Guarded by `this`.
     private final NavigableMap<Long, byte[]> byNumber = new TreeMap<>();
     private final NavigableMap<Long, Bytes32> hashByNumber = new TreeMap<>();
+    private final NavigableMap<Long, Bytes32> parentByNumber = new TreeMap<>();
     private final Map<String, byte[]> byHash = new HashMap<>();
 
     // Genesis (block 0) — always servable for fork probes, held outside the head window.
@@ -70,14 +73,39 @@ public final class ServedHeaderWindow {
      * Record a header we hold (received and verified). Genesis is ignored here — it is
      * seeded once via the constructor and never evicted.
      */
-    public synchronized void put(long number, Bytes32 hash, byte[] rlp) {
+    public synchronized void put(long number, Bytes32 hash, Bytes32 parentHash, byte[] rlp) {
         if (number <= 0 || hash == null || rlp == null) return;
         byNumber.put(number, rlp);
         // If this number previously mapped to a different hash (reorg), drop the stale hash.
         Bytes32 prev = hashByNumber.put(number, hash);
         if (prev != null && !prev.equals(hash)) byHash.remove(prev.toHexString());
+        parentByNumber.put(number, parentHash);
         byHash.put(hash.toHexString(), rlp);
         evict();
+    }
+
+    /** The stored parent hash of a held header (the backfill's downward anchor),
+     *  or null when the block isn't held. */
+    public synchronized Bytes32 parentHashOf(long number) {
+        return parentByNumber.get(number);
+    }
+
+    /** The stored hash of a held header, or null when the block isn't held. */
+    public synchronized Bytes32 hashOf(long number) {
+        return hashByNumber.get(number);
+    }
+
+    /** Evict every held header BELOW {@code number} (reorg splice repair: a
+     *  verified batch whose parent disagrees with the held entry below it proves
+     *  the entries below are a stale fork). */
+    public synchronized void evictBelow(long number) {
+        while (!byNumber.isEmpty() && byNumber.firstKey() < number) {
+            long n = byNumber.firstKey();
+            byNumber.remove(n);
+            parentByNumber.remove(n);
+            Bytes32 h = hashByNumber.remove(n);
+            if (h != null) byHash.remove(h.toHexString());
+        }
     }
 
     /** Serve a header by block number, or null if we don't hold it. */
@@ -130,6 +158,7 @@ public final class ServedHeaderWindow {
             long n = byNumber.firstKey();
             byNumber.remove(n);
             Bytes32 h = hashByNumber.remove(n);
+            parentByNumber.remove(n);
             if (h != null) byHash.remove(h.toHexString());
         }
     }

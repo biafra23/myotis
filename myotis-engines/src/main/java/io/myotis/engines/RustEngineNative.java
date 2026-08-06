@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 21; // 21: + eth_getLogs watch-list index trio
+    static final int EXPECTED_ABI_VERSION = 22; // 22: + setServedBlockWindow (live eth/69 window knob)
 
     private static final boolean AVAILABLE = load();
 
@@ -200,6 +200,15 @@ final class RustEngineNative {
     /** Rebuild networking for a PAUSED handle; true ONLY on PAUSED→RUNNING. */
     static boolean nativeResume(long handle) {
         return Myotis_engineKt.resumeHandle(handle);
+    }
+
+    /**
+     * Live-set the eth/69 served-block window (Settings knob). Applied live on a
+     * RUNNING handle; stashed and applied at the next start otherwise. False
+     * only for an unknown handle.
+     */
+    static boolean nativeSetServedBlockWindow(long handle, int blocks) {
+        return Myotis_engineKt.setServedBlockWindow(handle, blocks);
     }
 
     /** Up to {@code max} buffered engine tracing lines (oldest first, newline-joined). */

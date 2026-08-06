@@ -75,6 +75,11 @@ struct EngineState {
     rt: tokio::runtime::Runtime,
     handles: Mutex<HashMap<i64, ChainEntry>>,
     next_id: AtomicI64,
+    /// Per-handle LAST-REQUESTED served-block window (the Settings knob). Hosts
+    /// set it between create() and start(), and Saves update it live too; every
+    /// spin_up (start AND resume) re-applies it after building the EL reader,
+    /// mirroring the Java ChainStack's pre-start buffer. Dies with the handle.
+    pending_served_window: Mutex<HashMap<i64, u64>>,
     /// Per-handle last-good `eth_feeHistory`: the EMITTED JSON plus the raw
     /// request signature it answered, re-servable within
     /// [`FEE_HISTORY_STALE_MAX`] when a fresh build fails for the SAME
@@ -106,6 +111,7 @@ fn engine() -> Option<&'static EngineState> {
                     handles: Mutex::new(HashMap::new()),
                     // Start at 1 so a valid id is never confused with the -1 sentinel.
                     next_id: AtomicI64::new(1),
+                    pending_served_window: Mutex::new(HashMap::new()),
                     fee_history_cache: Mutex::new(HashMap::new()),
                 }),
                 Err(_) => None,
@@ -321,6 +327,17 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
         },
         None => None,
     };
+    // Apply a served-block-window set before this start (the Settings knob is
+    // applied between create() and start() by the hosts) so the very first
+    // eth/69 Status advertises the configured size. The stash survives
+    // pause/resume cycles too; it only dies with the handle (see stop()).
+    if let Some(reader) = &reader {
+        if let Ok(pending) = engine.pending_served_window.lock() {
+            if let Some(&w) = pending.get(&handle) {
+                reader.set_served_block_window(w);
+            }
+        }
+    }
     // Re-lock and publish ONLY if the entry is still the same Created/Paused one
     // we spun up from: a concurrent stop() may have removed it, or a racing
     // start()/resume() may have already published a Running one, while we were
@@ -545,6 +562,9 @@ pub fn stop(handle: i64) {
     if let Ok(mut cache) = engine.fee_history_cache.lock() {
         cache.remove(&handle);
     }
+    if let Ok(mut pending) = engine.pending_served_window.lock() {
+        pending.remove(&handle);
+    }
     if let Some(ChainEntry::Running(_, sync, reader)) = entry {
         engine.rt.block_on(async move {
             sync.stop().await;
@@ -558,9 +578,44 @@ pub fn stop(handle: i64) {
     }
 }
 
-/// `nativeRequestAccountJson`: run a verified account query for a running
-/// handle, returning the `AccountProofResult` JSON, or `{"error": "..."}` for a
-/// transport / not-running / bad-input failure.
+/// Live-set the eth/69 served-block window (ChainHandle.setServedBlockWindow).
+/// Clamped to [1, 4096] per the API contract (0 would disable serving; an
+/// unbounded window is an archive-node promise a light client cannot keep).
+/// Applied immediately on a RUNNING handle's EL reader; for a known handle in
+/// any other state (Created/Paused/EL-less) the value is STASHED and applied at
+/// the next spin_up — hosts set the knob between create() and start(), so
+/// without the stash the pref would silently revert to the default every boot.
+/// False only for an unknown handle.
+pub fn set_served_block_window(handle: i64, blocks: i32) -> bool {
+    let Some(engine) = engine() else { return false };
+    let clamped = blocks.clamp(1, 4096) as u64;
+    let map = match engine.handles.lock() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    match map.get(&handle) {
+        Some(ChainEntry::Running(_, _, Some(reader))) => {
+            reader.set_served_block_window(clamped);
+            // Keep the stash in sync: spin_up re-applies it on resume, and a
+            // stale pre-start value must not revert a newer live set.
+            if let Ok(mut pending) = engine.pending_served_window.lock() {
+                pending.insert(handle, clamped);
+            }
+            true
+        }
+        Some(_) => {
+            // Not running yet (or EL-less right now): remember for spin_up.
+            if let Ok(mut pending) = engine.pending_served_window.lock() {
+                pending.insert(handle, clamped);
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// Verified account query as JSON (`AccountProofResult` shape / an
+/// `{"error": ...}` object) — `nativeRequestAccountJson`.
 pub fn request_account_json(handle: i64, address_hex: &str) -> String {
     let Some(address) = parse_address(address_hex) else {
         return eljson::error_json("invalid address (expected 20-byte hex)");
@@ -1816,6 +1871,29 @@ mod tests {
                   "finalizedBlockNumber", "executionBlockNumber"] {
             assert_eq!(v[k], 0, "{k} should be 0 while paused");
         }
+    }
+
+    #[test]
+    fn served_block_window_stashes_pre_start_and_rejects_unknown() {
+        // Unknown handle → false (the Java wrapper logs the drop).
+        assert!(!set_served_block_window(999_999, 64));
+        // A Created (not-started) handle stashes the clamped value for spin_up.
+        let handle = create("mainnet", std::env::temp_dir().to_str().unwrap());
+        assert!(handle > 0);
+        assert!(set_served_block_window(handle, 999_999)); // clamps to 4096
+        let engine = engine().unwrap();
+        assert_eq!(
+            engine.pending_served_window.lock().unwrap().get(&handle),
+            Some(&4096)
+        );
+        assert!(set_served_block_window(handle, 0)); // clamps to 1
+        assert_eq!(
+            engine.pending_served_window.lock().unwrap().get(&handle),
+            Some(&1)
+        );
+        // The stash dies with the handle.
+        stop(handle);
+        assert!(engine.pending_served_window.lock().unwrap().get(&handle).is_none());
     }
 
     #[test]

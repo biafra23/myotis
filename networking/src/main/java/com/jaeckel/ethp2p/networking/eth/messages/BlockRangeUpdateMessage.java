@@ -5,14 +5,16 @@ import org.apache.tuweni.bytes.Bytes32;
 import org.apache.tuweni.rlp.RLP;
 
 /**
- * eth/69 (EIP-7642) {@code BlockRangeUpdate} (message id 0x11 within the eth capability).
+ * eth/69 (EIP-7642) {@code BlockRangeUpdate} — spec id 0x11 RELATIVE to the eth
+ * capability, i.e. absolute wire code 0x21 (the slot after Receipts that grows the
+ * eth/69 protocol length to 18 and moves the snap base to 0x22).
  *
  * <p>Wire form: {@code [earliestBlock, latestBlock, latestBlockHash]}. A node sends it to
  * already-connected peers when the range of blocks it can serve changes — for us, when
  * our {@link com.jaeckel.ethp2p.networking.eth.ServedHeaderWindow} grows as we cache more
  * recent headers, so peers learn they can now ask us for a wider window than we could
- * back at handshake time. Only valid on eth/69+ (on eth/68 the same id 0x11 is the
- * obsolete NewBlockHashes, so callers MUST gate on the negotiated version).
+ * back at handshake time. Only valid on eth/69+ — on eth/68 the absolute code 0x21
+ * is the SNAP base (GetAccountRange), so callers MUST gate on the negotiated version.
  */
 public final class BlockRangeUpdateMessage {
 

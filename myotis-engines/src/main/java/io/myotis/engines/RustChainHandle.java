@@ -631,8 +631,13 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
 
     @Override
     public void setServedBlockWindow(int blocks) {
-        log.debug("[engines] setServedBlockWindow({}) is a no-op on the R1 Rust engine (CL-only: no eth layer)",
-                blocks);
+        // Applied live on a running EL handle; stashed engine-side and applied at
+        // the next start for any other known state (hosts set the knob between
+        // create() and start()). False only for an unknown handle — log it, since
+        // a silently dropped Settings value is the bug this path used to have.
+        if (!RustEngineNative.nativeSetServedBlockWindow(handle, blocks)) {
+            log.warn("[engines] setServedBlockWindow({}) dropped: unknown handle {}", blocks, handle);
+        }
     }
 
     @Override
