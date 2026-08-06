@@ -2168,6 +2168,63 @@ fn parse_get_logs_filter(
 /// (the router maps it to strict -32000) — never an empty array for an
 /// unindexed range.
 pub fn get_logs_json(handle: i64, filter_json: &str) -> String {
+    let out = get_logs_json_impl(handle, filter_json);
+    // Observability for wallet integration (requested during the Kohaku
+    // bring-up): refusals log the exact filter at info so hosts can see what
+    // the wallet asked for without a proxy; successes stay at debug. A
+    // polling wallet repeats the identical refused filter every few seconds
+    // for the whole backfill, so identical refusals are debounced to one
+    // line per minute. (Filter content is addresses/topics/ranges — the
+    // watched contract set — no secrets, but it IS the wallet's query
+    // surface, hence info not warn.)
+    if let Some(reason) = out.strip_prefix("{\"error\":") {
+        // Strip the JSON wrapping (trailing brace and the value's quotes) so
+        // the log line reads as prose, not nested JSON.
+        let reason = reason
+            .strip_suffix('}')
+            .unwrap_or(reason)
+            .trim_matches('"');
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        handle.hash(&mut h); // distinct networks debounce independently
+        filter_json.hash(&mut h);
+        reason.hash(&mut h);
+        let key = h.finish();
+        // Per-key debounce map, NOT a single slot: wallets poll several
+        // distinct filters (one per watched contract), and alternating
+        // refusals would evict a single slot every call — logging everything
+        // during exactly the catch-up window the debounce targets. Bounded:
+        // swept of expired entries whenever it grows past a handful.
+        static RECENT_REFUSALS: std::sync::Mutex<
+            Option<std::collections::HashMap<u64, std::time::Instant>>,
+        > = std::sync::Mutex::new(None);
+        const DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(60);
+        let log_it = match RECENT_REFUSALS.lock() {
+            Ok(mut slot) => {
+                let map = slot.get_or_insert_with(std::collections::HashMap::new);
+                if map.len() > 64 {
+                    map.retain(|_, at| at.elapsed() < DEBOUNCE);
+                }
+                match map.get(&key) {
+                    Some(at) if at.elapsed() < DEBOUNCE => false,
+                    _ => {
+                        map.insert(key, std::time::Instant::now());
+                        true
+                    }
+                }
+            }
+            Err(_) => true,
+        };
+        if log_it {
+            tracing::info!(filter = %filter_json, refusal = %reason, "eth_getLogs refused");
+        }
+    } else {
+        tracing::debug!(filter = %filter_json, "eth_getLogs served");
+    }
+    out
+}
+
+fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
     use myotis_net::el::logindex::QueryError;
     let Ok(v) = serde_json::from_str::<serde_json::Value>(filter_json) else {
         return eljson::error_json("malformed filter");
