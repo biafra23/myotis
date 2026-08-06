@@ -2,6 +2,7 @@
 // and drives the Java backend (`node-core`) in-process via DesktopNodeController — the same
 // backend the daemon and Android use, so there's no duplication. (JVM target; not iOS.)
 
+import org.gradle.api.tasks.PathSensitivity
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 
 plugins {
@@ -109,12 +110,17 @@ val composeOsArchDir = run {
     "$osPart-$archPart"
 }
 
+// Single source of truth for the staged-resources root: the staging task's
+// output, Compose's appResourcesRootDir, and the packaging tasks' input all
+// derive from it (a drifting duplicate literal would silently untrack).
+val rustAppResourcesRoot = layout.buildDirectory.dir("rustAppResources")
+
 val prepareRustAppResources = tasks.register("prepareRustAppResources") {
     group = "build"
     description = "Stage the Rust engine host lib into Compose appResources for packaging"
     dependsOn(rootProject.tasks.named("cargoBuildHost"))
     val src = rootProject.file("$rustReleaseDir/$rustHostLibName")
-    val destDir = layout.buildDirectory.dir("rustAppResources/$composeOsArchDir")
+    val destDir = rustAppResourcesRoot.map { it.dir(composeOsArchDir) }
     inputs.files(src).optional() // optional so the ACTION runs even when absent
     outputs.dir(destDir)
     // A plain task, NOT Copy: a Copy with a missing source is skipped as
@@ -161,8 +167,9 @@ tasks.configureEach {
         // The uber-jar packagers match the name predicate but bundle no app
         // resources — skip them so a Rust-only change doesn't re-zip the jar.
         if (!name.contains("UberJar")) {
-            inputs.dir(layout.buildDirectory.dir("rustAppResources"))
+            inputs.dir(rustAppResourcesRoot)
                 .withPropertyName("rustEngineAppResources")
+                .withPathSensitivity(PathSensitivity.RELATIVE)
         }
     }
 }
@@ -185,7 +192,7 @@ compose.desktop {
         }.get().metadata.installationPath.asFile.absolutePath
         nativeDistributions {
             // The staged Rust engine lib (see prepareRustAppResources above).
-            appResourcesRootDir.set(layout.buildDirectory.dir("rustAppResources"))
+            appResourcesRootDir.set(rustAppResourcesRoot)
             // jpackage is host-OS-bound: the .dmg can only be produced on macOS, the .deb only
             // on Linux. CI builds each on its matching runner (desktop-dmg.yml /
             // desktop-linux-deb.yml); locally you get the format for your OS. Msi when a
