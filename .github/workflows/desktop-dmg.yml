@@ -32,6 +32,11 @@ jobs:
     # cross-build on the always-available arm64 runner removes that dependency.
     # An arm64 .dmg will NOT launch on an Intel Mac (Rosetta only translates x86→arm), so download
     # the one matching your Mac.
+    # PRs build only the arm64 dmg (the arch developers actually run; proves
+    # jpackage end-to-end). The x64/Rosetta leg is a release/main artifact —
+    # on PRs it doubled the macOS runner load for a result that never changes
+    # a PR decision.
+    if: ${{ matrix.arch == 'arm64' || github.event_name != 'pull_request' }}
     strategy:
       fail-fast: false
       matrix:
