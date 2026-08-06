@@ -72,6 +72,7 @@ async fn pool_dials_from_discovery_and_serves_a_verified_account() {
         cfg,
         PoolConfig::default(),
         myotis_net::el::peercache::ElPeerCache::disabled(),
+        Vec::new(), // no pinned boot enodes in fixtures
         rx,
         None,
         None,

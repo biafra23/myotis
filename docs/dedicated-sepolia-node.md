@@ -230,9 +230,11 @@ ExecStart=/usr/local/bin/geth-myotis \
   --authrpc.addr 127.0.0.1 \
   --authrpc.port 8551 \
   --authrpc.jwtsecret /data/jwt.hex \
-  --http --http.addr 127.0.0.1 --http.api eth,net,admin
+  --http --http.addr 127.0.0.1 --http.port 8560 --http.api eth,net,admin \
+  --history.chain all
 Restart=on-failure
 RestartSec=5
+StartLimitIntervalSec=0
 LimitNOFILE=65536
 TimeoutStopSec=300
 
@@ -246,7 +248,17 @@ sudo systemctl enable --now geth-sepolia
 ```
 
 The loopback HTTP endpoint is for operations only (`admin.peers`,
-`admin.nodeInfo`); myotis never uses RPC. Record the stable enode:
+`admin.nodeInfo`); myotis never uses RPC. It is on **8560**, not Geth's default
+8545, deliberately: 8545 is what every EVM dev tool assumes (anvil, hardhat,
+metamask-localhost), and a real synced client answering there masks a missing
+local dev node. Any free port works — keep it consistent with the §6 checks.
+
+`--history.chain all` pins the default (keep every pre-merge body and receipt).
+It is explicit because Geth 1.16+ can expire history (`--history.chain
+postmerge`), and myotis's trust anchors include the embedded pre-Merge
+accumulator — a future default flip must not silently drop what it needs.
+`StartLimitIntervalSec=0` removes systemd's give-up-after-5-restarts rule, so a
+crash-looping node keeps retrying instead of staying down. Record the stable enode:
 
 ```bash
 geth-myotis attach --datadir /data/geth --exec admin.nodeInfo.enode
@@ -307,6 +319,7 @@ ExecStart=/usr/bin/nimbus_beacon_node \
   --light-client-data-import-mode=full
 Restart=on-failure
 RestartSec=5
+StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target

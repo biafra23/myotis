@@ -129,6 +129,11 @@ struct PoolInner {
     blacklist: Mutex<HashSet<[u8; 64]>>,
     /// Proven snap-capable peers, persisted for warm-start on the next run.
     cache: Mutex<ElPeerCache>,
+    /// The network's pinned EL peers, `(addr, 64-byte pubkey)` — Java
+    /// `NetworkConfig.elBootEnodes()`. Dialed directly (warm start + every
+    /// maintainer tick below target), NOT seeded into the cache: see the
+    /// warm-start comment in `dialer_loop`.
+    boot_enodes: Vec<(SocketAddr, [u8; 64])>,
     /// Recent headers we can serve to peers + the eth/69 advertised range source.
     served: Arc<ServedHeaders>,
     /// The beacon-anchored head (number, hash) to backfill toward — the batch
@@ -396,6 +401,7 @@ impl PeerPool {
         cfg: Arc<EthConfig>,
         pool_cfg: PoolConfig,
         cache: ElPeerCache,
+        boot_enodes: Vec<(SocketAddr, [u8; 64])>,
         rx: mpsc::Receiver<TableEntry>,
         tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
         probe: Option<mpsc::Sender<SocketAddr>>,
@@ -421,6 +427,7 @@ impl PeerPool {
             backoff: Mutex::new(HashMap::new()),
             blacklist: Mutex::new(HashSet::new()),
             cache: Mutex::new(cache),
+            boot_enodes,
             served,
             head_source,
             backfill_rr: std::sync::atomic::AtomicUsize::new(0),
@@ -553,9 +560,29 @@ async fn dialer_loop(
     mut rx: mpsc::Receiver<TableEntry>,
     dial_slots: Arc<Semaphore>,
 ) {
-    // Warm start: re-dial proven snap peers from the cache, snap-quality first
-    // (Confirmed → Unknown → Denied). Snapshot the list so the cache lock isn't
-    // held across the dials.
+    // Warm start: the network's PINNED boot enodes first, then proven snap peers
+    // from the cache, snap-quality first (Confirmed → Unknown → Denied).
+    //
+    // The pins are dialed directly rather than seeded into the cache. Seeding
+    // would (a) be swallowed entirely by a disabled cache — a host with no
+    // dataDir runs `ElPeerCache::disabled()`, whose `add` early-returns, so the
+    // pin would silently never be dialed — and (b) force a snap flag onto the
+    // entry: `add` overwrites it, so re-seeding "known but unproven" on each
+    // start would DOWNGRADE the snap=true the peer earned in an earlier run and
+    // sort it dead last (non-snap = rank 3). Dialing directly keeps the earned
+    // quality intact and matches the Java twin, which dials
+    // `NetworkConfig.elBootEnodes()` unconditionally (ChainStack
+    // .directDialStaticEnodes). Once a pin connects, the normal path caches it
+    // with the snap flag it actually proved.
+    if !inner.boot_enodes.is_empty() {
+        tracing::info!(count = inner.boot_enodes.len(), "EL pool dialing pinned boot enodes");
+    }
+    for (addr, pubkey) in inner.boot_enodes.clone() {
+        if !try_dial(&inner, &dial_slots, addr, pubkey).await {
+            return; // pool shutting down (dial semaphore closed)
+        }
+    }
+    // Snapshot the list so the cache lock isn't held across the dials.
     let cached = inner.cache.lock().await.peers();
     if !cached.is_empty() {
         tracing::info!(count = cached.len(), "EL pool warm-starting from peer cache");
@@ -894,10 +921,21 @@ async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
             continue;
         }
         // Snapshot the cache (snap-quality-sorted) without holding its lock
-        // across the dials.
+        // across the dials, and re-offer the pinned boot enodes ahead of it: a
+        // pin that was down at startup (or whose backoff has since expired) must
+        // get another chance, and it must not depend on the cache being enabled.
+        // try_dial dedups against attempted/backoff, so re-listing is cheap.
         let cached = inner.cache.lock().await.peers();
-        if cached.is_empty() {
+        if cached.is_empty() && inner.boot_enodes.is_empty() {
             continue;
+        }
+        for (addr, pubkey) in inner.boot_enodes.clone() {
+            if inner.peers.lock().await.len() >= inner.pool_cfg.target_snap_peers {
+                break;
+            }
+            if !try_dial(&inner, &dial_slots, addr, pubkey).await {
+                return; // pool shutting down
+            }
         }
         if hunting {
             // Emergency: free the TRANSIENT backoffs of CONFIRMED snap servers
@@ -1149,6 +1187,7 @@ mod tests {
             cfg,
             PoolConfig::default(),
             ElPeerCache::disabled(),
+            Vec::new(), // no pinned boot enodes in fixtures
             rx,
             None,
             None,
@@ -1203,6 +1242,7 @@ mod tests {
             cfg,
             PoolConfig::default(),
             ElPeerCache::load(path.clone()),
+            Vec::new(), // no pinned boot enodes in fixtures
             rx,
             None,
             None,
@@ -1261,6 +1301,7 @@ mod tests {
             cfg,
             PoolConfig::default(),
             ElPeerCache::load(path.clone()),
+            Vec::new(), // no pinned boot enodes in fixtures
             rx,
             None,
             None,

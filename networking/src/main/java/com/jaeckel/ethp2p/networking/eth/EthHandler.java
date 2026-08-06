@@ -216,7 +216,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     // moves the snap base to 0x22). NB on eth/68 absolute 0x21 IS the snap base
     // (GetAccountRange), so 0x21 must be dispatched per-version — see handleReady's
     // default branch, deliberately NOT a switch case (a case would shadow eth/68 snap).
-    private static final int ETH_BLOCK_RANGE_UPDATE = 0x21;
+    // Package-private (not private) so EthWireCodeTest can pin the real value:
+    // asserting the arithmetic in the test alone would let a revert to 0x11 —
+    // the exact interop bug this guards — pass green.
+    static final int ETH_BLOCK_RANGE_UPDATE = 0x21;
 
     /** Optional sink for mempool-gossip tx hashes, set by the connector. When present
      *  AND {@link TxGossipObserver#watchingAny()} is true, inbound Transactions (0x12)

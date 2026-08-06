@@ -93,7 +93,12 @@ fn parse_boot_enodes(enodes: &[&str]) -> Vec<(std::net::SocketAddr, [u8; 64])> {
     for e in enodes {
         let Some(body) = e.strip_prefix("enode://") else { continue };
         let Some((pubkey_hex, host_port)) = body.split_once('@') else { continue };
-        if pubkey_hex.len() != 128 {
+        // is_ascii() is load-bearing, not belt-and-braces: len() counts BYTES,
+        // so 64 multi-byte chars (e.g. "é" × 64 = 128 bytes) pass the length
+        // check and then panic in the slicing below at a non-char boundary —
+        // an abort, since the workspace builds panic = "abort". This parser
+        // exists to be lenient with untrusted-ish input, so it must not.
+        if pubkey_hex.len() != 128 || !pubkey_hex.is_ascii() {
             continue;
         }
         let Ok(bytes) = (0..64)
@@ -647,21 +652,14 @@ impl ElReader {
                 .filter(|(h, _)| *h == cfg.genesis_hash)
                 .map(|(_, rlp)| rlp),
         });
-        // Load the EL peer cache for warm-start (disabled if no path), then seed
-        // the network's pinned boot enodes into it so the pool's existing
-        // warm-start path dials them like any known peer — no separate dial
-        // route to keep in step. Twin of the Java `NetworkConfig.elBootEnodes()`
-        // that `ChainStack` direct-dials.
-        let mut cache = match &cfg.cache_path {
+        // Load the EL peer cache for warm-start (disabled if no path). The
+        // network's pinned boot enodes are NOT seeded here — they go to the pool
+        // directly, so they survive a disabled cache and never overwrite a snap
+        // flag the peer earned in an earlier run (see PeerPool's warm start).
+        let cache = match &cfg.cache_path {
             Some(path) => crate::el::peercache::ElPeerCache::load(path.clone()),
             None => crate::el::peercache::ElPeerCache::disabled(),
         };
-        for (addr, pubkey) in cfg.boot_enodes.iter() {
-            // snap=false: "known and dialable", NOT "confirmed snap server".
-            // Only a peer that actually served chain-verified snap data earns
-            // that, and the EL hunt's backoff bypass keys off it.
-            cache.add(*addr, pubkey, false);
-        }
         let local_pubkey = key.public_key_bytes();
         let sent_tx_watch: crate::el::sent_tx::SharedSentTxWatch = Arc::new(
             std::sync::Mutex::new(crate::el::sent_tx::SentTxTracker::new()),
@@ -672,6 +670,7 @@ impl ElReader {
             Arc::clone(&eth_cfg),
             cfg.pool_config,
             cache,
+            cfg.boot_enodes.clone(),
             rx,
             Some(Arc::clone(&sent_tx_watch)),
             Some(discovery.probe_sender()),
@@ -3534,7 +3533,7 @@ mod tests {
         assert_eq!(c.bootnodes.len(), 4, "all four mainnet bootnodes must parse");
     }
 
-        #[test]
+    #[test]
     fn sepolia_pins_the_dedicated_serving_node_enode() {
         // Twin of the Java NetworkConfigGnosisTest#sepoliaPinsTheDedicatedServingNodeOnBothLayers.
         let cfg = ElConfig::sepolia();
@@ -3555,6 +3554,9 @@ mod tests {
         assert!(parse_boot_enodes(&[&format!("enode://{}@nonsense", "ab".repeat(64))]).is_empty());
         // Non-hex in an otherwise well-shaped key.
         assert!(parse_boot_enodes(&[&format!("enode://{}@1.2.3.4:30303", "zz".repeat(64))]).is_empty());
+        // Non-ASCII: 64 x "é" is EXACTLY 128 bytes, so it passes a naive length
+        // check and would panic (→ abort) when sliced at a non-char boundary.
+        assert!(parse_boot_enodes(&[&format!("enode://{}@1.2.3.4:30303", "\u{00e9}".repeat(64))]).is_empty());
         assert_eq!(parse_boot_enodes(&[SEPOLIA_MYOTIS_ENODE]).len(), 1);
     }
 

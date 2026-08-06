@@ -35,8 +35,15 @@ class EthWireCodeTest {
 
     @Test
     void blockRangeUpdateSitsAtTheBaseOffsetPlusItsRelativeId() {
-        assertEquals(0x21, P2P_BASE + REL_BLOCK_RANGE_UPDATE,
-                "eth/69 BlockRangeUpdate wire code must be 0x21, not the bare relative id 0x11");
+        // The assertion that actually guards production: the constant EthHandler
+        // puts on the wire, not arithmetic over constants defined in this file.
+        assertEquals(P2P_BASE + REL_BLOCK_RANGE_UPDATE, EthHandler.ETH_BLOCK_RANGE_UPDATE,
+                "eth/69 BlockRangeUpdate must go out at base 0x10 + relative 0x11");
+        assertEquals(0x21, EthHandler.ETH_BLOCK_RANGE_UPDATE,
+                "wire code regressed to the bare relative id — every eth/69 peer will "
+                        + "read 0x11 as NewBlockHashes and disconnect with DiscSubprotocolError");
+        assertNotEquals(REL_BLOCK_RANGE_UPDATE, EthHandler.ETH_BLOCK_RANGE_UPDATE,
+                "the relative id must never be used as the wire code");
     }
 
     @Test
@@ -52,9 +59,10 @@ class EthWireCodeTest {
         int snapBaseEth68 = P2P_BASE + 17; // eth/67-68 protocol length
         int snapBaseEth69 = P2P_BASE + 18; // eth/69 adds BlockRangeUpdate
 
-        assertEquals(0x21, snapBaseEth68,
-                "on eth/68 wire 0x21 is snap GetAccountRange — BlockRangeUpdate must not be a "
-                        + "static switch case, or it would shadow snap traffic");
+        assertEquals(snapBaseEth68, EthHandler.ETH_BLOCK_RANGE_UPDATE,
+                "on eth/68 the SAME wire code is snap's GetAccountRange — which is why "
+                        + "EthHandler dispatches it in the default branch behind a version "
+                        + "check and never as a switch case (a case would shadow eth/68 snap)");
         assertEquals(0x22, snapBaseEth69);
         assertNotEquals(snapBaseEth69, P2P_BASE + REL_BLOCK_RANGE_UPDATE,
                 "on eth/69 BlockRangeUpdate (0x21) must not collide with the snap base (0x22)");
