@@ -7,6 +7,7 @@ import io.myotis.engine.capi.myotis_drain_logs
 import io.myotis.engine.capi.myotis_ens_record_json
 import io.myotis.engine.capi.myotis_estimate_gas_json
 import io.myotis.engine.capi.myotis_eth_call_json
+import io.myotis.engine.capi.myotis_eth_call_overrides_json
 import io.myotis.engine.capi.myotis_fee_estimate_json
 import io.myotis.engine.capi.myotis_fee_history_json
 import io.myotis.engine.capi.myotis_get_block_by_hash_json
@@ -165,6 +166,22 @@ object RustEngine {
 
     fun ethCallJson(handle: Long, from: String, to: String, data: String, valueDecimal: String, block: String): String =
         jsonCall { myotis_eth_call_json(handle, from, to, data, valueDecimal, block) }
+
+    /** [ethCallJson] with the `eth_call` state-override object as JSON (empty ⇒
+     *  none). A SIMULATION over verified state — the caller's hypothesis, not a
+     *  chain fact. */
+    fun ethCallOverridesJson(
+        handle: Long,
+        from: String,
+        to: String,
+        data: String,
+        valueDecimal: String,
+        block: String,
+        stateOverrides: String,
+    ): String =
+        jsonCall {
+            myotis_eth_call_overrides_json(handle, from, to, data, valueDecimal, block, stateOverrides)
+        }
 
     fun estimateGasJson(handle: Long, from: String, to: String, data: String, valueDecimal: String): String =
         jsonCall { myotis_estimate_gas_json(handle, from, to, data, valueDecimal) }

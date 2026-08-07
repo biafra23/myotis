@@ -113,6 +113,33 @@ class IosRpcBackend(
         return hexToBytes(o.engineString("resultHex"))
     }
 
+    override fun supportsStateOverrides(): Boolean = true   // the revm executor applies them
+
+    override fun callWithOverrides(
+        from: ByteArray?,
+        to: ByteArray,
+        data: ByteArray,
+        valueWei: String?,
+        block: String,
+        stateOverridesJson: String,
+    ): ByteArray? {
+        if (!isServableBlock(block)) return null
+        if (to.size != 20) return null
+        if (from != null && from.size != 20) return null
+        val handle = handleProvider() ?: return null
+        val o = resultOrNull(RustEngine.ethCallOverridesJson(
+            handle,
+            from?.let(::hex) ?: "",  // empty = anonymous zero sender
+            hex(to),
+            if (data.isEmpty()) "" else hex(data),
+            valueWei ?: "",
+            block,
+            stateOverridesJson,
+        )) ?: return null
+        if (o.engineString("status") != "ok") return null
+        return hexToBytes(o.engineString("resultHex"))
+    }
+
     override fun estimateGas(from: ByteArray?, to: ByteArray?, data: ByteArray?, valueWei: String?): Long? {
         // Contract creation (to=null) isn't handled verified.
         if (to == null || to.size != 20) return null

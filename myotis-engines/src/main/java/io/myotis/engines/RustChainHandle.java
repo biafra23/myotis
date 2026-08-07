@@ -738,6 +738,22 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 handle, fromHex, toHex, dataHex, valueDecimal, block)));
     }
 
+    /**
+     * {@link #ethCallVerified} with the {@code eth_call} state-override object as
+     * JSON (empty ⇒ none) — the caller's hypothesis applied over verified state
+     * for this call only.
+     */
+    byte[] ethCallVerifiedWithOverrides(
+            String fromHex,
+            String toHex,
+            String dataHex,
+            String valueDecimal,
+            String block,
+            String stateOverridesJson) {
+        return callResultFromJson(gated(() -> RustEngineNative.nativeEthCallOverridesJson(
+                handle, fromHex, toHex, dataHex, valueDecimal, block, stateOverridesJson)));
+    }
+
     /** Package-private test seam: call JSON → result bytes (or null) without JNI. */
     static byte[] callResultFromJson(String json) {
         JsonObject o = parseResultOrThrow(json, "call");

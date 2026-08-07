@@ -24,6 +24,32 @@ interface RpcBackend {
      *  alive. Never null: an unreadable status reads as [RpcSyncState.SYNCING]. */
     fun syncState(): RpcSyncState
     fun call(from: ByteArray?, to: ByteArray, data: ByteArray, valueWei: String?, block: String): ByteArray?
+
+    /**
+     * Whether this backend can APPLY state overrides. Distinguishes "overrides
+     * unsupported" (permanent → -32602) from an ordinary null answer such as
+     * not-synced or a revert (transient → -32000, retryable). Collapsing the two
+     * would tell a client to stop asking over a condition that clears in
+     * seconds.
+     */
+    fun supportsStateOverrides(): Boolean = false
+
+    /**
+     * [call] with the `eth_call` state-override object as JSON — caller-supplied
+     * state layered over verified state for this call only.
+     *
+     * Default `null` means "this backend cannot apply overrides", which the
+     * router turns into an honest refusal rather than an answer computed
+     * against unmodified state (see the apply-or-refuse rule in CLAUDE.md).
+     */
+    fun callWithOverrides(
+        from: ByteArray?,
+        to: ByteArray,
+        data: ByteArray,
+        valueWei: String?,
+        block: String,
+        stateOverridesJson: String,
+    ): ByteArray? = null
     fun getBalance(address: ByteArray, block: String): String?
     fun getTransactionCount(address: ByteArray, block: String): Long?
     fun getCode(address: ByteArray, block: String): ByteArray?

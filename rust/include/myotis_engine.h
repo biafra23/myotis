@@ -89,6 +89,13 @@ char *myotis_get_storage_at_json(int64_t handle, const char *address,
 char *myotis_eth_call_json(int64_t handle, const char *from, const char *to,
                            const char *data, const char *value,
                            const char *block);
+
+/* eth_call with a STATE OVERRIDE object as JSON (empty => none). The answer is
+   a simulation over verified state — the caller's hypothesis, not a chain fact. */
+char *myotis_eth_call_overrides_json(int64_t handle, const char *from,
+                                     const char *to, const char *data,
+                                     const char *value, const char *block,
+                                     const char *state_overrides);
 /* {"status":"ok","gas":N} | {"status":"unavailable","reason"} | {"error"}. */
 char *myotis_estimate_gas_json(int64_t handle, const char *from,
                                const char *to, const char *data,

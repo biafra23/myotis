@@ -13,6 +13,8 @@ import kotlin.concurrent.Volatile
  * serve each" record — and feeds the {@code myotis_rpcCoverage} introspection map.
  *
  * `path` is one of VERIFIED (served by Myotis, cryptographically verified),
+ * SIMULATED (served over verified state but under CALLER-SUPPLIED overrides —
+ * proven state, but the answer is the caller's hypothesis, not a chain fact),
  * PROXY (relayed upstream — unverified), ERROR, or LOCAL (answered here, e.g.
  * the coverage introspection method).
  *
@@ -44,7 +46,11 @@ class MethodLogger {
         val proxied: Long = 0,
         val error: Long = 0,
         val local: Long = 0,
+        val simulated: Long = 0,
     )
+
+    /** Buckets that mean "answered" — anything else counts as an error. */
+    private val ANSWERED = setOf("VERIFIED", "SIMULATED", "PROXY", "LOCAL")
 
     private val mutex = Mutex()
 
@@ -57,7 +63,11 @@ class MethodLogger {
      * @param method the JSON-RPC method (or a placeholder like {@code <parse-error>} for
      *   a request that couldn't be parsed to a method)
      * @param id     the request id, stringified (e.g. {@code 42}, {@code "abc"}, {@code null})
-     * @param path   the coverage bucket: VERIFIED / PROXY / LOCAL / ERROR
+     * @param path   the coverage bucket: VERIFIED / SIMULATED / PROXY / LOCAL / ERROR.
+     *   SIMULATED is a call answered over verified state but under CALLER-SUPPLIED
+     *   overrides — the state underneath was proven, the answer is not a chain
+     *   fact, and lumping it in with VERIFIED would overstate what this node
+     *   proved.
      * @param latencyMs handling latency in millis (0 when not meaningfully measurable)
      * @param code   the JSON-RPC error code for ERROR outcomes (e.g. -32000), else null
      */
@@ -67,21 +77,24 @@ class MethodLogger {
             byMethod = byMethod + (method to s.copy(
                 count = s.count + 1,
                 verified = s.verified + if (path == "VERIFIED") 1 else 0,
+                simulated = s.simulated + if (path == "SIMULATED") 1 else 0,
                 proxied = s.proxied + if (path == "PROXY") 1 else 0,
                 local = s.local + if (path == "LOCAL") 1 else 0,
-                error = s.error + if (path != "VERIFIED" && path != "PROXY" && path != "LOCAL") 1 else 0,
+                error = s.error + if (path !in ANSWERED) 1 else 0,
             ))
         }
         val outcome = if (code != null) "$path($code)" else path
         rpcLogInfo(ACCESS_LOGGER, "[rpc] method=$method id=$id outcome=$outcome latencyMs=$latencyMs")
     }
 
-    /** Coverage map as a JSON object: method -> {count, verified, proxied, error, local}. */
+    /** Coverage map as a JSON object:
+     *  method -> {count, verified, simulated, proxied, error, local}. */
     fun coverage(): JsonObject = buildJsonObject {
         byMethod.entries.sortedBy { it.key }.forEach { (method, s) ->
             put(method, buildJsonObject {
                 put("count", s.count)
                 put("verified", s.verified)
+                put("simulated", s.simulated)
                 put("proxied", s.proxied)
                 put("error", s.error)
                 put("local", s.local)
