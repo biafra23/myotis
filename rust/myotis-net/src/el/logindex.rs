@@ -577,7 +577,15 @@ impl LogIndex {
                 }
             }
         }
-        match self.cursor {
+        // The cursor is a HASH: above the clamp it may name a block that was
+        // never re-checked (or was orphaned), and a reloading walker would
+        // parent-chain into it. Drop it rather than persist it — the appender
+        // re-seeds the trust edge on its first append.
+        let cursor = match (self.cursor, clamp) {
+            (Some((n, _)), Some(max)) if n > max => None,
+            (cursor, _) => cursor,
+        };
+        match cursor {
             None => out.push(0),
             Some((n, h)) => {
                 out.push(1);
@@ -870,6 +878,23 @@ mod tests {
         let below = LogIndex::deserialize(&cfg, &ix.serialize_clamped(9)).unwrap();
         assert_eq!(below.coverage_of(&addr(1)).unwrap().span, None);
         assert_eq!(below.log_count(), 0);
+    }
+
+    #[test]
+    fn clamping_drops_a_cursor_above_the_clamp() {
+        let cfg = config_ok(vec![watch_all(addr(1), 0)]);
+        let mut ix = LogIndex::new(cfg.clone()).unwrap();
+        // append_block seeds the cursor at the first appended block.
+        ix.append_block(20, [20; 32], vec![]).unwrap();
+        assert_eq!(ix.cursor, Some((20, [20; 32])));
+        // Clamped below it, the cursor must NOT persist: it is a hash, and
+        // above the clamp it may name a block that was never re-checked — a
+        // reloading walker would parent-chain into it.
+        let below = LogIndex::deserialize(&cfg, &ix.serialize_clamped(15)).unwrap();
+        assert_eq!(below.cursor, None);
+        // At or above the cursor, it survives.
+        let at = LogIndex::deserialize(&cfg, &ix.serialize_clamped(20)).unwrap();
+        assert_eq!(at.cursor, Some((20, [20; 32])));
     }
 
     #[test]

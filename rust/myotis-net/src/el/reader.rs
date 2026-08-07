@@ -434,6 +434,13 @@ struct BridgePlan {
     /// Collected blocks in DESCENDING order (`blocks[0]` is the anchor).
     /// `candidate` is the header-bloom verdict: false is a definitive skip.
     blocks: Vec<(u64, [u8; 32], bool)>,
+    /// The watch-list this plan's bloom verdicts were computed against. A
+    /// `candidate=false` is a DEFINITIVE skip for that list only, so applying
+    /// the plan to a replaced index would claim coverage for blocks whose
+    /// new-address logs were never fetched. Re-checked under the index lock
+    /// before every apply — `clear_log_index_bridge` cannot help here, since
+    /// the tick holds the plan outside the slot across its network I/O.
+    fingerprint: u64,
     /// Set once the descent has reached `target`; the ascent runs after.
     descended: bool,
     /// Next index to apply during the ascent, counted from the END of
@@ -1041,6 +1048,13 @@ impl ElReader {
         };
         let recorded: Vec<(u64, [u8; 32])> =
             self.log_index_tail.lock().map(|t| t.clone()).unwrap_or_default();
+        // The bloom decisions below are made against THIS watch-list; a
+        // concurrent replacement would make them lies about the new one (its
+        // addresses were "definitively" skipped). Every append re-checks it
+        // under the index lock, exactly as the backfill commit does.
+        let Some(fingerprint) = self.with_log_index(|ix| ix.config().fingerprint()) else {
+            return;
+        };
         // Coverage above finality this run cannot vouch for: rewind.
         if !tail_vouches_for(&recorded, edge, finalized) {
             tracing::info!(
@@ -1051,9 +1065,17 @@ impl ElReader {
             self.log_index_rewind_to(finalized);
             edge = finalized.saturating_add(1);
         }
-        if head_n.saturating_sub(finalized) > TAIL_MAX {
+        if head_n.saturating_sub(finalized) >= TAIL_MAX {
+            // Finality has stalled far below the head. The tail cannot
+            // re-check what it appended from here (the window would exceed
+            // the 1024-header serve ceiling, so no peer can cover the floor),
+            // and coverage nobody re-checks must not keep serving: drop back
+            // to finality rather than answer explicit-number queries from
+            // blocks that can still reorg. `>=` because the window is
+            // inclusive at both ends — at exactly TAIL_MAX it needs 1025.
+            self.log_index_rewind_to(finalized);
             if ticks % 100 == 0 {
-                tracing::warn!(finalized, head_n, "log index tail: head too far above finality; coverage holds at finality");
+                tracing::warn!(finalized, head_n, "log index tail: finality too far below the head; coverage held at finality");
             }
             return;
         }
@@ -1190,8 +1212,12 @@ impl ElReader {
             let block_logs = logs.get(&n).cloned().unwrap_or_default();
             let ok = match self.log_index.lock() {
                 Ok(mut slot) => match slot.as_mut() {
-                    Some(ix) => ix.append_block(n, c.hash, block_logs).is_ok(),
-                    None => false,
+                    Some(ix) if ix.config().fingerprint() == fingerprint => {
+                        ix.append_block(n, c.hash, block_logs).is_ok()
+                    }
+                    // Uninstalled, or the watch-list changed under us: this
+                    // block's candidacy was decided against the old list.
+                    _ => false,
                 },
                 Err(_) => false,
             };
@@ -1322,11 +1348,12 @@ impl ElReader {
         /// makes the same trade).
         const TICK_BUDGET: std::time::Duration = std::time::Duration::from_millis(3000);
         /// Widest gap a single plan will map. Each entry is a padded
-        /// `(u64, [u8;32], bool)` = 48 bytes, and the Vec peaks at ~1.5x that
-        /// while doubling, so 500k blocks is ~24 MB steady / ~36 MB peak —
+        /// `(u64, [u8;32], bool)` = 48 bytes, so 500k blocks is ~24 MB —
         /// deliberately sized for a phone (CLAUDE.md keeps Android
-        /// first-class), not for a workstation. Beyond it, re-enabling the
-        /// index (which re-seeds at the head) beats a giant in-memory plan.
+        /// first-class), not for a workstation. Beyond it coverage simply
+        /// holds: a staged bridge (descend headers-only to an intermediate
+        /// anchor, then map MAX_GAP at a time) is the follow-up that would
+        /// close arbitrarily deep gaps without an unbounded plan.
         const MAX_GAP: u64 = 500_000;
 
         let Some((fin_n, fin_hash)) = self.anchor.finalized_execution().map(|f| (f.block_number, f.block_hash))
@@ -1341,7 +1368,7 @@ impl ElReader {
                 tracing::warn!(
                     edge,
                     finalized,
-                    "log index head gap exceeds the bridge's span; re-enable the index to re-index from the head"
+                    "log index head gap exceeds the bridge's span; coverage holds here until the watch-list changes (which replaces the index) or the index file is removed"
                 );
             }
             return;
@@ -1382,9 +1409,16 @@ impl ElReader {
                 plan = None;
             }
         }
+        let Some(fingerprint) = self.with_log_index(|ix| ix.config().fingerprint()) else {
+            return;
+        };
+        if plan.as_ref().is_some_and(|p| p.fingerprint != fingerprint) {
+            plan = None; // watch-list replaced: the mapped blooms don't apply
+        }
         let mut plan = plan.unwrap_or_else(|| BridgePlan {
             anchor_n: fin_n,
             anchor_hash: fin_hash,
+            fingerprint,
             target: edge,
             low_n: fin_n.saturating_add(1),
             low_hash: fin_hash,
@@ -1548,8 +1582,11 @@ impl ElReader {
                     let block_logs = logs.get(&n).cloned().unwrap_or_default();
                     let ok = match self.log_index.lock() {
                         Ok(mut slot) => match slot.as_mut() {
-                            Some(ix) => ix.append_block(n, h, block_logs).is_ok(),
-                            None => false,
+                            Some(ix) if ix.config().fingerprint() == plan.fingerprint => {
+                                ix.append_block(n, h, block_logs).is_ok()
+                            }
+                            // Uninstalled, or the watch-list changed under us.
+                            _ => false,
                         },
                         Err(_) => false,
                     };
