@@ -16,9 +16,15 @@
 #   is what did happen on 2026-08-07: the job errored at turn 1 for
 #   total_cost_usd 0, having read nothing and posted nothing).
 #
-#   The retry is safe precisely because that failure mode is all-or-nothing —
-#   the limit is rejected before any inference, so no partial review has been
-#   posted and the second attempt cannot duplicate comments.
+#   The retry does NOT assume the failure was a usage limit. A timeout, an API
+#   error, or an action failure can strike AFTER Claude has already posted a
+#   summary or inline findings (the action flushes buffered inline comments in
+#   an always() sub-step), and a second review on top of that would duplicate
+#   or contradict the first. So the fallback is gated on the property we
+#   actually care about — that the failed attempt posted nothing — measured by
+#   comparing the PR's comment count before and after. If the first attempt
+#   failed after posting, the fallback is suppressed and the job fails loudly
+#   instead of quietly stacking two reviews.
 #
 #   NOT --fallback-model: that flag only covers "overloaded or not available".
 #   Verified against a live exhausted limit — it falls back correctly from a
@@ -72,6 +78,22 @@ jobs:
             echo 'CLAUDE_PROMPT_EOF'
           } >> "$GITHUB_OUTPUT"
 
+      # Baseline for the "posted nothing" check below. `.comments` (issue
+      # comments) + `.review_comments` (inline) come straight off the PR object,
+      # so this is one call with no pagination to get wrong.
+      - name: Count review feedback before the first attempt
+        id: before
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Assign, don't inline into echo: a failed gh api inside an echo
+          # argument would still exit 0 and silently record an empty baseline.
+          n=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" \
+            --jq '.comments + .review_comments')
+          [[ "$n" =~ ^[0-9]+$ ]] || { echo "::error::Unexpected comment count: '$n'"; exit 1; }
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+
       # First choice. continue-on-error so an exhausted Fable 5 limit falls
       # through to Opus 5 below instead of failing the job.
       - name: Review (Fable 5)
@@ -87,9 +109,33 @@ jobs:
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
       # `outcome` is the raw step result (conclusion is masked to success by
-      # continue-on-error), so this fires exactly when Fable 5 failed.
-      - name: Review (Opus 5 — Fable 5 limit exhausted)
+      # continue-on-error), so this fires exactly when Fable 5 failed. The
+      # action has already flushed any buffered inline comments by now, so an
+      # unchanged count means genuinely nothing was posted and a second attempt
+      # is safe. A human commenting during the review window also trips this —
+      # rare, and it fails safe (a loud skip, never a silent duplicate).
+      - name: Did the failed attempt post anything?
+        id: unposted
         if: steps.fable.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          before='${{ steps.before.outputs.count }}'
+          now=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" \
+            --jq '.comments + .review_comments')
+          [[ "$now" =~ ^[0-9]+$ && "$before" =~ ^[0-9]+$ ]] \
+            || { echo "::error::Non-numeric comment count (before='$before' now='$now')"; exit 1; }
+          echo "before=$before now=$now"
+          if [ "$now" -eq "$before" ]; then
+            echo "safe=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "safe=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Fable 5 failed after posting $((now - before)) comment(s) — suppressing the Opus 5 fallback so the PR does not get two overlapping reviews."
+          fi
+
+      - name: Review (Opus 5 — Fable 5 limit exhausted)
+        if: steps.fable.outcome == 'failure' && steps.unposted.outputs.safe == 'true'
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -98,3 +144,12 @@ jobs:
             --model claude-opus-5
             --effort max
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+
+      # Suppressing the fallback must not look like a clean review. Without
+      # this the job would go green (continue-on-error masks the Fable 5
+      # failure) having left only a partial review on the PR.
+      - name: Fail when the review was left incomplete
+        if: steps.fable.outcome == 'failure' && steps.unposted.outputs.safe != 'true'
+        run: |
+          echo "::error::The Fable 5 review failed partway through, after already posting to the PR. The Opus 5 fallback was suppressed to avoid a duplicate review, so this PR has only partial feedback — close/reopen it for a clean pass."
+          exit 1
