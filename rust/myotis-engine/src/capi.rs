@@ -246,6 +246,40 @@ pub unsafe extern "C" fn myotis_eth_call_json(
     ))
 }
 
+/// [`myotis_eth_call_json`] with the `eth_call` STATE OVERRIDE object as JSON
+/// (`nativeEthCallOverridesJson` twin); empty ⇒ none. The answer is a
+/// SIMULATION over verified state — the caller's hypothesis, not a chain fact —
+/// so hosts record it separately (see the SIMULATED bucket in MethodLogger).
+///
+/// # Safety
+/// All pointer params must be null or valid null-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_eth_call_overrides_json(
+    handle: i64,
+    from: *const c_char,
+    to: *const c_char,
+    data: *const c_char,
+    value: *const c_char,
+    block: *const c_char,
+    state_overrides: *const c_char,
+) -> *mut c_char {
+    let from = read_string(from).unwrap_or_default();
+    let to = read_string(to).unwrap_or_default();
+    let data = read_string(data).unwrap_or_default();
+    let value = read_string(value).unwrap_or_default();
+    let block = read_string(block).unwrap_or_default();
+    let state_overrides = read_string(state_overrides).unwrap_or_default();
+    into_c(crate::host::eth_call_overrides_json(
+        handle,
+        &from,
+        &to,
+        &data,
+        &value,
+        &block,
+        &state_overrides,
+    ))
+}
+
 /// Verified `eth_estimateGas` over the revm executor (`nativeEstimateGasJson`
 /// twin; runs against the verified head — no block arg).
 ///
