@@ -1100,32 +1100,29 @@ impl ElReader {
             }
             return;
         }
-        let peers = self.pool.snap_peers().await;
-        if peers.is_empty() {
-            return;
-        }
-        // The window must cover the RECORDED blocks (to re-check them) and the
-        // covered top (so the first appended block links to it by parent
-        // hash), not merely the blocks still to append.
-        // Bound the walk by TAIL_MAX below the head rather than by finality —
-        // see tail_window_floor. TAIL_MAX-1 because the window is inclusive at
-        // both ends: a floor exactly TAIL_MAX below the head would need 1025
-        // headers, one past the serve ceiling, so no peer could ever reach it.
-        let hard_floor = head_n.saturating_sub(TAIL_MAX - 1);
+        // COVERAGE DECISIONS FIRST, PEERS SECOND. Both checks below give
+        // coverage back, and neither needs the network — running them after an
+        // empty-pool return would let coverage the tail can no longer re-check
+        // keep answering local queries for as long as the pool stays empty.
         let lowest_recorded = recorded.iter().map(|(n, _)| *n).min();
-        if lowest_recorded.is_some_and(|low| low < hard_floor) {
-            // A record the window cannot cover can never be compared — and
-            // pruning it as "confirmed" would be a lie. Give its coverage back
-            // instead; the appender or bridge re-adds it verified.
+        // The window must reach down through every RECORDED block (so a reorg
+        // is detectable) and the covered top (so the first appended block links
+        // to it by parent hash) — with no clamp, since a clamp would silently
+        // drop records out of the comparison. Whether the resulting window is
+        // obtainable at all is `tail_window_is_servable`'s question.
+        let floor = tail_window_floor(edge, lowest_recorded);
+        if !tail_window_is_servable(head_n, floor, TAIL_MAX) {
+            // No single window can cover what must be compared, so those
+            // records can never be confirmed — and retiring them as if they
+            // had been would be exactly the lie this module exists to prevent.
+            // Give their coverage back; the appender or bridge re-adds it
+            // verified.
             self.retire_tail_record();
             return;
         }
-        let floor = tail_window_floor(edge, lowest_recorded, hard_floor);
         if !tail_chain_reaches_coverage(head_n, edge) {
             // The chain no longer reaches our covered top: a reorg shortened
-            // it, and every block above the new head is orphaned. (Comparing
-            // against the window floor here could never fire — the floor sits
-            // at finality whenever the record vouches for the tail.)
+            // it, and every block above the new head is orphaned.
             tracing::info!(head_n, covered_high = edge.saturating_sub(1), "log index tail: chain shortened; rewinding");
             self.log_index_rewind_to(head_n);
             if let Ok(mut t) = self.log_index_tail.lock() {
@@ -1133,7 +1130,16 @@ impl ElReader {
             }
             return;
         }
-        let want = (head_n - floor + 1).min(1024);
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return;
+        }
+        // Panic-free by construction, and it takes BOTH guards above to make
+        // it so: `tail_chain_reaches_coverage` puts `head_n` at or above the
+        // covered top (and the floor never exceeds that), so the subtraction
+        // cannot wrap; servability bounds the span at TAIL_MAX. A clamp here
+        // is what let the window stop above the floor and reject every peer.
+        let want = head_n.saturating_sub(floor) + 1;
         let mut window = Vec::new();
         for peer in peers.iter() {
             match peer.get_block_headers_by_number(head_n, want, 0, true).await {
@@ -1274,12 +1280,13 @@ impl ElReader {
             }
             appended += 1;
         }
-        // Retire records only now: every one of them was compared against the
-        // canonical window above (the floor is built to cover them, and a
-        // window that fails to reach it is rejected), so a survivor at or
-        // below finality is confirmed canonical and can never change again.
+        // Retire records only now, through the shared rule. The evidence this
+        // site can supply is `compared = true`: the canonical window above
+        // covered every record (a window that fails to reach the floor is
+        // rejected before this point), so a survivor at or below finality has
+        // been confirmed canonical and can never change again.
         if let Ok(mut t) = self.log_index_tail.lock() {
-            t.retain(|(bn, _)| *bn > finalized);
+            t.retain(|(bn, _)| !record_may_retire(*bn, finalized, true));
         }
         if appended > 0 {
             tracing::debug!(appended, head_n, "log index tail advanced");
@@ -4788,15 +4795,17 @@ fn tail_vouches_for(recorded: &[(u64, [u8; 32])], edge: u64, finalized: u64) -> 
 /// and can never detect anything) and the covered top itself (so the first
 /// appended block links to it by parent hash).
 ///
-/// NOT clamped at finality: finality advances BETWEEN ticks, and a record it
-/// overtook would then sit below the window, never be compared, and be pruned
-/// as "immutable" — which is only true of the CANONICAL block at that height,
-/// not of the possibly-orphaned one we appended. `hard_floor` bounds the walk
-/// instead. Pure — unit-tested.
-fn tail_window_floor(edge: u64, lowest_recorded: Option<u64>, hard_floor: u64) -> u64 {
+/// UNBOUNDED BELOW, deliberately. Not clamped at finality: finality advances
+/// BETWEEN ticks, and a record it overtook would then sit below the window,
+/// never be compared, and be pruned as "immutable" — which is only true of the
+/// CANONICAL block at that height, not of the possibly-orphaned one we
+/// appended. Not clamped at a walk limit either: whether the window can be
+/// obtained is [`tail_window_is_servable`]'s question, and a clamp here would
+/// answer it by silently dropping records out of the comparison. Pure —
+/// unit-tested.
+fn tail_window_floor(edge: u64, lowest_recorded: Option<u64>) -> u64 {
     let covered_top = edge.saturating_sub(1);
-    let floor = lowest_recorded.unwrap_or(covered_top).min(covered_top);
-    floor.max(hard_floor)
+    lowest_recorded.unwrap_or(covered_top).min(covered_top)
 }
 
 /// THE record-retirement rule, as a predicate: may an entry recorded at
@@ -4939,20 +4948,20 @@ mod tail_reorg_tests {
         // THE bug this pins: a window starting at the coverage edge (1_001)
         // compares against records that all sit BELOW it — disjoint ranges, so
         // a reorg could never be detected. The floor must reach the records.
-        assert_eq!(tail_window_floor(1_001, Some(996), 0), 996);
+        assert_eq!(tail_window_floor(1_001, Some(996)), 996);
         // No records: still include the covered top so the next block links
         // to it by parent hash.
-        assert_eq!(tail_window_floor(1_001, None, 0), 1_000);
+        assert_eq!(tail_window_floor(1_001, None), 1_000);
         // A record above the covered top can't widen the window past it.
-        assert_eq!(tail_window_floor(1_001, Some(1_100), 0), 1_000);
-        // The hard floor bounds the walk...
-        assert_eq!(tail_window_floor(1_001, Some(500), 900), 900);
-        // ...but it is a WALK bound, not finality: a record finality overtook
-        // between ticks must still be inside the window, because it is only
-        // the canonical block at that height that became immutable — not the
-        // possibly-orphaned one we appended.
+        assert_eq!(tail_window_floor(1_001, Some(1_100)), 1_000);
+        // Unbounded below: a record finality overtook between ticks must still
+        // be inside the window, because it is only the CANONICAL block at that
+        // height that became immutable — not the possibly-orphaned one we
+        // appended. (How far down the window may reach is a separate
+        // question, answered by tail_window_is_servable.)
         let finality_now = 998;
-        assert!(tail_window_floor(1_001, Some(996), 900) < finality_now);
+        assert!(tail_window_floor(1_001, Some(996)) < finality_now);
+        assert_eq!(tail_window_floor(1_001, Some(500)), 500);
     }
 
     #[test]
@@ -4962,9 +4971,10 @@ mod tail_reorg_tests {
         let (edge, finalized) = (1_001u64, 990u64);
         // A head that fell back to 995 no longer reaches the covered top.
         assert!(!tail_chain_reaches_coverage(995, edge));
-        // The window FLOOR would not have caught this: it sits at finality
-        // whenever the record vouches, so `head < floor` is unreachable here.
-        assert!(995 >= tail_window_floor(edge, Some(991), finalized));
+        // The window FLOOR would not have caught this: with the record
+        // reaching finality+1 the floor sits there, so `head < floor` is
+        // unreachable and only the covered-top comparison detects it.
+        assert!(995 >= tail_window_floor(edge, Some(finalized + 1)));
         // A head at or above the covered top is fine.
         assert!(tail_chain_reaches_coverage(1_000, edge));
         assert!(tail_chain_reaches_coverage(1_200, edge));
@@ -4995,12 +5005,17 @@ mod tail_reorg_tests {
         // One block lower needs 1025 — no peer can serve it, which stalled
         // the tail permanently.
         assert!(!tail_window_is_servable(head, hard_floor - 1, TAIL_MAX));
-        // Whatever the record asks for, the floor the tail computes stays
-        // servable because it never goes below the hard floor.
+        // The tail computes its floor UNCLAMPED and then asks whether the
+        // window is obtainable — so a record within reach is servable...
         for lowest in [hard_floor, hard_floor + 5, head - 1] {
-            let floor = tail_window_floor(head, Some(lowest), hard_floor);
+            let floor = tail_window_floor(head, Some(lowest));
             assert!(tail_window_is_servable(head, floor, TAIL_MAX), "floor {floor}");
         }
+        // ...and one out of reach is REJECTED rather than silently clamped
+        // out of the comparison (the clamp is what stalled the tail: the
+        // window stopped above the floor and every peer was refused).
+        let floor = tail_window_floor(head, Some(hard_floor - 1));
+        assert!(!tail_window_is_servable(head, floor, TAIL_MAX));
     }
 
     #[test]
