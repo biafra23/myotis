@@ -125,6 +125,51 @@ class RpcRouterTest {
         assertNull(bare.callWithOverrides(null, ByteArray(20), ByteArray(0), null, "latest", "{}"))
     }
 
+    @Test fun malformedStateOverride_isRefusedPermanently_notServedAsVerified() {
+        // Each of these would previously have been treated as ABSENT and served
+        // by the plain path, counted VERIFIED — a caller-supplied parameter that
+        // can change the answer, neither applied nor refused.
+        val cases = listOf(
+            """"latest"""",                                   // not an object at all
+            """{"0xnothex":{"code":"0x60"}}""",              // key isn't an address
+            """{"0x0000000000000000000000000000000000696969":"0x6080"}""",  // entry isn't an object
+            """{"0x0000000000000000000000000000000000696969":{"nonsense":"0x1"}}""", // unknown field
+        )
+        cases.forEach { param ->
+            val b = FakeBackend(callResult = byteArrayOf(0, 6), applyOverrides = true)
+            val resp = route(b,
+                """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+                   "params":[{"to":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","data":"0x313ce567"},
+                             "latest",$param]}""")
+            assertTrue(hasError(resp), "served instead of refused: $param")
+            // -32602 permanent: the engine's parser would reject it too, but that
+            // crosses the backend boundary as a bare null and would read retryable.
+            assertEquals(-32602, errorCode(resp), "wrong code for: $param")
+            assertNull(b.lastTo, "reached the plain path: $param")
+            assertNull(b.lastOverrides, "reached the override path: $param")
+        }
+    }
+
+    @Test fun noOpStateOverrideShapes_areServedNormally() {
+        // Absent, explicit null, an empty map, an address mapped to an empty
+        // object, and an address mapped to null (geth reads null as a
+        // zero-valued override) all change nothing — refusing them would break
+        // clients that always fill the positional slot.
+        listOf(
+            "", """,null""", """,{}""",
+            """,{"0x0000000000000000000000000000000000696969":{}}""",
+            """,{"0x0000000000000000000000000000000000696969":null}""",
+        ).forEach { tail ->
+            val b = FakeBackend(callResult = byteArrayOf(0, 6), applyOverrides = true)
+            val resp = route(b,
+                """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+                   "params":[{"to":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","data":"0x313ce567"},
+                             "latest"$tail]}""")
+            assertEquals("0x0006", result(resp), "not served for tail: $tail")
+            assertNull(b.lastOverrides, "took the override path for a no-op: $tail")
+        }
+    }
+
     private class FakeBackend(
         var callResult: ByteArray? = null,
         /** When true this fake CAN apply overrides (the engine-backed case);

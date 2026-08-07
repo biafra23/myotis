@@ -101,6 +101,11 @@ class RpcRouter(
         return if (s.length > 64) s.substring(0, 64) + "…" else s
     }
 
+    private val ADDRESS_HEX = Regex("^0[xX][0-9a-fA-F]{40}$")
+
+    /** Fields geth's state override defines; anything else is malformed. */
+    private val OVERRIDE_FIELDS = setOf("code", "balance", "nonce", "state", "stateDiff")
+
     /** True when the request carries a NON-EMPTY override object PAST THE BLOCK
      *  TAG — `stateOverride` at index 2 or `blockOverrides` at index 3 of
      *  `eth_call` / `eth_estimateGas`. geth's signature is
@@ -113,6 +118,7 @@ class RpcRouter(
      *  An EMPTY object is not an override — nothing would change — so it is
      *  served normally; clients that always send the parameter must not break. */
     private fun hasUnsupportedOverride(root: JsonObject): Boolean =
+        stateOverrideParam(root) is OverrideParam.Malformed ||
         // DERIVED, not re-implemented: this decides whether to REFUSE while
         // stateOverrideJson decides whether to APPLY and how to LABEL. If the
         // two ever disagreed, the node would answer a question the caller
@@ -120,23 +126,52 @@ class RpcRouter(
         // exists to prevent — so there is one source of truth.
         stateOverrideJson(root) != null || blockOverridePresent(root)
 
-    /** The `stateOverride` object (params[2]) as JSON when it would change
-     *  execution, else null.
-     *
-     *  Keyed BY ADDRESS, so a map whose entries are all EMPTY objects changes
-     *  nothing and is not an override. But an entry that is present and NOT an
-     *  object (`{"0x…":"0x6080"}`) is malformed, not absent — treating it as
-     *  absent would serve the call against unmodified state and count it
-     *  VERIFIED, i.e. neither apply nor refuse a parameter that can change the
-     *  answer. It therefore counts as an override so the request fails closed. */
-    private fun stateOverrideJson(root: JsonObject): String? {
-        val ov = root.params()?.getOrNull(2) as? JsonObject ?: return null
-        val changesExecution = ov.values.any { v ->
-            (v as? JsonObject)?.isNotEmpty() ?: (v !is JsonNull)   // non-object => malformed
-        }
-        if (!changesExecution) return null
-        return json.encodeToString(JsonObject.serializer(), ov)
+    /** What `params[2]` (the state override) is, as far as this node is
+     *  concerned. Three outcomes, because collapsing them is how a caller ends
+     *  up with an answer to a question they didn't ask:
+     *   - [Absent]: no parameter, JSON null, or a map that changes nothing —
+     *     serve normally.
+     *   - [Valid]: an override to apply (or refuse, if the backend can't).
+     *   - [Malformed]: structurally wrong. REFUSED, never treated as absent:
+     *     serving it would run the call against unmodified state and report
+     *     VERIFIED. Refusing here also keeps the error PERMANENT (-32602) — the
+     *     engine's own parser would reject it too, but that failure crosses the
+     *     backend boundary as a bare null and would be reported as retryable. */
+    private sealed interface OverrideParam {
+        object Absent : OverrideParam
+        data class Valid(val json: String) : OverrideParam
+        data class Malformed(val why: String) : OverrideParam
     }
+
+    private fun stateOverrideParam(root: JsonObject): OverrideParam {
+        val raw = root.params()?.getOrNull(2) ?: return OverrideParam.Absent
+        if (raw is JsonNull) return OverrideParam.Absent
+        val ov = raw as? JsonObject
+            ?: return OverrideParam.Malformed("state override must be an object keyed by address")
+        var changesExecution = false
+        for ((addr, entry) in ov) {
+            if (!ADDRESS_HEX.matches(addr)) {
+                return OverrideParam.Malformed("state override key '$addr' is not a 20-byte address")
+            }
+            // An explicit null is "no override for this account" — geth reads it
+            // the same way (null unmarshals to a zero-valued override).
+            if (entry is JsonNull) continue
+            val fields = entry as? JsonObject
+                ?: return OverrideParam.Malformed("state override for '$addr' must be an object")
+            for (k in fields.keys) {
+                if (k !in OVERRIDE_FIELDS) {
+                    return OverrideParam.Malformed("unsupported state override field '$k'")
+                }
+            }
+            if (fields.isNotEmpty()) changesExecution = true
+        }
+        if (!changesExecution) return OverrideParam.Absent
+        return OverrideParam.Valid(json.encodeToString(JsonObject.serializer(), ov))
+    }
+
+    /** [stateOverrideParam]'s JSON when it is one to apply, else null. */
+    private fun stateOverrideJson(root: JsonObject): String? =
+        (stateOverrideParam(root) as? OverrideParam.Valid)?.json
 
     /** `blockOverrides` (params[3]) — NOT applied by this node, so its presence
      *  forces the refusal path even when the state override could be served. */
@@ -235,6 +270,16 @@ class RpcRouter(
             // override can be refused for one. Without it every ordinary
             // eth_estimateGas failure (a revert, not synced) would come back
             // permanent — a pre-existing test caught exactly that.
+            // A MALFORMED override is permanently invalid regardless of backend
+            // capability, and its reason is worth returning: the engine's parser
+            // would reject it too, but that crosses the boundary as a bare null
+            // and would be reported retryable.
+            (stateOverrideParam(root) as? OverrideParam.Malformed)?.let { bad ->
+                if (takesOverrides(m)) {
+                    logger.record(m, idStr, "ERROR", elapsedMs(t0), -32602)
+                    return errorEnvelope(id, -32602, "invalid state override: ${bad.why}")
+                }
+            }
             val overrideUnsupported = takesOverrides(m) && hasUnsupportedOverride(root) && (
                 blockOverridePresent(root) ||            // never applied
                     m == "eth_estimateGas" ||            // executor path not wired
@@ -336,6 +381,7 @@ class RpcRouter(
                 // request against an unmodified block context: a well-formed
                 // answer to a different question, the very defect this closes).
                 if (blockOverridePresent(root)) return null
+                if (stateOverrideParam(root) is OverrideParam.Malformed) return null
                 val overrideJson = stateOverrideJson(root)
                 val callObj = p?.getOrNull(0) as? JsonObject ?: return null
                 val to = callObj["to"]?.asHexBytes() ?: return null   // contract creation (to=null) -> proxy
