@@ -1,5 +1,6 @@
 package io.myotis.ios
 
+import io.myotis.engine.capi.MYOTIS_ABI_VERSION
 import io.myotis.engine.capi.myotis_available_networks_json
 import io.myotis.engine.capi.myotis_canonical_network_name
 import io.myotis.engine.capi.myotis_create
@@ -47,9 +48,15 @@ import kotlinx.cinterop.toKString
 @OptIn(ExperimentalForeignApi::class)
 object RustEngine {
 
-    /** Must match `ABI_VERSION` in rust/myotis-engine/src/lib.rs — the same
-     *  handshake `RustEngineNative.EXPECTED_ABI_VERSION` performs over JNI. */
-    const val EXPECTED_ABI_VERSION = 22
+    /** The ABI this host was built against, taken from the C header itself
+     *  (`MYOTIS_ABI_VERSION` in rust/include/myotis_engine.h) rather than
+     *  copied — the header instructs consumers to gate on the macro, and a
+     *  capi.rs test pins it to `ABI_VERSION` in rust/myotis-engine/src/lib.rs.
+     *  So there is no number to keep in sync here; cinterop reads it from the
+     *  same header it generates these bindings from. The JVM twin
+     *  `RustEngineNative.EXPECTED_ABI_VERSION` still mirrors by hand (UniFFI,
+     *  no header in the loop). */
+    const val EXPECTED_ABI_VERSION = MYOTIS_ABI_VERSION
 
     private val abiVersion: Int by lazy { myotis_init() }
 

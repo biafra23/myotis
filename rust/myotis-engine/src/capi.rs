@@ -480,27 +480,44 @@ mod tests {
     /// The hand-maintained C header is the contract for the plain-ABI consumers
     /// (:app-ios via cinterop, the napi loader), and its version is what they
     /// gate on — so it has to name the same number as the crate constant. The
-    /// `include_str!` makes the header a compile input of this test: bumping
-    /// `ABI_VERSION` without touching the header fails `cargo test` (wired into
-    /// the root Gradle `check`) instead of shipping a header that tells C
-    /// consumers to refuse a perfectly good engine.
+    /// `include_str!` makes the header a compile input of this test, so a
+    /// header-only edit still reruns it: bumping `ABI_VERSION` without updating
+    /// the header fails `cargo test` instead of shipping a header that tells C
+    /// consumers to refuse a perfectly good engine. The root Gradle `check`
+    /// runs that suite whenever cargo is present — it self-skips on a
+    /// toolchain-less build, so this is the guard, not a hard gate.
     #[test]
     fn header_pins_the_current_abi_version() {
         const HEADER: &str = include_str!("../../include/myotis_engine.h");
-        let declared: i32 = HEADER
+        // Collect every definition rather than taking the first: being defined
+        // exactly once is itself part of the contract, so a leftover copy in a
+        // dead `#if 0` branch (or a per-platform variant) fails loudly instead
+        // of shadowing the live one and passing against a stale value.
+        let defined: Vec<&str> = HEADER
             .lines()
-            .find_map(|l| l.trim().strip_prefix("#define MYOTIS_ABI_VERSION "))
-            .expect("rust/include/myotis_engine.h must #define MYOTIS_ABI_VERSION")
-            .trim()
+            .filter_map(|l| l.trim().strip_prefix("#define MYOTIS_ABI_VERSION"))
+            .filter(|rest| rest.starts_with(char::is_whitespace))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .collect();
+        assert_eq!(
+            defined.len(),
+            1,
+            "rust/include/myotis_engine.h must #define MYOTIS_ABI_VERSION exactly once, \
+             found {defined:?}"
+        );
+        // First token only, so the house style of annotating a bump inline
+        // (`#define MYOTIS_ABI_VERSION 23 /* + setFoo */`, the C twin of
+        // RustEngineNative.EXPECTED_ABI_VERSION's trailing comment) still parses.
+        let declared: i32 = defined[0]
             .parse()
-            .expect("MYOTIS_ABI_VERSION must be a plain integer literal");
+            .expect("MYOTIS_ABI_VERSION must be an integer literal");
         assert_eq!(
             declared,
             crate::ABI_VERSION,
             "rust/include/myotis_engine.h declares MYOTIS_ABI_VERSION {declared} but \
-             crate::ABI_VERSION is {}. Update the header, and check the host mirrors \
-             too: RustEngineNative.EXPECTED_ABI_VERSION (myotis-engines) and \
-             RustEngine.EXPECTED_ABI_VERSION (app-ios).",
+             crate::ABI_VERSION is {}. Update the header; :app-ios picks the new value \
+             up automatically, but RustEngineNative.EXPECTED_ABI_VERSION (myotis-engines) \
+             is still a hand-kept mirror.",
             crate::ABI_VERSION
         );
     }
