@@ -1767,7 +1767,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn status_reports_the_handles_own_network() {
         // Issue #291: a gnosis handle self-reported "mainnet" because the key
         // was a constant. The napi/Node consumer reads this raw object, so the

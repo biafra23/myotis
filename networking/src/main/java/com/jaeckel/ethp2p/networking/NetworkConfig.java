@@ -283,7 +283,9 @@ public record NetworkConfig(
             // issue #291 — a cold Gnosis pool starves catch-up because so few nodes
             // serve light-client data; these give a fresh install a serving head start).
             // Same list and ORDER as the Rust GNOSIS_STATIC_PEERS (sync.rs) — keep in
-            // step. 141.94.46.9 appears on two ports deliberately (same peer id).
+            // step, one address per peer id: the Rust PeerPool dedupes by peer id, so a
+            // second address for a known id would be dropped there while Java (which
+            // dedupes by multiaddr string) dialed both.
             List.of(
                     "/ip4/104.37.190.86/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59",
                     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
@@ -292,7 +294,6 @@ public record NetworkConfig(
                     "/ip4/136.243.146.247/tcp/9000/p2p/16Uiu2HAmEFCgE5gLHQRHNMv1P1R673849q7cgH7S3WJBXTkg5698",
                     "/ip4/138.201.196.44/tcp/4001/p2p/16Uiu2HAmFXPBdWLwQQSLpXhvSAzUfRErcH1whnq3SuPE5dRmojAT",
                     "/ip4/141.94.46.9/tcp/4001/p2p/16Uiu2HAmBCpdwswdk1wdzZH4gkhPtytx1Jt8GfSjgNsgPdPHUW67",
-                    "/ip4/141.94.46.9/tcp/9000/p2p/16Uiu2HAmBCpdwswdk1wdzZH4gkhPtytx1Jt8GfSjgNsgPdPHUW67",
                     "/ip4/144.76.106.139/tcp/9200/p2p/16Uiu2HAm4B91Fn21jnSPKw58R46THxhp1ZTHmTWU1TDWvNpJySRB",
                     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
                     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",

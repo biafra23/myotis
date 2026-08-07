@@ -266,14 +266,15 @@ const SEPOLIA_BOOTSTRAP_ENRS: &[&str] = &[
     "enr:-L64QC9Hhov4DhQ7mRukTOz4_jHm4DHlGL726NWH4ojH1wFgEwSin_6H95Gs6nW2fktTWbPachHJ6rUFu0iJNgA0SB2CARqHYXR0bmV0c4j__________4RldGgykDb6UBOQAABx__________-CaWSCdjSCaXCEA-2vzolzZWNwMjU2azGhA17lsUg60R776rauYMdrAz383UUgESoaHEzMkvm4K6k6iHN5bmNuZXRzD4N0Y3CCIyiDdWRwgiMo",
 ];
 
-/// Gnosis CL discv5 bootstrap ENRs (Java `NetworkConfig.GNOSIS.clDiscv5Bootnodes`
-/// — gnosischain/configs bootstrap_nodes.txt).
 /// Pinned Gnosis LC-serving peer multiaddrs (Java `NetworkConfig.GNOSIS.clPeerMultiaddrs`
 /// — keep the two lists and their ORDER in step). Identify-confirmed LC servers
 /// harvested from a long-running desktop profile's cl-peers-gnosis.cache
 /// (2026-08-06, issue #291): a cold Gnosis pool starves catch-up because so few
 /// nodes serve light-client data, so a fresh install gets a serving head start.
-/// 141.94.46.9 appears on two ports deliberately (same peer id; the pool dedupes).
+/// One address per peer id: `PeerPool::add` dedupes by peer id, so a second
+/// address for an already-known id would be silently dropped here (Java dedupes
+/// by multiaddr string and would dial both) — keeping the lists identical means
+/// keeping them one-per-id.
 const GNOSIS_STATIC_PEERS: &[&str] = &[
     "/ip4/104.37.190.86/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59",
     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
@@ -282,7 +283,6 @@ const GNOSIS_STATIC_PEERS: &[&str] = &[
     "/ip4/136.243.146.247/tcp/9000/p2p/16Uiu2HAmEFCgE5gLHQRHNMv1P1R673849q7cgH7S3WJBXTkg5698",
     "/ip4/138.201.196.44/tcp/4001/p2p/16Uiu2HAmFXPBdWLwQQSLpXhvSAzUfRErcH1whnq3SuPE5dRmojAT",
     "/ip4/141.94.46.9/tcp/4001/p2p/16Uiu2HAmBCpdwswdk1wdzZH4gkhPtytx1Jt8GfSjgNsgPdPHUW67",
-    "/ip4/141.94.46.9/tcp/9000/p2p/16Uiu2HAmBCpdwswdk1wdzZH4gkhPtytx1Jt8GfSjgNsgPdPHUW67",
     "/ip4/144.76.106.139/tcp/9200/p2p/16Uiu2HAm4B91Fn21jnSPKw58R46THxhp1ZTHmTWU1TDWvNpJySRB",
     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
@@ -300,6 +300,8 @@ const GNOSIS_STATIC_PEERS: &[&str] = &[
     "/ip4/164.152.161.131/tcp/9500/p2p/16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw",
 ];
 
+/// Gnosis CL discv5 bootstrap ENRs (Java `NetworkConfig.GNOSIS.clDiscv5Bootnodes`
+/// — gnosischain/configs bootstrap_nodes.txt).
 const GNOSIS_BOOTSTRAP_ENRS: &[&str] = &[
     "enr:-Ly4QIAhiTHk6JdVhCdiLwT83wAolUFo5J4nI5HrF7-zJO_QEw3cmEGxC1jvqNNUN64Vu-xxqDKSM528vKRNCehZAfEBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCCS-QxAgAAZP__________gmlkgnY0gmlwhEFtZ5SJc2VjcDI1NmsxoQJwgL5C-30E8RJmW8gCb7sfwWvvfre7wGcCeV4X1G2wJYhzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA",
     "enr:-Ly4QDhEjlkf8fwO5uWAadexy88GXZneTuUCIPHhv98v8ZfXMtC0S1S_8soiT0CMEgoeLe9Db01dtkFQUnA9YcnYC_8Bh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCCS-QxAgAAZP__________gmlkgnY0gmlwhEFtZ5WJc2VjcDI1NmsxoQMRSho89q2GKx_l2FZhR1RmnSiQr6o_9hfXfQUuW6bjMohzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA",
@@ -2379,18 +2381,22 @@ mod tests {
             c.accepted_fork_digests(),
             vec![[0x32, 0x37, 0xDA, 0xB6], [0x7D, 0x5A, 0xAB, 0x40]]
         );
-        // 23 pinned LC peers — same list and order as the Java
-        // NetworkConfig.GNOSIS.clPeerMultiaddrs (multiaddrs unique; one peer id
-        // appears on two ports, which the pool dedupes at add time).
-        assert_eq!(c.static_peers.len(), 23);
+        // 22 pinned LC peers — same list and order as the Java
+        // NetworkConfig.GNOSIS.clPeerMultiaddrs, ONE ADDRESS PER PEER ID
+        // (`PeerPool::add` dedupes by peer id, so a second address for a known
+        // id would never be dialed here while Java dialed both).
+        assert_eq!(c.static_peers.len(), 22);
         assert!(c.static_peers[0].ends_with(
             "/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59"
         ));
-        assert!(c.static_peers[22].ends_with(
+        assert!(c.static_peers[21].ends_with(
             "/tcp/9500/p2p/16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw"
         ));
         let unique: std::collections::HashSet<_> = c.static_peers.iter().collect();
-        assert_eq!(unique.len(), 23);
+        assert_eq!(unique.len(), 22);
+        let ids: std::collections::HashSet<_> =
+            c.static_peers.iter().map(|a| a.rsplit('/').next().unwrap()).collect();
+        assert_eq!(ids.len(), 22, "one address per peer id (the pool dedupes by id)");
         assert!(c.static_peers.iter().all(|p| parse_static_peer(p).is_some()));
         assert_eq!(c.bootstrap_enrs.len(), 8);
     }
