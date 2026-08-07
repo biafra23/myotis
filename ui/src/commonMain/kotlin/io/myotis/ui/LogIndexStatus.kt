@@ -27,6 +27,10 @@ object LogIndexStatus {
         val blocksPerSec: Double? = null,
         /** remaining/rate, engine-computed; null whenever the rate is unknown. */
         val etaSeconds: Long? = null,
+        /** Blocks between the top of coverage and the finalized head. While
+         *  this is non-zero, `toBlock: "latest"` queries are outside coverage
+         *  and refused — the engine's head bridge is closing it. */
+        val headGap: Long? = null,
     )
 
     /** Structured parse of the engine's status JSON (regex over the fixed
@@ -49,15 +53,30 @@ object LogIndexStatus {
         val remaining = Regex("\"blocksRemaining\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
         val bps = Regex("\"blocksPerSec\":([0-9.]+)").find(json)?.groupValues?.get(1)?.toDoubleOrNull()
         val eta = Regex("\"etaSeconds\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
-        return Parsed(enabled, logCount, entries, targetLow, remaining, bps, eta)
+        val headGap = Regex("\"headGap\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
+        return Parsed(enabled, logCount, entries, targetLow, remaining, bps, eta, headGap)
     }
 
     /** Human progress line for the Index tab: an ETA when the engine has a
      *  measured rate, otherwise x/y blocks (or a waiting note). Pure Kotlin —
      *  commonMain compiles for Kotlin/Native too, so no String.format. */
+    /** The head-side line: while coverage trails the finalized head, queries
+     *  reaching `latest` are refused, so say so rather than claim completion.
+     *  A small gap is the normal one-epoch lag of finality and reads as
+     *  caught-up. Null when there is nothing to report. */
+    private fun headLine(p: Parsed): String? {
+        val gap = p.headGap ?: return null
+        return if (gap <= NORMAL_HEAD_LAG) null
+        else "catching up to the head (${grouped(gap)} blocks behind)"
+    }
+
+    /** One finalized epoch of slots plus slack: below this the index is
+     *  following the head normally, not lagging. */
+    private const val NORMAL_HEAD_LAG = 128L
+
     fun progressLine(p: Parsed): String? {
         val remaining = p.blocksRemaining ?: return null
-        if (remaining == 0L) return "backfill complete"
+        if (remaining == 0L) return headLine(p) ?: "backfill complete"
         val eta = p.etaSeconds
         if (eta != null && p.blocksPerSec != null) {
             return "~${formatDuration(eta)} remaining " +

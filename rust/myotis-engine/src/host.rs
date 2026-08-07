@@ -2112,7 +2112,8 @@ pub fn log_index_status_json(handle: i64) -> String {
         return eljson::error_json("node is not running");
     };
     let rate_bps = reader.log_index_rate_bps();
-    let status = reader.with_log_index(|ix| build_log_index_status(ix, rate_bps));
+    let finalized = reader.finalized_block_number();
+    let status = reader.with_log_index(|ix| build_log_index_status(ix, rate_bps, finalized));
     status.unwrap_or_else(|| "{\"enabled\":false,\"logCount\":0,\"entries\":[]}".to_string())
 }
 
@@ -2121,6 +2122,7 @@ pub fn log_index_status_json(handle: i64) -> String {
 fn build_log_index_status(
     ix: &myotis_net::el::logindex::LogIndex,
     rate_bps: Option<f64>,
+    finalized: u64,
 ) -> String {
     {
         let mut s = String::from("{\"enabled\":");
@@ -2153,6 +2155,16 @@ fn build_log_index_status(
                         s.push_str(&eta.to_string());
                     }
                 }
+            }
+        }
+        // How far the TOP of coverage trails the finalized head. Queries with
+        // `toBlock: "latest"` are refused while this is non-zero, so it is the
+        // number that explains a refusal even on a fully backfilled index —
+        // the head bridge closes it after downtime.
+        if finalized > 0 {
+            if let Some(edge) = ix.append_edge() {
+                s.push_str(",\"headGap\":");
+                s.push_str(&finalized.saturating_sub(edge).to_string());
             }
         }
         s.push_str(",\"entries\":[");
@@ -2383,7 +2395,7 @@ mod log_index_json_tests {
         };
         let mut ix = myotis_net::el::logindex::LogIndex::new(cfg).unwrap();
         ix.cursor = Some((600, [0u8; 32]));
-        let s = build_log_index_status(&ix, Some(9.44));
+        let s = build_log_index_status(&ix, Some(9.44), 0);
         assert!(s.contains("\"maxSpeed\":true"), "{s}");
         assert!(s.contains("\"targetLow\":100"), "{s}");
         assert!(s.contains("\"blocksRemaining\":500"), "{s}");
@@ -2391,7 +2403,7 @@ mod log_index_json_tests {
         // eta = 500 / 9.44 = 52.966 -> 53
         assert!(s.contains("\"etaSeconds\":53"), "{s}");
         // No rate -> no ETA keys, remaining still present.
-        let s2 = build_log_index_status(&ix, None);
+        let s2 = build_log_index_status(&ix, None, 0);
         assert!(s2.contains("\"blocksRemaining\":500"), "{s2}");
         assert!(!s2.contains("etaSeconds"), "{s2}");
     }

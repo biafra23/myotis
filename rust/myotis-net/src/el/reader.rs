@@ -387,6 +387,12 @@ const SENT_TX_CACHE_MAX: usize = 256;
 /// dedupe repeats anyway.
 const TX_REBROADCAST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How far behind the finalized head the log-index append edge may fall before
+/// the head BRIDGE takes over from the per-block appender. The per-block path
+/// anchors a window from each target block to the optimistic head, so it stays
+/// well inside that lookback cap; anything deeper is a bridge walk.
+const APPEND_WINDOW: u64 = 128;
+
 /// The sent-tx state behind one lock (see the `sent_txs` field doc). The
 /// WATCH itself lives separately in the shared Arc every peer read loop also
 /// holds (gossip sightings) — see `ElReader::sent_tx_watch`.
@@ -395,6 +401,51 @@ struct SentTxState {
     /// Raw broadcast bytes by tx hash — what a rebroadcast re-pushes.
     bytes: myotis_evm::Lru<[u8; 32], Vec<u8>>,
     last_rebroadcast: std::time::Instant,
+}
+
+/// An in-progress head-gap bridge: the plan that carries log-index coverage
+/// from its stale append edge up to a finalized anchor after downtime (see
+/// [`ElReader::log_index_bridge_step`]).
+///
+/// Two phases, both resumable across ticks:
+/// 1. DESCEND from the finalized anchor collecting `(number, hash, candidate)`
+///    for every block down to the edge. Trust flows downward only — a header
+///    is trusted because the block above it names its hash as parent — so the
+///    gap can only be learned top-down. Blooms are evaluated during the
+///    descent and discarded (one bool per block, not 256 bytes).
+/// 2. ASCEND from the edge applying blocks in order: coverage extends upward
+///    contiguously, so the bottom block must land first. Non-candidates apply
+///    with no network at all; candidates re-fetch their header by (trusted)
+///    hash plus body and receipts, verified against both roots exactly like
+///    the backfill walk.
+///
+/// The anchor is the FINALIZED block, so nothing collected here can reorg.
+struct BridgePlan {
+    /// The finalized block this plan descends from, and the coverage edge it
+    /// must reach. Both fixed for the plan's lifetime — a moved finalized head
+    /// or edge (an append landing, a config change) discards and rebuilds it.
+    anchor_n: u64,
+    anchor_hash: [u8; 32],
+    target: u64,
+    /// Lowest block the descent has reached so far (`anchor_n` + 1 hash when
+    /// the descent hasn't started), the resume point for the next slice.
+    low_n: u64,
+    low_hash: [u8; 32],
+    /// Collected blocks in DESCENDING order (`blocks[0]` is the anchor).
+    /// `candidate` is the header-bloom verdict: false is a definitive skip.
+    blocks: Vec<(u64, [u8; 32], bool)>,
+    /// Full headers for the CANDIDATES only — kept from the descent so the
+    /// ascent can verify bodies/receipts against their roots without
+    /// re-fetching a header per block. Candidates are sparse (a watch-list
+    /// bloom hit is roughly one block in a thousand), so this stays small
+    /// while `blocks` carries 41 bytes for everything else.
+    candidate_headers:
+        std::collections::HashMap<[u8; 32], crate::el::eth::messages::VerifiedHeader>,
+    /// Set once the descent has reached `target`; the ascent runs after.
+    descended: bool,
+    /// Next index to apply during the ascent, counted from the END of
+    /// `blocks` (the bottom block) upward.
+    applied: usize,
 }
 
 /// `eth_getTransactionByHash`'s three verified answers (the Java engine's
@@ -575,6 +626,9 @@ pub struct ElReader {
     /// tick tails count; a busy-time denominator overstated nice-mode rates
     /// ~6x). Reset on any config (re)apply and on cursor regression.
     log_index_rate: std::sync::Mutex<Option<(std::time::Instant, u64, f64)>>,
+    /// In-progress head-gap bridge (see [`Self::log_index_bridge_step`]).
+    /// `None` whenever the coverage edge is within the appender's reach.
+    log_index_bridge: std::sync::Mutex<Option<BridgePlan>>,
     log_index_path: Option<std::path::PathBuf>,
     /// The head-follow appender task (spawned on enable, aborted on stop).
     log_index_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -718,6 +772,7 @@ impl ElReader {
             sent_tx_watch,
             log_index: std::sync::Mutex::new(None),
             log_index_rate: std::sync::Mutex::new(None),
+            log_index_bridge: std::sync::Mutex::new(None),
             log_index_last_persist: std::sync::Mutex::new(None),
             log_index_pipeline_full: std::sync::atomic::AtomicBool::new(true),
             log_index_path: cfg.log_index_path,
@@ -815,7 +870,7 @@ impl ElReader {
             // Slice-3 rule: append FINALIZED blocks only. Finalized never
             // reorgs, so coverage stays honest with zero rewind machinery;
             // optimistic-tail appending (with the design doc's rewind rule)
-            // and deep-gap bridging both belong to the backfill slice.
+            // stays out of scope. A deep gap is closed by the head bridge.
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(6));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut since_persist = 0u32;
@@ -861,16 +916,19 @@ impl ElReader {
             Some(_) => return, // caught up
         };
         // The verified whole-block path anchors a window from the target to
-        // the optimistic head; stay well inside its lookback cap. A deeper
-        // lag is the backfill walker's job — say so once per tick.
-        if finalized.saturating_sub(start) > 128 {
-            // Rate-limited: this state persists until the backfill walker
-            // exists / catches up, and a warn every 6 s is just noise.
-            if ticks % 100 == 0 {
-                tracing::warn!(start, finalized, "log index append edge too far behind (node downtime?); upward bridging is a tracked follow-up — coverage above the edge stays frozen until then");
-            }
+        // the optimistic head; stay well inside its lookback cap. A deeper lag
+        // (downtime, a suspended laptop, an imported index whose top predates
+        // this run) is the BRIDGE's job — it closes the gap with the same
+        // verified machinery the backfill walk uses, after which this per-block
+        // path resumes. Without it the edge froze permanently: every later
+        // append needs contiguity, so a single gap wider than the window meant
+        // coverage never advanced again and every `toBlock: "latest"` query
+        // stayed outside coverage forever.
+        if finalized.saturating_sub(start) > APPEND_WINDOW {
+            self.log_index_bridge_step(start, finalized, ticks).await;
             return;
         }
+        self.clear_log_index_bridge();
         let last = finalized.min(start.saturating_add(15));
         for n in start..=last {
             let (block_hash, receipts) = match self.block_receipts_at(Some(n)).await {
@@ -922,6 +980,322 @@ impl ElReader {
         }
     }
 
+    /// True when a full-index checkpoint is due (and claims the slot). The
+    /// persist is a whole-file rewrite under the index lock, so both the
+    /// backfill and the bridge share this throttle.
+    fn log_index_persist_due(&self) -> bool {
+        const PERSIST_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+        self.log_index_last_persist.lock().is_ok_and(|mut t| {
+            if t.is_none_or(|prev| prev.elapsed() >= PERSIST_MIN_INTERVAL) {
+                *t = Some(std::time::Instant::now());
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Drop any in-progress bridge plan (the gap closed, or the premises it
+    /// was built on changed).
+    fn clear_log_index_bridge(&self) {
+        if let Ok(mut slot) = self.log_index_bridge.lock() {
+            if slot.is_some() {
+                *slot = None;
+            }
+        }
+    }
+
+    /// One head-gap bridge step: carry coverage from a stale append edge up to
+    /// the finalized head, one bounded slice per tick, using the same verified
+    /// machinery as the backfill walk (parent-hash chain from a beacon anchor,
+    /// header bloom pre-filter, receipts checked against both roots).
+    ///
+    /// Runs only while the gap exceeds the appender's per-block window; the
+    /// last slice hands back to the appender, which keeps up from there. See
+    /// [`BridgePlan`] for the two phases and why they run in that order.
+    async fn log_index_bridge_step(&self, edge: u64, finalized: u64, ticks: u64) {
+        /// Headers per descent request — the eth/66+ serve ceiling.
+        const DESCENT_BATCH: u64 = 1024;
+        /// Descent requests per tick: bounds a long gap's catch-up work per
+        /// 6s tick instead of monopolizing the walker for minutes.
+        const DESCENT_BATCHES_PER_TICK: usize = 8;
+        /// Blocks applied per tick during the ascent.
+        const ASCENT_PER_TICK: usize = 2048;
+        /// Candidate blocks per body/receipts request (backfill's chunk size).
+        const CANDIDATE_CHUNK: usize = 64;
+        /// Widest gap a single plan will map. ~41 bytes per block plus sparse
+        /// candidate headers, so 2M blocks is well under 100 MB — and on any
+        /// chain that is many months of downtime, where re-indexing from the
+        /// head is the saner answer than a giant in-memory plan.
+        const MAX_GAP: u64 = 2_000_000;
+
+        let Some((fin_n, fin_hash)) = self.anchor.finalized_execution().map(|f| (f.block_number, f.block_hash))
+        else {
+            return; // no finalized anchor yet — nothing to anchor trust on
+        };
+        if fin_n != finalized {
+            return; // moved under us; next tick re-reads it
+        }
+        if finalized.saturating_sub(edge) > MAX_GAP {
+            if ticks % 100 == 0 {
+                tracing::warn!(
+                    edge,
+                    finalized,
+                    "log index head gap exceeds the bridge's span; re-enable the index to re-index from the head"
+                );
+            }
+            return;
+        }
+        let peers = self.pool.snap_peers().await;
+        let Some(peer) = peers.first() else {
+            if ticks % 100 == 0 {
+                tracing::info!(edge, finalized, "log index head bridge idle: no peers this tick");
+            }
+            return;
+        };
+
+        // Take the plan out for the duration: the tick owns it, and any early
+        // return without putting it back discards a plan whose premises no
+        // longer hold (peer failure mid-descent, moved edge).
+        let mut plan = match self.log_index_bridge.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => None,
+        };
+        // A plan survives across ticks as long as it still lines up with where
+        // coverage now is. Two things move under it, and NEITHER invalidates
+        // the mapped blocks:
+        //  - the edge, which the ascent itself advances (so the plan's own
+        //    progress must be added back before comparing), and
+        //  - the finalized head, which only moves forward; everything the plan
+        //    mapped sits below its own anchor and below finality, so it stays
+        //    immutable. Blocks finalized since are simply not in this plan —
+        //    the appender (or the next plan) picks them up afterwards.
+        // Getting this wrong is expensive rather than unsafe: a discarded plan
+        // re-descends the whole gap, which for a large gap is every tick's
+        // work thrown away.
+        if let Some(p) = &plan {
+            if fin_n < p.anchor_n || p.target.saturating_add(p.applied as u64) != edge {
+                plan = None;
+            }
+        }
+        let mut plan = plan.unwrap_or(BridgePlan {
+            anchor_n: fin_n,
+            anchor_hash: fin_hash,
+            target: edge,
+            low_n: fin_n.saturating_add(1),
+            low_hash: fin_hash,
+            blocks: Vec::new(),
+            candidate_headers: std::collections::HashMap::new(),
+            descended: false,
+            applied: 0,
+        });
+
+        // The descent verifies against the plan's OWN anchor: finality may have
+        // advanced since the plan was built, and re-anchoring mid-descent would
+        // break the parent-hash chain the collected blocks were verified under.
+        let (anchor_n, anchor_hash) = (plan.anchor_n, plan.anchor_hash);
+        if !plan.descended {
+            for _ in 0..DESCENT_BATCHES_PER_TICK {
+                // First request starts AT the anchor; later ones continue from
+                // the lowest verified block (which is re-served as the head of
+                // the window, so its hash re-anchors the chain check).
+                let from = plan.low_n.min(anchor_n);
+                let want = (from.saturating_sub(plan.target) + 1).min(DESCENT_BATCH);
+                let window = match peer.get_block_headers_by_number(from, want, 0, true).await {
+                    Ok(w) => w,
+                    Err(e) => {
+                        tracing::debug!(error = %e, from, "log index head bridge: header window failed");
+                        return; // plan dropped; rebuilt next tick
+                    }
+                };
+                let Some((top, _)) = window.split_first() else {
+                    return;
+                };
+                let before_low = plan.low_n;
+                let expect_hash = if plan.blocks.is_empty() { anchor_hash } else { plan.low_hash };
+                if top.header.number != from || top.hash != expect_hash {
+                    tracing::debug!(from, "log index head bridge: window does not start at the anchor");
+                    return;
+                }
+                // Descending parent-hash chain, exactly as the backfill batch
+                // verifies it: only the chained prefix is trusted.
+                let mut verified = 1usize; // the anchor block itself
+                for pair in window.windows(2) {
+                    let [upper, lower] = pair else { break };
+                    if upper.header.parent_hash != lower.hash
+                        || lower.header.number != upper.header.number.wrapping_sub(1)
+                    {
+                        break;
+                    }
+                    verified += 1;
+                }
+                for vh in &window[..verified] {
+                    // The anchor block is collected once; continuation windows
+                    // re-serve their head, which is already collected.
+                    if !plan.blocks.is_empty() && vh.header.number >= plan.low_n {
+                        continue;
+                    }
+                    let candidate = match <&[u8; 256]>::try_from(vh.header.logs_bloom.as_slice()) {
+                        Ok(bloom) => self
+                            .with_log_index(|ix| ix.bloom_may_match(vh.header.number, bloom))
+                            .unwrap_or(false),
+                        Err(_) => true, // odd bloom width: verify via receipts
+                    };
+                    if candidate {
+                        plan.candidate_headers.insert(vh.hash, vh.clone());
+                    }
+                    plan.blocks.push((vh.header.number, vh.hash, candidate));
+                    plan.low_n = vh.header.number;
+                    plan.low_hash = vh.hash;
+                }
+                if plan.low_n >= before_low {
+                    // A window that chains nothing new (peer served only the
+                    // re-anchor block, or an unchained response) would spin
+                    // this loop; drop the plan and try another peer next tick.
+                    tracing::debug!(from, "log index head bridge: window added no chained blocks");
+                    return;
+                }
+                if plan.low_n <= plan.target {
+                    plan.descended = true;
+                    tracing::info!(
+                        from = plan.target,
+                        to = anchor_n,
+                        blocks = plan.blocks.len(),
+                        candidates = plan.blocks.iter().filter(|b| b.2).count(),
+                        "log index head bridge: gap mapped; applying"
+                    );
+                    break;
+                }
+            }
+        }
+
+        if plan.descended {
+            let total = plan.blocks.len();
+            let mut applied_this_tick = 0usize;
+            while plan.applied < total && applied_this_tick < ASCENT_PER_TICK {
+                // One request per RUN of candidates ahead of the cursor —
+                // candidates are sparse, so a chunk typically covers a long
+                // stretch of plain blocks that need no network at all.
+                let hashes = bridge_candidate_chunk(&plan.blocks, plan.applied, CANDIDATE_CHUNK);
+                let logs = if hashes.is_empty() {
+                    std::collections::HashMap::new()
+                } else {
+                    match self.bridge_fetch_logs(peer, &hashes, &plan.candidate_headers).await {
+                        Ok(map) => map,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "log index head bridge: candidate fetch failed");
+                            break; // keep the plan; retry the same slice next tick
+                        }
+                    }
+                };
+                // Apply this block plus every non-candidate up to the next
+                // candidate whose logs we just fetched.
+                let mut progressed = false;
+                while plan.applied < total && applied_this_tick < ASCENT_PER_TICK {
+                    let j = total - 1 - plan.applied;
+                    let (n, h, cand) = plan.blocks[j];
+                    if cand && !logs.contains_key(&n) {
+                        break; // needs a fetch this round didn't cover
+                    }
+                    let block_logs = logs.get(&n).cloned().unwrap_or_default();
+                    let ok = match self.log_index.lock() {
+                        Ok(mut slot) => match slot.as_mut() {
+                            Some(ix) => ix.append_block(n, h, block_logs).is_ok(),
+                            None => false,
+                        },
+                        Err(_) => false,
+                    };
+                    if !ok {
+                        // Uninstalled, replaced, or (impossible) non-adjacent:
+                        // drop the plan and let the next tick re-derive.
+                        tracing::debug!(block = n, "log index head bridge: append rejected; replanning");
+                        return;
+                    }
+                    plan.applied += 1;
+                    applied_this_tick += 1;
+                    progressed = true;
+                }
+                if !progressed {
+                    break; // nothing became applicable this round — retry next tick
+                }
+            }
+            let done = plan.applied >= total;
+            // Checkpoint on the same throttle the backfill uses — the persist
+            // is a full-index rewrite, and bridging can apply thousands of
+            // blocks per tick. Always checkpoint the final slice.
+            if applied_this_tick > 0 && (done || self.log_index_persist_due()) {
+                if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
+                    if let Some(ix) = slot.as_ref() {
+                        let _ = ix.persist(path);
+                    }
+                }
+            }
+            if done {
+                tracing::info!(to = anchor_n, "log index head bridge complete; head-follow resumes");
+                return; // plan finished — dropped, appender takes over
+            }
+        }
+        if let Ok(mut slot) = self.log_index_bridge.lock() {
+            *slot = Some(plan);
+        }
+    }
+
+    /// Fetch bodies+receipts for bridge candidate blocks and return their
+    /// watch-list logs by block number. Verification is the backfill's, block
+    /// for block: transactions against the header's `transactionsRoot`,
+    /// receipts against its `receiptsRoot`. The headers come from the plan's
+    /// descent — already parent-hash-chained to the finalized anchor — so a
+    /// peer serving this fetch cannot substitute a different block: its
+    /// bodies/receipts must hash to roots the trusted header names.
+    async fn bridge_fetch_logs(
+        &self,
+        peer: &ManagedPeer,
+        hashes: &[[u8; 32]],
+        headers: &std::collections::HashMap<[u8; 32], crate::el::eth::messages::VerifiedHeader>,
+    ) -> Result<std::collections::HashMap<u64, Vec<crate::el::logindex::StoredLog>>, String> {
+        let mut out = std::collections::HashMap::new();
+        if hashes.is_empty() {
+            return Ok(out);
+        }
+        let (bodies, receipt_blocks) = futures::future::join(
+            peer.get_block_bodies(hashes),
+            peer.get_receipts(hashes),
+        )
+        .await;
+        let (bodies, receipt_blocks) = (bodies?, receipt_blocks?);
+        // Honest byte-budget truncation: use the served prefix, leave the rest
+        // for the next round (the caller re-requests what it didn't get).
+        let usable = bodies.len().min(receipt_blocks.len()).min(hashes.len());
+        if usable == 0 {
+            return Err("peer served no bodies/receipts for bridge candidates".to_string());
+        }
+        for i in 0..usable {
+            let vh = headers
+                .get(&hashes[i])
+                .ok_or("bridge candidate header missing from the plan")?;
+            verify_body_transactions(&vh.header, &bodies[i])?;
+            if receipt_blocks[i].len() != bodies[i].transactions.len() {
+                return Err(format!(
+                    "block {}: {} receipts for {} transactions",
+                    vh.header.number,
+                    receipt_blocks[i].len(),
+                    bodies[i].transactions.len()
+                ));
+            }
+            verify_block_receipts(&vh.header, &receipt_blocks[i])?;
+            let built = build_block_receipts(&vh.header, vh.hash, &bodies[i], &receipt_blocks[i])?;
+            let stored =
+                stored_logs_for_block(&built).ok_or("malformed log field in verified receipts")?;
+            let watched: Vec<crate::el::logindex::StoredLog> = self
+                .with_log_index(|ix| {
+                    stored.iter().filter(|l| ix.config().watches(l)).cloned().collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            out.insert(vh.header.number, watched);
+        }
+        Ok(out)
+    }
+
     /// One backfill step: walk the verified header chain DOWNWARD from the
     /// index's trust cursor toward the lowest watched from_block, one batch
     /// per tick (docs/eth-getlogs-design.md §backfill). Every header is
@@ -948,20 +1322,10 @@ impl ElReader {
             // Yield between rounds so this task never monopolizes the runtime.
             tokio::task::yield_now().await;
         }
-        // Checkpoint at most every PERSIST_MIN_INTERVAL of progressing steps
-        // (not per batch, not even per step): the persist is a full-index
-        // rewrite under the index lock, and its cost grows with the store —
-        // a crash now costs at most ~10s of batches.
-        const PERSIST_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-        let persist_due = any_progress
-            && self.log_index_last_persist.lock().is_ok_and(|mut t| {
-                if t.is_none_or(|prev| prev.elapsed() >= PERSIST_MIN_INTERVAL) {
-                    *t = Some(std::time::Instant::now());
-                    true
-                } else {
-                    false
-                }
-            });
+        // Checkpoint at most once per throttle window of progressing steps
+        // (not per batch, not even per step) — see log_index_persist_due; a
+        // crash now costs at most ~10s of batches.
+        let persist_due = any_progress && self.log_index_persist_due();
         if persist_due {
             if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
                 if let Some(ix) = slot.as_ref() {
@@ -3905,6 +4269,34 @@ fn stored_logs_for_block(receipts: &[VerifiedReceipt]) -> Option<Vec<crate::el::
     Some(out)
 }
 
+/// The next run of head-bridge candidate hashes to request, in ASCENDING
+/// block order. `blocks` is the plan's descending `(number, hash, candidate)`
+/// list and `applied` is how many blocks the ascent has already applied
+/// (counted from the end). Returns at most `max` hashes; empty when the next
+/// block to apply is a plain (bloom-miss) block, which needs no request at
+/// all. Pure — the arithmetic that turns a descending plan into ascending
+/// work, unit-tested in `bridge_plan_tests`.
+fn bridge_candidate_chunk(
+    blocks: &[(u64, [u8; 32], bool)],
+    applied: usize,
+    max: usize,
+) -> Vec<[u8; 32]> {
+    let total = blocks.len();
+    let mut out = Vec::new();
+    if applied >= total || max == 0 || !blocks[total - 1 - applied].2 {
+        return out; // done, or the cursor sits on a plain block
+    }
+    let mut i = applied;
+    while i < total && out.len() < max {
+        let (_, hash, candidate) = blocks[total - 1 - i];
+        if candidate {
+            out.push(hash);
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Pure truncation arithmetic for one backfill candidate chunk: given the
 /// chunk's block numbers (descending) and how many bodies/receipts the peer
 /// actually served, return `(usable, stop_below)` — the verified-prefix
@@ -3929,6 +4321,63 @@ fn truncation_plan(
 /// claim a block whose candidate receipts were not verified.
 fn should_apply(n: u64, stop_below: Option<u64>) -> bool {
     !stop_below.is_some_and(|stop| n <= stop)
+}
+
+#[cfg(test)]
+mod bridge_plan_tests {
+    use super::bridge_candidate_chunk;
+
+    /// Descending `(number, hash, candidate)` — the plan's own layout.
+    fn plan(spec: &[(u64, bool)]) -> Vec<(u64, [u8; 32], bool)> {
+        spec.iter()
+            .map(|(n, c)| {
+                let mut h = [0u8; 32];
+                h[..8].copy_from_slice(&n.to_be_bytes());
+                (*n, h, *c)
+            })
+            .collect()
+    }
+
+    fn numbers(hashes: &[[u8; 32]]) -> Vec<u64> {
+        hashes
+            .iter()
+            .map(|h| u64::from_be_bytes(h[..8].try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn plain_cursor_needs_no_request() {
+        // Ascent starts at the bottom (100, plain) → nothing to fetch.
+        let p = plan(&[(102, true), (101, false), (100, false)]);
+        assert!(bridge_candidate_chunk(&p, 0, 64).is_empty());
+        // ...and still nothing one block up.
+        assert!(bridge_candidate_chunk(&p, 1, 64).is_empty());
+        // At 102 the cursor sits on a candidate.
+        assert_eq!(numbers(&bridge_candidate_chunk(&p, 2, 64)), vec![102]);
+    }
+
+    #[test]
+    fn chunk_collects_candidates_ascending_across_plain_blocks() {
+        let p = plan(&[(105, true), (104, false), (103, true), (102, false), (101, true)]);
+        // From the bottom candidate: ascending order, plain blocks skipped.
+        assert_eq!(numbers(&bridge_candidate_chunk(&p, 0, 64)), vec![101, 103, 105]);
+    }
+
+    #[test]
+    fn chunk_respects_the_request_cap() {
+        let p = plan(&[(105, true), (104, true), (103, true), (102, true), (101, true)]);
+        assert_eq!(numbers(&bridge_candidate_chunk(&p, 0, 2)), vec![101, 102]);
+        // A zero cap asks for nothing rather than panicking.
+        assert!(bridge_candidate_chunk(&p, 0, 0).is_empty());
+    }
+
+    #[test]
+    fn exhausted_plan_yields_nothing() {
+        let p = plan(&[(101, true), (100, true)]);
+        assert!(bridge_candidate_chunk(&p, 2, 64).is_empty());
+        assert!(bridge_candidate_chunk(&p, 9, 64).is_empty());
+        assert!(bridge_candidate_chunk(&[], 0, 64).is_empty());
+    }
 }
 
 #[cfg(test)]

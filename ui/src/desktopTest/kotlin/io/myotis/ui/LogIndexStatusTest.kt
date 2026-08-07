@@ -69,6 +69,25 @@ class LogIndexStatusTest {
     }
 
     @Test
+    fun a_trailing_head_is_reported_instead_of_claiming_completion() {
+        val json = "{\"enabled\":true,\"logCount\":13756,\"backfillCursor\":5594611," +
+            "\"maxSpeed\":true,\"targetLow\":5594611,\"blocksRemaining\":0," +
+            "\"headGap\":3821,\"entries\":[]}"
+        val p = LogIndexStatus.parse(json)
+        assertEquals(3821L, p.headGap)
+        // Backfill done but coverage trails the head: `latest` queries are
+        // still refused, so the line must not read "complete".
+        assertEquals(
+            "catching up to the head (3,821 blocks behind)",
+            LogIndexStatus.progressLine(p),
+        )
+        // A gap within the normal finality lag reads as complete.
+        assertEquals("backfill complete", LogIndexStatus.progressLine(p.copy(headGap = 64)))
+        // Engines that don't report the key keep the old wording.
+        assertEquals("backfill complete", LogIndexStatus.progressLine(p.copy(headGap = null)))
+    }
+
+    @Test
     fun disabled_and_error_shapes_parse_as_disabled() {
         assertEquals(false, LogIndexStatus.parse("{\"enabled\":false,\"logCount\":0,\"entries\":[]}").enabled)
         assertEquals(false, LogIndexStatus.parse("{\"error\":\"node is not running\"}").enabled)
