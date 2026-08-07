@@ -731,7 +731,9 @@ pub fn get_storage_at_json(handle: i64, address_hex: &str, position_hex: &str) -
 }
 
 /// `nativeEthCallJson`: run a verified `eth_call` for a running handle. `from` is
-/// empty for an anonymous call; `to` is required; `data_hex` is the calldata;
+/// empty for an anonymous call; an EMPTY `to` means CONTRACT CREATION (the
+/// calldata is init code and the constructor's return data is the answer);
+/// `data_hex` is the calldata;
 /// `value_dec` is the wei value as a decimal string (FFI-neutral); `block` is the
 /// RPC block tag (the Java side has already gated it to the servable window, so
 /// the call runs against the verified head). Returns the call JSON
@@ -764,9 +766,12 @@ pub fn eth_call_overrides_json(
         Ok(o) => o,
         Err(msg) => return eljson::error_json(&msg),
     };
-    let Some(to) = parse_address(to_hex) else {
-        return eljson::error_json("invalid 'to' address (expected 20-byte hex)");
+    let target = match call_target(to_hex) {
+        Ok(t) => t,
+        Err(msg) => return eljson::error_json(msg),
     };
+    let creation = target.is_none();
+    let to = target.unwrap_or([0u8; 20]);
     // 'from' is optional: empty → an anonymous zero-address sender.
     let from = if from_hex.trim().is_empty() {
         None
@@ -803,11 +808,34 @@ pub fn eth_call_overrides_json(
     match engine
         .rt
         .block_on(async {
-            reader.eth_call_overridden(from, to, data, value, chain_id, overrides).await
+            if creation {
+                reader.eth_call_create(from, data, value, chain_id, overrides).await
+            } else {
+                reader.eth_call_overridden(from, to, data, value, chain_id, overrides).await
+            }
         })
     {
         Ok(outcome) => eljson::call_json(&outcome),
         Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// Which call the `to` argument selects. This is where the FFI convention lives
+/// now that the signature is unchanged, so it is a pure function with tests:
+///
+/// - EMPTY ⇒ `Ok(None)` = CONTRACT CREATION (the calldata is init code and the
+///   constructor's return data is the answer, as geth answers a `to`-less call).
+/// - a 20-byte hex address ⇒ `Ok(Some(addr))` = an ordinary call.
+/// - anything else ⇒ `Err` — NOT creation. Running init code the caller never
+///   asked to run would be worse than refusing, and a malformed argument must
+///   never silently change which question is answered.
+fn call_target(to_hex: &str) -> Result<Option<[u8; 20]>, &'static str> {
+    if to_hex.trim().is_empty() {
+        return Ok(None);
+    }
+    match parse_address(to_hex) {
+        Some(a) => Ok(Some(a)),
+        None => Err("invalid 'to' address (expected 20-byte hex)"),
     }
 }
 
@@ -2535,6 +2563,34 @@ mod log_index_json_tests {
         let s2 = build_log_index_status(&ix, None, 0);
         assert!(s2.contains("\"blocksRemaining\":500"), "{s2}");
         assert!(!s2.contains("etaSeconds"), "{s2}");
+    }
+}
+
+#[cfg(test)]
+mod call_target_tests {
+    use super::call_target;
+
+    #[test]
+    fn empty_to_selects_contract_creation() {
+        // The load-bearing half of the design: the Java/iOS adapters map a null
+        // `to` to "" across the FFI, and THIS is what turns that into a create.
+        assert_eq!(call_target(""), Ok(None));
+        assert_eq!(call_target("   "), Ok(None));
+    }
+
+    #[test]
+    fn an_address_selects_an_ordinary_call() {
+        let a = call_target("0x00000000219ab540356cBB839Cbe05303d7705Fa").unwrap();
+        assert_eq!(a.map(|x| x[0]), Some(0x00));
+        assert_eq!(a.map(|x| x[19]), Some(0xFa));
+    }
+
+    #[test]
+    fn a_malformed_to_is_an_error_not_a_creation() {
+        // Serving this as a creation would run init code nobody asked to run.
+        assert!(call_target("0xZZ").is_err());
+        assert!(call_target("0x1234").is_err());          // too short
+        assert!(call_target("not-hex-at-all").is_err());
     }
 }
 

@@ -2682,6 +2682,30 @@ impl ElReader {
         self.eth_call_overridden(from, to, data, value, chain_id, Default::default()).await
     }
 
+    /// `eth_call` with NO `to` — contract creation. The init code runs and its
+    /// return data is the answer (the deployless `Deploy` form wallets use).
+    pub async fn eth_call_create(
+        &self,
+        from: Option<[u8; 20]>,
+        init_code: Vec<u8>,
+        value: U256,
+        chain_id: u64,
+        overrides: myotis_evm::overrides::StateOverrides,
+    ) -> Result<CallOutcome, String> {
+        let (ctx, executor) = self.evm_setup(chain_id, "eth_call (create)").await?;
+        let joined = tokio::task::spawn_blocking(move || {
+            let sender = from.unwrap_or([0u8; 20]);
+            executor.create_view(sender, &init_code, value, &ctx, overrides)
+        })
+        .await
+        .map_err(|e| format!("eth_call task join error: {e}"))?;
+        Ok(match joined {
+            Ok(bytes) => CallOutcome::Success(bytes),
+            Err(EvmError::Reverted { data }) => CallOutcome::Revert(data),
+            Err(other) => CallOutcome::Unavailable(other.to_string()),
+        })
+    }
+
     /// [`Self::eth_call`] with caller-supplied state overrides applied for this
     /// call only (see `myotis_evm::overrides`). The answer is what the call
     /// WOULD return under the caller's hypothesis — verified state underneath,

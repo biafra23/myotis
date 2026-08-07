@@ -175,6 +175,9 @@ class RpcRouterTest {
         /** When true this fake CAN apply overrides (the engine-backed case);
          *  when false it inherits the interface default (null = unsupported). */
         private val applyOverrides: Boolean = false,
+        /** Whether this fake serves contract creation (the Rust engine does;
+         *  the Java engine does not). */
+        private val serveCreation: Boolean = true,
         var balance: BigInteger? = null,
         var nonce: Long? = null,
         var head: Long? = 0x100,
@@ -196,7 +199,7 @@ class RpcRouterTest {
         override fun syncState() = syncStateValue
         var lastOverrides: String? = null
 
-        override fun call(from: ByteArray?, to: ByteArray, data: ByteArray,
+        override fun call(from: ByteArray?, to: ByteArray?, data: ByteArray,
                           valueWei: String?, block: String): ByteArray? {
             lastFrom = from; lastTo = to; lastData = data
             lastValue = valueWei?.let { BigInteger(it) }; lastBlock = block
@@ -204,7 +207,9 @@ class RpcRouterTest {
         }
         override fun supportsStateOverrides(): Boolean = applyOverrides
 
-        override fun callWithOverrides(from: ByteArray?, to: ByteArray, data: ByteArray,
+        override fun supportsContractCreation(): Boolean = serveCreation
+
+        override fun callWithOverrides(from: ByteArray?, to: ByteArray?, data: ByteArray,
                                        valueWei: String?, block: String,
                                        stateOverridesJson: String): ByteArray? {
             if (!applyOverrides) return null   // the interface default: unsupported
@@ -454,11 +459,46 @@ class RpcRouterTest {
         assertEquals("latest", b.lastBlock)
     }
 
-    @Test fun ethCall_missingTo_fallsThrough() {                   // contract creation -> proxy/strict
+    @Test fun ethCall_missingTo_isServedAsContractCreation() {
+        // CHANGED deliberately: a `to`-less eth_call is contract creation — the
+        // calldata is init code and its return data is the answer. It used to
+        // fall through to proxy/strict, which left wallets using the deployless
+        // Deploy form (Ambire picks it whenever a network is flagged
+        // rpcNoStateOverride) unable to read account state at all.
         val b = FakeBackend(callResult = byteArrayOf(9))
         val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"data":"0x00"}]}""")
-        assertTrue(hasError(resp))                                 // strict (no proxy) -> error, not the fake result
-        assertNull(b.lastTo)                                       // backend never invoked
+        assertEquals("0x09", result(resp))
+        assertNull(b.lastTo)                                       // null `to` reached the backend as creation
+        assertEquals("0x00", b.lastData!!.toHex())
+    }
+
+    @Test fun ethCall_creation_onABackendThatCannotServeIt_isRefusedWithoutDispatch() {
+        // The Java engine (still the default) cannot serve creation, and asking
+        // it anyway wakes a paused stack and waits for a verified head only to
+        // refuse — an expensive refusal where there used to be a free one, and
+        // reported as retryable though it is permanent for that build.
+        val b = FakeBackend(callResult = byteArrayOf(9), serveCreation = false)
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"data":"0x00"}]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32602, errorCode(resp))   // permanent, not the retryable -32000
+        assertNull(b.lastData)                  // never dispatched
+    }
+
+    @Test fun ethCall_explicitNullTo_isAlsoCreation() {
+        val b = FakeBackend(callResult = byteArrayOf(9))
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":null,"data":"0x00"}]}""")
+        assertEquals("0x09", result(resp))
+    }
+
+    @Test fun ethCall_malformedTo_isStillRefused() {
+        // Present-but-bad is not creation: serving it as one would run init code
+        // the caller never asked to run.
+        val b = FakeBackend(callResult = byteArrayOf(9))
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"0xZZ","data":"0x00"}]}""")
+        assertTrue(hasError(resp))
+        assertNull(b.lastData)
     }
 
     @Test fun ethCall_malformedData_fallsThrough() {            // present-but-bad calldata -> proxy, not empty

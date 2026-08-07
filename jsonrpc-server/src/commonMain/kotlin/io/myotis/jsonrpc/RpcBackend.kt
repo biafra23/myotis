@@ -23,7 +23,9 @@ interface RpcBackend {
      *  the caller, because wallets probe this to decide whether the node is
      *  alive. Never null: an unreadable status reads as [RpcSyncState.SYNCING]. */
     fun syncState(): RpcSyncState
-    fun call(from: ByteArray?, to: ByteArray, data: ByteArray, valueWei: String?, block: String): ByteArray?
+    /** `to` is NULL for contract creation (`eth_call` with no `to`): the calldata
+     *  is init code and its return data is the answer. */
+    fun call(from: ByteArray?, to: ByteArray?, data: ByteArray, valueWei: String?, block: String): ByteArray?
 
     /**
      * Whether this backend can APPLY state overrides. Distinguishes "overrides
@@ -35,6 +37,14 @@ interface RpcBackend {
     fun supportsStateOverrides(): Boolean = false
 
     /**
+     * Whether this backend can serve CONTRACT CREATION (`eth_call` with a null
+     * `to`). Consulted BEFORE dispatch: an engine that can't would otherwise be
+     * woken and made to wait for a verified head only to refuse — and the
+     * refusal would read as retryable when it is permanent for that build.
+     */
+    fun supportsContractCreation(): Boolean = false
+
+    /**
      * [call] with the `eth_call` state-override object as JSON — caller-supplied
      * state layered over verified state for this call only.
      *
@@ -44,7 +54,7 @@ interface RpcBackend {
      */
     fun callWithOverrides(
         from: ByteArray?,
-        to: ByteArray,
+        to: ByteArray?,
         data: ByteArray,
         valueWei: String?,
         block: String,

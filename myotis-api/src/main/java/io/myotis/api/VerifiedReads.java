@@ -30,6 +30,12 @@ public interface VerifiedReads {
      * null (zero sender — reverts {@code msg.sender}-gated contracts, as geth
      * does); {@code valueWei} decimal or null for zero.
      *
+     * <p>{@code to} may be null: that is CONTRACT CREATION, where {@code data}
+     * is init code and the constructor's return data is the result (geth's
+     * behaviour for a {@code to}-less call). Engines that cannot serve it must
+     * report {@link #supportsContractCreation()} false rather than relying on a
+     * null-{@code to} guard, so hosts can refuse without dispatching.
+     *
      * @return ABI return bytes, or null when unanswerable verified
      */
     byte[] call(byte[] from, byte[] to, byte[] data, String valueWei, String block);
@@ -48,6 +54,22 @@ public interface VerifiedReads {
      *     {@link #callWithOverrides} cannot apply them
      */
     default boolean supportsStateOverrides() {
+        return false;
+    }
+
+    /**
+     * Whether this engine can serve CONTRACT CREATION calls — {@code eth_call}
+     * with a null {@code to}, where the calldata is init code and the
+     * constructor's return data is the answer.
+     *
+     * <p>Hosts must consult this BEFORE dispatching: an engine that cannot serve
+     * it would otherwise be woken, wait for a verified head, and refuse anyway,
+     * turning a free refusal into an expensive one — and returning a retryable
+     * error for something permanently unanswerable on that build.
+     *
+     * @return false by default
+     */
+    default boolean supportsContractCreation() {
         return false;
     }
 

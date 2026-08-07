@@ -264,7 +264,16 @@ pub unsafe extern "C" fn myotis_eth_call_overrides_json(
     state_overrides: *const c_char,
 ) -> *mut c_char {
     let from = read_string(from).unwrap_or_default();
-    let to = read_string(to).unwrap_or_default();
+    // NOT `unwrap_or_default()`: an EMPTY `to` now means contract creation, so
+    // collapsing an UNDECODABLE one (NULL pointer, bad UTF-8) onto the same
+    // value would silently change which question is answered — the shape
+    // CLAUDE.md's apply-or-refuse rule exists to prevent. Absent and
+    // undecodable must stay distinguishable.
+    let Some(to) = read_string(to) else {
+        return into_c(crate::eljson::error_json(
+            "invalid 'to' (undecodable string; pass an empty string for contract creation)",
+        ));
+    };
     let data = read_string(data).unwrap_or_default();
     let value = read_string(value).unwrap_or_default();
     let block = read_string(block).unwrap_or_default();
