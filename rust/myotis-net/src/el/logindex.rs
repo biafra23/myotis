@@ -522,7 +522,37 @@ impl<'a> Cursor<'a> {
 }
 
 impl LogIndex {
+    /// Serialize with coverage and logs CLAMPED at `max_block`: everything
+    /// above it is left out of the file entirely. Used to keep optimistic
+    /// (above-finality) coverage out of checkpoints — that coverage is only
+    /// verifiable against the in-memory tail record, which does not survive a
+    /// restart, so persisting it would leave a later run holding coverage it
+    /// can never re-check.
+    pub fn serialize_clamped(&self, max_block: u64) -> Vec<u8> {
+        self.serialize_with_clamp(Some(max_block))
+    }
+
+    /// [`Self::persist`] with the same clamp as [`Self::serialize_clamped`].
+    pub fn persist_clamped(&self, path: &Path, max_block: u64) -> std::io::Result<()> {
+        let tmp: PathBuf = path.with_extension(format!("tmp.{}", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&self.serialize_clamped(max_block))?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+    }
+
     pub fn serialize(&self) -> Vec<u8> {
+        self.serialize_with_clamp(None)
+    }
+
+    /// The one serializer. `clamp` bounds what is written (see
+    /// [`Self::serialize_clamped`]) and filters DURING the write: the tail
+    /// keeps coverage above finality at all times, so a clamp that cloned the
+    /// index would deep-copy the whole log store on every checkpoint, under
+    /// the index lock, on a 10s cadence.
+    fn serialize_with_clamp(&self, clamp: Option<u64>) -> Vec<u8> {
         let mut out = Vec::with_capacity(64 + self.logs.len() * 200);
         out.extend_from_slice(MAGIC);
         put_u32(&mut out, VERSION);
@@ -531,7 +561,14 @@ impl LogIndex {
         // Coverage spans + cursor.
         put_u32(&mut out, self.coverage.len() as u32);
         for c in &self.coverage {
-            match c.span {
+            // A span whose LOW is above the clamp disappears entirely; one
+            // that straddles it is written with the clamped high.
+            let span = match (c.span, clamp) {
+                (Some((low, _)), Some(max)) if low > max => None,
+                (Some((low, high)), Some(max)) => Some((low, high.min(max))),
+                (span, _) => span,
+            };
+            match span {
                 None => out.push(0),
                 Some((low, high)) => {
                     out.push(1);
@@ -540,7 +577,15 @@ impl LogIndex {
                 }
             }
         }
-        match self.cursor {
+        // The cursor is a HASH: above the clamp it may name a block that was
+        // never re-checked (or was orphaned), and a reloading walker would
+        // parent-chain into it. Drop it rather than persist it — the appender
+        // re-seeds the trust edge on its first append.
+        let cursor = match (self.cursor, clamp) {
+            (Some((n, _)), Some(max)) if n > max => None,
+            (cursor, _) => cursor,
+        };
+        match cursor {
             None => out.push(0),
             Some((n, h)) => {
                 out.push(1);
@@ -548,9 +593,14 @@ impl LogIndex {
                 out.extend_from_slice(&h);
             }
         }
-        // Logs.
-        put_u64(&mut out, self.logs.len() as u64);
-        for log in self.logs.values() {
+        // Logs (the clamped range is a prefix of the key order, so this is a
+        // bounded scan rather than a filtered copy).
+        let clamped_logs: Vec<&StoredLog> = match clamp {
+            None => self.logs.values().collect(),
+            Some(max) => self.logs.range(..=(max, u32::MAX)).map(|(_, l)| l).collect(),
+        };
+        put_u64(&mut out, clamped_logs.len() as u64);
+        for log in clamped_logs {
             put_u64(&mut out, log.block_number);
             out.extend_from_slice(&log.block_hash);
             out.extend_from_slice(&log.tx_hash);
@@ -783,6 +833,68 @@ mod tests {
         assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((298, 300)));
         assert_eq!(ix.cursor, Some((298, [8; 32])));
         assert_eq!(ix.query(&filter(298, 300, addr(1))).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn clamped_persist_leaves_optimistic_coverage_out_of_the_file() {
+        let dir = std::env::temp_dir().join(format!("logindex-clamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clamped.db");
+        let cfg = config_ok(vec![watch_all(addr(1), 0)]);
+        let mut ix = LogIndex::new(cfg.clone()).unwrap();
+        for b in 10..=14 {
+            ix.append_block(b, [b as u8; 32], vec![log(b, 0, addr(1), vec![])]).unwrap();
+        }
+        // Finality at 12: blocks 13-14 are optimistic and must not persist —
+        // a later run has no way to re-check them, and once finality moves
+        // past them nothing would ever rewind them.
+        ix.persist_clamped(&path, 12).unwrap();
+        let loaded = LogIndex::load(&cfg, &path).unwrap();
+        assert_eq!(loaded.coverage_of(&addr(1)).unwrap().span, Some((10, 12)));
+        assert_eq!(loaded.log_count(), 3);
+        // The live index is untouched — the clamp is a serialization concern.
+        assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((10, 14)));
+        assert_eq!(ix.log_count(), 5);
+        // Nothing above the clamp → byte-identical to a plain serialize.
+        assert_eq!(ix.serialize_clamped(14), ix.serialize());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clamping_writes_a_prefix_without_touching_the_live_index() {
+        let cfg = config_ok(vec![watch_all(addr(1), 0)]);
+        let mut ix = LogIndex::new(cfg.clone()).unwrap();
+        for b in 10..=14 {
+            ix.append_block(b, [b as u8; 32], vec![log(b, 0, addr(1), vec![])]).unwrap();
+        }
+        // A span entirely above the clamp disappears; one that straddles it is
+        // written with the clamped high; the live index is untouched either way.
+        let bytes = ix.serialize_clamped(12);
+        let loaded = LogIndex::deserialize(&cfg, &bytes).unwrap();
+        assert_eq!(loaded.coverage_of(&addr(1)).unwrap().span, Some((10, 12)));
+        assert_eq!(loaded.log_count(), 3);
+        assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((10, 14)));
+        assert_eq!(ix.log_count(), 5);
+        let below = LogIndex::deserialize(&cfg, &ix.serialize_clamped(9)).unwrap();
+        assert_eq!(below.coverage_of(&addr(1)).unwrap().span, None);
+        assert_eq!(below.log_count(), 0);
+    }
+
+    #[test]
+    fn clamping_drops_a_cursor_above_the_clamp() {
+        let cfg = config_ok(vec![watch_all(addr(1), 0)]);
+        let mut ix = LogIndex::new(cfg.clone()).unwrap();
+        // append_block seeds the cursor at the first appended block.
+        ix.append_block(20, [20; 32], vec![]).unwrap();
+        assert_eq!(ix.cursor, Some((20, [20; 32])));
+        // Clamped below it, the cursor must NOT persist: it is a hash, and
+        // above the clamp it may name a block that was never re-checked — a
+        // reloading walker would parent-chain into it.
+        let below = LogIndex::deserialize(&cfg, &ix.serialize_clamped(15)).unwrap();
+        assert_eq!(below.cursor, None);
+        // At or above the cursor, it survives.
+        let at = LogIndex::deserialize(&cfg, &ix.serialize_clamped(20)).unwrap();
+        assert_eq!(at.cursor, Some((20, [20; 32])));
     }
 
     #[test]

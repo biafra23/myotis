@@ -387,6 +387,12 @@ const SENT_TX_CACHE_MAX: usize = 256;
 /// dedupe repeats anyway.
 const TX_REBROADCAST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How far behind the finalized head the log-index append edge may fall before
+/// the head BRIDGE takes over from the per-block appender. The per-block path
+/// anchors a window from each target block to the optimistic head, so it stays
+/// well inside that lookback cap; anything deeper is a bridge walk.
+const APPEND_WINDOW: u64 = 128;
+
 /// The sent-tx state behind one lock (see the `sent_txs` field doc). The
 /// WATCH itself lives separately in the shared Arc every peer read loop also
 /// holds (gossip sightings) — see `ElReader::sent_tx_watch`.
@@ -395,6 +401,51 @@ struct SentTxState {
     /// Raw broadcast bytes by tx hash — what a rebroadcast re-pushes.
     bytes: myotis_evm::Lru<[u8; 32], Vec<u8>>,
     last_rebroadcast: std::time::Instant,
+}
+
+/// An in-progress head-gap bridge: the plan that carries log-index coverage
+/// from its stale append edge up to a finalized anchor after downtime (see
+/// [`ElReader::log_index_bridge_step`]).
+///
+/// Two phases, both resumable across ticks:
+/// 1. DESCEND from the finalized anchor collecting `(number, hash, candidate)`
+///    for every block down to the edge. Trust flows downward only — a header
+///    is trusted because the block above it names its hash as parent — so the
+///    gap can only be learned top-down. Blooms are evaluated during the
+///    descent and discarded (one bool per block, not 256 bytes).
+/// 2. ASCEND from the edge applying blocks in order: coverage extends upward
+///    contiguously, so the bottom block must land first. Non-candidates apply
+///    with no network at all; candidates re-fetch their header by (trusted)
+///    hash plus body and receipts, verified against both roots exactly like
+///    the backfill walk.
+///
+/// The anchor is the FINALIZED block, so nothing collected here can reorg.
+struct BridgePlan {
+    /// The finalized block this plan descends from, and the coverage edge it
+    /// must reach. Both fixed for the plan's lifetime — a moved finalized head
+    /// or edge (an append landing, a config change) discards and rebuilds it.
+    anchor_n: u64,
+    anchor_hash: [u8; 32],
+    target: u64,
+    /// Lowest block the descent has reached so far (`anchor_n` + 1 hash when
+    /// the descent hasn't started), the resume point for the next slice.
+    low_n: u64,
+    low_hash: [u8; 32],
+    /// Collected blocks in DESCENDING order (`blocks[0]` is the anchor).
+    /// `candidate` is the header-bloom verdict: false is a definitive skip.
+    blocks: Vec<(u64, [u8; 32], bool)>,
+    /// The watch-list this plan's bloom verdicts were computed against. A
+    /// `candidate=false` is a DEFINITIVE skip for that list only, so applying
+    /// the plan to a replaced index would claim coverage for blocks whose
+    /// new-address logs were never fetched. Re-checked under the index lock
+    /// before every apply — `clear_log_index_bridge` cannot help here, since
+    /// the tick holds the plan outside the slot across its network I/O.
+    fingerprint: u64,
+    /// Set once the descent has reached `target`; the ascent runs after.
+    descended: bool,
+    /// Next index to apply during the ascent, counted from the END of
+    /// `blocks` (the bottom block) upward.
+    applied: usize,
 }
 
 /// `eth_getTransactionByHash`'s three verified answers (the Java engine's
@@ -575,6 +626,16 @@ pub struct ElReader {
     /// tick tails count; a busy-time denominator overstated nice-mode rates
     /// ~6x). Reset on any config (re)apply and on cursor regression.
     log_index_rate: std::sync::Mutex<Option<(std::time::Instant, u64, f64)>>,
+    /// In-progress head-gap bridge (see [`Self::log_index_bridge_step`]).
+    /// `None` whenever the coverage edge is within the appender's reach.
+    log_index_bridge: std::sync::Mutex<Option<BridgePlan>>,
+    /// `(number, hash)` for every block THIS RUN appended above finality,
+    /// ascending — the tail's own record of what it claimed, which is what
+    /// makes a reorg detectable (compare against the canonical chain) and a
+    /// tail inherited from a previous run identifiable (this list is empty,
+    /// so those blocks' hashes are unknown and coverage above finality must
+    /// be rewound rather than trusted). See [`Self::log_index_tail_tick`].
+    log_index_tail: std::sync::Mutex<Vec<(u64, [u8; 32])>>,
     log_index_path: Option<std::path::PathBuf>,
     /// The head-follow appender task (spawned on enable, aborted on stop).
     log_index_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -718,6 +779,8 @@ impl ElReader {
             sent_tx_watch,
             log_index: std::sync::Mutex::new(None),
             log_index_rate: std::sync::Mutex::new(None),
+            log_index_bridge: std::sync::Mutex::new(None),
+            log_index_tail: std::sync::Mutex::new(Vec::new()),
             log_index_last_persist: std::sync::Mutex::new(None),
             log_index_pipeline_full: std::sync::atomic::AtomicBool::new(true),
             log_index_path: cfg.log_index_path,
@@ -734,6 +797,7 @@ impl ElReader {
     /// in-memory progress survives settings pokes; a genuinely changed
     /// watch-list checkpoints the old index before replacing it.
     pub fn set_log_index_config(&self, config: crate::el::logindex::LogIndexConfig) -> bool {
+        let finalized_now = self.finalized_block_number();
         // A SUCCESSFUL config apply invalidates the rate anchor: a pacing
         // flip changes the true rate (stale EMA → bogus ETA for minutes) and
         // a watch-list change starts a new walk. Reset on the success paths
@@ -748,13 +812,31 @@ impl ElReader {
         };
         if let Some(ix) = slot.as_mut() {
             if ix.config().fingerprint() == config.fingerprint() {
+                // Same watch-list: the index (and so the mapped gap and the
+                // tail record) still describes this coverage. Toggling enable
+                // or max-speed must not cost a full re-descent and a tail
+                // rewind back to finality.
                 ix.set_enabled(config.enabled);
                 ix.set_max_speed(config.max_speed);
                 reset_rate();
                 return true;
             }
+            // A different watch-list REPLACES the index below, which
+            // invalidates both: neither describes the new coverage.
+            self.clear_log_index_bridge();
+            if let Ok(mut t) = self.log_index_tail.lock() {
+                t.clear();
+            }
             if let Some(p) = self.log_index_path.as_deref() {
-                let _ = ix.persist(p);
+                // Clamped like every other checkpoint: optimistic coverage is
+                // only verifiable against this run's tail record. A zero
+                // finality means no anchor (so nothing optimistic exists) —
+                // clamping there would erase the file.
+                let _ = if finalized_now == 0 {
+                    ix.persist(p)
+                } else {
+                    ix.persist_clamped(p, finalized_now)
+                };
             }
         }
         let loaded = self
@@ -812,10 +894,12 @@ impl ElReader {
         // stop() is the fast path.
         let weak = Arc::downgrade(self);
         *slot = Some(rt.spawn(async move {
-            // Slice-3 rule: append FINALIZED blocks only. Finalized never
-            // reorgs, so coverage stays honest with zero rewind machinery;
-            // optimistic-tail appending (with the design doc's rewind rule)
-            // and deep-gap bridging both belong to the backfill slice.
+            // Coverage grows on three paths, in this order of preference:
+            // the per-block appender (finalized, contiguous, cheap), the head
+            // BRIDGE when a gap outgrows the appender's window, and the
+            // optimistic TAIL above finality — which is where `latest` points
+            // and so what head-reaching queries actually need. Only the tail
+            // can reorg, and it carries the rewind machinery for that.
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(6));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut since_persist = 0u32;
@@ -839,38 +923,47 @@ impl ElReader {
         // Checkpoint due from a PREVIOUS tick first: batches that end early
         // (peer failure mid-catch-up) must not defer persistence forever.
         if *since_persist >= 64 {
-            if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
-                if let Some(ix) = slot.as_ref() {
-                    let _ = ix.persist(path);
-                }
-            }
+            self.persist_log_index(self.finalized_block_number());
             *since_persist = 0;
         }
         let enabled = self.with_log_index(|ix| ix.config().enabled).unwrap_or(false);
         if !enabled {
+            self.clear_log_index_bridge(); // don't park a mapped gap while off
+            self.retire_tail_record();
             return;
         }
         let finalized = self.finalized_block_number();
         if finalized == 0 {
+            self.clear_log_index_bridge();
+            self.retire_tail_record();
             return;
         }
         let edge = self.with_log_index(|ix| ix.append_edge()).flatten();
         let start = match edge {
             None => finalized, // fresh index: start at the finalized head
             Some(e) if e <= finalized => e,
-            Some(_) => return, // caught up
+            // Caught up to finality — now follow the OPTIMISTIC tail, which is
+            // where `toBlock: "latest"` actually points.
+            Some(_) => return self.log_index_tail_tick(finalized, ticks).await,
         };
         // The verified whole-block path anchors a window from the target to
-        // the optimistic head; stay well inside its lookback cap. A deeper
-        // lag is the backfill walker's job — say so once per tick.
-        if finalized.saturating_sub(start) > 128 {
-            // Rate-limited: this state persists until the backfill walker
-            // exists / catches up, and a warn every 6 s is just noise.
-            if ticks % 100 == 0 {
-                tracing::warn!(start, finalized, "log index append edge too far behind (node downtime?); upward bridging is a tracked follow-up — coverage above the edge stays frozen until then");
-            }
+        // the optimistic head; stay well inside its lookback cap. A deeper lag
+        // (downtime, a suspended laptop, an imported index whose top predates
+        // this run) is the BRIDGE's job — it closes the gap with the same
+        // verified machinery the backfill walk uses, after which this per-block
+        // path resumes. Without it the edge froze permanently: every later
+        // append needs contiguity, so a single gap wider than the window meant
+        // coverage never advanced again and every `toBlock: "latest"` query
+        // stayed outside coverage forever.
+        if finalized.saturating_sub(start) > APPEND_WINDOW {
+            self.log_index_bridge_step(start, finalized, ticks).await;
             return;
         }
+        self.clear_log_index_bridge();
+        // Coverage is at/below finality here, so the tail tick (and its
+        // vouched check) will not run: any entry left in the record describes
+        // a block this run never proved canonical.
+        self.retire_tail_record();
         let last = finalized.min(start.saturating_add(15));
         for n in start..=last {
             let (block_hash, receipts) = match self.block_receipts_at(Some(n)).await {
@@ -913,13 +1006,789 @@ impl ElReader {
         }
         // Checkpoint roughly every 64 appended blocks (best-effort).
         if *since_persist >= 64 {
-            if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
-                if let Some(ix) = slot.as_ref() {
-                    let _ = ix.persist(path);
-                }
-            }
+            self.persist_log_index(self.finalized_block_number());
             *since_persist = 0;
         }
+    }
+
+    /// Follow the OPTIMISTIC tail: keep coverage running from finality up to
+    /// the beacon-anchored head, which is where `latest` points and therefore
+    /// what every head-reaching `eth_getLogs` needs. Runs once coverage has
+    /// reached finality (the appender/bridge get there first).
+    ///
+    /// Finalized blocks can never reorg, but these can, so the tail keeps its
+    /// own `(number, hash)` record of what it appended and re-checks it
+    /// against the canonical chain every tick. The window therefore reaches
+    /// DOWN THROUGH the recorded blocks (not just up from the coverage edge —
+    /// comparing a window that starts at the edge against records that all sit
+    /// below it compares disjoint ranges and can never detect anything), and a
+    /// mismatch rewinds coverage and stored logs to the fork point before
+    /// re-appending. A chain that has shortened below the edge is itself proof
+    /// of a reorg and rewinds the same way.
+    ///
+    /// Coverage above finality that this run did NOT append — a persisted tail
+    /// from an older build, or an imported index — has unknown hashes and
+    /// cannot be re-checked, so it is rewound to finality rather than trusted.
+    /// (Checkpoints clamp at finality, so a normal restart never inherits
+    /// optimistic coverage in the first place.)
+    ///
+    /// Serving at the optimistic head matches the rest of the engine, where
+    /// every verified read (`eth_call`, `getCode`, `getBalance`) answers under
+    /// the same anchor.
+    async fn log_index_tail_tick(&self, finalized: u64, ticks: u64) {
+        /// Never chase more than this above finality: a stalled beacon anchor
+        /// must not turn into an unbounded walk.
+        const TAIL_MAX: u64 = 1024;
+        /// Candidate blocks per body/receipts request, as the bridge uses —
+        /// an unchunked burst of a full tail would blow every peer's response
+        /// budget and make no progress at all.
+        const CANDIDATE_CHUNK: usize = 64;
+        /// Wall-clock budget, for the same reason the bridge has one: after a
+        /// rewind the tail's catch-up spans the whole head-to-finality range,
+        /// and the backfill step runs after it in the same task.
+        const TICK_BUDGET: std::time::Duration = std::time::Duration::from_millis(2000);
+
+        let started = std::time::Instant::now();
+        let Ok((head_n, head_hash)) = self.anchored_head() else {
+            return;
+        };
+        // Re-read the edge under this tick (the caller's value predates the
+        // finalized catch-up that may have just advanced it).
+        let Some(mut edge) = self.with_log_index(|ix| ix.append_edge()).flatten() else {
+            return;
+        };
+        let recorded: Vec<(u64, [u8; 32])> =
+            self.log_index_tail.lock().map(|t| t.clone()).unwrap_or_default();
+        // The bloom decisions below are made against THIS watch-list; a
+        // concurrent replacement would make them lies about the new one (its
+        // addresses were "definitively" skipped). Every append re-checks it
+        // under the index lock, exactly as the backfill commit does.
+        let Some(fingerprint) = self.with_log_index(|ix| ix.config().fingerprint()) else {
+            return;
+        };
+        // Coverage above finality this run cannot vouch for: rewind.
+        if !tail_vouches_for(&recorded, edge, finalized) {
+            tracing::info!(
+                covered_high = edge.saturating_sub(1),
+                finalized,
+                "log index tail: rewinding unvouched coverage above finality"
+            );
+            self.log_index_rewind_to(finalized);
+            edge = finalized.saturating_add(1);
+        }
+        // The rewind above drops record entries; re-read rather than compare
+        // against a stale snapshot (which would fork-rewind coverage that no
+        // longer exists and waste a tick on a misleading warning).
+        let recorded: Vec<(u64, [u8; 32])> =
+            self.log_index_tail.lock().map(|t| t.clone()).unwrap_or_default();
+        if head_n.saturating_sub(finalized) >= TAIL_MAX {
+            // Finality has stalled far below the head. The tail cannot
+            // re-check what it appended from here (the window would exceed
+            // the 1024-header serve ceiling, so no peer can cover the floor),
+            // and coverage nobody re-checks must not keep serving: drop back
+            // to finality rather than answer explicit-number queries from
+            // blocks that can still reorg. `>=` because the window is
+            // inclusive at both ends — at exactly TAIL_MAX it needs 1025.
+            if edge > finalized.saturating_add(1) {
+                // Guarded: rewind_above scans the whole log store under the
+                // index lock, and this branch repeats every 6s for as long as
+                // finality stalls.
+                self.log_index_rewind_to(finalized);
+            }
+            if ticks % 100 == 0 {
+                tracing::warn!(finalized, head_n, "log index tail: finality too far below the head; coverage held at finality");
+            }
+            return;
+        }
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return;
+        }
+        // The window must cover the RECORDED blocks (to re-check them) and the
+        // covered top (so the first appended block links to it by parent
+        // hash), not merely the blocks still to append.
+        // Bound the walk by TAIL_MAX below the head rather than by finality —
+        // see tail_window_floor. TAIL_MAX-1 because the window is inclusive at
+        // both ends: a floor exactly TAIL_MAX below the head would need 1025
+        // headers, one past the serve ceiling, so no peer could ever reach it.
+        let hard_floor = head_n.saturating_sub(TAIL_MAX - 1);
+        let lowest_recorded = recorded.iter().map(|(n, _)| *n).min();
+        if lowest_recorded.is_some_and(|low| low < hard_floor) {
+            // A record the window cannot cover can never be compared — and
+            // pruning it as "confirmed" would be a lie. Give its coverage back
+            // instead; the appender or bridge re-adds it verified.
+            self.retire_tail_record();
+            return;
+        }
+        let floor = tail_window_floor(edge, lowest_recorded, hard_floor);
+        if !tail_chain_reaches_coverage(head_n, edge) {
+            // The chain no longer reaches our covered top: a reorg shortened
+            // it, and every block above the new head is orphaned. (Comparing
+            // against the window floor here could never fire — the floor sits
+            // at finality whenever the record vouches for the tail.)
+            tracing::info!(head_n, covered_high = edge.saturating_sub(1), "log index tail: chain shortened; rewinding");
+            self.log_index_rewind_to(head_n);
+            if let Ok(mut t) = self.log_index_tail.lock() {
+                t.retain(|(n, _)| *n <= head_n);
+            }
+            return;
+        }
+        let want = (head_n - floor + 1).min(1024);
+        let mut window = Vec::new();
+        for peer in peers.iter() {
+            match peer.get_block_headers_by_number(head_n, want, 0, true).await {
+                Ok(w) => {
+                    let w = &w[..w.len().min(want as usize)];
+                    let Some((top, _)) = w.split_first() else { continue };
+                    if top.header.number != head_n || top.hash != head_hash {
+                        continue; // not our anchored head; try another peer
+                    }
+                    let mut verified = 1usize;
+                    for pair in w.windows(2) {
+                        let [upper, lower] = pair else { break };
+                        if upper.header.parent_hash != lower.hash
+                            || lower.header.number != upper.header.number.wrapping_sub(1)
+                        {
+                            break;
+                        }
+                        verified += 1;
+                    }
+                    let reaches_floor = w
+                        .get(verified - 1)
+                        .is_some_and(|lowest| lowest.header.number <= floor);
+                    if !reaches_floor {
+                        // A window that stops above the floor cannot re-check
+                        // the recorded blocks — comparing against it is the
+                        // disjoint-range mistake all over again, and a peer
+                        // could induce it deliberately. Try another peer.
+                        tracing::debug!(floor, "log index tail: window does not reach the check floor");
+                        continue;
+                    }
+                    window = w[..verified].to_vec();
+                    break;
+                }
+                Err(e) => tracing::debug!(error = %e, "log index tail: header window failed"),
+            }
+        }
+        if window.is_empty() {
+            return;
+        }
+        // Ascending, so coverage extends contiguously.
+        let canonical: Vec<crate::el::eth::messages::VerifiedHeader> =
+            window.into_iter().rev().collect();
+        let canon_pairs: Vec<(u64, [u8; 32])> =
+            canonical.iter().map(|c| (c.header.number, c.hash)).collect();
+
+        if let Some(fork) = tail_fork_point(&recorded, &canon_pairs) {
+            tracing::info!(fork_at = fork, "log index tail: reorg detected; rewinding");
+            self.log_index_rewind_to(fork.saturating_sub(1));
+            if let Ok(mut t) = self.log_index_tail.lock() {
+                t.retain(|(n, _)| *n < fork);
+            }
+            edge = fork;
+        }
+
+        let pending: Vec<&crate::el::eth::messages::VerifiedHeader> =
+            canonical.iter().filter(|c| c.header.number >= edge).collect();
+        if pending.is_empty() {
+            return;
+        }
+        let candidate_hashes: Vec<[u8; 32]> = pending
+            .iter()
+            .filter(|c| match <&[u8; 256]>::try_from(c.header.logs_bloom.as_slice()) {
+                Ok(bloom) => {
+                    self.with_log_index(|ix| ix.bloom_may_match(c.header.number, bloom)).unwrap_or(false)
+                }
+                Err(_) => true,
+            })
+            .map(|c| c.hash)
+            .collect();
+        let mut logs: std::collections::HashMap<u64, Vec<crate::el::logindex::StoredLog>> =
+            std::collections::HashMap::new();
+        let mut peer_idx = 0usize;
+        'chunks: for chunk in candidate_hashes.chunks(CANDIDATE_CHUNK) {
+            if started.elapsed() >= TICK_BUDGET {
+                break; // apply the contiguous prefix; the rest is next tick's
+            }
+            // The headers are already in hand, parent-chain-verified in the
+            // window fetched above — no per-candidate header round trip.
+            let chunk_headers: Vec<Option<crate::el::eth::messages::VerifiedHeader>> = chunk
+                .iter()
+                .map(|h| canonical.iter().find(|c| c.hash == *h).cloned())
+                .collect();
+            loop {
+                let Some(peer) = peers.get(peer_idx) else {
+                    break 'chunks; // pool exhausted; apply the prefix we have
+                };
+                match self.fetch_logs_for_known_headers(peer, chunk, &chunk_headers).await {
+                    Ok(map) => {
+                        logs.extend(map);
+                        break;
+                    }
+                    Err(e) => {
+                        // Rotate rather than stall: a persistently failing
+                        // first peer would otherwise freeze the tail while
+                        // healthy peers sit idle.
+                        tracing::debug!(error = %e, "log index tail: candidate fetch failed");
+                        peer_idx += 1;
+                    }
+                }
+            }
+        }
+        let mut appended = 0usize;
+        for c in &pending {
+            let n = c.header.number;
+            // A candidate whose logs this round didn't get (byte-budget
+            // truncation) stops the tail here: coverage must stay contiguous.
+            if candidate_hashes.contains(&c.hash) && !logs.contains_key(&n) {
+                break;
+            }
+            let block_logs = logs.get(&n).cloned().unwrap_or_default();
+            let ok = match self.log_index.lock() {
+                Ok(mut slot) => match slot.as_mut() {
+                    Some(ix) if ix.config().fingerprint() == fingerprint => {
+                        let stored = ix.append_block(n, c.hash, block_logs).is_ok();
+                        if stored {
+                            // Under the SAME hold: a config replace between
+                            // the append and the push would otherwise seed a
+                            // record describing the old index into the new
+                            // one, whose next fork scan would rewind coverage
+                            // that record has nothing to do with.
+                            if let Ok(mut t) = self.log_index_tail.lock() {
+                                t.push((n, c.hash));
+                            }
+                        }
+                        stored
+                    }
+                    // Uninstalled, or the watch-list changed under us: this
+                    // block's candidacy was decided against the old list.
+                    _ => false,
+                },
+                Err(_) => false,
+            };
+            if !ok {
+                // Visible: a silently broken tail is the same failure shape as
+                // the frozen append edge this whole change exists to fix.
+                tracing::warn!(block = n, edge, "log index tail: append rejected; coverage holds here");
+                break;
+            }
+            appended += 1;
+        }
+        // Retire records only now: every one of them was compared against the
+        // canonical window above (the floor is built to cover them, and a
+        // window that fails to reach it is rejected), so a survivor at or
+        // below finality is confirmed canonical and can never change again.
+        if let Ok(mut t) = self.log_index_tail.lock() {
+            t.retain(|(bn, _)| *bn > finalized);
+        }
+        if appended > 0 {
+            tracing::debug!(appended, head_n, "log index tail advanced");
+            if self.log_index_persist_due() {
+                self.persist_log_index(finalized);
+            }
+        }
+    }
+
+    /// Rewind the index (coverage and stored logs) above `fork_point`, and
+    /// forget the tail record above it.
+    fn log_index_rewind_to(&self, fork_point: u64) {
+        if let Ok(mut slot) = self.log_index.lock() {
+            if let Some(ix) = slot.as_mut() {
+                ix.rewind_above(fork_point);
+            }
+        }
+        if let Ok(mut t) = self.log_index_tail.lock() {
+            t.retain(|(n, _)| *n <= fork_point);
+        }
+    }
+
+    /// Checkpoint the index, CLAMPED AT FINALITY: optimistic coverage is only
+    /// as trustworthy as this run's in-memory tail record, which does not
+    /// survive a restart. Persisting it would leave a later run holding
+    /// coverage it can never re-check — and once finality moves past those
+    /// blocks, nothing would ever rewind them (they would look immutable
+    /// while possibly being orphaned).
+    fn persist_log_index(&self, finalized: u64) {
+        if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
+            if let Some(ix) = slot.as_ref() {
+                if finalized == 0 {
+                    // No beacon anchor yet. There is no optimistic coverage to
+                    // clamp either (the tail only runs below a real finality),
+                    // and clamping AT ZERO would rewind the whole index and
+                    // rename an empty file over a good checkpoint — losing, on
+                    // a phone, months of backfill. Write it as it stands.
+                    let _ = ix.persist(path);
+                } else {
+                    let _ = ix.persist_clamped(path, finalized);
+                }
+            }
+        }
+    }
+
+    /// The highest block the log index currently covers, or None when nothing
+    /// is indexed. Hosts resolve `latest` against this so a head that moved
+    /// since the last tail tick doesn't flap head-reaching queries into
+    /// refusals (see `LOG_INDEX_LATEST_SLACK` on the host side).
+    pub fn log_index_covered_high(&self) -> Option<u64> {
+        self.with_log_index(|ix| ix.append_edge())
+            .flatten()
+            .map(|edge| edge.saturating_sub(1))
+    }
+
+    /// True when a full-index checkpoint is due (and claims the slot). The
+    /// persist is a whole-file rewrite under the index lock, so both the
+    /// backfill and the bridge share this throttle.
+    fn log_index_persist_due(&self) -> bool {
+        const PERSIST_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+        self.log_index_last_persist.lock().is_ok_and(|mut t| {
+            if t.is_none_or(|prev| prev.elapsed() >= PERSIST_MIN_INTERVAL) {
+                *t = Some(std::time::Instant::now());
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Drop any in-progress bridge plan (the gap closed, or the premises it
+    /// were built on changed). Deliberately does NOT touch the tail record —
+    /// see [`Self::retire_tail_record`] for the one invariant that governs it.
+    fn clear_log_index_bridge(&self) {
+        if let Ok(mut slot) = self.log_index_bridge.lock() {
+            if slot.is_some() {
+                *slot = None;
+            }
+        }
+    }
+
+    /// THE invariant for the tail record, and the only way an entry leaves it
+    /// besides the post-comparison prune at the end of a tail tick:
+    ///
+    /// > A record entry may be dropped only after the canonical chain
+    /// > confirmed it at a height at or below finality, or together with the
+    /// > coverage it describes.
+    ///
+    /// An entry is evidence that THIS run appended a block optimistically and
+    /// has not yet proven it canonical. Finality moving past it proves nothing
+    /// — finality fixes the canonical block at that height, not the possibly
+    /// orphaned one we stored. So when the walker leaves the tail (index
+    /// disabled, anchor lost, finality overtook the whole tail), unconfirmed
+    /// entries cannot simply be forgotten: their coverage goes with them.
+    ///
+    /// Cheap by construction — the record spans at most one tail window, so
+    /// the rewind gives back at most that many blocks, which the appender or
+    /// bridge re-adds verified.
+    fn retire_tail_record(&self) {
+        let lowest = match self.log_index_tail.lock() {
+            Ok(t) => t.iter().map(|(n, _)| *n).min(),
+            Err(_) => None,
+        };
+        let Some(lowest) = lowest else {
+            return; // nothing unconfirmed
+        };
+        tracing::info!(
+            from = lowest,
+            "log index tail: dropping coverage this run could not confirm canonical"
+        );
+        self.log_index_rewind_to(lowest.saturating_sub(1));
+    }
+
+    /// One head-gap bridge step: carry coverage from a stale append edge up to
+    /// the finalized head, one bounded slice per tick, using the same verified
+    /// machinery as the backfill walk (parent-hash chain from a beacon anchor,
+    /// header bloom pre-filter, receipts checked against both roots).
+    ///
+    /// Runs only while the gap exceeds the appender's per-block window; the
+    /// last slice hands back to the appender, which keeps up from there. See
+    /// [`BridgePlan`] for the two phases and why they run in that order.
+    async fn log_index_bridge_step(&self, edge: u64, finalized: u64, ticks: u64) {
+        /// Headers per descent request — the eth/66+ serve ceiling.
+        const DESCENT_BATCH: u64 = 1024;
+        /// Descent requests per tick: bounds a long gap's catch-up work per
+        /// 6s tick instead of monopolizing the walker for minutes.
+        const DESCENT_BATCHES_PER_TICK: usize = 8;
+        /// Blocks applied per tick during the ascent.
+        const ASCENT_PER_TICK: usize = 2048;
+        /// Candidate blocks per body/receipts request (backfill's chunk size).
+        const CANDIDATE_CHUNK: usize = 64;
+        /// Wall-clock budget per tick — the bridge shares the pool with RPC
+        /// traffic and runs BEFORE the backfill in the same task, so it must
+        /// leave the tail of the 6s tick to both (the backfill's own budget
+        /// makes the same trade).
+        const TICK_BUDGET: std::time::Duration = std::time::Duration::from_millis(3000);
+        /// Widest gap a single plan will map. Each entry is a padded
+        /// `(u64, [u8;32], bool)` = 48 bytes, so 500k blocks is ~24 MB —
+        /// deliberately sized for a phone (CLAUDE.md keeps Android
+        /// first-class), not for a workstation. Beyond it coverage simply
+        /// holds: a staged bridge (descend headers-only to an intermediate
+        /// anchor, then map MAX_GAP at a time) is the follow-up that would
+        /// close arbitrarily deep gaps without an unbounded plan.
+        const MAX_GAP: u64 = 500_000;
+
+        let Some((fin_n, fin_hash)) = self.anchor.finalized_execution().map(|f| (f.block_number, f.block_hash))
+        else {
+            return; // no finalized anchor yet — nothing to anchor trust on
+        };
+        if fin_n != finalized {
+            return; // moved under us; next tick re-reads it
+        }
+        if finalized.saturating_sub(edge) > MAX_GAP {
+            if ticks % 100 == 0 {
+                tracing::warn!(
+                    edge,
+                    finalized,
+                    "log index head gap exceeds the bridge's span; coverage holds here until the watch-list changes (which replaces the index) or the index file is removed"
+                );
+            }
+            return;
+        }
+        let started = std::time::Instant::now();
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            if ticks % 100 == 0 {
+                tracing::info!(edge, finalized, "log index head bridge idle: no peers this tick");
+            }
+            return;
+        }
+
+        // Take the plan out for the duration and put it back at the end. A
+        // PARTIAL descent is worth keeping: its blocks are parent-hash-chained
+        // to an immutable finalized anchor, so a transient peer failure must
+        // not throw away work — re-descending 8 windows (~4.5 MB) every tick
+        // would burn bandwidth forever on exactly the deep-gap case this
+        // exists for. Only a premise change (see the reuse check) discards it.
+        let mut plan = match self.log_index_bridge.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => None,
+        };
+        // A plan survives across ticks as long as it still lines up with where
+        // coverage now is. Two things move under it, and NEITHER invalidates
+        // the mapped blocks:
+        //  - the edge, which the ascent itself advances (so the plan's own
+        //    progress must be added back before comparing), and
+        //  - the finalized head, which only moves forward; everything the plan
+        //    mapped sits below its own anchor and below finality, so it stays
+        //    immutable. Blocks finalized since are simply not in this plan —
+        //    the appender (or the next plan) picks them up afterwards.
+        // Getting this wrong is expensive rather than unsafe: a discarded plan
+        // re-descends the whole gap, which for a large gap is every tick's
+        // work thrown away.
+        if let Some(p) = &plan {
+            if !plan_still_matches(p.anchor_n, p.target, p.applied, fin_n, edge) {
+                plan = None;
+            }
+        }
+        let Some(fingerprint) = self.with_log_index(|ix| ix.config().fingerprint()) else {
+            return;
+        };
+        if plan.as_ref().is_some_and(|p| p.fingerprint != fingerprint) {
+            plan = None; // watch-list replaced: the mapped blooms don't apply
+        }
+        let mut plan = plan.unwrap_or_else(|| BridgePlan {
+            anchor_n: fin_n,
+            anchor_hash: fin_hash,
+            fingerprint,
+            target: edge,
+            low_n: fin_n.saturating_add(1),
+            low_hash: fin_hash,
+            // Sized up front: growing by doubling would hold BOTH buffers
+            // live at the realloc — a ~1.5x transient spike on the deep-gap
+            // path, on a platform where that is an OOM kill, not a slowdown.
+            blocks: Vec::with_capacity((fin_n.saturating_sub(edge) + 1) as usize),
+            descended: false,
+            applied: 0,
+        });
+
+        // The descent verifies against the plan's OWN anchor: finality may have
+        // advanced since the plan was built, and re-anchoring mid-descent would
+        // break the parent-hash chain the collected blocks were verified under.
+        let (anchor_n, anchor_hash) = (plan.anchor_n, plan.anchor_hash);
+        let mut peer_idx = 0usize;
+        if !plan.descended {
+            for _ in 0..DESCENT_BATCHES_PER_TICK {
+                if started.elapsed() >= TICK_BUDGET {
+                    break;
+                }
+                // First request starts AT the anchor; later ones continue from
+                // the lowest verified block (which is re-served as the head of
+                // the window, so its hash re-anchors the chain check).
+                let from = plan.low_n.min(anchor_n);
+                let want = (from.saturating_sub(plan.target) + 1).min(DESCENT_BATCH);
+                // Rotate peers on failure like every other walker here: one
+                // slow or pruned peer at the head of the pool must not stall
+                // the bridge (and, with the plan retained, each retry keeps
+                // whatever the previous peers already chained).
+                let Some(peer) = peers.get(peer_idx) else {
+                    break; // pool exhausted this tick; plan survives
+                };
+                let window = match peer.get_block_headers_by_number(from, want, 0, true).await {
+                    Ok(w) => w,
+                    Err(e) => {
+                        tracing::debug!(error = %e, from, "log index head bridge: header window failed");
+                        peer_idx += 1;
+                        continue;
+                    }
+                };
+                // A peer may over-serve; anything past `want` is outside the
+                // gap this plan describes and would push `low_n` below the
+                // target, permanently desynchronizing plan and coverage.
+                let window = &window[..window.len().min(want as usize)];
+                let Some((top, _)) = window.split_first() else {
+                    peer_idx += 1;
+                    continue;
+                };
+                let before_low = plan.low_n;
+                let expect_hash = if plan.blocks.is_empty() { anchor_hash } else { plan.low_hash };
+                if top.header.number != from || top.hash != expect_hash {
+                    tracing::debug!(from, "log index head bridge: window does not start at the anchor");
+                    peer_idx += 1;
+                    continue;
+                }
+                // Descending parent-hash chain, exactly as the backfill batch
+                // verifies it: only the chained prefix is trusted.
+                let mut verified = 1usize; // the anchor block itself
+                for pair in window.windows(2) {
+                    let [upper, lower] = pair else { break };
+                    if upper.header.parent_hash != lower.hash
+                        || lower.header.number != upper.header.number.wrapping_sub(1)
+                    {
+                        break;
+                    }
+                    verified += 1;
+                }
+                for vh in &window[..verified] {
+                    // The anchor block is collected once; continuation windows
+                    // re-serve their head, which is already collected.
+                    if !plan.blocks.is_empty() && vh.header.number >= plan.low_n {
+                        continue;
+                    }
+                    let candidate = match <&[u8; 256]>::try_from(vh.header.logs_bloom.as_slice()) {
+                        Ok(bloom) => self
+                            .with_log_index(|ix| ix.bloom_may_match(vh.header.number, bloom))
+                            .unwrap_or(false),
+                        Err(_) => true, // odd bloom width: verify via receipts
+                    };
+                    plan.blocks.push((vh.header.number, vh.hash, candidate));
+                    plan.low_n = vh.header.number;
+                    plan.low_hash = vh.hash;
+                }
+                if plan.low_n >= before_low {
+                    // A window that chains nothing new (peer served only the
+                    // re-anchor block, or an unchained response): try the next
+                    // peer rather than spinning on this one.
+                    tracing::debug!(from, "log index head bridge: window added no chained blocks");
+                    peer_idx += 1;
+                    continue;
+                }
+                if plan.low_n <= plan.target {
+                    plan.descended = true;
+                    tracing::info!(
+                        from = plan.target,
+                        to = anchor_n,
+                        blocks = plan.blocks.len(),
+                        candidates = plan.blocks.iter().filter(|b| b.2).count(),
+                        "log index head bridge: gap mapped; applying"
+                    );
+                    break;
+                }
+            }
+        }
+
+        if plan.descended {
+            let total = plan.blocks.len();
+            let mut applied_this_tick = 0usize;
+            while plan.applied < total
+                && applied_this_tick < ASCENT_PER_TICK
+                && started.elapsed() < TICK_BUDGET
+            {
+                // One request per RUN of candidates ahead of the cursor —
+                // candidates are sparse, so a chunk typically covers a long
+                // stretch of plain blocks that need no network at all. The
+                // chunk is bounded by what this tick can still APPLY, so a
+                // sparse watch-list doesn't fetch 64 candidates' bodies and
+                // receipts only to discard most of them at the budget line.
+                let budget_left = ASCENT_PER_TICK - applied_this_tick;
+                let hashes = bridge_candidate_chunk(
+                    &plan.blocks,
+                    plan.applied,
+                    CANDIDATE_CHUNK,
+                    budget_left,
+                );
+                let logs = if hashes.is_empty() {
+                    std::collections::HashMap::new()
+                } else {
+                    // Rotate on failure like the descent: retry this slice
+                    // against the next peer rather than idling a whole tick
+                    // (and, once the pool is exhausted, keep the plan and let
+                    // the next tick start over from the top of the pool).
+                    let mut fetched = None;
+                    // `hashes[0]` is the block the ascent is standing on; a
+                    // response without it makes no progress possible, so it
+                    // counts as a failure and rotates. Returning it as success
+                    // wedged the bridge on one peer indefinitely (the apply
+                    // loop breaks, the plan survives, the same peer is first
+                    // again next tick).
+                    let need = plan.blocks[total - 1 - plan.applied].0;
+                    while peer_idx < peers.len() {
+                        match self.bridge_fetch_logs(&peers[peer_idx], &hashes).await {
+                            Ok(map) if map.contains_key(&need) => {
+                                fetched = Some(map);
+                                break;
+                            }
+                            Ok(_) => {
+                                tracing::debug!("log index head bridge: peer served no usable prefix");
+                                peer_idx += 1;
+                            }
+                            Err(e) => {
+                                tracing::debug!(error = %e, "log index head bridge: candidate fetch failed");
+                                peer_idx += 1;
+                            }
+                        }
+                    }
+                    let Some(map) = fetched else {
+                        break; // pool exhausted this tick; the plan survives
+                    };
+                    map
+                };
+                // Apply this block plus every non-candidate up to the next
+                // candidate whose logs we just fetched.
+                let mut progressed = false;
+                while plan.applied < total && applied_this_tick < ASCENT_PER_TICK {
+                    let j = total - 1 - plan.applied;
+                    let (n, h, cand) = plan.blocks[j];
+                    if cand && !logs.contains_key(&n) {
+                        break; // needs a fetch this round didn't cover
+                    }
+                    let block_logs = logs.get(&n).cloned().unwrap_or_default();
+                    let ok = match self.log_index.lock() {
+                        Ok(mut slot) => match slot.as_mut() {
+                            Some(ix) if ix.config().fingerprint() == plan.fingerprint => {
+                                ix.append_block(n, h, block_logs).is_ok()
+                            }
+                            // Uninstalled, or the watch-list changed under us.
+                            _ => false,
+                        },
+                        Err(_) => false,
+                    };
+                    if !ok {
+                        // Uninstalled, replaced, or non-adjacent: a genuine
+                        // premise change, so this IS one of the few paths that
+                        // deliberately drops the plan.
+                        tracing::debug!(block = n, "log index head bridge: append rejected; replanning");
+                        return;
+                    }
+                    plan.applied += 1;
+                    applied_this_tick += 1;
+                    progressed = true;
+                }
+                if !progressed {
+                    break; // nothing became applicable this round — retry next tick
+                }
+            }
+            let done = plan.applied >= total;
+            // Checkpoint on the same throttle the backfill uses — the persist
+            // is a full-index rewrite, and bridging can apply thousands of
+            // blocks per tick. Always checkpoint the final slice.
+            if applied_this_tick > 0 && (done || self.log_index_persist_due()) {
+                self.persist_log_index(self.finalized_block_number());
+            }
+            if done {
+                tracing::info!(to = anchor_n, "log index head bridge complete; head-follow resumes");
+                return; // plan finished — dropped, appender takes over
+            }
+        }
+        if let Ok(mut slot) = self.log_index_bridge.lock() {
+            *slot = Some(plan);
+        }
+    }
+
+    /// Fetch bodies+receipts for candidate blocks named by their TRUSTED
+    /// hashes (the plan's descent chained them to a beacon anchor) and return
+    /// their watch-list logs by block number.
+    ///
+    /// Headers are re-fetched here by hash rather than cached in the plan: a
+    /// header is self-verifying under a hash we already trust (`hash !=
+    /// requested` is rejected), and caching them would make plan memory scale
+    /// with candidate DENSITY — a watched high-traffic contract hits the bloom
+    /// in nearly every block, which on a long gap is hundreds of megabytes on
+    /// a phone. The fetches ride the multiplexed connection concurrently, so
+    /// the extra round trip costs latency once per chunk, not per block.
+    ///
+    /// Verification is the backfill's, block for block: transactions against
+    /// the header's `transactionsRoot`, receipts against its `receiptsRoot`,
+    /// so a peer cannot substitute a different block's data.
+    async fn bridge_fetch_logs(
+        &self,
+        peer: &ManagedPeer,
+        hashes: &[[u8; 32]],
+    ) -> Result<std::collections::HashMap<u64, Vec<crate::el::logindex::StoredLog>>, String> {
+        if hashes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        // join_all, not try_join_all: short-circuiting would drop the sibling
+        // requests still in flight (and the bodies/receipts already served)
+        // the moment one header failed. Failures become per-block holes that
+        // simply shorten the usable prefix.
+        let headers = futures::future::join_all(hashes.iter().map(|h| async move {
+            let got = peer.get_block_headers_by_hash(h, 1).await.ok()?;
+            let vh = got.into_iter().next()?;
+            (vh.hash == *h).then_some(vh)
+        }))
+        .await;
+        self.fetch_logs_for_known_headers(peer, hashes, &headers).await
+    }
+
+    /// The verify core shared by the bridge and the tail: given TRUSTED
+    /// headers (chained to a beacon anchor by the caller), fetch each block's
+    /// body and receipts and return the watch-list logs by block number. The
+    /// tail passes the headers from the window it just verified rather than
+    /// re-fetching one per candidate every tick.
+    async fn fetch_logs_for_known_headers(
+        &self,
+        peer: &ManagedPeer,
+        hashes: &[[u8; 32]],
+        headers: &[Option<crate::el::eth::messages::VerifiedHeader>],
+    ) -> Result<std::collections::HashMap<u64, Vec<crate::el::logindex::StoredLog>>, String> {
+        let mut out = std::collections::HashMap::new();
+        if hashes.is_empty() {
+            return Ok(out);
+        }
+        let (bodies, receipt_blocks) =
+            futures::future::join(peer.get_block_bodies(hashes), peer.get_receipts(hashes)).await;
+        let (bodies, receipt_blocks) = (bodies?, receipt_blocks?);
+        // Honest byte-budget truncation: use the served prefix, leave the rest
+        // for the next round (the caller re-requests what it didn't get).
+        let usable = bodies.len().min(receipt_blocks.len()).min(hashes.len());
+        if usable == 0 {
+            return Err("peer served no bodies/receipts for bridge candidates".to_string());
+        }
+        for i in 0..usable {
+            // A missing/mismatched header ends the usable prefix rather than
+            // failing the chunk: the caller applies what is contiguous.
+            let Some(vh) = headers.get(i).and_then(|h| h.as_ref()) else {
+                break;
+            };
+            verify_body_transactions(&vh.header, &bodies[i])?;
+            if receipt_blocks[i].len() != bodies[i].transactions.len() {
+                return Err(format!(
+                    "block {}: {} receipts for {} transactions",
+                    vh.header.number,
+                    receipt_blocks[i].len(),
+                    bodies[i].transactions.len()
+                ));
+            }
+            verify_block_receipts(&vh.header, &receipt_blocks[i])?;
+            let built = build_block_receipts(&vh.header, vh.hash, &bodies[i], &receipt_blocks[i])?;
+            let stored =
+                stored_logs_for_block(&built).ok_or("malformed log field in verified receipts")?;
+            let watched: Vec<crate::el::logindex::StoredLog> = self
+                .with_log_index(|ix| {
+                    stored.iter().filter(|l| ix.config().watches(l)).cloned().collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            out.insert(vh.header.number, watched);
+        }
+        Ok(out)
     }
 
     /// One backfill step: walk the verified header chain DOWNWARD from the
@@ -948,26 +1817,12 @@ impl ElReader {
             // Yield between rounds so this task never monopolizes the runtime.
             tokio::task::yield_now().await;
         }
-        // Checkpoint at most every PERSIST_MIN_INTERVAL of progressing steps
-        // (not per batch, not even per step): the persist is a full-index
-        // rewrite under the index lock, and its cost grows with the store —
-        // a crash now costs at most ~10s of batches.
-        const PERSIST_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-        let persist_due = any_progress
-            && self.log_index_last_persist.lock().is_ok_and(|mut t| {
-                if t.is_none_or(|prev| prev.elapsed() >= PERSIST_MIN_INTERVAL) {
-                    *t = Some(std::time::Instant::now());
-                    true
-                } else {
-                    false
-                }
-            });
+        // Checkpoint at most once per throttle window of progressing steps
+        // (not per batch, not even per step) — see log_index_persist_due; a
+        // crash now costs at most ~10s of batches.
+        let persist_due = any_progress && self.log_index_persist_due();
         if persist_due {
-            if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
-                if let Some(ix) = slot.as_ref() {
-                    let _ = ix.persist(path);
-                }
-            }
+            self.persist_log_index(self.finalized_block_number());
         }
         // Rolling throughput for the status ETA, measured against WALL CLOCK
         // between progress observations (the anchor persists across idle
@@ -3131,11 +3986,7 @@ impl ElReader {
         }
         // Best-effort index checkpoint before teardown: a failed write only
         // costs a re-index of the uncheckpointed tail, never correctness.
-        if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
-            if let Some(ix) = slot.as_ref() {
-                let _ = ix.persist(path);
-            }
-        }
+        self.persist_log_index(self.finalized_block_number());
         self.pool.stop().await;
         self.discovery.stop().await;
     }
@@ -3905,6 +4756,150 @@ fn stored_logs_for_block(receipts: &[VerifiedReceipt]) -> Option<Vec<crate::el::
     Some(out)
 }
 
+/// Whether this run's tail record accounts for ALL coverage above finality.
+/// Optimistic coverage is only trustworthy while the tail can re-check it
+/// against the canonical chain, which needs the hash of every block it
+/// claims; coverage reaching above finality whose top block this run did not
+/// record (an index from an older build that persisted its tail, an imported
+/// file) must be rewound instead of trusted. Pure — unit-tested.
+fn tail_vouches_for(recorded: &[(u64, [u8; 32])], edge: u64, finalized: u64) -> bool {
+    if edge <= finalized.saturating_add(1) {
+        return true; // coverage stops at (or below) finality: nothing optimistic
+    }
+    // The record must reach the covered top and run down to finality without
+    // holes — a hole is a block we cannot re-check.
+    let top = edge - 1;
+    let mut expect = top;
+    for (n, _) in recorded.iter().rev() {
+        if *n != expect {
+            return false;
+        }
+        if expect == finalized.saturating_add(1) {
+            return true;
+        }
+        expect -= 1;
+    }
+    expect <= finalized
+}
+
+/// The lowest block a tail window must reach. It has to cover every RECORDED
+/// block (so a reorg is detectable — a window starting at the coverage edge
+/// compares against records that all sit BELOW it, i.e. two disjoint ranges,
+/// and can never detect anything) and the covered top itself (so the first
+/// appended block links to it by parent hash).
+///
+/// NOT clamped at finality: finality advances BETWEEN ticks, and a record it
+/// overtook would then sit below the window, never be compared, and be pruned
+/// as "immutable" — which is only true of the CANONICAL block at that height,
+/// not of the possibly-orphaned one we appended. `hard_floor` bounds the walk
+/// instead. Pure — unit-tested.
+fn tail_window_floor(edge: u64, lowest_recorded: Option<u64>, hard_floor: u64) -> u64 {
+    let covered_top = edge.saturating_sub(1);
+    let floor = lowest_recorded.unwrap_or(covered_top).min(covered_top);
+    floor.max(hard_floor)
+}
+
+/// THE record-retirement rule, as a predicate: may an entry recorded at
+/// `block` be dropped WITHOUT giving back the coverage it describes?
+///
+/// Only if the canonical chain confirmed it at a height at or below finality
+/// — `compared_at_or_below_finality`. Finality moving past an entry on its own
+/// proves nothing: it fixes the CANONICAL block at that height, not the
+/// possibly-orphaned one this run appended there. Every retirement site must
+/// route through this rule (three separate rounds of review found a site that
+/// had drifted from it, each time by dropping records on a path where the
+/// tail's own check could no longer run).
+fn record_may_retire(block: u64, finalized: u64, compared_at_or_below_finality: bool) -> bool {
+    compared_at_or_below_finality && block <= finalized
+}
+
+/// Whether a `TAIL_MAX`-header window anchored at `head_n` can actually serve
+/// down to `floor`. The window is inclusive at both ends, so a floor exactly
+/// `TAIL_MAX` below the head needs one header more than the serve ceiling —
+/// which rejected every peer and stalled the tail until finality overtook
+/// coverage. Pure — unit-tested.
+fn tail_window_is_servable(head_n: u64, floor: u64, tail_max: u64) -> bool {
+    head_n.saturating_sub(floor) + 1 <= tail_max
+}
+
+/// Whether a chain whose head is `head_n` still reaches the top of what the
+/// index covers. `false` means a reorg SHORTENED the chain past our coverage,
+/// which is itself proof that the blocks above `head_n` are orphaned. Pure —
+/// unit-tested, because the obvious-looking comparison (against the tail
+/// window's floor) can never fire: the floor sits at finality whenever the
+/// tail record vouches for the coverage.
+fn tail_chain_reaches_coverage(head_n: u64, edge: u64) -> bool {
+    head_n >= edge.saturating_sub(1)
+}
+
+/// The lowest recorded block whose hash the canonical chain contradicts — the
+/// fork point of a reorg. `None` when every recorded block the window covers
+/// still matches (records outside the window are not evidence either way, and
+/// the window is built to cover them). Pure — unit-tested.
+fn tail_fork_point(
+    recorded: &[(u64, [u8; 32])],
+    canonical: &[(u64, [u8; 32])],
+) -> Option<u64> {
+    let mut fork: Option<u64> = None;
+    for (n, h) in recorded {
+        if let Some((_, canon_hash)) = canonical.iter().find(|(cn, _)| cn == n) {
+            if canon_hash != h {
+                fork = Some(fork.map_or(*n, |f: u64| f.min(*n)));
+            }
+        }
+    }
+    fork
+}
+
+/// Whether an in-progress bridge plan still describes the CURRENT gap, and so
+/// may be resumed instead of re-descended. Pure (unit-tested): the two moving
+/// premises are the coverage edge — which the plan's own ascent advances, so
+/// its progress is added back before comparing — and the finalized head, which
+/// only moves forward and leaves everything the plan mapped (below its own
+/// anchor) immutable. Anything else means the index changed underneath, and
+/// the plan must be rebuilt.
+fn plan_still_matches(
+    anchor_n: u64,
+    target: u64,
+    applied: usize,
+    finalized_now: u64,
+    edge_now: u64,
+) -> bool {
+    finalized_now >= anchor_n && target.saturating_add(applied as u64) == edge_now
+}
+
+/// The next run of head-bridge candidate hashes to request, in ASCENDING
+/// block order. `blocks` is the plan's descending `(number, hash, candidate)`
+/// list, `applied` is how many blocks the ascent has already applied (counted
+/// from the end), `max` caps the request size, and `within` caps how far ahead
+/// to look — the blocks this tick can still apply, so bodies and receipts are
+/// never fetched for candidates the tick will not reach. Empty when the next
+/// block to apply is a plain (bloom-miss) block, which needs no request at
+/// all. Pure — the arithmetic that turns a descending plan into ascending
+/// work, unit-tested in `bridge_plan_tests`.
+fn bridge_candidate_chunk(
+    blocks: &[(u64, [u8; 32], bool)],
+    applied: usize,
+    max: usize,
+    within: usize,
+) -> Vec<[u8; 32]> {
+    let total = blocks.len();
+    let mut out = Vec::new();
+    if applied >= total || max == 0 || within == 0 || !blocks[total - 1 - applied].2 {
+        return out; // done, out of budget, or the cursor sits on a plain block
+    }
+    let limit = total.min(applied.saturating_add(within));
+    let mut i = applied;
+    while i < limit && out.len() < max {
+        let (_, hash, candidate) = blocks[total - 1 - i];
+        if candidate {
+            out.push(hash);
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Pure truncation arithmetic for one backfill candidate chunk: given the
 /// chunk's block numbers (descending) and how many bodies/receipts the peer
 /// actually served, return `(usable, stop_below)` — the verified-prefix
@@ -3929,6 +4924,193 @@ fn truncation_plan(
 /// claim a block whose candidate receipts were not verified.
 fn should_apply(n: u64, stop_below: Option<u64>) -> bool {
     !stop_below.is_some_and(|stop| n <= stop)
+}
+
+#[cfg(test)]
+mod tail_reorg_tests {
+    use super::{tail_fork_point, tail_vouches_for, tail_window_floor};
+
+    fn h(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
+
+    #[test]
+    fn window_floor_reaches_the_records_not_just_the_edge() {
+        // THE bug this pins: a window starting at the coverage edge (1_001)
+        // compares against records that all sit BELOW it — disjoint ranges, so
+        // a reorg could never be detected. The floor must reach the records.
+        assert_eq!(tail_window_floor(1_001, Some(996), 0), 996);
+        // No records: still include the covered top so the next block links
+        // to it by parent hash.
+        assert_eq!(tail_window_floor(1_001, None, 0), 1_000);
+        // A record above the covered top can't widen the window past it.
+        assert_eq!(tail_window_floor(1_001, Some(1_100), 0), 1_000);
+        // The hard floor bounds the walk...
+        assert_eq!(tail_window_floor(1_001, Some(500), 900), 900);
+        // ...but it is a WALK bound, not finality: a record finality overtook
+        // between ticks must still be inside the window, because it is only
+        // the canonical block at that height that became immutable — not the
+        // possibly-orphaned one we appended.
+        let finality_now = 998;
+        assert!(tail_window_floor(1_001, Some(996), 900) < finality_now);
+    }
+
+    #[test]
+    fn a_shortened_chain_is_detected_against_the_covered_top() {
+        use super::{tail_chain_reaches_coverage, tail_window_floor};
+        // Coverage 991..1000 (edge 1001), finality 990, record intact.
+        let (edge, finalized) = (1_001u64, 990u64);
+        // A head that fell back to 995 no longer reaches the covered top.
+        assert!(!tail_chain_reaches_coverage(995, edge));
+        // The window FLOOR would not have caught this: it sits at finality
+        // whenever the record vouches, so `head < floor` is unreachable here.
+        assert!(995 >= tail_window_floor(edge, Some(991), finalized));
+        // A head at or above the covered top is fine.
+        assert!(tail_chain_reaches_coverage(1_000, edge));
+        assert!(tail_chain_reaches_coverage(1_200, edge));
+    }
+
+    #[test]
+    fn a_record_retires_only_once_confirmed_at_or_below_finality() {
+        use super::record_may_retire;
+        // Compared while already final: safe to forget.
+        assert!(record_may_retire(1_000, 1_000, true));
+        assert!(record_may_retire(999, 1_000, true));
+        // Finality passed it, but nothing ever compared it — the whole point:
+        // finality fixes the CANONICAL block at that height, not ours.
+        assert!(!record_may_retire(1_000, 1_000, false));
+        // Compared, but still above finality: it can still reorg.
+        assert!(!record_may_retire(1_001, 1_000, true));
+    }
+
+    #[test]
+    fn the_tail_window_floor_must_be_servable() {
+        use super::{tail_window_floor, tail_window_is_servable};
+        const TAIL_MAX: u64 = 1_024;
+        let head = 10_000u64;
+        // The hard floor the tail uses must be reachable within one window —
+        // head - (TAIL_MAX - 1) needs exactly TAIL_MAX headers.
+        let hard_floor = head - (TAIL_MAX - 1);
+        assert!(tail_window_is_servable(head, hard_floor, TAIL_MAX));
+        // One block lower needs 1025 — no peer can serve it, which stalled
+        // the tail permanently.
+        assert!(!tail_window_is_servable(head, hard_floor - 1, TAIL_MAX));
+        // Whatever the record asks for, the floor the tail computes stays
+        // servable because it never goes below the hard floor.
+        for lowest in [hard_floor, hard_floor + 5, head - 1] {
+            let floor = tail_window_floor(head, Some(lowest), hard_floor);
+            assert!(tail_window_is_servable(head, floor, TAIL_MAX), "floor {floor}");
+        }
+    }
+
+    #[test]
+    fn fork_point_is_the_lowest_contradicted_record() {
+        let canonical =
+            vec![(100, h(1)), (101, h(2)), (102, h(0xAA)), (103, h(0xBB))];
+        // All matching → no fork.
+        assert_eq!(tail_fork_point(&[(100, h(1)), (101, h(2))], &canonical), None);
+        // 102 and 103 both diverge → the LOWEST is the fork point.
+        let recorded = vec![(100, h(1)), (101, h(2)), (102, h(3)), (103, h(4))];
+        assert_eq!(tail_fork_point(&recorded, &canonical), Some(102));
+        // Records the window doesn't cover are not evidence either way.
+        assert_eq!(tail_fork_point(&[(99, h(9))], &canonical), None);
+        assert_eq!(tail_fork_point(&[], &canonical), None);
+    }
+
+    #[test]
+    fn vouching_requires_an_unbroken_record_down_to_finality() {
+        // Coverage at or below finality: nothing optimistic to vouch for.
+        assert!(tail_vouches_for(&[], 991, 990));
+        assert!(tail_vouches_for(&[], 500, 990));
+        // Full record from the covered top down to finality+1.
+        assert!(tail_vouches_for(&[(991, h(1)), (992, h(2))], 993, 990));
+        // Empty record but optimistic coverage: an inherited/imported tail.
+        assert!(!tail_vouches_for(&[], 993, 990));
+        // Record that doesn't reach the covered top (992 missing).
+        assert!(!tail_vouches_for(&[(991, h(1))], 993, 990));
+        // A HOLE in the record: 992 was never recorded, so it can't be
+        // re-checked and the whole optimistic span must be rewound.
+        assert!(!tail_vouches_for(&[(991, h(1)), (993, h(3))], 994, 990));
+    }
+}
+
+#[cfg(test)]
+mod bridge_plan_tests {
+    use super::bridge_candidate_chunk;
+
+    /// Descending `(number, hash, candidate)` — the plan's own layout.
+    fn plan(spec: &[(u64, bool)]) -> Vec<(u64, [u8; 32], bool)> {
+        spec.iter()
+            .map(|(n, c)| {
+                let mut h = [0u8; 32];
+                h[..8].copy_from_slice(&n.to_be_bytes());
+                (*n, h, *c)
+            })
+            .collect()
+    }
+
+    fn numbers(hashes: &[[u8; 32]]) -> Vec<u64> {
+        hashes
+            .iter()
+            .map(|h| u64::from_be_bytes(h[..8].try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn plain_cursor_needs_no_request() {
+        // Ascent starts at the bottom (100, plain) → nothing to fetch.
+        let p = plan(&[(102, true), (101, false), (100, false)]);
+        assert!(bridge_candidate_chunk(&p, 0, 64, 64).is_empty());
+        // ...and still nothing one block up.
+        assert!(bridge_candidate_chunk(&p, 1, 64, 64).is_empty());
+        // At 102 the cursor sits on a candidate.
+        assert_eq!(numbers(&bridge_candidate_chunk(&p, 2, 64, 64)), vec![102]);
+    }
+
+    #[test]
+    fn chunk_collects_candidates_ascending_across_plain_blocks() {
+        let p = plan(&[(105, true), (104, false), (103, true), (102, false), (101, true)]);
+        // From the bottom candidate: ascending order, plain blocks skipped.
+        assert_eq!(numbers(&bridge_candidate_chunk(&p, 0, 64, 64)), vec![101, 103, 105]);
+        // The look-ahead bound stops at blocks this tick can still apply:
+        // with room for 3 blocks only 101 and 103 are in reach.
+        assert_eq!(numbers(&bridge_candidate_chunk(&p, 0, 64, 3)), vec![101, 103]);
+        assert!(bridge_candidate_chunk(&p, 0, 64, 0).is_empty());
+    }
+
+    #[test]
+    fn chunk_respects_the_request_cap() {
+        let p = plan(&[(105, true), (104, true), (103, true), (102, true), (101, true)]);
+        assert_eq!(numbers(&bridge_candidate_chunk(&p, 0, 2, 64)), vec![101, 102]);
+        // A zero cap asks for nothing rather than panicking.
+        assert!(bridge_candidate_chunk(&p, 0, 0, 64).is_empty());
+    }
+
+    #[test]
+    fn a_plan_survives_its_own_progress_and_advancing_finality() {
+        use super::plan_still_matches;
+        // Fresh plan: target == edge, nothing applied.
+        assert!(plan_still_matches(2_000, 1_000, 0, 2_000, 1_000));
+        // Mid-ascent: the edge has moved by exactly what the plan applied.
+        assert!(plan_still_matches(2_000, 1_000, 250, 2_000, 1_250));
+        // Finality advanced past the plan's anchor: the mapped blocks are
+        // still below it and still immutable, so the plan is fine.
+        assert!(plan_still_matches(2_000, 1_000, 250, 2_064, 1_250));
+        // Coverage moved WITHOUT the plan (an appender landing, an import, a
+        // reset): the plan no longer lines up and must be rebuilt.
+        assert!(!plan_still_matches(2_000, 1_000, 250, 2_000, 1_400));
+        assert!(!plan_still_matches(2_000, 1_000, 0, 2_000, 900));
+        // Finality REGRESSED (a rewound anchor): rebuild rather than trust it.
+        assert!(!plan_still_matches(2_000, 1_000, 0, 1_900, 1_000));
+    }
+
+    #[test]
+    fn exhausted_plan_yields_nothing() {
+        let p = plan(&[(101, true), (100, true)]);
+        assert!(bridge_candidate_chunk(&p, 2, 64, 64).is_empty());
+        assert!(bridge_candidate_chunk(&p, 9, 64, 64).is_empty());
+        assert!(bridge_candidate_chunk(&[], 0, 64, 64).is_empty());
+    }
 }
 
 #[cfg(test)]

@@ -2112,7 +2112,12 @@ pub fn log_index_status_json(handle: i64) -> String {
         return eljson::error_json("node is not running");
     };
     let rate_bps = reader.log_index_rate_bps();
-    let status = reader.with_log_index(|ix| build_log_index_status(ix, rate_bps));
+    // Measured against the ANCHORED HEAD, which is what `latest` resolves to
+    // and therefore what decides whether a query is refused — reporting the
+    // gap to finality instead would show "caught up" through the whole band
+    // where queries still fail.
+    let head = reader.head_block_number().unwrap_or(0);
+    let status = reader.with_log_index(|ix| build_log_index_status(ix, rate_bps, head));
     status.unwrap_or_else(|| "{\"enabled\":false,\"logCount\":0,\"entries\":[]}".to_string())
 }
 
@@ -2121,6 +2126,7 @@ pub fn log_index_status_json(handle: i64) -> String {
 fn build_log_index_status(
     ix: &myotis_net::el::logindex::LogIndex,
     rate_bps: Option<f64>,
+    head: u64,
 ) -> String {
     {
         let mut s = String::from("{\"enabled\":");
@@ -2153,6 +2159,17 @@ fn build_log_index_status(
                         s.push_str(&eta.to_string());
                     }
                 }
+            }
+        }
+        // How far the TOP of coverage trails the head `latest` resolves to.
+        // Beyond LOG_INDEX_LATEST_SLACK, head-reaching queries are refused, so
+        // this is the number that explains a refusal even on a fully
+        // backfilled index — the bridge and tail close it after downtime.
+        if head > 0 {
+            if let Some(edge) = ix.append_edge() {
+                let covered_high = edge.saturating_sub(1);
+                s.push_str(",\"headGap\":");
+                s.push_str(&head.saturating_sub(covered_high).to_string());
             }
         }
         s.push_str(",\"entries\":[");
@@ -2309,6 +2326,15 @@ pub fn get_logs_json(handle: i64, filter_json: &str) -> String {
     out
 }
 
+/// How far the index's covered top may trail the anchored head and still be
+/// used to resolve `latest`. Sized to absorb TICK CADENCE only — the tail
+/// appender runs every 6s while blocks arrive every ~12s, so it is normally
+/// 0-1 blocks behind. Anything beyond this is a real lag, and the query is
+/// refused rather than answered against a narrower range the caller never
+/// asked for and cannot see (a wallet advancing its cursor from
+/// `eth_blockNumber` would silently lose those blocks' logs).
+const LOG_INDEX_LATEST_SLACK: u64 = 4;
+
 fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
     use myotis_net::el::logindex::QueryError;
     let Ok(v) = serde_json::from_str::<serde_json::Value>(filter_json) else {
@@ -2323,7 +2349,19 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
     let Some(head) = reader.head_block_number() else {
         return eljson::error_json("no verified head yet");
     };
-    let filter = match parse_get_logs_filter(&v, head, reader.finalized_block_number()) {
+    // `latest` resolves to the top of the index's coverage when that is within
+    // a block or two of the anchored head. The tail appender runs on a 6s tick
+    // while blocks arrive faster than it, so a literal `head` would put every
+    // other poll one block outside coverage and refuse it — a flapping refusal
+    // that reads as "broken" to a wallet. The clamp is deliberately TIGHT: a
+    // coverage top further behind than the appender's own window means the
+    // index is genuinely not current, and the query is refused (never silently
+    // answered against a stale range).
+    let servable = reader
+        .log_index_covered_high()
+        .filter(|top| head.saturating_sub(*top) <= LOG_INDEX_LATEST_SLACK)
+        .map_or(head, |top| top.min(head));
+    let filter = match parse_get_logs_filter(&v, servable, reader.finalized_block_number()) {
         Ok(f) => f,
         Err(msg) => return eljson::error_json(&msg),
     };
@@ -2383,7 +2421,7 @@ mod log_index_json_tests {
         };
         let mut ix = myotis_net::el::logindex::LogIndex::new(cfg).unwrap();
         ix.cursor = Some((600, [0u8; 32]));
-        let s = build_log_index_status(&ix, Some(9.44));
+        let s = build_log_index_status(&ix, Some(9.44), 0);
         assert!(s.contains("\"maxSpeed\":true"), "{s}");
         assert!(s.contains("\"targetLow\":100"), "{s}");
         assert!(s.contains("\"blocksRemaining\":500"), "{s}");
@@ -2391,7 +2429,7 @@ mod log_index_json_tests {
         // eta = 500 / 9.44 = 52.966 -> 53
         assert!(s.contains("\"etaSeconds\":53"), "{s}");
         // No rate -> no ETA keys, remaining still present.
-        let s2 = build_log_index_status(&ix, None);
+        let s2 = build_log_index_status(&ix, None, 0);
         assert!(s2.contains("\"blocksRemaining\":500"), "{s2}");
         assert!(!s2.contains("etaSeconds"), "{s2}");
     }

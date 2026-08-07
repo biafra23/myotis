@@ -27,6 +27,11 @@ object LogIndexStatus {
         val blocksPerSec: Double? = null,
         /** remaining/rate, engine-computed; null whenever the rate is unknown. */
         val etaSeconds: Long? = null,
+        /** Blocks between the top of coverage and the head `latest` resolves
+         *  to. Past a small slack the engine refuses head-reaching queries,
+         *  so this is what explains a refusal on an otherwise complete
+         *  index. */
+        val headGap: Long? = null,
     )
 
     /** Structured parse of the engine's status JSON (regex over the fixed
@@ -49,15 +54,32 @@ object LogIndexStatus {
         val remaining = Regex("\"blocksRemaining\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
         val bps = Regex("\"blocksPerSec\":([0-9.]+)").find(json)?.groupValues?.get(1)?.toDoubleOrNull()
         val eta = Regex("\"etaSeconds\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
-        return Parsed(enabled, logCount, entries, targetLow, remaining, bps, eta)
+        val headGap = Regex("\"headGap\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
+        return Parsed(enabled, logCount, entries, targetLow, remaining, bps, eta, headGap)
     }
+
+    /** The head-side line: while coverage trails the head `latest` resolves
+     *  to by more than the engine's serving slack, head-reaching queries are
+     *  refused — say that rather than claim the backfill is finished. Null
+     *  when there is nothing to report. */
+    private fun headLine(p: Parsed): String? {
+        val gap = p.headGap ?: return null
+        return if (gap <= NORMAL_HEAD_LAG) null
+        else "catching up to the head (${grouped(gap)} blocks behind)"
+    }
+
+    /** Mirrors the engine's `LOG_INDEX_LATEST_SLACK`: within this the index
+     *  is serving head-reaching queries, beyond it they are refused. Keep the
+     *  two in step — a wider value here would report "complete" through the
+     *  whole band where queries actually fail. */
+    private const val NORMAL_HEAD_LAG = 4L
 
     /** Human progress line for the Index tab: an ETA when the engine has a
      *  measured rate, otherwise x/y blocks (or a waiting note). Pure Kotlin —
      *  commonMain compiles for Kotlin/Native too, so no String.format. */
     fun progressLine(p: Parsed): String? {
         val remaining = p.blocksRemaining ?: return null
-        if (remaining == 0L) return "backfill complete"
+        if (remaining == 0L) return headLine(p) ?: "backfill complete"
         val eta = p.etaSeconds
         if (eta != null && p.blocksPerSec != null) {
             return "~${formatDuration(eta)} remaining " +
