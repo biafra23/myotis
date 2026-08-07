@@ -33,6 +33,15 @@ interface RpcBackend {
      * router turns into an honest refusal rather than an answer computed
      * against unmodified state (see the apply-or-refuse rule in CLAUDE.md).
      */
+    /**
+     * Whether this backend can APPLY state overrides. Distinguishes "overrides
+     * unsupported" (permanent → -32602) from an ordinary null answer such as
+     * not-synced or a revert (transient → -32000, retryable). Collapsing the two
+     * would tell a client to stop asking over a condition that clears in
+     * seconds.
+     */
+    fun supportsStateOverrides(): Boolean = false
+
     fun callWithOverrides(
         from: ByteArray?,
         to: ByteArray,

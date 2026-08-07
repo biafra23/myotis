@@ -166,6 +166,11 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public boolean supportsStateOverrides() {
+        return true;   // the revm executor applies them (myotis_evm::overrides)
+    }
+
+    @Override
     public byte[] callWithOverrides(
             byte[] from,
             byte[] to,

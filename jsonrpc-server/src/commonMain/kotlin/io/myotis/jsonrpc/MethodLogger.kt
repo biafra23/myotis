@@ -13,6 +13,8 @@ import kotlin.concurrent.Volatile
  * serve each" record — and feeds the {@code myotis_rpcCoverage} introspection map.
  *
  * `path` is one of VERIFIED (served by Myotis, cryptographically verified),
+ * SIMULATED (served over verified state but under CALLER-SUPPLIED overrides —
+ * proven state, but the answer is the caller's hypothesis, not a chain fact),
  * PROXY (relayed upstream — unverified), ERROR, or LOCAL (answered here, e.g.
  * the coverage introspection method).
  *
@@ -85,7 +87,8 @@ class MethodLogger {
         rpcLogInfo(ACCESS_LOGGER, "[rpc] method=$method id=$id outcome=$outcome latencyMs=$latencyMs")
     }
 
-    /** Coverage map as a JSON object: method -> {count, verified, proxied, error, local}. */
+    /** Coverage map as a JSON object:
+     *  method -> {count, verified, simulated, proxied, error, local}. */
     fun coverage(): JsonObject = buildJsonObject {
         byMethod.entries.sortedBy { it.key }.forEach { (method, s) ->
             put(method, buildJsonObject {

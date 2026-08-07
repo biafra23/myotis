@@ -41,6 +41,8 @@ class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBack
     override fun call(from: ByteArray?, to: ByteArray, data: ByteArray, valueWei: String?, block: String): ByteArray? =
         v.call(from, to, data, valueWei, block)
 
+    override fun supportsStateOverrides(): Boolean = v.supportsStateOverrides()
+
     override fun callWithOverrides(
         from: ByteArray?,
         to: ByteArray,

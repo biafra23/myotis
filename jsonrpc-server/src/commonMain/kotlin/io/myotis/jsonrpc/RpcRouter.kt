@@ -112,27 +112,29 @@ class RpcRouter(
      *
      *  An EMPTY object is not an override — nothing would change — so it is
      *  served normally; clients that always send the parameter must not break. */
-    private fun hasUnsupportedOverride(root: JsonObject): Boolean {
-        val p = root.params() ?: return false
-        // params[2] is keyed BY ADDRESS, so a non-empty map is not yet an
-        // override: `{"0x…":{}}` names an account and changes nothing about it.
-        // Refusing that would contradict the rule this gate implements (refuse
-        // what would alter execution, serve what wouldn't), so look one level
-        // deeper. params[3] (blockOverrides) is a flat field map — non-empty
-        // there IS a change.
-        val stateOverride = (p.getOrNull(2) as? JsonObject)
-            ?.values
-            ?.any { (it as? JsonObject)?.isNotEmpty() == true } == true
-        val blockOverride = (p.getOrNull(3) as? JsonObject)?.isNotEmpty() == true
-        return stateOverride || blockOverride
-    }
+    private fun hasUnsupportedOverride(root: JsonObject): Boolean =
+        // DERIVED, not re-implemented: this decides whether to REFUSE while
+        // stateOverrideJson decides whether to APPLY and how to LABEL. If the
+        // two ever disagreed, the node would answer a question the caller
+        // didn't ask — the exact class of bug CLAUDE.md's apply-or-refuse rule
+        // exists to prevent — so there is one source of truth.
+        stateOverrideJson(root) != null || blockOverridePresent(root)
 
     /** The `stateOverride` object (params[2]) as JSON when it would change
-     *  execution, else null. Keyed BY ADDRESS, so a map whose entries are all
-     *  empty changes nothing and is not an override. */
+     *  execution, else null.
+     *
+     *  Keyed BY ADDRESS, so a map whose entries are all EMPTY objects changes
+     *  nothing and is not an override. But an entry that is present and NOT an
+     *  object (`{"0x…":"0x6080"}`) is malformed, not absent — treating it as
+     *  absent would serve the call against unmodified state and count it
+     *  VERIFIED, i.e. neither apply nor refuse a parameter that can change the
+     *  answer. It therefore counts as an override so the request fails closed. */
     private fun stateOverrideJson(root: JsonObject): String? {
         val ov = root.params()?.getOrNull(2) as? JsonObject ?: return null
-        if (ov.values.none { (it as? JsonObject)?.isNotEmpty() == true }) return null
+        val changesExecution = ov.values.any { v ->
+            (v as? JsonObject)?.isNotEmpty() ?: (v !is JsonNull)   // non-object => malformed
+        }
+        if (!changesExecution) return null
         return json.encodeToString(JsonObject.serializer(), ov)
     }
 
@@ -141,7 +143,9 @@ class RpcRouter(
     private fun blockOverridePresent(root: JsonObject): Boolean =
         (root.params()?.getOrNull(3) as? JsonObject)?.isNotEmpty() == true
 
-    /** The methods whose override parameters this node does not apply. */
+    /** The methods that take override parameters. `eth_call` state overrides
+     *  are APPLIED when the backend supports them; `blockOverrides` and every
+     *  `eth_estimateGas` override are refused. */
     private fun takesOverrides(method: String?): Boolean =
         method == "eth_call" || method == "eth_estimateGas"
 
@@ -218,7 +222,25 @@ class RpcRouter(
             // and retrying would spin forever instead of taking the fallback this
             // refusal exists to unlock. -32602 says what is true: the params are
             // structurally valid but unsupported, and no retry will change that.
-            if (takesOverrides(m) && hasUnsupportedOverride(root)) {
+            // -32602 (permanent) ONLY when the override genuinely cannot be
+            // applied here: an unsupported KIND (blockOverrides, estimateGas), or
+            // a backend that cannot apply overrides at all. A capable backend
+            // that returned null did so for an ordinary reason — not synced, no
+            // peer, out-of-window block, a plain revert — and those are
+            // transient, so they must fall through to the retryable -32000
+            // below. Getting this wrong tells a wallet to stop asking and pin
+            // its public-node fallback for the session, which is the behaviour
+            // #314 exists to remove.
+            // NOTE the outer guard: only a request that actually CARRIES an
+            // override can be refused for one. Without it every ordinary
+            // eth_estimateGas failure (a revert, not synced) would come back
+            // permanent — a pre-existing test caught exactly that.
+            val overrideUnsupported = takesOverrides(m) && hasUnsupportedOverride(root) && (
+                blockOverridePresent(root) ||            // never applied
+                    m == "eth_estimateGas" ||            // executor path not wired
+                    backend?.supportsStateOverrides() != true   // this backend cannot
+                )
+            if (overrideUnsupported) {
                 logger.record(m, idStr, "ERROR", elapsedMs(t0), -32602)
                 return errorEnvelope(
                     id,

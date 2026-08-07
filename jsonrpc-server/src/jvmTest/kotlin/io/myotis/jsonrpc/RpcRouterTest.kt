@@ -28,7 +28,6 @@ class RpcRouterTest {
 
     private val json = Json { ignoreUnknownKeys = true }
 
-    /** Configurable fake; records the last eth_call args so we can assert decoding. */
     @Test fun ethCall_withOverride_isServedByAnOverrideCapableBackend_andLabelledSimulated() {
         val b = FakeBackend(callResult = byteArrayOf(0x2a), applyOverrides = true)
         val logger = MethodLogger()
@@ -60,6 +59,70 @@ class RpcRouterTest {
         val cov = logger.coverage()["eth_call"]!!.jsonObject
         assertEquals(1, cov["verified"]!!.jsonPrimitive.content.toInt())
         assertEquals(0, cov["simulated"]!!.jsonPrimitive.content.toInt())
+    }
+
+    /** Configurable fake; records the last eth_call args so we can assert decoding. */
+    @Test fun ethCall_withStateAndBlockOverrides_isRefused_evenOnACapableBackend() {
+        // The regression that matters: with a state override the capable path
+        // would otherwise answer, applying the state override and silently
+        // leaving the BLOCK context unmodified — labelled SIMULATED, and wrong.
+        // (The earlier blockOverrides test uses an incapable backend, so it
+        // would still pass with the params[3] gate deleted.)
+        val b = FakeBackend(callResult = byteArrayOf(0x2a), applyOverrides = true)
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x0000000000000000000000000000000000696969","data":"0x24b6b1a5"},
+                         "latest",
+                         {"0x0000000000000000000000000000000000696969":{"code":"0x6080"}},
+                         {"time":"0xdeadbeef"}]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32602, errorCode(resp))
+        assertNull(b.lastOverrides)   // never reached the override path either
+    }
+
+    @Test fun capableBackendReturningNull_getsTheRETRYABLEcode_notPermanent() {
+        // A capable backend returns null for ordinary reasons — not synced, no
+        // peer, out-of-window block, a plain revert. Those are transient, so the
+        // client must be told to retry; -32602 would make a wallet stop asking
+        // and pin its public-node fallback for the session.
+        val b = FakeBackend(callResult = null, applyOverrides = true)
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x0000000000000000000000000000000000696969","data":"0x24b6b1a5"},
+                         "latest",
+                         {"0x0000000000000000000000000000000000696969":{"code":"0x6080"}}]}""")
+        assertEquals(-32000, errorCode(resp))
+    }
+
+    @Test fun anImplementationThatDoesNotOverride_inheritsUnsupported() {
+        // Pins the property the design calls load-bearing: an engine that simply
+        // doesn't implement callWithOverrides inherits the interface default
+        // (null / unsupported), so the router refuses permanently instead of
+        // answering against unmodified state. Deliberately NOT FakeBackend,
+        // which simulates the default with a flag.
+        val bare = object : io.myotis.api.VerifiedReads {
+            override fun chainId(): Long = 1
+            override fun headBlockNumber(): Long = 1
+            override fun syncState(): io.myotis.api.SyncState = io.myotis.api.SyncState.SYNCED
+            override fun call(f: ByteArray?, t: ByteArray?, d: ByteArray?, v: String?, b: String?) =
+                byteArrayOf(0x2a)
+            override fun getBalance(a: ByteArray?, b: String?): String? = null
+            override fun getTransactionCount(a: ByteArray?, b: String?): Long? = null
+            override fun getCode(a: ByteArray?, b: String?): ByteArray? = null
+            override fun getStorageAt(a: ByteArray?, s: ByteArray?, b: String?): ByteArray? = null
+            override fun sendRawTransaction(r: ByteArray?): ByteArray? = null
+            override fun getTransactionReceipt(h: ByteArray?): String? = null
+            override fun getTransactionByHash(h: ByteArray?): String? = null
+            override fun getBlockByNumber(b: String?, full: Boolean): String? = null
+            override fun getBlockByHash(h: ByteArray?, full: Boolean): String? = null
+            override fun getBlockReceipts(s: String?): String? = null
+            override fun gasPrice(): String? = null
+            override fun maxPriorityFeePerGas(): String? = null
+            override fun feeHistory(c: Long, n: String?, p: DoubleArray?): String? = null
+            override fun estimateGas(f: ByteArray?, t: ByteArray?, d: ByteArray?, v: String?): Long? = null
+        }
+        assertEquals(false, bare.supportsStateOverrides())
+        assertNull(bare.callWithOverrides(null, ByteArray(20), ByteArray(0), null, "latest", "{}"))
     }
 
     private class FakeBackend(
@@ -94,6 +157,8 @@ class RpcRouterTest {
             lastValue = valueWei?.let { BigInteger(it) }; lastBlock = block
             return callResult
         }
+        override fun supportsStateOverrides(): Boolean = applyOverrides
+
         override fun callWithOverrides(from: ByteArray?, to: ByteArray, data: ByteArray,
                                        valueWei: String?, block: String,
                                        stateOverridesJson: String): ByteArray? {

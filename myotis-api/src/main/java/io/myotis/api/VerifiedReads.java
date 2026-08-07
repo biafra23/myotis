@@ -53,6 +53,23 @@ public interface VerifiedReads {
      * @return ABI return bytes, or null when unanswerable (including "overrides
      *     unsupported by this engine")
      */
+    /**
+     * Whether this engine can APPLY {@code eth_call} state overrides.
+     *
+     * <p>Needed because {@link #callWithOverrides} returns {@code null} for two
+     * different reasons — "this engine cannot apply overrides" and the ordinary
+     * "cannot answer verified right now" (not synced, no peer, out-of-window
+     * block, or a plain revert). A host that cannot tell them apart would report
+     * a PERMANENT error for a transient condition, and a client that obeys it
+     * stops asking for the rest of the session.
+     *
+     * @return false by default — an engine that does not override
+     *     {@link #callWithOverrides} cannot apply them
+     */
+    default boolean supportsStateOverrides() {
+        return false;
+    }
+
     default byte[] callWithOverrides(
             byte[] from,
             byte[] to,
