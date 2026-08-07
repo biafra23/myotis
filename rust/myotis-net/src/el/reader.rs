@@ -1111,16 +1111,21 @@ impl ElReader {
         // see tail_window_floor. TAIL_MAX-1 because the window is inclusive at
         // both ends: a floor exactly TAIL_MAX below the head would need 1025
         // headers, one past the serve ceiling, so no peer could ever reach it.
-        let hard_floor = head_n.saturating_sub(TAIL_MAX - 1);
         let lowest_recorded = recorded.iter().map(|(n, _)| *n).min();
-        if lowest_recorded.is_some_and(|low| low < hard_floor) {
-            // A record the window cannot cover can never be compared — and
-            // pruning it as "confirmed" would be a lie. Give its coverage back
-            // instead; the appender or bridge re-adds it verified.
+        // The floor the tail actually needs: down through every record (so a
+        // reorg is detectable) and the covered top (so the first append links
+        // by parent hash), with no clamp — a clamp here would silently drop
+        // records out of the comparison.
+        let floor = tail_window_floor(edge, lowest_recorded, 0);
+        if !tail_window_is_servable(head_n, floor, TAIL_MAX) {
+            // No single window can cover what must be compared, so those
+            // records can never be confirmed — and retiring them as if they
+            // had been would be exactly the lie this module exists to prevent.
+            // Give their coverage back; the appender or bridge re-adds it
+            // verified.
             self.retire_tail_record();
             return;
         }
-        let floor = tail_window_floor(edge, lowest_recorded, hard_floor);
         if !tail_chain_reaches_coverage(head_n, edge) {
             // The chain no longer reaches our covered top: a reorg shortened
             // it, and every block above the new head is orphaned. (Comparing
@@ -1133,7 +1138,9 @@ impl ElReader {
             }
             return;
         }
-        let want = (head_n - floor + 1).min(1024);
+        // Bounded by the servability guard above, so no clamp here: a clamp
+        // is what let the window stop above the floor and reject every peer.
+        let want = head_n - floor + 1;
         let mut window = Vec::new();
         for peer in peers.iter() {
             match peer.get_block_headers_by_number(head_n, want, 0, true).await {
@@ -1274,12 +1281,13 @@ impl ElReader {
             }
             appended += 1;
         }
-        // Retire records only now: every one of them was compared against the
-        // canonical window above (the floor is built to cover them, and a
-        // window that fails to reach it is rejected), so a survivor at or
-        // below finality is confirmed canonical and can never change again.
+        // Retire records only now, through the shared rule. The evidence this
+        // site can supply is `compared = true`: the canonical window above
+        // covered every record (a window that fails to reach the floor is
+        // rejected before this point), so a survivor at or below finality has
+        // been confirmed canonical and can never change again.
         if let Ok(mut t) = self.log_index_tail.lock() {
-            t.retain(|(bn, _)| *bn > finalized);
+            t.retain(|(bn, _)| !record_may_retire(*bn, finalized, true));
         }
         if appended > 0 {
             tracing::debug!(appended, head_n, "log index tail advanced");
@@ -4791,8 +4799,10 @@ fn tail_vouches_for(recorded: &[(u64, [u8; 32])], edge: u64, finalized: u64) -> 
 /// NOT clamped at finality: finality advances BETWEEN ticks, and a record it
 /// overtook would then sit below the window, never be compared, and be pruned
 /// as "immutable" — which is only true of the CANONICAL block at that height,
-/// not of the possibly-orphaned one we appended. `hard_floor` bounds the walk
-/// instead. Pure — unit-tested.
+/// not of the possibly-orphaned one we appended. `hard_floor` is a lower bound
+/// for callers that have one; the tail passes 0 and lets
+/// [`tail_window_is_servable`] decide whether the resulting window is
+/// obtainable at all. Pure — unit-tested.
 fn tail_window_floor(edge: u64, lowest_recorded: Option<u64>, hard_floor: u64) -> u64 {
     let covered_top = edge.saturating_sub(1);
     let floor = lowest_recorded.unwrap_or(covered_top).min(covered_top);
@@ -4995,12 +5005,17 @@ mod tail_reorg_tests {
         // One block lower needs 1025 — no peer can serve it, which stalled
         // the tail permanently.
         assert!(!tail_window_is_servable(head, hard_floor - 1, TAIL_MAX));
-        // Whatever the record asks for, the floor the tail computes stays
-        // servable because it never goes below the hard floor.
+        // The tail computes its floor UNCLAMPED and then asks whether the
+        // window is obtainable — so a record within reach is servable...
         for lowest in [hard_floor, hard_floor + 5, head - 1] {
-            let floor = tail_window_floor(head, Some(lowest), hard_floor);
+            let floor = tail_window_floor(head, Some(lowest), 0);
             assert!(tail_window_is_servable(head, floor, TAIL_MAX), "floor {floor}");
         }
+        // ...and one out of reach is REJECTED rather than silently clamped
+        // out of the comparison (the clamp is what stalled the tail: the
+        // window stopped above the floor and every peer was refused).
+        let floor = tail_window_floor(head, Some(hard_floor - 1), 0);
+        assert!(!tail_window_is_servable(head, floor, TAIL_MAX));
     }
 
     #[test]
