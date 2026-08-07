@@ -57,23 +57,23 @@ object LogIndexStatus {
         return Parsed(enabled, logCount, entries, targetLow, remaining, bps, eta, headGap)
     }
 
-    /** Human progress line for the Index tab: an ETA when the engine has a
-     *  measured rate, otherwise x/y blocks (or a waiting note). Pure Kotlin —
-     *  commonMain compiles for Kotlin/Native too, so no String.format. */
-    /** The head-side line: while coverage trails the finalized head, queries
-     *  reaching `latest` are refused, so say so rather than claim completion.
-     *  A small gap is the normal one-epoch lag of finality and reads as
-     *  caught-up. Null when there is nothing to report. */
+    /** The head-side line: while coverage trails the finalized head by more
+     *  than the appender's own window, the index is still catching up and
+     *  head-reaching queries can be refused — say that rather than claim the
+     *  backfill is finished. Null when there is nothing to report. */
     private fun headLine(p: Parsed): String? {
         val gap = p.headGap ?: return null
         return if (gap <= NORMAL_HEAD_LAG) null
         else "catching up to the head (${grouped(gap)} blocks behind)"
     }
 
-    /** One finalized epoch of slots plus slack: below this the index is
-     *  following the head normally, not lagging. */
+    /** The engine's append window: within this the head-follow appender keeps
+     *  up on its own and no bridging is needed. */
     private const val NORMAL_HEAD_LAG = 128L
 
+    /** Human progress line for the Index tab: an ETA when the engine has a
+     *  measured rate, otherwise x/y blocks (or a waiting note). Pure Kotlin —
+     *  commonMain compiles for Kotlin/Native too, so no String.format. */
     fun progressLine(p: Parsed): String? {
         val remaining = p.blocksRemaining ?: return null
         if (remaining == 0L) return headLine(p) ?: "backfill complete"

@@ -2163,8 +2163,11 @@ fn build_log_index_status(
         // the head bridge closes it after downtime.
         if finalized > 0 {
             if let Some(edge) = ix.append_edge() {
+                // edge = covered high + 1, so the gap is measured from the
+                // covered TOP: zero exactly when coverage reaches finality.
+                let covered_high = edge.saturating_sub(1);
                 s.push_str(",\"headGap\":");
-                s.push_str(&finalized.saturating_sub(edge).to_string());
+                s.push_str(&finalized.saturating_sub(covered_high).to_string());
             }
         }
         s.push_str(",\"entries\":[");
@@ -2321,6 +2324,10 @@ pub fn get_logs_json(handle: i64, filter_json: &str) -> String {
     out
 }
 
+/// How far the index's covered top may trail the anchored head and still be
+/// used to resolve `latest` (the engine's own append window).
+const LOG_INDEX_LATEST_SLACK: u64 = 128;
+
 fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
     use myotis_net::el::logindex::QueryError;
     let Ok(v) = serde_json::from_str::<serde_json::Value>(filter_json) else {
@@ -2335,7 +2342,19 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
     let Some(head) = reader.head_block_number() else {
         return eljson::error_json("no verified head yet");
     };
-    let filter = match parse_get_logs_filter(&v, head, reader.finalized_block_number()) {
+    // `latest` resolves to the top of the index's coverage when that is within
+    // a block or two of the anchored head. The tail appender runs on a 6s tick
+    // while blocks arrive faster than it, so a literal `head` would put every
+    // other poll one block outside coverage and refuse it — a flapping refusal
+    // that reads as "broken" to a wallet. The clamp is deliberately TIGHT: a
+    // coverage top further behind than the appender's own window means the
+    // index is genuinely not current, and the query is refused (never silently
+    // answered against a stale range).
+    let servable = reader
+        .log_index_covered_high()
+        .filter(|top| head.saturating_sub(*top) <= LOG_INDEX_LATEST_SLACK)
+        .map_or(head, |top| top.min(head));
+    let filter = match parse_get_logs_filter(&v, servable, reader.finalized_block_number()) {
         Ok(f) => f,
         Err(msg) => return eljson::error_json(&msg),
     };
