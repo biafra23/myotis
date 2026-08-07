@@ -565,6 +565,10 @@ pub struct ElReader {
     /// Last backfill checkpoint write — throttles the full-index persist
     /// (see the step's PERSIST_MIN_INTERVAL).
     log_index_last_persist: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Adaptive chunk-pipeline depth signal: true after an untruncated batch
+    /// (pipelining pays), false after a budget-truncated one (prefetch would
+    /// waste the serving link). See log_index_backfill_batch.
+    log_index_pipeline_full: std::sync::atomic::AtomicBool,
     /// Rolling backfill throughput — see [`Self::log_index_rate_bps`]. The
     /// sample anchor is (instant, cursor) at the last PROGRESS observation, so
     /// the rate is measured against WALL CLOCK between progress points (idle
@@ -715,6 +719,7 @@ impl ElReader {
             log_index: std::sync::Mutex::new(None),
             log_index_rate: std::sync::Mutex::new(None),
             log_index_last_persist: std::sync::Mutex::new(None),
+            log_index_pipeline_full: std::sync::atomic::AtomicBool::new(true),
             log_index_path: cfg.log_index_path,
             log_index_task: std::sync::Mutex::new(None),
         })
@@ -1144,13 +1149,78 @@ impl ElReader {
         // ranges a short response is the EXPECTED shape, and treating it as
         // peer failure permanently stalled the walk (observed on sepolia at
         // ~#11.43M: 64 requested → 41 bodies / 23 receipt sets served).
+        // PIPELINED chunk fetches (#297 option 1): keep several chunk
+        // requests in flight on the multiplexed connection while results are
+        // consumed strictly IN ORDER — verification is per-block, but the
+        // truncation cut and coverage adjacency depend on request order, so
+        // ordering lives in the consumer (`buffered`, not `buffer_unordered`).
+        // On truncation/failure the stream is dropped, cancelling in-flight
+        // fetches (their late responses are discarded by the peer read loop;
+        // worst case a few response budgets of wasted bandwidth past the cut —
+        // or, if a cancellation lands mid-frame-write, the connection itself:
+        // the writer's torn marker then fails the peer at its next send
+        // rather than let it write MAC-garbage; see peer.rs `GuardedWriter`).
+        const CHUNK_PIPELINE: usize = 4;
+        const CHUNK_LEN: usize = 64;
+        // ADAPTIVE depth: pipelining only pays where chunks come back FULL
+        // (sequential RTTs dominate); in budget-truncated ranges the batch
+        // ends at the first chunk and any prefetched chunks are pure wasted
+        // bandwidth on the already-saturated serving link — so after a
+        // truncated batch the next one degrades to depth 1 (identical to the
+        // pre-pipeline behavior), and a clean batch restores full depth.
+        let depth = if self
+            .log_index_pipeline_full
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            CHUNK_PIPELINE
+        } else {
+            1
+        };
         let mut stop_below: Option<u64> = None;
-        'chunks: for chunk in candidates.chunks(64) {
-            let hashes: Vec<[u8; 32]> = chunk.iter().map(|h| h.hash).collect();
-            let (bodies, receipt_blocks) =
-                futures::future::join(peer.get_block_bodies(&hashes), peer.get_receipts(&hashes)).await;
-            let bodies = bodies?;
-            let receipt_blocks = receipt_blocks?;
+        // Owned per-chunk hash lists move into the fetch futures (borrowing
+        // the header slices across the stream trips Send inference in the
+        // spawned appender task); the consumer re-derives each chunk slice by
+        // index for verification.
+        let chunk_hashes: Vec<Vec<[u8; 32]>> = candidates
+            .chunks(CHUNK_LEN)
+            .map(|c| c.iter().map(|h| h.hash).collect())
+            .collect();
+        let mut fetches = futures::StreamExt::buffered(
+            futures::stream::iter(chunk_hashes.into_iter().enumerate().map(|(i, hashes)| {
+                async move {
+                    let (bodies, receipts) = futures::future::join(
+                        peer.get_block_bodies(&hashes),
+                        peer.get_receipts(&hashes),
+                    )
+                    .await;
+                    (i, bodies, receipts)
+                }
+            })),
+            depth,
+        );
+        'chunks: while let Some((chunk_idx, bodies, receipt_blocks)) =
+            futures::StreamExt::next(&mut fetches).await
+        {
+            let chunk = candidates
+                .chunks(CHUNK_LEN)
+                .nth(chunk_idx)
+                .ok_or("chunk index out of range")?;
+            let (bodies, receipt_blocks) = match (bodies, receipt_blocks) {
+                (Ok(b), Ok(r)) => (b, r),
+                (b, r) => {
+                    // A failed chunk fetch may be a pipelining artifact: at
+                    // depth 4 a tail request's 15s timer runs while the peer
+                    // serves the full-budget responses queued ahead of it, so
+                    // a slow link can time out where the sequential shape
+                    // worked — and unlike truncation, an error would otherwise
+                    // leave the depth at 4 and repeat the failure on the next
+                    // peer. Degrade like a truncated batch; a clean batch
+                    // restores full depth.
+                    self.log_index_pipeline_full
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    return Err(b.err().or(r.err()).unwrap_or_else(|| "chunk fetch failed".into()));
+                }
+            };
             // Served items are an in-order prefix of the request (the per-block
             // root verification below catches any peer that violates that).
             let chunk_numbers: Vec<u64> = chunk.iter().map(|h| h.header.number).collect();
@@ -1196,6 +1266,8 @@ impl ElReader {
                 }
             }
             if let Some(stop) = chunk_stop {
+                self.log_index_pipeline_full
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 stop_below = Some(stop);
                 tracing::debug!(
                     served = usable,
@@ -1205,6 +1277,13 @@ impl ElReader {
                 );
                 break 'chunks;
             }
+        }
+        if stop_below.is_none() && !candidates.is_empty() {
+            // Whole candidate set served untruncated — this range rewards
+            // pipelining; restore full depth for the next batch. (A bloom-empty
+            // batch is no evidence either way and leaves the depth alone.)
+            self.log_index_pipeline_full
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         // Apply top-down (the response is already descending) so every block
         // adjoins the low edge; the trust edge advances with each block. A
