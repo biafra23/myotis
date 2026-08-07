@@ -1064,7 +1064,10 @@ impl ElReader {
         // The window must cover the RECORDED blocks (to re-check them) and the
         // covered top (so the first appended block links to it by parent
         // hash), not merely the blocks still to append.
-        let floor = tail_window_floor(edge, recorded.first().map(|(n, _)| *n), finalized);
+        // Bound the walk by TAIL_MAX below the head rather than by finality —
+        // see tail_window_floor.
+        let floor =
+            tail_window_floor(edge, recorded.iter().map(|(n, _)| *n).min(), head_n.saturating_sub(TAIL_MAX));
         if !tail_chain_reaches_coverage(head_n, edge) {
             // The chain no longer reaches our covered top: a reorg shortened
             // it, and every block above the new head is orphaned. (Comparing
@@ -1151,11 +1154,17 @@ impl ElReader {
             std::collections::HashMap::new();
         let mut peer_idx = 0usize;
         'chunks: for chunk in candidate_hashes.chunks(CANDIDATE_CHUNK) {
+            // The headers are already in hand, parent-chain-verified in the
+            // window fetched above — no per-candidate header round trip.
+            let chunk_headers: Vec<Option<crate::el::eth::messages::VerifiedHeader>> = chunk
+                .iter()
+                .map(|h| canonical.iter().find(|c| c.hash == *h).cloned())
+                .collect();
             loop {
                 let Some(peer) = peers.get(peer_idx) else {
                     break 'chunks; // pool exhausted; apply the prefix we have
                 };
-                match self.bridge_fetch_logs(peer, chunk).await {
+                match self.fetch_logs_for_known_headers(peer, chunk, &chunk_headers).await {
                     Ok(map) => {
                         logs.extend(map);
                         break;
@@ -1187,15 +1196,22 @@ impl ElReader {
                 Err(_) => false,
             };
             if !ok {
+                // Visible: a silently broken tail is the same failure shape as
+                // the frozen append edge this whole change exists to fix.
+                tracing::warn!(block = n, edge, "log index tail: append rejected; coverage holds here");
                 break;
             }
             if let Ok(mut t) = self.log_index_tail.lock() {
                 t.push((n, c.hash));
-                // Blocks at or below finality are immutable — the record only
-                // needs to cover what can still reorg.
-                t.retain(|(bn, _)| *bn > finalized);
             }
             appended += 1;
+        }
+        // Retire records only now: every one of them was compared against the
+        // canonical window above (the floor is built to cover them, and a
+        // window that fails to reach it is rejected), so a survivor at or
+        // below finality is confirmed canonical and can never change again.
+        if let Ok(mut t) = self.log_index_tail.lock() {
+            t.retain(|(bn, _)| *bn > finalized);
         }
         if appended > 0 {
             tracing::debug!(appended, head_n, "log index tail advanced");
@@ -1273,6 +1289,12 @@ impl ElReader {
             if slot.is_some() {
                 *slot = None;
             }
+        }
+        // The tail record describes coverage this run appended; when the
+        // walker stops (disabled index, no anchor) it must not survive to
+        // drive the vouched/fork checks of whatever comes next.
+        if let Ok(mut t) = self.log_index_tail.lock() {
+            t.clear();
         }
     }
 
@@ -1360,13 +1382,16 @@ impl ElReader {
                 plan = None;
             }
         }
-        let mut plan = plan.unwrap_or(BridgePlan {
+        let mut plan = plan.unwrap_or_else(|| BridgePlan {
             anchor_n: fin_n,
             anchor_hash: fin_hash,
             target: edge,
             low_n: fin_n.saturating_add(1),
             low_hash: fin_hash,
-            blocks: Vec::new(),
+            // Sized up front: growing by doubling would hold BOTH buffers
+            // live at the realloc — a ~1.5x transient spike on the deep-gap
+            // path, on a platform where that is an OOM kill, not a slowdown.
+            blocks: Vec::with_capacity((fin_n.saturating_sub(edge) + 1) as usize),
             descended: false,
             applied: 0,
         });
@@ -1580,24 +1605,39 @@ impl ElReader {
         peer: &ManagedPeer,
         hashes: &[[u8; 32]],
     ) -> Result<std::collections::HashMap<u64, Vec<crate::el::logindex::StoredLog>>, String> {
-        let mut out = std::collections::HashMap::new();
         if hashes.is_empty() {
-            return Ok(out);
+            return Ok(std::collections::HashMap::new());
         }
         // join_all, not try_join_all: short-circuiting would drop the sibling
         // requests still in flight (and the bodies/receipts already served)
         // the moment one header failed. Failures become per-block holes that
         // simply shorten the usable prefix.
-        let (bodies, receipt_blocks, headers) = futures::future::join3(
-            peer.get_block_bodies(hashes),
-            peer.get_receipts(hashes),
-            futures::future::join_all(hashes.iter().map(|h| async move {
-                let got = peer.get_block_headers_by_hash(h, 1).await.ok()?;
-                let vh = got.into_iter().next()?;
-                (vh.hash == *h).then_some(vh)
-            })),
-        )
+        let headers = futures::future::join_all(hashes.iter().map(|h| async move {
+            let got = peer.get_block_headers_by_hash(h, 1).await.ok()?;
+            let vh = got.into_iter().next()?;
+            (vh.hash == *h).then_some(vh)
+        }))
         .await;
+        self.fetch_logs_for_known_headers(peer, hashes, &headers).await
+    }
+
+    /// The verify core shared by the bridge and the tail: given TRUSTED
+    /// headers (chained to a beacon anchor by the caller), fetch each block's
+    /// body and receipts and return the watch-list logs by block number. The
+    /// tail passes the headers from the window it just verified rather than
+    /// re-fetching one per candidate every tick.
+    async fn fetch_logs_for_known_headers(
+        &self,
+        peer: &ManagedPeer,
+        hashes: &[[u8; 32]],
+        headers: &[Option<crate::el::eth::messages::VerifiedHeader>],
+    ) -> Result<std::collections::HashMap<u64, Vec<crate::el::logindex::StoredLog>>, String> {
+        let mut out = std::collections::HashMap::new();
+        if hashes.is_empty() {
+            return Ok(out);
+        }
+        let (bodies, receipt_blocks) =
+            futures::future::join(peer.get_block_bodies(hashes), peer.get_receipts(hashes)).await;
         let (bodies, receipt_blocks) = (bodies?, receipt_blocks?);
         // Honest byte-budget truncation: use the served prefix, leave the rest
         // for the next round (the caller re-requests what it didn't get).
@@ -4629,12 +4669,17 @@ fn tail_vouches_for(recorded: &[(u64, [u8; 32])], edge: u64, finalized: u64) -> 
 /// block (so a reorg is detectable — a window starting at the coverage edge
 /// compares against records that all sit BELOW it, i.e. two disjoint ranges,
 /// and can never detect anything) and the covered top itself (so the first
-/// appended block links to it by parent hash). Never below finality, which is
-/// immutable. Pure — unit-tested.
-fn tail_window_floor(edge: u64, lowest_recorded: Option<u64>, finalized: u64) -> u64 {
+/// appended block links to it by parent hash).
+///
+/// NOT clamped at finality: finality advances BETWEEN ticks, and a record it
+/// overtook would then sit below the window, never be compared, and be pruned
+/// as "immutable" — which is only true of the CANONICAL block at that height,
+/// not of the possibly-orphaned one we appended. `hard_floor` bounds the walk
+/// instead. Pure — unit-tested.
+fn tail_window_floor(edge: u64, lowest_recorded: Option<u64>, hard_floor: u64) -> u64 {
     let covered_top = edge.saturating_sub(1);
     let floor = lowest_recorded.unwrap_or(covered_top).min(covered_top);
-    floor.max(finalized)
+    floor.max(hard_floor)
 }
 
 /// Whether a chain whose head is `head_n` still reaches the top of what the
@@ -4754,14 +4799,20 @@ mod tail_reorg_tests {
         // THE bug this pins: a window starting at the coverage edge (1_001)
         // compares against records that all sit BELOW it — disjoint ranges, so
         // a reorg could never be detected. The floor must reach the records.
-        assert_eq!(tail_window_floor(1_001, Some(996), 990), 996);
+        assert_eq!(tail_window_floor(1_001, Some(996), 0), 996);
         // No records: still include the covered top so the next block links
         // to it by parent hash.
-        assert_eq!(tail_window_floor(1_001, None, 990), 1_000);
-        // Never below finality (immutable, and not worth re-fetching).
-        assert_eq!(tail_window_floor(1_001, Some(900), 990), 990);
+        assert_eq!(tail_window_floor(1_001, None, 0), 1_000);
         // A record above the covered top can't widen the window past it.
-        assert_eq!(tail_window_floor(1_001, Some(1_100), 990), 1_000);
+        assert_eq!(tail_window_floor(1_001, Some(1_100), 0), 1_000);
+        // The hard floor bounds the walk...
+        assert_eq!(tail_window_floor(1_001, Some(500), 900), 900);
+        // ...but it is a WALK bound, not finality: a record finality overtook
+        // between ticks must still be inside the window, because it is only
+        // the canonical block at that height that became immutable — not the
+        // possibly-orphaned one we appended.
+        let finality_now = 998;
+        assert!(tail_window_floor(1_001, Some(996), 900) < finality_now);
     }
 
     #[test]
