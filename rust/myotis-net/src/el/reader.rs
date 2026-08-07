@@ -929,11 +929,13 @@ impl ElReader {
         let enabled = self.with_log_index(|ix| ix.config().enabled).unwrap_or(false);
         if !enabled {
             self.clear_log_index_bridge(); // don't park a mapped gap while off
+            self.retire_tail_record();
             return;
         }
         let finalized = self.finalized_block_number();
         if finalized == 0 {
             self.clear_log_index_bridge();
+            self.retire_tail_record();
             return;
         }
         let edge = self.with_log_index(|ix| ix.append_edge()).flatten();
@@ -958,6 +960,10 @@ impl ElReader {
             return;
         }
         self.clear_log_index_bridge();
+        // Coverage is at/below finality here, so the tail tick (and its
+        // vouched check) will not run: any entry left in the record describes
+        // a block this run never proved canonical.
+        self.retire_tail_record();
         let last = finalized.min(start.saturating_add(15));
         for n in start..=last {
             let (block_hash, receipts) = match self.block_receipts_at(Some(n)).await {
@@ -1037,7 +1043,12 @@ impl ElReader {
         /// an unchunked burst of a full tail would blow every peer's response
         /// budget and make no progress at all.
         const CANDIDATE_CHUNK: usize = 64;
+        /// Wall-clock budget, for the same reason the bridge has one: after a
+        /// rewind the tail's catch-up spans the whole head-to-finality range,
+        /// and the backfill step runs after it in the same task.
+        const TICK_BUDGET: std::time::Duration = std::time::Duration::from_millis(2000);
 
+        let started = std::time::Instant::now();
         let Ok((head_n, head_hash)) = self.anchored_head() else {
             return;
         };
@@ -1065,6 +1076,11 @@ impl ElReader {
             self.log_index_rewind_to(finalized);
             edge = finalized.saturating_add(1);
         }
+        // The rewind above drops record entries; re-read rather than compare
+        // against a stale snapshot (which would fork-rewind coverage that no
+        // longer exists and waste a tick on a misleading warning).
+        let recorded: Vec<(u64, [u8; 32])> =
+            self.log_index_tail.lock().map(|t| t.clone()).unwrap_or_default();
         if head_n.saturating_sub(finalized) >= TAIL_MAX {
             // Finality has stalled far below the head. The tail cannot
             // re-check what it appended from here (the window would exceed
@@ -1073,7 +1089,12 @@ impl ElReader {
             // to finality rather than answer explicit-number queries from
             // blocks that can still reorg. `>=` because the window is
             // inclusive at both ends — at exactly TAIL_MAX it needs 1025.
-            self.log_index_rewind_to(finalized);
+            if edge > finalized.saturating_add(1) {
+                // Guarded: rewind_above scans the whole log store under the
+                // index lock, and this branch repeats every 6s for as long as
+                // finality stalls.
+                self.log_index_rewind_to(finalized);
+            }
             if ticks % 100 == 0 {
                 tracing::warn!(finalized, head_n, "log index tail: finality too far below the head; coverage held at finality");
             }
@@ -1087,9 +1108,19 @@ impl ElReader {
         // covered top (so the first appended block links to it by parent
         // hash), not merely the blocks still to append.
         // Bound the walk by TAIL_MAX below the head rather than by finality —
-        // see tail_window_floor.
-        let floor =
-            tail_window_floor(edge, recorded.iter().map(|(n, _)| *n).min(), head_n.saturating_sub(TAIL_MAX));
+        // see tail_window_floor. TAIL_MAX-1 because the window is inclusive at
+        // both ends: a floor exactly TAIL_MAX below the head would need 1025
+        // headers, one past the serve ceiling, so no peer could ever reach it.
+        let hard_floor = head_n.saturating_sub(TAIL_MAX - 1);
+        let lowest_recorded = recorded.iter().map(|(n, _)| *n).min();
+        if lowest_recorded.is_some_and(|low| low < hard_floor) {
+            // A record the window cannot cover can never be compared — and
+            // pruning it as "confirmed" would be a lie. Give its coverage back
+            // instead; the appender or bridge re-adds it verified.
+            self.retire_tail_record();
+            return;
+        }
+        let floor = tail_window_floor(edge, lowest_recorded, hard_floor);
         if !tail_chain_reaches_coverage(head_n, edge) {
             // The chain no longer reaches our covered top: a reorg shortened
             // it, and every block above the new head is orphaned. (Comparing
@@ -1176,6 +1207,9 @@ impl ElReader {
             std::collections::HashMap::new();
         let mut peer_idx = 0usize;
         'chunks: for chunk in candidate_hashes.chunks(CANDIDATE_CHUNK) {
+            if started.elapsed() >= TICK_BUDGET {
+                break; // apply the contiguous prefix; the rest is next tick's
+            }
             // The headers are already in hand, parent-chain-verified in the
             // window fetched above — no per-candidate header round trip.
             let chunk_headers: Vec<Option<crate::el::eth::messages::VerifiedHeader>> = chunk
@@ -1213,7 +1247,18 @@ impl ElReader {
             let ok = match self.log_index.lock() {
                 Ok(mut slot) => match slot.as_mut() {
                     Some(ix) if ix.config().fingerprint() == fingerprint => {
-                        ix.append_block(n, c.hash, block_logs).is_ok()
+                        let stored = ix.append_block(n, c.hash, block_logs).is_ok();
+                        if stored {
+                            // Under the SAME hold: a config replace between
+                            // the append and the push would otherwise seed a
+                            // record describing the old index into the new
+                            // one, whose next fork scan would rewind coverage
+                            // that record has nothing to do with.
+                            if let Ok(mut t) = self.log_index_tail.lock() {
+                                t.push((n, c.hash));
+                            }
+                        }
+                        stored
                     }
                     // Uninstalled, or the watch-list changed under us: this
                     // block's candidacy was decided against the old list.
@@ -1226,9 +1271,6 @@ impl ElReader {
                 // the frozen append edge this whole change exists to fix.
                 tracing::warn!(block = n, edge, "log index tail: append rejected; coverage holds here");
                 break;
-            }
-            if let Ok(mut t) = self.log_index_tail.lock() {
-                t.push((n, c.hash));
             }
             appended += 1;
         }
@@ -1309,19 +1351,46 @@ impl ElReader {
     }
 
     /// Drop any in-progress bridge plan (the gap closed, or the premises it
-    /// was built on changed).
+    /// were built on changed). Deliberately does NOT touch the tail record —
+    /// see [`Self::retire_tail_record`] for the one invariant that governs it.
     fn clear_log_index_bridge(&self) {
         if let Ok(mut slot) = self.log_index_bridge.lock() {
             if slot.is_some() {
                 *slot = None;
             }
         }
-        // The tail record describes coverage this run appended; when the
-        // walker stops (disabled index, no anchor) it must not survive to
-        // drive the vouched/fork checks of whatever comes next.
-        if let Ok(mut t) = self.log_index_tail.lock() {
-            t.clear();
-        }
+    }
+
+    /// THE invariant for the tail record, and the only way an entry leaves it
+    /// besides the post-comparison prune at the end of a tail tick:
+    ///
+    /// > A record entry may be dropped only after the canonical chain
+    /// > confirmed it at a height at or below finality, or together with the
+    /// > coverage it describes.
+    ///
+    /// An entry is evidence that THIS run appended a block optimistically and
+    /// has not yet proven it canonical. Finality moving past it proves nothing
+    /// — finality fixes the canonical block at that height, not the possibly
+    /// orphaned one we stored. So when the walker leaves the tail (index
+    /// disabled, anchor lost, finality overtook the whole tail), unconfirmed
+    /// entries cannot simply be forgotten: their coverage goes with them.
+    ///
+    /// Cheap by construction — the record spans at most one tail window, so
+    /// the rewind gives back at most that many blocks, which the appender or
+    /// bridge re-adds verified.
+    fn retire_tail_record(&self) {
+        let lowest = match self.log_index_tail.lock() {
+            Ok(t) => t.iter().map(|(n, _)| *n).min(),
+            Err(_) => None,
+        };
+        let Some(lowest) = lowest else {
+            return; // nothing unconfirmed
+        };
+        tracing::info!(
+            from = lowest,
+            "log index tail: dropping coverage this run could not confirm canonical"
+        );
+        self.log_index_rewind_to(lowest.saturating_sub(1));
     }
 
     /// One head-gap bridge step: carry coverage from a stale append edge up to
@@ -1553,11 +1622,22 @@ impl ElReader {
                     // (and, once the pool is exhausted, keep the plan and let
                     // the next tick start over from the top of the pool).
                     let mut fetched = None;
+                    // `hashes[0]` is the block the ascent is standing on; a
+                    // response without it makes no progress possible, so it
+                    // counts as a failure and rotates. Returning it as success
+                    // wedged the bridge on one peer indefinitely (the apply
+                    // loop breaks, the plan survives, the same peer is first
+                    // again next tick).
+                    let need = plan.blocks[total - 1 - plan.applied].0;
                     while peer_idx < peers.len() {
                         match self.bridge_fetch_logs(&peers[peer_idx], &hashes).await {
-                            Ok(map) => {
+                            Ok(map) if map.contains_key(&need) => {
                                 fetched = Some(map);
                                 break;
+                            }
+                            Ok(_) => {
+                                tracing::debug!("log index head bridge: peer served no usable prefix");
+                                peer_idx += 1;
                             }
                             Err(e) => {
                                 tracing::debug!(error = %e, "log index head bridge: candidate fetch failed");
@@ -4719,6 +4799,29 @@ fn tail_window_floor(edge: u64, lowest_recorded: Option<u64>, hard_floor: u64) -
     floor.max(hard_floor)
 }
 
+/// THE record-retirement rule, as a predicate: may an entry recorded at
+/// `block` be dropped WITHOUT giving back the coverage it describes?
+///
+/// Only if the canonical chain confirmed it at a height at or below finality
+/// — `compared_at_or_below_finality`. Finality moving past an entry on its own
+/// proves nothing: it fixes the CANONICAL block at that height, not the
+/// possibly-orphaned one this run appended there. Every retirement site must
+/// route through this rule (three separate rounds of review found a site that
+/// had drifted from it, each time by dropping records on a path where the
+/// tail's own check could no longer run).
+fn record_may_retire(block: u64, finalized: u64, compared_at_or_below_finality: bool) -> bool {
+    compared_at_or_below_finality && block <= finalized
+}
+
+/// Whether a `TAIL_MAX`-header window anchored at `head_n` can actually serve
+/// down to `floor`. The window is inclusive at both ends, so a floor exactly
+/// `TAIL_MAX` below the head needs one header more than the serve ceiling —
+/// which rejected every peer and stalled the tail until finality overtook
+/// coverage. Pure — unit-tested.
+fn tail_window_is_servable(head_n: u64, floor: u64, tail_max: u64) -> bool {
+    head_n.saturating_sub(floor) + 1 <= tail_max
+}
+
 /// Whether a chain whose head is `head_n` still reaches the top of what the
 /// index covers. `false` means a reorg SHORTENED the chain past our coverage,
 /// which is itself proof that the blocks above `head_n` are orphaned. Pure —
@@ -4865,6 +4968,39 @@ mod tail_reorg_tests {
         // A head at or above the covered top is fine.
         assert!(tail_chain_reaches_coverage(1_000, edge));
         assert!(tail_chain_reaches_coverage(1_200, edge));
+    }
+
+    #[test]
+    fn a_record_retires_only_once_confirmed_at_or_below_finality() {
+        use super::record_may_retire;
+        // Compared while already final: safe to forget.
+        assert!(record_may_retire(1_000, 1_000, true));
+        assert!(record_may_retire(999, 1_000, true));
+        // Finality passed it, but nothing ever compared it — the whole point:
+        // finality fixes the CANONICAL block at that height, not ours.
+        assert!(!record_may_retire(1_000, 1_000, false));
+        // Compared, but still above finality: it can still reorg.
+        assert!(!record_may_retire(1_001, 1_000, true));
+    }
+
+    #[test]
+    fn the_tail_window_floor_must_be_servable() {
+        use super::{tail_window_floor, tail_window_is_servable};
+        const TAIL_MAX: u64 = 1_024;
+        let head = 10_000u64;
+        // The hard floor the tail uses must be reachable within one window —
+        // head - (TAIL_MAX - 1) needs exactly TAIL_MAX headers.
+        let hard_floor = head - (TAIL_MAX - 1);
+        assert!(tail_window_is_servable(head, hard_floor, TAIL_MAX));
+        // One block lower needs 1025 — no peer can serve it, which stalled
+        // the tail permanently.
+        assert!(!tail_window_is_servable(head, hard_floor - 1, TAIL_MAX));
+        // Whatever the record asks for, the floor the tail computes stays
+        // servable because it never goes below the hard floor.
+        for lowest in [hard_floor, hard_floor + 5, head - 1] {
+            let floor = tail_window_floor(head, Some(lowest), hard_floor);
+            assert!(tail_window_is_servable(head, floor, TAIL_MAX), "floor {floor}");
+        }
     }
 
     #[test]
