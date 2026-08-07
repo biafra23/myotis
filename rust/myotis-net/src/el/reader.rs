@@ -790,6 +790,14 @@ impl ElReader {
     /// in-memory progress survives settings pokes; a genuinely changed
     /// watch-list checkpoints the old index before replacing it.
     pub fn set_log_index_config(&self, config: crate::el::logindex::LogIndexConfig) -> bool {
+        // A (re)applied config can replace the index wholesale, which
+        // invalidates both the mapped gap and the tail's record of what it
+        // appended — neither describes the new index's coverage.
+        let finalized_now = self.finalized_block_number();
+        self.clear_log_index_bridge();
+        if let Ok(mut t) = self.log_index_tail.lock() {
+            t.clear();
+        }
         // A SUCCESSFUL config apply invalidates the rate anchor: a pacing
         // flip changes the true rate (stale EMA → bogus ETA for minutes) and
         // a watch-list change starts a new walk. Reset on the success paths
@@ -810,7 +818,9 @@ impl ElReader {
                 return true;
             }
             if let Some(p) = self.log_index_path.as_deref() {
-                let _ = ix.persist(p);
+                // Clamped like every other checkpoint: optimistic coverage is
+                // only verifiable against this run's tail record.
+                let _ = ix.persist_clamped(p, finalized_now);
             }
         }
         let loaded = self
@@ -868,10 +878,12 @@ impl ElReader {
         // stop() is the fast path.
         let weak = Arc::downgrade(self);
         *slot = Some(rt.spawn(async move {
-            // Slice-3 rule: append FINALIZED blocks only. Finalized never
-            // reorgs, so coverage stays honest with zero rewind machinery;
-            // optimistic-tail appending (with the design doc's rewind rule)
-            // stays out of scope. A deep gap is closed by the head bridge.
+            // Coverage grows on three paths, in this order of preference:
+            // the per-block appender (finalized, contiguous, cheap), the head
+            // BRIDGE when a gap outgrows the appender's window, and the
+            // optimistic TAIL above finality — which is where `latest` points
+            // and so what head-reaching queries actually need. Only the tail
+            // can reorg, and it carries the rewind machinery for that.
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(6));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut since_persist = 0u32;
@@ -895,11 +907,7 @@ impl ElReader {
         // Checkpoint due from a PREVIOUS tick first: batches that end early
         // (peer failure mid-catch-up) must not defer persistence forever.
         if *since_persist >= 64 {
-            if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
-                if let Some(ix) = slot.as_ref() {
-                    let _ = ix.persist(path);
-                }
-            }
+            self.persist_log_index(self.finalized_block_number());
             *since_persist = 0;
         }
         let enabled = self.with_log_index(|ix| ix.config().enabled).unwrap_or(false);
@@ -976,28 +984,31 @@ impl ElReader {
         }
         // Checkpoint roughly every 64 appended blocks (best-effort).
         if *since_persist >= 64 {
-            if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
-                if let Some(ix) = slot.as_ref() {
-                    let _ = ix.persist(path);
-                }
-            }
+            self.persist_log_index(self.finalized_block_number());
             *since_persist = 0;
         }
     }
 
     /// Follow the OPTIMISTIC tail: keep coverage running from finality up to
     /// the beacon-anchored head, which is where `latest` points and therefore
-    /// what every head-reaching `eth_getLogs` needs. Runs only once coverage
-    /// has reached finality (the appender/bridge get there first).
+    /// what every head-reaching `eth_getLogs` needs. Runs once coverage has
+    /// reached finality (the appender/bridge get there first).
     ///
     /// Finalized blocks can never reorg, but these can, so the tail keeps its
-    /// own record of what it appended and re-checks it against the canonical
-    /// chain every tick: a mismatch rewinds coverage and the stored logs to
-    /// the fork point (`LogIndex::rewind_above`) before re-appending. Coverage
-    /// above finality that this run did NOT append — a persisted tail from a
-    /// previous run, or an imported index — cannot be re-checked (its hashes
-    /// are unknown), so it is rewound to finality rather than trusted: honest
-    /// coverage is the one invariant this module exists to keep.
+    /// own `(number, hash)` record of what it appended and re-checks it
+    /// against the canonical chain every tick. The window therefore reaches
+    /// DOWN THROUGH the recorded blocks (not just up from the coverage edge —
+    /// comparing a window that starts at the edge against records that all sit
+    /// below it compares disjoint ranges and can never detect anything), and a
+    /// mismatch rewinds coverage and stored logs to the fork point before
+    /// re-appending. A chain that has shortened below the edge is itself proof
+    /// of a reorg and rewinds the same way.
+    ///
+    /// Coverage above finality that this run did NOT append — a persisted tail
+    /// from an older build, or an imported index — has unknown hashes and
+    /// cannot be re-checked, so it is rewound to finality rather than trusted.
+    /// (Checkpoints clamp at finality, so a normal restart never inherits
+    /// optimistic coverage in the first place.)
     ///
     /// Serving at the optimistic head matches the rest of the engine, where
     /// every verified read (`eth_call`, `getCode`, `getBalance`) answers under
@@ -1005,115 +1016,106 @@ impl ElReader {
     async fn log_index_tail_tick(&self, finalized: u64, ticks: u64) {
         /// Never chase more than this above finality: a stalled beacon anchor
         /// must not turn into an unbounded walk.
-        const TAIL_MAX: u64 = 256;
+        const TAIL_MAX: u64 = 1024;
+        /// Candidate blocks per body/receipts request, as the bridge uses —
+        /// an unchunked burst of a full tail would blow every peer's response
+        /// budget and make no progress at all.
+        const CANDIDATE_CHUNK: usize = 64;
 
         let Ok((head_n, head_hash)) = self.anchored_head() else {
             return;
         };
         // Re-read the edge under this tick (the caller's value predates the
-        // finalized catch-up path that may have just advanced it).
+        // finalized catch-up that may have just advanced it).
         let Some(mut edge) = self.with_log_index(|ix| ix.append_edge()).flatten() else {
             return;
         };
-        // Coverage above finality that this run cannot vouch for: rewind.
-        let unvouched = {
-            let tail = self.log_index_tail.lock().ok();
-            let top_recorded = tail.as_ref().and_then(|t| t.last().map(|(n, _)| *n));
-            edge > finalized.saturating_add(1) && top_recorded != Some(edge - 1)
-        };
-        if unvouched {
+        let recorded: Vec<(u64, [u8; 32])> =
+            self.log_index_tail.lock().map(|t| t.clone()).unwrap_or_default();
+        // Coverage above finality this run cannot vouch for: rewind.
+        if !tail_vouches_for(&recorded, edge, finalized) {
             tracing::info!(
-                covered_high = edge - 1,
+                covered_high = edge.saturating_sub(1),
                 finalized,
-                "log index tail: rewinding unvouched coverage above finality (previous run or import)"
+                "log index tail: rewinding unvouched coverage above finality"
             );
-            if let Ok(mut slot) = self.log_index.lock() {
-                if let Some(ix) = slot.as_mut() {
-                    ix.rewind_above(finalized);
-                }
-            }
-            if let Ok(mut t) = self.log_index_tail.lock() {
-                t.clear();
-            }
+            self.log_index_rewind_to(finalized);
             edge = finalized.saturating_add(1);
         }
-        if head_n < edge {
-            return; // nothing above coverage yet
-        }
-        if head_n.saturating_sub(edge) > TAIL_MAX {
+        if head_n.saturating_sub(finalized) > TAIL_MAX {
             if ticks % 100 == 0 {
-                tracing::warn!(edge, head_n, "log index tail: head too far above coverage; leaving it to the bridge");
+                tracing::warn!(finalized, head_n, "log index tail: head too far above finality; coverage holds at finality");
             }
             return;
         }
         let peers = self.pool.snap_peers().await;
-        let Some(peer) = peers.first() else {
-            return;
-        };
-        // One descending window from the anchored head covers the whole tail.
-        let want = head_n.saturating_sub(edge) + 1;
-        let window = match peer.get_block_headers_by_number(head_n, want, 0, true).await {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::debug!(error = %e, "log index tail: header window failed");
-                return;
-            }
-        };
-        let window = &window[..window.len().min(want as usize)];
-        let Some((top, _)) = window.split_first() else {
-            return;
-        };
-        if top.header.number != head_n || top.hash != head_hash {
-            tracing::debug!("log index tail: window does not start at the anchored head");
+        if peers.is_empty() {
             return;
         }
-        let mut verified = 1usize;
-        for pair in window.windows(2) {
-            let [upper, lower] = pair else { break };
-            if upper.header.parent_hash != lower.hash
-                || lower.header.number != upper.header.number.wrapping_sub(1)
-            {
-                break;
+        // The window must cover the RECORDED blocks (to re-check them) and the
+        // covered top (so the first appended block links to it by parent
+        // hash), not merely the blocks still to append.
+        let floor = tail_window_floor(edge, recorded.first().map(|(n, _)| *n), finalized);
+        if head_n < floor {
+            // The chain is shorter than what we cover: a reorg, and every
+            // block above the head is orphaned.
+            tracing::info!(head_n, covered_high = edge.saturating_sub(1), "log index tail: chain shortened; rewinding");
+            self.log_index_rewind_to(head_n);
+            if let Ok(mut t) = self.log_index_tail.lock() {
+                t.retain(|(n, _)| *n <= head_n);
             }
-            verified += 1;
+            return;
+        }
+        let want = head_n - floor + 1;
+        let mut window = Vec::new();
+        for peer in peers.iter() {
+            match peer.get_block_headers_by_number(head_n, want, 0, true).await {
+                Ok(w) => {
+                    let w = &w[..w.len().min(want as usize)];
+                    let Some((top, _)) = w.split_first() else { continue };
+                    if top.header.number != head_n || top.hash != head_hash {
+                        continue; // not our anchored head; try another peer
+                    }
+                    let mut verified = 1usize;
+                    for pair in w.windows(2) {
+                        let [upper, lower] = pair else { break };
+                        if upper.header.parent_hash != lower.hash
+                            || lower.header.number != upper.header.number.wrapping_sub(1)
+                        {
+                            break;
+                        }
+                        verified += 1;
+                    }
+                    window = w[..verified].to_vec();
+                    break;
+                }
+                Err(e) => tracing::debug!(error = %e, "log index tail: header window failed"),
+            }
+        }
+        if window.is_empty() {
+            return;
         }
         // Ascending, so coverage extends contiguously.
-        let canonical: Vec<&crate::el::eth::messages::VerifiedHeader> =
-            window[..verified].iter().rev().collect();
+        let canonical: Vec<crate::el::eth::messages::VerifiedHeader> =
+            window.into_iter().rev().collect();
+        let canon_pairs: Vec<(u64, [u8; 32])> =
+            canonical.iter().map(|c| (c.header.number, c.hash)).collect();
 
-        // Reorg check against what this run claimed: the lowest recorded block
-        // whose hash no longer matches the canonical chain is the fork point.
-        let mut fork_at: Option<u64> = None;
-        if let Ok(tail) = self.log_index_tail.lock() {
-            for (n, h) in tail.iter() {
-                if let Some(c) = canonical.iter().find(|c| c.header.number == *n) {
-                    if c.hash != *h {
-                        fork_at = Some(*n);
-                        break;
-                    }
-                }
-            }
-        }
-        if let Some(n) = fork_at {
-            tracing::info!(fork_at = n, "log index tail: reorg detected; rewinding");
-            if let Ok(mut slot) = self.log_index.lock() {
-                if let Some(ix) = slot.as_mut() {
-                    ix.rewind_above(n.saturating_sub(1));
-                }
-            }
+        if let Some(fork) = tail_fork_point(&recorded, &canon_pairs) {
+            tracing::info!(fork_at = fork, "log index tail: reorg detected; rewinding");
+            self.log_index_rewind_to(fork.saturating_sub(1));
             if let Ok(mut t) = self.log_index_tail.lock() {
-                t.retain(|(bn, _)| *bn < n);
+                t.retain(|(n, _)| *n < fork);
             }
-            edge = n;
+            edge = fork;
         }
 
-        // Append everything from the edge up to the head.
         let pending: Vec<&crate::el::eth::messages::VerifiedHeader> =
-            canonical.into_iter().filter(|c| c.header.number >= edge).collect();
+            canonical.iter().filter(|c| c.header.number >= edge).collect();
         if pending.is_empty() {
             return;
         }
-        let candidates: Vec<[u8; 32]> = pending
+        let candidate_hashes: Vec<[u8; 32]> = pending
             .iter()
             .filter(|c| match <&[u8; 256]>::try_from(c.header.logs_bloom.as_slice()) {
                 Ok(bloom) => {
@@ -1123,20 +1125,23 @@ impl ElReader {
             })
             .map(|c| c.hash)
             .collect();
-        let logs = match self.bridge_fetch_logs(peer, &candidates).await {
-            Ok(map) => map,
-            Err(e) => {
-                tracing::debug!(error = %e, "log index tail: candidate fetch failed");
-                return;
+        let mut logs: std::collections::HashMap<u64, Vec<crate::el::logindex::StoredLog>> =
+            std::collections::HashMap::new();
+        for chunk in candidate_hashes.chunks(CANDIDATE_CHUNK) {
+            match self.bridge_fetch_logs(&peers[0], chunk).await {
+                Ok(map) => logs.extend(map),
+                Err(e) => {
+                    tracing::debug!(error = %e, "log index tail: candidate fetch failed");
+                    break; // apply the contiguous prefix we do have
+                }
             }
-        };
+        }
         let mut appended = 0usize;
         for c in &pending {
             let n = c.header.number;
             // A candidate whose logs this round didn't get (byte-budget
             // truncation) stops the tail here: coverage must stay contiguous.
-            let is_candidate = candidates.contains(&c.hash);
-            if is_candidate && !logs.contains_key(&n) {
+            if candidate_hashes.contains(&c.hash) && !logs.contains_key(&n) {
                 break;
             }
             let block_logs = logs.get(&n).cloned().unwrap_or_default();
@@ -1161,18 +1166,42 @@ impl ElReader {
         if appended > 0 {
             tracing::debug!(appended, head_n, "log index tail advanced");
             if self.log_index_persist_due() {
-                if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
-                    if let Some(ix) = slot.as_ref() {
-                        let _ = ix.persist(path);
-                    }
-                }
+                self.persist_log_index(finalized);
+            }
+        }
+    }
+
+    /// Rewind the index (coverage and stored logs) above `fork_point`, and
+    /// forget the tail record above it.
+    fn log_index_rewind_to(&self, fork_point: u64) {
+        if let Ok(mut slot) = self.log_index.lock() {
+            if let Some(ix) = slot.as_mut() {
+                ix.rewind_above(fork_point);
+            }
+        }
+        if let Ok(mut t) = self.log_index_tail.lock() {
+            t.retain(|(n, _)| *n <= fork_point);
+        }
+    }
+
+    /// Checkpoint the index, CLAMPED AT FINALITY: optimistic coverage is only
+    /// as trustworthy as this run's in-memory tail record, which does not
+    /// survive a restart. Persisting it would leave a later run holding
+    /// coverage it can never re-check — and once finality moves past those
+    /// blocks, nothing would ever rewind them (they would look immutable
+    /// while possibly being orphaned).
+    fn persist_log_index(&self, finalized: u64) {
+        if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
+            if let Some(ix) = slot.as_ref() {
+                let _ = ix.persist_clamped(path, finalized);
             }
         }
     }
 
     /// The highest block the log index currently covers, or None when nothing
-    /// is indexed. Hosts resolve `latest` against this so a head that has
-    /// moved since the last tail tick doesn't flap into refusals.
+    /// is indexed. Hosts resolve `latest` against this so a head that moved
+    /// since the last tail tick doesn't flap head-reaching queries into
+    /// refusals (see `LOG_INDEX_LATEST_SLACK` on the host side).
     pub fn log_index_covered_high(&self) -> Option<u64> {
         self.with_log_index(|ix| ix.append_edge())
             .flatten()
@@ -1227,11 +1256,13 @@ impl ElReader {
         /// leave the tail of the 6s tick to both (the backfill's own budget
         /// makes the same trade).
         const TICK_BUDGET: std::time::Duration = std::time::Duration::from_millis(3000);
-        /// Widest gap a single plan will map. ~41 bytes per block plus sparse
-        /// candidate headers, so 2M blocks is well under 100 MB — and on any
-        /// chain that is many months of downtime, where re-indexing from the
-        /// head is the saner answer than a giant in-memory plan.
-        const MAX_GAP: u64 = 2_000_000;
+        /// Widest gap a single plan will map. Each entry is a padded
+        /// `(u64, [u8;32], bool)` = 48 bytes, and the Vec peaks at ~1.5x that
+        /// while doubling, so 500k blocks is ~24 MB steady / ~36 MB peak —
+        /// deliberately sized for a phone (CLAUDE.md keeps Android
+        /// first-class), not for a workstation. Beyond it, re-enabling the
+        /// index (which re-seeds at the head) beats a giant in-memory plan.
+        const MAX_GAP: u64 = 500_000;
 
         let Some((fin_n, fin_hash)) = self.anchor.finalized_execution().map(|f| (f.block_number, f.block_hash))
         else {
@@ -1415,17 +1446,27 @@ impl ElReader {
                 let logs = if hashes.is_empty() {
                     std::collections::HashMap::new()
                 } else {
-                    let Some(peer) = peers.get(peer_idx.min(peers.len() - 1)) else {
-                        break;
-                    };
-                    match self.bridge_fetch_logs(peer, &hashes).await {
-                        Ok(map) => map,
-                        Err(e) => {
-                            tracing::debug!(error = %e, "log index head bridge: candidate fetch failed");
-                            peer_idx += 1;
-                            break; // keep the plan; retry the same slice next tick
+                    // Rotate on failure like the descent: retry this slice
+                    // against the next peer rather than idling a whole tick
+                    // (and, once the pool is exhausted, keep the plan and let
+                    // the next tick start over from the top of the pool).
+                    let mut fetched = None;
+                    while peer_idx < peers.len() {
+                        match self.bridge_fetch_logs(&peers[peer_idx], &hashes).await {
+                            Ok(map) => {
+                                fetched = Some(map);
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::debug!(error = %e, "log index head bridge: candidate fetch failed");
+                                peer_idx += 1;
+                            }
                         }
                     }
+                    let Some(map) = fetched else {
+                        break; // pool exhausted this tick; the plan survives
+                    };
+                    map
                 };
                 // Apply this block plus every non-candidate up to the next
                 // candidate whose logs we just fetched.
@@ -1464,11 +1505,7 @@ impl ElReader {
             // is a full-index rewrite, and bridging can apply thousands of
             // blocks per tick. Always checkpoint the final slice.
             if applied_this_tick > 0 && (done || self.log_index_persist_due()) {
-                if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
-                    if let Some(ix) = slot.as_ref() {
-                        let _ = ix.persist(path);
-                    }
-                }
+                self.persist_log_index(self.finalized_block_number());
             }
             if done {
                 tracing::info!(to = anchor_n, "log index head bridge complete; head-follow resumes");
@@ -1504,20 +1541,21 @@ impl ElReader {
         if hashes.is_empty() {
             return Ok(out);
         }
+        // join_all, not try_join_all: short-circuiting would drop the sibling
+        // requests still in flight (and the bodies/receipts already served)
+        // the moment one header failed. Failures become per-block holes that
+        // simply shorten the usable prefix.
         let (bodies, receipt_blocks, headers) = futures::future::join3(
             peer.get_block_bodies(hashes),
             peer.get_receipts(hashes),
-            futures::future::try_join_all(hashes.iter().map(|h| async move {
-                let got = peer.get_block_headers_by_hash(h, 1).await?;
-                let vh = got.into_iter().next().ok_or("peer served no header for a candidate")?;
-                if vh.hash != *h {
-                    return Err("peer served a header for the wrong hash".to_string());
-                }
-                Ok::<_, String>(vh)
+            futures::future::join_all(hashes.iter().map(|h| async move {
+                let got = peer.get_block_headers_by_hash(h, 1).await.ok()?;
+                let vh = got.into_iter().next()?;
+                (vh.hash == *h).then_some(vh)
             })),
         )
         .await;
-        let (bodies, receipt_blocks, headers) = (bodies?, receipt_blocks?, headers?);
+        let (bodies, receipt_blocks) = (bodies?, receipt_blocks?);
         // Honest byte-budget truncation: use the served prefix, leave the rest
         // for the next round (the caller re-requests what it didn't get).
         let usable = bodies.len().min(receipt_blocks.len()).min(hashes.len());
@@ -1525,7 +1563,11 @@ impl ElReader {
             return Err("peer served no bodies/receipts for bridge candidates".to_string());
         }
         for i in 0..usable {
-            let vh = &headers[i];
+            // A missing/mismatched header ends the usable prefix rather than
+            // failing the chunk: the caller applies what is contiguous.
+            let Some(vh) = headers.get(i).and_then(|h| h.as_ref()) else {
+                break;
+            };
             verify_body_transactions(&vh.header, &bodies[i])?;
             if receipt_blocks[i].len() != bodies[i].transactions.len() {
                 return Err(format!(
@@ -1580,11 +1622,7 @@ impl ElReader {
         // crash now costs at most ~10s of batches.
         let persist_due = any_progress && self.log_index_persist_due();
         if persist_due {
-            if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
-                if let Some(ix) = slot.as_ref() {
-                    let _ = ix.persist(path);
-                }
-            }
+            self.persist_log_index(self.finalized_block_number());
         }
         // Rolling throughput for the status ETA, measured against WALL CLOCK
         // between progress observations (the anchor persists across idle
@@ -3748,11 +3786,7 @@ impl ElReader {
         }
         // Best-effort index checkpoint before teardown: a failed write only
         // costs a re-index of the uncheckpointed tail, never correctness.
-        if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
-            if let Some(ix) = slot.as_ref() {
-                let _ = ix.persist(path);
-            }
-        }
+        self.persist_log_index(self.finalized_block_number());
         self.pool.stop().await;
         self.discovery.stop().await;
     }
@@ -4522,6 +4556,63 @@ fn stored_logs_for_block(receipts: &[VerifiedReceipt]) -> Option<Vec<crate::el::
     Some(out)
 }
 
+/// Whether this run's tail record accounts for ALL coverage above finality.
+/// Optimistic coverage is only trustworthy while the tail can re-check it
+/// against the canonical chain, which needs the hash of every block it
+/// claims; coverage reaching above finality whose top block this run did not
+/// record (an index from an older build that persisted its tail, an imported
+/// file) must be rewound instead of trusted. Pure — unit-tested.
+fn tail_vouches_for(recorded: &[(u64, [u8; 32])], edge: u64, finalized: u64) -> bool {
+    if edge <= finalized.saturating_add(1) {
+        return true; // coverage stops at (or below) finality: nothing optimistic
+    }
+    // The record must reach the covered top and run down to finality without
+    // holes — a hole is a block we cannot re-check.
+    let top = edge - 1;
+    let mut expect = top;
+    for (n, _) in recorded.iter().rev() {
+        if *n != expect {
+            return false;
+        }
+        if expect == finalized.saturating_add(1) {
+            return true;
+        }
+        expect -= 1;
+    }
+    expect <= finalized
+}
+
+/// The lowest block a tail window must reach. It has to cover every RECORDED
+/// block (so a reorg is detectable — a window starting at the coverage edge
+/// compares against records that all sit BELOW it, i.e. two disjoint ranges,
+/// and can never detect anything) and the covered top itself (so the first
+/// appended block links to it by parent hash). Never below finality, which is
+/// immutable. Pure — unit-tested.
+fn tail_window_floor(edge: u64, lowest_recorded: Option<u64>, finalized: u64) -> u64 {
+    let covered_top = edge.saturating_sub(1);
+    let floor = lowest_recorded.unwrap_or(covered_top).min(covered_top);
+    floor.max(finalized)
+}
+
+/// The lowest recorded block whose hash the canonical chain contradicts — the
+/// fork point of a reorg. `None` when every recorded block the window covers
+/// still matches (records outside the window are not evidence either way, and
+/// the window is built to cover them). Pure — unit-tested.
+fn tail_fork_point(
+    recorded: &[(u64, [u8; 32])],
+    canonical: &[(u64, [u8; 32])],
+) -> Option<u64> {
+    let mut fork: Option<u64> = None;
+    for (n, h) in recorded {
+        if let Some((_, canon_hash)) = canonical.iter().find(|(cn, _)| cn == n) {
+            if canon_hash != h {
+                fork = Some(fork.map_or(*n, |f: u64| f.min(*n)));
+            }
+        }
+    }
+    fork
+}
+
 /// Whether an in-progress bridge plan still describes the CURRENT gap, and so
 /// may be resumed instead of re-descended. Pure (unit-tested): the two moving
 /// premises are the coverage edge — which the plan's own ascent advances, so
@@ -4595,6 +4686,60 @@ fn truncation_plan(
 /// claim a block whose candidate receipts were not verified.
 fn should_apply(n: u64, stop_below: Option<u64>) -> bool {
     !stop_below.is_some_and(|stop| n <= stop)
+}
+
+#[cfg(test)]
+mod tail_reorg_tests {
+    use super::{tail_fork_point, tail_vouches_for, tail_window_floor};
+
+    fn h(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
+
+    #[test]
+    fn window_floor_reaches_the_records_not_just_the_edge() {
+        // THE bug this pins: a window starting at the coverage edge (1_001)
+        // compares against records that all sit BELOW it — disjoint ranges, so
+        // a reorg could never be detected. The floor must reach the records.
+        assert_eq!(tail_window_floor(1_001, Some(996), 990), 996);
+        // No records: still include the covered top so the next block links
+        // to it by parent hash.
+        assert_eq!(tail_window_floor(1_001, None, 990), 1_000);
+        // Never below finality (immutable, and not worth re-fetching).
+        assert_eq!(tail_window_floor(1_001, Some(900), 990), 990);
+        // A record above the covered top can't widen the window past it.
+        assert_eq!(tail_window_floor(1_001, Some(1_100), 990), 1_000);
+    }
+
+    #[test]
+    fn fork_point_is_the_lowest_contradicted_record() {
+        let canonical =
+            vec![(100, h(1)), (101, h(2)), (102, h(0xAA)), (103, h(0xBB))];
+        // All matching → no fork.
+        assert_eq!(tail_fork_point(&[(100, h(1)), (101, h(2))], &canonical), None);
+        // 102 and 103 both diverge → the LOWEST is the fork point.
+        let recorded = vec![(100, h(1)), (101, h(2)), (102, h(3)), (103, h(4))];
+        assert_eq!(tail_fork_point(&recorded, &canonical), Some(102));
+        // Records the window doesn't cover are not evidence either way.
+        assert_eq!(tail_fork_point(&[(99, h(9))], &canonical), None);
+        assert_eq!(tail_fork_point(&[], &canonical), None);
+    }
+
+    #[test]
+    fn vouching_requires_an_unbroken_record_down_to_finality() {
+        // Coverage at or below finality: nothing optimistic to vouch for.
+        assert!(tail_vouches_for(&[], 991, 990));
+        assert!(tail_vouches_for(&[], 500, 990));
+        // Full record from the covered top down to finality+1.
+        assert!(tail_vouches_for(&[(991, h(1)), (992, h(2))], 993, 990));
+        // Empty record but optimistic coverage: an inherited/imported tail.
+        assert!(!tail_vouches_for(&[], 993, 990));
+        // Record that doesn't reach the covered top (992 missing).
+        assert!(!tail_vouches_for(&[(991, h(1))], 993, 990));
+        // A HOLE in the record: 992 was never recorded, so it can't be
+        // re-checked and the whole optimistic span must be rewound.
+        assert!(!tail_vouches_for(&[(991, h(1)), (993, h(3))], 994, 990));
+    }
 }
 
 #[cfg(test)]

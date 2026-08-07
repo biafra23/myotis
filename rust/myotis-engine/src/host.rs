@@ -2112,8 +2112,12 @@ pub fn log_index_status_json(handle: i64) -> String {
         return eljson::error_json("node is not running");
     };
     let rate_bps = reader.log_index_rate_bps();
-    let finalized = reader.finalized_block_number();
-    let status = reader.with_log_index(|ix| build_log_index_status(ix, rate_bps, finalized));
+    // Measured against the ANCHORED HEAD, which is what `latest` resolves to
+    // and therefore what decides whether a query is refused — reporting the
+    // gap to finality instead would show "caught up" through the whole band
+    // where queries still fail.
+    let head = reader.head_block_number().unwrap_or(0);
+    let status = reader.with_log_index(|ix| build_log_index_status(ix, rate_bps, head));
     status.unwrap_or_else(|| "{\"enabled\":false,\"logCount\":0,\"entries\":[]}".to_string())
 }
 
@@ -2122,7 +2126,7 @@ pub fn log_index_status_json(handle: i64) -> String {
 fn build_log_index_status(
     ix: &myotis_net::el::logindex::LogIndex,
     rate_bps: Option<f64>,
-    finalized: u64,
+    head: u64,
 ) -> String {
     {
         let mut s = String::from("{\"enabled\":");
@@ -2157,17 +2161,15 @@ fn build_log_index_status(
                 }
             }
         }
-        // How far the TOP of coverage trails the finalized head. Queries with
-        // `toBlock: "latest"` are refused while this is non-zero, so it is the
-        // number that explains a refusal even on a fully backfilled index —
-        // the head bridge closes it after downtime.
-        if finalized > 0 {
+        // How far the TOP of coverage trails the head `latest` resolves to.
+        // Beyond LOG_INDEX_LATEST_SLACK, head-reaching queries are refused, so
+        // this is the number that explains a refusal even on a fully
+        // backfilled index — the bridge and tail close it after downtime.
+        if head > 0 {
             if let Some(edge) = ix.append_edge() {
-                // edge = covered high + 1, so the gap is measured from the
-                // covered TOP: zero exactly when coverage reaches finality.
                 let covered_high = edge.saturating_sub(1);
                 s.push_str(",\"headGap\":");
-                s.push_str(&finalized.saturating_sub(covered_high).to_string());
+                s.push_str(&head.saturating_sub(covered_high).to_string());
             }
         }
         s.push_str(",\"entries\":[");
@@ -2325,8 +2327,13 @@ pub fn get_logs_json(handle: i64, filter_json: &str) -> String {
 }
 
 /// How far the index's covered top may trail the anchored head and still be
-/// used to resolve `latest` (the engine's own append window).
-const LOG_INDEX_LATEST_SLACK: u64 = 128;
+/// used to resolve `latest`. Sized to absorb TICK CADENCE only — the tail
+/// appender runs every 6s while blocks arrive every ~12s, so it is normally
+/// 0-1 blocks behind. Anything beyond this is a real lag, and the query is
+/// refused rather than answered against a narrower range the caller never
+/// asked for and cannot see (a wallet advancing its cursor from
+/// `eth_blockNumber` would silently lose those blocks' logs).
+const LOG_INDEX_LATEST_SLACK: u64 = 4;
 
 fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
     use myotis_net::el::logindex::QueryError;

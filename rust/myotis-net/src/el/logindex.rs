@@ -218,7 +218,10 @@ pub enum QueryError {
 
 /// The index proper: watch-list, per-entry coverage, and the log store keyed
 /// by (block_number, log_index) so range queries are ordered scans.
-#[derive(Debug, Default)]
+/// `Clone` exists for the clamped checkpoint path (see
+/// [`Self::serialize_clamped`]) — cloning a large index is deliberate there
+/// and happens at most once per checkpoint window.
+#[derive(Debug, Default, Clone)]
 pub struct LogIndex {
     config: LogIndexConfig,
     coverage: Vec<Coverage>, // parallel to config.watch
@@ -522,6 +525,32 @@ impl<'a> Cursor<'a> {
 }
 
 impl LogIndex {
+    /// Serialize with coverage and logs CLAMPED at `max_block`: everything
+    /// above it is left out of the file entirely. Used to keep optimistic
+    /// (above-finality) coverage out of checkpoints — that coverage is only
+    /// verifiable against the in-memory tail record, which does not survive a
+    /// restart, so persisting it would leave a later run holding coverage it
+    /// can never re-check.
+    pub fn serialize_clamped(&self, max_block: u64) -> Vec<u8> {
+        if self.coverage.iter().all(|c| c.span.is_none_or(|(_, high)| high <= max_block)) {
+            return self.serialize(); // nothing above the clamp — no copy needed
+        }
+        let mut clamped = self.clone();
+        clamped.rewind_above(max_block);
+        clamped.serialize()
+    }
+
+    /// [`Self::persist`] with the same clamp as [`Self::serialize_clamped`].
+    pub fn persist_clamped(&self, path: &Path, max_block: u64) -> std::io::Result<()> {
+        let tmp: PathBuf = path.with_extension(format!("tmp.{}", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&self.serialize_clamped(max_block))?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+    }
+
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(64 + self.logs.len() * 200);
         out.extend_from_slice(MAGIC);
@@ -783,6 +812,31 @@ mod tests {
         assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((298, 300)));
         assert_eq!(ix.cursor, Some((298, [8; 32])));
         assert_eq!(ix.query(&filter(298, 300, addr(1))).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn clamped_persist_leaves_optimistic_coverage_out_of_the_file() {
+        let dir = std::env::temp_dir().join(format!("logindex-clamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clamped.db");
+        let cfg = config_ok(vec![watch_all(addr(1), 0)]);
+        let mut ix = LogIndex::new(cfg.clone()).unwrap();
+        for b in 10..=14 {
+            ix.append_block(b, [b as u8; 32], vec![log(b, 0, addr(1), vec![])]).unwrap();
+        }
+        // Finality at 12: blocks 13-14 are optimistic and must not persist —
+        // a later run has no way to re-check them, and once finality moves
+        // past them nothing would ever rewind them.
+        ix.persist_clamped(&path, 12).unwrap();
+        let loaded = LogIndex::load(&cfg, &path).unwrap();
+        assert_eq!(loaded.coverage_of(&addr(1)).unwrap().span, Some((10, 12)));
+        assert_eq!(loaded.log_count(), 3);
+        // The live index is untouched — the clamp is a serialization concern.
+        assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((10, 14)));
+        assert_eq!(ix.log_count(), 5);
+        // Nothing above the clamp → byte-identical to a plain serialize.
+        assert_eq!(ix.serialize_clamped(14), ix.serialize());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

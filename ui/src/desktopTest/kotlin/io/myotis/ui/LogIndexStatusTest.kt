@@ -81,8 +81,14 @@ class LogIndexStatusTest {
             "catching up to the head (3,821 blocks behind)",
             LogIndexStatus.progressLine(p),
         )
-        // A gap within the normal finality lag reads as complete.
-        assertEquals("backfill complete", LogIndexStatus.progressLine(p.copy(headGap = 64)))
+        // Within the engine's serving slack (LOG_INDEX_LATEST_SLACK) queries
+        // ARE served, so "complete" is honest there.
+        assertEquals("backfill complete", LogIndexStatus.progressLine(p.copy(headGap = 2)))
+        // Just beyond it, queries are refused — say so rather than "complete".
+        assertEquals(
+            "catching up to the head (64 blocks behind)",
+            LogIndexStatus.progressLine(p.copy(headGap = 64)),
+        )
         // Engines that don't report the key keep the old wording.
         assertEquals("backfill complete", LogIndexStatus.progressLine(p.copy(headGap = null)))
     }
