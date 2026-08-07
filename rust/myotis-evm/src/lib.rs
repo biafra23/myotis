@@ -42,6 +42,7 @@ pub mod error;
 pub mod executor;
 pub mod fork;
 pub mod oracle;
+pub mod overrides;
 
 // Re-exported so downstream crates implementing [`SnapStateOracle`] / building a
 // [`BlockContext`] can name revm's `U256` without depending on revm directly.

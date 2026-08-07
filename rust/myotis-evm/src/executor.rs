@@ -35,6 +35,7 @@ use crate::database::{AccessSet, OracleDatabase};
 use crate::error::EvmError;
 use crate::fork::spec_for;
 use crate::oracle::{OracleError, SnapStateOracle};
+use crate::overrides::StateOverrides;
 
 /// The gas a view call is given — the mainnet block gas limit. Also set as the
 /// per-tx gas cap so revm's spec-default cap (2²⁴ on the latest fork, EIP-7825)
@@ -121,6 +122,33 @@ impl EvmExecutor {
         self.call(Address::from(sender), target, calldata, value, ctx)
     }
 
+    /// [`Self::call_view_from`] with caller-supplied [`StateOverrides`] layered
+    /// over the verified state for this call only.
+    ///
+    /// The result is NOT a chain fact — it answers "what would this return if
+    /// these accounts looked like this", which is what the caller asked. The
+    /// override never reaches the proof or bytecode caches, so it cannot affect
+    /// any other call (see [`crate::overrides`]).
+    pub fn call_view_overridden(
+        &self,
+        sender: [u8; 20],
+        target: [u8; 20],
+        calldata: &[u8],
+        value: U256,
+        ctx: &BlockContext,
+        overrides: StateOverrides,
+    ) -> Result<Vec<u8>, EvmError> {
+        self.call_capped_with(
+            Address::from(sender),
+            target,
+            calldata,
+            value,
+            ctx,
+            PREFETCH_ITERATION_CAP,
+            overrides,
+        )
+    }
+
     /// `estimateGas` for a call (`to` != null): run it and return the gas LIMIT that
     /// would let it succeed. Reverts/halts yield no number (an `Err`) — the host
     /// maps that to a JSON-RPC null, like the reference engine.
@@ -157,11 +185,16 @@ impl EvmExecutor {
     }
 
     fn database_for(&self, ctx: &BlockContext) -> OracleDatabase {
-        OracleDatabase::new(
+        self.database_for_with(ctx, StateOverrides::new())
+    }
+
+    fn database_for_with(&self, ctx: &BlockContext, overrides: StateOverrides) -> OracleDatabase {
+        OracleDatabase::with_overrides(
             Arc::clone(&self.oracle),
             ctx.state_root,
             Arc::clone(&self.proof_cache),
             Arc::clone(&self.bytecode_cache),
+            overrides,
         )
     }
 
@@ -242,8 +275,22 @@ impl EvmExecutor {
         ctx: &BlockContext,
         cap: usize,
     ) -> Result<Vec<u8>, EvmError> {
+        self.call_capped_with(caller, target, calldata, value, ctx, cap, StateOverrides::new())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_capped_with(
+        &self,
+        caller: Address,
+        target: [u8; 20],
+        calldata: &[u8],
+        value: U256,
+        ctx: &BlockContext,
+        cap: usize,
+        overrides: StateOverrides,
+    ) -> Result<Vec<u8>, EvmError> {
         let spec = spec_for(ctx.chain_id, ctx.block_number, ctx.timestamp)?;
-        let db = self.database_for(ctx);
+        let db = self.database_for_with(ctx, overrides);
 
         // Prime the target's account + code synchronously (sentinel OFF, not
         // access-tracked — Java parity) so iteration 0 executes real top-level
@@ -446,6 +493,64 @@ mod tests {
             chain_id: 1,
             gas_limit: 30_000_000,
         }
+    }
+
+    /// THE wallet pattern this exists for (#314): Ambire/Kohaku reads account
+    /// state by calling a magic address that has NO on-chain account and
+    /// supplying the helper's bytecode as an override. Ignoring the override
+    /// returns empty output — a well-formed answer to a different question.
+    #[test]
+    fn deployless_call_runs_overridden_code_at_an_account_that_does_not_exist() {
+        use crate::overrides::{AccountOverride, StateOverrides};
+        const MAGIC: [u8; 20] = [0x69; 20];
+        // PUSH1 0x2a; PUSH1 0; MSTORE; PUSH1 32; PUSH1 0; RETURN  -> returns 42
+        let code = vec![0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        // Fixture has NOTHING at MAGIC: the account exists only as a hypothesis.
+        let ex = EvmExecutor::new(
+            Arc::new(FixtureSnapStateOracle::new()),
+            Arc::new(NoopStateProofCache),
+            Arc::new(NoopBytecodeCache),
+        );
+        let c = ctx(LONDON_BLOCK, CANCUN_TIME);
+
+        // Without the override there is no code to run: empty output.
+        let bare = ex.call_view(MAGIC, &[], &c).expect("call runs");
+        assert!(bare.is_empty(), "expected empty output without an override, got {bare:?}");
+
+        // With it, the injected code executes.
+        let mut ov = StateOverrides::new();
+        ov.insert(MAGIC, AccountOverride { code: Some(code), ..Default::default() });
+        let out = ex
+            .call_view_overridden(VIEW_CALLER.into_array(), MAGIC, &[], U256::ZERO, &c, ov)
+            .expect("overridden call runs");
+        assert_eq!(U256::from_be_slice(&out), U256::from(42));
+    }
+
+    #[test]
+    fn storage_and_balance_overrides_apply_and_do_not_leak() {
+        use crate::overrides::{AccountOverride, StateOverrides};
+        // SLOAD slot 0 and return it.
+        let code = vec![0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let ex = executor_with(code, Some(U256::from(7)));
+        let c = ctx(LONDON_BLOCK, CANCUN_TIME);
+
+        // Verified state says 7.
+        assert_eq!(U256::from_be_slice(&ex.call_view(TARGET, &[], &c).unwrap()), U256::from(7));
+
+        // stateDiff overlays just that slot.
+        let mut over = AccountOverride::default();
+        over.state_diff.insert(U256::ZERO, U256::from(99));
+        let mut ov = StateOverrides::new();
+        ov.insert(TARGET, over);
+        let out = ex
+            .call_view_overridden(VIEW_CALLER.into_array(), TARGET, &[], U256::ZERO, &c, ov)
+            .unwrap();
+        assert_eq!(U256::from_be_slice(&out), U256::from(99));
+
+        // The override must not have leaked into any cache: the next ordinary
+        // call sees verified state again. This is the trust-critical property —
+        // a hypothesis must not become a "fact" for later calls.
+        assert_eq!(U256::from_be_slice(&ex.call_view(TARGET, &[], &c).unwrap()), U256::from(7));
     }
 
     /// Build an executor whose fixture hosts `code` (and optional slot-0 value) at
