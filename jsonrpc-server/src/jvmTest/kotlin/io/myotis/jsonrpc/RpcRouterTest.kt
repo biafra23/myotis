@@ -144,6 +144,48 @@ class RpcRouterTest {
         assertEquals("latest", b.lastBlock)
     }
 
+    // --- state overrides (#314) -------------------------------------------------
+    // The wallet failure this prevents: Ambire reads account state by injecting a
+    // helper's bytecode via an override and calling a magic address. Ignoring the
+    // override returns `0x` — a well-formed answer to a DIFFERENT question — and the
+    // wallet reports "account state update error" with nothing to go on.
+
+    @Test fun ethCall_withStateOverride_isRefused_notSilentlyAnswered() {
+        val b = FakeBackend(callResult = byteArrayOf(1))
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x0000000000000000000000000000000000696969","data":"0x24b6b1a5"},
+                         "latest",
+                         {"0x0000000000000000000000000000000000696969":{"code":"0x6080"}}]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32000, errorCode(resp))
+        // The backend must not have been consulted at all: answering from unmodified
+        // state is the bug, so the call never reaches it.
+        assertNull(b.lastTo)
+    }
+
+    @Test fun ethEstimateGas_withStateOverride_isRefused() {
+        val b = FakeBackend(callResult = byteArrayOf(1))
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas",
+               "params":[{"to":"0x00000000219ab540356cBB839Cbe05303d7705Fa","data":"0xabcd"},
+                         "latest",
+                         {"0x00000000219ab540356cBB839Cbe05303d7705Fa":{"balance":"0x1"}}]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32000, errorCode(resp))
+    }
+
+    @Test fun ethCall_withEmptyOverrideObject_isServedNormally() {
+        // An empty object changes nothing, so refusing it would break callers that
+        // always send the parameter.
+        val b = FakeBackend(callResult = byteArrayOf(0, 6))
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","data":"0x313ce567"},
+                         "latest",{}]}""")
+        assertEquals("0x0006", result(resp))
+    }
+
     @Test fun ethCall_threadsFromAndValue_toBackend() {            // confirm-screen sim: msg.sender + value
         val b = FakeBackend(callResult = byteArrayOf(0, 6))
         route(b,

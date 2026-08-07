@@ -101,6 +101,14 @@ class RpcRouter(
         return if (s.length > 64) s.substring(0, 64) + "…" else s
     }
 
+    /** True when the request carries a NON-EMPTY state-override object (the third
+     *  parameter of `eth_call` / `eth_estimateGas`). An empty object is not an
+     *  override — nothing would change — so it is served normally. */
+    private fun hasStateOverride(root: JsonObject): Boolean {
+        val ov = root.params()?.getOrNull(2) as? JsonObject ?: return false
+        return ov.isNotEmpty()
+    }
+
     /**
      * Handle one request object, returning its complete JSON-RPC response envelope.
      * [wholeBody] is the original request text used for the single-request proxy path;
@@ -145,6 +153,28 @@ class RpcRouter(
                 val detail = e.message?.takeIf { it.isNotBlank() } ?: (e::class.simpleName ?: "Exception")
                 errorEnvelope(id, -32603, "status read failed: $detail")
             }
+        }
+        // STATE OVERRIDES: refuse, never ignore. `eth_call`/`eth_estimateGas` take an
+        // optional third parameter that replaces code/balance/nonce/storage for the
+        // duration of the call. This node does not apply it — and answering anyway
+        // returns a well-formed result computed against DIFFERENT state than the
+        // caller asked about, with no way for them to tell. That is how a wallet ends
+        // up silently broken: Ambire/Kohaku reads account state through a helper whose
+        // bytecode it injects this way, got `0x` back from us for every such call, and
+        // reported "account state update error" with no idea why (#314).
+        //
+        // The same rule the log index applies to an unindexed range: an honest error
+        // beats a plausible wrong answer. Clients that ask can also adapt — Ambire has
+        // a no-override code path it selects per network.
+        if ((method == "eth_call" || method == "eth_estimateGas") && hasStateOverride(root)) {
+            logger.record(method, idStr, "ERROR", 0, -32000)
+            return errorEnvelope(
+                id,
+                -32000,
+                "method '$method' with state overrides is not supported by this node " +
+                    "(the override was rejected, not ignored — a result computed without " +
+                    "it would answer a different question than you asked)",
+            )
         }
         val t0 = TimeSource.Monotonic.markNow()
         val verified = tryVerified(method, id, root)
