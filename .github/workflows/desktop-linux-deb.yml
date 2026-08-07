@@ -149,21 +149,34 @@ jobs:
           path: app-desktop/build/compose/binaries/main/deb/*.deb
           if-no-files-found: error
           retention-days: 30
+          # Artifacts are immutable per run; without this, "re-run all jobs" on a
+          # tag 409s in every build leg and the release job never runs. That is
+          # the button people reach for after the version guard fails, so the
+          # recovery path must not wedge the release. (node-binding.yml has
+          # carried this fix since it hit exactly that.)
+          overwrite: true
 
   # Refuse to publish when the pushed tag disagrees with the version in the tree
   # — the release is named after the tag, while the .deb's packageVersion comes
   # from project.version. See release-version-guard.yml.
   #
-  # Tag PUSHES only, hence the explicit event check (the sibling workflows can
-  # gate on the ref alone; this one can't). The workflow_dispatch path below
-  # deliberately uploads assets built from the dispatched ref to a SEPARATE,
-  # already-existing tag given as an input — the guard compares the ref's tag to
-  # the ref's version, which is not the pair that matters there, so it would
-  # either pass vacuously or fail a dispatch it has no business judging. That
-  # path stays deliberately unguarded; see the PR that added this file.
+  # The condition is finer-grained than the sibling workflows' because this one
+  # has TWO dispatch shapes hiding behind one event, and the guard compares the
+  # ref's tag to the ref's version:
+  #   - push of a `v*` tag                     → the right pair. Guard.
+  #   - dispatch, release-tag == the ref's tag → the right pair (plain
+  #     republish, matching node-binding's ref-gated republish path). Guard.
+  #   - dispatch, release-tag != the ref       → the documented BACKFILL: assets
+  #     built from the dispatched ref are uploaded to a different, existing tag,
+  #     so ref-version and target-tag are EXPECTED to disagree. Judging the ref's
+  #     own pair here would answer a question nobody asked. Deliberately skipped.
+  # On a push, `inputs` is null, so the second disjunct is false and the first
+  # decides — and `||` short-circuits, so it is never even reached.
   version-guard:
     name: Release version guard
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      startsWith(github.ref, 'refs/tags/v')
+      && (github.event_name == 'push' || inputs.release-tag == github.ref_name)
     uses: ./.github/workflows/release-version-guard.yml
 
   # Attach both arch debs to the GitHub Release. Runs on `v*` tags (same
@@ -201,11 +214,16 @@ jobs:
           # No checkout in this job — gh must be told the repo explicitly or it
           # dies with "fatal: not a git repository".
           GH_REPO: ${{ github.repository }}
+          # Through the ENVIRONMENT, never `${{ }}` inside the script: a `${{ }}`
+          # is pasted into the script text before bash parses it, so an input
+          # like `x"; curl … | sh; #` would execute — and the shape check below
+          # runs far too late to stop that, since bash has already parsed it.
+          RELEASE_TAG_INPUT: ${{ inputs.release-tag }}
         run: |
           set -eu
           # Tag ref on push; explicit input on manual dispatch.
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            tag="${{ inputs.release-tag }}"
+            tag="${RELEASE_TAG_INPUT}"
           else
             tag="${GITHUB_REF_NAME}"
           fi

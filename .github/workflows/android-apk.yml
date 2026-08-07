@@ -100,6 +100,12 @@ jobs:
           path: android-app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 30
+          # Artifacts are immutable per run; without this, "re-run all jobs" on a
+          # tag 409s in the build leg and the release job never runs. That is the
+          # button people reach for after the version guard fails, so the recovery
+          # path must not wedge the release. (node-binding.yml has carried this
+          # fix since it hit exactly that.)
+          overwrite: true
 
   # Refuse to publish when the pushed tag disagrees with the version in the tree
   # — the asset name below comes from the tag, the versionName inside the apk

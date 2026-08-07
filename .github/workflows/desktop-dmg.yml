@@ -202,6 +202,12 @@ jobs:
           path: app-desktop/build/compose/binaries/main/dmg/*.dmg
           if-no-files-found: error
           retention-days: 30
+          # Artifacts are immutable per run; without this, "re-run all jobs" on a
+          # tag 409s in every build leg and the release job never runs. That is
+          # the button people reach for after the version guard fails, so the
+          # recovery path must not wedge the release — and here it would cost two
+          # 40-minute jpackage legs. (node-binding.yml already carries this fix.)
+          overwrite: true
 
   # Refuse to publish when the pushed tag disagrees with the version in the tree
   # — the release is named after the tag, while the .dmg's packageVersion comes
