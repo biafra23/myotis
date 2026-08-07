@@ -216,7 +216,7 @@ compose.desktop {
             linux {
                 // Unlike the dmg (jpackage requires major > 0 on macOS), deb versions may
                 // start at 0 — so Linux carries the app's honest version.
-                packageVersion = "0.1.3"
+                packageVersion = "0.1.4"
                 debMaintainer = "dirk@jaeckel.com"
             }
         }

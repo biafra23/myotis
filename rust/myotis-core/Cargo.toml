@@ -1,6 +1,6 @@
 [package]
 name = "myotis-core"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Myotis execution-layer primitives: keccak-256, RLP, secp256k1 identity, BlockHeader, ENR (sans-I/O; grows through the EL-phase PRs)"
 license = "MIT OR Apache-2.0"

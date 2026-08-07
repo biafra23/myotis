@@ -89,8 +89,8 @@ android {
         applicationId = "com.jaeckel.ethp2p.android"
         minSdk = 29
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.1.3"
+        versionCode = 5
+        versionName = "0.1.4"
         buildConfigField("String", "RPC_UPSTREAM", "\"$rpcUpstream\"")
     }
 
