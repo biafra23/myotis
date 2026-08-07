@@ -13,6 +13,31 @@ plugins {
 
 kotlin { jvmToolchain(21) }
 
+// Installer versions, DERIVED from the project version so a release sweep can't
+// leave an installer stamped with the previous release (v0.1.0–v0.1.3 all shipped
+// a dmg hardcoded to "1.0.0", so every macOS bundle reported the same frozen
+// version in About / Get Info regardless of the release it came from).
+val releaseVersion = project.version.toString().substringBefore('-')  // 0.1.4-SNAPSHOT -> 0.1.4
+
+// jpackage REJECTS a major of 0 on macOS (--app-version must start above 0), so
+// the .dmg cannot carry the honest 0.x version. Force MAJOR to 1 and keep the
+// project's MINOR.PATCH (0.1.4 -> 1.1.4): that stays strictly increasing across
+// releases, which is what macOS needs to see a new bundle as an upgrade.
+//
+// Deliberately NOT "1.0.<patch>", which reads closer to the real version but is
+// not monotonic — the next minor bump (0.2.0) would emit 1.0.0, LOWER than
+// 0.1.4's 1.0.4, and macOS treats a lower bundle version as a downgrade.
+//
+// Revisit at the real 1.0.0: the honest 1.0.0 is lower than the 1.x this rule
+// emits for late 0.x (0.9.0 -> 1.9.0), so the macOS version has to jump ahead
+// (e.g. 2.0.0) to keep moving forward.
+val macOsPackageVersion: String = releaseVersion.split('.').let { parts ->
+    require(parts.size == 3) {
+        "Unexpected project version '${project.version}': expected MAJOR.MINOR.PATCH"
+    }
+    if (parts[0] == "0") "1.${parts[1]}.${parts[2]}" else releaseVersion
+}
+
 // Historical (Besu ≤24.12; 26.4 targets tuweni 2.7.2 so io.tmio is gone from the
 // graph — the exclude stays as a cheap guard):
 // Besu (via :myotis-evm) dragged in the pre-rename tuweni coordinates io.tmio:tuweni-* 2.4.2,
@@ -199,7 +224,9 @@ compose.desktop {
             // Windows host exists.
             targetFormats(TargetFormat.Dmg, TargetFormat.Deb)
             packageName = "Myotis"
-            packageVersion = "1.0.0"  // jpackage/dmg requires MAJOR > 0
+            // Applies to the dmg (and a future msi); the deb overrides it below.
+            // See macOsPackageVersion at the top of this file for the 0.x mapping.
+            packageVersion = macOsPackageVersion
             // jpackage builds the deb's Maintainer field as "<vendor> <debMaintainer>",
             // so the human name lives here and debMaintainer stays a bare email.
             vendor = "Dirk Jäckel"
@@ -216,7 +243,7 @@ compose.desktop {
             linux {
                 // Unlike the dmg (jpackage requires major > 0 on macOS), deb versions may
                 // start at 0 — so Linux carries the app's honest version.
-                packageVersion = "0.1.4"
+                packageVersion = releaseVersion
                 debMaintainer = "dirk@jaeckel.com"
             }
         }
