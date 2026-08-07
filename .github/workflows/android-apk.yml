@@ -93,6 +93,33 @@ jobs:
           echo "::error::APK build failed after 3 attempts"
           exit 1
 
+      # The Rust engine needs BOTH libmyotis_engine.so and JNA's
+      # libjnidispatch.so, per ABI, or UniFFI cannot load and the app silently
+      # falls back to the Java engine — a green build shipping a dead "Rust
+      # engine" toggle, which is exactly what v0.1.3 and v0.1.4 did. Every
+      # mechanism that puts these in the APK fails open (a resolution change
+      # dropping an artifact, the aar losing an ABI, the jniLib merge racing the
+      # extraction), and nothing else here would notice, so assert on the built
+      # artifact rather than trusting the build graph.
+      - name: Verify the APK can actually load the Rust engine
+        run: |
+          set -euo pipefail
+          apk=$(ls android-app/build/outputs/apk/debug/*.apk | head -n1)
+          # Read the listing ONCE into a variable and match against that. Piping
+          # `unzip -l` into `grep -q` looks natural but breaks under pipefail:
+          # grep exits at the first match, unzip takes SIGPIPE, and the pipeline
+          # reports failure on a perfectly good APK.
+          listing=$(unzip -l "$apk")
+          engines=$(sed -n 's#.*lib/\([^/]*\)/libmyotis_engine\.so.*#\1#p' <<< "$listing" | sort -u)
+          [ -n "$engines" ] \
+            || { echo "::error::no libmyotis_engine.so in the APK at all"; exit 1; }
+          while IFS= read -r abi; do
+            [ -n "$abi" ] || continue
+            grep -q "lib/$abi/libjnidispatch\.so" <<< "$listing" \
+              || { echo "::error::$abi ships libmyotis_engine.so with no libjnidispatch.so — JNA cannot dispatch, so the Rust engine would silently fall back to Java"; exit 1; }
+            echo "  ok: $abi has both libmyotis_engine.so and libjnidispatch.so"
+          done <<< "$engines"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:

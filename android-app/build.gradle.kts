@@ -1,5 +1,4 @@
 import java.util.Properties
-import org.gradle.kotlin.dsl.support.serviceOf
 
 plugins {
     alias(libs.plugins.android.application)
@@ -195,10 +194,13 @@ kotlin {
     jvmToolchain(21)
 }
 
-// JNA reaches the APK as its ANDROID artifact (jna-<v>.aar), declared in the
-// dependencies block below. The aar carries BOTH com.sun.jna.* and
-// jni/<abi>/libjnidispatch.so; the plain jar carries the classes plus desktop
-// natives only, which cannot dispatch on Android.
+// JNA reaches the APK in TWO pieces, because no single artifact carries both:
+//   - com.sun.jna.* classes come from the plain jna JAR, transitively via
+//     :myotis-engines and Besu (nothing here declares it directly);
+//   - jni/<abi>/libjnidispatch.so comes from jna-<v>.aar, extracted at the
+//     bottom of this file into jniLibs.
+// The aar cannot just be put on a classpath instead: it carries the same
+// classes as the jar and fails the duplicate-class check.
 //
 // A previous attempt used variant-aware dependency substitution with an
 // `artifactType = "aar"` attribute. That silently matched NO artifact — jna
@@ -362,41 +364,51 @@ dependencies {
     jnaAndroidNatives("net.java.dev.jna:jna:$jnaVersion@aar")
 }
 
-// Derived, not hardcoded: every ABI that gets libmyotis_engine.so needs a
-// matching libjnidispatch.so or UniFFI cannot load and that ABI silently falls
-// back to the Java engine. Reading the Rust jniLibs keeps the two in lockstep,
-// so adding an ABI to cargoNdkAndroid can't leave this behind. (The aar also
-// carries mips/mips64/armeabi — ABIs Android dropped years ago — which this
-// naturally excludes.)
-val rustJniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
-val shippedAbis: List<String> =
-    rustJniLibsDir.asFile.listFiles { f: java.io.File -> f.isDirectory }
-        ?.map { it.name }?.sorted()
-        ?: error("No ABI directories under $rustJniLibsDir — cannot align JNA natives")
+// Every ABI that gets libmyotis_engine.so needs a matching libjnidispatch.so,
+// or UniFFI cannot load and that ABI silently falls back to the Java engine.
+//
+// KEEP IN SYNC with `cargo ndk -t ...` in rust/build-android.sh and the
+// cargoNdkAndroid output paths in the root build.gradle.kts — one list, three
+// places. Deliberately a literal rather than a listing of src/main/jniLibs:
+// that directory is cargoNdkAndroid's EXECUTION-time output while this is read
+// at CONFIGURATION time, so the first build after an ABI was added would read
+// the pre-cargo state, omit the new ABI and ship it without a dispatcher — then
+// self-heal on the next build, which is the worst way for this to fail. What
+// actually enforces the invariant is the APK post-condition in
+// .github/workflows/android-apk.yml, which checks the built artifact.
+val shippedAbis = listOf("arm64-v8a", "x86_64")
 
 // aar layout is jni/<abi>/lib*.so; the jniLibs source set wants <abi>/lib*.so.
 // Sync, not Copy: Copy leaves behind files no longer in the spec, so a narrowed
 // abi list (or a jna upgrade dropping one) would keep packaging a stale .so.
-// Uses injected ArchiveOperations and local vals rather than the script's own
-// zipTree()/properties, to keep script-object capture to a minimum.
-//
-// NOT configuration-cache compatible, and knowingly so: the remaining capture
-// is the Kotlin lambdas themselves (`from { }`, `eachFile { }`), which hold a
-// reference to the build script, so `--configuration-cache` fails the whole
+// NOT configuration-cache compatible, knowingly: the `from {}` / `eachFile {}`
+// lambdas capture the build script, so `--configuration-cache` fails the whole
 // build with "cannot serialize Gradle script object references". CC is off
 // project-wide today (nothing sets it in gradle.properties or the Android CI
-// workflow), so this is latent — but enabling CC for :android-app means moving
-// this into a typed task class in buildSrc first. Same caveat already applies
-// to other lambda-configured tasks in this build.
-val archives = serviceOf<org.gradle.api.file.ArchiveOperations>()
-val abisToExtract = shippedAbis
+// workflow), so this is latent — enabling it for :android-app means moving this
+// into a typed task in buildSrc first, which would also let the jniLibs wiring
+// use AGP's addGeneratedSourceDirectory (a real producer->consumer edge)
+// instead of the preBuild anchor below.
 val extractJnaAndroidNatives = tasks.register<Sync>("extractJnaAndroidNatives") {
-    from(jnaAndroidNatives.elements.map { archives.zipTree(it.single().asFile) }) {
-        abisToExtract.forEach { abi -> include("jni/$abi/**") }
+    from(jnaAndroidNatives.elements.map { zipTree(it.single().asFile) }) {
+        shippedAbis.forEach { abi -> include("jni/$abi/**") }
     }
     eachFile { path = path.substringAfter("jni/") }
     includeEmptyDirs = false
     into(layout.buildDirectory.dir("jna-android-natives"))
+    // Gradle does not warn about include patterns that match nothing, so an ABI
+    // the aar has never carried (riscv64 being the realistic one) would extract
+    // silently to nothing and that ABI would ship an engine with no dispatcher.
+    doLast {
+        val got = destinationDir.listFiles { f: java.io.File -> f.isDirectory }
+            ?.map { it.name }.orEmpty().toSet()
+        val missing = shippedAbis.filterNot { it in got }
+        check(missing.isEmpty()) {
+            "jna-$jnaVersion.aar carries no libjnidispatch.so for $missing — those ABIs " +
+                "would ship libmyotis_engine.so with no JNA dispatcher and silently fall " +
+                "back to the Java engine at runtime."
+        }
+    }
 }
 
 android {
