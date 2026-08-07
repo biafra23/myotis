@@ -477,6 +477,34 @@ mod tests {
         assert_eq!(myotis_init(), crate::ABI_VERSION);
     }
 
+    /// The hand-maintained C header is the contract for the plain-ABI consumers
+    /// (:app-ios via cinterop, the napi loader), and its version is what they
+    /// gate on — so it has to name the same number as the crate constant. The
+    /// `include_str!` makes the header a compile input of this test: bumping
+    /// `ABI_VERSION` without touching the header fails `cargo test` (wired into
+    /// the root Gradle `check`) instead of shipping a header that tells C
+    /// consumers to refuse a perfectly good engine.
+    #[test]
+    fn header_pins_the_current_abi_version() {
+        const HEADER: &str = include_str!("../../include/myotis_engine.h");
+        let declared: i32 = HEADER
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("#define MYOTIS_ABI_VERSION "))
+            .expect("rust/include/myotis_engine.h must #define MYOTIS_ABI_VERSION")
+            .trim()
+            .parse()
+            .expect("MYOTIS_ABI_VERSION must be a plain integer literal");
+        assert_eq!(
+            declared,
+            crate::ABI_VERSION,
+            "rust/include/myotis_engine.h declares MYOTIS_ABI_VERSION {declared} but \
+             crate::ABI_VERSION is {}. Update the header, and check the host mirrors \
+             too: RustEngineNative.EXPECTED_ABI_VERSION (myotis-engines) and \
+             RustEngine.EXPECTED_ABI_VERSION (app-ios).",
+            crate::ABI_VERSION
+        );
+    }
+
     #[test]
     fn catalog_crosses_the_c_boundary_verbatim() {
         let json = unsafe { take(myotis_available_networks_json()) };
