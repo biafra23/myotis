@@ -495,9 +495,13 @@ mod tests {
         // exactly once is itself part of the contract, so a leftover copy in a
         // dead `#if 0` branch (or a per-platform variant) fails loudly instead
         // of shadowing the live one and passing against a stale value.
+        // Column 0 only (no `trim()`): the live definition starts its line, while a
+        // `#define` quoted inside a comment sits behind the block's ` * ` or is
+        // indented — so prose ABOUT a bump can't read as a stray second definition
+        // and turn the duplicate rule into a false positive.
         let defined: Vec<&str> = HEADER
             .lines()
-            .filter_map(|l| l.trim().strip_prefix("#define MYOTIS_ABI_VERSION"))
+            .filter_map(|l| l.strip_prefix("#define MYOTIS_ABI_VERSION"))
             .filter(|rest| rest.starts_with(char::is_whitespace))
             .filter_map(|rest| rest.split_whitespace().next())
             .collect();
