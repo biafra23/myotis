@@ -40,6 +40,15 @@ class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBack
     }
     override fun call(from: ByteArray?, to: ByteArray, data: ByteArray, valueWei: String?, block: String): ByteArray? =
         v.call(from, to, data, valueWei, block)
+
+    override fun callWithOverrides(
+        from: ByteArray?,
+        to: ByteArray,
+        data: ByteArray,
+        valueWei: String?,
+        block: String,
+        stateOverridesJson: String,
+    ): ByteArray? = v.callWithOverrides(from, to, data, valueWei, block, stateOverridesJson)
     override fun getBalance(address: ByteArray, block: String): String? = v.getBalance(address, block)
     override fun getTransactionCount(address: ByteArray, block: String): Long? = v.getTransactionCount(address, block)
     override fun getCode(address: ByteArray, block: String): ByteArray? = v.getCode(address, block)

@@ -34,6 +34,35 @@ public interface VerifiedReads {
      */
     byte[] call(byte[] from, byte[] to, byte[] data, String valueWei, String block);
 
+    /**
+     * {@link #call} with the JSON-RPC {@code eth_call} STATE OVERRIDE object
+     * (the third parameter) as JSON — caller-supplied code/balance/nonce/storage
+     * layered over verified state for this call only.
+     *
+     * <p>The answer is NOT a chain fact: it is what the call would return under
+     * the caller's own hypothesis, over state that is itself verified. Hosts
+     * therefore record it separately from a plain verified read.
+     *
+     * <p>Default: {@code null} — "this engine cannot apply overrides". Returning
+     * null rather than ignoring the parameter is deliberate; answering without
+     * the overrides would be a well-formed result computed against different
+     * state than the caller asked about, which they cannot detect (see the
+     * apply-or-refuse rule in CLAUDE.md).
+     *
+     * @param stateOverridesJson the override object as JSON; null/empty ⇒ none
+     * @return ABI return bytes, or null when unanswerable (including "overrides
+     *     unsupported by this engine")
+     */
+    default byte[] callWithOverrides(
+            byte[] from,
+            byte[] to,
+            byte[] data,
+            String valueWei,
+            String block,
+            String stateOverridesJson) {
+        return null;
+    }
+
     /** Balance in decimal wei, or null. */
     String getBalance(byte[] address, String block);
 

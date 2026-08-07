@@ -127,6 +127,20 @@ class RpcRouter(
         return stateOverride || blockOverride
     }
 
+    /** The `stateOverride` object (params[2]) as JSON when it would change
+     *  execution, else null. Keyed BY ADDRESS, so a map whose entries are all
+     *  empty changes nothing and is not an override. */
+    private fun stateOverrideJson(root: JsonObject): String? {
+        val ov = root.params()?.getOrNull(2) as? JsonObject ?: return null
+        if (ov.values.none { (it as? JsonObject)?.isNotEmpty() == true }) return null
+        return json.encodeToString(JsonObject.serializer(), ov)
+    }
+
+    /** `blockOverrides` (params[3]) — NOT applied by this node, so its presence
+     *  forces the refusal path even when the state override could be served. */
+    private fun blockOverridePresent(root: JsonObject): Boolean =
+        (root.params()?.getOrNull(3) as? JsonObject)?.isNotEmpty() == true
+
     /** The methods whose override parameters this node does not apply. */
     private fun takesOverrides(method: String?): Boolean =
         method == "eth_call" || method == "eth_estimateGas"
@@ -179,7 +193,16 @@ class RpcRouter(
         val t0 = TimeSource.Monotonic.markNow()
         val verified = tryVerified(method, id, root)
         if (verified != null) {
-            logger.record(method!!, idStr, "VERIFIED", elapsedMs(t0))
+            // Label the answer for what it IS. A served override ran over
+            // verified state but under the CALLER'S hypothesis, so it is not a
+            // chain fact; counting it as VERIFIED would overstate what this node
+            // proved in the coverage map. Only a request that carried an
+            // applicable override can have been served with one — a refusal
+            // returns null above.
+            val label =
+                if (takesOverrides(method) && stateOverrideJson(root) != null) "SIMULATED"
+                else "VERIFIED"
+            logger.record(method!!, idStr, label, elapsedMs(t0))
             return verified
         }
         val m = method ?: "request"
@@ -279,12 +302,19 @@ class RpcRouter(
 
             "eth_call" -> {
                 val p = root.params()
-                // Overrides we do not apply: refuse to answer from unmodified
-                // state. `null` here is the file's existing "can't serve this
-                // verified" signal, so a dev proxy still gets its chance —
-                // proxy mode is unverified by construction and the upstream
-                // DOES apply the override, which is the correct answer.
-                if (hasUnsupportedOverride(root)) return null
+                // An override the ENGINE can apply is served (and labelled
+                // SIMULATED below); one it cannot is `null` here — the file's
+                // existing "can't serve this verified" signal — so a dev proxy
+                // still gets its chance, and strict mode answers -32602.
+                // Never answer an override-bearing call from unmodified state:
+                // that is a well-formed result to a different question.
+                // blockOverrides are never applied, so their presence refuses on
+                // its own — regardless of whether a state override accompanies
+                // them (checking only the pair would serve a blockOverrides-only
+                // request against an unmodified block context: a well-formed
+                // answer to a different question, the very defect this closes).
+                if (blockOverridePresent(root)) return null
+                val overrideJson = stateOverrideJson(root)
                 val callObj = p?.getOrNull(0) as? JsonObject ?: return null
                 val to = callObj["to"]?.asHexBytes() ?: return null   // contract creation (to=null) -> proxy
                 // The caller (msg.sender). Absent/null -> anonymous (backend uses the
@@ -306,7 +336,13 @@ class RpcRouter(
                 } else null
                 val block = p.blockTag(1)
                 // VerifiedReads takes wei as a decimal string (FFI-neutral boundary).
-                val out = withContext(rpcIoDispatcher) { b.call(from, to, data, value, block) } ?: return null
+                val out = withContext(rpcIoDispatcher) {
+                    if (overrideJson != null) {
+                        b.callWithOverrides(from, to, data, value, block, overrideJson)
+                    } else {
+                        b.call(from, to, data, value, block)
+                    }
+                } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexData(out)))
             }
             "eth_getBalance" -> {
@@ -562,7 +598,7 @@ class RpcRouter(
             }
             "eth_estimateGas" -> {
                 val p = root.params()
-                if (hasUnsupportedOverride(root)) return null
+                if (hasUnsupportedOverride(root)) return null   // estimateGas: not wired yet
                 val callObj = p?.getOrNull(0) as? JsonObject ?: return null
                 val from = (callObj["from"]?.takeUnless { it is JsonNull })?.let { it.asHexBytes() ?: return null }
                 // to=null is contract creation — supported (estimates the deploy).

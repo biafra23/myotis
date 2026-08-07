@@ -166,6 +166,31 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public byte[] callWithOverrides(
+            byte[] from,
+            byte[] to,
+            byte[] data,
+            String valueWei,
+            String block,
+            String stateOverridesJson) {
+        if (!isServableBlock(block)) return null;
+        if (to == null || to.length != 20) return null;
+        if (from != null && from.length != 20) return null;
+        try {
+            return handle.ethCallVerifiedWithOverrides(
+                    from == null ? "" : toHex(from),
+                    toHex(to),
+                    data == null ? "" : toHex(data),
+                    valueWei == null ? "" : valueWei,
+                    block,
+                    stateOverridesJson == null ? "" : stateOverridesJson);
+        } catch (RuntimeException e) {
+            log.debug("[engines] verified eth_call (overrides) unavailable: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    @Override
     public byte[] call(byte[] from, byte[] to, byte[] data, String valueWei, String block) {
         if (!isServableBlock(block)) return null;
         if (to == null || to.length != 20) return null;        // 'to' is required

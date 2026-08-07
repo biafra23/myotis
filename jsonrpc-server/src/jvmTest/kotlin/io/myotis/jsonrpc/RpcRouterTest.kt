@@ -29,8 +29,44 @@ class RpcRouterTest {
     private val json = Json { ignoreUnknownKeys = true }
 
     /** Configurable fake; records the last eth_call args so we can assert decoding. */
+    @Test fun ethCall_withOverride_isServedByAnOverrideCapableBackend_andLabelledSimulated() {
+        val b = FakeBackend(callResult = byteArrayOf(0x2a), applyOverrides = true)
+        val logger = MethodLogger()
+        val resp = runBlocking {
+            RpcRouter(null, logger, VerifiedReadsBackend(b)).handle(
+                """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+                   "params":[{"to":"0x0000000000000000000000000000000000696969","data":"0x24b6b1a5"},
+                             "latest",
+                             {"0x0000000000000000000000000000000000696969":{"code":"0x6080"}}]}""")
+        }
+        assertEquals("0x2a", result(resp))
+        assertTrue(b.lastOverrides!!.contains("0x6080"))   // reached the backend verbatim
+        assertNull(b.lastTo)                               // via the override path, not the plain one
+        // Counted as SIMULATED, not VERIFIED: the state underneath was proven,
+        // but the answer is the caller's hypothesis, not a chain fact.
+        val cov = logger.coverage()["eth_call"]!!.jsonObject
+        assertEquals(1, cov["simulated"]!!.jsonPrimitive.content.toInt())
+        assertEquals(0, cov["verified"]!!.jsonPrimitive.content.toInt())
+    }
+
+    @Test fun ethCall_withoutOverride_staysVerified() {
+        val b = FakeBackend(callResult = byteArrayOf(0x2a), applyOverrides = true)
+        val logger = MethodLogger()
+        runBlocking {
+            RpcRouter(null, logger, VerifiedReadsBackend(b)).handle(
+                """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+                   "params":[{"to":"0x00000000219ab540356cBB839Cbe05303d7705Fa","data":"0xabcd"},"latest"]}""")
+        }
+        val cov = logger.coverage()["eth_call"]!!.jsonObject
+        assertEquals(1, cov["verified"]!!.jsonPrimitive.content.toInt())
+        assertEquals(0, cov["simulated"]!!.jsonPrimitive.content.toInt())
+    }
+
     private class FakeBackend(
         var callResult: ByteArray? = null,
+        /** When true this fake CAN apply overrides (the engine-backed case);
+         *  when false it inherits the interface default (null = unsupported). */
+        private val applyOverrides: Boolean = false,
         var balance: BigInteger? = null,
         var nonce: Long? = null,
         var head: Long? = 0x100,
@@ -50,10 +86,19 @@ class RpcRouterTest {
         override fun headBlockNumber() = head
         var syncStateValue = io.myotis.api.SyncState.SYNCED
         override fun syncState() = syncStateValue
+        var lastOverrides: String? = null
+
         override fun call(from: ByteArray?, to: ByteArray, data: ByteArray,
                           valueWei: String?, block: String): ByteArray? {
             lastFrom = from; lastTo = to; lastData = data
             lastValue = valueWei?.let { BigInteger(it) }; lastBlock = block
+            return callResult
+        }
+        override fun callWithOverrides(from: ByteArray?, to: ByteArray, data: ByteArray,
+                                       valueWei: String?, block: String,
+                                       stateOverridesJson: String): ByteArray? {
+            if (!applyOverrides) return null   // the interface default: unsupported
+            lastOverrides = stateOverridesJson
             return callResult
         }
         override fun getBalance(address: ByteArray, block: String): String? = balance?.toString()

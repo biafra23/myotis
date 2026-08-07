@@ -249,6 +249,23 @@ final class RustEngineNative {
                 handle, nz(from), nz(to), nz(data), nz(value), nz(block));
     }
 
+    /**
+     * {@link #nativeEthCallJson} with the {@code eth_call} state-override object
+     * as JSON (empty ⇒ none). The result is a SIMULATION over verified state,
+     * not a chain fact.
+     */
+    static String nativeEthCallOverridesJson(
+            long handle,
+            String from,
+            String to,
+            String data,
+            String value,
+            String block,
+            String stateOverrides) {
+        return Myotis_engineKt.ethCallOverridesJson(
+                handle, nz(from), nz(to), nz(data), nz(value), nz(block), nz(stateOverrides));
+    }
+
     /** Verified {@code eth_estimateGas} over the revm executor, as JSON. */
     static String nativeEstimateGasJson(
             long handle, String from, String to, String data, String value) {

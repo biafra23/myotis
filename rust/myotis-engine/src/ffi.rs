@@ -167,6 +167,23 @@ pub fn eth_call_json(
     crate::host::eth_call_json(handle, &from, &to, &data, &value, &block)
 }
 
+/// [`eth_call_json`] with an `eth_call` STATE OVERRIDE object (the JSON-RPC
+/// third parameter) as a JSON string; empty ⇒ none. The overrides are the
+/// caller's hypothesis layered over verified state for this call only, so the
+/// answer is not a chain fact — hosts log it under a distinct label.
+#[uniffi::export]
+pub fn eth_call_overrides_json(
+    handle: i64,
+    from: String,
+    to: String,
+    data: String,
+    value: String,
+    block: String,
+    state_overrides: String,
+) -> String {
+    crate::host::eth_call_overrides_json(handle, &from, &to, &data, &value, &block, &state_overrides)
+}
+
 /// Verified `eth_estimateGas` over the revm executor (verified head; no block arg).
 #[uniffi::export]
 pub fn estimate_gas_json(
