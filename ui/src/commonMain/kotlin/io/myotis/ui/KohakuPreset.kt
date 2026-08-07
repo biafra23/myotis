@@ -1,5 +1,8 @@
 package io.myotis.ui
 
+import kotlin.jvm.JvmOverloads
+import kotlin.jvm.JvmStatic
+
 /**
  * The shipped watch-list preset behind the "Log index (Kohaku contracts)"
  * toggle: the privacy contracts the Kohaku wallet libraries cold-sync from
