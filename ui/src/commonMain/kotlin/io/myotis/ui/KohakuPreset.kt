@@ -37,12 +37,24 @@ object KohakuPreset {
             // reconstruct balances or withdraw. Captured from a live Kohaku
             // session on 2026-08-07: 24 eth_getLogs for the ETH pool and 18
             // each for the two stable pools, none of which this node indexed.
-            // All three deploy in the same block (Kohaku's
-            // privacyPools/config.ts). The stable pools are commented out in
-            // that config yet still queried, so they are included here too.
-            Watch("0x644d5A2554d36e27509254F32ccfeBe8cd58861f", 8_587_019, "Privacy Pools ETH pool"),
-            Watch("0x6709277E170DEe3E54101cDb73a450E392ADfF54", 8_587_019, "Privacy Pools USDT pool"),
-            Watch("0x0b062Fe33c4f1592D8EA63f9a0177FcA44374C0f", 8_587_019, "Privacy Pools USDC pool"),
+            // The stable pools are commented out in Kohaku's own
+            // privacyPools/config.ts yet still queried, so they are here too.
+            //
+            // fromBlock DELIBERATELY UNDERSHOOTS. Kohaku's config gives
+            // deploymentBlock 8,587,019 for all three, but a from_block is a
+            // TRUST ASSERTION, not a hint: `LogIndex::query` clamps its
+            // coverage requirement to it (`need_from = max(filter.from, entry
+            // .from)`), so a value LATER than the real deployment makes the
+            // index answer without the earlier part being covered — events
+            // vanish with no error, and a wallet reads that as "no events".
+            // Undershooting cannot lie (no logs exist below deployment) and is
+            // nearly free: the backfill already descends to 5,594,611 for the
+            // tornado registries, so an earlier from_block adds no blocks to
+            // the walk, only bloom probes. Anchored on the entrypoint's own
+            // block, which these pools belong to.
+            Watch("0x644d5A2554d36e27509254F32ccfeBe8cd58861f", 8_461_453, "Privacy Pools ETH pool"),
+            Watch("0x6709277E170DEe3E54101cDb73a450E392ADfF54", 8_461_453, "Privacy Pools USDT pool"),
+            Watch("0x0b062Fe33c4f1592D8EA63f9a0177FcA44374C0f", 8_461_453, "Privacy Pools USDC pool"),
         ),
     )
 
