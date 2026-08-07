@@ -94,15 +94,15 @@ class IosRpcBackend(
         return ByteArray(32).also { raw.copyInto(it, 32 - raw.size) }
     }
 
-    override fun call(from: ByteArray?, to: ByteArray, data: ByteArray, valueWei: String?, block: String): ByteArray? {
+    override fun call(from: ByteArray?, to: ByteArray?, data: ByteArray, valueWei: String?, block: String): ByteArray? {
         if (!isServableBlock(block)) return null
-        if (to.size != 20) return null
+        if (to != null && to.size != 20) return null   // null = contract creation
         if (from != null && from.size != 20) return null
         val handle = handleProvider() ?: return null
         val o = resultOrNull(RustEngine.ethCallJson(
             handle,
             from?.let(::hex) ?: "",  // empty = anonymous zero sender
-            hex(to),
+            to?.let(::hex) ?: "",   // empty = contract creation
             if (data.isEmpty()) "" else hex(data),
             valueWei ?: "",
             block,
@@ -117,20 +117,20 @@ class IosRpcBackend(
 
     override fun callWithOverrides(
         from: ByteArray?,
-        to: ByteArray,
+        to: ByteArray?,
         data: ByteArray,
         valueWei: String?,
         block: String,
         stateOverridesJson: String,
     ): ByteArray? {
         if (!isServableBlock(block)) return null
-        if (to.size != 20) return null
+        if (to != null && to.size != 20) return null   // null = contract creation
         if (from != null && from.size != 20) return null
         val handle = handleProvider() ?: return null
         val o = resultOrNull(RustEngine.ethCallOverridesJson(
             handle,
             from?.let(::hex) ?: "",  // empty = anonymous zero sender
-            hex(to),
+            to?.let(::hex) ?: "",   // empty = contract creation
             if (data.isEmpty()) "" else hex(data),
             valueWei ?: "",
             block,

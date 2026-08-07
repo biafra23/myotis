@@ -384,7 +384,11 @@ class RpcRouter(
                 if (stateOverrideParam(root) is OverrideParam.Malformed) return null
                 val overrideJson = stateOverrideJson(root)
                 val callObj = p?.getOrNull(0) as? JsonObject ?: return null
-                val to = callObj["to"]?.asHexBytes() ?: return null   // contract creation (to=null) -> proxy
+                // `to` absent or null is CONTRACT CREATION — the calldata is init
+                // code and its return data is the answer (the deployless Deploy
+                // form). Present-but-malformed is still a refusal.
+                val toElement = callObj["to"]?.takeUnless { it is JsonNull }
+                val to = if (toElement != null) (toElement.asHexBytes() ?: return null) else null
                 // The caller (msg.sender). Absent/null -> anonymous (backend uses the
                 // zero-address default); present-but-malformed -> proxy. Threading this
                 // is what lets a wallet's confirm-screen simulation of a sender-gated

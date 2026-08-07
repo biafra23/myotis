@@ -140,8 +140,34 @@ impl EvmExecutor {
     ) -> Result<Vec<u8>, EvmError> {
         self.call_capped_with(
             Address::from(sender),
-            target,
+            Some(target),
             calldata,
+            value,
+            ctx,
+            PREFETCH_ITERATION_CAP,
+            overrides,
+        )
+    }
+
+    /// `eth_call` with NO `to` — contract creation. The init code runs and its
+    /// return data is the answer, exactly as geth answers a `to`-less call.
+    ///
+    /// This is the second way wallets run a helper contract they never deploy
+    /// (Ambire's deployless `Deploy` mode; the first is a state override). A
+    /// node that serves only one of the two forces the wallet's build-time
+    /// choice to match, which is not a choice we should be making for it.
+    pub fn create_view(
+        &self,
+        sender: [u8; 20],
+        init_code: &[u8],
+        value: U256,
+        ctx: &BlockContext,
+        overrides: StateOverrides,
+    ) -> Result<Vec<u8>, EvmError> {
+        self.call_capped_with(
+            Address::from(sender),
+            None,
+            init_code,
             value,
             ctx,
             PREFETCH_ITERATION_CAP,
@@ -169,7 +195,7 @@ impl EvmExecutor {
     fn execute(
         &self,
         caller: Address,
-        target: [u8; 20],
+        target: Option<[u8; 20]>,
         calldata: &[u8],
         value: U256,
         ctx: &BlockContext,
@@ -207,7 +233,7 @@ impl EvmExecutor {
         db: &OracleDatabase,
         spec: revm::primitives::hardfork::SpecId,
         caller: Address,
-        target: [u8; 20],
+        target: Option<[u8; 20]>,
         calldata: &[u8],
         value: U256,
         ctx: &BlockContext,
@@ -226,7 +252,15 @@ impl EvmExecutor {
 
         let tx = TxEnv::builder()
             .caller(caller)
-            .kind(TxKind::Call(Address::from(target)))
+            // `None` ⇒ CONTRACT CREATION: `eth_call` with no `to`, where the
+            // "constructor" runs and its RETURN DATA is the answer. Wallets use
+            // this to run a helper contract they never deploy (Ambire's
+            // deployless Deploy mode), which is the same job as a state
+            // override by another route.
+            .kind(match target {
+                Some(to) => TxKind::Call(Address::from(to)),
+                None => TxKind::Create,
+            })
             .value(value)
             .data(calldata.to_vec().into())
             .gas_limit(VIEW_CALL_GAS)
@@ -275,14 +309,14 @@ impl EvmExecutor {
         ctx: &BlockContext,
         cap: usize,
     ) -> Result<Vec<u8>, EvmError> {
-        self.call_capped_with(caller, target, calldata, value, ctx, cap, StateOverrides::new())
+        self.call_capped_with(caller, Some(target), calldata, value, ctx, cap, StateOverrides::new())
     }
 
     #[allow(clippy::too_many_arguments)]
     fn call_capped_with(
         &self,
         caller: Address,
-        target: [u8; 20],
+        target: Option<[u8; 20]>,
         calldata: &[u8],
         value: U256,
         ctx: &BlockContext,
@@ -295,8 +329,11 @@ impl EvmExecutor {
         // Prime the target's account + code synchronously (sentinel OFF, not
         // access-tracked — Java parity) so iteration 0 executes real top-level
         // code instead of a sentinel empty account.
-        if let Some(acc) = db.basic_ref(Address::from(target))? {
-            db.code_by_hash_ref(acc.code_hash)?;
+        // A create has no target account to prime; its code is the calldata.
+        if let Some(to) = target {
+            if let Some(acc) = db.basic_ref(Address::from(to))? {
+                db.code_by_hash_ref(acc.code_hash)?;
+            }
         }
         let _ = db.take_access_set(); // the prime is not part of any snapshot
 
@@ -410,7 +447,7 @@ impl EvmExecutor {
                 return Ok(PLAIN_TRANSFER_GAS);
             }
         }
-        match self.execute(caller, target, calldata, value, ctx)? {
+        match self.execute(caller, Some(target), calldata, value, ctx)? {
             ExecutionResult::Success { gas, .. } => {
                 // The gas-limit base must cover BOTH the gross execution draw
                 // (`total_gas_spent`, before the EIP-3529 refund — so the run never
@@ -551,6 +588,55 @@ mod tests {
         // call sees verified state again. This is the trust-critical property —
         // a hypothesis must not become a "fact" for later calls.
         assert_eq!(U256::from_be_slice(&ex.call_view(TARGET, &[], &c).unwrap()), U256::from(7));
+    }
+
+    /// THE OTHER deployless form (#314 follow-up): `eth_call` with NO `to`,
+    /// where init code runs and its RETURN DATA is the answer. Ambire picks this
+    /// mode whenever a network is flagged `rpcNoStateOverride`, so a node that
+    /// serves only the override form leaves those wallets broken.
+    #[test]
+    fn contract_creation_call_returns_the_constructor_output() {
+        use crate::overrides::StateOverrides;
+        // Init code that returns 42 as its "deployed code" — exactly the shape a
+        // deployless helper uses to hand back an ABI result.
+        // PUSH1 0x2a; PUSH1 0; MSTORE; PUSH1 32; PUSH1 0; RETURN
+        let init = vec![0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let ex = EvmExecutor::new(
+            Arc::new(FixtureSnapStateOracle::new()),
+            Arc::new(NoopStateProofCache),
+            Arc::new(NoopBytecodeCache),
+        );
+        let out = ex
+            .create_view([0u8; 20], &init, U256::ZERO, &ctx(LONDON_BLOCK, CANCUN_TIME), StateOverrides::new())
+            .expect("creation call runs");
+        assert_eq!(U256::from_be_slice(&out), U256::from(42));
+    }
+
+    #[test]
+    fn contract_creation_call_sees_overrides_too() {
+        // The two deployless modes are interchangeable to the caller, so the
+        // create form must honour overrides as well — e.g. init code that reads
+        // another account's storage.
+        use crate::overrides::{AccountOverride, StateOverrides};
+        const OTHER: [u8; 20] = [0x77; 20];
+        // PUSH20 OTHER; EXTCODESIZE; PUSH1 0; MSTORE; PUSH1 32; PUSH1 0; RETURN
+        let mut init = vec![0x73];
+        init.extend_from_slice(&OTHER);
+        init.extend_from_slice(&[0x3b, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+        let ex = EvmExecutor::new(
+            Arc::new(FixtureSnapStateOracle::new()),
+            Arc::new(NoopStateProofCache),
+            Arc::new(NoopBytecodeCache),
+        );
+        let c = ctx(LONDON_BLOCK, CANCUN_TIME);
+        // No override: the account has no code, so size 0.
+        let bare = ex.create_view([0u8; 20], &init, U256::ZERO, &c, StateOverrides::new()).unwrap();
+        assert_eq!(U256::from_be_slice(&bare), U256::ZERO);
+        // With one: the injected code's length.
+        let mut ov = StateOverrides::new();
+        ov.insert(OTHER, AccountOverride { code: Some(vec![0x00; 5]), ..Default::default() });
+        let with = ex.create_view([0u8; 20], &init, U256::ZERO, &c, ov).unwrap();
+        assert_eq!(U256::from_be_slice(&with), U256::from(5));
     }
 
     /// Build an executor whose fixture hosts `code` (and optional slot-0 value) at
@@ -825,7 +911,7 @@ mod tests {
             let spec = spec_for(c.chain_id, c.block_number, c.timestamp).unwrap();
             let db = exec.database_for(&c);
             match exec
-                .execute_with_db(&db, spec, Address::from([0u8; 20]), TARGET, &[], U256::ZERO, &c)
+                .execute_with_db(&db, spec, Address::from([0u8; 20]), Some(TARGET), &[], U256::ZERO, &c)
                 .unwrap()
             {
                 ExecutionResult::Success { output, .. } => output_bytes(output),

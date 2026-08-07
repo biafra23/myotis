@@ -764,8 +764,18 @@ pub fn eth_call_overrides_json(
         Ok(o) => o,
         Err(msg) => return eljson::error_json(&msg),
     };
-    let Some(to) = parse_address(to_hex) else {
-        return eljson::error_json("invalid 'to' address (expected 20-byte hex)");
+    // EMPTY `to` ⇒ contract creation (`eth_call` with no `to`): the calldata is
+    // init code, it runs, and its return data is the answer. Wallets use this
+    // as the second deployless form; serving only the override form would leave
+    // any wallet that picks this one broken.
+    let creation = to_hex.trim().is_empty();
+    let to = if creation {
+        [0u8; 20]
+    } else {
+        match parse_address(to_hex) {
+            Some(a) => a,
+            None => return eljson::error_json("invalid 'to' address (expected 20-byte hex)"),
+        }
     };
     // 'from' is optional: empty → an anonymous zero-address sender.
     let from = if from_hex.trim().is_empty() {
@@ -803,7 +813,11 @@ pub fn eth_call_overrides_json(
     match engine
         .rt
         .block_on(async {
-            reader.eth_call_overridden(from, to, data, value, chain_id, overrides).await
+            if creation {
+                reader.eth_call_create(from, data, value, chain_id, overrides).await
+            } else {
+                reader.eth_call_overridden(from, to, data, value, chain_id, overrides).await
+            }
         })
     {
         Ok(outcome) => eljson::call_json(&outcome),

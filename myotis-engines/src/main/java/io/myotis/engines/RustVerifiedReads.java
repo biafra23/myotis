@@ -179,12 +179,14 @@ final class RustVerifiedReads implements VerifiedReads {
             String block,
             String stateOverridesJson) {
         if (!isServableBlock(block)) return null;
-        if (to == null || to.length != 20) return null;
+        // A NULL `to` is contract creation (eth_call with no `to`), passed to
+        // the engine as an empty string — not an error.
+        if (to != null && to.length != 20) return null;
         if (from != null && from.length != 20) return null;
         try {
             return handle.ethCallVerifiedWithOverrides(
                     from == null ? "" : toHex(from),
-                    toHex(to),
+                    to == null ? "" : toHex(to),
                     data == null ? "" : toHex(data),
                     valueWei == null ? "" : valueWei,
                     block,
@@ -198,7 +200,7 @@ final class RustVerifiedReads implements VerifiedReads {
     @Override
     public byte[] call(byte[] from, byte[] to, byte[] data, String valueWei, String block) {
         if (!isServableBlock(block)) return null;
-        if (to == null || to.length != 20) return null;        // 'to' is required
+        if (to != null && to.length != 20) return null;        // null 'to' = creation
         if (from != null && from.length != 20) return null;    // if present, must be 20 bytes
         try {
             // 'from' empty → anonymous zero sender; the revm executor runs the call
@@ -206,7 +208,7 @@ final class RustVerifiedReads implements VerifiedReads {
             // unverifiable outcome, matching the reference engine).
             return handle.ethCallVerified(
                     from == null ? "" : toHex(from),
-                    toHex(to),
+                    to == null ? "" : toHex(to),
                     data == null ? "" : toHex(data),
                     valueWei == null ? "" : valueWei,
                     block);
