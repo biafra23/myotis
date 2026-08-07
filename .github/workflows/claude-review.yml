@@ -9,13 +9,33 @@
 #      API credits instead, swap the input below for
 #      anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}.
 #
+# Model strategy — Fable 5 first, Opus 5 when its limit is exhausted:
+#   Usage limits are PER MODEL, so an exhausted Fable 5 limit leaves Opus 5
+#   untouched. Fable 5 is the more capable reviewer, so it gets first refusal;
+#   Opus 5 covers the gap instead of the review silently not happening (which
+#   is what did happen on 2026-08-07: the job errored at turn 1 for
+#   total_cost_usd 0, having read nothing and posted nothing).
+#
+#   The retry is safe precisely because that failure mode is all-or-nothing —
+#   the limit is rejected before any inference, so no partial review has been
+#   posted and the second attempt cannot duplicate comments.
+#
+#   NOT --fallback-model: that flag only covers "overloaded or not available".
+#   Verified against a live exhausted limit — it falls back correctly from a
+#   retired model, but a usage-limit rejection does not trigger it.
+#
 # Scope decisions:
 #   - Reviews once per PR (opened / reopened / ready_for_review), NOT on every
 #     push (`synchronize`) — re-run the workflow from the Actions tab (or
-#     close/reopen the PR) for a fresh pass after big changes.
+#     close/reopen the PR) for a fresh pass after big changes. Note a re-run
+#     replays the ORIGINAL commit and workflow file, so it cannot pick up a
+#     workflow change; close/reopen is the way to get a fresh one.
 #   - Drafts are skipped until marked ready.
 #   - Fork PRs are skipped: `pull_request` runs from forks get no secrets, so
 #     the job could only fail there. Same-repo PRs are the review target.
+#   - A PR that edits THIS FILE cannot review itself: the action requires the
+#     workflow to match the default branch and skips (green, but a no-op).
+#     Changes here are only exercised once merged to main.
 name: claude-review
 
 on:
@@ -37,41 +57,43 @@ jobs:
         with:
           fetch-depth: 1
 
-      - uses: anthropics/claude-code-action@v1
+      # Both attempts below send the identical prompt, so it lives in one file
+      # and is assembled once here. GitHub Actions has no YAML anchors, and
+      # duplicating the prompt across two steps would drift.
+      - name: Assemble review prompt
+        id: prompt
+        run: |
+          {
+            echo 'text<<CLAUDE_PROMPT_EOF'
+            echo "REPO: ${{ github.repository }}"
+            echo "PR NUMBER: ${{ github.event.pull_request.number }}"
+            echo
+            cat .github/claude-review-prompt.md
+            echo 'CLAUDE_PROMPT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # First choice. continue-on-error so an exhausted Fable 5 limit falls
+      # through to Opus 5 below instead of failing the job.
+      - name: Review (Fable 5)
+        id: fable
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          prompt: |
-            REPO: ${{ github.repository }}
-            PR NUMBER: ${{ github.event.pull_request.number }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          claude_args: |
+            --model claude-fable-5
+            --effort max
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
-            Review this pull request as an independent reviewer with no prior
-            context. Read CLAUDE.md first and hold the diff against the repo's
-            standing rules, especially:
-            - Trust model: peer data is NEVER trusted — everything must be
-              cryptographically verified (sync-committee signatures + the
-              embedded accumulators are the only trust anchors). Flag any new
-              code path that returns unverified data without saying so.
-            - Data sources: devp2p/libp2p only in production; HTTP to a local
-              client is debugging-only. No trusted-RPC fallbacks.
-            - API boundary: hosts talk ONLY to :myotis-api — engine internals
-              (node-core/networking/consensus types) must not leak into host
-              runtime paths outside the documented exemptions in CLAUDE.md.
-            - Android first: no JVM-only APIs desugaring can't cover, no
-              java.net.http, HTTP via Ktor; Java 17 target unless a module
-              documents why it needs 21.
-            - FFI discipline: the Rust workspace builds panic = "abort" —
-              native-boundary paths must be panic-free by construction.
-
-            Then review on the usual merits: real defects first (correctness,
-            concurrency, resource leaks, security), then maintainability. Rank
-            findings by severity and skip style nits a formatter would catch.
-
-            The PR branch is checked out in the working directory. Use
-            `gh pr comment` for the overall review summary and
-            `mcp__github_inline_comment__create_inline_comment` (with
-            `confirmed: true`) for line-specific findings. Only post GitHub
-            comments — don't leave review text as plain messages.
-
+      # `outcome` is the raw step result (conclusion is masked to success by
+      # continue-on-error), so this fires exactly when Fable 5 failed.
+      - name: Review (Opus 5 — Fable 5 limit exhausted)
+        if: steps.fable.outcome == 'failure'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ steps.prompt.outputs.text }}
           claude_args: |
             --model claude-opus-5
             --effort max
