@@ -165,7 +165,21 @@ fun NodeScreen(
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             Column(Modifier.fillMaxSize().padding(16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Myotis", style = MaterialTheme.typography.headlineSmall)
+                    // Title + version stacked: the version is the first thing to ask for in
+                    // a bug report, so it's on screen everywhere rather than buried in an
+                    // about box. Release builds read "v0.1.4"; anything else carries the
+                    // commit it was built from ("v0.1.4-fbf551"), which is what makes a
+                    // screenshot actionable. Generated — see ui/build.gradle.kts.
+                    // Merged into one semantics node so a screen reader announces
+                    // "Myotis v0.1.4" rather than two unrelated labels.
+                    Column(Modifier.semantics(mergeDescendants = true) {}) {
+                        Text("Myotis", style = MaterialTheme.typography.headlineSmall)
+                        Text(
+                            "v$APP_VERSION",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                     if (chains.isNotEmpty()) {
                         Spacer(Modifier.width(12.dp))
                         NetworkChips(chains, network, engineOf = { snapshots[it]?.engine },

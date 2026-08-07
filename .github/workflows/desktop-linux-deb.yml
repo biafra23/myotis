@@ -52,6 +52,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          # Full history: :ui stamps the app's on-screen version from the nearest
+          # v* tag, and `git describe` needs HEAD's history to REACH that tag.
+          # fetch-tags alone can't do it — at depth 1 HEAD has no parents, so the
+          # tag stays unreachable even once its ref is present. .gitmodules is empty,
+          # so `submodules: recursive` adds nothing on top: the cost is one full
+          # (~150MB) clone per matrix job, on jobs that already build Kotlin + Rust.
+          fetch-depth: 0
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
