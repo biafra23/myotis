@@ -21,9 +21,13 @@ on:
         type: string
 
 # Cancel a superseded run when new commits land on the same branch/PR (both
-# arch jobs are cancelled/restarted together).
+# arch jobs are cancelled/restarted together). The event name is part of the
+# group — like node-binding, and for the same reason: this workflow has a
+# workflow_dispatch trigger that SHARES REFS with push runs, so without it a
+# republish dispatched on a tag ref would cancel that tag's in-flight push run
+# and leave the release with no debs.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -170,8 +174,16 @@ jobs:
   #     built from the dispatched ref are uploaded to a different, existing tag,
   #     so ref-version and target-tag are EXPECTED to disagree. Judging the ref's
   #     own pair here would answer a question nobody asked. Deliberately skipped.
-  # On a push, `inputs` is null, so the second disjunct is false and the first
-  # decides — and `||` short-circuits, so it is never even reached.
+  # On a push there is no `inputs` context; dereferencing a nonexistent property
+  # yields the EMPTY STRING (documented), which loose-compares as 0 against a
+  # `v…` tag name's NaN, so the second disjunct is simply false and the first
+  # decides. (Don't lean on `||` short-circuiting — GitHub documents no
+  # evaluation order, and an undefined named-value would be a template error
+  # rather than something position could protect against.)
+  #
+  # Expression `==` is case-INSENSITIVE while git tags are not, so this gate
+  # alone would also accept release-tag `V0.1.5` on ref `v0.1.5` — guard green,
+  # upload to a different tag. The release job asserts that away in shell below.
   version-guard:
     name: Release version guard
     if: >-
@@ -188,13 +200,20 @@ jobs:
     # Unlike the sibling workflows, this job's condition is BROADER than
     # version-guard's (it also runs on workflow_dispatch), and a skipped `needs:`
     # would otherwise skip it too — killing the manual publish path. So spell the
-    # dependency results out: success-or-skipped guard proceeds, a FAILED guard
-    # still blocks the upload, and a failed/cancelled build still blocks it as
-    # the implicit success() used to.
+    # dependency results out. A FAILED guard always blocks the upload, and a
+    # failed/cancelled build still blocks it as the implicit success() used to.
+    #
+    # 'skipped' is accepted ONLY on workflow_dispatch. On a tag push the guard is
+    # required to have actually SUCCEEDED: this is the one workflow of the five
+    # whose release job doesn't share its `if` with the guard, so it is the only
+    # one where a future mis-gate could silently degrade to an unguarded publish.
+    # Narrowing 'skipped' to the event that legitimately skips makes that fail
+    # closed instead.
     if: >-
       !cancelled()
       && needs.build.result == 'success'
-      && (needs.version-guard.result == 'success' || needs.version-guard.result == 'skipped')
+      && (needs.version-guard.result == 'success'
+          || (needs.version-guard.result == 'skipped' && github.event_name == 'workflow_dispatch'))
       && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
@@ -219,6 +238,7 @@ jobs:
           # like `x"; curl … | sh; #` would execute — and the shape check below
           # runs far too late to stop that, since bash has already parsed it.
           RELEASE_TAG_INPUT: ${{ inputs.release-tag }}
+          GUARD_RESULT: ${{ needs.version-guard.result }}
         run: |
           set -eu
           # Tag ref on push; explicit input on manual dispatch.
@@ -231,6 +251,18 @@ jobs:
           # to gh, so a stray value (e.g. leading '-') can't be parsed as a flag.
           printf '%s' "$tag" | grep -Eq '^v[A-Za-z0-9._-]+$' \
             || { echo "::error::'$tag' is not a valid release tag (expected v<version>)"; exit 1; }
+          # When the version guard RAN, it validated GITHUB_REF_NAME — so its
+          # green verdict only covers an upload to that same tag. Assert that
+          # identity here, in shell, where the comparison is case-SENSITIVE like
+          # git itself: the expression that gates the guard is not (GitHub
+          # ignores case in `==`), so release-tag 'V0.1.5' on ref 'v0.1.5' would
+          # otherwise run the guard against v0.1.5 and then publish to the
+          # distinct tag V0.1.5 — creating it — under a green check.
+          # Guard skipped (the backfill) => no verdict to over-claim, inert.
+          if [ "${GUARD_RESULT}" = "success" ] && [ "$tag" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::the version guard validated '${GITHUB_REF_NAME}' but this job would publish to '$tag'; refusing to trade on a verdict that does not cover this tag (differs only by case?)"
+            exit 1
+          fi
           # Fail loudly if either arch deb is missing rather than shipping a
           # half release (e.g. one matrix job was cancelled).
           for arch in x64 arm64; do
