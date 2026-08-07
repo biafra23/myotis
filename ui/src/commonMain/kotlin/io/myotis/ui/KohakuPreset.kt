@@ -31,6 +31,30 @@ object KohakuPreset {
             Watch("0xD6663593E71e4916eCb6f6606e1A6FbfA1634ffA", 5_594_660, "Tornado relayer registry"), // tornado relayer registry
             Watch("0xeCFCf3b4eC647c4Ca6D49108b311b7a7C9543fea", 5_784_774, "Railgun proxy"), // railgun proxy
             Watch("0x34A2068192b1297f2a7f85D7D8CdE66F8F0921cB", 8_461_453, "Privacy Pools entrypoint"), // privacy-pools entrypoint
+            // The POOL contracts, not just the entrypoint: a wallet rebuilding
+            // its Privacy Pools state scans the pools themselves (that is where
+            // the commitment events live), and refusing them left it unable to
+            // reconstruct balances or withdraw. Captured from a live Kohaku
+            // session on 2026-08-07: 24 eth_getLogs for the ETH pool and 18
+            // each for the two stable pools, none of which this node indexed.
+            // The stable pools are commented out in Kohaku's own
+            // privacyPools/config.ts yet still queried, so they are here too.
+            //
+            // fromBlock DELIBERATELY UNDERSHOOTS. Kohaku's config gives
+            // deploymentBlock 8,587,019 for all three, but a from_block is a
+            // TRUST ASSERTION, not a hint: `LogIndex::query` clamps its
+            // coverage requirement to it (`need_from = max(filter.from, entry
+            // .from)`), so a value LATER than the real deployment makes the
+            // index answer without the earlier part being covered — events
+            // vanish with no error, and a wallet reads that as "no events".
+            // Undershooting cannot lie (no logs exist below deployment) and is
+            // nearly free: the backfill already descends to 5,594,611 for the
+            // tornado registries, so an earlier from_block adds no blocks to
+            // the walk, only bloom probes. Anchored on the entrypoint's own
+            // block, which these pools belong to.
+            Watch("0x644d5A2554d36e27509254F32ccfeBe8cd58861f", 8_461_453, "Privacy Pools ETH pool"),
+            Watch("0x6709277E170DEe3E54101cDb73a450E392ADfF54", 8_461_453, "Privacy Pools USDT pool"),
+            Watch("0x0b062Fe33c4f1592D8EA63f9a0177FcA44374C0f", 8_461_453, "Privacy Pools USDC pool"),
         ),
     )
 
