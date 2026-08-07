@@ -153,6 +153,17 @@ android {
                 // several ship identical filenames and the merger rejects duplicates.
                 "META-INF/license/**",
                 "META-INF/com.jaeckel.versions.properties",
+                // JNA's jar carries jnidispatch for every DESKTOP platform. On
+                // Android JNA takes the System.loadLibrary path and reads
+                // lib/<abi>/libjnidispatch.so (added from the aar at the bottom
+                // of this file), never these resources — ~2.2 MB of dead weight.
+                "com/sun/jna/aix-*/**",
+                "com/sun/jna/darwin-*/**",
+                "com/sun/jna/win32-*/**",
+                "com/sun/jna/linux-*/**",
+                "com/sun/jna/freebsd-*/**",
+                "com/sun/jna/openbsd-*/**",
+                "com/sun/jna/sunos-*/**",
             )
             // Multiple netty modules ship the same native-image hint file;
             // metadata-only, take the first.
@@ -183,21 +194,22 @@ kotlin {
     jvmToolchain(21)
 }
 
-// Rewrite every net.java.dev.jna:jna graph edge (transitive jar requests from
-// :myotis-engines and Besu included) to the Android aar variant, so exactly ONE
-// JNA — classes + libjnidispatch.so — lands in the APK. See the jna dependency
-// note below for why neither per-edge nor configuration-wide excludes can do this.
-configurations.all {
-    resolutionStrategy.dependencySubstitution {
-        substitute(module("net.java.dev.jna:jna"))
-            .using(variant(module("net.java.dev.jna:jna:${libs.versions.jna.get()}")) {
-                attributes {
-                    attribute(Attribute.of("artifactType", String::class.java), "aar")
-                }
-            })
-            .because("Android needs the aar variant; jar+aar together fail the duplicate-class check")
-    }
-}
+// JNA reaches the APK in TWO pieces, because no single artifact carries both:
+//   - com.sun.jna.* classes come from the plain jna JAR, transitively via
+//     :myotis-engines and Besu (nothing here declares it directly);
+//   - jni/<abi>/libjnidispatch.so comes from jna-<v>.aar, extracted at the
+//     bottom of this file into jniLibs.
+// The aar cannot just be put on a classpath instead: it carries the same
+// classes as the jar and fails the duplicate-class check.
+//
+// A previous attempt used variant-aware dependency substitution with an
+// `artifactType = "aar"` attribute. That silently matched NO artifact — jna
+// publishes no Gradle Module Metadata (only jna-<v>.pom, <packaging>jar</packaging>),
+// so there is no aar variant to select — and the module resolved with its jar
+// artifact dropped. The APK ended up with NO JNA at all, so the UniFFI bindings
+// died on `NoClassDefFoundError: com.sun.jna.Native`, RustEngineNative reported
+// the engine unavailable, and the "Rust engine" toggle silently fell back to
+// Java. That is what shipped in v0.1.3 and v0.1.4.
 
 dependencies {
     testImplementation("junit:junit:4.13.2")
@@ -233,10 +245,10 @@ dependencies {
     // engine" toggle drives it via NodeService.applyEngineChoice.
     implementation(project(":myotis-engines"))
     // JNA (the UniFFI bindings' loader) arrives transitively via :myotis-engines
-    // and Besu; the substitution above turns those jar edges into the Android
-    // aar variant (classes + libjnidispatch.so), so no direct declaration is
-    // needed here — adding an explicit `@aar` artifact would re-introduce a
-    // duplicate of the substituted artifact and fail the duplicate-class check.
+    // and Besu, supplying com.sun.jna.*. Its ANDROID natives are added separately
+    // at the bottom of this file — see "JNA's Android natives". Do NOT also put
+    // jna-<v>.aar on a classpath here: it carries the same classes and fails the
+    // duplicate-class check.
     // TrueBlocks tx-history scan for the Query tab (documented API-boundary exemption:
     // NodeService reaches the raw connector via SelectorEngine.javaDelegate().debugStack).
     // Java-21 classfiles like :networking — already dexed fine (see libs.versions.toml).
@@ -314,4 +326,101 @@ dependencies {
 // and the committed jniLibs ship as-is. Root build.gradle.kts owns the task.
 tasks.matching { it.name == "preBuild" }.configureEach {
     dependsOn(rootProject.tasks.named("cargoNdkAndroid"))
+}
+
+// === JNA's Android natives =============================================
+// The graph resolves the plain jna JAR, which supplies com.sun.jna.* but
+// carries desktop natives only (win32/darwin/linux/aix). jni/<abi>/libjnidispatch.so
+// — without which JNA cannot dispatch at all — ships exclusively in jna-<v>.aar.
+//
+// Take ONLY the natives from the aar and leave the classes on the jar: putting
+// the aar on a classpath alongside the jar duplicates com.sun.jna.* and fails
+// the duplicate-class check. A detached, non-consumable configuration keeps the
+// aar off every classpath, so this adds files to the APK and changes no
+// dependency resolution.
+val jnaVersion = libs.versions.jna.get()
+
+// The classpath jar and the extracted natives MUST be the same version: JNA's
+// Native.<clinit> compares its own version against the native library's and
+// throws on a major/minor mismatch. The natives below are hard-pinned via
+// artifact-only @aar notation, which bypasses conflict resolution entirely, so
+// without this the jar side would float free — today it lands on the right
+// version only because Besu's BOM happens to constrain jna to the same value.
+// A Besu bump could therefore silently reintroduce the very failure this file
+// exists to prevent (JNA throws, RustEngineNative reports the engine
+// unavailable, the toggle falls back to Java) and CI could not catch it, since
+// it builds the APK but never runs it. Force keeps the two sides equal by
+// construction; to move jna, move the catalog entry.
+configurations.configureEach {
+    resolutionStrategy.force("net.java.dev.jna:jna:$jnaVersion")
+}
+
+val jnaAndroidNatives: Configuration by configurations.creating {
+    isTransitive = false
+    isCanBeConsumed = false
+}
+
+dependencies {
+    jnaAndroidNatives("net.java.dev.jna:jna:$jnaVersion@aar")
+}
+
+// Every ABI that gets libmyotis_engine.so needs a matching libjnidispatch.so,
+// or UniFFI cannot load and that ABI silently falls back to the Java engine.
+//
+// KEEP IN SYNC with `cargo ndk -t ...` in rust/build-android.sh and the
+// cargoNdkAndroid output paths in the root build.gradle.kts — one list, three
+// places. Deliberately a literal rather than a listing of src/main/jniLibs:
+// that directory is cargoNdkAndroid's EXECUTION-time output while this is read
+// at CONFIGURATION time, so the first build after an ABI was added would read
+// the pre-cargo state, omit the new ABI and ship it without a dispatcher — then
+// self-heal on the next build, which is the worst way for this to fail. What
+// actually enforces the invariant is the APK post-condition in
+// .github/workflows/android-apk.yml, which checks the built artifact.
+val shippedAbis = listOf("arm64-v8a", "x86_64")
+
+// aar layout is jni/<abi>/lib*.so; the jniLibs source set wants <abi>/lib*.so.
+// Sync, not Copy: Copy leaves behind files no longer in the spec, so a narrowed
+// abi list (or a jna upgrade dropping one) would keep packaging a stale .so.
+// NOT configuration-cache compatible, knowingly: the `from {}` / `eachFile {}`
+// lambdas capture the build script, so `--configuration-cache` fails the whole
+// build with "cannot serialize Gradle script object references". CC is off
+// project-wide today (nothing sets it in gradle.properties or the Android CI
+// workflow), so this is latent — enabling it for :android-app means moving this
+// into a typed task in buildSrc first, which would also let the jniLibs wiring
+// use AGP's addGeneratedSourceDirectory (a real producer->consumer edge)
+// instead of the preBuild anchor below.
+val extractJnaAndroidNatives = tasks.register<Sync>("extractJnaAndroidNatives") {
+    from(jnaAndroidNatives.elements.map { zipTree(it.single().asFile) }) {
+        shippedAbis.forEach { abi -> include("jni/$abi/**") }
+    }
+    eachFile { path = path.substringAfter("jni/") }
+    includeEmptyDirs = false
+    into(layout.buildDirectory.dir("jna-android-natives"))
+    // Gradle does not warn about include patterns that match nothing, so an ABI
+    // the aar has never carried (riscv64 being the realistic one) would extract
+    // silently to nothing and that ABI would ship an engine with no dispatcher.
+    doLast {
+        val got = destinationDir.listFiles { f: java.io.File -> f.isDirectory }
+            ?.map { it.name }.orEmpty().toSet()
+        val missing = shippedAbis.filterNot { it in got }
+        check(missing.isEmpty()) {
+            "jna-$jnaVersion.aar carries no libjnidispatch.so for $missing — those ABIs " +
+                "would ship libmyotis_engine.so with no JNA dispatcher and silently fall " +
+                "back to the Java engine at runtime."
+        }
+    }
+}
+
+android {
+    sourceSets.getByName("main").jniLibs.srcDir(extractJnaAndroidNatives)
+}
+
+// srcDir(<TaskProvider>) registers the DIRECTORY but does NOT carry a task
+// dependency through AGP's source sets: on a clean build the jniLib merge runs
+// before anything has extracted and the APK silently ships without
+// libjnidispatch.so (incremental builds hide this — the directory is already
+// populated from a previous run). Wire it through the same preBuild hook
+// cargoNdkAndroid uses, which runs ahead of every merge/assemble/bundle path.
+tasks.matching { it.name == "preBuild" }.configureEach {
+    dependsOn(extractJnaAndroidNatives)
 }
