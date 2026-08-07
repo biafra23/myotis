@@ -114,7 +114,17 @@ class RpcRouter(
      *  served normally; clients that always send the parameter must not break. */
     private fun hasUnsupportedOverride(root: JsonObject): Boolean {
         val p = root.params() ?: return false
-        return (2..3).any { (p.getOrNull(it) as? JsonObject)?.isNotEmpty() == true }
+        // params[2] is keyed BY ADDRESS, so a non-empty map is not yet an
+        // override: `{"0x…":{}}` names an account and changes nothing about it.
+        // Refusing that would contradict the rule this gate implements (refuse
+        // what would alter execution, serve what wouldn't), so look one level
+        // deeper. params[3] (blockOverrides) is a flat field map — non-empty
+        // there IS a change.
+        val stateOverride = (p.getOrNull(2) as? JsonObject)
+            ?.values
+            ?.any { (it as? JsonObject)?.isNotEmpty() == true } == true
+        val blockOverride = (p.getOrNull(3) as? JsonObject)?.isNotEmpty() == true
+        return stateOverride || blockOverride
     }
 
     /** The methods whose override parameters this node does not apply. */

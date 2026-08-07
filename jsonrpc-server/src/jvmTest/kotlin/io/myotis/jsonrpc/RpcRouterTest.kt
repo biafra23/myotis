@@ -175,6 +175,10 @@ class RpcRouterTest {
                          {"0x00000000219ab540356cBB839Cbe05303d7705Fa":{"balance":"0x1"}}]}""")
         assertTrue(hasError(resp))
         assertEquals(-32602, errorCode(resp))
+        // The assertion that actually pins the claim: the backend is never
+        // consulted. Without it this would still pass if the gate moved below
+        // tryVerified and the refusal became "estimate, then discard".
+        assertNull(b.lastEstTo)
     }
 
     @Test fun ethCall_withBlockOverrides_isAlsoRefused() {
@@ -215,6 +219,45 @@ class RpcRouterTest {
         assertEquals(-32603, errorCode(resp))   // proxy attempted, upstream unreachable
         assertNull(b.lastTo)                    // never answered from unmodified state
         unreachable.close()
+    }
+
+    @Test fun ethCall_withNullThirdParam_isServedNormally() {
+        // A library that always fills the positional slot sends an explicit
+        // null. Handled today (`as? JsonObject` on JsonNull -> no override), but
+        // unpinned a rewrite to e.g. `getOrNull(2) != null` would break it.
+        val b = FakeBackend(callResult = byteArrayOf(0, 6))
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","data":"0x313ce567"},
+                         "latest",null]}""")
+        assertEquals("0x0006", result(resp))
+    }
+
+    @Test fun ethCall_withOverrideNamingAnAccountButChangingNothing_isServedNormally() {
+        // `{"0x…":{}}` is a non-empty MAP whose only entry changes nothing. The
+        // gate refuses what would alter execution, not what merely mentions an
+        // address.
+        val b = FakeBackend(callResult = byteArrayOf(0, 6))
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","data":"0x313ce567"},
+                         "latest",{"0x0000000000000000000000000000000000696969":{}}]}""")
+        assertEquals("0x0006", result(resp))
+    }
+
+    @Test fun batchElement_withOverride_isRefusedIndividually() {
+        // The gate lives in handleOne, so it applies per element — and a batch is
+        // where a regression would be least visible (MetaMask batches heavily).
+        val b = FakeBackend(callResult = byteArrayOf(0, 6))
+        val resp = route(b,
+            """[{"jsonrpc":"2.0","id":1,"method":"eth_call",
+                "params":[{"to":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","data":"0x313ce567"},"latest"]},
+               {"jsonrpc":"2.0","id":2,"method":"eth_call",
+                "params":[{"to":"0x0000000000000000000000000000000000696969","data":"0x24b6b1a5"},
+                          "latest",{"0x0000000000000000000000000000000000696969":{"code":"0x6080"}}]}]""")
+        val arr = json.parseToJsonElement(resp).jsonArray
+        assertEquals("0x0006", arr[0].jsonObject["result"]!!.jsonPrimitive.content)
+        assertEquals(-32602, arr[1].jsonObject["error"]!!.jsonObject["code"]!!.jsonPrimitive.content.toInt())
     }
 
     @Test fun ethCall_withEmptyOverrideObject_isServedNormally() {
