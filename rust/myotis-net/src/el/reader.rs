@@ -2679,6 +2679,22 @@ impl ElReader {
         value: U256,
         chain_id: u64,
     ) -> Result<CallOutcome, String> {
+        self.eth_call_overridden(from, to, data, value, chain_id, Default::default()).await
+    }
+
+    /// [`Self::eth_call`] with caller-supplied state overrides applied for this
+    /// call only (see `myotis_evm::overrides`). The answer is what the call
+    /// WOULD return under the caller's hypothesis — verified state underneath,
+    /// but not itself a chain fact, so hosts label it distinctly.
+    pub async fn eth_call_overridden(
+        &self,
+        from: Option<[u8; 20]>,
+        to: [u8; 20],
+        data: Vec<u8>,
+        value: U256,
+        chain_id: u64,
+        overrides: myotis_evm::overrides::StateOverrides,
+    ) -> Result<CallOutcome, String> {
         let (ctx, executor) = self.evm_setup(chain_id, "eth_call").await?;
         // Run the SYNCHRONOUS executor off the runtime worker so the oracle's
         // per-fetch `block_on` is a fresh (non-nested) runtime entry.
@@ -2687,7 +2703,7 @@ impl ElReader {
             // ADDRESS, not zero value — so always thread `value` through
             // call_view_from (call_view would force value = 0 and drop it).
             let sender = from.unwrap_or([0u8; 20]);
-            executor.call_view_from(sender, to, &data, value, &ctx)
+            executor.call_view_overridden(sender, to, &data, value, &ctx, overrides)
         })
         .await
         .map_err(|e| format!("eth_call task join error: {e}"))?;

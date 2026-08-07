@@ -163,6 +163,16 @@ Key Gradle modules:
 
 - Peer trusted is never an option everything has to be cryptographically verified
 - The only trust anchors are sync committee signatures and  the embedded pre-Merge historical hashes accumulator and the Bellatrix-era historical roots accumulator
+- **A parameter that can change the answer must be APPLIED or REFUSED — never
+  accepted and silently ignored.** A well-formed result computed against
+  something other than what the caller asked for is indistinguishable from a
+  correct one, so the caller cannot detect it, retry it, or work around it. This
+  is the same rule the log index applies to an out-of-coverage range (an error,
+  never a misleading `[]`). It was learned the hard way: `eth_call` accepted the
+  state-override parameter and dropped it, which silently broke a wallet's
+  account-state reads and cost hours to trace back (#314). When refusing, use a
+  PERMANENT error code (`-32602`) — `-32000` is documented as retryable and a
+  client will spin on it.
 
 ## Data sources
 - the only sources for data are devp2p and libp2p calling a local client via http may only be used for debugging purposes it is not an option for production

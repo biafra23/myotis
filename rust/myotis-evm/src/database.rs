@@ -26,6 +26,7 @@ use myotis_core::trie::EMPTY_CODE_HASH;
 
 use crate::cache::{BytecodeCache, StateProofCache};
 use crate::oracle::{OracleAccount, OracleError, SnapStateOracle};
+use crate::overrides::StateOverrides;
 
 /// The per-call cache (tier 1). Bound to one `OracleDatabase` (one call) and
 /// discarded with it — it holds this call's reads regardless of proof/root and
@@ -104,6 +105,11 @@ pub struct OracleDatabase {
     bytecode_cache: Arc<dyn BytecodeCache>,
     view: Mutex<ViewCache>,
     track: Mutex<Track>,
+    /// Caller-supplied state for THIS call only (see [`crate::overrides`]).
+    /// Consulted ahead of every tier, and never written back to any of them —
+    /// an overridden value is a hypothesis, not a verified fact, and must not
+    /// outlive the call or leak into a cache another call reads.
+    overrides: StateOverrides,
 }
 
 impl OracleDatabase {
@@ -115,6 +121,24 @@ impl OracleDatabase {
         proof_cache: Arc<dyn StateProofCache>,
         bytecode_cache: Arc<dyn BytecodeCache>,
     ) -> OracleDatabase {
+        OracleDatabase::with_overrides(
+            oracle,
+            state_root,
+            proof_cache,
+            bytecode_cache,
+            StateOverrides::new(),
+        )
+    }
+
+    /// As [`Self::new`], with caller-supplied [`StateOverrides`] layered over
+    /// the verified state for this call.
+    pub fn with_overrides(
+        oracle: Arc<dyn SnapStateOracle>,
+        state_root: [u8; 32],
+        proof_cache: Arc<dyn StateProofCache>,
+        bytecode_cache: Arc<dyn BytecodeCache>,
+        overrides: StateOverrides,
+    ) -> OracleDatabase {
         OracleDatabase {
             oracle,
             state_root,
@@ -122,6 +146,7 @@ impl OracleDatabase {
             bytecode_cache,
             view: Mutex::new(ViewCache::default()),
             track: Mutex::new(Track::default()),
+            overrides,
         }
     }
 
@@ -219,14 +244,44 @@ impl DatabaseRef for OracleDatabase {
     type Error = OracleError;
 
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        Ok(self
-            .account(address.into_array())?
-            .as_ref()
-            .map(to_account_info))
+        let addr = address.into_array();
+        let over = self.overrides.get(&addr);
+        // No override: the ordinary verified path, untouched.
+        let Some(over) = over else {
+            return Ok(self.account(addr)?.as_ref().map(to_account_info));
+        };
+        // With an override the account EXISTS even if the chain has no such
+        // account (geth does the same) — otherwise a call to an address that
+        // only exists as a hypothesis could not run at all, which is exactly
+        // the deployless-helper pattern wallets use.
+        //
+        // A field the caller did not override still comes from verified state,
+        // so the fetch is still needed — except when `code` alone is given for
+        // an absent account, where there is nothing to fall through to.
+        let base = self.account(addr)?;
+        let mut info = base.as_ref().map(to_account_info).unwrap_or_default();
+        if let Some(balance) = over.balance {
+            info.balance = balance;
+        }
+        if let Some(nonce) = over.nonce {
+            info.nonce = nonce;
+        }
+        if let Some(code) = &over.code {
+            // Set BOTH: revm may execute the inline code directly, or resolve it
+            // by hash through `code_by_hash_ref` (which also honours overrides).
+            info.code_hash = B256::from(myotis_core::keccak::keccak256(code));
+            info.code = Some(to_bytecode(code.clone().into()));
+        }
+        Ok(Some(info))
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
         let hash: [u8; 32] = code_hash.0;
+        // An overridden account's code is addressed by ITS keccak, so answer
+        // from the override before any cache or fetch — and never store it.
+        if let Some(code) = self.overrides.code_by_hash(&hash) {
+            return Ok(to_bytecode(code.to_vec().into()));
+        }
         // Empty-code hash → provably empty code, no fetch.
         if hash == EMPTY_CODE_HASH {
             return Ok(Bytecode::default());
@@ -277,6 +332,12 @@ impl DatabaseRef for OracleDatabase {
     }
 
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        // An override may answer authoritatively (a `state` replacement makes
+        // even an unlisted slot provably zero FOR THIS CALL); `None` means the
+        // caller said nothing about this slot, so verified state answers.
+        if let Some(v) = self.overrides.get(&address.into_array()).and_then(|o| o.storage(index)) {
+            return Ok(v);
+        }
         let addr = address.into_array();
         self.track.lock().unwrap().set.slots.insert((addr, index));
         // Tier 1.
