@@ -213,7 +213,8 @@ jobs:
   # Both smoke jobs are manual-only (workflow_dispatch): a 100-minute
   # live-network job is too heavy for every main push, its outcome depends on
   # whether Ethereum peers accept connections from Azure datacenter IPs, and
-  # releases must never gate on it (the release job needs only `build`).
+  # releases must never gate on it (the release job needs `build` and the
+  # version guard — never the smokes).
   smoke-linux:
     # Tag refs excluded: dispatching on a tag is the release-republish path
     # and must not launch the smokes alongside it.

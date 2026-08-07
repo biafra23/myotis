@@ -39,7 +39,10 @@ allprojects {
 // build actually uses) and refuses to publish when the pushed `v*` tag disagrees:
 // otherwise tagging without running the version sweep goes green and ships assets
 // named after the tag while the binaries inside report the older version.
-// See .github/workflows/release-version-guard.yml.
+// See .github/workflows/release-version-guard.yml. This reads the ROOT project's
+// version, which is what the consumers see only because `allprojects` above sets
+// ONE version for the whole build — give a module its own version and it silently
+// stops being covered by the guard.
 //
 // Marker-prefixed output: `./gradlew -q` still lets non-task text reach stdout
 // (wrapper distribution download progress on a cold runner, JVM/plugin warnings),

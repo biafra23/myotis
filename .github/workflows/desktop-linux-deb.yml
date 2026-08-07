@@ -152,13 +152,18 @@ jobs:
 
   # Refuse to publish when the pushed tag disagrees with the version in the tree
   # — the release is named after the tag, while the .deb's packageVersion comes
-  # from project.version. See release-version-guard.yml. Tag pushes ONLY: the
-  # workflow_dispatch path below deliberately uploads assets built from the
-  # dispatched branch tip to an already-existing tag, so its ref and its tag are
-  # expected to disagree and this check does not apply to it.
+  # from project.version. See release-version-guard.yml.
+  #
+  # Tag PUSHES only, hence the explicit event check (the sibling workflows can
+  # gate on the ref alone; this one can't). The workflow_dispatch path below
+  # deliberately uploads assets built from the dispatched ref to a SEPARATE,
+  # already-existing tag given as an input — the guard compares the ref's tag to
+  # the ref's version, which is not the pair that matters there, so it would
+  # either pass vacuously or fail a dispatch it has no business judging. That
+  # path stays deliberately unguarded; see the PR that added this file.
   version-guard:
     name: Release version guard
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/release-version-guard.yml
 
   # Attach both arch debs to the GitHub Release. Runs on `v*` tags (same

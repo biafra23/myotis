@@ -206,8 +206,9 @@ jobs:
   # Refuse to publish when the pushed tag disagrees with the version in the tree
   # — the release is named after the tag, while the .dmg's packageVersion comes
   # from project.version (via the +1-major macOS rule). See
-  # release-version-guard.yml. Runs in parallel with the builds, so a mismatch
-  # surfaces in minutes instead of after both jpackage legs.
+  # release-version-guard.yml. Runs in parallel with the builds, so a mismatch is
+  # REPORTED within minutes rather than after both jpackage legs — Actions has no
+  # cross-job fail-fast, so the legs themselves still run to completion.
   version-guard:
     name: Release version guard
     if: startsWith(github.ref, 'refs/tags/v')
