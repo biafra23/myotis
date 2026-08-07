@@ -133,7 +133,8 @@ jobs:
           echo "::error::DMG build failed after 3 attempts"
           exit 1
 
-      # Compose names both arches' output the same (Myotis-1.0.0.dmg); rename so the
+      # Compose names both arches' output the same (Myotis-<packageVersion>.dmg, derived
+      # from the project version in app-desktop/build.gradle.kts); rename so the
       # downloaded file itself states the architecture, not just the artifact wrapper.
       - name: Tag .dmg with architecture
         run: |
