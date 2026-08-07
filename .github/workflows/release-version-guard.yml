@@ -11,12 +11,27 @@
 # android-apk, ci, desktop-dmg, desktop-linux-deb, node-binding. Each one gates
 # the call on startsWith(github.ref, 'refs/tags/v') and makes its publishing job
 # needs: it, so a mismatch fails the run before anything is uploaded. Because it
-# is a separate job it runs in PARALLEL with the builds — the verdict lands in a
-# couple of minutes instead of after a 40-minute dmg build.
+# is a separate job it runs in PARALLEL with the builds, and the whole step is
+# ~30s, so the verdict lands long before a 40-minute dmg leg. (Those legs still
+# run to completion — Actions has no cross-job fail-fast.)
 #
 # GitHub has no cross-workflow job dependencies, so "one shared guard" means one
 # shared *definition*: this file is the single source of the check, instantiated
 # once per calling workflow.
+#
+# HOW TO EXERCISE IT without waiting for a release, and without publishing
+# anything: a tag push runs the workflow files FROM THE TAGGED COMMIT, so a
+# throwaway tag on any branch tests the real thing. Pick a version the tree
+# cannot match, so the expected outcome is a refusal:
+#
+#     git tag v9.9.9-guardtest && git push origin v9.9.9-guardtest
+#     # expect: this job fails in all five workflows, every publishing job is
+#     #         SKIPPED, and `gh release view v9.9.9-guardtest` finds nothing
+#     git push origin --delete v9.9.9-guardtest && git tag -d v9.9.9-guardtest
+#
+# The opposite direction (a CORRECT tag passes) cannot be rehearsed this way —
+# it publishes a real prerelease — so it is first exercised by an actual
+# release. That is why changes to this guard should land well before one.
 name: Release version guard
 
 on:
