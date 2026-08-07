@@ -790,14 +790,7 @@ impl ElReader {
     /// in-memory progress survives settings pokes; a genuinely changed
     /// watch-list checkpoints the old index before replacing it.
     pub fn set_log_index_config(&self, config: crate::el::logindex::LogIndexConfig) -> bool {
-        // A (re)applied config can replace the index wholesale, which
-        // invalidates both the mapped gap and the tail's record of what it
-        // appended — neither describes the new index's coverage.
         let finalized_now = self.finalized_block_number();
-        self.clear_log_index_bridge();
-        if let Ok(mut t) = self.log_index_tail.lock() {
-            t.clear();
-        }
         // A SUCCESSFUL config apply invalidates the rate anchor: a pacing
         // flip changes the true rate (stale EMA → bogus ETA for minutes) and
         // a watch-list change starts a new walk. Reset on the success paths
@@ -812,15 +805,31 @@ impl ElReader {
         };
         if let Some(ix) = slot.as_mut() {
             if ix.config().fingerprint() == config.fingerprint() {
+                // Same watch-list: the index (and so the mapped gap and the
+                // tail record) still describes this coverage. Toggling enable
+                // or max-speed must not cost a full re-descent and a tail
+                // rewind back to finality.
                 ix.set_enabled(config.enabled);
                 ix.set_max_speed(config.max_speed);
                 reset_rate();
                 return true;
             }
+            // A different watch-list REPLACES the index below, which
+            // invalidates both: neither describes the new coverage.
+            self.clear_log_index_bridge();
+            if let Ok(mut t) = self.log_index_tail.lock() {
+                t.clear();
+            }
             if let Some(p) = self.log_index_path.as_deref() {
                 // Clamped like every other checkpoint: optimistic coverage is
-                // only verifiable against this run's tail record.
-                let _ = ix.persist_clamped(p, finalized_now);
+                // only verifiable against this run's tail record. A zero
+                // finality means no anchor (so nothing optimistic exists) —
+                // clamping there would erase the file.
+                let _ = if finalized_now == 0 {
+                    ix.persist(p)
+                } else {
+                    ix.persist_clamped(p, finalized_now)
+                };
             }
         }
         let loaded = self
@@ -1056,9 +1065,11 @@ impl ElReader {
         // covered top (so the first appended block links to it by parent
         // hash), not merely the blocks still to append.
         let floor = tail_window_floor(edge, recorded.first().map(|(n, _)| *n), finalized);
-        if head_n < floor {
-            // The chain is shorter than what we cover: a reorg, and every
-            // block above the head is orphaned.
+        if !tail_chain_reaches_coverage(head_n, edge) {
+            // The chain no longer reaches our covered top: a reorg shortened
+            // it, and every block above the new head is orphaned. (Comparing
+            // against the window floor here could never fire — the floor sits
+            // at finality whenever the record vouches for the tail.)
             tracing::info!(head_n, covered_high = edge.saturating_sub(1), "log index tail: chain shortened; rewinding");
             self.log_index_rewind_to(head_n);
             if let Ok(mut t) = self.log_index_tail.lock() {
@@ -1066,7 +1077,7 @@ impl ElReader {
             }
             return;
         }
-        let want = head_n - floor + 1;
+        let want = (head_n - floor + 1).min(1024);
         let mut window = Vec::new();
         for peer in peers.iter() {
             match peer.get_block_headers_by_number(head_n, want, 0, true).await {
@@ -1085,6 +1096,17 @@ impl ElReader {
                             break;
                         }
                         verified += 1;
+                    }
+                    let reaches_floor = w
+                        .get(verified - 1)
+                        .is_some_and(|lowest| lowest.header.number <= floor);
+                    if !reaches_floor {
+                        // A window that stops above the floor cannot re-check
+                        // the recorded blocks — comparing against it is the
+                        // disjoint-range mistake all over again, and a peer
+                        // could induce it deliberately. Try another peer.
+                        tracing::debug!(floor, "log index tail: window does not reach the check floor");
+                        continue;
                     }
                     window = w[..verified].to_vec();
                     break;
@@ -1127,12 +1149,24 @@ impl ElReader {
             .collect();
         let mut logs: std::collections::HashMap<u64, Vec<crate::el::logindex::StoredLog>> =
             std::collections::HashMap::new();
-        for chunk in candidate_hashes.chunks(CANDIDATE_CHUNK) {
-            match self.bridge_fetch_logs(&peers[0], chunk).await {
-                Ok(map) => logs.extend(map),
-                Err(e) => {
-                    tracing::debug!(error = %e, "log index tail: candidate fetch failed");
-                    break; // apply the contiguous prefix we do have
+        let mut peer_idx = 0usize;
+        'chunks: for chunk in candidate_hashes.chunks(CANDIDATE_CHUNK) {
+            loop {
+                let Some(peer) = peers.get(peer_idx) else {
+                    break 'chunks; // pool exhausted; apply the prefix we have
+                };
+                match self.bridge_fetch_logs(peer, chunk).await {
+                    Ok(map) => {
+                        logs.extend(map);
+                        break;
+                    }
+                    Err(e) => {
+                        // Rotate rather than stall: a persistently failing
+                        // first peer would otherwise freeze the tail while
+                        // healthy peers sit idle.
+                        tracing::debug!(error = %e, "log index tail: candidate fetch failed");
+                        peer_idx += 1;
+                    }
                 }
             }
         }
@@ -1193,7 +1227,16 @@ impl ElReader {
     fn persist_log_index(&self, finalized: u64) {
         if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
             if let Some(ix) = slot.as_ref() {
-                let _ = ix.persist_clamped(path, finalized);
+                if finalized == 0 {
+                    // No beacon anchor yet. There is no optimistic coverage to
+                    // clamp either (the tail only runs below a real finality),
+                    // and clamping AT ZERO would rewind the whole index and
+                    // rename an empty file over a good checkpoint — losing, on
+                    // a phone, months of backfill. Write it as it stands.
+                    let _ = ix.persist(path);
+                } else {
+                    let _ = ix.persist_clamped(path, finalized);
+                }
             }
         }
     }
@@ -4594,6 +4637,16 @@ fn tail_window_floor(edge: u64, lowest_recorded: Option<u64>, finalized: u64) ->
     floor.max(finalized)
 }
 
+/// Whether a chain whose head is `head_n` still reaches the top of what the
+/// index covers. `false` means a reorg SHORTENED the chain past our coverage,
+/// which is itself proof that the blocks above `head_n` are orphaned. Pure —
+/// unit-tested, because the obvious-looking comparison (against the tail
+/// window's floor) can never fire: the floor sits at finality whenever the
+/// tail record vouches for the coverage.
+fn tail_chain_reaches_coverage(head_n: u64, edge: u64) -> bool {
+    head_n >= edge.saturating_sub(1)
+}
+
 /// The lowest recorded block whose hash the canonical chain contradicts — the
 /// fork point of a reorg. `None` when every recorded block the window covers
 /// still matches (records outside the window are not evidence either way, and
@@ -4709,6 +4762,21 @@ mod tail_reorg_tests {
         assert_eq!(tail_window_floor(1_001, Some(900), 990), 990);
         // A record above the covered top can't widen the window past it.
         assert_eq!(tail_window_floor(1_001, Some(1_100), 990), 1_000);
+    }
+
+    #[test]
+    fn a_shortened_chain_is_detected_against_the_covered_top() {
+        use super::{tail_chain_reaches_coverage, tail_window_floor};
+        // Coverage 991..1000 (edge 1001), finality 990, record intact.
+        let (edge, finalized) = (1_001u64, 990u64);
+        // A head that fell back to 995 no longer reaches the covered top.
+        assert!(!tail_chain_reaches_coverage(995, edge));
+        // The window FLOOR would not have caught this: it sits at finality
+        // whenever the record vouches, so `head < floor` is unreachable here.
+        assert!(995 >= tail_window_floor(edge, Some(991), finalized));
+        // A head at or above the covered top is fine.
+        assert!(tail_chain_reaches_coverage(1_000, edge));
+        assert!(tail_chain_reaches_coverage(1_200, edge));
     }
 
     #[test]

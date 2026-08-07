@@ -218,10 +218,7 @@ pub enum QueryError {
 
 /// The index proper: watch-list, per-entry coverage, and the log store keyed
 /// by (block_number, log_index) so range queries are ordered scans.
-/// `Clone` exists for the clamped checkpoint path (see
-/// [`Self::serialize_clamped`]) — cloning a large index is deliberate there
-/// and happens at most once per checkpoint window.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct LogIndex {
     config: LogIndexConfig,
     coverage: Vec<Coverage>, // parallel to config.watch
@@ -532,12 +529,7 @@ impl LogIndex {
     /// restart, so persisting it would leave a later run holding coverage it
     /// can never re-check.
     pub fn serialize_clamped(&self, max_block: u64) -> Vec<u8> {
-        if self.coverage.iter().all(|c| c.span.is_none_or(|(_, high)| high <= max_block)) {
-            return self.serialize(); // nothing above the clamp — no copy needed
-        }
-        let mut clamped = self.clone();
-        clamped.rewind_above(max_block);
-        clamped.serialize()
+        self.serialize_with_clamp(Some(max_block))
     }
 
     /// [`Self::persist`] with the same clamp as [`Self::serialize_clamped`].
@@ -552,6 +544,15 @@ impl LogIndex {
     }
 
     pub fn serialize(&self) -> Vec<u8> {
+        self.serialize_with_clamp(None)
+    }
+
+    /// The one serializer. `clamp` bounds what is written (see
+    /// [`Self::serialize_clamped`]) and filters DURING the write: the tail
+    /// keeps coverage above finality at all times, so a clamp that cloned the
+    /// index would deep-copy the whole log store on every checkpoint, under
+    /// the index lock, on a 10s cadence.
+    fn serialize_with_clamp(&self, clamp: Option<u64>) -> Vec<u8> {
         let mut out = Vec::with_capacity(64 + self.logs.len() * 200);
         out.extend_from_slice(MAGIC);
         put_u32(&mut out, VERSION);
@@ -560,7 +561,14 @@ impl LogIndex {
         // Coverage spans + cursor.
         put_u32(&mut out, self.coverage.len() as u32);
         for c in &self.coverage {
-            match c.span {
+            // A span whose LOW is above the clamp disappears entirely; one
+            // that straddles it is written with the clamped high.
+            let span = match (c.span, clamp) {
+                (Some((low, _)), Some(max)) if low > max => None,
+                (Some((low, high)), Some(max)) => Some((low, high.min(max))),
+                (span, _) => span,
+            };
+            match span {
                 None => out.push(0),
                 Some((low, high)) => {
                     out.push(1);
@@ -577,9 +585,14 @@ impl LogIndex {
                 out.extend_from_slice(&h);
             }
         }
-        // Logs.
-        put_u64(&mut out, self.logs.len() as u64);
-        for log in self.logs.values() {
+        // Logs (the clamped range is a prefix of the key order, so this is a
+        // bounded scan rather than a filtered copy).
+        let clamped_logs: Vec<&StoredLog> = match clamp {
+            None => self.logs.values().collect(),
+            Some(max) => self.logs.range(..=(max, u32::MAX)).map(|(_, l)| l).collect(),
+        };
+        put_u64(&mut out, clamped_logs.len() as u64);
+        for log in clamped_logs {
             put_u64(&mut out, log.block_number);
             out.extend_from_slice(&log.block_hash);
             out.extend_from_slice(&log.tx_hash);
@@ -837,6 +850,26 @@ mod tests {
         // Nothing above the clamp → byte-identical to a plain serialize.
         assert_eq!(ix.serialize_clamped(14), ix.serialize());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clamping_writes_a_prefix_without_touching_the_live_index() {
+        let cfg = config_ok(vec![watch_all(addr(1), 0)]);
+        let mut ix = LogIndex::new(cfg.clone()).unwrap();
+        for b in 10..=14 {
+            ix.append_block(b, [b as u8; 32], vec![log(b, 0, addr(1), vec![])]).unwrap();
+        }
+        // A span entirely above the clamp disappears; one that straddles it is
+        // written with the clamped high; the live index is untouched either way.
+        let bytes = ix.serialize_clamped(12);
+        let loaded = LogIndex::deserialize(&cfg, &bytes).unwrap();
+        assert_eq!(loaded.coverage_of(&addr(1)).unwrap().span, Some((10, 12)));
+        assert_eq!(loaded.log_count(), 3);
+        assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((10, 14)));
+        assert_eq!(ix.log_count(), 5);
+        let below = LogIndex::deserialize(&cfg, &ix.serialize_clamped(9)).unwrap();
+        assert_eq!(below.coverage_of(&addr(1)).unwrap().span, None);
+        assert_eq!(below.log_count(), 0);
     }
 
     #[test]
