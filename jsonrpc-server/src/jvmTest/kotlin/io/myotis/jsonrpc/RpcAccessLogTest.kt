@@ -27,7 +27,7 @@ class RpcAccessLogTest {
         override fun chainId() = 1L
         override fun headBlockNumber() = 0x1L
         override fun syncState() = io.myotis.api.SyncState.SYNCED
-        override fun call(from: ByteArray?, to: ByteArray, data: ByteArray, valueWei: String?, block: String): ByteArray? = null
+        override fun call(from: ByteArray?, to: ByteArray?, data: ByteArray, valueWei: String?, block: String): ByteArray? = null
         override fun getBalance(address: ByteArray, block: String): String? = null
         override fun getTransactionCount(address: ByteArray, block: String): Long? = null
         override fun getCode(address: ByteArray, block: String): ByteArray? = null

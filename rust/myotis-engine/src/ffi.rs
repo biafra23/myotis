@@ -154,7 +154,9 @@ pub fn get_storage_at_json(handle: i64, address: String, position: String) -> St
 }
 
 /// Verified `eth_call` over the revm executor. `from` empty ⇒ anonymous call;
-/// `value` is wei as a decimal string; `block` is the RPC block tag.
+/// `to` EMPTY ⇒ contract creation (the calldata is init code, its return data
+/// is the answer); `value` is wei as a decimal string; `block` is the RPC block
+/// tag.
 #[uniffi::export]
 pub fn eth_call_json(
     handle: i64,
@@ -168,7 +170,8 @@ pub fn eth_call_json(
 }
 
 /// [`eth_call_json`] with an `eth_call` STATE OVERRIDE object (the JSON-RPC
-/// third parameter) as a JSON string; empty ⇒ none. The overrides are the
+/// third parameter) as a JSON string; empty ⇒ none. An empty `to` selects
+/// contract creation here too. The overrides are the
 /// caller's hypothesis layered over verified state for this call only, so the
 /// answer is not a chain fact — hosts log it under a distinct label.
 #[uniffi::export]

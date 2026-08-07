@@ -37,6 +37,14 @@ interface RpcBackend {
     fun supportsStateOverrides(): Boolean = false
 
     /**
+     * Whether this backend can serve CONTRACT CREATION (`eth_call` with a null
+     * `to`). Consulted BEFORE dispatch: an engine that can't would otherwise be
+     * woken and made to wait for a verified head only to refuse — and the
+     * refusal would read as retryable when it is permanent for that build.
+     */
+    fun supportsContractCreation(): Boolean = false
+
+    /**
      * [call] with the `eth_call` state-override object as JSON — caller-supplied
      * state layered over verified state for this call only.
      *

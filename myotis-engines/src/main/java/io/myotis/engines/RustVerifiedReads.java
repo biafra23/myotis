@@ -166,6 +166,11 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public boolean supportsContractCreation() {
+        return true;   // revm runs the init code (TxKind::Create)
+    }
+
+    @Override
     public boolean supportsStateOverrides() {
         return true;   // the revm executor applies them (myotis_evm::overrides)
     }

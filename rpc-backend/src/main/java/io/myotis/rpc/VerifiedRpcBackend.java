@@ -1989,8 +1989,17 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 && isHeadIntentTag(block)) {
             hotCalls.record(from, to, value, data, clock.elapsedMillis());
         }
+        // Cheap rejections FIRST: verifiedHeadFor can wake the stack and block
+        // on a head build, and this engine cannot serve a null `to` (contract
+        // creation) at all, so paying that cost to refuse is pure waste. Hosts
+        // are expected to consult VerifiedReads.supportsContractCreation() and
+        // not dispatch at all; this is the belt-and-braces half.
+        if (to == null || to.length != 20) {
+            log.info("[rpc] eth_call " + desc + " -> contract creation is not served by this engine");
+            return null;
+        }
         RpcCallContext h = verifiedHeadFor(block);
-        if (h == null || to == null || to.length != 20) {
+        if (h == null) {
             log.info("[rpc] eth_call " + desc + " -> no verified head for block tag");
             return null;
         }

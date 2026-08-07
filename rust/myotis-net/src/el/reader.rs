@@ -2682,10 +2682,6 @@ impl ElReader {
         self.eth_call_overridden(from, to, data, value, chain_id, Default::default()).await
     }
 
-    /// [`Self::eth_call`] with caller-supplied state overrides applied for this
-    /// call only (see `myotis_evm::overrides`). The answer is what the call
-    /// WOULD return under the caller's hypothesis — verified state underneath,
-    /// but not itself a chain fact, so hosts label it distinctly.
     /// `eth_call` with NO `to` — contract creation. The init code runs and its
     /// return data is the answer (the deployless `Deploy` form wallets use).
     pub async fn eth_call_create(
@@ -2710,6 +2706,10 @@ impl ElReader {
         })
     }
 
+    /// [`Self::eth_call`] with caller-supplied state overrides applied for this
+    /// call only (see `myotis_evm::overrides`). The answer is what the call
+    /// WOULD return under the caller's hypothesis — verified state underneath,
+    /// but not itself a chain fact, so hosts label it distinctly.
     pub async fn eth_call_overridden(
         &self,
         from: Option<[u8; 20]>,

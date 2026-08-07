@@ -178,6 +178,15 @@ class RpcRouter(
     private fun blockOverridePresent(root: JsonObject): Boolean =
         (root.params()?.getOrNull(3) as? JsonObject)?.isNotEmpty() == true
 
+    /** True when the request is a contract-creation `eth_call`: `to` absent or
+     *  explicitly null. A present-but-malformed `to` is NOT creation — running
+     *  init code the caller never asked to run would be worse than refusing. */
+    private fun isContractCreation(root: JsonObject): Boolean {
+        val callObj = root.params()?.getOrNull(0) as? JsonObject ?: return false
+        val to = callObj["to"]
+        return to == null || to is JsonNull
+    }
+
     /** The methods that take override parameters. `eth_call` state overrides
      *  are APPLIED when the backend supports them; `blockOverrides` and every
      *  `eth_estimateGas` override are refused. */
@@ -279,6 +288,18 @@ class RpcRouter(
                     logger.record(m, idStr, "ERROR", elapsedMs(t0), -32602)
                     return errorEnvelope(id, -32602, "invalid state override: ${bad.why}")
                 }
+            }
+            // Contract creation this build cannot serve is permanent, not retryable.
+            if (m == "eth_call" && isContractCreation(root) &&
+                backend?.supportsContractCreation() != true
+            ) {
+                logger.record(m, idStr, "ERROR", elapsedMs(t0), -32602)
+                return errorEnvelope(
+                    id,
+                    -32602,
+                    "method 'eth_call' without a 'to' (contract creation) is not supported by " +
+                        "this node's engine",
+                )
             }
             val overrideUnsupported = takesOverrides(m) && hasUnsupportedOverride(root) && (
                 blockOverridePresent(root) ||            // never applied
@@ -389,6 +410,12 @@ class RpcRouter(
                 // form). Present-but-malformed is still a refusal.
                 val toElement = callObj["to"]?.takeUnless { it is JsonNull }
                 val to = if (toElement != null) (toElement.asHexBytes() ?: return null) else null
+                // Ask BEFORE dispatching. On an engine that can't serve creation
+                // (the Java engine is still the default) the call would wake a
+                // paused stack, wait for a verified head, and refuse anyway —
+                // an expensive refusal where there used to be a free one, and
+                // reported as retryable though it is permanent for that build.
+                if (to == null && backend?.supportsContractCreation() != true) return null
                 // The caller (msg.sender). Absent/null -> anonymous (backend uses the
                 // zero-address default); present-but-malformed -> proxy. Threading this
                 // is what lets a wallet's confirm-screen simulation of a sender-gated

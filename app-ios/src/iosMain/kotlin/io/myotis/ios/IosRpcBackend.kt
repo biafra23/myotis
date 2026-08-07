@@ -115,6 +115,8 @@ class IosRpcBackend(
 
     override fun supportsStateOverrides(): Boolean = true   // the revm executor applies them
 
+    override fun supportsContractCreation(): Boolean = true // TxKind::Create
+
     override fun callWithOverrides(
         from: ByteArray?,
         to: ByteArray?,

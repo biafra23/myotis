@@ -91,7 +91,9 @@ char *myotis_eth_call_json(int64_t handle, const char *from, const char *to,
                            const char *block);
 
 /* eth_call with a STATE OVERRIDE object as JSON (empty => none). The answer is
-   a simulation over verified state — the caller's hypothesis, not a chain fact. */
+   a simulation over verified state — the caller's hypothesis, not a chain fact.
+   An EMPTY `to` selects contract creation: the calldata is init code and the
+   constructor's return data is the result. */
 char *myotis_eth_call_overrides_json(int64_t handle, const char *from,
                                      const char *to, const char *data,
                                      const char *value, const char *block,

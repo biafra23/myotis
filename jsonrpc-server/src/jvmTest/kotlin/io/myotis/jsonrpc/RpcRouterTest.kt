@@ -175,6 +175,9 @@ class RpcRouterTest {
         /** When true this fake CAN apply overrides (the engine-backed case);
          *  when false it inherits the interface default (null = unsupported). */
         private val applyOverrides: Boolean = false,
+        /** Whether this fake serves contract creation (the Rust engine does;
+         *  the Java engine does not). */
+        private val serveCreation: Boolean = true,
         var balance: BigInteger? = null,
         var nonce: Long? = null,
         var head: Long? = 0x100,
@@ -203,6 +206,8 @@ class RpcRouterTest {
             return callResult
         }
         override fun supportsStateOverrides(): Boolean = applyOverrides
+
+        override fun supportsContractCreation(): Boolean = serveCreation
 
         override fun callWithOverrides(from: ByteArray?, to: ByteArray?, data: ByteArray,
                                        valueWei: String?, block: String,
@@ -465,6 +470,18 @@ class RpcRouterTest {
         assertEquals("0x09", result(resp))
         assertNull(b.lastTo)                                       // null `to` reached the backend as creation
         assertEquals("0x00", b.lastData!!.toHex())
+    }
+
+    @Test fun ethCall_creation_onABackendThatCannotServeIt_isRefusedWithoutDispatch() {
+        // The Java engine (still the default) cannot serve creation, and asking
+        // it anyway wakes a paused stack and waits for a verified head only to
+        // refuse — an expensive refusal where there used to be a free one, and
+        // reported as retryable though it is permanent for that build.
+        val b = FakeBackend(callResult = byteArrayOf(9), serveCreation = false)
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"data":"0x00"}]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32602, errorCode(resp))   // permanent, not the retryable -32000
+        assertNull(b.lastData)                  // never dispatched
     }
 
     @Test fun ethCall_explicitNullTo_isAlsoCreation() {
