@@ -26,6 +26,14 @@ jobs:
           distribution: temurin
           java-version: "21"
 
+      - name: Set up Rust
+        # Pin to real stable like the sibling Rust workflows — the runner
+        # image's preinstalled rustc lags on its own schedule, keys the cache
+        # to a different compiler, and if it ever fell below the Gradle
+        # probe's floor, cargoBuildHost would silently self-skip and this
+        # workflow would quietly stop exercising the Rust build.
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Cache Rust build
         # The :app build compiles the Rust workspace (cargoBuildHost auto-runs
         # before :app:run); without this cache a cold run eats the whole job
