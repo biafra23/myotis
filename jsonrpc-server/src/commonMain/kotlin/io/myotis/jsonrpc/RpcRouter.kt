@@ -101,13 +101,25 @@ class RpcRouter(
         return if (s.length > 64) s.substring(0, 64) + "…" else s
     }
 
-    /** True when the request carries a NON-EMPTY state-override object (the third
-     *  parameter of `eth_call` / `eth_estimateGas`). An empty object is not an
-     *  override — nothing would change — so it is served normally. */
-    private fun hasStateOverride(root: JsonObject): Boolean {
-        val ov = root.params()?.getOrNull(2) as? JsonObject ?: return false
-        return ov.isNotEmpty()
+    /** True when the request carries a NON-EMPTY override object PAST THE BLOCK
+     *  TAG — `stateOverride` at index 2 or `blockOverrides` at index 3 of
+     *  `eth_call` / `eth_estimateGas`. geth's signature is
+     *  `(args, blockNrOrHash, stateOverride, blockOverrides)`, and this node
+     *  applies neither: `blockOverrides` rewrites number/time/baseFee/prevRandao/
+     *  coinbase, changing the answer exactly the way a state override does, so
+     *  checking only index 2 would leave the same silent-wrong-answer hole open
+     *  for time-warp simulations (vesting cliffs, deadlines, TWAP windows).
+     *
+     *  An EMPTY object is not an override — nothing would change — so it is
+     *  served normally; clients that always send the parameter must not break. */
+    private fun hasUnsupportedOverride(root: JsonObject): Boolean {
+        val p = root.params() ?: return false
+        return (2..3).any { (p.getOrNull(it) as? JsonObject)?.isNotEmpty() == true }
     }
+
+    /** The methods whose override parameters this node does not apply. */
+    private fun takesOverrides(method: String?): Boolean =
+        method == "eth_call" || method == "eth_estimateGas"
 
     /**
      * Handle one request object, returning its complete JSON-RPC response envelope.
@@ -154,28 +166,6 @@ class RpcRouter(
                 errorEnvelope(id, -32603, "status read failed: $detail")
             }
         }
-        // STATE OVERRIDES: refuse, never ignore. `eth_call`/`eth_estimateGas` take an
-        // optional third parameter that replaces code/balance/nonce/storage for the
-        // duration of the call. This node does not apply it — and answering anyway
-        // returns a well-formed result computed against DIFFERENT state than the
-        // caller asked about, with no way for them to tell. That is how a wallet ends
-        // up silently broken: Ambire/Kohaku reads account state through a helper whose
-        // bytecode it injects this way, got `0x` back from us for every such call, and
-        // reported "account state update error" with no idea why (#314).
-        //
-        // The same rule the log index applies to an unindexed range: an honest error
-        // beats a plausible wrong answer. Clients that ask can also adapt — Ambire has
-        // a no-override code path it selects per network.
-        if ((method == "eth_call" || method == "eth_estimateGas") && hasStateOverride(root)) {
-            logger.record(method, idStr, "ERROR", 0, -32000)
-            return errorEnvelope(
-                id,
-                -32000,
-                "method '$method' with state overrides is not supported by this node " +
-                    "(the override was rejected, not ignored — a result computed without " +
-                    "it would answer a different question than you asked)",
-            )
-        }
         val t0 = TimeSource.Monotonic.markNow()
         val verified = tryVerified(method, id, root)
         if (verified != null) {
@@ -189,6 +179,22 @@ class RpcRouter(
             // rejected method, so myotis_rpcCoverage keeps mapping what the wallet needs.
             // -32601 = we don't implement it verified (wallet can stop asking); -32000 =
             // implemented but can't answer right now — no peer / not synced (retryable).
+            // An override-bearing call is PERMANENTLY unanswerable on this build,
+            // so it must not use -32000 — that code is documented (here, and in
+            // the README integrators read) as retryable, and a client backing off
+            // and retrying would spin forever instead of taking the fallback this
+            // refusal exists to unlock. -32602 says what is true: the params are
+            // structurally valid but unsupported, and no retry will change that.
+            if (takesOverrides(m) && hasUnsupportedOverride(root)) {
+                logger.record(m, idStr, "ERROR", elapsedMs(t0), -32602)
+                return errorEnvelope(
+                    id,
+                    -32602,
+                    "method '$m' with state/block overrides is not supported by this node " +
+                        "(the override was rejected, not ignored — a result computed without " +
+                        "it would answer a different question than you asked)",
+                )
+            }
             val code = if (m in VERIFIED_METHODS) -32000 else -32601
             logger.record(m, idStr, "ERROR", elapsedMs(t0), code)
             return if (m in VERIFIED_METHODS) {
@@ -263,6 +269,12 @@ class RpcRouter(
 
             "eth_call" -> {
                 val p = root.params()
+                // Overrides we do not apply: refuse to answer from unmodified
+                // state. `null` here is the file's existing "can't serve this
+                // verified" signal, so a dev proxy still gets its chance —
+                // proxy mode is unverified by construction and the upstream
+                // DOES apply the override, which is the correct answer.
+                if (hasUnsupportedOverride(root)) return null
                 val callObj = p?.getOrNull(0) as? JsonObject ?: return null
                 val to = callObj["to"]?.asHexBytes() ?: return null   // contract creation (to=null) -> proxy
                 // The caller (msg.sender). Absent/null -> anonymous (backend uses the
@@ -540,6 +552,7 @@ class RpcRouter(
             }
             "eth_estimateGas" -> {
                 val p = root.params()
+                if (hasUnsupportedOverride(root)) return null
                 val callObj = p?.getOrNull(0) as? JsonObject ?: return null
                 val from = (callObj["from"]?.takeUnless { it is JsonNull })?.let { it.asHexBytes() ?: return null }
                 // to=null is contract creation — supported (estimates the deploy).

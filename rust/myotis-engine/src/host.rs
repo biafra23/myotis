@@ -742,8 +742,28 @@ pub fn eth_call_json(
     to_hex: &str,
     data_hex: &str,
     value_dec: &str,
-    _block: &str,
+    block: &str,
 ) -> String {
+    eth_call_overrides_json(handle, from_hex, to_hex, data_hex, value_dec, block, "")
+}
+
+/// [`eth_call_json`] with an `eth_call` STATE OVERRIDE object (the JSON-RPC
+/// third parameter) as JSON; empty means none. The overrides are the caller's
+/// hypothesis layered over verified state for this call only — the answer is
+/// not a chain fact, which is why hosts log it under a distinct label.
+pub fn eth_call_overrides_json(
+    handle: i64,
+    from_hex: &str,
+    to_hex: &str,
+    data_hex: &str,
+    value_dec: &str,
+    _block: &str,
+    overrides_json: &str,
+) -> String {
+    let overrides = match parse_state_overrides(overrides_json) {
+        Ok(o) => o,
+        Err(msg) => return eljson::error_json(&msg),
+    };
     let Some(to) = parse_address(to_hex) else {
         return eljson::error_json("invalid 'to' address (expected 20-byte hex)");
     };
@@ -782,11 +802,94 @@ pub fn eth_call_json(
     };
     match engine
         .rt
-        .block_on(async { reader.eth_call(from, to, data, value, chain_id).await })
+        .block_on(async {
+            reader.eth_call_overridden(from, to, data, value, chain_id, overrides).await
+        })
     {
         Ok(outcome) => eljson::call_json(&outcome),
         Err(e) => eljson::error_json(&e),
     }
+}
+
+/// Parse an `eth_call` state-override object (the JSON-RPC third parameter).
+/// Empty/absent ⇒ no overrides. Pure and unit-tested: this decides what state a
+/// call runs against, so a silently mis-parsed field would answer a different
+/// question than the caller asked — the exact failure mode issue #314 is about.
+///
+/// Accepts geth's shape per address: `code`, `balance`, `nonce`, `state`
+/// (full storage replacement) and `stateDiff` (per-slot overlay). An
+/// unrecognised key is an ERROR rather than a silent skip, for the same
+/// reason.
+fn parse_state_overrides(json: &str) -> Result<myotis_evm::overrides::StateOverrides, String> {
+    use myotis_evm::overrides::{AccountOverride, StateOverrides};
+    let mut out = StateOverrides::new();
+    let trimmed = json.trim();
+    if trimmed.is_empty() {
+        return Ok(out);
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(trimmed).map_err(|_| "malformed state override object".to_string())?;
+    let Some(map) = v.as_object() else {
+        return Err("state overrides must be an object keyed by address".to_string());
+    };
+    for (addr_str, entry) in map {
+        let address =
+            parse_address(addr_str).ok_or_else(|| format!("invalid override address {addr_str}"))?;
+        let obj = entry
+            .as_object()
+            .ok_or_else(|| format!("override for {addr_str} must be an object"))?;
+        let mut over = AccountOverride::default();
+        for (k, val) in obj {
+            match k.as_str() {
+                "code" => {
+                    let hex = val.as_str().ok_or("override 'code' must be a hex string")?;
+                    over.code =
+                        Some(parse_hex_bytes(hex).ok_or("override 'code' is not valid hex")?);
+                }
+                "balance" => {
+                    over.balance = Some(parse_u256_hex_or_dec(val)?);
+                }
+                "nonce" => {
+                    let n = parse_u256_hex_or_dec(val)?;
+                    over.nonce = Some(u64::try_from(n).map_err(|_| "override 'nonce' too large")?);
+                }
+                "state" | "stateDiff" => {
+                    let slots = val
+                        .as_object()
+                        .ok_or_else(|| format!("override '{k}' must be an object"))?;
+                    let mut parsed = std::collections::HashMap::new();
+                    for (slot, sv) in slots {
+                        let key = parse_word32(slot).ok_or("override slot is not a 32-byte hex")?;
+                        let sval = parse_word32(
+                            sv.as_str().ok_or("override slot value must be a hex string")?,
+                        )
+                        .ok_or("override slot value is not a 32-byte hex")?;
+                        parsed.insert(U256::from_be_bytes(key), U256::from_be_bytes(sval));
+                    }
+                    if k == "state" {
+                        over.state = Some(parsed);
+                    } else {
+                        over.state_diff = parsed;
+                    }
+                }
+                other => return Err(format!("unsupported state override field '{other}'")),
+            }
+        }
+        out.insert(address, over);
+    }
+    Ok(out)
+}
+
+/// A quantity that may arrive as `0x`-hex or a decimal string (wallets send
+/// both for `balance`/`nonce`).
+fn parse_u256_hex_or_dec(v: &serde_json::Value) -> Result<U256, String> {
+    let s = v.as_str().ok_or("override quantity must be a string")?.trim();
+    let parsed = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        U256::from_str_radix(hex, 16)
+    } else {
+        U256::from_str_radix(s, 10)
+    };
+    parsed.map_err(|_| format!("invalid override quantity '{s}'"))
 }
 
 /// `nativeResolveEnsJson`: verified ENS forward resolution for a running handle.

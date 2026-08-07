@@ -158,7 +158,9 @@ class RpcRouterTest {
                          "latest",
                          {"0x0000000000000000000000000000000000696969":{"code":"0x6080"}}]}""")
         assertTrue(hasError(resp))
-        assertEquals(-32000, errorCode(resp))
+        // -32602, NOT the retryable -32000: no retry can make this succeed on this
+        // build, and a client backing off would spin instead of taking its fallback.
+        assertEquals(-32602, errorCode(resp))
         // The backend must not have been consulted at all: answering from unmodified
         // state is the bug, so the call never reaches it.
         assertNull(b.lastTo)
@@ -172,7 +174,47 @@ class RpcRouterTest {
                          "latest",
                          {"0x00000000219ab540356cBB839Cbe05303d7705Fa":{"balance":"0x1"}}]}""")
         assertTrue(hasError(resp))
-        assertEquals(-32000, errorCode(resp))
+        assertEquals(-32602, errorCode(resp))
+    }
+
+    @Test fun ethCall_withBlockOverrides_isAlsoRefused() {
+        // geth's fourth positional parameter rewrites number/time/baseFee — it
+        // changes the answer exactly as a state override does, so checking only
+        // index 2 would leave the same silent-wrong-answer hole for time-warp
+        // simulations (vesting cliffs, deadlines, TWAP windows).
+        val b = FakeBackend(callResult = byteArrayOf(1))
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x00000000219ab540356cBB839Cbe05303d7705Fa","data":"0xabcd"},
+                         "latest",{},{"time":"0x deadbeef"}]}""".replace(" deadbeef", "deadbeef"))
+        assertTrue(hasError(resp))
+        assertEquals(-32602, errorCode(resp))
+        assertNull(b.lastTo)
+    }
+
+    @Test fun ethCall_withOverride_stillReachesTheDevProxy() {
+        // Proxy mode is unverified by construction, and an upstream DOES apply
+        // the override — so forwarding is the CORRECT answer there. The rule is
+        // "never fabricate one from unmodified state", not "never answer".
+        // Without this, bringing a wallet up against a still-syncing node in dev
+        // mode would break exactly where it used to work.
+        //
+        // UpstreamProxy is final and owns a real client, so this asserts the
+        // ROUTING: with a proxy configured the request must reach the proxy
+        // branch (which then fails to connect -> -32603) instead of being
+        // short-circuited with the strict-mode -32602.
+        val b = FakeBackend(callResult = byteArrayOf(9))
+        val unreachable = UpstreamProxy("http://127.0.0.1:1/")
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x0000000000000000000000000000000000696969","data":"0x24b6b1a5"},
+                         "latest",
+                         {"0x0000000000000000000000000000000000696969":{"code":"0x6080"}}]}""",
+            proxy = unreachable)
+        assertTrue(hasError(resp))
+        assertEquals(-32603, errorCode(resp))   // proxy attempted, upstream unreachable
+        assertNull(b.lastTo)                    // never answered from unmodified state
+        unreachable.close()
     }
 
     @Test fun ethCall_withEmptyOverrideObject_isServedNormally() {
