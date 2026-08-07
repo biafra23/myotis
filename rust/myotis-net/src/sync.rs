@@ -181,7 +181,7 @@ impl ChainConfig {
                 "dc1ce049946173d38463595f907f19893e4fd956c740913fb70d94d34e07e789",
             ),
             checkpoint_slot: 28_516_336,
-            static_peers: Vec::new(), // none pinned — discv5 bootnodes seed discovery
+            static_peers: GNOSIS_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: GNOSIS_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
             snapshot_path: None,
@@ -264,6 +264,40 @@ const SEPOLIA_BOOTSTRAP_ENRS: &[&str] = &[
     // remaining bootstrap_nodes.yaml entries (unattributed)
     "enr:-Iq4QMCTfIMXnow27baRUb35Q8iiFHSIDBJh6hQM5Axohhf4b6Kr_cOCu0htQ5WvVqKvFgY28893DHAg8gnBAXsAVqmGAX53x8JggmlkgnY0gmlwhLKAlv6Jc2VjcDI1NmsxoQK6S-Cii_KmfFdUJL2TANL3ksaKUnNXvTCv1tLwXs0QgIN1ZHCCIyk",
     "enr:-L64QC9Hhov4DhQ7mRukTOz4_jHm4DHlGL726NWH4ojH1wFgEwSin_6H95Gs6nW2fktTWbPachHJ6rUFu0iJNgA0SB2CARqHYXR0bmV0c4j__________4RldGgykDb6UBOQAABx__________-CaWSCdjSCaXCEA-2vzolzZWNwMjU2azGhA17lsUg60R776rauYMdrAz383UUgESoaHEzMkvm4K6k6iHN5bmNuZXRzD4N0Y3CCIyiDdWRwgiMo",
+];
+
+/// Pinned Gnosis LC-serving peer multiaddrs (Java `NetworkConfig.GNOSIS.clPeerMultiaddrs`
+/// — keep the two lists and their ORDER in step). Identify-confirmed LC servers
+/// harvested from a long-running desktop profile's cl-peers-gnosis.cache
+/// (2026-08-06, issue #291): a cold Gnosis pool starves catch-up because so few
+/// nodes serve light-client data, so a fresh install gets a serving head start.
+/// One address per peer id: `PeerPool::add` dedupes by peer id, so a second
+/// address for an already-known id would be silently dropped here (Java dedupes
+/// by multiaddr string and would dial both) — keeping the lists identical means
+/// keeping them one-per-id.
+const GNOSIS_STATIC_PEERS: &[&str] = &[
+    "/ip4/104.37.190.86/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59",
+    "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
+    "/ip4/135.129.103.34/tcp/9006/p2p/16Uiu2HAmA5FYL7dQftsHktHvuVTRyPdc1sH6qcWiXaVEPM6FMyN2",
+    "/ip4/135.148.35.18/tcp/9000/p2p/16Uiu2HAm5g8koS1AgicyMZKekLoyh5rK3eBGoZJP5KUsoK5wcehs",
+    "/ip4/136.243.146.247/tcp/9000/p2p/16Uiu2HAmEFCgE5gLHQRHNMv1P1R673849q7cgH7S3WJBXTkg5698",
+    "/ip4/138.201.196.44/tcp/4001/p2p/16Uiu2HAmFXPBdWLwQQSLpXhvSAzUfRErcH1whnq3SuPE5dRmojAT",
+    "/ip4/141.94.46.9/tcp/4001/p2p/16Uiu2HAmBCpdwswdk1wdzZH4gkhPtytx1Jt8GfSjgNsgPdPHUW67",
+    "/ip4/144.76.106.139/tcp/9200/p2p/16Uiu2HAm4B91Fn21jnSPKw58R46THxhp1ZTHmTWU1TDWvNpJySRB",
+    "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
+    "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
+    "/ip4/144.76.164.21/tcp/9016/p2p/16Uiu2HAm2UAjrJax6SAtu53VykpbmPrzDDdfB3G79ypQeiXnjj3u",
+    "/ip4/144.76.196.184/tcp/13000/p2p/16Uiu2HAm6wUQPL4FYKHqmGfZQBPYbDd8GNHxNYeH5DZGLunPAw4J",
+    "/ip4/146.103.38.79/tcp/4101/p2p/16Uiu2HAmKnRLFoU3QMX3zkTZLRv5mG8FBp4qfZpGJYuT3LAErt11",
+    "/ip4/146.70.243.142/tcp/9000/p2p/16Uiu2HAm6uE18CuSgCEi5LyjxvbEXdZFQHv1HJCad3WpqerJfDrE",
+    "/ip4/148.251.181.49/tcp/9000/p2p/16Uiu2HAmAWrwxf2murYQp1tdbwKbFwqUiVofwJ3xgJP5T7BLSpRa",
+    "/ip4/148.251.184.20/tcp/15974/p2p/16Uiu2HAmQYoJ6Gn5caze4BAZXMQ5CJX5qZbdkY3o7S23vvSAPLu9",
+    "/ip4/148.251.235.60/tcp/9001/p2p/16Uiu2HAmTeAHEG2tCFgC5RmrjZcw6zGeCgnE5svqM4528R5inSjA",
+    "/ip4/148.251.237.209/tcp/9000/p2p/16Uiu2HAmSLirTFzTcPE9wsHE6UhbXXmDxFkunHDVhPtrBfuPMq5U",
+    "/ip4/148.56.243.210/tcp/9000/p2p/16Uiu2HAkyQr5e7gobYTAutAoCDR6ZKEMrgmsChUztDkw2fQTiYL4",
+    "/ip4/159.195.138.9/tcp/9000/p2p/16Uiu2HAmUimXaHiCvWhx2YuvwTkDLtca6oq1bCH85Eb6JcEYiaGi",
+    "/ip4/159.195.30.80/tcp/9100/p2p/16Uiu2HAmDMWLqML5zdVVVuptjpfKAZi1qEb784HFtrqyJZGPFL3X",
+    "/ip4/164.152.161.131/tcp/9500/p2p/16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw",
 ];
 
 /// Gnosis CL discv5 bootstrap ENRs (Java `NetworkConfig.GNOSIS.clDiscv5Bootnodes`
@@ -715,12 +749,9 @@ impl PeerPool {
         if out.is_empty() {
             // Never starve the batch on the SOFT filters (Java: `if
             // (capable.isEmpty()) capable = peers`) — a no-lc/cooled peer may
-            // still serve. But keep honoring `skip`: those peers are provably
-            // incapable of the needed period, so asking them wastes a whole
-            // round and ratchets the empty-round backoff. If skip leaves
-            // nothing, return [] and let catch_up bounce to rediscovery.
-            // Sweep the fallback too, so consecutive drought rounds spread the
-            // retries across the pool instead of re-hammering the first few.
+            // still serve. Sweep the fallback too, so consecutive drought
+            // rounds spread the retries across the pool instead of
+            // re-hammering the first few.
             let start = self.sweep % self.peers.len();
             self.sweep = self.sweep.wrapping_add(n);
             for i in 0..self.peers.len() {
@@ -731,6 +762,32 @@ impl PeerPool {
                 if !skip.contains(&p.id) {
                     out.push(p.clone());
                 }
+            }
+        }
+        if out.is_empty() {
+            // LAST RESORT: `skip` too. It used to be honored even here, on the
+            // theory that a too-shallow peer is "provably incapable" of the
+            // needed period — but the evidence behind it is weaker than that
+            // (issue #291). `skip` is built from `earliest_available_slot`,
+            // which is the peer's BLOCK/data-availability floor, not its
+            // light-client-update floor: LC updates are a separate, tiny store
+            // (one best update per period), and a checkpoint-synced node that
+            // pruned blocks below its checkpoint still answers
+            // `light_client_updates_by_range` well beneath that floor. On a
+            // pool where nearly every node is checkpoint-synced (Gnosis), the
+            // filter condemned the WHOLE pool once the auto-Status replies had
+            // landed — including Tier-1 peers that had just served us — and
+            // catch_up bounced to rediscovery forever while the data was
+            // plainly available network-wide. Java never had this failure mode
+            // because its guard drops every filter. Asking a maybe-incapable
+            // peer costs one round; returning [] costs the whole sync.
+            let start = self.sweep % self.peers.len();
+            self.sweep = self.sweep.wrapping_add(n);
+            for i in 0..self.peers.len() {
+                if out.len() >= n {
+                    break;
+                }
+                out.push(self.peers[(start + i) % self.peers.len()].clone());
             }
         }
         out
@@ -1535,9 +1592,12 @@ async fn catch_up(
         // committee_period can still serve that period's update, so only skip
         // when its earliest period is strictly greater. Peers not yet
         // status-exchanged (absent from the map) are unknown and kept; v1 peers
-        // report 0 (genesis history) and are never skipped. candidates() still
-        // returns [] rather than a too-shallow-only batch, so an all-shallow
-        // pool bounces to the outer loop for rediscovery instead of thrashing.
+        // report 0 (genesis history) and are never skipped. This is a STRONG
+        // PREFERENCE, not a veto: candidates() falls back to the shallow peers
+        // when they are all that is left, because earliest_available_slot is a
+        // block floor rather than an LC-update floor and an all-shallow pool is
+        // not proof that nobody serves the period (issue #291). Only a
+        // genuinely empty pool bounces to rediscovery.
         let too_shallow: HashSet<PeerId> = earliest_slots
             .into_iter()
             .filter(|&(_, earliest)| {
@@ -2321,7 +2381,23 @@ mod tests {
             c.accepted_fork_digests(),
             vec![[0x32, 0x37, 0xDA, 0xB6], [0x7D, 0x5A, 0xAB, 0x40]]
         );
-        assert!(c.static_peers.is_empty());
+        // 22 pinned LC peers — same list and order as the Java
+        // NetworkConfig.GNOSIS.clPeerMultiaddrs, ONE ADDRESS PER PEER ID
+        // (`PeerPool::add` dedupes by peer id, so a second address for a known
+        // id would never be dialed here while Java dialed both).
+        assert_eq!(c.static_peers.len(), 22);
+        assert!(c.static_peers[0].ends_with(
+            "/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59"
+        ));
+        assert!(c.static_peers[21].ends_with(
+            "/tcp/9500/p2p/16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw"
+        ));
+        let unique: std::collections::HashSet<_> = c.static_peers.iter().collect();
+        assert_eq!(unique.len(), 22);
+        let ids: std::collections::HashSet<_> =
+            c.static_peers.iter().map(|a| a.rsplit('/').next().unwrap()).collect();
+        assert_eq!(ids.len(), 22, "one address per peer id (the pool dedupes by id)");
+        assert!(c.static_peers.iter().all(|p| parse_static_peer(p).is_some()));
         assert_eq!(c.bootstrap_enrs.len(), 8);
     }
 
@@ -2375,11 +2451,20 @@ mod tests {
         }
         assert!(!pool.candidates(2, true, false, &HashSet::new(), &HashSet::new()).is_empty());
 
-        // But the HARD skip is honored even by the never-starve fallback:
-        // a fully-skipped pool returns [] (provably-incapable peers are worse
-        // than none — catch_up bounces to rediscovery instead of thrashing).
+        // `skip` is preferred-against but NOT fatal: a fully-skipped pool
+        // still returns candidates (issue #291 — earliest_available_slot is a
+        // block floor, not an LC-update floor, so a fully-skipped pool is not
+        // proof that nobody can serve; returning [] stalled catch-up forever).
         let all_skip: HashSet<PeerId> = ids.iter().copied().collect();
-        assert!(pool.candidates(4, true, false, &HashSet::new(), &all_skip).is_empty());
+        assert!(!pool.candidates(4, true, false, &HashSet::new(), &all_skip).is_empty());
+
+        // The preference still holds while ANY non-skipped peer remains: with
+        // only ids[3] skipped, it must not be chosen over the other three.
+        let mut one_skip = HashSet::new();
+        one_skip.insert(ids[3]);
+        let c = pool.candidates(3, true, false, &HashSet::new(), &one_skip);
+        assert_eq!(c.len(), 3);
+        assert!(c.iter().all(|p| p.id != ids[3]));
     }
 
     #[test]

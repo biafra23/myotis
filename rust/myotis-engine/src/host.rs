@@ -457,10 +457,12 @@ pub fn status_json(handle: i64) -> String {
         // targetPeriod is derived from the config AT READ TIME (not carried in
         // the sync snapshot): fresh across bootstrap stalls, and real (not 0)
         // for a created-but-not-started handle — matching the Java engine.
-        Created(u64),
-        Running(SyncStatus, u64, Option<Arc<ElReader>>),
+        // Each arm carries the handle's network name so the status object can
+        // report the handle's OWN network (see `status_object`).
+        Created(&'static str, u64),
+        Running(&'static str, SyncStatus, u64, Option<Arc<ElReader>>),
         // The status frozen at pause time (warm beacon fields keep showing).
-        Paused(SyncStatus, u64),
+        Paused(&'static str, SyncStatus, u64),
         Unknown,
     }
     let snap = {
@@ -469,21 +471,26 @@ pub fn status_json(handle: i64) -> String {
             Err(_) => return "{}".to_string(),
         };
         match map.get(&handle) {
-            Some(ChainEntry::Created(config)) => Snap::Created(config.wall_clock_period()),
-            Some(ChainEntry::Running(config, sync, reader)) => {
-                Snap::Running(sync.status(), config.wall_clock_period(), reader.clone())
+            Some(ChainEntry::Created(config)) => {
+                Snap::Created(config.name, config.wall_clock_period())
             }
+            Some(ChainEntry::Running(config, sync, reader)) => Snap::Running(
+                config.name,
+                sync.status(),
+                config.wall_clock_period(),
+                reader.clone(),
+            ),
             Some(ChainEntry::Paused(config, frozen)) => {
-                Snap::Paused(frozen.clone(), config.wall_clock_period())
+                Snap::Paused(config.name, frozen.clone(), config.wall_clock_period())
             }
             None => Snap::Unknown,
         }
     };
     match snap {
-        Snap::Created(wall) => {
-            status_object(Lifecycle::NotStarted, None, wall, ElCounts::default())
+        Snap::Created(network, wall) => {
+            status_object(Lifecycle::NotStarted, network, None, wall, ElCounts::default())
         }
-        Snap::Running(status, wall, reader) => {
+        Snap::Running(network, status, wall, reader) => {
             let el = match reader {
                 Some(r) => engine.rt.block_on(async {
                     {
@@ -507,11 +514,11 @@ pub fn status_json(handle: i64) -> String {
                 }),
                 None => ElCounts::default(),
             };
-            status_object(Lifecycle::Running, Some(status), wall, el)
+            status_object(Lifecycle::Running, network, Some(status), wall, el)
         }
         // EL counts are zero while paused: the pool/discovery are torn down.
-        Snap::Paused(frozen, wall) => {
-            status_object(Lifecycle::Paused, Some(frozen), wall, ElCounts::default())
+        Snap::Paused(network, frozen, wall) => {
+            status_object(Lifecycle::Paused, network, Some(frozen), wall, ElCounts::default())
         }
         Snap::Unknown => "{}".to_string(),
     }
@@ -1570,6 +1577,7 @@ enum Lifecycle {
 /// both `status_json_shape` tests pin.
 fn status_object(
     lifecycle: Lifecycle,
+    network: &str,
     status: Option<SyncStatus>,
     target_period: u64,
     el: ElCounts,
@@ -1589,7 +1597,12 @@ fn status_object(
     // The PAUSED discriminator (running=false, paused=true → the API's PAUSED;
     // both false → STOPPED). Older Java wrappers ignore the unknown key.
     obj.insert("paused".into(), (lifecycle == Lifecycle::Paused).into());
-    obj.insert("network".into(), "mainnet".into());
+    // The handle's OWN network (`ChainConfig::name`), not a constant: the JVM
+    // hosts pass `networkName` in beside the JSON and ignore this key, but the
+    // napi/Node consumer reads the raw object and has nothing else to go on —
+    // a hardcoded "mainnet" made every gnosis/sepolia handle self-report as
+    // mainnet (issue #291).
+    obj.insert("network".into(), network.into());
     obj.insert("beaconState".into(), beacon.into());
     obj.insert("bootstrapped".into(), bootstrapped.into());
     obj.insert("finalizedSlot".into(), s.finalized_slot.into());
@@ -1636,7 +1649,9 @@ fn status_object(
 }
 
 /// The exact not-started shape, used only if serde ever failed (it can't for a
-/// primitive object) — keeps this function total.
+/// primitive object) — keeps this function total. Its `network` is necessarily
+/// a literal; every reachable path builds the object above with the handle's
+/// real network name.
 const NOT_STARTED_FALLBACK: &str = concat!(
     r#"{"running":false,"paused":false,"network":"mainnet","beaconState":"STARTING","#,
     r#""bootstrapped":false,"finalizedSlot":0,"optimisticSlot":0,"#,
@@ -1719,7 +1734,7 @@ mod tests {
     #[test]
     fn not_started_status_shape_is_stable() {
         // The golden not-started object (parsed by the Java RustChainHandle test).
-        let json = status_object(Lifecycle::NotStarted, None, 0, ElCounts::default());
+        let json = status_object(Lifecycle::NotStarted, "mainnet", None, 0, ElCounts::default());
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
         assert_eq!(v["running"], false);
         assert_eq!(v["paused"], false);
@@ -1749,6 +1764,29 @@ mod tests {
         let fb: serde_json::Value =
             serde_json::from_str(NOT_STARTED_FALLBACK).expect("fallback valid json");
         assert_eq!(v, fb);
+    }
+
+    #[test]
+    fn status_reports_the_handles_own_network() {
+        // Issue #291: a gnosis handle self-reported "mainnet" because the key
+        // was a constant. The napi/Node consumer reads this raw object, so the
+        // label is the only network identity it has.
+        for network in ["mainnet", "gnosis", "sepolia"] {
+            let json =
+                status_object(Lifecycle::NotStarted, network, None, 0, ElCounts::default());
+            let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+            assert_eq!(v["network"], network, "not-started handle on {network}");
+
+            let running = status_object(
+                Lifecycle::Running,
+                network,
+                Some(SyncStatus::initial()),
+                0,
+                ElCounts::default(),
+            );
+            let v: serde_json::Value = serde_json::from_str(&running).expect("valid json");
+            assert_eq!(v["network"], network, "running handle on {network}");
+        }
     }
 
     #[test]
@@ -1782,6 +1820,7 @@ mod tests {
         };
         let synced: serde_json::Value = serde_json::from_str(&status_object(
             Lifecycle::Running,
+            "mainnet",
             Some(mk(SyncState::Synced)),
             1795,
             el,
@@ -1824,6 +1863,7 @@ mod tests {
         ] {
             let v: serde_json::Value = serde_json::from_str(&status_object(
                 Lifecycle::Running,
+                "mainnet",
                 Some(mk(st)),
                 1795,
                 ElCounts::default(),
@@ -1853,6 +1893,7 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::from_str(&status_object(
             Lifecycle::Paused,
+            "mainnet",
             Some(frozen),
             1795,
             ElCounts::default(),
@@ -1931,6 +1972,7 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::from_str(&status_object(
             Lifecycle::Running,
+            "mainnet",
             Some(s),
             1770,
             ElCounts::default(),

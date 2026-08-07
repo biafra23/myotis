@@ -139,6 +139,27 @@ class NetworkConfigGnosisTest {
     }
 
     @Test
+    void gnosisPinsHarvestedLcServers() {
+        // 22 Identify-confirmed LC servers from a long-running desktop cache
+        // (issue #291) — same list and ORDER as the Rust GNOSIS_STATIC_PEERS
+        // (sync.rs gnosis_config_matches_networkconfig_java pins the twin side).
+        List<String> cl = G.clPeerMultiaddrs();
+        assertEquals(22, cl.size());
+        assertEquals("/ip4/104.37.190.86/tcp/15974/p2p/"
+                + "16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59", cl.get(0));
+        assertEquals("/ip4/164.152.161.131/tcp/9500/p2p/"
+                + "16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw", cl.get(21));
+        // One entry per peer id (the Rust pool dedupes by id, so a second address
+        // for a known id would be dropped there) — and every entry is a dialable
+        // ip4/tcp/p2p multiaddr.
+        assertEquals(22, cl.stream().distinct().count());
+        assertEquals(22, cl.stream().map(a -> a.substring(a.lastIndexOf('/') + 1)).distinct().count());
+        for (String addr : cl) {
+            assertTrue(addr.matches("/ip4/\\d+\\.\\d+\\.\\d+\\.\\d+/tcp/\\d+/p2p/16Uiu2HA\\S+"), addr);
+        }
+    }
+
+    @Test
     void sepoliaPinsTheDedicatedServingNodeOnBothLayers() {
         // Both halves of the dedicated pair are pinned so a wallet reaches them without
         // waiting on discovery. The CL entry must come FIRST: the light client walks
