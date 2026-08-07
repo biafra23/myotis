@@ -477,9 +477,11 @@ mod tests {
         assert_eq!(myotis_init(), crate::ABI_VERSION);
     }
 
-    /// The hand-maintained C header is the contract for the plain-ABI consumers
-    /// (:app-ios via cinterop, the napi loader), and its version is what they
-    /// gate on — so it has to name the same number as the crate constant. The
+    /// The hand-maintained C header is the contract for the plain-C ABI, and
+    /// :app-ios gates on its version: cinterop reads `MYOTIS_ABI_VERSION` out of
+    /// this file for `RustEngine.EXPECTED_ABI_VERSION`. (The napi binding links
+    /// the same surface but reaches the symbols from Rust, so it never parses the
+    /// header.) It therefore has to name the crate constant's number. The
     /// `include_str!` makes the header a compile input of this test, so a
     /// header-only edit still reruns it: bumping `ABI_VERSION` without updating
     /// the header fails `cargo test` instead of shipping a header that tells C
