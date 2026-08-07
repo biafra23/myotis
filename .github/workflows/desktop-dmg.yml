@@ -133,13 +133,24 @@ jobs:
           echo "::error::DMG build failed after 3 attempts"
           exit 1
 
-      # Compose names both arches' output the same (Myotis-1.0.0.dmg); rename so the
+      # Compose names both arches' output the same (Myotis-<packageVersion>.dmg, derived
+      # from the project version in app-desktop/build.gradle.kts); rename so the
       # downloaded file itself states the architecture, not just the artifact wrapper.
+      # Assert exactly one — zero or multiple should fail here, not silently ship
+      # an arbitrary pick (parity with the deb workflow). This matters more now
+      # that the filename tracks the project version: while it was frozen at
+      # Myotis-1.0.0.dmg a leftover build was overwritten in place, but two
+      # differently-versioned dmgs can now coexist and `head -n1` would take the
+      # lexicographically first — i.e. the OLDER one. The arch-verify step below
+      # wouldn't catch that: a stale bundle of the right arch passes.
       - name: Tag .dmg with architecture
         run: |
-          set -e
-          dmg=$(ls app-desktop/build/compose/binaries/main/dmg/*.dmg | head -n1)
-          mv "$dmg" "app-desktop/build/compose/binaries/main/dmg/Myotis-${{ matrix.arch }}.dmg"
+          set -eu
+          shopt -s nullglob
+          dmgs=(app-desktop/build/compose/binaries/main/dmg/*.dmg)
+          [ "${#dmgs[@]}" -eq 1 ] \
+            || { echo "::error::expected exactly 1 dmg, found ${#dmgs[@]}: ${dmgs[*]}"; exit 1; }
+          mv "${dmgs[0]}" "app-desktop/build/compose/binaries/main/dmg/Myotis-${{ matrix.arch }}.dmg"
 
       # Guard against a SILENTLY wrong-arch build. The job otherwise goes green on
       # "BUILD SUCCESSFUL" alone; any future regression (runner-image change, Gradle re-enabling

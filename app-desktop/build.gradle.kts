@@ -13,6 +13,35 @@ plugins {
 
 kotlin { jvmToolchain(21) }
 
+// Installer versions, DERIVED from the project version so a release sweep can't
+// leave an installer stamped with the previous release (v0.1.0–v0.1.3 all shipped
+// a dmg hardcoded to "1.0.0", so every macOS bundle reported the same frozen
+// version in About / Get Info regardless of the release it came from).
+val releaseVersion = project.version.toString().substringBefore('-')  // 0.1.4-SNAPSHOT -> 0.1.4
+
+// jpackage REJECTS a major of 0 on macOS (--app-version must start above 0), so
+// the .dmg cannot carry the honest 0.x version. The rule is therefore: macOS
+// MAJOR is always the project MAJOR plus one (0.1.4 -> 1.1.4, 1.0.0 -> 2.0.0).
+//
+// Adding a constant to the major is order-preserving, so the emitted version is
+// strictly increasing for every version bump, forever — which is what macOS
+// needs to treat a new bundle as an upgrade rather than a downgrade. Two wrong
+// rules it deliberately avoids:
+//   - "1.0.<patch>" reads closest to the real version but breaks on a minor
+//     bump: 0.2.0 would emit 1.0.0, LOWER than 0.1.4's 1.0.4.
+//   - "1.<minor>.<patch>" for 0.x only (what this started as) is fine within
+//     0.x but falls off a cliff at the real 1.0.0, which emits 1.0.0 — lower
+//     than every 1.x already shipped for late 0.x (0.9.0 -> 1.9.0). Silent
+//     downgrade, and it only surfaces years later.
+// The +1 rule has no cliff and needs no revisiting at 1.0, so nothing here
+// depends on someone re-reading this comment before the transition.
+val macOsPackageVersion: String = releaseVersion.split('.').let { parts ->
+    require(parts.size == 3 && parts.all { it.toIntOrNull() != null }) {
+        "Unexpected project version '${project.version}': expected numeric MAJOR.MINOR.PATCH"
+    }
+    "${parts[0].toInt() + 1}.${parts[1]}.${parts[2]}"
+}
+
 // Historical (Besu ≤24.12; 26.4 targets tuweni 2.7.2 so io.tmio is gone from the
 // graph — the exclude stays as a cheap guard):
 // Besu (via :myotis-evm) dragged in the pre-rename tuweni coordinates io.tmio:tuweni-* 2.4.2,
@@ -199,7 +228,9 @@ compose.desktop {
             // Windows host exists.
             targetFormats(TargetFormat.Dmg, TargetFormat.Deb)
             packageName = "Myotis"
-            packageVersion = "1.0.0"  // jpackage/dmg requires MAJOR > 0
+            // Applies to the dmg (and a future msi); the deb overrides it below.
+            // See macOsPackageVersion at the top of this file for the +1-major rule.
+            packageVersion = macOsPackageVersion
             // jpackage builds the deb's Maintainer field as "<vendor> <debMaintainer>",
             // so the human name lives here and debMaintainer stays a bare email.
             vendor = "Dirk Jäckel"
@@ -216,7 +247,7 @@ compose.desktop {
             linux {
                 // Unlike the dmg (jpackage requires major > 0 on macOS), deb versions may
                 // start at 0 — so Linux carries the app's honest version.
-                packageVersion = "0.1.3"
+                packageVersion = releaseVersion
                 debMaintainer = "dirk@jaeckel.com"
             }
         }

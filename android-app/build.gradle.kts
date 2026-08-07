@@ -81,6 +81,11 @@ val rpcUpstream: String = run {
     props.getProperty("rpc.upstream", "")
 }
 
+// Derived from the project version so a release sweep can't leave the app
+// reporting a stale version in Settings → Apps, the same way :app-desktop
+// derives its installer versions. 0.1.4-SNAPSHOT -> 0.1.4.
+val releaseVersion = project.version.toString().substringBefore('-')
+
 android {
     namespace = "com.jaeckel.ethp2p.android"
     compileSdk = 35
@@ -89,8 +94,11 @@ android {
         applicationId = "com.jaeckel.ethp2p.android"
         minSdk = 29
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.1.3"
+        // Stays a manual literal: a monotonic install counter with no relation
+        // to semver, so there is nothing to derive it from. Bump it on every
+        // release or the new APK won't install over the previous one.
+        versionCode = 5
+        versionName = releaseVersion
         buildConfigField("String", "RPC_UPSTREAM", "\"$rpcUpstream\"")
     }
 

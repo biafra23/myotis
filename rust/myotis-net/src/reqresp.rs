@@ -270,7 +270,7 @@ impl Behaviour {
             ),
             identify: identify::Behaviour::new(
                 identify::Config::new("eth2/1.0.0".into(), local_public_key)
-                    .with_agent_version("myotis/0.1.3-rs".into()),
+                    .with_agent_version("myotis/0.1.4-rs".into()),
             ),
             status_v2: rr(protocols::STATUS_V2, ProtocolSupport::Full, RESP_TIMEOUT),
             status_v1: rr(protocols::STATUS_V1, ProtocolSupport::Full, RESP_TIMEOUT),

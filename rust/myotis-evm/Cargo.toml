@@ -1,6 +1,6 @@
 [package]
 name = "myotis-evm"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Myotis EVM: view-call / gas-estimation over SNAP-proof-verified state (revm behind a SnapStateOracle trait; sans-I/O). Grows through the EL-phase Milestone-C PRs (docs/reimplementation/07)."
 license = "MIT OR Apache-2.0"
