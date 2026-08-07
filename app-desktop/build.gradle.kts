@@ -20,22 +20,26 @@ kotlin { jvmToolchain(21) }
 val releaseVersion = project.version.toString().substringBefore('-')  // 0.1.4-SNAPSHOT -> 0.1.4
 
 // jpackage REJECTS a major of 0 on macOS (--app-version must start above 0), so
-// the .dmg cannot carry the honest 0.x version. Force MAJOR to 1 and keep the
-// project's MINOR.PATCH (0.1.4 -> 1.1.4): that stays strictly increasing across
-// releases, which is what macOS needs to see a new bundle as an upgrade.
+// the .dmg cannot carry the honest 0.x version. The rule is therefore: macOS
+// MAJOR is always the project MAJOR plus one (0.1.4 -> 1.1.4, 1.0.0 -> 2.0.0).
 //
-// Deliberately NOT "1.0.<patch>", which reads closer to the real version but is
-// not monotonic — the next minor bump (0.2.0) would emit 1.0.0, LOWER than
-// 0.1.4's 1.0.4, and macOS treats a lower bundle version as a downgrade.
-//
-// Revisit at the real 1.0.0: the honest 1.0.0 is lower than the 1.x this rule
-// emits for late 0.x (0.9.0 -> 1.9.0), so the macOS version has to jump ahead
-// (e.g. 2.0.0) to keep moving forward.
+// Adding a constant to the major is order-preserving, so the emitted version is
+// strictly increasing for every version bump, forever — which is what macOS
+// needs to treat a new bundle as an upgrade rather than a downgrade. Two wrong
+// rules it deliberately avoids:
+//   - "1.0.<patch>" reads closest to the real version but breaks on a minor
+//     bump: 0.2.0 would emit 1.0.0, LOWER than 0.1.4's 1.0.4.
+//   - "1.<minor>.<patch>" for 0.x only (what this started as) is fine within
+//     0.x but falls off a cliff at the real 1.0.0, which emits 1.0.0 — lower
+//     than every 1.x already shipped for late 0.x (0.9.0 -> 1.9.0). Silent
+//     downgrade, and it only surfaces years later.
+// The +1 rule has no cliff and needs no revisiting at 1.0, so nothing here
+// depends on someone re-reading this comment before the transition.
 val macOsPackageVersion: String = releaseVersion.split('.').let { parts ->
-    require(parts.size == 3) {
-        "Unexpected project version '${project.version}': expected MAJOR.MINOR.PATCH"
+    require(parts.size == 3 && parts.all { it.toIntOrNull() != null }) {
+        "Unexpected project version '${project.version}': expected numeric MAJOR.MINOR.PATCH"
     }
-    if (parts[0] == "0") "1.${parts[1]}.${parts[2]}" else releaseVersion
+    "${parts[0].toInt() + 1}.${parts[1]}.${parts[2]}"
 }
 
 // Historical (Besu ≤24.12; 26.4 targets tuweni 2.7.2 so io.tmio is gone from the
@@ -225,7 +229,7 @@ compose.desktop {
             targetFormats(TargetFormat.Dmg, TargetFormat.Deb)
             packageName = "Myotis"
             // Applies to the dmg (and a future msi); the deb overrides it below.
-            // See macOsPackageVersion at the top of this file for the 0.x mapping.
+            // See macOsPackageVersion at the top of this file for the +1-major rule.
             packageVersion = macOsPackageVersion
             // jpackage builds the deb's Maintainer field as "<vendor> <debMaintainer>",
             // so the human name lives here and debMaintainer stays a bare email.
