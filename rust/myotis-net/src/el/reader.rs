@@ -1205,8 +1205,22 @@ impl ElReader {
                 .chunks(CHUNK_LEN)
                 .nth(chunk_idx)
                 .ok_or("chunk index out of range")?;
-            let bodies = bodies?;
-            let receipt_blocks = receipt_blocks?;
+            let (bodies, receipt_blocks) = match (bodies, receipt_blocks) {
+                (Ok(b), Ok(r)) => (b, r),
+                (b, r) => {
+                    // A failed chunk fetch may be a pipelining artifact: at
+                    // depth 4 a tail request's 15s timer runs while the peer
+                    // serves the full-budget responses queued ahead of it, so
+                    // a slow link can time out where the sequential shape
+                    // worked — and unlike truncation, an error would otherwise
+                    // leave the depth at 4 and repeat the failure on the next
+                    // peer. Degrade like a truncated batch; a clean batch
+                    // restores full depth.
+                    self.log_index_pipeline_full
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    return Err(b.err().or(r.err()).unwrap_or_else(|| "chunk fetch failed".into()));
+                }
+            };
             // Served items are an in-order prefix of the request (the per-block
             // root verification below catches any peer that violates that).
             let chunk_numbers: Vec<u64> = chunk.iter().map(|h| h.header.number).collect();

@@ -85,6 +85,35 @@ async fn send_frame(writer: &SharedWriter, code: u64, body: &[u8]) -> Result<(),
     result
 }
 
+/// Removes a request's pending-map entry if the owning [`ManagedPeer::request`]
+/// future is DROPPED mid-flight (routine under the backfill pipeline, which
+/// cancels in-flight fetches on truncation). Without this, a cancelled request
+/// whose peer never answers would leave its entry until disconnect. Disarmed on
+/// every completed path — there the entry is already removed (response
+/// delivery, explicit timeout removal, or `fail_all`'s drain). The pending
+/// mutex is async, so cleanup happens via a spawned task; at runtime shutdown
+/// (no handle) the whole map is being dropped anyway.
+struct PendingGuard {
+    pending: PendingMap,
+    id: u64,
+    armed: bool,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let pending = Arc::clone(&self.pending);
+            let id = self.id;
+            handle.spawn(async move {
+                pending.lock().await.remove(&id);
+            });
+        }
+    }
+}
+
 /// A negotiated eth/snap peer, driven by a background read loop.
 pub struct ManagedPeer {
     writer: SharedWriter,
@@ -228,6 +257,8 @@ impl ManagedPeer {
             }
             map.insert(id, Pending { want_code, tx });
         }
+        let mut guard =
+            PendingGuard { pending: Arc::clone(&self.pending), id, armed: true };
 
         // Send under the writer lock; a write failure leaves the egress frame
         // stream in an indeterminate state (a partial frame may be on the wire),
@@ -239,10 +270,11 @@ impl ManagedPeer {
         // discarded late response — either way it stays bounded.)
         if let Err(e) = send_frame(&self.writer, send_code, &body).await {
             fail_all(&self.pending, &self.closed, format!("peer write failure: {e}")).await;
+            guard.armed = false; // fail_all drained the map
             return Err(e);
         }
 
-        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+        let out = match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
             Ok(Ok(result)) => result,
             // The read loop dropped the sender (disconnect drained the map).
             Ok(Err(_)) => Err("peer connection closed".to_string()),
@@ -250,7 +282,9 @@ impl ManagedPeer {
                 self.pending.lock().await.remove(&id);
                 Err(format!("timed out awaiting code 0x{want_code:02x}"))
             }
-        }
+        };
+        guard.armed = false;
+        out
     }
 
     /// Push an eth/69 BlockRangeUpdate advertising our current servable range.
