@@ -101,6 +101,15 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # Refuse to publish when the pushed tag disagrees with the version in the tree
+  # — the asset name below comes from the tag, the versionName inside the apk
+  # comes from project.version. See release-version-guard.yml. Runs in parallel
+  # with the build, so a mismatch is reported early rather than after the build.
+  version-guard:
+    name: Release version guard
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/release-version-guard.yml
+
   # Attach the built APK to the GitHub Release for the pushed tag. Runs ONLY on
   # `v*` tags (never on branch/PR builds), and reuses the build job's artifact
   # rather than rebuilding. The desktop-dmg workflow publishes to the SAME
@@ -108,7 +117,9 @@ jobs:
   # just uploads its asset — the create step below tolerates that race.
   release:
     name: Publish APK to release
-    needs: build
+    # version-guard carries the same `if` as this job, so it is never merely
+    # skipped underneath it — on a tag push both run, otherwise both are skipped.
+    needs: [build, version-guard]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

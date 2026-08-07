@@ -150,13 +150,34 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # Refuse to publish when the pushed tag disagrees with the version in the tree
+  # — the release is named after the tag, while the .deb's packageVersion comes
+  # from project.version. See release-version-guard.yml. Tag pushes ONLY: the
+  # workflow_dispatch path below deliberately uploads assets built from the
+  # dispatched branch tip to an already-existing tag, so its ref and its tag are
+  # expected to disagree and this check does not apply to it.
+  version-guard:
+    name: Release version guard
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/release-version-guard.yml
+
   # Attach both arch debs to the GitHub Release. Runs on `v*` tags (same
   # race-tolerant create as the dmg/apk workflows) and on manual dispatch
   # (uploads to the given existing tag). Runs ONCE after both matrix jobs.
   release:
     name: Publish debs to release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: [build, version-guard]
+    # Unlike the sibling workflows, this job's condition is BROADER than
+    # version-guard's (it also runs on workflow_dispatch), and a skipped `needs:`
+    # would otherwise skip it too — killing the manual publish path. So spell the
+    # dependency results out: success-or-skipped guard proceeds, a FAILED guard
+    # still blocks the upload, and a failed/cancelled build still blocks it as
+    # the implicit success() used to.
+    if: >-
+      !cancelled()
+      && needs.build.result == 'success'
+      && (needs.version-guard.result == 'success' || needs.version-guard.result == 'skipped')
+      && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       # gh release create/upload needs write access to Releases (repo contents).
