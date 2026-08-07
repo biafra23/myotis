@@ -11,7 +11,10 @@ jobs:
   discover:
     name: Peer Discovery (UDP allowed)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Cold-cache days (post-outage evictions) compile the whole Rust workspace
+    # (~12 min) before Gradle even reaches the 5-min discovery run — 15 min
+    # guaranteed a timeout there. Warm runs stay well under the old budget.
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -22,6 +25,22 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
+
+      - name: Set up Rust
+        # Pin to real stable like the sibling Rust workflows — the runner
+        # image's preinstalled rustc lags on its own schedule, keys the cache
+        # to a different compiler, and if it ever fell below the Gradle
+        # probe's floor, cargoBuildHost would silently self-skip and this
+        # workflow would quietly stop exercising the Rust build.
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        # The :app build compiles the Rust workspace (cargoBuildHost auto-runs
+        # before :app:run); without this cache a cold run eats the whole job
+        # budget in cargo. Same action/config as the other Rust workflows.
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
 
       - name: Cache Gradle
         uses: actions/cache@v4
