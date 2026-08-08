@@ -75,6 +75,57 @@ pub struct ChainConfig {
 impl ChainConfig {
     /// Mainnet — values duplicated verbatim from the Java
     /// `NetworkConfig.MAINNET` (networking/src/main/java/.../NetworkConfig.java).
+    /// `MYOTIS_CL_STATIC_PEERS` — REPLACE the pinned light-client-serving peers
+    /// for this run, comma-separated `/ip4/../tcp/../p2p/..` multiaddrs.
+    ///
+    /// The CL twin of `MYOTIS_EL_BOOT_ENODES`, and it exists for the same two
+    /// reasons: dialing a serving node that lives on this machine over loopback
+    /// instead of hairpinning through the router's NAT, and pointing a wallet at
+    /// a *candidate* server — `rust/roost` — before its address is pinned in
+    /// this file or published in an ENR. An empty or unset value changes
+    /// nothing.
+    fn env_static_peers() -> Option<Vec<String>> {
+        let raw = std::env::var("MYOTIS_CL_STATIC_PEERS").ok()?;
+        let peers: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if peers.is_empty() {
+            return None;
+        }
+        tracing::info!(count = peers.len(), "MYOTIS_CL_STATIC_PEERS overrides the pinned CL peers");
+        Some(peers)
+    }
+
+    /// Apply any environment overrides. Called by every constructor, so a
+    /// network added later cannot silently miss them.
+    fn with_env_overrides(mut self) -> Self {
+        if let Some(peers) = Self::env_static_peers() {
+            self.static_peers = peers;
+        }
+        // `MYOTIS_CL_DISABLE_DISCV5=1` — drop the discv5 bootstrap ENRs, leaving
+        // the static peers as the ONLY way to find a CL peer. This is what makes
+        // "can a wallet sync from this one server alone?" an honest question:
+        // with discovery on, a wallet that silently syncs from a random public
+        // peer looks exactly like one the server is serving properly.
+        //
+        // Note this pair is strictly stronger than MYOTIS_EL_BOOT_ENODES on its
+        // own: pinning peers still leaves discovery as a fallback, while pinning
+        // AND disabling discovery lets whoever controls the environment decide
+        // the wallet's only source. That is a LIVENESS exposure, not a
+        // correctness one — every byte is still verified against the wallet's
+        // own anchor, so the worst case is withholding, which surfaces as
+        // `beaconNotSynced` rather than a wrong answer. Intended for testing a
+        // candidate server; do not set it in a shipped configuration.
+        if matches!(std::env::var("MYOTIS_CL_DISABLE_DISCV5").as_deref(), Ok("1") | Ok("true")) {
+            tracing::info!("MYOTIS_CL_DISABLE_DISCV5 set — discv5 bootstrap ENRs cleared");
+            self.bootstrap_enrs.clear();
+        }
+        self
+    }
+
     pub fn mainnet() -> Self {
         Self {
             name: "mainnet",
@@ -106,6 +157,7 @@ impl ChainConfig {
             snapshot_path: None,
             cl_peer_cache_path: None,
         }
+        .with_env_overrides()
     }
 
     /// Sepolia — values duplicated verbatim from the Java
@@ -148,6 +200,7 @@ impl ChainConfig {
             snapshot_path: None,
             cl_peer_cache_path: None,
         }
+        .with_env_overrides()
     }
 
     /// Gnosis Chain — values duplicated verbatim from the Java
@@ -187,6 +240,7 @@ impl ChainConfig {
             snapshot_path: None,
             cl_peer_cache_path: None,
         }
+        .with_env_overrides()
     }
 
     /// Fork digests accepted when filtering discv5 ENRs — current first, then

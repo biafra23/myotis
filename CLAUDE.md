@@ -237,6 +237,24 @@ on its allowlist.
 
 ## Data sources
 - the only sources for data are devp2p and libp2p calling a local client via http may only be used for debugging purposes it is not an option for production
+- **Carve-out for myotis-operated serving infrastructure (owner's decision,
+  2026-08-08).** The rule above governs the **wallet**. `roost`, the dedicated
+  light-client server (`rust/roost`, docs/lc-server-design.md), MAY source
+  *self-verifying* consensus objects — LC bootstrap, updates, finality and
+  optimistic updates — from a local beacon node over loopback REST, and does
+  NOT verify them itself. The verification happens in myotis: a bootstrap is
+  anchored to the checkpoint root the wallet already pins, and every update is
+  checked against sync-committee BLS signatures by the wallet receiving it. A
+  relay can withhold, but it cannot forge.
+  Two boundaries this carve-out does **not** cross:
+  - **"Self-verifying" is load-bearing.** It does not widen into "roost may
+    serve anything it read over REST". Any path relaying something a wallet
+    cannot check against sync-committee signatures — proxying
+    `beacon_blocks_by_range` is the live example — needs its own decision.
+  - **Withholding is a liveness attack and this concentrates it.** It is
+    *detected*, not silently wrong: `BeaconSyncState` regresses out of SYNCED
+    and queries fail with `beaconNotSynced`, so a stalled relay surfaces as
+    "not ready" rather than as a confidently wrong balance.
 - **TrueBlocks Unchained Index mainnet publishing appears stalled.** The designated
   publisher (`publisher.unchainedindex.eth`) last published a mainnet manifest indexed
   to ~block 23.0M (mid-2025); as of mid-2026 that is ~a year behind the head, and the
