@@ -726,11 +726,30 @@ impl PeerPool {
     /// Add a pinned static (config) peer and record its id as un-evictable
     /// (see `static_ids`). Same dedup/cap semantics as `add`.
     fn add_static(&mut self, id: PeerId, addr: Multiaddr) {
-        self.static_ids.insert(id);
         self.add(id, addr);
+        // Mark un-evictable ONLY once the peer is actually pooled, so the
+        // invariant static_ids ⊆ peers holds: `add` is a no-op past MAX_POOL,
+        // and marking an unpooled id un-evictable would make it permanently
+        // un-evictable while absent. `known` is exactly the set of pooled ids.
+        if self.known.contains(&id) {
+            self.static_ids.insert(id);
+        }
     }
 
     fn mark_no_lc_updates(&mut self, id: PeerId) {
+        // Never deny a curated static peer (issue #291). They are pinned
+        // precisely because they serve light-client data, AND they are
+        // un-evictable — but eviction is the path that clears the deny flag for
+        // an ordinary peer. So a nolc strike on a static peer (a transient
+        // `UnsupportedProtocol` under load, or a stale nolc flag replayed from
+        // the peer cache at startup) would be STICKY, recreating the very "went
+        // nolc and stayed there" wedge this change removes — scoped to the
+        // scarce curated set that matters most. Skipping the mark keeps them in
+        // every catch-up/finality tier; capability is still reconciled live
+        // from Identify via the prefer set.
+        if self.static_ids.contains(&id) {
+            return;
+        }
         self.no_lc_updates.insert(id);
     }
 
@@ -2704,6 +2723,32 @@ mod tests {
         // It is still handed out as a candidate after all those failures.
         let c = pool.candidates(4, true, false, &HashSet::new(), &HashSet::new());
         assert!(c.iter().any(|p| p.id == stat), "static peer still a candidate");
+    }
+
+    #[test]
+    fn static_peers_are_never_denied_nolc() {
+        // Issue #291 follow-up: static peers are un-evictable, and eviction is
+        // what clears the nolc deny flag for ordinary peers — so a static peer
+        // must never enter the deny set at all, or a transient strike (or a
+        // stale cache flag replayed at startup) would be permanently sticky and
+        // drop the curated server out of the skip_no_lc tiers.
+        let mut pool = PeerPool::new();
+        let stat = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+        let disc = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+        pool.add_static(stat, "/ip4/10.0.3.1/tcp/9000".parse().unwrap());
+        pool.add(disc, "/ip4/10.0.3.2/tcp/9000".parse().unwrap());
+
+        // The mark is a no-op for the static peer, effective for the ordinary one.
+        pool.mark_no_lc_updates(stat);
+        pool.mark_no_lc_updates(disc);
+        assert!(!pool.no_lc_updates.contains(&stat), "static peer never denied");
+        assert!(pool.no_lc_updates.contains(&disc), "ordinary peer denied");
+
+        // With skip_no_lc on, the static peer survives the filter; the denied
+        // ordinary peer only comes back via the soft-filter fallback.
+        let c = pool.candidates(1, true, false, &HashSet::new(), &HashSet::new());
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].id, stat, "static peer preferred over the denied peer");
     }
 
     #[test]
