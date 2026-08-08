@@ -90,6 +90,28 @@ jobs:
               || { echo "::error::$lib was NOT rebuilt (cargoNdkAndroid self-skipped?)"; exit 1; }
           done
 
+      # The COMMITTED UniFFI bindings (myotis_engine.kt) must match the current
+      # Rust source, or a from-source .so and the committed bindings disagree on
+      # per-function checksums and the Rust engine fails UniFFI validation
+      # on-device — silently falling back to Java. This bit hard in v0.1.4: a
+      # doc-comment edit on an `#[uniffi::export]` fn changed its checksum (recent
+      # UniFFI folds the docstring into the checksum), but the bindings were never
+      # regenerated, so the CI-built APK shipped a dead "Rust engine" toggle.
+      # cargoNdkAndroid rebuilds the .so but NOT the .kt, so regenerate and assert
+      # no drift. Scope the diff to the bindings file — the step above intentionally
+      # rewrote the (git-ignored-for-drift) .so binaries with fresh builds.
+      - name: Verify committed UniFFI bindings match the Rust source
+        run: |
+          ./gradlew uniffiGenerateKotlin --stacktrace
+          bindings=myotis-engines/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt
+          git diff --exit-code -- "$bindings" || {
+            echo "::error::$bindings is STALE vs rust/myotis-engine — regenerate with" \
+                 "\`./gradlew uniffiGenerateKotlin\` and commit. A from-source .so would" \
+                 "fail UniFFI checksum validation against these bindings and the Rust" \
+                 "engine would silently fall back to Java on-device."
+            exit 1
+          }
+
       # The ubuntu-latest runner ships an Android SDK via $ANDROID_HOME, which
       # AGP picks up automatically when local.properties is absent. No extra
       # sdkmanager calls needed for compileSdk 34.

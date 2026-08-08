@@ -961,10 +961,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_myotis_engine_checksum_func_estimate_gas_json() != 21056) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_eth_call_json() != 24325) {
+    if (lib.uniffi_myotis_engine_checksum_func_eth_call_json() != 39183) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_eth_call_overrides_json() != 10239) {
+    if (lib.uniffi_myotis_engine_checksum_func_eth_call_overrides_json() != 2974) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_fee_estimate_json() != 39989) {
@@ -1402,7 +1402,9 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
 
         /**
          * Verified `eth_call` over the revm executor. `from` empty ⇒ anonymous call;
-         * `value` is wei as a decimal string; `block` is the RPC block tag.
+         * `to` EMPTY ⇒ contract creation (the calldata is init code, its return data
+         * is the answer); `value` is wei as a decimal string; `block` is the RPC block
+         * tag.
          */ fun `ethCallJson`(`handle`: kotlin.Long, `from`: kotlin.String, `to`: kotlin.String, `data`: kotlin.String, `value`: kotlin.String, `block`: kotlin.String): kotlin.String {
             return FfiConverterString.lift(
     uniffiRustCall() { _status ->
@@ -1422,7 +1424,8 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
 
         /**
          * [`eth_call_json`] with an `eth_call` STATE OVERRIDE object (the JSON-RPC
-         * third parameter) as a JSON string; empty ⇒ none. The overrides are the
+         * third parameter) as a JSON string; empty ⇒ none. An empty `to` selects
+         * contract creation here too. The overrides are the
          * caller's hypothesis layered over verified state for this call only, so the
          * answer is not a chain fact — hosts log it under a distinct label.
          */ fun `ethCallOverridesJson`(`handle`: kotlin.Long, `from`: kotlin.String, `to`: kotlin.String, `data`: kotlin.String, `value`: kotlin.String, `block`: kotlin.String, `stateOverrides`: kotlin.String): kotlin.String {

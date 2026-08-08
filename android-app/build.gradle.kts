@@ -324,8 +324,20 @@ dependencies {
 // Rebuild the Rust jniLibs from source when the full toolchain (cargo +
 // cargo-ndk + NDK) is on this machine; cargoNdkAndroid self-skips otherwise
 // and the committed jniLibs ship as-is. Root build.gradle.kts owns the task.
+//
+// verifyAndroidJniLibs then asserts the jniLibs that will actually ship export
+// every UniFFI symbol the committed bindings require — catching a stale
+// committed .so (the v0.1.4 "Rust engine silently falls back to Java" bug)
+// as a loud build failure instead of a runtime surprise. mustRunAfter, so on a
+// full-toolchain machine it validates cargoNdkAndroid's FRESH output; on a
+// cargo-less machine cargoNdkAndroid is a no-op and it validates the committed
+// fallback. Both are dependencies of preBuild so `./gradlew build` (CI) runs them.
 tasks.matching { it.name == "preBuild" }.configureEach {
     dependsOn(rootProject.tasks.named("cargoNdkAndroid"))
+    dependsOn(rootProject.tasks.named("verifyAndroidJniLibs"))
+}
+rootProject.tasks.named("verifyAndroidJniLibs").configure {
+    mustRunAfter(rootProject.tasks.named("cargoNdkAndroid"))
 }
 
 // === JNA's Android natives =============================================

@@ -354,6 +354,84 @@ tasks.register<Exec>("cargoNdkAndroid") {
     )
 }
 
+// Guard the COMMITTED Android jniLibs against silent drift from the COMMITTED
+// UniFFI bindings — the failure that shipped a dead "Rust engine" toggle in
+// v0.1.4. When the engine's FFI surface grows a function, uniffiGenerateKotlin
+// regenerates myotis_engine.kt (which then declares the new symbol as an
+// `external fun`), but the committed jniLibs only refresh when someone runs
+// cargoNdkAndroid AND commits the result. Miss that step and the committed .so
+// is missing the symbol; on-device, JNA's `Native.register` resolves every
+// `external fun` eagerly at class-load, the absent symbol throws
+// UnsatisfiedLinkError inside IntegrityCheckingUniffiLib's static init, and
+// RustEngineNative catches the resulting ExceptionInInitializerError as "failed
+// UniFFI validation" and silently falls back to the Java engine.
+//
+// This check is PURE (no cargo/NDK): it reads the committed bindings and the
+// committed .so files, so it runs on every machine and in CI. It turns that
+// silent runtime fallback into a loud build-time failure. It deliberately does
+// NOT depend on cargoNdkAndroid producing anything — on a full-toolchain machine
+// cargoNdkAndroid refreshes the libs first (see the mustRunAfter wiring in
+// android-app/build.gradle.kts) and this then validates the fresh output; on a
+// cargo-less machine it validates the committed fallback that would actually ship.
+//
+// Symbol PRESENCE (a byte scan for each required name), not a full ELF .dynsym
+// parse or a checksum comparison: the drift we ship is always "bindings newer
+// than .so" (an added/renamed export), where the new name is simply absent from
+// the stale .so's string table — a substring scan catches every such case with
+// no external tools. A same-name signature change (checksum drift, no new
+// symbol) is still caught at load time by UniFFI's checksum gate; it is rarer
+// and out of scope here, where the goal is to catch the recurring miss offline.
+val engineJniLibs = listOf(
+    file("android-app/src/main/jniLibs/arm64-v8a/libmyotis_engine.so"),
+    file("android-app/src/main/jniLibs/x86_64/libmyotis_engine.so"),
+)
+val committedBindings = project(":myotis-engines").projectDir
+    .resolve("src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt")
+tasks.register("verifyAndroidJniLibs") {
+    group = "verification"
+    description =
+        "Fail if the committed Android jniLibs are missing UniFFI symbols the committed " +
+            "bindings require (stale-.so guard; pure, needs no cargo/NDK)"
+    inputs.file(committedBindings).withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.files(engineJniLibs).withPathSensitivity(PathSensitivity.RELATIVE)
+    val marker = layout.buildDirectory.file("verifyAndroidJniLibs.ok")
+    outputs.file(marker)
+    doLast {
+        // Every native symbol JNA's Native.register resolves eagerly at load:
+        // both the uniffi_* (per-function + per-function-checksum) and the
+        // ffi_* (rustbuffer/contract-version/future runtime) external funcs.
+        val required = Regex("""external fun (uniffi_myotis_engine_\w+|ffi_myotis_engine_\w+)\s*\(""")
+            .findAll(committedBindings.readText())
+            .map { it.groupValues[1] }
+            .toSortedSet()
+        check(required.isNotEmpty()) {
+            "verifyAndroidJniLibs: found no UniFFI symbols in $committedBindings — " +
+                "the bindings file moved or its shape changed; update this task."
+        }
+        engineJniLibs.forEach { so ->
+            check(so.exists()) {
+                "verifyAndroidJniLibs: missing committed jniLib $so — run cargoNdkAndroid " +
+                    "and commit the result."
+            }
+            // ISO-8859-1 maps each byte 1:1 to a char, so `contains` is an exact
+            // byte-substring search over the whole .so (symbol names live in .dynstr).
+            val bytes = String(so.readBytes(), Charsets.ISO_8859_1)
+            val missing = required.filterNot { bytes.contains(it) }
+            check(missing.isEmpty()) {
+                "verifyAndroidJniLibs: ${so.parentFile.name}/${so.name} is STALE — missing " +
+                    "${missing.size} UniFFI symbol(s) the committed bindings require, e.g. " +
+                    "${missing.take(3)}. The Rust engine would fail UniFFI validation on-device " +
+                    "and silently fall back to Java. Rebuild + commit the jniLibs: " +
+                    "`./gradlew cargoNdkAndroid` (needs cargo-ndk + NDK), or regenerate the " +
+                    "bindings with `./gradlew uniffiGenerateKotlin` if they are the stale side."
+            }
+        }
+        marker.get().asFile.apply { parentFile.mkdirs(); writeText("ok") }
+        logger.lifecycle("[rust] verifyAndroidJniLibs: committed jniLibs export all " +
+            "${required.size} required UniFFI symbols")
+    }
+}
+
 // iOS static libs (libmyotis_engine.a) for the :app-ios Kotlin/Native framework —
 // cinterop absorbs them into the framework over the plain C ABI (rust/include/
 // myotis_engine.h). One task per Apple triple; :app-ios wires each Kotlin/Native
