@@ -308,16 +308,15 @@ async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
 
             let finalized = client.finalized_root().await?;
             let bs = client.bootstrap(&finalized).await?;
-            let accepted = store.insert_bootstrap(finalized, digest, &bs.bytes);
+            store.insert_bootstrap(finalized, digest, &bs.bytes);
             bootstrap_root = Some(finalized);
 
             println!("  finality    {:>7} bytes", fin.bytes.len());
             println!("  optimistic  {:>7} bytes", opt.bytes.len());
             println!(
-                "  bootstrap   {:>7} bytes  root=0x{}{}",
+                "  bootstrap   {:>7} bytes  root=0x{}",
                 bs.bytes.len(),
                 hex::encode(&finalized[..8]),
-                if accepted { "" } else { "  (REFUSED: cache full)" }
             );
             println!(
                 "  context     0x{} — INTERIM: copied from the newest update chunk.\n\

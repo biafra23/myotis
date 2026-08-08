@@ -33,7 +33,7 @@
 //! on cached bootstraps — which are keyed by arbitrary block root and therefore
 //! the one genuinely unbounded key space.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
 use myotis_net::codec::encode_success_response;
@@ -51,10 +51,12 @@ pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// Cap on cached bootstraps.
 ///
 /// Bootstraps are keyed by an arbitrary block root, so this is the only part of
-/// the store an unco-operative caller could otherwise grow without limit. The
-/// design's answer is to pre-populate checkpoint-aligned roots and refuse the
-/// rest; this cap is the backstop that makes "refuse the rest" true even if a
-/// future ingestion path gets sloppy.
+/// the store an unco-operative caller could otherwise grow without limit.
+///
+/// The cap is enforced by FIFO **eviction**, not refusal — see
+/// [`LcStore::insert_bootstrap`] for why that distinction is load-bearing. What
+/// bounds the *upstream* cost of arbitrary roots is
+/// [`MAX_BOOTSTRAP_MISSES`] plus the once-only attempt rule, not this number.
 pub const MAX_BOOTSTRAPS: usize = 64;
 
 /// Cap on roots queued for a background bootstrap fetch.
@@ -75,12 +77,17 @@ struct Inner {
     bootstraps: HashMap<[u8; 32], Arc<[u8]>>,
     finality: Option<Arc<[u8]>>,
     optimistic: Option<Arc<[u8]>>,
+    /// Insertion order for `bootstraps`, so eviction is FIFO rather than
+    /// whatever order the map happens to iterate in.
+    bootstrap_order: VecDeque<[u8; 32]>,
     /// Roots a caller asked for and we did not have — drained by the background
     /// filler.
     bootstrap_misses: BTreeSet<[u8; 32]>,
     /// Roots already attempted, so a root the upstream cannot serve is fetched
     /// once rather than on every retry of a wallet that will keep asking.
+    /// The set answers "seen?"; the queue fixes the eviction order.
     bootstrap_attempted: BTreeSet<[u8; 32]>,
+    bootstrap_attempted_order: VecDeque<[u8; 32]>,
 }
 
 /// Shared, cheap to clone, safe to read from the swarm task.
@@ -126,26 +133,61 @@ impl LcStore {
         self.inner.write().unwrap().optimistic = Some(wire);
     }
 
-    /// Returns false if the bootstrap cache is full — the caller should treat
-    /// that as "this root is not one we pre-populate", not as an error.
-    pub fn insert_bootstrap(&self, block_root: [u8; 32], fork_digest: [u8; 4], ssz: &[u8]) -> bool {
+    /// Cache a bootstrap, evicting the least recently inserted root when full.
+    /// Returns the evicted root, if any.
+    ///
+    /// Eviction rather than refusal, and the difference is not cosmetic: the
+    /// finalized checkpoint advances every epoch, so a cache that refuses when
+    /// full would stop accepting new finalized roots after
+    /// `MAX_BOOTSTRAPS` epochs — a few hours — and from then on serve no
+    /// bootstrap any live wallet could use, while looking perfectly healthy.
+    pub fn insert_bootstrap(
+        &self,
+        block_root: [u8; 32],
+        fork_digest: [u8; 4],
+        ssz: &[u8],
+    ) -> Option<[u8; 32]> {
         let mut inner = self.inner.write().unwrap();
-        if !inner.bootstraps.contains_key(&block_root) && inner.bootstraps.len() >= MAX_BOOTSTRAPS {
-            return false;
-        }
         let wire: Arc<[u8]> = encode_success_response(ssz, Some(fork_digest)).into();
-        inner.bootstraps.insert(block_root, wire);
-        true
+
+        // Refreshing an existing root must not re-queue it for eviction, or a
+        // repeatedly refreshed root would push everything else out.
+        if inner.bootstraps.insert(block_root, wire).is_some() {
+            return None;
+        }
+        inner.bootstrap_order.push_back(block_root);
+
+        let mut evicted = None;
+        while inner.bootstrap_order.len() > MAX_BOOTSTRAPS {
+            if let Some(oldest) = inner.bootstrap_order.pop_front() {
+                inner.bootstraps.remove(&oldest);
+                evicted = Some(oldest);
+            }
+        }
+        evicted
     }
 
     /// Queue a root for the background filler. Returns false when the queue is
     /// full or the root was already attempted — both mean "do not fetch".
     pub fn record_bootstrap_miss(&self, root: [u8; 32]) -> bool {
-        let mut inner = self.inner.write().unwrap();
-        if inner.bootstrap_attempted.contains(&root) || inner.bootstrap_misses.contains(&root) {
-            return false;
+        // Read-lock first. This runs on the swarm task for EVERY miss, so a
+        // caller spamming unknown roots must not be able to serialise the
+        // responder behind a write lock it will not end up needing.
+        {
+            let inner = self.inner.read().unwrap();
+            if inner.bootstrap_attempted.contains(&root)
+                || inner.bootstrap_misses.contains(&root)
+                || inner.bootstrap_misses.len() >= MAX_BOOTSTRAP_MISSES
+            {
+                return false;
+            }
         }
-        if inner.bootstrap_misses.len() >= MAX_BOOTSTRAP_MISSES {
+        let mut inner = self.inner.write().unwrap();
+        // Re-check: the lock was released in between.
+        if inner.bootstrap_attempted.contains(&root)
+            || inner.bootstrap_misses.contains(&root)
+            || inner.bootstrap_misses.len() >= MAX_BOOTSTRAP_MISSES
+        {
             return false;
         }
         inner.bootstrap_misses.insert(root);
@@ -158,13 +200,17 @@ impl LcStore {
         let taken: Vec<[u8; 32]> = inner.bootstrap_misses.iter().copied().take(max).collect();
         for root in &taken {
             inner.bootstrap_misses.remove(root);
-            inner.bootstrap_attempted.insert(*root);
+            if inner.bootstrap_attempted.insert(*root) {
+                inner.bootstrap_attempted_order.push_back(*root);
+            }
         }
-        // The attempted set is a negative cache, not a log: bound it the same
-        // way, dropping the oldest keys rather than growing without limit.
-        while inner.bootstrap_attempted.len() > MAX_BOOTSTRAPS {
-            if let Some(&first) = inner.bootstrap_attempted.iter().next() {
-                inner.bootstrap_attempted.remove(&first);
+        // The attempted set is a negative cache, not a log: bound it, evicting
+        // in INSERTION order. A BTreeSet iterates by key, so trimming from its
+        // front would drop whichever root happens to sort lowest — arbitrary,
+        // and it would keep re-attempting roots we just gave up on.
+        while inner.bootstrap_attempted_order.len() > MAX_BOOTSTRAPS {
+            if let Some(oldest) = inner.bootstrap_attempted_order.pop_front() {
+                inner.bootstrap_attempted.remove(&oldest);
             }
         }
         taken
@@ -349,20 +395,64 @@ mod tests {
         assert_eq!(decode_multi_chunk_response(&body, 1).unwrap().len(), 1);
     }
 
+    fn root_n(i: u64) -> [u8; 32] {
+        let mut root = [0u8; 32];
+        root[0..8].copy_from_slice(&i.to_le_bytes());
+        root
+    }
+
     #[test]
-    fn bootstraps_are_capped() {
+    fn bootstraps_evict_fifo_rather_than_refusing() {
         let s = LcStore::new();
-        for i in 0..MAX_BOOTSTRAPS {
-            let mut root = [0u8; 32];
-            root[0..8].copy_from_slice(&(i as u64).to_le_bytes());
-            assert!(s.insert_bootstrap(root, D, &[1u8; 32]));
+        for i in 0..MAX_BOOTSTRAPS as u64 {
+            assert_eq!(s.insert_bootstrap(root_n(i), D, &[1u8; 32]), None);
         }
-        assert!(!s.insert_bootstrap([0xff; 32], D, &[1u8; 32]), "cap must hold");
-        // …but refreshing one already cached is always allowed.
-        let mut existing = [0u8; 32];
-        existing[0..8].copy_from_slice(&0u64.to_le_bytes());
-        assert!(s.insert_bootstrap(existing, D, &[2u8; 32]));
         assert_eq!(s.coverage().bootstraps, MAX_BOOTSTRAPS);
+
+        // One past the cap evicts the OLDEST, and — the point of the fix — the
+        // new root is actually cached. Refusing here would mean that after
+        // MAX_BOOTSTRAPS epochs the server stops caching the current finalized
+        // root and serves no bootstrap any live wallet can use.
+        assert_eq!(s.insert_bootstrap([0xff; 32], D, &[1u8; 32]), Some(root_n(0)));
+        assert!(s.bootstrap(&[0xff; 32]).is_some(), "the new root must be cached");
+        assert!(s.bootstrap(&root_n(0)).is_none(), "the oldest must be gone");
+        assert_eq!(s.coverage().bootstraps, MAX_BOOTSTRAPS);
+    }
+
+    #[test]
+    fn refreshing_a_cached_bootstrap_does_not_reorder_eviction() {
+        let s = LcStore::new();
+        for i in 0..MAX_BOOTSTRAPS as u64 {
+            s.insert_bootstrap(root_n(i), D, &[1u8; 32]);
+        }
+        // Refresh the oldest: it must NOT move to the back, or a repeatedly
+        // refreshed root would push everything else out.
+        assert_eq!(s.insert_bootstrap(root_n(0), D, &[2u8; 32]), None);
+        assert_eq!(s.insert_bootstrap([0xff; 32], D, &[1u8; 32]), Some(root_n(0)));
+        assert_eq!(s.coverage().bootstraps, MAX_BOOTSTRAPS);
+    }
+
+    #[test]
+    fn a_miss_is_queued_once_and_never_re_attempted() {
+        let s = LcStore::new();
+        let root = root_n(7);
+        assert!(s.record_bootstrap_miss(root), "first miss queues");
+        assert!(!s.record_bootstrap_miss(root), "already queued");
+        assert_eq!(s.take_bootstrap_misses(10), vec![root]);
+        assert!(
+            !s.record_bootstrap_miss(root),
+            "already attempted — a wallet that keeps asking must not keep costing us fetches"
+        );
+    }
+
+    #[test]
+    fn the_miss_queue_is_bounded() {
+        let s = LcStore::new();
+        for i in 0..MAX_BOOTSTRAP_MISSES as u64 {
+            assert!(s.record_bootstrap_miss(root_n(i)));
+        }
+        assert!(!s.record_bootstrap_miss(root_n(9999)), "queue cap must hold");
+        assert_eq!(s.take_bootstrap_misses(usize::MAX).len(), MAX_BOOTSTRAP_MISSES);
     }
 
     #[test]

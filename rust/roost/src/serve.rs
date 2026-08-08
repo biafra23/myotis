@@ -284,11 +284,10 @@ async fn fill_bootstrap_misses(
     for root in store.take_bootstrap_misses(MISS_FETCHES_PER_TICK) {
         match client.bootstrap(&root).await {
             Ok(bs) => {
-                if store.insert_bootstrap(root, fork_digest, &bs.bytes) {
-                    filled += 1;
-                    tracing::info!(root = %hex::encode(&root[..8]), bytes = bs.bytes.len(),
-                        "filled a requested bootstrap");
-                }
+                store.insert_bootstrap(root, fork_digest, &bs.bytes);
+                filled += 1;
+                tracing::info!(root = %hex::encode(&root[..8]), bytes = bs.bytes.len(),
+                    "filled a requested bootstrap");
             }
             // Upstream cannot serve it (typically below its window). Already
             // marked attempted, so we will not ask again.
