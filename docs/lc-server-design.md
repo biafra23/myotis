@@ -3,6 +3,17 @@
 Status: **design**, not built. Supersedes the CL half of
 `dedicated-sepolia-node.md` §8.
 
+**Scope: sepolia only.** Every measurement below is sepolia, and each network
+would need its own server, ENR, fork digest and archive. Two numbers in
+particular do not travel:
+
+- **~1327 periods ≈ 36 MB is sepolia's archive.** Mainnet's Altair floor and
+  Gnosis's own beacon chain (`docs/multichain-design.md`) give different sizes.
+- **Mainnet does not have this problem in the same shape.** `NetworkConfig` pins
+  **18** mainnet CL multiaddrs against sepolia's **2**, so "replace the pinned CL
+  multiaddr with discovery" is a sepolia-shaped statement. Whether mainnet and
+  gnosis follow is deliberately left open.
+
 ## Why
 
 A myotis wallet needs a beacon node that will (a) still have a free slot when
