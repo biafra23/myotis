@@ -321,23 +321,26 @@ dependencies {
     implementation(libs.androidx.work.runtime)
 }
 
-// Rebuild the Rust jniLibs from source when the full toolchain (cargo +
-// cargo-ndk + NDK) is on this machine; cargoNdkAndroid self-skips otherwise
-// and the committed jniLibs ship as-is. Root build.gradle.kts owns the task.
-//
-// verifyAndroidJniLibs then asserts the jniLibs that will actually ship export
-// every UniFFI symbol the committed bindings require — catching a stale
-// committed .so (the v0.1.4 "Rust engine silently falls back to Java" bug)
-// as a loud build failure instead of a runtime surprise. mustRunAfter, so on a
-// full-toolchain machine it validates cargoNdkAndroid's FRESH output; on a
-// cargo-less machine cargoNdkAndroid is a no-op and it validates the committed
-// fallback. Both are dependencies of preBuild so `./gradlew build` (CI) runs them.
+// The Rust engine is built FROM SOURCE as part of the Android build (there is no
+// committed .so to drift). requireAndroidRustEngine enforces the contract: with
+// the toolchain present, cargoNdkAndroid cross-compiles the jniLibs; without it,
+// the build fails and names `-PskipRustEngine` (which omits the engine and falls
+// back to the Java engine at runtime). verifyAndroidJniLibs is the post-build
+// backstop that the produced .so exports every UniFFI symbol the bindings
+// require. All three run before the APK via preBuild, so `./gradlew build`,
+// `assembleDebug`, etc. all honor the contract. Root build.gradle.kts owns the tasks.
 tasks.matching { it.name == "preBuild" }.configureEach {
+    dependsOn(rootProject.tasks.named("requireAndroidRustEngine"))
     dependsOn(rootProject.tasks.named("cargoNdkAndroid"))
     dependsOn(rootProject.tasks.named("verifyAndroidJniLibs"))
 }
+// The backstop must see cargoNdkAndroid's FRESH output; the gate should fail
+// first (before we spend time cross-compiling) when the toolchain is missing.
 rootProject.tasks.named("verifyAndroidJniLibs").configure {
     mustRunAfter(rootProject.tasks.named("cargoNdkAndroid"))
+}
+rootProject.tasks.named("cargoNdkAndroid").configure {
+    mustRunAfter(rootProject.tasks.named("requireAndroidRustEngine"))
 }
 
 // === JNA's Android natives =============================================

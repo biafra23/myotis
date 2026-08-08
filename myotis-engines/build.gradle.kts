@@ -14,6 +14,19 @@ plugins {
 
 kotlin { jvmToolchain(21) }
 
+// Keep the committed UniFFI bindings fresh AUTOMATICALLY: regenerate them from
+// the Rust source before compiling, whenever the toolchain is present. This is
+// the symmetric partner to cargoNdkAndroid rebuilding the .so — without it the
+// bindings were the one artifact nobody auto-refreshed, so a change to an
+// `#[uniffi::export]` fn (even a doc-comment, which UniFFI folds into the
+// per-function checksum) silently left the committed .kt stale and the Rust
+// engine failed UniFFI validation on-device. uniffiGenerateKotlin self-skips
+// without cargo (onlyIf rustAvailable), so cargo-less builds compile the
+// committed .kt as-is; CI's regenerate-and-diff step keeps that copy honest.
+tasks.named("compileKotlin") {
+    dependsOn(rootProject.tasks.named("uniffiGenerateKotlin"))
+}
+
 // JVM 21 class files, not the project's preferred 17: the :node-core dependency (the
 // Java engine) publishes a JVM-21 floor (transitively forced by :networking's discv5),
 // and Gradle's variant matching refuses a 17-targeted consumer. Same documented

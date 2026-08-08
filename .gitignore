@@ -46,3 +46,9 @@ app/cacheDir/
 xcuserdata/
 *.xcworkspace/xcuserdata/
 ios-app/DerivedData/
+
+# Rust native libs for Android (the Rust engine + native BLS) are BUILT FROM
+# SOURCE by the Android build (cargoNdkAndroid), not committed — a committed
+# binary would drift from the Rust source and silently ship a dead engine.
+# `-PskipRustEngine` omits them (the app falls back to the Java engine).
+/android-app/src/main/jniLibs/*/libmyotis_*.so

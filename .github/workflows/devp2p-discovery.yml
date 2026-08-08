@@ -54,7 +54,9 @@ jobs:
       - name: Build
         # (--offline was a jitpack-403 workaround for the retired tuweni-kotlin fork;
         # deps now come from Maven Central, so fetch normally.)
-        run: ./gradlew build -x test --no-daemon
+        # -PskipRustEngine: no Rust/Android toolchain here, and :android-app builds
+        # the engine from source by default; this job only exercises the JVM daemon.
+        run: ./gradlew build -x test --no-daemon -PskipRustEngine
 
       - name: Run devp2p discovery (5 min timeout)
         id: discovery
