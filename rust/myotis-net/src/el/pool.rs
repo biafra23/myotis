@@ -82,6 +82,33 @@ const EL_HUNT_STALL: Duration = Duration::from_secs(60);
 /// (Java `ChainStack.ONLINE_SIGNAL_MAX_AGE_MS`).
 const ONLINE_SIGNAL_MAX_AGE: Duration = Duration::from_secs(2 * 60);
 
+/// Which pinned boot enodes to (re-)dial this maintainer tick — pure, so the
+/// policy is unit-tested rather than buried in the loop.
+///
+/// - BELOW target: all of them. The incident this fixes (#311): a pin that had
+///   been serving dropped, the pool refilled to `target` with discovered full
+///   nodes that had pruned the finalized-root state, and the pin was never
+///   re-dialed — account proofs failed until a restart. A dropped pin must
+///   reconnect even while the pool is "full" of peers that cannot serve.
+/// - AT/ABOVE target: only pins ALREADY PROVEN to serve snap data (cache
+///   `Confirmed`). Otherwise a healthy pool would perpetually re-handshake a
+///   pin that has never served — background radio + flash churn every backoff
+///   window for the process lifetime, which scales with the pin count (Gnosis
+///   ships 16 static EL enodes) and hits the Android/iOS paths CLAUDE.md keeps
+///   first-class. `try_dial` dedups a still-connected pin, so a proven pin that
+///   is up costs nothing; only a proven pin that has DROPPED is re-dialed.
+fn pins_to_dial(
+    live: usize,
+    target: usize,
+    pins: &[(SocketAddr, [u8; 64])],
+    confirmed: &std::collections::HashSet<SocketAddr>,
+) -> Vec<(SocketAddr, [u8; 64])> {
+    pins.iter()
+        .filter(|(addr, _)| live < target || confirmed.contains(addr))
+        .copied()
+        .collect()
+}
+
 /// Pure trigger: pool empty AND it has been empty past the stall window.
 fn el_hunt_due(live: usize, zero_since: Option<Instant>, now: Instant) -> bool {
     live == 0
@@ -130,9 +157,10 @@ struct PoolInner {
     /// Proven snap-capable peers, persisted for warm-start on the next run.
     cache: Mutex<ElPeerCache>,
     /// The network's pinned EL peers, `(addr, 64-byte pubkey)` — Java
-    /// `NetworkConfig.elBootEnodes()`. Dialed directly (warm start + every
-    /// maintainer tick below target), NOT seeded into the cache: see the
-    /// warm-start comment in `dialer_loop`.
+    /// `NetworkConfig.elBootEnodes()`. Dialed directly (warm start; and on a
+    /// maintainer tick when below target, or when a PROVEN snap server has
+    /// dropped even with a full pool — see `pins_to_dial`), NOT seeded into the
+    /// cache: see the warm-start comment in `dialer_loop`.
     boot_enodes: Vec<(SocketAddr, [u8; 64])>,
     /// Recent headers we can serve to peers + the eth/69 advertised range source.
     served: Arc<ServedHeaders>,
@@ -874,9 +902,10 @@ fn range_broadcast_due(
     }
 }
 
-/// The snap-peer maintainer: on a timer, if the live snap count has dropped
-/// below `target_snap_peers`, re-dial cached snap peers (snap-quality first) to
-/// top back up. Twin of the Java `ChainStack.maintainSnapPeers` loop — the
+/// The snap-peer maintainer: on a timer, re-dial pinned boot enodes
+/// (`pins_to_dial` — always below target, proven-servers-only above it) and,
+/// while below `target_snap_peers`, top the pool back up from the cache
+/// (snap-quality first). Twin of the Java `ChainStack.maintainSnapPeers` loop — the
 /// discv4 dialer alone can starve on a long-running daemon once its stream goes
 /// quiet and pooled peers die, so this keeps the pool healed from the cache.
 async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
@@ -917,25 +946,30 @@ async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
                 "EL hunt engaged — serving pool empty past the stall window \
                  (bypassing transient backoffs for cache-confirmed snap servers)");
         }
-        if live >= inner.pool_cfg.target_snap_peers {
-            continue;
-        }
-        // Snapshot the cache (snap-quality-sorted) without holding its lock
-        // across the dials, and re-offer the pinned boot enodes ahead of it: a
-        // pin that was down at startup (or whose backoff has since expired) must
-        // get another chance, and it must not depend on the cache being enabled.
-        // try_dial dedups against attempted/backoff, so re-listing is cheap.
+        // PINNED BOOT ENODES: maintained ABOVE the count gate (see
+        // `pins_to_dial`). Below target, dial all — a dropped pin must reconnect
+        // even when the pool is "full" of peers that cannot serve state. At/above
+        // target, dial only proven snap servers, so a healthy pool doesn't
+        // perpetually re-handshake a never-serving pin.
         let cached = inner.cache.lock().await.peers();
-        if cached.is_empty() && inner.boot_enodes.is_empty() {
-            continue;
-        }
-        for (addr, pubkey) in inner.boot_enodes.clone() {
-            if inner.peers.lock().await.len() >= inner.pool_cfg.target_snap_peers {
-                break;
-            }
+        let confirmed: std::collections::HashSet<SocketAddr> = cached
+            .iter()
+            .filter(|c| c.quality == SnapQuality::Confirmed)
+            .map(|c| c.addr)
+            .collect();
+        for (addr, pubkey) in
+            pins_to_dial(live, inner.pool_cfg.target_snap_peers, &inner.boot_enodes, &confirmed)
+        {
             if !try_dial(&inner, &dial_slots, addr, pubkey).await {
                 return; // pool shutting down
             }
+        }
+        // Discovered/cached peers are fungible — only fill UP TO the count target.
+        if live >= inner.pool_cfg.target_snap_peers {
+            continue;
+        }
+        if cached.is_empty() {
+            continue;
         }
         if hunting {
             // Emergency: free the TRANSIENT backoffs of CONFIRMED snap servers
@@ -1343,6 +1377,31 @@ mod tests {
             crate::el::eth::session::describe_disconnect(&[0xc1, 0x03])
         );
         assert!(!is_busy_disconnect(&produced_other));
+    }
+
+    #[test]
+    fn pins_dial_below_target_and_only_confirmed_above() {
+        let a: SocketAddr = "1.1.1.1:1".parse().unwrap();
+        let b: SocketAddr = "2.2.2.2:2".parse().unwrap();
+        let pins = vec![(a, [1u8; 64]), (b, [2u8; 64])];
+        let none: std::collections::HashSet<SocketAddr> = Default::default();
+        let confirmed_a: std::collections::HashSet<SocketAddr> = [a].into_iter().collect();
+
+        // Below target: every pin, proven or not — a dropped pin must reconnect
+        // even when the pool is "full" of peers that cannot serve state.
+        assert_eq!(pins_to_dial(3, 8, &pins, &none).len(), 2);
+        assert_eq!(pins_to_dial(0, 8, &pins, &none).len(), 2);
+
+        // At/above target: only pins already proven to serve snap data, so a
+        // healthy pool doesn't perpetually re-handshake a never-serving pin.
+        assert_eq!(pins_to_dial(8, 8, &pins, &none).len(), 0);
+        let only = pins_to_dial(9, 8, &pins, &confirmed_a);
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].0, a); // the confirmed one, not b
+
+        // The incident shape: a proven pin (the dedicated node) dropped while the
+        // pool is at target with non-serving peers — it is still dialed.
+        assert_eq!(pins_to_dial(8, 8, &pins, &confirmed_a).len(), 1);
     }
 
     #[test]
