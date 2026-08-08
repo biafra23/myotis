@@ -339,9 +339,15 @@ tasks.named("check") { dependsOn(cargoCheckWasm) }
 // you don't have (or don't want) the toolchain — the app then uses the Java
 // engine (and JVM BLS) at runtime. requireAndroidRustEngine (below) tells the
 // developer about this switch if the toolchain is missing and the flag is unset.
-// Presence-based, like -PtorEngine: a bare `-PskipRustEngine` counts as true.
+// Presence-based: a bare `-PskipRustEngine` counts as true, as do the usual
+// truthy spellings (true/1/yes/on). Only an explicit false-y value
+// (false/0/no/off) disables it — this flag is the documented escape hatch out of
+// a hard failure, so a stray `-PskipRustEngine=1` must NOT silently parse as
+// "don't skip" and send the user straight back into the toolchain error.
 val skipRustEngine = project.hasProperty("skipRustEngine") &&
-    (project.property("skipRustEngine") as? String).let { it.isNullOrBlank() || it.toBoolean() }
+    (project.property("skipRustEngine") as? String).let {
+        it.isNullOrBlank() || it.trim().lowercase() !in setOf("false", "0", "no", "off")
+    }
 val androidRustTargets = listOf("aarch64-linux-android", "x86_64-linux-android")
 val androidRustToolchainReady = rustAvailable &&
     cargoNdkVersion.isNotEmpty() &&

@@ -5,14 +5,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Run
 
 ```bash
-# Build all modules
-./gradlew build
+# Build all modules. NOTE: :android-app builds the Rust engine from source by
+# default, so a full build needs the Android Rust toolchain (cargo + cargo-ndk +
+# NDK r28+ + the aarch64/x86_64-linux-android rustup targets). Without it, add
+# -PskipRustEngine to build the app on the Java engine (see the Rust section below).
+./gradlew build                  # add -PskipRustEngine without the Android Rust toolchain
 
 # Compile only (no tests)
 ./gradlew compileJava
 
-# Run tests (all modules)
-./gradlew test
+# Run tests (all modules) — same toolchain note as `build`; :android-app's test
+# tasks also go through its preBuild gate.
+./gradlew test                   # add -PskipRustEngine without the Android Rust toolchain
 
 # Run a single test class
 ./gradlew :networking:test --tests "com.jaeckel.ethp2p.networking.rlpx.HandshakeRoundTripTest"

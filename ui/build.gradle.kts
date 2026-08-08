@@ -68,15 +68,20 @@ abstract class AppVersionSource : ValueSource<String, AppVersionSource.Params> {
     }
 
     /**
-     * True when tracked files differ from HEAD, EXCLUDING the committed Rust jniLibs.
-     * Those are build outputs kept in the tree as a fallback, and android-apk.yml
-     * deliberately rebuilds them from source before assembling — a rebuilt .so is
-     * near-never byte-identical, so counting it would make every release APK label
-     * itself a dev build. Untracked files are ignored, matching `describe --dirty`.
+     * True when tracked files differ from HEAD, EXCLUDING the Rust build outputs
+     * that the Android build regenerates from source: the jniLibs .so files (now
+     * gitignored, so already invisible to --untracked-files=no — kept in the
+     * pathspec for intent) and the committed UniFFI bindings under
+     * myotis-engines/src/main/kotlin/uniffi. The Android build rebuilds the .so
+     * (near-never byte-identical) and regenerates the .kt from source before
+     * assembling; counting either would make every release APK label itself a dev
+     * build. Untracked files are ignored, matching `describe --dirty`.
      */
     private fun treeIsPatched(): Boolean = git(
         "status", "--porcelain", "--untracked-files=no",
-        "--", ".", ":(exclude)android-app/src/main/jniLibs",
+        "--", ".",
+        ":(exclude)android-app/src/main/jniLibs",
+        ":(exclude)myotis-engines/src/main/kotlin/uniffi",
     ).isNotEmpty()
 
     /** Newest RELEASED version reachable from HEAD, or null when none is. */

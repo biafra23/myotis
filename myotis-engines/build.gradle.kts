@@ -14,17 +14,22 @@ plugins {
 
 kotlin { jvmToolchain(21) }
 
-// Keep the committed UniFFI bindings fresh AUTOMATICALLY: regenerate them from
-// the Rust source before compiling, whenever the toolchain is present. This is
-// the symmetric partner to cargoNdkAndroid rebuilding the .so — without it the
-// bindings were the one artifact nobody auto-refreshed, so a change to an
-// `#[uniffi::export]` fn (even a doc-comment, which UniFFI folds into the
-// per-function checksum) silently left the committed .kt stale and the Rust
-// engine failed UniFFI validation on-device. uniffiGenerateKotlin self-skips
-// without cargo (onlyIf rustAvailable), so cargo-less builds compile the
-// committed .kt as-is; CI's regenerate-and-diff step keeps that copy honest.
+// The committed UniFFI bindings are NOT force-regenerated from compileKotlin:
+// a `dependsOn(uniffiGenerateKotlin)` would drag a full `cargo build --release`
+// (via cargoBuildHost) in front of every JVM host's Kotlin compile and make a
+// broken rust/ break the JVM build — violating "Rust is OPTIONAL for the JVM
+// hosts". Auto-regeneration is scoped to the Android build (:android-app
+// preBuild, where cargo is already required); CI enforces freshness everywhere
+// via the regenerate-and-diff step in android-apk.yml; regenerate manually
+// elsewhere with `./gradlew uniffiGenerateKotlin`.
+//
+// mustRunAfter (NOT dependsOn) is ORDERING ONLY — inert when uniffiGenerateKotlin
+// isn't in the graph (every non-Android build: no cargo pulled in), and, when it
+// IS (an Android build regenerating the bindings), it makes compileKotlin read
+// the fresh .kt and satisfies Gradle's implicit-dependency validation, since
+// compileKotlin consumes uniffiGenerateKotlin's declared output.
 tasks.named("compileKotlin") {
-    dependsOn(rootProject.tasks.named("uniffiGenerateKotlin"))
+    mustRunAfter(rootProject.tasks.named("uniffiGenerateKotlin"))
 }
 
 // JVM 21 class files, not the project's preferred 17: the :node-core dependency (the
