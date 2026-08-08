@@ -25,6 +25,10 @@ limits.
 - `store.rs` — the in-memory serving cache, holding **pre-encoded** libp2p
   responses so serving is a memcpy and a write. Bounded: spec update count,
   total response bytes, and a hard cap on bootstraps.
+- `forks.rs` — the chain's fork and blob schedule, read from the upstream's
+  `/eth/v1/config/spec`, and the fork digest for any slot. Context bytes are
+  **computed**, not guessed from a fork name — since EIP-7892 one fork name has
+  as many digests as it has BPO entries.
 - `archive.rs` — the durable, append-only archive (magic, version, per-record
   FNV-1a checksum), bound to a chain by its `genesis_validators_root`. Repairs a
   torn tail on open and scans past a corrupt record rather than losing every
@@ -47,10 +51,10 @@ re-published at fork *and* BPO boundaries) and the **back-archive** below the
 upstream node's light-client floor. Those are what stand between this and the
 design's rollout steps 4-5.
 
-Known interim: context bytes for the three single-object endpoints are copied
-from the newest update chunk. Correct except across a fork or BPO boundary.
-myotis' own decoder ignores context bytes; other CLs dispatch on them, so this
-must be computed via `fork_digest_bpo` before the ENR is published.
+Context bytes are now computed per object: `updates` re-emits the digest the
+source framed (the robust path), a bootstrap is stamped for the slot of the
+block it anchors to, and the per-slot objects for head. `roost probe` checks the
+computed value against the one the upstream actually put on the wire.
 
 ## Run
 

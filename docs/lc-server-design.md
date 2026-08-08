@@ -360,7 +360,7 @@ because `extra_data` is variable-length, so **the length prefix is the only
 authority for chunk boundaries** — do not derive one number from the other when
 checking a parser.
 
-### Context bytes: prefer re-emission, compute only as a fallback
+### Context bytes: prefer re-emission, compute only as a fallback — IMPLEMENTED
 
 `Eth-Consensus-Version` gives a fork *name*, and since EIP-7892 the fork digest
 is **not a function of the name**: it folds in the active blob parameters.
@@ -377,6 +377,17 @@ So: **re-emit the digest the source already framed** wherever one exists — whi
 the source supplies none (the single-object endpoints), and compute it for the
 *object's slot* via `fork_digest_bpo` against the network's blob schedule, not
 from the fork name.
+
+**Built** (`rust/roost/src/forks.rs`). The schedule — fork versions, activation
+epochs, `SLOTS_PER_EPOCH`, `BLOB_SCHEDULE` — is read from the upstream's
+`/eth/v1/config/spec`, so there is no per-network table to drift and gnosis's
+16-slot epochs need no special case. A bootstrap is stamped for the slot of the
+block it anchors to (looked up by root, since a pinned checkpoint can sit many
+epochs behind head); the per-slot objects are stamped for head, which they track
+to within a slot or two. `roost probe` checks the computed digest against the one
+the upstream framed on the wire — verified equal on sepolia at `0x74d01459`, and
+`myotis-net`'s pinned mainnet values (`0x82FAE541` base, `0x8C9F62FE` with BPO2)
+are reached through the same selection in unit tests.
 
 The blast radius of getting this wrong is asymmetric and worth knowing: myotis'
 own decoder skips the context bytes (`codec.rs`: "the payload's own fork sniffing

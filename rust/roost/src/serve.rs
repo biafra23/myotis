@@ -28,6 +28,7 @@ use myotis_net::status::StatusMessage;
 
 use crate::archive::Archive;
 use crate::framing::split_updates;
+use crate::forks::ForkSchedule;
 use crate::rest::{period_of_slot, FetchError, NimbusRest, SLOTS_PER_PERIOD};
 use crate::store::LcStore;
 
@@ -42,6 +43,13 @@ const REFRESH: Duration = Duration::from_secs(12);
 /// cost here is a Noise session and a yamux stream — tens of KB — with no
 /// gossipsub mesh, no peer scoring and no per-peer computation.
 const MAX_INBOUND: u32 = 1024;
+
+/// How often to re-read the chain's fork/blob schedule, in ticks.
+///
+/// It is configuration and changes only when the upstream is upgraded — but it
+/// DOES change then (a client release can add a BPO entry), and a roost that
+/// cached it at startup would keep stamping the old digest. ~5 minutes.
+const SCHEDULE_REFRESH_TICKS: u32 = 25;
 
 /// Bootstrap misses fetched per tick. The rate limit the design asks for: a
 /// caller inventing roots costs us at most this many upstream requests per
@@ -149,6 +157,70 @@ async fn chain_view(
         head_slot,
         earliest_available_slot,
     })
+}
+
+/// Where a response's context bytes come from.
+///
+/// Computed from the chain's schedule when it is available, which is the
+/// correct answer for any slot. The observed fallback exists only so an
+/// upstream that cannot serve `/config/spec` degrades to the previous
+/// behaviour instead of taking the daemon down — it is the newest `updates`
+/// chunk's digest, which is right for the current fork and stale across a
+/// boundary.
+struct Digests {
+    schedule: Option<ForkSchedule>,
+    observed: [u8; 4],
+}
+
+impl Digests {
+    fn for_slot(&self, slot: u64) -> [u8; 4] {
+        match &self.schedule {
+            Some(s) => s.digest_for_slot(slot),
+            None => self.observed,
+        }
+    }
+
+    fn source(&self) -> &'static str {
+        if self.schedule.is_some() { "computed" } else { "observed (interim)" }
+    }
+}
+
+/// Log — loudly — when the digest we compute disagrees with one the upstream
+/// actually framed on the wire.
+///
+/// Deliberately does NOT fall back to the observed value. A disagreement has two
+/// causes and they pull in opposite directions:
+///
+/// - The schedule or the selection is wrong, in which case computed is wrong.
+/// - A fork or BPO boundary falls inside the current sync-committee period, in
+///   which case the two SHOULD differ: `observed` is the digest of that period's
+///   update, whose attested header may predate the boundary, while `computed` is
+///   for head. A period spans 256 epochs, so this is entirely possible.
+///
+/// Falling back would mean serving the stale digest during exactly the fork
+/// transition this whole module exists to handle. `computed` is derived from the
+/// chain's own configuration and is authoritative for a known slot, so it wins;
+/// the mismatch is surfaced for a human instead.
+fn report_digest_disagreement(digests: &Digests, observed: [u8; 4], head_slot: u64) {
+    if digests.schedule.is_none() {
+        return;
+    }
+    let computed = digests.for_slot(head_slot);
+    if computed != observed {
+        tracing::error!(
+            computed = %hex::encode(computed),
+            observed = %hex::encode(observed),
+            head_slot,
+            "computed fork digest disagrees with the newest digest seen on the wire — \
+             expected across a fork/BPO boundary inside the current period, otherwise a \
+             schedule bug. Serving the COMPUTED value."
+        );
+    }
+}
+
+/// Read the fork and blob schedule from the upstream.
+async fn fetch_schedule(client: &NimbusRest, gvr: [u8; 32]) -> Result<ForkSchedule> {
+    ForkSchedule::fetch(client, gvr).await
 }
 
 /// The fork digest to stamp on responses, taken from the newest update chunk.
@@ -279,7 +351,7 @@ pub async fn serve(
         Err(e) => println!("  filled    upstream probe failed: {e}; serving the archive"),
     }
 
-    let fork_digest = match resolve_fork_digest(&client, &store, head_period).await {
+    let observed = match resolve_fork_digest(&client, &store, head_period).await {
         Some(d) => d,
         None => {
             return Err(anyhow!(
@@ -288,11 +360,24 @@ pub async fn serve(
             ))
         }
     };
-    if let Err(e) = refresh_live(&client, &store, fork_digest).await {
+    let schedule = match fetch_schedule(&client, gvr).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(error = %e,
+                "could not read the fork/blob schedule — falling back to the observed digest, \
+                 which goes stale across a fork boundary; will retry");
+            None
+        }
+    };
+    let digests = Digests { schedule, observed };
+
+    report_digest_disagreement(&digests, observed, head_slot);
+
+    if let Err(e) = refresh_live(&client, &store, &digests, head_slot).await {
         tracing::warn!(error = %e, "initial live-object fetch failed; the ticker will retry");
     }
 
-    let status = LocalStatus::new(chain_view(&client, &store, fork_digest).await?);
+    let status = LocalStatus::new(chain_view(&client, &store, digests.for_slot(head_slot)).await?);
     let key_path = key_path.unwrap_or_else(|| archive_path.with_extension("key"));
     let keypair = load_or_create_key(&key_path)?;
 
@@ -315,12 +400,17 @@ pub async fn serve(
     println!("  identity  {} (persisted in {})", peer_id, key_path.display());
     println!("  multiaddr /ip4/127.0.0.1/tcp/{port}/p2p/{peer_id}");
     println!("  periods   {} ({:?}..={:?})", c.periods, c.lowest_period, c.highest_period);
-    println!("  digest    0x{} (interim)", hex::encode(fork_digest));
+    println!(
+        "  digest    0x{} ({})",
+        hex::encode(digests.for_slot(head_slot)),
+        digests.source()
+    );
     println!("  inbound   cap {MAX_INBOUND}");
     println!("\n  point a wallet at the multiaddr above; Ctrl-C to stop.\n");
 
+    let mut digests = digests;
     let mut swarm_task = swarm_task;
-    let mut fork_digest = fork_digest;
+    let mut ticks: u32 = 0;
     let mut ticker = tokio::time::interval(REFRESH);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -348,50 +438,67 @@ pub async fn serve(
                 // degrade what we serve, never take the responder down. A stale
                 // relay surfaces to wallets as "not ready", which is the
                 // detectable failure the design accepts.
-                // Re-resolve the digest EVERY tick. It is not only context
-                // bytes: it is also `status.fork_digest`, which every peer's
-                // relevance check reads on the mandatory handshake. Held
-                // constant, a process that stays up across a fork or BPO
-                // boundary advertises the pre-fork digest indefinitely — other
-                // clients answer with Goodbye(IrrelevantNetwork), and myotis
-                // wallets filter us out on `accepted_fork_digests`, so we go
-                // invisible to exactly the clients we exist for.
-                match client.syncing().await {
-                    Ok((slot, _)) => {
-                        if let Some(d) = resolve_fork_digest(&client, &store, period_of_slot(slot)).await {
-                            if d != fork_digest {
-                                tracing::warn!(old = %hex::encode(fork_digest), new = %hex::encode(d),
-                                    "fork digest changed — fork or BPO boundary crossed");
-                                fork_digest = d;
+                ticks = ticks.wrapping_add(1);
+                let head_slot_hint = status.get().head_slot;
+
+                // Re-read the schedule periodically, and keep retrying while we
+                // are on the observed fallback. A client upgrade can add a BPO
+                // entry, and a roost that cached the schedule at startup would
+                // keep stamping the pre-BPO digest indefinitely.
+                if digests.schedule.is_none() || ticks.is_multiple_of(SCHEDULE_REFRESH_TICKS) {
+                    match fetch_schedule(&client, gvr).await {
+                        Ok(s) => {
+                            if digests.schedule.as_ref() != Some(&s) {
+                                tracing::info!("fork/blob schedule updated");
                             }
+                            digests.schedule = Some(s);
                         }
+                        Err(e) => tracing::warn!(error = %e, "re-reading the schedule failed"),
                     }
-                    Err(e) => tracing::warn!(error = %e, "polling head slot for the digest failed"),
+                    if let Some(observed) = store.newest_fork_digest() {
+                        // Re-check against the wire after every refresh, not only
+                        // at startup — otherwise a schedule rejected at boot would
+                        // be silently reinstated by the first refresh.
+                        report_digest_disagreement(&digests, observed, head_slot_hint);
+                    }
                 }
-                if let Err(e) = refresh_live(&client, &store, fork_digest).await {
+
+                let head_slot = match client.syncing().await {
+                    Ok((slot, _)) => slot,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "polling head slot failed");
+                        continue;
+                    }
+                };
+
+                // status.fork_digest is not merely context bytes: it is what
+                // every peer's relevance check reads on the mandatory handshake.
+                // Computing it per tick from the head slot is what carries us
+                // across a fork or BPO boundary — held constant, other clients
+                // answer Goodbye(IrrelevantNetwork) and myotis wallets filter us
+                // out on `accepted_fork_digests`, making us invisible to exactly
+                // the clients we exist for.
+                let head_digest = digests.for_slot(head_slot);
+
+                if let Err(e) = refresh_live(&client, &store, &digests, head_slot).await {
                     tracing::warn!(error = %e, "refreshing live objects failed");
                 }
-                if let Err(e) = fill_bootstrap_misses(&client, &store, fork_digest).await {
+                if let Err(e) = fill_bootstrap_misses(&client, &store, &digests, head_slot).await {
                     tracing::warn!(error = %e, "filling bootstrap misses failed");
                 }
-                match chain_view(&client, &store, fork_digest).await {
+                match chain_view(&client, &store, head_digest).await {
                     Ok(view) => status.set(view),
                     Err(e) => tracing::warn!(error = %e, "refreshing the chain view failed"),
                 }
                 // A new period turns over every ~27 hours; checking each slot is
                 // free next to the HTTP calls above.
-                match client.syncing().await {
-                    Ok((slot, _)) => {
-                        let p = period_of_slot(slot);
-                        if !store.has_period(p) {
-                            match fill_periods(&client, &store, &mut archive, p, p).await {
-                                Ok(n) if n > 0 => tracing::info!(period = p, "archived a new period"),
-                                Ok(_) => {}
-                                Err(e) => tracing::warn!(error = %e, "filling the new period failed"),
-                            }
-                        }
+                let p = period_of_slot(head_slot);
+                if !store.has_period(p) {
+                    match fill_periods(&client, &store, &mut archive, p, p).await {
+                        Ok(n) if n > 0 => tracing::info!(period = p, "archived a new period"),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "filling the new period failed"),
                     }
-                    Err(e) => tracing::warn!(error = %e, "polling head slot failed"),
                 }
             }
         }
@@ -399,20 +506,59 @@ pub async fn serve(
 }
 
 /// Refresh the per-slot objects and the checkpoint bootstrap.
-async fn refresh_live(client: &NimbusRest, store: &LcStore, fork_digest: [u8; 4]) -> Result<()> {
-    let fin = client.finality_update().await?;
-    store.set_finality(fork_digest, &fin.bytes);
-    let opt = client.optimistic_update().await?;
-    store.set_optimistic(fork_digest, &opt.bytes);
+///
+/// The per-slot objects are stamped with the digest for the HEAD slot at fetch
+/// time. roost is a byte cache and does not decode SSZ, so it cannot read the
+/// object's own attested-header slot without the light-client type modelling
+/// this design exists to avoid — and head is what these objects track, to
+/// within a slot or two. The residual error is confined to the handful of slots
+/// straddling a fork or BPO boundary, and self-corrects on the next tick because
+/// both objects are refetched every slot.
+///
+/// A BOOTSTRAP is different: it is keyed by an arbitrary root that may be far
+/// from head, so its epoch is looked up exactly.
+async fn refresh_live(
+    client: &NimbusRest,
+    store: &LcStore,
+    digests: &Digests,
+    head_slot: u64,
+) -> Result<()> {
+    let head_digest = digests.for_slot(head_slot);
 
-    // The current finalized root is pre-populated; anything else arrives through
-    // the miss queue below, which is what keeps this key space bounded.
+    let fin = client.finality_update().await?;
+    store.set_finality(head_digest, &fin.bytes);
+    let opt = client.optimistic_update().await?;
+    store.set_optimistic(head_digest, &opt.bytes);
+
     let finalized = client.finalized_root().await?;
     if store.bootstrap(&finalized).is_none() {
         let bs = client.bootstrap(&finalized).await?;
-        store.insert_bootstrap(finalized, fork_digest, &bs.bytes);
+        let digest = bootstrap_digest(client, digests, &finalized, head_slot).await;
+        store.insert_bootstrap(finalized, digest, &bs.bytes);
     }
     Ok(())
+}
+
+/// The digest for a bootstrap, from the slot of the block it anchors to.
+///
+/// A pinned checkpoint can sit many epochs behind head — potentially across a
+/// fork boundary — so stamping it with head's digest would be wrong for exactly
+/// the wallets that are furthest behind. Falls back to head only if the header
+/// lookup fails, which is strictly better than refusing to serve.
+async fn bootstrap_digest(
+    client: &NimbusRest,
+    digests: &Digests,
+    root: &[u8; 32],
+    head_slot: u64,
+) -> [u8; 4] {
+    match client.header_slot(root).await {
+        Ok(slot) => digests.for_slot(slot),
+        Err(e) => {
+            tracing::warn!(root = %hex::encode(&root[..8]), error = %e,
+                "could not resolve a bootstrap's slot — stamping it with head's digest");
+            digests.for_slot(head_slot)
+        }
+    }
 }
 
 /// Fetch bootstraps that callers asked for and we did not have.
@@ -424,13 +570,15 @@ async fn refresh_live(client: &NimbusRest, store: &LcStore, fork_digest: [u8; 4]
 async fn fill_bootstrap_misses(
     client: &NimbusRest,
     store: &LcStore,
-    fork_digest: [u8; 4],
+    digests: &Digests,
+    head_slot: u64,
 ) -> Result<usize> {
     let mut filled = 0;
     for root in store.take_bootstrap_misses(MISS_FETCHES_PER_TICK) {
         match client.bootstrap_classified(&root).await {
             Ok(bs) => {
-                store.insert_bootstrap(root, fork_digest, &bs.bytes);
+                let digest = bootstrap_digest(client, digests, &root, head_slot).await;
+                store.insert_bootstrap(root, digest, &bs.bytes);
                 filled += 1;
                 tracing::info!(root = %hex::encode(&root[..8]), bytes = bs.bytes.len(),
                     "filled a requested bootstrap");

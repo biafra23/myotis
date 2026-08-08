@@ -308,6 +308,79 @@ impl NimbusRest {
         Ok((parse_root(root)?, epoch))
     }
 
+    /// `/eth/v1/config/spec` — the chain's fork versions, activation epochs,
+    /// `SLOTS_PER_EPOCH` and blob schedule.
+    ///
+    /// Returns only the SCALAR entries; `BLOB_SCHEDULE` is an array of objects
+    /// and comes back from [`NimbusRest::blob_schedule`] instead.
+    ///
+    /// This is chain CONFIGURATION, not consensus data — it decides what fork
+    /// digest to stamp on a response, and a wrong one costs reachability rather
+    /// than correctness (peers answer a mismatched `status` with
+    /// Goodbye(IrrelevantNetwork)). Reading it from the node roost already
+    /// follows is what stops roost disagreeing with its own upstream about which
+    /// fork it is on.
+    /// Returns the scalars AND the blob schedule from ONE request — they live
+    /// in the same document, and fetching it twice would be two round trips for
+    /// one payload.
+    pub async fn config_spec(
+        &self,
+    ) -> Result<(
+        std::collections::BTreeMap<String, String>,
+        Vec<crate::forks::BlobParams>,
+    )> {
+        let v = self.get_json("/eth/v1/config/spec").await?;
+        let obj = v["data"]
+            .as_object()
+            .ok_or_else(|| anyhow!("config/spec: data is not an object"))?;
+        let scalars = obj
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect();
+        Ok((scalars, parse_blob_schedule(&v)?))
+    }
+}
+
+/// The EIP-7892 `BLOB_SCHEDULE` entries. Absent on a chain with none (pre-Fulu,
+/// or a client that does not expose it), which is not an error.
+fn parse_blob_schedule(v: &serde_json::Value) -> Result<Vec<crate::forks::BlobParams>> {
+    {
+        let Some(entries) = v["data"]["BLOB_SCHEDULE"].as_array() else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(entries.len());
+        for e in entries {
+            let epoch = e["EPOCH"]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .ok_or_else(|| anyhow!("BLOB_SCHEDULE entry missing EPOCH"))?;
+            let max_blobs = e["MAX_BLOBS_PER_BLOCK"]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .ok_or_else(|| anyhow!("BLOB_SCHEDULE entry missing MAX_BLOBS_PER_BLOCK"))?;
+            out.push(crate::forks::BlobParams { epoch, max_blobs });
+        }
+        Ok(out)
+    }
+}
+
+impl NimbusRest {
+    /// The slot of a block identified by root — how roost learns the epoch a
+    /// BOOTSTRAP belongs to without decoding SSZ (it is a byte cache, and
+    /// modelling light-client types is exactly what this design avoids).
+    pub async fn header_slot(&self, block_root: &[u8; 32]) -> Result<u64> {
+        let v = self
+            .get_json(&format!(
+                "/eth/v1/beacon/headers/0x{}",
+                hex::encode(block_root)
+            ))
+            .await?;
+        v["data"]["header"]["message"]["slot"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| anyhow!("headers/<root>: missing slot"))
+    }
+
     /// The chain's `genesis_validators_root` — the identity an archive is bound
     /// to, so a file collected for one network can never load for another.
     pub async fn genesis_validators_root(&self) -> Result<[u8; 32]> {
