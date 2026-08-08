@@ -86,24 +86,65 @@ entirely: no semaphore, no trimmer, no peer scoring. Requires `--rest`
 This satisfies the hard requirement that the LC server can **always** reach the
 newest update regardless of how Nimbus's 500 p2p slots are being used.
 
-### This does not breach the no-HTTP rule
+### OPEN DECISION: this needs a CLAUDE.md amendment, not an exception
 
-CLAUDE.md forbids sourcing production data from a local client over HTTP. That
-rule governs how a **wallet** obtains data. Here the consumer is our own
-infrastructure, and the payload is self-verifying end to end: a bootstrap is
-anchored to the checkpoint root the wallet already pins, and every update is
-verified against sync-committee BLS signatures by the wallet that receives it.
-A relay can withhold data; it cannot forge it. The wallet's trust anchors are
-unchanged.
+CLAUDE.md's rule is unqualified: "the only sources for data are devp2p and
+libp2p calling a local client via http may only be used for debugging purposes
+it is not an option for production". Nothing in it scopes to the wallet, so
+reading it as wallet-only would be a narrowing invented here, in a document
+CLAUDE.md does not reference — leaving two texts that disagree and the next
+reader to guess which wins. **This is the owner's call and is not settled by
+this document.**
+
+The substantive argument, for what it is worth: the payload is self-verifying
+end to end. A bootstrap is anchored to the checkpoint root the wallet already
+pins, every update is verified against sync-committee BLS signatures by the
+wallet receiving it, and a relay can withhold but not forge. That is a genuinely
+different situation from an EL RPC fallback, which is what the rule was written
+against.
+
+If accepted, the amendment belongs in CLAUDE.md's **Data sources** section, e.g.:
+
+> …for a wallet; myotis-operated relay infrastructure may source *self-verifying*
+> consensus objects (LC bootstrap/updates) from a local beacon node over loopback
+> REST, because the wallet still verifies every byte against its own anchor.
+
+Two boundaries the carve-out must keep, and they are the reason to write it down
+rather than leave it implicit:
+
+- **"Self-verifying" is doing all the work.** This must not widen into "the relay
+  may serve anything it read over REST". Any path relaying something a wallet
+  cannot check against sync-committee signatures — the `beacon_blocks_by_range`
+  proxy floated above is the live example — needs its own justification, not this
+  one.
+- **Withholding is a liveness attack, and this design concentrates it.** After
+  rollout, a wallet's LC data comes from one relay fed by one Nimbus. That
+  failure is *detected*, not silently wrong: `BeaconSyncState` regresses out of
+  SYNCED and queries fail with `beaconNotSynced` (gate 1 in
+  `docs/readiness-and-verified-head-age.md`), so a stalled relay surfaces as "not
+  ready" rather than as a confidently wrong balance, and the wallet falls back to
+  discv5-discovered CL peers.
+
+The alternative that needs no amendment: have the LC server peer with Nimbus over
+**libp2p** as a `--direct-peer` (outbound from Nimbus, trim-exempt) instead of
+using REST. It stays on-policy, but it is weaker — direct peers still take a slot
+from the shared semaphore, so it reintroduces exactly the "can we always reach
+the newest update" question that REST answers unconditionally.
 
 ## What already exists
 
 Most of the server is written. In `rust/myotis-net`:
 
 - Full libp2p host — Noise, yamux, SSZ+snappy req/resp codecs.
-- **Inbound already works for 5 of 9 protocols** with real answers:
-  `respond_inbound` (`reqresp.rs`) serves `status/1`, `status/2`, `ping`,
-  `metadata/2`, `goodbye`. The four LC protocols currently fall through to
+- **Inbound is already wired for 5 of 9 protocols**, though two of those are not
+  yet spec-correct. `respond_inbound` (`reqresp.rs`) answers `status/1`,
+  `status/2`, `ping`, `metadata/2`, `goodbye`. Of these, `status` and `metadata`
+  are real answers; **`ping` echoes the caller's value instead of returning this
+  node's metadata sequence number, and `goodbye` replies without disconnecting**
+  even though Goodbye is a one-way notification. Both are acceptable in a client
+  that dials out and closes; both must be fixed before shipping a public
+  responder, or the daemon retains peers that asked to leave. Count them as
+  remaining work. The four LC protocols currently fall through to
   `ResourceUnavailable` — "no relay cache yet".
 - **Multi-chunk responses already round-trip.** `decode_multi_chunk_response`
   exists and its test builds the wire by concatenating `encode_success_response`,
@@ -117,26 +158,122 @@ Most of the server is written. In `rust/myotis-net`:
 1. **An LC store** — bootstraps keyed by block root, updates keyed by period,
    plus the latest finality and optimistic update. Small and fully shareable:
    every client gets identical bytes. Dominated by the 512×48-byte sync
-   committee, so ~25 KB per update.
-2. **Ingestion** — poll Nimbus REST per slot for finality/optimistic; fetch
-   updates by period on demand and cache; fetch bootstraps on demand by root.
-   Prefer the SSE stream (`/eth/v1/events`) over polling if Nimbus exposes the
-   light-client topics.
-3. **Serve the four LC protocols** in `respond_inbound`, replacing the
-   `ResourceUnavailable` fallthrough. `updates_by_range` additionally needs
-   `ProtocolSupport::Outbound` → `Full` and removal from the responder's
-   excluded arm.
-4. **Publish an ENR** — build the discv5 record with ip/tcp/udp and the `eth2`
-   fork-digest field so wallets discover the server without hard-coding it.
-   This is the point of the whole exercise.
-5. **Daemon + limits** — a binary, a systemd unit, and a connection cap we
-   choose.
+   committee, so ~27 KB per update (measured). Store the **fully encoded response** (result
+   byte, context bytes, snappy frames), not the raw SSZ — serving then costs a
+   memcpy and a write, which is what the capacity claim below rests on.
+
+2. **Ingestion, entirely in background tasks.** Poll Nimbus REST for
+   finality/optimistic; fetch and cache update periods; pre-populate bootstraps.
+   Never fetch from the request path — see item 4.
+
+   `/eth/v1/events` may be used as a **notification only, never as a data
+   source**: it is `text/event-stream` with JSON payloads and offers no SSZ
+   negotiation, so consuming its bodies would reintroduce the LC type modelling
+   this design exists to avoid, and would make what we serve a re-encode rather
+   than a verbatim relay of what Nimbus produced. Let an event trigger a refetch
+   of the SSZ endpoint: same latency benefit, byte-cache property intact.
+
+3. **A chain-view poller for `status`.** Easy to miss, and the daemon is dead
+   without it: `respond_inbound` answers `status` from `LocalStatus`, which today
+   stays current only because `refresh_local_status` (`sync.rs`) derives
+   finalized/head roots and slots from decoded light-client headers as the sync
+   loop runs. A byte-only cache that skips this keeps serving its **initial
+   checkpoint status forever**, and peers judge us on it. Feed `LocalStatus`
+   from REST (head + finality checkpoints) or by decoding the LC headers we
+   already ingest, and handle fork transitions.
+
+4. **Serve the four LC protocols as a pure cache read.** This is *not* a
+   one-line replacement of the `ResourceUnavailable` fallthrough.
+   `respond_inbound` is **synchronous**, called inline from `on_rr_event` on the
+   single swarm task — there is no `await` point. An on-demand REST fetch there
+   would either stall every other connection's handshakes and responses for an
+   HTTP round trip, or `block_on` inside a tokio worker and panic.
+
+   So: the handler stays a pure read of a shared cache, and **`ResourceUnavailable`
+   remains the miss path**, with a background task filling on miss. That is
+   correct behaviour today — a wallet retries against another peer and the second
+   attempt hits — and it preserves the broadcast-cache property. (The alternative,
+   parking the `ResponseChannel` and answering from a spawned task, is permitted
+   by libp2p but a much larger change.)
+
+   `updates_by_range` additionally needs `ProtocolSupport::Outbound` → `Full` and
+   removal from the responder's excluded arm.
+
+5. **Bound the work per request.** A connection cap alone does not do this: this
+   is a public responder and `updates_by_range` carries caller-controlled `u64`
+   start and count. Enforce the spec's `MAX_REQUEST_LIGHT_CLIENT_UPDATES = 128`,
+   cap total response bytes, refuse ranges outside the servable window rather
+   than scanning, and coalesce plus rate-limit upstream cache misses so one
+   caller cannot fan out into a burst of Nimbus fetches. Bootstraps are the
+   awkward case — keyed by arbitrary block root, so unbounded and genuinely
+   miss-prone — which argues for pre-populating only checkpoint-aligned roots and
+   refusing the rest.
+
+6. **Fix `ping` and `goodbye`** (see above): return our own metadata sequence
+   number rather than echoing, and actually disconnect on Goodbye.
+
+7. **Publish an ENR** — the discv5 record with ip/tcp/udp and an **`eth2`** field
+   carrying the complete 16-byte SSZ `ENRForkID`
+   (`fork_digest || next_fork_version || next_fork_epoch`), not merely the
+   4-byte digest; a truncated field is malformed and standard clients reject it.
+   This is the point of the whole exercise, and it needs three things the
+   client-side code deliberately does not do:
+
+   - **Persist both keys.** Today the discv5 key (`discovery.rs`:
+     `CombinedKey::generate_secp256k1()`) and the libp2p host key (`reqresp.rs`:
+     `Keypair::generate_secp256k1()`) are generated fresh on every start. Right
+     for a wallet; fatal for a published server — each restart becomes a new node
+     ID, so the ENR is a fresh DHT entry with no accumulated reachability, and
+     every wallet's cached `/p2p/<peer-id>` entry points at an identity that no
+     longer exists. Those then burn the three strikes to eviction
+     (`clcache.rs`, `FAILURE_THRESHOLD = 3`), taking the `lc` and period-range
+     tokens that made the peer worth keeping. A routine deploy would repeatedly
+     un-learn the server from every wallet that had proven it. This is the same
+     lesson `--netkey-file` taught us on the Nimbus side, and it cost a day.
+   - **Persist the ENR sequence number** too, so it stays monotonic across
+     restarts; otherwise updated records lose to cached ones in the DHT.
+   - **Re-publish at fork *and* BPO boundaries.** Wallets filter discovered peers
+     on `accepted_fork_digests` (`discovery.rs`), so a stale digest makes the
+     server invisible to precisely the clients it exists for.
+
+8. **Daemon + limits** — a binary, a systemd unit with an explicit
+   `LimitNOFILE` (the shell default here is 2048; Nimbus's unit sets 524288),
+   and a connection cap we choose.
 
 ## Library policy
 
 This is a **server-side daemon**, so the constraints that shape `myotis-net` —
 iOS/Android targets, binary size, dependency minimalism — do not apply. Prefer
 libraries; the question is only which.
+
+### Where the crate lives — decide this first, it gates the rest
+
+That "constraints do not apply" claim is only true if the crate sits **outside**
+the workspace. As a member of `rust/` it would inherit two things it must not:
+
+- **Everyone's build cost.** `cargoBuildHost` is `cargo build --release
+  --workspace` and runs before `:app:run` and `:consensus:test`; `cargoTest` is
+  `cargo test --workspace`, wired into root `check`. Every Android, iOS and JVM
+  developer would compile an HTTP stack they never link.
+- **`panic = "abort"`**, set workspace-wide in `rust/Cargo.toml`, which a member
+  cannot override (crate-level `[profile.*]` is ignored in a workspace). That is
+  the correct FFI rule for the engine. In a daemon holding 1000+ connections it
+  means one panic anywhere kills the process for every connected wallet, with
+  none of tokio's per-task isolation — and the framing parser above walks an
+  attacker-influenced `u64` length prefix and slices on it.
+
+**Resolution: a standalone excluded crate**, following the existing `tor-poc`
+precedent (`exclude = ["tor-poc"]` — "pulls the whole Arti dependency tree, which
+must never burden the pure-engine build or CI"). That fixes both at once, since
+an excluded crate carries its own profile and can set `panic = "unwind"`, so a
+malformed chunk kills one connection rather than the daemon.
+
+If it is ever made a member instead, the design must additionally commit to
+checked slicing at the framing parser (`get(..)`, `checked_add`,
+`usize::try_from` on the prefix) and `Restart=always` in the unit — because
+"prefer libraries" plus `panic = "abort"` plus untrusted framing is exactly the
+combination that turns a parse bug into an outage. Do the checked slicing
+regardless; it is cheap.
 
 **Not Lighthouse's networking or REST crates.** `lighthouse_network` (its
 libp2p req/resp + discv5 + ENR machinery) and `eth2` (its beacon REST client)
@@ -188,9 +325,35 @@ split on the length prefix, and for each chunk call the existing
 is precisely the shape `decode_multi_chunk_response`'s own round-trip test
 builds, so both directions are already covered by code we have.
 
-The single-object endpoints need a fork-name → fork-digest mapping for the
-context bytes (from `Eth-Consensus-Version`); myotis already computes fork
-digests for `status`, so this is a lookup, not new machinery.
+Note the two byte counts above come from **separate fetches** (period 1327 alone
+is 26 927 = 8 + 26 919; the hexdump is period 1326 at 8 + 26 926). They differ
+because `extra_data` is variable-length, so **the length prefix is the only
+authority for chunk boundaries** — do not derive one number from the other when
+checking a parser.
+
+### Context bytes: prefer re-emission, compute only as a fallback
+
+`Eth-Consensus-Version` gives a fork *name*, and since EIP-7892 the fork digest
+is **not a function of the name**: it folds in the active blob parameters.
+`status.rs`'s `fork_digest_bpo(fork_version, gvr, blob_params_epoch,
+blob_params_max_blobs)` computes
+`(fork_data_root XOR sha256(epoch_le || max_blobs_le))[0..4]`, and its own test
+pins mainnet Fulu at `0x82FAE541` *base* versus `0x8C9F62FE` *with BPO2* — the
+same fork name, two digests. A name→digest table built today would silently emit
+a stale digest after the next blob-parameter-only fork, indefinitely, while
+Nimbus keeps returning 200s.
+
+So: **re-emit the digest the source already framed** wherever one exists — which
+`updates_by_range` does, per chunk, making it the robust path. Compute only where
+the source supplies none (the single-object endpoints), and compute it for the
+*object's slot* via `fork_digest_bpo` against the network's blob schedule, not
+from the fork name.
+
+The blast radius of getting this wrong is asymmetric and worth knowing: myotis'
+own decoder skips the context bytes (`codec.rs`: "the payload's own fork sniffing
+governs decode"), so our wallets tolerate a stale digest. Every other CL — which
+§Capacity expects to dial us once the ENR is published — dispatches
+deserialization on it and does not.
 
 ## Historical depth: the server archives, Nimbus does not
 
@@ -274,11 +437,42 @@ later, exactly like the log-index seed.
 
 ## Capacity
 
-Comfortably past 1000 connections. Per-connection state is a Noise session and
-a yamux stream — tens of KB — and there is no per-peer computation: every client
-receives the same cached bytes. It is a broadcast cache with a request
-interface. What makes a beacon node expensive per peer (gossipsub mesh, peer
-scoring, attnet/syncnet tracking, full chain state) is absent by construction.
+Comfortably past 1000 connections, and the binding constraint is **not** this
+machine. Per-connection state is a Noise session and a yamux stream — tens of KB
+— and there is no per-peer computation: every client receives the same cached
+bytes, pre-encoded per item 1, so serving is a memcpy and a write. What makes a
+beacon node expensive per peer (gossipsub mesh, peer scoring, attnet/syncnet
+tracking, full chain state) is absent by construction.
+
+This claim depends on items 1, 2 and 4 holding: pre-encoded responses, ingestion
+strictly off the request path, and a synchronous handler that only reads cache.
+An on-demand fetch inside `respond_inbound` would invalidate it outright.
+
+Measured headroom on zbox (2026-08-08): 31 GB RAM with 14 GB available, 8 cores,
+Nimbus at 0.4 GB RSS. At ~100–200 KB per idle connection including kernel socket
+buffers, 1000 connections is ~100–200 MB — not the limit.
+
+The real limits, in order:
+
+1. **Residential upload bandwidth.** A cold client pulls a bootstrap (~26 KB)
+   plus its missing periods (~27 KB each); three periods behind is ~107 KB.
+   A thousand cold clients arriving together is ~100 MB of uplink. Steady state
+   is trivial by comparison — an optimistic update is 1 KB, so 1000 clients
+   polling once per 12-second slot is well under 1 Mbit/s. **The cost is the
+   cold-start burst, not the resting load.**
+2. **File descriptors.** The unit must set `LimitNOFILE` explicitly; the shell
+   default here is 2048, while Nimbus's unit sets 524288.
+3. **CPU** — Noise handshakes only, and pre-encoded responses keep the serving
+   path free of snappy work. Not expected to bind.
+
+**Capping Nimbus helps, for the right reason.** `--max-peers=100` is ample for
+chain-following (gossipsub needs a mesh degree of 8; Nimbus's own default is
+160). It frees little RAM — a beacon node's memory is dominated by state and DB
+caches, not peers — but it meaningfully cuts *gossip uplink*, since Nimbus
+forwards attestations and blocks to its mesh. That is exactly the resource the
+LC server is short of. Note `--max-peers` sets both `wantedPeers` and the single
+shared in+out semaphore, so 100 means 100 total — fine for a node that no longer
+serves wallets.
 
 Expect stranger traffic anyway: once the ENR is published, every CL on the
 network will discover it, dial, complete `status`, find no blocks and no gossip,
@@ -293,9 +487,40 @@ Ordered so nothing regresses:
    `127.0.0.1:5052`, verified serving all four LC endpoints in SSZ.
 2. Build the server. Verify a wallet can bootstrap and stay synced from it
    alone, with Nimbus's pinned multiaddr removed from the client config.
-3. Only then: flip Nimbus to `--discv5=true`, drop the direct-peer anchors, the
+   **Validate on both engines and say which is which** — `myotis.engine`
+   defaults to *java*, so "a wallet" is ambiguous exactly where it matters.
+
+3. **Settle the Java `beacon_blocks_by_range` gap explicitly.** Without this step
+   the choice gets made by omission: step 2 can pass on the Rust engine while
+   steps 4–5 remove the pinned full-CL path from under the default one.
+
+   The earlier framing ("Java-engine hosts still need a full CL") overstates it.
+   `BeaconSyncState.FILL_THRESHOLD = 4` is deliberately sized for a fill path
+   that often never lands — "in practice many peers reject
+   `beacon_blocks_by_range/2` with protocol negotiation failures and the window
+   only grows via `updateSyncState` (2 roots per finality poll)". So a
+   Java-engine wallet on this server alone still reaches SYNCED; what it loses is
+   the *dense* recent state-root window (40–80 roots per invocation versus 2 per
+   poll). Real degradation for reads at slots between finality and head, but
+   characterizable rather than fatal.
+
+   Pick one, with a measurement behind it:
+   - **Measure and accept** the sparse-window degradation — this deletes the
+     "proxy blocks" option entirely; or
+   - **Fix `fillChainStateRoots`** to take the execution state root from the LC
+     header's `execution` field, as the Rust engine already does
+     (`myotis-consensus/src/store.rs:157`). Removes the asymmetry permanently and
+     is where this document's own analysis points.
+
+   Note what proxying blocks would cost, if it is ever revisited: §Capacity rests
+   on "every client receives the same cached bytes". A block range is per-wallet
+   (each asks a different `finalizedSlot..attestedSlot`) and a post-Deneb 2-epoch
+   window is ~64 blocks at orders of magnitude more than an LC update. That is a
+   different service with different sizing, not an extra endpoint.
+
+4. Only then: flip Nimbus to `--discv5=true`, drop the direct-peer anchors, the
    candidate pool, the top-up timer and its unit, and restore stock peer limits.
-4. Replace the pinned CL multiaddr in `NetworkConfig` with discovery.
+5. Replace the pinned CL multiaddr in `NetworkConfig` with discovery.
 
 ## Rejected alternative: patching Nimbus
 
