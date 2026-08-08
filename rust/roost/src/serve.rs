@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use myotis_net::libp2p::identity::Keypair;
+use myotis_net::identity::Keypair;
 use myotis_net::reqresp::{start_host_with, HostConfig, LocalStatus};
 use myotis_net::status::StatusMessage;
 

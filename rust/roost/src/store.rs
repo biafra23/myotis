@@ -186,6 +186,20 @@ impl LcStore {
         while inner.bootstrap_order.len() > MAX_BOOTSTRAPS {
             if let Some(oldest) = inner.bootstrap_order.pop_front() {
                 inner.bootstraps.remove(&oldest);
+                // Clearing the attempted marker with it is what keeps the
+                // invariant "never attempted-without-cached" true by
+                // construction rather than by arithmetic accident. Both sets are
+                // capped at MAX_BOOTSTRAPS but fill at different rates —
+                // `refresh_live` inserts the finalized root into `bootstraps`
+                // without touching `attempted` — so an evicted root could
+                // otherwise sit marked-attempted and uncached, and be refused
+                // with no re-fetch until the marker aged out.
+                //
+                // Roots the upstream CANNOT serve are unaffected: they never
+                // entered `bootstraps`, so nothing here evicts them and their
+                // marker keeps doing its job.
+                inner.bootstrap_attempted.remove(&oldest);
+                inner.bootstrap_attempted_order.retain(|r| r != &oldest);
                 evicted = Some(oldest);
             }
         }
@@ -421,7 +435,9 @@ mod tests {
     #[test]
     fn a_huge_start_period_cannot_overflow_the_range_walk() {
         let s = store_with(&[u64::MAX]);
-        // start + count would overflow; saturating_add keeps the walk sane.
+        // start + count would overflow. The walk uses checked_add precisely
+        // because `start..start.saturating_add(count)` would be EMPTY here
+        // rather than one element long — see updates_range's own note.
         let body = s.updates_range(u64::MAX, 128).unwrap();
         assert_eq!(decode_multi_chunk_response(&body, 1).unwrap().len(), 1);
     }
@@ -474,6 +490,42 @@ mod tests {
             !s.record_bootstrap_miss(root),
             "already attempted — a wallet that keeps asking must not keep costing us fetches"
         );
+    }
+
+    #[test]
+    fn evicting_a_bootstrap_clears_its_attempted_marker() {
+        // Otherwise a root can be simultaneously uncached and already-attempted,
+        // and every request for it is refused with no re-fetch.
+        let s = LcStore::new();
+        let root = root_n(1);
+        assert!(s.record_bootstrap_miss(root));
+        assert_eq!(s.take_bootstrap_misses(1), vec![root]);
+        s.insert_bootstrap(root, D, &[1u8; 32]);
+        assert!(!s.record_bootstrap_miss(root), "cached, so nothing to fetch");
+
+        // Push it out of the cache.
+        for i in 100..(100 + MAX_BOOTSTRAPS as u64) {
+            s.insert_bootstrap(root_n(i), D, &[1u8; 32]);
+        }
+        assert!(s.bootstrap(&root).is_none(), "evicted");
+        assert!(
+            s.record_bootstrap_miss(root),
+            "an evicted root must become re-fetchable, not stay marked attempted"
+        );
+    }
+
+    #[test]
+    fn a_root_upstream_cannot_serve_stays_blocked() {
+        // The other half: a root that never made it into the cache keeps its
+        // marker, so a wallet retrying forever costs one upstream fetch.
+        let s = LcStore::new();
+        let root = root_n(42);
+        assert!(s.record_bootstrap_miss(root));
+        assert_eq!(s.take_bootstrap_misses(1), vec![root]);
+        for i in 200..(200 + MAX_BOOTSTRAPS as u64) {
+            s.insert_bootstrap(root_n(i), D, &[1u8; 32]);
+        }
+        assert!(!s.record_bootstrap_miss(root), "never cached, so still blocked");
     }
 
     #[test]

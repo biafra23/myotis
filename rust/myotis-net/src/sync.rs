@@ -110,6 +110,15 @@ impl ChainConfig {
         // "can a wallet sync from this one server alone?" an honest question:
         // with discovery on, a wallet that silently syncs from a random public
         // peer looks exactly like one the server is serving properly.
+        //
+        // Note this pair is strictly stronger than MYOTIS_EL_BOOT_ENODES on its
+        // own: pinning peers still leaves discovery as a fallback, while pinning
+        // AND disabling discovery lets whoever controls the environment decide
+        // the wallet's only source. That is a LIVENESS exposure, not a
+        // correctness one — every byte is still verified against the wallet's
+        // own anchor, so the worst case is withholding, which surfaces as
+        // `beaconNotSynced` rather than a wrong answer. Intended for testing a
+        // candidate server; do not set it in a shipped configuration.
         if matches!(std::env::var("MYOTIS_CL_DISABLE_DISCV5").as_deref(), Ok("1") | Ok("true")) {
             tracing::info!("MYOTIS_CL_DISABLE_DISCV5 set — discv5 bootstrap ENRs cleared");
             self.bootstrap_enrs.clear();
