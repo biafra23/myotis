@@ -50,8 +50,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # The Android app builds the Rust engine FROM SOURCE by default — cargo + cargo-ndk
 # + NDK r28+ + `rustup target add aarch64-linux-android x86_64-linux-android` are
 # REQUIRED to build :android-app. There is no committed .so (so nothing can drift);
-# the bindings (:myotis-engines) auto-regenerate on any cargo build. Opt out when
-# you lack the toolchain — the build tells you about the switch — with:
+# an Android build also regenerates the committed UniFFI bindings (:myotis-engines)
+# from source — other workflows do NOT, so regenerate them explicitly with
+# `./gradlew uniffiGenerateKotlin` after changing the Rust FFI. Opt out when you
+# lack the toolchain — the build tells you about the switch — with:
 ./gradlew :android-app:assembleDebug -PskipRustEngine  # Java engine only (no Rust engine / native BLS)
 
 # iOS (macOS only; needs Xcode 26+ and the rustup targets on the toolchain the

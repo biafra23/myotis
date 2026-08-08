@@ -377,7 +377,16 @@ rootProject.tasks.named("verifyAndroidJniLibs").configure {
     mustRunAfter(rootProject.tasks.named("cargoNdkAndroid"))
     mustRunAfter(rootProject.tasks.named("uniffiGenerateKotlin"))
 }
+// Both expensive Rust producers run AFTER the gate, so a machine with cargo but
+// without the Android toolchain (cargo-ndk / NDK / targets) fails fast instead of
+// first building the whole host workspace: cargoNdkAndroid directly, and
+// cargoBuildHost because uniffiGenerateKotlin dependsOn it (ordering the generator
+// alone wouldn't hold cargoBuildHost back). Both edges are inert off-Android,
+// where requireAndroidRustEngine isn't in the graph.
 rootProject.tasks.named("cargoNdkAndroid").configure {
+    mustRunAfter(rootProject.tasks.named("requireAndroidRustEngine"))
+}
+rootProject.tasks.named("cargoBuildHost").configure {
     mustRunAfter(rootProject.tasks.named("requireAndroidRustEngine"))
 }
 
