@@ -528,8 +528,26 @@ struct Peer {
 struct PeerPool {
     peers: Vec<Peer>,
     known: HashSet<PeerId>,
+    /// Pinned static (config) peers — the curated LC-serving set
+    /// (`ChainConfig::static_peers`, e.g. the #302 Gnosis list). Loaded once at
+    /// startup and NEVER re-added from any other source, so they must never be
+    /// permanently evicted: a single transient failure used to drop them for
+    /// the whole process lifetime, draining the scarce LC pool on Gnosis with
+    /// nothing to bring them back (issue #291). The Java engine keeps
+    /// re-seeding its pinned list; we keep these entries un-evictable instead
+    /// (the set is a handful of ids — bounded either way).
+    static_ids: HashSet<PeerId>,
     /// Peers proven NOT to serve light_client_updates_by_range (protocol
-    /// negotiation failed) — mirrors the Java `peersNoLcUpdates`.
+    /// negotiation failed) — mirrors the Java `peersNoLcUpdates`. REVERSIBLE:
+    /// an authoritative positive signal (Identify advertising the protocol, or
+    /// a fresh verified serve) clears the flag via `clear_no_lc`/`mark_proven`,
+    /// exactly like the Java classification sweep's `peersNoLcUpdates.remove`
+    /// (BeaconLightClient.java). Without that reversal a peer that returned
+    /// `UnsupportedProtocol` once — which a busy Lighthouse/Nimbus emits
+    /// transiently when it throttles or resets a new substream — was condemned
+    /// to nolc for the process lifetime, excluded from every catch-up tier AND
+    /// from hunt re-probing, and never dialed again so never evicted: the
+    /// #291 "previously-LC nodes went nolc and stayed there" zero-peer stall.
     no_lc_updates: HashSet<PeerId>,
     /// Peers that actually SERVED light-client data (bootstrap or an applied
     /// update) — mirrors the Java proven-server tracking; preferred first.
@@ -586,6 +604,7 @@ impl PeerPool {
         Self {
             peers: Vec::new(),
             known: HashSet::new(),
+            static_ids: HashSet::new(),
             no_lc_updates: HashSet::new(),
             proven: HashSet::new(),
             cooldown_until: HashMap::new(),
@@ -600,6 +619,29 @@ impl PeerPool {
     fn mark_proven(&mut self, id: PeerId) {
         self.proven.insert(id);
         self.fail_counts.remove(&id); // a served peer is demonstrably alive
+        // A peer that just served light-client data is, by definition, not a
+        // non-server: clear any stale nolc verdict so it rejoins the normal
+        // catch-up tiers (issue #291 — the deny set must be reversible, or one
+        // transient UnsupportedProtocol permanently blacklists an LC server
+        // that is now demonstrably serving us). Mirrors Java line
+        // `peersNoLcUpdates.remove(ma) | provenLightClient.add(ma)`.
+        self.no_lc_updates.remove(&id);
+    }
+
+    /// Reconcile the authoritative LC-capability signal (Identify's advertised
+    /// protocol list + this run's hunt-confirmed servers) into the deny set:
+    /// any peer the signal says DOES serve `light_client_updates_by_range` has
+    /// its nolc flag cleared. The Java classification sweep does exactly this
+    /// every cycle (BeaconLightClient.java); without it the Rust engine's
+    /// Identify verdict fed a SEPARATE prefer set that never un-did an earlier
+    /// request-time nolc strike, so an Identify-confirmed server could sit in
+    /// `no_lc_updates` forever and be filtered out of every catch-up tier
+    /// (issue #291).
+    fn clear_no_lc(&mut self, servers: &HashSet<PeerId>) {
+        if self.no_lc_updates.is_empty() || servers.is_empty() {
+            return;
+        }
+        self.no_lc_updates.retain(|id| !servers.contains(id));
     }
 
     /// Stamp a VERIFIED serve (bootstrap applied / catch-up update applied /
@@ -648,6 +690,16 @@ impl PeerPool {
     /// re-discoverable rather than permanently tombstoned; `fail_counts` resets
     /// with it, so a recovered peer starts clean).
     fn evict(&mut self, id: &PeerId) {
+        if self.static_ids.contains(id) {
+            // A pinned LC server is never dropped (issue #291): nothing would
+            // re-add it, so evicting it on a transient blip permanently loses a
+            // curated server. Clear its transient failure/cooldown state so it
+            // stays dialable and a later recovery starts clean, but keep it in
+            // the pool.
+            self.fail_counts.remove(id);
+            self.cooldown_until.remove(id);
+            return;
+        }
         self.peers.retain(|p| &p.id != id);
         self.known.remove(id);
         self.no_lc_updates.remove(id);
@@ -669,6 +721,13 @@ impl PeerPool {
             return;
         }
         self.peers.push(Peer { id, addr });
+    }
+
+    /// Add a pinned static (config) peer and record its id as un-evictable
+    /// (see `static_ids`). Same dedup/cap semantics as `add`.
+    fn add_static(&mut self, id: PeerId, addr: Multiaddr) {
+        self.static_ids.insert(id);
+        self.add(id, addr);
     }
 
     fn mark_no_lc_updates(&mut self, id: PeerId) {
@@ -860,7 +919,7 @@ async fn run_sync(
     let mut pool = PeerPool::new();
     for s in &config.static_peers {
         match parse_static_peer(s) {
-            Some(p) => pool.add(p.id, p.addr),
+            Some(p) => pool.add_static(p.id, p.addr),
             None => tracing::warn!(peer = s, "skipping unparseable static peer multiaddr"),
         }
     }
@@ -1584,6 +1643,11 @@ async fn catch_up(
         // Hunt-confirmed servers join the Identify-confirmed prefer tier —
         // same dial-priority-only trust level (see poll_finality).
         lc_servers.extend(hunt_confirmed.iter().copied());
+        // Reconcile that authoritative capability signal into the deny set: a
+        // peer Identify (or a hunt) now says DOES serve LC gets any stale nolc
+        // strike cleared, so it rejoins the fan-out instead of being filtered
+        // out forever (issue #291). Java does this every classification cycle.
+        pool.clear_no_lc(&lc_servers);
         // Skip peers whose advertised earliest_available_slot proves their
         // light-client history begins in a LATER period than the one we need —
         // they'd only return far-future updates the period gate discards (Java
@@ -1915,6 +1979,9 @@ async fn poll_finality(
     // Hunt-confirmed servers (decodable LC response this run) join the
     // Identify-confirmed prefer tier — same dial-priority-only trust level.
     lc_servers.extend(hunt_confirmed.iter().copied());
+    // Reverse any stale nolc verdict for peers now confirmed LC-capable, so a
+    // once-mismarked server rejoins the finality fan-out (issue #291).
+    pool.clear_no_lc(&lc_servers);
     // No earliest-slot skip here: finality polling asks for the LATEST update,
     // which every synced peer holds regardless of how far its history is pruned.
     let peers = pool.candidates(16, false, false, &lc_servers, &HashSet::new());
@@ -2609,5 +2676,67 @@ mod tests {
         pool.note_failure(ids[2]);
         pool.note_failure(ids[2]);
         assert_eq!(pool.len(), 1, "serve-reset keeps a blippy proven server alive");
+    }
+
+    #[test]
+    fn static_peers_are_never_evicted() {
+        // Issue #291: a pinned LC server must survive transient failures — it
+        // is loaded once and nothing re-adds it, so eviction is permanent loss.
+        let mut pool = PeerPool::new();
+        let stat = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+        let disc = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+        pool.add_static(stat, "/ip4/10.0.0.1/tcp/9000".parse().unwrap());
+        pool.add(disc, "/ip4/10.0.0.2/tcp/9000".parse().unwrap());
+        assert_eq!(pool.len(), 2);
+
+        // Far more failures than any threshold: the static peer stays put (and
+        // stays `known`, so it is not treated as re-discoverable-only), while
+        // the ordinary discovered peer is evicted on its first strike.
+        for _ in 0..10 {
+            pool.note_failure(stat);
+        }
+        pool.note_failure(disc);
+        assert!(pool.known.contains(&stat), "static peer stays known");
+        assert!(pool.peers.iter().any(|p| p.id == stat), "static peer stays pooled");
+        assert!(!pool.peers.iter().any(|p| p.id == disc), "discovered peer evicted");
+        assert_eq!(pool.len(), 1);
+
+        // It is still handed out as a candidate after all those failures.
+        let c = pool.candidates(4, true, false, &HashSet::new(), &HashSet::new());
+        assert!(c.iter().any(|p| p.id == stat), "static peer still a candidate");
+    }
+
+    #[test]
+    fn nolc_verdict_is_reversible() {
+        // Issue #291: an authoritative positive LC signal (Identify / a fresh
+        // serve) must clear a stale nolc strike, or a transiently-mismarked
+        // server is filtered out of every catch-up tier for the process life.
+        let mut pool = PeerPool::new();
+        let mut ids = Vec::new();
+        for i in 0..3u8 {
+            let id = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+            ids.push(id);
+            pool.add(id, format!("/ip4/10.0.2.{i}/tcp/9000").parse().unwrap());
+        }
+        // All three transiently mark nolc.
+        for id in &ids {
+            pool.mark_no_lc_updates(*id);
+        }
+        assert!(pool.no_lc_updates.contains(&ids[0]));
+
+        // Identify (via clear_no_lc) re-confirms ids[0] and ids[1] as servers.
+        let confirmed: HashSet<PeerId> = [ids[0], ids[1]].into_iter().collect();
+        pool.clear_no_lc(&confirmed);
+        assert!(!pool.no_lc_updates.contains(&ids[0]), "confirmed server un-denied");
+        assert!(!pool.no_lc_updates.contains(&ids[1]), "confirmed server un-denied");
+        assert!(pool.no_lc_updates.contains(&ids[2]), "unconfirmed peer still denied");
+
+        // A verified serve on ids[2] clears its flag too (mark_proven path).
+        pool.mark_proven(ids[2]);
+        assert!(!pool.no_lc_updates.contains(&ids[2]), "served peer un-denied");
+
+        // With the deny set empty, the skip_no_lc filter no longer drops them.
+        let c = pool.candidates(3, true, false, &HashSet::new(), &HashSet::new());
+        assert_eq!(c.len(), 3, "all three rejoin the fan-out once un-denied");
     }
 }
