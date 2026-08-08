@@ -225,11 +225,17 @@ async fn probe(rest_base: &str) -> Result<()> {
             if computed == observed {
                 println!("  MATCH     context bytes can be computed for any slot");
             } else {
-                return Err(anyhow!(
-                    "computed digest 0x{} != wire digest 0x{} — the schedule and the chain disagree",
-                    hex::encode(computed),
-                    hex::encode(observed)
-                ));
+                // NOT an error. The wire digest belongs to the update's attested
+                // header, which can predate a fork or BPO boundary that head is
+                // already past — a period spans 256 epochs, so the two SHOULD
+                // differ during a transition. Failing here would make `probe`
+                // report a schedule fault precisely when the schedule is doing
+                // its job. `serve` treats the same signal the same way.
+                println!(
+                    "  DIFFER    expected across a fork/BPO boundary inside this period\n\
+                     \x20           (the wire digest is the update's attested header, not head);\n\
+                     \x20           otherwise it means the schedule and the chain disagree."
+                );
             }
         }
         Err(e) => println!("  unavailable — {e:#}"),

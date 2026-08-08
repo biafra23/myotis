@@ -450,8 +450,19 @@ pub async fn serve(
                         Ok(s) => {
                             if digests.schedule.as_ref() != Some(&s) {
                                 tracing::info!("fork/blob schedule updated");
+                                digests.schedule = Some(s);
+                                // Bootstraps are encoded once and then kept, so
+                                // any cached under the previous schedule carry
+                                // stale context bytes. The per-slot objects
+                                // refetch every tick and periods carry the
+                                // digest their source framed, so only these need
+                                // invalidating.
+                                let dropped = store.clear_bootstraps();
+                                if dropped > 0 {
+                                    tracing::info!(dropped,
+                                        "dropped cached bootstraps so they are re-stamped");
+                                }
                             }
-                            digests.schedule = Some(s);
                         }
                         Err(e) => tracing::warn!(error = %e, "re-reading the schedule failed"),
                     }
@@ -470,6 +481,24 @@ pub async fn serve(
                         continue;
                     }
                 };
+
+                // While we are on the fallback, the observed digest must keep
+                // tracking the chain. It is assigned at startup, so leaving it
+                // alone would freeze `status.fork_digest` at the boot value —
+                // and after a fork or BPO boundary every peer would drop us,
+                // which is the exact failure this module exists to prevent,
+                // reintroduced through the degraded path.
+                if digests.schedule.is_none() {
+                    if let Some(d) =
+                        resolve_fork_digest(&client, &store, period_of_slot(head_slot)).await
+                    {
+                        if d != digests.observed {
+                            tracing::warn!(old = %hex::encode(digests.observed), new = %hex::encode(d),
+                                "observed fork digest changed (no schedule available)");
+                            digests.observed = d;
+                        }
+                    }
+                }
 
                 // status.fork_digest is not merely context bytes: it is what
                 // every peer's relevance check reads on the mandatory handshake.

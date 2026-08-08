@@ -83,9 +83,14 @@ impl ForkSchedule {
     ///
     /// Forks are discovered by key shape (`<NAME>_FORK_VERSION` paired with
     /// `<NAME>_FORK_EPOCH`) rather than from a hardcoded list, so a fork added
-    /// by a client upgrade is picked up without a code change here. A version
-    /// with no matching epoch key is treated as genesis (epoch 0), which is
-    /// exactly the `GENESIS_FORK_VERSION` case.
+    /// by a client upgrade is picked up without a code change here.
+    ///
+    /// `GENESIS_FORK_VERSION` is the ONLY version legitimately without an epoch
+    /// key. Any other unpaired version is refused rather than defaulted: a
+    /// partial or half-published fork entry silently defaulting to epoch 0 would
+    /// sort ahead of the real schedule and could win for early epochs, producing
+    /// a wrong digest instead of an obvious failure. An unusable schedule should
+    /// fail loudly — roost then falls back to the observed digest and says so.
     pub fn from_spec(
         spec: &BTreeMap<String, String>,
         genesis_validators_root: [u8; 32],
@@ -101,7 +106,13 @@ impl ForkSchedule {
                 Some(e) => e
                     .parse::<u64>()
                     .with_context(|| format!("parsing {name}_FORK_EPOCH = {e}"))?,
-                None => 0, // GENESIS_FORK_VERSION has no epoch key
+                None if name == "GENESIS" => 0,
+                None => {
+                    return Err(anyhow!(
+                        "config/spec has {key} but no {name}_FORK_EPOCH — refusing a schedule \
+                         that would silently activate {name} from genesis"
+                    ))
+                }
             };
             forks.push(Fork { epoch, version });
         }
@@ -307,6 +318,22 @@ mod tests {
         let s = ForkSchedule::from_spec(&spec, sepolia_gvr()).unwrap();
         assert_eq!(s.slots_per_epoch(), 16);
         assert_eq!(s.digest_for_slot(16), s.digest_for_epoch(1));
+    }
+
+    #[test]
+    fn refuses_a_fork_version_with_no_epoch() {
+        // A half-published fork entry must fail loudly, not default to genesis
+        // and quietly outrank the real schedule for early epochs.
+        let mut spec = sepolia_spec();
+        spec.insert("NEWFORK_FORK_VERSION".into(), "0x90000099".into());
+        let err = ForkSchedule::from_spec(&spec, sepolia_gvr()).unwrap_err().to_string();
+        assert!(err.contains("NEWFORK_FORK_EPOCH"), "got: {err}");
+
+        // GENESIS remains the one legitimate exception.
+        let mut only_genesis = sepolia_spec();
+        only_genesis.remove("ALTAIR_FORK_EPOCH");
+        only_genesis.remove("ALTAIR_FORK_VERSION");
+        assert!(ForkSchedule::from_spec(&only_genesis, sepolia_gvr()).is_ok());
     }
 
     #[test]
