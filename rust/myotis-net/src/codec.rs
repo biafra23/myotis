@@ -167,7 +167,11 @@ pub fn parse_request_ssz_expecting(raw: &[u8], expected: Option<usize>) -> Optio
         return None;
     }
     if let Some(expected) = expected {
-        if uncompressed_len as usize != expected {
+        // Compare as u64 BEFORE narrowing. `uncompressed_len as usize` would
+        // truncate on a 32-bit target (android armv7 is one), so a declared
+        // 2^32 + expected would pass this check and then be treated as a short
+        // request. Equality here makes the conversion below provably safe.
+        if uncompressed_len != expected as u64 {
             return None;
         }
     }

@@ -248,9 +248,27 @@ fn parse(
                 report.loaded += 1;
                 pos = next;
             }
-            // Ran out of bytes mid-record: the classic interrupted write. Every
-            // record before it stays valid — that is what append-only buys.
+            // Ran out of bytes mid-record. Usually the classic interrupted
+            // write — but a CORRUPTED length field in a non-tail record looks
+            // identical, and treating that as a torn tail would truncate the
+            // file from here and delete every valid record after it. That is
+            // exactly the salvage guarantee this format exists to provide, so
+            // check before truncating: if an intact record follows, this is
+            // corruption in the middle, not a torn tail.
             RecordRead::Torn => {
+                if valid_record_follows(buf, pos) {
+                    report.corrupt_regions += 1;
+                    match find_next_valid_record(buf, pos + 1) {
+                        Some(next) => {
+                            pos = next;
+                            continue;
+                        }
+                        // Unreachable given valid_record_follows, but falling
+                        // through to truncation here would be the destructive
+                        // branch, so stop instead.
+                        None => break,
+                    }
+                }
                 report.torn_tail_bytes = (buf.len() - pos) as u64;
                 break;
             }
@@ -259,7 +277,7 @@ fn parse(
             // abandoning everything after it — this file may be irreplaceable.
             RecordRead::Corrupt => {
                 report.corrupt_regions += 1;
-                match find_next_record(buf, pos + 1) {
+                match find_next_valid_record(buf, pos + 1) {
                     Some(next) => pos = next,
                     None => {
                         report.torn_tail_bytes = (buf.len() - pos) as u64;
@@ -323,8 +341,28 @@ fn read_record(buf: &[u8], pos: usize) -> RecordRead {
     }
 }
 
-fn find_next_record(buf: &[u8], from: usize) -> Option<usize> {
-    (from..buf.len().saturating_sub(3)).find(|&i| &buf[i..i + 4] == REC_MAGIC)
+/// The next offset at which a record actually reads cleanly.
+///
+/// Scanning for `REC_MAGIC` alone is not enough: those four bytes can occur
+/// inside a payload by chance, and resuming there would manufacture garbage
+/// records. Each candidate is parsed and checksummed before it is accepted.
+fn find_next_valid_record(buf: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i + 4 <= buf.len() {
+        if &buf[i..i + 4] == REC_MAGIC {
+            if let RecordRead::Ok { .. } = read_record(buf, i) {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether any intact record exists after `pos` — the test that separates a
+/// torn tail (nothing follows) from mid-file corruption (something does).
+fn valid_record_follows(buf: &[u8], pos: usize) -> bool {
+    find_next_valid_record(buf, pos.saturating_add(1)).is_some()
 }
 
 #[cfg(test)]
@@ -447,6 +485,43 @@ mod tests {
         assert!(!recs.contains_key(&1), "the corrupt period is the one lost");
         assert!(recs.contains_key(&2));
         assert!(recs.contains_key(&3));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_corrupt_length_mid_file_does_not_truncate_the_records_after_it() {
+        // A corrupted length field runs past EOF exactly like a torn tail. If
+        // that is misread as a torn tail, the file is truncated from there and
+        // every valid record behind it is destroyed — in a file nothing can
+        // regenerate.
+        let path = tmp("corrupt-length-midfile");
+        {
+            let (mut a, _, _) = Archive::open(&path, &GVR).unwrap();
+            for p in 0..4u64 {
+                a.append(p, [1, 1, 1, 1], &[p as u8; 48]).unwrap();
+            }
+            a.flush().unwrap();
+        }
+        // Overwrite the SECOND record's ssz_len with something enormous.
+        let rec_len = 4 + 1 + 8 + 4 + 4 + 48 + 8;
+        let second = HEADER_LEN + rec_len;
+        let mut bytes = std::fs::read(&path).unwrap();
+        let len_at = second + 4 + 1 + 8 + 4;
+        bytes[len_at..len_at + 4].copy_from_slice(&(900_000u32).to_le_bytes());
+        let original_len = bytes.len();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (_a, recs, report) = Archive::open(&path, &GVR).unwrap();
+        assert_eq!(report.corrupt_regions, 1, "must be classified as corruption");
+        assert_eq!(report.torn_tail_bytes, 0, "must NOT be treated as a torn tail");
+        assert!(recs.contains_key(&0));
+        assert!(recs.contains_key(&2), "records after the bad length must survive");
+        assert!(recs.contains_key(&3));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            original_len as u64,
+            "the file must not be truncated"
+        );
         std::fs::remove_file(&path).ok();
     }
 

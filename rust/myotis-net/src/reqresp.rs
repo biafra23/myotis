@@ -610,10 +610,16 @@ struct SwarmCtx {
     /// Present only on a serving host; `None` on a wallet, where the
     /// light-client protocols answer `ResourceUnavailable` as before.
     lc: Option<Arc<dyn LcResponder>>,
-    /// Response bytes handed to `send_response` but not yet written, per inbound
-    /// request, plus their running total. Bounded by
-    /// [`MAX_IN_FLIGHT_RESPONSE_BYTES`].
-    in_flight: HashMap<InboundRequestId, usize>,
+    /// Response bytes handed to `send_response` but not yet written, plus their
+    /// running total. Bounded by [`MAX_IN_FLIGHT_RESPONSE_BYTES`].
+    ///
+    /// Keyed by (protocol, id) because `InboundRequestId` is issued PER
+    /// `request_response::Behaviour`, and this host runs one behaviour per
+    /// protocol — so two protocols can each mint id 1. Keyed on the id alone,
+    /// the second insert would overwrite the first while both lengths stayed in
+    /// the total, and whichever terminal event arrived first would release the
+    /// wrong entry: the budget leaks until everything is refused.
+    in_flight: HashMap<(&'static str, InboundRequestId), usize>,
     in_flight_bytes: usize,
 }
 
@@ -859,7 +865,7 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
                 if rr.send_response(channel, response).is_err() {
                     tracing::debug!(peer = %peer, protocol, "inbound response channel closed");
                 } else {
-                    ctx.in_flight.insert(request_id, response_len);
+                    ctx.in_flight.insert((protocol, request_id), response_len);
                     ctx.in_flight_bytes = ctx.in_flight_bytes.saturating_add(response_len);
                 }
                 // Goodbye means the peer is leaving. Answering without closing
@@ -889,11 +895,11 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
         // Both terminal outcomes release the budget; missing either would leak it
         // and converge on a responder that refuses everything.
         request_response::Event::InboundFailure { peer, error, request_id, .. } => {
-            release_in_flight(ctx, request_id);
+            release_in_flight(ctx, protocol, request_id);
             tracing::debug!(peer = %peer, protocol, error = %error, "inbound failure");
         }
         request_response::Event::ResponseSent { request_id, .. } => {
-            release_in_flight(ctx, request_id);
+            release_in_flight(ctx, protocol, request_id);
         }
     }
 }
@@ -1081,8 +1087,8 @@ fn respond_inbound(ctx: &SwarmCtx, protocol: &'static str, peer: PeerId, raw: &[
     }
 }
 
-fn release_in_flight(ctx: &mut SwarmCtx, request_id: InboundRequestId) {
-    if let Some(bytes) = ctx.in_flight.remove(&request_id) {
+fn release_in_flight(ctx: &mut SwarmCtx, protocol: &'static str, request_id: InboundRequestId) {
+    if let Some(bytes) = ctx.in_flight.remove(&(protocol, request_id)) {
         ctx.in_flight_bytes = ctx.in_flight_bytes.saturating_sub(bytes);
     }
 }

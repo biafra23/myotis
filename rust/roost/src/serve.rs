@@ -28,7 +28,7 @@ use myotis_net::status::StatusMessage;
 
 use crate::archive::Archive;
 use crate::framing::split_updates;
-use crate::rest::{period_of_slot, NimbusRest, SLOTS_PER_PERIOD};
+use crate::rest::{period_of_slot, FetchError, NimbusRest, SLOTS_PER_PERIOD};
 use crate::store::LcStore;
 
 /// How often to refresh the chain view and the per-slot objects. One slot.
@@ -58,24 +58,70 @@ const MISS_FETCHES_PER_TICK: usize = 4;
 /// would repeatedly un-learn this server from every wallet that had proven it.
 /// The same lesson `--netkey-file` taught us on the Nimbus side.
 fn load_or_create_key(path: &Path) -> Result<Keypair> {
-    if path.exists() {
-        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        return Keypair::from_protobuf_encoding(&bytes)
-            .with_context(|| format!("decoding the identity key in {}", path.display()));
-    }
-    // The CL spec requires secp256k1 identities.
-    let kp = Keypair::generate_secp256k1();
-    let bytes = kp
-        .to_protobuf_encoding()
-        .map_err(|e| anyhow!("encoding a new identity key: {e}"))?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
-    std::fs::write(path, &bytes).with_context(|| format!("writing {}", path.display()))?;
-    tracing::info!(path = %path.display(), "generated a new libp2p identity");
-    Ok(kp)
+
+    // The CL spec requires secp256k1 identities.
+    let kp = Keypair::generate_secp256k1();
+    let bytes = kp
+        .to_protobuf_encoding()
+        .map_err(|e| anyhow!("encoding a new identity key: {e}"))?;
+
+    // create_new + mode 0600 in ONE call. `exists()` then `write()` is both a
+    // race (two starts can each see "missing" and the second clobbers the
+    // identity the first published) and a permissions hole: plain `fs::write`
+    // creates with the process umask, typically 0644, so any local user could
+    // copy this key and impersonate the published server.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(path) {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(&bytes)
+                .with_context(|| format!("writing {}", path.display()))?;
+            f.sync_all()?;
+            tracing::info!(path = %path.display(), "generated a new libp2p identity (0600)");
+            Ok(kp)
+        }
+        // Already there — the normal path on every restart after the first.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing =
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            let kp = Keypair::from_protobuf_encoding(&existing)
+                .with_context(|| format!("decoding the identity key in {}", path.display()))?;
+            warn_if_group_or_world_readable(path);
+            Ok(kp)
+        }
+        Err(e) => Err(e).with_context(|| format!("creating {}", path.display())),
+    }
+}
+
+/// A key written by an older build (or copied in by hand) may be 0644. Say so
+/// rather than silently serving with an identity anyone on the box can steal.
+fn warn_if_group_or_world_readable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode() & 0o077;
+            if mode != 0 {
+                tracing::warn!(
+                    path = %path.display(),
+                    mode = format!("{:o}", meta.permissions().mode() & 0o777),
+                    "identity key is readable beyond its owner — chmod 600 it; \
+                     anyone who copies it can impersonate this server"
+                );
+            }
+        }
+    }
 }
 
 /// Build the chain view a `status` answer is made of.
@@ -382,17 +428,31 @@ async fn fill_bootstrap_misses(
 ) -> Result<usize> {
     let mut filled = 0;
     for root in store.take_bootstrap_misses(MISS_FETCHES_PER_TICK) {
-        match client.bootstrap(&root).await {
+        match client.bootstrap_classified(&root).await {
             Ok(bs) => {
                 store.insert_bootstrap(root, fork_digest, &bs.bytes);
                 filled += 1;
                 tracing::info!(root = %hex::encode(&root[..8]), bytes = bs.bytes.len(),
                     "filled a requested bootstrap");
             }
-            // Upstream cannot serve it (typically below its window). Already
-            // marked attempted, so we will not ask again.
-            Err(e) => tracing::info!(root = %hex::encode(&root[..8]), error = %e,
-                "upstream cannot serve this bootstrap"),
+            // Definitive: the upstream answered and does not have it (typically
+            // below its light-client window). The attempted marker set by the
+            // drain is correct — asking again would cost a fetch per retry of a
+            // wallet that will keep asking forever.
+            Err(FetchError::Unavailable(code)) => {
+                tracing::info!(root = %hex::encode(&root[..8]), code,
+                    "upstream does not have this bootstrap — not retrying");
+            }
+            // Transient: a timeout, a connection failure, a 5xx. The drain
+            // already marked it attempted, so leaving it there would make ONE
+            // Nimbus hiccup permanently poison a wallet's pinned checkpoint —
+            // every later request refused with ResourceUnavailable and no
+            // re-fetch. Put it back at the front of the queue instead.
+            Err(FetchError::Transient(e)) => {
+                tracing::warn!(root = %hex::encode(&root[..8]), error = %e,
+                    "transient failure fetching a bootstrap — requeued");
+                store.requeue_bootstrap_miss(root);
+            }
         }
     }
     Ok(filled)

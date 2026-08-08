@@ -85,8 +85,14 @@ async fn main() -> Result<()> {
                 port = args
                     .get(i)
                     .ok_or_else(|| anyhow!("--port needs a number\n\n{}", usage()))?
-                    .parse()
-                    .map_err(|_| anyhow!("--port must be a number 1-65535\n\n{}", usage()))?;
+                    .parse::<u16>()
+                    .ok()
+                    // Zero is a valid u16 but not a valid listen port here: it
+                    // asks the OS for an ephemeral one, and the daemon would
+                    // then advertise `/tcp/0`, which nothing can dial. Reject it
+                    // rather than print an unusable multiaddr.
+                    .filter(|p| *p != 0)
+                    .ok_or_else(|| anyhow!("--port must be a number 1-65535\n\n{}", usage()))?;
             }
             "--key" => {
                 i += 1;

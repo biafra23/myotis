@@ -50,6 +50,41 @@ fn parse_root(s: &str) -> Result<[u8; 32]> {
         .map_err(|_| anyhow!("root is {} bytes, want 32", raw.len()))
 }
 
+/// Ceiling on a buffered SSZ response body.
+///
+/// A full 128-period `updates` answer is ~3.4 MB, so 32 MiB is ~10x headroom.
+/// The cap exists because the body is read into memory before `split_updates`
+/// can enforce anything: a compromised or malfunctioning upstream could
+/// otherwise stream an arbitrarily large chunked response and exhaust the
+/// daemon, which would bypass every ingestion bound downstream of it.
+pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Why a fetch failed, split by whether retrying could ever help.
+///
+/// The distinction is load-bearing for bootstraps: a root is marked attempted
+/// BEFORE the fetch, so treating a timeout like a 404 would permanently poison a
+/// wallet's pinned checkpoint on one upstream hiccup.
+#[derive(Debug)]
+pub enum FetchError {
+    /// The upstream answered, and its answer means "I do not have this" — 4xx.
+    /// Retrying is pointless.
+    Unavailable(u16),
+    /// Timeout, connection failure, 5xx, oversized or unreadable body. The same
+    /// request may well succeed later.
+    Transient(anyhow::Error),
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(code) => write!(f, "upstream does not have it (HTTP {code})"),
+            Self::Transient(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for FetchError {}
+
 /// An SSZ response body plus the fork name Nimbus tagged it with.
 #[derive(Debug, Clone)]
 pub struct SszResponse {
@@ -87,14 +122,24 @@ impl NimbusRest {
     }
 
     async fn get_ssz(&self, path: &str) -> Result<SszResponse> {
+        self.get_ssz_classified(path).await.map_err(|e| match e {
+            FetchError::Unavailable(code) => anyhow!("GET {path} -> HTTP {code}"),
+            FetchError::Transient(e) => e,
+        })
+    }
+
+    /// As [`NimbusRest::get_ssz`], but distinguishing "upstream does not have
+    /// it" from "try again later", and streaming the body under a hard cap
+    /// rather than buffering whatever arrives.
+    async fn get_ssz_classified(&self, path: &str) -> std::result::Result<SszResponse, FetchError> {
         let url = format!("{}{}", self.base, path);
-        let resp = self
+        let mut resp = self
             .http
             .get(&url)
             .header(reqwest::header::ACCEPT, "application/octet-stream")
             .send()
             .await
-            .with_context(|| format!("GET {url}"))?;
+            .map_err(|e| FetchError::Transient(anyhow!("GET {url}: {e}")))?;
 
         let status = resp.status();
         let consensus_version = resp
@@ -104,13 +149,36 @@ impl NimbusRest {
             .map(str::to_string);
 
         if !status.is_success() {
-            return Err(anyhow!("GET {url} -> HTTP {status}"));
+            return Err(if status.is_client_error() {
+                FetchError::Unavailable(status.as_u16())
+            } else {
+                FetchError::Transient(anyhow!("GET {url} -> HTTP {status}"))
+            });
         }
-        let bytes = resp
-            .bytes()
+
+        // A declared Content-Length over the cap is refused before a byte of
+        // body is read; a chunked response without one is caught below.
+        if let Some(len) = resp.content_length() {
+            if len > MAX_BODY_BYTES as u64 {
+                return Err(FetchError::Transient(anyhow!(
+                    "GET {url}: declared body {len} exceeds MAX_BODY_BYTES ({MAX_BODY_BYTES})"
+                )));
+            }
+        }
+
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .with_context(|| format!("reading body of {url}"))?
-            .to_vec();
+            .map_err(|e| FetchError::Transient(anyhow!("reading body of {url}: {e}")))?
+        {
+            if bytes.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
+                return Err(FetchError::Transient(anyhow!(
+                    "GET {url}: body exceeds MAX_BODY_BYTES ({MAX_BODY_BYTES})"
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
 
         Ok(SszResponse {
             bytes,
@@ -145,7 +213,17 @@ impl NimbusRest {
     /// unbounded and genuinely miss-prone — which is why the design pre-populates
     /// only checkpoint-aligned roots and refuses the rest.
     pub async fn bootstrap(&self, block_root: &[u8; 32]) -> Result<SszResponse> {
-        self.get_ssz(&format!(
+        self.bootstrap_classified(block_root).await.map_err(Into::into)
+    }
+
+    /// [`NimbusRest::bootstrap`] keeping the transient/definitive distinction,
+    /// which the background filler needs in order not to poison a root over a
+    /// timeout.
+    pub async fn bootstrap_classified(
+        &self,
+        block_root: &[u8; 32],
+    ) -> std::result::Result<SszResponse, FetchError> {
+        self.get_ssz_classified(&format!(
             "/eth/v1/beacon/light_client/bootstrap/0x{}",
             hex::encode(block_root)
         ))

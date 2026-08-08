@@ -81,8 +81,15 @@ struct Inner {
     /// whatever order the map happens to iterate in.
     bootstrap_order: VecDeque<[u8; 32]>,
     /// Roots a caller asked for and we did not have — drained by the background
-    /// filler.
-    bootstrap_misses: BTreeSet<[u8; 32]>,
+    /// filler, in ARRIVAL order.
+    ///
+    /// A queue plus a membership set rather than an ordered set: draining a
+    /// `BTreeSet` in key order would let a caller starve a legitimate checkpoint
+    /// indefinitely by enqueueing lexicographically smaller roots before every
+    /// tick, and the whole point of the queue is that a cold wallet's pinned
+    /// root gets fetched.
+    bootstrap_misses: VecDeque<[u8; 32]>,
+    bootstrap_miss_set: BTreeSet<[u8; 32]>,
     /// Roots already attempted, so a root the upstream cannot serve is fetched
     /// once rather than on every retry of a wallet that will keep asking.
     /// The set answers "seen?"; the queue fixes the eviction order.
@@ -215,7 +222,7 @@ impl LcStore {
         {
             let inner = self.read();
             if inner.bootstrap_attempted.contains(&root)
-                || inner.bootstrap_misses.contains(&root)
+                || inner.bootstrap_miss_set.contains(&root)
                 || inner.bootstrap_misses.len() >= MAX_BOOTSTRAP_MISSES
             {
                 return false;
@@ -224,21 +231,43 @@ impl LcStore {
         let mut inner = self.write();
         // Re-check: the lock was released in between.
         if inner.bootstrap_attempted.contains(&root)
-            || inner.bootstrap_misses.contains(&root)
+            || inner.bootstrap_miss_set.contains(&root)
             || inner.bootstrap_misses.len() >= MAX_BOOTSTRAP_MISSES
         {
             return false;
         }
-        inner.bootstrap_misses.insert(root);
+        inner.bootstrap_misses.push_back(root);
+        inner.bootstrap_miss_set.insert(root);
         true
+    }
+
+    /// Put a root back at the FRONT of the queue and clear its attempted marker.
+    ///
+    /// For TRANSIENT upstream failures only. Without this, one Nimbus timeout
+    /// would permanently poison a wallet's pinned checkpoint: the root is marked
+    /// attempted before the fetch, so every later request for it is refused with
+    /// no re-fetch, forever.
+    pub fn requeue_bootstrap_miss(&self, root: [u8; 32]) {
+        let mut inner = self.write();
+        inner.bootstrap_attempted.remove(&root);
+        inner.bootstrap_attempted_order.retain(|r| r != &root);
+        if inner.bootstrap_miss_set.insert(root) {
+            inner.bootstrap_misses.push_front(root);
+        }
     }
 
     /// Drain at most `max` queued roots, marking them attempted.
     pub fn take_bootstrap_misses(&self, max: usize) -> Vec<[u8; 32]> {
         let mut inner = self.write();
-        let taken: Vec<[u8; 32]> = inner.bootstrap_misses.iter().copied().take(max).collect();
+        let mut taken: Vec<[u8; 32]> = Vec::new();
+        while taken.len() < max {
+            match inner.bootstrap_misses.pop_front() {
+                Some(root) => taken.push(root),
+                None => break,
+            }
+        }
         for root in &taken {
-            inner.bootstrap_misses.remove(root);
+            inner.bootstrap_miss_set.remove(root);
             if inner.bootstrap_attempted.insert(*root) {
                 inner.bootstrap_attempted_order.push_back(*root);
             }
@@ -526,6 +555,33 @@ mod tests {
             s.insert_bootstrap(root_n(i), D, &[1u8; 32]);
         }
         assert!(!s.record_bootstrap_miss(root), "never cached, so still blocked");
+    }
+
+    #[test]
+    fn misses_drain_in_arrival_order_not_key_order() {
+        // Otherwise a caller can starve a legitimate checkpoint forever by
+        // enqueueing lexicographically smaller roots before each drain.
+        let s = LcStore::new();
+        let first = root_n(9_000);
+        assert!(s.record_bootstrap_miss(first));
+        assert!(s.record_bootstrap_miss(root_n(1))); // sorts lower, arrived later
+        assert_eq!(s.take_bootstrap_misses(1), vec![first]);
+    }
+
+    #[test]
+    fn a_transient_failure_can_be_requeued() {
+        let s = LcStore::new();
+        let root = root_n(5);
+        assert!(s.record_bootstrap_miss(root));
+        assert_eq!(s.take_bootstrap_misses(1), vec![root]);
+        assert!(!s.record_bootstrap_miss(root), "marked attempted by the drain");
+
+        s.requeue_bootstrap_miss(root);
+        assert_eq!(
+            s.take_bootstrap_misses(1),
+            vec![root],
+            "a transient upstream failure must not permanently poison a pinned checkpoint"
+        );
     }
 
     #[test]
