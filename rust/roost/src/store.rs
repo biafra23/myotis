@@ -34,7 +34,7 @@
 //! the one genuinely unbounded key space.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use myotis_net::codec::encode_success_response;
 
@@ -88,6 +88,8 @@ struct Inner {
     /// The set answers "seen?"; the queue fixes the eviction order.
     bootstrap_attempted: BTreeSet<[u8; 32]>,
     bootstrap_attempted_order: VecDeque<[u8; 32]>,
+    /// Digest of the highest period inserted so far.
+    newest_fork_digest: Option<[u8; 4]>,
 }
 
 /// Shared, cheap to clone, safe to read from the swarm task.
@@ -113,6 +115,24 @@ impl LcStore {
         Self::default()
     }
 
+    /// Lock accessors that IGNORE poisoning.
+    ///
+    /// A panic while one of these locks is held would otherwise poison it and
+    /// make every later `unwrap()` panic too — so a single panic anywhere on
+    /// the swarm task would convert this store into one that refuses forever.
+    /// Nothing here has an invariant a torn write can break in a way a reader
+    /// would misinterpret: the maps hold immutable pre-encoded byte blobs, and
+    /// the worst case is a bootstrap present in the map but missing from the
+    /// eviction queue, which costs one extra entry. Serving stale-but-valid
+    /// bytes beats serving nothing.
+    fn read(&self) -> RwLockReadGuard<'_, Inner> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, Inner> {
+        self.inner.write().unwrap_or_else(|e| e.into_inner())
+    }
+
     // --- ingestion (background tasks only; never the request path) --------
 
     /// Encode once, at ingest. `fork_digest` is the digest the source framed,
@@ -120,17 +140,22 @@ impl LcStore {
     /// would not determine it.
     pub fn insert_update(&self, period: u64, fork_digest: [u8; 4], ssz: &[u8]) {
         let wire: Arc<[u8]> = encode_success_response(ssz, Some(fork_digest)).into();
-        self.inner.write().unwrap().updates.insert(period, wire);
+        let mut inner = self.write();
+        let newest = inner.updates.keys().next_back().copied();
+        if newest.is_none_or(|n| period >= n) {
+            inner.newest_fork_digest = Some(fork_digest);
+        }
+        inner.updates.insert(period, wire);
     }
 
     pub fn set_finality(&self, fork_digest: [u8; 4], ssz: &[u8]) {
         let wire: Arc<[u8]> = encode_success_response(ssz, Some(fork_digest)).into();
-        self.inner.write().unwrap().finality = Some(wire);
+        self.write().finality = Some(wire);
     }
 
     pub fn set_optimistic(&self, fork_digest: [u8; 4], ssz: &[u8]) {
         let wire: Arc<[u8]> = encode_success_response(ssz, Some(fork_digest)).into();
-        self.inner.write().unwrap().optimistic = Some(wire);
+        self.write().optimistic = Some(wire);
     }
 
     /// Cache a bootstrap, evicting the least recently inserted root when full.
@@ -147,7 +172,7 @@ impl LcStore {
         fork_digest: [u8; 4],
         ssz: &[u8],
     ) -> Option<[u8; 32]> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.write();
         let wire: Arc<[u8]> = encode_success_response(ssz, Some(fork_digest)).into();
 
         // Refreshing an existing root must not re-queue it for eviction, or a
@@ -174,7 +199,7 @@ impl LcStore {
         // caller spamming unknown roots must not be able to serialise the
         // responder behind a write lock it will not end up needing.
         {
-            let inner = self.inner.read().unwrap();
+            let inner = self.read();
             if inner.bootstrap_attempted.contains(&root)
                 || inner.bootstrap_misses.contains(&root)
                 || inner.bootstrap_misses.len() >= MAX_BOOTSTRAP_MISSES
@@ -182,7 +207,7 @@ impl LcStore {
                 return false;
             }
         }
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.write();
         // Re-check: the lock was released in between.
         if inner.bootstrap_attempted.contains(&root)
             || inner.bootstrap_misses.contains(&root)
@@ -196,7 +221,7 @@ impl LcStore {
 
     /// Drain at most `max` queued roots, marking them attempted.
     pub fn take_bootstrap_misses(&self, max: usize) -> Vec<[u8; 32]> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.write();
         let taken: Vec<[u8; 32]> = inner.bootstrap_misses.iter().copied().take(max).collect();
         for root in &taken {
             inner.bootstrap_misses.remove(root);
@@ -228,7 +253,7 @@ impl LcStore {
         if count == 0 || count > MAX_REQUEST_LIGHT_CLIENT_UPDATES {
             return None;
         }
-        let inner = self.inner.read().unwrap();
+        let inner = self.read();
 
         // Refuse out-of-window rather than scanning for it.
         let (&lowest, _) = inner.updates.iter().next()?;
@@ -264,23 +289,29 @@ impl LcStore {
     }
 
     pub fn finality(&self) -> Option<Arc<[u8]>> {
-        self.inner.read().unwrap().finality.clone()
+        self.read().finality.clone()
     }
 
     pub fn optimistic(&self) -> Option<Arc<[u8]>> {
-        self.inner.read().unwrap().optimistic.clone()
+        self.read().optimistic.clone()
     }
 
     pub fn bootstrap(&self, block_root: &[u8; 32]) -> Option<Arc<[u8]>> {
-        self.inner.read().unwrap().bootstraps.get(block_root).cloned()
+        self.read().bootstraps.get(block_root).cloned()
+    }
+
+    /// The fork digest of the newest stored period — the last-resort fallback
+    /// when upstream cannot supply one at startup.
+    pub fn newest_fork_digest(&self) -> Option<[u8; 4]> {
+        self.read().newest_fork_digest
     }
 
     pub fn has_period(&self, period: u64) -> bool {
-        self.inner.read().unwrap().updates.contains_key(&period)
+        self.read().updates.contains_key(&period)
     }
 
     pub fn coverage(&self) -> Coverage {
-        let inner = self.inner.read().unwrap();
+        let inner = self.read();
         Coverage {
             lowest_period: inner.updates.keys().next().copied(),
             highest_period: inner.updates.keys().next_back().copied(),
@@ -294,7 +325,7 @@ impl LcStore {
 
     /// Periods missing from `[from, to]` — what a background filler works from.
     pub fn gaps(&self, from: u64, to: u64) -> Vec<u64> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.read();
         (from..=to).filter(|p| !inner.updates.contains_key(p)).collect()
     }
 }
@@ -344,7 +375,7 @@ mod tests {
     fn store_with(periods: &[u64]) -> LcStore {
         let s = LcStore::new();
         for (i, p) in periods.iter().enumerate() {
-            s.insert_update(*p, D, &vec![i as u8 + 1; 64]);
+            s.insert_update(*p, D, &[i as u8 + 1; 64]);
         }
         s
     }

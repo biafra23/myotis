@@ -21,7 +21,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::prelude::*;
 use libp2p::identify;
-use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
+use libp2p::request_response::{self, InboundRequestId, OutboundRequestId, ProtocolSupport};
 use libp2p::connection_limits::{self, ConnectionLimits};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm};
@@ -68,6 +68,26 @@ const RESPONSE_QUIET_WINDOW: Duration = Duration::from_secs(3);
 /// Must comfortably exceed the observed inter-chunk pacing (~10 s) or the
 /// quiet window truncates paced batches to their first chunk.
 const UPDATES_QUIET_WINDOW: Duration = Duration::from_secs(12);
+
+/// Ceiling on response bytes queued but not yet written, across ALL inbound
+/// connections.
+///
+/// Per-request bounds (`MAX_REQUEST_LIGHT_CLIENT_UPDATES`, response byte caps)
+/// say nothing about how many responses can be in flight at once, and the two
+/// are very different numbers on a public responder: a full updates_by_range
+/// body is ~3.4 MiB built from a 16-byte request, held until written or until
+/// UPDATES_TIMEOUT (60 s) expires. One peer opening its permitted connections,
+/// filling its concurrent streams and then not reading would otherwise pin
+/// hundreds of MiB for a minute at a cost to itself of a couple of KiB.
+///
+/// Over budget we answer ResourceUnavailable, which is already the correct
+/// "ask someone else" answer and costs the caller nothing to retry.
+const MAX_IN_FLIGHT_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Concurrent inbound streams per connection for `updates_by_range` when
+/// serving. A wallet catching up needs one at a time; 64 (the default for the
+/// cheap protocols) only multiplies the in-flight ceiling above.
+const SERVING_UPDATES_MAX_STREAMS: usize = 4;
 
 const MAX_REQUEST_WIRE_BYTES: usize = 1024;
 /// A full 128-update batch is ~3.5 MiB on the wire (~128 x ~60 KB SSZ
@@ -232,12 +252,21 @@ impl request_response::Codec for Eth2Codec {
 type RR = request_response::Behaviour<Eth2Codec>;
 
 fn rr(protocol: &'static str, support: ProtocolSupport, timeout: Duration) -> RR {
+    rr_with_streams(protocol, support, timeout, 64)
+}
+
+fn rr_with_streams(
+    protocol: &'static str,
+    support: ProtocolSupport,
+    timeout: Duration,
+    max_streams: usize,
+) -> RR {
     request_response::Behaviour::with_codec(
         Eth2Codec,
         [(Eth2Protocol(StreamProtocol::new(protocol)), support)],
         request_response::Config::default()
             .with_request_timeout(timeout)
-            .with_max_concurrent_streams(64),
+            .with_max_concurrent_streams(max_streams),
     )
 }
 
@@ -291,7 +320,7 @@ impl Behaviour {
             // the Java learned that advertising unservable protocols gets us
             // goodbye'd ("durationMs=1 closes in the wild"). A serving host has
             // the archive that makes the advertisement honest, so it goes Full.
-            updates: rr(
+            updates: rr_with_streams(
                 protocols::UPDATES_BY_RANGE,
                 if serving {
                     ProtocolSupport::Full
@@ -299,6 +328,7 @@ impl Behaviour {
                     ProtocolSupport::Outbound
                 },
                 UPDATES_TIMEOUT,
+                if serving { SERVING_UPDATES_MAX_STREAMS } else { 64 },
             ),
             finality: rr(protocols::FINALITY_UPDATE, ProtocolSupport::Full, RESP_TIMEOUT),
             optimistic: rr(protocols::OPTIMISTIC_UPDATE, ProtocolSupport::Full, RESP_TIMEOUT),
@@ -495,15 +525,26 @@ impl Default for HostConfig {
 /// Start the libp2p host and its event-loop task. Returns the request client;
 /// the task exits on [`ReqRespClient::shutdown`] (or when every client is dropped).
 pub fn start_host(local_status: Arc<LocalStatus>) -> Result<ReqRespClient, String> {
-    start_host_with(local_status, HostConfig::default()).map(|(client, _)| client)
+    // The wallet drops the JoinHandle: dropping it does not abort the task, and
+    // a wallet that loses its host recovers by its own reconnect paths rather
+    // than by exiting the process.
+    start_host_with(local_status, HostConfig::default()).map(|(client, _, _)| client)
 }
 
-/// [`start_host`] with explicit configuration; also returns the local peer id,
-/// which a server needs in order to publish a dialable multiaddr.
+/// [`start_host`] with explicit configuration. Also returns the local peer id
+/// (a server needs it to publish a dialable multiaddr) and the swarm task's
+/// `JoinHandle`.
+///
+/// **A server must watch that handle.** The swarm task owns the listener and
+/// every connection, so if it ends — panic or otherwise — the host stops
+/// accepting while the process keeps running perfectly happily. Nothing else
+/// notices: the caller's `ReqRespClient` still exists and background pollers
+/// keep polling. A supervisor cannot help with a process that never exits, so
+/// detecting it is the owner's job. See `roost::serve`, which exits non-zero.
 pub fn start_host_with(
     local_status: Arc<LocalStatus>,
     config: HostConfig,
-) -> Result<(ReqRespClient, PeerId), String> {
+) -> Result<(ReqRespClient, PeerId, tokio::task::JoinHandle<()>), String> {
     // Ethereum CL spec requires secp256k1 identity keys (same as the Java
     // HostBuilder's KeyType.SECP256K1) — the default ed25519 would make some
     // peers reject the noise handshake payload.
@@ -533,8 +574,8 @@ pub fn start_host_with(
     tracing::info!(peer_id = %peer_id, serving, "libp2p host starting");
 
     let (tx, rx) = mpsc::channel(256);
-    tokio::spawn(run_swarm(swarm, rx, local_status, config.lc_responder));
-    Ok((ReqRespClient { tx }, peer_id))
+    let task = tokio::spawn(run_swarm(swarm, rx, local_status, config.lc_responder));
+    Ok((ReqRespClient { tx }, peer_id, task))
 }
 
 /// What a pending outbound request id maps back to.
@@ -569,6 +610,11 @@ struct SwarmCtx {
     /// Present only on a serving host; `None` on a wallet, where the
     /// light-client protocols answer `ResourceUnavailable` as before.
     lc: Option<Arc<dyn LcResponder>>,
+    /// Response bytes handed to `send_response` but not yet written, per inbound
+    /// request, plus their running total. Bounded by
+    /// [`MAX_IN_FLIGHT_RESPONSE_BYTES`].
+    in_flight: HashMap<InboundRequestId, usize>,
+    in_flight_bytes: usize,
 }
 
 async fn run_swarm(
@@ -586,6 +632,8 @@ async fn run_swarm(
         peer_earliest: HashMap::new(),
         local_status,
         lc,
+        in_flight: HashMap::new(),
+        in_flight_bytes: 0,
     };
     loop {
         tokio::select! {
@@ -779,8 +827,22 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
             request_response::Message::Response { request_id, response } => {
                 complete(ctx, swarm, request_id, peer, Ok(response));
             }
-            request_response::Message::Request { request, channel, .. } => {
-                let response = respond_inbound(ctx, protocol, peer, &request);
+            request_response::Message::Request { request, channel, request_id, .. } => {
+                let mut response = respond_inbound(ctx, protocol, peer, &request);
+                // Refuse rather than queue when the in-flight budget is spent.
+                // ResourceUnavailable is the answer a wallet already knows how
+                // to handle, and it costs us nothing to hold.
+                if ctx.in_flight_bytes.saturating_add(response.len()) > MAX_IN_FLIGHT_RESPONSE_BYTES
+                {
+                    tracing::warn!(peer = %peer, protocol, queued = ctx.in_flight_bytes,
+                        want = response.len(),
+                        "in-flight response budget exhausted — answering ResourceUnavailable");
+                    response = codec::encode_error_response(
+                        codec::RESULT_RESOURCE_UNAVAILABLE,
+                        "ResourceUnavailable",
+                    );
+                }
+                let response_len = response.len();
                 let behaviour = swarm.behaviour_mut();
                 let rr = match protocol {
                     protocols::STATUS_V2 => &mut behaviour.status_v2,
@@ -796,6 +858,9 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
                 };
                 if rr.send_response(channel, response).is_err() {
                     tracing::debug!(peer = %peer, protocol, "inbound response channel closed");
+                } else {
+                    ctx.in_flight.insert(request_id, response_len);
+                    ctx.in_flight_bytes = ctx.in_flight_bytes.saturating_add(response_len);
                 }
                 // Goodbye means the peer is leaving. Answering without closing
                 // leaves us holding a connection its owner considers gone —
@@ -821,10 +886,15 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
             tracing::debug!(peer = %peer, protocol, error = %error, "outbound failure");
             complete(ctx, swarm, request_id, peer, Err(mapped));
         }
-        request_response::Event::InboundFailure { peer, error, .. } => {
+        // Both terminal outcomes release the budget; missing either would leak it
+        // and converge on a responder that refuses everything.
+        request_response::Event::InboundFailure { peer, error, request_id, .. } => {
+            release_in_flight(ctx, request_id);
             tracing::debug!(peer = %peer, protocol, error = %error, "inbound failure");
         }
-        request_response::Event::ResponseSent { .. } => {}
+        request_response::Event::ResponseSent { request_id, .. } => {
+            release_in_flight(ctx, request_id);
+        }
     }
 }
 
@@ -919,7 +989,9 @@ fn respond_inbound(ctx: &SwarmCtx, protocol: &'static str, peer: PeerId, raw: &[
     let req_ssz: Vec<u8> = if expected == 0 {
         Vec::new()
     } else {
-        match codec::parse_request_ssz(raw) {
+        // `expected` is exact for every protocol we answer, so the declared
+        // length is checked before the allocation it would otherwise cause.
+        match codec::parse_request_ssz_expecting(raw, Some(expected)) {
             Some(ssz) => ssz,
             None => {
                 return codec::encode_error_response(
@@ -1006,6 +1078,12 @@ fn respond_inbound(ctx: &SwarmCtx, protocol: &'static str, peer: PeerId, raw: &[
         },
 
         _ => resource_unavailable(),
+    }
+}
+
+fn release_in_flight(ctx: &mut SwarmCtx, request_id: InboundRequestId) {
+    if let Some(bytes) = ctx.in_flight.remove(&request_id) {
+        ctx.in_flight_bytes = ctx.in_flight_bytes.saturating_sub(bytes);
     }
 }
 

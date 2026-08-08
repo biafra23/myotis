@@ -122,6 +122,29 @@ async fn interim_fork_digest(client: &NimbusRest, head_period: u64) -> Result<[u
         .ok_or_else(|| anyhow!("no update at period {head_period} to take a fork digest from"))
 }
 
+/// The digest, trying the head period, then the one below it, then the newest
+/// period already archived.
+///
+/// The middle case is the period rollover; the last is "upstream is briefly
+/// unreachable but we hold an archive", where serving the last known digest
+/// beats not serving.
+async fn resolve_fork_digest(
+    client: &NimbusRest,
+    store: &LcStore,
+    head_period: u64,
+) -> Option<[u8; 4]> {
+    for candidate in [Some(head_period), head_period.checked_sub(1)].into_iter().flatten() {
+        if let Ok(d) = interim_fork_digest(client, candidate).await {
+            return Some(d);
+        }
+    }
+    let archived = store.newest_fork_digest();
+    if archived.is_some() {
+        tracing::warn!("upstream gave no fork digest — falling back to the newest archived one");
+    }
+    archived
+}
+
 /// Fill every period the upstream still serves that we do not already hold.
 async fn fill_periods(
     client: &NimbusRest,
@@ -135,8 +158,23 @@ async fn fill_periods(
         if store.has_period(period) {
             continue;
         }
-        let resp = client.updates(period, 1).await?;
-        for c in &split_updates(&resp.bytes)? {
+        // One flaky request out of ~1300 must not abort a whole backfill; the
+        // gap is simply retried on the next pass.
+        let resp = match client.updates(period, 1).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(period, error = %e, "fetching a period failed; will retry");
+                continue;
+            }
+        };
+        let chunks = match split_updates(&resp.bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(period, error = %e, "unparseable updates body; skipping");
+                continue;
+            }
+        };
+        for c in &chunks {
             archive.append(period, c.fork_digest, &c.ssz)?;
             store.insert_update(period, c.fork_digest, &c.ssz);
             fetched += 1;
@@ -173,14 +211,40 @@ pub async fn serve(
     // Initial fill, so the server is useful the moment it starts listening.
     let (head_slot, _) = client.syncing().await?;
     let head_period = period_of_slot(head_slot);
-    let floor = crate::find_window_floor(&client, head_period)
-        .await?
-        .ok_or_else(|| anyhow!("nimbus serves no light-client periods"))?;
-    let fetched = fill_periods(&client, &store, &mut archive, floor, head_period).await?;
-    println!("  filled    {fetched} new period(s), window {floor}..={head_period}");
+    // Everything from here to `start_host_with` is BEST EFFORT. Startup must not
+    // be able to fail on a transient upstream condition: at a period rollover
+    // the head slot is already in period P while the newest servable update is
+    // still P-1, so `find_window_floor` legitimately answers None — and a daemon
+    // that exits there is one that cannot be restarted during a window which
+    // recurs every ~27 hours. Whatever the archive already holds is servable, so
+    // serve it and fill the rest in the background.
+    match crate::find_window_floor(&client, head_period).await {
+        Ok(Some(floor)) => {
+            match fill_periods(&client, &store, &mut archive, floor, head_period).await {
+                Ok(fetched) => {
+                    println!("  filled    {fetched} new period(s), window {floor}..={head_period}")
+                }
+                Err(e) => println!("  filled    PARTIAL — {e}; the ticker will retry"),
+            }
+        }
+        Ok(None) => println!(
+            "  filled    upstream has no servable period yet (period rollover?) — serving the archive"
+        ),
+        Err(e) => println!("  filled    upstream probe failed: {e}; serving the archive"),
+    }
 
-    let fork_digest = interim_fork_digest(&client, head_period).await?;
-    refresh_live(&client, &store, fork_digest).await?;
+    let fork_digest = match resolve_fork_digest(&client, &store, head_period).await {
+        Some(d) => d,
+        None => {
+            return Err(anyhow!(
+                "no fork digest available from upstream or the archive — refusing to serve, \
+                 because a wrong digest in `status` makes every peer drop us"
+            ))
+        }
+    };
+    if let Err(e) = refresh_live(&client, &store, fork_digest).await {
+        tracing::warn!(error = %e, "initial live-object fetch failed; the ticker will retry");
+    }
 
     let status = LocalStatus::new(chain_view(&client, &store, fork_digest).await?);
     let key_path = key_path.unwrap_or_else(|| archive_path.with_extension("key"));
@@ -189,7 +253,7 @@ pub async fn serve(
     let listen = format!("/ip4/0.0.0.0/tcp/{port}")
         .parse()
         .map_err(|e| anyhow!("bad listen address: {e}"))?;
-    let (_handle, peer_id) = start_host_with(
+    let (_client, peer_id, swarm_task) = start_host_with(
         status.clone(),
         HostConfig {
             listen,
@@ -209,6 +273,8 @@ pub async fn serve(
     println!("  inbound   cap {MAX_INBOUND}");
     println!("\n  point a wallet at the multiaddr above; Ctrl-C to stop.\n");
 
+    let mut swarm_task = swarm_task;
+    let mut fork_digest = fork_digest;
     let mut ticker = tokio::time::interval(REFRESH);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -217,11 +283,45 @@ pub async fn serve(
                 println!("\nshutting down");
                 return Ok(());
             }
+            // The swarm task owns the listener and every connection. If it ends
+            // we are no longer serving anything, but the process would happily
+            // keep polling Nimbus forever — a silent outage no supervisor can
+            // see, because `Restart=` only acts on a process that exits. So
+            // exit, loudly, and let the unit restart us.
+            joined = &mut swarm_task => {
+                let how = match joined {
+                    Ok(()) => "returned".to_string(),
+                    Err(e) if e.is_panic() => "PANICKED".to_string(),
+                    Err(e) => format!("failed: {e}"),
+                };
+                tracing::error!(outcome = %how, "libp2p swarm task ended — no longer serving");
+                return Err(anyhow!("libp2p swarm task ended ({how}) — exiting so the supervisor can restart us"));
+            }
             _ = ticker.tick() => {
                 // Every failure here is logged and swallowed: a REST hiccup must
                 // degrade what we serve, never take the responder down. A stale
                 // relay surfaces to wallets as "not ready", which is the
                 // detectable failure the design accepts.
+                // Re-resolve the digest EVERY tick. It is not only context
+                // bytes: it is also `status.fork_digest`, which every peer's
+                // relevance check reads on the mandatory handshake. Held
+                // constant, a process that stays up across a fork or BPO
+                // boundary advertises the pre-fork digest indefinitely — other
+                // clients answer with Goodbye(IrrelevantNetwork), and myotis
+                // wallets filter us out on `accepted_fork_digests`, so we go
+                // invisible to exactly the clients we exist for.
+                match client.syncing().await {
+                    Ok((slot, _)) => {
+                        if let Some(d) = resolve_fork_digest(&client, &store, period_of_slot(slot)).await {
+                            if d != fork_digest {
+                                tracing::warn!(old = %hex::encode(fork_digest), new = %hex::encode(d),
+                                    "fork digest changed — fork or BPO boundary crossed");
+                                fork_digest = d;
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "polling head slot for the digest failed"),
+                }
                 if let Err(e) = refresh_live(&client, &store, fork_digest).await {
                     tracing::warn!(error = %e, "refreshing live objects failed");
                 }

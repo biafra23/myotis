@@ -1,9 +1,10 @@
 //! roost — a dedicated light-client server (docs/lc-server-design.md).
 //!
-//! Status: **in progress.** `probe` verifies the upstream path; `ingest` fills
-//! the durable archive and the in-memory serving store from Nimbus. The libp2p
-//! responder, the chain-view poller behind `status`, and ENR publication come
-//! next.
+//! Status: **in progress.** `serve` runs the server — the libp2p responder over
+//! the light-client store, the chain-view poller behind `status`, and ingestion
+//! in background tasks. `probe` verifies the upstream path and `ingest` fills
+//! the archive without listening. ENR publication and the back-archive below the
+//! upstream light-client floor are what remain.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

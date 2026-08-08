@@ -29,14 +29,23 @@ limits.
   FNV-1a checksum), bound to a chain by its `genesis_validators_root`. Repairs a
   torn tail on open and scans past a corrupt record rather than losing every
   record behind it.
+- `serve.rs` — the daemon: persisted secp256k1 identity, the chain-view poller
+  behind `status`, per-slot refresh of the live objects, new-period archiving,
+  and a coalesced background filler for bootstrap misses.
+- The four light-client protocols are served, via the `LcResponder` seam in
+  `myotis-net` — which also gained the `ping` and `goodbye` spec fixes a public
+  responder needs.
 - `roost probe` — runs the whole upstream path against a live node and
   round-trips the result through myotis' own wire decoder.
 - `roost ingest` — loads the archive, fills it from Nimbus, and finishes with a
   serving self-check that reads back through the real serving API.
+- `roost serve` — the server itself. A myotis wallet bootstraps and stays synced
+  from it alone (verified on sepolia with discovery disabled).
 
-Not built yet: the ingestion background tasks, the four serving handlers, the
-chain-view poller behind `status`, the `ping`/`goodbye` fixes in `myotis-net`,
-ENR publication, and the daemon itself.
+Not built yet: **ENR publication** (persisted discv5 key and sequence number,
+re-published at fork *and* BPO boundaries) and the **back-archive** below the
+upstream node's light-client floor. Those are what stand between this and the
+design's rollout steps 4-5.
 
 Known interim: context bytes for the three single-object endpoints are copied
 from the newest update chunk. Correct except across a fork or BPO boundary.
