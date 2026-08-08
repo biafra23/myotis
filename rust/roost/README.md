@@ -22,17 +22,32 @@ limits.
 - `framing.rs` — walks the `updates` body's length-prefixed chunks and re-frames
   them as a libp2p multi-chunk response, re-emitting each chunk's fork digest
   verbatim.
+- `store.rs` — the in-memory serving cache, holding **pre-encoded** libp2p
+  responses so serving is a memcpy and a write. Bounded: spec update count,
+  total response bytes, and a hard cap on bootstraps.
+- `archive.rs` — the durable, append-only archive (magic, version, per-record
+  FNV-1a checksum), bound to a chain by its `genesis_validators_root`. Repairs a
+  torn tail on open and scans past a corrupt record rather than losing every
+  record behind it.
 - `roost probe` — runs the whole upstream path against a live node and
   round-trips the result through myotis' own wire decoder.
+- `roost ingest` — loads the archive, fills it from Nimbus, and finishes with a
+  serving self-check that reads back through the real serving API.
 
-Not built yet: the LC store, the ingestion tasks, the four serving handlers, the
-chain-view poller behind `status`, ENR publication, and the daemon itself.
+Not built yet: the ingestion background tasks, the four serving handlers, the
+chain-view poller behind `status`, the `ping`/`goodbye` fixes in `myotis-net`,
+ENR publication, and the daemon itself.
+
+Known interim: context bytes for the three single-object endpoints are copied
+from the newest update chunk. Correct except across a fork or BPO boundary.
+myotis' own decoder ignores context bytes; other CLs dispatch on them, so this
+must be computed via `fork_digest_bpo` before the ENR is published.
 
 ## Run
 
 ```bash
 cargo run --manifest-path rust/roost/Cargo.toml -- probe
-cargo run --manifest-path rust/roost/Cargo.toml -- probe --rest http://127.0.0.1:5052
+cargo run --manifest-path rust/roost/Cargo.toml -- ingest --archive /var/lib/roost/sepolia.db
 cargo test  --manifest-path rust/roost/Cargo.toml
 ```
 

@@ -195,6 +195,20 @@ impl NimbusRest {
         Ok((head, syncing))
     }
 
+    /// The chain's `genesis_validators_root` — the identity an archive is bound
+    /// to, so a file collected for one network can never load for another.
+    pub async fn genesis_validators_root(&self) -> Result<[u8; 32]> {
+        let v = self.get_json("/eth/v1/beacon/genesis").await?;
+        let s = v["data"]["genesis_validators_root"]
+            .as_str()
+            .ok_or_else(|| anyhow!("genesis: missing genesis_validators_root"))?;
+        let raw = hex::decode(s.trim_start_matches("0x"))
+            .context("decoding genesis_validators_root hex")?;
+        raw.as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("genesis_validators_root is {} bytes, want 32", raw.len()))
+    }
+
     /// The finalized checkpoint root — the checkpoint-aligned block root a
     /// bootstrap should be pre-populated for.
     pub async fn finalized_root(&self) -> Result<[u8; 32]> {
