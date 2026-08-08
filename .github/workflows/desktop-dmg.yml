@@ -216,6 +216,23 @@ jobs:
           path: app-desktop/build/compose/binaries/main/dmg/*.dmg
           if-no-files-found: error
           retention-days: 30
+          # Artifacts are immutable per run; without this, "re-run all jobs" on a
+          # tag 409s in every build leg and the release job never runs. That is
+          # the button people reach for after the version guard fails, so the
+          # recovery path must not wedge the release — and here it would cost two
+          # 40-minute jpackage legs. (node-binding.yml already carries this fix.)
+          overwrite: true
+
+  # Refuse to publish when the pushed tag disagrees with the version in the tree
+  # — the release is named after the tag, while the .dmg's packageVersion comes
+  # from project.version (via the +1-major macOS rule). See
+  # release-version-guard.yml. Runs in parallel with the builds, so a mismatch is
+  # REPORTED within minutes rather than after both jpackage legs — Actions has no
+  # cross-job fail-fast, so the legs themselves still run to completion.
+  version-guard:
+    name: Release version guard
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/release-version-guard.yml
 
   # Attach both arch dmgs to the GitHub Release for the pushed tag. Runs ONLY on
   # `v*` tags, ONCE (not per-arch), after BOTH matrix build jobs finish, and
@@ -224,7 +241,9 @@ jobs:
   # creates it and the other just uploads — the create step tolerates that race.
   release:
     name: Publish dmgs to release
-    needs: build
+    # version-guard carries the same `if` as this job, so it is never merely
+    # skipped underneath it — on a tag push both run, otherwise both are skipped.
+    needs: [build, version-guard]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

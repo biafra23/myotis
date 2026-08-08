@@ -82,6 +82,14 @@ jobs:
           # on a tag 409s in every build leg and the release job never runs.
           overwrite: true
 
+  # Refuse to publish when the pushed tag disagrees with the version in the tree
+  # (see release-version-guard.yml). Gated on the REF like the release job below,
+  # so it covers the manual republish path (dispatch against a tag ref) too.
+  version-guard:
+    name: Release version guard
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/release-version-guard.yml
+
   # Attach the five prebuilt addons plus a SHA-256 checksum file to the GitHub
   # Release for the pushed tag, and pin the engine ABI version in the release
   # notes so downstream loaders can gate on it. Runs ONLY on `v*` tags. The
@@ -90,7 +98,9 @@ jobs:
   # the create step below tolerates that race.
   release:
     name: Publish addons to release
-    needs: build
+    # version-guard carries the same `if` as this job, so it is never merely
+    # skipped underneath it — both run on a tag ref, both skip otherwise.
+    needs: [build, version-guard]
     # Deliberately gated on the REF, not the event: a workflow_dispatch
     # targeting a tag ref (gh workflow run node-binding.yml --ref vX.Y.Z) is
     # the manual republish path — the job is idempotent (--clobber uploads,
@@ -203,7 +213,8 @@ jobs:
   # Both smoke jobs are manual-only (workflow_dispatch): a 100-minute
   # live-network job is too heavy for every main push, its outcome depends on
   # whether Ethereum peers accept connections from Azure datacenter IPs, and
-  # releases must never gate on it (the release job needs only `build`).
+  # releases must never gate on it (the release job needs `build` and the
+  # version guard — never the smokes).
   smoke-linux:
     # Tag refs excluded: dispatching on a tag is the release-republish path
     # and must not launch the smokes alongside it.

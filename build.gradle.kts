@@ -33,6 +33,29 @@ allprojects {
     version = "0.1.5-SNAPSHOT"
 }
 
+// The release version — project.version minus the -SNAPSHOT suffix — exactly as
+// :app-desktop and :android-app derive their installer / app versions from it.
+// Release CI reads it from HERE (via Gradle, so it can never drift from what the
+// build actually uses) and refuses to publish when the pushed `v*` tag disagrees:
+// otherwise tagging without running the version sweep goes green and ships assets
+// named after the tag while the binaries inside report the older version.
+// See .github/workflows/release-version-guard.yml. This reads the ROOT project's
+// version, which is what the consumers see only because `allprojects` above sets
+// ONE version for the whole build — give a module its own version and it silently
+// stops being covered by the guard.
+//
+// Marker-prefixed output: `./gradlew -q` still lets non-task text reach stdout
+// (wrapper distribution download progress on a cold runner, JVM/plugin warnings),
+// so the consumer greps for the marker instead of trusting the last line.
+tasks.register("printReleaseVersion") {
+    group = "help"
+    description = "Print the release version (project.version without -SNAPSHOT) as releaseVersion=<x.y.z>"
+    // Read at configuration time: the task action captures a plain String, so it
+    // stays configuration-cache compatible.
+    val releaseVersion = project.version.toString().substringBefore('-')
+    doLast { println("releaseVersion=$releaseVersion") }
+}
+
 subprojects {
     // These bring their own plugins (Android Gradle Plugin / Kotlin Multiplatform /
     // Compose), which are incompatible with the `java` plugin applied below:

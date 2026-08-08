@@ -1,0 +1,125 @@
+# Refuse to publish a release whose TAG disagrees with the version in the TREE.
+#
+# Release asset names come from the tag (Myotis-${GITHUB_REF_NAME}-android-debug.apk,
+# the release title), while what is *inside* those assets comes from the source:
+# :app-desktop and :android-app both derive their versions from project.version.
+# Nothing connected the two, so tagging v0.1.5 without first running the version
+# sweep went green and published a v0.1.5-named apk that reports versionName 0.1.4
+# in Settings -> Apps, next to a .deb stamped 0.1.4 and a .dmg stamped 1.1.4.
+#
+# Called as a job by every workflow that publishes tag-named release assets:
+# android-apk, ci, desktop-dmg, desktop-linux-deb, node-binding. Each one gates
+# the call on startsWith(github.ref, 'refs/tags/v') and makes its publishing job
+# needs: it, so a mismatch fails the run before anything is uploaded. Because it
+# is a separate job it runs in PARALLEL with the builds, and the whole step is
+# ~30s, so the verdict lands long before a 40-minute dmg leg. (Those legs still
+# run to completion — Actions has no cross-job fail-fast.)
+#
+# GitHub has no cross-workflow job dependencies, so "one shared guard" means one
+# shared *definition*: this file is the single source of the check, instantiated
+# once per calling workflow.
+#
+# HOW TO EXERCISE IT without waiting for a release, and without publishing
+# anything: a tag push runs the workflow files FROM THE TAGGED COMMIT, so a
+# throwaway tag on any branch tests the real thing. Pick a version the tree
+# cannot match, so the expected outcome is a refusal:
+#
+#     git tag v9.9.9-guardtest && git push origin v9.9.9-guardtest
+#     # expect: this job fails in all five workflows, every publishing job is
+#     #         SKIPPED, and `gh release view v9.9.9-guardtest` finds nothing
+#     git push origin --delete v9.9.9-guardtest && git tag -d v9.9.9-guardtest
+#
+# The opposite direction (a CORRECT tag passes) cannot be rehearsed this way —
+# it publishes a real prerelease — so it is first exercised by an actual
+# release. That is why changes to this guard should land well before one.
+name: Release version guard
+
+on:
+  workflow_call:
+
+jobs:
+  verify:
+    name: Verify tag matches project version
+    runs-on: ubuntu-latest
+    # This job gates every release upload, so a wedged Gradle configuration must
+    # not hold the release hostage for the 6-hour default. Generous enough that
+    # three COLD attempts plus their two 25s sleeps still end in the explicit
+    # error below rather than a bare, unexplained timeout.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      # No `submodules: recursive` (unlike the sibling build jobs): the repo has
+      # none, and this job only ever reads the build scripts.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Compare tag against project version
+        run: |
+          set -eu
+          # Defence in depth: the callers gate on refs/tags/v*, but a mis-wired
+          # caller must fail loudly here rather than compare a branch name to a
+          # version and report a confusing "mismatch".
+          case "${GITHUB_REF}" in
+            refs/tags/v*) ;;
+            *) echo "::error::release-version-guard ran on ${GITHUB_REF}; it is only meaningful on a refs/tags/v* push"; exit 1 ;;
+          esac
+
+          # Ask the BUILD for the version (never grep the build file) so this can
+          # never drift from the version the packaged apps actually report.
+          # Retry to ride out transient repo-resolution blips, like the sibling
+          # build steps: a flaky download must not read as a version mismatch.
+          # Only stdout is captured — Gradle's own failure output goes to stderr
+          # and streams straight into this log, so a real breakage is readable.
+          out=""
+          for attempt in 1 2 3; do
+            if out=$(./gradlew -q :printReleaseVersion); then break; fi
+            [ "$attempt" -lt 3 ] || { echo "::error::could not read the project version from Gradle after 3 attempts — see the Gradle output above (a renamed or removed :printReleaseVersion task fails exactly like this, and retrying will not fix it)"; exit 1; }
+            echo "::warning::reading the project version failed (attempt $attempt); retrying in 25s"
+            sleep 25
+          done
+
+          # The task prints releaseVersion=<x.y.z>. Match the marker anywhere in
+          # the output rather than trusting the last line: even under -q a cold
+          # runner puts the wrapper's distribution-download progress on stdout,
+          # and it is emitted without a trailing newline, so the marker is not
+          # guaranteed to start its own line. The strict shape check below is
+          # what actually decides whether we got a version.
+          version=$(printf '%s\n' "$out" | sed -n 's/.*releaseVersion=\([0-9][0-9.]*\).*/\1/p' | tail -n1)
+          printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::printReleaseVersion did not yield a MAJOR.MINOR.PATCH version (got '$version')"; exit 1; }
+
+          tag="${GITHUB_REF_NAME}"
+          echo "pushed tag:      $tag"
+          echo "project version: $version (accepted tags: v$version, or v$version-<suffix>)"
+          # `v*` is the trigger, so pre-release/hotfix shapes like v0.1.5-rc1 must
+          # stay publishable: require the tag's version CORE to match, and allow a
+          # -suffix after it. The '-' is mandatory in the second pattern, so
+          # v0.1.40 can never satisfy a 0.1.4 tree.
+          case "$tag" in
+            "v$version"|"v$version-"*) ;;
+            *)
+              echo "Release assets are named after the TAG, but the binaries inside report the"
+              echo "PROJECT VERSION — so publishing now would ship $tag assets that identify"
+              echo "themselves as $version."
+              echo "Fix: run the version sweep on main (the version in build.gradle.kts, and"
+              echo "bump android-app's versionCode — which this guard does NOT check), merge"
+              echo "it, then tag that commit."
+              echo "::error::tag/version mismatch: pushed tag $tag, but the tree builds $version (expected v$version or v$version-<suffix>)"
+              exit 1
+              ;;
+          esac
+          echo "OK: tag $tag matches project version $version"
