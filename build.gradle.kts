@@ -99,15 +99,18 @@ subprojects {
 
 // -------------------------------------------------------------------------
 // Optional Rust build (rust/ Cargo workspace — the coming Rust engine plus the
-// native BLS backend). Rust is strictly OPTIONAL: without cargo on the machine
-// every cargo* task self-skips with a single lifecycle note and the pure-Java
-// build is untouched. With cargo installed, Gradle builds both engines:
+// native BLS backend). Rust is OPTIONAL for the JVM hosts: without cargo the
+// cargo* tasks self-skip with a single lifecycle note and the pure-Java build is
+// untouched. The ANDROID app is the exception — it builds the Rust engine from
+// source by default (see requireAndroidRustEngine / -PskipRustEngine below).
+// With cargo installed, Gradle builds both engines:
 //   cargoBuildHost  → rust/target/release/*.{so,dylib,dll}; wired into
 //                     :app run (java.library.path) and :consensus test
 //   cargoTest       → cargo test --workspace; wired into root `check`
-//   cargoNdkAndroid → Android jniLibs via rust/build-android.sh; wired into
-//                     :android-app preBuild. Extra-guarded on cargo-ndk + an
-//                     NDK — the committed jniLibs stay the fallback.
+//   cargoNdkAndroid → Android jniLibs (engine + native BLS) via
+//                     rust/build-android.sh; built from source (no committed
+//                     .so) and wired into :android-app preBuild. Required by
+//                     default; -PskipRustEngine opts out.
 // -------------------------------------------------------------------------
 
 // Configuration-cache-safe tool probe: `<cmd...>` stdout, or "" when the tool
@@ -326,10 +329,35 @@ val cargoCheckWasm = tasks.register<Exec>("cargoCheckWasm") {
 }
 tasks.named("check") { dependsOn(cargoCheckWasm) }
 
+// The Android app builds the Rust engine (its jniLibs) FROM SOURCE — cargo,
+// cargo-ndk, the Android NDK, and the Android rustup targets are REQUIRED to
+// build :android-app by default. Making the engine a build output (not a
+// committed binary) is what stops a stale artifact from silently shipping a
+// dead "Rust engine" toggle: there is no committed .so to drift from the source.
+//
+// Opt out with `-PskipRustEngine` to build the app WITHOUT the Rust engine when
+// you don't have (or don't want) the toolchain — the app then uses the Java
+// engine (and JVM BLS) at runtime. requireAndroidRustEngine (below) tells the
+// developer about this switch if the toolchain is missing and the flag is unset.
+// Presence-based: a bare `-PskipRustEngine` counts as true, as do the usual
+// truthy spellings (true/1/yes/on). Only an explicit false-y value
+// (false/0/no/off) disables it — this flag is the documented escape hatch out of
+// a hard failure, so a stray `-PskipRustEngine=1` must NOT silently parse as
+// "don't skip" and send the user straight back into the toolchain error.
+val skipRustEngine = project.hasProperty("skipRustEngine") &&
+    (project.property("skipRustEngine") as? String).let {
+        it.isNullOrBlank() || it.trim().lowercase() !in setOf("false", "0", "no", "off")
+    }
+val androidRustTargets = listOf("aarch64-linux-android", "x86_64-linux-android")
+val androidRustToolchainReady = rustAvailable &&
+    cargoNdkVersion.isNotEmpty() &&
+    androidNdkDir != null &&
+    androidRustTargets.all { it in installedRustupTargets }
+
 tasks.register<Exec>("cargoNdkAndroid") {
     group = "rust"
-    description = "Cross-compile the Android jniLibs via rust/build-android.sh (self-skips without cargo + cargo-ndk + NDK; the committed jniLibs are the fallback)"
-    onlyIf { rustAvailable && cargoNdkVersion.isNotEmpty() && androidNdkDir != null }
+    description = "Cross-compile the Android jniLibs (the Rust engine + native BLS) from source via rust/build-android.sh; skipped by -PskipRustEngine"
+    onlyIf { androidRustToolchainReady && !skipRustEngine }
     workingDir = file("rust")
     androidNdkDir?.let { environment("ANDROID_NDK_HOME", it.absolutePath) }
     // Windows can't exec a .sh directly (CreateProcess error=193); route it
@@ -352,6 +380,122 @@ tasks.register<Exec>("cargoNdkAndroid") {
         file("android-app/src/main/jniLibs/arm64-v8a/libmyotis_engine.so"),
         file("android-app/src/main/jniLibs/x86_64/libmyotis_engine.so"),
     )
+}
+
+// Build-time contract for :android-app: the Rust engine is built from source by
+// default (cargoNdkAndroid), so a MISSING toolchain must fail loudly and name the
+// escape hatch — never silently produce a Java-only app. Wired into
+// :android-app:preBuild (see its build file). `-PskipRustEngine` is the opt-out.
+tasks.register("requireAndroidRustEngine") {
+    group = "verification"
+    description = "Fail the Android build when the Rust engine toolchain is missing, unless -PskipRustEngine is set"
+    // A fast environment gate — no inputs/outputs, always evaluates.
+    doLast {
+        if (skipRustEngine) {
+            logger.lifecycle("[rust] -PskipRustEngine set — building :android-app WITHOUT the " +
+                "Rust engine; it will use the Java engine (and JVM BLS) at runtime.")
+            return@doLast
+        }
+        if (!androidRustToolchainReady) {
+            val missing = buildList {
+                if (cargoVersion.isEmpty()) add("cargo/rustc (need 1.$minRustMinor or newer)")
+                else if (!rustAvailable) add("a newer rustc (need 1.$minRustMinor+; found \"$cargoVersion\")")
+                if (cargoNdkVersion.isEmpty()) add("cargo-ndk (`cargo install cargo-ndk`)")
+                if (androidNdkDir == null) add("the Android NDK r28+ (set ANDROID_NDK_HOME, or install it under <sdk>/ndk/)")
+                val tgts = androidRustTargets.filterNot { it in installedRustupTargets }
+                if (tgts.isNotEmpty()) add("Android rustup targets (`rustup target add ${tgts.joinToString(" ")}`)")
+            }
+            throw GradleException(
+                "The Android app builds the Rust engine from source, but the toolchain is " +
+                    "incomplete — missing: ${missing.joinToString("; ")}.\n" +
+                    "  • Install it (one-time setup is documented in rust/build-android.sh), OR\n" +
+                    "  • Build WITHOUT the Rust engine: add -PskipRustEngine (the app will use the " +
+                    "Java engine at runtime).",
+            )
+        }
+    }
+}
+
+// Post-build sanity check on the jniLibs that will actually ship. With the libs
+// built from source (not committed) this normally can't drift, but it's a cheap
+// backstop against a partial/interrupted cargoNdkAndroid or a bindings/scaffolding
+// skew, turning a broken .so into a build failure instead of a silent runtime
+// fallback — the failure class this whole contract exists to prevent. Two checks:
+//   • libmyotis_engine.so exports every UniFFI symbol the committed bindings
+//     require (else the Rust engine fails UniFFI validation on-device → Java);
+//   • libmyotis_bls.so is present and a valid ELF for each shipped ABI (else the
+//     native BLS backend is unavailable on-device → the slower JVM BLS).
+// The BLS lib carries no UniFFI surface to check, so presence + ELF magic is the
+// meaningful signal there. Skipped with -PskipRustEngine (nothing is built).
+//
+// Symbol PRESENCE (one scan of the .so for the required names), not a full ELF
+// .dynsym parse: a missing export is simply absent from the .so's string table,
+// which a byte scan catches with no external tools. A same-name signature change
+// (checksum drift, no new symbol) is still caught at load time by UniFFI's
+// checksum gate and, in CI, by the regenerate-and-diff step in android-apk.yml.
+val shippedAbis = listOf("arm64-v8a", "x86_64")
+val engineJniLibs = shippedAbis.map { file("android-app/src/main/jniLibs/$it/libmyotis_engine.so") }
+val blsJniLibs = shippedAbis.map { file("android-app/src/main/jniLibs/$it/libmyotis_bls.so") }
+val committedBindings = project(":myotis-engines").projectDir
+    .resolve("src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt")
+tasks.register("verifyAndroidJniLibs") {
+    group = "verification"
+    description =
+        "Fail if the built Android jniLibs are broken — engine .so missing a required UniFFI " +
+            "symbol, or BLS .so missing/not an ELF (post-build backstop; skipped by -PskipRustEngine)"
+    onlyIf { !skipRustEngine }
+    inputs.file(committedBindings).withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.files(engineJniLibs).withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.files(blsJniLibs).withPathSensitivity(PathSensitivity.RELATIVE)
+    val marker = layout.buildDirectory.file("verifyAndroidJniLibs.ok")
+    outputs.file(marker)
+    doLast {
+        fun requireElf(so: File, hint: String) {
+            check(so.exists()) {
+                "verifyAndroidJniLibs: missing jniLib $so — cargoNdkAndroid did not produce it$hint. " +
+                    "Run `./gradlew cargoNdkAndroid` (needs the Android Rust toolchain), or build " +
+                    "without the native libs via -PskipRustEngine."
+            }
+            val magic = so.inputStream().use { ins -> ByteArray(4).also { ins.read(it) } }
+            check(magic.contentEquals(byteArrayOf(0x7F, 'E'.code.toByte(), 'L'.code.toByte(), 'F'.code.toByte()))) {
+                "verifyAndroidJniLibs: ${so.parentFile.name}/${so.name} is not an ELF binary " +
+                    "(truncated/corrupt build?). Rebuild with `./gradlew cargoNdkAndroid`."
+            }
+        }
+        // Every native symbol JNA's Native.register resolves eagerly at load:
+        // both the uniffi_* (per-function + per-function-checksum) and the
+        // ffi_* (rustbuffer/contract-version/future runtime) external funcs.
+        val required = Regex("""external fun (uniffi_myotis_engine_\w+|ffi_myotis_engine_\w+)\s*\(""")
+            .findAll(committedBindings.readText())
+            .map { it.groupValues[1] }
+            .toSortedSet()
+        check(required.isNotEmpty()) {
+            "verifyAndroidJniLibs: found no UniFFI symbols in $committedBindings — " +
+                "the bindings file moved or its shape changed; update this task."
+        }
+        val symbol = Regex("""uniffi_myotis_engine_\w+|ffi_myotis_engine_\w+""")
+        engineJniLibs.forEach { so ->
+            requireElf(so, " (the Rust engine)")
+            // ISO-8859-1 maps each byte 1:1 to a char; one scan collects every
+            // engine symbol present (they live in .dynstr), then set-diff vs required.
+            val present = symbol.findAll(String(so.readBytes(), Charsets.ISO_8859_1))
+                .map { it.value }.toHashSet()
+            val missing = required.filterNot { it in present }
+            check(missing.isEmpty()) {
+                "verifyAndroidJniLibs: ${so.parentFile.name}/${so.name} is missing " +
+                    "${missing.size} UniFFI symbol(s) the bindings require, e.g. " +
+                    "${missing.take(3)}. The Rust engine would fail UniFFI validation on-device " +
+                    "and silently fall back to Java. Rebuild with `./gradlew cargoNdkAndroid`; if " +
+                    "the bindings are the stale side, regenerate them with " +
+                    "`./gradlew uniffiGenerateKotlin`."
+            }
+        }
+        // The native BLS lib has no UniFFI surface — presence + ELF is the signal.
+        blsJniLibs.forEach { requireElf(it, " (native BLS)") }
+        marker.get().asFile.apply { parentFile.mkdirs(); writeText("ok") }
+        logger.lifecycle("[rust] verifyAndroidJniLibs: engine jniLibs export all " +
+            "${required.size} required UniFFI symbols; native BLS present for ${shippedAbis.joinToString(", ")}")
+    }
 }
 
 // iOS static libs (libmyotis_engine.a) for the :app-ios Kotlin/Native framework —
@@ -412,10 +556,10 @@ gradle.taskGraph.whenReady {
     if (allTasks.none { it.name.startsWith("cargo") }) return@whenReady
     if (rustSkipNote != null) {
         logger.lifecycle(rustSkipNote)
-    } else if (allTasks.any { it.name == "cargoNdkAndroid" } &&
-        (cargoNdkVersion.isEmpty() || androidNdkDir == null)
-    ) {
-        logger.lifecycle("[rust] cargo-ndk or Android NDK not found — Android keeps the committed jniLibs")
+    } else if (allTasks.any { it.name == "cargoNdkAndroid" } && skipRustEngine) {
+        // Missing-toolchain (without the flag) is handled loudly at execution by
+        // requireAndroidRustEngine; here we only note the deliberate opt-out.
+        logger.lifecycle("[rust] -PskipRustEngine set — the Android app will omit the Rust engine (Java engine at runtime)")
     } else if (allTasks.any { it.name == "cargoCheckWasm" } &&
         (!wasmTargetInstalled || !clangAvailable)
     ) {

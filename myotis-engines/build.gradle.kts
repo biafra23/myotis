@@ -14,6 +14,24 @@ plugins {
 
 kotlin { jvmToolchain(21) }
 
+// The committed UniFFI bindings are NOT force-regenerated from compileKotlin:
+// a `dependsOn(uniffiGenerateKotlin)` would drag a full `cargo build --release`
+// (via cargoBuildHost) in front of every JVM host's Kotlin compile and make a
+// broken rust/ break the JVM build — violating "Rust is OPTIONAL for the JVM
+// hosts". Auto-regeneration is scoped to the Android build (:android-app
+// preBuild, where cargo is already required); CI enforces freshness everywhere
+// via the regenerate-and-diff step in android-apk.yml; regenerate manually
+// elsewhere with `./gradlew uniffiGenerateKotlin`.
+//
+// mustRunAfter (NOT dependsOn) is ORDERING ONLY — inert when uniffiGenerateKotlin
+// isn't in the graph (every non-Android build: no cargo pulled in), and, when it
+// IS (an Android build regenerating the bindings), it makes compileKotlin read
+// the fresh .kt and satisfies Gradle's implicit-dependency validation, since
+// compileKotlin consumes uniffiGenerateKotlin's declared output.
+tasks.named("compileKotlin") {
+    mustRunAfter(rootProject.tasks.named("uniffiGenerateKotlin"))
+}
+
 // JVM 21 class files, not the project's preferred 17: the :node-core dependency (the
 // Java engine) publishes a JVM-21 floor (transitively forced by :networking's discv5),
 // and Gradle's variant matching refuses a 17-targeted consumer. Same documented

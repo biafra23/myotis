@@ -24,12 +24,18 @@ especially for iOS), the decisions taken, and a phased plan. Facts marked
 
 The integration builds on three assets:
 
-1. **Android: RN-ready today.** The Rust engine ships behind the hand-JNI
-   surface (`myotis-engines/.../RustEngineNative.java`, ABI handshake
-   `EXPECTED_ABI_VERSION = 14`), with committed binaries
-   (`android-app/src/main/jniLibs/{arm64-v8a,x86_64}/libmyotis_engine.so`)
-   and the `cargoNdkAndroid` self-skip fallback, so consumers build without
-   a Rust toolchain. Compound values cross as JSON strings pinned by golden
+   > **Note (updated):** `:android-app` no longer commits the `.so` binaries.
+   > It builds the Rust engine **from source** by default (cargo + cargo-ndk +
+   > NDK required; `-PskipRustEngine` opts out to the Java engine). The
+   > "committed jniLibs as a no-toolchain fallback" model described in this
+   > proposal is stale; an RN package can still ship prebuilt binaries **in its
+   > published npm tarball** without committing them to git — decide that
+   > independently rather than by analogy to `:android-app`.
+
+1. **Android: RN-ready today.** The Rust engine ships behind the UniFFI
+   surface (`myotis-engines/.../RustEngineNative.java` over the generated
+   Kotlin bindings), so consumers on the published package build without a
+   Rust toolchain. Compound values cross as JSON strings pinned by golden
    tests on both sides (`rust/testdata/networks_catalog.json`, the
    `Rust*JsonTest` suite).
 
@@ -219,9 +225,11 @@ examples/rn-demo/                 # bare RN app used as the validation harness
 - **Android**: an AAR bundling the Kotlin module, `:myotis-api` +
   `:myotis-engines`, and the same jniLibs (arm64-v8a, x86_64; 16 KB
   page-size alignment inherited from `rust/.cargo/config.toml` +
-  `build-android.sh`). `cargoNdkAndroid` stays an optional `dependsOn` with
-  self-skip, committed `.so`s as the fallback — same as
-  `android-app/build.gradle.kts` today.
+  `build-android.sh`). Build those `.so`s from source via `cargoNdkAndroid`
+  at package-assembly time and bundle them into the AAR / npm tarball —
+  `:android-app` builds them from source (no committed `.so`, no self-skip
+  fallback) and this package should do the same, shipping the binaries in the
+  published artifact rather than committing them.
 - **iOS**: the podspec vendors a prebuilt `libmyotis_engine.a` per slice
   (device + simulator — an xcframework assembly step over the existing
   `cargoBuildIosDevice`/`cargoBuildIosSim` outputs) plus

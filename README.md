@@ -729,19 +729,23 @@ Myotis is mid-migration from a single Java implementation to a **Rust engine** t
 - **Selection**: the `:myotis-engines` selector (`Engines.engine()`) routes each network to an engine via the `myotis.engine` property — `java` (default), `rust`, or `auto`. On run tasks use `-Pengine=rust`; in the apps it's a Settings toggle (applies on network restart). The Status screen shows which engine hosts each network — "Mainnet (r)" vs "(j)".
 - **Parity** is enforced by shared conformance vectors (BLS fixtures, a captured mainnet light-client corpus, the EL verification-ladder vectors) run against both implementations, plus a benchmark gate for the JNI path.
 
-**rustc/cargo are NOT required to build or run Myotis.** The JVM/Android build is
-pure Java/Kotlin end to end: the UniFFI-generated Kotlin bindings are committed
-source (no bindgen step at build time), JNA comes from Maven Central like any other
-dependency, and every `cargo*` Gradle task self-skips with a single note when cargo
-is missing. On a cargo-less machine the engine selector simply reports the Rust
-engine as unavailable and everything runs on the Java engine (the default,
-`myotis.engine=java`) — there is nothing to configure or disable. The exceptions
-that DO need a Rust toolchain: the packaged desktop installers
-(`packageDmg`/`packageDeb`/`runDistributable` fail loudly without cargo, so an
-installed app can always switch engines) and regenerating the Android jniLibs
-(`cargoNdkAndroid`; the committed jniLibs are the fallback). Release artifacts
-don't rely on committed binaries — CI builds the Rust engine from source for the
-APK and the packaged desktop apps.
+**rustc/cargo are NOT required to build or run the JVM hosts (daemon + desktop).**
+That build is pure Java/Kotlin end to end: the UniFFI-generated Kotlin bindings are
+committed source (no bindgen step for a JVM-host build), JNA comes from Maven Central
+like any other dependency, and every `cargo*` Gradle task self-skips with a single
+note when cargo is missing. On a cargo-less machine the JVM hosts' engine selector
+simply reports the Rust engine as unavailable and everything runs on the Java engine
+(the default, `myotis.engine=java`) — there is nothing to configure or disable. The
+**Android app** is the exception: it builds the Rust engine from source by default
+(cargo + cargo-ndk + NDK + the Android rustup targets; its `preBuild` runs
+`cargoNdkAndroid` and regenerates the bindings). There is no committed `.so`, so
+nothing can drift; a missing toolchain fails the build with a message pointing at
+`-PskipRustEngine`, which builds the app without the Rust engine (Java engine at
+runtime). The packaged **desktop installers** also need cargo
+(`packageDmg`/`packageDeb`/`runDistributable` fail loudly without it, so an
+installed app can always switch engines).
+Release artifacts don't rely on committed binaries — CI builds the Rust engine
+from source for the APK and the packaged desktop apps.
 
 To actually build the Rust engine and bundle it, per target:
 

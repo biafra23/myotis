@@ -57,12 +57,14 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
-      # Build the Rust engine jniLibs FROM SOURCE so the published APK can
-      # never ship the committed binaries stale (a recurring failure mode:
-      # ABI-compatible but feature-stale .so files pass the version handshake
-      # silently). The committed jniLibs remain the fallback for local builds
-      # without cargo. The runner's preinstalled NDK is found via
-      # ANDROID_NDK_HOME / $ANDROID_HOME/ndk by the cargoNdkAndroid task.
+      # The Android app builds the Rust engine jniLibs FROM SOURCE by default —
+      # there is no committed .so, so the published APK can never ship a stale
+      # binary (the recurring failure mode: an ABI-compatible but feature-stale
+      # .so that fails UniFFI validation on-device and silently falls back to
+      # Java). This job provides the required toolchain: the Android rustup
+      # targets below, cargo-ndk, and the runner's preinstalled NDK (found via
+      # ANDROID_NDK_HOME / $ANDROID_HOME/ndk). No -PskipRustEngine here — the
+      # shipped APK must carry the engine.
       - name: Set up Rust (Android targets)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -78,17 +80,41 @@ jobs:
         with:
           tool: cargo-ndk
 
-      # Explicit + guarded: cargoNdkAndroid self-skips when its toolchain is
-      # missing — in CI that must FAIL, not silently fall back to the committed
-      # binaries. The newer-than check catches any silent skip.
+      # assembleDebug below already builds the engine via preBuild, but run it
+      # explicitly first so a toolchain problem fails here with a clear step name.
+      # The newer-than check catches a silent skip (cargoNdkAndroid self-skips
+      # only when the toolchain is incomplete — which requireAndroidRustEngine
+      # would already have turned into a hard error).
       - name: Build Rust jniLibs from source
         run: |
           ./gradlew cargoNdkAndroid --stacktrace
           for abi in arm64-v8a x86_64; do
             lib="android-app/src/main/jniLibs/$abi/libmyotis_engine.so"
             [ "$lib" -nt gradlew ] \
-              || { echo "::error::$lib was NOT rebuilt (cargoNdkAndroid self-skipped?)"; exit 1; }
+              || { echo "::error::$lib was NOT built (cargoNdkAndroid self-skipped?)"; exit 1; }
           done
+
+      # The COMMITTED UniFFI bindings (myotis_engine.kt) must match the current
+      # Rust source, or a from-source .so and the committed bindings disagree on
+      # per-function checksums and the Rust engine fails UniFFI validation
+      # on-device — silently falling back to Java. This bit hard in v0.1.4: a
+      # doc-comment edit on an `#[uniffi::export]` fn changed its checksum (recent
+      # UniFFI folds the docstring into the checksum), but the bindings were never
+      # regenerated, so the CI-built APK shipped a dead "Rust engine" toggle.
+      # cargoNdkAndroid rebuilds the .so but NOT the .kt, so regenerate and assert
+      # no drift. Scope the diff to the bindings file — the step above intentionally
+      # rewrote the (git-ignored-for-drift) .so binaries with fresh builds.
+      - name: Verify committed UniFFI bindings match the Rust source
+        run: |
+          ./gradlew uniffiGenerateKotlin --stacktrace
+          bindings=myotis-engines/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt
+          git diff --exit-code -- "$bindings" || {
+            echo "::error::$bindings is STALE vs rust/myotis-engine — regenerate with" \
+                 "\`./gradlew uniffiGenerateKotlin\` and commit. A from-source .so would" \
+                 "fail UniFFI checksum validation against these bindings and the Rust" \
+                 "engine would silently fall back to Java on-device."
+            exit 1
+          }
 
       # The ubuntu-latest runner ships an Android SDK via $ANDROID_HOME, which
       # AGP picks up automatically when local.properties is absent. No extra

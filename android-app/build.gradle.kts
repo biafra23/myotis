@@ -86,6 +86,16 @@ val rpcUpstream: String = run {
 // derives its installer versions. 0.1.4-SNAPSHOT -> 0.1.4.
 val releaseVersion = project.version.toString().substringBefore('-')
 
+// Mirror the root build's -PskipRustEngine parse (same truthy rules). When set,
+// the Android build omits the Rust native libs — so packaging must also drop any
+// libmyotis_*.so LEFT OVER in the source tree from an earlier toolchain build,
+// or the APK would ship a stale engine and silently fall back to Java on-device
+// (the very failure this contract prevents). See the packaging block below.
+val skipRustEngine = project.hasProperty("skipRustEngine") &&
+    (project.property("skipRustEngine") as? String).let {
+        it.isNullOrBlank() || it.trim().lowercase() !in setOf("false", "0", "no", "off")
+    }
+
 android {
     namespace = "com.jaeckel.ethp2p.android"
     compileSdk = 35
@@ -174,6 +184,18 @@ android {
                 // META-INF/versions/9; the file is metadata-only.
                 "META-INF/versions/9/OSGI-INF/MANIFEST.MF",
             )
+        }
+        // -PskipRustEngine means "no Rust engine in this APK". The jniLibs live in
+        // the source tree (src/main/jniLibs), outside build/, so a lib left there
+        // by an earlier full-toolchain build is NOT removed by `clean`, by
+        // .gitignore, or by cargoNdkAndroid being skipped — AGP would happily
+        // package it, and on-device it would fail UniFFI validation (bindings vs a
+        // stale .so) and silently fall back to Java. Exclude them so the flag
+        // means what requireAndroidRustEngine says it does.
+        if (skipRustEngine) {
+            jniLibs {
+                excludes += setOf("**/libmyotis_engine.so", "**/libmyotis_bls.so")
+            }
         }
     }
 }
@@ -321,11 +343,51 @@ dependencies {
     implementation(libs.androidx.work.runtime)
 }
 
-// Rebuild the Rust jniLibs from source when the full toolchain (cargo +
-// cargo-ndk + NDK) is on this machine; cargoNdkAndroid self-skips otherwise
-// and the committed jniLibs ship as-is. Root build.gradle.kts owns the task.
+// The Rust engine is built FROM SOURCE as part of the Android build (there is no
+// committed .so to drift). requireAndroidRustEngine enforces the contract: with
+// the toolchain present, cargoNdkAndroid cross-compiles the jniLibs and
+// uniffiGenerateKotlin refreshes the committed bindings from the same source;
+// without it, the build fails and names `-PskipRustEngine` (which omits the
+// engine and falls back to the Java engine at runtime). verifyAndroidJniLibs is
+// the post-build backstop that the produced .so exports every UniFFI symbol the
+// (now-fresh) bindings require. Auto-regen is scoped to the Android build ON
+// PURPOSE — the JVM hosts must stay buildable without cargo (see
+// myotis-engines/build.gradle.kts), and CI enforces bindings freshness for
+// everyone via the regenerate-and-diff step in android-apk.yml. Root
+// build.gradle.kts owns the tasks.
 tasks.matching { it.name == "preBuild" }.configureEach {
-    dependsOn(rootProject.tasks.named("cargoNdkAndroid"))
+    // Always run the gate: with -PskipRustEngine it just logs the opt-out.
+    dependsOn(rootProject.tasks.named("requireAndroidRustEngine"))
+    // Only pull the Rust build tasks into the graph when we actually want the
+    // engine — under -PskipRustEngine they'd only self-skip anyway, and keeping
+    // them out avoids the JVM build touching cargo/bindings at all.
+    if (!skipRustEngine) {
+        dependsOn(rootProject.tasks.named("uniffiGenerateKotlin"))
+        dependsOn(rootProject.tasks.named("cargoNdkAndroid"))
+        dependsOn(rootProject.tasks.named("verifyAndroidJniLibs"))
+    }
+}
+// The backstop must see the FRESH outputs of BOTH producers: cargoNdkAndroid's
+// .so and uniffiGenerateKotlin's regenerated bindings (which verifyAndroidJniLibs
+// reads as an input — without this ordering Gradle 8.12 fails the build with an
+// implicit-dependency validation error, and the check could otherwise validate
+// against the stale .kt it is about to replace). The gate should fail first
+// (before we spend time cross-compiling) when the toolchain is missing.
+rootProject.tasks.named("verifyAndroidJniLibs").configure {
+    mustRunAfter(rootProject.tasks.named("cargoNdkAndroid"))
+    mustRunAfter(rootProject.tasks.named("uniffiGenerateKotlin"))
+}
+// Both expensive Rust producers run AFTER the gate, so a machine with cargo but
+// without the Android toolchain (cargo-ndk / NDK / targets) fails fast instead of
+// first building the whole host workspace: cargoNdkAndroid directly, and
+// cargoBuildHost because uniffiGenerateKotlin dependsOn it (ordering the generator
+// alone wouldn't hold cargoBuildHost back). Both edges are inert off-Android,
+// where requireAndroidRustEngine isn't in the graph.
+rootProject.tasks.named("cargoNdkAndroid").configure {
+    mustRunAfter(rootProject.tasks.named("requireAndroidRustEngine"))
+}
+rootProject.tasks.named("cargoBuildHost").configure {
+    mustRunAfter(rootProject.tasks.named("requireAndroidRustEngine"))
 }
 
 // === JNA's Android natives =============================================
