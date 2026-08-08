@@ -33,7 +33,7 @@
 //! on cached bootstraps — which are keyed by arbitrary block root and therefore
 //! the one genuinely unbounded key space.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
 use myotis_net::codec::encode_success_response;
@@ -57,6 +57,16 @@ pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// future ingestion path gets sloppy.
 pub const MAX_BOOTSTRAPS: usize = 64;
 
+/// Cap on roots queued for a background bootstrap fetch.
+///
+/// The queue is the other half of "ResourceUnavailable is the miss path": a
+/// wallet's FIRST bootstrap request is for its own pinned checkpoint root,
+/// which no amount of pre-population can guess, so a server that only ever
+/// caches the current finalized root refuses every cold wallet forever. Bounded
+/// and coalesced so one caller cannot turn misses into a burst of upstream
+/// fetches.
+pub const MAX_BOOTSTRAP_MISSES: usize = 32;
+
 #[derive(Debug, Default)]
 struct Inner {
     /// period → pre-encoded single chunk.
@@ -65,6 +75,12 @@ struct Inner {
     bootstraps: HashMap<[u8; 32], Arc<[u8]>>,
     finality: Option<Arc<[u8]>>,
     optimistic: Option<Arc<[u8]>>,
+    /// Roots a caller asked for and we did not have — drained by the background
+    /// filler.
+    bootstrap_misses: BTreeSet<[u8; 32]>,
+    /// Roots already attempted, so a root the upstream cannot serve is fetched
+    /// once rather than on every retry of a wallet that will keep asking.
+    bootstrap_attempted: BTreeSet<[u8; 32]>,
 }
 
 /// Shared, cheap to clone, safe to read from the swarm task.
@@ -120,6 +136,38 @@ impl LcStore {
         let wire: Arc<[u8]> = encode_success_response(ssz, Some(fork_digest)).into();
         inner.bootstraps.insert(block_root, wire);
         true
+    }
+
+    /// Queue a root for the background filler. Returns false when the queue is
+    /// full or the root was already attempted — both mean "do not fetch".
+    pub fn record_bootstrap_miss(&self, root: [u8; 32]) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if inner.bootstrap_attempted.contains(&root) || inner.bootstrap_misses.contains(&root) {
+            return false;
+        }
+        if inner.bootstrap_misses.len() >= MAX_BOOTSTRAP_MISSES {
+            return false;
+        }
+        inner.bootstrap_misses.insert(root);
+        true
+    }
+
+    /// Drain at most `max` queued roots, marking them attempted.
+    pub fn take_bootstrap_misses(&self, max: usize) -> Vec<[u8; 32]> {
+        let mut inner = self.inner.write().unwrap();
+        let taken: Vec<[u8; 32]> = inner.bootstrap_misses.iter().copied().take(max).collect();
+        for root in &taken {
+            inner.bootstrap_misses.remove(root);
+            inner.bootstrap_attempted.insert(*root);
+        }
+        // The attempted set is a negative cache, not a log: bound it the same
+        // way, dropping the oldest keys rather than growing without limit.
+        while inner.bootstrap_attempted.len() > MAX_BOOTSTRAPS {
+            if let Some(&first) = inner.bootstrap_attempted.iter().next() {
+                inner.bootstrap_attempted.remove(&first);
+            }
+        }
+        taken
     }
 
     // --- serving (pure reads; safe from the synchronous handler) ----------
@@ -202,6 +250,41 @@ impl LcStore {
     pub fn gaps(&self, from: u64, to: u64) -> Vec<u64> {
         let inner = self.inner.read().unwrap();
         (from..=to).filter(|p| !inner.updates.contains_key(p)).collect()
+    }
+}
+
+/// The seam `myotis-net`'s swarm calls into.
+///
+/// Every method is a pure read of what ingestion already encoded — no I/O, no
+/// allocation beyond the response copy, no await. That is a hard requirement,
+/// not a style choice: this runs inline on the single swarm task, so anything
+/// blocking here stalls every other connection's handshakes and responses.
+impl myotis_net::reqresp::LcResponder for LcStore {
+    fn bootstrap(&self, block_root: &[u8; 32]) -> Option<Vec<u8>> {
+        match LcStore::bootstrap(self, block_root) {
+            Some(b) => Some(b.to_vec()),
+            None => {
+                // Miss: queue it and answer ResourceUnavailable. The wallet
+                // retries, and the retry hits. Still no I/O on this task.
+                if self.record_bootstrap_miss(*block_root) {
+                    tracing::info!(root = %hex::encode(&block_root[..8]),
+                        "bootstrap miss queued for background fetch");
+                }
+                None
+            }
+        }
+    }
+
+    fn updates_by_range(&self, start_period: u64, count: u64) -> Option<Vec<u8>> {
+        self.updates_range(start_period, count)
+    }
+
+    fn finality_update(&self) -> Option<Vec<u8>> {
+        self.finality().map(|b| b.to_vec())
+    }
+
+    fn optimistic_update(&self) -> Option<Vec<u8>> {
+        self.optimistic().map(|b| b.to_vec())
     }
 }
 

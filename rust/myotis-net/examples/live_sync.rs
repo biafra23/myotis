@@ -29,7 +29,21 @@ async fn main() {
 
     let once = std::env::args().any(|a| a == "--once");
 
-    let handle = match SyncHandle::start(ChainConfig::mainnet()) {
+    // NET selects the chain (default mainnet), so this example can drive a
+    // sepolia wallet against a candidate LC server — see rust/roost.
+    let net = std::env::var("NET").unwrap_or_else(|_| "mainnet".into());
+    let config = match net.as_str() {
+        "sepolia" => ChainConfig::sepolia(),
+        "gnosis" => ChainConfig::gnosis(),
+        "mainnet" => ChainConfig::mainnet(),
+        other => {
+            tracing::error!(net = other, "unknown NET (want mainnet|sepolia|gnosis)");
+            std::process::exit(2);
+        }
+    };
+    tracing::info!(net = %net, peers = config.static_peers.len(), "starting light client");
+
+    let handle = match SyncHandle::start(config) {
         Ok(h) => h,
         Err(e) => {
             tracing::error!(error = %e, "failed to start sync");

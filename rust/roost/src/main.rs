@@ -13,6 +13,7 @@ use anyhow::{anyhow, Result};
 mod archive;
 mod framing;
 mod rest;
+mod serve;
 mod store;
 
 use archive::Archive;
@@ -22,6 +23,7 @@ use store::LcStore;
 
 const DEFAULT_REST: &str = "http://127.0.0.1:5052";
 const DEFAULT_ARCHIVE: &str = "roost-archive.db";
+const DEFAULT_PORT: u16 = 9105;
 
 fn usage() -> String {
     format!(
@@ -33,11 +35,14 @@ fn usage() -> String {
          COMMANDS:\n    \
          probe     Fetch every light-client endpoint from Nimbus, check the\n              \
          framing, and round-trip the updates through myotis' own decoder.\n    \
-         ingest    Load the archive, fill it from Nimbus, and report coverage.\n\
+         ingest    Load the archive, fill it from Nimbus, and report coverage.\n    \
+         serve     Run the light-client server: libp2p responder + ingestion.\n\
          \n\
          OPTIONS:\n    \
          --rest URL       Nimbus REST base (default {DEFAULT_REST})\n    \
-         --archive PATH   Archive file (default {DEFAULT_ARCHIVE})\n"
+         --archive PATH   Archive file (default {DEFAULT_ARCHIVE})\n    \
+         --port N         libp2p listen port for `serve` (default {DEFAULT_PORT})\n    \
+         --key PATH       libp2p identity file (default: archive path with .key)\n"
     )
 }
 
@@ -53,6 +58,8 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut rest_base = DEFAULT_REST.to_string();
     let mut archive_path = PathBuf::from(DEFAULT_ARCHIVE);
+    let mut key_path: Option<PathBuf> = None;
+    let mut port = DEFAULT_PORT;
     let mut command = None;
 
     let mut i = 0;
@@ -72,6 +79,21 @@ async fn main() -> Result<()> {
                         .ok_or_else(|| anyhow!("--archive needs a path\n\n{}", usage()))?,
                 );
             }
+            "--port" => {
+                i += 1;
+                port = args
+                    .get(i)
+                    .ok_or_else(|| anyhow!("--port needs a number\n\n{}", usage()))?
+                    .parse()
+                    .map_err(|_| anyhow!("--port must be a number 1-65535\n\n{}", usage()))?;
+            }
+            "--key" => {
+                i += 1;
+                key_path = Some(PathBuf::from(
+                    args.get(i)
+                        .ok_or_else(|| anyhow!("--key needs a path\n\n{}", usage()))?,
+                ));
+            }
             "-h" | "--help" => {
                 print!("{}", usage());
                 return Ok(());
@@ -85,6 +107,7 @@ async fn main() -> Result<()> {
     match command.as_deref() {
         Some("probe") => probe(&rest_base).await,
         Some("ingest") => ingest(&rest_base, &archive_path).await,
+        Some("serve") => serve::serve(&rest_base, &archive_path, key_path, port).await,
         Some(other) => Err(anyhow!("unknown command '{other}'\n\n{}", usage())),
         None => {
             print!("{}", usage());

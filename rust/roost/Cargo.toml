@@ -44,7 +44,7 @@ myotis-net = { path = "../myotis-net" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset"] }
 serde_json = "1"
 
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"

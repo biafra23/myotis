@@ -43,6 +43,13 @@ pub fn period_of_slot(slot: u64) -> u64 {
     slot / SLOTS_PER_PERIOD
 }
 
+fn parse_root(s: &str) -> Result<[u8; 32]> {
+    let raw = hex::decode(s.trim_start_matches("0x")).context("decoding a 32-byte root")?;
+    raw.as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("root is {} bytes, want 32", raw.len()))
+}
+
 /// An SSZ response body plus the fork name Nimbus tagged it with.
 #[derive(Debug, Clone)]
 pub struct SszResponse {
@@ -193,6 +200,34 @@ impl NimbusRest {
             .ok_or_else(|| anyhow!("syncing: missing head_slot"))?;
         let syncing = v["data"]["is_syncing"].as_bool().unwrap_or(true);
         Ok((head, syncing))
+    }
+
+    /// `(head_slot, head_root)` — half of what a `status` answer needs.
+    pub async fn head_header(&self) -> Result<(u64, [u8; 32])> {
+        let v = self.get_json("/eth/v1/beacon/headers/head").await?;
+        let slot = v["data"]["header"]["message"]["slot"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| anyhow!("headers/head: missing slot"))?;
+        let root = v["data"]["root"]
+            .as_str()
+            .ok_or_else(|| anyhow!("headers/head: missing root"))?;
+        Ok((slot, parse_root(root)?))
+    }
+
+    /// `(finalized_root, finalized_epoch)` — the other half.
+    pub async fn finalized_checkpoint(&self) -> Result<([u8; 32], u64)> {
+        let v = self
+            .get_json("/eth/v1/beacon/states/head/finality_checkpoints")
+            .await?;
+        let root = v["data"]["finalized"]["root"]
+            .as_str()
+            .ok_or_else(|| anyhow!("finality_checkpoints: missing finalized.root"))?;
+        let epoch = v["data"]["finalized"]["epoch"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| anyhow!("finality_checkpoints: missing finalized.epoch"))?;
+        Ok((parse_root(root)?, epoch))
     }
 
     /// The chain's `genesis_validators_root` — the identity an archive is bound

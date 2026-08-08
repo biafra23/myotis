@@ -21,6 +21,11 @@
 //! Library hygiene: tracing only (no println), no global mutable state — every
 //! [`sync::SyncHandle`] owns its own libp2p host, discv5 service, and store.
 
+// Re-exported so downstream crates (rust/roost) can build a `HostConfig`
+// without pinning their own libp2p version — the types in that config are
+// libp2p's, so version skew would be a confusing type error.
+pub use libp2p;
+
 pub mod clcache;
 pub mod codec;
 pub mod discovery;
