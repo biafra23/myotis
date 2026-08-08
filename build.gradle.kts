@@ -410,35 +410,52 @@ tasks.register("requireAndroidRustEngine") {
     }
 }
 
-// Post-build sanity check: the jniLibs that will actually ship export every
-// UniFFI symbol the committed bindings require. With the engine built from
-// source (not committed) this normally can't drift, but it's a cheap backstop
-// against a partial/interrupted cargoNdkAndroid or a bindings/scaffolding skew,
-// turning "the .so is missing a symbol" into a build failure instead of a
-// silent runtime fallback to Java. Skipped with -PskipRustEngine (no .so built).
+// Post-build sanity check on the jniLibs that will actually ship. With the libs
+// built from source (not committed) this normally can't drift, but it's a cheap
+// backstop against a partial/interrupted cargoNdkAndroid or a bindings/scaffolding
+// skew, turning a broken .so into a build failure instead of a silent runtime
+// fallback — the failure class this whole contract exists to prevent. Two checks:
+//   • libmyotis_engine.so exports every UniFFI symbol the committed bindings
+//     require (else the Rust engine fails UniFFI validation on-device → Java);
+//   • libmyotis_bls.so is present and a valid ELF for each shipped ABI (else the
+//     native BLS backend is unavailable on-device → the slower JVM BLS).
+// The BLS lib carries no UniFFI surface to check, so presence + ELF magic is the
+// meaningful signal there. Skipped with -PskipRustEngine (nothing is built).
 //
-// Symbol PRESENCE (a byte scan for each required name), not a full ELF .dynsym
-// parse: a missing export is simply absent from the .so's string table, which a
-// substring scan catches with no external tools. A same-name signature change
+// Symbol PRESENCE (one scan of the .so for the required names), not a full ELF
+// .dynsym parse: a missing export is simply absent from the .so's string table,
+// which a byte scan catches with no external tools. A same-name signature change
 // (checksum drift, no new symbol) is still caught at load time by UniFFI's
 // checksum gate and, in CI, by the regenerate-and-diff step in android-apk.yml.
-val engineJniLibs = listOf(
-    file("android-app/src/main/jniLibs/arm64-v8a/libmyotis_engine.so"),
-    file("android-app/src/main/jniLibs/x86_64/libmyotis_engine.so"),
-)
+val shippedAbis = listOf("arm64-v8a", "x86_64")
+val engineJniLibs = shippedAbis.map { file("android-app/src/main/jniLibs/$it/libmyotis_engine.so") }
+val blsJniLibs = shippedAbis.map { file("android-app/src/main/jniLibs/$it/libmyotis_bls.so") }
 val committedBindings = project(":myotis-engines").projectDir
     .resolve("src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt")
 tasks.register("verifyAndroidJniLibs") {
     group = "verification"
     description =
-        "Fail if the built Android jniLibs are missing UniFFI symbols the bindings require " +
-            "(post-build backstop; skipped by -PskipRustEngine)"
+        "Fail if the built Android jniLibs are broken — engine .so missing a required UniFFI " +
+            "symbol, or BLS .so missing/not an ELF (post-build backstop; skipped by -PskipRustEngine)"
     onlyIf { !skipRustEngine }
     inputs.file(committedBindings).withPathSensitivity(PathSensitivity.RELATIVE)
     inputs.files(engineJniLibs).withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.files(blsJniLibs).withPathSensitivity(PathSensitivity.RELATIVE)
     val marker = layout.buildDirectory.file("verifyAndroidJniLibs.ok")
     outputs.file(marker)
     doLast {
+        fun requireElf(so: File, hint: String) {
+            check(so.exists()) {
+                "verifyAndroidJniLibs: missing jniLib $so — cargoNdkAndroid did not produce it$hint. " +
+                    "Run `./gradlew cargoNdkAndroid` (needs the Android Rust toolchain), or build " +
+                    "without the native libs via -PskipRustEngine."
+            }
+            val magic = so.inputStream().use { ins -> ByteArray(4).also { ins.read(it) } }
+            check(magic.contentEquals(byteArrayOf(0x7F, 'E'.code.toByte(), 'L'.code.toByte(), 'F'.code.toByte()))) {
+                "verifyAndroidJniLibs: ${so.parentFile.name}/${so.name} is not an ELF binary " +
+                    "(truncated/corrupt build?). Rebuild with `./gradlew cargoNdkAndroid`."
+            }
+        }
         // Every native symbol JNA's Native.register resolves eagerly at load:
         // both the uniffi_* (per-function + per-function-checksum) and the
         // ffi_* (rustbuffer/contract-version/future runtime) external funcs.
@@ -450,16 +467,14 @@ tasks.register("verifyAndroidJniLibs") {
             "verifyAndroidJniLibs: found no UniFFI symbols in $committedBindings — " +
                 "the bindings file moved or its shape changed; update this task."
         }
+        val symbol = Regex("""uniffi_myotis_engine_\w+|ffi_myotis_engine_\w+""")
         engineJniLibs.forEach { so ->
-            check(so.exists()) {
-                "verifyAndroidJniLibs: missing jniLib $so — cargoNdkAndroid did not produce it. " +
-                    "Run `./gradlew cargoNdkAndroid` (needs the Android Rust toolchain), or build " +
-                    "without the engine via -PskipRustEngine."
-            }
-            // ISO-8859-1 maps each byte 1:1 to a char, so `contains` is an exact
-            // byte-substring search over the whole .so (symbol names live in .dynstr).
-            val bytes = String(so.readBytes(), Charsets.ISO_8859_1)
-            val missing = required.filterNot { bytes.contains(it) }
+            requireElf(so, " (the Rust engine)")
+            // ISO-8859-1 maps each byte 1:1 to a char; one scan collects every
+            // engine symbol present (they live in .dynstr), then set-diff vs required.
+            val present = symbol.findAll(String(so.readBytes(), Charsets.ISO_8859_1))
+                .map { it.value }.toHashSet()
+            val missing = required.filterNot { it in present }
             check(missing.isEmpty()) {
                 "verifyAndroidJniLibs: ${so.parentFile.name}/${so.name} is missing " +
                     "${missing.size} UniFFI symbol(s) the bindings require, e.g. " +
@@ -469,9 +484,11 @@ tasks.register("verifyAndroidJniLibs") {
                     "`./gradlew uniffiGenerateKotlin`."
             }
         }
+        // The native BLS lib has no UniFFI surface — presence + ELF is the signal.
+        blsJniLibs.forEach { requireElf(it, " (native BLS)") }
         marker.get().asFile.apply { parentFile.mkdirs(); writeText("ok") }
-        logger.lifecycle("[rust] verifyAndroidJniLibs: built jniLibs export all " +
-            "${required.size} required UniFFI symbols")
+        logger.lifecycle("[rust] verifyAndroidJniLibs: engine jniLibs export all " +
+            "${required.size} required UniFFI symbols; native BLS present for ${shippedAbis.joinToString(", ")}")
     }
 }
 
