@@ -159,9 +159,27 @@ impl ClPeerCache {
     }
 
     /// A finality/other serve succeeded: reset the failure streak (Java resets
-    /// on any successful interaction). In-memory only — no file write.
+    /// on any successful interaction) and lift any persisted `nolc` denial — a
+    /// peer that just served a light-client response is demonstrably not a
+    /// non-server, so the shared cache must not keep denying it across a restart
+    /// while the in-memory pool has already cleared it (PR #322 review). The
+    /// failure reset is in-memory only; a lifted denial is persisted.
     pub fn note_success(&mut self, addr: &str) {
         self.failures.remove(addr);
+        if self.nolc.remove(addr) {
+            self.dirty = true;
+        }
+    }
+
+    /// Lift a persisted `nolc` denial without asserting the stronger `lc` token
+    /// — the exact mirror of the in-memory `PeerPool::clear_no_lc`, used when a
+    /// LIVE Identify signal re-confirms the peer serves LC updates. Keeps the
+    /// shared cache from disagreeing with the pool across a restart (PR #322
+    /// review). No-op when the peer was not denied.
+    pub fn clear_nolc(&mut self, addr: &str) {
+        if self.nolc.remove(addr) {
+            self.dirty = true;
+        }
     }
 
     /// LC-hunt confirmation: the peer answered a light-client request with a
@@ -188,6 +206,10 @@ impl ClPeerCache {
             self.bootstrap.insert(addr.to_string(), period);
             changed = true;
         }
+        // A served bootstrap lifts any persisted denial for the same reason a
+        // served update does (PR #322 review): the peer is demonstrably an
+        // LC server, so the shared cache must not keep denying it.
+        changed |= self.nolc.remove(addr);
         self.failures.remove(addr);
         if changed {
             self.dirty = true;
@@ -421,6 +443,35 @@ mod tests {
         let mut c3 = c2;
         c3.mark_nolc("/ip4/4.4.4.4/tcp/9000/p2p/16Uddd");
         assert!(!c3.is_nolc("/ip4/4.4.4.4/tcp/9000/p2p/16Uddd"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn positive_verdicts_lift_a_persisted_nolc_denial() {
+        // PR #322 review: reversing an in-memory nolc must not leave the shared
+        // cache denying the peer across a restart. clear_nolc (Identify),
+        // note_success (finality serve), and record_bootstrap (bootstrap serve)
+        // each lift the persisted denial; record_served already did.
+        let p = tmp_path("liftnolc");
+        let mut c = ClPeerCache::load(p.clone());
+        let a = "/ip4/5.5.5.5/tcp/9000/p2p/16Ue1";
+        let b = "/ip4/6.6.6.6/tcp/9000/p2p/16Ue2";
+        let d = "/ip4/7.7.7.7/tcp/9000/p2p/16Ue3";
+        for x in [a, b, d] {
+            c.mark_nolc(x);
+        }
+        c.clear_nolc(a); // live Identify re-confirm
+        c.note_success(b); // finality serve
+        c.record_bootstrap(d, 3500); // bootstrap serve
+        assert!(!c.is_nolc(a) && !c.is_nolc(b) && !c.is_nolc(d));
+        c.flush();
+        let c2 = ClPeerCache::load(p.clone());
+        assert!(!c2.is_nolc(a), "Identify reversal persisted");
+        assert!(!c2.is_nolc(b), "finality-serve reversal persisted");
+        assert!(!c2.is_nolc(d), "bootstrap-serve reversal persisted");
+        // clear_nolc on an undenied peer is a harmless no-op.
+        let mut c3 = ClPeerCache::load(p.clone());
+        c3.clear_nolc("/ip4/8.8.8.8/tcp/9000/p2p/16Ue4");
         let _ = std::fs::remove_file(&p);
     }
 }

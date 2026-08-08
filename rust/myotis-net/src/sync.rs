@@ -528,8 +528,26 @@ struct Peer {
 struct PeerPool {
     peers: Vec<Peer>,
     known: HashSet<PeerId>,
+    /// Pinned static (config) peers — the curated LC-serving set
+    /// (`ChainConfig::static_peers`, e.g. the #302 Gnosis list). Loaded once at
+    /// startup and NEVER re-added from any other source, so they must never be
+    /// permanently evicted: a single transient failure used to drop them for
+    /// the whole process lifetime, draining the scarce LC pool on Gnosis with
+    /// nothing to bring them back (issue #291). The Java engine keeps
+    /// re-seeding its pinned list; we keep these entries un-evictable instead
+    /// (the set is a handful of ids — bounded either way).
+    static_ids: HashSet<PeerId>,
     /// Peers proven NOT to serve light_client_updates_by_range (protocol
-    /// negotiation failed) — mirrors the Java `peersNoLcUpdates`.
+    /// negotiation failed) — mirrors the Java `peersNoLcUpdates`. REVERSIBLE:
+    /// an authoritative positive signal (Identify advertising the protocol, or
+    /// a fresh verified serve) clears the flag via `clear_no_lc`/`mark_proven`,
+    /// exactly like the Java classification sweep's `peersNoLcUpdates.remove`
+    /// (BeaconLightClient.java). Without that reversal a peer that returned
+    /// `UnsupportedProtocol` once — which a busy Lighthouse/Nimbus emits
+    /// transiently when it throttles or resets a new substream — was condemned
+    /// to nolc for the process lifetime, excluded from every catch-up tier AND
+    /// from hunt re-probing, and never dialed again so never evicted: the
+    /// #291 "previously-LC nodes went nolc and stayed there" zero-peer stall.
     no_lc_updates: HashSet<PeerId>,
     /// Peers that actually SERVED light-client data (bootstrap or an applied
     /// update) — mirrors the Java proven-server tracking; preferred first.
@@ -586,6 +604,7 @@ impl PeerPool {
         Self {
             peers: Vec::new(),
             known: HashSet::new(),
+            static_ids: HashSet::new(),
             no_lc_updates: HashSet::new(),
             proven: HashSet::new(),
             cooldown_until: HashMap::new(),
@@ -600,6 +619,41 @@ impl PeerPool {
     fn mark_proven(&mut self, id: PeerId) {
         self.proven.insert(id);
         self.fail_counts.remove(&id); // a served peer is demonstrably alive
+        // A peer that just served light-client data is, by definition, not a
+        // non-server: clear any stale nolc verdict so it rejoins the normal
+        // catch-up tiers (issue #291 — the deny set must be reversible, or one
+        // transient UnsupportedProtocol permanently blacklists an LC server
+        // that is now demonstrably serving us). Mirrors Java line
+        // `peersNoLcUpdates.remove(ma) | provenLightClient.add(ma)`.
+        self.no_lc_updates.remove(&id);
+    }
+
+    /// Reconcile the LIVE Identify LC-capability signal into the deny set: any
+    /// peer whose Identify currently advertises `light_client_updates_by_range`
+    /// has its nolc flag cleared. Returns the ids actually cleared so the caller
+    /// can persist the same reversal to the shared cache (keeping pool and cache
+    /// from disagreeing — PR #322 review). The Java classification sweep does
+    /// exactly this every cycle (BeaconLightClient.java); without it the Rust
+    /// engine's Identify verdict fed a SEPARATE prefer set that never un-did an
+    /// earlier request-time nolc strike, so an Identify-confirmed server could
+    /// sit in `no_lc_updates` forever, filtered out of every catch-up tier
+    /// (issue #291).
+    ///
+    /// Callers reconcile against the Identify set ONLY — deliberately not the
+    /// hunt-confirmed set. Hunt confirmation attests to `light_client_finality_
+    /// update`, a DIFFERENT protocol from the one nolc tracks, and that set is
+    /// never pruned for the process lifetime; reconciling against it would make
+    /// one decodable finality response permanently immune a peer to the
+    /// updates_by_range denial it may genuinely deserve (PR #322 review).
+    fn clear_no_lc(&mut self, servers: &HashSet<PeerId>) -> Vec<PeerId> {
+        if self.no_lc_updates.is_empty() || servers.is_empty() {
+            return Vec::new();
+        }
+        let cleared: Vec<PeerId> = self.no_lc_updates.intersection(servers).copied().collect();
+        for id in &cleared {
+            self.no_lc_updates.remove(id);
+        }
+        cleared
     }
 
     /// Stamp a VERIFIED serve (bootstrap applied / catch-up update applied /
@@ -648,6 +702,19 @@ impl PeerPool {
     /// re-discoverable rather than permanently tombstoned; `fail_counts` resets
     /// with it, so a recovered peer starts clean).
     fn evict(&mut self, id: &PeerId) {
+        if self.static_ids.contains(id) {
+            // A pinned LC server is never dropped (issue #291): nothing would
+            // re-add it, so evicting it on a transient blip permanently loses a
+            // curated server. Clear only its transient FAILURE state so a later
+            // recovery starts clean, and keep it in the pool. Deliberately does
+            // NOT touch cooldown_until: that is the UPDATES_SERVE_COOLDOWN
+            // rotation mark (the LC serve quota), not failure state — wiping it
+            // on a failure would re-admit the peer to the next respect_cooldown
+            // batch inside its quota window and risk a rate-limit/peer-score
+            // penalty from the very servers we want to keep (PR #322 review).
+            self.fail_counts.remove(id);
+            return;
+        }
         self.peers.retain(|p| &p.id != id);
         self.known.remove(id);
         self.no_lc_updates.remove(id);
@@ -665,13 +732,70 @@ impl PeerPool {
     }
 
     fn add(&mut self, id: PeerId, addr: Multiaddr) {
-        if self.peers.len() >= MAX_POOL || !self.known.insert(id) {
+        if self.known.contains(&id) {
+            // Already pooled. Refresh a pinned static peer's address in place:
+            // it is un-evictable, so removal-then-rediscovery (the path an
+            // ordinary peer self-heals an IP change through) never runs for it.
+            // The 22 Gnosis statics are hardcoded /ip4/…; when an operator moves
+            // (same node key, new address) discovery re-reports the same PeerId
+            // at the current address, and without this refresh the entry would
+            // be dialed at the stale address for the process lifetime (PR #322
+            // review). `add()` used to keep the first multiaddr and drop later
+            // ones — that still holds for ordinary peers, which self-heal via
+            // evict→rediscover.
+            if self.static_ids.contains(&id) {
+                if let Some(p) = self.peers.iter_mut().find(|p| p.id == id) {
+                    p.addr = addr;
+                }
+            }
             return;
         }
+        if self.peers.len() >= MAX_POOL {
+            return;
+        }
+        self.known.insert(id);
         self.peers.push(Peer { id, addr });
     }
 
+    /// Whether `id` is a pinned static (config) peer.
+    fn is_static(&self, id: &PeerId) -> bool {
+        self.static_ids.contains(id)
+    }
+
+    /// The shared-cache key (`{addr}/p2p/{id}`) for a pooled peer, if present —
+    /// so a caller reversing an in-memory denial can persist the same reversal
+    /// to the cross-engine cache under the exact key it was written with.
+    fn cache_key(&self, id: &PeerId) -> Option<String> {
+        self.peers.iter().find(|p| &p.id == id).map(|p| format!("{}/p2p/{}", p.addr, p.id))
+    }
+
+    /// Add a pinned static (config) peer and record its id as un-evictable
+    /// (see `static_ids`). Same dedup/cap semantics as `add`.
+    fn add_static(&mut self, id: PeerId, addr: Multiaddr) {
+        self.add(id, addr);
+        // Mark un-evictable ONLY once the peer is actually pooled, so the
+        // invariant static_ids ⊆ peers holds: `add` is a no-op past MAX_POOL,
+        // and marking an unpooled id un-evictable would make it permanently
+        // un-evictable while absent. `known` is exactly the set of pooled ids.
+        if self.known.contains(&id) {
+            self.static_ids.insert(id);
+        }
+    }
+
     fn mark_no_lc_updates(&mut self, id: PeerId) {
+        // Never deny a curated static peer (issue #291). They are pinned
+        // precisely because they serve light-client data, AND they are
+        // un-evictable — but eviction is the path that clears the deny flag for
+        // an ordinary peer. So a nolc strike on a static peer (a transient
+        // `UnsupportedProtocol` under load, or a stale nolc flag replayed from
+        // the peer cache at startup) would be STICKY, recreating the very "went
+        // nolc and stayed there" wedge this change removes — scoped to the
+        // scarce curated set that matters most. Skipping the mark keeps them in
+        // every catch-up/finality tier; capability is still reconciled live
+        // from Identify via the prefer set.
+        if self.static_ids.contains(&id) {
+            return;
+        }
         self.no_lc_updates.insert(id);
     }
 
@@ -860,7 +984,7 @@ async fn run_sync(
     let mut pool = PeerPool::new();
     for s in &config.static_peers {
         match parse_static_peer(s) {
-            Some(p) => pool.add(p.id, p.addr),
+            Some(p) => pool.add_static(p.id, p.addr),
             None => tracing::warn!(peer = s, "skipping unparseable static peer multiaddr"),
         }
     }
@@ -1581,6 +1705,17 @@ async fn catch_up(
             staged = staged.len(), "catch-up: requesting updates_by_range");
 
         let (mut lc_servers, earliest_slots) = client.catchup_peer_meta().await;
+        // Reconcile the deny set against the LIVE Identify signal (same protocol
+        // nolc tracks, self-expiring on disconnect) BEFORE folding in
+        // hunt_confirmed — see clear_no_lc for why the finality-attesting hunt
+        // set must not un-deny updates_by_range. Persist each reversal to the
+        // shared cache so pool and cache never disagree across a restart or an
+        // engine switch (issue #291, PR #322 review).
+        for id in pool.clear_no_lc(&lc_servers) {
+            if let Some(key) = pool.cache_key(&id) {
+                clcache.clear_nolc(&key);
+            }
+        }
         // Hunt-confirmed servers join the Identify-confirmed prefer tier —
         // same dial-priority-only trust level (see poll_finality).
         lc_servers.extend(hunt_confirmed.iter().copied());
@@ -1656,8 +1791,14 @@ async fn catch_up(
                     if e == RequestError::UnsupportedProtocol {
                         // Doesn't serve updates_by_range at all — skip in future
                         // batches (Java peersNoLcUpdates). Peer is alive, keep it.
+                        // Both are no-ops for a static peer: the pool exempts it,
+                        // and the shared cache is read by the Java engine, which
+                        // would otherwise inherit the denial for a curated peer
+                        // (PR #322 review) — so gate the persist on it too.
                         pool.mark_no_lc_updates(peer.id);
-                        clcache.mark_nolc(&format!("{}/p2p/{}", peer.addr, peer.id));
+                        if !pool.is_static(&peer.id) {
+                            clcache.mark_nolc(&format!("{}/p2p/{}", peer.addr, peer.id));
+                        }
                     } else if e != RequestError::Shutdown {
                         // Dial/timeout/connection-closed — count toward eviction
                         // so dead peers stop occupying MAX_POOL slots.
@@ -1912,6 +2053,15 @@ async fn poll_finality(
     hunt_confirmed: &HashSet<PeerId>,
 ) -> bool {
     let mut lc_servers = client.lc_update_servers().await;
+    // Reverse any stale nolc verdict for peers whose LIVE Identify now advertises
+    // updates_by_range, and persist the reversal to the shared cache — before
+    // folding in hunt_confirmed, which attests to a different protocol (see
+    // clear_no_lc, issue #291, PR #322 review).
+    for id in pool.clear_no_lc(&lc_servers) {
+        if let Some(key) = pool.cache_key(&id) {
+            clcache.clear_nolc(&key);
+        }
+    }
     // Hunt-confirmed servers (decodable LC response this run) join the
     // Identify-confirmed prefer tier — same dial-priority-only trust level.
     lc_servers.extend(hunt_confirmed.iter().copied());
@@ -2063,7 +2213,11 @@ async fn hunt_round(
             Err(RequestError::UnsupportedProtocol) => {
                 nolc += 1;
                 pool.mark_no_lc_updates(peer.id);
-                clcache.mark_nolc(&format!("{}/p2p/{}", peer.addr, peer.id));
+                // Never persist a static peer's transient strike (PR #322
+                // review) — the Java engine seeds its deny set from this cache.
+                if !pool.is_static(&peer.id) {
+                    clcache.mark_nolc(&format!("{}/p2p/{}", peer.addr, peer.id));
+                }
                 continue;
             }
             Err(e) => {
@@ -2609,5 +2763,141 @@ mod tests {
         pool.note_failure(ids[2]);
         pool.note_failure(ids[2]);
         assert_eq!(pool.len(), 1, "serve-reset keeps a blippy proven server alive");
+    }
+
+    #[test]
+    fn static_peers_are_never_evicted() {
+        // Issue #291: a pinned LC server must survive transient failures — it
+        // is loaded once and nothing re-adds it, so eviction is permanent loss.
+        let mut pool = PeerPool::new();
+        let stat = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+        let disc = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+        pool.add_static(stat, "/ip4/10.0.0.1/tcp/9000".parse().unwrap());
+        pool.add(disc, "/ip4/10.0.0.2/tcp/9000".parse().unwrap());
+        assert_eq!(pool.len(), 2);
+
+        // Far more failures than any threshold: the static peer stays put (and
+        // stays `known`, so it is not treated as re-discoverable-only), while
+        // the ordinary discovered peer is evicted on its first strike.
+        for _ in 0..10 {
+            pool.note_failure(stat);
+        }
+        pool.note_failure(disc);
+        assert!(pool.known.contains(&stat), "static peer stays known");
+        assert!(pool.peers.iter().any(|p| p.id == stat), "static peer stays pooled");
+        assert!(!pool.peers.iter().any(|p| p.id == disc), "discovered peer evicted");
+        assert_eq!(pool.len(), 1);
+
+        // It is still handed out as a candidate after all those failures.
+        let c = pool.candidates(4, true, false, &HashSet::new(), &HashSet::new());
+        assert!(c.iter().any(|p| p.id == stat), "static peer still a candidate");
+    }
+
+    #[test]
+    fn static_peers_are_never_denied_nolc() {
+        // Issue #291 follow-up: static peers are un-evictable, and eviction is
+        // what clears the nolc deny flag for ordinary peers — so a static peer
+        // must never enter the deny set at all, or a transient strike (or a
+        // stale cache flag replayed at startup) would be permanently sticky and
+        // drop the curated server out of the skip_no_lc tiers.
+        let mut pool = PeerPool::new();
+        let stat = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+        let disc = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+        pool.add_static(stat, "/ip4/10.0.3.1/tcp/9000".parse().unwrap());
+        pool.add(disc, "/ip4/10.0.3.2/tcp/9000".parse().unwrap());
+
+        // The mark is a no-op for the static peer, effective for the ordinary one.
+        pool.mark_no_lc_updates(stat);
+        pool.mark_no_lc_updates(disc);
+        assert!(!pool.no_lc_updates.contains(&stat), "static peer never denied");
+        assert!(pool.no_lc_updates.contains(&disc), "ordinary peer denied");
+
+        // With skip_no_lc on, the static peer survives the filter; the denied
+        // ordinary peer only comes back via the soft-filter fallback.
+        let c = pool.candidates(1, true, false, &HashSet::new(), &HashSet::new());
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].id, stat, "static peer preferred over the denied peer");
+    }
+
+    #[test]
+    fn static_peer_address_refreshes_on_rediscovery() {
+        // PR #322 review: a static peer is un-evictable, so an operator IP
+        // change can only reach the pool through add()'s in-place refresh —
+        // otherwise the entry is dialed at the stale address forever.
+        let mut pool = PeerPool::new();
+        let stat = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+        let disc = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+        pool.add_static(stat, "/ip4/10.0.4.1/tcp/9000".parse().unwrap());
+        pool.add(disc, "/ip4/10.0.4.2/tcp/9000".parse().unwrap());
+
+        // Discovery re-reports both at a new address (same PeerId, new /ip4/…).
+        pool.add(stat, "/ip4/198.51.100.7/tcp/9000".parse().unwrap());
+        pool.add(disc, "/ip4/198.51.100.8/tcp/9000".parse().unwrap());
+
+        let addr_of = |pool: &PeerPool, id| {
+            pool.peers.iter().find(|p| p.id == id).map(|p| p.addr.to_string()).unwrap()
+        };
+        assert_eq!(addr_of(&pool, stat), "/ip4/198.51.100.7/tcp/9000",
+            "static peer address refreshed in place");
+        assert_eq!(addr_of(&pool, disc), "/ip4/10.0.4.2/tcp/9000",
+            "ordinary peer keeps its first address (self-heals via evict instead)");
+        assert_eq!(pool.len(), 2, "no duplicate entries");
+    }
+
+    #[test]
+    fn clear_no_lc_returns_the_ids_it_cleared() {
+        // The reconcile call sites persist the reversal to the shared cache
+        // using exactly the ids clear_no_lc reports as cleared.
+        let mut pool = PeerPool::new();
+        let mut ids = Vec::new();
+        for i in 0..3u8 {
+            let id = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+            ids.push(id);
+            pool.add(id, format!("/ip4/10.0.5.{i}/tcp/9000").parse().unwrap());
+            pool.mark_no_lc_updates(id);
+        }
+        let servers: HashSet<PeerId> = [ids[0], ids[2]].into_iter().collect();
+        let mut cleared = pool.clear_no_lc(&servers);
+        cleared.sort();
+        let mut want = vec![ids[0], ids[2]];
+        want.sort();
+        assert_eq!(cleared, want, "returns exactly the cleared ids");
+        assert!(pool.cache_key(&ids[0]).is_some(), "cleared id maps to a cache key");
+        // Idempotent: nothing left to clear for the same set.
+        assert!(pool.clear_no_lc(&servers).is_empty());
+    }
+
+    #[test]
+    fn nolc_verdict_is_reversible() {
+        // Issue #291: an authoritative positive LC signal (Identify / a fresh
+        // serve) must clear a stale nolc strike, or a transiently-mismarked
+        // server is filtered out of every catch-up tier for the process life.
+        let mut pool = PeerPool::new();
+        let mut ids = Vec::new();
+        for i in 0..3u8 {
+            let id = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+            ids.push(id);
+            pool.add(id, format!("/ip4/10.0.2.{i}/tcp/9000").parse().unwrap());
+        }
+        // All three transiently mark nolc.
+        for id in &ids {
+            pool.mark_no_lc_updates(*id);
+        }
+        assert!(pool.no_lc_updates.contains(&ids[0]));
+
+        // Identify (via clear_no_lc) re-confirms ids[0] and ids[1] as servers.
+        let confirmed: HashSet<PeerId> = [ids[0], ids[1]].into_iter().collect();
+        pool.clear_no_lc(&confirmed);
+        assert!(!pool.no_lc_updates.contains(&ids[0]), "confirmed server un-denied");
+        assert!(!pool.no_lc_updates.contains(&ids[1]), "confirmed server un-denied");
+        assert!(pool.no_lc_updates.contains(&ids[2]), "unconfirmed peer still denied");
+
+        // A verified serve on ids[2] clears its flag too (mark_proven path).
+        pool.mark_proven(ids[2]);
+        assert!(!pool.no_lc_updates.contains(&ids[2]), "served peer un-denied");
+
+        // With the deny set empty, the skip_no_lc filter no longer drops them.
+        let c = pool.candidates(3, true, false, &HashSet::new(), &HashSet::new());
+        assert_eq!(c.len(), 3, "all three rejoin the fan-out once un-denied");
     }
 }
