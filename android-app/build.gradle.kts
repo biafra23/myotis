@@ -97,7 +97,7 @@ android {
         // Stays a manual literal: a monotonic install counter with no relation
         // to semver, so there is nothing to derive it from. Bump it on every
         // release or the new APK won't install over the previous one.
-        versionCode = 5
+        versionCode = 6
         versionName = releaseVersion
         buildConfigField("String", "RPC_UPSTREAM", "\"$rpcUpstream\"")
     }
