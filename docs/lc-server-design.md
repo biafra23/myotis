@@ -251,6 +251,36 @@ Most of the server is written. In `rust/myotis-net`:
    - **Re-publish at fork *and* BPO boundaries.** Wallets filter discovered peers
      on `accepted_fork_digests` (`discovery.rs`), so a stale digest makes the
      server invisible to precisely the clients it exists for.
+   - **Handle the address changing while the server runs.** The deployment is a
+     residential Telekom line and the public IP is not guaranteed stable
+     (docs/dedicated-sepolia-node.md §7 and the pinned constants in
+     `NetworkConfig` have the same exposure). A published ENR carrying a dead
+     IP is worse than no ENR: wallets discover it, dial, fail, and spend their
+     three strikes to eviction (`clcache.rs`, `FAILURE_THRESHOLD = 3`) on a node
+     that is actually healthy — so the record must track the address rather than
+     be written once at boot.
+
+     The signal is already available and needs no third-party service: libp2p
+     **Identify** reports `observed_addr`, i.e. the address each peer sees us
+     on, and `myotis-net` already receives those events
+     (`identify::Event::Received` in `handle_behaviour_event`). Take a quorum
+     across several distinct recent peers rather than trusting one — a single
+     peer can lie, and one behind the same NAT can be honestly wrong. discv5's
+     own endpoint prediction is the same idea and is the mechanism Geth
+     (`--nat stun`) and Nimbus (`--enr-auto-update`) use.
+
+     On a confirmed change: bump the ENR sequence number (which must already be
+     persisted and monotonic, per the item above), re-publish, and log it
+     loudly. The sequence-number requirement and this one are the same
+     mechanism — an updated record that does not out-rank the cached one is
+     ignored by the DHT.
+
+     Note the ordering trap: the wallet-side pins in `NetworkConfig` are a
+     SEPARATE copy of the address with no such mechanism, which is why the
+     rollout replaces them with discovery (step 5) rather than leaving both.
+     Until that lands, an IP change still breaks the pinned path no matter what
+     the ENR says.
+
    - **Decide what `status.earliest_available_slot` should say.** OPEN, and it
      becomes load-bearing exactly here — once the ENR is published, non-myotis
      clients start dialling. The field is a **block** floor
