@@ -30,7 +30,7 @@ plugins {
 
 allprojects {
     group = "com.jaeckel.ethp2p"
-    version = "0.1.4-SNAPSHOT"
+    version = "0.1.5-SNAPSHOT"
 }
 
 subprojects {
