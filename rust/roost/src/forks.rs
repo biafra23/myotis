@@ -95,7 +95,8 @@ impl ForkSchedule {
         spec: &BTreeMap<String, String>,
         genesis_validators_root: [u8; 32],
     ) -> Result<Self> {
-        let mut forks: Vec<Fork> = Vec::new();
+        // (fork, is_genesis) — the flag drives the tie-break below.
+        let mut forks: Vec<(Fork, bool)> = Vec::new();
         for (key, value) in spec {
             let Some(name) = key.strip_suffix("_FORK_VERSION") else {
                 continue;
@@ -114,12 +115,36 @@ impl ForkSchedule {
                     ))
                 }
             };
-            forks.push(Fork { epoch, version });
+            forks.push((Fork { epoch, version }, name == "GENESIS"));
         }
         if forks.is_empty() {
             return Err(anyhow!("config/spec exposed no *_FORK_VERSION entries"));
         }
-        forks.sort_by_key(|f| f.epoch);
+
+        // Tie-break: GENESIS sorts FIRST within an epoch, everything else after.
+        //
+        // `fork_at_epoch` takes the LAST entry with `epoch <= target`, and the
+        // input order is `BTreeMap` key order — lexicographic. Ethereum's fork
+        // names happen to be alphabetical in chronological order (ALTAIR <
+        // BELLATRIX < CAPELLA < DENEB < ELECTRA < FULU < GLOAS), so real forks
+        // tie correctly by luck. `GENESIS` is the one name that breaks it: it
+        // sorts between FULU and GLOAS, and its epoch is forced to 0.
+        //
+        // Without this, ANY chain with a non-genesis fork activated at epoch 0
+        // would resolve to GENESIS_FORK_VERSION for every epoch below the next
+        // distinctly-scheduled fork — the normal shape for a network launched
+        // after a fork rather than before it (a devnet with everything at 0
+        // would stamp every response, `status.fork_digest` included, with the
+        // genesis digest). mainnet/sepolia/gnosis are unaffected only because
+        // GENESIS alone sits at epoch 0 there.
+        //
+        // The residual assumption — that among NON-genesis forks tying at one
+        // epoch, lexicographic order matches chronological order — is left
+        // standing deliberately: encoding a fork-rank table here would
+        // reintroduce exactly the per-network hardcoding this module exists to
+        // avoid. It holds for every fork name shipped to date.
+        forks.sort_by_key(|(f, is_genesis)| (f.epoch, !*is_genesis));
+        let forks: Vec<Fork> = forks.into_iter().map(|(f, _)| f).collect();
 
         let slots_per_epoch = spec
             .get("SLOTS_PER_EPOCH")
@@ -297,6 +322,34 @@ mod tests {
         assert_eq!(with_bpo.digest_for_epoch(419_072), [0x8C, 0x9F, 0x62, 0xFE]);
         // Before BPO2 activates, the base digest still applies.
         assert_eq!(with_bpo.digest_for_epoch(419_071), [0x82, 0xFA, 0xE5, 0x41]);
+    }
+
+    #[test]
+    fn a_fork_activated_at_genesis_beats_the_genesis_version() {
+        // The shape of any network launched after a fork: several forks live
+        // from epoch 0. GENESIS must not win those ties, or every response
+        // below the next distinctly-scheduled fork carries the genesis digest.
+        let mut spec = sepolia_spec();
+        spec.insert("ALTAIR_FORK_EPOCH".into(), "0".into());
+        spec.insert("BELLATRIX_FORK_EPOCH".into(), "0".into());
+        spec.insert("CAPELLA_FORK_EPOCH".into(), "0".into());
+        spec.insert("DENEB_FORK_EPOCH".into(), "0".into());
+        let s = ForkSchedule::from_spec(&spec, sepolia_gvr()).unwrap();
+
+        // DENEB is the latest fork at epoch 0 and must win — not GENESIS, which
+        // sorts after FULU lexicographically and would otherwise take the tie.
+        assert_eq!(s.fork_at_epoch(0).version, [0x90, 0, 0, 0x73], "want DENEB");
+        assert_eq!(s.fork_at_epoch(1000).version, [0x90, 0, 0, 0x73]);
+        // The later, distinctly-scheduled forks still take over on time.
+        assert_eq!(s.fork_at_epoch(222_464).version, [0x90, 0, 0, 0x74]);
+    }
+
+    #[test]
+    fn genesis_still_wins_when_it_is_alone_at_epoch_zero() {
+        let s = sepolia();
+        assert_eq!(s.fork_at_epoch(0).version, [0x90, 0, 0, 0x69]);
+        assert_eq!(s.fork_at_epoch(49).version, [0x90, 0, 0, 0x69]);
+        assert_eq!(s.fork_at_epoch(50).version, [0x90, 0, 0, 0x70], "ALTAIR");
     }
 
     #[test]

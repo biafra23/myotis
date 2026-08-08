@@ -51,9 +51,14 @@ const MAX_INBOUND: u32 = 1024;
 /// cached it at startup would keep stamping the old digest. ~5 minutes.
 const SCHEDULE_REFRESH_TICKS: u32 = 25;
 
-/// Bootstrap misses fetched per tick. The rate limit the design asks for: a
-/// caller inventing roots costs us at most this many upstream requests per
-/// slot, no matter how fast it asks.
+/// Bootstrap misses fetched per tick — the rate limit the design asks for.
+///
+/// A caller inventing roots costs us at most this many upstream fetches per
+/// slot, no matter how fast it asks. Note each SUCCESSFUL fill is up to two
+/// loopback requests — the bootstrap itself plus the `header_slot` lookup that
+/// resolves its epoch — so the ceiling is 2x this number. Invented roots 404 on
+/// the bootstrap and never reach the header lookup, so the ABUSE ceiling is
+/// unchanged at one request each.
 const MISS_FETCHES_PER_TICK: usize = 4;
 
 /// Load a persisted identity, or create and persist one.
@@ -223,15 +228,14 @@ async fn fetch_schedule(client: &NimbusRest, gvr: [u8; 32]) -> Result<ForkSchedu
     ForkSchedule::fetch(client, gvr).await
 }
 
-/// The fork digest to stamp on responses, taken from the newest update chunk.
+/// The digest observed on the wire, from the newest update chunk.
 ///
-/// INTERIM, and the one place roost is knowingly not spec-perfect: since
-/// EIP-7892 the digest is not a function of the fork name, so it cannot be
-/// derived from `Eth-Consensus-Version`; it has to be computed for the object's
-/// slot via `fork_digest_bpo`. Re-using the newest period's digest is correct
-/// except across a fork or BPO boundary. myotis' own decoder ignores context
-/// bytes, so our wallets are unaffected; other CLs dispatch on them, which is
-/// why this must be fixed before the ENR is published.
+/// This is now the FALLBACK, used only when the chain's schedule cannot be read
+/// (see [`Digests`]); [`crate::forks::ForkSchedule`] computes the primary value
+/// for an object's own slot. It remains useful because it is ground truth for
+/// the current fork — the upstream framed it — and it is what the computed value
+/// is checked against. It is stale across a fork or BPO boundary, which is
+/// exactly why it is no longer the primary.
 async fn interim_fork_digest(client: &NimbusRest, head_period: u64) -> Result<[u8; 4]> {
     let resp = client.updates(head_period, 1).await?;
     split_updates(&resp.bytes)?
@@ -467,18 +471,26 @@ pub async fn serve(
                         Err(e) => tracing::warn!(error = %e, "re-reading the schedule failed"),
                     }
                     if let Some(observed) = store.newest_fork_digest() {
-                        // Re-check against the wire after every refresh, not only
-                        // at startup — otherwise a schedule rejected at boot would
-                        // be silently reinstated by the first refresh.
+                        // Re-check after every refresh, not only at boot, so a
+                        // schedule that STARTS disagreeing with the wire keeps
+                        // being reported rather than being noticed once and
+                        // never again.
                         report_digest_disagreement(&digests, observed, head_slot_hint);
                     }
                 }
 
+                // A failed head poll must not skip the rest of the tick: the
+                // live objects are still worth refreshing, and the last known
+                // head is good enough to pick a digest with (it only changes at
+                // an epoch boundary). Skipping was a behaviour change against
+                // the code this replaced, where a failed poll warned and carried
+                // on.
                 let head_slot = match client.syncing().await {
                     Ok((slot, _)) => slot,
                     Err(e) => {
-                        tracing::warn!(error = %e, "polling head slot failed");
-                        continue;
+                        tracing::warn!(error = %e,
+                            "polling head slot failed — continuing with the last known head");
+                        head_slot_hint
                     }
                 };
 

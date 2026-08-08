@@ -311,8 +311,9 @@ impl NimbusRest {
     /// `/eth/v1/config/spec` — the chain's fork versions, activation epochs,
     /// `SLOTS_PER_EPOCH` and blob schedule.
     ///
-    /// Returns only the SCALAR entries; `BLOB_SCHEDULE` is an array of objects
-    /// and comes back from [`NimbusRest::blob_schedule`] instead.
+    /// Returns the scalar entries AND the `BLOB_SCHEDULE` array from ONE
+    /// request: they live in the same document, and fetching it twice would be
+    /// two round trips for one payload.
     ///
     /// This is chain CONFIGURATION, not consensus data — it decides what fork
     /// digest to stamp on a response, and a wrong one costs reachability rather
@@ -320,9 +321,6 @@ impl NimbusRest {
     /// Goodbye(IrrelevantNetwork)). Reading it from the node roost already
     /// follows is what stops roost disagreeing with its own upstream about which
     /// fork it is on.
-    /// Returns the scalars AND the blob schedule from ONE request — they live
-    /// in the same document, and fetching it twice would be two round trips for
-    /// one payload.
     pub async fn config_spec(
         &self,
     ) -> Result<(
@@ -343,6 +341,24 @@ impl NimbusRest {
 
 /// The EIP-7892 `BLOB_SCHEDULE` entries. Absent on a chain with none (pre-Fulu,
 /// or a client that does not expose it), which is not an error.
+/// A `u64` written either as a JSON string (what the Beacon API spec pins for
+/// scalars, and what Nimbus emits) or as a JSON number.
+///
+/// Accepting both is deliberate. `BLOB_SCHEDULE` is a nested array-of-objects
+/// added by Fusaka and is the least settled shape this feature depends on; a
+/// client emitting `{"EPOCH": 411072}` as a number would otherwise take roost's
+/// computed digests out entirely — the parse fails, the whole schedule is
+/// discarded, and serving silently drops to the observed fallback.
+fn json_u64(v: &serde_json::Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+}
+
+/// Parse `BLOB_SCHEDULE`.
+///
+/// All-or-nothing on purpose: a PARTIAL blob schedule computes wrong digests
+/// silently, which is worse than no schedule at all — the caller falls back to
+/// the digest observed on the wire and says so.
 fn parse_blob_schedule(v: &serde_json::Value) -> Result<Vec<crate::forks::BlobParams>> {
     {
         let Some(entries) = v["data"]["BLOB_SCHEDULE"].as_array() else {
@@ -350,14 +366,11 @@ fn parse_blob_schedule(v: &serde_json::Value) -> Result<Vec<crate::forks::BlobPa
         };
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
-            let epoch = e["EPOCH"]
-                .as_str()
-                .and_then(|s| s.parse::<u64>().ok())
-                .ok_or_else(|| anyhow!("BLOB_SCHEDULE entry missing EPOCH"))?;
-            let max_blobs = e["MAX_BLOBS_PER_BLOCK"]
-                .as_str()
-                .and_then(|s| s.parse::<u64>().ok())
-                .ok_or_else(|| anyhow!("BLOB_SCHEDULE entry missing MAX_BLOBS_PER_BLOCK"))?;
+            let epoch = json_u64(&e["EPOCH"])
+                .ok_or_else(|| anyhow!("BLOB_SCHEDULE entry has no usable EPOCH"))?;
+            let max_blobs = json_u64(&e["MAX_BLOBS_PER_BLOCK"]).ok_or_else(|| {
+                anyhow!("BLOB_SCHEDULE entry has no usable MAX_BLOBS_PER_BLOCK")
+            })?;
             out.push(crate::forks::BlobParams { epoch, max_blobs });
         }
         Ok(out)
@@ -417,6 +430,56 @@ impl NimbusRest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    /// The exact shape zbox's Nimbus v26.7.0 returns — strings.
+    #[test]
+    fn parses_the_live_nimbus_blob_schedule() {
+        let v = json!({"data": {"BLOB_SCHEDULE": [
+            {"EPOCH": "274176", "MAX_BLOBS_PER_BLOCK": "15"},
+            {"EPOCH": "275712", "MAX_BLOBS_PER_BLOCK": "21"}
+        ]}});
+        let got = parse_blob_schedule(&v).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].epoch, 274_176);
+        assert_eq!(got[0].max_blobs, 15);
+        assert_eq!(got[1].epoch, 275_712);
+        assert_eq!(got[1].max_blobs, 21);
+    }
+
+    /// A client emitting numbers instead of strings must not silently take the
+    /// computed digests out — BLOB_SCHEDULE's per-client encoding is the least
+    /// settled shape this feature rests on.
+    #[test]
+    fn parses_a_numeric_blob_schedule() {
+        let v = json!({"data": {"BLOB_SCHEDULE": [
+            {"EPOCH": 274176, "MAX_BLOBS_PER_BLOCK": 15}
+        ]}});
+        let got = parse_blob_schedule(&v).unwrap();
+        assert_eq!(got[0].epoch, 274_176);
+        assert_eq!(got[0].max_blobs, 15);
+    }
+
+    #[test]
+    fn a_chain_with_no_blob_schedule_is_not_an_error() {
+        // Pre-Fulu, or a client that does not expose the key.
+        let v = json!({"data": {"SLOTS_PER_EPOCH": "32"}});
+        assert_eq!(parse_blob_schedule(&v).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn a_malformed_entry_fails_rather_than_yielding_a_partial_schedule() {
+        // A partial schedule computes wrong digests silently; failing drops us
+        // to the observed fallback, which announces itself.
+        let v = json!({"data": {"BLOB_SCHEDULE": [
+            {"EPOCH": "274176", "MAX_BLOBS_PER_BLOCK": "15"},
+            {"EPOCH": "275712"}
+        ]}});
+        assert!(parse_blob_schedule(&v).is_err());
+
+        let v = json!({"data": {"BLOB_SCHEDULE": [{"EPOCH": true, "MAX_BLOBS_PER_BLOCK": "15"}]}});
+        assert!(parse_blob_schedule(&v).is_err());
+    }
 
     #[test]
     fn period_math_matches_the_live_node() {
