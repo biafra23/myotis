@@ -917,25 +917,33 @@ async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
                 "EL hunt engaged — serving pool empty past the stall window \
                  (bypassing transient backoffs for cache-confirmed snap servers)");
         }
+        // PINNED BOOT ENODES ARE MAINTAINED EVERY TICK, REGARDLESS OF POOL
+        // COUNT. They are deliberately-chosen state servers, not interchangeable
+        // with discovered peers — a pool full of pruning full nodes that cannot
+        // serve state (e.g. an account proof at the finalized root, which is
+        // near their ~128-block prune horizon) still needs the pin. Gating the
+        // pin re-dial behind `live >= target` meant a pool refilled to `target`
+        // with non-serving peers after the pin dropped never dialed the pin
+        // again, and account reads failed with "empty proof for non-empty root"
+        // until a restart. `try_dial` dedups a still-connected pin (its address
+        // stays in `attempted`), so this is a no-op until the pin actually
+        // drops, then reconnects it within one maintainer tick.
+        for (addr, pubkey) in inner.boot_enodes.clone() {
+            if !try_dial(&inner, &dial_slots, addr, pubkey).await {
+                return; // pool shutting down
+            }
+        }
+        // Discovered/cached peers, on the other hand, only fill UP TO the count
+        // target — they are fungible, so there is no point dialing more once the
+        // pool is full.
         if live >= inner.pool_cfg.target_snap_peers {
             continue;
         }
         // Snapshot the cache (snap-quality-sorted) without holding its lock
-        // across the dials, and re-offer the pinned boot enodes ahead of it: a
-        // pin that was down at startup (or whose backoff has since expired) must
-        // get another chance, and it must not depend on the cache being enabled.
-        // try_dial dedups against attempted/backoff, so re-listing is cheap.
+        // across the dials. try_dial dedups against attempted/backoff.
         let cached = inner.cache.lock().await.peers();
-        if cached.is_empty() && inner.boot_enodes.is_empty() {
+        if cached.is_empty() {
             continue;
-        }
-        for (addr, pubkey) in inner.boot_enodes.clone() {
-            if inner.peers.lock().await.len() >= inner.pool_cfg.target_snap_peers {
-                break;
-            }
-            if !try_dial(&inner, &dial_slots, addr, pubkey).await {
-                return; // pool shutting down
-            }
         }
         if hunting {
             // Emergency: free the TRANSIENT backoffs of CONFIRMED snap servers
@@ -1265,6 +1273,67 @@ mod tests {
         drop(listener); // kept alive so the pending dial stayed claimed while polling
         // The cached peer survived load → warm-start → flush-on-stop.
         assert_eq!(ElPeerCache::load(path.clone()).len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn pinned_boot_enode_is_dialed_even_with_an_empty_cache() {
+        // Guards the pin-dial path itself: pins must be dialed from a maintainer
+        // tick regardless of cache state (the fix hoists this ABOVE the
+        // live>=target gate, so a "full" pool of non-serving peers can't starve
+        // the pin). A silent listener parks the handshake, keeping the pin's
+        // address claimed in `attempted` while we poll.
+        //
+        // NOTE (honest coverage gap): this proves the pin IS dialed, not that it
+        // is dialed WHEN live>=target — the test harness parks handshakes at
+        // HANDSHAKE_TIMEOUT, so peers never become `live` and the count gate
+        // cannot be synthesized here. Exercising the gate needs a
+        // completing-handshake peer fixture; tracked as a maintainer-loop
+        // testability follow-up.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let remote =
+            NodeKey::from_secret_bytes(&myotis_core::keccak::keccak256(b"pin-remote")).unwrap();
+        let path = std::env::temp_dir().join(format!("myotis-pool-pin-{}.cache", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let key = Arc::new(
+            NodeKey::from_secret_bytes(&myotis_core::keccak::keccak256(b"pin-test")).unwrap(),
+        );
+        let cfg = Arc::new(EthConfig {
+            network_id: 1,
+            genesis_hash: [0u8; 32],
+            fork_id_hash: [0u8; 4],
+            fork_next: 0,
+            head_hash: [0u8; 32],
+            head_number: 0,
+            listen_port: 30303,
+            genesis_header_rlp: None,
+        });
+        let (_tx, rx) = mpsc::channel(4);
+        let pool = PeerPool::start(
+            Arc::clone(&key),
+            key.public_key_bytes(),
+            cfg,
+            PoolConfig::default(),
+            ElPeerCache::load(path.clone()), // EMPTY cache
+            vec![(addr, remote.public_key_bytes())], // one PINNED boot enode
+            rx,
+            None,
+            None,
+            None,
+        );
+        let mut attempted = 0;
+        for _ in 0..40 {
+            attempted = pool.attempted_count().await;
+            if attempted >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(attempted, 1, "the pinned boot enode should have been dialed with no cache");
+        pool.stop().await;
+        drop(listener);
         let _ = std::fs::remove_file(&path);
     }
 
