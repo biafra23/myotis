@@ -10,9 +10,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 
 mod archive;
+mod enr;
 mod forks;
 mod framing;
 mod rest;
@@ -39,13 +40,15 @@ fn usage() -> String {
          probe     Fetch every light-client endpoint from Nimbus, check the\n              \
          framing, and round-trip the updates through myotis' own decoder.\n    \
          ingest    Load the archive, fill it from Nimbus, and report coverage.\n    \
-         serve     Run the light-client server: libp2p responder + ingestion.\n\
+         serve     Run the light-client server: libp2p responder + ingestion.\n    \
+         enr       Print the ENR roost WOULD publish. Publishes nothing.\n\
          \n\
          OPTIONS:\n    \
          --rest URL       Nimbus REST base (default {DEFAULT_REST})\n    \
          --archive PATH   Archive file (default {DEFAULT_ARCHIVE})\n    \
          --port N         libp2p listen port for `serve` (default {DEFAULT_PORT})\n    \
-         --key PATH       libp2p identity file (default: archive path with .key)\n"
+         --key PATH       libp2p identity file (default: archive path with .key)\n    \
+         --advertise IP   address to build the ENR for (`enr` command)\n"
     )
 }
 
@@ -62,6 +65,7 @@ async fn main() -> Result<()> {
     let mut rest_base = DEFAULT_REST.to_string();
     let mut archive_path = PathBuf::from(DEFAULT_ARCHIVE);
     let mut key_path: Option<PathBuf> = None;
+    let mut advertise: Option<String> = None;
     let mut port = DEFAULT_PORT;
     let mut command = None;
 
@@ -103,6 +107,14 @@ async fn main() -> Result<()> {
                         .ok_or_else(|| anyhow!("--key needs a path\n\n{}", usage()))?,
                 ));
             }
+            "--advertise" => {
+                i += 1;
+                advertise = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow!("--advertise needs an IP\n\n{}", usage()))?
+                        .clone(),
+                );
+            }
             "-h" | "--help" => {
                 print!("{}", usage());
                 return Ok(());
@@ -117,6 +129,7 @@ async fn main() -> Result<()> {
         Some("probe") => probe(&rest_base).await,
         Some("ingest") => ingest(&rest_base, &archive_path).await,
         Some("serve") => serve::serve(&rest_base, &archive_path, key_path, port).await,
+        Some("enr") => show_enr(&rest_base, &archive_path, key_path, advertise, port).await,
         Some(other) => Err(anyhow!("unknown command '{other}'\n\n{}", usage())),
         None => {
             print!("{}", usage());
@@ -495,6 +508,107 @@ fn serving_self_check(
         None => println!("  bootstrap   absent"),
     }
 
+    Ok(())
+}
+
+/// Print the ENR roost would publish, and publish nothing.
+///
+/// Separating "build the record" from "put it in the DHT" is deliberate: a
+/// published record is cached by wallets and a wrong one is worse than none —
+/// they discover it, dial, fail, and spend their three strikes to eviction on a
+/// node that is healthy. This makes the record inspectable first.
+async fn show_enr(
+    rest_base: &str,
+    archive_path: &Path,
+    key_path: Option<PathBuf>,
+    advertise: Option<String>,
+    port: u16,
+) -> Result<()> {
+    let ip: std::net::IpAddr = advertise
+        .ok_or_else(|| {
+            anyhow!(
+                "--advertise <ip> is required.\n\n\
+                 There is deliberately no default: the address must come from \
+                 somewhere that knows it — an operator who checked, or the running \
+                 daemon's quorum of Identify reports. Guessing it is how a record \
+                 ends up pointing at an address nothing answers on."
+            )
+        })?
+        .parse()
+        .context("parsing --advertise")?;
+
+    if !myotis_net::reqresp::is_routable(ip) {
+        println!("WARNING: {ip} is not reachable from the public internet.\n");
+    }
+    // `serve` listens on /ip4/0.0.0.0 only, so a v6 record would advertise an
+    // endpoint nothing is listening on — undialable in the one place that must
+    // not be.
+    if ip.is_ipv6() {
+        return Err(anyhow!(
+            "IPv6 is not supported yet: `serve` listens on /ip4/0.0.0.0/tcp/{port} only, so a \
+             v6 record would advertise an endpoint this server is not listening on"
+        ));
+    }
+
+    let client = NimbusRest::new(rest_base, Duration::from_secs(30))?;
+    let gvr = client.genesis_validators_root().await?;
+    let schedule = forks::ForkSchedule::fetch(&client, gvr).await?;
+    let (head_slot, syncing) = client.syncing().await?;
+    // A syncing upstream reports a head behind the real one, and if it is behind
+    // the most recent fork or BPO boundary the digest computed from it is the
+    // PREVIOUS one. In a log that self-corrects on the next tick; in a published
+    // record it is cached by wallets and only displaced by a higher-sequence
+    // record — so refuse rather than bake a stale digest into an artifact whose
+    // whole purpose is to be found.
+    if syncing {
+        return Err(anyhow!(
+            "upstream is still syncing (head slot {head_slot}) — the head epoch, and therefore \
+             the fork digest, would be stale. A published record with a stale digest is \
+             invisible to exactly the clients it is for."
+        ));
+    }
+    let epoch = head_slot / schedule.slots_per_epoch();
+    let eth2 = schedule.enr_fork_id(epoch);
+
+    // The SAME key the libp2p host authenticates with — including a --key
+    // override, which this command previously accepted and silently ignored
+    // while auto-creating a different identity next to the archive.
+    let key_path = key_path.unwrap_or_else(|| archive_path.with_extension("key"));
+    let host_key = serve::load_or_create_key(&key_path)?;
+    let key = myotis_net::discovery::discv5_key_from_libp2p(&host_key).map_err(|e| anyhow!("{e}"))?;
+    let mut seq = enr::EnrSeq::load(archive_path.with_extension("enrseq"))?;
+
+    // Persist BEFORE use, which is the discipline EnrSeq documents: a crash
+    // between publishing and persisting would re-issue a number the network has
+    // already seen, and the DHT ignores a record that does not out-rank the
+    // cached one.
+    let seq_for_record = seq.bump()?;
+    let record = myotis_net::discovery::build_server_enr(&key, seq_for_record, ip, port, port, eth2)
+        .map_err(|e| anyhow!("{e}"))?;
+
+    println!("== enr ==");
+    println!("  identity  {} (the libp2p host key)", key_path.display());
+    println!("  node id   {}", record.node_id());
+    println!(
+        "  peer id   {} (derived from the ENR key — must match what `serve` announces)",
+        myotis_net::PeerId::from(host_key.public())
+    );
+    println!("  seq       {seq_for_record} (persisted before use)");
+    println!("  endpoint  {ip} tcp/{port} udp/{port}");
+    println!("  eth2      0x{}", hex::encode(eth2));
+    println!("    digest      0x{}", hex::encode(&eth2[..4]));
+    println!("    next fork   0x{}", hex::encode(&eth2[4..8]));
+    let next_epoch = u64::from_le_bytes(eth2[8..].try_into().expect("16-byte field"));
+    println!(
+        "    next epoch  {}",
+        if next_epoch == u64::MAX { "far future (none scheduled)".to_string() } else { next_epoch.to_string() }
+    );
+    // to_base64() explicitly rather than Display. They are the same today
+    // (enr 0.13's Display forwards to it), but this is a WIRE format and
+    // depending on a Display impl for one lets an upstream cosmetic change
+    // silently alter what an operator pastes into a bootnode list.
+    println!("\n  {}", record.to_base64());
+    println!("\n  NOT published. This command only builds the record.");
     Ok(())
 }
 
