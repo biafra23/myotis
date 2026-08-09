@@ -198,16 +198,50 @@ public record NetworkConfig(
             // No prior-fork fallback (same rationale as mainnet: stale digests
             // wouldn't help us sync to the current head anyway).
             null,
-            // CL peer multiaddrs for sepolia. First entry is the dedicated
-            // myotis-serving Nimbus (docs/dedicated-sepolia-node.md): it serves
-            // light_client_bootstrap / updates_by_range default-on, and being
-            // first means the light client tries it before the discovered pool.
-            // Its peer-id is stable only because the node pins --netkey-file;
-            // Nimbus otherwise mints a new one per restart, which invalidates
-            // this entry with InvalidRemotePubKey (see the doc's §5 note).
+            // CL peer multiaddrs for sepolia. First entry is roost, the
+            // dedicated light-client server (rust/roost, docs/lc-server-design.md).
+            // It is first because it exists precisely for this: a general-purpose
+            // beacon node is structurally bad at serving wallets — one connection
+            // semaphore shared between inbound and outbound, and a trimmer that
+            // scores light clients at zero and drops them first.
+            //
+            // BUT ORDER HERE IS A PREFERENCE, NOT A PRIORITY, on this engine.
+            // ChainStack loads the peer CACHE first and appends these after
+            // (ChainStack.buildAndStartBeacon), bootstrap fans out to every peer
+            // in parallel with first-valid-response-wins (BeaconLightClient
+            // ~:1419), and addPeer inserts discovered peers at index 1. So being
+            // element 0 does not mean "tried first" — it means "in the initial
+            // list, ahead of the other pins".
+            //
+            // AND NOTE WHAT A HEALTHY ROOST COSTS THIS ENGINE. The fallback below
+            // only engages when roost FAILS. roost serves no blocks —
+            // beacon_blocks_by_range is not among the nine protocols in
+            // rust/myotis-net/src/protocols.rs — while the steady-state chain
+            // fill follows the finality-poll WINNER with no per-peer fallback
+            // (fillChainStateRoots(win.peer(), ...)). A pre-encoded byte cache
+            // wins that race most rounds, so the fill fails every cycle and is
+            // swallowed at debug level: the state-root window then grows ~2 roots
+            // per poll instead of 40-80, the stateRootMatch fast path stops
+            // hitting, and verified reads pay the headerChain EL walk instead.
+            // Bounded, not a correctness break — headerChain anchors on the
+            // finalized execution block hash, not the window — but it is a
+            // silent regression on the DEFAULT engine, and the reason
+            // lc-server-design rollout step 3 wants this settled.
+            //
+            // The dedicated Nimbus follows it, so a roost OUTAGE degrades to
+            // exactly the previous behaviour rather than to nothing. That entry's
+            // peer-id is stable only because the node pins --netkey-file; Nimbus
+            // otherwise mints a new one per restart, which invalidates it with
+            // InvalidRemotePubKey (see the doc's §5 note). roost has no such
+            // mode — its identity is persisted by construction.
+            //
+            // Both literal IPs carry the same exposure: the line is residential
+            // and the address is not guaranteed stable. ENR publication
+            // (lc-server-design §7) is what removes the need to pin at all.
             prependLocal(
-                    "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
+                    "/ip4/87.154.209.161/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
                     List.of(
+                            "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
                             "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS"
                     )),
             null,

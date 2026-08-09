@@ -290,14 +290,28 @@ fn hex32(s: &str) -> [u8; 32] {
 }
 
 /// Pinned sepolia LC-serving peer multiaddrs (Java `NetworkConfig.SEPOLIA.clPeerMultiaddrs`
-/// — keep the two lists and their ORDER in step).
+/// — keep the two lists, their ORDER and their addresses in step;
+/// `sepolia_config_matches_networkconfig_java` pins this side, and the Java
+/// `NetworkConfigGnosisTest` pins that one).
 ///
-/// First is the dedicated myotis-serving Nimbus (docs/dedicated-sepolia-node.md): it
-/// serves `light_client_bootstrap` / `updates_by_range` default-on, and being first
-/// means the light client tries it before the discovered pool. Its peer-id is stable
-/// only because that node pins `--netkey-file`; Nimbus otherwise mints a new one per
-/// restart, which invalidates this entry with `InvalidRemotePubKey`.
+/// First is roost, the dedicated light-client server. The per-entry comments below
+/// carry the reasoning and each entry's own stability caveat.
 const SEPOLIA_STATIC_PEERS: &[&str] = &[
+    // roost, the dedicated light-client server (rust/roost, docs/lc-server-design.md).
+    // FIRST on purpose: it exists because a general-purpose beacon node is
+    // structurally bad at serving wallets — one connection semaphore shared
+    // between inbound and outbound, and a trimmer that drops light clients
+    // first. Nimbus stays below it, so a roost fault degrades to exactly
+    // today's behaviour rather than to nothing.
+    //
+    // Its peer id comes from /data/roost/sepolia.key and is stable across
+    // restarts by construction; unlike the Nimbus entry there is no flag to
+    // forget, because roost has no mode in which it mints a fresh one.
+    //
+    // Pinning a literal IP has the same exposure as the entries below: the line
+    // is residential and the address is not guaranteed stable. ENR publication
+    // (design §7) is what removes it.
+    "/ip4/87.154.209.161/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
     "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
     "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS",
 ];
@@ -2553,12 +2567,34 @@ mod tests {
         // NetworkConfig.SEPOLIA.currentForkDigest() — BPO2 folded in).
         assert_eq!(c.current_fork_digest(), [0x74, 0xD0, 0x14, 0x59]);
         assert_eq!(c.accepted_fork_digests(), vec![[0x74, 0xD0, 0x14, 0x59]]);
-        // Two pinned LC peers, the dedicated serving node FIRST — same list and
-        // order as the Java NetworkConfig.SEPOLIA.clPeerMultiaddrs.
-        assert_eq!(c.static_peers.len(), 2);
-        assert!(c.static_peers[0].ends_with(
-            "/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6"
-        ));
+        // The full list, in order, addresses included — NOT a suffix match.
+        //
+        // This does NOT read the Java config: the two are hand-maintained copies
+        // and nothing mechanically compares them. What it does is fail whenever
+        // THIS side changes, which pairs with the Java `NetworkConfigGnosisTest`
+        // failing whenever THAT side changes — so an edit to one is caught by
+        // the other's test only if the editor runs both suites. Treat it as a
+        // tripwire, not an enforced invariant.
+        //
+        // The addresses matter as much as the order. The Java twin asserts full
+        // strings; matching only the `/tcp/<port>/p2p/<peer-id>` suffix here
+        // would let an IP rotation be fixed on the Java side while this list
+        // kept a dead address — and this list is the ONLY one iOS has, since
+        // :app-ios runs the Rust engine exclusively.
+        assert_eq!(
+            c.static_peers,
+            vec![
+                "/ip4/87.154.209.161/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
+                "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
+                "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS",
+            ],
+            "roost first (the dedicated LC server), the dedicated Nimbus second as \
+             fallback — same list, order AND addresses as the Java \
+             NetworkConfig.SEPOLIA.clPeerMultiaddrs"
+        );
+        // A malformed pin would otherwise reach run_sync and surface only as a
+        // "skipping unparseable static peer multiaddr" warn.
+        assert!(c.static_peers.iter().all(|p| parse_static_peer(p).is_some()));
         assert_eq!(c.bootstrap_enrs.len(), 9);
     }
 
