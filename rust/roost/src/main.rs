@@ -4,7 +4,8 @@
 //! the light-client store, the chain-view poller behind `status`, and ingestion
 //! in background tasks. `probe` verifies the upstream path and `ingest` fills
 //! the archive without listening. ENR publication and the back-archive below the
-//! upstream light-client floor are what remain.
+//! upstream light-client floor are what remain. Context bytes are computed from
+//! the chain's fork and blob schedule (`forks.rs`), not approximated.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -12,6 +13,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 
 mod archive;
+mod forks;
 mod framing;
 mod rest;
 mod serve;
@@ -193,6 +195,51 @@ async fn probe(rest_base: &str) -> Result<()> {
         chunks.len(),
         wire.len()
     );
+
+    // The check that keeps context bytes honest: what we COMPUTE from the
+    // chain's fork and blob schedule must equal what the upstream actually
+    // framed. Only the `updates` protocol carries a digest on the wire, so this
+    // is the one place the computation can be checked against ground truth —
+    // and it is what every other endpoint's context bytes now rest on.
+    println!("\n== fork digest ==");
+    let gvr = client.genesis_validators_root().await?;
+    match forks::ForkSchedule::fetch(&client, gvr).await {
+        Ok(schedule) => {
+            let computed = schedule.digest_for_slot(head_slot);
+            let observed = chunks[0].fork_digest;
+            let fork = schedule.fork_at_epoch(head_slot / schedule.slots_per_epoch());
+            println!(
+                "  fork      version 0x{} active from epoch {}",
+                hex::encode(fork.version),
+                fork.epoch
+            );
+            match schedule.blob_params_at_epoch(head_slot / schedule.slots_per_epoch()) {
+                Some(bp) => println!(
+                    "  blobs     BPO epoch {}, max {} per block",
+                    bp.epoch, bp.max_blobs
+                ),
+                None => println!("  blobs     no BPO active (pre-Fulu formula)"),
+            }
+            println!("  computed  0x{}", hex::encode(computed));
+            println!("  on wire   0x{}", hex::encode(observed));
+            if computed == observed {
+                println!("  MATCH     context bytes can be computed for any slot");
+            } else {
+                // NOT an error. The wire digest belongs to the update's attested
+                // header, which can predate a fork or BPO boundary that head is
+                // already past — a period spans 256 epochs, so the two SHOULD
+                // differ during a transition. Failing here would make `probe`
+                // report a schedule fault precisely when the schedule is doing
+                // its job. `serve` treats the same signal the same way.
+                println!(
+                    "  DIFFER    expected across a fork/BPO boundary inside this period\n\
+                     \x20           (the wire digest is the update's attested header, not head);\n\
+                     \x20           otherwise it means the schedule and the chain disagree."
+                );
+            }
+        }
+        Err(e) => println!("  unavailable — {e:#}"),
+    }
 
     let span = 3u64.min(head_period + 1);
     let multi = client.updates(head_period + 1 - span, span).await?;

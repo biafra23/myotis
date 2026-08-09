@@ -213,6 +213,30 @@ impl LcStore {
         evicted
     }
 
+    /// Drop every cached bootstrap, so they are refetched and re-stamped.
+    ///
+    /// Called when the fork schedule changes. Bootstraps are the only objects
+    /// encoded ONCE and then kept: the per-slot objects are refetched every
+    /// tick and periods carry the digest their source framed, but a bootstrap
+    /// cached under an old schedule would keep its stale context bytes until
+    /// FIFO eviction pushed it out — potentially hours, for the pinned
+    /// checkpoint a cold wallet actually asks for.
+    ///
+    /// Clears the attempted markers with them, for the same reason eviction
+    /// does: a root that is uncached but still marked attempted is refused with
+    /// no re-fetch.
+    pub fn clear_bootstraps(&self) -> usize {
+        let mut inner = self.write();
+        let dropped = inner.bootstraps.len();
+        for root in inner.bootstrap_order.clone() {
+            inner.bootstrap_attempted.remove(&root);
+            inner.bootstrap_attempted_order.retain(|r| r != &root);
+        }
+        inner.bootstraps.clear();
+        inner.bootstrap_order.clear();
+        dropped
+    }
+
     /// Queue a root for the background filler. Returns false when the queue is
     /// full or the root was already attempted — both mean "do not fetch".
     pub fn record_bootstrap_miss(&self, root: [u8; 32]) -> bool {
@@ -555,6 +579,22 @@ mod tests {
             s.insert_bootstrap(root_n(i), D, &[1u8; 32]);
         }
         assert!(!s.record_bootstrap_miss(root), "never cached, so still blocked");
+    }
+
+    #[test]
+    fn clearing_bootstraps_makes_them_refetchable() {
+        let s = LcStore::new();
+        let root = root_n(3);
+        assert!(s.record_bootstrap_miss(root));
+        s.take_bootstrap_misses(1);
+        s.insert_bootstrap(root, D, &[1u8; 32]);
+
+        assert_eq!(s.clear_bootstraps(), 1);
+        assert!(s.bootstrap(&root).is_none());
+        assert!(
+            s.record_bootstrap_miss(root),
+            "a cleared root must be re-queued, or it is refused forever with no re-fetch"
+        );
     }
 
     #[test]
