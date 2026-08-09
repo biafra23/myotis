@@ -50,3 +50,22 @@ jobs:
         run: cargo test --manifest-path rust/roost/Cargo.toml --locked
       - name: Clippy
         run: cargo clippy --manifest-path rust/roost/Cargo.toml --all-targets -- -D warnings
+      # Neither build, test nor clippy checks rustdoc links, so a broken
+      # intra-doc link is invisible to CI — one shipped in #328 and was caught by
+      # a human reading the diff rather than by a machine. The class matters here
+      # because this crate's doc comments carry the reasoning (why the ENR key
+      # must be the host key, why a BPO counts as a transition), and a link that
+      # silently stops resolving takes a reader away from it.
+      - name: Rustdoc links
+        env:
+          RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
+        # --document-private-items explicitly: most of this crate's
+        # reasoning-carrying doc comments are on PRIVATE items (`Digests`,
+        # `interim_fork_digest`, `NimbusRest::get_ssz`), and they are covered
+        # today only because Cargo adds the flag automatically for a bin-only
+        # package. If roost ever grows a [lib] target — plausible for a daemon
+        # whose codec is already shared by path — the gate would silently narrow
+        # to the public surface and stop checking most of the crate. That is the
+        # same "silently stops resolving" failure this step exists to prevent,
+        # one level up. A no-op today, verified.
+        run: cargo doc --manifest-path rust/roost/Cargo.toml --no-deps --locked --document-private-items
