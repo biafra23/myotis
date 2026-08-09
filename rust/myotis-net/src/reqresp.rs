@@ -432,10 +432,9 @@ impl ReqRespClient {
         // so `build_swarm` falls back to plain TCP and a /dns4/ address is
         // rejected outright with "Multiaddr is not supported").
         let dns_name = multiaddr_dns_name(&addr).map(|n| n.to_string());
+        // Never empty: a resolver failure yields the original address, so an
+        // already-connected peer is unaffected by a transient DNS blip.
         let addrs = resolve_dial_addrs(&addr).await;
-        if addrs.is_empty() {
-            return Err(RequestError::DialFailure);
-        }
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Command::Request { peer, dns_name, addrs, protocol, wire, reply })
@@ -697,7 +696,15 @@ async fn resolve_dial_addrs(addr: &Multiaddr) -> Vec<Multiaddr> {
     let Some(name) = multiaddr_dns_name(addr).map(|n| n.to_string()) else {
         return vec![addr.clone()];
     };
-    let port = multiaddr_port(addr).unwrap_or(0);
+    // Without a /tcp/ component there is nothing to rebuild around: `skip_while`
+    // would consume the whole iterator and every candidate would come out a bare
+    // /ip4/A — no port, no transport, no /p2p/ id — while `unwrap_or(0)` looked
+    // the name up on port 0. Hand the address back untouched instead and let the
+    // transport reject it on its own terms. Reaches here via /dnsaddr/ (which
+    // resolves to TXT records, not A/AAAA) and via a name with no transport.
+    let Some(port) = multiaddr_port(addr) else {
+        return vec![addr.clone()];
+    };
     let tail: Vec<Protocol> = addr
         .iter()
         .skip_while(|p| !matches!(p, Protocol::Tcp(_)))
@@ -723,6 +730,7 @@ async fn resolve_dial_addrs(addr: &Multiaddr) -> Vec<Multiaddr> {
             }
             if out.is_empty() {
                 tracing::warn!(%name, "DNS-PIN resolve EMPTY — name exists but has no A/AAAA record");
+                return vec![addr.clone()];
             } else {
                 let ips: Vec<String> =
                     out.iter().filter_map(|m| multiaddr_ip(m).map(|i| i.to_string())).collect();
@@ -731,38 +739,16 @@ async fn resolve_dial_addrs(addr: &Multiaddr) -> Vec<Multiaddr> {
             out
         }
         Err(e) => {
+            // Hand back the ORIGINAL rather than nothing. `request_raw` resolves
+            // before it can know whether a dial is even needed — connection state
+            // lives on the swarm task — so returning empty made a transient
+            // resolver blip fail requests on peers we were already connected to,
+            // where the candidates would never have been used. The failure is
+            // logged; if a dial really is required it fails on its own.
             tracing::warn!(%name, error = %e, "DNS-PIN resolve FAILED");
-            Vec::new()
+            vec![addr.clone()]
         }
     }
-}
-
-/// Log what a name currently resolves to, without blocking the swarm task.
-///
-/// libp2p resolves inside the transport and does not surface the answer — the
-/// established connection still reports the `/dns4/` address it was asked for —
-/// so the mapping is invisible unless we look it up ourselves. On a dynamic
-/// address that mapping is the operationally interesting fact: it is what says
-/// whether a pinned name is currently pointing at the right machine.
-///
-/// This is a SECOND lookup, not the one the transport used. With a ~30s TTL the
-/// two agree in practice, but treat it as "what the name says now" rather than
-/// "what this connection went to".
-fn log_resolution(name: &str, port: u16) {
-    let name = name.to_string();
-    tokio::spawn(async move {
-        match tokio::net::lookup_host((name.as_str(), port)).await {
-            Ok(addrs) => {
-                let ips: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
-                if ips.is_empty() {
-                    tracing::warn!(%name, "DNS-PIN resolve EMPTY — name exists but has no A/AAAA record");
-                } else {
-                    tracing::info!(%name, resolved = %ips.join(","), "DNS-PIN resolved");
-                }
-            }
-            Err(e) => tracing::warn!(%name, error = %e, "DNS-PIN resolve FAILED"),
-        }
-    });
 }
 
 /// One peer's report: where they reached us from, and what they see us as.
@@ -1189,7 +1175,7 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
                 // NOTE: not `endpoint.get_remote_address()` — for a dial by name
                 // that returns the /dns4/ address we asked for, not the address
                 // it resolved to, which makes it useless for exactly this. The
-                // answer is logged by `log_resolution` at dial time instead.
+                // answer is logged by `resolve_dial_addrs` at dial time instead.
                 tracing::info!(peer = %peer_id, %name, "DNS-PIN connected");
             }
             tracing::debug!(peer = %peer_id, remote = %endpoint.get_remote_address(),
@@ -1863,15 +1849,26 @@ mod dial_resolution_tests {
     }
 
     #[tokio::test]
-    async fn an_unresolvable_name_yields_no_candidates() {
-        // Empty, not the input: dialing a /dns4/ address on a DNS-less transport
-        // fails with a misleading "Multiaddr is not supported" rather than a
-        // resolution error. The caller turns this into DialFailure.
+    async fn an_unresolvable_name_falls_back_to_the_original() {
+        // NOT empty. `request_raw` resolves before it can know whether a dial is
+        // even needed, so returning nothing would fail requests on peers we are
+        // already connected to over a transient resolver blip. The failure is
+        // logged; a dial that genuinely needs the address fails on its own.
         let a: Multiaddr = "/dns4/no-such-host.invalid/tcp/9105/p2p/\
             16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"
             .parse()
             .unwrap();
-        assert!(resolve_dial_addrs(&a).await.is_empty());
+        assert_eq!(resolve_dial_addrs(&a).await, vec![a.clone()]);
+    }
+
+    #[tokio::test]
+    async fn an_address_without_tcp_is_returned_untouched() {
+        // No /tcp/ means nothing to rebuild around: rewriting would drop the
+        // port, the transport and the /p2p/ id, leaving a bare /ip4/A.
+        for raw in ["/dnsaddr/example.com", "/dns4/localhost"] {
+            let a: Multiaddr = raw.parse().unwrap();
+            assert_eq!(resolve_dial_addrs(&a).await, vec![a.clone()], "{raw}");
+        }
     }
 
     #[tokio::test]
