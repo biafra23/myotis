@@ -15,13 +15,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::prelude::*;
 use libp2p::identify;
-use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
+use libp2p::request_response::{self, InboundRequestId, OutboundRequestId, ProtocolSupport};
 use libp2p::connection_limits::{self, ConnectionLimits};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm};
@@ -68,6 +69,26 @@ const RESPONSE_QUIET_WINDOW: Duration = Duration::from_secs(3);
 /// Must comfortably exceed the observed inter-chunk pacing (~10 s) or the
 /// quiet window truncates paced batches to their first chunk.
 const UPDATES_QUIET_WINDOW: Duration = Duration::from_secs(12);
+
+/// Ceiling on response bytes queued but not yet written, across ALL inbound
+/// connections.
+///
+/// Per-request bounds (`MAX_REQUEST_LIGHT_CLIENT_UPDATES`, response byte caps)
+/// say nothing about how many responses can be in flight at once, and the two
+/// are very different numbers on a public responder: a full updates_by_range
+/// body is ~3.4 MiB built from a 16-byte request, held until written or until
+/// UPDATES_TIMEOUT (60 s) expires. One peer opening its permitted connections,
+/// filling its concurrent streams and then not reading would otherwise pin
+/// hundreds of MiB for a minute at a cost to itself of a couple of KiB.
+///
+/// Over budget we answer ResourceUnavailable, which is already the correct
+/// "ask someone else" answer and costs the caller nothing to retry.
+const MAX_IN_FLIGHT_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Concurrent inbound streams per connection for `updates_by_range` when
+/// serving. A wallet catching up needs one at a time; 64 (the default for the
+/// cheap protocols) only multiplies the in-flight ceiling above.
+const SERVING_UPDATES_MAX_STREAMS: usize = 4;
 
 const MAX_REQUEST_WIRE_BYTES: usize = 1024;
 /// A full 128-update batch is ~3.5 MiB on the wire (~128 x ~60 KB SSZ
@@ -232,12 +253,21 @@ impl request_response::Codec for Eth2Codec {
 type RR = request_response::Behaviour<Eth2Codec>;
 
 fn rr(protocol: &'static str, support: ProtocolSupport, timeout: Duration) -> RR {
+    rr_with_streams(protocol, support, timeout, 64)
+}
+
+fn rr_with_streams(
+    protocol: &'static str,
+    support: ProtocolSupport,
+    timeout: Duration,
+    max_streams: usize,
+) -> RR {
     request_response::Behaviour::with_codec(
         Eth2Codec,
         [(Eth2Protocol(StreamProtocol::new(protocol)), support)],
         request_response::Config::default()
             .with_request_timeout(timeout)
-            .with_max_concurrent_streams(64),
+            .with_max_concurrent_streams(max_streams),
     )
 }
 
@@ -260,13 +290,22 @@ pub struct Behaviour {
 }
 
 impl Behaviour {
-    fn new(local_public_key: libp2p::identity::PublicKey) -> Self {
+    /// `serving` ⇒ this host answers the light-client protocols, so
+    /// `updates_by_range` is advertised inbound as well as outbound.
+    fn new(
+        local_public_key: libp2p::identity::PublicKey,
+        serving: bool,
+        max_established_incoming: Option<u32>,
+    ) -> Self {
         Self {
             limits: connection_limits::Behaviour::new(
                 ConnectionLimits::default()
-                    .with_max_established_incoming(Some(64))
+                    .with_max_established_incoming(max_established_incoming)
+                    // A server sees many wallets behind one NAT, and a wallet
+                    // opening a second connection is normal; the per-peer cap
+                    // is about a single peer monopolising us, not about volume.
                     .with_max_established_per_peer(Some(2))
-                    .with_max_pending_incoming(Some(16)),
+                    .with_max_pending_incoming(Some(if serving { 256 } else { 16 })),
             ),
             identify: identify::Behaviour::new(
                 identify::Config::new("eth2/1.0.0".into(), local_public_key)
@@ -278,10 +317,20 @@ impl Behaviour {
             metadata: rr(protocols::METADATA_V2, ProtocolSupport::Full, RESP_TIMEOUT),
             goodbye: rr(protocols::GOODBYE, ProtocolSupport::Full, RESP_TIMEOUT),
             bootstrap: rr(protocols::BOOTSTRAP, ProtocolSupport::Full, RESP_TIMEOUT),
-            // Never advertised inbound: we can't serve catch-up history, and the
-            // Java learned that advertising unservable protocols gets us
-            // goodbye'd ("durationMs=1 closes in the wild").
-            updates: rr(protocols::UPDATES_BY_RANGE, ProtocolSupport::Outbound, UPDATES_TIMEOUT),
+            // Outbound-only for a WALLET: it can't serve catch-up history, and
+            // the Java learned that advertising unservable protocols gets us
+            // goodbye'd ("durationMs=1 closes in the wild"). A serving host has
+            // the archive that makes the advertisement honest, so it goes Full.
+            updates: rr_with_streams(
+                protocols::UPDATES_BY_RANGE,
+                if serving {
+                    ProtocolSupport::Full
+                } else {
+                    ProtocolSupport::Outbound
+                },
+                UPDATES_TIMEOUT,
+                if serving { SERVING_UPDATES_MAX_STREAMS } else { 64 },
+            ),
             finality: rr(protocols::FINALITY_UPDATE, ProtocolSupport::Full, RESP_TIMEOUT),
             optimistic: rr(protocols::OPTIMISTIC_UPDATE, ProtocolSupport::Full, RESP_TIMEOUT),
         }
@@ -334,6 +383,17 @@ enum Command {
     LcServers {
         reply: oneshot::Sender<HashSet<PeerId>>,
     },
+    /// The externally observed address, once EXTERNAL_ADDR_QUORUM peers agree.
+    ExternalAddress {
+        reply: oneshot::Sender<Option<ExternalAddress>>,
+    },
+    /// Dial peers purely to collect Identify observations of our own address.
+    /// Fire-and-forget: nothing is requested and no reply is sent, because the
+    /// answer arrives asynchronously as `observed_ips` and is read later via
+    /// [`Command::ExternalAddress`].
+    Observe {
+        peers: Vec<(PeerId, Multiaddr)>,
+    },
     /// One snapshot of both catch-up peer-selection inputs — the LC-server set
     /// and the per-peer `earliest_available_slot` map — so a round fetches them
     /// in a single swarm round-trip instead of two.
@@ -367,6 +427,45 @@ impl ReqRespClient {
             .await
             .map_err(|_| RequestError::Shutdown)?;
         rx.await.map_err(|_| RequestError::Shutdown)?
+    }
+
+    /// The address peers say they see us on, once at least
+    /// [`EXTERNAL_ADDR_QUORUM`] distinct peers agree on it.
+    ///
+    /// `None` until enough peers have reported — which is the honest answer, not
+    /// a failure: a server with too few connections genuinely does not know its
+    /// own address, and acting on a guess is how a published record ends up
+    /// pointing somewhere dead.
+    /// Dial `peers` for the sole purpose of learning our own external address.
+    ///
+    /// A host that only ever ACCEPTS connections never learns this. Identify
+    /// reports what the remote observes about us, so it takes a connection to
+    /// produce one — and [`external_address`](Self::external_address) needs
+    /// [`EXTERNAL_ADDR_QUORUM`] of them from distinct source IPs. A wallet gets
+    /// these for free from the peers it syncs against; a pure server
+    /// (`rust/roost`) has no such traffic and would sit below quorum forever.
+    ///
+    /// The observations are BOUNDED BY THE CONNECTION: they are dropped when it
+    /// closes, and idle connections close after 120s. So this establishes a
+    /// quorum that is momentary by design, not a standing one. Callers should
+    /// re-probe on a cadence and treat a `None` from `external_address` as "no
+    /// fresh reading", not as "the address is gone".
+    ///
+    /// Fire-and-forget: dial failures are logged, not returned. Probing is a
+    /// best-effort background concern and must never fail a caller's real work.
+    pub async fn observe_via(&self, peers: Vec<(PeerId, Multiaddr)>) {
+        if peers.is_empty() {
+            return;
+        }
+        let _ = self.tx.send(Command::Observe { peers }).await;
+    }
+
+    pub async fn external_address(&self) -> Option<ExternalAddress> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::ExternalAddress { reply }).await.is_err() {
+            return None;
+        }
+        rx.await.ok().flatten()
     }
 
     pub async fn connected_peer_count(&self) -> usize {
@@ -423,37 +522,339 @@ impl LocalStatus {
     }
 }
 
+/// How many DISTINCT peers must report the same address before it is believed.
+///
+/// One peer's `observed_addr` is not evidence: it can lie, and a peer behind the
+/// same NAT can be honestly wrong. This is the same reasoning discv5's endpoint
+/// prediction uses, and the reason Geth's `--nat stun` and Nimbus's
+/// `--enr-auto-update` do not act on a single report.
+///
+/// # What this is not
+///
+/// A floor against accident, **not** a defence against a determined Sybil. The
+/// answer is a plurality among connected peers, so an attacker who can hold more
+/// simultaneous connections than the honest peers reporting the true address can
+/// move it. That is tolerable while the result is only logged; before it drives
+/// a PUBLISHED ENR it wants at least one of:
+///
+/// - a majority of currently connected peers rather than a fixed floor,
+/// - cross-checking against discv5's own endpoint prediction, which is a
+///   different peer set reached over a different transport, or
+/// - refusing to act on a change until it survives several rounds.
+///
+/// The cost of getting it wrong is reachability, not correctness: a wrong
+/// address makes us undialable, it cannot make a wallet accept bad data.
+pub const EXTERNAL_ADDR_QUORUM: usize = 3;
+
+/// The address other peers say they see us on, once enough of them agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalAddress {
+    pub ip: IpAddr,
+    /// The port reporters see, when it is meaningful — see
+    /// [`ExternalAddress::port`]'s note below.
+    ///
+    /// Populated ONLY from inbound connections, where the reporter dialed us and
+    /// their view of our port is the externally mapped one. On an outbound
+    /// connection the port they see is our ephemeral source port and says
+    /// nothing about where we listen, so it is discarded. A server that never
+    /// dials therefore gets a real answer here, which is what makes a NAT
+    /// rewriting the port detectable rather than invisible.
+    pub port: Option<u16>,
+    /// Distinct reporters behind the winning address.
+    pub confirmations: usize,
+    /// Total distinct reporters. The denominator `confirmations` is out of —
+    /// without it a consumer cannot tell 3-of-3 from 3-of-200, nor implement a
+    /// majority rule without a second, racing round-trip.
+    pub reporters: usize,
+    /// Whether the winner is an address that could actually be reached from the
+    /// public internet. See [`is_routable`].
+    pub routable: bool,
+}
+
+impl ExternalAddress {
+    /// Whether the winner failed to clear half the reporters.
+    ///
+    /// A near-even split is the shape both a Sybil and a genuine mid-flight
+    /// address change produce, and the tie-break makes each CALL deterministic
+    /// without making the SEQUENCE stable — one more reporter can flip the
+    /// winner. A consumer that publishes a record should wait rather than act on
+    /// a contested answer.
+    pub fn is_contested(&self) -> bool {
+        self.confirmations * 2 <= self.reporters
+    }
+}
+
+/// Whether an address could be reached from the public internet.
+///
+/// `IpAddr::is_global()` is still unstable on the pinned toolchain, so the
+/// classes are spelled out. This exists because the mechanism will happily
+/// establish `127.0.0.1` or `192.168.x.x` — a couple of wallets on the same LAN
+/// can reach quorum before any internet peer does — and a record carrying a
+/// non-routable IP fails in exactly the way publishing an address is meant to
+/// prevent.
+pub fn is_routable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                // 100.64.0.0/10, carrier-grade NAT — routable-looking, not reachable.
+                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])))
+        }
+        IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // fc00::/7 unique-local
+                || (v6.octets()[0] & 0xfe) == 0xfc
+                // fe80::/10 link-local
+                || (v6.octets()[0] == 0xfe && (v6.octets()[1] & 0xc0) == 0x80))
+        }
+    }
+}
+
+/// Extract the IP from a libp2p multiaddr.
+///
+/// Only the IP is meaningful. Identify reports the remote address of the
+/// connection as the reporter sees it, so for a connection WE dialed that is our
+/// source IP with an ephemeral port — the port says nothing about where we
+/// listen. Callers pair the IP with their own configured listen port.
+fn multiaddr_ip(addr: &Multiaddr) -> Option<IpAddr> {
+    use libp2p::multiaddr::Protocol;
+    addr.iter().find_map(|p| match p {
+        Protocol::Ip4(v4) => Some(IpAddr::V4(v4)),
+        Protocol::Ip6(v6) => Some(IpAddr::V6(v6)),
+        _ => None,
+    })
+}
+
+fn multiaddr_port(addr: &Multiaddr) -> Option<u16> {
+    use libp2p::multiaddr::Protocol;
+    addr.iter().find_map(|p| match p {
+        Protocol::Tcp(port) => Some(port),
+        _ => None,
+    })
+}
+
+/// The DNS name in a multiaddr, if it is dialed by name rather than by address.
+///
+/// Used only for logging: libp2p resolves the name inside the transport, so
+/// without this the operator sees a connection to an IP with no indication that
+/// a name was involved, or which one — and on a dynamic address the whole point
+/// is being able to see what the name currently points at.
+fn multiaddr_dns_name(addr: &Multiaddr) -> Option<String> {
+    use libp2p::multiaddr::Protocol;
+    addr.iter().find_map(|p| match p {
+        Protocol::Dns(n) | Protocol::Dns4(n) | Protocol::Dns6(n) | Protocol::Dnsaddr(n) => {
+            Some(n.to_string())
+        }
+        _ => None,
+    })
+}
+
+/// Log what a name currently resolves to, without blocking the swarm task.
+///
+/// libp2p resolves inside the transport and does not surface the answer — the
+/// established connection still reports the `/dns4/` address it was asked for —
+/// so the mapping is invisible unless we look it up ourselves. On a dynamic
+/// address that mapping is the operationally interesting fact: it is what says
+/// whether a pinned name is currently pointing at the right machine.
+///
+/// This is a SECOND lookup, not the one the transport used. With a ~30s TTL the
+/// two agree in practice, but treat it as "what the name says now" rather than
+/// "what this connection went to".
+fn log_resolution(name: &str, port: u16) {
+    let name = name.to_string();
+    tokio::spawn(async move {
+        match tokio::net::lookup_host((name.as_str(), port)).await {
+            Ok(addrs) => {
+                let ips: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
+                if ips.is_empty() {
+                    tracing::warn!(%name, "DNS-PIN resolve EMPTY — name exists but has no A/AAAA record");
+                } else {
+                    tracing::info!(%name, resolved = %ips.join(","), "DNS-PIN resolved");
+                }
+            }
+            Err(e) => tracing::warn!(%name, error = %e, "DNS-PIN resolve FAILED"),
+        }
+    });
+}
+
+/// One peer's report: where they reached us from, and what they see us as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Observation {
+    source: IpAddr,
+    ip: IpAddr,
+    /// Only set for inbound connections — see [`ExternalAddress::port`].
+    port: Option<u16>,
+}
+
+/// A source of pre-encoded light-client responses.
+///
+/// This is the seam that lets a SERVER (`rust/roost`) reuse this host verbatim
+/// instead of standing up a second libp2p stack — the design's "one protocol
+/// stack, not two". The wallet passes `None` and keeps behaving exactly as
+/// before: the four light-client protocols fall through to
+/// `ResourceUnavailable`.
+///
+/// Every method returns the **fully encoded response body** (`result byte ||
+/// fork digest || varint || snappy frames`), because these are called from
+/// [`respond_inbound`], which is **synchronous** and runs inline on the swarm
+/// task. There is no await point here: an implementation must be a pure cache
+/// read, never an I/O fetch. `None` means miss, and the caller answers
+/// `ResourceUnavailable` — correct behaviour, since a wallet simply retries
+/// against another peer.
+pub trait LcResponder: Send + Sync {
+    fn bootstrap(&self, block_root: &[u8; 32]) -> Option<Vec<u8>>;
+    fn updates_by_range(&self, start_period: u64, count: u64) -> Option<Vec<u8>>;
+    fn finality_update(&self) -> Option<Vec<u8>>;
+    fn optimistic_update(&self) -> Option<Vec<u8>>;
+}
+
+/// How to build the host. [`HostConfig::default`] is the wallet's shape.
+pub struct HostConfig {
+    /// Where to listen. The wallet uses an ephemeral port because some peers
+    /// reject dial-only hosts; a server pins one so its ENR stays valid.
+    pub listen: Multiaddr,
+    /// Cap on established inbound connections. The wallet's 64 is
+    /// defense-in-depth; a server sets its own, which is the entire point of
+    /// splitting it out of a beacon node whose limit it would otherwise inherit.
+    pub max_established_incoming: Option<u32>,
+    /// Identity key. `None` generates a fresh one — right for a wallet, fatal
+    /// for a published server, where every restart would mint a new node ID and
+    /// invalidate every cached `/p2p/<peer-id>`.
+    pub keypair: Option<libp2p::identity::Keypair>,
+    /// Present ⇒ serve the light-client protocols, and advertise
+    /// `updates_by_range` inbound.
+    pub lc_responder: Option<Arc<dyn LcResponder>>,
+}
+
+impl Default for HostConfig {
+    fn default() -> Self {
+        Self {
+            listen: "/ip4/0.0.0.0/tcp/0".parse().expect("static multiaddr"),
+            max_established_incoming: Some(64),
+            keypair: None,
+            lc_responder: None,
+        }
+    }
+}
+
 /// Start the libp2p host and its event-loop task. Returns the request client;
 /// the task exits on [`ReqRespClient::shutdown`] (or when every client is dropped).
 pub fn start_host(local_status: Arc<LocalStatus>) -> Result<ReqRespClient, String> {
+    // The wallet drops the JoinHandle: dropping it does not abort the task, and
+    // a wallet that loses its host recovers by its own reconnect paths rather
+    // than by exiting the process.
+    start_host_with(local_status, HostConfig::default()).map(|(client, _, _)| client)
+}
+
+/// [`start_host`] with explicit configuration. Also returns the local peer id
+/// (a server needs it to publish a dialable multiaddr) and the swarm task's
+/// `JoinHandle`.
+///
+/// **A server must watch that handle.** The swarm task owns the listener and
+/// every connection, so if it ends — panic or otherwise — the host stops
+/// accepting while the process keeps running perfectly happily. Nothing else
+/// notices: the caller's `ReqRespClient` still exists and background pollers
+/// keep polling. A supervisor cannot help with a process that never exits, so
+/// detecting it is the owner's job. See `roost::serve`, which exits non-zero.
+/// Build the swarm, optionally with the DNS resolution layer.
+///
+/// Two near-identical chains rather than one with a branch: `with_dns()`
+/// consumes the builder and does not hand it back on failure, so recovering
+/// from a failed DNS setup means building again from the identity.
+fn build_swarm(
+    keypair: libp2p::identity::Keypair,
+    serving: bool,
+    max_incoming: Option<u32>,
+    dns: bool,
+) -> Result<Swarm<Behaviour>, String> {
+    let base = libp2p::SwarmBuilder::with_existing_identity(keypair).with_tokio();
+    let idle = |c: libp2p::swarm::Config| c.with_idle_connection_timeout(Duration::from_secs(120));
+    let behaviour = |key: &libp2p::identity::Keypair| {
+        Behaviour::new(key.public(), serving, max_incoming)
+    };
+    if dns {
+        Ok(base
+            .with_tcp(
+                libp2p::tcp::Config::default().nodelay(true),
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )
+            .map_err(|e| format!("tcp/noise/yamux setup failed: {e}"))?
+            .with_dns()
+            .map_err(|e| format!("dns transport setup failed: {e}"))?
+            .with_behaviour(behaviour)
+            .map_err(|e| format!("behaviour setup failed: {e}"))?
+            .with_swarm_config(idle)
+            .build())
+    } else {
+        Ok(base
+            .with_tcp(
+                libp2p::tcp::Config::default().nodelay(true),
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )
+            .map_err(|e| format!("tcp/noise/yamux setup failed: {e}"))?
+            .with_behaviour(behaviour)
+            .map_err(|e| format!("behaviour setup failed: {e}"))?
+            .with_swarm_config(idle)
+            .build())
+    }
+}
+
+pub fn start_host_with(
+    local_status: Arc<LocalStatus>,
+    config: HostConfig,
+) -> Result<(ReqRespClient, PeerId, tokio::task::JoinHandle<()>), String> {
     // Ethereum CL spec requires secp256k1 identity keys (same as the Java
     // HostBuilder's KeyType.SECP256K1) — the default ed25519 would make some
     // peers reject the noise handshake payload.
-    let keypair = libp2p::identity::Keypair::generate_secp256k1();
-    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
-        .with_tokio()
-        .with_tcp(
-            libp2p::tcp::Config::default().nodelay(true),
-            libp2p::noise::Config::new,
-            libp2p::yamux::Config::default,
-        )
-        .map_err(|e| format!("tcp/noise/yamux setup failed: {e}"))?
-        .with_behaviour(|key| Behaviour::new(key.public()))
-        .map_err(|e| format!("behaviour setup failed: {e}"))?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
-        .build();
+    let keypair = config
+        .keypair
+        .unwrap_or_else(libp2p::identity::Keypair::generate_secp256k1);
+    let serving = config.lc_responder.is_some();
+    let max_incoming = config.max_established_incoming;
+    // DNS is layered in so `/dns4/host/tcp/port/p2p/<id>` peers resolve AT DIAL
+    // TIME, every dial, honouring the record's TTL. That is what lets a server
+    // on a dynamic residential address be pinned by NAME instead of by a literal
+    // IP that goes stale (rust/roost).
+    //
+    // It must not be load-bearing, because it CANNOT be relied on everywhere:
+    // the system resolver is configured from /etc/resolv.conf, which Android has
+    // not had since Oreo (DNS goes through netd), so this legitimately fails
+    // there. Android is a first-class consumer (CLAUDE.md, Platform & language
+    // direction), and failing the whole host over an optional transport layer
+    // would take out `/ip4/` peers — every peer we pin today — on the default
+    // Android path.
+    //
+    // So: try with DNS, fall back to plain TCP with a warning. The degraded mode
+    // is exactly today's behaviour, and the warning names what stops working.
+    let mut swarm = match build_swarm(keypair.clone(), serving, max_incoming, true) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e,
+                "no system DNS resolver — continuing WITHOUT the DNS transport; \
+                 /ip4/ peers are unaffected but /dns4/ peers cannot be dialed");
+            build_swarm(keypair, serving, max_incoming, false)?
+        }
+    };
 
-    // Listen on an ephemeral port: some peers reject dial-only hosts (same
-    // reason the Java host listens on /ip4/0.0.0.0/tcp/0).
     swarm
-        .listen_on("/ip4/0.0.0.0/tcp/0".parse().expect("static multiaddr"))
+        .listen_on(config.listen)
         .map_err(|e| format!("listen failed: {e}"))?;
 
-    tracing::info!(peer_id = %swarm.local_peer_id(), "libp2p host starting");
+    let peer_id = *swarm.local_peer_id();
+    tracing::info!(peer_id = %peer_id, serving, "libp2p host starting");
 
     let (tx, rx) = mpsc::channel(256);
-    tokio::spawn(run_swarm(swarm, rx, local_status));
-    Ok(ReqRespClient { tx })
+    let task = tokio::spawn(run_swarm(swarm, rx, local_status, config.lc_responder));
+    Ok((ReqRespClient { tx }, peer_id, task))
 }
 
 /// What a pending outbound request id maps back to.
@@ -475,6 +876,9 @@ struct QueuedRequest {
 struct SwarmCtx {
     pending: HashMap<OutboundRequestId, Pending>,
     connected: HashSet<PeerId>,
+    /// Peers we dialed BY NAME, and the name used. Logging only — cleared when
+    /// the dial resolves one way or the other.
+    dns_dials: HashMap<PeerId, String>,
     /// Peers whose spec-required first Status exchange has completed (either
     /// way). Requests to peers not in this set are parked in `queued` —
     /// opening a light_client stream before Status completes gets the whole
@@ -485,21 +889,52 @@ struct SwarmCtx {
     /// `earliest_available_slot` learned from each peer's auto-Status reply.
     peer_earliest: HashMap<PeerId, u64>,
     local_status: Arc<LocalStatus>,
+    /// Present only on a serving host; `None` on a wallet, where the
+    /// light-client protocols answer `ResourceUnavailable` as before.
+    lc: Option<Arc<dyn LcResponder>>,
+    /// Response bytes handed to `send_response` but not yet written, plus their
+    /// running total. Bounded by [`MAX_IN_FLIGHT_RESPONSE_BYTES`].
+    ///
+    /// Keyed by (protocol, id) because `InboundRequestId` is issued PER
+    /// `request_response::Behaviour`, and this host runs one behaviour per
+    /// protocol — so two protocols can each mint id 1. Keyed on the id alone,
+    /// the second insert would overwrite the first while both lengths stayed in
+    /// the total, and whichever terminal event arrived first would release the
+    /// wrong entry: the budget leaks until everything is refused.
+    in_flight: HashMap<(&'static str, InboundRequestId), usize>,
+    in_flight_bytes: usize,
+    /// Per connected peer: (the address WE see them coming from, the address
+    /// THEY report seeing us on).
+    ///
+    /// The tally dedupes on the first element, not on the peer id — see
+    /// [`external_address`]. Dropped with the connection, so this is bounded by
+    /// the connected set.
+    observed_ips: HashMap<PeerId, Observation>,
+    /// Source address per peer plus whether THEY dialed US, learned at
+    /// connection time and needed before their Identify arrives.
+    peer_source_ips: HashMap<PeerId, (IpAddr, bool)>,
 }
 
 async fn run_swarm(
     mut swarm: Swarm<Behaviour>,
     mut rx: mpsc::Receiver<Command>,
     local_status: Arc<LocalStatus>,
+    lc: Option<Arc<dyn LcResponder>>,
 ) {
     let mut ctx = SwarmCtx {
         pending: HashMap::new(),
         connected: HashSet::new(),
+        dns_dials: HashMap::new(),
         status_done: HashSet::new(),
         queued: HashMap::new(),
         lc_servers: HashSet::new(),
         peer_earliest: HashMap::new(),
         local_status,
+        lc,
+        in_flight: HashMap::new(),
+        in_flight_bytes: 0,
+        observed_ips: HashMap::new(),
+        peer_source_ips: HashMap::new(),
     };
     loop {
         tokio::select! {
@@ -526,6 +961,31 @@ async fn run_swarm(
                 }
                 Some(Command::LcServers { reply }) => {
                     let _ = reply.send(ctx.lc_servers.clone());
+                }
+                Some(Command::ExternalAddress { reply }) => {
+                    let _ = reply.send(external_address(&ctx.observed_ips));
+                }
+                Some(Command::Observe { peers }) => {
+                    for (peer, addr) in peers {
+                        // Skip peers we already hold a connection to: their
+                        // Identify has already been recorded, and a redundant
+                        // dial would only churn the connection.
+                        if ctx.connected.contains(&peer) {
+                            continue;
+                        }
+                        if let Some(name) = multiaddr_dns_name(&addr) {
+                            ctx.dns_dials.insert(peer, name);
+                        }
+                        use libp2p::swarm::dial_opts::DialOpts;
+                        let opts = DialOpts::peer_id(peer).addresses(vec![addr]).build();
+                        match swarm.dial(opts) {
+                            Ok(()) => {}
+                            Err(libp2p::swarm::DialError::DialPeerConditionFalse(_)) => {}
+                            Err(e) => {
+                                tracing::debug!(peer = %peer, error = %e, "observation dial failed");
+                            }
+                        }
+                    }
                 }
                 Some(Command::CatchupMeta { reply }) => {
                     let _ = reply.send((ctx.lc_servers.clone(), ctx.peer_earliest.clone()));
@@ -564,6 +1024,10 @@ fn submit_request(
         .or_default()
         .push(QueuedRequest { addr: addr.clone(), protocol, wire, reply });
     if !ctx.connected.contains(&peer) {
+        if let Some(name) = multiaddr_dns_name(&addr) {
+            log_resolution(&name, multiaddr_port(&addr).unwrap_or(0));
+            ctx.dns_dials.insert(peer, name);
+        }
         use libp2p::swarm::dial_opts::DialOpts;
         let opts = DialOpts::peer_id(peer).addresses(vec![addr]).build();
         match swarm.dial(opts) {
@@ -619,7 +1083,25 @@ fn mark_status_done(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, peer: Peer
 fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: SwarmEvent<BehaviourEvent>) {
     match event {
         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+            // Remember where this peer reached us from: the external-address
+            // tally dedupes on it, so a host cannot vote more than once by
+            // minting extra peer ids.
+            if let Some(ip) = multiaddr_ip(endpoint.get_remote_address()) {
+                ctx.peer_source_ips.insert(peer_id, (ip, endpoint.is_listener()));
+            }
             let newly = ctx.connected.insert(peer_id);
+            // The name's CURRENT answer. libp2p resolves inside the transport,
+            // so this is the only place the mapping is observable — and on a
+            // dynamic address it is the thing an operator actually wants to
+            // see: which IP the name points at right now, confirmed by a
+            // connection that succeeded rather than by a lookup done elsewhere.
+            if let Some(name) = ctx.dns_dials.remove(&peer_id) {
+                // NOTE: not `endpoint.get_remote_address()` — for a dial by name
+                // that returns the /dns4/ address we asked for, not the address
+                // it resolved to, which makes it useless for exactly this. The
+                // answer is logged by `log_resolution` at dial time instead.
+                tracing::info!(peer = %peer_id, %name, "DNS-PIN connected");
+            }
             tracing::debug!(peer = %peer_id, remote = %endpoint.get_remote_address(),
                 "connection established");
             if newly {
@@ -642,11 +1124,21 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
                 ctx.status_done.remove(&peer_id);
                 ctx.lc_servers.remove(&peer_id);
                 ctx.peer_earliest.remove(&peer_id);
+                ctx.observed_ips.remove(&peer_id);
+                ctx.peer_source_ips.remove(&peer_id);
                 fail_queued(ctx, &peer_id, RequestError::ConnectionClosed);
                 tracing::debug!(peer = %peer_id, "connection closed");
             }
         }
         SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. } => {
+            if let Some(name) = ctx.dns_dials.remove(&peer_id) {
+                // WARN, not debug: a pinned name that stops resolving makes the
+                // server unreachable to every wallet at once, and it is
+                // otherwise indistinguishable from the server being down.
+                tracing::warn!(peer = %peer_id, %name, error = %error,
+                    "DNS-PIN dial FAILED — the name did not resolve, or resolved to \
+                     an address that refused the connection");
+            }
             tracing::debug!(peer = %peer_id, error = %error, "outgoing connection failed");
             fail_queued(ctx, &peer_id, RequestError::DialFailure);
         }
@@ -668,6 +1160,16 @@ fn handle_behaviour_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, even
                 .any(|p| p.as_ref().contains("light_client_updates_by_range"));
             if lc {
                 ctx.lc_servers.insert(peer_id);
+            }
+            if let (Some(ip), Some((source, inbound))) = (
+                multiaddr_ip(&info.observed_addr),
+                ctx.peer_source_ips.get(&peer_id).copied(),
+            ) {
+                // The port is only meaningful when THEY dialed US: then what
+                // they see is our externally mapped port. On a connection we
+                // dialed it is our ephemeral source port.
+                let port = inbound.then(|| multiaddr_port(&info.observed_addr)).flatten();
+                ctx.observed_ips.insert(peer_id, Observation { source, ip, port });
             }
             tracing::debug!(peer = %peer_id, agent = %info.agent_version,
                 protocols = info.protocols.len(), lc_updates = lc, "identify received");
@@ -693,8 +1195,22 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
             request_response::Message::Response { request_id, response } => {
                 complete(ctx, swarm, request_id, peer, Ok(response));
             }
-            request_response::Message::Request { request, channel, .. } => {
-                let response = respond_inbound(ctx, protocol, peer, &request);
+            request_response::Message::Request { request, channel, request_id, .. } => {
+                let mut response = respond_inbound(ctx, protocol, peer, &request);
+                // Refuse rather than queue when the in-flight budget is spent.
+                // ResourceUnavailable is the answer a wallet already knows how
+                // to handle, and it costs us nothing to hold.
+                if ctx.in_flight_bytes.saturating_add(response.len()) > MAX_IN_FLIGHT_RESPONSE_BYTES
+                {
+                    tracing::warn!(peer = %peer, protocol, queued = ctx.in_flight_bytes,
+                        want = response.len(),
+                        "in-flight response budget exhausted — answering ResourceUnavailable");
+                    response = codec::encode_error_response(
+                        codec::RESULT_RESOURCE_UNAVAILABLE,
+                        "ResourceUnavailable",
+                    );
+                }
+                let response_len = response.len();
                 let behaviour = swarm.behaviour_mut();
                 let rr = match protocol {
                     protocols::STATUS_V2 => &mut behaviour.status_v2,
@@ -703,12 +1219,23 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
                     protocols::METADATA_V2 => &mut behaviour.metadata,
                     protocols::GOODBYE => &mut behaviour.goodbye,
                     protocols::BOOTSTRAP => &mut behaviour.bootstrap,
+                    protocols::UPDATES_BY_RANGE => &mut behaviour.updates,
                     protocols::FINALITY_UPDATE => &mut behaviour.finality,
                     protocols::OPTIMISTIC_UPDATE => &mut behaviour.optimistic,
-                    _ => return, // updates_by_range is outbound-only
+                    _ => return,
                 };
                 if rr.send_response(channel, response).is_err() {
                     tracing::debug!(peer = %peer, protocol, "inbound response channel closed");
+                } else {
+                    ctx.in_flight.insert((protocol, request_id), response_len);
+                    ctx.in_flight_bytes = ctx.in_flight_bytes.saturating_add(response_len);
+                }
+                // Goodbye means the peer is leaving. Answering without closing
+                // leaves us holding a connection its owner considers gone —
+                // which on a public responder is how the connection table fills
+                // with peers that will never talk again.
+                if protocol == protocols::GOODBYE {
+                    let _ = swarm.disconnect_peer_id(peer);
                 }
             }
         },
@@ -727,10 +1254,15 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
             tracing::debug!(peer = %peer, protocol, error = %error, "outbound failure");
             complete(ctx, swarm, request_id, peer, Err(mapped));
         }
-        request_response::Event::InboundFailure { peer, error, .. } => {
+        // Both terminal outcomes release the budget; missing either would leak it
+        // and converge on a responder that refuses everything.
+        request_response::Event::InboundFailure { peer, error, request_id, .. } => {
+            release_in_flight(ctx, protocol, request_id);
             tracing::debug!(peer = %peer, protocol, error = %error, "inbound failure");
         }
-        request_response::Event::ResponseSent { .. } => {}
+        request_response::Event::ResponseSent { request_id, .. } => {
+            release_in_flight(ctx, protocol, request_id);
+        }
     }
 }
 
@@ -825,7 +1357,9 @@ fn respond_inbound(ctx: &SwarmCtx, protocol: &'static str, peer: PeerId, raw: &[
     let req_ssz: Vec<u8> = if expected == 0 {
         Vec::new()
     } else {
-        match codec::parse_request_ssz(raw) {
+        // `expected` is exact for every protocol we answer, so the declared
+        // length is checked before the allocation it would otherwise cause.
+        match codec::parse_request_ssz_expecting(raw, Some(expected)) {
             Some(ssz) => ssz,
             None => {
                 return codec::encode_error_response(
@@ -845,13 +1379,22 @@ fn respond_inbound(ctx: &SwarmCtx, protocol: &'static str, peer: PeerId, raw: &[
             let local = ctx.local_status.get();
             codec::encode_success_response(&local.encode_v1(), None)
         }
+        // Ping answers with OUR metadata sequence number, never an echo of the
+        // caller's. Echoing is harmless for a client that dials out and closes,
+        // but a public responder that echoes tells every peer its metadata
+        // changes in lockstep with theirs — so they never refetch our real
+        // metadata, and never learn what we actually serve.
         protocols::PING => {
-            let body: &[u8] = if req_ssz.len() == 8 { &req_ssz } else { &[0u8; 8] };
-            codec::encode_success_response(body, None)
+            codec::encode_success_response(&status::metadata_seq_number().to_le_bytes(), None)
         }
         protocols::METADATA_V2 => {
             codec::encode_success_response(&status::metadata_v2_light_client(), None)
         }
+        // Goodbye is a one-way notification: the spec has no response for it,
+        // and the caller does not wait. We answer to keep the request_response
+        // machinery happy, and the CALLER of this function disconnects the peer
+        // — retaining someone who asked to leave is how a responder accumulates
+        // dead connections.
         protocols::GOODBYE => {
             let reason = if req_ssz.len() == 8 {
                 u64::from_le_bytes(req_ssz[..8].try_into().expect("length checked"))
@@ -862,8 +1405,333 @@ fn respond_inbound(ctx: &SwarmCtx, protocol: &'static str, peer: PeerId, raw: &[
             let body: &[u8] = if req_ssz.len() == 8 { &req_ssz } else { &[0u8; 8] };
             codec::encode_success_response(body, None)
         }
-        // No relay cache yet: same observable result as the Java handlers on a
-        // cold cache — ResourceUnavailable, "ask someone else".
-        _ => codec::encode_error_response(codec::RESULT_RESOURCE_UNAVAILABLE, "ResourceUnavailable"),
+
+        // --- light client -------------------------------------------------
+        // A serving host reads its cache; a wallet has no responder and falls
+        // through to ResourceUnavailable, exactly as before. Note there is no
+        // await point in here by construction: a miss is answered, not filled.
+        protocols::BOOTSTRAP => match (&ctx.lc, req_ssz.as_slice().try_into()) {
+            (Some(lc), Ok(root)) => {
+                let root: [u8; 32] = root;
+                lc.bootstrap(&root).unwrap_or_else(resource_unavailable)
+            }
+            (Some(_), Err(_)) => codec::encode_error_response(
+                codec::RESULT_INVALID_REQUEST,
+                "InvalidRequest: bootstrap root must be 32 bytes",
+            ),
+            (None, _) => resource_unavailable(),
+        },
+        protocols::UPDATES_BY_RANGE => match &ctx.lc {
+            Some(lc) => {
+                if req_ssz.len() != 16 {
+                    return codec::encode_error_response(
+                        codec::RESULT_INVALID_REQUEST,
+                        "InvalidRequest: updates_by_range request must be 16 bytes",
+                    );
+                }
+                let start = u64::from_le_bytes(req_ssz[..8].try_into().expect("checked"));
+                let count = u64::from_le_bytes(req_ssz[8..16].try_into().expect("checked"));
+                lc.updates_by_range(start, count)
+                    .unwrap_or_else(resource_unavailable)
+            }
+            None => resource_unavailable(),
+        },
+        protocols::FINALITY_UPDATE => match &ctx.lc {
+            Some(lc) => lc.finality_update().unwrap_or_else(resource_unavailable),
+            None => resource_unavailable(),
+        },
+        protocols::OPTIMISTIC_UPDATE => match &ctx.lc {
+            Some(lc) => lc.optimistic_update().unwrap_or_else(resource_unavailable),
+            None => resource_unavailable(),
+        },
+
+        _ => resource_unavailable(),
+    }
+}
+
+/// The address a quorum of distinct SOURCES agrees on.
+///
+/// Plurality among reports, then a floor: the winner must have at least
+/// [`EXTERNAL_ADDR_QUORUM`] distinct reporters behind it. Below that we return
+/// `None` rather than the leading candidate — "I do not know yet" is the honest
+/// answer for a server with few connections, and publishing a guess is how a
+/// record ends up pointing at an address nothing answers on.
+///
+/// # Reporters are counted by source address, not by peer id
+///
+/// A peer id is a self-minted keypair that costs nothing, so counting distinct
+/// ids would let ONE host reach quorum alone with three fresh identities —
+/// out-voting every honest reporter whenever the honest set is small, which is
+/// precisely the state just after a restart, when the answer first settles.
+/// Deduping on the address the reporter reached us from raises that cost from
+/// "generate three keypairs" to "hold three distinct addresses".
+///
+/// Honest peers behind one NAT now count once between them. That makes quorum
+/// HARDER to reach, which is the safe direction for a value that will drive a
+/// published record: the failure mode becomes "we decline to claim an address",
+/// not "we claim the wrong one".
+fn external_address(observed: &HashMap<PeerId, Observation>) -> Option<ExternalAddress> {
+    // One vote per source address. A source reporting different values across
+    // its own connections collapses to one of them, which is the point.
+    let mut by_source: HashMap<IpAddr, (IpAddr, Option<u16>)> = HashMap::new();
+    for o in observed.values() {
+        by_source.insert(o.source, (o.ip, o.port));
+    }
+    let reporters = by_source.len();
+    let mut counts: HashMap<IpAddr, usize> = HashMap::new();
+    for (ip, _) in by_source.values() {
+        *counts.entry(*ip).or_insert(0) += 1;
+    }
+    // Ties break on the IP itself, so the answer is deterministic rather than
+    // dependent on hash iteration order — a flapping answer would look exactly
+    // like a flapping address.
+    let (ip, confirmations) = counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))?;
+    // The port MOST reporters who back the winning IP agree on — by frequency,
+    // ties broken on the value, exactly as the IP above.
+    //
+    // `find_map` over a HashMap took whichever backer hash order happened to
+    // visit first, so when reporters disagreed (a NAT rewriting the port for
+    // some peers, or a mix of listen-port and mapped-port views) the answer
+    // flipped between calls with no change in the underlying data. That is the
+    // same failure the IP tie-break exists to prevent, and it matters more here
+    // because `dialable()` publishes this port.
+    let mut port_counts: HashMap<u16, usize> = HashMap::new();
+    for (seen, port) in by_source.values() {
+        if *seen == ip {
+            if let Some(p) = port {
+                *port_counts.entry(*p).or_insert(0) += 1;
+            }
+        }
+    }
+    let port = port_counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+        .map(|(p, _)| p);
+
+    (confirmations >= EXTERNAL_ADDR_QUORUM).then_some(ExternalAddress {
+        ip,
+        port,
+        confirmations,
+        reporters,
+        routable: is_routable(ip),
+    })
+}
+
+fn release_in_flight(ctx: &mut SwarmCtx, protocol: &'static str, request_id: InboundRequestId) {
+    if let Some(bytes) = ctx.in_flight.remove(&(protocol, request_id)) {
+        ctx.in_flight_bytes = ctx.in_flight_bytes.saturating_sub(bytes);
+    }
+}
+
+/// The miss answer — "ask someone else", which is what makes a pure-cache-read
+/// handler correct rather than a shortcut.
+fn resource_unavailable() -> Vec<u8> {
+    codec::encode_error_response(codec::RESULT_RESOURCE_UNAVAILABLE, "ResourceUnavailable")
+}
+
+#[cfg(test)]
+mod external_address_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    /// Deterministic distinct peer ids — a seeded key, not a random one, so a
+    /// failure reproduces.
+    fn peer(n: u8) -> PeerId {
+        let mut seed = [0u8; 32];
+        seed[0] = n;
+        let kp = libp2p::identity::Keypair::ed25519_from_bytes(seed).expect("seeded key");
+        PeerId::from(kp.public())
+    }
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(87, 154, 209, last))
+    }
+
+    /// A report from a distinct host: source address `src`, seeing us as `seen`.
+    fn obs(src: u8, seen: IpAddr) -> Observation {
+        Observation {
+            source: IpAddr::V4(Ipv4Addr::new(10, 0, 0, src)),
+            ip: seen,
+            port: None,
+        }
+    }
+
+    #[test]
+    fn below_quorum_is_none_not_a_best_guess() {
+        let mut observed = HashMap::new();
+        for i in 0..(EXTERNAL_ADDR_QUORUM - 1) as u8 {
+            observed.insert(peer(i), obs(i, ip(161)));
+        }
+        assert_eq!(
+            external_address(&observed),
+            None,
+            "a server with too few reports genuinely does not know its own address"
+        );
+    }
+
+    #[test]
+    fn quorum_is_believed() {
+        let mut observed = HashMap::new();
+        for i in 0..EXTERNAL_ADDR_QUORUM as u8 {
+            observed.insert(peer(i), obs(i, ip(161)));
+        }
+        let got = external_address(&observed).unwrap();
+        assert_eq!(got.ip, ip(161));
+        assert_eq!(got.confirmations, EXTERNAL_ADDR_QUORUM);
+        assert_eq!(got.reporters, EXTERNAL_ADDR_QUORUM);
+        assert!(got.routable);
+        assert!(!got.is_contested());
+    }
+
+    #[test]
+    fn a_minority_cannot_move_the_answer() {
+        // The point of the quorum: peers claiming something else — lying, or
+        // honestly wrong behind the same NAT — must not win.
+        let mut observed = HashMap::new();
+        for i in 0..5u8 {
+            observed.insert(peer(i), obs(i, ip(161)));
+        }
+        for i in 5..7u8 {
+            observed.insert(peer(i), obs(i, ip(99)));
+        }
+        let got = external_address(&observed).unwrap();
+        assert_eq!(got.ip, ip(161));
+        assert_eq!(got.reporters, 7, "the denominator must be visible");
+        assert!(!got.is_contested(), "5 of 7 is not contested");
+    }
+
+    #[test]
+    fn one_peer_cannot_stuff_the_ballot() {
+        // Keyed by peer, so repeated reports from one peer replace rather than
+        // accumulate.
+        let mut observed = HashMap::new();
+        let loud = peer(1);
+        for _ in 0..10 {
+            observed.insert(loud, obs(1, ip(99)));
+        }
+        assert_eq!(external_address(&observed), None, "one peer is not a quorum");
+    }
+
+    #[test]
+    fn the_answer_is_deterministic_under_a_tie() {
+        // A tie resolved by hash iteration order would look exactly like a
+        // flapping address — the thing this mechanism exists to detect.
+        let mut observed = HashMap::new();
+        for i in 0..EXTERNAL_ADDR_QUORUM as u8 {
+            observed.insert(peer(i), obs(i, ip(1)));
+        }
+        for i in 0..EXTERNAL_ADDR_QUORUM as u8 {
+            observed.insert(peer(i + 50), obs(i + 50, ip(2)));
+        }
+        let first = external_address(&observed).unwrap().ip;
+        for _ in 0..20 {
+            assert_eq!(external_address(&observed).unwrap().ip, first);
+        }
+    }
+
+    #[test]
+    fn one_host_cannot_stuff_the_ballot_with_free_keypairs() {
+        // The property the ENR actually needs. A peer id is a self-minted
+        // keypair costing nothing, so counting distinct IDS would let one
+        // machine reach quorum alone — most easily right after a restart, when
+        // the honest set is smallest and the answer first settles.
+        let mut observed = HashMap::new();
+        for i in 0..10u8 {
+            // Ten identities, ONE source address.
+            observed.insert(peer(i), obs(7, ip(99)));
+        }
+        assert_eq!(
+            external_address(&observed),
+            None,
+            "ten identities behind one address are one reporter"
+        );
+    }
+
+    #[test]
+    fn a_contested_plurality_is_flagged() {
+        // 3-vs-3 must not read as an established address: one more reporter
+        // flips the winner, and that is the shape both a Sybil and a genuine
+        // mid-flight address change produce.
+        let mut observed = HashMap::new();
+        for i in 0..3u8 {
+            observed.insert(peer(i), obs(i, ip(1)));
+        }
+        for i in 3..6u8 {
+            observed.insert(peer(i), obs(i, ip(2)));
+        }
+        let got = external_address(&observed).unwrap();
+        assert_eq!(got.reporters, 6);
+        assert_eq!(got.confirmations, 3);
+        assert!(got.is_contested(), "3 of 6 is contested");
+    }
+
+    #[test]
+    fn non_routable_winners_are_labelled() {
+        // The PR's own verification established 127.0.0.1 from three loopback
+        // wallets. The realistic version is RFC1918: LAN wallets reach quorum
+        // before internet peers do.
+        for addr in [
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
+            IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
+            IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), // carrier-grade NAT
+            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+        ] {
+            assert!(!is_routable(addr), "{addr} must not read as routable");
+        }
+        assert!(is_routable(ip(161)), "the pinned deployment's address is routable");
+        assert!(!is_routable("fd00::1".parse().unwrap()), "ULA");
+        assert!(!is_routable("fe80::1".parse().unwrap()), "link-local");
+        assert!(!is_routable("::1".parse().unwrap()), "v6 loopback");
+        assert!(is_routable("2001:db8::1".parse().unwrap()));
+
+        let mut observed = HashMap::new();
+        for i in 0..EXTERNAL_ADDR_QUORUM as u8 {
+            observed.insert(peer(i), obs(i, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5))));
+        }
+        assert!(!external_address(&observed).unwrap().routable);
+    }
+
+    #[test]
+    fn the_port_is_carried_only_from_inbound_reports() {
+        // Inbound: the reporter dialed us, so what they see IS our externally
+        // mapped port — the fact that makes a NAT rewriting it detectable.
+        let mut observed = HashMap::new();
+        for i in 0..EXTERNAL_ADDR_QUORUM as u8 {
+            observed.insert(
+                peer(i),
+                Observation {
+                    source: IpAddr::V4(Ipv4Addr::new(10, 0, 0, i)),
+                    ip: ip(161),
+                    port: Some(9105),
+                },
+            );
+        }
+        assert_eq!(external_address(&observed).unwrap().port, Some(9105));
+
+        // Outbound-only reports carry no port rather than an ephemeral one.
+        let mut outbound = HashMap::new();
+        for i in 0..EXTERNAL_ADDR_QUORUM as u8 {
+            outbound.insert(peer(i), obs(i, ip(161)));
+        }
+        assert_eq!(external_address(&outbound).unwrap().port, None);
+    }
+
+    #[test]
+    fn extracts_the_ip_and_ignores_the_port() {
+        // Identify reports the connection's remote address, so for a connection
+        // WE dialed the port is our ephemeral source port and says nothing about
+        // where we listen.
+        let addr: Multiaddr = "/ip4/87.154.209.161/tcp/54321".parse().unwrap();
+        assert_eq!(multiaddr_ip(&addr), Some(ip(161)));
+        let addr6: Multiaddr = "/ip6/::1/tcp/9105".parse().unwrap();
+        assert!(multiaddr_ip(&addr6).is_some());
+        let no_ip: Multiaddr = "/dns4/example.com/tcp/9105".parse().unwrap();
+        assert_eq!(multiaddr_ip(&no_ip), None);
+        assert_eq!(multiaddr_port(&addr), Some(54321));
     }
 }

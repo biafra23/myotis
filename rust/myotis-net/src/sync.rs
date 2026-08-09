@@ -51,6 +51,12 @@ pub struct ChainConfig {
     pub genesis_time: u64,
     pub seconds_per_slot: u64,
     pub slots_per_epoch: u64,
+    /// Epochs per sync-committee period. 256 everywhere except gnosis (512),
+    /// whose 16-slot epochs make `slots_per_epoch * this` land on 8192 anyway —
+    /// which is exactly why hardcoding 8192 survived this long. It is a
+    /// VERIFICATION input (it picks the committee an update is checked
+    /// against), so the wallet is told it and never asks a node for it.
+    pub epochs_per_sync_committee_period: u64,
     /// EIP-7892 active BPO entry folded into the fork digest (0 epoch = none).
     pub blob_params_epoch: u64,
     pub blob_params_max_blobs: u64,
@@ -73,8 +79,72 @@ pub struct ChainConfig {
 }
 
 impl ChainConfig {
+    /// Slots per sync-committee period — the geometry every period division uses.
+    pub fn slots_per_period(&self) -> u64 {
+        // CHECKED, not saturating. Saturating would turn an overflowing config
+        // into u64::MAX, which puts every real slot in period 0 — a wrong
+        // committee for every update, silently. Both factors are compile-time
+        // constants in every shipped config, so a panic here is a build error
+        // surfacing, never a runtime condition.
+        self.slots_per_epoch
+            .checked_mul(self.epochs_per_sync_committee_period)
+            .filter(|p| *p > 0)
+            .expect("chain geometry must be non-zero and must not overflow")
+    }
+
     /// Mainnet — values duplicated verbatim from the Java
     /// `NetworkConfig.MAINNET` (networking/src/main/java/.../NetworkConfig.java).
+    /// `MYOTIS_CL_STATIC_PEERS` — REPLACE the pinned light-client-serving peers
+    /// for this run, comma-separated `/ip4/../tcp/../p2p/..` multiaddrs.
+    ///
+    /// The CL twin of `MYOTIS_EL_BOOT_ENODES`, and it exists for the same two
+    /// reasons: dialing a serving node that lives on this machine over loopback
+    /// instead of hairpinning through the router's NAT, and pointing a wallet at
+    /// a *candidate* server — `rust/roost` — before its address is pinned in
+    /// this file or published in an ENR. An empty or unset value changes
+    /// nothing.
+    fn env_static_peers() -> Option<Vec<String>> {
+        let raw = std::env::var("MYOTIS_CL_STATIC_PEERS").ok()?;
+        let peers: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if peers.is_empty() {
+            return None;
+        }
+        tracing::info!(count = peers.len(), "MYOTIS_CL_STATIC_PEERS overrides the pinned CL peers");
+        Some(peers)
+    }
+
+    /// Apply any environment overrides. Called by every constructor, so a
+    /// network added later cannot silently miss them.
+    fn with_env_overrides(mut self) -> Self {
+        if let Some(peers) = Self::env_static_peers() {
+            self.static_peers = peers;
+        }
+        // `MYOTIS_CL_DISABLE_DISCV5=1` — drop the discv5 bootstrap ENRs, leaving
+        // the static peers as the ONLY way to find a CL peer. This is what makes
+        // "can a wallet sync from this one server alone?" an honest question:
+        // with discovery on, a wallet that silently syncs from a random public
+        // peer looks exactly like one the server is serving properly.
+        //
+        // Note this pair is strictly stronger than MYOTIS_EL_BOOT_ENODES on its
+        // own: pinning peers still leaves discovery as a fallback, while pinning
+        // AND disabling discovery lets whoever controls the environment decide
+        // the wallet's only source. That is a LIVENESS exposure, not a
+        // correctness one — every byte is still verified against the wallet's
+        // own anchor, so the worst case is withholding, which surfaces as
+        // `beaconNotSynced` rather than a wrong answer. Intended for testing a
+        // candidate server; do not set it in a shipped configuration.
+        if matches!(std::env::var("MYOTIS_CL_DISABLE_DISCV5").as_deref(), Ok("1") | Ok("true")) {
+            tracing::info!("MYOTIS_CL_DISABLE_DISCV5 set — discv5 bootstrap ENRs cleared");
+            self.bootstrap_enrs.clear();
+        }
+        self
+    }
+
     pub fn mainnet() -> Self {
         Self {
             name: "mainnet",
@@ -88,6 +158,7 @@ impl ChainConfig {
             genesis_time: 1_606_824_023, // 2020-12-01 12:00:23 UTC
             seconds_per_slot: 12,
             slots_per_epoch: 32,
+            epochs_per_sync_committee_period: 256,
             // BPO2 (Fusaka) blob schedule entry: epoch 419072, MAX_BLOBS=21.
             blob_params_epoch: 419_072,
             blob_params_max_blobs: 21,
@@ -106,6 +177,7 @@ impl ChainConfig {
             snapshot_path: None,
             cl_peer_cache_path: None,
         }
+        .with_env_overrides()
     }
 
     /// Sepolia — values duplicated verbatim from the Java
@@ -126,6 +198,7 @@ impl ChainConfig {
             genesis_time: 1_655_733_600, // 2022-06-20 14:00:00 UTC
             seconds_per_slot: 12, // mainnet preset
             slots_per_epoch: 32,
+            epochs_per_sync_committee_period: 256,
             // EIP-7892 BLOB_SCHEDULE — latest active entry on sepolia: BPO2 at
             // epoch 275712, MAX_BLOBS_PER_BLOCK=21 (2025-10-28).
             blob_params_epoch: 275_712,
@@ -148,6 +221,7 @@ impl ChainConfig {
             snapshot_path: None,
             cl_peer_cache_path: None,
         }
+        .with_env_overrides()
     }
 
     /// Gnosis Chain — values duplicated verbatim from the Java
@@ -168,25 +242,37 @@ impl ChainConfig {
             genesis_time: 1_638_993_340, // 2021-12-08 19:55:40 UTC
             seconds_per_slot: 5,
             slots_per_epoch: 16,
+            epochs_per_sync_committee_period: 512,
             // EIP-7892: Gnosis has no explicit BLOB_SCHEDULE — clients fold the
             // Electra-baseline params (ELECTRA_FORK_EPOCH=1337856, MAX_BLOBS=2)
             // into the Fulu digest. Yields the live-verified digest 0x3237dab6.
             blob_params_epoch: 1_337_856,
             blob_params_max_blobs: 2,
             // Copied verbatim from the @checkpoint:gnosis:begin/end region of
-            // NetworkConfig.java (slot 28516336, 2026-06-16, period 3480 —
-            // deliberately one period behind head, see refreshGnosisCheckpoint).
+            // NetworkConfig.java (slot 29460368, 2026-08-09, period 3596).
             // A refresh must be mirrored here by hand until plan PR7.
+            //
+            // Refreshed so the anchor sits INSIDE the period roost@gnosis can
+            // serve. The previous anchor (period 3480) was 116 periods behind,
+            // and roost's archive only grows forward from where it started, so
+            // no amount of waiting would have closed that gap — a wallet
+            // bootstrapping from it got ResourceUnavailable forever.
+            //
+            // Cross-validated: refreshGnosisCheckpoint could only reach ONE of
+            // its three providers (the other two 404), so this root was checked
+            // against the local gnosis beacon node, which reached the same slot
+            // independently over p2p, and against its finalized checkpoint.
             checkpoint_root: hex32(
-                "dc1ce049946173d38463595f907f19893e4fd956c740913fb70d94d34e07e789",
+                "84f127f4bbb1e733c5607910c2df1d2c0e726e2fab0a4690b66cd07a5c2455bf",
             ),
-            checkpoint_slot: 28_516_336,
+            checkpoint_slot: 29_460_368,
             static_peers: GNOSIS_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: GNOSIS_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
             snapshot_path: None,
             cl_peer_cache_path: None,
         }
+        .with_env_overrides()
     }
 
     /// Fork digests accepted when filtering discv5 ENRs — current first, then
@@ -214,7 +300,10 @@ impl ChainConfig {
     /// correct for created-but-not-started handles, instead of snapshot-carrying
     /// a value that goes stale).
     pub fn wall_clock_period(&self) -> u64 {
-        spec::compute_sync_committee_period(self.current_slot_estimate())
+        spec::compute_sync_committee_period_with(
+            self.current_slot_estimate(),
+            self.slots_per_period(),
+        )
     }
 
     /// Wall-clock slot estimate — THE clock read of this crate.
@@ -235,15 +324,61 @@ fn hex32(s: &str) -> [u8; 32] {
     out
 }
 
-/// Pinned sepolia LC-serving peer multiaddrs (Java `NetworkConfig.SEPOLIA.clPeerMultiaddrs`
-/// — keep the two lists and their ORDER in step).
 ///
-/// First is the dedicated myotis-serving Nimbus (docs/dedicated-sepolia-node.md): it
-/// serves `light_client_bootstrap` / `updates_by_range` default-on, and being first
-/// means the light client tries it before the discovered pool. Its peer-id is stable
-/// only because that node pins `--netkey-file`; Nimbus otherwise mints a new one per
-/// restart, which invalidates this entry with `InvalidRemotePubKey`.
+/// ORDER LOOKS BACKWARDS AND IS NOT. The literal comes FIRST and the name LAST
+/// because the two engines consume the pair differently, and the engine that
+/// cannot recover is the one that must end up on the name:
+///
+///   Rust  — `PeerPool::add` REFRESHES a static peer's address in place (the
+///           #322 fix), so for one peer id the LAST entry wins. Statics are
+///           un-evictable and roost publishes no ENR, so a stale literal here
+///           could never self-heal: no eviction, no rediscovery, undialable
+///           until a release. Ending on the name is what makes an address
+///           change survivable.
+///   Java  — dedupes by multiaddr string and walks the list in order, so it
+///           tries the literal first and falls through to the name. A stale
+///           literal costs one failed dial, then the name resolves. That is why
+///           the "worse" order is harmless there.
+///
+/// Putting the name first inverts both: Rust would keep the literal (the case
+/// that cannot recover) and gain nothing.
+
+/// Pinned sepolia LC-serving peer multiaddrs (Java `NetworkConfig.SEPOLIA.clPeerMultiaddrs`
+/// — keep the two lists, their ORDER and their addresses in step;
+/// `sepolia_config_matches_networkconfig_java` pins this side, and the Java
+/// `NetworkConfigGnosisTest` pins that one).
+///
+/// First is roost, the dedicated light-client server. The per-entry comments below
+/// carry the reasoning and each entry's own stability caveat.
 const SEPOLIA_STATIC_PEERS: &[&str] = &[
+    // roost, the dedicated light-client server (rust/roost, docs/lc-server-design.md).
+    // FIRST on purpose: it exists because a general-purpose beacon node is
+    // structurally bad at serving wallets — one connection semaphore shared
+    // between inbound and outbound, and a trimmer that drops light clients
+    // first. Nimbus stays below it, so a roost fault degrades to exactly
+    // today's behaviour rather than to nothing.
+    //
+    // Its peer id comes from /data/roost/sepolia.key and is stable across
+    // restarts by construction; unlike the Nimbus entry there is no flag to
+    // forget, because roost has no mode in which it mints a fresh one.
+    //
+    // Pinning a literal IP has the same exposure as the entries below: the line
+    // is residential and the address is not guaranteed stable. ENR publication
+    // (design §7) is what removes it. See ROOST_PIN_ORDER above for why the
+    // literal precedes the name.
+    // roost BY NAME, ahead of its own literal IP.
+    //
+    // The line is residential and the address is not guaranteed stable; the
+    // name is DynDNS with a ~30s TTL and libp2p resolves it AT DIAL TIME, every
+    // dial, so an address change costs one failed dial instead of a release.
+    //
+    // The literal below is kept deliberately as the next entry: DNS resolution
+    // is verified working on the RUST engine (live sync from roost over this
+    // name) but NOT on the Java one, which is the default — jvm-libp2p parses
+    // the multiaddr and extracts the peer id, but its transport's DNS handling
+    // is unverified. If it cannot dial a name it falls through to the IP and
+    // behaves exactly as before. Drop the literal once Java is confirmed.
+    "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
     "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
     "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS",
 ];
@@ -276,6 +411,16 @@ const SEPOLIA_BOOTSTRAP_ENRS: &[&str] = &[
 /// by multiaddr string and would dial both) — keeping the lists identical means
 /// keeping them one-per-id.
 const GNOSIS_STATIC_PEERS: &[&str] = &[
+    // roost gnosis. Same reasoning as the other two chains; see
+    // MAINNET_STATIC_PEERS. 9108/tcp verified forwarded before pinning (hairpin
+    // connect showing the public IP as the source address).
+    //
+    // Gnosis is the chain where roost's fork digest had to be FIXED before this
+    // pin was safe: BLOB_SCHEDULE is empty here, so roost stamped the bare Fulu
+    // digest and every peer answered Goodbye(IrrelevantNetwork). Pinning a
+    // server in that state would have cost every gnosis wallet its
+    // strikes-to-eviction on a peer that could never answer.
+    "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
     "/ip4/104.37.190.86/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59",
     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
     "/ip4/135.129.103.34/tcp/9006/p2p/16Uiu2HAmA5FYL7dQftsHktHvuVTRyPdc1sH6qcWiXaVEPM6FMyN2",
@@ -316,6 +461,23 @@ const GNOSIS_BOOTSTRAP_ENRS: &[&str] = &[
 /// Known light-client-serving mainnet peers — the Java `NetworkConfig.MAINNET`
 /// clPeerMultiaddrs list (nimbus/lodestar/lighthouse, discovered 2026-03-11).
 const MAINNET_STATIC_PEERS: &[&str] = &[
+    // roost mainnet (rust/roost). FIRST for the same reason as sepolia: a
+    // general-purpose beacon node shares one connection semaphore between
+    // inbound and outbound and trims light clients first, so the peers below
+    // are structurally unreliable for us in a way roost is not. Identity comes
+    // from /data/roost/mainnet.key and is stable by construction.
+    //
+    // 9109/tcp was confirmed forwarded before this was pinned (hairpin connect
+    // showing the public IP as the source address, plus 145 inbound peers on
+    // the neighbouring 9107). Pinning an unreachable address is not free — a
+    // wallet spends its strikes-to-eviction on a node that is actually fine.
+    //
+    // Same residential-IP exposure as every literal here; ENR publication
+    // (docs/lc-server-design.md §7) is what removes it. NOTE that roost cannot
+    // currently notice its own IP changing — its Identify quorum never settles
+    // because it makes no outbound connections — so this line is the thing that
+    // breaks if the address moves.
+    "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
     "/ip4/176.229.58.1/tcp/9001/p2p/16Uiu2HAmHu1BxzrSWg7sN9JyJenC5unK5ntdk5QFYqQdQyyD7x3a",
     "/ip4/81.172.166.237/tcp/9001/p2p/16Uiu2HAmRogw5aqM4ZuVEmZoQvFp25sUnnQ9wpGuWXRLFMmXc88j",
     "/ip4/54.157.213.0/tcp/9000/p2p/16Uiu2HAmQz83bNmMaBFCafuxDasiNdPYZF1B4zhgo3DckByU8bo3",
@@ -1029,7 +1191,7 @@ async fn run_sync(
     let mut discovery_retry_in = 0u32;
 
     let mut processor = LightClientProcessor::new(
-        LightClientStore::new(),
+        LightClientStore::new(config.slots_per_period()),
         config.fork_version,
         config.genesis_validators_root,
     );
@@ -1070,7 +1232,8 @@ async fn run_sync(
     // reads/writes the identical file). Anything else → fresh bootstrap. A
     // restored store stays on probation (ResumeGuard) until one update
     // BLS-verifies against it; see RESUME_REJECTS_MAX.
-    let checkpoint_period = spec::compute_sync_committee_period(config.checkpoint_slot);
+    let checkpoint_period =
+        spec::compute_sync_committee_period_with(config.checkpoint_slot, config.slots_per_period());
     let mut in_catchup = false;
     // Floor the persist throttle at the CHECKPOINT period: a snapshot at (or
     // below) the checkpoint period can never be resumed (the strictly-newer
@@ -1142,6 +1305,7 @@ async fn run_sync(
             processor.store.current_period(),
             processor.store.finalized_slot(),
             config.slots_per_epoch,
+            config.slots_per_period(),
         );
         if hunt_now != hunting {
             hunting = hunt_now;
@@ -1201,7 +1365,7 @@ async fn run_sync(
             }
         }
 
-        let wall_period = spec::compute_sync_committee_period(config.current_slot_estimate());
+        let wall_period = config.wall_clock_period();
         if wall_period > processor.store.current_period() {
             // Baseline the progress bar at every catch-up ENTRY (not just
             // bootstrap/resume): a process that reached SYNCED and re-enters
@@ -1238,7 +1402,7 @@ async fn run_sync(
                 if let Some(path) = &config.snapshot_path {
                     let _ = std::fs::remove_file(path);
                 }
-                processor.store = LightClientStore::new();
+                processor.store = LightClientStore::new(config.slots_per_period());
                 staged_updates.clear();
                 last_persisted_period = checkpoint_period; // keep the never-persist-checkpoint floor
                 resume = ResumeGuard::fresh();
@@ -1256,7 +1420,7 @@ async fn run_sync(
             persist_snapshot(&config, &processor, &mut last_persisted_period);
             refresh_local_status(&config, &processor, &local_status);
             publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, hunting).await;
-            if spec::compute_sync_committee_period(config.current_slot_estimate())
+            if config.wall_clock_period()
                 > processor.store.current_period()
             {
                 // Still behind: skip the finality poll — while the committee is
@@ -1614,11 +1778,12 @@ fn hunt_due(
     store_period: u64,
     finalized_slot: u64,
     slots_per_epoch: u64,
+    slots_per_period: u64,
 ) -> bool {
     if !store_initialized {
         return since_sync_start >= HUNT_BOOTSTRAP_STALL;
     }
-    let wall_period = spec::compute_sync_committee_period(wall_slot);
+    let wall_period = spec::compute_sync_committee_period_with(wall_slot, slots_per_period);
     if wall_period > store_period {
         return since_progress >= HUNT_CATCHUP_STALL;
     }
@@ -1677,7 +1842,8 @@ async fn catch_up(
     loop {
         drain_discovered(peer_rx, pool);
         let slot_estimate = config.current_slot_estimate();
-        let wall_period = spec::compute_sync_committee_period(slot_estimate);
+        let wall_period =
+        spec::compute_sync_committee_period_with(slot_estimate, config.slots_per_period());
         // Start from the committee's own period, NOT the finalized slot's:
         // after a force-rotate the two diverge by one period (see the Java
         // comment in catchUpSyncCommittee).
@@ -1736,7 +1902,8 @@ async fn catch_up(
         let too_shallow: HashSet<PeerId> = earliest_slots
             .into_iter()
             .filter(|&(_, earliest)| {
-                spec::compute_sync_committee_period(earliest) > committee_period
+                spec::compute_sync_committee_period_with(earliest, config.slots_per_period())
+                    > committee_period
             })
             .map(|(id, _)| id)
             .collect();
@@ -2351,7 +2518,8 @@ async fn publish_status(
     let store = &processor.store;
     update_exec_anchor(store, anchor);
     let wall_slot = config.current_slot_estimate();
-    let wall_period = spec::compute_sync_committee_period(wall_slot);
+    let wall_period =
+        spec::compute_sync_committee_period_with(wall_slot, config.slots_per_period());
     let state = if !store.is_initialized() {
         SyncState::Bootstrapping
     } else if wall_period == store.current_period()
@@ -2412,7 +2580,7 @@ mod tests {
     #[test]
     fn exec_anchor_fed_from_store_headers() {
         let anchor = ExecAnchor::new();
-        let mut store = LightClientStore::new();
+        let mut store = LightClientStore::new_mainnet_preset();
         store.update_finalized(&header_with_exec(1000, [0x11; 32], 21_000_000, [0x22; 32]), 1000);
         // Mirror the processor: the optimistic header is tracked at the SIGNATURE
         // slot (1003), one past the attested block's beacon.slot (1002).
@@ -2442,7 +2610,7 @@ mod tests {
         // register a zero state root as the finalized anchor — that would make
         // is_synced() true against a bogus root.
         let anchor = ExecAnchor::new();
-        let mut store = LightClientStore::new();
+        let mut store = LightClientStore::new_mainnet_preset();
         store.update_finalized(&header_with_exec(5, [0u8; 32], 0, [0u8; 32]), 5);
 
         update_exec_anchor(&store, &anchor);
@@ -2470,7 +2638,16 @@ mod tests {
         // The live digest the Java computes (verified against jshell).
         assert_eq!(c.current_fork_digest(), [0x8C, 0x9F, 0x62, 0xFE]);
         assert_eq!(c.accepted_fork_digests(), vec![[0x8C, 0x9F, 0x62, 0xFE]]);
-        assert_eq!(c.static_peers.len(), 18);
+        // 18 discovered peers + roost mainnet, pinned by NAME only.
+        assert_eq!(c.static_peers.len(), 19);
+        // roost is FIRST — the ordering is the point, not an accident of the
+        // list. The Java twin prepends it with prependLocal(); if these two ever
+        // disagree on position, the default engine and the Rust engine pick
+        // different first-choice peers and only one of them is the dedicated one.
+        assert_eq!(
+            c.static_peers[0],
+            "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC"
+        );
         assert_eq!(c.bootstrap_enrs.len(), 17);
         assert_eq!(c.chain_id, 1);
     }
@@ -2499,12 +2676,34 @@ mod tests {
         // NetworkConfig.SEPOLIA.currentForkDigest() — BPO2 folded in).
         assert_eq!(c.current_fork_digest(), [0x74, 0xD0, 0x14, 0x59]);
         assert_eq!(c.accepted_fork_digests(), vec![[0x74, 0xD0, 0x14, 0x59]]);
-        // Two pinned LC peers, the dedicated serving node FIRST — same list and
-        // order as the Java NetworkConfig.SEPOLIA.clPeerMultiaddrs.
-        assert_eq!(c.static_peers.len(), 2);
-        assert!(c.static_peers[0].ends_with(
-            "/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6"
-        ));
+        // The full list, in order, addresses included — NOT a suffix match.
+        //
+        // This does NOT read the Java config: the two are hand-maintained copies
+        // and nothing mechanically compares them. What it does is fail whenever
+        // THIS side changes, which pairs with the Java `NetworkConfigGnosisTest`
+        // failing whenever THAT side changes — so an edit to one is caught by
+        // the other's test only if the editor runs both suites. Treat it as a
+        // tripwire, not an enforced invariant.
+        //
+        // The addresses matter as much as the order. The Java twin asserts full
+        // strings; matching only the `/tcp/<port>/p2p/<peer-id>` suffix here
+        // would let an IP rotation be fixed on the Java side while this list
+        // kept a dead address — and this list is the ONLY one iOS has, since
+        // :app-ios runs the Rust engine exclusively.
+        assert_eq!(
+            c.static_peers,
+            vec![
+                "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
+                "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
+                "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS",
+            ],
+            "roost first (the dedicated LC server), the dedicated Nimbus second as \
+             fallback — same list, order AND addresses as the Java \
+             NetworkConfig.SEPOLIA.clPeerMultiaddrs"
+        );
+        // A malformed pin would otherwise reach run_sync and surface only as a
+        // "skipping unparseable static peer multiaddr" warn.
+        assert!(c.static_peers.iter().all(|p| parse_static_peer(p).is_some()));
         assert_eq!(c.bootstrap_enrs.len(), 9);
     }
 
@@ -2514,10 +2713,10 @@ mod tests {
         assert_eq!(c.chain_id, 100);
         assert_eq!(c.fork_version, [0x06, 0x00, 0x00, 0x64]); // Fulu on Gnosis
         assert_eq!(c.prior_fork_version, Some([0x05, 0x00, 0x00, 0x64])); // Electra
-        assert_eq!(c.checkpoint_slot, 28_516_336);
+        assert_eq!(c.checkpoint_slot, 29_460_368);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "dc1ce049946173d38463595f907f19893e4fd956c740913fb70d94d34e07e789"
+            "84f127f4bbb1e733c5607910c2df1d2c0e726e2fab0a4690b66cd07a5c2455bf"
         );
         assert_eq!(
             hex_str(&c.genesis_validators_root),
@@ -2525,9 +2724,21 @@ mod tests {
         );
         assert_eq!(c.genesis_time, 1_638_993_340);
         assert_eq!((c.seconds_per_slot, c.slots_per_epoch), (5, 16));
+        // 16 x 512 = 8192, the SAME product as mainnet's 32 x 256. That equality
+        // is why a hardcoded 8192 worked on gnosis by accident; pin both factors
+        // so a chain that breaks the coincidence fails here rather than in
+        // committee selection.
+        assert_eq!(c.epochs_per_sync_committee_period, 512);
+        assert_eq!(c.slots_per_period(), 8192);
+        assert_eq!(ChainConfig::mainnet().slots_per_period(), 8192);
+        assert_eq!(ChainConfig::mainnet().epochs_per_sync_committee_period, 256);
         assert_eq!((c.blob_params_epoch, c.blob_params_max_blobs), (1_337_856, 2));
         // 512 epochs x 16 slots = the same 8192-slot period as mainnet-preset.
-        assert_eq!(spec::compute_sync_committee_period(c.checkpoint_slot), 3480);
+        // 3596 — the SAME period roost@gnosis serves. That is not incidental:
+        // the previous anchor sat at 3480, 116 periods below roost's floor, and
+        // roost's archive only grows forward, so a wallet could never have
+        // bootstrapped from it.
+        assert_eq!(spec::compute_sync_committee_period(c.checkpoint_slot), 3596);
         // Live-verified digests the Java computes (NetworkConfig.GNOSIS
         // currentForkDigest / acceptedForkDigests): Fulu first, Electra fallback.
         assert_eq!(c.current_fork_digest(), [0x32, 0x37, 0xDA, 0xB6]);
@@ -2539,20 +2750,47 @@ mod tests {
         // NetworkConfig.GNOSIS.clPeerMultiaddrs, ONE ADDRESS PER PEER ID
         // (`PeerPool::add` dedupes by peer id, so a second address for a known
         // id would never be dialed here while Java dialed both).
-        assert_eq!(c.static_peers.len(), 22);
-        assert!(c.static_peers[0].ends_with(
+        // 22 discovered gnosis peers + roost, pinned by NAME only.
+        assert_eq!(c.static_peers.len(), 23);
+        // POSITION, like the other two chains: both engines must agree on which
+        // peer the light client tries FIRST, not merely that roost is present.
+        assert_eq!(c.static_peers[0], "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh");
+        // The discovered list is unchanged, just shifted by the one roost entry.
+        assert!(c.static_peers[1].ends_with(
             "/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59"
         ));
-        assert!(c.static_peers[21].ends_with(
+        assert!(c.static_peers[22].ends_with(
             "/tcp/9500/p2p/16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw"
         ));
         let unique: std::collections::HashSet<_> = c.static_peers.iter().collect();
-        assert_eq!(unique.len(), 22);
+        assert_eq!(unique.len(), 23);
         let ids: std::collections::HashSet<_> =
             c.static_peers.iter().map(|a| a.rsplit('/').next().unwrap()).collect();
-        assert_eq!(ids.len(), 22, "one address per peer id (the pool dedupes by id)");
+        assert_eq!(ids.len(), 23, "one address per peer id (the pool dedupes by id)");
         assert!(c.static_peers.iter().all(|p| parse_static_peer(p).is_some()));
         assert_eq!(c.bootstrap_enrs.len(), 8);
+    }
+
+    /// A chain whose geometry does NOT multiply to 8192, which is the case every
+    /// period division must survive and the one no real chain exercises today.
+    ///
+    /// The config-parity tests pin both factors, but they assert the CONFIG —
+    /// they cannot catch a consumer that ignores it. This asserts the consumer:
+    /// `wall_clock_period` must follow the config, not the mainnet preset.
+    #[test]
+    fn period_consumers_follow_the_config_not_the_preset() {
+        let mut c = ChainConfig::mainnet();
+        c.slots_per_epoch = 32;
+        c.epochs_per_sync_committee_period = 128; // 4096, deliberately not 8192
+        assert_eq!(c.slots_per_period(), 4096);
+        // Same slot, two geometries, two answers — if this ever equals the
+        // mainnet-preset value the consumer has stopped reading the config.
+        let slot = 4096 * 7 + 5;
+        assert_eq!(
+            spec::compute_sync_committee_period_with(slot, c.slots_per_period()),
+            7
+        );
+        assert_eq!(spec::compute_sync_committee_period(slot), 3);
     }
 
     #[test]
@@ -2665,31 +2903,31 @@ mod tests {
         let z = Duration::ZERO;
 
         // Bootstrap stall: only after the stall window.
-        assert!(!hunt_due(false, false, Duration::from_secs(10), z, wall, 0, 0, epoch));
-        assert!(hunt_due(false, false, HUNT_BOOTSTRAP_STALL, z, wall, 0, 0, epoch));
+        assert!(!hunt_due(false, false, Duration::from_secs(10), z, wall, 0, 0, epoch, 8192));
+        assert!(hunt_due(false, false, HUNT_BOOTSTRAP_STALL, z, wall, 0, 0, epoch, 8192));
 
         // Finality starvation: period current + finalized older than slack.
-        assert!(hunt_due(false, true, z, z, wall, period, wall - slack - 1, epoch));
+        assert!(hunt_due(false, true, z, z, wall, period, wall - slack - 1, epoch, 8192));
         // Fresh finality → no hunt.
-        assert!(!hunt_due(false, true, z, z, wall, period, wall - 64, epoch));
+        assert!(!hunt_due(false, true, z, z, wall, period, wall - 64, epoch, 8192));
 
         // PROGRESSING catch-up (period behind, store advancing) → no hunt:
         // catch-up's own wide fan-out covers the pool; hunting double-dials.
-        assert!(!hunt_due(false, true, z, z, wall, period - 1, wall - slack - 1, epoch));
+        assert!(!hunt_due(false, true, z, z, wall, period - 1, wall - slack - 1, epoch, 8192));
         // STARVED catch-up (no store progress past the stall window) → hunt.
         assert!(hunt_due(false, true, z, HUNT_CATCHUP_STALL, wall, period - 1,
-            wall - slack - 1, epoch));
+            wall - slack - 1, epoch, 8192));
         // ...and an ENGAGED hunt survives the period boundary the same way
         // (finality starvation rotating into catch-up must not disengage).
         assert!(hunt_due(true, true, z, HUNT_CATCHUP_STALL, wall, period - 1,
-            wall - slack - 1, epoch));
+            wall - slack - 1, epoch, 8192));
 
         // Hysteresis on the finality trigger: at staleness between the
         // engaged and disengaged thresholds, an engaged hunt stays on and a
         // disengaged one stays off (no flapping at the boundary).
         let between = wall - slack + epoch - 1; // stale by SLACK-1 epochs + 1 slot
-        assert!(hunt_due(true, true, z, z, wall, period, between, epoch));
-        assert!(!hunt_due(false, true, z, z, wall, period, between, epoch));
+        assert!(hunt_due(true, true, z, z, wall, period, between, epoch, 8192));
+        assert!(!hunt_due(false, true, z, z, wall, period, between, epoch, 8192));
     }
 
     #[test]

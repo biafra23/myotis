@@ -1,0 +1,73 @@
+# roost — the dedicated light-client server (docs/lc-server-design.md).
+#
+# It needs its own workflow because it is deliberately NOT a workspace member
+# (rust/Cargo.toml `exclude`), so `cargo test --workspace` in node-binding.yml
+# does not see it. Without this, nothing in CI would build or test roost at all.
+#
+# That gap matters more than it would for the other excluded crate: roost
+# depends on `myotis-net` BY PATH, and myotis-net is under active development
+# with no compile-time link back to this consumer. A change there can break
+# roost silently, and the first signal would be someone running `roost serve` by
+# hand — a bad moment to find out, for a daemon holding an irreplaceable archive.
+#
+# Path-filtered, so it costs CI time only when roost or its one path dependency
+# changes.
+name: roost
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "rust/roost/**"
+      - "rust/myotis-net/**"
+      - "rust/myotis-consensus/**"
+      - "rust/myotis-core/**"
+      - "rust/myotis-evm/**"
+      - ".github/workflows/roost.yml"
+  pull_request:
+    paths:
+      - "rust/roost/**"
+      - "rust/myotis-net/**"
+      - "rust/myotis-consensus/**"
+      - "rust/myotis-core/**"
+      - "rust/myotis-evm/**"
+      - ".github/workflows/roost.yml"
+
+jobs:
+  test:
+    name: roost build and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/roost
+      - name: Build
+        run: cargo build --manifest-path rust/roost/Cargo.toml --locked
+      - name: Tests
+        run: cargo test --manifest-path rust/roost/Cargo.toml --locked
+      - name: Clippy
+        run: cargo clippy --manifest-path rust/roost/Cargo.toml --all-targets -- -D warnings
+      # Neither build, test nor clippy checks rustdoc links, so a broken
+      # intra-doc link is invisible to CI — one shipped in #328 and was caught by
+      # a human reading the diff rather than by a machine. The class matters here
+      # because this crate's doc comments carry the reasoning (why the ENR key
+      # must be the host key, why a BPO counts as a transition), and a link that
+      # silently stops resolving takes a reader away from it.
+      - name: Rustdoc links
+        env:
+          RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
+        # --document-private-items explicitly: most of this crate's
+        # reasoning-carrying doc comments are on PRIVATE items (`Digests`,
+        # `interim_fork_digest`, `NimbusRest::get_ssz`), and they are covered
+        # today only because Cargo adds the flag automatically for a bin-only
+        # package. If roost ever grows a [lib] target — plausible for a daemon
+        # whose codec is already shared by path — the gate would silently narrow
+        # to the public surface and stop checking most of the crate. That is the
+        # same "silently stops resolving" failure this step exists to prevent,
+        # one level up. A no-op today, verified.
+        run: cargo doc --manifest-path rust/roost/Cargo.toml --no-deps --locked --document-private-items

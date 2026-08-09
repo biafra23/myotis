@@ -144,18 +144,20 @@ class NetworkConfigGnosisTest {
         // (issue #291) — same list and ORDER as the Rust GNOSIS_STATIC_PEERS
         // (sync.rs gnosis_config_matches_networkconfig_java pins the twin side).
         List<String> cl = G.clPeerMultiaddrs();
-        assertEquals(22, cl.size());
+        assertEquals(23, cl.size(), "22 harvested peers + roost, pinned by NAME only");
+        // roost FIRST, and by NAME — no literal behind it. A dynamic address is
+        // absorbed by DNS instead of by a second entry.
+        assertEquals("/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh", cl.get(0));
+        // The harvested list is unchanged, just shifted by the one roost entry.
         assertEquals("/ip4/104.37.190.86/tcp/15974/p2p/"
-                + "16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59", cl.get(0));
+                + "16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59", cl.get(1));
         assertEquals("/ip4/164.152.161.131/tcp/9500/p2p/"
-                + "16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw", cl.get(21));
-        // One entry per peer id (the Rust pool dedupes by id, so a second address
-        // for a known id would be dropped there) — and every entry is a dialable
-        // ip4/tcp/p2p multiaddr.
-        assertEquals(22, cl.stream().distinct().count());
-        assertEquals(22, cl.stream().map(a -> a.substring(a.lastIndexOf('/') + 1)).distinct().count());
+                + "16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw", cl.get(22));
+        assertEquals(23, cl.stream().distinct().count());
+        assertEquals(23, cl.stream().map(a -> a.substring(a.lastIndexOf('/') + 1)).distinct().count(),
+                "one address per peer id");
         for (String addr : cl) {
-            assertTrue(addr.matches("/ip4/\\d+\\.\\d+\\.\\d+\\.\\d+/tcp/\\d+/p2p/16Uiu2HA\\S+"), addr);
+            assertTrue(addr.matches("/(ip4/\\d+\\.\\d+\\.\\d+\\.\\d+|dns4/[\\w.-]+)/tcp/\\d+/p2p/16Uiu2HA\\S+"), addr);
         }
     }
 
@@ -167,11 +169,44 @@ class NetworkConfigGnosisTest {
         String enode = NetworkConfig.SEPOLIA.elBootEnodes().get(0);
         assertTrue(enode.endsWith("@87.154.209.161:30405"), enode);
 
+        // roost, the dedicated light-client server, is tried first — that is the
+        // point of having it. The dedicated Nimbus stays behind it as fallback,
+        // so a roost fault degrades to the previous behaviour.
         String cl = NetworkConfig.SEPOLIA.clPeerMultiaddrs().get(0);
+        assertEquals("/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5", cl,
+                "roost must be the first CL peer tried");
+        // POSITION, not presence: the Rust twin asserts index 1, and index is
+        // load-bearing on this side in particular — addPeer inserts every
+        // discovered peer at Math.min(1, size()), i.e. exactly the slot the
+        // Nimbus occupies, so "somewhere in the list" is a weaker guarantee here
+        // than anywhere else.
         assertEquals("/ip4/87.154.209.161/tcp/9104/p2p/"
-                        + "16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6", cl,
-                "the dedicated Nimbus must be the first CL peer tried");
-        assertTrue(NetworkConfig.SEPOLIA.clPeerMultiaddrs().size() > 1,
+                        + "16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
+                NetworkConfig.SEPOLIA.clPeerMultiaddrs().get(1),
+                "the dedicated Nimbus must remain SECOND as fallback — a roost outage "
+                        + "then degrades to exactly the previous behaviour");
+        assertTrue(NetworkConfig.SEPOLIA.clPeerMultiaddrs().size() > 2,
                 "pinning must not drop the existing CL peers");
+    }
+
+    @Test
+    void mainnetPinsRoostFirst() {
+        // The Rust twin (sync.rs mainnet_config_matches_networkconfig_java)
+        // asserts index 0 and the list length; without this, POSITION was pinned
+        // on one side only. That asymmetry is the failure worth catching: both
+        // engines would still "contain" roost while disagreeing about which peer
+        // the light client actually tries first, and only one of them would be
+        // reaching the dedicated server.
+        //
+        // It also matters more here than in Rust: addPeer inserts discovered
+        // peers at Math.min(1, size()), so presence-anywhere is a weak claim on
+        // this side.
+        List<String> cl = NetworkConfig.MAINNET.clPeerMultiaddrs();
+        assertEquals("/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/"
+                        + "16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
+                cl.get(0),
+                "roost mainnet must be the first CL peer tried");
+        assertEquals(19, cl.size(),
+                "18 discovered peers + roost; pinning must not drop the fallbacks");
     }
 }

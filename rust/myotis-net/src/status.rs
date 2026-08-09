@@ -75,7 +75,21 @@ impl StatusMessage {
 /// || syncnets Bitvector[4](1) = 17 bytes. A pure light client subscribes to
 /// nothing, so the canonical answer is all zeros.
 pub fn metadata_v2_light_client() -> Vec<u8> {
-    vec![0u8; 17]
+    let mut out = Vec::with_capacity(17);
+    out.extend_from_slice(&metadata_seq_number().to_le_bytes());
+    out.extend_from_slice(&[0u8; 9]); // attnets(8) + syncnets(1): a light client subscribes to none
+    out
+}
+
+/// Our metadata sequence number — what `ping` must answer with.
+///
+/// Constant zero because this node's metadata never changes: it subscribes to
+/// no attnets and no syncnets, so there is nothing for a peer to refetch. The
+/// number matters anyway, because a peer uses it to decide *whether* to
+/// refetch; answering with the caller's own value (an echo) tells them nothing
+/// about us.
+pub fn metadata_seq_number() -> u64 {
+    0
 }
 
 // -------------------------------------------------------------------------

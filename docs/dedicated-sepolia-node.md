@@ -315,6 +315,7 @@ ExecStart=/usr/bin/nimbus_beacon_node \
   --insecure-netkey-password=true \
   --max-peers=500 \
   --hard-max-peers=800 \
+  --rest \
   --light-client-data-serve=true \
   --light-client-data-import-mode=full
 Restart=on-failure
@@ -460,7 +461,8 @@ client tries it first.
 | layer | identity |
 |---|---|
 | EL | `enode://cfd3572b…c37e1b2c@87.154.209.161:30405` |
-| CL | `/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6` |
+| CL (roost, first) | `/ip4/87.154.209.161/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5` |
+| CL (Nimbus, fallback) | `/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6` |
 
 Both are only stable because of the key-persistence flags above (Geth's
 datadir `nodekey`, Nimbus's `--netkey-file`). The **IP** in both entries is

@@ -22,7 +22,7 @@ myotis-evm = { path = "../myotis-evm" }
 # discv5 packet format). Cargo.lock would pin them anyway; the `=` makes the
 # intent explicit and survives lockfile regeneration.
 tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net", "io-util"] }
-libp2p = { version = "=0.56.0", features = ["tokio", "tcp", "noise", "yamux", "identify", "request-response", "secp256k1", "macros"] }
+libp2p = { version = "=0.56.0", features = ["tokio", "tcp", "dns", "noise", "yamux", "identify", "request-response", "secp256k1", "macros"] }
 discv5 = "=0.11.0"
 snap = "=1.1.1"
 tracing = "=0.1.44"

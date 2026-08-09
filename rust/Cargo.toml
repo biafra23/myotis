@@ -34,7 +34,13 @@ members = ["myotis-bls", "myotis-consensus", "myotis-core", "myotis-evm", "myoti
 # excluded on purpose: it pulls the whole Arti dependency tree, which must never
 # burden the pure-engine build or CI. It depends on myotis-net/myotis-core by
 # path and builds on its own with `cargo run --manifest-path tor-poc/Cargo.toml`.
-exclude = ["tor-poc"]
+#
+# roost (docs/lc-server-design.md) is excluded for the same two reasons plus one
+# more: it is a SERVER daemon, so it must not inherit `panic = "abort"` below —
+# in a process holding 1000+ wallet connections that turns one panic into an
+# outage for all of them. Excluded, it carries its own profile with
+# `panic = "unwind"`. It also pulls an HTTP stack no engine target links.
+exclude = ["tor-poc", "roost"]
 
 # Release profile is workspace-owned (crate-level [profile.*] is ignored in a
 # workspace): same tuning myotis-bls always shipped with.

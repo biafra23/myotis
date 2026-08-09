@@ -1,0 +1,59 @@
+# roost — the dedicated light-client server (docs/lc-server-design.md).
+#
+# Standalone crate (its own workspace root, own Cargo.lock) — deliberately NOT a
+# member of ../Cargo.toml's workspace, for the two reasons the design gates the
+# decision on:
+#
+#  * Build cost. `cargoBuildHost` is `cargo build --release --workspace` and runs
+#    before `:app:run` / `:consensus:test`; `cargoTest` is `cargo test
+#    --workspace`, wired into root `check`. As a member, every Android, iOS and
+#    JVM developer would compile an HTTP stack they never link.
+#  * `panic = "abort"`. The parent workspace sets it profile-wide and a member
+#    cannot override it (crate-level [profile.*] is ignored in a workspace).
+#    That is the right FFI rule for the engine and the wrong one for a daemon
+#    holding 1000+ connections, where it would turn one panic into an outage for
+#    every connected wallet. Below, this crate sets `panic = "unwind"` so a
+#    malformed chunk kills one connection instead.
+#
+# Same precedent as `tor-poc`. It reuses the real eth2 req/resp codec from
+# `myotis-net` by path — one protocol stack, not two.
+[package]
+name = "roost"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Own workspace root: keeps this out of the parent workspace entirely.
+[workspace]
+
+[[bin]]
+name = "roost"
+path = "src/main.rs"
+
+[dependencies]
+# The real myotis eth2 wire codec — `encode_success_response` /
+# `decode_multi_chunk_response` / `protocols`. The whole point is to serve bytes
+# our own wallets are already proven against.
+myotis-net = { path = "../myotis-net" }
+
+# An async HTTP client is a genuine gap in the Rust workspace (it has only
+# serde_json today). rustls rather than native-tls: this is a Linux daemon, and
+# loopback REST needs no system trust store. `json` is off — the SSZ endpoints
+# are the data path; serde_json handles the few JSON control endpoints.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset"] }
+serde_json = "1"
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+hex = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# DELIBERATE divergence from the parent workspace's `panic = "abort"` — see the
+# header. This is the reason the crate is excluded rather than a member.
+panic = "unwind"

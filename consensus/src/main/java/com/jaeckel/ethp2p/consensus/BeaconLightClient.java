@@ -2312,7 +2312,15 @@ public class BeaconLightClient implements AutoCloseable {
         recordLcVerdicts(lcConfirmed, lcDenied);
         if (win.applied()) {
             updateSyncState();
-            fillChainStateRoots(win.peer(), true);
+            // The finality winner is not necessarily a BLOCK server. roost is the
+            // deliberate case — beacon_blocks_by_range is not a light-client
+            // protocol and is absent from its Behaviour, so it answers
+            // ResourceUnavailable, which means "ask someone else". Any beacon node
+            // under load can answer the same way. Falling through keeps a fast LC
+            // peer from costing us the fill.
+            if (!fillChainStateRoots(win.peer(), true)) {
+                fillChainStateRootsFromAnyPeer(true);
+            }
             notifyPeerSuccess(win.peer());
             // Steady-state advance — persist so a restart resumes here
             // (no-op unless the committee period actually moved).
@@ -2456,8 +2464,8 @@ public class BeaconLightClient implements AutoCloseable {
         for (String peer : copyPeers()) {
             if (!running) return;
             try {
-                fillChainStateRoots(peer, blsVerified);
-                return; // success
+                if (fillChainStateRoots(peer, blsVerified)) return; // served — done
+                // else: this peer could not serve blocks; try the next one.
             } catch (Exception e) {
                 log.debug("[beacon] Post-bootstrap chain fill failed from {}: {}", peer, e.getMessage());
             }
@@ -2476,13 +2484,13 @@ public class BeaconLightClient implements AutoCloseable {
      * @param peer           the CL peer multiaddr to fetch blocks from
      * @param blsVerified    true if the finality update was BLS-verified
      */
-    private void fillChainStateRoots(String peer, boolean blsVerified) {
+    private boolean fillChainStateRoots(String peer, boolean blsVerified) {
         long finalizedSlot = store.getFinalizedSlot();
         long optimisticSlot = store.getOptimisticSlot();
         LightClientHeader attestedHeader = store.getOptimisticHeader();
         byte[] attestedBlockRoot = attestedHeader != null
                 ? attestedHeader.beacon().hashTreeRoot() : null;
-        fillChainStateRoots(peer, blsVerified, finalizedSlot, optimisticSlot, attestedBlockRoot);
+        return fillChainStateRoots(peer, blsVerified, finalizedSlot, optimisticSlot, attestedBlockRoot);
     }
 
     /**
@@ -2495,10 +2503,16 @@ public class BeaconLightClient implements AutoCloseable {
      * @param attestedSlot       the attested/optimistic slot (end of range)
      * @param attestedBlockRoot  hash tree root of the attested beacon block header (for chain verification), or null
      */
-    private void fillChainStateRoots(String peer, boolean blsVerified,
+    private boolean fillChainStateRoots(String peer, boolean blsVerified,
                                       long finalizedSlot, long attestedSlot,
                                       byte[] attestedBlockRoot) {
-        if (attestedSlot <= finalizedSlot + 1) return; // nothing to fill
+        // Returns whether this peer actually produced state roots. It used to be
+        // void AND swallow every exception, which made fillChainStateRootsFromAnyPeer's
+        // catch unreachable: that loop returned after the FIRST peer whether or
+        // not it served anything, so the "try every peer" fallback never tried a
+        // second one. A peer that cannot serve beacon_blocks_by_range — roost by
+        // design, and any beacon node under load — therefore ended the round.
+        if (attestedSlot <= finalizedSlot + 1) return true; // nothing to fill: not a failure
 
         long startSlot = finalizedSlot + 1;
         long count = attestedSlot - finalizedSlot; // includes the attested slot
@@ -2511,7 +2525,7 @@ public class BeaconLightClient implements AutoCloseable {
             if (blockSszList.isEmpty()) {
                 log.debug("[beacon] Chain fill: no blocks returned for slots {}-{}",
                         startSlot, attestedSlot);
-                return;
+                return false;
             }
 
             // Parse all blocks
@@ -2525,7 +2539,7 @@ public class BeaconLightClient implements AutoCloseable {
                 }
             }
 
-            if (blocks.isEmpty()) return;
+            if (blocks.isEmpty()) return false; // nothing parsed — let the caller try another peer
 
             // Verify hash chain: walk from newest to oldest.
             // The attested header's blockHeaderRoot should match the last block,
@@ -2559,9 +2573,11 @@ public class BeaconLightClient implements AutoCloseable {
 
             log.info("[beacon] Chain fill: recorded {} verified state roots for slots {}-{} from {}",
                     verified, startSlot, blocks.get(blocks.size() - 1).slot(), peer);
+            return verified > 0;
 
         } catch (Exception e) {
             log.debug("[beacon] Chain fill failed from {}: {}", peer, e.getMessage());
+            return false;
         }
     }
 

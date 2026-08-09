@@ -1,0 +1,39 @@
+[Unit]
+Description=roost Sepolia (myotis dedicated light-client server)
+# Needs Nimbus's REST API on 127.0.0.1:5052 as its only upstream. `After` orders
+# startup but does not require it: roost serves whatever its archive already
+# holds and fills the rest in the background, so a Nimbus restart degrades what
+# it can serve rather than taking it down.
+After=network-online.target nimbus-sepolia.service
+Wants=network-online.target
+# Same as the siblings: never give up restarting. roost exits non-zero when its
+# libp2p swarm task dies, and that exit is the ONLY signal that it has stopped
+# serving — the process would otherwise keep running with no listener.
+StartLimitIntervalSec=0
+
+[Service]
+User=roost
+ExecStart=/usr/local/bin/roost serve \
+  --rest http://127.0.0.1:5052 \
+  --archive /data/roost/sepolia.db \
+  --key /data/roost/sepolia.key \
+  --port 9105
+Restart=on-failure
+RestartSec=5
+# Explicit, per docs/lc-server-design.md §8: the shell default here is 2048,
+# and roost's inbound cap is 1024 connections — each needing a socket, plus
+# loopback HTTP to Nimbus. 2048 would bind before the connection cap does.
+LimitNOFILE=65536
+TimeoutStopSec=30
+
+# Hardening. The siblings predate this and don't set it; roost is a public
+# responder with an attacker-influenced parser, so it is worth having. Remove
+# any line that gets in the way — none is load-bearing for correctness.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/data/roost
+
+[Install]
+WantedBy=multi-user.target

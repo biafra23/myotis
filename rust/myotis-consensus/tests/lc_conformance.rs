@@ -97,7 +97,7 @@ fn replay_reproduces_recorded_verdicts() {
     actual.insert("genesisValidatorsRoot".into(), expected["genesisValidatorsRoot"].clone());
     actual.insert("input.currentSlotEstimate".into(), slot_estimate.to_string());
 
-    let mut store = LightClientStore::new();
+    let mut store = LightClientStore::new_mainnet_preset();
     store.initialize(bootstrap.header.clone(), bootstrap.current_sync_committee.clone());
     let mut processor = LightClientProcessor::new(store, fork_version, gvr);
 

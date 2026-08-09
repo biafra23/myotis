@@ -123,7 +123,7 @@ fn replay_from(
 }
 
 fn organic_processor(c: &Corpus) -> LightClientProcessor {
-    let mut store = LightClientStore::new();
+    let mut store = LightClientStore::new_mainnet_preset();
     store.initialize(c.bootstrap.header.clone(), c.bootstrap.current_sync_committee.clone());
     LightClientProcessor::new(store, c.fork_version, c.gvr)
 }
@@ -167,7 +167,7 @@ fn resume_at_every_split_point_matches_uninterrupted_replay() {
         let bytes = snapshot::serialize(&snap, &c.gvr);
         let restored = snapshot::deserialize(&bytes, &c.gvr)
             .unwrap_or_else(|| panic!("split {k}: snapshot must deserialize"));
-        let mut resumed_store = LightClientStore::new();
+        let mut resumed_store = LightClientStore::new_mainnet_preset();
         resumed_store.restore(restored);
         let mut resumed = LightClientProcessor::new(resumed_store, c.fork_version, c.gvr);
 

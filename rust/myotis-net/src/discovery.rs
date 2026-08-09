@@ -326,3 +326,143 @@ mod tests {
         assert_eq!(rlp_short_string_payload(&[]), None);
     }
 }
+
+// -------------------------------------------------------------------------
+// Server-mode ENR: a record other nodes can find
+// -------------------------------------------------------------------------
+
+/// Derive the discv5 identity from the libp2p host key.
+///
+/// They MUST be the same key. In the eth2 network a node's libp2p peer id is
+/// derived from the secp256k1 public key in its ENR — this crate's own
+/// `enr_to_peer_id` does exactly that when turning a discovered record into a
+/// dial target. Publishing a record signed by a different key would therefore
+/// advertise a peer id we cannot authenticate as: every wallet that discovered
+/// us would dial, fail the Noise handshake, and charge us a strike.
+///
+/// (An earlier version of this module generated and persisted a SEPARATE discv5
+/// key, on the reasoning that conflating the two identities would be a mistake.
+/// That was backwards, and roost's own client code is the proof.)
+pub fn discv5_key_from_libp2p(
+    keypair: &libp2p::identity::Keypair,
+) -> Result<CombinedKey, String> {
+    let secp = keypair
+        .clone()
+        .try_into_secp256k1()
+        .map_err(|_| "the libp2p host key is not secp256k1 — the CL spec requires it".to_string())?;
+    let mut bytes = secp.secret().to_bytes();
+    CombinedKey::secp256k1_from_bytes(&mut bytes)
+        .map_err(|e| format!("converting the libp2p key to a discv5 key: {e}"))
+}
+
+/// Build the ENR a SERVER publishes: reachable endpoint plus the `eth2` field.
+///
+/// The endpoint is what makes the record listable at all — the client-side
+/// record is built with no endpoint, which is why a wallet is unlistable by
+/// omission rather than by configuration.
+///
+/// `eth2` MUST be the complete 16-byte SSZ `ENRForkID`
+/// (`fork_digest || next_fork_version || next_fork_epoch`). A truncated field
+/// carrying only the 4-byte digest is malformed, and standard clients reject the
+/// record — so a half-filled field is worse than none.
+///
+/// `seq` must be persisted and monotonic across restarts. The DHT keeps the
+/// highest-sequence record it has seen, so a record that does not out-rank the
+/// cached one is ignored — which would make an address update silently
+/// ineffective, the failure mode that matters most on a connection whose IP can
+/// change.
+pub fn build_server_enr(
+    key: &CombinedKey,
+    seq: u64,
+    ip: std::net::IpAddr,
+    tcp_port: u16,
+    udp_port: u16,
+    eth2: [u8; 16],
+) -> Result<Enr, String> {
+    let mut builder = Enr::builder();
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            builder.ip4(v4).tcp4(tcp_port).udp4(udp_port);
+        }
+        std::net::IpAddr::V6(v6) => {
+            builder.ip6(v6).tcp6(tcp_port).udp6(udp_port);
+        }
+    }
+    builder.add_value(b"eth2".as_slice(), &eth2.as_slice());
+    builder.seq(seq);
+    builder.build(key).map_err(|e| format!("building the server ENR: {e}"))
+}
+
+#[cfg(test)]
+mod server_enr_tests {
+    use super::*;
+
+    fn eth2_field() -> [u8; 16] {
+        let mut f = [0u8; 16];
+        f[..4].copy_from_slice(&[0x74, 0xd0, 0x14, 0x59]);
+        f[4..8].copy_from_slice(&[0x07, 0x00, 0x00, 0x00]);
+        f[8..].copy_from_slice(&u64::MAX.to_le_bytes());
+        f
+    }
+
+    #[test]
+    fn a_server_record_carries_an_endpoint_and_the_full_eth2_field() {
+        let key = CombinedKey::generate_secp256k1();
+        let enr = build_server_enr(
+            &key,
+            7,
+            "87.154.209.161".parse().unwrap(),
+            9105,
+            9105,
+            eth2_field(),
+        )
+        .unwrap();
+
+        assert_eq!(enr.seq(), 7);
+        assert_eq!(enr.ip4().map(|i| i.to_string()).as_deref(), Some("87.154.209.161"));
+        assert_eq!(enr.tcp4(), Some(9105));
+        assert_eq!(enr.udp4(), Some(9105), "no udp means unlistable for discv5");
+
+        // The field must round-trip through the SAME reader the client side uses
+        // to filter candidates — a record we cannot read ourselves is one no
+        // wallet will match either.
+        assert_eq!(enr_eth2_fork_digest(&enr), Some([0x74, 0xd0, 0x14, 0x59]));
+
+        let raw = enr.get_raw_rlp(b"eth2").expect("eth2 present");
+        let payload = rlp_short_string_payload(raw).expect("rlp string");
+        assert_eq!(payload.len(), 16, "a truncated eth2 field is malformed");
+        assert_eq!(u64::from_le_bytes(payload[8..].try_into().unwrap()), u64::MAX);
+    }
+
+    /// THE property: a wallet that discovers our record must derive the peer id
+    /// it will actually be able to authenticate against.
+    #[test]
+    fn the_enr_yields_the_libp2p_peer_id_the_host_authenticates_as() {
+        let host_key = libp2p::identity::Keypair::generate_secp256k1();
+        let host_peer_id = PeerId::from(host_key.public());
+
+        let enr_key = discv5_key_from_libp2p(&host_key).unwrap();
+        let record = build_server_enr(
+            &enr_key,
+            1,
+            "87.154.209.161".parse().unwrap(),
+            9105,
+            9105,
+            eth2_field(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            enr_to_peer_id(&record),
+            Some(host_peer_id),
+            "a record signed by any other key advertises a peer id we cannot authenticate as: \
+             every wallet that discovers us dials, fails the Noise handshake, and charges a strike"
+        );
+    }
+
+    #[test]
+    fn a_non_secp256k1_host_key_is_refused_rather_than_silently_wrong() {
+        let ed = libp2p::identity::Keypair::generate_ed25519();
+        assert!(discv5_key_from_libp2p(&ed).is_err());
+    }
+}

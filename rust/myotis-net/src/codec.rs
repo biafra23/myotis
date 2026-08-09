@@ -146,12 +146,34 @@ pub fn encode_empty_request() -> Vec<u8> {
 /// Decode an inbound request body: `varint(len) || snappy_frames` → ssz bytes.
 /// Mirrors the Java responder's `parseRequestSsz` (None on anything unparseable).
 pub fn parse_request_ssz(raw: &[u8]) -> Option<Vec<u8>> {
+    parse_request_ssz_expecting(raw, None)
+}
+
+/// As [`parse_request_ssz`], but refusing a declared length that does not match
+/// what the protocol's request is defined to be, BEFORE decompressing.
+///
+/// Every eth2 request this host answers is a fixed size (32 bytes for bootstrap,
+/// 16 for updates_by_range, 8 for ping/goodbye, 84/92 for status). Without this
+/// check the declared varint is honoured first and bounded only by
+/// `MAX_UNCOMPRESSED_PAYLOAD`, so a 1 KB inbound frame declaring 10 MiB buys a
+/// 10 MiB `Vec::with_capacity` per request — free amplification against a public
+/// responder, on a protocol where the correct length was known in advance.
+pub fn parse_request_ssz_expecting(raw: &[u8], expected: Option<usize>) -> Option<Vec<u8>> {
     if raw.len() < 2 {
         return None;
     }
     let (uncompressed_len, snappy_start) = read_varint(raw, 0).ok()?;
     if uncompressed_len == 0 || snappy_start >= raw.len() {
         return None;
+    }
+    if let Some(expected) = expected {
+        // Compare as u64 BEFORE narrowing. `uncompressed_len as usize` would
+        // truncate on a 32-bit target (android armv7 is one), so a declared
+        // 2^32 + expected would pass this check and then be treated as a short
+        // request. Equality here makes the conversion below provably safe.
+        if uncompressed_len != expected as u64 {
+            return None;
+        }
     }
     snappy_decompress(&raw[snappy_start..], uncompressed_len as usize).ok()
 }

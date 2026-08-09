@@ -105,6 +105,19 @@ public record NetworkConfig(
             null,
             // CL peer multiaddrs: known light-client-serving peers (nimbus, lodestar, lighthouse)
             // discovered via Lighthouse peer API 2026-03-11
+            // NOTE the order: the LITERAL leads and the NAME follows. That looks
+            // backwards and is not — see ROOST_PIN_ORDER in the Rust twin. Java
+            // walks this list in order and falls through, so a stale literal
+            // costs one failed dial before the name resolves; the Rust pool
+            // refreshes a static's address in place and keeps the LAST entry,
+            // which must be the name because a static there can never self-heal.
+            // roost mainnet is prepended for the same reason as sepolia's: it is a
+            // dedicated LC server, so it neither trims us nor shares its inbound
+            // budget with a gossip mesh. 9109/tcp was verified forwarded before
+            // pinning. See the Rust twin (MAINNET_STATIC_PEERS) for the full
+            // reasoning; keep the two lists and their ORDER in step.
+            prependLocal(
+                    "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
             List.of(
                     // nimbus peers (4 light_client protocols)
                     "/ip4/176.229.58.1/tcp/9001/p2p/16Uiu2HAmHu1BxzrSWg7sN9JyJenC5unK5ntdk5QFYqQdQyyD7x3a",
@@ -127,7 +140,7 @@ public record NetworkConfig(
                     // lighthouse peers (3 light_client protocols)
                     "/ip4/54.201.148.177/tcp/9000/p2p/16Uiu2HAmNwEsdBC2phX7qU7camNe9Gs21WyrpV5AZDYyjZBMYjWZ",
                     "/ip4/16.63.94.117/tcp/9000/p2p/16Uiu2HAmSd7qzG5joNgvEYYcgVvg1y9MiYjpMHMvzRzaWYqXxkCM"
-            ),
+            )),
             "http://localhost:5052",
             1606824023L, // mainnet beacon genesis: 2020-12-01 12:00:23 UTC
             // EIP-1459 ENR tree URLs — DNS-seeded discv4 bootnodes (EL) and libp2p peers (CL).
@@ -198,16 +211,50 @@ public record NetworkConfig(
             // No prior-fork fallback (same rationale as mainnet: stale digests
             // wouldn't help us sync to the current head anyway).
             null,
-            // CL peer multiaddrs for sepolia. First entry is the dedicated
-            // myotis-serving Nimbus (docs/dedicated-sepolia-node.md): it serves
-            // light_client_bootstrap / updates_by_range default-on, and being
-            // first means the light client tries it before the discovered pool.
-            // Its peer-id is stable only because the node pins --netkey-file;
-            // Nimbus otherwise mints a new one per restart, which invalidates
-            // this entry with InvalidRemotePubKey (see the doc's §5 note).
+            // CL peer multiaddrs for sepolia. First entry is roost, the
+            // dedicated light-client server (rust/roost, docs/lc-server-design.md).
+            // It is first because it exists precisely for this: a general-purpose
+            // beacon node is structurally bad at serving wallets — one connection
+            // semaphore shared between inbound and outbound, and a trimmer that
+            // scores light clients at zero and drops them first.
+            //
+            // BUT ORDER HERE IS A PREFERENCE, NOT A PRIORITY, on this engine.
+            // ChainStack loads the peer CACHE first and appends these after
+            // (ChainStack.buildAndStartBeacon), bootstrap fans out to every peer
+            // in parallel with first-valid-response-wins (BeaconLightClient
+            // ~:1419), and addPeer inserts discovered peers at index 1. So being
+            // element 0 does not mean "tried first" — it means "in the initial
+            // list, ahead of the other pins".
+            //
+            // AND NOTE WHAT A HEALTHY ROOST COSTS THIS ENGINE. The fallback below
+            // only engages when roost FAILS. roost serves no blocks —
+            // beacon_blocks_by_range is not among the nine protocols in
+            // rust/myotis-net/src/protocols.rs — while the steady-state chain
+            // fill follows the finality-poll WINNER with no per-peer fallback
+            // (fillChainStateRoots(win.peer(), ...)). A pre-encoded byte cache
+            // wins that race most rounds, so the fill fails every cycle and is
+            // swallowed at debug level: the state-root window then grows ~2 roots
+            // per poll instead of 40-80, the stateRootMatch fast path stops
+            // hitting, and verified reads pay the headerChain EL walk instead.
+            // Bounded, not a correctness break — headerChain anchors on the
+            // finalized execution block hash, not the window — but it is a
+            // silent regression on the DEFAULT engine, and the reason
+            // lc-server-design rollout step 3 wants this settled.
+            //
+            // The dedicated Nimbus follows it, so a roost OUTAGE degrades to
+            // exactly the previous behaviour rather than to nothing. That entry's
+            // peer-id is stable only because the node pins --netkey-file; Nimbus
+            // otherwise mints a new one per restart, which invalidates it with
+            // InvalidRemotePubKey (see the doc's §5 note). roost has no such
+            // mode — its identity is persisted by construction.
+            //
+            // Both literal IPs carry the same exposure: the line is residential
+            // and the address is not guaranteed stable. ENR publication
+            // (lc-server-design §7) is what removes the need to pin at all.
             prependLocal(
-                    "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
+                    "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
                     List.of(
+                            "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
                             "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS"
                     )),
             null,
@@ -266,10 +313,9 @@ public record NetworkConfig(
             // genesis_validators_root (Gnosis Beacon Chain)
             Bytes.fromHexString("f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47").toArrayUnsafe(),
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshGnosisCheckpoint`
-            // trusted checkpoint: Gnosis block root one period behind head (slot 28516336, 2026-06-16, period 3480)
-            // — deliberately stale so the light client must catch up to head via light_client_updates_by_range.
-            Bytes.fromHexString("dc1ce049946173d38463595f907f19893e4fd956c740913fb70d94d34e07e789").toArrayUnsafe(),
-            28516336L, // checkpoint slot. Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized Gnosis block root (slot 29460368, 2026-08-09, period 3596)
+            Bytes.fromHexString("84f127f4bbb1e733c5607910c2df1d2c0e726e2fab0a4690b66cd07a5c2455bf").toArrayUnsafe(),
+            29460368L, // checkpoint slot. Must stay in sync with the root above.
             // @checkpoint:gnosis:end
             // current fork version: Fulu on Gnosis (0x06000064), active since 2026-04-14
             new byte[]{0x06, 0x00, 0x00, 0x64},
@@ -286,6 +332,11 @@ public record NetworkConfig(
             // step, one address per peer id: the Rust PeerPool dedupes by peer id, so a
             // second address for a known id would be dropped there while Java (which
             // dedupes by multiaddr string) dialed both.
+            // roost gnosis first, by name then by literal — same shape as the
+            // other two chains. See the Rust GNOSIS_STATIC_PEERS for why the
+            // literal stays behind the name.
+            prependLocal(
+                    "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
             List.of(
                     "/ip4/104.37.190.86/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59",
                     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
@@ -309,7 +360,7 @@ public record NetworkConfig(
                     "/ip4/159.195.138.9/tcp/9000/p2p/16Uiu2HAmUimXaHiCvWhx2YuvwTkDLtca6oq1bCH85Eb6JcEYiaGi",
                     "/ip4/159.195.30.80/tcp/9100/p2p/16Uiu2HAmDMWLqML5zdVVVuptjpfKAZi1qEb784HFtrqyJZGPFL3X",
                     "/ip4/164.152.161.131/tcp/9500/p2p/16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw"
-            ),
+            )),
             null,
             1638993340L, // Gnosis beacon genesis: 2021-12-08 19:55:40 UTC
             List.of(), // EL ENR trees — Gnosis has no enrtree
