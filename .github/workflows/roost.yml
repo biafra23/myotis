@@ -59,4 +59,13 @@ jobs:
       - name: Rustdoc links
         env:
           RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
-        run: cargo doc --manifest-path rust/roost/Cargo.toml --no-deps --locked
+        # --document-private-items explicitly: most of this crate's
+        # reasoning-carrying doc comments are on PRIVATE items (`Digests`,
+        # `interim_fork_digest`, `NimbusRest::get_ssz`), and they are covered
+        # today only because Cargo adds the flag automatically for a bin-only
+        # package. If roost ever grows a [lib] target — plausible for a daemon
+        # whose codec is already shared by path — the gate would silently narrow
+        # to the public surface and stop checking most of the crate. That is the
+        # same "silently stops resolving" failure this step exists to prevent,
+        # one level up. A no-op today, verified.
+        run: cargo doc --manifest-path rust/roost/Cargo.toml --no-deps --locked --document-private-items
