@@ -371,7 +371,12 @@ impl std::error::Error for RequestError {}
 enum Command {
     Request {
         peer: PeerId,
-        addr: Multiaddr,
+        /// The DNS name these candidates came from, if any — logging only.
+        dns_name: Option<String>,
+        /// Dial candidates in RESOLVER ORDER — a DNS name expands to every
+        /// address it resolves to, and order is load-bearing (see
+        /// [`resolve_dial_addrs`]).
+        addrs: Vec<Multiaddr>,
         protocol: &'static str,
         wire: Vec<u8>,
         reply: oneshot::Sender<Result<Vec<u8>, RequestError>>,
@@ -421,9 +426,19 @@ impl ReqRespClient {
         protocol: &'static str,
         wire: Vec<u8>,
     ) -> Result<Vec<u8>, RequestError> {
+        // Resolve HERE, per request, in async context. The swarm task's dial
+        // path is synchronous, so it cannot await a lookup — and libp2p's own
+        // DNS transport is not always present (Android has no /etc/resolv.conf,
+        // so `build_swarm` falls back to plain TCP and a /dns4/ address is
+        // rejected outright with "Multiaddr is not supported").
+        let dns_name = multiaddr_dns_name(&addr).map(|n| n.to_string());
+        let addrs = resolve_dial_addrs(&addr).await;
+        if addrs.is_empty() {
+            return Err(RequestError::DialFailure);
+        }
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Command::Request { peer, addr, protocol, wire, reply })
+            .send(Command::Request { peer, dns_name, addrs, protocol, wire, reply })
             .await
             .map_err(|_| RequestError::Shutdown)?;
         rx.await.map_err(|_| RequestError::Shutdown)?
@@ -656,6 +671,72 @@ fn multiaddr_dns_name(addr: &Multiaddr) -> Option<String> {
     })
 }
 
+/// Expand a dial address into concrete candidates, resolving any DNS component.
+///
+/// Returns the input unchanged when there is no name to resolve.
+///
+/// **Why we resolve rather than letting libp2p do it.** `build_swarm` layers in
+/// libp2p's DNS transport when a system resolver is configured, but that reads
+/// `/etc/resolv.conf`, which Android has not had since Oreo. There the swarm
+/// falls back to plain TCP and rejects a `/dns4/` address outright — "Multiaddr
+/// is not supported" — before any connection is attempted. `getaddrinfo`, which
+/// `lookup_host` uses, works on every platform we ship.
+///
+/// **Order is load-bearing.** `getaddrinfo` already sorts by RFC 6724
+/// destination-address selection, and every candidate is passed on in that
+/// order. On an IPv6-only mobile network with DNS64/NAT64 the synthesized
+/// `64:ff9b::/96` address sorts first and is the one that works, while the raw
+/// A record is unroutable there — so preferring IPv4 by hand would break
+/// exactly the networks this exists to support.
+///
+/// Substituting the address is safe: Noise still authenticates the remote
+/// against the `/p2p/` peer id, so a wrong or hostile answer cannot impersonate
+/// the pinned server — it can only fail to connect.
+async fn resolve_dial_addrs(addr: &Multiaddr) -> Vec<Multiaddr> {
+    use libp2p::multiaddr::Protocol;
+    let Some(name) = multiaddr_dns_name(addr).map(|n| n.to_string()) else {
+        return vec![addr.clone()];
+    };
+    let port = multiaddr_port(addr).unwrap_or(0);
+    let tail: Vec<Protocol> = addr
+        .iter()
+        .skip_while(|p| !matches!(p, Protocol::Tcp(_)))
+        .map(|p| p.acquire())
+        .collect();
+    match tokio::net::lookup_host(format!("{name}:{port}")).await {
+        Ok(found) => {
+            let mut out = Vec::new();
+            let mut seen = HashSet::new();
+            for sa in found {
+                if !seen.insert(sa.ip()) {
+                    continue;
+                }
+                let mut m = Multiaddr::empty();
+                m.push(match sa.ip() {
+                    IpAddr::V4(a) => Protocol::Ip4(a),
+                    IpAddr::V6(a) => Protocol::Ip6(a),
+                });
+                for p in &tail {
+                    m.push(p.clone());
+                }
+                out.push(m);
+            }
+            if out.is_empty() {
+                tracing::warn!(%name, "DNS-PIN resolve EMPTY — name exists but has no A/AAAA record");
+            } else {
+                let ips: Vec<String> =
+                    out.iter().filter_map(|m| multiaddr_ip(m).map(|i| i.to_string())).collect();
+                tracing::info!(%name, resolved = %ips.join(","), "DNS-PIN resolved");
+            }
+            out
+        }
+        Err(e) => {
+            tracing::warn!(%name, error = %e, "DNS-PIN resolve FAILED");
+            Vec::new()
+        }
+    }
+}
+
 /// Log what a name currently resolves to, without blocking the swarm task.
 ///
 /// libp2p resolves inside the transport and does not surface the answer — the
@@ -867,7 +948,7 @@ enum Pending {
 
 /// A request parked until the peer's Status handshake completes.
 struct QueuedRequest {
-    addr: Multiaddr,
+    addrs: Vec<Multiaddr>,
     protocol: &'static str,
     wire: Vec<u8>,
     reply: oneshot::Sender<Result<Vec<u8>, RequestError>>,
@@ -953,8 +1034,10 @@ async fn run_swarm(
                     tracing::info!("libp2p host stopping");
                     return;
                 }
-                Some(Command::Request { peer, addr, protocol, wire, reply }) => {
-                    submit_request(&mut swarm, &mut ctx, peer, addr, protocol, wire, reply);
+                Some(Command::Request { peer, dns_name, addrs, protocol, wire, reply }) => {
+                    submit_request(
+                        &mut swarm, &mut ctx, peer, dns_name, addrs, protocol, wire, reply,
+                    );
                 }
                 Some(Command::PeerCount { reply }) => {
                     let _ = reply.send(ctx.connected.len());
@@ -1004,7 +1087,9 @@ fn submit_request(
     swarm: &mut Swarm<Behaviour>,
     ctx: &mut SwarmCtx,
     peer: PeerId,
-    addr: Multiaddr,
+    dns_name: Option<String>,
+    // Candidates in resolver order — see `resolve_dial_addrs`.
+    addrs: Vec<Multiaddr>,
     protocol: &'static str,
     wire: Vec<u8>,
     reply: oneshot::Sender<Result<Vec<u8>, RequestError>>,
@@ -1014,7 +1099,7 @@ fn submit_request(
             let _ = reply.send(Err(RequestError::Io(format!("unknown protocol {protocol}"))));
             return;
         };
-        let id = rr.send_request_with_addresses(&peer, wire, vec![addr]);
+        let id = rr.send_request_with_addresses(&peer, wire, addrs);
         ctx.pending.insert(id, Pending::External(reply));
         return;
     }
@@ -1022,14 +1107,19 @@ fn submit_request(
     ctx.queued
         .entry(peer)
         .or_default()
-        .push(QueuedRequest { addr: addr.clone(), protocol, wire, reply });
+        .push(QueuedRequest { addrs: addrs.clone(), protocol, wire, reply });
     if !ctx.connected.contains(&peer) {
-        if let Some(name) = multiaddr_dns_name(&addr) {
-            log_resolution(&name, multiaddr_port(&addr).unwrap_or(0));
+        // The name is carried through rather than re-derived: by this point the
+        // candidates are concrete /ip4//ip6/ addresses, so the name only exists
+        // because the caller resolved it. Kept so a connection or dial failure
+        // can still be attributed to the pin that produced it.
+        if let Some(name) = dns_name {
             ctx.dns_dials.insert(peer, name);
         }
         use libp2p::swarm::dial_opts::DialOpts;
-        let opts = DialOpts::peer_id(peer).addresses(vec![addr]).build();
+        // EVERY candidate, in resolver order: libp2p tries them in turn, which
+        // is what makes a NAT64 network work without special-casing it.
+        let opts = DialOpts::peer_id(peer).addresses(addrs).build();
         match swarm.dial(opts) {
             Ok(()) => {}
             // Already dialing / connecting — the queued request rides along.
@@ -1075,7 +1165,7 @@ fn mark_status_done(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, peer: Peer
             let _ = q.reply.send(Err(RequestError::Io(format!("unknown protocol {}", q.protocol))));
             continue;
         };
-        let id = rr.send_request_with_addresses(&peer, q.wire, vec![q.addr]);
+        let id = rr.send_request_with_addresses(&peer, q.wire, q.addrs);
         ctx.pending.insert(id, Pending::External(q.reply));
     }
 }
@@ -1733,5 +1823,64 @@ mod external_address_tests {
         let no_ip: Multiaddr = "/dns4/example.com/tcp/9105".parse().unwrap();
         assert_eq!(multiaddr_ip(&no_ip), None);
         assert_eq!(multiaddr_port(&addr), Some(54321));
+    }
+}
+
+#[cfg(test)]
+mod dial_resolution_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_plain_ip_address_passes_through_untouched() {
+        let a: Multiaddr = "/ip4/87.154.209.161/tcp/9105/p2p/\
+            16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"
+            .parse()
+            .unwrap();
+        assert_eq!(resolve_dial_addrs(&a).await, vec![a.clone()]);
+    }
+
+    #[tokio::test]
+    async fn a_name_becomes_concrete_candidates_keeping_port_and_peer_id() {
+        // localhost is the one name guaranteed resolvable in CI and offline.
+        let a: Multiaddr = "/dns4/localhost/tcp/9105/p2p/\
+            16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"
+            .parse()
+            .unwrap();
+        let out = resolve_dial_addrs(&a).await;
+        assert!(!out.is_empty(), "localhost must resolve");
+        for m in &out {
+            // No DNS component survives — that is the whole point: the swarm's
+            // transport may have no DNS layer at all (Android), where a /dns4/
+            // address is rejected with "Multiaddr is not supported".
+            assert!(multiaddr_dns_name(m).is_none(), "{m} still carries a name");
+            assert!(multiaddr_ip(m).is_some(), "{m} has no IP");
+            assert_eq!(multiaddr_port(m), Some(9105), "port must survive");
+            assert!(
+                m.to_string().ends_with("16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"),
+                "peer id must survive: {m}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_name_yields_no_candidates() {
+        // Empty, not the input: dialing a /dns4/ address on a DNS-less transport
+        // fails with a misleading "Multiaddr is not supported" rather than a
+        // resolution error. The caller turns this into DialFailure.
+        let a: Multiaddr = "/dns4/no-such-host.invalid/tcp/9105/p2p/\
+            16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"
+            .parse()
+            .unwrap();
+        assert!(resolve_dial_addrs(&a).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_addresses_are_collapsed() {
+        // localhost commonly resolves to 127.0.0.1 twice (once per socket type);
+        // dialing the same address twice buys nothing.
+        let a: Multiaddr = "/dns4/localhost/tcp/9105".parse().unwrap();
+        let out = resolve_dial_addrs(&a).await;
+        let ips: HashSet<_> = out.iter().filter_map(multiaddr_ip).collect();
+        assert_eq!(ips.len(), out.len(), "candidates must be unique by IP");
     }
 }
