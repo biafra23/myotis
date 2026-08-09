@@ -186,4 +186,25 @@ class NetworkConfigGnosisTest {
         assertTrue(NetworkConfig.SEPOLIA.clPeerMultiaddrs().size() > 2,
                 "pinning must not drop the existing CL peers");
     }
+
+    @Test
+    void mainnetPinsRoostFirst() {
+        // The Rust twin (sync.rs mainnet_config_matches_networkconfig_java)
+        // asserts index 0 and the list length; without this, POSITION was pinned
+        // on one side only. That asymmetry is the failure worth catching: both
+        // engines would still "contain" roost while disagreeing about which peer
+        // the light client actually tries first, and only one of them would be
+        // reaching the dedicated server.
+        //
+        // It also matters more here than in Rust: addPeer inserts discovered
+        // peers at Math.min(1, size()), so presence-anywhere is a weak claim on
+        // this side.
+        List<String> cl = NetworkConfig.MAINNET.clPeerMultiaddrs();
+        assertEquals("/ip4/87.154.209.161/tcp/9109/p2p/"
+                        + "16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
+                cl.get(0),
+                "roost mainnet must be the first CL peer tried");
+        assertEquals(19, cl.size(),
+                "18 discovered peers + roost; pinning must not drop the fallbacks");
+    }
 }
