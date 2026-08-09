@@ -230,7 +230,14 @@ impl NimbusRest {
             .map(str::to_string);
 
         if !status.is_success() {
-            return Err(if status.is_client_error() {
+            // 408 and 429 are 4xx but RETRYABLE, and treating them as definitive
+            // poisons a root permanently: `take_bootstrap_misses` marks it
+            // attempted before this request and only `Transient` is requeued, so
+            // one rate-limit answer makes every later wallet retry return
+            // ResourceUnavailable forever. The Unavailable/Transient split exists
+            // precisely to keep a temporary condition from becoming permanent.
+            let retryable = matches!(status.as_u16(), 408 | 429);
+            return Err(if status.is_client_error() && !retryable {
                 FetchError::Unavailable(status.as_u16())
             } else {
                 FetchError::Transient(anyhow!("GET {url} -> HTTP {status}"))

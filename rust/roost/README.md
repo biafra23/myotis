@@ -55,10 +55,14 @@ a bootstrap is stamped for the slot of the block it anchors to; the per-slot
 objects use head. `roost probe` checks the computed value against the one the
 upstream actually put on the wire.
 
-**The external address is tracked but not published.** roost takes a quorum of
-libp2p Identify reports — deduped by connection source, so extra peer ids buy
-nothing — and warns loudly when it changes. That is the input an ENR needs on a
-connection whose public IP is not guaranteed stable.
+**The external address comes from the UPSTREAM, and is not published.** roost
+reads Nimbus's own discv5 view (`/eth/v1/node/identity`) every tick and warns
+loudly when it changes; that is what drives IP-change detection. The libp2p
+Identify quorum is a fallback, used only when the upstream cannot answer,
+because dialing peers to harvest observations was measured here and does not
+work: beacon nodes close a non-gossiping peer's connection before Identify
+completes. Either way this is the input an ENR needs on a connection whose
+public IP is not guaranteed stable.
 
 ## Not built yet
 
@@ -117,9 +121,16 @@ reviewable rather than assertions about a file on one machine.
 
 ```bash
 cargo build --release --manifest-path rust/roost/Cargo.toml
-sudo bash rust/roost/deploy/install-roost.sh   # idempotent; never touches an existing key
-sudo systemctl start roost-sepolia
+# One instance per chain, from the systemd TEMPLATE (deploy/roost@.service):
+sudo bash deploy/install-roost-instance.sh sepolia   # tcp 9105, upstream 5052
+sudo bash deploy/install-roost-instance.sh mainnet   # tcp 9109, upstream 5054
+sudo bash deploy/install-roost-instance.sh gnosis    # tcp 9108, upstream 5053
+sudo systemctl start roost@sepolia roost@mainnet roost@gnosis
 ```
+
+The older `rust/roost/deploy/install-roost.sh` + `roost-sepolia.service` pair
+installs a **second, differently-named** sepolia unit and is superseded by the
+template. Do not run both: two units on port 9105 means one restart-loops.
 
 What that lays down:
 
@@ -185,11 +196,11 @@ failing on them. Extending `probe` to cover them is a worthwhile follow-up.
 but with the public IP. That is the only step that exercises the listener, the
 serving handlers and the archive together.
 
-**Note what deploying does not yet do.** roost publishes no ENR, and
-`NetworkConfig`'s pinned sepolia multiaddr still points at Nimbus — so a
-deployed roost serves only wallets explicitly told about it. Running it now is
-worth doing to keep the archive warm and prove stability, not because it is in
-the wallet path yet.
+**Note what deploying does not yet do.** roost publishes no ENR, so wallets
+cannot DISCOVER it (#335). It is nonetheless in the default wallet path: both
+engines pin roost first on mainnet, gnosis and sepolia, by DynDNS name
+(`/dns4/…`), resolved at dial time. So a deployed roost serves every wallet
+that ships with those pins — it just cannot be found by one that does not.
 
 ## Why it is not a workspace member
 
@@ -198,8 +209,14 @@ stack into every Android, iOS and JVM developer's `cargo build --workspace`, and
 — the one that matters — it would inherit the workspace's `panic = "abort"`,
 which a member cannot override. In a daemon holding a thousand wallet
 connections that turns one panic into an outage for all of them. Excluded, roost
-carries its own profile with `panic = "unwind"`, so a malformed chunk kills one
-connection rather than the process.
+carries its own profile with `panic = "unwind"`, so a panic is a recoverable,
+observable failure rather than an instant process abort.
+
+Be precise about what that does NOT buy: request handling runs inline on the
+single swarm task, so a panic there takes the task down and with it every
+connection. `serve` detects the dead task and exits non-zero for the
+supervisor. The gain is a controlled, logged exit that systemd restarts —
+not per-connection isolation.
 
 That only holds because the daemon watches for it: the libp2p swarm task owns
 the listener, so if it dies the process would otherwise keep running with no

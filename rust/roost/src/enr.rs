@@ -93,6 +93,17 @@ impl EnrSeq {
         }
         std::fs::rename(&tmp, &self.path)
             .with_context(|| format!("renaming into {}", self.path.display()))?;
+        // fsync the DIRECTORY too: syncing the file makes its contents durable,
+        // but the rename is a directory operation and can still be lost on power
+        // loss. The invariant here is persistence-BEFORE-use — a sequence number
+        // that was returned but not durable lets a later record reuse a value the
+        // DHT has already seen, and the DHT then ignores every record until the
+        // count climbs back past it. The node looks healthy and is undiscoverable.
+        if let Some(dir) = self.path.parent() {
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
         self.current = next;
         Ok(next)
     }
