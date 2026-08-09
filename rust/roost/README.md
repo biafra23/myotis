@@ -51,7 +51,11 @@ reports, and logs a change loudly. Nothing is published from it yet — it is th
 input the ENR will need, on a deployment whose public IP is not guaranteed
 stable.
 
-Not built yet: **ENR publication** (persisted discv5 key and sequence number,
+`roost enr --advertise <ip>` builds and prints the record roost would publish —
+persisted discv5 identity (separate from the libp2p key), monotonic sequence
+number, endpoint, and the full 16-byte `eth2` ENRForkID. It publishes nothing.
+
+Not built yet: **putting that record in the DHT** (persisted discv5 key and sequence number,
 re-published at fork *and* BPO boundaries) and the **back-archive** below the
 upstream node's light-client floor. Those are what stand between this and the
 design's rollout steps 4-5.

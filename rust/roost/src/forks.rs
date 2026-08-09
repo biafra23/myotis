@@ -212,6 +212,48 @@ impl ForkSchedule {
         }
     }
 
+    /// The next scheduled fork after `epoch`, if any.
+    pub fn next_fork_after(&self, epoch: u64) -> Option<Fork> {
+        self.forks.iter().find(|f| f.epoch > epoch).copied()
+    }
+
+    /// The 16-byte SSZ `ENRForkID` for `epoch`:
+    /// `fork_digest(4) || next_fork_version(4) || next_fork_epoch(u64 LE)`.
+    ///
+    /// This is the ENR's `eth2` field — the thing that makes a published record
+    /// findable by the clients it is meant for, and invisible to them if it is
+    /// wrong. A TRUNCATED field (just the 4-byte digest) is malformed and
+    /// standard clients reject the record outright.
+    ///
+    /// With no future fork scheduled, the spec's convention is
+    /// `next_fork_version = current_fork_version` and
+    /// `next_fork_epoch = FAR_FUTURE_EPOCH` (`u64::MAX`).
+    ///
+    /// # BPO entries are not treated as "the next fork"
+    ///
+    /// A blob-parameter-only boundary changes the fork DIGEST but not the fork
+    /// VERSION, and `next_fork_version` is a version. So the next fork here is
+    /// the next entry in the fork schedule, not the next entry in the blob
+    /// schedule. That reading follows from the field's shape, but it is worth
+    /// confirming against the spec and against what other clients publish
+    /// before a record built this way goes into the DHT — a disagreement here
+    /// costs discoverability, which is the entire point of publishing.
+    pub fn enr_fork_id(&self, epoch: u64) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[..4].copy_from_slice(&self.digest_for_epoch(epoch));
+        match self.next_fork_after(epoch) {
+            Some(next) => {
+                out[4..8].copy_from_slice(&next.version);
+                out[8..].copy_from_slice(&next.epoch.to_le_bytes());
+            }
+            None => {
+                out[4..8].copy_from_slice(&self.fork_at_epoch(epoch).version);
+                out[8..].copy_from_slice(&u64::MAX.to_le_bytes());
+            }
+        }
+        out
+    }
+
     /// The fork digest an object at `slot` must carry.
     pub fn digest_for_slot(&self, slot: u64) -> [u8; 4] {
         self.digest_for_epoch(slot / self.slots_per_epoch)
@@ -350,6 +392,57 @@ mod tests {
         assert_eq!(s.fork_at_epoch(0).version, [0x90, 0, 0, 0x69]);
         assert_eq!(s.fork_at_epoch(49).version, [0x90, 0, 0, 0x69]);
         assert_eq!(s.fork_at_epoch(50).version, [0x90, 0, 0, 0x70], "ALTAIR");
+    }
+
+    #[test]
+    fn enr_fork_id_has_the_full_16_byte_shape() {
+        // A truncated eth2 field (digest only) is malformed and standard
+        // clients reject the whole record.
+        let s = sepolia();
+        let epoch = 339_810; // the live head epoch this was verified at
+        let id = s.enr_fork_id(epoch);
+        assert_eq!(id.len(), 16);
+        assert_eq!(&id[..4], &[0x74, 0xd0, 0x14, 0x59], "current digest");
+        // GLOAS is scheduled at u64::MAX, so it IS the next fork by version.
+        assert_eq!(&id[4..8], &[0x07, 0x00, 0x00, 0x00], "GLOAS version");
+        assert_eq!(u64::from_le_bytes(id[8..].try_into().unwrap()), u64::MAX);
+    }
+
+    #[test]
+    fn enr_fork_id_names_the_next_scheduled_fork() {
+        let s = sepolia();
+        // Before ELECTRA, the next fork is ELECTRA at its own epoch.
+        let id = s.enr_fork_id(222_000);
+        assert_eq!(&id[4..8], &[0x90, 0, 0, 0x74], "ELECTRA version");
+        assert_eq!(u64::from_le_bytes(id[8..].try_into().unwrap()), 222_464);
+    }
+
+    #[test]
+    fn enr_fork_id_falls_back_to_the_current_fork_when_nothing_is_scheduled() {
+        // No future fork at all: spec convention is current version + far-future
+        // epoch, NOT a zeroed version.
+        let spec: BTreeMap<String, String> = [
+            ("GENESIS_FORK_VERSION", "0x90000069"),
+            ("FULU_FORK_VERSION", "0x90000075"),
+            ("FULU_FORK_EPOCH", "272640"),
+            ("SLOTS_PER_EPOCH", "32"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let s = ForkSchedule::from_spec(&spec, sepolia_gvr()).unwrap();
+        let id = s.enr_fork_id(300_000);
+        assert_eq!(&id[4..8], &[0x90, 0, 0, 0x75], "current version, not zeros");
+        assert_eq!(u64::from_le_bytes(id[8..].try_into().unwrap()), u64::MAX);
+    }
+
+    #[test]
+    fn a_bpo_boundary_is_not_the_next_fork() {
+        // BPO changes the digest, not the version — and next_fork_version is a
+        // version. So the next fork after Fulu is GLOAS, not BPO2.
+        let s = sepolia();
+        let next = s.next_fork_after(272_640).unwrap();
+        assert_eq!(next.version, [0x07, 0x00, 0x00, 0x00], "GLOAS, not a BPO");
     }
 
     #[test]

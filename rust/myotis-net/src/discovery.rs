@@ -326,3 +326,168 @@ mod tests {
         assert_eq!(rlp_short_string_payload(&[]), None);
     }
 }
+
+// -------------------------------------------------------------------------
+// Server-mode ENR: a record other nodes can find
+// -------------------------------------------------------------------------
+
+/// Load a persisted discv5 identity, or create one with owner-only permissions.
+///
+/// SEPARATE from the libp2p host key: discv5 and libp2p have different node
+/// identities, and conflating them would publish a record whose node id does not
+/// match the peer id wallets dial.
+///
+/// Persistence is the whole point. A fresh key per start means a new node ID, so
+/// the published ENR becomes a new DHT entry with no accumulated reachability
+/// and every cached record points at an identity that no longer exists. A
+/// routine deploy would repeatedly un-learn the server from the network.
+pub fn load_or_create_discv5_key(path: &std::path::Path) -> Result<CombinedKey, String> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("creating {parent:?}: {e}"))?;
+        }
+    }
+
+    // create_new + 0600 in ONE call: `exists()` then write is both a race (two
+    // starts each see "missing", the second clobbers a published identity) and a
+    // permissions hole, since plain writes use the process umask.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(path) {
+        Ok(mut f) => {
+            let key = CombinedKey::generate_secp256k1();
+            let bytes = match &key {
+                CombinedKey::Secp256k1(k) => k.to_bytes().to_vec(),
+                _ => return Err("generated a non-secp256k1 discv5 key".into()),
+            };
+            f.write_all(&bytes)
+                .map_err(|e| format!("writing {}: {e}", path.display()))?;
+            f.sync_all().map_err(|e| format!("syncing {}: {e}", path.display()))?;
+            tracing::info!(path = %path.display(), "generated a new discv5 identity (0600)");
+            Ok(key)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut bytes =
+                std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+            CombinedKey::secp256k1_from_bytes(&mut bytes)
+                .map_err(|e| format!("decoding the discv5 key in {}: {e}", path.display()))
+        }
+        Err(e) => Err(format!("creating {}: {e}", path.display())),
+    }
+}
+
+/// Build the ENR a SERVER publishes: reachable endpoint plus the `eth2` field.
+///
+/// The endpoint is what makes the record listable at all — the client-side
+/// record is built with no endpoint, which is why a wallet is unlistable by
+/// omission rather than by configuration.
+///
+/// `eth2` MUST be the complete 16-byte SSZ `ENRForkID`
+/// (`fork_digest || next_fork_version || next_fork_epoch`). A truncated field
+/// carrying only the 4-byte digest is malformed, and standard clients reject the
+/// record — so a half-filled field is worse than none.
+///
+/// `seq` must be persisted and monotonic across restarts. The DHT keeps the
+/// highest-sequence record it has seen, so a record that does not out-rank the
+/// cached one is ignored — which would make an address update silently
+/// ineffective, the failure mode that matters most on a connection whose IP can
+/// change.
+pub fn build_server_enr(
+    key: &CombinedKey,
+    seq: u64,
+    ip: std::net::IpAddr,
+    tcp_port: u16,
+    udp_port: u16,
+    eth2: [u8; 16],
+) -> Result<Enr, String> {
+    let mut builder = Enr::builder();
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            builder.ip4(v4).tcp4(tcp_port).udp4(udp_port);
+        }
+        std::net::IpAddr::V6(v6) => {
+            builder.ip6(v6).tcp6(tcp_port).udp6(udp_port);
+        }
+    }
+    builder.add_value(b"eth2".as_slice(), &eth2.as_slice());
+    builder.seq(seq);
+    builder.build(key).map_err(|e| format!("building the server ENR: {e}"))
+}
+
+#[cfg(test)]
+mod server_enr_tests {
+    use super::*;
+
+    fn eth2_field() -> [u8; 16] {
+        let mut f = [0u8; 16];
+        f[..4].copy_from_slice(&[0x74, 0xd0, 0x14, 0x59]);
+        f[4..8].copy_from_slice(&[0x07, 0x00, 0x00, 0x00]);
+        f[8..].copy_from_slice(&u64::MAX.to_le_bytes());
+        f
+    }
+
+    #[test]
+    fn a_server_record_carries_an_endpoint_and_the_full_eth2_field() {
+        let key = CombinedKey::generate_secp256k1();
+        let enr = build_server_enr(
+            &key,
+            7,
+            "87.154.209.161".parse().unwrap(),
+            9105,
+            9105,
+            eth2_field(),
+        )
+        .unwrap();
+
+        assert_eq!(enr.seq(), 7);
+        assert_eq!(enr.ip4().map(|i| i.to_string()).as_deref(), Some("87.154.209.161"));
+        assert_eq!(enr.tcp4(), Some(9105));
+        assert_eq!(enr.udp4(), Some(9105), "no udp means unlistable for discv5");
+
+        // The field must round-trip through the SAME reader the client side uses
+        // to filter candidates — a record we cannot read ourselves is one no
+        // wallet will match either.
+        assert_eq!(enr_eth2_fork_digest(&enr), Some([0x74, 0xd0, 0x14, 0x59]));
+
+        let raw = enr.get_raw_rlp(b"eth2").expect("eth2 present");
+        let payload = rlp_short_string_payload(raw).expect("rlp string");
+        assert_eq!(payload.len(), 16, "a truncated eth2 field is malformed");
+        assert_eq!(u64::from_le_bytes(payload[8..].try_into().unwrap()), u64::MAX);
+    }
+
+    #[test]
+    fn the_persisted_key_survives_a_reload_and_keeps_the_node_id() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("roost-discv5-key-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // Compare NODE IDs, which is the thing the DHT indexes on and the thing
+        // a restart must not change.
+        let node_id = |k: &CombinedKey| {
+            build_server_enr(k, 1, "1.2.3.4".parse().unwrap(), 1, 1, eth2_field())
+                .unwrap()
+                .node_id()
+        };
+        let first = node_id(&load_or_create_discv5_key(&path).unwrap());
+        let second = node_id(&load_or_create_discv5_key(&path).unwrap());
+        assert_eq!(
+            first, second,
+            "a restart that changes the node id un-learns the server from every peer"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "a world-readable identity can be impersonated");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+}
