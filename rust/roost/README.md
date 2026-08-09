@@ -46,6 +46,11 @@ limits.
 - `roost serve` — the server itself. A myotis wallet bootstraps and stays synced
   from it alone (verified on sepolia with discovery disabled).
 
+roost tracks the address peers say they see it on, by quorum of libp2p Identify
+reports, and logs a change loudly. Nothing is published from it yet — it is the
+input the ENR will need, on a deployment whose public IP is not guaranteed
+stable.
+
 Not built yet: **ENR publication** (persisted discv5 key and sequence number,
 re-published at fork *and* BPO boundaries) and the **back-archive** below the
 upstream node's light-client floor. Those are what stand between this and the

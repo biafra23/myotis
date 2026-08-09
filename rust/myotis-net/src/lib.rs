@@ -24,10 +24,12 @@
 // Re-exported so downstream crates (rust/roost) can build a `HostConfig`
 // without pinning their own libp2p version — the types in that config are
 // libp2p's, so version skew would be a confusing type error. Narrowed to the
-// two items a `HostConfig` actually needs rather than `pub use libp2p;`, which
-// would put the whole crate in this one's public surface for the sake of one
-// type.
-pub use libp2p::{identity, Multiaddr};
+// items a downstream actually needs — building a `HostConfig` (`identity`,
+// `Multiaddr`) and handling what `start_host_with` returns (`PeerId`), plus
+// `multiaddr` for constructing an address from its protocols. Deliberately not
+// `pub use libp2p;`, which would put the whole crate in this one's public
+// surface.
+pub use libp2p::{identity, multiaddr, Multiaddr, PeerId};
 
 pub mod clcache;
 pub mod codec;
