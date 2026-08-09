@@ -23,9 +23,11 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use myotis_net::identity::Keypair;
+use myotis_net::multiaddr::Protocol;
 use myotis_net::reqresp::{
     start_host_with, ExternalAddress, HostConfig, LocalStatus, EXTERNAL_ADDR_QUORUM,
 };
+use myotis_net::Multiaddr;
 use myotis_net::status::StatusMessage;
 
 use crate::archive::Archive;
@@ -225,6 +227,22 @@ fn report_digest_disagreement(digests: &Digests, observed: [u8; 4], head_slot: u
     }
 }
 
+/// Build the multiaddr an operator would dial.
+///
+/// Constructed from `Protocol::from(ip)` rather than formatted with a hardcoded
+/// `/ip4/`, which would emit an unparseable `/ip4/2001:db8::1/...` the moment an
+/// observation is IPv6 — in the one line someone would copy to test reachability.
+/// Not reachable today (the listener is v4-only and roost never dials), which is
+/// exactly why it is cheap to make impossible now.
+fn dialable(seen: &ExternalAddress, listen_port: u16, peer_id: myotis_net::PeerId) -> Multiaddr {
+    Multiaddr::empty()
+        .with(Protocol::from(seen.ip))
+        // The observed port when reporters supplied one (inbound connections
+        // see our externally mapped port); otherwise what we asked to listen on.
+        .with(Protocol::Tcp(seen.port.unwrap_or(listen_port)))
+        .with(Protocol::P2p(peer_id))
+}
+
 /// Read the fork and blob schedule from the upstream.
 async fn fetch_schedule(client: &NimbusRest, gvr: [u8; 32]) -> Result<ForkSchedule> {
     ForkSchedule::fetch(client, gvr).await
@@ -416,7 +434,7 @@ pub async fn serve(
         digests.source()
     );
     println!("  inbound   cap {MAX_INBOUND}");
-    println!("\n  point a wallet at the multiaddr above; Ctrl-C to stop.\n");
+    println!("\n  point a wallet at the loopback address above; Ctrl-C to stop.\n");
 
     let mut digests = digests;
     let mut external: Option<ExternalAddress> = None;
@@ -563,27 +581,48 @@ pub async fn serve(
                 // keeping the last known answer beats oscillating to "unknown"
                 // every time a peer disconnects.
                 if let Some(seen) = net.external_address().await {
-                    match external {
+                    let advertised = dialable(&seen, port, peer_id);
+                    let changed = external.map(|p: ExternalAddress| p.ip != seen.ip);
+                    match changed {
                         None => {
-                            tracing::info!(
-                                ip = %seen.ip, confirmations = seen.confirmations,
-                                multiaddr = %format!("/ip4/{}/tcp/{}/p2p/{}", seen.ip, port, peer_id),
-                                "external address established"
-                            );
+                            // First settle. Say plainly whether this is an
+                            // address anything outside could dial: a couple of
+                            // wallets on the same LAN can reach quorum before a
+                            // single internet peer does, and an ENR carrying an
+                            // RFC1918 address fails exactly the way publishing
+                            // an address is meant to prevent.
+                            if seen.routable && !seen.is_contested() {
+                                tracing::info!(
+                                    ip = %seen.ip, port = ?seen.port,
+                                    confirmations = seen.confirmations, reporters = seen.reporters,
+                                    multiaddr = %advertised, "external address established"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    ip = %seen.ip, routable = seen.routable,
+                                    contested = seen.is_contested(),
+                                    confirmations = seen.confirmations, reporters = seen.reporters,
+                                    multiaddr = %advertised,
+                                    "external address seen but NOT usable for publication — \
+                                     non-routable and/or contested; treating it as provisional"
+                                );
+                            }
                             external = Some(seen);
                         }
-                        Some(prev) if prev.ip != seen.ip => {
+                        Some(true) => {
                             tracing::warn!(
-                                old = %prev.ip, new = %seen.ip,
-                                confirmations = seen.confirmations,
-                                multiaddr = %format!("/ip4/{}/tcp/{}/p2p/{}", seen.ip, port, peer_id),
+                                old = %external.map(|p| p.ip.to_string()).unwrap_or_default(),
+                                new = %seen.ip, routable = seen.routable,
+                                contested = seen.is_contested(),
+                                confirmations = seen.confirmations, reporters = seen.reporters,
+                                multiaddr = %advertised,
                                 "EXTERNAL ADDRESS CHANGED — anything pinning the old one is now \
                                  dialling a dead address; the ENR will need re-publishing with a \
                                  bumped sequence number once it exists"
                             );
                             external = Some(seen);
                         }
-                        Some(_) => external = Some(seen),
+                        Some(false) => external = Some(seen),
                     }
                 }
 
