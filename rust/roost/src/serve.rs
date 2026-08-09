@@ -74,7 +74,7 @@ const MISS_FETCHES_PER_TICK: usize = 4;
 /// taking the tokens that made the peer worth keeping with it. A routine deploy
 /// would repeatedly un-learn this server from every wallet that had proven it.
 /// The same lesson `--netkey-file` taught us on the Nimbus side.
-fn load_or_create_key(path: &Path) -> Result<Keypair> {
+pub(crate) fn load_or_create_key(path: &Path) -> Result<Keypair> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;

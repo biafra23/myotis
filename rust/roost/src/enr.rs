@@ -46,6 +46,9 @@ impl EnrSeq {
         Ok(Self { path, current })
     }
 
+    /// The last issued number. Callers publishing a record want [`Self::bump`]
+    /// instead — see its note on ordering.
+    #[allow(dead_code)] // used by tests and by the publish step
     pub fn current(&self) -> u64 {
         self.current
     }
@@ -65,11 +68,29 @@ impl EnrSeq {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        // Write-then-rename so a crash mid-write cannot leave a truncated number
-        // that would parse as something smaller.
-        let tmp = self.path.with_extension("seq.tmp");
-        std::fs::write(&tmp, next.to_string())
-            .with_context(|| format!("writing {}", tmp.display()))?;
+        // Write, FSYNC, then rename. `fs::write` alone returns once the data is
+        // in the page cache: rename makes the NAME change atomic and says
+        // nothing about the contents being on disk, so a power loss can leave a
+        // renamed file of length zero. That is normally a shrug — but `load`
+        // deliberately refuses to recover from a corrupt file, so the residue
+        // would be a startup failure until someone wrote a number back by hand.
+        // The write side should make the state the read side hard-fails on
+        // unreachable, not merely unlikely.
+        //
+        // The temp name carries the pid so two instances sharing a data
+        // directory cannot race on the same path.
+        let tmp = self
+            .path
+            .with_extension(format!("seq.tmp.{}", std::process::id()));
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)
+                .with_context(|| format!("creating {}", tmp.display()))?;
+            f.write_all(next.to_string().as_bytes())
+                .with_context(|| format!("writing {}", tmp.display()))?;
+            f.sync_all()
+                .with_context(|| format!("syncing {}", tmp.display()))?;
+        }
         std::fs::rename(&tmp, &self.path)
             .with_context(|| format!("renaming into {}", self.path.display()))?;
         self.current = next;

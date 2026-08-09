@@ -55,8 +55,7 @@ stable.
 persisted discv5 identity (separate from the libp2p key), monotonic sequence
 number, endpoint, and the full 16-byte `eth2` ENRForkID. It publishes nothing.
 
-Not built yet: **putting that record in the DHT** (persisted discv5 key and sequence number,
-re-published at fork *and* BPO boundaries) and the **back-archive** below the
+Not built yet: **putting that record in the DHT** (re-published at fork *and* BPO boundaries) and the **back-archive** below the
 upstream node's light-client floor. Those are what stand between this and the
 design's rollout steps 4-5.
 

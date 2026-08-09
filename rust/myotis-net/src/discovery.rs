@@ -331,56 +331,28 @@ mod tests {
 // Server-mode ENR: a record other nodes can find
 // -------------------------------------------------------------------------
 
-/// Load a persisted discv5 identity, or create one with owner-only permissions.
+/// Derive the discv5 identity from the libp2p host key.
 ///
-/// SEPARATE from the libp2p host key: discv5 and libp2p have different node
-/// identities, and conflating them would publish a record whose node id does not
-/// match the peer id wallets dial.
+/// They MUST be the same key. In the eth2 network a node's libp2p peer id is
+/// derived from the secp256k1 public key in its ENR — this crate's own
+/// `enr_to_peer_id` does exactly that when turning a discovered record into a
+/// dial target. Publishing a record signed by a different key would therefore
+/// advertise a peer id we cannot authenticate as: every wallet that discovered
+/// us would dial, fail the Noise handshake, and charge us a strike.
 ///
-/// Persistence is the whole point. A fresh key per start means a new node ID, so
-/// the published ENR becomes a new DHT entry with no accumulated reachability
-/// and every cached record points at an identity that no longer exists. A
-/// routine deploy would repeatedly un-learn the server from the network.
-pub fn load_or_create_discv5_key(path: &std::path::Path) -> Result<CombinedKey, String> {
-    use std::io::Write;
-
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("creating {parent:?}: {e}"))?;
-        }
-    }
-
-    // create_new + 0600 in ONE call: `exists()` then write is both a race (two
-    // starts each see "missing", the second clobbers a published identity) and a
-    // permissions hole, since plain writes use the process umask.
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    match opts.open(path) {
-        Ok(mut f) => {
-            let key = CombinedKey::generate_secp256k1();
-            let bytes = match &key {
-                CombinedKey::Secp256k1(k) => k.to_bytes().to_vec(),
-                _ => return Err("generated a non-secp256k1 discv5 key".into()),
-            };
-            f.write_all(&bytes)
-                .map_err(|e| format!("writing {}: {e}", path.display()))?;
-            f.sync_all().map_err(|e| format!("syncing {}: {e}", path.display()))?;
-            tracing::info!(path = %path.display(), "generated a new discv5 identity (0600)");
-            Ok(key)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let mut bytes =
-                std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-            CombinedKey::secp256k1_from_bytes(&mut bytes)
-                .map_err(|e| format!("decoding the discv5 key in {}: {e}", path.display()))
-        }
-        Err(e) => Err(format!("creating {}: {e}", path.display())),
-    }
+/// (An earlier version of this module generated and persisted a SEPARATE discv5
+/// key, on the reasoning that conflating the two identities would be a mistake.
+/// That was backwards, and roost's own client code is the proof.)
+pub fn discv5_key_from_libp2p(
+    keypair: &libp2p::identity::Keypair,
+) -> Result<CombinedKey, String> {
+    let secp = keypair
+        .clone()
+        .try_into_secp256k1()
+        .map_err(|_| "the libp2p host key is not secp256k1 — the CL spec requires it".to_string())?;
+    let mut bytes = secp.secret().to_bytes();
+    CombinedKey::secp256k1_from_bytes(&mut bytes)
+        .map_err(|e| format!("converting the libp2p key to a discv5 key: {e}"))
 }
 
 /// Build the ENR a SERVER publishes: reachable endpoint plus the `eth2` field.
@@ -462,32 +434,35 @@ mod server_enr_tests {
         assert_eq!(u64::from_le_bytes(payload[8..].try_into().unwrap()), u64::MAX);
     }
 
+    /// THE property: a wallet that discovers our record must derive the peer id
+    /// it will actually be able to authenticate against.
     #[test]
-    fn the_persisted_key_survives_a_reload_and_keeps_the_node_id() {
-        let mut path = std::env::temp_dir();
-        path.push(format!("roost-discv5-key-test-{}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+    fn the_enr_yields_the_libp2p_peer_id_the_host_authenticates_as() {
+        let host_key = libp2p::identity::Keypair::generate_secp256k1();
+        let host_peer_id = PeerId::from(host_key.public());
 
-        // Compare NODE IDs, which is the thing the DHT indexes on and the thing
-        // a restart must not change.
-        let node_id = |k: &CombinedKey| {
-            build_server_enr(k, 1, "1.2.3.4".parse().unwrap(), 1, 1, eth2_field())
-                .unwrap()
-                .node_id()
-        };
-        let first = node_id(&load_or_create_discv5_key(&path).unwrap());
-        let second = node_id(&load_or_create_discv5_key(&path).unwrap());
+        let enr_key = discv5_key_from_libp2p(&host_key).unwrap();
+        let record = build_server_enr(
+            &enr_key,
+            1,
+            "87.154.209.161".parse().unwrap(),
+            9105,
+            9105,
+            eth2_field(),
+        )
+        .unwrap();
+
         assert_eq!(
-            first, second,
-            "a restart that changes the node id un-learns the server from every peer"
+            enr_to_peer_id(&record),
+            Some(host_peer_id),
+            "a record signed by any other key advertises a peer id we cannot authenticate as: \
+             every wallet that discovers us dials, fails the Noise handshake, and charges a strike"
         );
+    }
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "a world-readable identity can be impersonated");
-        }
-        std::fs::remove_file(&path).ok();
+    #[test]
+    fn a_non_secp256k1_host_key_is_refused_rather_than_silently_wrong() {
+        let ed = libp2p::identity::Keypair::generate_ed25519();
+        assert!(discv5_key_from_libp2p(&ed).is_err());
     }
 }

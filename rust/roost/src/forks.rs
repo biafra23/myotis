@@ -212,9 +212,44 @@ impl ForkSchedule {
         }
     }
 
-    /// The next scheduled fork after `epoch`, if any.
-    pub fn next_fork_after(&self, epoch: u64) -> Option<Fork> {
-        self.forks.iter().find(|f| f.epoch > epoch).copied()
+    /// The next scheduled transition after `epoch` — a regular fork OR a BPO
+    /// boundary — and the fork version that applies at it.
+    ///
+    /// Two corrections over the obvious implementation, both from review:
+    ///
+    /// 1. **A fork parked at `u64::MAX` is not scheduled.** That is the
+    ///    placeholder every live spec uses for a fork with no date (GLOAS
+    ///    today), and [`ForkSchedule::fork_at_epoch`] already treats it that way.
+    ///    Returning it here would have made the documented no-future-fork
+    ///    fallback dead code on every real chain.
+    /// 2. **A BPO counts as a transition.** Nimbus and Lighthouse both take
+    ///    `next_fork_epoch` as the next regular *or* BPO fork, while
+    ///    `next_fork_version` stays the CURRENT version across a BPO — because a
+    ///    blob-parameter-only boundary changes the digest, not the version.
+    ///    Emitting GLOAS/far-future in front of an imminent BPO would disagree
+    ///    with every peer that implements it that way.
+    pub fn next_transition_after(&self, epoch: u64) -> Option<(u64, [u8; 4])> {
+        let next_fork = self
+            .forks
+            .iter()
+            .find(|f| f.epoch > epoch && f.epoch != u64::MAX)
+            .copied();
+        let next_bpo = self
+            .blob_schedule
+            .iter()
+            .find(|b| b.epoch > epoch && b.epoch != u64::MAX)
+            .copied();
+
+        match (next_fork, next_bpo) {
+            // Whichever comes first. A BPO keeps the current version; a regular
+            // fork brings its own.
+            (Some(f), Some(b)) if b.epoch < f.epoch => {
+                Some((b.epoch, self.fork_at_epoch(epoch).version))
+            }
+            (Some(f), _) => Some((f.epoch, f.version)),
+            (None, Some(b)) => Some((b.epoch, self.fork_at_epoch(epoch).version)),
+            (None, None) => None,
+        }
     }
 
     /// The 16-byte SSZ `ENRForkID` for `epoch`:
@@ -229,22 +264,21 @@ impl ForkSchedule {
     /// `next_fork_version = current_fork_version` and
     /// `next_fork_epoch = FAR_FUTURE_EPOCH` (`u64::MAX`).
     ///
-    /// # BPO entries are not treated as "the next fork"
+    /// # BPO boundaries count as transitions
     ///
-    /// A blob-parameter-only boundary changes the fork DIGEST but not the fork
-    /// VERSION, and `next_fork_version` is a version. So the next fork here is
-    /// the next entry in the fork schedule, not the next entry in the blob
-    /// schedule. That reading follows from the field's shape, but it is worth
-    /// confirming against the spec and against what other clients publish
-    /// before a record built this way goes into the DHT — a disagreement here
-    /// costs discoverability, which is the entire point of publishing.
+    /// `next_fork_epoch` is the next regular *or* BPO fork, matching Nimbus and
+    /// Lighthouse; `next_fork_version` stays the current version across a BPO,
+    /// because a blob-parameter-only boundary changes the digest and not the
+    /// version. See [`ForkSchedule::next_transition_after`] — an earlier draft
+    /// of this walked only the fork schedule, which would have advertised
+    /// GLOAS/far-future in front of an imminent BPO.
     pub fn enr_fork_id(&self, epoch: u64) -> [u8; 16] {
         let mut out = [0u8; 16];
         out[..4].copy_from_slice(&self.digest_for_epoch(epoch));
-        match self.next_fork_after(epoch) {
-            Some(next) => {
-                out[4..8].copy_from_slice(&next.version);
-                out[8..].copy_from_slice(&next.epoch.to_le_bytes());
+        match self.next_transition_after(epoch) {
+            Some((next_epoch, version)) => {
+                out[4..8].copy_from_slice(&version);
+                out[8..].copy_from_slice(&next_epoch.to_le_bytes());
             }
             None => {
                 out[4..8].copy_from_slice(&self.fork_at_epoch(epoch).version);
@@ -394,27 +428,52 @@ mod tests {
         assert_eq!(s.fork_at_epoch(50).version, [0x90, 0, 0, 0x70], "ALTAIR");
     }
 
+    /// The PRODUCTION path: the live sepolia schedule, at the epoch this was
+    /// verified against the wire. Previously only a hand-built spec with GLOAS
+    /// deleted exercised the no-future-fork branch — a shape no beacon node
+    /// returns — so the branch that actually runs was untested.
     #[test]
-    fn enr_fork_id_has_the_full_16_byte_shape() {
-        // A truncated eth2 field (digest only) is malformed and standard
-        // clients reject the whole record.
+    fn enr_fork_id_on_the_live_sepolia_schedule() {
         let s = sepolia();
-        let epoch = 339_810; // the live head epoch this was verified at
-        let id = s.enr_fork_id(epoch);
-        assert_eq!(id.len(), 16);
+        let id = s.enr_fork_id(339_810);
+        assert_eq!(id.len(), 16, "a truncated eth2 field is malformed");
         assert_eq!(&id[..4], &[0x74, 0xd0, 0x14, 0x59], "current digest");
-        // GLOAS is scheduled at u64::MAX, so it IS the next fork by version.
-        assert_eq!(&id[4..8], &[0x07, 0x00, 0x00, 0x00], "GLOAS version");
-        assert_eq!(u64::from_le_bytes(id[8..].try_into().unwrap()), u64::MAX);
+        // Both BPOs are already past and GLOAS sits at u64::MAX — i.e. NOT
+        // scheduled — so there is no future transition at all.
+        assert_eq!(&id[4..8], &[0x90, 0, 0, 0x75], "current (FULU) version");
+        assert_eq!(
+            u64::from_le_bytes(id[8..].try_into().unwrap()),
+            u64::MAX,
+            "a u64::MAX placeholder is not a scheduled fork"
+        );
     }
 
     #[test]
     fn enr_fork_id_names_the_next_scheduled_fork() {
         let s = sepolia();
-        // Before ELECTRA, the next fork is ELECTRA at its own epoch.
+        // Before ELECTRA, the next transition is ELECTRA at its own epoch.
         let id = s.enr_fork_id(222_000);
         assert_eq!(&id[4..8], &[0x90, 0, 0, 0x74], "ELECTRA version");
         assert_eq!(u64::from_le_bytes(id[8..].try_into().unwrap()), 222_464);
+    }
+
+    #[test]
+    fn a_bpo_is_the_next_transition_and_keeps_the_current_version() {
+        // Nimbus and Lighthouse both count a BPO as next_fork_epoch while
+        // leaving next_fork_version at the current fork.
+        let s = sepolia();
+        // Just after FULU activates, BPO1 (274176) is the next transition.
+        let id = s.enr_fork_id(272_640);
+        assert_eq!(
+            u64::from_le_bytes(id[8..].try_into().unwrap()),
+            274_176,
+            "the imminent BPO, not GLOAS/far-future"
+        );
+        assert_eq!(&id[4..8], &[0x90, 0, 0, 0x75], "version stays FULU across a BPO");
+
+        // Between the two BPOs, BPO2 is next.
+        let id = s.enr_fork_id(274_176);
+        assert_eq!(u64::from_le_bytes(id[8..].try_into().unwrap()), 275_712);
     }
 
     #[test]
@@ -434,15 +493,6 @@ mod tests {
         let id = s.enr_fork_id(300_000);
         assert_eq!(&id[4..8], &[0x90, 0, 0, 0x75], "current version, not zeros");
         assert_eq!(u64::from_le_bytes(id[8..].try_into().unwrap()), u64::MAX);
-    }
-
-    #[test]
-    fn a_bpo_boundary_is_not_the_next_fork() {
-        // BPO changes the digest, not the version — and next_fork_version is a
-        // version. So the next fork after Fulu is GLOAS, not BPO2.
-        let s = sepolia();
-        let next = s.next_fork_after(272_640).unwrap();
-        assert_eq!(next.version, [0x07, 0x00, 0x00, 0x00], "GLOAS, not a BPO");
     }
 
     #[test]

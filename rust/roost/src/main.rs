@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
         Some("probe") => probe(&rest_base).await,
         Some("ingest") => ingest(&rest_base, &archive_path).await,
         Some("serve") => serve::serve(&rest_base, &archive_path, key_path, port).await,
-        Some("enr") => show_enr(&rest_base, &archive_path, advertise, port).await,
+        Some("enr") => show_enr(&rest_base, &archive_path, key_path, advertise, port).await,
         Some(other) => Err(anyhow!("unknown command '{other}'\n\n{}", usage())),
         None => {
             print!("{}", usage());
@@ -520,6 +520,7 @@ fn serving_self_check(
 async fn show_enr(
     rest_base: &str,
     archive_path: &Path,
+    key_path: Option<PathBuf>,
     advertise: Option<String>,
     port: u16,
 ) -> Result<()> {
@@ -539,26 +540,60 @@ async fn show_enr(
     if !myotis_net::reqresp::is_routable(ip) {
         println!("WARNING: {ip} is not reachable from the public internet.\n");
     }
+    // `serve` listens on /ip4/0.0.0.0 only, so a v6 record would advertise an
+    // endpoint nothing is listening on — undialable in the one place that must
+    // not be.
+    if ip.is_ipv6() {
+        return Err(anyhow!(
+            "IPv6 is not supported yet: `serve` listens on /ip4/0.0.0.0/tcp/{port} only, so a \
+             v6 record would advertise an endpoint this server is not listening on"
+        ));
+    }
 
     let client = NimbusRest::new(rest_base, Duration::from_secs(30))?;
     let gvr = client.genesis_validators_root().await?;
     let schedule = forks::ForkSchedule::fetch(&client, gvr).await?;
-    let (head_slot, _) = client.syncing().await?;
+    let (head_slot, syncing) = client.syncing().await?;
+    // A syncing upstream reports a head behind the real one, and if it is behind
+    // the most recent fork or BPO boundary the digest computed from it is the
+    // PREVIOUS one. In a log that self-corrects on the next tick; in a published
+    // record it is cached by wallets and only displaced by a higher-sequence
+    // record — so refuse rather than bake a stale digest into an artifact whose
+    // whole purpose is to be found.
+    if syncing {
+        return Err(anyhow!(
+            "upstream is still syncing (head slot {head_slot}) — the head epoch, and therefore \
+             the fork digest, would be stale. A published record with a stale digest is \
+             invisible to exactly the clients it is for."
+        ));
+    }
     let epoch = head_slot / schedule.slots_per_epoch();
     let eth2 = schedule.enr_fork_id(epoch);
 
-    let key_path = archive_path.with_extension("discv5key");
-    let key = myotis_net::discovery::load_or_create_discv5_key(&key_path)
-        .map_err(|e| anyhow!("{e}"))?;
+    // The SAME key the libp2p host authenticates with — including a --key
+    // override, which this command previously accepted and silently ignored
+    // while auto-creating a different identity next to the archive.
+    let key_path = key_path.unwrap_or_else(|| archive_path.with_extension("key"));
+    let host_key = serve::load_or_create_key(&key_path)?;
+    let key = myotis_net::discovery::discv5_key_from_libp2p(&host_key).map_err(|e| anyhow!("{e}"))?;
     let mut seq = enr::EnrSeq::load(archive_path.with_extension("enrseq"))?;
 
-    let record = myotis_net::discovery::build_server_enr(&key, seq.current(), ip, port, port, eth2)
+    // Persist BEFORE use, which is the discipline EnrSeq documents: a crash
+    // between publishing and persisting would re-issue a number the network has
+    // already seen, and the DHT ignores a record that does not out-rank the
+    // cached one.
+    let seq_for_record = seq.bump()?;
+    let record = myotis_net::discovery::build_server_enr(&key, seq_for_record, ip, port, port, eth2)
         .map_err(|e| anyhow!("{e}"))?;
 
     println!("== enr ==");
-    println!("  identity  {} (persisted)", key_path.display());
+    println!("  identity  {} (the libp2p host key)", key_path.display());
     println!("  node id   {}", record.node_id());
-    println!("  seq       {} (next bump -> {})", seq.current(), seq.current() + 1);
+    println!(
+        "  peer id   {} (derived from the ENR key — must match what `serve` announces)",
+        myotis_net::PeerId::from(host_key.public())
+    );
+    println!("  seq       {seq_for_record} (persisted before use)");
     println!("  endpoint  {ip} tcp/{port} udp/{port}");
     println!("  eth2      0x{}", hex::encode(eth2));
     println!("    digest      0x{}", hex::encode(&eth2[..4]));
@@ -568,13 +603,12 @@ async fn show_enr(
         "    next epoch  {}",
         if next_epoch == u64::MAX { "far future (none scheduled)".to_string() } else { next_epoch.to_string() }
     );
-    println!("\n  {record}");
+    // to_base64() explicitly rather than Display. They are the same today
+    // (enr 0.13's Display forwards to it), but this is a WIRE format and
+    // depending on a Display impl for one lets an upstream cosmetic change
+    // silently alter what an operator pastes into a bootnode list.
+    println!("\n  {}", record.to_base64());
     println!("\n  NOT published. This command only builds the record.");
-
-    // Prove the sequence number actually advances and persists, without
-    // publishing anything — the property a later address change depends on.
-    let bumped = seq.bump()?;
-    println!("  sequence advanced to {bumped} and persisted");
     Ok(())
 }
 
