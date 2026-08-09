@@ -25,8 +25,13 @@ User=nimbus
 # discv5 stays ON and peer limits stay stock. The sepolia node runs unlisted with
 # hand-fed anchors because it had to serve wallets directly; roost exists so this
 # one does not, and can go back to being an ordinary beacon node.
+# --network is a PATH, not a name: this Nimbus build knows mainnet, hoodi and
+# sepolia only ("config.yaml not found for network networkName=gnosis"). The
+# gnosis chain config is vendored in the nimbus-eth2 source and the installer
+# copies it here, so the unit does not depend on a user's home directory
+# surviving.
 ExecStart=/usr/bin/nimbus_beacon_node \
-  --network=gnosis \
+  --network=/etc/myotis/gnosis-chain-config \
   --data-dir=/data/nimbus-gnosis \
   --tcp-port=9106 --udp-port=9106 \
   --nat=any \

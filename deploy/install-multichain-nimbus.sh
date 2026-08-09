@@ -30,6 +30,14 @@ declare -A CHECKPOINT_ALT=(
   [gnosis]="https://rpc-gbc.gnosischain.com"
   [mainnet]="https://sync-mainnet.beaconcha.in"
 )
+# gnosis is NOT a built-in network name in this Nimbus build — `--network` takes
+# mainnet, hoodi, sepolia or a PATH. The chain config is vendored in the
+# nimbus-eth2 source; copy it somewhere stable so the unit does not depend on a
+# home directory. Override GNOSIS_CONFIG_SRC if your checkout lives elsewhere.
+GNOSIS_CONFIG_SRC="${GNOSIS_CONFIG_SRC:-$HOME/myotis-node/nimbus-eth2/vendor/gnosis-chain-configs/mainnet}"
+GNOSIS_CONFIG_DST=/etc/myotis/gnosis-chain-config
+
+declare -A NETWORK=([gnosis]="$GNOSIS_CONFIG_DST" [mainnet]=mainnet)
 declare -A PORT=([gnosis]=9106 [mainnet]=9107)
 declare -A REST=([gnosis]=5053 [mainnet]=5054)
 
@@ -39,11 +47,30 @@ CHAINS=(${CHAINS[*]})
 
 id nimbus >/dev/null 2>&1 || useradd --system --home /data/nimbus --shell /usr/sbin/nologin nimbus
 
+# Chains are installed independently: one failing must not skip the other, which
+# is what `set -e` did the first time gnosis could not find its config. Failures
+# are collected and reported, and the script still exits non-zero.
+failed=()
+installed=()
+
 for chain in "${CHAINS[@]}"; do
   case "$chain" in gnosis|mainnet) ;; *) echo "unknown chain '$chain'"; exit 1 ;; esac
 
   dir="/data/nimbus-$chain"
   echo "=== $chain -> $dir (p2p ${PORT[$chain]}, rest 127.0.0.1:${REST[$chain]}) ==="
+
+  if [ "$chain" = gnosis ]; then
+    if [ ! -f "$GNOSIS_CONFIG_SRC/config.yaml" ]; then
+      echo "!!! gnosis chain config not found at $GNOSIS_CONFIG_SRC"
+      echo "    set GNOSIS_CONFIG_SRC=<nimbus-eth2>/vendor/gnosis-chain-configs/mainnet"
+      failed+=("gnosis")
+      continue
+    fi
+    mkdir -p "$GNOSIS_CONFIG_DST"
+    cp -a "$GNOSIS_CONFIG_SRC/." "$GNOSIS_CONFIG_DST/"
+    chmod -R a+rX "$GNOSIS_CONFIG_DST"
+    echo "--- gnosis chain config installed to $GNOSIS_CONFIG_DST"
+  fi
   mkdir -p "$dir"
   chown -R nimbus:nimbus "$dir"
   chmod 700 "$dir"
@@ -58,24 +85,28 @@ for chain in "${CHAINS[@]}"; do
   # the sync on the next run and enable a node with an incomplete database. The
   # marker is written only after trustedNodeSync returns 0.
   marker="$dir/.checkpoint-synced"
-  if [ ! -f "$marker" ]; then
-    echo "--- checkpoint sync from ${CHECKPOINT[$chain]}"
-    sudo -u nimbus "$NIMBUS" trustedNodeSync \
-      --network="$chain" \
-      --data-dir="$dir" \
-      --trusted-node-url="${CHECKPOINT[$chain]}" \
-      --backfill=false \
-      || {
-        echo "--- primary failed, retrying from ${CHECKPOINT_ALT[$chain]}"
-        sudo -u nimbus "$NIMBUS" trustedNodeSync \
-          --network="$chain" \
-          --data-dir="$dir" \
-          --trusted-node-url="${CHECKPOINT_ALT[$chain]}" \
-          --backfill=false
-      }
-    sudo -u nimbus touch "$marker"
-  else
+  if [ -f "$marker" ]; then
     echo "--- already checkpoint-synced ($marker), skipping"
+  else
+    echo "--- checkpoint sync from ${CHECKPOINT[$chain]}"
+    if sudo -u nimbus "$NIMBUS" trustedNodeSync \
+         --network="${NETWORK[$chain]}" \
+         --data-dir="$dir" \
+         --trusted-node-url="${CHECKPOINT[$chain]}" \
+         --backfill=false \
+       || { echo "--- primary failed, retrying from ${CHECKPOINT_ALT[$chain]}"
+            sudo -u nimbus "$NIMBUS" trustedNodeSync \
+              --network="${NETWORK[$chain]}" \
+              --data-dir="$dir" \
+              --trusted-node-url="${CHECKPOINT_ALT[$chain]}" \
+              --backfill=false; }
+    then
+      sudo -u nimbus touch "$marker"
+    else
+      echo "!!! $chain checkpoint sync failed — leaving it uninstalled"
+      failed+=("$chain")
+      continue
+    fi
   fi
 
   if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
@@ -85,10 +116,16 @@ for chain in "${CHAINS[@]}"; do
 
   install -o root -g root -m 0644 "$STAGE/nimbus-$chain.service" \
     "/etc/systemd/system/nimbus-$chain.service"
+  installed+=("$chain")
 done
 
 systemctl daemon-reload
-for chain in "${CHAINS[@]}"; do systemctl enable "nimbus-$chain.service"; done
+for chain in "${installed[@]:-}"; do [ -n "$chain" ] && systemctl enable "nimbus-$chain.service"; done
+
+if [ "${#failed[@]}" -gt 0 ]; then
+  echo
+  echo "!!! FAILED: ${failed[*]} — see above. Installed: ${installed[*]:-none}"
+fi
 
 cat <<'NOTE'
 
