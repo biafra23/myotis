@@ -167,11 +167,16 @@ class NetworkConfigGnosisTest {
         String enode = NetworkConfig.SEPOLIA.elBootEnodes().get(0);
         assertTrue(enode.endsWith("@87.154.209.161:30405"), enode);
 
+        // roost, the dedicated light-client server, is tried first — that is the
+        // point of having it. The dedicated Nimbus stays behind it as fallback,
+        // so a roost fault degrades to the previous behaviour.
         String cl = NetworkConfig.SEPOLIA.clPeerMultiaddrs().get(0);
-        assertEquals("/ip4/87.154.209.161/tcp/9104/p2p/"
-                        + "16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6", cl,
-                "the dedicated Nimbus must be the first CL peer tried");
-        assertTrue(NetworkConfig.SEPOLIA.clPeerMultiaddrs().size() > 1,
+        assertEquals("/ip4/87.154.209.161/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5", cl,
+                "roost must be the first CL peer tried");
+        assertTrue(NetworkConfig.SEPOLIA.clPeerMultiaddrs().stream()
+                        .anyMatch(a -> a.contains("16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6")),
+                "the dedicated Nimbus must remain as fallback");
+        assertTrue(NetworkConfig.SEPOLIA.clPeerMultiaddrs().size() > 2,
                 "pinning must not drop the existing CL peers");
     }
 }

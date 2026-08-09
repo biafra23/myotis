@@ -198,16 +198,28 @@ public record NetworkConfig(
             // No prior-fork fallback (same rationale as mainnet: stale digests
             // wouldn't help us sync to the current head anyway).
             null,
-            // CL peer multiaddrs for sepolia. First entry is the dedicated
-            // myotis-serving Nimbus (docs/dedicated-sepolia-node.md): it serves
-            // light_client_bootstrap / updates_by_range default-on, and being
-            // first means the light client tries it before the discovered pool.
-            // Its peer-id is stable only because the node pins --netkey-file;
-            // Nimbus otherwise mints a new one per restart, which invalidates
-            // this entry with InvalidRemotePubKey (see the doc's §5 note).
+            // CL peer multiaddrs for sepolia. First entry is roost, the
+            // dedicated light-client server (rust/roost, docs/lc-server-design.md),
+            // and being first means the light client tries it before the
+            // discovered pool. It is first on purpose: it exists because a
+            // general-purpose beacon node is structurally bad at serving wallets
+            // — one connection semaphore shared between inbound and outbound,
+            // and a trimmer that drops light clients first.
+            //
+            // The dedicated Nimbus follows it, so a roost fault degrades to
+            // exactly the previous behaviour rather than to nothing. That entry's
+            // peer-id is stable only because the node pins --netkey-file; Nimbus
+            // otherwise mints a new one per restart, which invalidates it with
+            // InvalidRemotePubKey (see the doc's §5 note). roost has no such
+            // mode — its identity is persisted by construction.
+            //
+            // Both literal IPs carry the same exposure: the line is residential
+            // and the address is not guaranteed stable. ENR publication
+            // (lc-server-design §7) is what removes the need to pin at all.
             prependLocal(
-                    "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
+                    "/ip4/87.154.209.161/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
                     List.of(
+                            "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
                             "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS"
                     )),
             null,

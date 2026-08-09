@@ -298,6 +298,21 @@ fn hex32(s: &str) -> [u8; 32] {
 /// only because that node pins `--netkey-file`; Nimbus otherwise mints a new one per
 /// restart, which invalidates this entry with `InvalidRemotePubKey`.
 const SEPOLIA_STATIC_PEERS: &[&str] = &[
+    // roost, the dedicated light-client server (rust/roost, docs/lc-server-design.md).
+    // FIRST on purpose: it exists because a general-purpose beacon node is
+    // structurally bad at serving wallets — one connection semaphore shared
+    // between inbound and outbound, and a trimmer that drops light clients
+    // first. Nimbus stays below it, so a roost fault degrades to exactly
+    // today's behaviour rather than to nothing.
+    //
+    // Its peer id comes from /data/roost/sepolia.key and is stable across
+    // restarts by construction; unlike the Nimbus entry there is no flag to
+    // forget, because roost has no mode in which it mints a fresh one.
+    //
+    // Pinning a literal IP has the same exposure as the entries below: the line
+    // is residential and the address is not guaranteed stable. ENR publication
+    // (design §7) is what removes it.
+    "/ip4/87.154.209.161/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
     "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
     "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS",
 ];
@@ -2553,12 +2568,23 @@ mod tests {
         // NetworkConfig.SEPOLIA.currentForkDigest() — BPO2 folded in).
         assert_eq!(c.current_fork_digest(), [0x74, 0xD0, 0x14, 0x59]);
         assert_eq!(c.accepted_fork_digests(), vec![[0x74, 0xD0, 0x14, 0x59]]);
-        // Two pinned LC peers, the dedicated serving node FIRST — same list and
-        // order as the Java NetworkConfig.SEPOLIA.clPeerMultiaddrs.
-        assert_eq!(c.static_peers.len(), 2);
-        assert!(c.static_peers[0].ends_with(
-            "/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6"
-        ));
+        // Three pinned LC peers, roost FIRST — same list and order as the Java
+        // NetworkConfig.SEPOLIA.clPeerMultiaddrs. This assertion is the only
+        // thing keeping the two engines' lists in step; they are hand-maintained
+        // copies, so a change to one that skips the other fails here.
+        assert_eq!(c.static_peers.len(), 3);
+        assert!(
+            c.static_peers[0].ends_with(
+                "/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"
+            ),
+            "roost is the dedicated LC server and is tried first"
+        );
+        assert!(
+            c.static_peers[1].ends_with(
+                "/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6"
+            ),
+            "the dedicated Nimbus remains as fallback"
+        );
         assert_eq!(c.bootstrap_enrs.len(), 9);
     }
 
