@@ -20,20 +20,33 @@ sync-committee signatures chained from its own anchor, so a relay can withhold
 but cannot forge. That carve-out is recorded in
 [`CLAUDE.md`](../../CLAUDE.md) under **Data sources**.
 
+One thing roost relays is **not** self-verifying, and is worth naming so the
+boundary is not widened by accident: the `status` handshake, built from REST
+`head_header` + `finalized_checkpoint`. A wallet uses a peer's status only for
+fork-digest relevance and `earliest_available_slot` peer selection, so a wrong
+one costs peer choice and never correctness. Anything beyond that — relaying
+something a wallet cannot check against sync-committee signatures — needs its
+own decision, per the carve-out.
+
 ## What works
 
 | | |
 |---|---|
 | `rest.rs` | Nimbus REST client, SSZ over loopback. Bodies streamed under a cap; failures classified transient vs definitive. |
 | `framing.rs` | Splits the `updates` body's length-prefixed chunks and re-frames them as a libp2p multi-chunk response. |
-| `store.rs` | Serving cache holding **pre-encoded** responses, so serving is a memcpy and a write. Bounded on update count, response bytes, in-flight bytes and cached bootstraps. |
+| `store.rs` | Serving cache holding **pre-encoded** responses, so serving is a memcpy and a write. Bounded on update count, response bytes, cached bootstraps and queued bootstrap misses. (The global in-flight response budget lives in `myotis-net`, not here.) |
 | `archive.rs` | Durable append-only archive (magic, version, per-record checksum), bound to a chain by `genesis_validators_root`. Repairs a torn tail; scans past a corrupt record instead of losing what follows. |
 | `forks.rs` | Fork and blob schedule read from the upstream, and the fork digest for any slot. |
 | `enr.rs` | Persisted, monotonic ENR sequence number. |
 | `serve.rs` | The daemon: persisted identity, chain-view poller behind `status`, per-slot refresh, new-period archiving, background bootstrap filler, external-address tracking. |
 
-A myotis wallet bootstraps and stays synced from roost alone — verified on
-sepolia with discovery disabled, so it cannot have been another peer.
+A **Rust-engine** myotis wallet bootstraps and stays synced from roost alone —
+verified on sepolia with discovery disabled, so it cannot have been another
+peer. The **Java engine is untested against roost**, and `myotis.engine`
+defaults to *java*, so that gap is the default path: `MYOTIS_CL_STATIC_PEERS`
+exists only on the Rust side, and pointing a Java-engine wallet at roost means
+editing `NetworkConfig` and rebuilding. `docs/lc-server-design.md` rollout step 2
+asks for both engines and for saying which is which; this is the which.
 
 **Context bytes are computed, not guessed.** Since EIP-7892 one fork name has as
 many digests as it has BPO entries, so a name→digest table would go stale at the
@@ -78,7 +91,7 @@ an honest claim:
 NET=sepolia \
 MYOTIS_CL_STATIC_PEERS=/ip4/127.0.0.1/tcp/9105/p2p/<peer-id> \
 MYOTIS_CL_DISABLE_DISCV5=1 \
-cargo run -p myotis-net --example live_sync -- --once
+cargo run --manifest-path rust/Cargo.toml -p myotis-net --example live_sync -- --once
 ```
 
 ## Deploy
@@ -87,17 +100,24 @@ Staging lives in `~/myotis-node/` alongside the geth and Nimbus units;
 runtime data lives in `/data/roost/`, matching `/data/geth` and `/data/nimbus`.
 
 **Prerequisite.** Nimbus must expose REST on loopback and serve light-client
-data — the sepolia unit already does:
+data:
 
 ```
 --rest --light-client-data-serve=true --light-client-data-import-mode=full
 ```
 
-**Build, then install:**
+`--rest` is **off by default** and was added to the running sepolia node on
+2026-08-08 (`docs/lc-server-design.md` §Rollout). Check your unit actually has
+it before installing roost: without it roost fails on its first upstream call,
+and under `Restart=on-failure` that is a restart loop rather than a clear error.
+
+The unit and installer live in [`deploy/`](deploy/) — in the repo, so
+`LimitNOFILE`, `Restart=on-failure` and "never overwrites the key" are
+reviewable rather than assertions about a file on one machine.
 
 ```bash
-cd ~/myotis && cargo build --release --manifest-path rust/roost/Cargo.toml
-sudo bash ~/myotis-node/install-roost.sh      # idempotent; never touches an existing key
+cargo build --release --manifest-path rust/roost/Cargo.toml
+sudo bash rust/roost/deploy/install-roost.sh   # idempotent; never touches an existing key
 sudo systemctl start roost-sepolia
 ```
 
@@ -117,12 +137,18 @@ re-mints the node identity: every wallet that had learned this server dials an
 identity that no longer exists, fails, and spends its three strikes to eviction
 on a node that is actually healthy. The installer never overwrites it.
 
+**Back up `sepolia.enrseq` with it** — restoring one without the other is worse
+than restoring neither, once publication is enabled. `EnrSeq::load` starts at 1
+when the file is missing, so an identity restored without its sequence number
+re-issues numbers the network has already seen, and the DHT ignores every record
+until the count climbs back past the previously published high-water mark. The
+node would look healthy and be undiscoverable. If the file is ever lost, set it
+by hand to something comfortably above the last published value rather than
+letting it restart.
+
 Back up `sepolia.db` too, once it holds periods below Nimbus's floor — nothing
 you run can regenerate those. While it only holds the live window it is
 refetchable in seconds.
-
-`sepolia.enrseq` must only ever increase. The DHT keeps the highest-sequence
-record it has seen, so a reset makes every later update silently ignored.
 
 **Ports.** `9105/tcp` inbound, forwarded on the router. Add `9105/udp` only when
 discv5 publication lands — nothing listens on it today.
@@ -135,11 +161,29 @@ journalctl -u roost-sepolia -f          # look for the startup banner and "diges
 sudo -u roost /usr/local/bin/roost probe --rest http://127.0.0.1:5052
 ```
 
-`probe` is the honest end-to-end check: it exercises every upstream endpoint,
-round-trips a re-encoded update through myotis' own wire decoder, and compares
-the computed fork digest against the one on the wire.
+**Run `roost enr` as the service user too** — it *writes*. It consumes a
+sequence number on every invocation and creates the identity key if one is
+absent, so running it as root leaves both root-owned and the service unable to
+read them:
 
-Then point a wallet at it, as above but with the public address.
+```bash
+sudo -u roost /usr/local/bin/roost enr \
+    --archive /data/roost/sepolia.db --advertise <public-ip>
+```
+
+`probe` checks the **upstream** path only: it exercises the light-client REST
+endpoints, round-trips a re-encoded update through myotis' own wire decoder, and
+compares the computed fork digest against the one on the wire. It talks to
+Nimbus directly and never connects to roost's libp2p listener, so a green
+`probe` says nothing about whether the deployed service is reachable. It also
+does not call three REST paths `serve` depends on — `head_header`,
+`finalized_checkpoint` and `header_slot`, the two behind `status` and the one
+that stamps a bootstrap's digest — so a green `probe` is consistent with `serve`
+failing on them. Extending `probe` to cover them is a worthwhile follow-up.
+
+**The end-to-end check is the wallet**, pointed at the deployed address as above
+but with the public IP. That is the only step that exercises the listener, the
+serving handlers and the archive together.
 
 **Note what deploying does not yet do.** roost publishes no ENR, and
 `NetworkConfig`'s pinned sepolia multiaddr still points at Nimbus — so a

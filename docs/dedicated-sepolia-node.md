@@ -315,6 +315,7 @@ ExecStart=/usr/bin/nimbus_beacon_node \
   --insecure-netkey-password=true \
   --max-peers=500 \
   --hard-max-peers=800 \
+  --rest \
   --light-client-data-serve=true \
   --light-client-data-import-mode=full
 Restart=on-failure
