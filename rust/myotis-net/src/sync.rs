@@ -399,6 +399,23 @@ const GNOSIS_BOOTSTRAP_ENRS: &[&str] = &[
 /// Known light-client-serving mainnet peers — the Java `NetworkConfig.MAINNET`
 /// clPeerMultiaddrs list (nimbus/lodestar/lighthouse, discovered 2026-03-11).
 const MAINNET_STATIC_PEERS: &[&str] = &[
+    // roost mainnet (rust/roost). FIRST for the same reason as sepolia: a
+    // general-purpose beacon node shares one connection semaphore between
+    // inbound and outbound and trims light clients first, so the peers below
+    // are structurally unreliable for us in a way roost is not. Identity comes
+    // from /data/roost/mainnet.key and is stable by construction.
+    //
+    // 9109/tcp was confirmed forwarded before this was pinned (hairpin connect
+    // showing the public IP as the source address, plus 145 inbound peers on
+    // the neighbouring 9107). Pinning an unreachable address is not free — a
+    // wallet spends its strikes-to-eviction on a node that is actually fine.
+    //
+    // Same residential-IP exposure as every literal here; ENR publication
+    // (docs/lc-server-design.md §7) is what removes it. NOTE that roost cannot
+    // currently notice its own IP changing — its Identify quorum never settles
+    // because it makes no outbound connections — so this line is the thing that
+    // breaks if the address moves.
+    "/ip4/87.154.209.161/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
     "/ip4/176.229.58.1/tcp/9001/p2p/16Uiu2HAmHu1BxzrSWg7sN9JyJenC5unK5ntdk5QFYqQdQyyD7x3a",
     "/ip4/81.172.166.237/tcp/9001/p2p/16Uiu2HAmRogw5aqM4ZuVEmZoQvFp25sUnnQ9wpGuWXRLFMmXc88j",
     "/ip4/54.157.213.0/tcp/9000/p2p/16Uiu2HAmQz83bNmMaBFCafuxDasiNdPYZF1B4zhgo3DckByU8bo3",
@@ -2553,7 +2570,16 @@ mod tests {
         // The live digest the Java computes (verified against jshell).
         assert_eq!(c.current_fork_digest(), [0x8C, 0x9F, 0x62, 0xFE]);
         assert_eq!(c.accepted_fork_digests(), vec![[0x8C, 0x9F, 0x62, 0xFE]]);
-        assert_eq!(c.static_peers.len(), 18);
+        // 18 discovered peers + roost mainnet prepended.
+        assert_eq!(c.static_peers.len(), 19);
+        // roost is FIRST — the ordering is the point, not an accident of the
+        // list. The Java twin prepends it with prependLocal(); if these two ever
+        // disagree on position, the default engine and the Rust engine pick
+        // different first-choice peers and only one of them is the dedicated one.
+        assert_eq!(
+            c.static_peers[0],
+            "/ip4/87.154.209.161/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC"
+        );
         assert_eq!(c.bootstrap_enrs.len(), 17);
         assert_eq!(c.chain_id, 1);
     }

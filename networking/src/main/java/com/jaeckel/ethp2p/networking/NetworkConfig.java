@@ -105,6 +105,13 @@ public record NetworkConfig(
             null,
             // CL peer multiaddrs: known light-client-serving peers (nimbus, lodestar, lighthouse)
             // discovered via Lighthouse peer API 2026-03-11
+            // roost mainnet is prepended for the same reason as sepolia's: it is a
+            // dedicated LC server, so it neither trims us nor shares its inbound
+            // budget with a gossip mesh. 9109/tcp was verified forwarded before
+            // pinning. See the Rust twin (MAINNET_STATIC_PEERS) for the full
+            // reasoning; keep the two lists and their ORDER in step.
+            prependLocal(
+                    "/ip4/87.154.209.161/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
             List.of(
                     // nimbus peers (4 light_client protocols)
                     "/ip4/176.229.58.1/tcp/9001/p2p/16Uiu2HAmHu1BxzrSWg7sN9JyJenC5unK5ntdk5QFYqQdQyyD7x3a",
@@ -127,7 +134,7 @@ public record NetworkConfig(
                     // lighthouse peers (3 light_client protocols)
                     "/ip4/54.201.148.177/tcp/9000/p2p/16Uiu2HAmNwEsdBC2phX7qU7camNe9Gs21WyrpV5AZDYyjZBMYjWZ",
                     "/ip4/16.63.94.117/tcp/9000/p2p/16Uiu2HAmSd7qzG5joNgvEYYcgVvg1y9MiYjpMHMvzRzaWYqXxkCM"
-            ),
+            )),
             "http://localhost:5052",
             1606824023L, // mainnet beacon genesis: 2020-12-01 12:00:23 UTC
             // EIP-1459 ENR tree URLs — DNS-seeded discv4 bootnodes (EL) and libp2p peers (CL).
