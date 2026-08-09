@@ -173,9 +173,16 @@ class NetworkConfigGnosisTest {
         String cl = NetworkConfig.SEPOLIA.clPeerMultiaddrs().get(0);
         assertEquals("/ip4/87.154.209.161/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5", cl,
                 "roost must be the first CL peer tried");
-        assertTrue(NetworkConfig.SEPOLIA.clPeerMultiaddrs().stream()
-                        .anyMatch(a -> a.contains("16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6")),
-                "the dedicated Nimbus must remain as fallback");
+        // POSITION, not presence: the Rust twin asserts index 1, and index is
+        // load-bearing on this side in particular — addPeer inserts every
+        // discovered peer at Math.min(1, size()), i.e. exactly the slot the
+        // Nimbus occupies, so "somewhere in the list" is a weaker guarantee here
+        // than anywhere else.
+        assertEquals("/ip4/87.154.209.161/tcp/9104/p2p/"
+                        + "16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
+                NetworkConfig.SEPOLIA.clPeerMultiaddrs().get(1),
+                "the dedicated Nimbus must remain SECOND as fallback — a roost outage "
+                        + "then degrades to exactly the previous behaviour");
         assertTrue(NetworkConfig.SEPOLIA.clPeerMultiaddrs().size() > 2,
                 "pinning must not drop the existing CL peers");
     }
