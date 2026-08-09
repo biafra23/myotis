@@ -51,6 +51,12 @@ pub struct ChainConfig {
     pub genesis_time: u64,
     pub seconds_per_slot: u64,
     pub slots_per_epoch: u64,
+    /// Epochs per sync-committee period. 256 everywhere except gnosis (512),
+    /// whose 16-slot epochs make `slots_per_epoch * this` land on 8192 anyway —
+    /// which is exactly why hardcoding 8192 survived this long. It is a
+    /// VERIFICATION input (it picks the committee an update is checked
+    /// against), so the wallet is told it and never asks a node for it.
+    pub epochs_per_sync_committee_period: u64,
     /// EIP-7892 active BPO entry folded into the fork digest (0 epoch = none).
     pub blob_params_epoch: u64,
     pub blob_params_max_blobs: u64,
@@ -73,6 +79,12 @@ pub struct ChainConfig {
 }
 
 impl ChainConfig {
+    /// Slots per sync-committee period — the geometry every period division uses.
+    pub fn slots_per_period(&self) -> u64 {
+        self.slots_per_epoch
+            .saturating_mul(self.epochs_per_sync_committee_period)
+    }
+
     /// Mainnet — values duplicated verbatim from the Java
     /// `NetworkConfig.MAINNET` (networking/src/main/java/.../NetworkConfig.java).
     /// `MYOTIS_CL_STATIC_PEERS` — REPLACE the pinned light-client-serving peers
@@ -139,6 +151,7 @@ impl ChainConfig {
             genesis_time: 1_606_824_023, // 2020-12-01 12:00:23 UTC
             seconds_per_slot: 12,
             slots_per_epoch: 32,
+            epochs_per_sync_committee_period: 256,
             // BPO2 (Fusaka) blob schedule entry: epoch 419072, MAX_BLOBS=21.
             blob_params_epoch: 419_072,
             blob_params_max_blobs: 21,
@@ -178,6 +191,7 @@ impl ChainConfig {
             genesis_time: 1_655_733_600, // 2022-06-20 14:00:00 UTC
             seconds_per_slot: 12, // mainnet preset
             slots_per_epoch: 32,
+            epochs_per_sync_committee_period: 256,
             // EIP-7892 BLOB_SCHEDULE — latest active entry on sepolia: BPO2 at
             // epoch 275712, MAX_BLOBS_PER_BLOCK=21 (2025-10-28).
             blob_params_epoch: 275_712,
@@ -221,6 +235,7 @@ impl ChainConfig {
             genesis_time: 1_638_993_340, // 2021-12-08 19:55:40 UTC
             seconds_per_slot: 5,
             slots_per_epoch: 16,
+            epochs_per_sync_committee_period: 512,
             // EIP-7892: Gnosis has no explicit BLOB_SCHEDULE — clients fold the
             // Electra-baseline params (ELECTRA_FORK_EPOCH=1337856, MAX_BLOBS=2)
             // into the Fulu digest. Yields the live-verified digest 0x3237dab6.
@@ -1097,7 +1112,7 @@ async fn run_sync(
     let mut discovery_retry_in = 0u32;
 
     let mut processor = LightClientProcessor::new(
-        LightClientStore::new(),
+        LightClientStore::new(config.slots_per_period()),
         config.fork_version,
         config.genesis_validators_root,
     );
@@ -1306,7 +1321,7 @@ async fn run_sync(
                 if let Some(path) = &config.snapshot_path {
                     let _ = std::fs::remove_file(path);
                 }
-                processor.store = LightClientStore::new();
+                processor.store = LightClientStore::new(config.slots_per_period());
                 staged_updates.clear();
                 last_persisted_period = checkpoint_period; // keep the never-persist-checkpoint floor
                 resume = ResumeGuard::fresh();
@@ -2480,7 +2495,7 @@ mod tests {
     #[test]
     fn exec_anchor_fed_from_store_headers() {
         let anchor = ExecAnchor::new();
-        let mut store = LightClientStore::new();
+        let mut store = LightClientStore::new_mainnet_preset();
         store.update_finalized(&header_with_exec(1000, [0x11; 32], 21_000_000, [0x22; 32]), 1000);
         // Mirror the processor: the optimistic header is tracked at the SIGNATURE
         // slot (1003), one past the attested block's beacon.slot (1002).
@@ -2510,7 +2525,7 @@ mod tests {
         // register a zero state root as the finalized anchor — that would make
         // is_synced() true against a bogus root.
         let anchor = ExecAnchor::new();
-        let mut store = LightClientStore::new();
+        let mut store = LightClientStore::new_mainnet_preset();
         store.update_finalized(&header_with_exec(5, [0u8; 32], 0, [0u8; 32]), 5);
 
         update_exec_anchor(&store, &anchor);
@@ -2615,6 +2630,14 @@ mod tests {
         );
         assert_eq!(c.genesis_time, 1_638_993_340);
         assert_eq!((c.seconds_per_slot, c.slots_per_epoch), (5, 16));
+        // 16 x 512 = 8192, the SAME product as mainnet's 32 x 256. That equality
+        // is why a hardcoded 8192 worked on gnosis by accident; pin both factors
+        // so a chain that breaks the coincidence fails here rather than in
+        // committee selection.
+        assert_eq!(c.epochs_per_sync_committee_period, 512);
+        assert_eq!(c.slots_per_period(), 8192);
+        assert_eq!(ChainConfig::mainnet().slots_per_period(), 8192);
+        assert_eq!(ChainConfig::mainnet().epochs_per_sync_committee_period, 256);
         assert_eq!((c.blob_params_epoch, c.blob_params_max_blobs), (1_337_856, 2));
         // 512 epochs x 16 slots = the same 8192-slot period as mainnet-preset.
         assert_eq!(spec::compute_sync_committee_period(c.checkpoint_slot), 3480);

@@ -19,18 +19,49 @@ pub struct LightClientStore {
     finalized_slot: u64,
     optimistic_slot: u64,
     current_sync_committee_period: u64,
+    /// Slots per sync-committee period FOR THIS CHAIN. Mainnet and sepolia pair
+    /// 32-slot epochs with 256 epochs; gnosis pairs 16 with 512. Both reach
+    /// 8192, so the old global constant was right by coincidence — see
+    /// `spec::compute_sync_committee_period_with`.
+    slots_per_period: u64,
 }
 
 impl LightClientStore {
-    pub fn new() -> Self {
-        Self::default()
+    /// `slots_per_period` comes from the chain config, not from a peer: it
+    /// selects the sync committee a signature is verified against.
+    pub fn new(slots_per_period: u64) -> Self {
+        Self {
+            slots_per_period: if slots_per_period == 0 {
+                spec::SLOTS_PER_SYNC_COMMITTEE_PERIOD
+            } else {
+                slots_per_period
+            },
+            ..Self::default()
+        }
+    }
+
+    /// Mainnet-preset store, for tests and for callers that genuinely mean it.
+    pub fn new_mainnet_preset() -> Self {
+        Self::new(spec::SLOTS_PER_SYNC_COMMITTEE_PERIOD)
+    }
+
+    pub fn slots_per_period(&self) -> u64 {
+        if self.slots_per_period == 0 {
+            spec::SLOTS_PER_SYNC_COMMITTEE_PERIOD
+        } else {
+            self.slots_per_period
+        }
+    }
+
+    fn period_of(&self, slot: u64) -> u64 {
+        spec::compute_sync_committee_period_with(slot, self.slots_per_period())
     }
 
     pub fn initialize(&mut self, header: LightClientHeader, committee: SyncCommittee) {
         self.finalized_slot = header.beacon.slot;
         self.optimistic_slot = header.beacon.slot;
         self.current_sync_committee_period =
-            spec::compute_sync_committee_period(self.finalized_slot);
+            self.period_of(self.finalized_slot);
         self.finalized_header = Some(header.clone());
         self.optimistic_header = Some(header);
         self.current_sync_committee = Some(committee);
@@ -63,8 +94,8 @@ impl LightClientStore {
         if self.next_sync_committee.is_none() {
             return;
         }
-        let old_period = spec::compute_sync_committee_period(old_finalized_slot);
-        let new_period = spec::compute_sync_committee_period(new_finalized_slot);
+        let old_period = self.period_of(old_finalized_slot);
+        let new_period = self.period_of(new_finalized_slot);
         if new_period > old_period {
             self.current_sync_committee = self.next_sync_committee.take();
             self.current_sync_committee_period += 1;
@@ -77,7 +108,7 @@ impl LightClientStore {
         if self.next_sync_committee.is_none() {
             return;
         }
-        let wall_period = spec::compute_sync_committee_period(current_slot_estimate);
+        let wall_period = self.period_of(current_slot_estimate);
         if wall_period > self.current_sync_committee_period {
             self.current_sync_committee = self.next_sync_committee.take();
             self.current_sync_committee_period += 1;
@@ -172,7 +203,7 @@ impl LightClientProcessor {
         // Applicability gate BEFORE the expensive BLS verify (per spec
         // validate_light_client_update; mirrors the Java gate exactly).
         let store_period = self.store.current_period();
-        let sig_period = spec::compute_sync_committee_period(update.signature_slot);
+        let sig_period = self.store.period_of(update.signature_slot);
         let have_next = self.store.next_sync_committee().is_some();
         let applicable = if have_next {
             sig_period == store_period || sig_period == store_period + 1

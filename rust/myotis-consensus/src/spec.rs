@@ -45,8 +45,33 @@ pub fn finalized_root_gindex(branch_depth: usize) -> u64 {
     checkpoint_gindex * 2 + 1
 }
 
+/// Mainnet-preset period math. Prefer [`compute_sync_committee_period_with`]
+/// wherever the chain is known — see its note.
 pub fn compute_sync_committee_period(slot: u64) -> u64 {
     slot / SLOTS_PER_SYNC_COMMITTEE_PERIOD
+}
+
+/// The sync-committee period a slot falls in, for a chain whose period length
+/// is `slots_per_period`.
+///
+/// # Why this is parameterised
+///
+/// The constants above are MAINNET's preset. Gnosis pairs 16-slot epochs with
+/// 512 epochs per period — it reaches the same 8192, so the constant is right by
+/// coincidence and its derivation is false for that chain. Nimbus makes the same
+/// distinction at compile time: a mainnet-preset binary refuses to load gnosis
+/// outright rather than mis-reading it.
+///
+/// This matters more here than in a cache. `LightClientStore` uses the period to
+/// select the sync committee an update's signature is verified against, so a
+/// wrong period would check a signature against the wrong committee. The
+/// equivalent bug in `rust/roost` only mis-keyed an archive record.
+///
+/// Note the wallet must be TOLD this, never ask a node for it: it is a
+/// verification input, and asking the thing being verified is not a check.
+pub fn compute_sync_committee_period_with(slot: u64, slots_per_period: u64) -> u64 {
+    debug_assert!(slots_per_period > 0, "slots_per_period must be non-zero");
+    slot / slots_per_period.max(1)
 }
 
 #[cfg(test)]
