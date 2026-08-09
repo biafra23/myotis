@@ -171,16 +171,20 @@ class NetworkConfigGnosisTest {
         // point of having it. The dedicated Nimbus stays behind it as fallback,
         // so a roost fault degrades to the previous behaviour.
         String cl = NetworkConfig.SEPOLIA.clPeerMultiaddrs().get(0);
-        assertEquals("/ip4/87.154.209.161/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5", cl,
+        assertEquals("/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5", cl,
                 "roost must be the first CL peer tried");
         // POSITION, not presence: the Rust twin asserts index 1, and index is
         // load-bearing on this side in particular — addPeer inserts every
         // discovered peer at Math.min(1, size()), i.e. exactly the slot the
         // Nimbus occupies, so "somewhere in the list" is a weaker guarantee here
         // than anywhere else.
+        assertEquals("/ip4/87.154.209.161/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
+                NetworkConfig.SEPOLIA.clPeerMultiaddrs().get(1),
+                "roost's literal IP must sit directly behind its name — the Java engine's "
+                        + "DNS dialing is unverified, so this is the no-regression fallback");
         assertEquals("/ip4/87.154.209.161/tcp/9104/p2p/"
                         + "16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
-                NetworkConfig.SEPOLIA.clPeerMultiaddrs().get(1),
+                NetworkConfig.SEPOLIA.clPeerMultiaddrs().get(2),
                 "the dedicated Nimbus must remain SECOND as fallback — a roost outage "
                         + "then degrades to exactly the previous behaviour");
         assertTrue(NetworkConfig.SEPOLIA.clPeerMultiaddrs().size() > 2,
@@ -200,11 +204,11 @@ class NetworkConfigGnosisTest {
         // peers at Math.min(1, size()), so presence-anywhere is a weak claim on
         // this side.
         List<String> cl = NetworkConfig.MAINNET.clPeerMultiaddrs();
-        assertEquals("/ip4/87.154.209.161/tcp/9109/p2p/"
+        assertEquals("/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/"
                         + "16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
                 cl.get(0),
                 "roost mainnet must be the first CL peer tried");
-        assertEquals(19, cl.size(),
+        assertEquals(20, cl.size(),
                 "18 discovered peers + roost; pinning must not drop the fallbacks");
     }
 }

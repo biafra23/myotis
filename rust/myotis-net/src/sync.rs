@@ -326,6 +326,19 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // Pinning a literal IP has the same exposure as the entries below: the line
     // is residential and the address is not guaranteed stable. ENR publication
     // (design §7) is what removes it.
+    // roost BY NAME, ahead of its own literal IP.
+    //
+    // The line is residential and the address is not guaranteed stable; the
+    // name is DynDNS with a ~30s TTL and libp2p resolves it AT DIAL TIME, every
+    // dial, so an address change costs one failed dial instead of a release.
+    //
+    // The literal below is kept deliberately as the next entry: DNS resolution
+    // is verified working on the RUST engine (live sync from roost over this
+    // name) but NOT on the Java one, which is the default — jvm-libp2p parses
+    // the multiaddr and extracts the peer id, but its transport's DNS handling
+    // is unverified. If it cannot dial a name it falls through to the IP and
+    // behaves exactly as before. Drop the literal once Java is confirmed.
+    "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
     "/ip4/87.154.209.161/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
     "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
     "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS",
@@ -415,6 +428,7 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     // currently notice its own IP changing — its Identify quorum never settles
     // because it makes no outbound connections — so this line is the thing that
     // breaks if the address moves.
+    "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
     "/ip4/87.154.209.161/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
     "/ip4/176.229.58.1/tcp/9001/p2p/16Uiu2HAmHu1BxzrSWg7sN9JyJenC5unK5ntdk5QFYqQdQyyD7x3a",
     "/ip4/81.172.166.237/tcp/9001/p2p/16Uiu2HAmRogw5aqM4ZuVEmZoQvFp25sUnnQ9wpGuWXRLFMmXc88j",
@@ -2571,14 +2585,14 @@ mod tests {
         assert_eq!(c.current_fork_digest(), [0x8C, 0x9F, 0x62, 0xFE]);
         assert_eq!(c.accepted_fork_digests(), vec![[0x8C, 0x9F, 0x62, 0xFE]]);
         // 18 discovered peers + roost mainnet prepended.
-        assert_eq!(c.static_peers.len(), 19);
+        assert_eq!(c.static_peers.len(), 20);
         // roost is FIRST — the ordering is the point, not an accident of the
         // list. The Java twin prepends it with prependLocal(); if these two ever
         // disagree on position, the default engine and the Rust engine pick
         // different first-choice peers and only one of them is the dedicated one.
         assert_eq!(
             c.static_peers[0],
-            "/ip4/87.154.209.161/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC"
+            "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC"
         );
         assert_eq!(c.bootstrap_enrs.len(), 17);
         assert_eq!(c.chain_id, 1);
@@ -2625,6 +2639,7 @@ mod tests {
         assert_eq!(
             c.static_peers,
             vec![
+                "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
                 "/ip4/87.154.209.161/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
                 "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
                 "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS",

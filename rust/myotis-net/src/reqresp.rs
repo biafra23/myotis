@@ -640,6 +640,50 @@ fn multiaddr_port(addr: &Multiaddr) -> Option<u16> {
     })
 }
 
+/// The DNS name in a multiaddr, if it is dialed by name rather than by address.
+///
+/// Used only for logging: libp2p resolves the name inside the transport, so
+/// without this the operator sees a connection to an IP with no indication that
+/// a name was involved, or which one — and on a dynamic address the whole point
+/// is being able to see what the name currently points at.
+fn multiaddr_dns_name(addr: &Multiaddr) -> Option<String> {
+    use libp2p::multiaddr::Protocol;
+    addr.iter().find_map(|p| match p {
+        Protocol::Dns(n) | Protocol::Dns4(n) | Protocol::Dns6(n) | Protocol::Dnsaddr(n) => {
+            Some(n.to_string())
+        }
+        _ => None,
+    })
+}
+
+/// Log what a name currently resolves to, without blocking the swarm task.
+///
+/// libp2p resolves inside the transport and does not surface the answer — the
+/// established connection still reports the `/dns4/` address it was asked for —
+/// so the mapping is invisible unless we look it up ourselves. On a dynamic
+/// address that mapping is the operationally interesting fact: it is what says
+/// whether a pinned name is currently pointing at the right machine.
+///
+/// This is a SECOND lookup, not the one the transport used. With a ~30s TTL the
+/// two agree in practice, but treat it as "what the name says now" rather than
+/// "what this connection went to".
+fn log_resolution(name: &str, port: u16) {
+    let name = name.to_string();
+    tokio::spawn(async move {
+        match tokio::net::lookup_host((name.as_str(), port)).await {
+            Ok(addrs) => {
+                let ips: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
+                if ips.is_empty() {
+                    tracing::warn!(%name, "name resolved to no addresses");
+                } else {
+                    tracing::info!(%name, resolved = %ips.join(","), "name resolved");
+                }
+            }
+            Err(e) => tracing::warn!(%name, error = %e, "name failed to resolve"),
+        }
+    });
+}
+
 /// One peer's report: where they reached us from, and what they see us as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Observation {
@@ -719,6 +763,51 @@ pub fn start_host(local_status: Arc<LocalStatus>) -> Result<ReqRespClient, Strin
 /// notices: the caller's `ReqRespClient` still exists and background pollers
 /// keep polling. A supervisor cannot help with a process that never exits, so
 /// detecting it is the owner's job. See `roost::serve`, which exits non-zero.
+/// Build the swarm, optionally with the DNS resolution layer.
+///
+/// Two near-identical chains rather than one with a branch: `with_dns()`
+/// consumes the builder and does not hand it back on failure, so recovering
+/// from a failed DNS setup means building again from the identity.
+fn build_swarm(
+    keypair: libp2p::identity::Keypair,
+    serving: bool,
+    max_incoming: Option<u32>,
+    dns: bool,
+) -> Result<Swarm<Behaviour>, String> {
+    let base = libp2p::SwarmBuilder::with_existing_identity(keypair).with_tokio();
+    let idle = |c: libp2p::swarm::Config| c.with_idle_connection_timeout(Duration::from_secs(120));
+    let behaviour = |key: &libp2p::identity::Keypair| {
+        Behaviour::new(key.public(), serving, max_incoming)
+    };
+    if dns {
+        Ok(base
+            .with_tcp(
+                libp2p::tcp::Config::default().nodelay(true),
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )
+            .map_err(|e| format!("tcp/noise/yamux setup failed: {e}"))?
+            .with_dns()
+            .map_err(|e| format!("dns transport setup failed: {e}"))?
+            .with_behaviour(behaviour)
+            .map_err(|e| format!("behaviour setup failed: {e}"))?
+            .with_swarm_config(idle)
+            .build())
+    } else {
+        Ok(base
+            .with_tcp(
+                libp2p::tcp::Config::default().nodelay(true),
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )
+            .map_err(|e| format!("tcp/noise/yamux setup failed: {e}"))?
+            .with_behaviour(behaviour)
+            .map_err(|e| format!("behaviour setup failed: {e}"))?
+            .with_swarm_config(idle)
+            .build())
+    }
+}
+
 pub fn start_host_with(
     local_status: Arc<LocalStatus>,
     config: HostConfig,
@@ -731,18 +820,30 @@ pub fn start_host_with(
         .unwrap_or_else(libp2p::identity::Keypair::generate_secp256k1);
     let serving = config.lc_responder.is_some();
     let max_incoming = config.max_established_incoming;
-    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
-        .with_tokio()
-        .with_tcp(
-            libp2p::tcp::Config::default().nodelay(true),
-            libp2p::noise::Config::new,
-            libp2p::yamux::Config::default,
-        )
-        .map_err(|e| format!("tcp/noise/yamux setup failed: {e}"))?
-        .with_behaviour(|key| Behaviour::new(key.public(), serving, max_incoming))
-        .map_err(|e| format!("behaviour setup failed: {e}"))?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
-        .build();
+    // DNS is layered in so `/dns4/host/tcp/port/p2p/<id>` peers resolve AT DIAL
+    // TIME, every dial, honouring the record's TTL. That is what lets a server
+    // on a dynamic residential address be pinned by NAME instead of by a literal
+    // IP that goes stale (rust/roost).
+    //
+    // It must not be load-bearing, because it CANNOT be relied on everywhere:
+    // the system resolver is configured from /etc/resolv.conf, which Android has
+    // not had since Oreo (DNS goes through netd), so this legitimately fails
+    // there. Android is a first-class consumer (CLAUDE.md, Platform & language
+    // direction), and failing the whole host over an optional transport layer
+    // would take out `/ip4/` peers — every peer we pin today — on the default
+    // Android path.
+    //
+    // So: try with DNS, fall back to plain TCP with a warning. The degraded mode
+    // is exactly today's behaviour, and the warning names what stops working.
+    let mut swarm = match build_swarm(keypair.clone(), serving, max_incoming, true) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e,
+                "no system DNS resolver — continuing WITHOUT the DNS transport; \
+                 /ip4/ peers are unaffected but /dns4/ peers cannot be dialed");
+            build_swarm(keypair, serving, max_incoming, false)?
+        }
+    };
 
     swarm
         .listen_on(config.listen)
@@ -775,6 +876,9 @@ struct QueuedRequest {
 struct SwarmCtx {
     pending: HashMap<OutboundRequestId, Pending>,
     connected: HashSet<PeerId>,
+    /// Peers we dialed BY NAME, and the name used. Logging only — cleared when
+    /// the dial resolves one way or the other.
+    dns_dials: HashMap<PeerId, String>,
     /// Peers whose spec-required first Status exchange has completed (either
     /// way). Requests to peers not in this set are parked in `queued` —
     /// opening a light_client stream before Status completes gets the whole
@@ -820,6 +924,7 @@ async fn run_swarm(
     let mut ctx = SwarmCtx {
         pending: HashMap::new(),
         connected: HashSet::new(),
+        dns_dials: HashMap::new(),
         status_done: HashSet::new(),
         queued: HashMap::new(),
         lc_servers: HashSet::new(),
@@ -867,6 +972,9 @@ async fn run_swarm(
                         // dial would only churn the connection.
                         if ctx.connected.contains(&peer) {
                             continue;
+                        }
+                        if let Some(name) = multiaddr_dns_name(&addr) {
+                            ctx.dns_dials.insert(peer, name);
                         }
                         use libp2p::swarm::dial_opts::DialOpts;
                         let opts = DialOpts::peer_id(peer).addresses(vec![addr]).build();
@@ -916,6 +1024,10 @@ fn submit_request(
         .or_default()
         .push(QueuedRequest { addr: addr.clone(), protocol, wire, reply });
     if !ctx.connected.contains(&peer) {
+        if let Some(name) = multiaddr_dns_name(&addr) {
+            log_resolution(&name, multiaddr_port(&addr).unwrap_or(0));
+            ctx.dns_dials.insert(peer, name);
+        }
         use libp2p::swarm::dial_opts::DialOpts;
         let opts = DialOpts::peer_id(peer).addresses(vec![addr]).build();
         match swarm.dial(opts) {
@@ -978,6 +1090,18 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
                 ctx.peer_source_ips.insert(peer_id, (ip, endpoint.is_listener()));
             }
             let newly = ctx.connected.insert(peer_id);
+            // The name's CURRENT answer. libp2p resolves inside the transport,
+            // so this is the only place the mapping is observable — and on a
+            // dynamic address it is the thing an operator actually wants to
+            // see: which IP the name points at right now, confirmed by a
+            // connection that succeeded rather than by a lookup done elsewhere.
+            if let Some(name) = ctx.dns_dials.remove(&peer_id) {
+                // NOTE: not `endpoint.get_remote_address()` — for a dial by name
+                // that returns the /dns4/ address we asked for, not the address
+                // it resolved to, which makes it useless for exactly this. The
+                // answer is logged by `log_resolution` at dial time instead.
+                tracing::info!(peer = %peer_id, %name, "connected by name");
+            }
             tracing::debug!(peer = %peer_id, remote = %endpoint.get_remote_address(),
                 "connection established");
             if newly {
@@ -1007,6 +1131,14 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
             }
         }
         SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. } => {
+            if let Some(name) = ctx.dns_dials.remove(&peer_id) {
+                // WARN, not debug: a pinned name that stops resolving makes the
+                // server unreachable to every wallet at once, and it is
+                // otherwise indistinguishable from the server being down.
+                tracing::warn!(peer = %peer_id, %name, error = %error,
+                    "dial by name failed — the name did not resolve, or resolved to \
+                     an address that refused the connection");
+            }
             tracing::debug!(peer = %peer_id, error = %error, "outgoing connection failed");
             fail_queued(ctx, &peer_id, RequestError::DialFailure);
         }
