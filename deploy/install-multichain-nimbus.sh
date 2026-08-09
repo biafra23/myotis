@@ -34,7 +34,10 @@ declare -A CHECKPOINT_ALT=(
 # mainnet, hoodi, sepolia or a PATH. The chain config is vendored in the
 # nimbus-eth2 source; copy it somewhere stable so the unit does not depend on a
 # home directory. Override GNOSIS_CONFIG_SRC if your checkout lives elsewhere.
-GNOSIS_CONFIG_SRC="${GNOSIS_CONFIG_SRC:-$HOME/myotis-node/nimbus-eth2/vendor/gnosis-chain-configs/mainnet}"
+# $HOME is /root under sudo, not the invoking user's home — resolve the real one.
+INVOKING_USER="${SUDO_USER:-$(id -un)}"
+INVOKING_HOME="$(getent passwd "$INVOKING_USER" | cut -d: -f6)"
+GNOSIS_CONFIG_SRC="${GNOSIS_CONFIG_SRC:-$INVOKING_HOME/myotis-node/nimbus-eth2/vendor/gnosis-chain-configs/mainnet}"
 GNOSIS_CONFIG_DST=/etc/myotis/gnosis-chain-config
 
 declare -A NETWORK=([gnosis]="$GNOSIS_CONFIG_DST" [mainnet]=mainnet)
