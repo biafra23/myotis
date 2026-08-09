@@ -29,19 +29,69 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 
-/// Slots per sync-committee period: `SLOTS_PER_EPOCH (32) *
-/// EPOCHS_PER_SYNC_COMMITTEE_PERIOD (256)`.
-pub const SLOTS_PER_PERIOD: u64 = 32 * 256;
+/// The chain's slot/period geometry, read from the upstream rather than assumed.
+///
+/// # Why this is not a constant
+///
+/// It was `32 * 256`, documented as `SLOTS_PER_EPOCH (32) *
+/// EPOCHS_PER_SYNC_COMMITTEE_PERIOD (256)`. Both factors are mainnet's.
+/// **Gnosis runs 16-slot epochs** — it reaches the same 8192 only because it
+/// pairs them with 512 epochs per period, so the old constant was right by
+/// coincidence and its stated derivation was false for that chain. A future
+/// network that pairs different factors would have broken it silently.
+///
+/// Silently is the operative word: every period number roost computes rests on
+/// this, including the keys its **archive records are written under**. A wrong
+/// value does not fail — it mis-keys durable data, and the archive is the one
+/// thing here that cannot be regenerated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainParams {
+    pub slots_per_epoch: u64,
+    pub epochs_per_sync_committee_period: u64,
+}
+
+impl ChainParams {
+    pub fn slots_per_period(&self) -> u64 {
+        self.slots_per_epoch
+            .saturating_mul(self.epochs_per_sync_committee_period)
+    }
+
+    /// The sync-committee period a slot falls in.
+    pub fn period_of_slot(&self, slot: u64) -> u64 {
+        slot / self.slots_per_period()
+    }
+
+    pub fn epoch_of_slot(&self, slot: u64) -> u64 {
+        slot / self.slots_per_epoch
+    }
+
+    /// Parse from a decoded `config/spec` map, refusing anything unusable.
+    ///
+    /// Both values are REQUIRED and a zero is refused: defaulting either would
+    /// reintroduce exactly the silent-wrong-answer failure this type exists to
+    /// remove, and a zero would divide by zero.
+    pub fn from_spec(spec: &std::collections::BTreeMap<String, String>) -> Result<Self> {
+        let read = |key: &str| -> Result<u64> {
+            let raw = spec
+                .get(key)
+                .ok_or_else(|| anyhow!("config/spec has no {key}"))?;
+            let v: u64 = raw.parse().with_context(|| format!("parsing {key} = {raw}"))?;
+            if v == 0 {
+                return Err(anyhow!("config/spec reports {key} = 0"));
+            }
+            Ok(v)
+        };
+        Ok(Self {
+            slots_per_epoch: read("SLOTS_PER_EPOCH")?,
+            epochs_per_sync_committee_period: read("EPOCHS_PER_SYNC_COMMITTEE_PERIOD")?,
+        })
+    }
+}
 
 /// The spec's `MAX_REQUEST_LIGHT_CLIENT_UPDATES`. Enforced here as well as on
 /// the serving side: a caller-controlled count must never fan out into an
 /// unbounded upstream fetch.
 pub const MAX_REQUEST_LIGHT_CLIENT_UPDATES: u64 = 128;
-
-/// The sync-committee period a slot falls in.
-pub fn period_of_slot(slot: u64) -> u64 {
-    slot / SLOTS_PER_PERIOD
-}
 
 fn parse_root(s: &str) -> Result<[u8; 32]> {
     let raw = hex::decode(s.trim_start_matches("0x")).context("decoding a 32-byte root")?;
@@ -394,6 +444,12 @@ impl NimbusRest {
             .ok_or_else(|| anyhow!("headers/<root>: missing slot"))
     }
 
+    /// The chain's slot/period geometry.
+    pub async fn chain_params(&self) -> Result<ChainParams> {
+        let (spec, _) = self.config_spec().await?;
+        ChainParams::from_spec(&spec)
+    }
+
     /// The chain's `genesis_validators_root` — the identity an archive is bound
     /// to, so a file collected for one network can never load for another.
     pub async fn genesis_validators_root(&self) -> Result<[u8; 32]> {
@@ -481,15 +537,66 @@ mod tests {
         assert!(parse_blob_schedule(&v).is_err());
     }
 
+    fn mainnet_shaped() -> ChainParams {
+        ChainParams { slots_per_epoch: 32, epochs_per_sync_committee_period: 256 }
+    }
+
     #[test]
     fn period_math_matches_the_live_node() {
         // zbox head 10 873 925 sat in period 1327 while serving 1327 as its
         // newest update.
-        assert_eq!(period_of_slot(10_873_925), 1327);
-        // Boundaries.
-        assert_eq!(period_of_slot(0), 0);
-        assert_eq!(period_of_slot(SLOTS_PER_PERIOD - 1), 0);
-        assert_eq!(period_of_slot(SLOTS_PER_PERIOD), 1);
+        let p = mainnet_shaped();
+        assert_eq!(p.slots_per_period(), 8192);
+        assert_eq!(p.period_of_slot(10_873_925), 1327);
+        assert_eq!(p.period_of_slot(0), 0);
+        assert_eq!(p.period_of_slot(8191), 0);
+        assert_eq!(p.period_of_slot(8192), 1);
+    }
+
+    #[test]
+    fn gnosis_geometry_reaches_the_same_period_length_by_different_factors() {
+        // 16-slot epochs, 512 epochs per period. The old constant (32 * 256)
+        // landed on 8192 too — right answer, false derivation. This is the case
+        // that would have made a differently-shaped chain wrong in silence.
+        let g = ChainParams { slots_per_epoch: 16, epochs_per_sync_committee_period: 512 };
+        assert_eq!(g.slots_per_period(), 8192);
+        assert_eq!(g.epoch_of_slot(16), 1, "gnosis epochs are 16 slots, not 32");
+        assert_ne!(g.epoch_of_slot(32), mainnet_shaped().epoch_of_slot(32));
+    }
+
+    #[test]
+    fn a_hypothetical_chain_with_different_factors_is_honoured() {
+        // The point of reading it rather than assuming: nothing here says 8192.
+        let odd = ChainParams { slots_per_epoch: 8, epochs_per_sync_committee_period: 64 };
+        assert_eq!(odd.slots_per_period(), 512);
+        assert_eq!(odd.period_of_slot(512), 1);
+    }
+
+    #[test]
+    fn refuses_a_spec_it_cannot_use() {
+        use std::collections::BTreeMap;
+        let ok: BTreeMap<String, String> = [
+            ("SLOTS_PER_EPOCH", "16"),
+            ("EPOCHS_PER_SYNC_COMMITTEE_PERIOD", "512"),
+        ]
+        .into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        assert_eq!(ChainParams::from_spec(&ok).unwrap().slots_per_period(), 8192);
+
+        for bad in [
+            vec![("SLOTS_PER_EPOCH", "32")],                                  // missing the other
+            vec![("EPOCHS_PER_SYNC_COMMITTEE_PERIOD", "256")],                // missing the other
+            vec![("SLOTS_PER_EPOCH", "0"), ("EPOCHS_PER_SYNC_COMMITTEE_PERIOD", "256")],
+            vec![("SLOTS_PER_EPOCH", "32"), ("EPOCHS_PER_SYNC_COMMITTEE_PERIOD", "0")],
+            vec![("SLOTS_PER_EPOCH", "x"), ("EPOCHS_PER_SYNC_COMMITTEE_PERIOD", "256")],
+        ] {
+            let m: BTreeMap<String, String> =
+                bad.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            assert!(
+                ChainParams::from_spec(&m).is_err(),
+                "an unusable spec must fail rather than default — a wrong period \
+                 length mis-keys archive records, which are not regenerable"
+            );
+        }
     }
 
     #[tokio::test]

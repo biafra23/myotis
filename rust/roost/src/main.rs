@@ -22,7 +22,7 @@ mod store;
 
 use archive::Archive;
 use framing::{split_updates, updates_to_wire};
-use rest::{period_of_slot, NimbusRest};
+use rest::NimbusRest;
 use store::LcStore;
 
 const DEFAULT_REST: &str = "http://127.0.0.1:5052";
@@ -146,9 +146,16 @@ async fn probe(rest_base: &str) -> Result<()> {
     println!("== upstream ==");
     println!("  rest      {rest_base}");
     println!("  version   {}", client.node_version().await?);
+    let params = client.chain_params().await?;
     let (head_slot, syncing) = client.syncing().await?;
-    let head_period = period_of_slot(head_slot);
+    let head_period = params.period_of_slot(head_slot);
     println!("  head      slot {head_slot} (period {head_period}), syncing={syncing}");
+    println!(
+        "  geometry  {} slots/epoch x {} epochs/period = {} slots per period",
+        params.slots_per_epoch,
+        params.epochs_per_sync_committee_period,
+        params.slots_per_period()
+    );
 
     println!("\n== single-object endpoints ==");
     for (name, resp) in [
@@ -322,10 +329,17 @@ async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
         store.insert_update(*period, rec.fork_digest, &rec.ssz);
     }
 
+    let params = client.chain_params().await?;
     let (head_slot, syncing) = client.syncing().await?;
-    let head_period = period_of_slot(head_slot);
+    let head_period = params.period_of_slot(head_slot);
     println!("\n== upstream ==");
     println!("  head      slot {head_slot} (period {head_period}), syncing={syncing}");
+    println!(
+        "  geometry  {} slots/epoch x {} epochs/period = {} slots per period",
+        params.slots_per_epoch,
+        params.epochs_per_sync_committee_period,
+        params.slots_per_period()
+    );
 
     let floor = match find_window_floor(&client, head_period).await? {
         Some(f) => f,
@@ -553,6 +567,7 @@ async fn show_enr(
     let client = NimbusRest::new(rest_base, Duration::from_secs(30))?;
     let gvr = client.genesis_validators_root().await?;
     let schedule = forks::ForkSchedule::fetch(&client, gvr).await?;
+    let params = client.chain_params().await?;
     let (head_slot, syncing) = client.syncing().await?;
     // A syncing upstream reports a head behind the real one, and if it is behind
     // the most recent fork or BPO boundary the digest computed from it is the
@@ -567,7 +582,9 @@ async fn show_enr(
              invisible to exactly the clients it is for."
         ));
     }
-    let epoch = head_slot / schedule.slots_per_epoch();
+    // One source for slot->epoch, so the ENR's fork id cannot disagree with the
+    // period math the rest of the daemon uses.
+    let epoch = params.epoch_of_slot(head_slot);
     let eth2 = schedule.enr_fork_id(epoch);
 
     // The SAME key the libp2p host authenticates with — including a --key

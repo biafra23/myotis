@@ -33,7 +33,7 @@ use myotis_net::status::StatusMessage;
 use crate::archive::Archive;
 use crate::framing::split_updates;
 use crate::forks::ForkSchedule;
-use crate::rest::{period_of_slot, FetchError, NimbusRest, SLOTS_PER_PERIOD};
+use crate::rest::{ChainParams, FetchError, NimbusRest};
 use crate::store::LcStore;
 
 /// How often to refresh the chain view and the per-slot objects. One slot.
@@ -149,6 +149,7 @@ fn warn_if_group_or_world_readable(path: &Path) {
 async fn chain_view(
     client: &NimbusRest,
     store: &LcStore,
+    params: ChainParams,
     fork_digest: [u8; 4],
 ) -> Result<StatusMessage> {
     let (head_slot, head_root) = client.head_header().await?;
@@ -156,7 +157,7 @@ async fn chain_view(
     let earliest_available_slot = store
         .coverage()
         .lowest_period
-        .map(|p| p.saturating_mul(SLOTS_PER_PERIOD))
+        .map(|p| p.saturating_mul(params.slots_per_period()))
         .unwrap_or(0);
     Ok(StatusMessage {
         fork_digest,
@@ -337,6 +338,10 @@ pub async fn serve(
 ) -> Result<()> {
     let client = NimbusRest::new(rest_base, Duration::from_secs(30))?;
     let gvr = client.genesis_validators_root().await?;
+    // REQUIRED, and fetched before the archive is opened: every period number
+    // below — including the keys archive records are written under — depends on
+    // it, and a wrong value mis-keys durable data rather than failing.
+    let params = client.chain_params().await?;
 
     let (mut archive, records, report) = Archive::open(archive_path, &gvr)?;
     let store = Arc::new(LcStore::new());
@@ -352,7 +357,7 @@ pub async fn serve(
 
     // Initial fill, so the server is useful the moment it starts listening.
     let (head_slot, _) = client.syncing().await?;
-    let head_period = period_of_slot(head_slot);
+    let head_period = params.period_of_slot(head_slot);
     // Everything from here to `start_host_with` is BEST EFFORT. Startup must not
     // be able to fail on a transient upstream condition: at a period rollover
     // the head slot is already in period P while the newest servable update is
@@ -401,7 +406,7 @@ pub async fn serve(
         tracing::warn!(error = %e, "initial live-object fetch failed; the ticker will retry");
     }
 
-    let status = LocalStatus::new(chain_view(&client, &store, digests.for_slot(head_slot)).await?);
+    let status = LocalStatus::new(chain_view(&client, &store, params, digests.for_slot(head_slot)).await?);
     let key_path = key_path.unwrap_or_else(|| archive_path.with_extension("key"));
     let keypair = load_or_create_key(&key_path)?;
 
@@ -527,7 +532,7 @@ pub async fn serve(
                 // reintroduced through the degraded path.
                 if digests.schedule.is_none() {
                     if let Some(d) =
-                        resolve_fork_digest(&client, &store, period_of_slot(head_slot)).await
+                        resolve_fork_digest(&client, &store, params.period_of_slot(head_slot)).await
                     {
                         if d != digests.observed {
                             tracing::warn!(old = %hex::encode(digests.observed), new = %hex::encode(d),
@@ -552,7 +557,7 @@ pub async fn serve(
                 if let Err(e) = fill_bootstrap_misses(&client, &store, &digests, head_slot).await {
                     tracing::warn!(error = %e, "filling bootstrap misses failed");
                 }
-                match chain_view(&client, &store, head_digest).await {
+                match chain_view(&client, &store, params, head_digest).await {
                     Ok(view) => status.set(view),
                     Err(e) => tracing::warn!(error = %e, "refreshing the chain view failed"),
                 }
@@ -628,7 +633,7 @@ pub async fn serve(
 
                 // A new period turns over every ~27 hours; checking each slot is
                 // free next to the HTTP calls above.
-                let p = period_of_slot(head_slot);
+                let p = params.period_of_slot(head_slot);
                 if !store.has_period(p) {
                     match fill_periods(&client, &store, &mut archive, p, p).await {
                         Ok(n) if n > 0 => tracing::info!(period = p, "archived a new period"),
