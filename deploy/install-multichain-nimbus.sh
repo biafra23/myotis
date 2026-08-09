@@ -14,9 +14,17 @@
 set -euo pipefail
 
 NIMBUS=/usr/bin/nimbus_beacon_node
+NIMBUS_GNOSIS=/usr/local/bin/nimbus_beacon_node-gnosis
 STAGE="$(cd "$(dirname "$0")" && pwd)"
 
 [ -x "$NIMBUS" ] || { echo "nimbus not installed at $NIMBUS"; exit 1; }
+
+# Per-chain binary. gnosis needs a build with -d:const_preset=gnosis — the
+# preset is compile-time, so the packaged mainnet binary refuses the network
+# rather than mis-reading it. Build it with:
+#   cd <nimbus-eth2> && make -j$(nproc) NIMFLAGS="-d:const_preset=gnosis" nimbus_beacon_node
+#   sudo install -m 0755 build/nimbus_beacon_node /usr/local/bin/nimbus_beacon_node-gnosis
+binary_for() { [ "$1" = gnosis ] && echo "$NIMBUS_GNOSIS" || echo "$NIMBUS"; }
 
 # Two live providers per chain, so a sync can be re-run against the other if one
 # is down. Verified reachable 2026-08-09; beaconstate.info and
@@ -62,6 +70,14 @@ for chain in "${CHAINS[@]}"; do
   dir="/data/nimbus-$chain"
   echo "=== $chain -> $dir (p2p ${PORT[$chain]}, rest 127.0.0.1:${REST[$chain]}) ==="
 
+  bin="$(binary_for "$chain")"
+  if [ ! -x "$bin" ]; then
+    echo "!!! $chain needs $bin, which is not installed"
+    [ "$chain" = gnosis ] && echo "    build it with -d:const_preset=gnosis (see the header of this script)"
+    failed+=("$chain")
+    continue
+  fi
+
   if [ "$chain" = gnosis ]; then
     if [ ! -f "$GNOSIS_CONFIG_SRC/config.yaml" ]; then
       echo "!!! gnosis chain config not found at $GNOSIS_CONFIG_SRC"
@@ -92,13 +108,13 @@ for chain in "${CHAINS[@]}"; do
     echo "--- already checkpoint-synced ($marker), skipping"
   else
     echo "--- checkpoint sync from ${CHECKPOINT[$chain]}"
-    if sudo -u nimbus "$NIMBUS" trustedNodeSync \
+    if sudo -u nimbus "$bin" trustedNodeSync \
          --network="${NETWORK[$chain]}" \
          --data-dir="$dir" \
          --trusted-node-url="${CHECKPOINT[$chain]}" \
          --backfill=false \
        || { echo "--- primary failed, retrying from ${CHECKPOINT_ALT[$chain]}"
-            sudo -u nimbus "$NIMBUS" trustedNodeSync \
+            sudo -u nimbus "$bin" trustedNodeSync \
               --network="${NETWORK[$chain]}" \
               --data-dir="$dir" \
               --trusted-node-url="${CHECKPOINT_ALT[$chain]}" \

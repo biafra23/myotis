@@ -1,0 +1,39 @@
+[Unit]
+# Template: roost@mainnet, roost@gnosis, roost@sepolia.
+#
+# roost is ONE CHAIN PER PROCESS — one archive, one identity, one upstream, one
+# port — so multichain means several instances, not one multi-chain daemon. A
+# template rather than N near-identical units because the copies are what drift:
+# the sepolia Nimbus unit and its checked-in twin diverged on --rest exactly that
+# way, and it took a review to notice.
+#
+# Per-instance settings live in /etc/myotis/roost-%i.env (ports differ per chain
+# and cannot be derived from the instance name).
+Description=roost %i (myotis dedicated light-client server)
+After=network-online.target nimbus-%i.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=roost
+EnvironmentFile=/etc/myotis/roost-%i.env
+ExecStart=/usr/local/bin/roost serve \
+  --rest http://127.0.0.1:${ROOST_UPSTREAM_REST} \
+  --archive /data/roost/%i.db \
+  --key /data/roost/%i.key \
+  --port ${ROOST_PORT}
+Restart=on-failure
+RestartSec=5
+# Explicit per docs/lc-server-design.md §8: the shell default is 2048 and roost's
+# inbound cap is 1024 connections, so 2048 would bind before the cap does.
+LimitNOFILE=65536
+TimeoutStopSec=30
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/data/roost
+
+[Install]
+WantedBy=multi-user.target

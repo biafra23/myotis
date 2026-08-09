@@ -30,7 +30,18 @@ User=nimbus
 # gnosis chain config is vendored in the nimbus-eth2 source and the installer
 # copies it here, so the unit does not depend on a user's home directory
 # surviving.
-ExecStart=/usr/bin/nimbus_beacon_node \
+# A SEPARATE BINARY, not /usr/bin/nimbus_beacon_node.
+#
+# Nimbus bakes the consensus preset in at COMPILE time. The packaged binary is a
+# mainnet-preset build and refuses gnosis outright:
+#   "Config not compatible with binary, compile with -d:const_preset=gnosis"
+# so this is not something a config path or flag can fix. deploy's installer
+# builds nimbus-eth2 with that flag and installs the result here.
+#
+# That refusal is also the clearest evidence for why roost reads slot/period
+# geometry from the node at runtime: gnosis's preset (16-slot epochs, 512 epochs
+# per period) differs enough that a mainnet binary will not load it.
+ExecStart=/usr/local/bin/nimbus_beacon_node-gnosis \
   --network=/etc/myotis/gnosis-chain-config \
   --data-dir=/data/nimbus-gnosis \
   --tcp-port=9106 --udp-port=9106 \
