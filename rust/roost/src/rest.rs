@@ -44,16 +44,31 @@ use anyhow::{anyhow, Context, Result};
 /// this, including the keys its **archive records are written under**. A wrong
 /// value does not fail — it mis-keys durable data, and the archive is the one
 /// thing here that cannot be regenerated.
+/// Fields are PRIVATE so [`ChainParams::from_spec`] is the only way in. They
+/// were `pub`, which meant `ChainParams { slots_per_epoch: 0, .. }` compiled and
+/// divided by zero in `period_of_slot` — unwinding out of `serve`'s main task,
+/// not a per-connection one. "Refuse anything unusable" is only a contract if
+/// the unusable value cannot be built at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChainParams {
-    pub slots_per_epoch: u64,
-    pub epochs_per_sync_committee_period: u64,
+    slots_per_epoch: u64,
+    epochs_per_sync_committee_period: u64,
+    /// Validated once, at construction — see `from_spec`.
+    slots_per_period: u64,
 }
 
 impl ChainParams {
-    pub fn slots_per_period(&self) -> u64 {
+    pub fn slots_per_epoch(&self) -> u64 {
         self.slots_per_epoch
-            .saturating_mul(self.epochs_per_sync_committee_period)
+    }
+
+    pub fn epochs_per_sync_committee_period(&self) -> u64 {
+        self.epochs_per_sync_committee_period
+    }
+
+    /// Proven usable at construction, so this cannot saturate.
+    pub fn slots_per_period(&self) -> u64 {
+        self.slots_per_period
     }
 
     /// The sync-committee period a slot falls in.
@@ -81,9 +96,25 @@ impl ChainParams {
             }
             Ok(v)
         };
+        let slots_per_epoch = read("SLOTS_PER_EPOCH")?;
+        let epochs_per_sync_committee_period = read("EPOCHS_PER_SYNC_COMMITTEE_PERIOD")?;
+        // checked, not saturating: a saturating product answers u64::MAX, which
+        // makes period_of_slot answer 0 for every real slot — so every archive
+        // record would be written under period 0. Silently mis-keying
+        // unregenerable data is the exact failure this type exists to prevent,
+        // and saturation would have reintroduced it.
+        let slots_per_period = slots_per_epoch
+            .checked_mul(epochs_per_sync_committee_period)
+            .ok_or_else(|| {
+                anyhow!(
+                    "config/spec geometry overflows u64: {slots_per_epoch} x \
+                     {epochs_per_sync_committee_period}"
+                )
+            })?;
         Ok(Self {
-            slots_per_epoch: read("SLOTS_PER_EPOCH")?,
-            epochs_per_sync_committee_period: read("EPOCHS_PER_SYNC_COMMITTEE_PERIOD")?,
+            slots_per_epoch,
+            epochs_per_sync_committee_period,
+            slots_per_period,
         })
     }
 }
@@ -381,9 +412,21 @@ impl NimbusRest {
         let obj = v["data"]
             .as_object()
             .ok_or_else(|| anyhow!("config/spec: data is not an object"))?;
+        // Stringify NUMERIC scalars too, not just string ones. The Beacon API
+        // spec pins these as strings and Nimbus emits them that way, but a
+        // client emitting `"SLOTS_PER_EPOCH": 32` would otherwise arrive
+        // downstream as an ABSENT key — refused with "config/spec has no
+        // SLOTS_PER_EPOCH", which points at the wrong problem entirely. The
+        // same brittleness already bit BLOB_SCHEDULE; there it degraded to a
+        // fallback, here it is fatal to both serve and probe.
         let scalars = obj
             .iter()
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .filter_map(|(k, v)| match v {
+                serde_json::Value::String(s) => Some((k.clone(), s.clone())),
+                serde_json::Value::Number(n) => Some((k.clone(), n.to_string())),
+                serde_json::Value::Bool(b) => Some((k.clone(), b.to_string())),
+                _ => None,
+            })
             .collect();
         Ok((scalars, parse_blob_schedule(&v)?))
     }
@@ -537,8 +580,19 @@ mod tests {
         assert!(parse_blob_schedule(&v).is_err());
     }
 
+    fn params(spe: u64, epp: u64) -> ChainParams {
+        let m: std::collections::BTreeMap<String, String> = [
+            ("SLOTS_PER_EPOCH", spe.to_string()),
+            ("EPOCHS_PER_SYNC_COMMITTEE_PERIOD", epp.to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        ChainParams::from_spec(&m).unwrap()
+    }
+
     fn mainnet_shaped() -> ChainParams {
-        ChainParams { slots_per_epoch: 32, epochs_per_sync_committee_period: 256 }
+        params(32, 256)
     }
 
     #[test]
@@ -558,7 +612,7 @@ mod tests {
         // 16-slot epochs, 512 epochs per period. The old constant (32 * 256)
         // landed on 8192 too — right answer, false derivation. This is the case
         // that would have made a differently-shaped chain wrong in silence.
-        let g = ChainParams { slots_per_epoch: 16, epochs_per_sync_committee_period: 512 };
+        let g = params(16, 512);
         assert_eq!(g.slots_per_period(), 8192);
         assert_eq!(g.epoch_of_slot(16), 1, "gnosis epochs are 16 slots, not 32");
         assert_ne!(g.epoch_of_slot(32), mainnet_shaped().epoch_of_slot(32));
@@ -567,7 +621,7 @@ mod tests {
     #[test]
     fn a_hypothetical_chain_with_different_factors_is_honoured() {
         // The point of reading it rather than assuming: nothing here says 8192.
-        let odd = ChainParams { slots_per_epoch: 8, epochs_per_sync_committee_period: 64 };
+        let odd = params(8, 64);
         assert_eq!(odd.slots_per_period(), 512);
         assert_eq!(odd.period_of_slot(512), 1);
     }
@@ -588,6 +642,12 @@ mod tests {
             vec![("SLOTS_PER_EPOCH", "0"), ("EPOCHS_PER_SYNC_COMMITTEE_PERIOD", "256")],
             vec![("SLOTS_PER_EPOCH", "32"), ("EPOCHS_PER_SYNC_COMMITTEE_PERIOD", "0")],
             vec![("SLOTS_PER_EPOCH", "x"), ("EPOCHS_PER_SYNC_COMMITTEE_PERIOD", "256")],
+            // Overflowing product: saturation would have made every slot land in
+            // period 0 rather than failing.
+            vec![
+                ("SLOTS_PER_EPOCH", "18446744073709551615"),
+                ("EPOCHS_PER_SYNC_COMMITTEE_PERIOD", "2"),
+            ],
         ] {
             let m: BTreeMap<String, String> =
                 bad.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();

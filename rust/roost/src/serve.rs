@@ -172,11 +172,17 @@ async fn chain_view(
 /// Where a response's context bytes come from.
 ///
 /// Computed from the chain's schedule when it is available, which is the
-/// correct answer for any slot. The observed fallback exists only so an
-/// upstream that cannot serve `/config/spec` degrades to the previous
-/// behaviour instead of taking the daemon down — it is the newest `updates`
-/// chunk's digest, which is right for the current fork and stale across a
-/// boundary.
+/// correct answer for any slot.
+///
+/// The observed fallback covers a NARROWER set than it once did. An upstream
+/// that cannot serve `/eth/v1/config/spec` at all now takes the daemon down
+/// before this is consulted, because the chain geometry is read from the same
+/// document and is required — a chain roost cannot measure is one it must not
+/// write archive records for. What still degrades here is a schedule that fails
+/// for its own reasons: an unpaired `*_FORK_VERSION`, an unparseable
+/// `BLOB_SCHEDULE`, or a spec with no fork versions at all. The fallback value
+/// is the newest `updates` chunk's digest — right for the current fork, stale
+/// across a boundary.
 struct Digests {
     schedule: Option<ForkSchedule>,
     observed: [u8; 4],
@@ -341,7 +347,7 @@ pub async fn serve(
     // REQUIRED, and fetched before the archive is opened: every period number
     // below — including the keys archive records are written under — depends on
     // it, and a wrong value mis-keys durable data rather than failing.
-    let params = client.chain_params().await?;
+    let (params, initial_schedule) = ForkSchedule::fetch_with_params(&client, gvr).await?;
 
     let (mut archive, records, report) = Archive::open(archive_path, &gvr)?;
     let store = Arc::new(LcStore::new());
@@ -389,7 +395,7 @@ pub async fn serve(
             ))
         }
     };
-    let schedule = match fetch_schedule(&client, gvr).await {
+    let schedule = match initial_schedule {
         Ok(s) => Some(s),
         Err(e) => {
             tracing::warn!(error = %e,
