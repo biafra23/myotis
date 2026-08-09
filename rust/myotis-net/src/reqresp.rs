@@ -14,6 +14,7 @@
 //! "write nothing, just half-close" (finality/optimistic — see `requestFinalityUpdate`).
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -382,6 +383,10 @@ enum Command {
     LcServers {
         reply: oneshot::Sender<HashSet<PeerId>>,
     },
+    /// The externally observed address, once EXTERNAL_ADDR_QUORUM peers agree.
+    ExternalAddress {
+        reply: oneshot::Sender<Option<ExternalAddress>>,
+    },
     /// One snapshot of both catch-up peer-selection inputs — the LC-server set
     /// and the per-peer `earliest_available_slot` map — so a round fetches them
     /// in a single swarm round-trip instead of two.
@@ -415,6 +420,21 @@ impl ReqRespClient {
             .await
             .map_err(|_| RequestError::Shutdown)?;
         rx.await.map_err(|_| RequestError::Shutdown)?
+    }
+
+    /// The address peers say they see us on, once at least
+    /// [`EXTERNAL_ADDR_QUORUM`] distinct peers agree on it.
+    ///
+    /// `None` until enough peers have reported — which is the honest answer, not
+    /// a failure: a server with too few connections genuinely does not know its
+    /// own address, and acting on a guess is how a published record ends up
+    /// pointing somewhere dead.
+    pub async fn external_address(&self) -> Option<ExternalAddress> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::ExternalAddress { reply }).await.is_err() {
+            return None;
+        }
+        rx.await.ok().flatten()
     }
 
     pub async fn connected_peer_count(&self) -> usize {
@@ -469,6 +489,53 @@ impl LocalStatus {
     pub fn get(&self) -> StatusMessage {
         self.inner.lock().expect("status lock").clone()
     }
+}
+
+/// How many DISTINCT peers must report the same address before it is believed.
+///
+/// One peer's `observed_addr` is not evidence: it can lie, and a peer behind the
+/// same NAT can be honestly wrong. This is the same reasoning discv5's endpoint
+/// prediction uses, and the reason Geth's `--nat stun` and Nimbus's
+/// `--enr-auto-update` do not act on a single report.
+///
+/// # What this is not
+///
+/// A floor against accident, **not** a defence against a determined Sybil. The
+/// answer is a plurality among connected peers, so an attacker who can hold more
+/// simultaneous connections than the honest peers reporting the true address can
+/// move it. That is tolerable while the result is only logged; before it drives
+/// a PUBLISHED ENR it wants at least one of:
+///
+/// - a majority of currently connected peers rather than a fixed floor,
+/// - cross-checking against discv5's own endpoint prediction, which is a
+///   different peer set reached over a different transport, or
+/// - refusing to act on a change until it survives several rounds.
+///
+/// The cost of getting it wrong is reachability, not correctness: a wrong
+/// address makes us undialable, it cannot make a wallet accept bad data.
+pub const EXTERNAL_ADDR_QUORUM: usize = 3;
+
+/// The address other peers say they see us on, once enough of them agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalAddress {
+    pub ip: IpAddr,
+    /// Distinct peers currently reporting this address.
+    pub confirmations: usize,
+}
+
+/// Extract the IP from a libp2p multiaddr.
+///
+/// Only the IP is meaningful. Identify reports the remote address of the
+/// connection as the reporter sees it, so for a connection WE dialed that is our
+/// source IP with an ephemeral port — the port says nothing about where we
+/// listen. Callers pair the IP with their own configured listen port.
+fn multiaddr_ip(addr: &Multiaddr) -> Option<IpAddr> {
+    use libp2p::multiaddr::Protocol;
+    addr.iter().find_map(|p| match p {
+        Protocol::Ip4(v4) => Some(IpAddr::V4(v4)),
+        Protocol::Ip6(v6) => Some(IpAddr::V6(v6)),
+        _ => None,
+    })
 }
 
 /// A source of pre-encoded light-client responses.
@@ -621,6 +688,10 @@ struct SwarmCtx {
     /// wrong entry: the budget leaks until everything is refused.
     in_flight: HashMap<(&'static str, InboundRequestId), usize>,
     in_flight_bytes: usize,
+    /// The address each connected peer reports seeing us on, ONE entry per peer
+    /// so a single peer cannot stuff the ballot by reconnecting. Dropped with
+    /// the connection, so this is bounded by the connected set.
+    observed_ips: HashMap<PeerId, IpAddr>,
 }
 
 async fn run_swarm(
@@ -640,6 +711,7 @@ async fn run_swarm(
         lc,
         in_flight: HashMap::new(),
         in_flight_bytes: 0,
+        observed_ips: HashMap::new(),
     };
     loop {
         tokio::select! {
@@ -666,6 +738,9 @@ async fn run_swarm(
                 }
                 Some(Command::LcServers { reply }) => {
                     let _ = reply.send(ctx.lc_servers.clone());
+                }
+                Some(Command::ExternalAddress { reply }) => {
+                    let _ = reply.send(external_address(&ctx.observed_ips));
                 }
                 Some(Command::CatchupMeta { reply }) => {
                     let _ = reply.send((ctx.lc_servers.clone(), ctx.peer_earliest.clone()));
@@ -782,6 +857,7 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
                 ctx.status_done.remove(&peer_id);
                 ctx.lc_servers.remove(&peer_id);
                 ctx.peer_earliest.remove(&peer_id);
+                ctx.observed_ips.remove(&peer_id);
                 fail_queued(ctx, &peer_id, RequestError::ConnectionClosed);
                 tracing::debug!(peer = %peer_id, "connection closed");
             }
@@ -808,6 +884,9 @@ fn handle_behaviour_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, even
                 .any(|p| p.as_ref().contains("light_client_updates_by_range"));
             if lc {
                 ctx.lc_servers.insert(peer_id);
+            }
+            if let Some(ip) = multiaddr_ip(&info.observed_addr) {
+                ctx.observed_ips.insert(peer_id, ip);
             }
             tracing::debug!(peer = %peer_id, agent = %info.agent_version,
                 protocols = info.protocols.len(), lc_updates = lc, "identify received");
@@ -1087,6 +1166,27 @@ fn respond_inbound(ctx: &SwarmCtx, protocol: &'static str, peer: PeerId, raw: &[
     }
 }
 
+/// The address a quorum of distinct peers agrees on.
+///
+/// Plurality among reports, then a floor: the winner must have at least
+/// [`EXTERNAL_ADDR_QUORUM`] distinct peers behind it. Below that we return
+/// `None` rather than the leading candidate — "I do not know yet" is the honest
+/// answer for a server with few connections, and publishing a guess is how a
+/// record ends up pointing at an address nothing answers on.
+fn external_address(observed: &HashMap<PeerId, IpAddr>) -> Option<ExternalAddress> {
+    let mut counts: HashMap<IpAddr, usize> = HashMap::new();
+    for ip in observed.values() {
+        *counts.entry(*ip).or_insert(0) += 1;
+    }
+    // Ties break on the IP itself, so the answer is deterministic rather than
+    // dependent on hash iteration order — a flapping answer would look exactly
+    // like a flapping address.
+    let (ip, confirmations) = counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))?;
+    (confirmations >= EXTERNAL_ADDR_QUORUM).then_some(ExternalAddress { ip, confirmations })
+}
+
 fn release_in_flight(ctx: &mut SwarmCtx, protocol: &'static str, request_id: InboundRequestId) {
     if let Some(bytes) = ctx.in_flight.remove(&(protocol, request_id)) {
         ctx.in_flight_bytes = ctx.in_flight_bytes.saturating_sub(bytes);
@@ -1097,4 +1197,103 @@ fn release_in_flight(ctx: &mut SwarmCtx, protocol: &'static str, request_id: Inb
 /// handler correct rather than a shortcut.
 fn resource_unavailable() -> Vec<u8> {
     codec::encode_error_response(codec::RESULT_RESOURCE_UNAVAILABLE, "ResourceUnavailable")
+}
+
+#[cfg(test)]
+mod external_address_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    /// Deterministic distinct peer ids — a seeded key, not a random one, so a
+    /// failure reproduces.
+    fn peer(n: u8) -> PeerId {
+        let mut seed = [0u8; 32];
+        seed[0] = n;
+        let kp = libp2p::identity::Keypair::ed25519_from_bytes(seed).expect("seeded key");
+        PeerId::from(kp.public())
+    }
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(87, 154, 209, last))
+    }
+
+    #[test]
+    fn below_quorum_is_none_not_a_best_guess() {
+        let mut observed = HashMap::new();
+        for i in 0..(EXTERNAL_ADDR_QUORUM - 1) {
+            observed.insert(peer(i as u8), ip(161));
+        }
+        assert_eq!(
+            external_address(&observed),
+            None,
+            "a server with too few reports genuinely does not know its own address"
+        );
+    }
+
+    #[test]
+    fn quorum_is_believed() {
+        let mut observed = HashMap::new();
+        for i in 0..EXTERNAL_ADDR_QUORUM {
+            observed.insert(peer(i as u8), ip(161));
+        }
+        let got = external_address(&observed).unwrap();
+        assert_eq!(got.ip, ip(161));
+        assert_eq!(got.confirmations, EXTERNAL_ADDR_QUORUM);
+    }
+
+    #[test]
+    fn a_minority_cannot_move_the_answer() {
+        // The point of the quorum: peers claiming something else — lying, or
+        // honestly wrong behind the same NAT — must not win.
+        let mut observed = HashMap::new();
+        for i in 0..5u8 {
+            observed.insert(peer(i), ip(161));
+        }
+        for i in 5..7u8 {
+            observed.insert(peer(i), ip(99));
+        }
+        assert_eq!(external_address(&observed).unwrap().ip, ip(161));
+    }
+
+    #[test]
+    fn one_peer_cannot_stuff_the_ballot() {
+        // Keyed by peer, so repeated reports from one peer replace rather than
+        // accumulate.
+        let mut observed = HashMap::new();
+        let loud = peer(1);
+        for _ in 0..10 {
+            observed.insert(loud, ip(99));
+        }
+        assert_eq!(external_address(&observed), None, "one peer is not a quorum");
+    }
+
+    #[test]
+    fn the_answer_is_deterministic_under_a_tie() {
+        // A tie resolved by hash iteration order would look exactly like a
+        // flapping address — the thing this mechanism exists to detect.
+        let mut observed = HashMap::new();
+        for i in 0..EXTERNAL_ADDR_QUORUM as u8 {
+            observed.insert(peer(i), ip(1));
+        }
+        for i in 0..EXTERNAL_ADDR_QUORUM as u8 {
+            observed.insert(peer(i + 50), ip(2));
+        }
+        let first = external_address(&observed).unwrap().ip;
+        for _ in 0..20 {
+            assert_eq!(external_address(&observed).unwrap().ip, first);
+        }
+    }
+
+    #[test]
+    fn extracts_the_ip_and_ignores_the_port() {
+        // Identify reports the connection's remote address, so for a connection
+        // WE dialed the port is our ephemeral source port and says nothing about
+        // where we listen.
+        let addr: Multiaddr = "/ip4/87.154.209.161/tcp/54321".parse().unwrap();
+        assert_eq!(multiaddr_ip(&addr), Some(ip(161)));
+        let addr6: Multiaddr = "/ip6/::1/tcp/9105".parse().unwrap();
+        assert!(multiaddr_ip(&addr6).is_some());
+        let no_ip: Multiaddr = "/dns4/example.com/tcp/9105".parse().unwrap();
+        assert_eq!(multiaddr_ip(&no_ip), None);
+    }
 }

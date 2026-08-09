@@ -23,7 +23,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use myotis_net::identity::Keypair;
-use myotis_net::reqresp::{start_host_with, HostConfig, LocalStatus};
+use myotis_net::reqresp::{
+    start_host_with, ExternalAddress, HostConfig, LocalStatus, EXTERNAL_ADDR_QUORUM,
+};
 use myotis_net::status::StatusMessage;
 
 use crate::archive::Archive;
@@ -388,7 +390,7 @@ pub async fn serve(
     let listen = format!("/ip4/0.0.0.0/tcp/{port}")
         .parse()
         .map_err(|e| anyhow!("bad listen address: {e}"))?;
-    let (_client, peer_id, swarm_task) = start_host_with(
+    let (net, peer_id, swarm_task) = start_host_with(
         status.clone(),
         HostConfig {
             listen,
@@ -402,7 +404,11 @@ pub async fn serve(
     let c = store.coverage();
     println!("\n== serving ==");
     println!("  identity  {} (persisted in {})", peer_id, key_path.display());
-    println!("  multiaddr /ip4/127.0.0.1/tcp/{port}/p2p/{peer_id}");
+    println!("  loopback  /ip4/127.0.0.1/tcp/{port}/p2p/{peer_id}");
+    println!(
+        "  public    unknown — needs {EXTERNAL_ADDR_QUORUM} peers to agree on what they see \
+         (logged when it settles)"
+    );
     println!("  periods   {} ({:?}..={:?})", c.periods, c.lowest_period, c.highest_period);
     println!(
         "  digest    0x{} ({})",
@@ -413,6 +419,7 @@ pub async fn serve(
     println!("\n  point a wallet at the multiaddr above; Ctrl-C to stop.\n");
 
     let mut digests = digests;
+    let mut external: Option<ExternalAddress> = None;
     let mut swarm_task = swarm_task;
     let mut ticks: u32 = 0;
     let mut ticker = tokio::time::interval(REFRESH);
@@ -531,6 +538,55 @@ pub async fn serve(
                     Ok(view) => status.set(view),
                     Err(e) => tracing::warn!(error = %e, "refreshing the chain view failed"),
                 }
+                // Track the address peers say they see us on.
+                //
+                // The PORT here is our configured listen port, not something
+                // observed: Identify reports the remote address of the
+                // connection, which for a connection we dialed carries an
+                // ephemeral source port. That is correct for the pinned
+                // deployment, where the router forwards the same port — but a
+                // NAT rewriting the port would make the advertised multiaddr
+                // wrong in a way this cannot detect. Worth revisiting when the
+                // ENR lands, where the port is published rather than logged.
+                //
+                // The deployment sits on a residential line whose public IP is
+                // not guaranteed stable, so this is not a startup question that
+                // gets answered once. It matters most for the ENR that is not
+                // published yet: a record carrying a dead IP is WORSE than no
+                // record, because wallets discover it, dial, fail, and spend
+                // their three strikes to eviction on a node that is actually
+                // healthy — taking the tokens that made it worth keeping. Until
+                // the ENR exists, this reports the dialable address and makes a
+                // change visible rather than silent.
+                // A `None` here is not an error and deliberately does nothing:
+                // below quorum simply means too few peers have reported yet, and
+                // keeping the last known answer beats oscillating to "unknown"
+                // every time a peer disconnects.
+                if let Some(seen) = net.external_address().await {
+                    match external {
+                        None => {
+                            tracing::info!(
+                                ip = %seen.ip, confirmations = seen.confirmations,
+                                multiaddr = %format!("/ip4/{}/tcp/{}/p2p/{}", seen.ip, port, peer_id),
+                                "external address established"
+                            );
+                            external = Some(seen);
+                        }
+                        Some(prev) if prev.ip != seen.ip => {
+                            tracing::warn!(
+                                old = %prev.ip, new = %seen.ip,
+                                confirmations = seen.confirmations,
+                                multiaddr = %format!("/ip4/{}/tcp/{}/p2p/{}", seen.ip, port, peer_id),
+                                "EXTERNAL ADDRESS CHANGED — anything pinning the old one is now \
+                                 dialling a dead address; the ENR will need re-publishing with a \
+                                 bumped sequence number once it exists"
+                            );
+                            external = Some(seen);
+                        }
+                        Some(_) => external = Some(seen),
+                    }
+                }
+
                 // A new period turns over every ~27 hours; checking each slot is
                 // free next to the HTTP calls above.
                 let p = period_of_slot(head_slot);
