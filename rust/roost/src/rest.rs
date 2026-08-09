@@ -276,14 +276,40 @@ impl NimbusRest {
             .await
             .with_context(|| format!("GET {url}"))?;
         let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .with_context(|| format!("reading body of {url}"))?;
-        if !status.is_success() {
-            return Err(anyhow!("GET {url} -> HTTP {status}: {text}"));
+        // Same ceiling and the same reason as the SSZ path above: the body is
+        // buffered before anything can bound it, so a compromised or
+        // malfunctioning upstream could stream an arbitrarily large chunked
+        // response and exhaust the daemon. `resp.text()` has no ceiling, and the
+        // JSON endpoints are not the small ones — /eth/v1/node/peers is polled
+        // against a node this design sizes at 500-800 peers.
+        if let Some(len) = resp.content_length() {
+            if len > MAX_BODY_BYTES as u64 {
+                return Err(anyhow!(
+                    "GET {url}: declared body {len} exceeds MAX_BODY_BYTES ({MAX_BODY_BYTES})"
+                ));
+            }
         }
-        serde_json::from_str(&text).with_context(|| format!("parsing JSON from {url}"))
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut resp = resp;
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .with_context(|| format!("reading body of {url}"))?
+        {
+            if bytes.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
+                return Err(anyhow!(
+                    "GET {url}: body exceeds MAX_BODY_BYTES ({MAX_BODY_BYTES})"
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            return Err(anyhow!(
+                "GET {url} -> HTTP {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            ));
+        }
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing JSON from {url}"))
     }
 
     // --- the four light-client endpoints ---------------------------------

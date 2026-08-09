@@ -674,12 +674,12 @@ fn log_resolution(name: &str, port: u16) {
             Ok(addrs) => {
                 let ips: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
                 if ips.is_empty() {
-                    tracing::warn!(%name, "name resolved to no addresses");
+                    tracing::warn!(%name, "DNS-PIN resolve EMPTY — name exists but has no A/AAAA record");
                 } else {
-                    tracing::info!(%name, resolved = %ips.join(","), "name resolved");
+                    tracing::info!(%name, resolved = %ips.join(","), "DNS-PIN resolved");
                 }
             }
-            Err(e) => tracing::warn!(%name, error = %e, "name failed to resolve"),
+            Err(e) => tracing::warn!(%name, error = %e, "DNS-PIN resolve FAILED"),
         }
     });
 }
@@ -1100,7 +1100,7 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
                 // that returns the /dns4/ address we asked for, not the address
                 // it resolved to, which makes it useless for exactly this. The
                 // answer is logged by `log_resolution` at dial time instead.
-                tracing::info!(peer = %peer_id, %name, "connected by name");
+                tracing::info!(peer = %peer_id, %name, "DNS-PIN connected");
             }
             tracing::debug!(peer = %peer_id, remote = %endpoint.get_remote_address(),
                 "connection established");
@@ -1136,7 +1136,7 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
                 // server unreachable to every wallet at once, and it is
                 // otherwise indistinguishable from the server being down.
                 tracing::warn!(peer = %peer_id, %name, error = %error,
-                    "dial by name failed — the name did not resolve, or resolved to \
+                    "DNS-PIN dial FAILED — the name did not resolve, or resolved to \
                      an address that refused the connection");
             }
             tracing::debug!(peer = %peer_id, error = %error, "outgoing connection failed");
@@ -1488,13 +1488,27 @@ fn external_address(observed: &HashMap<PeerId, Observation>) -> Option<ExternalA
     let (ip, confirmations) = counts
         .into_iter()
         .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))?;
-    // The port agreed by the reporters who back the winning IP. Inbound-only,
-    // so a server that never dials gets a real answer and one that does gets
-    // None rather than an ephemeral port.
-    let port = by_source
-        .values()
-        .filter(|(seen, _)| *seen == ip)
-        .find_map(|(_, port)| *port);
+    // The port MOST reporters who back the winning IP agree on — by frequency,
+    // ties broken on the value, exactly as the IP above.
+    //
+    // `find_map` over a HashMap took whichever backer hash order happened to
+    // visit first, so when reporters disagreed (a NAT rewriting the port for
+    // some peers, or a mix of listen-port and mapped-port views) the answer
+    // flipped between calls with no change in the underlying data. That is the
+    // same failure the IP tie-break exists to prevent, and it matters more here
+    // because `dialable()` publishes this port.
+    let mut port_counts: HashMap<u16, usize> = HashMap::new();
+    for (seen, port) in by_source.values() {
+        if *seen == ip {
+            if let Some(p) = port {
+                *port_counts.entry(*p).or_insert(0) += 1;
+            }
+        }
+    }
+    let port = port_counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+        .map(|(p, _)| p);
 
     (confirmations >= EXTERNAL_ADDR_QUORUM).then_some(ExternalAddress {
         ip,

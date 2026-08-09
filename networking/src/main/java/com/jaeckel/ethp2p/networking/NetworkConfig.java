@@ -105,6 +105,12 @@ public record NetworkConfig(
             null,
             // CL peer multiaddrs: known light-client-serving peers (nimbus, lodestar, lighthouse)
             // discovered via Lighthouse peer API 2026-03-11
+            // NOTE the order: the LITERAL leads and the NAME follows. That looks
+            // backwards and is not — see ROOST_PIN_ORDER in the Rust twin. Java
+            // walks this list in order and falls through, so a stale literal
+            // costs one failed dial before the name resolves; the Rust pool
+            // refreshes a static's address in place and keeps the LAST entry,
+            // which must be the name because a static there can never self-heal.
             // roost mainnet is prepended for the same reason as sepolia's: it is a
             // dedicated LC server, so it neither trims us nor shares its inbound
             // budget with a gossip mesh. 9109/tcp was verified forwarded before
@@ -113,7 +119,6 @@ public record NetworkConfig(
             prependLocal(
                     "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
             List.of(
-                    "/ip4/87.154.209.161/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
                     // nimbus peers (4 light_client protocols)
                     "/ip4/176.229.58.1/tcp/9001/p2p/16Uiu2HAmHu1BxzrSWg7sN9JyJenC5unK5ntdk5QFYqQdQyyD7x3a",
                     "/ip4/81.172.166.237/tcp/9001/p2p/16Uiu2HAmRogw5aqM4ZuVEmZoQvFp25sUnnQ9wpGuWXRLFMmXc88j",
@@ -249,7 +254,6 @@ public record NetworkConfig(
             prependLocal(
                     "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
                     List.of(
-                            "/ip4/87.154.209.161/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
                             "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
                             "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS"
                     )),
@@ -334,7 +338,6 @@ public record NetworkConfig(
             prependLocal(
                     "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
             List.of(
-                    "/ip4/87.154.209.161/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
                     "/ip4/104.37.190.86/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59",
                     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
                     "/ip4/135.129.103.34/tcp/9006/p2p/16Uiu2HAmA5FYL7dQftsHktHvuVTRyPdc1sH6qcWiXaVEPM6FMyN2",

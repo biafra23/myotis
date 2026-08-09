@@ -458,7 +458,8 @@ pub async fn serve(
         None => println!(
             "  public    unknown — the upstream advertises no routable address yet"
         ),
-    }    println!("  periods   {} ({:?}..={:?})", c.periods, c.lowest_period, c.highest_period);
+    }
+    println!("  periods   {} ({:?}..={:?})", c.periods, c.lowest_period, c.highest_period);
     println!(
         "  digest    0x{} ({})",
         hex::encode(digests.for_slot(head_slot)),
@@ -597,9 +598,24 @@ pub async fn serve(
                 // answers the question.
                 upstream_ip = track_upstream_ip(&client, upstream_ip, port, peer_id).await;
 
-                // Probe BEFORE reading the address below, so a round's dials
-                // and the read that consumes them are not a full tick apart.
-                if ticks.is_multiple_of(OBSERVE_TICKS) {
+                // FALLBACK ONLY, and deliberately not a second opinion.
+                //
+                // Dialing peers to harvest Identify observations was measured in
+                // this deployment and does not work: over 150s, 10 dials failed
+                // and the 2 connections that established were closed by the
+                // remote in ~20ms, before Identify completed. Beacon nodes trim
+                // a peer that does not gossip — the same behaviour roost exists
+                // to escape, met from the other side.
+                //
+                // Running it anyway while the primary answers would mean ~360
+                // dial-and-abandon connections an hour to peers we have no other
+                // reason to talk to, to recompute a value already in hand. That
+                // is precisely the behaviour that gets a node scored down, and
+                // roost of all things should not be doing it.
+                //
+                // So it runs only when the upstream cannot answer — a Nimbus
+                // that has not yet discovered its own address, or is down.
+                if upstream_ip.is_none() && ticks.is_multiple_of(OBSERVE_TICKS) {
                     probe_external(&client, &net).await;
                 }
 
@@ -688,18 +704,6 @@ pub async fn serve(
     }
 }
 
-/// Refresh the per-slot objects and the checkpoint bootstrap.
-///
-/// The per-slot objects are stamped with the digest for the HEAD slot at fetch
-/// time. roost is a byte cache and does not decode SSZ, so it cannot read the
-/// object's own attested-header slot without the light-client type modelling
-/// this design exists to avoid — and head is what these objects track, to
-/// within a slot or two. The residual error is confined to the handful of slots
-/// straddling a fork or BPO boundary, and self-corrects on the next tick because
-/// both objects are refetched every slot.
-///
-/// A BOOTSTRAP is different: it is keyed by an arbitrary root that may be far
-/// from head, so its epoch is looked up exactly.
 /// Dial a handful of the upstream's peers so somebody tells us our own address.
 ///
 /// roost is a pure server: it answers connections and never opens one. Identify
@@ -843,6 +847,18 @@ fn select_probe_peers(addrs: &[String]) -> Vec<(PeerId, Multiaddr)> {
     picked
 }
 
+/// Refresh the per-slot objects and the checkpoint bootstrap.
+///
+/// The per-slot objects are stamped with the digest for the HEAD slot at fetch
+/// time. roost is a byte cache and does not decode SSZ, so it cannot read the
+/// object's own attested-header slot without the light-client type modelling
+/// this design exists to avoid — and head is what these objects track, to
+/// within a slot or two. The residual error is confined to the handful of slots
+/// straddling a fork or BPO boundary, and self-corrects on the next tick because
+/// both objects are refetched every slot.
+///
+/// A BOOTSTRAP is different: it is keyed by an arbitrary root that may be far
+/// from head, so its epoch is looked up exactly.
 async fn refresh_live(
     client: &NimbusRest,
     store: &LcStore,

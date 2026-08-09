@@ -293,7 +293,10 @@ impl ChainConfig {
     /// correct for created-but-not-started handles, instead of snapshot-carrying
     /// a value that goes stale).
     pub fn wall_clock_period(&self) -> u64 {
-        spec::compute_sync_committee_period(self.current_slot_estimate())
+        spec::compute_sync_committee_period_with(
+            self.current_slot_estimate(),
+            self.slots_per_period(),
+        )
     }
 
     /// Wall-clock slot estimate — THE clock read of this crate.
@@ -313,6 +316,25 @@ fn hex32(s: &str) -> [u8; 32] {
     }
     out
 }
+
+///
+/// ORDER LOOKS BACKWARDS AND IS NOT. The literal comes FIRST and the name LAST
+/// because the two engines consume the pair differently, and the engine that
+/// cannot recover is the one that must end up on the name:
+///
+///   Rust  — `PeerPool::add` REFRESHES a static peer's address in place (the
+///           #322 fix), so for one peer id the LAST entry wins. Statics are
+///           un-evictable and roost publishes no ENR, so a stale literal here
+///           could never self-heal: no eviction, no rediscovery, undialable
+///           until a release. Ending on the name is what makes an address
+///           change survivable.
+///   Java  — dedupes by multiaddr string and walks the list in order, so it
+///           tries the literal first and falls through to the name. A stale
+///           literal costs one failed dial, then the name resolves. That is why
+///           the "worse" order is harmless there.
+///
+/// Putting the name first inverts both: Rust would keep the literal (the case
+/// that cannot recover) and gain nothing.
 
 /// Pinned sepolia LC-serving peer multiaddrs (Java `NetworkConfig.SEPOLIA.clPeerMultiaddrs`
 /// — keep the two lists, their ORDER and their addresses in step;
@@ -335,7 +357,8 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     //
     // Pinning a literal IP has the same exposure as the entries below: the line
     // is residential and the address is not guaranteed stable. ENR publication
-    // (design §7) is what removes it.
+    // (design §7) is what removes it. See ROOST_PIN_ORDER above for why the
+    // literal precedes the name.
     // roost BY NAME, ahead of its own literal IP.
     //
     // The line is residential and the address is not guaranteed stable; the
@@ -349,7 +372,6 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // is unverified. If it cannot dial a name it falls through to the IP and
     // behaves exactly as before. Drop the literal once Java is confirmed.
     "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
-    "/ip4/87.154.209.161/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
     "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
     "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS",
 ];
@@ -392,7 +414,6 @@ const GNOSIS_STATIC_PEERS: &[&str] = &[
     // server in that state would have cost every gnosis wallet its
     // strikes-to-eviction on a peer that could never answer.
     "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
-    "/ip4/87.154.209.161/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
     "/ip4/104.37.190.86/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59",
     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
     "/ip4/135.129.103.34/tcp/9006/p2p/16Uiu2HAmA5FYL7dQftsHktHvuVTRyPdc1sH6qcWiXaVEPM6FMyN2",
@@ -450,7 +471,6 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     // because it makes no outbound connections — so this line is the thing that
     // breaks if the address moves.
     "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
-    "/ip4/87.154.209.161/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
     "/ip4/176.229.58.1/tcp/9001/p2p/16Uiu2HAmHu1BxzrSWg7sN9JyJenC5unK5ntdk5QFYqQdQyyD7x3a",
     "/ip4/81.172.166.237/tcp/9001/p2p/16Uiu2HAmRogw5aqM4ZuVEmZoQvFp25sUnnQ9wpGuWXRLFMmXc88j",
     "/ip4/54.157.213.0/tcp/9000/p2p/16Uiu2HAmQz83bNmMaBFCafuxDasiNdPYZF1B4zhgo3DckByU8bo3",
@@ -1205,7 +1225,8 @@ async fn run_sync(
     // reads/writes the identical file). Anything else → fresh bootstrap. A
     // restored store stays on probation (ResumeGuard) until one update
     // BLS-verifies against it; see RESUME_REJECTS_MAX.
-    let checkpoint_period = spec::compute_sync_committee_period(config.checkpoint_slot);
+    let checkpoint_period =
+        spec::compute_sync_committee_period_with(config.checkpoint_slot, config.slots_per_period());
     let mut in_catchup = false;
     // Floor the persist throttle at the CHECKPOINT period: a snapshot at (or
     // below) the checkpoint period can never be resumed (the strictly-newer
@@ -1277,6 +1298,7 @@ async fn run_sync(
             processor.store.current_period(),
             processor.store.finalized_slot(),
             config.slots_per_epoch,
+            config.slots_per_period(),
         );
         if hunt_now != hunting {
             hunting = hunt_now;
@@ -1336,7 +1358,7 @@ async fn run_sync(
             }
         }
 
-        let wall_period = spec::compute_sync_committee_period(config.current_slot_estimate());
+        let wall_period = config.wall_clock_period();
         if wall_period > processor.store.current_period() {
             // Baseline the progress bar at every catch-up ENTRY (not just
             // bootstrap/resume): a process that reached SYNCED and re-enters
@@ -1391,7 +1413,7 @@ async fn run_sync(
             persist_snapshot(&config, &processor, &mut last_persisted_period);
             refresh_local_status(&config, &processor, &local_status);
             publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, hunting).await;
-            if spec::compute_sync_committee_period(config.current_slot_estimate())
+            if config.wall_clock_period()
                 > processor.store.current_period()
             {
                 // Still behind: skip the finality poll — while the committee is
@@ -1749,11 +1771,12 @@ fn hunt_due(
     store_period: u64,
     finalized_slot: u64,
     slots_per_epoch: u64,
+    slots_per_period: u64,
 ) -> bool {
     if !store_initialized {
         return since_sync_start >= HUNT_BOOTSTRAP_STALL;
     }
-    let wall_period = spec::compute_sync_committee_period(wall_slot);
+    let wall_period = spec::compute_sync_committee_period_with(wall_slot, slots_per_period);
     if wall_period > store_period {
         return since_progress >= HUNT_CATCHUP_STALL;
     }
@@ -1812,7 +1835,8 @@ async fn catch_up(
     loop {
         drain_discovered(peer_rx, pool);
         let slot_estimate = config.current_slot_estimate();
-        let wall_period = spec::compute_sync_committee_period(slot_estimate);
+        let wall_period =
+        spec::compute_sync_committee_period_with(slot_estimate, config.slots_per_period());
         // Start from the committee's own period, NOT the finalized slot's:
         // after a force-rotate the two diverge by one period (see the Java
         // comment in catchUpSyncCommittee).
@@ -1871,7 +1895,8 @@ async fn catch_up(
         let too_shallow: HashSet<PeerId> = earliest_slots
             .into_iter()
             .filter(|&(_, earliest)| {
-                spec::compute_sync_committee_period(earliest) > committee_period
+                spec::compute_sync_committee_period_with(earliest, config.slots_per_period())
+                    > committee_period
             })
             .map(|(id, _)| id)
             .collect();
@@ -2486,7 +2511,8 @@ async fn publish_status(
     let store = &processor.store;
     update_exec_anchor(store, anchor);
     let wall_slot = config.current_slot_estimate();
-    let wall_period = spec::compute_sync_committee_period(wall_slot);
+    let wall_period =
+        spec::compute_sync_committee_period_with(wall_slot, config.slots_per_period());
     let state = if !store.is_initialized() {
         SyncState::Bootstrapping
     } else if wall_period == store.current_period()
@@ -2605,8 +2631,8 @@ mod tests {
         // The live digest the Java computes (verified against jshell).
         assert_eq!(c.current_fork_digest(), [0x8C, 0x9F, 0x62, 0xFE]);
         assert_eq!(c.accepted_fork_digests(), vec![[0x8C, 0x9F, 0x62, 0xFE]]);
-        // 18 discovered peers + roost mainnet prepended.
-        assert_eq!(c.static_peers.len(), 20);
+        // 18 discovered peers + roost mainnet, pinned by NAME only.
+        assert_eq!(c.static_peers.len(), 19);
         // roost is FIRST — the ordering is the point, not an accident of the
         // list. The Java twin prepends it with prependLocal(); if these two ever
         // disagree on position, the default engine and the Rust engine pick
@@ -2661,7 +2687,6 @@ mod tests {
             c.static_peers,
             vec![
                 "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
-                "/ip4/87.154.209.161/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
                 "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
                 "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS",
             ],
@@ -2718,33 +2743,47 @@ mod tests {
         // NetworkConfig.GNOSIS.clPeerMultiaddrs, ONE ADDRESS PER PEER ID
         // (`PeerPool::add` dedupes by peer id, so a second address for a known
         // id would never be dialed here while Java dialed both).
-        // 22 discovered gnosis peers + roost by name + roost by literal.
-        assert_eq!(c.static_peers.len(), 24);
+        // 22 discovered gnosis peers + roost, pinned by NAME only.
+        assert_eq!(c.static_peers.len(), 23);
         // POSITION, like the other two chains: both engines must agree on which
         // peer the light client tries FIRST, not merely that roost is present.
         assert_eq!(c.static_peers[0], "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh");
-        assert_eq!(c.static_peers[1], "/ip4/87.154.209.161/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh");
-        // The discovered list is unchanged, just shifted by the two roost
-        // entries — first and last still bracket it.
-        assert!(c.static_peers[2].ends_with(
+        // The discovered list is unchanged, just shifted by the one roost entry.
+        assert!(c.static_peers[1].ends_with(
             "/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59"
         ));
-        assert!(c.static_peers[23].ends_with(
+        assert!(c.static_peers[22].ends_with(
             "/tcp/9500/p2p/16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw"
         ));
         let unique: std::collections::HashSet<_> = c.static_peers.iter().collect();
-        assert_eq!(unique.len(), 24);
+        assert_eq!(unique.len(), 23);
         let ids: std::collections::HashSet<_> =
             c.static_peers.iter().map(|a| a.rsplit('/').next().unwrap()).collect();
-        // 23 ids for 24 entries: roost appears TWICE with one id (by name and
-        // by literal). That is a deliberate exception to the one-per-id rule
-        // above, and the two engines resolve it differently — Java dedupes by
-        // multiaddr string and dials both, Rust's PeerPool dedupes by peer id
-        // and keeps only the FIRST. So on Rust the literal is inert and the
-        // name is the only address; see the note on GNOSIS_STATIC_PEERS.
-        assert_eq!(ids.len(), 23, "roost is the one id with two addresses");
+        assert_eq!(ids.len(), 23, "one address per peer id (the pool dedupes by id)");
         assert!(c.static_peers.iter().all(|p| parse_static_peer(p).is_some()));
         assert_eq!(c.bootstrap_enrs.len(), 8);
+    }
+
+    /// A chain whose geometry does NOT multiply to 8192, which is the case every
+    /// period division must survive and the one no real chain exercises today.
+    ///
+    /// The config-parity tests pin both factors, but they assert the CONFIG —
+    /// they cannot catch a consumer that ignores it. This asserts the consumer:
+    /// `wall_clock_period` must follow the config, not the mainnet preset.
+    #[test]
+    fn period_consumers_follow_the_config_not_the_preset() {
+        let mut c = ChainConfig::mainnet();
+        c.slots_per_epoch = 32;
+        c.epochs_per_sync_committee_period = 128; // 4096, deliberately not 8192
+        assert_eq!(c.slots_per_period(), 4096);
+        // Same slot, two geometries, two answers — if this ever equals the
+        // mainnet-preset value the consumer has stopped reading the config.
+        let slot = 4096 * 7 + 5;
+        assert_eq!(
+            spec::compute_sync_committee_period_with(slot, c.slots_per_period()),
+            7
+        );
+        assert_eq!(spec::compute_sync_committee_period(slot), 3);
     }
 
     #[test]
@@ -2857,31 +2896,31 @@ mod tests {
         let z = Duration::ZERO;
 
         // Bootstrap stall: only after the stall window.
-        assert!(!hunt_due(false, false, Duration::from_secs(10), z, wall, 0, 0, epoch));
-        assert!(hunt_due(false, false, HUNT_BOOTSTRAP_STALL, z, wall, 0, 0, epoch));
+        assert!(!hunt_due(false, false, Duration::from_secs(10), z, wall, 0, 0, epoch, 8192));
+        assert!(hunt_due(false, false, HUNT_BOOTSTRAP_STALL, z, wall, 0, 0, epoch, 8192));
 
         // Finality starvation: period current + finalized older than slack.
-        assert!(hunt_due(false, true, z, z, wall, period, wall - slack - 1, epoch));
+        assert!(hunt_due(false, true, z, z, wall, period, wall - slack - 1, epoch, 8192));
         // Fresh finality → no hunt.
-        assert!(!hunt_due(false, true, z, z, wall, period, wall - 64, epoch));
+        assert!(!hunt_due(false, true, z, z, wall, period, wall - 64, epoch, 8192));
 
         // PROGRESSING catch-up (period behind, store advancing) → no hunt:
         // catch-up's own wide fan-out covers the pool; hunting double-dials.
-        assert!(!hunt_due(false, true, z, z, wall, period - 1, wall - slack - 1, epoch));
+        assert!(!hunt_due(false, true, z, z, wall, period - 1, wall - slack - 1, epoch, 8192));
         // STARVED catch-up (no store progress past the stall window) → hunt.
         assert!(hunt_due(false, true, z, HUNT_CATCHUP_STALL, wall, period - 1,
-            wall - slack - 1, epoch));
+            wall - slack - 1, epoch, 8192));
         // ...and an ENGAGED hunt survives the period boundary the same way
         // (finality starvation rotating into catch-up must not disengage).
         assert!(hunt_due(true, true, z, HUNT_CATCHUP_STALL, wall, period - 1,
-            wall - slack - 1, epoch));
+            wall - slack - 1, epoch, 8192));
 
         // Hysteresis on the finality trigger: at staleness between the
         // engaged and disengaged thresholds, an engaged hunt stays on and a
         // disengaged one stays off (no flapping at the boundary).
         let between = wall - slack + epoch - 1; // stale by SLACK-1 epochs + 1 slot
-        assert!(hunt_due(true, true, z, z, wall, period, between, epoch));
-        assert!(!hunt_due(false, true, z, z, wall, period, between, epoch));
+        assert!(hunt_due(true, true, z, z, wall, period, between, epoch, 8192));
+        assert!(!hunt_due(false, true, z, z, wall, period, between, epoch, 8192));
     }
 
     #[test]

@@ -144,22 +144,18 @@ class NetworkConfigGnosisTest {
         // (issue #291) — same list and ORDER as the Rust GNOSIS_STATIC_PEERS
         // (sync.rs gnosis_config_matches_networkconfig_java pins the twin side).
         List<String> cl = G.clPeerMultiaddrs();
-        assertEquals(24, cl.size(), "22 harvested peers + roost by name + roost by literal");
-        // roost FIRST, by name, with its literal IP directly behind it.
+        assertEquals(23, cl.size(), "22 harvested peers + roost, pinned by NAME only");
+        // roost FIRST, and by NAME — no literal behind it. A dynamic address is
+        // absorbed by DNS instead of by a second entry.
         assertEquals("/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh", cl.get(0));
-        assertEquals("/ip4/87.154.209.161/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh", cl.get(1));
-        // The harvested list is unchanged, just shifted by two.
+        // The harvested list is unchanged, just shifted by the one roost entry.
         assertEquals("/ip4/104.37.190.86/tcp/15974/p2p/"
-                + "16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59", cl.get(2));
+                + "16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59", cl.get(1));
         assertEquals("/ip4/164.152.161.131/tcp/9500/p2p/"
-                + "16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw", cl.get(23));
-        assertEquals(24, cl.stream().distinct().count());
-        // 23 ids for 24 entries: roost is the ONE peer id with two addresses.
-        // The engines differ on what that means — Java dedupes by multiaddr
-        // string and dials both; the Rust pool dedupes by peer id and keeps only
-        // the first. So the literal is a real fallback here and inert there.
+                + "16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw", cl.get(22));
+        assertEquals(23, cl.stream().distinct().count());
         assertEquals(23, cl.stream().map(a -> a.substring(a.lastIndexOf('/') + 1)).distinct().count(),
-                "roost is the one id with two addresses");
+                "one address per peer id");
         for (String addr : cl) {
             assertTrue(addr.matches("/(ip4/\\d+\\.\\d+\\.\\d+\\.\\d+|dns4/[\\w.-]+)/tcp/\\d+/p2p/16Uiu2HA\\S+"), addr);
         }
@@ -184,13 +180,9 @@ class NetworkConfigGnosisTest {
         // discovered peer at Math.min(1, size()), i.e. exactly the slot the
         // Nimbus occupies, so "somewhere in the list" is a weaker guarantee here
         // than anywhere else.
-        assertEquals("/ip4/87.154.209.161/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
-                NetworkConfig.SEPOLIA.clPeerMultiaddrs().get(1),
-                "roost's literal IP must sit directly behind its name — the Java engine's "
-                        + "DNS dialing is unverified, so this is the no-regression fallback");
         assertEquals("/ip4/87.154.209.161/tcp/9104/p2p/"
                         + "16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
-                NetworkConfig.SEPOLIA.clPeerMultiaddrs().get(2),
+                NetworkConfig.SEPOLIA.clPeerMultiaddrs().get(1),
                 "the dedicated Nimbus must remain SECOND as fallback — a roost outage "
                         + "then degrades to exactly the previous behaviour");
         assertTrue(NetworkConfig.SEPOLIA.clPeerMultiaddrs().size() > 2,
@@ -214,7 +206,7 @@ class NetworkConfigGnosisTest {
                         + "16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
                 cl.get(0),
                 "roost mainnet must be the first CL peer tried");
-        assertEquals(20, cl.size(),
+        assertEquals(19, cl.size(),
                 "18 discovered peers + roost; pinning must not drop the fallbacks");
     }
 }
