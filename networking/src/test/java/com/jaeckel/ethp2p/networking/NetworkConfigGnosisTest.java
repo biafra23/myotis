@@ -144,18 +144,24 @@ class NetworkConfigGnosisTest {
         // (issue #291) — same list and ORDER as the Rust GNOSIS_STATIC_PEERS
         // (sync.rs gnosis_config_matches_networkconfig_java pins the twin side).
         List<String> cl = G.clPeerMultiaddrs();
-        assertEquals(22, cl.size());
+        assertEquals(24, cl.size(), "22 harvested peers + roost by name + roost by literal");
+        // roost FIRST, by name, with its literal IP directly behind it.
+        assertEquals("/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh", cl.get(0));
+        assertEquals("/ip4/87.154.209.161/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh", cl.get(1));
+        // The harvested list is unchanged, just shifted by two.
         assertEquals("/ip4/104.37.190.86/tcp/15974/p2p/"
-                + "16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59", cl.get(0));
+                + "16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59", cl.get(2));
         assertEquals("/ip4/164.152.161.131/tcp/9500/p2p/"
-                + "16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw", cl.get(21));
-        // One entry per peer id (the Rust pool dedupes by id, so a second address
-        // for a known id would be dropped there) — and every entry is a dialable
-        // ip4/tcp/p2p multiaddr.
-        assertEquals(22, cl.stream().distinct().count());
-        assertEquals(22, cl.stream().map(a -> a.substring(a.lastIndexOf('/') + 1)).distinct().count());
+                + "16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw", cl.get(23));
+        assertEquals(24, cl.stream().distinct().count());
+        // 23 ids for 24 entries: roost is the ONE peer id with two addresses.
+        // The engines differ on what that means — Java dedupes by multiaddr
+        // string and dials both; the Rust pool dedupes by peer id and keeps only
+        // the first. So the literal is a real fallback here and inert there.
+        assertEquals(23, cl.stream().map(a -> a.substring(a.lastIndexOf('/') + 1)).distinct().count(),
+                "roost is the one id with two addresses");
         for (String addr : cl) {
-            assertTrue(addr.matches("/ip4/\\d+\\.\\d+\\.\\d+\\.\\d+/tcp/\\d+/p2p/16Uiu2HA\\S+"), addr);
+            assertTrue(addr.matches("/(ip4/\\d+\\.\\d+\\.\\d+\\.\\d+|dns4/[\\w.-]+)/tcp/\\d+/p2p/16Uiu2HA\\S+"), addr);
         }
     }
 

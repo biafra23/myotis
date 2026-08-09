@@ -242,13 +242,23 @@ impl ChainConfig {
             blob_params_epoch: 1_337_856,
             blob_params_max_blobs: 2,
             // Copied verbatim from the @checkpoint:gnosis:begin/end region of
-            // NetworkConfig.java (slot 28516336, 2026-06-16, period 3480 —
-            // deliberately one period behind head, see refreshGnosisCheckpoint).
+            // NetworkConfig.java (slot 29460368, 2026-08-09, period 3596).
             // A refresh must be mirrored here by hand until plan PR7.
+            //
+            // Refreshed so the anchor sits INSIDE the period roost@gnosis can
+            // serve. The previous anchor (period 3480) was 116 periods behind,
+            // and roost's archive only grows forward from where it started, so
+            // no amount of waiting would have closed that gap — a wallet
+            // bootstrapping from it got ResourceUnavailable forever.
+            //
+            // Cross-validated: refreshGnosisCheckpoint could only reach ONE of
+            // its three providers (the other two 404), so this root was checked
+            // against the local gnosis beacon node, which reached the same slot
+            // independently over p2p, and against its finalized checkpoint.
             checkpoint_root: hex32(
-                "dc1ce049946173d38463595f907f19893e4fd956c740913fb70d94d34e07e789",
+                "84f127f4bbb1e733c5607910c2df1d2c0e726e2fab0a4690b66cd07a5c2455bf",
             ),
-            checkpoint_slot: 28_516_336,
+            checkpoint_slot: 29_460_368,
             static_peers: GNOSIS_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: GNOSIS_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
@@ -372,6 +382,17 @@ const SEPOLIA_BOOTSTRAP_ENRS: &[&str] = &[
 /// by multiaddr string and would dial both) — keeping the lists identical means
 /// keeping them one-per-id.
 const GNOSIS_STATIC_PEERS: &[&str] = &[
+    // roost gnosis. Same reasoning as the other two chains; see
+    // MAINNET_STATIC_PEERS. 9108/tcp verified forwarded before pinning (hairpin
+    // connect showing the public IP as the source address).
+    //
+    // Gnosis is the chain where roost's fork digest had to be FIXED before this
+    // pin was safe: BLOB_SCHEDULE is empty here, so roost stamped the bare Fulu
+    // digest and every peer answered Goodbye(IrrelevantNetwork). Pinning a
+    // server in that state would have cost every gnosis wallet its
+    // strikes-to-eviction on a peer that could never answer.
+    "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
+    "/ip4/87.154.209.161/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
     "/ip4/104.37.190.86/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59",
     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
     "/ip4/135.129.103.34/tcp/9006/p2p/16Uiu2HAmA5FYL7dQftsHktHvuVTRyPdc1sH6qcWiXaVEPM6FMyN2",
@@ -2660,10 +2681,10 @@ mod tests {
         assert_eq!(c.chain_id, 100);
         assert_eq!(c.fork_version, [0x06, 0x00, 0x00, 0x64]); // Fulu on Gnosis
         assert_eq!(c.prior_fork_version, Some([0x05, 0x00, 0x00, 0x64])); // Electra
-        assert_eq!(c.checkpoint_slot, 28_516_336);
+        assert_eq!(c.checkpoint_slot, 29_460_368);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "dc1ce049946173d38463595f907f19893e4fd956c740913fb70d94d34e07e789"
+            "84f127f4bbb1e733c5607910c2df1d2c0e726e2fab0a4690b66cd07a5c2455bf"
         );
         assert_eq!(
             hex_str(&c.genesis_validators_root),
@@ -2681,7 +2702,11 @@ mod tests {
         assert_eq!(ChainConfig::mainnet().epochs_per_sync_committee_period, 256);
         assert_eq!((c.blob_params_epoch, c.blob_params_max_blobs), (1_337_856, 2));
         // 512 epochs x 16 slots = the same 8192-slot period as mainnet-preset.
-        assert_eq!(spec::compute_sync_committee_period(c.checkpoint_slot), 3480);
+        // 3596 — the SAME period roost@gnosis serves. That is not incidental:
+        // the previous anchor sat at 3480, 116 periods below roost's floor, and
+        // roost's archive only grows forward, so a wallet could never have
+        // bootstrapped from it.
+        assert_eq!(spec::compute_sync_committee_period(c.checkpoint_slot), 3596);
         // Live-verified digests the Java computes (NetworkConfig.GNOSIS
         // currentForkDigest / acceptedForkDigests): Fulu first, Electra fallback.
         assert_eq!(c.current_fork_digest(), [0x32, 0x37, 0xDA, 0xB6]);
@@ -2693,18 +2718,31 @@ mod tests {
         // NetworkConfig.GNOSIS.clPeerMultiaddrs, ONE ADDRESS PER PEER ID
         // (`PeerPool::add` dedupes by peer id, so a second address for a known
         // id would never be dialed here while Java dialed both).
-        assert_eq!(c.static_peers.len(), 22);
-        assert!(c.static_peers[0].ends_with(
+        // 22 discovered gnosis peers + roost by name + roost by literal.
+        assert_eq!(c.static_peers.len(), 24);
+        // POSITION, like the other two chains: both engines must agree on which
+        // peer the light client tries FIRST, not merely that roost is present.
+        assert_eq!(c.static_peers[0], "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh");
+        assert_eq!(c.static_peers[1], "/ip4/87.154.209.161/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh");
+        // The discovered list is unchanged, just shifted by the two roost
+        // entries — first and last still bracket it.
+        assert!(c.static_peers[2].ends_with(
             "/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59"
         ));
-        assert!(c.static_peers[21].ends_with(
+        assert!(c.static_peers[23].ends_with(
             "/tcp/9500/p2p/16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw"
         ));
         let unique: std::collections::HashSet<_> = c.static_peers.iter().collect();
-        assert_eq!(unique.len(), 22);
+        assert_eq!(unique.len(), 24);
         let ids: std::collections::HashSet<_> =
             c.static_peers.iter().map(|a| a.rsplit('/').next().unwrap()).collect();
-        assert_eq!(ids.len(), 22, "one address per peer id (the pool dedupes by id)");
+        // 23 ids for 24 entries: roost appears TWICE with one id (by name and
+        // by literal). That is a deliberate exception to the one-per-id rule
+        // above, and the two engines resolve it differently — Java dedupes by
+        // multiaddr string and dials both, Rust's PeerPool dedupes by peer id
+        // and keeps only the FIRST. So on Rust the literal is inert and the
+        // name is the only address; see the note on GNOSIS_STATIC_PEERS.
+        assert_eq!(ids.len(), 23, "roost is the one id with two addresses");
         assert!(c.static_peers.iter().all(|p| parse_static_peer(p).is_some()));
         assert_eq!(c.bootstrap_enrs.len(), 8);
     }

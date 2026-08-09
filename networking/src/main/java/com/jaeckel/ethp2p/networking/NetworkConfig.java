@@ -309,10 +309,9 @@ public record NetworkConfig(
             // genesis_validators_root (Gnosis Beacon Chain)
             Bytes.fromHexString("f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47").toArrayUnsafe(),
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshGnosisCheckpoint`
-            // trusted checkpoint: Gnosis block root one period behind head (slot 28516336, 2026-06-16, period 3480)
-            // — deliberately stale so the light client must catch up to head via light_client_updates_by_range.
-            Bytes.fromHexString("dc1ce049946173d38463595f907f19893e4fd956c740913fb70d94d34e07e789").toArrayUnsafe(),
-            28516336L, // checkpoint slot. Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized Gnosis block root (slot 29460368, 2026-08-09, period 3596)
+            Bytes.fromHexString("84f127f4bbb1e733c5607910c2df1d2c0e726e2fab0a4690b66cd07a5c2455bf").toArrayUnsafe(),
+            29460368L, // checkpoint slot. Must stay in sync with the root above.
             // @checkpoint:gnosis:end
             // current fork version: Fulu on Gnosis (0x06000064), active since 2026-04-14
             new byte[]{0x06, 0x00, 0x00, 0x64},
@@ -329,7 +328,13 @@ public record NetworkConfig(
             // step, one address per peer id: the Rust PeerPool dedupes by peer id, so a
             // second address for a known id would be dropped there while Java (which
             // dedupes by multiaddr string) dialed both.
+            // roost gnosis first, by name then by literal — same shape as the
+            // other two chains. See the Rust GNOSIS_STATIC_PEERS for why the
+            // literal stays behind the name.
+            prependLocal(
+                    "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
             List.of(
+                    "/ip4/87.154.209.161/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
                     "/ip4/104.37.190.86/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59",
                     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
                     "/ip4/135.129.103.34/tcp/9006/p2p/16Uiu2HAmA5FYL7dQftsHktHvuVTRyPdc1sH6qcWiXaVEPM6FMyN2",
@@ -352,7 +357,7 @@ public record NetworkConfig(
                     "/ip4/159.195.138.9/tcp/9000/p2p/16Uiu2HAmUimXaHiCvWhx2YuvwTkDLtca6oq1bCH85Eb6JcEYiaGi",
                     "/ip4/159.195.30.80/tcp/9100/p2p/16Uiu2HAmDMWLqML5zdVVVuptjpfKAZi1qEb784HFtrqyJZGPFL3X",
                     "/ip4/164.152.161.131/tcp/9500/p2p/16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw"
-            ),
+            )),
             null,
             1638993340L, // Gnosis beacon genesis: 2021-12-08 19:55:40 UTC
             List.of(), // EL ENR trees — Gnosis has no enrtree
