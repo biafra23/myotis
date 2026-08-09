@@ -999,14 +999,24 @@ mod probe_tests {
         assert_eq!(picked.len(), 1, "only the one dialable entry survives");
     }
 
+    /// Both invariants are over constants, so they are checked at COMPILE time —
+    /// a bad edit fails the build rather than a test run.
+    ///
+    /// The swarm closes idle connections after 120s and DROPS the observation
+    /// with them, so a probe interval above that makes the quorum blink instead
+    /// of hold, and IP-change detection silently degrades.
     #[test]
     fn probe_cadence_stays_inside_the_idle_timeout() {
-        // The swarm closes idle connections after 120s and DROPS the
-        // observation with them. If this ever exceeds that, the quorum blinks
-        // instead of holding and IP-change detection silently degrades.
-        let interval = REFRESH.as_secs() * u64::from(OBSERVE_TICKS);
-        assert!(interval < 120, "probe every {interval}s must stay under the 120s idle timeout");
-        assert!(OBSERVE_PEERS >= EXTERNAL_ADDR_QUORUM, "a round must be able to reach quorum");
+        const {
+            assert!(
+                REFRESH.as_secs() * (OBSERVE_TICKS as u64) < 120,
+                "probe interval must stay under the swarm's 120s idle timeout"
+            );
+            assert!(
+                OBSERVE_PEERS >= EXTERNAL_ADDR_QUORUM,
+                "a round must be able to reach quorum"
+            );
+        }
     }
 }
 
