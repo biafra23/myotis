@@ -92,7 +92,7 @@ impl ForkSchedule {
         let (spec, blobs) = client.config_spec().await?;
         let params = ChainParams::from_spec(&spec)?;
         let schedule = Self::from_spec(&spec, genesis_validators_root, params)
-            .map(|s| s.with_blob_schedule(blobs));
+            .map(|s| s.with_blob_schedule(blobs).with_implicit_electra_blobs(&spec));
         Ok((params, schedule))
     }
 
@@ -184,6 +184,39 @@ impl ForkSchedule {
     pub fn with_blob_schedule(mut self, mut entries: Vec<BlobParams>) -> Self {
         entries.sort_by_key(|b| b.epoch);
         self.blob_schedule = entries;
+        self
+    }
+
+    /// Fold in the blob parameters Electra set, which are NOT in `BLOB_SCHEDULE`.
+    ///
+    /// EIP-7892's schedule lists the parameters a chain has CHANGED to; it does
+    /// not restate the ones the Electra fork already established. On mainnet and
+    /// sepolia that distinction is invisible, because both have explicit later
+    /// entries that win the `rfind` anyway. On GNOSIS it is the whole answer:
+    /// `BLOB_SCHEDULE` is `[]`, so reading the schedule alone concluded "no BPO
+    /// active", roost stamped the bare Fulu digest `f9ab5f85`, and every peer
+    /// answered `Goodbye(IrrelevantNetwork)` — the server was live, reachable
+    /// and invisible.
+    ///
+    /// The wire is what proved it: the observed digest `3237dab6` is exactly
+    /// `fulu_base XOR sha256(le(1337856) || le(2))`, i.e. `ELECTRA_FORK_EPOCH`
+    /// and `MAX_BLOBS_PER_BLOCK_ELECTRA`.
+    ///
+    /// Added as an ordinary entry rather than a special case, so `rfind` keeps
+    /// being the single rule: an explicit later entry still wins, an empty
+    /// schedule now has a floor. Absent keys are left alone — a pre-Electra
+    /// chain legitimately has neither.
+    pub fn with_implicit_electra_blobs(mut self, spec: &BTreeMap<String, String>) -> Self {
+        let epoch = spec.get("ELECTRA_FORK_EPOCH").and_then(|v| v.parse::<u64>().ok());
+        let max_blobs = spec
+            .get("MAX_BLOBS_PER_BLOCK_ELECTRA")
+            .and_then(|v| v.parse::<u64>().ok());
+        if let (Some(epoch), Some(max_blobs)) = (epoch, max_blobs) {
+            if !self.blob_schedule.iter().any(|b| b.epoch == epoch) {
+                self.blob_schedule.push(BlobParams { epoch, max_blobs });
+                self.blob_schedule.sort_by_key(|b| b.epoch);
+            }
+        }
         self
     }
 
@@ -592,5 +625,120 @@ mod tests {
             ChainParams::from_spec(&zero).is_err(),
             "a zero epoch length would divide by zero in digest_for_slot"
         );
+    }
+}
+
+#[cfg(test)]
+mod implicit_electra_blob_tests {
+    use super::*;
+
+    /// Gnosis, from the live node's /eth/v1/config/spec (zbox, 2026-08-09).
+    fn gnosis_spec() -> BTreeMap<String, String> {
+        [
+            ("GENESIS_FORK_VERSION", "0x00000064"),
+            ("ALTAIR_FORK_VERSION", "0x01000064"),
+            ("ALTAIR_FORK_EPOCH", "512"),
+            ("BELLATRIX_FORK_VERSION", "0x02000064"),
+            ("BELLATRIX_FORK_EPOCH", "385536"),
+            ("CAPELLA_FORK_VERSION", "0x03000064"),
+            ("CAPELLA_FORK_EPOCH", "648704"),
+            ("DENEB_FORK_VERSION", "0x04000064"),
+            ("DENEB_FORK_EPOCH", "889856"),
+            ("ELECTRA_FORK_VERSION", "0x05000064"),
+            ("ELECTRA_FORK_EPOCH", "1337856"),
+            ("FULU_FORK_VERSION", "0x06000064"),
+            ("FULU_FORK_EPOCH", "1714688"),
+            ("GLOAS_FORK_VERSION", "0x07000064"),
+            ("GLOAS_FORK_EPOCH", "18446744073709551615"),
+            ("SLOTS_PER_EPOCH", "16"),
+            ("EPOCHS_PER_SYNC_COMMITTEE_PERIOD", "512"),
+            // Gnosis states its blob parameters ONLY here — BLOB_SCHEDULE is [].
+            ("MAX_BLOBS_PER_BLOCK_ELECTRA", "2"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    fn gnosis_gvr() -> [u8; 32] {
+        let hex = "f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47";
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        out
+    }
+
+    fn gnosis() -> ForkSchedule {
+        let spec = gnosis_spec();
+        let params = ChainParams::from_spec(&spec).unwrap();
+        ForkSchedule::from_spec(&spec, gnosis_gvr(), params)
+            .unwrap()
+            .with_blob_schedule(vec![]) // BLOB_SCHEDULE really is empty here
+            .with_implicit_electra_blobs(&spec)
+    }
+
+    /// THE test, in the same shape as the sepolia one: the computed digest must
+    /// equal what the live node framed on the wire. Observed on zbox at head
+    /// slot 29,459,820 — `0x3237dab6`.
+    ///
+    /// Before the implicit Electra entry, roost computed `0xf9ab5f85` (the bare
+    /// Fulu digest, no BPO folded in) and every peer answered
+    /// Goodbye(IrrelevantNetwork). The server was live, reachable, and invisible
+    /// to exactly the wallets it exists for.
+    #[test]
+    fn computed_digest_matches_the_live_gnosis_wire_value() {
+        assert_eq!(gnosis().digest_for_slot(29_459_820), [0x32, 0x37, 0xda, 0xb6]);
+    }
+
+    #[test]
+    fn the_electra_parameters_are_what_produce_it() {
+        let bp = gnosis().blob_params_at_epoch(1_841_238).expect("electra params apply");
+        assert_eq!((bp.epoch, bp.max_blobs), (1_337_856, 2));
+    }
+
+    /// An explicit later entry must still win — the implicit one is a FLOOR, not
+    /// an override. Getting this backwards would break mainnet and sepolia,
+    /// which were already correct.
+    #[test]
+    fn explicit_later_entries_still_win() {
+        let spec = gnosis_spec();
+        let params = ChainParams::from_spec(&spec).unwrap();
+        let s = ForkSchedule::from_spec(&spec, gnosis_gvr(), params)
+            .unwrap()
+            .with_blob_schedule(vec![BlobParams { epoch: 1_800_000, max_blobs: 21 }])
+            .with_implicit_electra_blobs(&spec);
+        let bp = s.blob_params_at_epoch(1_841_238).unwrap();
+        assert_eq!((bp.epoch, bp.max_blobs), (1_800_000, 21));
+    }
+
+    #[test]
+    fn pre_electra_epochs_have_no_blob_parameters() {
+        assert!(gnosis().blob_params_at_epoch(1_000_000).is_none());
+    }
+
+    /// A chain that never reached Electra must not gain a phantom entry.
+    #[test]
+    fn absent_keys_add_nothing() {
+        let mut spec = gnosis_spec();
+        spec.remove("MAX_BLOBS_PER_BLOCK_ELECTRA");
+        let params = ChainParams::from_spec(&spec).unwrap();
+        let s = ForkSchedule::from_spec(&spec, gnosis_gvr(), params)
+            .unwrap()
+            .with_implicit_electra_blobs(&spec);
+        assert!(s.blob_params_at_epoch(u64::MAX).is_none());
+    }
+
+    /// Idempotent: an explicit entry AT the Electra epoch must survive a
+    /// re-read rather than being shadowed by the synthesized one.
+    #[test]
+    fn does_not_duplicate_an_explicit_electra_entry() {
+        let spec = gnosis_spec();
+        let params = ChainParams::from_spec(&spec).unwrap();
+        let s = ForkSchedule::from_spec(&spec, gnosis_gvr(), params)
+            .unwrap()
+            .with_blob_schedule(vec![BlobParams { epoch: 1_337_856, max_blobs: 6 }])
+            .with_implicit_electra_blobs(&spec);
+        assert_eq!(s.blob_params_at_epoch(1_841_238).unwrap().max_blobs, 6);
     }
 }
