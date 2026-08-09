@@ -350,6 +350,55 @@ impl NimbusRest {
         Ok(v["data"]["version"].as_str().unwrap_or("unknown").to_string())
     }
 
+    /// Connected peers' last-seen multiaddrs, for external-address probing.
+    ///
+    /// The upstream already maintains a live, chain-appropriate peer set (145
+    /// inbound on the mainnet node at the time of writing), so probing borrows
+    /// it rather than introducing a second hardcoded bootnode list that would
+    /// rot independently of the one in `myotis-net`.
+    ///
+    /// Only `connected` peers are asked for, and only entries whose multiaddr
+    /// carries a peer id are returned — a probe needs both halves to dial.
+    /// Filtering to ROUTABLE addresses is left to the caller, which owns the
+    /// routability rule (`myotis_net::is_routable`); duplicating it here would
+    /// be a second definition of the same thing.
+    pub async fn connected_peer_addrs(&self) -> Result<Vec<String>> {
+        let v = self.get_json("/eth/v1/node/peers?state=connected").await?;
+        let arr = v["data"].as_array().ok_or_else(|| anyhow!("node/peers: data is not an array"))?;
+        Ok(arr
+            .iter()
+            .filter_map(|p| p["last_seen_p2p_address"].as_str())
+            .filter(|a| a.contains("/p2p/"))
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// The upstream's own externally-visible IPs, from `/eth/v1/node/identity`.
+    ///
+    /// This is the PRIMARY external-address source, and it is better than
+    /// anything roost can determine for itself. Nimbus runs discv5 with
+    /// `--enr-auto-update=true`, so it already does robust external-address
+    /// discovery across many peers and keeps the answer current; roost shares
+    /// its host, therefore its public IP. Asking is one loopback call.
+    ///
+    /// It does NOT create a new trust dependency: roost is a byte cache over
+    /// this same loopback REST already (CLAUDE.md, Data sources carve-out), and
+    /// an upstream that lies here costs a wrong advertised address, not a wrong
+    /// answer to a wallet — every update a wallet takes is still checked against
+    /// sync-committee signatures.
+    ///
+    /// Returns every routable candidate, unfiltered and in the upstream's own
+    /// order; the caller applies `myotis_net::is_routable` and picks. The PORT
+    /// in these multiaddrs is the UPSTREAM's listen port and must be discarded —
+    /// roost's own port is the one that belongs in anything it advertises.
+    pub async fn external_ips(&self) -> Result<Vec<String>> {
+        let v = self.get_json("/eth/v1/node/identity").await?;
+        let arr = v["data"]["p2p_addresses"]
+            .as_array()
+            .ok_or_else(|| anyhow!("node/identity: p2p_addresses is not an array"))?;
+        Ok(arr.iter().filter_map(|a| a.as_str()).map(str::to_string).collect())
+    }
+
     /// `(head_slot, is_syncing)`.
     pub async fn syncing(&self) -> Result<(u64, bool)> {
         let v = self.get_json("/eth/v1/node/syncing").await?;

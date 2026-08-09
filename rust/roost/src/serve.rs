@@ -17,6 +17,8 @@
 //! The libp2p host itself is `myotis-net`'s, unmodified — one protocol stack,
 //! not two. The only thing this crate adds is a responder to plug into it.
 
+use std::collections::HashSet;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,9 +27,10 @@ use anyhow::{anyhow, Context, Result};
 use myotis_net::identity::Keypair;
 use myotis_net::multiaddr::Protocol;
 use myotis_net::reqresp::{
-    start_host_with, ExternalAddress, HostConfig, LocalStatus, EXTERNAL_ADDR_QUORUM,
+    is_routable, start_host_with, ExternalAddress, HostConfig, LocalStatus, ReqRespClient,
+    EXTERNAL_ADDR_QUORUM,
 };
-use myotis_net::Multiaddr;
+use myotis_net::{Multiaddr, PeerId};
 use myotis_net::status::StatusMessage;
 
 use crate::archive::Archive;
@@ -54,6 +57,22 @@ const MAX_INBOUND: u32 = 1024;
 /// DOES change then (a client release can add a BPO entry), and a roost that
 /// cached it at startup would keep stamping the old digest. ~5 minutes.
 const SCHEDULE_REFRESH_TICKS: u32 = 25;
+
+/// How often to dial peers for an external-address reading, in ticks. ~60s.
+///
+/// Deliberately shorter than the swarm's 120s idle-connection timeout. An
+/// observation is dropped when its connection closes, so probing slower than
+/// the timeout would make the quorum blink in and out; probing inside it keeps
+/// a healthy probe set connected and the reading effectively continuous.
+const OBSERVE_TICKS: u32 = 5;
+
+/// Peers dialed per observation round.
+///
+/// Twice [`EXTERNAL_ADDR_QUORUM`], because the tally dedupes by SOURCE IP and
+/// dials fail: three reachable peers on three distinct addresses is the
+/// minimum for an answer at all, and asking for exactly the minimum means one
+/// unreachable peer costs the whole round.
+const OBSERVE_PEERS: usize = EXTERNAL_ADDR_QUORUM * 2;
 
 /// Bootstrap misses fetched per tick — the rate limit the design asks for.
 ///
@@ -434,11 +453,12 @@ pub async fn serve(
     println!("\n== serving ==");
     println!("  identity  {} (persisted in {})", peer_id, key_path.display());
     println!("  loopback  /ip4/127.0.0.1/tcp/{port}/p2p/{peer_id}");
-    println!(
-        "  public    unknown — needs {EXTERNAL_ADDR_QUORUM} peers to agree on what they see \
-         (logged when it settles)"
-    );
-    println!("  periods   {} ({:?}..={:?})", c.periods, c.lowest_period, c.highest_period);
+    match client.external_ips().await.ok().as_deref().and_then(upstream_external_ip) {
+        Some(ip) => println!("  public    /ip4/{ip}/tcp/{port}/p2p/{peer_id} (upstream's discv5 view)"),
+        None => println!(
+            "  public    unknown — the upstream advertises no routable address yet"
+        ),
+    }    println!("  periods   {} ({:?}..={:?})", c.periods, c.lowest_period, c.highest_period);
     println!(
         "  digest    0x{} ({})",
         hex::encode(digests.for_slot(head_slot)),
@@ -449,6 +469,7 @@ pub async fn serve(
 
     let mut digests = digests;
     let mut external: Option<ExternalAddress> = None;
+    let mut upstream_ip: Option<IpAddr> = None;
     let mut swarm_task = swarm_task;
     let mut ticks: u32 = 0;
     let mut ticker = tokio::time::interval(REFRESH);
@@ -567,6 +588,21 @@ pub async fn serve(
                     Ok(view) => status.set(view),
                     Err(e) => tracing::warn!(error = %e, "refreshing the chain view failed"),
                 }
+                // PRIMARY external-address source: the upstream's own discv5
+                // view. roost cannot determine this for itself — it is a pure
+                // server, and the peers it dials to try close the connection
+                // before Identify completes (measured: 2 establishes, 0
+                // identify, in 150s). The upstream shares roost's host and
+                // therefore its public IP, and already runs the discovery that
+                // answers the question.
+                upstream_ip = track_upstream_ip(&client, upstream_ip, port, peer_id).await;
+
+                // Probe BEFORE reading the address below, so a round's dials
+                // and the read that consumes them are not a full tick apart.
+                if ticks.is_multiple_of(OBSERVE_TICKS) {
+                    probe_external(&client, &net).await;
+                }
+
                 // Track the address peers say they see us on.
                 //
                 // The PORT here is our configured listen port, not something
@@ -664,6 +700,149 @@ pub async fn serve(
 ///
 /// A BOOTSTRAP is different: it is keyed by an arbitrary root that may be far
 /// from head, so its epoch is looked up exactly.
+/// Dial a handful of the upstream's peers so somebody tells us our own address.
+///
+/// roost is a pure server: it answers connections and never opens one. Identify
+/// only reports what a REMOTE observes about us, so with no outbound traffic
+/// the external-address tally stays at zero reporters forever — the mechanism
+/// was built and then deployed somewhere it could never fire. The fix is to
+/// make the outbound traffic deliberately rather than to wait for traffic that
+/// by construction never comes.
+///
+/// Peers come from the upstream's own connected set, which is live and
+/// chain-appropriate by construction. The alternative — a second hardcoded
+/// bootnode list inside roost — would rot on its own schedule and be wrong on
+/// exactly the chains we add later.
+///
+/// Selection dedupes by IP because the tally does: six peers behind one NAT are
+/// one vote, so dialing them would burn the round. Non-routable peers are
+/// dropped for the same reason a non-routable answer is unusable — a reading
+/// backed by LAN peers is how you publish an RFC1918 address.
+///
+/// Best effort throughout. A failed probe round is logged at debug and the next
+/// tick tries again; it must never disturb serving.
+async fn probe_external(client: &NimbusRest, net: &ReqRespClient) {
+    let addrs = match client.connected_peer_addrs().await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::debug!(error = %e, "listing upstream peers for address probing failed");
+            return;
+        }
+    };
+    let picked = select_probe_peers(&addrs);
+    if picked.len() < EXTERNAL_ADDR_QUORUM {
+        // Not an error: an upstream still finding its feet legitimately has too
+        // few distinct peers. Say so rather than failing silently, because
+        // "never reaches quorum" is precisely the bug this exists to fix and it
+        // should not be able to come back quietly.
+        tracing::debug!(
+            candidates = addrs.len(), usable = picked.len(), need = EXTERNAL_ADDR_QUORUM,
+            "too few distinct routable upstream peers to establish an address this round"
+        );
+    }
+    net.observe_via(picked).await;
+}
+
+/// The upstream's externally-visible IP, from its advertised multiaddrs.
+///
+/// IPv4 is preferred over IPv6 because the pinned wallet entries and any ENR we
+/// publish are v4, and answering with a v6 address roost is not reachable on
+/// would be worse than answering nothing.
+fn upstream_external_ip(addrs: &[String]) -> Option<IpAddr> {
+    let mut v6 = None;
+    for raw in addrs {
+        let Ok(addr) = raw.parse::<Multiaddr>() else { continue };
+        for proto in addr.iter() {
+            match proto {
+                Protocol::Ip4(a) if is_routable(IpAddr::V4(a)) => return Some(IpAddr::V4(a)),
+                Protocol::Ip6(a) if is_routable(IpAddr::V6(a)) && v6.is_none() => {
+                    v6 = Some(IpAddr::V6(a));
+                }
+                _ => {}
+            }
+        }
+    }
+    v6
+}
+
+/// Read the upstream's view of our public address and report any change.
+///
+/// Returns the current IP so the caller can carry it to the next tick.
+async fn track_upstream_ip(
+    client: &NimbusRest,
+    last: Option<IpAddr>,
+    port: u16,
+    peer_id: PeerId,
+) -> Option<IpAddr> {
+    let addrs = match client.external_ips().await {
+        Ok(a) => a,
+        Err(e) => {
+            // Keep the last known value: a failed poll is not evidence the
+            // address changed, and treating it as one would fire the alarm
+            // every time the upstream restarts.
+            tracing::debug!(error = %e, "reading the upstream's external address failed");
+            return last;
+        }
+    };
+    let Some(ip) = upstream_external_ip(&addrs) else {
+        tracing::debug!(candidates = addrs.len(),
+            "upstream advertises no routable address yet (discv5 may still be settling)");
+        return last;
+    };
+    match last {
+        None => {
+            tracing::info!(%ip, multiaddr = %format!("/ip4/{ip}/tcp/{port}/p2p/{peer_id}"),
+                "external address established (from the upstream's discv5 view)");
+        }
+        Some(prev) if prev != ip => {
+            // The event this whole mechanism exists for. WARN, not info: on a
+            // residential line this invalidates the multiaddrs pinned in
+            // NetworkConfig and would invalidate a published ENR, and it is
+            // silent everywhere else.
+            tracing::warn!(old = %prev, new = %ip,
+                multiaddr = %format!("/ip4/{ip}/tcp/{port}/p2p/{peer_id}"),
+                "EXTERNAL ADDRESS CHANGED — anything pinning the old address can no longer \
+                 reach this server; update NetworkConfig (and re-publish the ENR once that exists)");
+        }
+        Some(_) => {}
+    }
+    Some(ip)
+}
+
+/// Pick up to [`OBSERVE_PEERS`] dialable peers with DISTINCT routable IPs.
+///
+/// Split out from [`probe_external`] because the filtering is the part with the
+/// failure modes and the I/O is not: dedupe-by-IP mirrors the tally's own
+/// dedupe (six peers behind one NAT are one vote, so dialing them burns the
+/// round), and dropping non-routable peers keeps a LAN-backed reading — the
+/// exact way one publishes an RFC1918 address — from ever forming.
+fn select_probe_peers(addrs: &[String]) -> Vec<(PeerId, Multiaddr)> {
+    let mut seen_ips = HashSet::new();
+    let mut picked: Vec<(PeerId, Multiaddr)> = Vec::new();
+    for raw in addrs {
+        if picked.len() >= OBSERVE_PEERS {
+            break;
+        }
+        let Ok(addr) = raw.parse::<Multiaddr>() else { continue };
+        let mut peer = None;
+        let mut ip = None;
+        for proto in addr.iter() {
+            match proto {
+                Protocol::P2p(p) => peer = Some(p),
+                Protocol::Ip4(a) => ip = Some(IpAddr::V4(a)),
+                Protocol::Ip6(a) => ip = Some(IpAddr::V6(a)),
+                _ => {}
+            }
+        }
+        let (Some(peer), Some(ip)) = (peer, ip) else { continue };
+        if !is_routable(ip) || !seen_ips.insert(ip) {
+            continue;
+        }
+        picked.push((peer, addr));
+    }
+    picked
+}
+
 async fn refresh_live(
     client: &NimbusRest,
     store: &LcStore,
@@ -751,4 +930,158 @@ async fn fill_bootstrap_misses(
         }
     }
     Ok(filled)
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    const P1: &str = "16Uiu2HAmLBZgzF4QKAjjERDh2wWaxtCkLBktEDxKsBmnNhjfcdyR";
+    const P2: &str = "16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC";
+    const P3: &str = "16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5";
+
+    fn addr(ip: &str, port: u16, peer: &str) -> String {
+        format!("/ip4/{ip}/tcp/{port}/p2p/{peer}")
+    }
+
+    #[test]
+    fn picks_distinct_routable_peers() {
+        let addrs = vec![
+            addr("45.139.159.102", 9010, P1),
+            addr("54.157.213.0", 9000, P2),
+            addr("176.229.58.1", 9001, P3),
+        ];
+        assert_eq!(select_probe_peers(&addrs).len(), 3);
+    }
+
+    #[test]
+    fn dedupes_by_ip_not_by_peer_id() {
+        // Three DIFFERENT peer ids behind one address. The tally counts one
+        // vote for them between it, so dialing all three would spend the round
+        // and still leave us below quorum — the selection has to mirror that
+        // rule, not merely avoid dialing the same peer id twice.
+        let addrs = vec![
+            addr("45.139.159.102", 9010, P1),
+            addr("45.139.159.102", 9011, P2),
+            addr("45.139.159.102", 9012, P3),
+        ];
+        assert_eq!(select_probe_peers(&addrs).len(), 1, "one address is one vote");
+    }
+
+    #[test]
+    fn drops_non_routable_peers() {
+        // A reading backed by LAN peers is how an RFC1918 address gets
+        // published. These must never become probe targets.
+        let addrs = vec![
+            addr("127.0.0.1", 9000, P1),
+            addr("192.168.178.74", 9000, P2),
+            addr("10.0.0.5", 9000, P3),
+        ];
+        assert!(select_probe_peers(&addrs).is_empty());
+    }
+
+    #[test]
+    fn caps_the_round() {
+        let addrs: Vec<String> =
+            (1..40).map(|i| addr(&format!("45.139.159.{i}"), 9000, P1)).collect();
+        assert_eq!(select_probe_peers(&addrs).len(), OBSERVE_PEERS);
+    }
+
+    #[test]
+    fn skips_entries_without_a_peer_id_or_ip() {
+        let addrs = vec![
+            "/ip4/45.139.159.102/tcp/9010".to_string(), // no /p2p
+            format!("/dns4/example.com/tcp/9000/p2p/{P1}"), // no ip
+            "not a multiaddr".to_string(),
+            addr("54.157.213.0", 9000, P2),
+        ];
+        let picked = select_probe_peers(&addrs);
+        assert_eq!(picked.len(), 1, "only the one dialable entry survives");
+    }
+
+    #[test]
+    fn probe_cadence_stays_inside_the_idle_timeout() {
+        // The swarm closes idle connections after 120s and DROPS the
+        // observation with them. If this ever exceeds that, the quorum blinks
+        // instead of holding and IP-change detection silently degrades.
+        let interval = REFRESH.as_secs() * u64::from(OBSERVE_TICKS);
+        assert!(interval < 120, "probe every {interval}s must stay under the 120s idle timeout");
+        assert!(OBSERVE_PEERS >= EXTERNAL_ADDR_QUORUM, "a round must be able to reach quorum");
+    }
+}
+
+#[cfg(test)]
+mod upstream_ip_tests {
+    use super::*;
+
+    #[test]
+    fn prefers_routable_v4() {
+        // Nimbus lists the public v4 first but surrounds it with loopback, ULA,
+        // link-local and LAN entries — this is the real shape of the endpoint.
+        let addrs: Vec<String> = [
+            "/ip4/87.154.209.161/tcp/9107/p2p/16Uiu2HAmSNPCPWg1nysEdBVpTTg3kw7mvEbjrxXW3tQ84td1yax5",
+            "/ip6/::1/tcp/9107",
+            "/ip6/fd5b:65e6:3b39::eaef:7f15:9f02:c5eb/tcp/9107",
+            "/ip4/127.0.0.1/tcp/9107",
+            "/ip4/192.168.178.74/tcp/9107",
+        ]
+        .iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            upstream_external_ip(&addrs),
+            Some("87.154.209.161".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn v4_wins_over_v6_regardless_of_order() {
+        // A published v6 roost is not reachable on the v4 multiaddrs wallets
+        // pin, so order in the upstream's list must not decide this.
+        let addrs: Vec<String> = [
+            "/ip6/2003:fb:ef3a:2300:788a:d7bf:513e:223/tcp/9107",
+            "/ip4/87.154.209.161/tcp/9107",
+        ]
+        .iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            upstream_external_ip(&addrs),
+            Some("87.154.209.161".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn falls_back_to_v6_when_there_is_no_v4() {
+        let addrs = vec![
+            "/ip4/127.0.0.1/tcp/9107".to_string(),
+            "/ip6/2003:fb:ef3a:2300:788a:d7bf:513e:223/tcp/9107".to_string(),
+        ];
+        assert_eq!(
+            upstream_external_ip(&addrs),
+            Some("2003:fb:ef3a:2300:788a:d7bf:513e:223".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn none_when_only_private_addresses() {
+        // A node that has not yet discovered itself advertises only local
+        // addresses. Answering with one of those is how an RFC1918 address ends
+        // up pinned or published, so this must be None rather than a best guess.
+        let addrs = vec![
+            "/ip4/127.0.0.1/tcp/9107".to_string(),
+            "/ip4/192.168.178.74/tcp/9107".to_string(),
+            "/ip6/fe80::1/tcp/9107".to_string(),
+            "/ip6/fd5b:65e6:3b39::1/tcp/9107".to_string(),
+        ];
+        assert_eq!(upstream_external_ip(&addrs), None);
+    }
+
+    #[test]
+    fn ignores_unparseable_entries() {
+        let addrs = vec![
+            "not a multiaddr".to_string(),
+            "/ip4/87.154.209.161/tcp/9107".to_string(),
+        ];
+        assert_eq!(
+            upstream_external_ip(&addrs),
+            Some("87.154.209.161".parse::<IpAddr>().unwrap())
+        );
+    }
 }

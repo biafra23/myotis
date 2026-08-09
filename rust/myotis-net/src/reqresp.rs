@@ -387,6 +387,13 @@ enum Command {
     ExternalAddress {
         reply: oneshot::Sender<Option<ExternalAddress>>,
     },
+    /// Dial peers purely to collect Identify observations of our own address.
+    /// Fire-and-forget: nothing is requested and no reply is sent, because the
+    /// answer arrives asynchronously as `observed_ips` and is read later via
+    /// [`Command::ExternalAddress`].
+    Observe {
+        peers: Vec<(PeerId, Multiaddr)>,
+    },
     /// One snapshot of both catch-up peer-selection inputs — the LC-server set
     /// and the per-peer `earliest_available_slot` map — so a round fetches them
     /// in a single swarm round-trip instead of two.
@@ -429,6 +436,30 @@ impl ReqRespClient {
     /// a failure: a server with too few connections genuinely does not know its
     /// own address, and acting on a guess is how a published record ends up
     /// pointing somewhere dead.
+    /// Dial `peers` for the sole purpose of learning our own external address.
+    ///
+    /// A host that only ever ACCEPTS connections never learns this. Identify
+    /// reports what the remote observes about us, so it takes a connection to
+    /// produce one — and [`external_address`](Self::external_address) needs
+    /// [`EXTERNAL_ADDR_QUORUM`] of them from distinct source IPs. A wallet gets
+    /// these for free from the peers it syncs against; a pure server
+    /// (`rust/roost`) has no such traffic and would sit below quorum forever.
+    ///
+    /// The observations are BOUNDED BY THE CONNECTION: they are dropped when it
+    /// closes, and idle connections close after 120s. So this establishes a
+    /// quorum that is momentary by design, not a standing one. Callers should
+    /// re-probe on a cadence and treat a `None` from `external_address` as "no
+    /// fresh reading", not as "the address is gone".
+    ///
+    /// Fire-and-forget: dial failures are logged, not returned. Probing is a
+    /// best-effort background concern and must never fail a caller's real work.
+    pub async fn observe_via(&self, peers: Vec<(PeerId, Multiaddr)>) {
+        if peers.is_empty() {
+            return;
+        }
+        let _ = self.tx.send(Command::Observe { peers }).await;
+    }
+
     pub async fn external_address(&self) -> Option<ExternalAddress> {
         let (reply, rx) = oneshot::channel();
         if self.tx.send(Command::ExternalAddress { reply }).await.is_err() {
@@ -828,6 +859,25 @@ async fn run_swarm(
                 }
                 Some(Command::ExternalAddress { reply }) => {
                     let _ = reply.send(external_address(&ctx.observed_ips));
+                }
+                Some(Command::Observe { peers }) => {
+                    for (peer, addr) in peers {
+                        // Skip peers we already hold a connection to: their
+                        // Identify has already been recorded, and a redundant
+                        // dial would only churn the connection.
+                        if ctx.connected.contains(&peer) {
+                            continue;
+                        }
+                        use libp2p::swarm::dial_opts::DialOpts;
+                        let opts = DialOpts::peer_id(peer).addresses(vec![addr]).build();
+                        match swarm.dial(opts) {
+                            Ok(()) => {}
+                            Err(libp2p::swarm::DialError::DialPeerConditionFalse(_)) => {}
+                            Err(e) => {
+                                tracing::debug!(peer = %peer, error = %e, "observation dial failed");
+                            }
+                        }
+                    }
                 }
                 Some(Command::CatchupMeta { reply }) => {
                     let _ = reply.send((ctx.lc_servers.clone(), ctx.peer_earliest.clone()));
