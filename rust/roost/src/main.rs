@@ -22,7 +22,7 @@ mod store;
 
 use archive::Archive;
 use framing::{split_updates, updates_to_wire};
-use rest::{period_of_slot, NimbusRest};
+use rest::NimbusRest;
 use store::LcStore;
 
 const DEFAULT_REST: &str = "http://127.0.0.1:5052";
@@ -147,8 +147,7 @@ async fn probe(rest_base: &str) -> Result<()> {
     println!("  rest      {rest_base}");
     println!("  version   {}", client.node_version().await?);
     let (head_slot, syncing) = client.syncing().await?;
-    let head_period = period_of_slot(head_slot);
-    println!("  head      slot {head_slot} (period {head_period}), syncing={syncing}");
+    println!("  head      slot {head_slot}, syncing={syncing}");
 
     println!("\n== single-object endpoints ==");
     for (name, resp) in [
@@ -171,6 +170,32 @@ async fn probe(rest_base: &str) -> Result<()> {
         bootstrap.consensus_version.as_deref().unwrap_or("-"),
         hex::encode(&finalized[..8]),
     );
+
+    // Geometry LAST of the things that can fail, and non-fatally. probe writes
+    // nothing, so unlike `serve` it should still report what it managed to
+    // learn: a failure here is exactly the run an operator makes when the
+    // upstream is already misbehaving, and aborting before the report is the
+    // least useful moment to abort.
+    println!("\n== geometry ==");
+    let params = match client.chain_params().await {
+        Ok(p) => {
+            println!(
+                "  {} slots/epoch x {} epochs/period = {} slots per period",
+                p.slots_per_epoch(),
+                p.epochs_per_sync_committee_period(),
+                p.slots_per_period()
+            );
+            p
+        }
+        Err(e) => {
+            println!("  unavailable — {e:#}");
+            println!("\n  skipping the period-dependent sections (updates framing, fork digest,");
+            println!("  servable window): every one of them is keyed by period.");
+            return Ok(());
+        }
+    };
+    let head_period = params.period_of_slot(head_slot);
+    println!("  head slot {head_slot} is in period {head_period}");
 
     println!("\n== updates: framing and re-encode ==");
     let resp = client.updates(head_period, 1).await?;
@@ -295,6 +320,11 @@ async fn probe(rest_base: &str) -> Result<()> {
 async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
     let client = NimbusRest::new(rest_base, Duration::from_secs(30))?;
     let gvr = client.genesis_validators_root().await?;
+    // Before Archive::open, matching `serve`. Archive::open is not read-only —
+    // it repairs a torn tail with an in-place set_len — so "a chain roost cannot
+    // measure is one it never touches records for" should hold on both write
+    // paths, not just the one where it was written down.
+    let params = client.chain_params().await?;
 
     println!("== archive ==");
     let (mut archive, records, report) = Archive::open(archive_path, &gvr)?;
@@ -323,9 +353,15 @@ async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
     }
 
     let (head_slot, syncing) = client.syncing().await?;
-    let head_period = period_of_slot(head_slot);
+    let head_period = params.period_of_slot(head_slot);
     println!("\n== upstream ==");
     println!("  head      slot {head_slot} (period {head_period}), syncing={syncing}");
+    println!(
+        "  geometry  {} slots/epoch x {} epochs/period = {} slots per period",
+        params.slots_per_epoch(),
+        params.epochs_per_sync_committee_period(),
+        params.slots_per_period()
+    );
 
     let floor = match find_window_floor(&client, head_period).await? {
         Some(f) => f,
@@ -552,7 +588,10 @@ async fn show_enr(
 
     let client = NimbusRest::new(rest_base, Duration::from_secs(30))?;
     let gvr = client.genesis_validators_root().await?;
-    let schedule = forks::ForkSchedule::fetch(&client, gvr).await?;
+    // ONE fetch of /config/spec feeding both, so the epoch the ENR is built for
+    // cannot come from a different reading than the digest it carries.
+    let (params, schedule) = forks::ForkSchedule::fetch_with_params(&client, gvr).await?;
+    let schedule = schedule?;
     let (head_slot, syncing) = client.syncing().await?;
     // A syncing upstream reports a head behind the real one, and if it is behind
     // the most recent fork or BPO boundary the digest computed from it is the
@@ -567,7 +606,9 @@ async fn show_enr(
              invisible to exactly the clients it is for."
         ));
     }
-    let epoch = head_slot / schedule.slots_per_epoch();
+    // One source for slot->epoch, so the ENR's fork id cannot disagree with the
+    // period math the rest of the daemon uses.
+    let epoch = params.epoch_of_slot(head_slot);
     let eth2 = schedule.enr_fork_id(epoch);
 
     // The SAME key the libp2p host authenticates with — including a --key

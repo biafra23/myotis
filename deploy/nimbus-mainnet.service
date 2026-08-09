@@ -1,0 +1,46 @@
+[Unit]
+Description=Nimbus Mainnet (myotis light-client source, no execution client)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=nimbus
+# NO --el AND NO --jwt-secret, deliberately.
+#
+# This node exists to be roost's upstream, nothing else. Without an execution
+# client Nimbus logs "Running without execution client - validator features
+# disabled" and follows the chain optimistically: it can never mark execution
+# payloads valid. That costs nothing here, because light-client data is derived
+# from the beacon DAG (blockchain_dag_light_client.nim), not from the EL — and
+# because no wallet trusts this node anyway. Every update it produces is checked
+# against sync-committee signatures by the wallet that receives it.
+#
+# NO --history FLAG, so the default (prune) applies. This matters most on
+# mainnet: archive mode here is a multi-terabyte, multi-day trustedNodeSync with
+# --reindex, and docs/lc-server-design.md argues against it explicitly — "Don't.
+# Archive in the LC server instead." roost holds periods below this node's floor
+# in its own append-only archive at roughly 36 MB, which is the whole reason it
+# has one.
+#
+# discv5 stays ON and peer limits stay stock. The sepolia node runs unlisted with
+# hand-fed anchors because it had to serve wallets directly; roost exists so this
+# one does not, and can go back to being an ordinary beacon node.
+ExecStart=/usr/bin/nimbus_beacon_node \
+  --network=mainnet \
+  --data-dir=/data/nimbus-mainnet \
+  --tcp-port=9107 --udp-port=9107 \
+  --nat=any \
+  --enr-auto-update=true \
+  --netkey-file=/data/nimbus-mainnet/netkey \
+  --insecure-netkey-password=true \
+  --rest --rest-port=5054 \
+  --light-client-data-serve=true \
+  --light-client-data-import-mode=full
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

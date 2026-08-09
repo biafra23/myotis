@@ -44,7 +44,7 @@ use std::collections::BTreeMap;
 use anyhow::{anyhow, Context, Result};
 use myotis_net::status::fork_digest_bpo;
 
-use crate::rest::NimbusRest;
+use crate::rest::{ChainParams, NimbusRest};
 
 /// A fork's activation epoch and version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,15 +68,39 @@ pub struct ForkSchedule {
     forks: Vec<Fork>,
     /// Ascending by activation epoch. Empty ⇒ no BPO active, pre-Fulu formula.
     blob_schedule: Vec<BlobParams>,
-    slots_per_epoch: u64,
+    /// The chain's geometry — NOT a second parse of SLOTS_PER_EPOCH. This type
+    /// used to read that key itself, which meant two independent readings of the
+    /// same document: this one governing `digest_for_slot` (and therefore
+    /// `status.fork_digest`), the other governing period math. They could not
+    /// disagree in practice, but nothing made that true.
+    params: ChainParams,
 }
 
 impl ForkSchedule {
-    /// Read the whole schedule — forks and blob parameters — from the
-    /// upstream's `/eth/v1/config/spec`, in one request.
-    pub async fn fetch(client: &NimbusRest, genesis_validators_root: [u8; 32]) -> Result<Self> {
+    /// Read the chain's geometry AND schedule from `/eth/v1/config/spec` in a
+    /// single request.
+    ///
+    /// The two have different failure policies, so they are returned separately:
+    /// the geometry is required (a chain roost cannot measure is one it must not
+    /// write records for), while the schedule may fail for narrower reasons — an
+    /// unpaired `*_FORK_VERSION`, an unparseable `BLOB_SCHEDULE` — and degrade to
+    /// the observed fork digest.
+    pub async fn fetch_with_params(
+        client: &NimbusRest,
+        genesis_validators_root: [u8; 32],
+    ) -> Result<(ChainParams, Result<Self>)> {
         let (spec, blobs) = client.config_spec().await?;
-        Ok(Self::from_spec(&spec, genesis_validators_root)?.with_blob_schedule(blobs))
+        let params = ChainParams::from_spec(&spec)?;
+        let schedule = Self::from_spec(&spec, genesis_validators_root, params)
+            .map(|s| s.with_blob_schedule(blobs));
+        Ok((params, schedule))
+    }
+
+    /// The schedule alone, for callers that already hold the geometry.
+    pub async fn fetch(client: &NimbusRest, genesis_validators_root: [u8; 32]) -> Result<Self> {
+        Self::fetch_with_params(client, genesis_validators_root)
+            .await?
+            .1
     }
 
     /// Build from a decoded `config/spec` map.
@@ -94,6 +118,7 @@ impl ForkSchedule {
     pub fn from_spec(
         spec: &BTreeMap<String, String>,
         genesis_validators_root: [u8; 32],
+        params: ChainParams,
     ) -> Result<Self> {
         // (fork, is_genesis) — the flag drives the tie-break below.
         let mut forks: Vec<(Fork, bool)> = Vec::new();
@@ -146,20 +171,11 @@ impl ForkSchedule {
         forks.sort_by_key(|(f, is_genesis)| (f.epoch, !*is_genesis));
         let forks: Vec<Fork> = forks.into_iter().map(|(f, _)| f).collect();
 
-        let slots_per_epoch = spec
-            .get("SLOTS_PER_EPOCH")
-            .ok_or_else(|| anyhow!("config/spec has no SLOTS_PER_EPOCH"))?
-            .parse::<u64>()
-            .context("parsing SLOTS_PER_EPOCH")?;
-        if slots_per_epoch == 0 {
-            return Err(anyhow!("config/spec reports SLOTS_PER_EPOCH = 0"));
-        }
-
         Ok(Self {
             genesis_validators_root,
             forks,
             blob_schedule: Vec::new(),
-            slots_per_epoch,
+            params,
         })
     }
 
@@ -172,8 +188,9 @@ impl ForkSchedule {
     }
 
     pub fn slots_per_epoch(&self) -> u64 {
-        self.slots_per_epoch
+        self.params.slots_per_epoch()
     }
+
 
     /// The fork active at `epoch` — the latest whose activation is not in the
     /// future. Forks scheduled at `u64::MAX` (a placeholder for "not scheduled",
@@ -290,7 +307,7 @@ impl ForkSchedule {
 
     /// The fork digest an object at `slot` must carry.
     pub fn digest_for_slot(&self, slot: u64) -> [u8; 4] {
-        self.digest_for_epoch(slot / self.slots_per_epoch)
+        self.digest_for_epoch(slot / self.params.slots_per_epoch())
     }
 }
 
@@ -305,6 +322,21 @@ fn parse_version(raw: &str) -> Result<[u8; 4]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// Geometry derived from the SAME spec the schedule is built from — which is
+    /// the property this change is about.
+    fn params_of(spec: &BTreeMap<String, String>) -> ChainParams {
+        ChainParams::from_spec(spec).unwrap()
+    }
+
+    fn mainnet_params() -> ChainParams {
+        let m: BTreeMap<String, String> = [
+            ("SLOTS_PER_EPOCH", "32"),
+            ("EPOCHS_PER_SYNC_COMMITTEE_PERIOD", "256"),
+        ].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        ChainParams::from_spec(&m).unwrap()
+    }
 
     fn hex32(s: &str) -> [u8; 32] {
         let v = hex::decode(s).unwrap();
@@ -334,6 +366,7 @@ mod tests {
             ("GLOAS_FORK_VERSION", "0x07000000"),
             ("GLOAS_FORK_EPOCH", "18446744073709551615"),
             ("SLOTS_PER_EPOCH", "32"),
+            ("EPOCHS_PER_SYNC_COMMITTEE_PERIOD", "256"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -341,7 +374,7 @@ mod tests {
     }
 
     fn sepolia() -> ForkSchedule {
-        ForkSchedule::from_spec(&sepolia_spec(), sepolia_gvr())
+        ForkSchedule::from_spec(&sepolia_spec(), sepolia_gvr(), params_of(&sepolia_spec()))
             .unwrap()
             .with_blob_schedule(vec![
                 BlobParams { epoch: 274_176, max_blobs: 15 },
@@ -383,12 +416,13 @@ mod tests {
             ("FULU_FORK_VERSION", "0x06000000"),
             ("FULU_FORK_EPOCH", "0"),
             ("SLOTS_PER_EPOCH", "32"),
+            ("EPOCHS_PER_SYNC_COMMITTEE_PERIOD", "256"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
-        let base = ForkSchedule::from_spec(&spec, gvr).unwrap();
+        let base = ForkSchedule::from_spec(&spec, gvr, params_of(&spec)).unwrap();
         assert_eq!(base.digest_for_epoch(1), [0x82, 0xFA, 0xE5, 0x41]);
 
         let with_bpo = base.with_blob_schedule(vec![BlobParams {
@@ -410,7 +444,7 @@ mod tests {
         spec.insert("BELLATRIX_FORK_EPOCH".into(), "0".into());
         spec.insert("CAPELLA_FORK_EPOCH".into(), "0".into());
         spec.insert("DENEB_FORK_EPOCH".into(), "0".into());
-        let s = ForkSchedule::from_spec(&spec, sepolia_gvr()).unwrap();
+        let s = ForkSchedule::from_spec(&spec, sepolia_gvr(), params_of(&spec)).unwrap();
 
         // DENEB is the latest fork at epoch 0 and must win — not GENESIS, which
         // sorts after FULU lexicographically and would otherwise take the tie.
@@ -485,11 +519,12 @@ mod tests {
             ("FULU_FORK_VERSION", "0x90000075"),
             ("FULU_FORK_EPOCH", "272640"),
             ("SLOTS_PER_EPOCH", "32"),
+            ("EPOCHS_PER_SYNC_COMMITTEE_PERIOD", "256"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-        let s = ForkSchedule::from_spec(&spec, sepolia_gvr()).unwrap();
+        let s = ForkSchedule::from_spec(&spec, sepolia_gvr(), params_of(&spec)).unwrap();
         let id = s.enr_fork_id(300_000);
         assert_eq!(&id[4..8], &[0x90, 0, 0, 0x75], "current version, not zeros");
         assert_eq!(u64::from_le_bytes(id[8..].try_into().unwrap()), u64::MAX);
@@ -511,7 +546,7 @@ mod tests {
         // what keeps this network-agnostic.
         let mut spec = sepolia_spec();
         spec.insert("SLOTS_PER_EPOCH".into(), "16".into());
-        let s = ForkSchedule::from_spec(&spec, sepolia_gvr()).unwrap();
+        let s = ForkSchedule::from_spec(&spec, sepolia_gvr(), params_of(&spec)).unwrap();
         assert_eq!(s.slots_per_epoch(), 16);
         assert_eq!(s.digest_for_slot(16), s.digest_for_epoch(1));
     }
@@ -522,29 +557,39 @@ mod tests {
         // and quietly outrank the real schedule for early epochs.
         let mut spec = sepolia_spec();
         spec.insert("NEWFORK_FORK_VERSION".into(), "0x90000099".into());
-        let err = ForkSchedule::from_spec(&spec, sepolia_gvr()).unwrap_err().to_string();
+        let err = ForkSchedule::from_spec(&spec, sepolia_gvr(), params_of(&spec)).unwrap_err().to_string();
         assert!(err.contains("NEWFORK_FORK_EPOCH"), "got: {err}");
 
         // GENESIS remains the one legitimate exception.
         let mut only_genesis = sepolia_spec();
         only_genesis.remove("ALTAIR_FORK_EPOCH");
         only_genesis.remove("ALTAIR_FORK_VERSION");
-        assert!(ForkSchedule::from_spec(&only_genesis, sepolia_gvr()).is_ok());
+        assert!(ForkSchedule::from_spec(&only_genesis, sepolia_gvr(), params_of(&only_genesis)).is_ok());
     }
 
     #[test]
     fn refuses_a_spec_it_cannot_use() {
+        // A spec with no *_FORK_VERSION at all is this type's OWN refusal.
         let empty: BTreeMap<String, String> = BTreeMap::new();
-        assert!(ForkSchedule::from_spec(&empty, sepolia_gvr()).is_err());
+        assert!(ForkSchedule::from_spec(&empty, sepolia_gvr(), mainnet_params()).is_err());
 
+        // The geometry refusals — missing or zero SLOTS_PER_EPOCH — now belong
+        // to ChainParams (rest.rs), which is the single reading of them. This
+        // type is handed an already-validated ChainParams, so asserting them
+        // here would test nothing. Kept as an explicit note rather than deleted
+        // silently, because "the schedule validates the epoch length" was true
+        // until this change and someone will look for it.
         let mut no_epoch_len = sepolia_spec();
         no_epoch_len.remove("SLOTS_PER_EPOCH");
-        assert!(ForkSchedule::from_spec(&no_epoch_len, sepolia_gvr()).is_err());
+        assert!(
+            ChainParams::from_spec(&no_epoch_len).is_err(),
+            "the geometry refusal lives in ChainParams now"
+        );
 
         let mut zero = sepolia_spec();
         zero.insert("SLOTS_PER_EPOCH".into(), "0".into());
         assert!(
-            ForkSchedule::from_spec(&zero, sepolia_gvr()).is_err(),
+            ChainParams::from_spec(&zero).is_err(),
             "a zero epoch length would divide by zero in digest_for_slot"
         );
     }

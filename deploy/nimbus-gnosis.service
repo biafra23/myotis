@@ -1,0 +1,50 @@
+[Unit]
+Description=Nimbus Gnosis (myotis light-client source, no execution client)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=nimbus
+# NO --el AND NO --jwt-secret, deliberately.
+#
+# This node exists to be roost's upstream, nothing else. Without an execution
+# client Nimbus logs "Running without execution client - validator features
+# disabled" and follows the chain optimistically: it can never mark execution
+# payloads valid. That costs nothing here, because light-client data is derived
+# from the beacon DAG (blockchain_dag_light_client.nim), not from the EL — and
+# because no wallet trusts this node anyway. Every update it produces is checked
+# against sync-committee signatures by the wallet that receives it.
+#
+# NO --history FLAG, so the default (prune) applies. Archive mode on a chain
+# this size is a multi-day, multi-hundred-GB commitment that buys a permanently
+# slower startup, and it is not how the deep archive is meant to be held:
+# docs/lc-server-design.md keeps periods below this node's floor in roost's own
+# ~36 MB append-only archive instead.
+#
+# discv5 stays ON and peer limits stay stock. The sepolia node runs unlisted with
+# hand-fed anchors because it had to serve wallets directly; roost exists so this
+# one does not, and can go back to being an ordinary beacon node.
+# --network is a PATH, not a name: this Nimbus build knows mainnet, hoodi and
+# sepolia only ("config.yaml not found for network networkName=gnosis"). The
+# gnosis chain config is vendored in the nimbus-eth2 source and the installer
+# copies it here, so the unit does not depend on a user's home directory
+# surviving.
+ExecStart=/usr/bin/nimbus_beacon_node \
+  --network=/etc/myotis/gnosis-chain-config \
+  --data-dir=/data/nimbus-gnosis \
+  --tcp-port=9106 --udp-port=9106 \
+  --nat=any \
+  --enr-auto-update=true \
+  --netkey-file=/data/nimbus-gnosis/netkey \
+  --insecure-netkey-password=true \
+  --rest --rest-port=5053 \
+  --light-client-data-serve=true \
+  --light-client-data-import-mode=full
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target
