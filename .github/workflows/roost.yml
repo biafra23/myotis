@@ -22,6 +22,7 @@ on:
       - "rust/myotis-net/**"
       - "rust/myotis-consensus/**"
       - "rust/myotis-core/**"
+      - "rust/myotis-evm/**"
       - ".github/workflows/roost.yml"
   pull_request:
     paths:
@@ -29,6 +30,7 @@ on:
       - "rust/myotis-net/**"
       - "rust/myotis-consensus/**"
       - "rust/myotis-core/**"
+      - "rust/myotis-evm/**"
       - ".github/workflows/roost.yml"
 
 jobs:

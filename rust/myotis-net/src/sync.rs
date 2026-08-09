@@ -81,8 +81,15 @@ pub struct ChainConfig {
 impl ChainConfig {
     /// Slots per sync-committee period — the geometry every period division uses.
     pub fn slots_per_period(&self) -> u64 {
+        // CHECKED, not saturating. Saturating would turn an overflowing config
+        // into u64::MAX, which puts every real slot in period 0 — a wrong
+        // committee for every update, silently. Both factors are compile-time
+        // constants in every shipped config, so a panic here is a build error
+        // surfacing, never a runtime condition.
         self.slots_per_epoch
-            .saturating_mul(self.epochs_per_sync_committee_period)
+            .checked_mul(self.epochs_per_sync_committee_period)
+            .filter(|p| *p > 0)
+            .expect("chain geometry must be non-zero and must not overflow")
     }
 
     /// Mainnet — values duplicated verbatim from the Java

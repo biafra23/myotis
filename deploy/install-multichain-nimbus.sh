@@ -144,6 +144,11 @@ for chain in "${installed[@]:-}"; do [ -n "$chain" ] && systemctl enable "nimbus
 if [ "${#failed[@]}" -gt 0 ]; then
   echo
   echo "!!! FAILED: ${failed[*]} — see above. Installed: ${installed[*]:-none}"
+  # EXIT NONZERO. Collecting failures so one chain cannot skip the other is the
+  # point of the loop, but reaching EOF afterwards exits 0 and tells automation
+  # a missing binary or a failed checkpoint sync was a successful install —
+  # contradicting the invariant stated at the top of this loop.
+  exit 1
 fi
 
 cat <<'NOTE'

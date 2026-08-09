@@ -29,15 +29,16 @@ pub struct LightClientStore {
 impl LightClientStore {
     /// `slots_per_period` comes from the chain config, not from a peer: it
     /// selects the sync committee a signature is verified against.
+    ///
+    /// REFUSES zero rather than defaulting to the mainnet preset. Silently
+    /// substituting one geometry for another would verify updates against a
+    /// different committee than the caller configured, and the result would look
+    /// entirely plausible — the failure CLAUDE.md singles out for any parameter
+    /// that can change the answer. Zero only arises from a mis-built config, so
+    /// failing at construction beats a wrong committee at runtime.
     pub fn new(slots_per_period: u64) -> Self {
-        Self {
-            slots_per_period: if slots_per_period == 0 {
-                spec::SLOTS_PER_SYNC_COMMITTEE_PERIOD
-            } else {
-                slots_per_period
-            },
-            ..Self::default()
-        }
+        assert!(slots_per_period > 0, "slots_per_period must be non-zero");
+        Self { slots_per_period, ..Self::default() }
     }
 
     /// Mainnet-preset store, for tests and for callers that genuinely mean it.

@@ -69,9 +69,16 @@ pub fn compute_sync_committee_period(slot: u64) -> u64 {
 ///
 /// Note the wallet must be TOLD this, never ask a node for it: it is a
 /// verification input, and asking the thing being verified is not a check.
+///
+/// PANICS on a zero period length, in every build. `debug_assert!` plus
+/// `.max(1)` would have silently treated an invalid configuration as one slot
+/// per period in release — selecting a different committee than the caller
+/// asked for, which is exactly the "accepted and silently ignored" failure
+/// CLAUDE.md forbids for anything that can change the answer. A zero here is a
+/// build-time configuration error, not a runtime condition to paper over.
 pub fn compute_sync_committee_period_with(slot: u64, slots_per_period: u64) -> u64 {
-    debug_assert!(slots_per_period > 0, "slots_per_period must be non-zero");
-    slot / slots_per_period.max(1)
+    assert!(slots_per_period > 0, "slots_per_period must be non-zero");
+    slot / slots_per_period
 }
 
 #[cfg(test)]
