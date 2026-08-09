@@ -7,8 +7,10 @@
 # These are LIGHT-CLIENT SOURCES, not validating nodes: no execution client, no
 # JWT, default history. See the unit files for why each of those is deliberate.
 #
-# Idempotent. The checkpoint sync is skipped when a db already exists, and the
-# netkey — which fixes the node's peer id — is never touched once created.
+# Idempotent. The checkpoint sync is gated on a success marker, not on the db
+# directory (Nimbus creates that before fetching, so a failed sync would
+# otherwise look done), and the netkey — which fixes the node's peer id — is
+# never touched once created.
 set -euo pipefail
 
 NIMBUS=/usr/bin/nimbus_beacon_node
@@ -49,7 +51,14 @@ for chain in "${CHAINS[@]}"; do
   # Checkpoint sync once. --backfill=false is what keeps this minutes rather
   # than days: it takes the finalized state and follows forward, leaving deep
   # history to roost's archive.
-  if [ ! -d "$dir/db" ]; then
+  #
+  # Gated on a SUCCESS MARKER, not on the db directory existing. Nimbus creates
+  # and opens the database before it fetches the checkpoint, so a sync that
+  # fails part-way leaves $dir/db behind — and a directory check would then skip
+  # the sync on the next run and enable a node with an incomplete database. The
+  # marker is written only after trustedNodeSync returns 0.
+  marker="$dir/.checkpoint-synced"
+  if [ ! -f "$marker" ]; then
     echo "--- checkpoint sync from ${CHECKPOINT[$chain]}"
     sudo -u nimbus "$NIMBUS" trustedNodeSync \
       --network="$chain" \
@@ -64,8 +73,9 @@ for chain in "${CHAINS[@]}"; do
           --trusted-node-url="${CHECKPOINT_ALT[$chain]}" \
           --backfill=false
       }
+    sudo -u nimbus touch "$marker"
   else
-    echo "--- db exists, skipping checkpoint sync"
+    echo "--- already checkpoint-synced ($marker), skipping"
   fi
 
   if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
