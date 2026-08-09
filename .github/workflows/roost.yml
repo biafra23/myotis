@@ -50,3 +50,13 @@ jobs:
         run: cargo test --manifest-path rust/roost/Cargo.toml --locked
       - name: Clippy
         run: cargo clippy --manifest-path rust/roost/Cargo.toml --all-targets -- -D warnings
+      # Neither build, test nor clippy checks rustdoc links, so a broken
+      # intra-doc link is invisible to CI — one shipped in #328 and was caught by
+      # a human reading the diff rather than by a machine. The class matters here
+      # because this crate's doc comments carry the reasoning (why the ENR key
+      # must be the host key, why a BPO counts as a transition), and a link that
+      # silently stops resolving takes a reader away from it.
+      - name: Rustdoc links
+        env:
+          RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
+        run: cargo doc --manifest-path rust/roost/Cargo.toml --no-deps --locked
