@@ -1,6 +1,6 @@
 [package]
 name = "myotis-consensus"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Myotis sync-committee light client (pure Rust; grows through the Rust-engine PRs)"
 license = "MIT OR Apache-2.0"

@@ -39,7 +39,7 @@ public final class HelloMessage {
             // Keep in sync with the Rust engine's Hello client id
             // (rust/myotis-net/src/el/rlpx/transport.rs) — dedicated
             // myotis-serving nodes admit peers by matching "myotis" here.
-            writer.writeString("myotis/0.1.5");
+            writer.writeString("myotis/0.1.6");
             writer.writeList(capWriter -> {
                 // Capabilities must be ascending (name, then version). eth/66 is the
                 // floor: it has request-IDs (which our GetBlockHeaders/snap requests

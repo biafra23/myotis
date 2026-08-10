@@ -320,7 +320,7 @@ pub fn encode_hello(node_pubkey: &[u8; 64], listen_port: u16) -> Vec<u8> {
     };
     rlp::encode(&Item::List(vec![
         Item::Bytes(rlp::u64_to_minimal_be(5)), // protocol version
-        Item::Bytes(b"myotis/0.1.5".to_vec()),
+        Item::Bytes(b"myotis/0.1.6".to_vec()),
         Item::List(vec![
             cap("eth", 66),
             cap("eth", 67),
@@ -392,7 +392,7 @@ mod tests {
         let body = encode_hello(&pubkey, 30303);
         let hello = decode_hello(&body).unwrap();
         assert_eq!(hello.protocol_version, 5);
-        assert_eq!(hello.client_id, "myotis/0.1.5");
+        assert_eq!(hello.client_id, "myotis/0.1.6");
         assert_eq!(hello.listen_port, 30303);
         assert_eq!(hello.node_id, pubkey.to_vec());
         assert_eq!(hello.capabilities.len(), 5);
