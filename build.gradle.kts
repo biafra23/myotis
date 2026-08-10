@@ -612,315 +612,301 @@ gradle.taskGraph.whenReady {
 }
 
 // -------------------------------------------------------------------------
-// Trust anchor refresh: fetch the current finalized block root from multiple
-// independent public checkpoint endpoints, cross-validate, and rewrite the
-// `@checkpoint:<network>` region in NetworkConfig.java. Shared by the mainnet
-// and sepolia tasks (identical Beacon API shape and mainnet-preset slot math);
-// Gnosis has its own task below (different API surface, scarce endpoints).
+// Trust anchor refresh — ONE task for every network, writing EVERY engine.
+//
+// Supersedes the per-network tasks (refreshMainnetCheckpoint / Sepolia /
+// Gnosis), which are removed rather than left alongside: they wrote only the
+// Java region, so running one after this would silently split the anchor
+// between the two engines — the failure this task exists to prevent.
 // -------------------------------------------------------------------------
 
-fun registerCheckpointRefresh(taskName: String, network: String, endpoints: List<String>, genesisTimeProperty: String) =
-    tasks.register(taskName) {
-    group = "trust"
-    description = "Fetch the finalized $network block root from ${endpoints.size} public checkpoint providers, cross-validate, and update NetworkConfig.java. Use -Pdry to preview the diff without writing."
+/** One network: fetch, cross-validate, then rewrite the marked region in every engine. */
+fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger, net: String) {
+    // Public checkpointz providers serve `finalized` ONLY — they 404 on any
+    // historical slot — so -Pperiod needs a full node, and the operator names it
+    // explicitly rather than the task reaching for loopback behind their back:
+    //   -PextraEndpoint=http://127.0.0.1:5054
+    // It is appended, never substituted, so it adds a voice to cross-validation
+    // instead of replacing the public ones.
+    val extra = (project.findProperty("extraEndpoint") as String?)?.split(",")?.map { it.trim() }
+        ?.filter { it.isNotEmpty() } ?: emptyList()
+    val endpoints = checkpointEndpoints.getValue(net) + extra
+    val secondsPerSlot = checkpointSecondsPerSlot.getValue(net)
+    val slotsPerPeriod = checkpointSlotsPerPeriod.getValue(net)
+    // Guarded, as the helper this replaces was: a missing or malformed property
+    // would otherwise surface as a ClassCastException or NumberFormatException
+    // deep in the task rather than as the configuration error it is.
+    val genesis = (project.findProperty("ethp2p.$net.genesisTime") as? String)
+        ?.takeIf { it.isNotBlank() }?.toLongOrNull()
+        ?: throw GradleException("missing or malformed property ethp2p.$net.genesisTime")
 
-    doLast {
-        val dryRun = project.hasProperty("dry")
-        val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
+    val dryRun = project.hasProperty("dry")
+    val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
 
-        fun fetch(url: String): String? = try {
-            val req = HttpRequest.newBuilder()
-                .uri(URI(url))
-                .timeout(Duration.ofSeconds(15))
-                .header("Accept", "application/json")
-                .GET().build()
-            val resp = client.send(req, HttpResponse.BodyHandlers.ofString())
-            if (resp.statusCode() == 200) resp.body()
-            else { logger.warn("[refresh] $url → HTTP ${resp.statusCode()}"); null }
-        } catch (e: Exception) {
-            logger.warn("[refresh] $url failed: ${e.message}"); null
+    fun fetch(url: String): String? = try {
+        val req = HttpRequest.newBuilder()
+            .uri(URI(url))
+            .timeout(Duration.ofSeconds(15))
+            .header("Accept", "application/json")
+            .GET().build()
+        val resp = client.send(req, HttpResponse.BodyHandlers.ofString())
+        if (resp.statusCode() == 200) resp.body()
+        else { logger.warn("[refresh] $url → HTTP ${resp.statusCode()}"); null }
+    } catch (e: Exception) {
+        logger.warn("[refresh] $url failed: ${e.message}"); null
+    }
+
+    // headers/finalized JSON: data.root is the first "root":"0x..64hex.." key
+    // (parent_root/state_root/body_root keys don't match the bare "root").
+    val rootRe = Regex(""""root"\s*:\s*"(0x)?([0-9a-fA-F]{64})"""")
+    val slotRe = Regex(""""slot"\s*:\s*"?(\d+)"?""")
+
+    data class Hdr(val base: String, val slot: Long, val root: String)
+
+    // An explicit target period anchors at that period's FIRST slot instead of at
+    // head. Anchoring at head is wrong for this deployment: roost's archive only
+    // grows FORWARD, so an anchor at the newest period leaves a wallet nothing to
+    // walk and goes stale the moment the period rolls. The useful anchor is
+    // roost's FLOOR — the oldest period it can still serve.
+    //
+    // A period's first slot may be SKIPPED (no block proposed), which the beacon
+    // API answers with 404, so walk forward until a block exists. Bounded at one
+    // epoch: past that the chain has bigger problems, and failing loudly beats
+    // anchoring somewhere unintended.
+    val targetPeriod = (project.findProperty("period") as String?)?.toLong()
+    val pinnedSlot: Long? = targetPeriod?.let { p ->
+        val first = p * slotsPerPeriod
+        (first until first + 32).firstOrNull { slot ->
+            endpoints.any { base -> fetch("$base/eth/v2/beacon/blocks/$slot") != null }
+        } ?: throw GradleException(
+            "[refresh:$net] no block in slots $first..${first + 31} for period $p")
+    }
+    if (pinnedSlot != null) {
+        logger.lifecycle("[refresh:$net] pinning period $targetPeriod → slot $pinnedSlot")
+    }
+
+    val probed = endpoints.mapNotNull { base ->
+        val path = if (pinnedSlot != null) "$pinnedSlot" else "finalized"
+        val body = fetch("$base/eth/v2/beacon/blocks/$path") ?: return@mapNotNull null
+        val slot = slotRe.find(body)?.groupValues?.get(1)?.toLong()
+        val root = rootRe.find(body)?.groupValues?.get(2)?.lowercase()
+        if (slot == null || root == null) {
+            logger.warn("[refresh] $base response missing slot/root"); null
+        } else {
+            logger.lifecycle("[refresh] $base → finalized slot=$slot root=0x$root")
+            Hdr(base, slot, root)
         }
+    }
+    if (probed.isEmpty()) {
+        throw GradleException("No $net endpoint returned a finalized header")
+    }
 
-        // `data.root` is nested directly under `data`; target that specifically to avoid
-        // matching `parent_root`/`state_root`/`body_root` inside a header. Some endpoints
-        // omit the `0x` prefix, so accept either form.
-        val rootRe = Regex(""""data"\s*:\s*\{\s*"root"\s*:\s*"(0x)?([0-9a-fA-F]+)"""")
-        // Anchor the slot search inside the "data" object. A full beacon block response
-        // contains nested attestations that each carry a "slot" field — without the
-        // anchor the regex would otherwise match those.
-        val slotRe = Regex(""""data"\s*:\s*\{.*?"slot"\s*:\s*"?(\d+)"?""", RegexOption.DOT_MATCHES_ALL)
-
-        fun normRoot(m: MatchResult): String = m.groupValues[2].lowercase()
-
-        data class Fetched(val base: String, val slot: Long, val root: String? = null)
-
-        // Phase 1: discover each endpoint's currently-finalized slot. Providers can disagree
-        // by an epoch because they poll upstream nodes at different rates.
-        val probed = endpoints.mapNotNull { base ->
-            val body = fetch("$base/eth/v2/beacon/blocks/finalized") ?: return@mapNotNull null
-            val slot = slotRe.find(body)?.groupValues?.get(1)?.toLong()
-            if (slot == null) {
-                logger.warn("[refresh] $base response missing slot"); null
+    // Normalize to the oldest observed finalized slot so all responders can agree,
+    // then re-query the endpoints that reported a *newer* slot for the header AT minSlot.
+    // Beacon nodes are routinely a few slots out of sync, so filtering to those that
+    // happened to report exactly minSlot would usually leave a single endpoint and
+    // silently skip cross-validation. The standard /eth/v1/beacon/headers/{slot}
+    // endpoint lets every responder be checked at the same slot (mirrors the
+    // mainnet task's Phase 2).
+    val minSlot = probed.minOf { it.slot }
+    val resolved = probed.mapNotNull { f ->
+        if (f.slot == minSlot) {
+            f
+        } else {
+            val body = fetch("${f.base}/eth/v2/beacon/blocks/$minSlot")
+            val root = body?.let { rootRe.find(it)?.groupValues?.get(2)?.lowercase() }
+            if (root == null) {
+                logger.warn("[refresh] ${f.base} could not resolve slot $minSlot"); null
             } else {
-                logger.lifecycle("[refresh] $base → finalized slot=$slot")
-                Fetched(base, slot)
+                Hdr(f.base, minSlot, root)
             }
         }
-        if (probed.size < 2) {
-            throw GradleException("Need at least 2 successful endpoints; got ${probed.size}")
+    }
+    if (resolved.isEmpty()) {
+        throw GradleException("No $net endpoint could resolve slot $minSlot")
+    }
+    val distinct = resolved.map { it.root }.toSet()
+    if (distinct.size != 1) {
+        val detail = resolved.joinToString("\n  ") { "${it.base} → 0x${it.root}" }
+        throw GradleException(
+            "Cross-validation FAILED at slot $minSlot. Endpoints disagreed:\n  $detail\n" +
+            "Aborting; NetworkConfig.java not modified.")
+    }
+    val finalRoot = distinct.single()
+    // REFUSE on a single responder rather than warn. This writes a TRUST ROOT,
+    // and the per-network tasks this replaces already refused — warning instead
+    // would have quietly weakened mainnet and sepolia while claiming to unify
+    // them. -PallowSingleSource is the named escape hatch for a chain whose
+    // providers really are unavailable, so the weaker guarantee is always an
+    // explicit choice made on the command line.
+    if (resolved.size < 2) {
+        val msg = "[refresh:$net] only ${resolved.size} endpoint served slot $minSlot — " +
+            "NOT cross-validated (root 0x$finalRoot)"
+        if (project.hasProperty("allowSingleSource")) {
+            logger.warn("$msg; -PallowSingleSource set, continuing. " +
+                "Verify against a $net explorer before trusting this anchor.")
+        } else {
+            throw GradleException("$msg. Re-run with -PallowSingleSource to accept it.")
         }
+    }
 
-        // Phase 2: normalize to the oldest observed finalized slot (which all endpoints can
-        // serve) and re-query each for the canonical root AT that slot.
-        val minSlot = probed.minOf { it.slot }
-        val resolved = probed.map { f ->
-            val body = fetch("${f.base}/eth/v1/beacon/blocks/$minSlot/root")
-                ?: throw GradleException("${f.base} could not resolve slot $minSlot")
-            val root = rootRe.find(body)?.let { normRoot(it) }
-                ?: throw GradleException("${f.base} response at slot $minSlot missing root field")
-            logger.lifecycle("[refresh] ${f.base} @ slot $minSlot → $root")
-            Fetched(f.base, minSlot, root)
-        }
+    val period = minSlot / slotsPerPeriod
+    val ts = Instant.ofEpochSecond(genesis + minSlot * secondsPerSlot)
 
-        val distinct = resolved.mapNotNull { it.root }.toSet()
-        if (distinct.size != 1) {
-            val detail = resolved.joinToString("\n  ") { "${it.base} → ${it.root}" }
-            throw GradleException(
-                "Cross-validation FAILED at slot $minSlot. Endpoints disagreed:\n  $detail\n" +
-                "Aborting; NetworkConfig.java not modified.")
-        }
+    val date = DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(ZoneOffset.UTC).format(ts)
 
-        val finalRoot = distinct.single().removePrefix("0x")
-        val period = minSlot / 8192
-        // Shared with the Java-side genesis constants via gradle.properties
-        val genesis = (project.findProperty(genesisTimeProperty) as? String)?.takeIf { it.isNotBlank() }?.toLongOrNull()
-            ?: throw GradleException("Property '$genesisTimeProperty' is missing, blank, or not a valid Long")
-        val ts = Instant.ofEpochSecond(genesis + minSlot * 12)
-        val date = DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(ZoneOffset.UTC).format(ts)
+    // BOTH engines, from one fetch. Hand-mirroring the Rust copy is what was
+    // forgotten before, and a disagreement between them is a split trust anchor.
+    val targets = listOf(
+        project(":networking").projectDir.resolve("src/main/java/com/jaeckel/ethp2p/networking/NetworkConfig.java")
+            to { ind: String, eol: String ->
+                buildString {
+                    append(ind).append("// @checkpoint:$net:begin — managed by `./gradlew refreshCheckpoint`").append(eol)
+                    append(ind).append("// trusted checkpoint: recent finalized $net block root (slot $minSlot, $date, period $period)").append(eol)
+                    append(ind).append("Bytes.fromHexString(\"$finalRoot\").toArrayUnsafe(),").append(eol)
+                    append(ind).append("${minSlot}L, // checkpoint slot. Must stay in sync with the root above.").append(eol)
+                    append(ind).append("// @checkpoint:$net:end")
+                }
+            },
+        project.rootDir.resolve("rust/myotis-net/src/sync.rs")
+            to { ind: String, eol: String ->
+                buildString {
+                    append(ind).append("// @checkpoint:$net:begin — managed by `./gradlew refreshCheckpoint`").append(eol)
+                    append(ind).append("checkpoint_root: hex32(").append(eol)
+                    append(ind).append("    \"$finalRoot\",").append(eol)
+                    append(ind).append("),").append(eol)
+                    append(ind).append("checkpoint_slot: ${minSlot},").append(eol)
+                    append(ind).append("// @checkpoint:$net:end")
+                }
+            },
+        // THIRD target: the parity test literals. They pin the same two values
+        // outside the config markers, so a refresh that skipped them would leave
+        // `cargo test -p myotis-net` red on its first real run — the tool would
+        // break the repo it is meant to maintain.
+        project.rootDir.resolve("rust/myotis-net/src/sync.rs")
+            to { ind: String, eol: String ->
+                buildString {
+                    append(ind).append("// @checkpoint:$net:test:begin — managed by `./gradlew refreshCheckpoint`").append(eol)
+                    append(ind).append("assert_eq!(c.checkpoint_slot, ${minSlot});").append(eol)
+                    append(ind).append("assert_eq!(").append(eol)
+                    append(ind).append("    hex_str(&c.checkpoint_root),").append(eol)
+                    append(ind).append("    \"$finalRoot\"").append(eol)
+                    append(ind).append(");").append(eol)
+                    append(ind).append("// @checkpoint:$net:test:end")
+                }
+            },
+    )
 
-        val file = project(":networking").projectDir.resolve(
-            "src/main/java/com/jaeckel/ethp2p/networking/NetworkConfig.java")
+    // Render and validate EVERY target before writing ANY. Writing as we go
+    // could commit NetworkConfig.java and then throw on sync.rs, leaving the two
+    // engines disagreeing about the trust anchor — the exact split this exists
+    // to prevent.
+    val planned = targets.mapIndexed { idx, (file, render) ->
         val original = file.readText()
-        val beginMarker = "// @checkpoint:$network:begin"
-        val endMarker = "// @checkpoint:$network:end"
+        val suffix = if (idx == 2) ":test" else ""
+        val beginMarker = "// @checkpoint:$net$suffix:begin"
+        val endMarker = "// @checkpoint:$net$suffix:end"
         val beginIdx = original.indexOf(beginMarker)
         val endIdx = original.indexOf(endMarker)
         if (beginIdx < 0 || endIdx < 0 || endIdx < beginIdx) {
-            throw GradleException("Could not find @checkpoint:$network:begin/end markers in NetworkConfig.java")
+            throw GradleException("Could not find @checkpoint:$net markers in ${file.name}")
         }
-        // Preserve whatever line ending the source file uses so we don't mix CRLF/LF
-        // when running on Windows.
         val eol = if (original.contains("\r\n")) "\r\n" else "\n"
         val beginLineStart = original.lastIndexOf('\n', beginIdx) + 1
-        // Stop the replaced region at the end of the end-marker text itself (not at the
-        // following newline), so the original line terminator is preserved verbatim.
         val endMarkerEnd = endIdx + endMarker.length
         val indent = original.substring(beginLineStart, beginIdx)
-
-        val replacement = buildString {
-            append(indent).append("// @checkpoint:$network:begin — managed by `./gradlew $taskName`").append(eol)
-            append(indent).append("// trusted checkpoint: recent finalized $network block root (slot $minSlot, $date, period $period)").append(eol)
-            append(indent).append("Bytes.fromHexString(\"$finalRoot\").toArrayUnsafe(),").append(eol)
-            append(indent).append("${minSlot}L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.").append(eol)
-            append(indent).append("// @checkpoint:$network:end")
-        }
+        val replacement = render(indent, eol)
         val updated = original.substring(0, beginLineStart) + replacement + original.substring(endMarkerEnd)
+        Triple(file, updated, original.substring(beginLineStart, endMarkerEnd) to replacement)
+    }
 
+    planned.forEach { (file, updated, diff) ->
+        val original = file.readText()
         if (original == updated) {
-            logger.lifecycle("[refresh] NetworkConfig.java already up to date (slot $minSlot, root 0x$finalRoot). No change.")
-            return@doLast
-        }
-
-        val matchedHosts = probed.map { URI(it.base).host }
-        if (dryRun) {
-            logger.lifecycle("[refresh] -Pdry set; preview only (no write):")
-            original.substring(beginLineStart, endMarkerEnd).lines().forEach { logger.lifecycle("- $it") }
-            replacement.lines().forEach { logger.lifecycle("+ $it") }
-            logger.lifecycle("[refresh] consensus: slot=$minSlot date=$date period=$period")
-            logger.lifecycle("[refresh] matched ${probed.size}/${endpoints.size} endpoints: $matchedHosts")
+            logger.lifecycle("[refresh:$net] ${file.name} already up to date (slot $minSlot). No change.")
+        } else if (dryRun) {
+            logger.lifecycle("[refresh:$net] -Pdry; preview of ${file.name}:")
+            diff.first.lines().forEach { logger.lifecycle("- $it") }
+            diff.second.lines().forEach { logger.lifecycle("+ $it") }
         } else {
             val tmp = File(file.absolutePath + ".tmp")
             tmp.writeText(updated)
-            Files.move(
-                tmp.toPath(), file.toPath(),
-                StandardCopyOption.REPLACE_EXISTING,
-                StandardCopyOption.ATOMIC_MOVE,
-            )
-            logger.lifecycle("[refresh] NetworkConfig.java updated.")
-            logger.lifecycle("[refresh]   slot=$minSlot period=$period date=$date")
-            logger.lifecycle("[refresh]   root=0x$finalRoot")
-            logger.lifecycle("[refresh]   matched ${probed.size}/${endpoints.size} endpoints: $matchedHosts")
+            Files.move(tmp.toPath(), file.toPath(),
+                StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+            logger.lifecycle("[refresh:$net] ${file.name} updated: slot=$minSlot period=$period root=0x$finalRoot")
         }
     }
 }
 
-// Independent checkpoint-sync endpoints per network. These serve only a narrow
-// slice of the Beacon API (/eth/v1/beacon/blocks/{id}/root + /eth/v2/beacon/blocks/{id}),
-// which is enough for what we need here.
-registerCheckpointRefresh(
-    "refreshMainnetCheckpoint", "mainnet",
-    listOf(
+/** Per-network checkpoint sources.
+ *
+ *  A LOCAL beacon node comes first when one is running. As of 2026-08-10 the
+ *  public checkpoint-sync providers no longer answer
+ *  `/eth/v1/beacon/headers/finalized` — beaconstate.info, beaconcha.in and
+ *  attestant all fail or 404 — so on a machine without a local node this task
+ *  now has no source at all. That is a finding about the providers, not about
+ *  this task: the pre-existing per-network tasks depend on the same endpoint
+ *  and are equally dead.
+ *
+ *  A local node is a legitimate source and NOT a shortcut: it followed the chain
+ *  over p2p from its own checkpoint, so it is an independent opinion rather than
+ *  a relay of one of these providers. It is still ONE opinion — when it is the
+ *  only responder the task says so loudly, exactly as it did for gnosis, and
+ *  the operator is expected to cross-check against an explorer before trusting
+ *  a fresh anchor.
+ *
+ *  Unreachable endpoints are skipped and reported; the task refuses to write
+ *  when nothing responds. */
+val checkpointEndpoints = mapOf(
+    "mainnet" to listOf(
         "https://beaconstate.info",
         "https://sync-mainnet.beaconcha.in",
         "https://mainnet-checkpoint-sync.attestant.io",
     ),
-    "ethp2p.mainnet.genesisTime",
-)
-// The full eth-clients/checkpoint-sync-endpoints sepolia list; the task needs
-// any 2 of them live for cross-validation.
-registerCheckpointRefresh(
-    "refreshSepoliaCheckpoint", "sepolia",
-    listOf(
+    "sepolia" to listOf(
         "https://sepolia.beaconstate.info",
         "https://checkpoint-sync.sepolia.ethpandaops.io",
         "https://beaconstate-sepolia.chainsafe.io",
     ),
-    "ethp2p.sepolia.genesisTime",
+    "gnosis" to listOf(
+        "https://rpc-gbc.gnosischain.com",
+        "https://checkpoint.gnosischain.com",
+        "https://gnosis-beacon.publicnode.com",
+    ),
 )
+val checkpointSecondsPerSlot = mapOf("mainnet" to 12L, "sepolia" to 12L, "gnosis" to 5L)
+val checkpointSlotsPerPeriod = mapOf("mainnet" to 8192L, "sepolia" to 8192L, "gnosis" to 8192L)
 
-// -------------------------------------------------------------------------
-// Gnosis checkpoint refresh. Public Gnosis beacon endpoints serving the
-// finalized API are scarce (effectively only the official rpc-gbc), so this
-// cross-validates when ≥2 respond at the same slot and otherwise proceeds from
-// a single trusted source with a loud warning. Uses
-// /eth/v1/beacon/headers/finalized (root + slot in one response), which works
-// on checkpointz and full nodes alike — unlike the mainnet task's two-call
-// blocks API, which Gnosis checkpointz servers don't fully expose.
-// Regenerates BOTH the root and the checkpoint-slot line inside the markers.
-// -------------------------------------------------------------------------
-tasks.register("refreshGnosisCheckpoint") {
+/**
+ * Refresh a network's trusted checkpoint in BOTH engines.
+ *
+ *   ./gradlew refreshCheckpoint                      # all three networks
+ *   ./gradlew refreshCheckpoint -Pnetwork=mainnet    # one
+ *   ./gradlew refreshCheckpoint -Pdry                # preview, no write
+ *
+ * Generalised from the gnosis-only task after the same gap appeared twice: an
+ * anchor that drifts below roost's archive floor can never be reached, because
+ * the archive only grows FORWARD. mainnet sat at period 1777 against a roost
+ * floor of 1825 and simply could not sync.
+ *
+ * It writes the Rust `ChainConfig` as well as `NetworkConfig.java`. The Rust
+ * copy used to carry a "mirror this by hand" note, and hand-mirroring is
+ * exactly what gets forgotten — the two engines then disagree about the trust
+ * anchor, which the cross-engine parity tests catch only if someone runs them.
+ */
+tasks.register("refreshCheckpoint") {
     group = "trust"
-    description = "Fetch the finalized Gnosis block root, cross-validate when possible, and update the @checkpoint:gnosis region in NetworkConfig.java. Use -Pdry to preview without writing."
+    description = "Refresh trusted checkpoints in NetworkConfig.java AND the Rust ChainConfig. -Pnetwork=<name> for one, -Pdry to preview."
 
     doLast {
-        val endpoints = listOf(
-            "https://rpc-gbc.gnosischain.com",
-            "https://checkpoint.gnosischain.com",
-            "https://gnosis-beacon.publicnode.com",
-        )
-        val dryRun = project.hasProperty("dry")
-        val secondsPerSlot = 5L
-        val genesis = (project.property("ethp2p.gnosis.genesisTime") as String).toLong()
-        val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
-
-        fun fetch(url: String): String? = try {
-            val req = HttpRequest.newBuilder()
-                .uri(URI(url))
-                .timeout(Duration.ofSeconds(15))
-                .header("Accept", "application/json")
-                .GET().build()
-            val resp = client.send(req, HttpResponse.BodyHandlers.ofString())
-            if (resp.statusCode() == 200) resp.body()
-            else { logger.warn("[refresh] $url → HTTP ${resp.statusCode()}"); null }
-        } catch (e: Exception) {
-            logger.warn("[refresh] $url failed: ${e.message}"); null
-        }
-
-        // headers/finalized JSON: data.root is the first "root":"0x..64hex.." key
-        // (parent_root/state_root/body_root keys don't match the bare "root").
-        val rootRe = Regex(""""root"\s*:\s*"(0x)?([0-9a-fA-F]{64})"""")
-        val slotRe = Regex(""""slot"\s*:\s*"?(\d+)"?""")
-
-        data class Hdr(val base: String, val slot: Long, val root: String)
-
-        val probed = endpoints.mapNotNull { base ->
-            val body = fetch("$base/eth/v1/beacon/headers/finalized") ?: return@mapNotNull null
-            val slot = slotRe.find(body)?.groupValues?.get(1)?.toLong()
-            val root = rootRe.find(body)?.groupValues?.get(2)?.lowercase()
-            if (slot == null || root == null) {
-                logger.warn("[refresh] $base response missing slot/root"); null
-            } else {
-                logger.lifecycle("[refresh] $base → finalized slot=$slot root=0x$root")
-                Hdr(base, slot, root)
+        val only = project.findProperty("network") as String?
+        val nets = if (only != null) listOf(only) else listOf("mainnet", "sepolia", "gnosis")
+        nets.forEach { n ->
+            if (!checkpointEndpoints.containsKey(n)) {
+                throw GradleException("unknown network '$n' (mainnet|sepolia|gnosis)")
             }
         }
-        if (probed.isEmpty()) {
-            throw GradleException("No Gnosis endpoint returned a finalized header")
-        }
-
-        // Normalize to the oldest observed finalized slot so all responders can agree,
-        // then re-query the endpoints that reported a *newer* slot for the header AT minSlot.
-        // Beacon nodes are routinely a few slots out of sync, so filtering to those that
-        // happened to report exactly minSlot would usually leave a single endpoint and
-        // silently skip cross-validation. The standard /eth/v1/beacon/headers/{slot}
-        // endpoint lets every responder be checked at the same slot (mirrors the
-        // mainnet task's Phase 2).
-        val minSlot = probed.minOf { it.slot }
-        val resolved = probed.mapNotNull { f ->
-            if (f.slot == minSlot) {
-                f
-            } else {
-                val body = fetch("${f.base}/eth/v1/beacon/headers/$minSlot")
-                val root = body?.let { rootRe.find(it)?.groupValues?.get(2)?.lowercase() }
-                if (root == null) {
-                    logger.warn("[refresh] ${f.base} could not resolve slot $minSlot"); null
-                } else {
-                    Hdr(f.base, minSlot, root)
-                }
-            }
-        }
-        if (resolved.isEmpty()) {
-            throw GradleException("No Gnosis endpoint could resolve slot $minSlot")
-        }
-        val distinct = resolved.map { it.root }.toSet()
-        if (distinct.size != 1) {
-            val detail = resolved.joinToString("\n  ") { "${it.base} → 0x${it.root}" }
-            throw GradleException(
-                "Cross-validation FAILED at slot $minSlot. Endpoints disagreed:\n  $detail\n" +
-                "Aborting; NetworkConfig.java not modified.")
-        }
-        val finalRoot = distinct.single()
-        if (resolved.size < 2) {
-            logger.warn("[refresh] WARNING: only ${resolved.size} endpoint served slot $minSlot — " +
-                "checkpoint NOT cross-validated. Verify 0x$finalRoot against a Gnosis explorer.")
-        }
-
-        val period = minSlot / 8192
-        val ts = Instant.ofEpochSecond(genesis + minSlot * secondsPerSlot)
-        val date = DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(ZoneOffset.UTC).format(ts)
-
-        val file = project(":networking").projectDir.resolve(
-            "src/main/java/com/jaeckel/ethp2p/networking/NetworkConfig.java")
-        val original = file.readText()
-        val beginMarker = "// @checkpoint:gnosis:begin"
-        val endMarker = "// @checkpoint:gnosis:end"
-        val beginIdx = original.indexOf(beginMarker)
-        val endIdx = original.indexOf(endMarker)
-        if (beginIdx < 0 || endIdx < 0 || endIdx < beginIdx) {
-            throw GradleException("Could not find @checkpoint:gnosis:begin/end markers in NetworkConfig.java")
-        }
-        val eol = if (original.contains("\r\n")) "\r\n" else "\n"
-        val beginLineStart = original.lastIndexOf('\n', beginIdx) + 1
-        val endMarkerEnd = endIdx + endMarker.length
-        val indent = original.substring(beginLineStart, beginIdx)
-
-        val replacement = buildString {
-            append(indent).append("// @checkpoint:gnosis:begin — managed by `./gradlew refreshGnosisCheckpoint`").append(eol)
-            append(indent).append("// trusted checkpoint: recent finalized Gnosis block root (slot $minSlot, $date, period $period)").append(eol)
-            append(indent).append("Bytes.fromHexString(\"$finalRoot\").toArrayUnsafe(),").append(eol)
-            append(indent).append("${minSlot}L, // checkpoint slot. Must stay in sync with the root above.").append(eol)
-            append(indent).append("// @checkpoint:gnosis:end")
-        }
-        val updated = original.substring(0, beginLineStart) + replacement + original.substring(endMarkerEnd)
-
-        if (original == updated) {
-            logger.lifecycle("[refresh] NetworkConfig.java already up to date (slot $minSlot, root 0x$finalRoot). No change.")
-            return@doLast
-        }
-
-        if (dryRun) {
-            logger.lifecycle("[refresh] -Pdry set; preview only (no write):")
-            original.substring(beginLineStart, endMarkerEnd).lines().forEach { logger.lifecycle("- $it") }
-            replacement.lines().forEach { logger.lifecycle("+ $it") }
-        } else {
-            val tmp = File(file.absolutePath + ".tmp")
-            tmp.writeText(updated)
-            Files.move(
-                tmp.toPath(), file.toPath(),
-                StandardCopyOption.REPLACE_EXISTING,
-                StandardCopyOption.ATOMIC_MOVE,
-            )
-            logger.lifecycle("[refresh] NetworkConfig.java updated: gnosis slot=$minSlot date=$date root=0x$finalRoot")
-        }
+        nets.forEach { net -> refreshOneCheckpoint(project, logger, net) }
     }
 }
+

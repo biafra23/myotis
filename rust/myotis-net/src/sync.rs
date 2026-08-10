@@ -162,15 +162,14 @@ impl ChainConfig {
             // BPO2 (Fusaka) blob schedule entry: epoch 419072, MAX_BLOBS=21.
             blob_params_epoch: 419_072,
             blob_params_max_blobs: 21,
-            // Copied verbatim from the @checkpoint:mainnet:begin/end region of
-            // NetworkConfig.java (slot 14560000, 2026-06-15, period 1777).
-            // NOTE: `./gradlew refreshMainnetCheckpoint` rewrites only the Java
-            // region today — it does NOT rewrite this constant yet (plan PR7);
-            // until then a checkpoint refresh must be mirrored here by hand.
+            // Mirrors the @checkpoint:mainnet region of NetworkConfig.java;
+            // `./gradlew refreshCheckpoint` rewrites both from one fetch.
+            // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
             checkpoint_root: hex32(
                 "58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e",
             ),
             checkpoint_slot: 14_560_000,
+            // @checkpoint:mainnet:end
             static_peers: MAINNET_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: MAINNET_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
@@ -203,18 +202,18 @@ impl ChainConfig {
             // epoch 275712, MAX_BLOBS_PER_BLOCK=21 (2025-10-28).
             blob_params_epoch: 275_712,
             blob_params_max_blobs: 21,
-            // Copied verbatim from the @checkpoint:sepolia:begin/end region of
-            // NetworkConfig.java (slot 10851360, 2026-08-05, period 1324). Like
-            // mainnet, `./gradlew refreshSepoliaCheckpoint` rewrites only the Java
-            // region — a refresh must be mirrored here by hand until plan PR7.
+            // Mirrors the @checkpoint:sepolia region of NetworkConfig.java;
+            // `./gradlew refreshCheckpoint` rewrites both from one fetch.
             //
             // This pin must also stay NEWER than the dedicated serving node's
             // trustedNodeSync point, or that node cannot answer the bootstrap for
             // it (docs/dedicated-sepolia-node.md §5).
+            // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
             checkpoint_root: hex32(
                 "a064b99bb711d152efbc88674dcba50d4e6c1b9151dae0a2e5bfbb7c40bc7cb9",
             ),
             checkpoint_slot: 10_851_360,
+            // @checkpoint:sepolia:end
             static_peers: SEPOLIA_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: SEPOLIA_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
@@ -248,9 +247,9 @@ impl ChainConfig {
             // into the Fulu digest. Yields the live-verified digest 0x3237dab6.
             blob_params_epoch: 1_337_856,
             blob_params_max_blobs: 2,
-            // Copied verbatim from the @checkpoint:gnosis:begin/end region of
+            // Mirrors the @checkpoint:gnosis region of
             // NetworkConfig.java (slot 29460368, 2026-08-09, period 3596).
-            // A refresh must be mirrored here by hand until plan PR7.
+            // Rewritten by `./gradlew refreshCheckpoint` together with the Java twin.
             //
             // Refreshed so the anchor sits INSIDE the period roost@gnosis can
             // serve. The previous anchor (period 3480) was 116 periods behind,
@@ -262,10 +261,12 @@ impl ChainConfig {
             // its three providers (the other two 404), so this root was checked
             // against the local gnosis beacon node, which reached the same slot
             // independently over p2p, and against its finalized checkpoint.
+            // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
             checkpoint_root: hex32(
                 "84f127f4bbb1e733c5607910c2df1d2c0e726e2fab0a4690b66cd07a5c2455bf",
             ),
             checkpoint_slot: 29_460_368,
+            // @checkpoint:gnosis:end
             static_peers: GNOSIS_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: GNOSIS_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
@@ -2623,11 +2624,13 @@ mod tests {
     fn mainnet_config_matches_networkconfig_java() {
         let c = ChainConfig::mainnet();
         assert_eq!(c.fork_version, [6, 0, 0, 0]);
+        // @checkpoint:mainnet:test:begin — managed by `./gradlew refreshCheckpoint`
         assert_eq!(c.checkpoint_slot, 14_560_000);
         assert_eq!(
             hex_str(&c.checkpoint_root),
             "58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e"
         );
+        // @checkpoint:mainnet:test:end
         assert_eq!(
             hex_str(&c.genesis_validators_root),
             "4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
@@ -2657,11 +2660,13 @@ mod tests {
         let c = ChainConfig::sepolia();
         assert_eq!(c.chain_id, 11_155_111);
         assert_eq!(c.fork_version, [0x90, 0x00, 0x00, 0x75]); // Fulu on sepolia
+        // @checkpoint:sepolia:test:begin — managed by `./gradlew refreshCheckpoint`
         assert_eq!(c.checkpoint_slot, 10_851_360);
         assert_eq!(
             hex_str(&c.checkpoint_root),
             "a064b99bb711d152efbc88674dcba50d4e6c1b9151dae0a2e5bfbb7c40bc7cb9"
         );
+        // @checkpoint:sepolia:test:end
         assert_eq!(
             hex_str(&c.genesis_validators_root),
             "d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078"
@@ -2713,11 +2718,13 @@ mod tests {
         assert_eq!(c.chain_id, 100);
         assert_eq!(c.fork_version, [0x06, 0x00, 0x00, 0x64]); // Fulu on Gnosis
         assert_eq!(c.prior_fork_version, Some([0x05, 0x00, 0x00, 0x64])); // Electra
+        // @checkpoint:gnosis:test:begin — managed by `./gradlew refreshCheckpoint`
         assert_eq!(c.checkpoint_slot, 29_460_368);
         assert_eq!(
             hex_str(&c.checkpoint_root),
             "84f127f4bbb1e733c5607910c2df1d2c0e726e2fab0a4690b66cd07a5c2455bf"
         );
+        // @checkpoint:gnosis:test:end
         assert_eq!(
             hex_str(&c.genesis_validators_root),
             "f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47"
