@@ -40,6 +40,13 @@ public final class DiscV5Service implements AutoCloseable {
     private final NodeKey nodeKey;
     private final List<String> bootnodeEnrs;
     private final Consumer<Enr> onPeerDiscovered;
+    /** discv5 node ids of the chain's PINNED peers (derived from their libp2p
+     *  peer ids — {@code Enr.nodeIdForPeerId}). Lookups walk TOWARD these ids
+     *  instead of hoping a random walk lands in their bucket, which on the
+     *  mainnet DHT it rarely does. Same design as the Rust engine's
+     *  {@code pinned_targets} (parity contract, #347): a stale pinned address
+     *  heals through third-party tables in bounded time. */
+    private final List<org.apache.tuweni.bytes.Bytes> pinnedNodeIds;
 
     private DiscoverySystem system;
     private ScheduledExecutorService scheduler;
@@ -75,8 +82,15 @@ public final class DiscV5Service implements AutoCloseable {
 
     public DiscV5Service(NodeKey nodeKey, List<String> bootnodeEnrs,
                          Consumer<Enr> onPeerDiscovered) {
+        this(nodeKey, bootnodeEnrs, List.of(), onPeerDiscovered);
+    }
+
+    public DiscV5Service(NodeKey nodeKey, List<String> bootnodeEnrs,
+                         List<org.apache.tuweni.bytes.Bytes> pinnedNodeIds,
+                         Consumer<Enr> onPeerDiscovered) {
         this.nodeKey = nodeKey;
         this.bootnodeEnrs = bootnodeEnrs;
+        this.pinnedNodeIds = List.copyOf(pinnedNodeIds);
         this.onPeerDiscovered = onPeerDiscovered;
     }
 
@@ -163,6 +177,10 @@ public final class DiscV5Service implements AutoCloseable {
             // First poll at 5s to pick up fast bootnode responses; then every
             // 15s (same cadence as discv4-refresh) to surface new peers.
             scheduler.scheduleAtFixedRate(this::pollAndNotify, 5, 15, TimeUnit.SECONDS);
+            // Targeted lookups toward the pinned servers (#347) run on their
+            // own thread — a full walk blocks for up to ~30 s worst-case, which
+            // must not stall the poll cadence.
+            startWalker();
         });
     }
 
@@ -217,6 +235,174 @@ public final class DiscV5Service implements AutoCloseable {
      */
     public int liveNodeCount() {
         return system == null ? 0 : (int) system.streamLiveNodes().count();
+    }
+
+    // -------------------------------------------------------------------------
+    // Targeted lookups (#347) — walk TOWARD the pinned servers
+    // -------------------------------------------------------------------------
+
+    /** Queries per walk round (Kademlia α). */
+    private static final int WALK_ALPHA = 3;
+    /** Rounds per walk before giving up (each round queries α nodes). */
+    private static final int WALK_MAX_ROUNDS = 4;
+    /** Per-query answer budget; a silent node must not stall the walk. */
+    private static final long WALK_QUERY_TIMEOUT_MS = 3_000;
+    /** Pause between opening-pass walks (each pinned id once, quickly). */
+    private static final long WALK_OPENING_GAP_MS = 2_000;
+    /** Pause between steady-state revisits (round-robin, one per gap). */
+    private static final long WALK_REVISIT_GAP_MS = 60_000;
+
+    private Thread walker;
+    /** Closest records learned per target, carried across revisits so each
+     *  walk resumes from the best-known frontier instead of the bootnodes.
+     *  Walker-thread only. */
+    private final java.util.Map<org.apache.tuweni.bytes.Bytes, List<NodeRecord>> learnedFrontier =
+            new java.util.HashMap<>();
+
+    /**
+     * Milliseconds to sleep after the {@code completedWalks}-th walk. The first
+     * {@code nTargets} walks are the OPENING PASS — each pinned id visited once,
+     * near back-to-back, so a wallet finds its servers in the first minute even
+     * on the mainnet DHT — then revisits go round-robin at a polite cadence
+     * (the revisit is what heals a stale pinned address after the server
+     * republishes). Package-private for tests.
+     */
+    static long walkDelayMs(int completedWalks, int nTargets) {
+        return completedWalks < nTargets ? WALK_OPENING_GAP_MS : WALK_REVISIT_GAP_MS;
+    }
+
+    private void startWalker() {
+        if (pinnedNodeIds.isEmpty()) {
+            return;
+        }
+        walker = new Thread(() -> {
+            int i = 0;
+            while (!Thread.currentThread().isInterrupted()) {
+                org.apache.tuweni.bytes.Bytes target = pinnedNodeIds.get(i % pinnedNodeIds.size());
+                try {
+                    targetedWalk(target);
+                } catch (Throwable e) {
+                    // Throwable, not Exception: a linkage error on the walker
+                    // thread would otherwise kill it with no trace, and the
+                    // walker never logging again reads as "working, no finds".
+                    log.warn("[discv5] targeted walk failed: {}", e.toString());
+                }
+                try {
+                    Thread.sleep(walkDelayMs(i, pinnedNodeIds.size()));
+                } catch (InterruptedException gone) {
+                    return;
+                }
+                i++;
+            }
+        }, "discv5-target");
+        walker.setDaemon(true);
+        walker.start();
+    }
+
+    /**
+     * One bounded iterative Kademlia walk toward {@code target}: query the α
+     * closest known nodes for the target's bucket (±1), merge what they return,
+     * repeat while progress is made. Runs entirely on the walker thread;
+     * queries are sequential with a short timeout each, so a full walk is
+     * bounded at roughly {@code WALK_MAX_ROUNDS × α × timeout}.
+     *
+     * <p>A found record is handed to the poll scheduler for emission, so the
+     * seen-set and the caller's consumer stay single-threaded. Re-notification
+     * semantics come free from the existing dedupe: the seen-set keys on the
+     * full ENR string, so a REPUBLISHED record (new seq, new address) is a new
+     * string and re-emits, while the same record stays deduped — the Java
+     * equivalent of the Rust engine's seq gate. The pool side is naturally
+     * name-wins: {@code addPeer} only ever ADDS a new multiaddr entry; the
+     * configured {@code /dns4} pin is never overwritten (parity contract,
+     * #347/#348 review).
+     */
+    private void targetedWalk(org.apache.tuweni.bytes.Bytes target) {
+        java.util.Comparator<NodeRecord> byDistance = java.util.Comparator.comparing(
+                nr -> org.ethereum.beacon.discovery.util.Functions.distance(target, nr.getNodeId()));
+        java.util.Map<org.apache.tuweni.bytes.Bytes, NodeRecord> frontier = new java.util.HashMap<>();
+        system.streamLiveNodes().forEach(nr -> frontier.put(nr.getNodeId(), nr));
+        for (NodeRecord nr : learnedFrontier.getOrDefault(target, List.of())) {
+            frontier.putIfAbsent(nr.getNodeId(), nr);
+        }
+        Set<org.apache.tuweni.bytes.Bytes> queried = new HashSet<>();
+
+        for (int round = 0; round < WALK_MAX_ROUNDS; round++) {
+            List<NodeRecord> candidates = frontier.values().stream()
+                    .filter(nr -> !queried.contains(nr.getNodeId()))
+                    .sorted(byDistance)
+                    .limit(WALK_ALPHA)
+                    .toList();
+            if (candidates.isEmpty()) {
+                break;
+            }
+            boolean progressed = false;
+            for (NodeRecord candidate : candidates) {
+                queried.add(candidate.getNodeId());
+                int d = org.ethereum.beacon.discovery.util.Functions.logDistance(
+                        candidate.getNodeId(), target);
+                List<Integer> distances = java.util.stream.IntStream.of(d - 1, d, d + 1)
+                        .filter(x -> x >= 1 && x <= 256).distinct().boxed().toList();
+                java.util.Collection<NodeRecord> answers;
+                try {
+                    answers = system.findNodes(candidate, distances)
+                            .get(WALK_QUERY_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                } catch (Exception unresponsive) {
+                    continue;
+                }
+                for (NodeRecord nr : answers) {
+                    if (nr.getNodeId().equals(target)) {
+                        log.info("[discv5] targeted walk toward {}… : FOUND (round={} seq={})",
+                                target.slice(0, 4), round, nr.getSeq());
+                        emitFromWalker(nr);
+                        rememberFrontier(target, frontier.values(), byDistance);
+                        return;
+                    }
+                    if (frontier.putIfAbsent(nr.getNodeId(), nr) == null) {
+                        progressed = true;
+                    }
+                }
+            }
+            if (!progressed) {
+                break; // converged without finding — record not propagated (yet)
+            }
+        }
+        rememberFrontier(target, frontier.values(), byDistance);
+        // One line per completed walk, kept at INFO deliberately: with the
+        // found-path logging living behind the emit dedupe, a silent walker is
+        // indistinguishable from a dead one (observed on the first live run).
+        log.info("[discv5] targeted walk toward {}… : not found (queried={} frontier={})",
+                target.slice(0, 4), queried.size(), frontier.size());
+    }
+
+    /** Keep the closest few learned records so the next revisit resumes there. */
+    private void rememberFrontier(org.apache.tuweni.bytes.Bytes target,
+                                  java.util.Collection<NodeRecord> frontier,
+                                  java.util.Comparator<NodeRecord> byDistance) {
+        learnedFrontier.put(target,
+                frontier.stream().sorted(byDistance).limit(8).toList());
+    }
+
+    /** Marshal a walker-found record onto the poll thread: the seen-set and the
+     *  downstream consumer are single-threaded by design. */
+    private void emitFromWalker(NodeRecord nr) {
+        String enrStr = nr.asEnr();
+        ScheduledExecutorService s = scheduler;
+        if (s == null || s.isShutdown()) {
+            return;
+        }
+        s.execute(() -> {
+            if (!seenEnrs.add(enrStr)) {
+                return; // same record already surfaced (poll or earlier walk)
+            }
+            try {
+                Enr parsed = Enr.fromEnrString(enrStr);
+                log.info("[discv5] targeted lookup found pinned server (seq={}): {}",
+                        parsed.seq(), enrStr.substring(0, Math.min(40, enrStr.length())));
+                onPeerDiscovered.accept(parsed);
+            } catch (Exception e) {
+                log.warn("[discv5] failed to parse walked ENR: {}", e.getMessage());
+            }
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -334,6 +520,10 @@ public final class DiscV5Service implements AutoCloseable {
 
     @Override
     public void close() {
+        if (walker != null) {
+            walker.interrupt();
+            walker = null;
+        }
         if (scheduler != null) {
             scheduler.shutdownNow();
             scheduler = null;

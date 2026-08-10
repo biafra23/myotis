@@ -266,6 +266,52 @@ public final class Enr {
         return base58Encode(multihash);
     }
 
+    /**
+     * The discv5 node id a libp2p peer id will present — the REVERSE of
+     * {@link #derivePeerId}: base58 → identity multihash → libp2p crypto
+     * protobuf → compressed secp256k1 key → keccak256 of the uncompressed
+     * point's 64 coordinate bytes.
+     *
+     * <p>Works because secp256k1 peer ids are identity-multihashed (the 37-byte
+     * protobuf is ≤ 42, so the key travels inline), and roost signs its ENR
+     * with its libp2p host key — one key, two identities. This is what lets
+     * discovery walk the DHT <em>toward</em> a pinned server instead of hoping
+     * a random walk lands in its bucket. Empty for ids that don't inline a
+     * secp256k1 key (sha256-multihashed RSA/ed25519 ids can't be reversed).
+     */
+    public static Optional<Bytes> nodeIdForPeerId(String base58PeerId) {
+        try {
+            byte[] multihash = base58Decode(base58PeerId);
+            // identity multihash: code=0x00, length, payload
+            if (multihash.length < 2 || multihash[0] != 0x00
+                    || (multihash[1] & 0xFF) != multihash.length - 2) {
+                return Optional.empty();
+            }
+            // libp2p crypto protobuf: 0x08 <type> 0x12 <len> <key>; Secp256k1=2
+            byte[] pb = java.util.Arrays.copyOfRange(multihash, 2, multihash.length);
+            if (pb.length < 4 || pb[0] != 0x08 || pb[1] != 0x02 || pb[2] != 0x12
+                    || (pb[3] & 0xFF) != pb.length - 4) {
+                return Optional.empty();
+            }
+            byte[] compressed = java.util.Arrays.copyOfRange(pb, 4, pb.length);
+            org.bouncycastle.math.ec.ECPoint point =
+                org.bouncycastle.asn1.sec.SECNamedCurves.getByName("secp256k1")
+                    .getCurve().decodePoint(compressed);
+            byte[] uncompressed = point.getEncoded(false); // 0x04 || x || y
+            // BouncyCastle's lightweight digest, deliberately: tuweni's
+            // Hash.keccak256 goes through the JCA and throws unless the BC
+            // PROVIDER happens to be registered by some earlier caller.
+            org.bouncycastle.crypto.digests.KeccakDigest keccak =
+                new org.bouncycastle.crypto.digests.KeccakDigest(256);
+            keccak.update(uncompressed, 1, 64);
+            byte[] nodeId = new byte[32];
+            keccak.doFinal(nodeId, 0);
+            return Optional.of(Bytes.wrap(nodeId));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
     private static final String BASE58_ALPHABET =
             "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
@@ -291,6 +337,27 @@ public final class Enr {
 
         for (int i = 0; i < zeros; i++) sb.append('1');
         return sb.reverse().toString();
+    }
+
+    /** Inverse of {@link #base58Encode}; throws on characters outside the alphabet. */
+    static byte[] base58Decode(String input) {
+        BigInteger value = BigInteger.ZERO;
+        BigInteger fiftyEight = BigInteger.valueOf(58);
+        for (int i = 0; i < input.length(); i++) {
+            int digit = BASE58_ALPHABET.indexOf(input.charAt(i));
+            if (digit < 0) {
+                throw new IllegalArgumentException("not base58: '" + input.charAt(i) + "'");
+            }
+            value = value.multiply(fiftyEight).add(BigInteger.valueOf(digit));
+        }
+        int zeros = 0;
+        while (zeros < input.length() && input.charAt(zeros) == '1') zeros++;
+        byte[] num = value.equals(BigInteger.ZERO) ? new byte[0] : value.toByteArray();
+        // toByteArray may prepend a sign byte — strip it.
+        int start = (num.length > 0 && num[0] == 0) ? 1 : 0;
+        byte[] out = new byte[zeros + num.length - start];
+        System.arraycopy(num, start, out, zeros, num.length - start);
+        return out;
     }
 
     public long seq() { return seq; }

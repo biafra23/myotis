@@ -870,7 +870,20 @@ public final class ChainStack {
         List<byte[]> acceptedForkDigests = network.acceptedForkDigests();
         AtomicInteger mismatchesLogged = new AtomicInteger();
 
-        this.discV5 = new DiscV5Service(nodeKey, network.clDiscv5Bootnodes(), enr -> {
+        // Targeted lookups (#347): derive the discv5 node ids of the pinned CL
+        // peers from their libp2p peer ids (same key on both identities — the
+        // invariant roost maintains and the Rust engine's parity test pins), so
+        // discovery can walk TOWARD them instead of waiting on random-walk luck.
+        List<org.apache.tuweni.bytes.Bytes> pinnedNodeIds = network.clPeerMultiaddrs().stream()
+                .map(ma -> {
+                    int i = ma.lastIndexOf("/p2p/");
+                    return i < 0 ? null : ma.substring(i + "/p2p/".length());
+                })
+                .filter(java.util.Objects::nonNull)
+                .map(com.jaeckel.ethp2p.core.enr.Enr::nodeIdForPeerId)
+                .flatMap(java.util.Optional::stream)
+                .toList();
+        this.discV5 = new DiscV5Service(nodeKey, network.clDiscv5Bootnodes(), pinnedNodeIds, enr -> {
             var eth2 = enr.eth2();
             if (eth2.isEmpty()) return;
             byte[] peerDigest = eth2.get().forkDigest();
