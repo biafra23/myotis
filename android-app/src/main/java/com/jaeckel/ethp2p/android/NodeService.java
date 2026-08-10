@@ -1645,11 +1645,13 @@ public final class NodeService extends Service {
                 // finished. Overwriting the old run's stamps here also keeps a mid-boot
                 // snapshot from showing the old run's uptime (plus downtime); it reads
                 // the seconds since this boot began instead. The same stamps give the
-                // fresh stack its full idle window and start the sync-run ceiling; every
-                // bail path below runs forgetStack, which removes them again. Stamped
-                // INSIDE the bootLock: written outside it, a racing stopNetwork's
-                // forgetStack could remove them first and have these puts leak them
-                // back for a dead network.
+                // fresh stack its full idle window and start the sync-run ceiling. The
+                // bail paths below run forgetStack, which removes them again (the catch
+                // handles the threw-before-publish case itself); a stopNetwork racing
+                // this boot may remove them concurrently (its forgetStack runs without
+                // the bootLock) — harmless: nothing below re-puts them, and the
+                // stop-generation re-check after start() runs forgetStack under this
+                // lock hold, tearing down whatever this boot published.
                 stackStartMs.put(n, System.currentTimeMillis());
                 stackStartNano.put(n, System.nanoTime());   // monotonic clock for the sync-run ceiling
                 // Apply the Settings served-block window (before start(), so the very first
@@ -1700,6 +1702,15 @@ public final class NodeService extends Service {
                     if (created != null && ENGINE.get(n) == created) {
                         try { ENGINE.stop(n); } catch (Throwable ignored) {}
                     }
+                } else if (created != null && current == null) {
+                    // This attempt stamped (the stamps land right after create()) but
+                    // threw before publishing its handle. forgetStack would over-reach
+                    // here — the guard above deliberately spares bookkeeping that isn't
+                    // provably this attempt's — but the boot stamps ARE ours: left
+                    // behind, a later boot's "already hosted" recovery would render an
+                    // uptime counting from this failed attempt.
+                    stackStartMs.remove(n);
+                    stackStartNano.remove(n);
                 }
             }
             // service-stop check happens in the boot worker's finally, after the in-flight count drops
@@ -1805,9 +1816,9 @@ public final class NodeService extends Service {
         // deliberately NOT cleared here (it's static, per-network, and owned by boots): a
         // whole-service stop may leave stale entries, but they're invisible — handles was
         // cleared above so no snapshot is rendered — and the next boot of each network
-        // removes its stamp before publishing the handle, then re-stamps after start()
-        // succeeds. Clearing here would race a quick Stop->Start's fresh boot (the old
-        // service-global startTimeMs had exactly that clobber bug).
+        // overwrite-stamps its entry before publishing the handle. Clearing here would
+        // race a quick Stop->Start's fresh boot (the old service-global startTimeMs had
+        // exactly that clobber bug).
         reachedSynced.clear();
         LogBuffer.i(TAG, "node shutdown complete");
     }

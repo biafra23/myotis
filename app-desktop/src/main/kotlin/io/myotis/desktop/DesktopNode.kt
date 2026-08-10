@@ -151,20 +151,22 @@ class DesktopNodeController(
                     dropNetwork(canonical)
                     throw t
                 }
-                // Apply the Settings served-block window before start() (so the very first
-                // eth/69 Status advertises the configured size), reading the setting INSIDE
-                // servedWindowApplyLock: the Save fan-out takes the same lock, and create()
-                // above already made this handle visible to hostedNetworks() — so either the
-                // fan-out reaches this handle, or our read observes its already-persisted
-                // value. Without the pairing a Save landing between our read and apply
-                // would be overwritten, leaving the live window one Save behind settings.
-                synchronized(servedWindowApplyLock) {
-                    handle.setServedBlockWindow(settings.servedBlockWindow())
-                }
                 // start() is fault-isolated: false (resources closed) on failure rather than a
                 // throw. Either way, drop the network so a later enable can retry — leaving a
-                // dead entry would report "running" forever and block retries.
+                // dead entry would report "running" forever and block retries. The served-window
+                // apply shares the try: a throw there would otherwise leave a registered-but-
+                // never-started network behind, uptime stamp included.
                 val ok = try {
+                    // Apply the Settings served-block window before start() (so the very first
+                    // eth/69 Status advertises the configured size), reading the setting INSIDE
+                    // servedWindowApplyLock: the Save fan-out takes the same lock, and create()
+                    // above already made this handle visible to hostedNetworks() — so either the
+                    // fan-out reaches this handle, or our read observes its already-persisted
+                    // value. Without the pairing a Save landing between our read and apply
+                    // would be overwritten, leaving the live window one Save behind settings.
+                    synchronized(servedWindowApplyLock) {
+                        handle.setServedBlockWindow(settings.servedBlockWindow())
+                    }
                     handle.start()
                 } catch (t: Throwable) {
                     dropNetwork(canonical)

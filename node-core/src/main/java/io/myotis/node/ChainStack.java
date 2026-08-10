@@ -311,8 +311,9 @@ public final class ChainStack {
             // Anchor uptime only after a fully successful start (a failed start below tears
             // the stack down via shutdown(), which clears `started` so a later start
             // re-anchors) — but anchor it TO the entry stamp, so the boot itself counts.
-            // The serve counters share the same epoch: reset here (first start and any
-            // start-after-shutdown), never on pause/resume — matching uptime exactly.
+            // The serve counters reset at the same anchor (first start and any
+            // start-after-shutdown), never on pause/resume — one epoch per run, though
+            // theirs starts a boot-duration after uptime's entry stamp.
             if (!started) { startedAtNs = startRequestNs; started = true; serveStats.reset(); }
             return true;
         } catch (Throwable t) {
