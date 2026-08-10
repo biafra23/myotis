@@ -819,8 +819,31 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
 
     data class Hdr(val base: String, val slot: Long, val root: String)
 
+    // An explicit target period anchors at that period's FIRST slot instead of at
+    // head. Anchoring at head is wrong for this deployment: roost's archive only
+    // grows FORWARD, so an anchor at the newest period leaves a wallet nothing to
+    // walk and goes stale the moment the period rolls. The useful anchor is
+    // roost's FLOOR — the oldest period it can still serve.
+    //
+    // A period's first slot may be SKIPPED (no block proposed), which the beacon
+    // API answers with 404, so walk forward until a block exists. Bounded at one
+    // epoch: past that the chain has bigger problems, and failing loudly beats
+    // anchoring somewhere unintended.
+    val targetPeriod = (project.findProperty("period") as String?)?.toLong()
+    val pinnedSlot: Long? = targetPeriod?.let { p ->
+        val first = p * slotsPerPeriod
+        (first until first + 32).firstOrNull { slot ->
+            endpoints.any { base -> fetch("$base/eth/v1/beacon/headers/$slot") != null }
+        } ?: throw GradleException(
+            "[refresh:$net] no block in slots $first..${first + 31} for period $p")
+    }
+    if (pinnedSlot != null) {
+        logger.lifecycle("[refresh:$net] pinning period $targetPeriod → slot $pinnedSlot")
+    }
+
     val probed = endpoints.mapNotNull { base ->
-        val body = fetch("$base/eth/v1/beacon/headers/finalized") ?: return@mapNotNull null
+        val path = if (pinnedSlot != null) "$pinnedSlot" else "finalized"
+        val body = fetch("$base/eth/v1/beacon/headers/$path") ?: return@mapNotNull null
         val slot = slotRe.find(body)?.groupValues?.get(1)?.toLong()
         val root = rootRe.find(body)?.groupValues?.get(2)?.lowercase()
         if (slot == null || root == null) {
