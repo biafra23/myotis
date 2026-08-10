@@ -47,8 +47,8 @@ impl EnrSeq {
     }
 
     /// The last issued number. Callers publishing a record want [`Self::bump`]
-    /// instead — see its note on ordering.
-    #[allow(dead_code)] // used by tests and by the publish step
+    /// instead — see its note on ordering. `serve` reads this only for the
+    /// initial, endpoint-less (unpublished) record.
     pub fn current(&self) -> u64 {
         self.current
     }

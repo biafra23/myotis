@@ -16,6 +16,11 @@
 //!
 //! The libp2p host itself is `myotis-net`'s, unmodified — one protocol stack,
 //! not two. The only thing this crate adds is a responder to plug into it.
+//!
+//! On top of those, the daemon joins the discv5 DHT and — gated on a confirmed
+//! routable address — publishes its ENR so wallets can DISCOVER it instead of
+//! being pointed at it (#335). See [`start_discovery`] and
+//! [`desired_publication`] for the two halves and their refusals.
 
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -24,6 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use myotis_net::discovery::{spawn_server, ServerDiscovery, ServerDiscoveryConfig};
 use myotis_net::identity::Keypair;
 use myotis_net::multiaddr::Protocol;
 use myotis_net::reqresp::{
@@ -34,6 +40,7 @@ use myotis_net::{Multiaddr, PeerId};
 use myotis_net::status::StatusMessage;
 
 use crate::archive::Archive;
+use crate::enr::EnrSeq;
 use crate::framing::split_updates;
 use crate::forks::ForkSchedule;
 use crate::rest::{ChainParams, FetchError, NimbusRest};
@@ -355,11 +362,17 @@ async fn fill_periods(
 }
 
 /// Run the daemon until Ctrl-C.
+///
+/// `publish_enr` gates the discv5 record publication (#335): `false` runs the
+/// deliberate first deployment step — join the DHT, populate the table, be
+/// pingable, publish nothing — so an operator can verify participation before
+/// a single wallet can discover the node.
 pub async fn serve(
     rest_base: &str,
     archive_path: &Path,
     key_path: Option<PathBuf>,
     port: u16,
+    publish_enr: bool,
 ) -> Result<()> {
     let client = NimbusRest::new(rest_base, Duration::from_secs(30))?;
     let gvr = client.genesis_validators_root().await?;
@@ -381,7 +394,7 @@ pub async fn serve(
     }
 
     // Initial fill, so the server is useful the moment it starts listening.
-    let (head_slot, _) = client.syncing().await?;
+    let (head_slot, mut upstream_syncing) = client.syncing().await?;
     let head_period = params.period_of_slot(head_slot);
     // Everything from here to `start_host_with` is BEST EFFORT. Startup must not
     // be able to fail on a transient upstream condition: at a period rollover
@@ -443,11 +456,33 @@ pub async fn serve(
         HostConfig {
             listen,
             max_established_incoming: Some(MAX_INBOUND),
-            keypair: Some(keypair),
+            keypair: Some(keypair.clone()),
             lc_responder: Some(store.clone()),
         },
     )
     .map_err(|e| anyhow!("starting the libp2p host: {e}"))?;
+
+    // The persisted sequence-number discipline (enr.rs): a corrupt file
+    // refuses to load, and what must stop in that case is PUBLICATION, not
+    // serving — so the failure narrows discovery to join-only rather than
+    // taking the daemon down.
+    let mut enr_seq = match EnrSeq::load(archive_path.with_extension("enrseq")) {
+        Ok(seq) => Some(seq),
+        Err(e) => {
+            tracing::error!(error = %e,
+                "ENR sequence file unusable — the record will NOT be published this run; \
+                 repair the file (a bare decimal number) and restart");
+            None
+        }
+    };
+    let discovery = start_discovery(
+        &client,
+        &gvr,
+        &keypair,
+        port,
+        enr_seq.as_ref().map(EnrSeq::current).unwrap_or(1),
+    )
+    .await;
 
     let c = store.coverage();
     println!("\n== serving ==");
@@ -466,11 +501,34 @@ pub async fn serve(
         digests.source()
     );
     println!("  inbound   cap {MAX_INBOUND}");
+    match &discovery {
+        Some(d) => {
+            println!("  discv5    udp/{port}, node id {}", d.local_enr().node_id());
+            println!(
+                "            {}",
+                if !publish_enr {
+                    "join-only (--no-publish): the record will not be published"
+                } else if enr_seq.is_some() {
+                    "record publication gated on a confirmed routable address"
+                } else {
+                    "join-only: the ENR sequence file is unusable (see the log)"
+                }
+            );
+        }
+        None => println!("  discv5    off (failed to start) — wallets cannot discover this node"),
+    }
     println!("\n  point a wallet at the loopback address above; Ctrl-C to stop.\n");
 
     let mut digests = digests;
     let mut external: Option<ExternalAddress> = None;
     let mut upstream_ip: Option<IpAddr> = None;
+    // What the published record currently advertises. None until the first
+    // publish of this run; a restart always re-publishes once (with a bumped
+    // sequence number), which is what re-asserts the record after downtime.
+    let mut published: Option<(IpAddr, [u8; 16])> = None;
+    // The last logged publication refusal, so a steady state logs once rather
+    // than every tick.
+    let mut publish_refusal: Option<&'static str> = None;
     let mut swarm_task = swarm_task;
     let mut ticks: u32 = 0;
     let mut ticker = tokio::time::interval(REFRESH);
@@ -544,7 +602,10 @@ pub async fn serve(
                 // the code this replaced, where a failed poll warned and carried
                 // on.
                 let head_slot = match client.syncing().await {
-                    Ok((slot, _)) => slot,
+                    Ok((slot, syncing)) => {
+                        upstream_syncing = syncing;
+                        slot
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e,
                             "polling head slot failed — continuing with the last known head");
@@ -613,9 +674,15 @@ pub async fn serve(
                 // is precisely the behaviour that gets a node scored down, and
                 // roost of all things should not be doing it.
                 //
-                // So it runs only when the upstream cannot answer — a Nimbus
-                // that has not yet discovered its own address, or is down.
-                if upstream_ip.is_none() && ticks.is_multiple_of(OBSERVE_TICKS) {
+                // So it runs only when the upstream cannot answer WITH AN
+                // ADDRESS THE RECORD CAN USE — none at all (a Nimbus that has
+                // not yet discovered its own address, or is down), or a
+                // v6-only one, which the v4-only listener cannot advertise.
+                // Without the second case a dual-stack upstream that settled
+                // on v6 would suppress the only mechanism able to confirm the
+                // v4 address, and publication would silently never happen.
+                let upstream_v4 = upstream_ip.is_some_and(|ip| ip.is_ipv4());
+                if !upstream_v4 && ticks.is_multiple_of(OBSERVE_TICKS) {
                     probe_external(&client, &net).await;
                 }
 
@@ -625,25 +692,34 @@ pub async fn serve(
                 // observed: Identify reports the remote address of the
                 // connection, which for a connection we dialed carries an
                 // ephemeral source port. That is correct for the pinned
-                // deployment, where the router forwards the same port — but a
-                // NAT rewriting the port would make the advertised multiaddr
-                // wrong in a way this cannot detect. Worth revisiting when the
-                // ENR lands, where the port is published rather than logged.
+                // deployment, where the router forwards the same port. A NAT
+                // rewriting the port IS detectable — inbound reporters see the
+                // externally mapped one (`ExternalAddress::port`) — and
+                // `desired_publication` refuses to publish on that evidence;
+                // here it only shapes the logged multiaddr.
                 //
                 // The deployment sits on a residential line whose public IP is
                 // not guaranteed stable, so this is not a startup question that
-                // gets answered once. It matters most for the ENR that is not
-                // published yet: a record carrying a dead IP is WORSE than no
-                // record, because wallets discover it, dial, fail, and spend
-                // their three strikes to eviction on a node that is actually
-                // healthy — taking the tokens that made it worth keeping. Until
-                // the ENR exists, this reports the dialable address and makes a
-                // change visible rather than silent.
-                // A `None` here is not an error and deliberately does nothing:
-                // below quorum simply means too few peers have reported yet, and
-                // keeping the last known answer beats oscillating to "unknown"
-                // every time a peer disconnects.
-                if let Some(seen) = net.external_address().await {
+                // gets answered once. It is one of the two confirmed-address
+                // sources the ENR publication below draws from (the fallback
+                // one), because a record carrying a dead IP is WORSE than no
+                // record: wallets discover it, dial, fail, and spend their
+                // three strikes to eviction on a node that is actually
+                // healthy — taking the tokens that made it worth keeping.
+                // A `None` here is not an error and deliberately does nothing
+                // TO THE LOG STATE: below quorum simply means too few peers
+                // have reported yet, and keeping the last known answer beats
+                // oscillating to "unknown" every time a peer disconnects. That
+                // rationale is for LOGGING only — the tick's live reading is
+                // captured separately because publication must not act on a
+                // frozen one: observations drop with their connections, so
+                // `external` can hold an address the quorum stopped vouching
+                // for long ago, and a record published from it points at
+                // whatever the line's IP was back then. A below-quorum tick
+                // merely refuses a NEW publish; it never retracts a published
+                // record, so using the live value costs no flapping.
+                let quorum_now = net.external_address().await;
+                if let Some(seen) = quorum_now {
                     let advertised = dialable(&seen, port, peer_id);
                     let changed = external.map(|p: ExternalAddress| p.ip != seen.ip);
                     match changed {
@@ -680,12 +756,94 @@ pub async fn serve(
                                 confirmations = seen.confirmations, reporters = seen.reporters,
                                 multiaddr = %advertised,
                                 "EXTERNAL ADDRESS CHANGED — anything pinning the old one is now \
-                                 dialling a dead address; the ENR will need re-publishing with a \
-                                 bumped sequence number once it exists"
+                                 dialling a dead address; the ENR re-publishes automatically with \
+                                 a bumped sequence number once the new address is confirmed"
                             );
                             external = Some(seen);
                         }
                         Some(false) => external = Some(seen),
+                    }
+                }
+
+                // ENR publication (#335). The record follows the CONFIRMED view
+                // of this node — address and ENRForkID — and any change
+                // re-publishes with a bumped, PERSISTED-FIRST sequence number.
+                // That covers the two triggers the issue names: an endpoint
+                // change (a residential IP moved) and an eth2 change (a fork or
+                // BPO boundary crossed, or a schedule refresh after a client
+                // upgrade). Nothing here can take serving down: a failed bump
+                // or publish is logged and retried next tick, because
+                // `published` only advances on success.
+                if let Some(d) = &discovery {
+                    let eth2 = digests
+                        .schedule
+                        .as_ref()
+                        .map(|s| s.enr_fork_id(params.epoch_of_slot(head_slot)));
+                    match desired_publication(
+                        publish_enr && enr_seq.is_some(),
+                        upstream_syncing,
+                        upstream_ip,
+                        quorum_now.as_ref(),
+                        eth2,
+                        port,
+                    ) {
+                        Ok((ip, eth2)) => {
+                            publish_refusal = None;
+                            if published != Some((ip, eth2)) {
+                                // enr_seq is Some here — publish_enabled above
+                                // includes enr_seq.is_some() — but a serving
+                                // daemon does not panic on a can't-happen; it
+                                // refuses loudly and keeps serving.
+                                let Some(seq) = enr_seq.as_mut() else {
+                                    tracing::error!(
+                                        "BUG: publication gates passed without a usable sequence file"
+                                    );
+                                    continue;
+                                };
+                                // Persist BEFORE use — EnrSeq's contract. A
+                                // number consumed by a failed publish stays
+                                // consumed; gaps are harmless, reuse is not.
+                                match seq.bump() {
+                                    Ok(n) => match d.publish(n, ip, port, port, eth2) {
+                                        Ok(record) => {
+                                            tracing::info!(
+                                                seq = n, %ip, port,
+                                                eth2 = %hex::encode(eth2),
+                                                republished = published.is_some(),
+                                                enr = %record,
+                                                "ENR published — wallets can now discover this node"
+                                            );
+                                            published = Some((ip, eth2));
+                                        }
+                                        Err(e) => tracing::error!(error = %e, seq = n,
+                                            "publishing the ENR failed"),
+                                    },
+                                    Err(e) => tracing::error!(error = %e,
+                                        "bumping the ENR sequence number failed — not publishing"),
+                                }
+                            }
+                        }
+                        // Logged on CHANGE, not every tick: the steady states
+                        // ("--no-publish", "waiting for an address") would
+                        // otherwise print five times a minute forever.
+                        Err(reason) => {
+                            if publish_refusal != Some(reason) {
+                                tracing::info!(reason, "ENR not published");
+                                publish_refusal = Some(reason);
+                            }
+                        }
+                    }
+                    if ticks.is_multiple_of(SCHEDULE_REFRESH_TICKS) {
+                        // The join-health numbers step 1 asks operators to
+                        // watch: a table that stays at 0 means the node never
+                        // joined, and a published record on top of that is a
+                        // record nobody can have learned.
+                        tracing::info!(
+                            table = d.table_entries(),
+                            live = d.connected_peers(),
+                            published = published.is_some(),
+                            "discv5 health"
+                        );
                     }
                 }
 
@@ -702,6 +860,136 @@ pub async fn serve(
             }
         }
     }
+}
+
+/// Join the discv5 DHT (#335 step 1): bind UDP on the SAME port number as the
+/// TCP listener, seed the table, participate. Publishes nothing — that is
+/// [`desired_publication`]'s gate plus [`ServerDiscovery::publish`] in the
+/// tick loop.
+///
+/// Seeds are the upstream's own ENR first — live, chain-appropriate, and on
+/// this very host, so joining works even on the day the shipped list has
+/// rotted — then the wallet build's bootstrap ENRs for this chain, matched by
+/// `genesis_validators_root` so this stays ONE list per network (the one in
+/// `myotis-net`), not a second one rotting on roost's schedule.
+///
+/// Best effort: discv5 is non-essential here exactly as it is in the Java
+/// daemon. A node that cannot join the DHT still serves every wallet that
+/// finds it another way, so a failure warns and returns None rather than
+/// taking the daemon down.
+async fn start_discovery(
+    client: &NimbusRest,
+    gvr: &[u8; 32],
+    keypair: &Keypair,
+    udp_port: u16,
+    initial_seq: u64,
+) -> Option<ServerDiscovery> {
+    let mut seeds: Vec<String> = Vec::new();
+    match client.identity_enr().await {
+        Ok(enr) => seeds.push(enr),
+        Err(e) => tracing::debug!(error = %e, "upstream identity ENR unavailable for seeding"),
+    }
+    match myotis_net::ChainConfig::for_genesis(gvr) {
+        Some(chain) => seeds.extend(chain.bootstrap_enrs),
+        None => tracing::warn!(
+            "chain not in the shipped config — discv5 seeded from the upstream's own ENR only"
+        ),
+    }
+    match spawn_server(ServerDiscoveryConfig {
+        keypair: keypair.clone(),
+        initial_seq,
+        udp_port,
+        bootstrap_enrs: seeds,
+    })
+    .await
+    {
+        Ok(d) => Some(d),
+        Err(e) => {
+            tracing::warn!(error = %e, "discv5 failed to start — serving without discovery");
+            None
+        }
+    }
+}
+
+/// The `(address, eth2)` pair the published record should currently carry, or
+/// the gate that refuses — returned as a reason rather than a bare None so the
+/// tick can LOG why publication is not happening. A node silently refusing to
+/// publish looks identical to one that has not gotten around to it, and the
+/// operator staring at `published=false` in the health line deserves the
+/// difference.
+///
+/// Every gate here is one of #335's explicit failure modes — each produces a
+/// node that LOOKS healthy while being useless, which is why they are refusals
+/// rather than best guesses:
+///
+/// - `publish_enabled` is off — `--no-publish` (deployment step 1: join,
+///   observe, publish nothing), or no usable sequence file, without which a
+///   re-issued number would make every later update invisible to the DHT.
+/// - a syncing upstream reports a head behind the real one, and a digest
+///   computed from it can be the PREVIOUS fork's — cached by wallets and only
+///   displaced by a higher-sequence record. The same refusal `roost enr` makes.
+/// - no schedule means no ENRForkID, and a record without the full 16-byte
+///   `eth2` field is malformed to standard clients — nothing to publish.
+/// - the address must be CONFIRMED — the upstream's discv5 view first, the
+///   Identify quorum as fallback (only when routable and uncontested) —
+///   and IPv4, because the libp2p listener binds `/ip4/0.0.0.0` only. An ENR
+///   carrying a dead or wrong address is WORSE than none: wallets discover it,
+///   dial, fail, and spend their three strikes to eviction on a node that is
+///   actually healthy. A v6-only upstream answer is unusable for the record,
+///   so it falls THROUGH to the quorum rather than suppressing it — a
+///   dual-stack host whose upstream settled on v6 can still be v4-reachable,
+///   and the quorum is the mechanism that can see that.
+/// - inbound reporters must not be seeing a DIFFERENT port than the one the
+///   record would carry. `ExternalAddress::port` is populated only from
+///   inbound connections, where the reporter's view is the externally mapped
+///   port — the one signal that makes a NAT port-rewrite detectable — so a
+///   disagreement is positive evidence the published `tcp4`/`udp4` fields
+///   would point somewhere nothing listens.
+///
+/// `quorum` must be the CURRENT tick's tally, not a kept-last-known copy: a
+/// below-quorum reading here only postpones a new publish (it never retracts
+/// a published record), while a frozen reading can "confirm" an address the
+/// reporters stopped vouching for long ago.
+fn desired_publication(
+    publish_enabled: bool,
+    upstream_syncing: bool,
+    upstream_ip: Option<IpAddr>,
+    quorum: Option<&ExternalAddress>,
+    eth2: Option<[u8; 16]>,
+    listen_port: u16,
+) -> Result<(IpAddr, [u8; 16]), &'static str> {
+    if !publish_enabled {
+        return Err("publication disabled (--no-publish, or an unusable sequence file)");
+    }
+    if upstream_syncing {
+        return Err("upstream is syncing — the fork digest computed from its head could be stale");
+    }
+    let eth2 = eth2.ok_or("no fork schedule — cannot build the 16-byte ENRForkID")?;
+    // Checked regardless of which source ends up naming the ADDRESS: the
+    // upstream shares this host's NAT, so inbound-port evidence against the
+    // configured port indicts the record either way.
+    if quorum.is_some_and(|seen| seen.port.is_some_and(|p| p != listen_port)) {
+        return Err(
+            "inbound reporters see a different port than the configured one — a NAT is \
+             rewriting the port and the record would advertise an endpoint nothing listens on",
+        );
+    }
+    let ip = upstream_ip
+        .filter(|ip| ip.is_ipv4())
+        .or_else(|| {
+            quorum
+                .filter(|seen| seen.routable && !seen.is_contested())
+                .map(|seen| seen.ip)
+        })
+        .ok_or("no confirmed v4 external address (upstream view or uncontested Identify quorum)")?;
+    // `upstream_external_ip` already filters for routability, but the quorum
+    // path's `routable` flag is a struct field a future refactor could fill
+    // differently — this is the last gate before a record exists, so it
+    // re-checks rather than trusts.
+    if !ip.is_ipv4() || !is_routable(ip) {
+        return Err("confirmed address is not a routable IPv4 one");
+    }
+    Ok((ip, eth2))
 }
 
 /// Dial a handful of the upstream's peers so somebody tells us our own address.
@@ -806,7 +1094,7 @@ async fn track_upstream_ip(
             tracing::warn!(old = %prev, new = %ip,
                 multiaddr = %format!("/ip4/{ip}/tcp/{port}/p2p/{peer_id}"),
                 "EXTERNAL ADDRESS CHANGED — anything pinning the old address can no longer \
-                 reach this server; update NetworkConfig (and re-publish the ENR once that exists)");
+                 reach this server; update NetworkConfig (the ENR re-publishes automatically)");
         }
         Some(_) => {}
     }
@@ -1108,6 +1396,130 @@ mod upstream_ip_tests {
         assert_eq!(
             upstream_external_ip(&addrs),
             Some("87.154.209.161".parse::<IpAddr>().unwrap())
+        );
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    const ETH2: [u8; 16] = [0x74, 0xd0, 0x14, 0x59, 7, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255];
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn quorum(ip_s: &str, confirmations: usize, reporters: usize, routable: bool) -> ExternalAddress {
+        ExternalAddress { ip: ip(ip_s), port: None, confirmations, reporters, routable }
+    }
+
+    #[test]
+    fn publishes_from_the_upstream_view_when_everything_is_confirmed() {
+        assert_eq!(
+            desired_publication(true, false, Some(ip("87.154.209.161")), None, Some(ETH2), 9105),
+            Ok((ip("87.154.209.161"), ETH2))
+        );
+    }
+
+    #[test]
+    fn no_publish_flag_and_syncing_upstream_both_refuse() {
+        let up = Some(ip("87.154.209.161"));
+        assert!(desired_publication(false, false, up, None, Some(ETH2), 9105).is_err());
+        // A syncing upstream's head can sit behind a fork boundary, and a
+        // record with the previous digest is invisible to exactly the
+        // clients it is for — the same refusal `roost enr` makes.
+        assert!(desired_publication(true, true, up, None, Some(ETH2), 9105).is_err());
+    }
+
+    #[test]
+    fn no_eth2_means_nothing_to_publish() {
+        // A record without the full ENRForkID is malformed to standard
+        // clients, so a missing schedule refuses rather than half-fills.
+        assert!(desired_publication(true, false, Some(ip("87.154.209.161")), None, None, 9105).is_err());
+    }
+
+    #[test]
+    fn quorum_is_the_fallback_and_its_gates_hold() {
+        // Upstream answer wins over a disagreeing quorum: it is the primary.
+        let q = quorum("54.157.213.0", 3, 3, true);
+        assert_eq!(
+            desired_publication(true, false, Some(ip("87.154.209.161")), Some(&q), Some(ETH2), 9105),
+            Ok((ip("87.154.209.161"), ETH2))
+        );
+        // No upstream: a clean quorum reading publishes.
+        assert_eq!(
+            desired_publication(true, false, None, Some(&q), Some(ETH2), 9105),
+            Ok((ip("54.157.213.0"), ETH2))
+        );
+        // Contested (winner at half the reporters or fewer): both a Sybil and
+        // a genuine mid-change look like this — wait, don't publish.
+        let contested = quorum("54.157.213.0", 3, 6, true);
+        assert!(desired_publication(true, false, None, Some(&contested), Some(ETH2), 9105).is_err());
+        // Non-routable quorum winner: publishing an RFC1918 address is the
+        // exact failure the gate exists to prevent.
+        let lan = quorum("192.168.178.74", 3, 3, false);
+        assert!(desired_publication(true, false, None, Some(&lan), Some(ETH2), 9105).is_err());
+        // And the re-check catches a routable FLAG on a non-routable address.
+        let lying = quorum("10.0.0.5", 3, 3, true);
+        assert!(desired_publication(true, false, None, Some(&lying), Some(ETH2), 9105).is_err());
+    }
+
+    #[test]
+    fn a_v6_only_upstream_answer_falls_through_to_the_quorum() {
+        // `serve` listens on /ip4/0.0.0.0 only, so a v6 record would
+        // advertise an endpoint nothing is listening on — refuse when v6 is
+        // all there is...
+        let v6 = Some(ip("2003:fb:ef3a:2300:788a:d7bf:513e:223"));
+        assert!(desired_publication(true, false, v6, None, Some(ETH2), 9105).is_err());
+        // ...but a dual-stack host whose upstream settled on v6 can still be
+        // v4-reachable, and the quorum is the mechanism that can see that. A
+        // v6 primary answer must not suppress it.
+        let q = quorum("54.157.213.0", 3, 3, true);
+        assert_eq!(
+            desired_publication(true, false, v6, Some(&q), Some(ETH2), 9105),
+            Ok((ip("54.157.213.0"), ETH2))
+        );
+    }
+
+    #[test]
+    fn no_confirmed_address_means_no_record() {
+        assert!(desired_publication(true, false, None, None, Some(ETH2), 9105).is_err());
+    }
+
+    #[test]
+    fn an_observed_port_rewrite_refuses_publication() {
+        // `ExternalAddress::port` is filled only from INBOUND connections,
+        // where the reporter's view is the externally mapped port — the one
+        // signal that makes a NAT port-rewrite detectable. When it disagrees
+        // with the configured port, the record's tcp4/udp4 would point at an
+        // endpoint nothing listens on, so publication refuses.
+        let rewritten = ExternalAddress {
+            ip: ip("54.157.213.0"),
+            port: Some(9106),
+            confirmations: 3,
+            reporters: 3,
+            routable: true,
+        };
+        // ...on the quorum path,
+        assert!(desired_publication(true, false, None, Some(&rewritten), Some(ETH2), 9105).is_err());
+        // ...and on the upstream path too — the upstream shares this host's
+        // NAT, so the inbound-port evidence indicts the record either way.
+        assert!(desired_publication(
+            true, false, Some(ip("87.154.209.161")), Some(&rewritten), Some(ETH2), 9105
+        )
+        .is_err());
+        // An AGREEING observed port publishes.
+        let agreeing = ExternalAddress { port: Some(9105), ..rewritten };
+        assert_eq!(
+            desired_publication(true, false, None, Some(&agreeing), Some(ETH2), 9105),
+            Ok((ip("54.157.213.0"), ETH2))
+        );
+        // And outbound-only observations (port: None) carry no evidence.
+        let outbound_only = ExternalAddress { port: None, ..rewritten };
+        assert_eq!(
+            desired_publication(true, false, None, Some(&outbound_only), Some(ETH2), 9105),
+            Ok((ip("54.157.213.0"), ETH2))
         );
     }
 }

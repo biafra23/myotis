@@ -17,11 +17,17 @@ StartLimitIntervalSec=0
 [Service]
 User=roost
 EnvironmentFile=/etc/myotis/roost-%i.env
+# $ROOST_EXTRA_ARGS is unbraced ON PURPOSE: systemd word-splits `$VAR` and
+# passes `${VAR}` as a single argument, and this carries whole flags —
+# the installer seeds it with --no-publish (deployment step 1: join the
+# discv5 DHT, verify UDP reachability, publish nothing). Clear it in the
+# env file to let the ENR publish (#335).
 ExecStart=/usr/local/bin/roost serve \
   --rest http://127.0.0.1:${ROOST_UPSTREAM_REST} \
   --archive /data/roost/%i.db \
   --key /data/roost/%i.key \
-  --port ${ROOST_PORT}
+  --port ${ROOST_PORT} \
+  $ROOST_EXTRA_ARGS
 Restart=on-failure
 RestartSec=5
 # Explicit per docs/lc-server-design.md §8: the shell default is 2048 and roost's

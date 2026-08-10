@@ -24,10 +24,13 @@ mkdir -p /data/roost
 chown -R roost:roost /data/roost
 chmod 750 /data/roost
 
-# Firewall. NOTE: also forward 9105 tcp on the router — and 9105 udp as well
-# once discv5 is published, which it is not yet.
+# Firewall. NOTE: also forward 9105 tcp AND 9105 udp on the router — serve
+# binds discv5 on the same port number over UDP, and without the UDP forward
+# no peer can complete the endpoint proof back to us, so a published record
+# points at a dead UDP endpoint (README §Ports).
 if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
   ufw allow ${PORT}/tcp
+  ufw allow ${PORT}/udp
 fi
 
 # --- install ---

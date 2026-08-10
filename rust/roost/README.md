@@ -38,7 +38,7 @@ own decision, per the carve-out.
 | `archive.rs` | Durable append-only archive (magic, version, per-record checksum), bound to a chain by `genesis_validators_root`. Repairs a torn tail; scans past a corrupt record instead of losing what follows. |
 | `forks.rs` | Fork and blob schedule read from the upstream, and the fork digest for any slot. |
 | `enr.rs` | Persisted, monotonic ENR sequence number. |
-| `serve.rs` | The daemon: persisted identity, chain-view poller behind `status`, per-slot refresh, new-period archiving, background bootstrap filler, external-address tracking. |
+| `serve.rs` | The daemon: persisted identity, chain-view poller behind `status`, per-slot refresh, new-period archiving, background bootstrap filler, external-address tracking, discv5 (join + gated ENR publication, #335). |
 
 A **Rust-engine** myotis wallet bootstraps and stays synced from roost alone —
 verified on sepolia with discovery disabled, so it cannot have been another
@@ -55,26 +55,38 @@ a bootstrap is stamped for the slot of the block it anchors to; the per-slot
 objects use head. `roost probe` checks the computed value against the one the
 upstream actually put on the wire.
 
-**The external address comes from the UPSTREAM, and is not published.** roost
+**The external address comes from the UPSTREAM, and gates publication.** roost
 reads Nimbus's own discv5 view (`/eth/v1/node/identity`) every tick and warns
 loudly when it changes; that is what drives IP-change detection. The libp2p
 Identify quorum is a fallback, used only when the upstream cannot answer,
 because dialing peers to harvest observations was measured here and does not
 work: beacon nodes close a non-gossiping peer's connection before Identify
-completes. Either way this is the input an ENR needs on a connection whose
-public IP is not guaranteed stable.
+completes. Either way this is the input the published ENR follows on a
+connection whose public IP is not guaranteed stable.
+
+**The ENR is published from `serve`, and only when it would be dialable.**
+`serve` joins the discv5 DHT on the same UDP port number as the TCP listener,
+seeded by the upstream's own ENR plus the wallet build's bootstrap list for the
+chain (matched by `genesis_validators_root` — one list per network, not two).
+The record — endpoint, the full 16-byte `eth2` ENRForkID, signed with the
+libp2p host key so the peer id wallets derive is the one roost authenticates
+as — is published once the external address is confirmed and routable, and
+re-published with a bumped, persisted-first sequence number whenever the
+address or the ENRForkID changes (a residential IP moved; a fork or BPO
+boundary crossed). `--no-publish` is the deliberate first deployment step:
+join, watch the `discv5 health` log line populate the table, be pingable,
+publish nothing. `roost enr --advertise <ip>` still builds and prints the
+record without publishing, for inspection.
 
 ## Not built yet
 
-- **Publishing the ENR.** `roost enr --advertise <ip>` builds and prints the
-  record — endpoint, the full 16-byte `eth2` ENRForkID, signed with the libp2p
-  host key so the peer id wallets derive is the one roost authenticates as — and
-  puts nothing in the DHT. Until that lands, **wallets cannot discover roost**;
-  they have to be pointed at it (`MYOTIS_CL_STATIC_PEERS`, or a pinned
-  multiaddr in `NetworkConfig`).
 - **The back-archive** below the upstream's light-client floor. Nimbus serves
   updates only from the period its states reach; everything older is
   irreplaceable once collected.
+- **Dropping the wallet-side pins** (#335 step 4): both engines still pin
+  roost's multiaddr by DynDNS name. That stays until discovery is proven on all
+  three networks — a wallet with no pin and discovery enabled finds roost,
+  bootstraps, and stays synced.
 
 ## Run locally
 
@@ -161,8 +173,19 @@ Back up `sepolia.db` too, once it holds periods below Nimbus's floor — nothing
 you run can regenerate those. While it only holds the live window it is
 refetchable in seconds.
 
-**Ports.** `9105/tcp` inbound, forwarded on the router. Add `9105/udp` only when
-discv5 publication lands — nothing listens on it today.
+**Ports.** `9105/tcp` inbound, forwarded on the router — and `9105/udp` with
+it: `serve` binds discv5 on the same port number over UDP. Without the UDP
+forward the node can still QUERY the DHT but no peer can complete the
+endpoint proof back to it, so it never enters other nodes' tables and a
+published record points at a dead UDP endpoint.
+
+Deploy with `--no-publish` first and be precise about what each check proves:
+the `discv5 health` log line (table/live counts) proves the node JOINED — its
+counts grow from outbound queries alone, so they say nothing about inbound.
+Verifying inbound needs a probe from outside the LAN: take the record from
+`roost enr --advertise <public-ip>` and ping it with a discv5 tool (e.g.
+sigp's `discv5-cli`) from another network, or at minimum confirm the router
+rule forwards UDP as well as TCP. Only then enable publication.
 
 **Verify:**
 
@@ -175,7 +198,10 @@ sudo -u roost /usr/local/bin/roost probe --rest http://127.0.0.1:5052
 **Run `roost enr` as the service user too** — it *writes*. It consumes a
 sequence number on every invocation and creates the identity key if one is
 absent, so running it as root leaves both root-owned and the service unable to
-read them:
+read them. Prefer not to run it beside a live `serve` on the same data
+directory at all — `serve` holds its own count in memory, so read a live
+deployment's record from its `ENR published` log line instead. When you do
+run it:
 
 ```bash
 sudo -u roost /usr/local/bin/roost enr \
@@ -196,11 +222,13 @@ failing on them. Extending `probe` to cover them is a worthwhile follow-up.
 but with the public IP. That is the only step that exercises the listener, the
 serving handlers and the archive together.
 
-**Note what deploying does not yet do.** roost publishes no ENR, so wallets
-cannot DISCOVER it (#335). It is nonetheless in the default wallet path: both
-engines pin roost first on mainnet, gnosis and sepolia, by DynDNS name
-(`/dns4/…`), resolved at dial time. So a deployed roost serves every wallet
-that ships with those pins — it just cannot be found by one that does not.
+**What deploying now does.** roost joins the discv5 DHT and, once its external
+address is confirmed, publishes its ENR — wallets can DISCOVER it (#335).
+Deploy in two steps: start with `--no-publish` and confirm the table populates
+and the node is pingable on UDP from outside; then drop the flag. The pinned
+multiaddrs in both engines stay for now (mainnet, gnosis and sepolia, by
+DynDNS name, resolved at dial time) — removing them is #335 step 4, gated on
+discovery being proven end to end.
 
 ## Why it is not a workspace member
 

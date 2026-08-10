@@ -432,6 +432,21 @@ impl NimbusRest {
         Ok(arr.iter().filter_map(|a| a.as_str()).map(str::to_string).collect())
     }
 
+    /// The upstream's own ENR, used as an extra discv5 bootstrap seed.
+    ///
+    /// Same borrow-the-upstream rationale as `connected_peer_addrs`: it is a
+    /// live, chain-appropriate entry point into the DHT that sits on this very
+    /// host, so joining through it works even on the day the shipped bootnode
+    /// list has rotted. A seed is a starting point for lookups, not a trust
+    /// grant — everything roost learns through it is just addresses.
+    pub async fn identity_enr(&self) -> Result<String> {
+        let v = self.get_json("/eth/v1/node/identity").await?;
+        v["data"]["enr"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("node/identity: enr is missing"))
+    }
+
     /// `(head_slot, is_syncing)`.
     pub async fn syncing(&self) -> Result<(u64, bool)> {
         let v = self.get_json("/eth/v1/node/syncing").await?;
