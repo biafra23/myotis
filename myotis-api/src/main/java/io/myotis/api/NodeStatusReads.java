@@ -23,6 +23,7 @@ public interface NodeStatusReads {
     /** CL light-client view (the {@code beacon-status} command's source). */
     BeaconStatus beaconStatus();
 
-    /** Node uptime in seconds; {@code 0} before the first start. */
+    /** Node uptime in seconds, anchored to when the start was REQUESTED (so the boot
+     *  itself counts); {@code 0} until the first start succeeds. */
     long uptimeSeconds();
 }

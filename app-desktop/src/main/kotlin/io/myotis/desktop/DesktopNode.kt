@@ -61,9 +61,11 @@ class DesktopNodeController(
 
     private val log = org.slf4j.LoggerFactory.getLogger(DesktopNodeController::class.java)
 
-    // Per-network engine-start stamp driving the UI uptime: stamped on each successful
-    // start (any engine, Java or Rust) and cleared on drop, so the uptime counter restarts
-    // from zero on every network/engine (re)boot — it is NOT the controller's (app's) lifetime.
+    // Per-network boot stamp driving the UI uptime: stamped when a boot BEGINS (any engine,
+    // Java or Rust) — uptime counts from the start request (Status button / app-launch
+    // auto-start), not from when the blocking start() finished — and cleared on drop
+    // (every failure path runs dropNetwork), so the counter restarts from zero on every
+    // network/engine (re)boot; it is NOT the controller's (app's) lifetime.
     // nanoTime, not currentTimeMillis: wall-clock / NTP steps must not skew uptime.
     private val startNsByNetwork = ConcurrentHashMap<String, Long>()
     // Per-network boot locks keyed by CANONICAL name, mirroring Android's NodeService.bootLocks:
@@ -134,6 +136,13 @@ class DesktopNodeController(
                     JavaHttpCcipGateway(),
                     null, null,              // engine default logger/clock
                 )
+                // Anchor uptime to the start REQUEST: create()+start() below block through
+                // key load, DNS resolution, and socket binds — the counter must already be
+                // running while that happens (it becomes visible once create() registers
+                // the handle). Stamped immediately before the try so the invariant is
+                // structural, not dependent on earlier lines staying non-throwing: every
+                // failure path from here on runs dropNetwork, which clears it.
+                startNsByNetwork[canonical] = System.nanoTime()
                 // create() is all-or-nothing (nothing registered on failure), so on a throw
                 // dropNetwork only forgets the cache instances retained above — leaving them
                 // would hand clearCaches a live-looking instance for a network that never
@@ -144,20 +153,22 @@ class DesktopNodeController(
                     dropNetwork(canonical)
                     throw t
                 }
-                // Apply the Settings served-block window before start() (so the very first
-                // eth/69 Status advertises the configured size), reading the setting INSIDE
-                // servedWindowApplyLock: the Save fan-out takes the same lock, and create()
-                // above already made this handle visible to hostedNetworks() — so either the
-                // fan-out reaches this handle, or our read observes its already-persisted
-                // value. Without the pairing a Save landing between our read and apply
-                // would be overwritten, leaving the live window one Save behind settings.
-                synchronized(servedWindowApplyLock) {
-                    handle.setServedBlockWindow(settings.servedBlockWindow())
-                }
                 // start() is fault-isolated: false (resources closed) on failure rather than a
                 // throw. Either way, drop the network so a later enable can retry — leaving a
-                // dead entry would report "running" forever and block retries.
+                // dead entry would report "running" forever and block retries. The served-window
+                // apply shares the try: a throw there would otherwise leave a registered-but-
+                // never-started network behind, uptime stamp included.
                 val ok = try {
+                    // Apply the Settings served-block window before start() (so the very first
+                    // eth/69 Status advertises the configured size), reading the setting INSIDE
+                    // servedWindowApplyLock: the Save fan-out takes the same lock, and create()
+                    // above already made this handle visible to hostedNetworks() — so either the
+                    // fan-out reaches this handle, or our read observes its already-persisted
+                    // value. Without the pairing a Save landing between our read and apply
+                    // would be overwritten, leaving the live window one Save behind settings.
+                    synchronized(servedWindowApplyLock) {
+                        handle.setServedBlockWindow(settings.servedBlockWindow())
+                    }
                     handle.start()
                 } catch (t: Throwable) {
                     dropNetwork(canonical)
@@ -165,7 +176,6 @@ class DesktopNodeController(
                 }
                 if (!ok) dropNetwork(canonical)
                 else {
-                    startNsByNetwork[canonical] = System.nanoTime() // uptime anchors to THIS start
                     // Boot-time apply of the log-index preset — AFTER start:
                     // the engine only accepts the config on a running handle
                     // (its reader owns the index). Re-pushed on every

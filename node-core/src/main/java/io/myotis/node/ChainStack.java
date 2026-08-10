@@ -175,8 +175,10 @@ public final class ChainStack {
     /** Status source for the JSON-RPC myotis_status / myotis_beaconStatus methods; the
      *  wrapping handle late-binds it (see {@link #setStatusReads}) before start(). */
     private volatile io.myotis.api.NodeStatusReads statusReads;
-    /** Monotonic start time (ns) of the first start; drives {@link #uptimeSeconds()}. Paired
-     *  with {@link #started} because nanoTime()'s origin is arbitrary (0 is a valid reading). */
+    /** Monotonic time (ns) the first successful {@link #start()} was ENTERED — uptime counts
+     *  the boot itself (DNS resolution, dials, binds), not just the time since it finished;
+     *  drives {@link #uptimeSeconds()}. Paired with {@link #started} because nanoTime()'s
+     *  origin is arbitrary (0 is a valid reading). */
     private volatile long startedAtNs;
     private volatile boolean started;
 
@@ -257,6 +259,10 @@ public final class ChainStack {
      */
     public synchronized boolean start() {
         if (!phase.compareAndSet(STOPPED, RUNNING)) return true; // already started
+        // Entry stamp for uptime: the counter must cover the whole boot below (DNS
+        // resolution, dials, binds), not start once it finished. Anchored at the
+        // bottom, only when the start fully succeeded.
+        long startRequestNs = System.nanoTime();
         try {
             log.info("[{}] Node ID: {}", network.name(), nodeKey.nodeId().toHexString());
 
@@ -303,10 +309,12 @@ public final class ChainStack {
             if (maintainerEnabled) startPeerMaintainer();
 
             // Anchor uptime only after a fully successful start (a failed start below tears
-            // the stack down via shutdown(), which clears `started` so a later start re-anchors).
-            // The serve counters share the same epoch: reset here (first start and any
-            // start-after-shutdown), never on pause/resume — matching uptime exactly.
-            if (!started) { startedAtNs = System.nanoTime(); started = true; serveStats.reset(); }
+            // the stack down via shutdown(), which clears `started` so a later start
+            // re-anchors) — but anchor it TO the entry stamp, so the boot itself counts.
+            // The serve counters reset at the same anchor (first start and any
+            // start-after-shutdown), never on pause/resume — one epoch per run, though
+            // theirs starts a boot-duration after uptime's entry stamp.
+            if (!started) { startedAtNs = startRequestNs; started = true; serveStats.reset(); }
             return true;
         } catch (Throwable t) {
             log.error("[{}] stack failed to start: {}", network.name(), t.toString());
@@ -523,8 +531,9 @@ public final class ChainStack {
     /** Late-bind the JSON-RPC status source (the wrapping handle), before {@link #start()}. */
     public void setStatusReads(io.myotis.api.NodeStatusReads statusReads) { this.statusReads = statusReads; }
 
-    /** Node uptime in seconds since the first start; 0 before then. Monotonic (nanoTime),
-     *  so it's immune to wall-clock/NTP adjustments. */
+    /** Node uptime in seconds since the first start was requested (start() entry, so the
+     *  boot itself counts); 0 until that start succeeds. Monotonic (nanoTime), so it's
+     *  immune to wall-clock/NTP adjustments. */
     public long uptimeSeconds() {
         return !started ? 0L : (System.nanoTime() - startedAtNs) / 1_000_000_000L;
     }
