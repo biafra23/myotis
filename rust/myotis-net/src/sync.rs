@@ -166,7 +166,7 @@ impl ChainConfig {
             // `./gradlew refreshCheckpoint` rewrites both from one fetch, and
             // `java_and_rust_checkpoints_agree` fails if they ever diverge.
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 14954528, 2026-08-09, period 1825)
+            // trusted checkpoint: pinned mainnet block root (slot 14954528, 2026-08-09, period 1825)
             checkpoint_root: hex32(
                 "be4ab798de3dce15ec3602dad3d27bb4af5d3b70524b90dce627ef5e372e9f89",
             ),
@@ -213,7 +213,7 @@ impl ChainConfig {
             // serving node's trustedNodeSync point, or that node cannot answer
             // the bootstrap for it (docs/dedicated-sepolia-node.md §5).
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized sepolia block root (slot 10838080, 2026-08-03, period 1323)
+            // trusted checkpoint: pinned sepolia block root (slot 10838080, 2026-08-03, period 1323)
             checkpoint_root: hex32(
                 "a00884e558ff8a4b721ab7ab4b2e3452a1cc45b4212c60de39d033bdcf75c5de",
             ),
@@ -264,7 +264,7 @@ impl ChainConfig {
             // bootstrapping from it gets ResourceUnavailable forever. Pick the
             // floor with `-Pperiod=<n>`, not head.
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized gnosis block root (slot 29458656, 2026-08-09, period 3596)
+            // trusted checkpoint: pinned gnosis block root (slot 29458656, 2026-08-09, period 3596)
             checkpoint_root: hex32(
                 "5387a11e014d8d4a9e8ca072ccd6639be912ab9a15b14b3b1f2d49b79551d954",
             ),

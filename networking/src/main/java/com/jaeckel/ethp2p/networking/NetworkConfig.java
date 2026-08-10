@@ -88,7 +88,7 @@ public record NetworkConfig(
             // genesis_validators_root (mainnet)
             Bytes.fromHexString("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95").toArrayUnsafe(),
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 14954528, 2026-08-09, period 1825)
+            // trusted checkpoint: pinned mainnet block root (slot 14954528, 2026-08-09, period 1825)
             Bytes.fromHexString("be4ab798de3dce15ec3602dad3d27bb4af5d3b70524b90dce627ef5e372e9f89").toArrayUnsafe(),
             14954528L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:mainnet:end
@@ -198,7 +198,7 @@ public record NetworkConfig(
             // genesis_validators_root (sepolia)
             Bytes.fromHexString("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078").toArrayUnsafe(),
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized sepolia block root (slot 10838080, 2026-08-03, period 1323)
+            // trusted checkpoint: pinned sepolia block root (slot 10838080, 2026-08-03, period 1323)
             Bytes.fromHexString("a00884e558ff8a4b721ab7ab4b2e3452a1cc45b4212c60de39d033bdcf75c5de").toArrayUnsafe(),
             10838080L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:sepolia:end
@@ -313,7 +313,7 @@ public record NetworkConfig(
             // genesis_validators_root (Gnosis Beacon Chain)
             Bytes.fromHexString("f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47").toArrayUnsafe(),
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized gnosis block root (slot 29458656, 2026-08-09, period 3596)
+            // trusted checkpoint: pinned gnosis block root (slot 29458656, 2026-08-09, period 3596)
             Bytes.fromHexString("5387a11e014d8d4a9e8ca072ccd6639be912ab9a15b14b3b1f2d49b79551d954").toArrayUnsafe(),
             29458656L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
             // @checkpoint:gnosis:end

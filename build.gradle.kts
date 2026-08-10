@@ -741,8 +741,15 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
     // anchor), not period firsts — the oldest testable anchor is one of them.
     // The slot must hold a block: a skipped slot fails loudly rather than being
     // walked past, because an explicit slot is a statement of intent.
-    val targetPeriod = (project.findProperty("period") as String?)?.toLong()
-    val targetSlot = (project.findProperty("slot") as String?)?.toLong()
+    // Guarded like genesisTime above: a malformed value ('10,838,080', a stray
+    // space, a bare -Pslot) must surface as the configuration error it is, not
+    // as a NumberFormatException deep in the task.
+    val targetPeriod = (project.findProperty("period") as String?)?.let {
+        it.trim().toLongOrNull() ?: throw GradleException("[refresh:$net] malformed -Pperiod: '$it'")
+    }
+    val targetSlot = (project.findProperty("slot") as String?)?.let {
+        it.trim().toLongOrNull() ?: throw GradleException("[refresh:$net] malformed -Pslot: '$it'")
+    }
     if (targetPeriod != null && targetSlot != null) {
         // Applied-or-refused: silently preferring one would compute a well-formed
         // anchor against something other than what the caller asked for.
@@ -762,19 +769,30 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
     // Phase 1 — slot DISCOVERY only. The v2 block body is fetched to learn each
     // responder's finalized slot (or to confirm the pinned slot exists); its
     // roots are deliberately not read — see the rootRe note above.
+    //
+    // In pinned mode a responder whose body reports a DIFFERENT slot than the
+    // one requested (nonconformant gateway, caching proxy) is dropped, not
+    // believed: minSlot is min() over responders, so one bad body could
+    // otherwise drag the anchor to a slot nobody pinned — with every honest
+    // endpoint then agreeing on the canonical root at that wrong slot, the
+    // exact silent re-anchoring -Pslot exists to refuse.
     val probed = endpoints.mapNotNull { base ->
         val path = if (pinnedSlot != null) "$pinnedSlot" else "finalized"
         val body = fetch("$base/eth/v2/beacon/blocks/$path") ?: return@mapNotNull null
         val slot = slotRe.find(body)?.groupValues?.get(1)?.toLong()
         if (slot == null) {
             logger.warn("[refresh] $base response missing slot"); null
+        } else if (pinnedSlot != null && slot != pinnedSlot) {
+            logger.warn("[refresh] $base answered slot $slot for a request pinned to $pinnedSlot — dropped"); null
         } else {
-            logger.lifecycle("[refresh] $base → finalized slot=$slot")
+            logger.lifecycle("[refresh] $base → ${if (pinnedSlot != null) "pinned" else "finalized"} slot=$slot")
             base to slot
         }
     }
     if (probed.isEmpty()) {
-        throw GradleException("No $net endpoint returned a finalized block")
+        throw GradleException(
+            if (pinnedSlot != null) "No $net endpoint served pinned slot $pinnedSlot"
+            else "No $net endpoint returned a finalized block")
     }
 
     // Phase 2 — resolve the BLOCK ROOT at one agreed slot, from every responder.
@@ -791,6 +809,11 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
     // slot and root in the committed anchor.)
     data class Hdr(val base: String, val slot: Long, val root: String)
     val minSlot = probed.minOf { it.second }
+    // Unreachable after the pinned-mode filter above; kept as the written
+    // invariant so a refactor of the probe cannot silently reopen the gap.
+    if (pinnedSlot != null && minSlot != pinnedSlot) {
+        throw GradleException("[refresh:$net] resolved slot $minSlot != pinned slot $pinnedSlot")
+    }
     val resolved = probed.mapNotNull { (base, _) ->
         val body = fetch("$base/eth/v1/beacon/blocks/$minSlot/root")
         val root = body?.let { rootRe.find(it)?.groupValues?.get(2)?.lowercase() }
@@ -840,6 +863,11 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
 
     val date = DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(ZoneOffset.UTC).format(ts)
 
+    // An anchor pinned to a chosen old slot is NOT "recent finalized" — wrong
+    // provenance wording beside a trust root invites the next reader to trust
+    // the wrong story, same argument as keeping provenance inside the markers.
+    val provenance = if (pinnedSlot != null) "pinned" else "recent finalized"
+
     /** 14560000 -> 14_560_000, the form every other numeric literal in sync.rs uses. */
     fun rustLiteral(n: Long): String = n.toString().reversed().chunked(3).joinToString("_").reversed()
 
@@ -858,7 +886,7 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
             { ind: String, eol: String ->
                 buildString {
                     append(ind).append("// @checkpoint:$net:begin — managed by `./gradlew refreshCheckpoint`").append(eol)
-                    append(ind).append("// trusted checkpoint: recent finalized $net block root (slot $minSlot, $date, period $period)").append(eol)
+                    append(ind).append("// trusted checkpoint: $provenance $net block root (slot $minSlot, $date, period $period)").append(eol)
                     append(ind).append("Bytes.fromHexString(\"$finalRoot\").toArrayUnsafe(),").append(eol)
                     append(ind).append("${minSlot}L, // checkpoint slot (epoch = slot/$slotsPerEpoch). Must stay in sync with the root above.").append(eol)
                     append(ind).append("// @checkpoint:$net:end")
@@ -873,7 +901,7 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
                     // previous anchor next to the new root — and wrong provenance
                     // beside a trust root invites the next reader to skip the
                     // verification that was never done for the value in front of them.
-                    append(ind).append("// trusted checkpoint: recent finalized $net block root (slot $minSlot, $date, period $period)").append(eol)
+                    append(ind).append("// trusted checkpoint: $provenance $net block root (slot $minSlot, $date, period $period)").append(eol)
                     append(ind).append("checkpoint_root: hex32(").append(eol)
                     append(ind).append("    \"$finalRoot\",").append(eol)
                     append(ind).append("),").append(eol)
@@ -1047,6 +1075,14 @@ tasks.register("refreshCheckpoint") {
 
     doLast {
         val only = project.findProperty("network") as String?
+        // A slot or period number is meaningful on ONE chain. Fanning it out to
+        // all three would, on any chain whose head is past it, find a real
+        // block, cross-validate the root honestly, and re-anchor a chain the
+        // caller never meant to touch — well-formed, verified, and wrong.
+        // Applied-or-refused: a pin requires naming the chain it pins.
+        if ((project.findProperty("slot") != null || project.findProperty("period") != null) && only == null) {
+            throw GradleException("-Pslot/-Pperiod need an explicit -Pnetwork=<name> — a slot is only meaningful on one chain")
+        }
         val nets = if (only != null) listOf(only) else listOf("mainnet", "sepolia", "gnosis")
         nets.forEach { n ->
             if (!checkpointEndpoints.containsKey(n)) {
