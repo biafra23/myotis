@@ -415,7 +415,8 @@ Gnosis Chain:
   CLI) that owns system routing and DNS. No SDK, no SOCKS interface — nothing
   an engine could link, and nothing it could drive per-connection.
 - Status per its published roadmap (fetched 2026-08-10): the current beta
-  ("El Dorado") is **Mac/Linux only**; **multi-hop routing only arrives with
+  ("El Dorado") is **desktop-only — macOS and Linux builds, explicitly not
+  Windows or mobile**; **multi-hop routing only arrives with
   "Shangri-La" (Sep 2026)** — until then a relay/exit can see both the user's
   IP and the destination, i.e. trust-the-operator VPN privacy, not mixnet
   privacy; six exit locations; **on-chain metered payments**; broader
@@ -427,7 +428,7 @@ Gnosis Chain:
 |---|---|---|---|
 | Embeddable in the engine | Yes — in-process library (§3) | No — needs a staked, waitlisted hoprd | No — root-owned system service |
 | Mobile | Compiles for the same NDK/iOS targets (§3) | No | No (2027 roadmap) |
-| Per-address unlinkability | Yes — one `IsolationToken` per address (§3) | Conceivable via per-address Sessions | **No — one tunnel, one exit identity** |
+| Per-address unlinkability | Yes — one `IsolationToken` per address (§3) | Conceivable via per-address Sessions | **No — current interface is one tunnel, one exit identity** |
 | Anonymity set | ~7–8k relays, millions of users | Hundreds of nodes | Its (beta) user base |
 | Cost to use | Free | On-chain ticket payments | On-chain metered payments; planned Circles-identity onboarding |
 | Maturity | ~20 years in production | Mixnet live; the wallet product (RPCh) paused | Closed beta |
@@ -435,11 +436,14 @@ Gnosis Chain:
 Two of these rows are decisive:
 
 - **Per-address unlinkability.** The §1 core leak is not only address ↔ IP but
-  the clustering of one user's addresses. Per-address isolation makes queries
-  for different addresses arrive at snap peers from different exit IPs; a
-  single system tunnel hides the home IP but presents one exit identity, so a
-  peer can still cluster every queried address as "same user." A VPN-shaped
-  transport cannot express the §3 isolation model at all.
+  the clustering of one user's addresses. Per-address isolation guarantees
+  different addresses never share a circuit, so any one circuit's exit-side
+  view covers one address — independently built circuits can still land on
+  the same exit relay, so this sharply reduces cross-address linkability
+  rather than guaranteeing a distinct exit IP per address. Gnosis VPN's
+  current single-tunnel interface cannot express even that much: it hides the
+  home IP but presents one exit identity for everything, so a peer can still
+  cluster every queried address as "same user."
 - **Payment bootstrap circularity.** Both HOPR and Gnosis VPN charge on-chain.
   A wallet would need chain access — and would leave a linkable on-chain
   payment trail — to buy the privacy layer that is supposed to protect its
