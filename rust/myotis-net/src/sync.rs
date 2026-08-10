@@ -2626,11 +2626,13 @@ mod tests {
     fn mainnet_config_matches_networkconfig_java() {
         let c = ChainConfig::mainnet();
         assert_eq!(c.fork_version, [6, 0, 0, 0]);
+        // @checkpoint:mainnet:test:begin — managed by `./gradlew refreshCheckpoint`
         assert_eq!(c.checkpoint_slot, 14_560_000);
         assert_eq!(
             hex_str(&c.checkpoint_root),
             "58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e"
         );
+        // @checkpoint:mainnet:test:end
         assert_eq!(
             hex_str(&c.genesis_validators_root),
             "4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
@@ -2660,11 +2662,13 @@ mod tests {
         let c = ChainConfig::sepolia();
         assert_eq!(c.chain_id, 11_155_111);
         assert_eq!(c.fork_version, [0x90, 0x00, 0x00, 0x75]); // Fulu on sepolia
+        // @checkpoint:sepolia:test:begin — managed by `./gradlew refreshCheckpoint`
         assert_eq!(c.checkpoint_slot, 10_851_360);
         assert_eq!(
             hex_str(&c.checkpoint_root),
             "a064b99bb711d152efbc88674dcba50d4e6c1b9151dae0a2e5bfbb7c40bc7cb9"
         );
+        // @checkpoint:sepolia:test:end
         assert_eq!(
             hex_str(&c.genesis_validators_root),
             "d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078"
@@ -2716,11 +2720,13 @@ mod tests {
         assert_eq!(c.chain_id, 100);
         assert_eq!(c.fork_version, [0x06, 0x00, 0x00, 0x64]); // Fulu on Gnosis
         assert_eq!(c.prior_fork_version, Some([0x05, 0x00, 0x00, 0x64])); // Electra
+        // @checkpoint:gnosis:test:begin — managed by `./gradlew refreshCheckpoint`
         assert_eq!(c.checkpoint_slot, 29_460_368);
         assert_eq!(
             hex_str(&c.checkpoint_root),
             "84f127f4bbb1e733c5607910c2df1d2c0e726e2fab0a4690b66cd07a5c2455bf"
         );
+        // @checkpoint:gnosis:test:end
         assert_eq!(
             hex_str(&c.genesis_validators_root),
             "f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47"
