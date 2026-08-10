@@ -1708,7 +1708,14 @@ public final class NodeService extends Service {
                     // here — the guard above deliberately spares bookkeeping that isn't
                     // provably this attempt's — but the boot stamps ARE ours: left
                     // behind, a later boot's "already hosted" recovery would render an
-                    // uptime counting from this failed attempt.
+                    // uptime counting from this failed attempt. (One interleaving
+                    // excepted: a full boot completing while this catch waited for the
+                    // lock, followed by a rebootNetwork — whose handles.remove
+                    // deliberately leaves its stamps for the reboot's buildAndStart to
+                    // overwrite — lands this remove on the pending reboot's stamps
+                    // instead. Still harmless: nothing renders while handles has no
+                    // entry, and the reboot overwrite-stamps or bails through
+                    // forgetStack.)
                     stackStartMs.remove(n);
                     stackStartNano.remove(n);
                 }

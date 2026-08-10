@@ -110,11 +110,6 @@ class DesktopNodeController(
         Thread({
             synchronized(bootLock(canonical)) {
                 if (engine.get(canonical) != null) return@synchronized
-                // Anchor uptime to the start REQUEST: create()+start() below block through
-                // key load, DNS resolution, and socket binds — the counter must already be
-                // running while that happens (it becomes visible once create() registers
-                // the handle). Every failure path runs dropNetwork, which clears it.
-                startNsByNetwork[canonical] = System.nanoTime()
                 val suffix = if (canonical == "mainnet") "" else "-$canonical"
                 val peerCache = PeerCache(dataDir.resolve("peers$suffix.cache"))
                 val clPeerCache = CLPeerCache(dataDir.resolve("cl-peers$suffix.cache"))
@@ -141,6 +136,13 @@ class DesktopNodeController(
                     JavaHttpCcipGateway(),
                     null, null,              // engine default logger/clock
                 )
+                // Anchor uptime to the start REQUEST: create()+start() below block through
+                // key load, DNS resolution, and socket binds — the counter must already be
+                // running while that happens (it becomes visible once create() registers
+                // the handle). Stamped immediately before the try so the invariant is
+                // structural, not dependent on earlier lines staying non-throwing: every
+                // failure path from here on runs dropNetwork, which clears it.
+                startNsByNetwork[canonical] = System.nanoTime()
                 // create() is all-or-nothing (nothing registered on failure), so on a throw
                 // dropNetwork only forgets the cache instances retained above — leaving them
                 // would hand clearCaches a live-looking instance for a network that never
