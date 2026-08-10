@@ -87,10 +87,10 @@ public record NetworkConfig(
             ),
             // genesis_validators_root (mainnet)
             Bytes.fromHexString("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95").toArrayUnsafe(),
-            // @checkpoint:mainnet:begin — managed by `./gradlew refreshMainnetCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 14560000, 2026-06-15, period 1777)
-            Bytes.fromHexString("58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e").toArrayUnsafe(),
-            14560000L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
+            // trusted checkpoint: recent finalized mainnet block root (slot 14960992, 2026-08-10, period 1826)
+            Bytes.fromHexString("b920b928a2fd6e3e2fb46b1f39ff53bb4174dfbc319eb21745f9fcec2efbc78a").toArrayUnsafe(),
+            14960992L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:mainnet:end
             // current fork version: Fulu (0x06000000) — activated at slot 13164544 (2025-12-03)
             new byte[]{0x06, 0x00, 0x00, 0x00},
@@ -197,7 +197,7 @@ public record NetworkConfig(
             ),
             // genesis_validators_root (sepolia)
             Bytes.fromHexString("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078").toArrayUnsafe(),
-            // @checkpoint:sepolia:begin — managed by `./gradlew refreshSepoliaCheckpoint`
+            // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
             // trusted checkpoint: recent finalized sepolia block root (slot 10851360, 2026-08-05, period 1324)
             Bytes.fromHexString("a064b99bb711d152efbc88674dcba50d4e6c1b9151dae0a2e5bfbb7c40bc7cb9").toArrayUnsafe(),
             10851360L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
@@ -312,10 +312,10 @@ public record NetworkConfig(
             ),
             // genesis_validators_root (Gnosis Beacon Chain)
             Bytes.fromHexString("f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47").toArrayUnsafe(),
-            // @checkpoint:gnosis:begin — managed by `./gradlew refreshGnosisCheckpoint`
+            // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
             // trusted checkpoint: recent finalized Gnosis block root (slot 29460368, 2026-08-09, period 3596)
             Bytes.fromHexString("84f127f4bbb1e733c5607910c2df1d2c0e726e2fab0a4690b66cd07a5c2455bf").toArrayUnsafe(),
-            29460368L, // checkpoint slot. Must stay in sync with the root above.
+            29460368L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
             // @checkpoint:gnosis:end
             // current fork version: Fulu on Gnosis (0x06000064), active since 2026-04-14
             new byte[]{0x06, 0x00, 0x00, 0x64},

@@ -622,17 +622,52 @@ gradle.taskGraph.whenReady {
 
 /** One network: fetch, cross-validate, then rewrite the marked region in every engine. */
 fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger, net: String) {
-    // Public checkpointz providers serve `finalized` ONLY — they 404 on any
-    // historical slot — so -Pperiod needs a full node, and the operator names it
-    // explicitly rather than the task reaching for loopback behind their back:
-    //   -PextraEndpoint=http://127.0.0.1:5054
+    // An extra source the operator NAMES, e.g. -PextraEndpoint=http://127.0.0.1:5054.
     // It is appended, never substituted, so it adds a voice to cross-validation
-    // instead of replacing the public ones.
+    // rather than displacing the public ones — and it is checked against the
+    // pinned genesis_validators_root below before it counts.
+    //
+    // Not normally needed: the checkpointz providers answer `finalized` only and
+    // 404 on historical slots, but each network's list leads with a full archive
+    // endpoint, so even -Pperiod cross-validates without a local node. This is
+    // the escape hatch for when that stops being true.
     val extra = (project.findProperty("extraEndpoint") as String?)?.split(",")?.map { it.trim() }
         ?.filter { it.isNotEmpty() } ?: emptyList()
     val endpoints = checkpointEndpoints.getValue(net) + extra
     val secondsPerSlot = checkpointSecondsPerSlot.getValue(net)
     val slotsPerPeriod = checkpointSlotsPerPeriod.getValue(net)
+    val slotsPerEpoch = checkpointSlotsPerEpoch.getValue(net)
+
+    val javaFile = project(":networking").projectDir
+        .resolve("src/main/java/com/jaeckel/ethp2p/networking/NetworkConfig.java")
+    // The chain identity we check a named endpoint against. It is a COPY of a
+    // value that lives in the engines, so verify it still matches before
+    // trusting it — a drifted copy would turn the check below into theatre.
+    val gvr = checkpointGenesisValidatorsRoot.getValue(net)
+    // Scoped to THIS network's block of the file, not the whole file: all three
+    // networks' roots appear in NetworkConfig.java, so whole-file containment
+    // would pass a cross-network swap in the map above — which would invert the
+    // chain gate below (refuse the right chain, accept the wrong one). The gvr
+    // literal sits a few lines above its network's checkpoint region, so the
+    // slice from the previous network's end marker to this one's begin marker
+    // identifies it uniquely.
+    run {
+        val cfgText = javaFile.readText()
+        val beginIdx = cfgText.indexOf("// @checkpoint:$net:begin")
+        if (beginIdx < 0) {
+            throw GradleException("[refresh:$net] no @checkpoint:$net:begin marker in ${javaFile.name}")
+        }
+        val sliceStart = checkpointEndpoints.keys.filter { it != net }
+            .mapNotNull { other ->
+                cfgText.indexOf("// @checkpoint:$other:end").takeIf { it in 0 until beginIdx }
+            }
+            .maxOrNull() ?: 0
+        if (!cfgText.substring(sliceStart, beginIdx).contains(gvr)) {
+            throw GradleException(
+                "[refresh:$net] genesis_validators_root $gvr is not in the $net block of ${javaFile.name} — " +
+                "this build script's copy has drifted (or been swapped across networks); fix it before refreshing an anchor")
+        }
+    }
     // Guarded, as the helper this replaces was: a missing or malformed property
     // would otherwise surface as a ClassCastException or NumberFormatException
     // deep in the task rather than as the configuration error it is.
@@ -656,12 +691,39 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
         logger.warn("[refresh] $url failed: ${e.message}"); null
     }
 
-    // headers/finalized JSON: data.root is the first "root":"0x..64hex.." key
-    // (parent_root/state_root/body_root keys don't match the bare "root").
+    // A named endpoint is unauthenticated and unidentified — nothing about
+    // `http://127.0.0.1:5054` says which chain answers on it. Ask, and refuse if
+    // the answer is not this chain: a gnosis node on the port meant for mainnet
+    // would otherwise put its root straight into the mainnet trust anchor, and
+    // every downstream check would pass on a value from the wrong network.
+    val gvrRe = Regex(""""genesis_validators_root"\s*:\s*"(0x)?([0-9a-fA-F]{64})"""")
+    extra.forEach { base ->
+        val body = fetch("$base/eth/v1/beacon/genesis")
+            ?: throw GradleException(
+                "[refresh:$net] -PextraEndpoint $base did not answer /eth/v1/beacon/genesis — " +
+                "refusing to use an endpoint whose chain cannot be confirmed")
+        val seen = gvrRe.find(body)?.groupValues?.get(2)?.lowercase()
+            ?: throw GradleException(
+                "[refresh:$net] -PextraEndpoint $base answered /eth/v1/beacon/genesis without a " +
+                "parseable genesis_validators_root — refusing an endpoint whose chain cannot be confirmed")
+        if (seen != gvr) {
+            throw GradleException(
+                "[refresh:$net] -PextraEndpoint $base is on the WRONG CHAIN: " +
+                "genesis_validators_root 0x$seen, expected 0x$gvr")
+        }
+        logger.lifecycle("[refresh:$net] $base chain-checked: genesis_validators_root matches $net")
+    }
+
+    // rootRe is applied ONLY to /eth/v1/beacon/blocks/{slot}/root responses,
+    // whose data.root is the first (and only) bare "root" key. It must NEVER be
+    // applied to a /eth/v2/beacon/blocks body: a block names itself by
+    // parent_root/state_root/body_root only, so the first bare "root" there is
+    // an attestation's justified-checkpoint root — an epoch-boundary root 2-3
+    // epochs OLDER than the block. Extracting that mispairs (slot, root) in the
+    // committed anchor, invisibly: every provider serves the same canonical
+    // JSON, so cross-validation agrees on the same wrong value.
     val rootRe = Regex(""""root"\s*:\s*"(0x)?([0-9a-fA-F]{64})"""")
     val slotRe = Regex(""""slot"\s*:\s*"?(\d+)"?""")
-
-    data class Hdr(val base: String, val slot: Long, val root: String)
 
     // An explicit target period anchors at that period's FIRST slot instead of at
     // head. Anchoring at head is wrong for this deployment: roost's archive only
@@ -670,9 +732,9 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
     // roost's FLOOR — the oldest period it can still serve.
     //
     // A period's first slot may be SKIPPED (no block proposed), which the beacon
-    // API answers with 404, so walk forward until a block exists. Bounded at one
-    // epoch: past that the chain has bigger problems, and failing loudly beats
-    // anchoring somewhere unintended.
+    // API answers with 404, so walk forward until a block exists. Bounded at 32
+    // slots (one mainnet epoch, two gnosis epochs): past that the chain has
+    // bigger problems, and failing loudly beats anchoring somewhere unintended.
     val targetPeriod = (project.findProperty("period") as String?)?.toLong()
     val pinnedSlot: Long? = targetPeriod?.let { p ->
         val first = p * slotsPerPeriod
@@ -685,45 +747,50 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
         logger.lifecycle("[refresh:$net] pinning period $targetPeriod → slot $pinnedSlot")
     }
 
+    // Phase 1 — slot DISCOVERY only. The v2 block body is fetched to learn each
+    // responder's finalized slot (or to confirm the pinned slot exists); its
+    // roots are deliberately not read — see the rootRe note above.
     val probed = endpoints.mapNotNull { base ->
         val path = if (pinnedSlot != null) "$pinnedSlot" else "finalized"
         val body = fetch("$base/eth/v2/beacon/blocks/$path") ?: return@mapNotNull null
         val slot = slotRe.find(body)?.groupValues?.get(1)?.toLong()
-        val root = rootRe.find(body)?.groupValues?.get(2)?.lowercase()
-        if (slot == null || root == null) {
-            logger.warn("[refresh] $base response missing slot/root"); null
+        if (slot == null) {
+            logger.warn("[refresh] $base response missing slot"); null
         } else {
-            logger.lifecycle("[refresh] $base → finalized slot=$slot root=0x$root")
-            Hdr(base, slot, root)
+            logger.lifecycle("[refresh] $base → finalized slot=$slot")
+            base to slot
         }
     }
     if (probed.isEmpty()) {
-        throw GradleException("No $net endpoint returned a finalized header")
+        throw GradleException("No $net endpoint returned a finalized block")
     }
 
-    // Normalize to the oldest observed finalized slot so all responders can agree,
-    // then re-query the endpoints that reported a *newer* slot for the header AT minSlot.
-    // Beacon nodes are routinely a few slots out of sync, so filtering to those that
-    // happened to report exactly minSlot would usually leave a single endpoint and
-    // silently skip cross-validation. The standard /eth/v1/beacon/headers/{slot}
-    // endpoint lets every responder be checked at the same slot (mirrors the
-    // mainnet task's Phase 2).
-    val minSlot = probed.minOf { it.slot }
-    val resolved = probed.mapNotNull { f ->
-        if (f.slot == minSlot) {
-            f
+    // Phase 2 — resolve the BLOCK ROOT at one agreed slot, from every responder.
+    // Normalized to the oldest observed finalized slot so all responders can
+    // answer: beacon nodes are routinely a few slots out of sync, and filtering
+    // to those that happened to report exactly minSlot would usually leave a
+    // single endpoint and silently skip cross-validation.
+    //
+    // The root comes from /eth/v1/beacon/blocks/{slot}/root — the endpoint that
+    // returns the block's OWN hash_tree_root — for every responder, including
+    // those whose finalized slot already was minSlot. (This mirrors the original
+    // per-network mainnet task's Phase 2; the generalised task briefly read the
+    // v2 body instead and extracted an attestation checkpoint root, mispairing
+    // slot and root in the committed anchor.)
+    data class Hdr(val base: String, val slot: Long, val root: String)
+    val minSlot = probed.minOf { it.second }
+    val resolved = probed.mapNotNull { (base, _) ->
+        val body = fetch("$base/eth/v1/beacon/blocks/$minSlot/root")
+        val root = body?.let { rootRe.find(it)?.groupValues?.get(2)?.lowercase() }
+        if (root == null) {
+            logger.warn("[refresh] $base could not resolve the block root at slot $minSlot"); null
         } else {
-            val body = fetch("${f.base}/eth/v2/beacon/blocks/$minSlot")
-            val root = body?.let { rootRe.find(it)?.groupValues?.get(2)?.lowercase() }
-            if (root == null) {
-                logger.warn("[refresh] ${f.base} could not resolve slot $minSlot"); null
-            } else {
-                Hdr(f.base, minSlot, root)
-            }
+            logger.lifecycle("[refresh] $base → slot=$minSlot root=0x$root")
+            Hdr(base, minSlot, root)
         }
     }
     if (resolved.isEmpty()) {
-        throw GradleException("No $net endpoint could resolve slot $minSlot")
+        throw GradleException("No $net endpoint could resolve the block root at slot $minSlot")
     }
     val distinct = resolved.map { it.root }.toSet()
     if (distinct.size != 1) {
@@ -733,15 +800,21 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
             "Aborting; NetworkConfig.java not modified.")
     }
     val finalRoot = distinct.single()
-    // REFUSE on a single responder rather than warn. This writes a TRUST ROOT,
-    // and the per-network tasks this replaces already refused — warning instead
-    // would have quietly weakened mainnet and sepolia while claiming to unify
-    // them. -PallowSingleSource is the named escape hatch for a chain whose
-    // providers really are unavailable, so the weaker guarantee is always an
-    // explicit choice made on the command line.
-    if (resolved.size < 2) {
-        val msg = "[refresh:$net] only ${resolved.size} endpoint served slot $minSlot — " +
-            "NOT cross-validated (root 0x$finalRoot)"
+    // REFUSE below two agreeing OPERATORS rather than warn. This writes a TRUST
+    // ROOT, and the per-network tasks this replaces already refused — warning
+    // instead would have quietly weakened mainnet and sepolia while claiming to
+    // unify them. Agreement is counted per registrable domain, not per URL:
+    // two hostnames of the same operator (gnosis-beacon-api.publicnode.com and
+    // gnosis-beacon.publicnode.com, say) are one voice, not two — otherwise a
+    // single operator could satisfy the gate alone. -PallowSingleSource is the
+    // named escape hatch for a chain whose providers really are unavailable, so
+    // the weaker guarantee is always an explicit choice made on the command line.
+    val operators = resolved.map { hdr ->
+        URI(hdr.base).host.split(".").takeLast(2).joinToString(".")
+    }.toSet()
+    if (operators.size < 2) {
+        val msg = "[refresh:$net] only ${operators.size} operator (${operators.joinToString()}) " +
+            "served the block root at slot $minSlot — NOT cross-validated (root 0x$finalRoot)"
         if (project.hasProperty("allowSingleSource")) {
             logger.warn("$msg; -PallowSingleSource set, continuing. " +
                 "Verify against a $net explorer before trusting this anchor.")
@@ -755,79 +828,115 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
 
     val date = DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(ZoneOffset.UTC).format(ts)
 
+    /** 14560000 -> 14_560_000, the form every other numeric literal in sync.rs uses. */
+    fun rustLiteral(n: Long): String = n.toString().reversed().chunked(3).joinToString("_").reversed()
+
+    // One marked region to rewrite. The marker suffix is carried EXPLICITLY
+    // rather than inferred from position in the list: two of these regions live
+    // in the same file, and a position-inferred suffix made that coupling
+    // invisible — which is exactly how the last-writer-wins bug below got in.
+    data class Region(val file: File, val suffix: String, val render: (String, String) -> String)
+
+    val rustFile = project.rootDir.resolve("rust/myotis-net/src/sync.rs")
+
     // BOTH engines, from one fetch. Hand-mirroring the Rust copy is what was
     // forgotten before, and a disagreement between them is a split trust anchor.
     val targets = listOf(
-        project(":networking").projectDir.resolve("src/main/java/com/jaeckel/ethp2p/networking/NetworkConfig.java")
-            to { ind: String, eol: String ->
+        Region(javaFile, "",
+            { ind: String, eol: String ->
                 buildString {
                     append(ind).append("// @checkpoint:$net:begin — managed by `./gradlew refreshCheckpoint`").append(eol)
                     append(ind).append("// trusted checkpoint: recent finalized $net block root (slot $minSlot, $date, period $period)").append(eol)
                     append(ind).append("Bytes.fromHexString(\"$finalRoot\").toArrayUnsafe(),").append(eol)
-                    append(ind).append("${minSlot}L, // checkpoint slot. Must stay in sync with the root above.").append(eol)
+                    append(ind).append("${minSlot}L, // checkpoint slot (epoch = slot/$slotsPerEpoch). Must stay in sync with the root above.").append(eol)
                     append(ind).append("// @checkpoint:$net:end")
                 }
-            },
-        project.rootDir.resolve("rust/myotis-net/src/sync.rs")
-            to { ind: String, eol: String ->
+            }),
+        Region(rustFile, "",
+            { ind: String, eol: String ->
                 buildString {
                     append(ind).append("// @checkpoint:$net:begin — managed by `./gradlew refreshCheckpoint`").append(eol)
+                    // Provenance INSIDE the region, so it is rewritten with the
+                    // values it describes. Outside, it would keep narrating the
+                    // previous anchor next to the new root — and wrong provenance
+                    // beside a trust root invites the next reader to skip the
+                    // verification that was never done for the value in front of them.
+                    append(ind).append("// trusted checkpoint: recent finalized $net block root (slot $minSlot, $date, period $period)").append(eol)
                     append(ind).append("checkpoint_root: hex32(").append(eol)
                     append(ind).append("    \"$finalRoot\",").append(eol)
                     append(ind).append("),").append(eol)
-                    append(ind).append("checkpoint_slot: ${minSlot},").append(eol)
+                    append(ind).append("checkpoint_slot: ${rustLiteral(minSlot)},").append(eol)
                     append(ind).append("// @checkpoint:$net:end")
                 }
-            },
-        // THIRD target: the parity test literals. They pin the same two values
-        // outside the config markers, so a refresh that skipped them would leave
-        // `cargo test -p myotis-net` red on its first real run — the tool would
-        // break the repo it is meant to maintain.
-        project.rootDir.resolve("rust/myotis-net/src/sync.rs")
-            to { ind: String, eol: String ->
+            }),
+        // THIRD region, SECOND one in sync.rs: the parity test literals. They pin
+        // the same two values outside the config markers, so a refresh that
+        // skipped them would leave `cargo test -p myotis-net` red on its first
+        // real run — the tool would break the repo it is meant to maintain.
+        Region(rustFile, ":test",
+            { ind: String, eol: String ->
                 buildString {
                     append(ind).append("// @checkpoint:$net:test:begin — managed by `./gradlew refreshCheckpoint`").append(eol)
-                    append(ind).append("assert_eq!(c.checkpoint_slot, ${minSlot});").append(eol)
+                    append(ind).append("assert_eq!(c.checkpoint_slot, ${rustLiteral(minSlot)});").append(eol)
                     append(ind).append("assert_eq!(").append(eol)
                     append(ind).append("    hex_str(&c.checkpoint_root),").append(eol)
                     append(ind).append("    \"$finalRoot\"").append(eol)
                     append(ind).append(");").append(eol)
                     append(ind).append("// @checkpoint:$net:test:end")
                 }
-            },
+            }),
     )
 
-    // Render and validate EVERY target before writing ANY. Writing as we go
+    data class Staged(
+        val file: File,
+        val original: String,
+        val updated: String,
+        val previews: List<Pair<String, String>>,
+    )
+
+    // Render and validate EVERY region before writing ANY file. Writing as we go
     // could commit NetworkConfig.java and then throw on sync.rs, leaving the two
     // engines disagreeing about the trust anchor — the exact split this exists
     // to prevent.
-    val planned = targets.mapIndexed { idx, (file, render) ->
+    //
+    // Group by FILE and fold every region of a file into ONE text. sync.rs holds
+    // two regions, and computing each from the pristine file would make the
+    // second write discard the first: the config region would silently revert
+    // while the test region moved, leaving Rust anchored to the old root and its
+    // own parity test asserting the new one. (That is not hypothetical — it is
+    // what this code did until a non-dry run was actually tried.)
+    val staged = targets.groupBy { it.file }.map { (file, regions) ->
         val original = file.readText()
-        val suffix = if (idx == 2) ":test" else ""
-        val beginMarker = "// @checkpoint:$net$suffix:begin"
-        val endMarker = "// @checkpoint:$net$suffix:end"
-        val beginIdx = original.indexOf(beginMarker)
-        val endIdx = original.indexOf(endMarker)
-        if (beginIdx < 0 || endIdx < 0 || endIdx < beginIdx) {
-            throw GradleException("Could not find @checkpoint:$net markers in ${file.name}")
+        var text = original
+        val previews = regions.map { region ->
+            val beginMarker = "// @checkpoint:$net${region.suffix}:begin"
+            val endMarker = "// @checkpoint:$net${region.suffix}:end"
+            val beginIdx = text.indexOf(beginMarker)
+            val endIdx = text.indexOf(endMarker)
+            if (beginIdx < 0 || endIdx < 0 || endIdx < beginIdx) {
+                throw GradleException("Could not find $beginMarker / $endMarker in ${file.name}")
+            }
+            val eol = if (text.contains("\r\n")) "\r\n" else "\n"
+            val beginLineStart = text.lastIndexOf('\n', beginIdx) + 1
+            val endMarkerEnd = endIdx + endMarker.length
+            val indent = text.substring(beginLineStart, beginIdx)
+            val replacement = region.render(indent, eol)
+            val before = text.substring(beginLineStart, endMarkerEnd)
+            text = text.substring(0, beginLineStart) + replacement + text.substring(endMarkerEnd)
+            before to replacement
         }
-        val eol = if (original.contains("\r\n")) "\r\n" else "\n"
-        val beginLineStart = original.lastIndexOf('\n', beginIdx) + 1
-        val endMarkerEnd = endIdx + endMarker.length
-        val indent = original.substring(beginLineStart, beginIdx)
-        val replacement = render(indent, eol)
-        val updated = original.substring(0, beginLineStart) + replacement + original.substring(endMarkerEnd)
-        Triple(file, updated, original.substring(beginLineStart, endMarkerEnd) to replacement)
+        Staged(file, original, text, previews)
     }
 
-    planned.forEach { (file, updated, diff) ->
-        val original = file.readText()
+    staged.forEach { (file, original, updated, previews) ->
         if (original == updated) {
             logger.lifecycle("[refresh:$net] ${file.name} already up to date (slot $minSlot). No change.")
         } else if (dryRun) {
             logger.lifecycle("[refresh:$net] -Pdry; preview of ${file.name}:")
-            diff.first.lines().forEach { logger.lifecycle("- $it") }
-            diff.second.lines().forEach { logger.lifecycle("+ $it") }
+            previews.forEach { (before, after) ->
+                before.lines().forEach { logger.lifecycle("- $it") }
+                after.lines().forEach { logger.lifecycle("+ $it") }
+            }
         } else {
             val tmp = File(file.absolutePath + ".tmp")
             tmp.writeText(updated)
@@ -838,44 +947,70 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
     }
 }
 
-/** Per-network checkpoint sources.
+/** Per-network checkpoint sources — independent, public, and PLURAL by design.
  *
- *  A LOCAL beacon node comes first when one is running. As of 2026-08-10 the
- *  public checkpoint-sync providers no longer answer
- *  `/eth/v1/beacon/headers/finalized` — beaconstate.info, beaconcha.in and
- *  attestant all fail or 404 — so on a machine without a local node this task
- *  now has no source at all. That is a finding about the providers, not about
- *  this task: the pre-existing per-network tasks depend on the same endpoint
- *  and are equally dead.
+ *  These serve a narrow slice of the Beacon API (`/eth/v2/beacon/blocks/{id}`
+ *  + `/eth/v1/beacon/blocks/{id}/root`), which is all this task needs. An
+ *  earlier revision of this task queried `/eth/v1/beacon/headers/finalized`
+ *  instead — the shape the gnosis-only task used — saw 404s, and concluded the
+ *  providers were dead. They are not: on the endpoint they actually document,
+ *  mainnet and sepolia both cross-validate across several of these hosts.
  *
- *  A local node is a legitimate source and NOT a shortcut: it followed the chain
- *  over p2p from its own checkpoint, so it is an independent opinion rather than
- *  a relay of one of these providers. It is still ONE opinion — when it is the
- *  only responder the task says so loudly, exactly as it did for gnosis, and
- *  the operator is expected to cross-check against an explorer before trusting
- *  a fresh anchor.
+ *  No loopback address belongs in this list. A local node is a legitimate
+ *  source — it followed the chain over p2p, so it is an opinion rather than a
+ *  relay — but listing it here makes it a slot-SETTING peer: a node that is
+ *  behind drags `minSlot` down to a slot the checkpointz providers will not
+ *  serve historically, they drop out, and the run degrades to the single
+ *  source that is by construction least independent of the operator. It is
+ *  `-PextraEndpoint=<url>` instead: appended, never substituted, and
+ *  chain-checked against the pinned `genesis_validators_root` before it counts.
  *
  *  Unreachable endpoints are skipped and reported; the task refuses to write
- *  when nothing responds. */
+ *  when fewer than two agree (`-PallowSingleSource` to override). */
 val checkpointEndpoints = mapOf(
     "mainnet" to listOf(
+        // publicnode serves HISTORICAL slots, which the checkpointz providers
+        // below do not (they answer `finalized` only and 404 on anything else).
+        // That is what lets -Pperiod cross-validate instead of falling back to a
+        // single source. Verified 2026-08-10 for all three networks.
+        "https://ethereum-beacon-api.publicnode.com",
         "https://beaconstate.info",
         "https://sync-mainnet.beaconcha.in",
         "https://mainnet-checkpoint-sync.attestant.io",
     ),
     "sepolia" to listOf(
+        "https://ethereum-sepolia-beacon-api.publicnode.com",
         "https://sepolia.beaconstate.info",
         "https://checkpoint-sync.sepolia.ethpandaops.io",
         "https://beaconstate-sepolia.chainsafe.io",
     ),
+    // NOTE: rpc-gbc and checkpoint are both the Gnosis team — one operator, two
+    // hostnames. The agreement gate counts operators (registrable domains), so
+    // they add redundancy but only one voice; publicnode is the second voice.
+    // (gnosis-beacon.publicnode.com was dropped: same operator and backend as
+    // the api hostname, so it could never add a voice either.)
     "gnosis" to listOf(
+        "https://gnosis-beacon-api.publicnode.com",
         "https://rpc-gbc.gnosischain.com",
         "https://checkpoint.gnosischain.com",
-        "https://gnosis-beacon.publicnode.com",
     ),
 )
 val checkpointSecondsPerSlot = mapOf("mainnet" to 12L, "sepolia" to 12L, "gnosis" to 5L)
 val checkpointSlotsPerPeriod = mapOf("mainnet" to 8192L, "sepolia" to 8192L, "gnosis" to 8192L)
+// Gnosis reaches the same 8192-slot period from 16 x 512 rather than 32 x 256,
+// so the epoch divisor is NOT shared even though the period one is. Only used
+// for the generated comment — but a comment on a trust anchor that says
+// `epoch = slot/32` on a 16-slot-epoch chain is exactly the kind of wrong an
+// operator would act on.
+val checkpointSlotsPerEpoch = mapOf("mainnet" to 32L, "sepolia" to 32L, "gnosis" to 16L)
+/** Pinned `genesis_validators_root` per network — the chain's identity, used to
+ *  confirm a `-PextraEndpoint` node is on the chain the operator thinks it is.
+ *  Checked against `NetworkConfig.java` on every run so this copy cannot drift. */
+val checkpointGenesisValidatorsRoot = mapOf(
+    "mainnet" to "4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95",
+    "sepolia" to "d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078",
+    "gnosis" to "f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47",
+)
 
 /**
  * Refresh a network's trusted checkpoint in BOTH engines.

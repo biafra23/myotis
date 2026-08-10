@@ -163,12 +163,14 @@ impl ChainConfig {
             blob_params_epoch: 419_072,
             blob_params_max_blobs: 21,
             // Mirrors the @checkpoint:mainnet region of NetworkConfig.java;
-            // `./gradlew refreshCheckpoint` rewrites both from one fetch.
+            // `./gradlew refreshCheckpoint` rewrites both from one fetch, and
+            // `java_and_rust_checkpoints_agree` fails if they ever diverge.
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
+            // trusted checkpoint: recent finalized mainnet block root (slot 14960992, 2026-08-10, period 1826)
             checkpoint_root: hex32(
-                "58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e",
+                "b920b928a2fd6e3e2fb46b1f39ff53bb4174dfbc319eb21745f9fcec2efbc78a",
             ),
-            checkpoint_slot: 14_560_000,
+            checkpoint_slot: 14_960_992,
             // @checkpoint:mainnet:end
             static_peers: MAINNET_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: MAINNET_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
@@ -203,12 +205,15 @@ impl ChainConfig {
             blob_params_epoch: 275_712,
             blob_params_max_blobs: 21,
             // Mirrors the @checkpoint:sepolia region of NetworkConfig.java;
-            // `./gradlew refreshCheckpoint` rewrites both from one fetch.
+            // `./gradlew refreshCheckpoint` rewrites both from one fetch, and
+            // `java_and_rust_checkpoints_agree` fails if they ever diverge.
             //
-            // This pin must also stay NEWER than the dedicated serving node's
-            // trustedNodeSync point, or that node cannot answer the bootstrap for
-            // it (docs/dedicated-sepolia-node.md §5).
+            // DURABLE CONSTRAINT (survives every refresh, so it lives outside the
+            // rewritten region): this pin must stay NEWER than the dedicated
+            // serving node's trustedNodeSync point, or that node cannot answer
+            // the bootstrap for it (docs/dedicated-sepolia-node.md §5).
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
+            // trusted checkpoint: recent finalized sepolia block root (slot 10851360, 2026-08-05, period 1324)
             checkpoint_root: hex32(
                 "a064b99bb711d152efbc88674dcba50d4e6c1b9151dae0a2e5bfbb7c40bc7cb9",
             ),
@@ -247,21 +252,19 @@ impl ChainConfig {
             // into the Fulu digest. Yields the live-verified digest 0x3237dab6.
             blob_params_epoch: 1_337_856,
             blob_params_max_blobs: 2,
-            // Mirrors the @checkpoint:gnosis region of
-            // NetworkConfig.java (slot 29460368, 2026-08-09, period 3596).
-            // Rewritten by `./gradlew refreshCheckpoint` together with the Java twin.
+            // Mirrors the @checkpoint:gnosis region of NetworkConfig.java;
+            // `./gradlew refreshCheckpoint` rewrites both from one fetch, and
+            // `java_and_rust_checkpoints_agree` fails if they ever diverge.
             //
-            // Refreshed so the anchor sits INSIDE the period roost@gnosis can
-            // serve. The previous anchor (period 3480) was 116 periods behind,
-            // and roost's archive only grows forward from where it started, so
-            // no amount of waiting would have closed that gap — a wallet
-            // bootstrapping from it got ResourceUnavailable forever.
-            //
-            // Cross-validated: refreshGnosisCheckpoint could only reach ONE of
-            // its three providers (the other two 404), so this root was checked
-            // against the local gnosis beacon node, which reached the same slot
-            // independently over p2p, and against its finalized checkpoint.
+            // DURABLE CONSTRAINT (survives every refresh, so it lives outside the
+            // rewritten region): the anchor must sit INSIDE the period window
+            // roost@gnosis can serve. An earlier anchor sat 116 periods below
+            // roost's floor, and roost's archive only grows FORWARD from where it
+            // started, so no amount of waiting closes such a gap — a wallet
+            // bootstrapping from it gets ResourceUnavailable forever. Pick the
+            // floor with `-Pperiod=<n>`, not head.
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
+            // trusted checkpoint: recent finalized gnosis block root (slot 29460368, 2026-08-09, period 3596)
             checkpoint_root: hex32(
                 "84f127f4bbb1e733c5607910c2df1d2c0e726e2fab0a4690b66cd07a5c2455bf",
             ),
@@ -2625,10 +2628,10 @@ mod tests {
         let c = ChainConfig::mainnet();
         assert_eq!(c.fork_version, [6, 0, 0, 0]);
         // @checkpoint:mainnet:test:begin — managed by `./gradlew refreshCheckpoint`
-        assert_eq!(c.checkpoint_slot, 14_560_000);
+        assert_eq!(c.checkpoint_slot, 14_960_992);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e"
+            "b920b928a2fd6e3e2fb46b1f39ff53bb4174dfbc319eb21745f9fcec2efbc78a"
         );
         // @checkpoint:mainnet:test:end
         assert_eq!(
@@ -2636,8 +2639,14 @@ mod tests {
             "4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
         );
         assert_eq!(c.genesis_time, 1_606_824_023);
-        // Checkpoint period 1777 (slot / 8192).
-        assert_eq!(spec::compute_sync_committee_period(c.checkpoint_slot), 1777);
+        // Structural, not a pinned period number: the anchor moves every time
+        // `./gradlew refreshCheckpoint` runs, so a literal here would make the
+        // refresh tool break this test. What must hold is that the default
+        // helper and the config-aware one agree for this chain.
+        assert_eq!(
+            spec::compute_sync_committee_period(c.checkpoint_slot),
+            spec::compute_sync_committee_period_with(c.checkpoint_slot, c.slots_per_period())
+        );
         // The live digest the Java computes (verified against jshell).
         assert_eq!(c.current_fork_digest(), [0x8C, 0x9F, 0x62, 0xFE]);
         assert_eq!(c.accepted_fork_digests(), vec![[0x8C, 0x9F, 0x62, 0xFE]]);
@@ -2675,8 +2684,11 @@ mod tests {
         assert_eq!(c.seconds_per_slot, 12);
         assert_eq!(c.slots_per_epoch, 32);
         assert_eq!((c.blob_params_epoch, c.blob_params_max_blobs), (275_712, 21));
-        // Checkpoint period 1324 (slot / 8192) — matches the Java region comment.
-        assert_eq!(spec::compute_sync_committee_period(c.checkpoint_slot), 1324);
+        // Structural rather than a pinned period — see the mainnet twin.
+        assert_eq!(
+            spec::compute_sync_committee_period(c.checkpoint_slot),
+            spec::compute_sync_committee_period_with(c.checkpoint_slot, c.slots_per_period())
+        );
         // The live digest the Java computes (verified by running
         // NetworkConfig.SEPOLIA.currentForkDigest() — BPO2 folded in).
         assert_eq!(c.current_fork_digest(), [0x74, 0xD0, 0x14, 0x59]);
@@ -2740,12 +2752,15 @@ mod tests {
         assert_eq!(ChainConfig::mainnet().slots_per_period(), 8192);
         assert_eq!(ChainConfig::mainnet().epochs_per_sync_committee_period, 256);
         assert_eq!((c.blob_params_epoch, c.blob_params_max_blobs), (1_337_856, 2));
-        // 512 epochs x 16 slots = the same 8192-slot period as mainnet-preset.
-        // 3596 — the SAME period roost@gnosis serves. That is not incidental:
-        // the previous anchor sat at 3480, 116 periods below roost's floor, and
-        // roost's archive only grows forward, so a wallet could never have
-        // bootstrapped from it.
-        assert_eq!(spec::compute_sync_committee_period(c.checkpoint_slot), 3596);
+        // 512 epochs x 16 slots = the same 8192-slot period as mainnet-preset,
+        // which is why the default helper may be used on gnosis at all. Pinned
+        // structurally rather than as a period number: the anchor must track
+        // roost@gnosis's servable window, so it moves on every refresh — see the
+        // mainnet twin.
+        assert_eq!(
+            spec::compute_sync_committee_period(c.checkpoint_slot),
+            spec::compute_sync_committee_period_with(c.checkpoint_slot, c.slots_per_period())
+        );
         // Live-verified digests the Java computes (NetworkConfig.GNOSIS
         // currentForkDigest / acceptedForkDigests): Fulu first, Electra fallback.
         assert_eq!(c.current_fork_digest(), [0x32, 0x37, 0xDA, 0xB6]);
@@ -2776,6 +2791,90 @@ mod tests {
         assert_eq!(ids.len(), 23, "one address per peer id (the pool dedupes by id)");
         assert!(c.static_peers.iter().all(|p| parse_static_peer(p).is_some()));
         assert_eq!(c.bootstrap_enrs.len(), 8);
+    }
+
+    /// The Java anchor and the Rust one, compared directly.
+    ///
+    /// The `*_config_matches_networkconfig_java` tests above are ONE-SIDED: they
+    /// pin the Rust config against literals copied into this file, so they fail
+    /// when someone edits Rust and stay green when the two engines drift apart.
+    /// A split trust anchor is precisely a drift, so it slipped through — this
+    /// reads `NetworkConfig.java` itself and asserts the two agree.
+    ///
+    /// `./gradlew refreshCheckpoint` writes both from one fetch and so keeps this
+    /// green by construction; the test is what makes that a checked property
+    /// rather than a claim in a KDoc.
+    #[test]
+    fn java_and_rust_checkpoints_agree() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let java = repo_root
+            .join("networking/src/main/java/com/jaeckel/ethp2p/networking/NetworkConfig.java");
+        let src = match std::fs::read_to_string(&java) {
+            Ok(s) => s,
+            Err(e) => {
+                // Skipping is legitimate ONLY outside a repo checkout (a vendored
+                // crate has no Java engine to disagree with). Inside one, an
+                // unreadable path means the Java file MOVED — and skipping there
+                // would silently disarm this guard forever, degrading the parity
+                // guarantee back to a claim in a comment. Distinguish the two by
+                // a repo landmark.
+                if repo_root.join("settings.gradle.kts").exists() {
+                    panic!(
+                        "this is a repo checkout (settings.gradle.kts present) but {} is \
+                         unreadable ({e}) — NetworkConfig.java moved; update this test's path \
+                         and the refreshCheckpoint task in build.gradle.kts",
+                        java.display()
+                    );
+                }
+                eprintln!("skipping: not a repo checkout ({} unreadable: {e})", java.display());
+                return;
+            }
+        };
+
+        for (net, c) in [
+            ("mainnet", ChainConfig::mainnet()),
+            ("sepolia", ChainConfig::sepolia()),
+            ("gnosis", ChainConfig::gnosis()),
+        ] {
+            let begin = format!("// @checkpoint:{net}:begin");
+            let end = format!("// @checkpoint:{net}:end");
+            let from = src
+                .find(&begin)
+                .unwrap_or_else(|| panic!("no {begin} marker in NetworkConfig.java"));
+            let to = src[from..]
+                .find(&end)
+                .unwrap_or_else(|| panic!("no {end} marker in NetworkConfig.java"))
+                + from;
+            let region = &src[from..to];
+
+            // Bytes.fromHexString("<64 hex>")
+            let root_at = region
+                .find("fromHexString(\"")
+                .unwrap_or_else(|| panic!("no root literal in the {net} region"))
+                + "fromHexString(\"".len();
+            let java_root = region[root_at..root_at + 64].to_ascii_lowercase();
+            assert_eq!(
+                java_root,
+                hex_str(&c.checkpoint_root),
+                "{net}: checkpoint_root differs between NetworkConfig.java and ChainConfig::{net}() \
+                 — the two engines are anchored to different blocks. Run `./gradlew refreshCheckpoint`."
+            );
+
+            // <digits>L, on its own line
+            let java_slot: u64 = region
+                .lines()
+                .find_map(|l| {
+                    l.trim()
+                        .strip_suffix("L,")
+                        .or_else(|| l.trim().split_once("L, //").map(|p| p.0))
+                })
+                .and_then(|d| d.trim().parse().ok())
+                .unwrap_or_else(|| panic!("no slot literal in the {net} region"));
+            assert_eq!(
+                java_slot, c.checkpoint_slot,
+                "{net}: checkpoint_slot differs between NetworkConfig.java and ChainConfig::{net}()"
+            );
+        }
     }
 
     /// A chain whose geometry does NOT multiply to 8192, which is the case every
