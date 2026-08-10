@@ -1463,6 +1463,12 @@ fn hex4(b: &[u8; 4]) -> String {
     format!("{:02x}{:02x}{:02x}{:02x}", b[0], b[1], b[2], b[3])
 }
 
+/// First 8 bytes of a root as hex — matches how `roost`'s store logs a
+/// bootstrap root, so the two log lines line up on the same identifier.
+fn hex8(b: &[u8]) -> String {
+    b.iter().take(8).map(|x| format!("{x:02x}")).collect()
+}
+
 /// Serve a peer-initiated request, mirroring the Java responder handlers:
 /// status → our current Status; ping/goodbye → echo; metadata → light-client
 /// zeros; light_client_* → ResourceUnavailable (no relay cache in this stage).
@@ -1527,7 +1533,10 @@ fn respond_inbound(ctx: &SwarmCtx, protocol: &'static str, peer: PeerId, raw: &[
         protocols::BOOTSTRAP => match (&ctx.lc, req_ssz.as_slice().try_into()) {
             (Some(lc), Ok(root)) => {
                 let root: [u8; 32] = root;
-                lc.bootstrap(&root).unwrap_or_else(resource_unavailable)
+                let served = lc.bootstrap(&root);
+                tracing::info!(peer = %peer, root = %hex8(&root),
+                    served = served.is_some(), "light_client_bootstrap request");
+                served.unwrap_or_else(resource_unavailable)
             }
             (Some(_), Err(_)) => codec::encode_error_response(
                 codec::RESULT_INVALID_REQUEST,
@@ -1545,17 +1554,29 @@ fn respond_inbound(ctx: &SwarmCtx, protocol: &'static str, peer: PeerId, raw: &[
                 }
                 let start = u64::from_le_bytes(req_ssz[..8].try_into().expect("checked"));
                 let count = u64::from_le_bytes(req_ssz[8..16].try_into().expect("checked"));
-                lc.updates_by_range(start, count)
-                    .unwrap_or_else(resource_unavailable)
+                let served = lc.updates_by_range(start, count);
+                tracing::info!(peer = %peer, start, count, served = served.is_some(),
+                    "light_client_updates_by_range request");
+                served.unwrap_or_else(resource_unavailable)
             }
             None => resource_unavailable(),
         },
         protocols::FINALITY_UPDATE => match &ctx.lc {
-            Some(lc) => lc.finality_update().unwrap_or_else(resource_unavailable),
+            Some(lc) => {
+                let served = lc.finality_update();
+                tracing::debug!(peer = %peer, served = served.is_some(),
+                    "light_client_finality_update request");
+                served.unwrap_or_else(resource_unavailable)
+            }
             None => resource_unavailable(),
         },
         protocols::OPTIMISTIC_UPDATE => match &ctx.lc {
-            Some(lc) => lc.optimistic_update().unwrap_or_else(resource_unavailable),
+            Some(lc) => {
+                let served = lc.optimistic_update();
+                tracing::debug!(peer = %peer, served = served.is_some(),
+                    "light_client_optimistic_update request");
+                served.unwrap_or_else(resource_unavailable)
+            }
             None => resource_unavailable(),
         },
 

@@ -96,6 +96,9 @@ async fn main() {
             listen_port: 0,
             // The census is a hunt by definition: crawl at the boosted cadence.
             hunt_boost: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            // A census enumerates the whole DHT; targeted rounds toward the
+            // pinned servers would only skew the sample toward nodes we run.
+            pinned_peer_ids: vec![],
         },
         disc_tx,
     )

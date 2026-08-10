@@ -41,6 +41,15 @@ pub struct DiscoveryConfig {
     pub accepted_fork_digests: Vec<[u8; 4]>,
     /// UDP port to bind. 0 lets the OS pick.
     pub listen_port: u16,
+    /// libp2p ids of the chain's PINNED peers (the static-peer list). Lookups
+    /// walk TOWARD these ids first — O(log n) convergence — instead of hoping a
+    /// random walk lands in their bucket, which on the mainnet DHT it rarely
+    /// does. This is what lets a STALE static-peer address heal in seconds: the
+    /// server (roost) signs its current endpoint into its ENR under the same
+    /// secp256k1 key its libp2p peer id encodes, so its discv5 node id is
+    /// DERIVABLE from the pin (`node_id_for_peer`) and the record third-party
+    /// tables return is verifiable — a wrong key cannot produce this peer id.
+    pub pinned_peer_ids: Vec<PeerId>,
     /// LC-hunt escalation flag, shared with the sync loop: while `true`,
     /// lookup rounds run back-to-back (short sleep) instead of the polite
     /// steady-state cadence, so the pool fills with fresh candidates fast when
@@ -79,13 +88,27 @@ pub async fn spawn(
         .start()
         .await
         .map_err(|e| format!("discv5 start failed: {e}"))?;
-    tracing::info!(bootnodes = bootnodes.len(), port = config.listen_port, "discv5 started");
+    // Pinned ids whose discv5 node id is derivable get TARGETED lookups; the
+    // rest (non-secp256k1 ids, if any ever appear) silently fall back to being
+    // findable only by the random walk, which is what they were before.
+    let pinned_targets: Vec<NodeId> = config
+        .pinned_peer_ids
+        .iter()
+        .filter_map(node_id_for_peer)
+        .collect();
+    tracing::info!(
+        bootnodes = bootnodes.len(),
+        pinned_targets = pinned_targets.len(),
+        port = config.listen_port,
+        "discv5 started"
+    );
 
     let table_size = Arc::new(AtomicUsize::new(0));
     let task = tokio::spawn(run_lookups(
         discv5,
         config.accepted_fork_digests,
         bootnodes,
+        pinned_targets,
         Arc::clone(&table_size),
         config.hunt_boost,
         tx,
@@ -97,6 +120,25 @@ pub async fn spawn(
 /// successfully PARSED one for the empty-table re-seed — including ones whose
 /// initial `add_enr` fails (a full bucket at spawn must not permanently exclude
 /// a bootnode from recovery; only malformed ENRs are dropped, with a warn).
+/// The discv5 node id a pinned libp2p peer will present, derived from the peer
+/// id alone.
+///
+/// Works because secp256k1 libp2p peer ids are IDENTITY-multihashed protobuf
+/// public keys (33 compressed bytes inline), and roost deliberately signs its
+/// ENR with its libp2p host key — one key, two identities, so the discv5 id is
+/// keccak256 of the same point. `None` for peer ids that don't inline a
+/// secp256k1 key (sha256-multihashed RSA/ed25519 ids can't be reversed).
+pub fn node_id_for_peer(peer_id: &PeerId) -> Option<NodeId> {
+    let mh = libp2p::multihash::Multihash::from(*peer_id);
+    if mh.code() != 0x00 {
+        return None; // not identity-hashed: the key is not recoverable
+    }
+    let key = libp2p::identity::PublicKey::try_decode_protobuf(mh.digest()).ok()?;
+    let secp = key.try_into_secp256k1().ok()?;
+    let vk = discv5::enr::k256::ecdsa::VerifyingKey::from_sec1_bytes(&secp.to_bytes()).ok()?;
+    Some(NodeId::from(vk))
+}
+
 fn seed_bootnodes(discv5: &Discv5, bootstrap_enrs: &[String]) -> Vec<Enr> {
     let mut bootnodes: Vec<Enr> = Vec::with_capacity(bootstrap_enrs.len());
     for enr_str in bootstrap_enrs {
@@ -113,22 +155,63 @@ fn seed_bootnodes(discv5: &Discv5, bootstrap_enrs: &[String]) -> Vec<Enr> {
     bootnodes
 }
 
+/// Every Nth steady-state round revisits one pinned target (after the opening
+/// rounds visited each once). Between visits the random walk enumerates the
+/// wider DHT exactly as before — pinned targets ride alongside, they don't
+/// displace enumeration.
+const PINNED_ROUND_EVERY: usize = 4;
+
 async fn run_lookups(
     discv5: Discv5,
     accepted_digests: Vec<[u8; 4]>,
     bootnodes: Vec<Enr>,
+    pinned_targets: Vec<NodeId>,
     table_size: Arc<AtomicUsize>,
     hunt_boost: Arc<AtomicBool>,
     tx: mpsc::Sender<DiscoveredPeer>,
 ) {
     let mut seen: HashSet<NodeId> = HashSet::new();
+    // Last emitted ENR sequence number per PINNED id. A pinned server may be
+    // re-found on every targeted round, but only a STRICTLY newer record — a
+    // genuine republication, e.g. after an address change — re-emits. Gating on
+    // seq (not on "address differs") also means a laggard or adversarial table
+    // serving an OLDER record can never flap a pinned peer's pooled address
+    // backward (#348 review).
+    let mut pinned_seq: std::collections::HashMap<NodeId, u64> = std::collections::HashMap::new();
     let mut empty_rounds = 0u32;
+    let mut round: usize = 0;
     loop {
-        match discv5.find_node(NodeId::random()).await {
+        // The FIRST rounds walk toward each pinned server id in turn — that is
+        // the startup fast path (O(log n) hops instead of random-walk luck) —
+        // then every PINNED_ROUND_EVERY-th round revisits one, which is what
+        // heals a stale pinned ADDRESS: third-party tables return the server's
+        // current signed ENR and, when its seq has advanced, the emission
+        // below re-feeds the pool.
+        let target = if pinned_targets.is_empty() {
+            NodeId::random()
+        } else if round < pinned_targets.len() {
+            pinned_targets[round]
+        } else if round % PINNED_ROUND_EVERY == 0 {
+            pinned_targets[(round / PINNED_ROUND_EVERY) % pinned_targets.len()]
+        } else {
+            NodeId::random()
+        };
+        round = round.wrapping_add(1);
+        match discv5.find_node(target).await {
             Ok(enrs) => {
                 let mut emitted = 0usize;
                 for enr in enrs {
-                    if !seen.insert(enr.node_id()) {
+                    if pinned_targets.contains(&enr.node_id()) {
+                        // Pinned ids bypass the once-ever dedup, but only on a
+                        // record NEWER than the last one emitted.
+                        match pinned_seq.get(&enr.node_id()) {
+                            Some(&last) if enr.seq() <= last => continue,
+                            _ => {
+                                pinned_seq.insert(enr.node_id(), enr.seq());
+                                seen.insert(enr.node_id());
+                            }
+                        }
+                    } else if !seen.insert(enr.node_id()) {
                         continue;
                     }
                     if let Some(peer) = filter_candidate(&enr, &accepted_digests) {

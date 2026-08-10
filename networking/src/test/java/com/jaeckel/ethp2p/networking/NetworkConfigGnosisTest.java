@@ -83,7 +83,7 @@ class NetworkConfigGnosisTest {
     @Test
     void discoveryPeersArePresent() {
         assertFalse(G.bootnodes().isEmpty(), "EL discv4 bootnodes must be present");
-        assertEquals(8, G.clDiscv5Bootnodes().size(), "CL discv5 bootnodes seed");
+        assertEquals(9, G.clDiscv5Bootnodes().size(), "CL discv5 bootnodes seed");
         for (String enr : G.clDiscv5Bootnodes()) {
             assertTrue(enr.startsWith("enr:"), "CL bootnode must be an ENR: " + enr);
         }
