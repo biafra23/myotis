@@ -735,8 +735,20 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
     // API answers with 404, so walk forward until a block exists. Bounded at 32
     // slots (one mainnet epoch, two gnosis epochs): past that the chain has
     // bigger problems, and failing loudly beats anchoring somewhere unintended.
+    // -Pslot pins an EXACT slot instead. It exists because a bootstrap is only
+    // servable where the serving node retained a state, and those retention
+    // points are specific slots (epoch boundaries near its trustedNodeSync
+    // anchor), not period firsts — the oldest testable anchor is one of them.
+    // The slot must hold a block: a skipped slot fails loudly rather than being
+    // walked past, because an explicit slot is a statement of intent.
     val targetPeriod = (project.findProperty("period") as String?)?.toLong()
-    val pinnedSlot: Long? = targetPeriod?.let { p ->
+    val targetSlot = (project.findProperty("slot") as String?)?.toLong()
+    if (targetPeriod != null && targetSlot != null) {
+        // Applied-or-refused: silently preferring one would compute a well-formed
+        // anchor against something other than what the caller asked for.
+        throw GradleException("[refresh:$net] -Pperiod and -Pslot are mutually exclusive — pass one")
+    }
+    val pinnedSlot: Long? = targetSlot ?: targetPeriod?.let { p ->
         val first = p * slotsPerPeriod
         (first until first + 32).firstOrNull { slot ->
             endpoints.any { base -> fetch("$base/eth/v2/beacon/blocks/$slot") != null }
@@ -744,7 +756,7 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
             "[refresh:$net] no block in slots $first..${first + 31} for period $p")
     }
     if (pinnedSlot != null) {
-        logger.lifecycle("[refresh:$net] pinning period $targetPeriod → slot $pinnedSlot")
+        logger.lifecycle("[refresh:$net] pinning ${targetSlot?.let { "slot $it" } ?: "period $targetPeriod"} → slot $pinnedSlot (period ${pinnedSlot / slotsPerPeriod})")
     }
 
     // Phase 1 — slot DISCOVERY only. The v2 block body is fetched to learn each
@@ -1031,7 +1043,7 @@ val checkpointGenesisValidatorsRoot = mapOf(
  */
 tasks.register("refreshCheckpoint") {
     group = "trust"
-    description = "Refresh trusted checkpoints in NetworkConfig.java AND the Rust ChainConfig. -Pnetwork=<name> for one, -Pdry to preview."
+    description = "Refresh trusted checkpoints in NetworkConfig.java AND the Rust ChainConfig. -Pnetwork=<name> for one, -Pdry to preview, -Pperiod=<n>/-Pslot=<n> to pin instead of head."
 
     doLast {
         val only = project.findProperty("network") as String?
