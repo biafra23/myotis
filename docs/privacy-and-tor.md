@@ -3,11 +3,14 @@
 > **Status: the core transport path is in production, feature-gated and
 > experimental.** `-PtorEngine` links Arti into the Rust engine
 > (`rust/myotis-net/src/el/tor.rs`), and a Settings toggle routes **account
-> (balance/nonce) reads only** — the single routing switch sits in
+> (balance/nonce) reads** — the single routing switch sits in
 > `get_account` (`reader.rs`) — over per-address isolated circuits with
 > ephemeral RLPx keys. Wired up on the desktop host only today; storage/token
-> reads, contract code, `eth_call`/gas estimation, tx broadcast, the CL fetch,
-> and discovery still use the real IP. And the shipped path reuses the live
+> reads, `eth_call`/gas estimation, tx broadcast, the CL fetch, and discovery
+> still use the real IP, while contract-code reads are a hybrid: `get_code`
+> anchors through the same `get_account`, so its address-carrying account
+> query follows the Tor toggle and only the content-addressed bytecode fetch
+> stays clearnet. And the shipped path reuses the live
 > clearnet-validated peer pool — no quarantine/aging yet — so the peer serving
 > a Tor read simultaneously holds a clearnet connection from the user's real
 > IP and could pair the two by timing (`reader.rs`'s own KNOWN LIMITATION): a
