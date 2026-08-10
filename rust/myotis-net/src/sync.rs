@@ -164,13 +164,12 @@ impl ChainConfig {
             blob_params_max_blobs: 21,
             // Copied verbatim from the @checkpoint:mainnet:begin/end region of
             // NetworkConfig.java (slot 14560000, 2026-06-15, period 1777).
-            // NOTE: `./gradlew refreshMainnetCheckpoint` rewrites only the Java
-            // region today — it does NOT rewrite this constant yet (plan PR7);
-            // until then a checkpoint refresh must be mirrored here by hand.
+            // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
             checkpoint_root: hex32(
                 "58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e",
             ),
             checkpoint_slot: 14_560_000,
+            // @checkpoint:mainnet:end
             static_peers: MAINNET_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: MAINNET_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
@@ -211,10 +210,12 @@ impl ChainConfig {
             // This pin must also stay NEWER than the dedicated serving node's
             // trustedNodeSync point, or that node cannot answer the bootstrap for
             // it (docs/dedicated-sepolia-node.md §5).
+            // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
             checkpoint_root: hex32(
                 "a064b99bb711d152efbc88674dcba50d4e6c1b9151dae0a2e5bfbb7c40bc7cb9",
             ),
             checkpoint_slot: 10_851_360,
+            // @checkpoint:sepolia:end
             static_peers: SEPOLIA_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: SEPOLIA_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
@@ -250,7 +251,7 @@ impl ChainConfig {
             blob_params_max_blobs: 2,
             // Copied verbatim from the @checkpoint:gnosis:begin/end region of
             // NetworkConfig.java (slot 29460368, 2026-08-09, period 3596).
-            // A refresh must be mirrored here by hand until plan PR7.
+            // Rewritten by `./gradlew refreshCheckpoint` together with the Java twin.
             //
             // Refreshed so the anchor sits INSIDE the period roost@gnosis can
             // serve. The previous anchor (period 3480) was 116 periods behind,
@@ -262,10 +263,12 @@ impl ChainConfig {
             // its three providers (the other two 404), so this root was checked
             // against the local gnosis beacon node, which reached the same slot
             // independently over p2p, and against its finalized checkpoint.
+            // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
             checkpoint_root: hex32(
                 "84f127f4bbb1e733c5607910c2df1d2c0e726e2fab0a4690b66cd07a5c2455bf",
             ),
             checkpoint_slot: 29_460_368,
+            // @checkpoint:gnosis:end
             static_peers: GNOSIS_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: GNOSIS_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
