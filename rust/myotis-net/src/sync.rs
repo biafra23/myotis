@@ -162,8 +162,8 @@ impl ChainConfig {
             // BPO2 (Fusaka) blob schedule entry: epoch 419072, MAX_BLOBS=21.
             blob_params_epoch: 419_072,
             blob_params_max_blobs: 21,
-            // Copied verbatim from the @checkpoint:mainnet:begin/end region of
-            // NetworkConfig.java (slot 14560000, 2026-06-15, period 1777).
+            // Mirrors the @checkpoint:mainnet region of NetworkConfig.java;
+            // `./gradlew refreshCheckpoint` rewrites both from one fetch.
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
             checkpoint_root: hex32(
                 "58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e",
@@ -202,10 +202,8 @@ impl ChainConfig {
             // epoch 275712, MAX_BLOBS_PER_BLOCK=21 (2025-10-28).
             blob_params_epoch: 275_712,
             blob_params_max_blobs: 21,
-            // Copied verbatim from the @checkpoint:sepolia:begin/end region of
-            // NetworkConfig.java (slot 10851360, 2026-08-05, period 1324). Like
-            // mainnet, `./gradlew refreshSepoliaCheckpoint` rewrites only the Java
-            // region — a refresh must be mirrored here by hand until plan PR7.
+            // Mirrors the @checkpoint:sepolia region of NetworkConfig.java;
+            // `./gradlew refreshCheckpoint` rewrites both from one fetch.
             //
             // This pin must also stay NEWER than the dedicated serving node's
             // trustedNodeSync point, or that node cannot answer the bootstrap for
@@ -249,7 +247,7 @@ impl ChainConfig {
             // into the Fulu digest. Yields the live-verified digest 0x3237dab6.
             blob_params_epoch: 1_337_856,
             blob_params_max_blobs: 2,
-            // Copied verbatim from the @checkpoint:gnosis:begin/end region of
+            // Mirrors the @checkpoint:gnosis region of
             // NetworkConfig.java (slot 29460368, 2026-08-09, period 3596).
             // Rewritten by `./gradlew refreshCheckpoint` together with the Java twin.
             //

@@ -633,7 +633,12 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
     val endpoints = checkpointEndpoints.getValue(net) + extra
     val secondsPerSlot = checkpointSecondsPerSlot.getValue(net)
     val slotsPerPeriod = checkpointSlotsPerPeriod.getValue(net)
-    val genesis = (project.property("ethp2p.$net.genesisTime") as String).toLong()
+    // Guarded, as the helper this replaces was: a missing or malformed property
+    // would otherwise surface as a ClassCastException or NumberFormatException
+    // deep in the task rather than as the configuration error it is.
+    val genesis = (project.findProperty("ethp2p.$net.genesisTime") as? String)
+        ?.takeIf { it.isNotBlank() }?.toLongOrNull()
+        ?: throw GradleException("missing or malformed property ethp2p.$net.genesisTime")
 
     val dryRun = project.hasProperty("dry")
     val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
