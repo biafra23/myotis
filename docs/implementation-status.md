@@ -6,7 +6,7 @@ Comparison of the [architecture document](architecture-doc.md) against what is a
 **POC: Implemented**
 
 - Beacon light client with bootstrap, finality updates, and sync committee rotation (`BeaconLightClient`, `LightClientProcessor`)
-- Bootstrap response is pinned to a hardcoded beacon block root (`checkpointRoot`) in `NetworkConfig` (mainnet: slot 14158720, root `611c852c…ff5d`). `verifyCheckpointPin` enforces the pin on every bootstrap response, whether fetched over libp2p or HTTP. The pin is refreshed via the `./gradlew refreshCheckpoint` Gradle task, which rewrites the Java and Rust anchors together.
+- Bootstrap response is pinned to a hardcoded beacon block root (`checkpointRoot`) in `NetworkConfig` — the current value lives in the `@checkpoint:mainnet` marker region of `NetworkConfig.java` (deliberately not duplicated here: a copy in prose goes stale on every refresh and then contradicts the source it describes). `verifyCheckpointPin` enforces the pin on every bootstrap response, whether fetched over libp2p or HTTP. The pin is refreshed via the `./gradlew refreshCheckpoint` Gradle task, which rewrites the Java and Rust anchors together; `java_and_rust_checkpoints_agree` fails if they diverge.
 - BLS12-381 signature verification with 2/3 supermajority check (`SyncCommitteeVerifier`, `BlsVerifier`). Implementation is pure-Java Milagro AMCL — the jblst JNI dependency has been removed, which unblocks the Android port. Validation rejects non-canonical point encodings, non-subgroup points, and identity pubkeys/signatures to prevent trivial forgeries.
 - libp2p networking with Noise XX, Yamux/Mplex (`BeaconP2PService`)
 - All four light client req/resp protocols implemented (bootstrap, updates_by_range, finality_update, optimistic_update)
