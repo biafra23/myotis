@@ -52,3 +52,4 @@ ios-app/DerivedData/
 # binary would drift from the Rust source and silently ship a dead engine.
 # `-PskipRustEngine` omits them (the app falls back to the Java engine).
 /android-app/src/main/jniLibs/*/libmyotis_*.so
+logindex-*.db

@@ -241,12 +241,22 @@ public final class DiscV5Service implements AutoCloseable {
     // Targeted lookups (#347) — walk TOWARD the pinned servers
     // -------------------------------------------------------------------------
 
-    /** Queries per walk round (Kademlia α). */
-    private static final int WALK_ALPHA = 3;
-    /** Rounds per walk before giving up (each round queries α nodes). */
-    private static final int WALK_MAX_ROUNDS = 4;
+    /** Total FINDNODE queries per walk. Termination is spec-Kademlia — stop
+     *  when the near window has no unqueried nodes left — and this budget is
+     *  the hard cap. Sized from live tuning: round-based variants with early
+     *  "no progress" breaks stalled at logDistance ~244-252 of 256; a
+     *  closest-first budgeted loop converges or proves absence within ~24. */
+    private static final int WALK_QUERY_BUDGET = 32;
+    // (No near-window cutoff: live runs showed the records CLOSEST to a target
+    // are often stale/dead entries — 13 of 16 timed out — and a "closest-16
+    // all queried → unreachable" rule gave up with budget left while alive
+    // nodes slightly farther out held the target's record. Closest-first over
+    // the whole frontier, bounded by the budget, is the rule that finds it.)
     /** Per-query answer budget; a silent node must not stall the walk. */
-    private static final long WALK_QUERY_TIMEOUT_MS = 3_000;
+    private static final long WALK_QUERY_TIMEOUT_MS = 1_500;
+    // Live tuning: answered queries return in ~100 ms; the walk's wall time is
+    // dominated by timeouts on dead frontier entries (15 of 20 on one run), so
+    // a short budget beats a generous one.
     /** Pause between opening-pass walks (each pinned id once, quickly). */
     private static final long WALK_OPENING_GAP_MS = 2_000;
     /** Pause between steady-state revisits (round-robin, one per gap). */
@@ -257,6 +267,15 @@ public final class DiscV5Service implements AutoCloseable {
      *  walk resumes from the best-known frontier instead of the bootnodes.
      *  Walker-thread only. */
     private final java.util.Map<org.apache.tuweni.bytes.Bytes, List<NodeRecord>> learnedFrontier =
+            new java.util.HashMap<>();
+    /** Pinned records already FOUND, reused as first-query seeds for the other
+     *  walks. The pinned servers know each other better than the wider DHT
+     *  does — roost's discv5 bootstraps THROUGH the co-located beacon node, so
+     *  the established pin's table holds the young pin long before the young
+     *  record has propagated widely (observed live: every walk toward roost
+     *  converged and stalled while nimbus — found in 9 queries every run — had
+     *  the record all along). Walker-thread only. */
+    private final java.util.Map<org.apache.tuweni.bytes.Bytes, NodeRecord> foundPinned =
             new java.util.HashMap<>();
 
     /**
@@ -276,6 +295,16 @@ public final class DiscV5Service implements AutoCloseable {
             return;
         }
         walker = new Thread(() -> {
+            // The opening pass is worthless against an empty table (observed:
+            // walk 1 fired ~2 s after start, before any bootnode answered, and
+            // burned the first slot on frontier=0). Wait briefly for the table.
+            for (int w = 0; w < 20 && system.streamLiveNodes().findAny().isEmpty(); w++) {
+                try {
+                    Thread.sleep(1_000);
+                } catch (InterruptedException gone) {
+                    return;
+                }
+            }
             int i = 0;
             while (!Thread.currentThread().isInterrupted()) {
                 org.apache.tuweni.bytes.Bytes target = pinnedNodeIds.get(i % pinnedNodeIds.size());
@@ -317,61 +346,172 @@ public final class DiscV5Service implements AutoCloseable {
      * #347/#348 review).
      */
     private void targetedWalk(org.apache.tuweni.bytes.Bytes target) {
-        java.util.Comparator<NodeRecord> byDistance = java.util.Comparator.comparing(
-                nr -> org.ethereum.beacon.discovery.util.Functions.distance(target, nr.getNodeId()));
+        // NOT Functions.distance: that helper reads the XOR as LITTLE-endian
+        // (toUnsignedBigInteger(LITTLE_ENDIAN)), so ordering by it sorts on the
+        // XOR's LOW bytes — near-random with respect to actual closeness, which
+        // scrambled the closest-first selection on the first live runs (the
+        // walk queried 256-distance nodes while 249s sat in the frontier).
+        // logDistance is the spec bucket index and interops with the wire.
+        java.util.Comparator<NodeRecord> byDistance = java.util.Comparator
+                .comparingInt((NodeRecord nr) -> org.ethereum.beacon.discovery.util.Functions
+                        .logDistance(nr.getNodeId(), target))
+                .thenComparing(nr -> new java.math.BigInteger(
+                        1, nr.getNodeId().xor(target).toArray()));
         java.util.Map<org.apache.tuweni.bytes.Bytes, NodeRecord> frontier = new java.util.HashMap<>();
         system.streamLiveNodes().forEach(nr -> frontier.put(nr.getNodeId(), nr));
         for (NodeRecord nr : learnedFrontier.getOrDefault(target, List.of())) {
             frontier.putIfAbsent(nr.getNodeId(), nr);
         }
         Set<org.apache.tuweni.bytes.Bytes> queried = new HashSet<>();
+        int answered = 0;
+        int failed = 0;
 
-        for (int round = 0; round < WALK_MAX_ROUNDS; round++) {
-            List<NodeRecord> candidates = frontier.values().stream()
-                    .filter(nr -> !queried.contains(nr.getNodeId()))
-                    .sorted(byDistance)
-                    .limit(WALK_ALPHA)
-                    .toList();
-            if (candidates.isEmpty()) {
+        // Phase -1 — ask the pinned servers already FOUND (see foundPinned):
+        // they are session-verified responders and the likeliest tables to
+        // hold a sibling pin's young record.
+        for (NodeRecord sibling : List.copyOf(foundPinned.values())) {
+            if (sibling.getNodeId().equals(target) || queried.contains(sibling.getNodeId())) {
+                continue;
+            }
+            queried.add(sibling.getNodeId());
+            int d = org.ethereum.beacon.discovery.util.Functions.logDistance(
+                    sibling.getNodeId(), target);
+            List<Integer> distances = java.util.stream.IntStream.rangeClosed(d - 4, d)
+                    .filter(x -> x >= 1 && x <= 256).boxed()
+                    .sorted(java.util.Collections.reverseOrder()).toList();
+            java.util.Collection<NodeRecord> answers;
+            try {
+                answers = system.findNodes(sibling, distances)
+                        .get(WALK_QUERY_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                answered++;
+            } catch (Exception unresponsive) {
+                failed++;
+                continue;
+            }
+            for (NodeRecord nr : answers) {
+                if (nr.getNodeId().equals(target)) {
+                    log.info("[discv5] targeted walk toward {}… : FOUND at a sibling pin (seq={})",
+                            target.slice(0, 4), nr.getSeq());
+                    foundPinned.put(nr.getNodeId(), nr);
+                    emitFromWalker(nr);
+                    rememberFrontier(target, frontier.values(), byDistance);
+                    return;
+                }
+                frontier.putIfAbsent(nr.getNodeId(), nr);
+            }
+        }
+
+        // Phase 0 — ask the BOOTNODES first, at the target's bucket as each of
+        // them sees it. Their tables are the largest and freshest in the
+        // network, and a server that pinged them at startup is often in them
+        // directly: the sigp verifier finds roost in its FIRST round precisely
+        // because a fresh sigp table contains only bootnodes. A closest-first
+        // walk would never ask them (they sit at random distance from any
+        // target), which is how it can converge to logDistance ~237 through a
+        // cluster of stale near-records and still miss a record the bootnodes
+        // are holding (observed live).
+        for (NodeRecord bootnode : bootnodeRecords()) {
+            if (queried.size() >= 6) {
                 break;
             }
-            boolean progressed = false;
-            for (NodeRecord candidate : candidates) {
-                queried.add(candidate.getNodeId());
-                int d = org.ethereum.beacon.discovery.util.Functions.logDistance(
-                        candidate.getNodeId(), target);
-                List<Integer> distances = java.util.stream.IntStream.of(d - 1, d, d + 1)
-                        .filter(x -> x >= 1 && x <= 256).distinct().boxed().toList();
-                java.util.Collection<NodeRecord> answers;
-                try {
-                    answers = system.findNodes(candidate, distances)
-                            .get(WALK_QUERY_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-                } catch (Exception unresponsive) {
-                    continue;
-                }
-                for (NodeRecord nr : answers) {
-                    if (nr.getNodeId().equals(target)) {
-                        log.info("[discv5] targeted walk toward {}… : FOUND (round={} seq={})",
-                                target.slice(0, 4), round, nr.getSeq());
-                        emitFromWalker(nr);
-                        rememberFrontier(target, frontier.values(), byDistance);
-                        return;
-                    }
-                    if (frontier.putIfAbsent(nr.getNodeId(), nr) == null) {
-                        progressed = true;
-                    }
-                }
+            if (bootnode.getNodeId().equals(target) || queried.contains(bootnode.getNodeId())) {
+                continue;
             }
-            if (!progressed) {
-                break; // converged without finding — record not propagated (yet)
+            queried.add(bootnode.getNodeId());
+            int d = org.ethereum.beacon.discovery.util.Functions.logDistance(
+                    bootnode.getNodeId(), target);
+            List<Integer> distances = java.util.stream.IntStream.rangeClosed(d - 4, d)
+                    .filter(x -> x >= 1 && x <= 256).boxed()
+                    .sorted(java.util.Collections.reverseOrder()).toList();
+            java.util.Collection<NodeRecord> answers;
+            try {
+                answers = system.findNodes(bootnode, distances)
+                        .get(WALK_QUERY_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                answered++;
+            } catch (Exception unresponsive) {
+                failed++;
+                continue;
+            }
+            for (NodeRecord nr : answers) {
+                if (nr.getNodeId().equals(target)) {
+                    log.info("[discv5] targeted walk toward {}… : FOUND at a bootnode (seq={})",
+                            target.slice(0, 4), nr.getSeq());
+                    foundPinned.put(nr.getNodeId(), nr);
+                    emitFromWalker(nr);
+                    rememberFrontier(target, frontier.values(), byDistance);
+                    return;
+                }
+                frontier.putIfAbsent(nr.getNodeId(), nr);
+            }
+        }
+
+        // Closest-first, budgeted: always query the closest node not yet asked,
+        // stop when the WALK_WINDOW closest have all been asked (they are the
+        // ones that would hold the target) or the budget runs out. Deliberately
+        // no "no progress this round" break: live tuning showed any such round
+        // heuristic either never terminates (any new node counts) or gives up
+        // while still ~250 bits out (closer-node-required) — spec-Kademlia
+        // termination is the one that actually converges.
+        for (int q = 0; q < WALK_QUERY_BUDGET; q++) {
+            NodeRecord candidate = frontier.values().stream()
+                    .filter(nr -> !queried.contains(nr.getNodeId()))
+                    .min(byDistance)
+                    .orElse(null);
+            if (candidate == null) {
+                break; // frontier exhausted — the target is not reachable today
+            }
+            queried.add(candidate.getNodeId());
+            int d = org.ethereum.beacon.discovery.util.Functions.logDistance(
+                    candidate.getNodeId(), target);
+            // The bucket at d contains the target's neighborhood as this
+            // candidate sees it; the lower buckets sample strictly closer
+            // halves. Five buckets per query: the responder caps the reply at
+            // 16 records total anyway, so a wider ask mines each RESPONSIVE
+            // node harder — which matters when the target's nearest neighbors
+            // are dead entries and answers are scarce.
+            List<Integer> distances = java.util.stream.IntStream.rangeClosed(d - 4, d)
+                    .filter(x -> x >= 1 && x <= 256).boxed().sorted(java.util.Collections.reverseOrder())
+                    .toList();
+            java.util.Collection<NodeRecord> answers;
+            try {
+                answers = system.findNodes(candidate, distances)
+                        .get(WALK_QUERY_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                answered++;
+            } catch (Exception unresponsive) {
+                failed++;
+                continue;
+            }
+            if (log.isDebugEnabled()) {
+                java.util.IntSummaryStatistics stats = answers.stream()
+                        .mapToInt(nr -> org.ethereum.beacon.discovery.util.Functions.logDistance(
+                                nr.getNodeId(), target))
+                        .summaryStatistics();
+                log.debug("[discv5] walk query: candidateDist={} asked={} answers={} answerDistToTarget=[{}..{}]",
+                        d, distances, answers.size(),
+                        stats.getCount() == 0 ? -1 : stats.getMin(),
+                        stats.getCount() == 0 ? -1 : stats.getMax());
+            }
+            for (NodeRecord nr : answers) {
+                if (nr.getNodeId().equals(target)) {
+                    log.info("[discv5] targeted walk toward {}… : FOUND (queries={} seq={})",
+                            target.slice(0, 4), answered + failed, nr.getSeq());
+                    foundPinned.put(nr.getNodeId(), nr);
+                    emitFromWalker(nr);
+                    rememberFrontier(target, frontier.values(), byDistance);
+                    return;
+                }
+                frontier.putIfAbsent(nr.getNodeId(), nr);
             }
         }
         rememberFrontier(target, frontier.values(), byDistance);
         // One line per completed walk, kept at INFO deliberately: with the
         // found-path logging living behind the emit dedupe, a silent walker is
         // indistinguishable from a dead one (observed on the first live run).
-        log.info("[discv5] targeted walk toward {}… : not found (queried={} frontier={})",
-                target.slice(0, 4), queried.size(), frontier.size());
+        int closest = frontier.keySet().stream()
+                .mapToInt(id -> org.ethereum.beacon.discovery.util.Functions.logDistance(id, target))
+                .min().orElse(-1);
+        log.info("[discv5] targeted walk toward {}… : not found (answered={} failed={} frontier={} closestLogDist={})",
+                target.slice(0, 4), answered, failed, frontier.size(), closest);
     }
 
     /** Keep the closest few learned records so the next revisit resumes there. */
