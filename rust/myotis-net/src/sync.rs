@@ -421,6 +421,13 @@ const SEPOLIA_BOOTSTRAP_ENRS: &[&str] = &[
     // remaining bootstrap_nodes.yaml entries (unattributed)
     "enr:-Iq4QMCTfIMXnow27baRUb35Q8iiFHSIDBJh6hQM5Axohhf4b6Kr_cOCu0htQ5WvVqKvFgY28893DHAg8gnBAXsAVqmGAX53x8JggmlkgnY0gmlwhLKAlv6Jc2VjcDI1NmsxoQK6S-Cii_KmfFdUJL2TANL3ksaKUnNXvTCv1tLwXs0QgIN1ZHCCIyk",
     "enr:-L64QC9Hhov4DhQ7mRukTOz4_jHm4DHlGL726NWH4ojH1wFgEwSin_6H95Gs6nW2fktTWbPachHJ6rUFu0iJNgA0SB2CARqHYXR0bmV0c4j__________4RldGgykDb6UBOQAABx__________-CaWSCdjSCaXCEA-2vzolzZWNwMjU2azGhA17lsUg60R776rauYMdrAz383UUgESoaHEzMkvm4K6k6iHN5bmNuZXRzD4N0Y3CCIyiDdWRwgiMo",
+    // roost sepolia (this project's dedicated LC server) — a SNAPSHOT of its
+    // published record (2026-08-10): seeding it makes roost dialable from the
+    // first table without waiting for any walk. The embedded IP goes stale if
+    // the server's address rotates; the targeted-lookup path (node_id derived
+    // from the position-0 static peer pin, `discovery::node_id_for_peer`)
+    // is what recovers the CURRENT record then.
+    "enr:-KG4QGERMtMCoXY2T1Jwp3zk2fpdn9e-Q8p9IeUCuJ1ZA7JjVLXvrtuxMHqP6iRWbkO3O2eWETkvMBcIRAV3SkBgKAADhGV0aDKQdNAUWZAAAHX__________4JpZIJ2NIJpcIRXmtGhiXNlY3AyNTZrMaECOGinXjNuey5xwLNiO0Cd-MB7I3zLqCC5rbLWG6Bo9rqDdGNwgiORg3VkcIIjkQ",
 ];
 
 /// Pinned Gnosis LC-serving peer multiaddrs (Java `NetworkConfig.GNOSIS.clPeerMultiaddrs`
@@ -478,6 +485,13 @@ const GNOSIS_BOOTSTRAP_ENRS: &[&str] = &[
     "enr:-KK4QKXJq1QOVWuJAGige4uaT8LRPQGCVRf3lH3pxjaVScMRUfFW1eiiaz8RwOAYvw33D4EX-uASGJ5QVqVCqwccxa-Bi4RldGgykCGm-DYDAABk__________-CaWSCdjSCaXCEM0QnzolzZWNwMjU2azGhAhNvrRkpuK4MWTf3WqiOXSOePL8Zc-wKVpZ9FQx_BDadg3RjcIIjKIN1ZHCCIyg",
     "enr:-LO4QO87Rn2ejN3SZdXkx7kv8m11EZ3KWWqoIN5oXwQ7iXR9CVGd1dmSyWxOL1PGsdIqeMf66OZj4QGEJckSi6okCdWBpIdhdHRuZXRziAAAAABgAAAAhGV0aDKQPr_UhAQAAGT__________4JpZIJ2NIJpcIQj0iX1iXNlY3AyNTZrMaEDd-_eqFlWWJrUfEp8RhKT9NxdYaZoLHvsp3bbejPyOoeDdGNwgiMog3VkcIIjKA",
     "enr:-LK4QIJUAxX9uNgW4ACkq8AixjnSTcs9sClbEtWRq9F8Uy9OEExsr4ecpBTYpxX66cMk6pUHejCSX3wZkK2pOCCHWHEBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpA-v9SEBAAAZP__________gmlkgnY0gmlwhCPSnDuJc2VjcDI1NmsxoQNuaAjFE-ANkH3pbeBdPiEIwjR5kxFuKaBWxHkqFuPz5IN0Y3CCIyiDdWRwgiMo",
+    // roost gnosis (this project's dedicated LC server) — a SNAPSHOT of its
+    // published record (2026-08-10): seeding it makes roost dialable from the
+    // first table without waiting for any walk. The embedded IP goes stale if
+    // the server's address rotates; the targeted-lookup path (node_id derived
+    // from the position-0 static peer pin, `discovery::node_id_for_peer`)
+    // is what recovers the CURRENT record then.
+    "enr:-KG4QM_0UweYmWFjBAaZ1JnMTeUkeGgHWEVp3N2vewhkzNtlRlnObTaz3ki1RP1lNvOvMBh_iOu0-LnEacfdZN8dx4IChGV0aDKQMjfatgYAAGT__________4JpZIJ2NIJpcIRXmtGhiXNlY3AyNTZrMaEDM0NY9iNV9hZMrtkoRrPEKj7tm2TLriwZv-m1ctszvvKDdGNwgiOUg3VkcIIjlA",
 ];
 
 /// Known light-client-serving mainnet peers — the Java `NetworkConfig.MAINNET`
@@ -546,6 +560,13 @@ const MAINNET_BOOTSTRAP_ENRS: &[&str] = &[
     // Lodestar
     "enr:-IS4QPi-onjNsT5xAIAenhCGTDl4z-4UOR25Uq-3TmG4V3kwB9ljLTb_Kp1wdjHNj-H8VVLRBSSWVZo3GUe3z6k0E-IBgmlkgnY0gmlwhKB3_qGJc2VjcDI1NmsxoQMvAfgB4cJXvvXeM6WbCG86CstbSxbQBSGx31FAwVtOTYN1ZHCCIyg",
     "enr:-KG4QPUf8-g_jU-KrwzG42AGt0wWM1BTnQxgZXlvCEIfTQ5hSmptkmgmMbRkpOqv6kzb33SlhPHJp7x4rLWWiVq5lSECgmlkgnY0gmlwhFPlR9KDaXA2kCoGxcAJAAAVAAAAAAAAABCJc2VjcDI1NmsxoQLdUv9Eo9sxCt0tc_CheLOWnX59yHJtkBSOL7kpxdJ6GYN1ZHCCIyiEdWRwNoIjKA",
+    // roost mainnet (this project's dedicated LC server) — a SNAPSHOT of its
+    // published record (2026-08-10): seeding it makes roost dialable from the
+    // first table without waiting for any walk. The embedded IP goes stale if
+    // the server's address rotates; the targeted-lookup path (node_id derived
+    // from the position-0 static peer pin, `discovery::node_id_for_peer`)
+    // is what recovers the CURRENT record then.
+    "enr:-KG4QCbsE9s7xHdLK_32iZh-P840CxuQ3rbJAtuoFgh3IVLqQP0-Hhkllnv-k9qLfZb47V4sxPw0Ynmj4UaabQ3-RjkChGV0aDKQjJ9i_gYAAAD__________4JpZIJ2NIJpcIRXmtGhiXNlY3AyNTZrMaEC41NP_bzrL7-rq6KmsQIeTl2Nw9yvIlgEvz-Pjz2dwTmDdGNwgiOVg3VkcIIjlQ",
 ];
 
 // -------------------------------------------------------------------------
@@ -656,6 +677,16 @@ impl SyncHandle {
             // Shared with run_sync's hunt trigger; discovery re-spawns reuse
             // the same flag, so a boost survives a discv5 restart.
             hunt_boost: Arc::new(AtomicBool::new(false)),
+            // The pinned CL peers, for targeted lookups: discovery walks toward
+            // their derived discv5 ids so a stale pinned address (roost behind
+            // a rotated residential IP) heals from third-party tables in
+            // seconds instead of waiting on random-walk luck.
+            pinned_peer_ids: config
+                .static_peers
+                .iter()
+                .filter_map(|s| parse_static_peer(s))
+                .map(|p| p.id)
+                .collect(),
         };
 
         let exec_anchor = Arc::new(ExecAnchor::new());
@@ -2678,7 +2709,7 @@ mod tests {
             c.static_peers[0],
             "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC"
         );
-        assert_eq!(c.bootstrap_enrs.len(), 17);
+        assert_eq!(c.bootstrap_enrs.len(), 18);
         assert_eq!(c.chain_id, 1);
     }
 
@@ -2739,7 +2770,7 @@ mod tests {
         // A malformed pin would otherwise reach run_sync and surface only as a
         // "skipping unparseable static peer multiaddr" warn.
         assert!(c.static_peers.iter().all(|p| parse_static_peer(p).is_some()));
-        assert_eq!(c.bootstrap_enrs.len(), 9);
+        assert_eq!(c.bootstrap_enrs.len(), 10);
     }
 
     #[test]
@@ -2808,7 +2839,7 @@ mod tests {
             c.static_peers.iter().map(|a| a.rsplit('/').next().unwrap()).collect();
         assert_eq!(ids.len(), 23, "one address per peer id (the pool dedupes by id)");
         assert!(c.static_peers.iter().all(|p| parse_static_peer(p).is_some()));
-        assert_eq!(c.bootstrap_enrs.len(), 8);
+        assert_eq!(c.bootstrap_enrs.len(), 9);
     }
 
     /// The Java anchor and the Rust one, compared directly.
@@ -2926,6 +2957,58 @@ mod tests {
         assert_eq!(p.addr.to_string(), "/ip4/176.229.58.1/tcp/9001");
         assert!(parse_static_peer("/ip4/1.2.3.4/tcp/9000").is_none()); // no peer id
         assert!(parse_static_peer("nonsense").is_none());
+    }
+
+    /// The position-0 static peer (roost, pinned by libp2p peer id) and the
+    /// last bootstrap ENR (roost's published record, seeded as a snapshot)
+    /// must be the SAME node, per network — and the discv5 node id derived
+    /// from the pinned peer id must equal the ENR's.
+    ///
+    /// This is the invariant the targeted-lookup fast path stands on: roost
+    /// signs its ENR with its libp2p host key, so a wallet can walk the DHT
+    /// toward `node_id_for_peer(pinned id)` and trust what comes back. If
+    /// roost ever splits the keys — or someone reorders either list — the
+    /// stale-pin recovery silently degrades to random-walk luck; this test
+    /// makes that a red build instead.
+    #[test]
+    fn pinned_roost_identity_matches_its_seeded_enr() {
+        for c in [
+            ChainConfig::mainnet(),
+            ChainConfig::sepolia(),
+            ChainConfig::gnosis(),
+        ] {
+            let pinned = parse_static_peer(&c.static_peers[0])
+                .unwrap_or_else(|| panic!("{}: unparseable position-0 static peer", c.name));
+            let derived = crate::discovery::node_id_for_peer(&pinned.id).unwrap_or_else(|| {
+                panic!("{}: pinned peer id does not inline a secp256k1 key", c.name)
+            });
+            let enr: discv5::Enr = c
+                .bootstrap_enrs
+                .last()
+                .expect("bootstrap list is never empty")
+                .parse()
+                .unwrap_or_else(|e| panic!("{}: last bootstrap ENR unparseable: {e}", c.name));
+            assert_eq!(
+                derived,
+                enr.node_id(),
+                "{}: the pinned roost peer id and the seeded roost ENR disagree — \
+                 either a list was reordered or roost's libp2p and discv5 keys split",
+                c.name
+            );
+            // The snapshot must also advertise the same TCP port the pin dials.
+            let pinned_port = c.static_peers[0]
+                .split("/tcp/")
+                .nth(1)
+                .and_then(|s| s.split('/').next())
+                .and_then(|s| s.parse::<u16>().ok())
+                .expect("pinned peer has a tcp port");
+            assert_eq!(
+                enr.tcp4(),
+                Some(pinned_port),
+                "{}: ENR tcp port != pinned port",
+                c.name
+            );
+        }
     }
 
     #[test]
