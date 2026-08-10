@@ -1,14 +1,26 @@
 # Privacy & Tor — design sketch
 
-> **Status: design discussion. The core transport path now has a runnable
-> proof of concept** (`rust/tor-poc`, see [§9](#9-proof-of-concept--what-was-validated)),
-> but no production integration exists. The PoC validates the load-bearing
-> transport claims against live mainnet and its measurements are folded back in
+> **Status: the core transport path is in production, feature-gated and
+> experimental.** `-PtorEngine` links Arti into the Rust engine
+> (`rust/myotis-net/src/el/tor.rs`), and a Settings toggle routes **account
+> (balance/nonce) reads** — the single routing switch sits in
+> `get_account` (`reader.rs`) — over per-address isolated circuits with
+> ephemeral RLPx keys. Wired up on the desktop host only today; storage/token
+> reads, `eth_call`/gas estimation, tx broadcast, the CL fetch, and discovery
+> still use the real IP, while contract-code reads are a hybrid: `get_code`
+> anchors through the same `get_account`, so its address-carrying account
+> query follows the Tor toggle and only the content-addressed bytecode fetch
+> stays clearnet. And the shipped path reuses the live
+> clearnet-validated peer pool — no quarantine/aging yet — so the peer serving
+> a Tor read simultaneously holds a clearnet connection from the user's real
+> IP and could pair the two by timing (`reader.rs`'s own KNOWN LIMITATION): a
+> network-privacy win, not yet the full §5 unlinkability. The runnable proof
+> of concept
+> (`rust/tor-poc`, see [§9](#9-proof-of-concept--what-was-validated)) validated
+> the transport against live mainnet and its measurements are folded back in
 > below (marked **PoC:**). The quarantined peer pool, multi-source promotion,
-> and request-shape hardening remain unimplemented proposals.
-> Facts about current Myotis behavior are code-grounded and marked with file
-> pointers; everything about Tor routing, quarantined peer pools, and identity
-> separation is a proposal except where a **PoC:** note says it was validated.
+> and request-shape hardening remain unimplemented proposals — everything about
+> them is design, not shipped behavior.
 
 Companion docs: [Disk & Network Usage](disk-and-network-usage.md) (traffic volumes
 this design would route), [Optimisations & Limitations](../OPTIMISATIONS_AND_LIMITATIONS.md)
@@ -329,7 +341,9 @@ and for not shipping a unique clientId on the Tor path.
    nodes that *do* accept skew toward unsynced ones (§5). How large is the
    population of synced, snap-serving, Tor-accepting mainnet peers really, and is
    it stable enough to sustain a fail-closed pool? This gates everything and is
-   the first thing to measure at scale.
+   the first thing to measure at scale. If it proves fatal, the first
+   alternative to measure is a VPN-style overlay whose exit IPs are not the
+   Tor exit set — see §10.
 
 ## 9. Proof of concept — what was validated
 
@@ -367,6 +381,110 @@ requirement and mandatory handshake timeout (§3), the measured latency tail
 (§2/§8.5), the reduced-exit-policy reality for `:30303` (§2/§8.1), and the
 dominant blocker — peer-side rejection of Tor exit IPs, which promotes
 "Tor-reachable + synced" to a first-class peer-selection gate (§5/§8.9).
+
+## 10. Alternatives considered: HOPR / Gnosis VPN (assessment, 2026-08-10)
+
+Would the [HOPR mixnet](https://hoprnet.org) or
+[Gnosis VPN](https://vpn.gnosis.eth.limo) (a VPN built on it, funded by
+GnosisDAO) serve the §1 goal better than Tor? Short answer: **not instead —
+possibly alongside.** Arti stays the embedded transport; Gnosis VPN is worth
+recommending to desktop users as a system-level complement once it is
+generally available; direct HOPR integration is a dead end today.
+
+### The facts (as of 2026-08)
+
+**HOPR** — incentivized Sphinx mixnet; relays are paid in tickets settled on
+Gnosis Chain:
+
+- No embeddable client library exists. Using the mixnet means running a
+  `hoprd` node: operator onboarding is permissioned (waitlist), with a 30k
+  wxHOPR minimum stake (10k with an early-supporter NFT) behind a Safe, per
+  HOPR's node docs.
+- The Sessions API — TCP **and UDP** tunneling over 0–3 hops — is the right
+  shape for a wallet, but it is an API *of a running hoprd*, not a library.
+- HOPR's own productization of exactly this use case — **RPCh**, "private RPC
+  for wallets" — is officially paused (the `hoprnet/RPCh` repo is flagged
+  "-development paused-").
+- The relay network is on the order of hundreds of nodes with modest traffic;
+  whatever the mixing theory says, the practical anonymity set is orders of
+  magnitude below Tor's (~7–8k relays, millions of daily users).
+
+**Gnosis VPN** — a system-level VPN over the HOPR mixnet:
+
+- Not a library: a Rust system service (root routing daemon + worker + control
+  CLI) that owns system routing and DNS. No SDK, no SOCKS interface — nothing
+  an engine could link, and nothing it could drive per-connection.
+- Status per its published roadmap (fetched 2026-08-10): the current beta
+  ("El Dorado") is **desktop-only — macOS and Linux builds, explicitly not
+  Windows or mobile**; **multi-hop routing only arrives with
+  "Shangri-La" (Sep 2026)** — until then a relay/exit can see both the user's
+  IP and the destination, i.e. trust-the-operator VPN privacy, not mixnet
+  privacy; six exit locations; **on-chain metered payments**; broader
+  platform/OS support is a 2027 milestone ("Xanadu").
+
+### Why neither replaces the embedded Arti path
+
+| Axis | Arti/Tor (embedded) | HOPR direct | Gnosis VPN |
+|---|---|---|---|
+| Embeddable in the engine | Yes — in-process library (§3) | No — needs a staked, waitlisted hoprd | No — root-owned system service |
+| Mobile | Compiles for the same NDK/iOS targets (§3) | No | No (2027 roadmap) |
+| Per-address unlinkability | Yes — one `IsolationToken` per address (§3) | Conceivable via per-address Sessions | **No — current interface is one tunnel, one exit identity** |
+| Anonymity set | ~7–8k relays, millions of users | Hundreds of nodes | Its (beta) user base |
+| Cost to use | Free | On-chain ticket payments | On-chain metered payments; planned Circles-identity onboarding |
+| Maturity | ~20 years in production | Mixnet live; the wallet product (RPCh) paused | Closed beta |
+
+Two of these rows are decisive:
+
+- **Per-address unlinkability.** The §1 core leak is not only address ↔ IP but
+  the clustering of one user's addresses. Per-address isolation guarantees
+  different addresses never share a circuit, so any one circuit's exit-side
+  view covers one address — independently built circuits can still land on
+  the same exit relay, so this sharply reduces cross-address linkability
+  rather than guaranteeing a distinct exit IP per address. Gnosis VPN's
+  current single-tunnel interface cannot express even that much: it hides the
+  home IP but presents one exit identity for everything, so a peer can still
+  cluster every queried address as "same user."
+- **Payment bootstrap circularity.** Both HOPR and Gnosis VPN charge on-chain.
+  A wallet would need chain access — and would leave a linkable on-chain
+  payment trail — to buy the privacy layer that is supposed to protect its
+  chain access. Tor is free and leaves no such footprint.
+
+### What Gnosis VPN is genuinely good for (complementary, user-operated)
+
+Run *underneath* Myotis by the user, a system VPN covers, with zero Myotis
+code, everything the embedded Tor path does not:
+
+- **The UDP surfaces** — discv4/discv5 discovery can never cross Tor (§2).
+- **Every not-yet-routed flow** — storage/token reads, `eth_call`, tx
+  broadcast, the CL fetch, and the host-side HTTP/DNS surfaces (DNS ENR walk,
+  CCIP-Read, the tx-history debug fetch) — on both engines.
+- **A path around §8.9.** Synced peers drop Tor exits because the whole Tor
+  network arrives from one small, saturated, widely blocklisted set of exit
+  IPs. Gnosis VPN's exits are today ordinary, low-traffic addresses that
+  devp2p peers treat like any VPN customer — though a six-location fleet would
+  recreate the same funnel if its adoption grew.
+
+The properties are weaker (table above: one exit identity, operator-visible
+until multi-hop ships, beta-sized anonymity set) but the *coverage* is total,
+and the two compose: the engine's Tor mode keeps per-address isolation for
+account reads while the VPN blankets everything else. (Running Arti through a
+VPN is unremarkable — the guard then sees the VPN exit instead of the home IP;
+the exit-side story of §3–§5 is unchanged.)
+
+### Revisit triggers
+
+Re-evaluate when any of these becomes true:
+
+1. **Gnosis VPN ships something embeddable** — an SDK, a SOCKS/local-proxy
+   interface, or mobile support ("Xanadu", 2027, is the earliest plausible
+   date). A local-proxy interface would slot in as a second `S` behind the
+   generic `RlpxConnection<S>`/`EthSession<S>` seam (§3), same as Arti did.
+2. **HOPR Sessions become permissionless** — usable without a staked,
+   waitlisted hoprd, with a payment story that doesn't leave an on-chain
+   trail.
+3. **§8.9 proves fatal at scale** — if the synced-and-Tor-accepting peer
+   population cannot sustain a fail-closed pool, Gnosis VPN's exit fleet is
+   the first alternative to measure.
 
 ## Code pointers (current behavior this design touches)
 
