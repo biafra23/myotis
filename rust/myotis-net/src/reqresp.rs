@@ -748,13 +748,19 @@ async fn resolve_dial_addrs(
                 // the two events that actually matter — the first answer, and
                 // the address moving — in the noise, on a phone especially.
                 let ips: Vec<IpAddr> = out.iter().filter_map(multiaddr_ip).collect();
-                let previous = last
-                    .lock()
-                    .ok()
-                    .and_then(|mut m| m.insert(name.clone(), ips.clone()));
+                // Compare as a SET, not as an ordered list. `ips` is in
+                // getaddrinfo's RFC 6724 order, which is a function of the local
+                // network as well as the record — dual-stack source-address
+                // selection can reorder the same two addresses between calls. On
+                // an ordered compare that reads as ADDRESS CHANGED at INFO, and
+                // a false alarm on exactly the line an operator is watching for a
+                // real one is worse than the noise this commit removes.
+                let mut key = ips.clone();
+                key.sort();
+                let previous = last.lock().ok().and_then(|mut m| m.insert(name.clone(), key.clone()));
                 let shown = ips.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
                 match previous {
-                    Some(prev) if prev == ips => {
+                    Some(prev) if prev == key => {
                         tracing::debug!(%name, resolved = %shown, "DNS-PIN resolved (unchanged)");
                     }
                     Some(prev) => {
@@ -1201,11 +1207,14 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
             // see: which IP the name points at right now, confirmed by a
             // connection that succeeded rather than by a lookup done elsewhere.
             if let Some(name) = ctx.dns_dials.remove(&peer_id) {
-                // NOTE: not `endpoint.get_remote_address()` — for a dial by name
-                // that returns the /dns4/ address we asked for, not the address
-                // it resolved to, which makes it useless for exactly this. The
-                // answer is logged by `resolve_dial_addrs` at dial time instead.
-                tracing::info!(peer = %peer_id, %name, "DNS-PIN connected");
+                // `endpoint.get_remote_address()` IS the concrete address now:
+                // since dialing resolves names itself, the candidates handed to
+                // the swarm are /ip4//ip6/, never /dns4/. So this line carries
+                // the address the connection actually went to — which matters
+                // because the resolve line is emitted once per distinct answer
+                // and would otherwise be the only place the IP ever appears.
+                tracing::info!(peer = %peer_id, %name,
+                    addr = %endpoint.get_remote_address(), "DNS-PIN connected");
             }
             tracing::debug!(peer = %peer_id, remote = %endpoint.get_remote_address(),
                 "connection established");
@@ -1926,5 +1935,35 @@ mod dial_resolution_tests {
         let out = resolve_dial_addrs(&a, &memo()).await;
         let ips: HashSet<_> = out.iter().filter_map(multiaddr_ip).collect();
         assert_eq!(ips.len(), out.len(), "candidates must be unique by IP");
+    }
+}
+
+#[cfg(test)]
+mod dns_change_detection_tests {
+    use super::*;
+
+    /// A REORDER of the same addresses must not read as a change. getaddrinfo's
+    /// RFC 6724 order depends on the local network, not only on the record, so a
+    /// dual-stack host can legitimately return the same two addresses in either
+    /// order between calls — and a false ADDRESS CHANGED on the line an operator
+    /// watches for a real one is worse than the noise it replaced.
+    #[test]
+    fn a_reorder_is_not_a_change() {
+        let v6: IpAddr = "64:ff9b::579a:d1a1".parse().unwrap();
+        let v4: IpAddr = "87.154.209.161".parse().unwrap();
+        let mut a = vec![v6, v4];
+        let mut b = vec![v4, v6];
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "same set in either order must compare equal");
+    }
+
+    #[test]
+    fn a_different_address_is_a_change() {
+        let mut a = vec!["87.154.209.161".parse::<IpAddr>().unwrap()];
+        let mut b = vec!["87.154.209.162".parse::<IpAddr>().unwrap()];
+        a.sort();
+        b.sort();
+        assert_ne!(a, b);
     }
 }
