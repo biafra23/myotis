@@ -703,6 +703,9 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
                 "[refresh:$net] -PextraEndpoint $base did not answer /eth/v1/beacon/genesis — " +
                 "refusing to use an endpoint whose chain cannot be confirmed")
         val seen = gvrRe.find(body)?.groupValues?.get(2)?.lowercase()
+            ?: throw GradleException(
+                "[refresh:$net] -PextraEndpoint $base answered /eth/v1/beacon/genesis without a " +
+                "parseable genesis_validators_root — refusing an endpoint whose chain cannot be confirmed")
         if (seen != gvr) {
             throw GradleException(
                 "[refresh:$net] -PextraEndpoint $base is on the WRONG CHAIN: " +
@@ -729,9 +732,9 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
     // roost's FLOOR — the oldest period it can still serve.
     //
     // A period's first slot may be SKIPPED (no block proposed), which the beacon
-    // API answers with 404, so walk forward until a block exists. Bounded at one
-    // epoch: past that the chain has bigger problems, and failing loudly beats
-    // anchoring somewhere unintended.
+    // API answers with 404, so walk forward until a block exists. Bounded at 32
+    // slots (one mainnet epoch, two gnosis epochs): past that the chain has
+    // bigger problems, and failing loudly beats anchoring somewhere unintended.
     val targetPeriod = (project.findProperty("period") as String?)?.toLong()
     val pinnedSlot: Long? = targetPeriod?.let { p ->
         val first = p * slotsPerPeriod
