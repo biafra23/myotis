@@ -78,9 +78,9 @@ a Pixel re-test of the fixed Java build.
    logcat; on-device you only see the status JSON (period/finalizedSlot/
    peerCount). Wire an android-logger or a drainable ring buffer before serious
    phone debugging.
-3. **Checkpoint constant is duplicated in Rust** (`myotis-net/src/sync.rs`),
-   with a cross-check test but no rewrite tooling: `refreshMainnetCheckpoint`
-   does not update it. Gnosis/sepolia are not wired in the Rust engine at all.
+3. **RESOLVED: checkpoint constant duplicated in Rust** (`myotis-net/src/sync.rs`).
+   `./gradlew refreshCheckpoint` now rewrites the Java and Rust anchors from one
+   fetch, and `java_and_rust_checkpoints_agree` fails if they diverge.
 4. **Live-tuned LC-server behavior — preserve it** (learned the hard way,
    documented in #130): mainstream LC servers (Lighthouse) truncate a count=16
    `updates_by_range` to ONE ~27 KB chunk (rate limiter, ~1 req/10 s/peer);
