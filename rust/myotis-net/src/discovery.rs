@@ -171,6 +171,13 @@ async fn run_lookups(
     tx: mpsc::Sender<DiscoveredPeer>,
 ) {
     let mut seen: HashSet<NodeId> = HashSet::new();
+    // Last emitted ENR sequence number per PINNED id. A pinned server may be
+    // re-found on every targeted round, but only a STRICTLY newer record — a
+    // genuine republication, e.g. after an address change — re-emits. Gating on
+    // seq (not on "address differs") also means a laggard or adversarial table
+    // serving an OLDER record can never flap a pinned peer's pooled address
+    // backward (#348 review).
+    let mut pinned_seq: std::collections::HashMap<NodeId, u64> = std::collections::HashMap::new();
     let mut empty_rounds = 0u32;
     let mut round: usize = 0;
     loop {
@@ -178,7 +185,8 @@ async fn run_lookups(
         // the startup fast path (O(log n) hops instead of random-walk luck) —
         // then every PINNED_ROUND_EVERY-th round revisits one, which is what
         // heals a stale pinned ADDRESS: third-party tables return the server's
-        // current signed ENR, and the emission below re-feeds the pool.
+        // current signed ENR and, when its seq has advanced, the emission
+        // below re-feeds the pool.
         let target = if pinned_targets.is_empty() {
             NodeId::random()
         } else if round < pinned_targets.len() {
@@ -188,22 +196,22 @@ async fn run_lookups(
         } else {
             NodeId::random()
         };
-        let targeted = !pinned_targets.is_empty()
-            && (round < pinned_targets.len() || round % PINNED_ROUND_EVERY == 0);
-        if targeted {
-            // Emission is once-ever per node id (`seen`), but a pinned server
-            // re-announcing under a NEW address is exactly what a targeted
-            // round exists to surface — let it re-emit.
-            for id in &pinned_targets {
-                seen.remove(id);
-            }
-        }
         round = round.wrapping_add(1);
         match discv5.find_node(target).await {
             Ok(enrs) => {
                 let mut emitted = 0usize;
                 for enr in enrs {
-                    if !seen.insert(enr.node_id()) {
+                    if pinned_targets.contains(&enr.node_id()) {
+                        // Pinned ids bypass the once-ever dedup, but only on a
+                        // record NEWER than the last one emitted.
+                        match pinned_seq.get(&enr.node_id()) {
+                            Some(&last) if enr.seq() <= last => continue,
+                            _ => {
+                                pinned_seq.insert(enr.node_id(), enr.seq());
+                                seen.insert(enr.node_id());
+                            }
+                        }
+                    } else if !seen.insert(enr.node_id()) {
                         continue;
                     }
                     if let Some(peer) = filter_candidate(&enr, &accepted_digests) {

@@ -127,8 +127,8 @@ data:
 it before installing roost: without it roost fails on its first upstream call,
 and under `Restart=on-failure` that is a restart loop rather than a clear error.
 
-The unit and installer live in [`deploy/`](deploy/) — in the repo, so
-`LimitNOFILE`, `Restart=on-failure` and "never overwrites the key" are
+The unit template and installer live in [`deploy/`](../../deploy/) — in the
+repo, so `LimitNOFILE`, `Restart=on-failure` and "never overwrites the key" are
 reviewable rather than assertions about a file on one machine.
 
 ```bash
@@ -140,16 +140,13 @@ sudo bash deploy/install-roost-instance.sh gnosis    # tcp 9108, upstream 5053
 sudo systemctl start roost@sepolia roost@mainnet roost@gnosis
 ```
 
-The older `rust/roost/deploy/install-roost.sh` + `roost-sepolia.service` pair
-installs a **second, differently-named** sepolia unit and is superseded by the
-template. Do not run both: two units on port 9105 means one restart-loops.
-
-What that lays down:
+What that lays down (per instance — `sepolia` shown; substitute the chain):
 
 | Path | |
 |---|---|
 | `/usr/local/bin/roost` | the binary |
-| `/etc/systemd/system/roost-sepolia.service` | unit; `LimitNOFILE=65536`, `Restart=on-failure` |
+| `/etc/systemd/system/roost@.service` | template unit; `LimitNOFILE=65536`, `Restart=on-failure` |
+| `/etc/myotis/roost-sepolia.env` | per-chain settings (port, upstream REST, `ROOST_EXTRA_ARGS`) |
 | `/data/roost/sepolia.key` | **libp2p + discv5 identity.** Created `0600` on first start. |
 | `/data/roost/sepolia.db` | light-client archive |
 | `/data/roost/sepolia.enrseq` | ENR sequence number |
@@ -190,8 +187,8 @@ rule forwards UDP as well as TCP. Only then enable publication.
 **Verify:**
 
 ```bash
-systemctl status roost-sepolia
-journalctl -u roost-sepolia -f          # look for the startup banner and "digest … (computed)"
+systemctl status roost@sepolia
+journalctl -u roost@sepolia -f          # look for the startup banner and "digest … (computed)"
 sudo -u roost /usr/local/bin/roost probe --rest http://127.0.0.1:5052
 ```
 

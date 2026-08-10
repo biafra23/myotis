@@ -54,30 +54,22 @@ async fn main() {
     let mut seeded = 0;
     for enr_str in &config.bootstrap_enrs {
         if let Ok(e) = enr_str.parse::<Enr<CombinedKey>>() {
+            // NEVER seed the target: the bootstrap lists now carry roost's own
+            // record, and a FOUND satisfied by the target vouching for itself
+            // proves inbound UDP but not what this tool claims — that THIRD
+            // PARTIES hand its record back from their tables. Same reason the
+            // direct-endpoint probe runs AFTER the walk: it opens a session
+            // that tables the target locally.
+            if e.node_id() == target_id {
+                continue;
+            }
             if discv5.add_enr(e).is_ok() {
                 seeded += 1;
             }
         }
     }
-    eprintln!("[{net}] seeded {seeded} bootnodes; looking up {target_id}");
+    eprintln!("[{net}] seeded {seeded} bootnodes (target excluded); looking up {target_id}");
     discv5.start().await.expect("discv5 start");
-
-    // Direct session first: FINDNODE(0) straight at the target's ADVERTISED
-    // endpoint. Completing it requires the full discv5 handshake against that
-    // endpoint, so success proves the advertised UDP address answers (through
-    // the router when probed from its public side). Distance 0 asks the node
-    // for its own record.
-    match discv5
-        .find_node_designated_peer(target_enr.clone(), vec![0])
-        .await
-    {
-        Ok(returned) => eprintln!(
-            "[direct] session ESTABLISHED with the advertised endpoint; it returned {} record(s), seq={:?}",
-            returned.len(),
-            returned.first().map(|e| e.seq())
-        ),
-        Err(e) => eprintln!("[direct] session FAILED against the advertised endpoint: {e}"),
-    }
 
     // find_node toward the target id walks the DHT via third parties. A few
     // rounds, because propagation after a fresh publication takes time.
@@ -102,6 +94,22 @@ async fn main() {
             Err(e) => eprintln!("[round {round}] find_node failed: {e}"),
         }
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    }
+    // Failure diagnostic, deliberately LAST (it would pollute the walk's
+    // verdict): a direct FINDNODE(0) at the target's advertised endpoint.
+    // Success here with NOT FOUND above means inbound UDP works but the record
+    // has not propagated yet; failure here too points at the endpoint itself
+    // (router forward, dead address in the record).
+    match discv5
+        .find_node_designated_peer(target_enr.clone(), vec![0])
+        .await
+    {
+        Ok(returned) => eprintln!(
+            "[direct] session ESTABLISHED with the advertised endpoint; it returned {} record(s), seq={:?}",
+            returned.len(),
+            returned.first().map(|e| e.seq())
+        ),
+        Err(e) => eprintln!("[direct] session FAILED against the advertised endpoint: {e}"),
     }
     println!("NOT FOUND — record not in third-party tables (yet)");
     std::process::exit(1);

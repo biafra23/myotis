@@ -958,9 +958,29 @@ impl PeerPool {
             // review). `add()` used to keep the first multiaddr and drop later
             // ones — that still holds for ordinary peers, which self-heal via
             // evict→rediscover.
+            // …but NEVER replace a DNS-NAME pin with a numeric snapshot. A
+            // /dns4 pin re-resolves at every dial (#338), so it heals through
+            // the operator's dyndns within a TTL — faster than any DHT record,
+            // whose IP only updates after the server notices the change and
+            // republishes. Overwriting the name with the ENR's /ip4 would trade
+            // the self-healing path for a snapshot that goes stale with the
+            // next rotation, and targeted discovery re-imposing it would keep
+            // the pool pointed at the dead address (#348 review). The #322
+            // refresh stays for numeric pins, which have no such path.
             if self.static_ids.contains(&id) {
                 if let Some(p) = self.peers.iter_mut().find(|p| p.id == id) {
-                    p.addr = addr;
+                    let name_pinned = p.addr.iter().any(|proto| {
+                        matches!(
+                            proto,
+                            libp2p::multiaddr::Protocol::Dns(_)
+                                | libp2p::multiaddr::Protocol::Dns4(_)
+                                | libp2p::multiaddr::Protocol::Dns6(_)
+                                | libp2p::multiaddr::Protocol::Dnsaddr(_)
+                        )
+                    });
+                    if !name_pinned {
+                        p.addr = addr;
+                    }
                 }
             }
             return;
@@ -3287,6 +3307,28 @@ mod tests {
         assert_eq!(addr_of(&pool, disc), "/ip4/10.0.4.2/tcp/9000",
             "ordinary peer keeps its first address (self-heals via evict instead)");
         assert_eq!(pool.len(), 2, "no duplicate entries");
+    }
+
+    /// A DNS-NAME pin must survive rediscovery. The /dns4 pin re-resolves at
+    /// every dial, so it heals through the operator's dyndns within a TTL —
+    /// faster than any DHT record, whose IP updates only after the server
+    /// notices the change and republishes. Overwriting the name with a
+    /// discovered /ip4 snapshot (which targeted lookups would re-impose every
+    /// revisit) traded the self-healing path for a stale address (#348 review).
+    #[test]
+    fn dns_pinned_static_is_never_downgraded_to_a_numeric_address() {
+        let mut pool = PeerPool::new();
+        let roost = libp2p::identity::Keypair::generate_secp256k1()
+            .public()
+            .to_peer_id();
+        pool.add_static(roost, "/dns4/roost.example.org/tcp/9109".parse().unwrap());
+
+        // Discovery re-reports it at its ENR's numeric address.
+        pool.add(roost, "/ip4/198.51.100.7/tcp/9109".parse().unwrap());
+
+        let addr = pool.peers.iter().find(|p| p.id == roost).map(|p| p.addr.to_string()).unwrap();
+        assert_eq!(addr, "/dns4/roost.example.org/tcp/9109",
+            "the name is the healing path; a numeric snapshot must not replace it");
     }
 
     #[test]
