@@ -166,11 +166,11 @@ impl ChainConfig {
             // `./gradlew refreshCheckpoint` rewrites both from one fetch, and
             // `java_and_rust_checkpoints_agree` fails if they ever diverge.
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 14960288, 2026-08-10, period 1826)
+            // trusted checkpoint: recent finalized mainnet block root (slot 14960992, 2026-08-10, period 1826)
             checkpoint_root: hex32(
-                "ae69edacf2020e75ec8f51246bd9357cf9f9401ac8f659b4c055ca329f8ab0fd",
+                "b920b928a2fd6e3e2fb46b1f39ff53bb4174dfbc319eb21745f9fcec2efbc78a",
             ),
-            checkpoint_slot: 14_960_288,
+            checkpoint_slot: 14_960_992,
             // @checkpoint:mainnet:end
             static_peers: MAINNET_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: MAINNET_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
@@ -2628,10 +2628,10 @@ mod tests {
         let c = ChainConfig::mainnet();
         assert_eq!(c.fork_version, [6, 0, 0, 0]);
         // @checkpoint:mainnet:test:begin — managed by `./gradlew refreshCheckpoint`
-        assert_eq!(c.checkpoint_slot, 14_960_288);
+        assert_eq!(c.checkpoint_slot, 14_960_992);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "ae69edacf2020e75ec8f51246bd9357cf9f9401ac8f659b4c055ca329f8ab0fd"
+            "b920b928a2fd6e3e2fb46b1f39ff53bb4174dfbc319eb21745f9fcec2efbc78a"
         );
         // @checkpoint:mainnet:test:end
         assert_eq!(
@@ -2806,15 +2806,27 @@ mod tests {
     /// rather than a claim in a KDoc.
     #[test]
     fn java_and_rust_checkpoints_agree() {
-        let java = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
-            "../../networking/src/main/java/com/jaeckel/ethp2p/networking/NetworkConfig.java",
-        );
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let java = repo_root
+            .join("networking/src/main/java/com/jaeckel/ethp2p/networking/NetworkConfig.java");
         let src = match std::fs::read_to_string(&java) {
             Ok(s) => s,
-            // Only reachable outside a repo checkout (e.g. a vendored crate),
-            // where there is no Java engine to disagree with.
             Err(e) => {
-                eprintln!("skipping: {} unreadable ({e})", java.display());
+                // Skipping is legitimate ONLY outside a repo checkout (a vendored
+                // crate has no Java engine to disagree with). Inside one, an
+                // unreadable path means the Java file MOVED — and skipping there
+                // would silently disarm this guard forever, degrading the parity
+                // guarantee back to a claim in a comment. Distinguish the two by
+                // a repo landmark.
+                if repo_root.join("settings.gradle.kts").exists() {
+                    panic!(
+                        "this is a repo checkout (settings.gradle.kts present) but {} is \
+                         unreadable ({e}) — NetworkConfig.java moved; update this test's path \
+                         and the refreshCheckpoint task in build.gradle.kts",
+                        java.display()
+                    );
+                }
+                eprintln!("skipping: not a repo checkout ({} unreadable: {e})", java.display());
                 return;
             }
         };

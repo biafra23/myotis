@@ -88,9 +88,9 @@ public record NetworkConfig(
             // genesis_validators_root (mainnet)
             Bytes.fromHexString("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95").toArrayUnsafe(),
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 14960288, 2026-08-10, period 1826)
-            Bytes.fromHexString("ae69edacf2020e75ec8f51246bd9357cf9f9401ac8f659b4c055ca329f8ab0fd").toArrayUnsafe(),
-            14960288L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized mainnet block root (slot 14960992, 2026-08-10, period 1826)
+            Bytes.fromHexString("b920b928a2fd6e3e2fb46b1f39ff53bb4174dfbc319eb21745f9fcec2efbc78a").toArrayUnsafe(),
+            14960992L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:mainnet:end
             // current fork version: Fulu (0x06000000) — activated at slot 13164544 (2025-12-03)
             new byte[]{0x06, 0x00, 0x00, 0x00},
