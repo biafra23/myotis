@@ -63,7 +63,11 @@ else
   # the same join-only default as fresh installs; enabling publication stays
   # an explicit operator edit.
   if ! grep -q '^ROOST_EXTRA_ARGS=' "$ENVFILE"; then
-    printf '# Added on upgrade (#335): see the fresh-install comment — clear to publish.\nROOST_EXTRA_ARGS=--no-publish\n' >> "$ENVFILE"
+    # Leading \n: if the operator's editor left the last line without a
+    # trailing newline, a bare append would glue the comment onto it — and
+    # systemd's EnvironmentFile does NOT strip inline comments, so that line's
+    # value would silently grow a "# Added…" suffix. A blank line is harmless.
+    printf '\n# Added on upgrade (#335): see the fresh-install comment — clear to publish.\nROOST_EXTRA_ARGS=--no-publish\n' >> "$ENVFILE"
     echo "added ROOST_EXTRA_ARGS=--no-publish to $ENVFILE (deployment step 1; clear it to publish)"
   fi
   # The kept file's port wins over this run's argument — the ufw rules below

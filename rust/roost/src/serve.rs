@@ -692,10 +692,11 @@ pub async fn serve(
                 // observed: Identify reports the remote address of the
                 // connection, which for a connection we dialed carries an
                 // ephemeral source port. That is correct for the pinned
-                // deployment, where the router forwards the same port — but a
-                // NAT rewriting the port would make the advertised multiaddr
-                // (and the published record, which also carries the configured
-                // port) wrong in a way this cannot detect.
+                // deployment, where the router forwards the same port. A NAT
+                // rewriting the port IS detectable — inbound reporters see the
+                // externally mapped one (`ExternalAddress::port`) — and
+                // `desired_publication` refuses to publish on that evidence;
+                // here it only shapes the logged multiaddr.
                 //
                 // The deployment sits on a residential line whose public IP is
                 // not guaranteed stable, so this is not a startup question that
@@ -705,11 +706,20 @@ pub async fn serve(
                 // record: wallets discover it, dial, fail, and spend their
                 // three strikes to eviction on a node that is actually
                 // healthy — taking the tokens that made it worth keeping.
-                // A `None` here is not an error and deliberately does nothing:
-                // below quorum simply means too few peers have reported yet, and
-                // keeping the last known answer beats oscillating to "unknown"
-                // every time a peer disconnects.
-                if let Some(seen) = net.external_address().await {
+                // A `None` here is not an error and deliberately does nothing
+                // TO THE LOG STATE: below quorum simply means too few peers
+                // have reported yet, and keeping the last known answer beats
+                // oscillating to "unknown" every time a peer disconnects. That
+                // rationale is for LOGGING only — the tick's live reading is
+                // captured separately because publication must not act on a
+                // frozen one: observations drop with their connections, so
+                // `external` can hold an address the quorum stopped vouching
+                // for long ago, and a record published from it points at
+                // whatever the line's IP was back then. A below-quorum tick
+                // merely refuses a NEW publish; it never retracts a published
+                // record, so using the live value costs no flapping.
+                let quorum_now = net.external_address().await;
+                if let Some(seen) = quorum_now {
                     let advertised = dialable(&seen, port, peer_id);
                     let changed = external.map(|p: ExternalAddress| p.ip != seen.ip);
                     match changed {
@@ -773,8 +783,9 @@ pub async fn serve(
                         publish_enr && enr_seq.is_some(),
                         upstream_syncing,
                         upstream_ip,
-                        external.as_ref(),
+                        quorum_now.as_ref(),
                         eth2,
+                        port,
                     ) {
                         Ok((ip, eth2)) => {
                             publish_refusal = None;
@@ -928,12 +939,24 @@ async fn start_discovery(
 ///   so it falls THROUGH to the quorum rather than suppressing it — a
 ///   dual-stack host whose upstream settled on v6 can still be v4-reachable,
 ///   and the quorum is the mechanism that can see that.
+/// - inbound reporters must not be seeing a DIFFERENT port than the one the
+///   record would carry. `ExternalAddress::port` is populated only from
+///   inbound connections, where the reporter's view is the externally mapped
+///   port — the one signal that makes a NAT port-rewrite detectable — so a
+///   disagreement is positive evidence the published `tcp4`/`udp4` fields
+///   would point somewhere nothing listens.
+///
+/// `quorum` must be the CURRENT tick's tally, not a kept-last-known copy: a
+/// below-quorum reading here only postpones a new publish (it never retracts
+/// a published record), while a frozen reading can "confirm" an address the
+/// reporters stopped vouching for long ago.
 fn desired_publication(
     publish_enabled: bool,
     upstream_syncing: bool,
     upstream_ip: Option<IpAddr>,
     quorum: Option<&ExternalAddress>,
     eth2: Option<[u8; 16]>,
+    listen_port: u16,
 ) -> Result<(IpAddr, [u8; 16]), &'static str> {
     if !publish_enabled {
         return Err("publication disabled (--no-publish, or an unusable sequence file)");
@@ -942,6 +965,15 @@ fn desired_publication(
         return Err("upstream is syncing — the fork digest computed from its head could be stale");
     }
     let eth2 = eth2.ok_or("no fork schedule — cannot build the 16-byte ENRForkID")?;
+    // Checked regardless of which source ends up naming the ADDRESS: the
+    // upstream shares this host's NAT, so inbound-port evidence against the
+    // configured port indicts the record either way.
+    if quorum.is_some_and(|seen| seen.port.is_some_and(|p| p != listen_port)) {
+        return Err(
+            "inbound reporters see a different port than the configured one — a NAT is \
+             rewriting the port and the record would advertise an endpoint nothing listens on",
+        );
+    }
     let ip = upstream_ip
         .filter(|ip| ip.is_ipv4())
         .or_else(|| {
@@ -1385,7 +1417,7 @@ mod publication_tests {
     #[test]
     fn publishes_from_the_upstream_view_when_everything_is_confirmed() {
         assert_eq!(
-            desired_publication(true, false, Some(ip("87.154.209.161")), None, Some(ETH2)),
+            desired_publication(true, false, Some(ip("87.154.209.161")), None, Some(ETH2), 9105),
             Ok((ip("87.154.209.161"), ETH2))
         );
     }
@@ -1393,18 +1425,18 @@ mod publication_tests {
     #[test]
     fn no_publish_flag_and_syncing_upstream_both_refuse() {
         let up = Some(ip("87.154.209.161"));
-        assert!(desired_publication(false, false, up, None, Some(ETH2)).is_err());
+        assert!(desired_publication(false, false, up, None, Some(ETH2), 9105).is_err());
         // A syncing upstream's head can sit behind a fork boundary, and a
         // record with the previous digest is invisible to exactly the
         // clients it is for — the same refusal `roost enr` makes.
-        assert!(desired_publication(true, true, up, None, Some(ETH2)).is_err());
+        assert!(desired_publication(true, true, up, None, Some(ETH2), 9105).is_err());
     }
 
     #[test]
     fn no_eth2_means_nothing_to_publish() {
         // A record without the full ENRForkID is malformed to standard
         // clients, so a missing schedule refuses rather than half-fills.
-        assert!(desired_publication(true, false, Some(ip("87.154.209.161")), None, None).is_err());
+        assert!(desired_publication(true, false, Some(ip("87.154.209.161")), None, None, 9105).is_err());
     }
 
     #[test]
@@ -1412,25 +1444,25 @@ mod publication_tests {
         // Upstream answer wins over a disagreeing quorum: it is the primary.
         let q = quorum("54.157.213.0", 3, 3, true);
         assert_eq!(
-            desired_publication(true, false, Some(ip("87.154.209.161")), Some(&q), Some(ETH2)),
+            desired_publication(true, false, Some(ip("87.154.209.161")), Some(&q), Some(ETH2), 9105),
             Ok((ip("87.154.209.161"), ETH2))
         );
         // No upstream: a clean quorum reading publishes.
         assert_eq!(
-            desired_publication(true, false, None, Some(&q), Some(ETH2)),
+            desired_publication(true, false, None, Some(&q), Some(ETH2), 9105),
             Ok((ip("54.157.213.0"), ETH2))
         );
         // Contested (winner at half the reporters or fewer): both a Sybil and
         // a genuine mid-change look like this — wait, don't publish.
         let contested = quorum("54.157.213.0", 3, 6, true);
-        assert!(desired_publication(true, false, None, Some(&contested), Some(ETH2)).is_err());
+        assert!(desired_publication(true, false, None, Some(&contested), Some(ETH2), 9105).is_err());
         // Non-routable quorum winner: publishing an RFC1918 address is the
         // exact failure the gate exists to prevent.
         let lan = quorum("192.168.178.74", 3, 3, false);
-        assert!(desired_publication(true, false, None, Some(&lan), Some(ETH2)).is_err());
+        assert!(desired_publication(true, false, None, Some(&lan), Some(ETH2), 9105).is_err());
         // And the re-check catches a routable FLAG on a non-routable address.
         let lying = quorum("10.0.0.5", 3, 3, true);
-        assert!(desired_publication(true, false, None, Some(&lying), Some(ETH2)).is_err());
+        assert!(desired_publication(true, false, None, Some(&lying), Some(ETH2), 9105).is_err());
     }
 
     #[test]
@@ -1439,19 +1471,55 @@ mod publication_tests {
         // advertise an endpoint nothing is listening on — refuse when v6 is
         // all there is...
         let v6 = Some(ip("2003:fb:ef3a:2300:788a:d7bf:513e:223"));
-        assert!(desired_publication(true, false, v6, None, Some(ETH2)).is_err());
+        assert!(desired_publication(true, false, v6, None, Some(ETH2), 9105).is_err());
         // ...but a dual-stack host whose upstream settled on v6 can still be
         // v4-reachable, and the quorum is the mechanism that can see that. A
         // v6 primary answer must not suppress it.
         let q = quorum("54.157.213.0", 3, 3, true);
         assert_eq!(
-            desired_publication(true, false, v6, Some(&q), Some(ETH2)),
+            desired_publication(true, false, v6, Some(&q), Some(ETH2), 9105),
             Ok((ip("54.157.213.0"), ETH2))
         );
     }
 
     #[test]
     fn no_confirmed_address_means_no_record() {
-        assert!(desired_publication(true, false, None, None, Some(ETH2)).is_err());
+        assert!(desired_publication(true, false, None, None, Some(ETH2), 9105).is_err());
+    }
+
+    #[test]
+    fn an_observed_port_rewrite_refuses_publication() {
+        // `ExternalAddress::port` is filled only from INBOUND connections,
+        // where the reporter's view is the externally mapped port — the one
+        // signal that makes a NAT port-rewrite detectable. When it disagrees
+        // with the configured port, the record's tcp4/udp4 would point at an
+        // endpoint nothing listens on, so publication refuses.
+        let rewritten = ExternalAddress {
+            ip: ip("54.157.213.0"),
+            port: Some(9106),
+            confirmations: 3,
+            reporters: 3,
+            routable: true,
+        };
+        // ...on the quorum path,
+        assert!(desired_publication(true, false, None, Some(&rewritten), Some(ETH2), 9105).is_err());
+        // ...and on the upstream path too — the upstream shares this host's
+        // NAT, so the inbound-port evidence indicts the record either way.
+        assert!(desired_publication(
+            true, false, Some(ip("87.154.209.161")), Some(&rewritten), Some(ETH2), 9105
+        )
+        .is_err());
+        // An AGREEING observed port publishes.
+        let agreeing = ExternalAddress { port: Some(9105), ..rewritten };
+        assert_eq!(
+            desired_publication(true, false, None, Some(&agreeing), Some(ETH2), 9105),
+            Ok((ip("54.157.213.0"), ETH2))
+        );
+        // And outbound-only observations (port: None) carry no evidence.
+        let outbound_only = ExternalAddress { port: None, ..rewritten };
+        assert_eq!(
+            desired_publication(true, false, None, Some(&outbound_only), Some(ETH2), 9105),
+            Ok((ip("54.157.213.0"), ETH2))
+        );
     }
 }
