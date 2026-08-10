@@ -414,6 +414,13 @@ enum Command {
 #[derive(Clone)]
 pub struct ReqRespClient {
     tx: mpsc::Sender<Command>,
+    /// Last answer seen per DNS name, so repeat resolutions can log at DEBUG
+    /// while a CHANGE still logs at INFO.
+    ///
+    /// Per-instance, not a global: independent stacks stay independent, which is
+    /// this crate's standing rule. Bounded by the number of distinct pinned
+    /// names, which is a handful.
+    last_resolved: Arc<std::sync::Mutex<HashMap<String, Vec<IpAddr>>>>,
 }
 
 impl ReqRespClient {
@@ -434,7 +441,7 @@ impl ReqRespClient {
         let dns_name = multiaddr_dns_name(&addr).map(|n| n.to_string());
         // Never empty: a resolver failure yields the original address, so an
         // already-connected peer is unaffected by a transient DNS blip.
-        let addrs = resolve_dial_addrs(&addr).await;
+        let addrs = resolve_dial_addrs(&addr, &self.last_resolved).await;
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Command::Request { peer, dns_name, addrs, protocol, wire, reply })
@@ -691,7 +698,10 @@ fn multiaddr_dns_name(addr: &Multiaddr) -> Option<String> {
 /// Substituting the address is safe: Noise still authenticates the remote
 /// against the `/p2p/` peer id, so a wrong or hostile answer cannot impersonate
 /// the pinned server — it can only fail to connect.
-async fn resolve_dial_addrs(addr: &Multiaddr) -> Vec<Multiaddr> {
+async fn resolve_dial_addrs(
+    addr: &Multiaddr,
+    last: &std::sync::Mutex<HashMap<String, Vec<IpAddr>>>,
+) -> Vec<Multiaddr> {
     use libp2p::multiaddr::Protocol;
     let Some(name) = multiaddr_dns_name(addr).map(|n| n.to_string()) else {
         return vec![addr.clone()];
@@ -732,9 +742,34 @@ async fn resolve_dial_addrs(addr: &Multiaddr) -> Vec<Multiaddr> {
                 tracing::warn!(%name, "DNS-PIN resolve EMPTY — name exists but has no A/AAAA record");
                 return vec![addr.clone()];
             } else {
-                let ips: Vec<String> =
-                    out.iter().filter_map(|m| multiaddr_ip(m).map(|i| i.to_string())).collect();
-                tracing::info!(%name, resolved = %ips.join(","), "DNS-PIN resolved");
+                // INFO on the FIRST answer and on any CHANGE; DEBUG for a repeat
+                // of what we already saw. Resolution runs per request, so a
+                // flat INFO here repeated every few seconds forever and buried
+                // the two events that actually matter — the first answer, and
+                // the address moving — in the noise, on a phone especially.
+                let ips: Vec<IpAddr> = out.iter().filter_map(multiaddr_ip).collect();
+                // Compare as a SET, not as an ordered list. `ips` is in
+                // getaddrinfo's RFC 6724 order, which is a function of the local
+                // network as well as the record — dual-stack source-address
+                // selection can reorder the same two addresses between calls. On
+                // an ordered compare that reads as ADDRESS CHANGED at INFO, and
+                // a false alarm on exactly the line an operator is watching for a
+                // real one is worse than the noise this commit removes.
+                let mut key = ips.clone();
+                key.sort();
+                let previous = last.lock().ok().and_then(|mut m| m.insert(name.clone(), key.clone()));
+                let shown = ips.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+                match previous {
+                    Some(prev) if prev == key => {
+                        tracing::debug!(%name, resolved = %shown, "DNS-PIN resolved (unchanged)");
+                    }
+                    Some(prev) => {
+                        let was = prev.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+                        tracing::info!(%name, was = %was, resolved = %shown,
+                            "DNS-PIN resolved — ADDRESS CHANGED");
+                    }
+                    None => tracing::info!(%name, resolved = %shown, "DNS-PIN resolved"),
+                }
             }
             out
         }
@@ -921,7 +956,7 @@ pub fn start_host_with(
 
     let (tx, rx) = mpsc::channel(256);
     let task = tokio::spawn(run_swarm(swarm, rx, local_status, config.lc_responder));
-    Ok((ReqRespClient { tx }, peer_id, task))
+    Ok((ReqRespClient { tx, last_resolved: Arc::default() }, peer_id, task))
 }
 
 /// What a pending outbound request id maps back to.
@@ -1172,11 +1207,14 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
             // see: which IP the name points at right now, confirmed by a
             // connection that succeeded rather than by a lookup done elsewhere.
             if let Some(name) = ctx.dns_dials.remove(&peer_id) {
-                // NOTE: not `endpoint.get_remote_address()` — for a dial by name
-                // that returns the /dns4/ address we asked for, not the address
-                // it resolved to, which makes it useless for exactly this. The
-                // answer is logged by `resolve_dial_addrs` at dial time instead.
-                tracing::info!(peer = %peer_id, %name, "DNS-PIN connected");
+                // `endpoint.get_remote_address()` IS the concrete address now:
+                // since dialing resolves names itself, the candidates handed to
+                // the swarm are /ip4//ip6/, never /dns4/. So this line carries
+                // the address the connection actually went to — which matters
+                // because the resolve line is emitted once per distinct answer
+                // and would otherwise be the only place the IP ever appears.
+                tracing::info!(peer = %peer_id, %name,
+                    addr = %endpoint.get_remote_address(), "DNS-PIN connected");
             }
             tracing::debug!(peer = %peer_id, remote = %endpoint.get_remote_address(),
                 "connection established");
@@ -1816,13 +1854,17 @@ mod external_address_tests {
 mod dial_resolution_tests {
     use super::*;
 
+    fn memo() -> std::sync::Mutex<HashMap<String, Vec<IpAddr>>> {
+        std::sync::Mutex::new(HashMap::new())
+    }
+
     #[tokio::test]
     async fn a_plain_ip_address_passes_through_untouched() {
         let a: Multiaddr = "/ip4/87.154.209.161/tcp/9105/p2p/\
             16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"
             .parse()
             .unwrap();
-        assert_eq!(resolve_dial_addrs(&a).await, vec![a.clone()]);
+        assert_eq!(resolve_dial_addrs(&a, &memo()).await, vec![a.clone()]);
     }
 
     #[tokio::test]
@@ -1832,7 +1874,7 @@ mod dial_resolution_tests {
             16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"
             .parse()
             .unwrap();
-        let out = resolve_dial_addrs(&a).await;
+        let out = resolve_dial_addrs(&a, &memo()).await;
         assert!(!out.is_empty(), "localhost must resolve");
         for m in &out {
             // No DNS component survives — that is the whole point: the swarm's
@@ -1858,7 +1900,7 @@ mod dial_resolution_tests {
             16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"
             .parse()
             .unwrap();
-        assert_eq!(resolve_dial_addrs(&a).await, vec![a.clone()]);
+        assert_eq!(resolve_dial_addrs(&a, &memo()).await, vec![a.clone()]);
     }
 
     #[tokio::test]
@@ -1867,8 +1909,22 @@ mod dial_resolution_tests {
         // port, the transport and the /p2p/ id, leaving a bare /ip4/A.
         for raw in ["/dnsaddr/example.com", "/dns4/localhost"] {
             let a: Multiaddr = raw.parse().unwrap();
-            assert_eq!(resolve_dial_addrs(&a).await, vec![a.clone()], "{raw}");
+            assert_eq!(resolve_dial_addrs(&a, &memo()).await, vec![a.clone()], "{raw}");
         }
+    }
+
+    /// The first answer is INFO, a repeat is DEBUG — the memo is what decides,
+    /// so it must actually be written on the first pass.
+    #[tokio::test]
+    async fn the_answer_is_remembered_so_repeats_can_be_quiet() {
+        let a: Multiaddr = "/dns4/localhost/tcp/9105".parse().unwrap();
+        let m = memo();
+        let first = resolve_dial_addrs(&a, &m).await;
+        assert!(!first.is_empty());
+        assert_eq!(m.lock().unwrap().len(), 1, "first resolution must be recorded");
+        let again = resolve_dial_addrs(&a, &m).await;
+        assert_eq!(first, again, "a repeat must return the same candidates");
+        assert_eq!(m.lock().unwrap().len(), 1, "and must not grow the memo");
     }
 
     #[tokio::test]
@@ -1876,8 +1932,38 @@ mod dial_resolution_tests {
         // localhost commonly resolves to 127.0.0.1 twice (once per socket type);
         // dialing the same address twice buys nothing.
         let a: Multiaddr = "/dns4/localhost/tcp/9105".parse().unwrap();
-        let out = resolve_dial_addrs(&a).await;
+        let out = resolve_dial_addrs(&a, &memo()).await;
         let ips: HashSet<_> = out.iter().filter_map(multiaddr_ip).collect();
         assert_eq!(ips.len(), out.len(), "candidates must be unique by IP");
+    }
+}
+
+#[cfg(test)]
+mod dns_change_detection_tests {
+    use super::*;
+
+    /// A REORDER of the same addresses must not read as a change. getaddrinfo's
+    /// RFC 6724 order depends on the local network, not only on the record, so a
+    /// dual-stack host can legitimately return the same two addresses in either
+    /// order between calls — and a false ADDRESS CHANGED on the line an operator
+    /// watches for a real one is worse than the noise it replaced.
+    #[test]
+    fn a_reorder_is_not_a_change() {
+        let v6: IpAddr = "64:ff9b::579a:d1a1".parse().unwrap();
+        let v4: IpAddr = "87.154.209.161".parse().unwrap();
+        let mut a = vec![v6, v4];
+        let mut b = vec![v4, v6];
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "same set in either order must compare equal");
+    }
+
+    #[test]
+    fn a_different_address_is_a_change() {
+        let mut a = vec!["87.154.209.161".parse::<IpAddr>().unwrap()];
+        let mut b = vec!["87.154.209.162".parse::<IpAddr>().unwrap()];
+        a.sort();
+        b.sort();
+        assert_ne!(a, b);
     }
 }
