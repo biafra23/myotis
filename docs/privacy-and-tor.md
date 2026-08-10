@@ -1,13 +1,18 @@
 # Privacy & Tor — design sketch
 
-> **Status: the core transport path is in production, feature-gated.**
-> `-PtorEngine` links Arti into the Rust engine
+> **Status: the core transport path is in production, feature-gated and
+> experimental.** `-PtorEngine` links Arti into the Rust engine
 > (`rust/myotis-net/src/el/tor.rs`), and a Settings toggle routes **account
 > (balance/nonce) reads only** — the single routing switch sits in
 > `get_account` (`reader.rs`) — over per-address isolated circuits with
 > ephemeral RLPx keys. Wired up on the desktop host only today; storage/token
 > reads, contract code, `eth_call`/gas estimation, tx broadcast, the CL fetch,
-> and discovery still use the real IP. The runnable proof of concept
+> and discovery still use the real IP. And the shipped path reuses the live
+> clearnet-validated peer pool — no quarantine/aging yet — so the peer serving
+> a Tor read simultaneously holds a clearnet connection from the user's real
+> IP and could pair the two by timing (`reader.rs`'s own KNOWN LIMITATION): a
+> network-privacy win, not yet the full §5 unlinkability. The runnable proof
+> of concept
 > (`rust/tor-poc`, see [§9](#9-proof-of-concept--what-was-validated)) validated
 > the transport against live mainnet and its measurements are folded back in
 > below (marked **PoC:**). The quarantined peer pool, multi-source promotion,
@@ -415,7 +420,7 @@ Gnosis Chain:
 
 ### Why neither replaces the embedded Arti path
 
-| Axis | Arti/Tor (shipped) | HOPR direct | Gnosis VPN |
+| Axis | Arti/Tor (embedded) | HOPR direct | Gnosis VPN |
 |---|---|---|---|
 | Embeddable in the engine | Yes — in-process library (§3) | No — needs a staked, waitlisted hoprd | No — root-owned system service |
 | Mobile | Compiles for the same NDK/iOS targets (§3) | No | No (2027 roadmap) |
@@ -444,7 +449,7 @@ code, everything the embedded Tor path does not:
 
 - **The UDP surfaces** — discv4/discv5 discovery can never cross Tor (§2).
 - **Every not-yet-routed flow** — storage/token reads, `eth_call`, tx
-  broadcast, the CL fetch, and the Java-engine host surfaces (DNS ENR walk,
+  broadcast, the CL fetch, and the host-side HTTP/DNS surfaces (DNS ENR walk,
   CCIP-Read, the tx-history debug fetch) — on both engines.
 - **A path around §8.9.** Synced peers drop Tor exits because the whole Tor
   network arrives from one small, saturated, widely blocklisted set of exit
