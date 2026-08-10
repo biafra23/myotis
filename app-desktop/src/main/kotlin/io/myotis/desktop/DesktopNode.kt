@@ -61,9 +61,11 @@ class DesktopNodeController(
 
     private val log = org.slf4j.LoggerFactory.getLogger(DesktopNodeController::class.java)
 
-    // Per-network engine-start stamp driving the UI uptime: stamped on each successful
-    // start (any engine, Java or Rust) and cleared on drop, so the uptime counter restarts
-    // from zero on every network/engine (re)boot — it is NOT the controller's (app's) lifetime.
+    // Per-network boot stamp driving the UI uptime: stamped when a boot BEGINS (any engine,
+    // Java or Rust) — uptime counts from the start request (Status button / app-launch
+    // auto-start), not from when the blocking start() finished — and cleared on drop
+    // (every failure path runs dropNetwork), so the counter restarts from zero on every
+    // network/engine (re)boot; it is NOT the controller's (app's) lifetime.
     // nanoTime, not currentTimeMillis: wall-clock / NTP steps must not skew uptime.
     private val startNsByNetwork = ConcurrentHashMap<String, Long>()
     // Per-network boot locks keyed by CANONICAL name, mirroring Android's NodeService.bootLocks:
@@ -108,6 +110,11 @@ class DesktopNodeController(
         Thread({
             synchronized(bootLock(canonical)) {
                 if (engine.get(canonical) != null) return@synchronized
+                // Anchor uptime to the start REQUEST: create()+start() below block through
+                // key load, DNS resolution, and socket binds — the counter must already be
+                // running while that happens (it becomes visible once create() registers
+                // the handle). Every failure path runs dropNetwork, which clears it.
+                startNsByNetwork[canonical] = System.nanoTime()
                 val suffix = if (canonical == "mainnet") "" else "-$canonical"
                 val peerCache = PeerCache(dataDir.resolve("peers$suffix.cache"))
                 val clPeerCache = CLPeerCache(dataDir.resolve("cl-peers$suffix.cache"))
@@ -165,7 +172,6 @@ class DesktopNodeController(
                 }
                 if (!ok) dropNetwork(canonical)
                 else {
-                    startNsByNetwork[canonical] = System.nanoTime() // uptime anchors to THIS start
                     // Boot-time apply of the log-index preset — AFTER start:
                     // the engine only accepts the config on a running handle
                     // (its reader owns the index). Re-pushed on every

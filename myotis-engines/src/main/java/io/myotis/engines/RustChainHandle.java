@@ -71,8 +71,10 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     /** The running JSON-RPC server, or null when disabled / not started. */
     private volatile io.myotis.jsonrpc.MyotisRpcServer rpcServer;
 
-    /** Monotonic start time (ns) of the current run; drives {@link #uptimeSeconds()}. Paired
-     *  with {@link #started} because nanoTime()'s origin is arbitrary (0 is a valid reading). */
+    /** Monotonic time (ns) the current run's start() was ENTERED — uptime counts the native
+     *  boot itself, not just the time since it finished; drives {@link #uptimeSeconds()}.
+     *  Paired with {@link #started} because nanoTime()'s origin is arbitrary (0 is a valid
+     *  reading). */
     private volatile long startedAtNs;
     private volatile boolean started;
 
@@ -120,11 +122,14 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
 
     @Override
     public synchronized boolean start() {
+        // Entry stamp for uptime: count from the start request, including the native
+        // boot itself — anchored below only when the start succeeds.
+        long startRequestNs = System.nanoTime();
         boolean ok = RustEngineNative.nativeStart(handle);
         // Only expose the verified JSON-RPC endpoint once the native stack is up.
         if (ok) {
             // Anchor uptime to this successful start (cleared in stop() so a restart re-anchors).
-            if (!started) { startedAtNs = System.nanoTime(); started = true; }
+            if (!started) { startedAtNs = startRequestNs; started = true; }
             startRpc();
         }
         return ok;

@@ -196,19 +196,25 @@ class IosNodeController(
     /** Blocking create+start; caller holds [bootMutex] and runs on IO. */
     private fun boot(net: String) {
         if (locked { net in handles }) return
+        // Anchor uptime to the start REQUEST (Status button / app-launch auto-start):
+        // create()+start() below block, and the counter must already be running while
+        // they do (it becomes visible once the handle is published). Both failure
+        // paths remove the mark; drop() removes it on teardown.
+        locked { startMarks[net] = TimeSource.Monotonic.markNow() }
         val handle = RustEngine.create(net, dataDir)
         if (handle < 1) {
             logs.append("ERROR failed to create the $net stack (sentinel $handle)")
+            locked { startMarks.remove(net) }
             return
         }
         if (!RustEngine.start(handle)) {
             RustEngine.stop(handle)
             logs.append("ERROR failed to start the $net stack")
+            locked { startMarks.remove(net) }
             return
         }
         locked {
             handles[net] = handle
-            startMarks[net] = TimeSource.Monotonic.markNow()
         }
         // Boot-time apply of the log-index preset — AFTER start (the engine
         // only accepts config on a running handle). Cures restart dormancy;
