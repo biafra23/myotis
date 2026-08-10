@@ -235,6 +235,14 @@ Most of the server is written. In `rust/myotis-net`:
    This is the point of the whole exercise, and it needs three things the
    client-side code deliberately does not do:
 
+   *Status (#335): built.* `serve` joins the DHT on the same UDP port number as
+   the TCP listener (`myotis_net::discovery::spawn_server`, IP-voting disabled
+   so the persisted sequence file stays the only authority) and publishes once
+   the external address is confirmed, re-publishing on address or ENRForkID
+   change (`serve.rs::desired_publication` holds the gates). `--no-publish`
+   runs the join-only first deployment step. Every bullet below is implemented
+   except the `earliest_available_slot` decision, which remains OPEN.
+
    - **Persist both keys.** Today the discv5 key (`discovery.rs`:
      `CombinedKey::generate_secp256k1()`) and the libp2p host key (`reqresp.rs`:
      `Keypair::generate_secp256k1()`) are generated fresh on every start. Right

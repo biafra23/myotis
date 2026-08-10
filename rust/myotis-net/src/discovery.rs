@@ -73,22 +73,7 @@ pub async fn spawn(
     let mut discv5 = Discv5::new(local_enr, enr_key, discv5_config)
         .map_err(|e| format!("discv5 init failed: {e}"))?;
 
-    // Keep every successfully PARSED bootstrap ENR for the empty-table
-    // re-seed — including ones whose initial add_enr fails (a full bucket at
-    // spawn must not permanently exclude a bootnode from recovery; only
-    // malformed ENRs are dropped, with a warn).
-    let mut bootnodes: Vec<Enr> = Vec::with_capacity(config.bootstrap_enrs.len());
-    for enr_str in &config.bootstrap_enrs {
-        match enr_str.parse::<Enr>() {
-            Ok(enr) => {
-                if let Err(e) = discv5.add_enr(enr.clone()) {
-                    tracing::warn!(error = e, "bootstrap ENR not added to table (kept for re-seed)");
-                }
-                bootnodes.push(enr);
-            }
-            Err(e) => tracing::warn!(error = %e, "skipping malformed bootstrap ENR"),
-        }
-    }
+    let bootnodes = seed_bootnodes(&discv5, &config.bootstrap_enrs);
 
     discv5
         .start()
@@ -106,6 +91,26 @@ pub async fn spawn(
         tx,
     ));
     Ok((task, table_size))
+}
+
+/// Parse the bootstrap ENRs and add them to the routing table, keeping every
+/// successfully PARSED one for the empty-table re-seed — including ones whose
+/// initial `add_enr` fails (a full bucket at spawn must not permanently exclude
+/// a bootnode from recovery; only malformed ENRs are dropped, with a warn).
+fn seed_bootnodes(discv5: &Discv5, bootstrap_enrs: &[String]) -> Vec<Enr> {
+    let mut bootnodes: Vec<Enr> = Vec::with_capacity(bootstrap_enrs.len());
+    for enr_str in bootstrap_enrs {
+        match enr_str.parse::<Enr>() {
+            Ok(enr) => {
+                if let Err(e) = discv5.add_enr(enr.clone()) {
+                    tracing::warn!(error = e, "bootstrap ENR not added to table (kept for re-seed)");
+                }
+                bootnodes.push(enr);
+            }
+            Err(e) => tracing::warn!(error = %e, "skipping malformed bootstrap ENR"),
+        }
+    }
+    bootnodes
 }
 
 async fn run_lookups(
@@ -145,21 +150,7 @@ async fn run_lookups(
         table_size.store(discv5.table_entries_id().len(), Ordering::Relaxed);
         let live = discv5.connected_peers();
         if reseed_due(&mut empty_rounds, live, bootnodes.len()) {
-            // add_enr alone is PASSIVE and rejected outright when the target
-            // bucket is full of dead Disconnected entries (sigp only evicts on
-            // a Connected-status insert) — so also PING every bootnode, the
-            // active path the Java re-seed uses: one Pong drives the
-            // Connected insert that evicts a dead entry and refills a bucket.
-            let mut readded = 0usize;
-            for enr in &bootnodes {
-                if discv5.add_enr(enr.clone()).is_ok() {
-                    readded += 1;
-                }
-                let ping = discv5.send_ping(enr.clone());
-                tokio::spawn(async move {
-                    let _ = ping.await; // fire-and-forget; failure is expected noise
-                });
-            }
+            let readded = reseed(&discv5, &bootnodes);
             // A recovered table must also REFILL the sync pool: without this,
             // every re-found peer fails the seen-dedup and is never re-emitted
             // (emission is once-ever per NodeId), leaving the pool starved
@@ -183,6 +174,29 @@ async fn run_lookups(
             seen.clear();
         }
     }
+}
+
+/// Re-seed the routing table from the bootnodes, returning how many `add_enr`
+/// calls took. Shared by the client and server loops so a fix to the re-seed
+/// mechanics lands in both.
+///
+/// add_enr alone is PASSIVE and rejected outright when the target bucket is
+/// full of dead Disconnected entries (sigp only evicts on a Connected-status
+/// insert) — so also PING every bootnode, the active path the Java re-seed
+/// uses: one Pong drives the Connected insert that evicts a dead entry and
+/// refills a bucket.
+fn reseed(discv5: &Discv5, bootnodes: &[Enr]) -> usize {
+    let mut readded = 0usize;
+    for enr in bootnodes {
+        if discv5.add_enr(enr.clone()).is_ok() {
+            readded += 1;
+        }
+        let ping = discv5.send_ping(enr.clone());
+        tokio::spawn(async move {
+            let _ = ping.await; // fire-and-forget; failure is expected noise
+        });
+    }
+    readded
 }
 
 /// The stateful counter step behind the empty-table re-seed — the Rust twin
@@ -464,5 +478,250 @@ mod server_enr_tests {
     fn a_non_secp256k1_host_key_is_refused_rather_than_silently_wrong() {
         let ed = libp2p::identity::Keypair::generate_ed25519();
         assert!(discv5_key_from_libp2p(&ed).is_err());
+    }
+}
+
+// -------------------------------------------------------------------------
+// Server-mode discv5: join the DHT, then publish the server record (#335)
+// -------------------------------------------------------------------------
+
+/// Steady-state pause between server lookup rounds.
+///
+/// Slower than the client's 15 s: a wallet enumerates the DHT hunting for
+/// servers, while a server runs lookups only to keep its own table healthy and
+/// to keep showing up in other nodes' tables — each query we send is also the
+/// traffic that gets us inserted (and endpoint-proven) on the remote side.
+const SERVER_LOOKUP_PAUSE: std::time::Duration = std::time::Duration::from_secs(60);
+
+pub struct ServerDiscoveryConfig {
+    /// The libp2p HOST key. The discv5 identity is derived from it so the peer
+    /// id a wallet computes from the published record is the one the libp2p
+    /// listener authenticates as — see [`discv5_key_from_libp2p`].
+    pub keypair: libp2p::identity::Keypair,
+    /// Sequence number for the initial, endpoint-less record: the caller's
+    /// persisted high-water mark. NOT bumped here — nothing is published until
+    /// [`ServerDiscovery::publish`], and every publish must arrive with a
+    /// freshly persisted, out-ranking number.
+    pub initial_seq: u64,
+    /// UDP port to bind — the deployment forwards it under the same number as
+    /// the TCP listener, so a single port per instance covers both.
+    pub udp_port: u16,
+    pub bootstrap_enrs: Vec<String>,
+}
+
+/// A running server-side discv5 node.
+///
+/// Starts in the JOIN-ONLY state (issue #335 step 1): the local record carries
+/// no endpoint, so the node can query the DHT and populate its table but no
+/// remote can insert it into theirs — unlistable by omission, exactly like the
+/// wallet's client record. [`Self::publish`] is the separate, deliberate step
+/// that makes the node findable.
+///
+/// `enr_update` is DISABLED on the underlying service: sigp's IP-voting would
+/// otherwise rewrite the record's socket (and bump its sequence number) from
+/// inside the service, invisibly to the caller whose persisted sequence file is
+/// supposed to be the source of truth. Every mutation of the record goes
+/// through `publish`, which takes a caller-persisted sequence number.
+pub struct ServerDiscovery {
+    discv5: Arc<Discv5>,
+    /// A second derivation of the same host key, kept for building records at
+    /// publish time (the first copy is consumed by `Discv5::new`).
+    record_key: CombinedKey,
+    maintenance: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ServerDiscovery {
+    fn drop(&mut self) {
+        // The maintenance task holds an Arc<Discv5>; aborting it releases the
+        // last clone so the service (and its UDP socket) shuts down promptly.
+        self.maintenance.abort();
+    }
+}
+
+/// Start the server discv5 node: bind UDP, seed the table, begin maintenance
+/// lookups. Publishes nothing (see [`ServerDiscovery`]).
+pub async fn spawn_server(config: ServerDiscoveryConfig) -> Result<ServerDiscovery, String> {
+    let enr_key = discv5_key_from_libp2p(&config.keypair)?;
+    let record_key = discv5_key_from_libp2p(&config.keypair)?;
+
+    // Endpoint-less on purpose — join-only until `publish`.
+    let local_enr = {
+        let mut builder = Enr::builder();
+        builder.seq(config.initial_seq);
+        builder
+            .build(&enr_key)
+            .map_err(|e| format!("building the initial (endpoint-less) ENR: {e}"))?
+    };
+
+    let listen = ListenConfig::Ipv4 {
+        ip: std::net::Ipv4Addr::UNSPECIFIED,
+        port: config.udp_port,
+    };
+    let discv5_config = ConfigBuilder::new(listen).disable_enr_update().build();
+    let mut discv5 = Discv5::new(local_enr, enr_key, discv5_config)
+        .map_err(|e| format!("discv5 init failed: {e}"))?;
+
+    let bootnodes = seed_bootnodes(&discv5, &config.bootstrap_enrs);
+
+    discv5
+        .start()
+        .await
+        .map_err(|e| format!("discv5 start failed: {e}"))?;
+    tracing::info!(
+        bootnodes = bootnodes.len(),
+        port = config.udp_port,
+        node_id = %discv5.local_enr().node_id(),
+        "server discv5 started (join-only until the record is published)"
+    );
+
+    let discv5 = Arc::new(discv5);
+    let maintenance = tokio::spawn(run_server_maintenance(Arc::clone(&discv5), bootnodes));
+    Ok(ServerDiscovery { discv5, record_key, maintenance })
+}
+
+/// Keep the table alive and the node visible: periodic random-target lookups,
+/// plus the same empty-table bootnode re-seed the client runs ([`reseed_due`]).
+async fn run_server_maintenance(discv5: Arc<Discv5>, bootnodes: Vec<Enr>) {
+    let mut empty_rounds = 0u32;
+    loop {
+        match discv5.find_node(NodeId::random()).await {
+            Ok(found) => tracing::debug!(
+                found = found.len(),
+                table = discv5.table_entries_id().len(),
+                live = discv5.connected_peers(),
+                "server discv5 lookup round complete"
+            ),
+            Err(e) => tracing::debug!(error = %e, "server discv5 lookup failed"),
+        }
+
+        if reseed_due(&mut empty_rounds, discv5.connected_peers(), bootnodes.len()) {
+            let readded = reseed(&discv5, &bootnodes);
+            tracing::info!(pinged = bootnodes.len(), readded, rounds = RESEED_EMPTY_ROUNDS,
+                "server discv5 live table empty — pinged bootnodes");
+        }
+
+        tokio::time::sleep(SERVER_LOOKUP_PAUSE).await;
+    }
+}
+
+impl ServerDiscovery {
+    /// Replace the local record with a complete server ENR — endpoint plus the
+    /// full 16-byte `eth2` ENRForkID — built via [`build_server_enr`] and
+    /// signed with the host key. From this moment the node is listable: every
+    /// peer that talks to us learns the record and can hand it to wallets.
+    ///
+    /// `seq` MUST be persisted by the caller BEFORE this call (the `EnrSeq`
+    /// discipline): a crash between publishing and persisting would re-issue a
+    /// number the network has already seen, and the DHT ignores a record that
+    /// does not out-rank the cached one. The same-rule is enforced here against
+    /// the CURRENT record — a non-out-ranking sequence number is refused rather
+    /// than published into silence.
+    ///
+    /// Returns the published record's base64 form, for the operator's log.
+    pub fn publish(
+        &self,
+        seq: u64,
+        ip: IpAddr,
+        tcp_port: u16,
+        udp_port: u16,
+        eth2: [u8; 16],
+    ) -> Result<String, String> {
+        let record = build_server_enr(&self.record_key, seq, ip, tcp_port, udp_port, eth2)?;
+        // The shared handle is the SAME Arc the running service answers
+        // handshakes and NODES responses from (`Discv5::external_enr` — "useful
+        // for synchronising views of the local ENR outside of Discv5"), so the
+        // swap is visible to peers on their next exchange. Safe to replace
+        // wholesale because `disable_enr_update` above makes this the only
+        // writer, and the key (therefore the node id) never changes.
+        let shared = self.discv5.external_enr();
+        let mut current = shared.write();
+        if record.node_id() != current.node_id() {
+            return Err("record node id changed — the signing key must be the host key".into());
+        }
+        if record.seq() <= current.seq() {
+            return Err(format!(
+                "sequence {} does not out-rank the current record's {} — peers would silently \
+                 ignore it; the persisted sequence file has gone backwards",
+                record.seq(),
+                current.seq()
+            ));
+        }
+        *current = record.clone();
+        Ok(record.to_base64())
+    }
+
+    /// The current local record.
+    pub fn local_enr(&self) -> Enr {
+        self.discv5.local_enr()
+    }
+
+    /// Total routing-table entries (including Disconnected ones) — the "did the
+    /// table populate?" number issue #335 step 1 asks operators to verify.
+    pub fn table_entries(&self) -> usize {
+        self.discv5.table_entries_id().len()
+    }
+
+    /// Peers with live sessions.
+    pub fn connected_peers(&self) -> usize {
+        self.discv5.connected_peers()
+    }
+}
+
+#[cfg(test)]
+mod server_discovery_tests {
+    use super::*;
+
+    fn eth2_field() -> [u8; 16] {
+        let mut f = [0u8; 16];
+        f[..4].copy_from_slice(&[0x74, 0xd0, 0x14, 0x59]);
+        f[4..8].copy_from_slice(&[0x07, 0x00, 0x00, 0x00]);
+        f[8..].copy_from_slice(&u64::MAX.to_le_bytes());
+        f
+    }
+
+    /// The full lifecycle the design describes: start join-only (endpoint-less,
+    /// at the persisted sequence number), then publish a complete record, and
+    /// refuse a sequence number that does not out-rank it.
+    #[tokio::test]
+    async fn joins_unpublished_then_publishes_only_with_an_outranking_seq() {
+        let keypair = libp2p::identity::Keypair::generate_secp256k1();
+        let host_peer_id = PeerId::from(keypair.public());
+        let sd = spawn_server(ServerDiscoveryConfig {
+            keypair,
+            initial_seq: 41,
+            udp_port: 0, // OS-assigned: tests must not fight over a port
+            bootstrap_enrs: vec![],
+        })
+        .await
+        .expect("server discv5 starts");
+
+        // Join-only: no endpoint, so no remote can list us — and the sequence
+        // number is the caller's persisted value, not a restart at 1.
+        let initial = sd.local_enr();
+        assert_eq!(initial.seq(), 41);
+        assert!(initial.ip4().is_none() && initial.udp4().is_none(), "join-only means endpoint-less");
+
+        // A stale (equal) sequence number must be refused, not published into
+        // silence: the DHT keeps the highest-sequence record it has seen.
+        let ip: IpAddr = "87.154.209.161".parse().unwrap();
+        assert!(sd.publish(41, ip, 9105, 9105, eth2_field()).is_err());
+
+        let b64 = sd.publish(42, ip, 9105, 9105, eth2_field()).expect("out-ranking seq publishes");
+        assert!(b64.starts_with("enr:"));
+
+        let published = sd.local_enr();
+        assert_eq!(published.seq(), 42);
+        assert_eq!(published.ip4().map(|i| i.to_string()).as_deref(), Some("87.154.209.161"));
+        assert_eq!(published.tcp4(), Some(9105));
+        assert_eq!(published.udp4(), Some(9105));
+        // The record a wallet discovers must filter and dial exactly as the
+        // client side does — same digest reader, same peer-id derivation.
+        assert_eq!(enr_eth2_fork_digest(&published), Some([0x74, 0xd0, 0x14, 0x59]));
+        assert_eq!(enr_to_peer_id(&published), Some(host_peer_id));
+
+        // Re-publication (address change) keeps working: bump again, new IP.
+        let moved: IpAddr = "87.154.210.7".parse().unwrap();
+        sd.publish(43, moved, 9105, 9105, eth2_field()).expect("address change re-publishes");
+        assert_eq!(sd.local_enr().ip4().map(|i| i.to_string()).as_deref(), Some("87.154.210.7"));
     }
 }

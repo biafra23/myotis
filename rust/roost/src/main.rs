@@ -1,11 +1,13 @@
 //! roost — a dedicated light-client server (docs/lc-server-design.md).
 //!
 //! Status: **in progress.** `serve` runs the server — the libp2p responder over
-//! the light-client store, the chain-view poller behind `status`, and ingestion
-//! in background tasks. `probe` verifies the upstream path and `ingest` fills
-//! the archive without listening. ENR publication and the back-archive below the
-//! upstream light-client floor are what remain. Context bytes are computed from
-//! the chain's fork and blob schedule (`forks.rs`), not approximated.
+//! the light-client store, the chain-view poller behind `status`, ingestion in
+//! background tasks, and discv5: it joins the DHT and publishes the ENR once
+//! the external address is confirmed (#335; `--no-publish` joins without
+//! publishing). `probe` verifies the upstream path and `ingest` fills the
+//! archive without listening. The back-archive below the upstream light-client
+//! floor is what remains. Context bytes are computed from the chain's fork and
+//! blob schedule (`forks.rs`), not approximated.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -40,15 +42,20 @@ fn usage() -> String {
          probe     Fetch every light-client endpoint from Nimbus, check the\n              \
          framing, and round-trip the updates through myotis' own decoder.\n    \
          ingest    Load the archive, fill it from Nimbus, and report coverage.\n    \
-         serve     Run the light-client server: libp2p responder + ingestion.\n    \
-         enr       Print the ENR roost WOULD publish. Publishes nothing.\n\
+         serve     Run the light-client server: libp2p responder + ingestion +\n              \
+         discv5 (joins the DHT; publishes the ENR once the address is\n              \
+         confirmed — see --no-publish).\n    \
+         enr       Print the ENR roost would publish. Publishes nothing.\n\
          \n\
          OPTIONS:\n    \
          --rest URL       Nimbus REST base (default {DEFAULT_REST})\n    \
          --archive PATH   Archive file (default {DEFAULT_ARCHIVE})\n    \
-         --port N         libp2p listen port for `serve` (default {DEFAULT_PORT})\n    \
+         --port N         libp2p TCP listen port for `serve`; discv5 binds the\n                     \
+         same number on UDP (default {DEFAULT_PORT})\n    \
          --key PATH       libp2p identity file (default: archive path with .key)\n    \
-         --advertise IP   address to build the ENR for (`enr` command)\n"
+         --advertise IP   address to build the ENR for (`enr` command)\n    \
+         --no-publish     `serve`: join the discv5 DHT but never publish the\n                     \
+         record — the deliberate first deployment step (#335)\n"
     )
 }
 
@@ -67,6 +74,7 @@ async fn main() -> Result<()> {
     let mut key_path: Option<PathBuf> = None;
     let mut advertise: Option<String> = None;
     let mut port = DEFAULT_PORT;
+    let mut publish_enr = true;
     let mut command = None;
 
     let mut i = 0;
@@ -115,6 +123,7 @@ async fn main() -> Result<()> {
                         .clone(),
                 );
             }
+            "--no-publish" => publish_enr = false,
             "-h" | "--help" => {
                 print!("{}", usage());
                 return Ok(());
@@ -128,7 +137,7 @@ async fn main() -> Result<()> {
     match command.as_deref() {
         Some("probe") => probe(&rest_base).await,
         Some("ingest") => ingest(&rest_base, &archive_path).await,
-        Some("serve") => serve::serve(&rest_base, &archive_path, key_path, port).await,
+        Some("serve") => serve::serve(&rest_base, &archive_path, key_path, port, publish_enr).await,
         Some("enr") => show_enr(&rest_base, &archive_path, key_path, advertise, port).await,
         Some(other) => Err(anyhow!("unknown command '{other}'\n\n{}", usage())),
         None => {
@@ -649,7 +658,14 @@ async fn show_enr(
     // depending on a Display impl for one lets an upstream cosmetic change
     // silently alter what an operator pastes into a bootnode list.
     println!("\n  {}", record.to_base64());
-    println!("\n  NOT published. This command only builds the record.");
+    println!(
+        "\n  NOT published by this command — `serve` publishes automatically once the\n  \
+         external address is confirmed (or joins without publishing under --no-publish).\n  \
+         Note this run consumed a sequence number from the shared .enrseq file; that is\n  \
+         harmless (gaps are fine, reuse is not), but a `serve` running on the same data\n  \
+         directory holds its own count in memory, so inspect a LIVE deployment's record\n  \
+         from its log rather than by running `enr` beside it."
+    );
     Ok(())
 }
 

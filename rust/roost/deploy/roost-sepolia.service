@@ -13,11 +13,16 @@ StartLimitIntervalSec=0
 
 [Service]
 User=roost
+# --no-publish is deployment step 1 (#335): join the discv5 DHT, publish no
+# ENR. This legacy unit has no env-file hook (the deploy/roost@.service
+# template does — prefer it), so enabling publication here means editing this
+# line once 9105/udp is forwarded and verified reachable from outside.
 ExecStart=/usr/local/bin/roost serve \
   --rest http://127.0.0.1:5052 \
   --archive /data/roost/sepolia.db \
   --key /data/roost/sepolia.key \
-  --port 9105
+  --port 9105 \
+  --no-publish
 Restart=on-failure
 RestartSec=5
 # Explicit, per docs/lc-server-design.md §8: the shell default here is 2048,

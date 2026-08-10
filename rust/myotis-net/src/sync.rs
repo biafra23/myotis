@@ -279,6 +279,24 @@ impl ChainConfig {
         .with_env_overrides()
     }
 
+    /// The shipped config whose chain matches this `genesis_validators_root`,
+    /// or None for a chain this build does not know.
+    ///
+    /// For consumers that learn their chain from a live source instead of
+    /// being configured with one — `rust/roost` reads the root from its
+    /// upstream and needs the matching discv5 bootstrap ENRs to join the DHT
+    /// (#335). Keying by the root rather than by a name keeps it ONE list per
+    /// network (this file's), not a second one rotting on roost's schedule.
+    ///
+    /// Note the constructors apply the usual env overrides, so
+    /// `MYOTIS_CL_DISABLE_DISCV5=1` empties `bootstrap_enrs` here too — the
+    /// consistent reading of "disable discv5" for any process honoring it.
+    pub fn for_genesis(genesis_validators_root: &[u8; 32]) -> Option<Self> {
+        [Self::mainnet(), Self::sepolia(), Self::gnosis()]
+            .into_iter()
+            .find(|c| &c.genesis_validators_root == genesis_validators_root)
+    }
+
     /// Fork digests accepted when filtering discv5 ENRs — current first, then
     /// the prior fork's when configured (`NetworkConfig.acceptedForkDigests`).
     pub fn accepted_fork_digests(&self) -> Vec<[u8; 4]> {
