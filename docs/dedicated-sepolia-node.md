@@ -282,7 +282,7 @@ geth-myotis attach --datadir /data/geth --exec admin.nodeInfo.enode
 
 Install a recent `nimbus_beacon_node` (distro package, released binary, or
 `make nimbus_beacon_node`). One-time checkpoint sync (pick any maintained
-Sepolia checkpoint provider — the same set `./gradlew refreshSepoliaCheckpoint`
+Sepolia checkpoint provider — the same set `./gradlew refreshCheckpoint -Pnetwork=sepolia`
 cross-validates, e.g. `https://sepolia.beaconstate.info`):
 
 ```bash
@@ -339,13 +339,13 @@ Notes:
   and the default retention covers all available periods. This matters
   because a wallet's first request is `light_client_bootstrap` for its
   **pinned checkpoint** (`NetworkConfig.SEPOLIA`, refreshed via
-  `./gradlew refreshSepoliaCheckpoint`), which is typically days-to-weeks old
+  `./gradlew refreshCheckpoint -Pnetwork=sepolia`), which is typically days-to-weeks old
   (a sync-committee period is ~27 h) — with `only-new` the node could not
   serve bootstraps older than its own start.
 - Hard limit either way: Nimbus can only produce light-client data for slots
   it processed with state — i.e. from its trustedNodeSync point forward
   (block backfill doesn't help; bootstraps need the sync committee from
-  state). So after the node is up, run `./gradlew refreshSepoliaCheckpoint`
+  state). So after the node is up, run `./gradlew refreshCheckpoint -Pnetwork=sepolia`
   in the myotis repo so the shipped pin is **newer than the node's sync
   point** — that is the mitigation that actually works.
 - **`--netkey-file` is REQUIRED for a stable peer-id.** It defaults to

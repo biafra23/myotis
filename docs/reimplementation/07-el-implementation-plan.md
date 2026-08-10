@@ -585,9 +585,9 @@ Java engine's.
   the native `UNSUPPORTED_NETWORK` contract + catalog-driven rpc port/chain id. Parity
   tests pin the sepolia CL config incl. the cross-language fork digest (`0x74d01459`,
   computed identically by `NetworkConfig.SEPOLIA.currentForkDigest()` and Rust
-  `fork_digest_bpo`). Sepolia checkpoint refreshes (`refreshSepoliaCheckpoint`) must be
-  hand-mirrored into `ChainConfig::sepolia()` like mainnet's, until the plan-PR7 task
-  rewrite covers the Rust constants.
+  `fork_digest_bpo`). Sepolia checkpoint refreshes (`refreshCheckpoint -Pnetwork=sepolia`) rewrite
+  `ChainConfig::sepolia()` alongside the Java region from one fetch — the hand-mirroring
+  this note used to describe is gone.
 - **MC-2 (landed): gnosis hosted by the Rust engine.** `ChainConfig::gnosis()` /
   `ElConfig::gnosis()` mirror the Java `NetworkConfig.GNOSIS` (own beacon chain: 5s slots,
   16-slot epochs, gvr `f5dcb556…`, Fulu fork `0x06000064` / prior Electra `0x05000064`,
@@ -604,7 +604,7 @@ Java engine's.
   `0x3237dab6`, prior Electra `0x7d5aab40`). Validated live: the gnosis checkpoint bootstrap
   discovered a CL peer (fork-digest correct) and verified against the genesis validators root
   (`period=3480`, state `CATCHING_UP`); full SYNCED is peer-supply-bound on the dev host, as with
-  mainnet. `refreshGnosisCheckpoint` is hand-mirrored into `ChainConfig::gnosis()` like the others.
+  mainnet. `refreshCheckpoint -Pnetwork=gnosis` rewrites `ChainConfig::gnosis()` together with the Java region.
 - **CLOSED: OSAKA on both engines** (after the Besu 26.4.0 bump made the Java side
   capable). Both fork tables gained the Osaka rung in ONE coordinated change: mainnet
   1764798551 / sepolia 1760427360 (go-ethereum ChainConfig) / gnosis 1776168380

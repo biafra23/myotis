@@ -142,7 +142,7 @@ layer (Gnosis Beacon Chain — 5s slots, 16 slots/epoch). Select it with
 # 1. Refresh the trusted checkpoint (weak-subjectivity anchor) for Gnosis.
 #    Do this before the first sync so the light client bootstraps from a recent
 #    finalized root that peers still serve.
-./gradlew refreshGnosisCheckpoint
+./gradlew refreshCheckpoint -Pnetwork=gnosis
 
 # 2. Start the Gnosis daemon.
 ./gradlew :app:run -Pnetwork=gnosis
@@ -683,15 +683,20 @@ Ethereum's weak-subjectivity window is only ~28 hours of stake-weighted safety, 
 
 ```bash
 # Preview the diff without writing
-./gradlew refreshMainnetCheckpoint -Pdry
+./gradlew refreshCheckpoint -Pnetwork=mainnet -Pdry
 
-# Fetch + write (commit the resulting NetworkConfig.java diff)
-./gradlew refreshMainnetCheckpoint
+# Fetch + write (commit the resulting diff — BOTH engines move together)
+./gradlew refreshCheckpoint -Pnetwork=mainnet
+
+# All three networks in one run
+./gradlew refreshCheckpoint
 ```
 
 The task queries `/eth/v2/beacon/blocks/finalized` on three independent mainnet checkpoint providers (beaconstate.info, sync-mainnet.beaconcha.in, mainnet-checkpoint-sync.attestant.io), normalizes to the oldest observed finalized slot, re-queries each provider for the canonical block root at that slot, and requires byte-for-byte agreement before writing. Any disagreement aborts without modifying the source.
 
-The same machinery serves the other networks: `./gradlew refreshSepoliaCheckpoint` refreshes the `@checkpoint:sepolia` region from the eth-clients sepolia checkpoint providers, and `./gradlew refreshGnosisCheckpoint` refreshes `@checkpoint:gnosis` (its own task — Gnosis exposes a different API slice and fewer providers).
+The same task serves every network — `-Pnetwork=sepolia` and `-Pnetwork=gnosis` refresh the `@checkpoint:sepolia` and `@checkpoint:gnosis` regions, and a bare `./gradlew refreshCheckpoint` does all three. It refuses to write a root fewer than two providers agree on; `-PallowSingleSource` is the explicit opt-out, which Gnosis sometimes needs and the other two do not.
+
+Each run rewrites **both engines** from one fetch — `NetworkConfig.java` and the Rust `ChainConfig` in `rust/myotis-net/src/sync.rs` — because a hand-mirrored anchor is a split anchor waiting to happen. The `java_and_rust_checkpoints_agree` test fails if they ever diverge. Use `-Pperiod=<n>` to anchor at a chosen sync-committee period rather than at head (an anchor at head leaves a wallet nothing to walk, and goes stale as soon as the period rolls); historical slots need a full node, named with `-PextraEndpoint=<url>` and checked against the pinned `genesis_validators_root` before it counts.
 
 ### Verification flow
 
