@@ -155,6 +155,19 @@ impl ExecAnchor {
         self.inner.lock().expect("anchor mutex").optimistic_block_number
     }
 
+    /// The optimistic execution `(block_number, state_root)` read atomically —
+    /// the CURRENT beacon-attested head state, at most a couple of slots old.
+    /// `None` until the first optimistic update lands. This is the root snap
+    /// queries should prefer: it is BLS-verified and recent enough that every
+    /// honest synced peer still retains it in its snap serve window (unlike a
+    /// peer's handshake-time head, which post-merge never refreshes).
+    pub fn optimistic_execution(&self) -> Option<(u64, [u8; 32])> {
+        let inner = self.inner.lock().expect("anchor mutex");
+        inner
+            .optimistic_state_root
+            .map(|root| (inner.optimistic_block_number, root))
+    }
+
     /// The `stateRootMatch` fast-path lookup: is `state_root` a root the beacon
     /// client already recorded? Searches NEWEST-first (twin of
     /// `findStateRoot`'s `descendingIterator`) so the freshest/best match wins.
@@ -209,6 +222,14 @@ mod tests {
     }
 
     #[test]
+    fn optimistic_execution_none_until_first_update() {
+        let anchor = ExecAnchor::new();
+        // Before the first optimistic update the accessor must be None — the
+        // snap-root selection falls back to the peer handshake head then.
+        assert_eq!(anchor.optimistic_execution(), None);
+    }
+
+    #[test]
     fn finalized_and_optimistic_updates() {
         let anchor = ExecAnchor::new();
         assert_eq!(anchor.finalized_execution(), None);
@@ -224,6 +245,8 @@ mod tests {
         anchor.update_optimistic(102, 21_000_005, root(0xf2), root(2));
         assert_eq!(anchor.optimistic_block_hash(), Some(root(0xf2)));
         assert_eq!(anchor.optimistic_block_number(), 21_000_005);
+        // The atomic (number, root) pair snap queries prefer (issue #355).
+        assert_eq!(anchor.optimistic_execution(), Some((21_000_005, root(2))));
 
         // Both roots are in the fast-path window.
         assert!(anchor.find_state_root(&root(1)).is_some());
