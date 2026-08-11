@@ -1038,10 +1038,27 @@ impl ElReader {
     /// otherwise be refused for those few seconds even though the block is
     /// verified and about to be indexed. This runs the SAME verified machinery
     /// as the background tick (no new trust path); it just runs it now.
-    pub async fn advance_log_index_tail_now(&self) {
-        let _drive = self.log_index_drive.lock().await;
-        let mut since_persist = 0u32;
-        self.log_index_append_tick(&mut since_persist, 0).await;
+    /// `target`: the block the caller needs covered. Bounded by a hard deadline —
+    /// this sits on a wallet-facing request path, and in degraded peer conditions
+    /// an unbounded lock-wait + tick could turn a microsecond refusal into a
+    /// minutes-long stall. On timeout the caller just re-queries and serves the
+    /// original refusal; the wallet already handles retry.
+    pub async fn advance_log_index_tail_now(&self, target: u64) {
+        const FILL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+        let fill = async {
+            let _drive = self.log_index_drive.lock().await;
+            // Re-check under the lock: the background tick — or another caller's
+            // fill that just finished — may already cover the target. Skipping
+            // saves a full header-window fetch per queued caller.
+            if self.log_index_covered_high().is_some_and(|top| top >= target) {
+                return;
+            }
+            let mut since_persist = 0u32;
+            self.log_index_append_tick(&mut since_persist, 0).await;
+        };
+        // Cancellation at an await point is safe: coverage and the tail record
+        // mutate only synchronously under the index lock (append_block).
+        let _ = tokio::time::timeout(FILL_DEADLINE, fill).await;
     }
 
     /// Follow the OPTIMISTIC tail: keep coverage running from finality up to

@@ -2511,14 +2511,20 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
     let needs_fill = matches!(
         &result,
         Some(Err(QueryError::OutOfCoverage { covered, .. }))
-            if covered.span.is_some_and(|(_low, high)| {
-                filter.to_block <= head
+            if covered.span.is_some_and(|(low, high)| {
+                // The fill helps ONLY when the high edge is the sole shortfall.
+                // A fromBlock below the covered low (the classic full-history
+                // scan while backfill is still running) cannot be served by
+                // advancing the tail — firing there would spend a synchronous
+                // network tick per poll for nothing.
+                filter.from_block >= low
+                    && filter.to_block <= head
                     && filter.to_block > high
                     && filter.to_block - high <= LOG_INDEX_LATEST_SLACK
             })
     );
     if needs_fill {
-        engine.rt.block_on(async { reader.advance_log_index_tail_now().await });
+        engine.rt.block_on(async { reader.advance_log_index_tail_now(filter.to_block).await });
         result = reader.with_log_index(|ix| ix.query(&filter));
     }
     match result {
