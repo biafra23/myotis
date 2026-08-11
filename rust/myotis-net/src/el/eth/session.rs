@@ -130,7 +130,9 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
                 )
             };
             tracing::debug!(
-                client = %peer_hello.client_id,
+                // `{:?}` — client_id is peer-controlled and the host log drains
+                // split on '\n'; Debug-escape it so it can't forge log lines.
+                client = ?peer_hello.client_id,
                 eth = eth_version,
                 status_hex = %hex_all(&status),
                 "eth handshake: Hello ok, sending Status"
@@ -146,13 +148,10 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
                             .map_err(|e| format!("peer Status decode: {}", e.0))?
                     }
                     P2P_DISCONNECT => {
-                        // Keep the "peer disconnected" prefix + "reason=N" suffix —
-                        // the pool's busy classifier pins that exact shape.
-                        return Err(format!(
-                            "peer disconnected after our Status (client={} eth={}): {}",
-                            peer_hello.client_id,
+                        return Err(status_disconnect_error(
+                            &peer_hello.client_id,
                             eth_version,
-                            describe_disconnect(&frame.payload)
+                            &frame.payload,
                         ))
                     }
                     other => {
@@ -516,6 +515,20 @@ async fn recv_answering_ping<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 fn response_request_id(payload: &[u8]) -> Option<u64> {
     let items = rlp::raw_list_items(payload).ok()?;
     rlp::decode(items.first()?).ok()?.as_u64().ok()
+}
+
+/// The Status-stage disconnect error. Keeps the "peer disconnected" prefix +
+/// `describe_disconnect`'s "reason=N" suffix — the pool's busy classifier pins
+/// both ends (its test builds a string through THIS producer). `{:?}` on the
+/// peer-controlled client id Debug-escapes newlines so it can't forge log
+/// lines in the hosts' split-on-'\n' drains.
+pub(crate) fn status_disconnect_error(client_id: &str, eth_version: u64, payload: &[u8]) -> String {
+    format!(
+        "peer disconnected after our Status (client={:?} eth={}): {}",
+        client_id,
+        eth_version,
+        describe_disconnect(payload)
+    )
 }
 
 /// A p2p Disconnect body is `[reason]`; decode the reason code for logging.

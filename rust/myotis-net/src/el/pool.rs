@@ -1365,14 +1365,23 @@ mod tests {
         assert!(!is_busy_disconnect("incompatible peer: networkId=137 genesis=..."));
         // A peer-controlled client id echoed mid-string can't fake the prefix.
         assert!(!is_busy_disconnect("expected Status, got code 0x04 from peer disconnected: reason=4x"));
-        // The Status-stage variant classifies by the same ends, and a hostile
-        // client id mid-string can't steer either end.
-        assert!(is_busy_disconnect(
-            "peer disconnected after our Status (client=Nethermind/v1.36.2 eth=69): reason=4"
-        ));
-        assert!(!is_busy_disconnect(
-            "peer disconnected after our Status (client=reason=4 eth=69): reason=16"
-        ));
+        // The Status-stage variant classifies by the same ends. Built through
+        // the REAL producer so a rewording that drops the "peer disconnected"
+        // prefix breaks here instead of silently degrading busy to transient —
+        // and a hostile client id mid-string can't steer either end.
+        let status_busy = crate::el::eth::session::status_disconnect_error(
+            "Nethermind/v1.36.2",
+            69,
+            &[0xc1, 0x04],
+        );
+        assert!(is_busy_disconnect(&status_busy), "producer drifted: {status_busy}");
+        let status_hostile = crate::el::eth::session::status_disconnect_error(
+            "reason=4\nforged line",
+            69,
+            &[0xc1, 0x10],
+        );
+        assert!(!is_busy_disconnect(&status_hostile));
+        assert!(!status_hostile.contains('\n'), "client id must be Debug-escaped");
         // Producer-coupled: build the string through the REAL session
         // formatter (RLP [0x04] = TooManyPeers) so a future format change in
         // describe_disconnect breaks this test instead of silently degrading
