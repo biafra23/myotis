@@ -76,8 +76,9 @@ public final class DiscV5Service implements AutoCloseable {
     // handful of public CL bootnodes 4x as often for the life of the process.)
     private static final int RESEED_EMPTY_POLLS = 4;
     private int consecutiveEmptyPolls;
-    // Bootnode ENRs parsed once, on the first re-seed (malformed entries are
-    // logged once and dropped, not re-swallowed every fire). Poll-thread only.
+    // Bootnode ENRs parsed once, on first use (malformed entries are logged
+    // once and dropped, not re-swallowed every fire). Guarded by
+    // bootnodeRecords()'s synchronization — poll thread and walker both call it.
     private List<NodeRecord> bootnodeRecords;
 
     public DiscV5Service(NodeKey nodeKey, List<String> bootnodeEnrs,
@@ -329,11 +330,13 @@ public final class DiscV5Service implements AutoCloseable {
     }
 
     /**
-     * One bounded iterative Kademlia walk toward {@code target}: query the α
-     * closest known nodes for the target's bucket (±1), merge what they return,
-     * repeat while progress is made. Runs entirely on the walker thread;
-     * queries are sequential with a short timeout each, so a full walk is
-     * bounded at roughly {@code WALK_MAX_ROUNDS × α × timeout}.
+     * One bounded iterative Kademlia walk toward {@code target}: seed from
+     * sibling pins and bootnodes, then repeatedly query the closest unqueried
+     * frontier node for the target's bucket neighborhood, merging what each
+     * returns. Runs entirely on the walker thread; queries are sequential with
+     * a short timeout each, so a full walk is bounded at roughly
+     * {@code (seeds + WALK_QUERY_BUDGET) × WALK_QUERY_TIMEOUT_MS} worst-case,
+     * a few seconds typically.
      *
      * <p>A found record is handed to the poll scheduler for emission, so the
      * seen-set and the caller's consumer stay single-threaded. Re-notification
@@ -384,6 +387,13 @@ public final class DiscV5Service implements AutoCloseable {
                 answers = system.findNodes(sibling, distances)
                         .get(WALK_QUERY_TIMEOUT_MS, TimeUnit.MILLISECONDS);
                 answered++;
+            } catch (InterruptedException shutdown) {
+                // close() interrupts the walker; the flag must SURVIVE this
+                // catch or the outer loop never sees it and the thread keeps
+                // walking a stopped system forever (ChainStack stop/start
+                // cycles would leak one such thread per restart).
+                Thread.currentThread().interrupt();
+                return;
             } catch (Exception unresponsive) {
                 failed++;
                 continue;
@@ -428,6 +438,9 @@ public final class DiscV5Service implements AutoCloseable {
                 answers = system.findNodes(bootnode, distances)
                         .get(WALK_QUERY_TIMEOUT_MS, TimeUnit.MILLISECONDS);
                 answered++;
+            } catch (InterruptedException shutdown) {
+                Thread.currentThread().interrupt(); // see the sibling-phase note
+                return;
             } catch (Exception unresponsive) {
                 failed++;
                 continue;
@@ -460,6 +473,17 @@ public final class DiscV5Service implements AutoCloseable {
             if (candidate == null) {
                 break; // frontier exhausted — the target is not reachable today
             }
+            if (candidate.getNodeId().equals(target)) {
+                // The frontier already HOLDS the target's record (e.g. it sits
+                // in the local live table) — that IS the find. Asking it for
+                // "bucket 0" would also produce an empty distances list below.
+                log.info("[discv5] targeted walk toward {}… : FOUND in local frontier (seq={})",
+                        target.slice(0, 4), candidate.getSeq());
+                foundPinned.put(candidate.getNodeId(), candidate);
+                emitFromWalker(candidate);
+                rememberFrontier(target, frontier.values(), byDistance);
+                return;
+            }
             queried.add(candidate.getNodeId());
             int d = org.ethereum.beacon.discovery.util.Functions.logDistance(
                     candidate.getNodeId(), target);
@@ -477,6 +501,9 @@ public final class DiscV5Service implements AutoCloseable {
                 answers = system.findNodes(candidate, distances)
                         .get(WALK_QUERY_TIMEOUT_MS, TimeUnit.MILLISECONDS);
                 answered++;
+            } catch (InterruptedException shutdown) {
+                Thread.currentThread().interrupt(); // see the sibling-phase note
+                return;
             } catch (Exception unresponsive) {
                 failed++;
                 continue;
@@ -530,7 +557,8 @@ public final class DiscV5Service implements AutoCloseable {
         if (s == null || s.isShutdown()) {
             return;
         }
-        s.execute(() -> {
+        try {
+            s.execute(() -> {
             if (!seenEnrs.add(enrStr)) {
                 return; // same record already surfaced (poll or earlier walk)
             }
@@ -542,7 +570,11 @@ public final class DiscV5Service implements AutoCloseable {
             } catch (Exception e) {
                 log.warn("[discv5] failed to parse walked ENR: {}", e.getMessage());
             }
-        });
+            });
+        } catch (java.util.concurrent.RejectedExecutionException shutdownRace) {
+            // close() won the race between the isShutdown check and execute —
+            // the record is simply dropped, like every other in-flight find.
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -620,8 +652,11 @@ public final class DiscV5Service implements AutoCloseable {
                 RESEED_EMPTY_POLLS, bootnodes.size());
     }
 
-    /** The bootnode ENRs parsed to records, once; malformed entries warn once and drop. */
-    private List<NodeRecord> bootnodeRecords() {
+    /** The bootnode ENRs parsed to records, once; malformed entries warn once
+     *  and drop. Synchronized: the re-seed path calls this on the poll thread
+     *  and the walker's bootnode phase calls it on the walker thread — an
+     *  unsynchronized lazy init would race the two into an unsafe publication. */
+    private synchronized List<NodeRecord> bootnodeRecords() {
         if (bootnodeRecords == null) {
             bootnodeRecords = new java.util.ArrayList<>(bootnodeEnrs.size());
             for (String enr : bootnodeEnrs) {
