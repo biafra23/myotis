@@ -35,6 +35,25 @@ pub enum AccountOutcome {
     Absent,
 }
 
+/// Marker shared by every proof-verification failure message. LOAD-BEARING:
+/// `reader::snap_account_at_best_root` classifies anchor-root failures by this
+/// substring — "the peer answered but could not prove at that root" (pruned /
+/// trailing / malformed proof) takes the handshake-head fallback, while
+/// transport-shaped errors propagate immediately. Keep the format strings
+/// below built from this constant, and keep
+/// [`is_unservable_root_error`] + its tests in sync.
+pub const PROOF_INVALID_MARKER: &str = "proof invalid";
+
+/// Does this fetch error mean "the peer responded, but the proof did not
+/// verify against the requested root"? True for a pruned/unknown root (empty
+/// proof), a trailing peer, or a malformed/hostile proof — all cases where a
+/// retry against a DIFFERENT root can still succeed. False for
+/// transport-shaped failures (timeout/disconnect), where a second query
+/// against the same peer would just pay the same timeout again.
+pub fn is_unservable_root_error(error: &str) -> bool {
+    error.contains(PROOF_INVALID_MARKER)
+}
+
 /// Verify an AccountRange response for `address` against the trusted
 /// `state_root`. A single-account query (`starting = keccak(address)`) yields a
 /// left-boundary proof that is exactly the Merkle proof for `keccak(address)`.
@@ -48,7 +67,7 @@ pub fn verify_account(
         ProofResult::Found(leaf) => Ok(AccountOutcome::Present(decode_account_leaf(&leaf)?)),
         ProofResult::Absent => Ok(AccountOutcome::Absent),
         ProofResult::Invalid(reason) => {
-            Err(CoreError(format!("account proof invalid: {reason}")))
+            Err(CoreError(format!("account {PROOF_INVALID_MARKER}: {reason}")))
         }
     }
 }
@@ -70,7 +89,7 @@ pub fn verify_storage(
         ProofResult::Found(value) => decode_storage_leaf(&value),
         ProofResult::Absent => Ok(Vec::new()),
         ProofResult::Invalid(reason) => {
-            Err(CoreError(format!("storage proof invalid: {reason}")))
+            Err(CoreError(format!("storage {PROOF_INVALID_MARKER}: {reason}")))
         }
     }
 }
@@ -147,6 +166,36 @@ mod tests {
             }
             AccountOutcome::Absent => panic!("expected Present"),
         }
+    }
+
+    #[test]
+    fn unservable_root_classification_pins_the_real_error_shapes() {
+        // The exact #355 failure: a peer that pruned (or never had) the root
+        // answers with an EMPTY proof against a non-empty root. The resulting
+        // error MUST classify as unservable-root (→ handshake-head fallback in
+        // reader::snap_account_at_best_root), or the fallback silently dies.
+        let address = [0x33u8; 20];
+        let response = AccountRange { request_id: 1, accounts: vec![], proof: vec![] };
+        let err = verify_account(&[0x42u8; 32], &address, &response).unwrap_err();
+        assert!(
+            is_unservable_root_error(&err.0),
+            "empty-proof error must take the fallback: {}",
+            err.0
+        );
+        // A garbage proof (ProofResult::Invalid of another shape) also counts:
+        // the peer answered; a different root may still be servable.
+        let response = AccountRange {
+            request_id: 1,
+            accounts: vec![],
+            proof: vec![vec![0xde, 0xad, 0xbe, 0xef]],
+        };
+        let err = verify_account(&[0x42u8; 32], &address, &response).unwrap_err();
+        assert!(is_unservable_root_error(&err.0), "garbage proof: {}", err.0);
+        // Transport-shaped failures must NOT take the fallback — a second
+        // query against the same dead peer just pays the same timeout again.
+        assert!(!is_unservable_root_error("request timed out"));
+        assert!(!is_unservable_root_error("peer disconnected"));
+        assert!(!is_unservable_root_error("connection reset by peer"));
     }
 
     #[test]

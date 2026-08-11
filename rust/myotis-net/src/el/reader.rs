@@ -2345,7 +2345,10 @@ impl ElReader {
     /// is the anchor's optimistic number (consistent with `eth_blockNumber`),
     /// not a peer-head claim — the FFI `peerBlockNumber` field follows. This
     /// is deliberate; the Java engine still reports the peer's handshake head
-    /// there.
+    /// there, and so does this engine's TOR read path
+    /// ([`Self::account_from_tor_session`] — a fresh session per read, so its
+    /// handshake head is seconds old and #355 does not apply; preferring the
+    /// anchor root there too is a follow-up).
     async fn snap_account_at_best_root(
         &self,
         peer: &ManagedPeer,
@@ -2354,12 +2357,15 @@ impl ElReader {
         if let Some((number, root)) = self.anchor.optimistic_execution() {
             match peer.snap_get_account(&root, &address).await {
                 Ok(outcome) => return Ok((root, number, outcome)),
-                // The peer ANSWERED but cannot prove at the anchored root
-                // (pruned it / trails the anchor): its own head may still be
+                // The peer ANSWERED but could not prove at the anchored root —
+                // pruned it, trails the anchor, OR served a malformed/hostile
+                // proof (every ProofResult::Invalid shape matches; a bad-proof
+                // peer thus earns exactly one bounded fallback attempt before
+                // the outer loop strikes it). Its own head may still be
                 // servable — fall back, and carry BOTH causes so the surfaced
                 // "all N peers failed" error names the primary path's failure,
                 // not just the fallback symptom.
-                Err(e) if e.contains("proof invalid") => {
+                Err(e) if crate::el::snap::fetch::is_unservable_root_error(&e) => {
                     let fb = |e2: String| {
                         format!("anchor-root query failed ({e}); handshake-head fallback: {e2}")
                     };
