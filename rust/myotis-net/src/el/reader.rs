@@ -918,12 +918,17 @@ impl ElReader {
                     return; // reader torn down; the appender dies with it
                 };
                 {
-                    // Serialize against on-demand fills (advance_log_index_tail_now):
-                    // both advance coverage and touch the tail reorg record.
+                    // Serialize only the coverage-advancing tick against
+                    // on-demand fills (advance_log_index_tail_now): both mutate
+                    // coverage + the tail reorg record. The backfill step works
+                    // the low-side cursor only (never the tail record), so it
+                    // runs OUTSIDE the lock — holding it there would make an
+                    // on-demand caller (a synchronous FFI thread) wait behind the
+                    // backfill budget for nothing.
                     let _drive = reader.log_index_drive.lock().await;
                     reader.log_index_append_tick(&mut since_persist, ticks).await;
-                    reader.log_index_backfill_step(ticks, &mut backfill_ok).await;
                 }
+                reader.log_index_backfill_step(ticks, &mut backfill_ok).await;
                 ticks = ticks.wrapping_add(1);
             }
         }));
