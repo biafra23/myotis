@@ -129,6 +129,12 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
                     cfg.fork_next,
                 )
             };
+            tracing::debug!(
+                client = %peer_hello.client_id,
+                eth = eth_version,
+                status_hex = %hex_all(&status),
+                "eth handshake: Hello ok, sending Status"
+            );
             conn.send(messages::STATUS, &status).await?;
 
             // Read the peer's Status (answering Ping in between).
@@ -140,8 +146,12 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
                             .map_err(|e| format!("peer Status decode: {}", e.0))?
                     }
                     P2P_DISCONNECT => {
+                        // Keep the "peer disconnected" prefix + "reason=N" suffix —
+                        // the pool's busy classifier pins that exact shape.
                         return Err(format!(
-                            "peer disconnected: {}",
+                            "peer disconnected after our Status (client={} eth={}): {}",
+                            peer_hello.client_id,
+                            eth_version,
                             describe_disconnect(&frame.payload)
                         ))
                     }
@@ -521,6 +531,10 @@ pub(crate) fn describe_disconnect(payload: &[u8]) -> String {
         })
         .unwrap_or(u64::MAX);
     format!("reason={reason}")
+}
+
+fn hex_all(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 fn hex4(b: &[u8]) -> String {
