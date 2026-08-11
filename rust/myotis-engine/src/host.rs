@@ -2496,7 +2496,37 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
         Ok(f) => f,
         Err(msg) => return eljson::error_json(&msg),
     };
-    let result = reader.with_log_index(|ix| ix.query(&filter));
+    let mut result = reader.with_log_index(|ix| ix.query(&filter));
+    // On-demand tail fill. An explicit `toBlock` at the very head can land one
+    // block past the covered top while the 6s appender tick hasn't recorded it
+    // yet — a wallet takes `toBlock` from `eth_blockNumber`, which follows the
+    // anchored head the log index trails by up to a tick. That block IS verified
+    // and moments from indexed, so rather than refuse the query, drive one
+    // catch-up tick and retry once. Fire ONLY when the missing part is the HIGH
+    // edge of the erroring address's coverage — `toBlock` at most
+    // `LOG_INDEX_LATEST_SLACK` above the covered top and never above the head. A
+    // shortfall on the LOW side (fromBlock below the index floor) cannot be
+    // helped by advancing the tail, and a deeper high-side lag is the bridge's
+    // job; neither should spend a synchronous network tick here.
+    let needs_fill = matches!(
+        &result,
+        Some(Err(QueryError::OutOfCoverage { covered, .. }))
+            if covered.span.is_some_and(|(low, high)| {
+                // The fill helps ONLY when the high edge is the sole shortfall.
+                // A fromBlock below the covered low (the classic full-history
+                // scan while backfill is still running) cannot be served by
+                // advancing the tail — firing there would spend a synchronous
+                // network tick per poll for nothing.
+                filter.from_block >= low
+                    && filter.to_block <= head
+                    && filter.to_block > high
+                    && filter.to_block - high <= LOG_INDEX_LATEST_SLACK
+            })
+    );
+    if needs_fill {
+        engine.rt.block_on(async { reader.advance_log_index_tail_now(filter.to_block).await });
+        result = reader.with_log_index(|ix| ix.query(&filter));
+    }
     match result {
         None => eljson::error_json("log index is not configured on this network"),
         Some(Ok(logs)) => eljson::get_logs_json(&logs),

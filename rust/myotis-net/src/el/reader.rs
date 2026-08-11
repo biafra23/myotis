@@ -639,6 +639,12 @@ pub struct ElReader {
     log_index_path: Option<std::path::PathBuf>,
     /// The head-follow appender task (spawned on enable, aborted on stop).
     log_index_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Serializes coverage-advancing ticks. The background appender and an
+    /// on-demand fill ([`Self::advance_log_index_tail_now`]) both mutate
+    /// coverage and the tail's `(number, hash)` reorg record; running them
+    /// concurrently would race that bookkeeping. Async mutex: held across the
+    /// tick's network awaits.
+    log_index_drive: tokio::sync::Mutex<()>,
 }
 
 /// The scan-cursor map plus its last TTL sweep — one lock covers both, so the
@@ -785,6 +791,7 @@ impl ElReader {
             log_index_pipeline_full: std::sync::atomic::AtomicBool::new(true),
             log_index_path: cfg.log_index_path,
             log_index_task: std::sync::Mutex::new(None),
+            log_index_drive: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -910,7 +917,17 @@ impl ElReader {
                 let Some(reader) = weak.upgrade() else {
                     return; // reader torn down; the appender dies with it
                 };
-                reader.log_index_append_tick(&mut since_persist, ticks).await;
+                {
+                    // Serialize only the coverage-advancing tick against
+                    // on-demand fills (advance_log_index_tail_now): both mutate
+                    // coverage + the tail reorg record. The backfill step works
+                    // the low-side cursor only (never the tail record), so it
+                    // runs OUTSIDE the lock — holding it there would make an
+                    // on-demand caller (a synchronous FFI thread) wait behind the
+                    // backfill budget for nothing.
+                    let _drive = reader.log_index_drive.lock().await;
+                    reader.log_index_append_tick(&mut since_persist, ticks).await;
+                }
                 reader.log_index_backfill_step(ticks, &mut backfill_ok).await;
                 ticks = ticks.wrapping_add(1);
             }
@@ -1009,6 +1026,39 @@ impl ElReader {
             self.persist_log_index(self.finalized_block_number());
             *since_persist = 0;
         }
+    }
+
+    /// Drive ONE coverage-advancing tick on demand, serialized against the
+    /// background appender.
+    ///
+    /// Purpose: close the 0-1 block gap between the anchored head — what
+    /// `eth_blockNumber` reports, and what a wallet then passes as an explicit
+    /// `toBlock` — and the log index's covered top, which the 6s appender tick
+    /// leaves trailing for up to a tick. A head-reaching `eth_getLogs` would
+    /// otherwise be refused for those few seconds even though the block is
+    /// verified and about to be indexed. This runs the SAME verified machinery
+    /// as the background tick (no new trust path); it just runs it now.
+    /// `target`: the block the caller needs covered. Bounded by a hard deadline —
+    /// this sits on a wallet-facing request path, and in degraded peer conditions
+    /// an unbounded lock-wait + tick could turn a microsecond refusal into a
+    /// minutes-long stall. On timeout the caller just re-queries and serves the
+    /// original refusal; the wallet already handles retry.
+    pub async fn advance_log_index_tail_now(&self, target: u64) {
+        const FILL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+        let fill = async {
+            let _drive = self.log_index_drive.lock().await;
+            // Re-check under the lock: the background tick — or another caller's
+            // fill that just finished — may already cover the target. Skipping
+            // saves a full header-window fetch per queued caller.
+            if self.log_index_covered_high().is_some_and(|top| top >= target) {
+                return;
+            }
+            let mut since_persist = 0u32;
+            self.log_index_append_tick(&mut since_persist, 0).await;
+        };
+        // Cancellation at an await point is safe: coverage and the tail record
+        // mutate only synchronously under the index lock (append_block).
+        let _ = tokio::time::timeout(FILL_DEADLINE, fill).await;
     }
 
     /// Follow the OPTIMISTIC tail: keep coverage running from finality up to
