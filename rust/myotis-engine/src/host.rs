@@ -2496,7 +2496,24 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
         Ok(f) => f,
         Err(msg) => return eljson::error_json(&msg),
     };
-    let result = reader.with_log_index(|ix| ix.query(&filter));
+    let mut result = reader.with_log_index(|ix| ix.query(&filter));
+    // On-demand tail fill. An explicit `toBlock` at the very head can land one
+    // block past the covered top while the 6s appender tick hasn't recorded it
+    // yet — a wallet takes `toBlock` from `eth_blockNumber`, which follows the
+    // anchored head the log index trails by up to a tick. That block IS verified
+    // and moments from indexed, so rather than refuse the query, drive one
+    // catch-up tick and retry once. Bounded to the head edge (at most
+    // `LOG_INDEX_LATEST_SLACK` above coverage, never above the head) so a deeper
+    // lag stays the bridge's job rather than a synchronous fetch here.
+    if matches!(result, Some(Err(QueryError::OutOfCoverage { .. })))
+        && filter.to_block <= head
+        && reader
+            .log_index_covered_high()
+            .is_some_and(|top| filter.to_block > top && filter.to_block - top <= LOG_INDEX_LATEST_SLACK)
+    {
+        engine.rt.block_on(async { reader.advance_log_index_tail_now().await });
+        result = reader.with_log_index(|ix| ix.query(&filter));
+    }
     match result {
         None => eljson::error_json("log index is not configured on this network"),
         Some(Ok(logs)) => eljson::get_logs_json(&logs),

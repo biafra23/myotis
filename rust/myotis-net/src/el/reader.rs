@@ -639,6 +639,12 @@ pub struct ElReader {
     log_index_path: Option<std::path::PathBuf>,
     /// The head-follow appender task (spawned on enable, aborted on stop).
     log_index_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Serializes coverage-advancing ticks. The background appender and an
+    /// on-demand fill ([`Self::advance_log_index_tail_now`]) both mutate
+    /// coverage and the tail's `(number, hash)` reorg record; running them
+    /// concurrently would race that bookkeeping. Async mutex: held across the
+    /// tick's network awaits.
+    log_index_drive: tokio::sync::Mutex<()>,
 }
 
 /// The scan-cursor map plus its last TTL sweep — one lock covers both, so the
@@ -785,6 +791,7 @@ impl ElReader {
             log_index_pipeline_full: std::sync::atomic::AtomicBool::new(true),
             log_index_path: cfg.log_index_path,
             log_index_task: std::sync::Mutex::new(None),
+            log_index_drive: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -910,8 +917,13 @@ impl ElReader {
                 let Some(reader) = weak.upgrade() else {
                     return; // reader torn down; the appender dies with it
                 };
-                reader.log_index_append_tick(&mut since_persist, ticks).await;
-                reader.log_index_backfill_step(ticks, &mut backfill_ok).await;
+                {
+                    // Serialize against on-demand fills (advance_log_index_tail_now):
+                    // both advance coverage and touch the tail reorg record.
+                    let _drive = reader.log_index_drive.lock().await;
+                    reader.log_index_append_tick(&mut since_persist, ticks).await;
+                    reader.log_index_backfill_step(ticks, &mut backfill_ok).await;
+                }
                 ticks = ticks.wrapping_add(1);
             }
         }));
@@ -1009,6 +1021,22 @@ impl ElReader {
             self.persist_log_index(self.finalized_block_number());
             *since_persist = 0;
         }
+    }
+
+    /// Drive ONE coverage-advancing tick on demand, serialized against the
+    /// background appender.
+    ///
+    /// Purpose: close the 0-1 block gap between the anchored head — what
+    /// `eth_blockNumber` reports, and what a wallet then passes as an explicit
+    /// `toBlock` — and the log index's covered top, which the 6s appender tick
+    /// leaves trailing for up to a tick. A head-reaching `eth_getLogs` would
+    /// otherwise be refused for those few seconds even though the block is
+    /// verified and about to be indexed. This runs the SAME verified machinery
+    /// as the background tick (no new trust path); it just runs it now.
+    pub async fn advance_log_index_tail_now(&self) {
+        let _drive = self.log_index_drive.lock().await;
+        let mut since_persist = 0u32;
+        self.log_index_append_tick(&mut since_persist, 0).await;
     }
 
     /// Follow the OPTIMISTIC tail: keep coverage running from finality up to
