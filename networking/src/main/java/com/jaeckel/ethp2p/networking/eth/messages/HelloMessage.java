@@ -36,8 +36,10 @@ public final class HelloMessage {
     public static byte[] encode(Bytes nodePublicKey, int tcpPort) {
         return RLP.encodeList(writer -> {
             writer.writeInt(PROTOCOL_VERSION);
-            // Keep in sync with the Rust engine's Hello client id
-            // (rust/myotis-net/src/el/rlpx/transport.rs) — dedicated
+            // Keep the version in sync with the myotis-net crate version
+            // (rust/myotis-net/Cargo.toml): the Rust engine derives its Hello
+            // client id from CARGO_PKG_VERSION, so this literal is the release
+            // sweep's one remaining hand-edited client id. Dedicated
             // myotis-serving nodes admit peers by matching "myotis" here.
             writer.writeString("myotis/0.1.6");
             writer.writeList(capWriter -> {

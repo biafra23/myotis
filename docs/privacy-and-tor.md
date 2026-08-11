@@ -280,9 +280,11 @@ handles membership.
 
 ### 6.3 Client fingerprinting — anonymity bounded by the user base
 
-The Hello advertises `myotis/0.1.2` (`HelloMessage.java`), and even with a
-spoofed clientId the request shape is distinctive (single-account ranges with
-full-range limit and the 4 KiB response cap, the characteristic header probe).
+The Hello advertises a `myotis/<version>` client id (Java engine:
+`HelloMessage.java`; Rust engine — the one that serves this Tor path — derives
+it from the `myotis-net` crate version), and even with a spoofed clientId the
+request shape is distinctive (single-account ranges with full-range limit and
+the 4 KiB response cap, the characteristic header probe).
 A peer can plausibly tag both the clearnet prober and the Tor-side client as "a
 Myotis instance." With many Myotis users, fine — the delay plus a large
 anonymity set prevents pairing *which* instance. With very few users, the
