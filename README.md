@@ -7,7 +7,9 @@
 
 # myotis
 
-Myotis is a **trustless Ethereum wallet engine** — a full participant in Ethereum's peer-to-peer networks that runs **on an Android phone** (minSdk 29) and answers a wallet's requests with cryptographically verified data, with **no trusted RPC provider in the loop**. It speaks devp2p on the execution layer (discv4 discovery, RLPx encrypted transport, eth/66-69, and snap/1 state proofs) and libp2p on the consensus layer (a beacon-chain light client), and verifies every byte against sync-committee BLS signatures back to beacon-chain finality. The same engine runs as a desktop daemon/CLI for development.
+Myotis is a **trustless Ethereum wallet engine** — a full participant in Ethereum's peer-to-peer networks that answers a wallet's requests with cryptographically verified data, with **no trusted RPC provider in the loop**. It speaks devp2p on the execution layer (discv4 discovery, RLPx encrypted transport, eth/66-69, and snap/1 state proofs) and libp2p on the consensus layer (a beacon-chain light client), and verifies every byte against sync-committee BLS signatures back to beacon-chain finality.
+
+Myotis runs **on mobile, on desktop, and as a library embedded in other apps**. The apps: an **Android app** (minSdk 29), an **iOS app**, a **desktop GUI app**, and a **desktop daemon/CLI** for development. The embeddings: a **Node.js native addon** that Electron and Node hosts load to run the node invisibly in-process, the way they run other embedded nodes — the [Freedom browser](https://github.com/solardev-xyz/freedom-browser) is integrating Myotis this way as an experimental tier for fully-P2P verified `.eth` resolution ([PR #181](https://github.com/solardev-xyz/freedom-browser/pull/181)) — and, on iOS, the **`MyotisKit` framework** over the engine's C ABI: iOS suspends backgrounded apps, so an iOS wallet embeds Myotis as a library and runs the node in its own process rather than talking to a separate node app. Prebuilt addon binaries for macOS/Linux/Windows ship with every [release](https://github.com/biafra23/myotis/releases) since v0.1.3; see [Embedding: Node.js / Electron](#embedding-nodejs--electron).
 
 A built-in **JSON-RPC server** exposes a verified subset of the Ethereum API over HTTP, so an **unmodified MetaMask** — pointed at the phone — can read balances, simulate calls, estimate gas, suggest fees, and **broadcast a real transaction**, all served from locally verified state. Nothing is taken on a peer's word: account and storage reads carry Merkle-Patricia proofs against a beacon-anchored `stateRoot`; blocks, transactions, and receipts are verified against the header's `transactionsRoot`/`receiptsRoot`; `eth_call`/`eth_estimateGas` run in a local EVM over proof-served state. When a request can't be answered from verified data, it returns an error rather than falling back to a trusted source.
 
@@ -28,7 +30,7 @@ There are now **two interchangeable engines** behind the same zero-dependency AP
 
 ## Wallet API — verified JSON-RPC over HTTP
 
-The Android app runs an embedded JSON-RPC server (Ktor, **loopback-only `127.0.0.1:8545`**) that an on-device wallet talks to like any other Ethereum endpoint. Every method is answered **only** from cryptographically verified data; there is no trusted-RPC fallback in production (a dev-only upstream proxy exists purely to map what a wallet needs and is off in strict mode). When a request can't be served verified, the server returns a JSON-RPC error:
+The Android and desktop apps and the desktop daemon run an embedded JSON-RPC server (**loopback-only `127.0.0.1:8545`** for mainnet; per-network ports beside it) that a same-device wallet talks to like any other Ethereum endpoint. (The iOS app carries the same listener for development, but iOS suspends backgrounded apps, so a separate wallet app cannot rely on it — on iOS a wallet embeds Myotis as a library instead.) Every method is answered **only** from cryptographically verified data; there is no trusted-RPC fallback in production (a dev-only upstream proxy exists purely to map what a wallet needs and is off in strict mode). When a request can't be served verified, the server returns a JSON-RPC error:
 
 - `-32601` — the method isn't served verified at all (the wallet can stop asking).
 - `-32000` — the method is implemented but can't be answered right now (not synced, no snap peer, or the head isn't beacon-anchored yet — retryable).
@@ -36,7 +38,7 @@ The Android app runs an embedded JSON-RPC server (Ktor, **loopback-only `127.0.0
 
 > **Security:** the server binds **loopback only** by default — the wallet is a same-device client, and the endpoint is unauthenticated with no TLS or rate limiting (and `eth_sendRawTransaction` relays whatever signed bytes it's handed), so it is deliberately not reachable from other devices. Exposing it on a routable interface would require an explicit, opt-in change.
 
-**Connecting MetaMask:** MetaMask runs on the same device as the node. Add a custom network pointing at `http://localhost:8545` (chain id 1 for mainnet). The desktop daemon does **not** serve JSON-RPC — it exposes the same verified operations over its CLI/IPC socket (see *Query commands* below).
+**Connecting MetaMask:** MetaMask runs on the same device as the node. Add a custom network pointing at `http://localhost:8545` (chain id 1 for mainnet). The desktop daemon serves the same verified JSON-RPC (mainnet on `127.0.0.1:8545`) and additionally exposes the verified operations over its CLI/IPC socket (see *Query commands* below).
 
 ### Implemented (verified) methods
 
@@ -75,7 +77,7 @@ A number-pinned read (wallets pin every read to the block they just saw) is serv
 
 ## Run
 
-Myotis runs in three forms: the **Android app** and the **desktop app** (both Compose GUIs over the shared `:ui`, running the wallet node with the verified JSON-RPC server), and the **desktop daemon/CLI** (the same engine for development, with a CLI/IPC command surface). All three run the full devp2p + libp2p stack, the beacon light client, and the local EVM.
+Myotis runs in four app forms: the **Android app**, the **iOS app**, and the **desktop app** (Compose GUIs over the shared `:ui`, running the wallet node with the verified JSON-RPC server), and the **desktop daemon/CLI** (the same engine for development, with a CLI/IPC command surface). All of them run the full devp2p + libp2p stack, the beacon light client, and the local EVM; on iOS the node runs on the Rust engine (the JVM engine never runs there). A fifth form is an embedding rather than an app: the engine as a **Node.js addon** for Electron/Node hosts — and on iOS as the embeddable `MyotisKit` framework — see [Embedding: Node.js / Electron](#embedding-nodejs--electron).
 
 ### Android
 
@@ -85,6 +87,21 @@ Myotis runs in three forms: the **Android app** and the **desktop app** (both Co
 ```
 
 The app runs the node as a foreground `NodeService` (Start/Stop in the UI). Once it reaches `SYNCED`, the JSON-RPC server is live on `127.0.0.1:8545`; point an on-device MetaMask at `http://localhost:8545` (custom network, chain id 1). The app persists the sync snapshot, the known-state-root window, and light-client-capable peers, so warm restarts reach `SYNCED` in ~10 s. minSdk 29.
+
+### iOS
+
+The iOS app builds on macOS only (Xcode 26+, plus the Rust iOS targets: `rustup target add --toolchain stable aarch64-apple-ios aarch64-apple-ios-sim`). On iOS the node always runs the **Rust engine** over its plain C ABI — the JVM engine never runs there. `:app-ios` bundles the shared `:ui` and the engine into a Kotlin/Native framework (`MyotisKit`); the app shell is the Xcode project in `ios-app/` (regenerable with `xcodegen generate`).
+
+```bash
+# Kotlin/Native framework for the arm64 simulator (builds the Rust engine first)
+./gradlew :app-ios:linkDebugFrameworkIosSimulatorArm64
+
+# Build the app from the Xcode shell
+cd ios-app && xcodebuild -project Myotis.xcodeproj -scheme Myotis \
+  -destination 'platform=iOS Simulator,name=<device>' build
+```
+
+On iOS the app form is a development host more than an integration point: iOS suspends backgrounded apps, so the app's loopback JSON-RPC listener (foreground-only) can't serve a separate wallet app the way the Android and desktop nodes can. The supported iOS integration is **embedding** — a wallet links the `MyotisKit` framework (or the engine's C ABI directly) and runs the node in its own process.
 
 ### Desktop app (GUI)
 
@@ -116,9 +133,24 @@ Build a native installer for the host OS with jpackage. **jpackage is host-OS-bo
 
 The bundle embeds a full Java 21 runtime (the `:networking`/`:myotis-evm` backend ships Java-21 classes and reaches JDK modules reflectively, so the whole module graph is included). Packaged builds (dmg/deb/`runDistributable`) **bundle the Rust engine** as an app resource — packaging fails loudly if cargo isn't available, so an installed app can always switch engines. Logs roll under `~/.myotis/logs`; the app's log level comes from the `myotis.log.level` JVM system property (default `INFO`). Note that a `-D` flag on a `./gradlew :app-desktop:run` command line reaches the Gradle JVM, not the app — for a packaged app, edit the `java-options` in the bundle's generated `Myotis.cfg`.
 
+### Embedding: Node.js / Electron
+
+Myotis also runs **inside other applications** as a Node.js native addon: [`rust/myotis-node`](rust/myotis-node/README.md) is a [napi-rs](https://napi.rs) binding over the engine's C ABI (the same seam the iOS host consumes). A Node or Electron host loads `myotis-node.node`, starts the node in-process, and gets verified reads back as ordinary Promises — the engine's blocking calls run on the libuv thread pool. Every [release](https://github.com/biafra23/myotis/releases) since v0.1.3 ships prebuilt addon binaries (macOS arm64/x64, Linux arm64/x64, Windows x64) plus a `SHA256SUMS` manifest.
+
+```js
+const myotis = require('./myotis-node.node');   // ESM: createRequire(import.meta.url)
+myotis.init();                                  // ABI handshake
+const h = myotis.create('mainnet', '/path/to/data-dir');
+myotis.start(h);
+// once statusJson(h) reports beaconState === 'SYNCED', elReaderAvailable, and snapPeers > 0:
+const ens = JSON.parse(await myotis.resolveEnsJson(h, 'vitalik.eth'));
+```
+
+This is how the [Freedom browser](https://github.com/solardev-xyz/freedom-browser) is integrating Myotis ([PR #181](https://github.com/solardev-xyz/freedom-browser/pull/181)): an invisible background node — alongside the browser's Swarm and IPFS nodes — behind an experimental tier that serves fully-P2P verified `.eth` resolution with no prover service and no RPC provider in the loop.
+
 ### Desktop daemon
 
-The daemon discovers peers, maintains connections, and listens for CLI commands on a Unix domain socket (`/tmp/ethp2p.sock`); it exposes the verified operations as CLI commands (`get-account`, `get-storage`, `resolve-ens`, …), not JSON-RPC. A **client** invocation sends a single command to the running daemon and exits.
+The daemon discovers peers, maintains connections, and listens for CLI commands on a Unix domain socket (`/tmp/ethp2p.sock`); it exposes the verified operations as CLI commands (`get-account`, `get-storage`, `resolve-ens`, …) alongside the same verified JSON-RPC server the apps run (mainnet on `127.0.0.1:8545`). A **client** invocation sends a single command to the running daemon and exits.
 
 ### Start the daemon
 
@@ -730,7 +762,7 @@ Myotis is mid-migration from a single Java implementation to a **Rust engine** t
 
 - **The contract** is `:myotis-api` — zero-dependency Java-17 interfaces (`MyotisEngine`/`ChainHandle`, FFI-portable types only). Hosts (Android app, desktop app, daemon) consume *only* this API and never import engine internals.
 - **The Java engine** is the original implementation (`node-core` adapters over the `networking`/`consensus`/`myotis-evm` modules).
-- **The Rust engine** is the `rust/` Cargo workspace (`myotis-core`, `myotis-net`, `myotis-consensus`, `myotis-bls`, `myotis-evm`, `myotis-engine`): discv4 + discv5 discovery, RLPx/eth/snap, the beacon light client with BLS via blst, a revm-based EVM with the same snap-proof state oracle, ENS incl. CCIP-Read, and multichain (mainnet, Sepolia, Gnosis). It reaches the JVM through UniFFI-generated Kotlin bindings over JNA (the generated bindings are committed in `:myotis-engines`, regenerated via `uniffiGenerateKotlin`); compound values cross as JSON, pinned by golden tests on both sides.
+- **The Rust engine** is the `rust/` Cargo workspace (`myotis-core`, `myotis-net`, `myotis-consensus`, `myotis-bls`, `myotis-evm`, `myotis-engine`): discv4 + discv5 discovery, RLPx/eth/snap, the beacon light client with BLS via blst, a revm-based EVM with the same snap-proof state oracle, ENS incl. CCIP-Read, and multichain (mainnet, Sepolia, Gnosis). It reaches the JVM through UniFFI-generated Kotlin bindings over JNA (the generated bindings are committed in `:myotis-engines`, regenerated via `uniffiGenerateKotlin`); compound values cross as JSON, pinned by golden tests on both sides. The same engine's plain C ABI also serves the two non-JVM hosts: the iOS app (Kotlin/Native cinterop) and the Node.js addon (`rust/myotis-node`, napi-rs) — identical JSON shapes, pinned by the same golden tests.
 - **Selection**: the `:myotis-engines` selector (`Engines.engine()`) routes each network to an engine via the `myotis.engine` property — `java` (default), `rust`, or `auto`. On run tasks use `-Pengine=rust`; in the apps it's a Settings toggle (applies on network restart). The Status screen shows which engine hosts each network — "Mainnet (r)" vs "(j)".
 - **Parity** is enforced by shared conformance vectors (BLS fixtures, a captured mainnet light-client corpus, the EL verification-ladder vectors) run against both implementations, plus a benchmark gate for the JNI path.
 
@@ -787,12 +819,14 @@ Key Gradle modules (plus the `rust/` Cargo workspace):
 - **consensus** -- beacon chain light client (sync committee BLS verification), Merkle-Patricia proof verification
 - **myotis-evm** -- Hyperledger Besu EVM running against a SNAP-backed `StateOracle`. Powers ENS resolution, `eth_call`, and local gas estimation (`DefaultEvmExecutor.estimateGas` — intrinsic + EVM-metered + 15% safety buffer). Includes `CcipReadEvmExecutor` for ERC-3668 off-chain lookups and `PrefetchingEvmExecutor` (multi-hop speculative prefetch) to amortize SNAP round-trips.
 - **myotis-ens** -- ENS resolver (`EnsResolver`, `ReverseLookup`) using the Universal Resolver via the local EVM. Forward and reverse resolution, ENSIP-10 wildcards, ERC-3668 off-chain records.
-- **jsonrpc-server** -- host-agnostic verified JSON-RPC router (Kotlin/Ktor). `RpcRouter` maps the Ethereum API onto a `MyotisRpcBackend` interface that the Android `NodeService` implements against its connector + beacon state. Strict permissionless mode by default; binds loopback only. (Consumed by `android-app`; the daemon uses its own CLI/IPC surface instead.)
+- **jsonrpc-server** -- host-agnostic verified JSON-RPC router (Kotlin Multiplatform/Ktor). `RpcRouter` maps the Ethereum API onto this module's `RpcBackend` seam — implemented on the JVM by `VerifiedReadsBackend` over the `io.myotis.api.VerifiedReads` contract, and on iOS by `:app-ios`'s `IosRpcBackend`. Strict permissionless mode by default; binds loopback only. (Consumed by the Android, iOS, and desktop apps and the daemon — which additionally has its CLI/IPC command surface.)
 - **rpc-backend** -- the verified RPC backend (`VerifiedRpcBackend`): anchored-head building, serve-stale policy, and the readiness probe (`verifiedHeadAgeMs`) shared by the JSON-RPC server and the hosts
-- **ui** -- shared Compose Multiplatform `NodeScreen` (status, readiness strip, peers, logs, settings) used by both apps
+- **ui** -- shared Compose Multiplatform `NodeScreen` (status, readiness strip, peers, logs, settings) used by the Android, desktop, and iOS apps
 - **app** -- daemon/CLI entry point, Unix domain socket IPC server, peer caching
 - **app-desktop** -- the Compose desktop GUI over `:ui`, packaged with jpackage (dmg/deb), bundling the Rust engine
+- **app-ios** -- the iOS host: a Kotlin/Native framework (`MyotisKit`) bundling `:ui` with iOS seam actuals over the Rust engine's plain C ABI; the Xcode shell lives in `ios-app/` (the JVM engine never runs on iOS)
 - **android-app** -- the Android wallet node (`NodeService` foreground service). Runs the full devp2p + libp2p stack, the local EVM, and the JSON-RPC server on-device, with Android-native peer/snapshot caching and a Compose UI; persists the sync snapshot, the known-state-root window, and light-client-capable peers for fast warm restarts (~10 s vs. a cold checkpoint bootstrap).
+- **rust/myotis-node** (Cargo, not Gradle) -- the Node.js (napi-rs) addon over the engine's C ABI, for Electron/Node hosts — the embedding the Freedom browser's experimental Myotis tier consumes
 
 ### Protocol flow
 
