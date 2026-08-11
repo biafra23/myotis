@@ -2,7 +2,9 @@
 //! (docs/reimplementation/02 §5.3, §9.5-6).
 //!
 //! Frame: `header(16) ‖ header-mac(16) ‖ body(padded to 16) ‖ body-mac(16)`.
-//! Header (16, encrypted): `body-size(3 BE) ‖ 0xc0 (RLP empty list) ‖ zeros`.
+//! Header (16, encrypted): `body-size(3 BE) ‖ rlp([0, 0]) = 0xc2 0x80 0x80 ‖
+//! zeros` (geth's zeroHeader — see `encode_frame` for why the list must not
+//! be empty).
 //!
 //! Two AES-256-CTR ciphers (egress encrypt / ingress decrypt), both keyed with
 //! `aesSecret`, **zero IV, one continuous keystream per direction**. The MAC is

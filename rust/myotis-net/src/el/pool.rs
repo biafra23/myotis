@@ -48,9 +48,11 @@ const BACKOFF_TRANSIENT: Duration = Duration::from_secs(30);
 const BACKOFF_BUSY: Duration = Duration::from_secs(60);
 
 /// True when a dial error is a TooManyPeers rejection. The session's
-/// disconnect errors are fixed-format ("peer disconnected[ during
-/// handshake]: reason=N" — see `describe_disconnect`), so prefix+suffix
-/// matching cannot be steered by peer-controlled content. 0x04 says nothing
+/// disconnect errors all start with the literal "peer disconnected" and end
+/// with `describe_disconnect`'s "reason=N"; the Status-stage variant embeds
+/// the peer's client id MID-string, but the prefix is producer-literal and
+/// the suffix is always appended last, so neither end can be steered by
+/// peer-controlled content. 0x04 says nothing
 /// about the peer's CHAIN (full wrong-chain nodes send it too), so busy only
 /// selects a backoff class — never a verified/known-good promotion.
 ///
@@ -1363,6 +1365,14 @@ mod tests {
         assert!(!is_busy_disconnect("incompatible peer: networkId=137 genesis=..."));
         // A peer-controlled client id echoed mid-string can't fake the prefix.
         assert!(!is_busy_disconnect("expected Status, got code 0x04 from peer disconnected: reason=4x"));
+        // The Status-stage variant classifies by the same ends, and a hostile
+        // client id mid-string can't steer either end.
+        assert!(is_busy_disconnect(
+            "peer disconnected after our Status (client=Nethermind/v1.36.2 eth=69): reason=4"
+        ));
+        assert!(!is_busy_disconnect(
+            "peer disconnected after our Status (client=reason=4 eth=69): reason=16"
+        ));
         // Producer-coupled: build the string through the REAL session
         // formatter (RLP [0x04] = TooManyPeers) so a future format change in
         // describe_disconnect breaks this test instead of silently degrading
