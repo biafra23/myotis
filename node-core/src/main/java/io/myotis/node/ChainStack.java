@@ -874,15 +874,25 @@ public final class ChainStack {
         // peers from their libp2p peer ids (same key on both identities — the
         // invariant roost maintains and the Rust engine's parity test pins), so
         // discovery can walk TOWARD them instead of waiting on random-walk luck.
-        List<org.apache.tuweni.bytes.Bytes> pinnedNodeIds = network.clPeerMultiaddrs().stream()
+        List<String> pinnedPeerIds = network.clPeerMultiaddrs().stream()
                 .map(ma -> {
                     int i = ma.lastIndexOf("/p2p/");
                     return i < 0 ? null : ma.substring(i + "/p2p/".length());
                 })
                 .filter(java.util.Objects::nonNull)
-                .map(com.jaeckel.ethp2p.core.enr.Enr::nodeIdForPeerId)
-                .flatMap(java.util.Optional::stream)
                 .toList();
+        List<org.apache.tuweni.bytes.Bytes> pinnedNodeIds = new ArrayList<>(pinnedPeerIds.size());
+        for (String peerId : pinnedPeerIds) {
+            com.jaeckel.ethp2p.core.enr.Enr.nodeIdForPeerId(peerId).ifPresentOrElse(
+                    pinnedNodeIds::add,
+                    // A pin that does not derive silently loses targeted lookups
+                    // (it is still DIALED via its configured multiaddr) — say so,
+                    // or the degradation to random-walk luck is invisible.
+                    () -> log.warn("[{}][discv5] pinned peer id {} does not derive a discv5 node id — "
+                            + "no targeted lookups for it", network.name(), peerId));
+        }
+        log.info("[{}][discv5] derived {} of {} pinned ids for targeted lookup",
+                network.name(), pinnedNodeIds.size(), pinnedPeerIds.size());
         this.discV5 = new DiscV5Service(nodeKey, network.clDiscv5Bootnodes(), pinnedNodeIds, enr -> {
             var eth2 = enr.eth2();
             if (eth2.isEmpty()) return;

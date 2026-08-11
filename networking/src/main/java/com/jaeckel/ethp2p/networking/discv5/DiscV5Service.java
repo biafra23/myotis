@@ -242,41 +242,64 @@ public final class DiscV5Service implements AutoCloseable {
     // Targeted lookups (#347) — walk TOWARD the pinned servers
     // -------------------------------------------------------------------------
 
-    /** Total FINDNODE queries per walk. Termination is spec-Kademlia — stop
-     *  when the near window has no unqueried nodes left — and this budget is
-     *  the hard cap. Sized from live tuning: round-based variants with early
-     *  "no progress" breaks stalled at logDistance ~244-252 of 256; a
-     *  closest-first budgeted loop converges or proves absence within ~24. */
+    /** Total FINDNODE queries per walk's budgeted convergence loop. Termination
+     *  is spec-Kademlia — stop when the frontier has no unqueried nodes — and
+     *  this budget is the hard cap. Sized from live tuning: round-based
+     *  variants with early "no progress" breaks stalled at logDistance
+     *  ~244-252 of 256; a closest-first budgeted loop converges or proves
+     *  absence well within it. (No near-window cutoff either: the records
+     *  CLOSEST to a target are often stale/dead — 13 of 16 timed out on one
+     *  run — and a closest-16 rule gave up with budget left while alive nodes
+     *  slightly farther out held the record.) */
     private static final int WALK_QUERY_BUDGET = 32;
-    // (No near-window cutoff: live runs showed the records CLOSEST to a target
-    // are often stale/dead entries — 13 of 16 timed out — and a "closest-16
-    // all queried → unreachable" rule gave up with budget left while alive
-    // nodes slightly farther out held the target's record. Closest-first over
-    // the whole frontier, bounded by the budget, is the rule that finds it.)
-    /** Per-query answer budget; a silent node must not stall the walk. */
+    /** Per-query answer budget; a silent node must not stall the walk. Live
+     *  tuning: answers arrive in ~100 ms; wall time is dominated by timeouts
+     *  on dead frontier entries, so a short budget beats a generous one. */
     private static final long WALK_QUERY_TIMEOUT_MS = 1_500;
-    // Live tuning: answered queries return in ~100 ms; the walk's wall time is
-    // dominated by timeouts on dead frontier entries (15 of 20 on one run), so
-    // a short budget beats a generous one.
+    /** Sibling-phase cap. Mainnet pins ~19 peers; iterating every found
+     *  sibling before the real walk would burn most of a walk's wall time on
+     *  the front phase (the bootnode phase is capped for the same reason). */
+    private static final int WALK_SIBLING_CAP = 4;
+    /** Bootnode-phase cap (politeness toward the public seed set). */
+    private static final int WALK_BOOTNODE_CAP = 6;
     /** Pause between opening-pass walks (each pinned id once, quickly). */
     private static final long WALK_OPENING_GAP_MS = 2_000;
     /** Pause between steady-state revisits (round-robin, one per gap). */
     private static final long WALK_REVISIT_GAP_MS = 60_000;
 
+    /** Guards walker lifecycle: startWalker() runs on the discovery library's
+     *  completion thread while close() runs on a host thread (ChainStack
+     *  pause/resume cycles both routinely), and without a common lock two
+     *  interleavings leak a walker that nothing will ever interrupt: close()
+     *  landing between the poll scheduling and startWalker(), and close()'s
+     *  read of the walker field simply not seeing the callback's write (no
+     *  happens-before edge; Android/ARM is a first-class target). Both
+     *  synchronize on this object, and closed is checked under the lock. */
+    private final Object walkerLock = new Object();
+    private boolean walkerClosed;
     private Thread walker;
+
     /** Closest records learned per target, carried across revisits so each
      *  walk resumes from the best-known frontier instead of the bootnodes.
      *  Walker-thread only. */
     private final java.util.Map<org.apache.tuweni.bytes.Bytes, List<NodeRecord>> learnedFrontier =
             new java.util.HashMap<>();
     /** Pinned records already FOUND, reused as first-query seeds for the other
-     *  walks. The pinned servers know each other better than the wider DHT
-     *  does — roost's discv5 bootstraps THROUGH the co-located beacon node, so
-     *  the established pin's table holds the young pin long before the young
-     *  record has propagated widely (observed live: every walk toward roost
-     *  converged and stalled while nimbus — found in 9 queries every run — had
-     *  the record all along). Walker-thread only. */
+     *  walks — the pinned servers know each other better than the wider DHT
+     *  does (roost's discv5 bootstraps THROUGH the co-located beacon node).
+     *  A sibling whose query fails is EVICTED and re-added on its next find,
+     *  so a found-then-offline pin cannot become a permanent 1.5 s tax at the
+     *  front of every walk. Walker-thread only. */
     private final java.util.Map<org.apache.tuweni.bytes.Bytes, NodeRecord> foundPinned =
+            new java.util.HashMap<>();
+    /** Last EMITTED seq per pinned id — the same strictly-newer gate the Rust
+     *  engine applies to its pinned re-emissions (#348 review): ENR signatures
+     *  do not expire, so a laggard or adversarial table can serve a pinned
+     *  server's OLDER record, and the string-keyed seen-set alone would
+     *  re-emit it (exact-string dedupe is direction-blind). Walker finds pass
+     *  through this gate; the poll path is unchanged (it surfaces the local
+     *  table, which keeps the highest seq it has seen). Walker-thread only. */
+    private final java.util.Map<org.apache.tuweni.bytes.Bytes, Long> emittedPinnedSeq =
             new java.util.HashMap<>();
 
     /**
@@ -292,63 +315,151 @@ public final class DiscV5Service implements AutoCloseable {
     }
 
     private void startWalker() {
-        if (pinnedNodeIds.isEmpty()) {
+        synchronized (walkerLock) {
+            if (walkerClosed || pinnedNodeIds.isEmpty() || walker != null) {
+                return;
+            }
+            walker = new Thread(this::walkForever, "discv5-target");
+            walker.setDaemon(true);
+            walker.start();
+        }
+    }
+
+    private void walkForever() {
+        // The opening pass is worthless against an empty table (observed:
+        // walk 1 fired ~2 s after start, before any bootnode answered, and
+        // burned the first slot on frontier=0). Wait briefly for the table.
+        for (int w = 0; w < 20; w++) {
+            DiscoverySystem sys = system;
+            if (sys == null || sys.streamLiveNodes().findAny().isPresent()) {
+                break;
+            }
+            try {
+                Thread.sleep(1_000);
+            } catch (InterruptedException gone) {
+                return;
+            }
+        }
+        int i = 0;
+        while (!Thread.currentThread().isInterrupted()) {
+            // Snapshot: close() nulls the system field on a host thread; a walk
+            // against the snapshot either completes or fails fast, and the
+            // interrupt (sent under walkerLock) ends the loop.
+            DiscoverySystem sys = system;
+            if (sys == null) {
+                return;
+            }
+            org.apache.tuweni.bytes.Bytes target = pinnedNodeIds.get(i % pinnedNodeIds.size());
+            try {
+                targetedWalk(sys, target);
+            } catch (Throwable e) {
+                // Throwable, not Exception: a linkage error on the walker
+                // thread would otherwise kill it with no trace, and the
+                // walker never logging again reads as "working, no finds".
+                log.warn("[discv5] targeted walk failed: {}", e.toString());
+            }
+            try {
+                Thread.sleep(walkDelayMs(i, pinnedNodeIds.size()));
+            } catch (InterruptedException gone) {
+                return;
+            }
+            i++;
+        }
+    }
+
+    /** Outcome of one {@link #queryToward} call. */
+    private enum QueryOutcome { FOUND, MERGED, FAILED, INTERRUPTED }
+
+    /**
+     * Query one node for {@code target}'s bucket neighborhood and merge what it
+     * returns into {@code frontier}. THE one copy of the query rules, kept
+     * together because each is load-bearing:
+     *
+     * <ul>
+     *   <li>Distances {@code d-4..d}: the bucket at d contains the target's
+     *       neighborhood as the queried node sees it, the lower buckets sample
+     *       strictly closer halves, and the responder caps the reply at 16
+     *       records total — a wider ask mines each RESPONSIVE node harder,
+     *       which matters when the target's nearest neighbors are dead.</li>
+     *   <li>{@code InterruptedException} must re-interrupt and surface as
+     *       {@link QueryOutcome#INTERRUPTED}: swallowing it (the generic catch
+     *       would) clears the flag, and the walker then keeps walking a
+     *       stopped system forever — one leaked thread per ChainStack restart.
+     *       Caught once by the internal review; kept in one place since.</li>
+     *   <li>A found record passes the strictly-newer seq gate before emission
+     *       (see {@link #emittedPinnedSeq}).</li>
+     * </ul>
+     */
+    private QueryOutcome queryToward(DiscoverySystem sys, NodeRecord node,
+                                     org.apache.tuweni.bytes.Bytes target,
+                                     java.util.Map<org.apache.tuweni.bytes.Bytes, NodeRecord> frontier,
+                                     String foundWhere) {
+        int d = org.ethereum.beacon.discovery.util.Functions.logDistance(node.getNodeId(), target);
+        List<Integer> distances = java.util.stream.IntStream.rangeClosed(d - 4, d)
+                .filter(x -> x >= 1 && x <= 256).boxed()
+                .sorted(java.util.Collections.reverseOrder()).toList();
+        java.util.Collection<NodeRecord> answers;
+        try {
+            answers = sys.findNodes(node, distances)
+                    .get(WALK_QUERY_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException shutdown) {
+            Thread.currentThread().interrupt();
+            return QueryOutcome.INTERRUPTED;
+        } catch (Exception unresponsive) {
+            return QueryOutcome.FAILED;
+        }
+        if (log.isDebugEnabled()) {
+            java.util.IntSummaryStatistics stats = answers.stream()
+                    .mapToInt(nr -> org.ethereum.beacon.discovery.util.Functions.logDistance(
+                            nr.getNodeId(), target))
+                    .summaryStatistics();
+            log.debug("[discv5] walk query: candidateDist={} asked={} answers={} answerDistToTarget=[{}..{}]",
+                    d, distances, answers.size(),
+                    stats.getCount() == 0 ? -1 : stats.getMin(),
+                    stats.getCount() == 0 ? -1 : stats.getMax());
+        }
+        for (NodeRecord nr : answers) {
+            if (nr.getNodeId().equals(target)) {
+                foundTarget(nr, foundWhere);
+                return QueryOutcome.FOUND;
+            }
+            frontier.putIfAbsent(nr.getNodeId(), nr);
+        }
+        return QueryOutcome.MERGED;
+    }
+
+    /** Record + (seq-gated) emit a found pinned record. Walker thread. */
+    private void foundTarget(NodeRecord nr, String where) {
+        long seq = nr.getSeq().toLong();
+        Long last = emittedPinnedSeq.get(nr.getNodeId());
+        if (last != null && seq <= last) {
+            log.debug("[discv5] targeted walk: {} record seq={} not newer than emitted {} — not re-emitted",
+                    where, seq, last);
+            foundPinned.put(nr.getNodeId(), nr);
             return;
         }
-        walker = new Thread(() -> {
-            // The opening pass is worthless against an empty table (observed:
-            // walk 1 fired ~2 s after start, before any bootnode answered, and
-            // burned the first slot on frontier=0). Wait briefly for the table.
-            for (int w = 0; w < 20 && system.streamLiveNodes().findAny().isEmpty(); w++) {
-                try {
-                    Thread.sleep(1_000);
-                } catch (InterruptedException gone) {
-                    return;
-                }
-            }
-            int i = 0;
-            while (!Thread.currentThread().isInterrupted()) {
-                org.apache.tuweni.bytes.Bytes target = pinnedNodeIds.get(i % pinnedNodeIds.size());
-                try {
-                    targetedWalk(target);
-                } catch (Throwable e) {
-                    // Throwable, not Exception: a linkage error on the walker
-                    // thread would otherwise kill it with no trace, and the
-                    // walker never logging again reads as "working, no finds".
-                    log.warn("[discv5] targeted walk failed: {}", e.toString());
-                }
-                try {
-                    Thread.sleep(walkDelayMs(i, pinnedNodeIds.size()));
-                } catch (InterruptedException gone) {
-                    return;
-                }
-                i++;
-            }
-        }, "discv5-target");
-        walker.setDaemon(true);
-        walker.start();
+        log.info("[discv5] targeted walk: FOUND pinned server {} (seq={}, {})",
+                nr.getNodeId().slice(0, 4), seq, where);
+        emittedPinnedSeq.put(nr.getNodeId(), seq);
+        foundPinned.put(nr.getNodeId(), nr);
+        emitFromWalker(nr);
     }
 
     /**
      * One bounded iterative Kademlia walk toward {@code target}: seed from
      * sibling pins and bootnodes, then repeatedly query the closest unqueried
-     * frontier node for the target's bucket neighborhood, merging what each
-     * returns. Runs entirely on the walker thread; queries are sequential with
-     * a short timeout each, so a full walk is bounded at roughly
-     * {@code (seeds + WALK_QUERY_BUDGET) × WALK_QUERY_TIMEOUT_MS} worst-case,
-     * a few seconds typically.
+     * frontier node, merging what each returns. Runs entirely on the walker
+     * thread; queries are sequential with a short timeout each.
      *
      * <p>A found record is handed to the poll scheduler for emission, so the
-     * seen-set and the caller's consumer stay single-threaded. Re-notification
-     * semantics come free from the existing dedupe: the seen-set keys on the
-     * full ENR string, so a REPUBLISHED record (new seq, new address) is a new
-     * string and re-emits, while the same record stays deduped — the Java
-     * equivalent of the Rust engine's seq gate. The pool side is naturally
-     * name-wins: {@code addPeer} only ever ADDS a new multiaddr entry; the
-     * configured {@code /dns4} pin is never overwritten (parity contract,
-     * #347/#348 review).
+     * seen-set and the caller's consumer stay single-threaded. Walker finds
+     * are gated on a STRICTLY NEWER seq per pinned id ({@link #emittedPinnedSeq}
+     * — the Rust engine's gate, #348 review); the poll path's string-keyed
+     * dedupe is unchanged. The pool side is naturally name-wins: {@code addPeer}
+     * only ever ADDS a new multiaddr entry; the configured {@code /dns4} pin is
+     * never overwritten (parity contract, #347/#348 review).
      */
-    private void targetedWalk(org.apache.tuweni.bytes.Bytes target) {
+    private void targetedWalk(DiscoverySystem sys, org.apache.tuweni.bytes.Bytes target) {
         // NOT Functions.distance: that helper reads the XOR as LITTLE-endian
         // (toUnsignedBigInteger(LITTLE_ENDIAN)), so ordering by it sorts on the
         // XOR's LOW bytes — near-random with respect to actual closeness, which
@@ -361,7 +472,7 @@ public final class DiscV5Service implements AutoCloseable {
                 .thenComparing(nr -> new java.math.BigInteger(
                         1, nr.getNodeId().xor(target).toArray()));
         java.util.Map<org.apache.tuweni.bytes.Bytes, NodeRecord> frontier = new java.util.HashMap<>();
-        system.streamLiveNodes().forEach(nr -> frontier.put(nr.getNodeId(), nr));
+        sys.streamLiveNodes().forEach(nr -> frontier.put(nr.getNodeId(), nr));
         for (NodeRecord nr : learnedFrontier.getOrDefault(target, List.of())) {
             frontier.putIfAbsent(nr.getNodeId(), nr);
         }
@@ -369,102 +480,64 @@ public final class DiscV5Service implements AutoCloseable {
         int answered = 0;
         int failed = 0;
 
-        // Phase -1 — ask the pinned servers already FOUND (see foundPinned):
-        // they are session-verified responders and the likeliest tables to
-        // hold a sibling pin's young record.
-        for (NodeRecord sibling : List.copyOf(foundPinned.values())) {
-            if (sibling.getNodeId().equals(target) || queried.contains(sibling.getNodeId())) {
+        // Phase -1 — the CLOSEST few sibling pins already found: session-
+        // verified responders, and the likeliest tables to hold a sibling's
+        // young record (observed live: every walk toward the young roost pin
+        // stalled while the established pin had the record all along). Capped,
+        // and closest-to-target first: on a ~19-pin network an uncapped pass
+        // would burn most of the walk on this phase.
+        List<NodeRecord> siblings = foundPinned.values().stream()
+                .filter(nr -> !nr.getNodeId().equals(target))
+                .sorted(byDistance)
+                .limit(WALK_SIBLING_CAP)
+                .toList();
+        for (NodeRecord sibling : siblings) {
+            if (!queried.add(sibling.getNodeId())) {
                 continue;
             }
-            queried.add(sibling.getNodeId());
-            int d = org.ethereum.beacon.discovery.util.Functions.logDistance(
-                    sibling.getNodeId(), target);
-            List<Integer> distances = java.util.stream.IntStream.rangeClosed(d - 4, d)
-                    .filter(x -> x >= 1 && x <= 256).boxed()
-                    .sorted(java.util.Collections.reverseOrder()).toList();
-            java.util.Collection<NodeRecord> answers;
-            try {
-                answers = system.findNodes(sibling, distances)
-                        .get(WALK_QUERY_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-                answered++;
-            } catch (InterruptedException shutdown) {
-                // close() interrupts the walker; the flag must SURVIVE this
-                // catch or the outer loop never sees it and the thread keeps
-                // walking a stopped system forever (ChainStack stop/start
-                // cycles would leak one such thread per restart).
-                Thread.currentThread().interrupt();
+            QueryOutcome outcome = queryToward(sys, sibling, target, frontier, "at a sibling pin");
+            if (outcome == QueryOutcome.FOUND || outcome == QueryOutcome.INTERRUPTED) {
+                rememberFrontier(target, frontier.values(), byDistance);
                 return;
-            } catch (Exception unresponsive) {
-                failed++;
-                continue;
             }
-            for (NodeRecord nr : answers) {
-                if (nr.getNodeId().equals(target)) {
-                    log.info("[discv5] targeted walk toward {}… : FOUND at a sibling pin (seq={})",
-                            target.slice(0, 4), nr.getSeq());
-                    foundPinned.put(nr.getNodeId(), nr);
-                    emitFromWalker(nr);
-                    rememberFrontier(target, frontier.values(), byDistance);
-                    return;
-                }
-                frontier.putIfAbsent(nr.getNodeId(), nr);
+            if (outcome == QueryOutcome.FAILED) {
+                failed++;
+                // Evict: a dead sibling must not tax the front of every walk;
+                // its next find re-adds it.
+                foundPinned.remove(sibling.getNodeId());
+            } else {
+                answered++;
             }
         }
 
-        // Phase 0 — ask the BOOTNODES first, at the target's bucket as each of
-        // them sees it. Their tables are the largest and freshest in the
-        // network, and a server that pinged them at startup is often in them
-        // directly: the sigp verifier finds roost in its FIRST round precisely
-        // because a fresh sigp table contains only bootnodes. A closest-first
-        // walk would never ask them (they sit at random distance from any
-        // target), which is how it can converge to logDistance ~237 through a
-        // cluster of stale near-records and still miss a record the bootnodes
-        // are holding (observed live).
+        // Phase 0 — a few BOOTNODES, at the target's bucket as each sees it.
+        // Their tables are the largest and freshest in the network, and a
+        // server that pinged them at startup is often in them directly: the
+        // closest-first loop below would never ask them (they sit at random
+        // distance from any target), which is how a walk can converge to
+        // logDistance ~237 through a cluster of stale near-records and still
+        // miss a record a bootnode is holding (observed live).
         for (NodeRecord bootnode : bootnodeRecords()) {
-            if (queried.size() >= 6) {
+            if (queried.size() >= WALK_SIBLING_CAP + WALK_BOOTNODE_CAP) {
                 break;
             }
-            if (bootnode.getNodeId().equals(target) || queried.contains(bootnode.getNodeId())) {
+            if (bootnode.getNodeId().equals(target) || !queried.add(bootnode.getNodeId())) {
                 continue;
             }
-            queried.add(bootnode.getNodeId());
-            int d = org.ethereum.beacon.discovery.util.Functions.logDistance(
-                    bootnode.getNodeId(), target);
-            List<Integer> distances = java.util.stream.IntStream.rangeClosed(d - 4, d)
-                    .filter(x -> x >= 1 && x <= 256).boxed()
-                    .sorted(java.util.Collections.reverseOrder()).toList();
-            java.util.Collection<NodeRecord> answers;
-            try {
-                answers = system.findNodes(bootnode, distances)
-                        .get(WALK_QUERY_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-                answered++;
-            } catch (InterruptedException shutdown) {
-                Thread.currentThread().interrupt(); // see the sibling-phase note
+            QueryOutcome outcome = queryToward(sys, bootnode, target, frontier, "at a bootnode");
+            if (outcome == QueryOutcome.FOUND || outcome == QueryOutcome.INTERRUPTED) {
+                rememberFrontier(target, frontier.values(), byDistance);
                 return;
-            } catch (Exception unresponsive) {
-                failed++;
-                continue;
             }
-            for (NodeRecord nr : answers) {
-                if (nr.getNodeId().equals(target)) {
-                    log.info("[discv5] targeted walk toward {}… : FOUND at a bootnode (seq={})",
-                            target.slice(0, 4), nr.getSeq());
-                    foundPinned.put(nr.getNodeId(), nr);
-                    emitFromWalker(nr);
-                    rememberFrontier(target, frontier.values(), byDistance);
-                    return;
-                }
-                frontier.putIfAbsent(nr.getNodeId(), nr);
+            if (outcome == QueryOutcome.FAILED) {
+                failed++;
+            } else {
+                answered++;
             }
         }
 
-        // Closest-first, budgeted: always query the closest node not yet asked,
-        // stop when the WALK_WINDOW closest have all been asked (they are the
-        // ones that would hold the target) or the budget runs out. Deliberately
-        // no "no progress this round" break: live tuning showed any such round
-        // heuristic either never terminates (any new node counts) or gives up
-        // while still ~250 bits out (closer-node-required) — spec-Kademlia
-        // termination is the one that actually converges.
+        // Budgeted closest-first convergence: always query the closest node not
+        // yet asked, stop when the frontier is exhausted or the budget is spent.
         for (int q = 0; q < WALK_QUERY_BUDGET; q++) {
             NodeRecord candidate = frontier.values().stream()
                     .filter(nr -> !queried.contains(nr.getNodeId()))
@@ -475,59 +548,21 @@ public final class DiscV5Service implements AutoCloseable {
             }
             if (candidate.getNodeId().equals(target)) {
                 // The frontier already HOLDS the target's record (e.g. it sits
-                // in the local live table) — that IS the find. Asking it for
-                // "bucket 0" would also produce an empty distances list below.
-                log.info("[discv5] targeted walk toward {}… : FOUND in local frontier (seq={})",
-                        target.slice(0, 4), candidate.getSeq());
-                foundPinned.put(candidate.getNodeId(), candidate);
-                emitFromWalker(candidate);
+                // in the local live table) — that IS the find.
+                foundTarget(candidate, "in local frontier");
                 rememberFrontier(target, frontier.values(), byDistance);
                 return;
             }
             queried.add(candidate.getNodeId());
-            int d = org.ethereum.beacon.discovery.util.Functions.logDistance(
-                    candidate.getNodeId(), target);
-            // The bucket at d contains the target's neighborhood as this
-            // candidate sees it; the lower buckets sample strictly closer
-            // halves. Five buckets per query: the responder caps the reply at
-            // 16 records total anyway, so a wider ask mines each RESPONSIVE
-            // node harder — which matters when the target's nearest neighbors
-            // are dead entries and answers are scarce.
-            List<Integer> distances = java.util.stream.IntStream.rangeClosed(d - 4, d)
-                    .filter(x -> x >= 1 && x <= 256).boxed().sorted(java.util.Collections.reverseOrder())
-                    .toList();
-            java.util.Collection<NodeRecord> answers;
-            try {
-                answers = system.findNodes(candidate, distances)
-                        .get(WALK_QUERY_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-                answered++;
-            } catch (InterruptedException shutdown) {
-                Thread.currentThread().interrupt(); // see the sibling-phase note
+            QueryOutcome outcome = queryToward(sys, candidate, target, frontier, "via the walk");
+            if (outcome == QueryOutcome.FOUND || outcome == QueryOutcome.INTERRUPTED) {
+                rememberFrontier(target, frontier.values(), byDistance);
                 return;
-            } catch (Exception unresponsive) {
+            }
+            if (outcome == QueryOutcome.FAILED) {
                 failed++;
-                continue;
-            }
-            if (log.isDebugEnabled()) {
-                java.util.IntSummaryStatistics stats = answers.stream()
-                        .mapToInt(nr -> org.ethereum.beacon.discovery.util.Functions.logDistance(
-                                nr.getNodeId(), target))
-                        .summaryStatistics();
-                log.debug("[discv5] walk query: candidateDist={} asked={} answers={} answerDistToTarget=[{}..{}]",
-                        d, distances, answers.size(),
-                        stats.getCount() == 0 ? -1 : stats.getMin(),
-                        stats.getCount() == 0 ? -1 : stats.getMax());
-            }
-            for (NodeRecord nr : answers) {
-                if (nr.getNodeId().equals(target)) {
-                    log.info("[discv5] targeted walk toward {}… : FOUND (queries={} seq={})",
-                            target.slice(0, 4), answered + failed, nr.getSeq());
-                    foundPinned.put(nr.getNodeId(), nr);
-                    emitFromWalker(nr);
-                    rememberFrontier(target, frontier.values(), byDistance);
-                    return;
-                }
-                frontier.putIfAbsent(nr.getNodeId(), nr);
+            } else {
+                answered++;
             }
         }
         rememberFrontier(target, frontier.values(), byDistance);
@@ -559,17 +594,15 @@ public final class DiscV5Service implements AutoCloseable {
         }
         try {
             s.execute(() -> {
-            if (!seenEnrs.add(enrStr)) {
-                return; // same record already surfaced (poll or earlier walk)
-            }
-            try {
-                Enr parsed = Enr.fromEnrString(enrStr);
-                log.info("[discv5] targeted lookup found pinned server (seq={}): {}",
-                        parsed.seq(), enrStr.substring(0, Math.min(40, enrStr.length())));
-                onPeerDiscovered.accept(parsed);
-            } catch (Exception e) {
-                log.warn("[discv5] failed to parse walked ENR: {}", e.getMessage());
-            }
+                if (!seenEnrs.add(enrStr)) {
+                    return; // same record already surfaced (poll or earlier walk)
+                }
+                try {
+                    Enr parsed = Enr.fromEnrString(enrStr);
+                    onPeerDiscovered.accept(parsed);
+                } catch (Exception e) {
+                    log.warn("[discv5] failed to parse walked ENR: {}", e.getMessage());
+                }
             });
         } catch (java.util.concurrent.RejectedExecutionException shutdownRace) {
             // close() won the race between the isShutdown check and execute —
@@ -695,9 +728,16 @@ public final class DiscV5Service implements AutoCloseable {
 
     @Override
     public void close() {
-        if (walker != null) {
-            walker.interrupt();
-            walker = null;
+        // Under walkerLock, and closed is set FIRST: a startWalker() racing on
+        // the library's completion thread either sees closed and refuses, or
+        // finishes first and its walker is interrupted here — no interleaving
+        // leaves a walker that nothing will ever stop (see walkerLock's doc).
+        synchronized (walkerLock) {
+            walkerClosed = true;
+            if (walker != null) {
+                walker.interrupt();
+                walker = null;
+            }
         }
         if (scheduler != null) {
             scheduler.shutdownNow();
