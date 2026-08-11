@@ -2365,15 +2365,79 @@ impl ElReader {
         peer: &ManagedPeer,
         address: [u8; 20],
     ) -> Result<VerifiedAccount, String> {
-        let (state_root, block_number) = fresh_head(peer).await?;
-        // Verify-on-fetch: snap_get_account MPT-verifies against state_root and
-        // returns Present/Absent only when the proof holds.
-        let outcome = peer.snap_get_account(&state_root, &address).await?;
-        // Anchor the (proof-valid) peer state root to the beacon chain.
+        let (state_root, block_number, outcome) =
+            self.snap_account_at_best_root(peer, address).await?;
+        // Anchor the (proof-valid) state root to the beacon chain. The anchor
+        // path's root short-circuits via the stateRootMatch fast path; the
+        // fallback path's peer root runs the full ladder.
         let verdict = peer
             .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
             .await;
         Ok(self.build_verified_account(address, state_root, block_number, outcome, verdict))
+    }
+
+    /// Fetch + MPT-verify one account against the best available state root:
+    /// the beacon anchor's CURRENT optimistic root first, the peer's
+    /// handshake-time head as fallback.
+    ///
+    /// The fallback exists for two cases only — the anchor not yet synced, and
+    /// a peer trailing the anchor by more than its snap window. The old
+    /// always-handshake-head behavior was issue #355: post-merge the eth
+    /// subprotocol has no block gossip, so `peer_status.best_hash` never
+    /// refreshes after the handshake; on an aged session every peer's "head"
+    /// names state all of them have long pruned, and every read collapses to
+    /// "empty proof for non-empty root" ×N. The anchor root is BLS-verified
+    /// and at most a couple of slots old, so honest synced peers always
+    /// retain it — and a peer that STILL can't serve it is genuinely useless
+    /// for reads, which makes the outer loop's failure strike an honest
+    /// quality signal instead of punishment for our own stale query root.
+    /// NOTE on result semantics: on the anchor path the returned block number
+    /// is the anchor's optimistic number (consistent with `eth_blockNumber`),
+    /// not a peer-head claim — the FFI `peerBlockNumber` field follows. This
+    /// is deliberate; the Java engine still reports the peer's handshake head
+    /// there, and so does this engine's TOR read path
+    /// ([`Self::account_from_tor_session`] — a fresh session per read, so its
+    /// handshake head is seconds old and #355 does not apply; preferring the
+    /// anchor root there too is a follow-up).
+    async fn snap_account_at_best_root(
+        &self,
+        peer: &ManagedPeer,
+        address: [u8; 20],
+    ) -> Result<([u8; 32], u64, AccountOutcome), String> {
+        if let Some((number, root)) = self.anchor.optimistic_execution() {
+            match peer.snap_get_account(&root, &address).await {
+                Ok(outcome) => return Ok((root, number, outcome)),
+                // The peer ANSWERED but could not prove at the anchored root —
+                // pruned it, trails the anchor, OR served a malformed/hostile
+                // proof (every ProofResult::Invalid shape matches; a bad-proof
+                // peer thus earns exactly one bounded fallback attempt before
+                // the outer loop strikes it). Its own head may still be
+                // servable — fall back, and carry BOTH causes so the surfaced
+                // "all N peers failed" error names the primary path's failure,
+                // not just the fallback symptom.
+                Err(e) if crate::el::snap::fetch::is_unservable_root_error(&e) => {
+                    let fb = |e2: String| {
+                        format!("anchor-root query failed ({e}); handshake-head fallback: {e2}")
+                    };
+                    let (root, number) = fresh_head(peer).await.map_err(fb)?;
+                    let outcome =
+                        peer.snap_get_account(&root, &address).await.map_err(fb)?;
+                    return Ok((root, number, outcome));
+                }
+                // Transport-shaped failure (timeout/disconnect): a second
+                // query against the same peer would pay the same timeout
+                // again — propagate so the outer loop moves to the next peer.
+                // (Without this, a dead peer costs up to three timeouts per
+                // read instead of one.)
+                Err(e) => return Err(e),
+            }
+        }
+        // Anchor not yet synced: the peer's handshake head is all we have.
+        let (root, number) = fresh_head(peer).await?;
+        // Verify-on-fetch: snap_get_account MPT-verifies against the root and
+        // returns Present/Absent only when the proof holds.
+        let outcome = peer.snap_get_account(&root, &address).await?;
+        Ok((root, number, outcome))
     }
 
     /// Assemble a `VerifiedAccount` from the proof-verified outcome + the beacon
@@ -2581,12 +2645,13 @@ impl ElReader {
         holder: Option<[u8; 20]>,
         storage_key: [u8; 32],
     ) -> Result<VerifiedStorage, String> {
-        let (state_root, block_number) = fresh_head(peer).await?;
+        // Step 1: the proof-verified account gives the trusted storage root.
+        // Root selection prefers the beacon anchor's current optimistic root
+        // (issue #355 — see snap_account_at_best_root).
+        let (state_root, block_number, outcome) =
+            self.snap_account_at_best_root(peer, address).await?;
 
         let slot_key_hash = keccak256(&storage_key);
-
-        // Step 1: the proof-verified account gives the trusted storage root.
-        let outcome = peer.snap_get_account(&state_root, &address).await?;
 
         let (fin_num, opt_num, synced) = self.anchor_diagnostics();
         let mut result = VerifiedStorage {

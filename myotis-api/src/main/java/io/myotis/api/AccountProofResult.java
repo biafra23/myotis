@@ -18,7 +18,12 @@ import java.util.List;
  * @param storageRootHex        from the proof-verified leaf when available (never
  *                              the peer's slim body in that case), else peer-claimed
  * @param codeHashHex           same provenance rule as {@code storageRootHex}
- * @param blockNumber           peer-reported block the proof anchors to
+ * @param blockNumber           block the proof anchors to. Java engine (and the
+ *                              Rust engine's Tor path): the serving peer's reported
+ *                              head. Rust engine clearnet path: the beacon anchor's
+ *                              optimistic head when the query ran against the
+ *                              anchored root (the preferred path since the #355
+ *                              fix), the peer's head only on its fallback
  * @param peerStateRootHex      the peer's state root the proof was checked against
  * @param peerProofValid        the MPT proof verifies against {@code peerStateRoot}
  * @param beaconChainVerified   {@code peerStateRoot} ties to a beacon-attested root

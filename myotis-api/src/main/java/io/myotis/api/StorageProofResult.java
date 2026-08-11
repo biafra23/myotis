@@ -27,7 +27,12 @@ import java.util.List;
  * @param matchedBeaconSlot     slot of the matching beacon attestation; -1 if none
  * @param verifyMethod          "stateRootMatch" / "headerChain" / null
  * @param failReason            null when verified; otherwise a stable reason token
- * @param peerBlockNumber       peer-reported block the account proof anchors to
+ * @param peerBlockNumber       block the account proof anchors to. Java engine (and
+ *                              the Rust engine's Tor path): the serving peer's
+ *                              reported head. Rust engine clearnet path: the beacon
+ *                              anchor's optimistic head when the query ran against
+ *                              the anchored root (preferred since the #355 fix),
+ *                              the peer's head only on its fallback
  * @param finalizedBlockNumber  finalized execution block number (0 if none)
  * @param optimisticBlockNumber optimistic-head execution block number (0 if none)
  * @param finalizedSlot         finalized beacon slot (0 if none)
