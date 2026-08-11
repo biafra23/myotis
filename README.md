@@ -142,7 +142,7 @@ const myotis = require('./myotis-node.node');   // ESM: createRequire(import.met
 myotis.init();                                  // ABI handshake
 const h = myotis.create('mainnet', '/path/to/data-dir');
 myotis.start(h);
-// once statusJson(h) reports beaconState === 'SYNCED':
+// once statusJson(h) reports beaconState === 'SYNCED', elReaderAvailable, and snapPeers > 0:
 const ens = JSON.parse(await myotis.resolveEnsJson(h, 'vitalik.eth'));
 ```
 
@@ -819,7 +819,7 @@ Key Gradle modules (plus the `rust/` Cargo workspace):
 - **consensus** -- beacon chain light client (sync committee BLS verification), Merkle-Patricia proof verification
 - **myotis-evm** -- Hyperledger Besu EVM running against a SNAP-backed `StateOracle`. Powers ENS resolution, `eth_call`, and local gas estimation (`DefaultEvmExecutor.estimateGas` — intrinsic + EVM-metered + 15% safety buffer). Includes `CcipReadEvmExecutor` for ERC-3668 off-chain lookups and `PrefetchingEvmExecutor` (multi-hop speculative prefetch) to amortize SNAP round-trips.
 - **myotis-ens** -- ENS resolver (`EnsResolver`, `ReverseLookup`) using the Universal Resolver via the local EVM. Forward and reverse resolution, ENSIP-10 wildcards, ERC-3668 off-chain records.
-- **jsonrpc-server** -- host-agnostic verified JSON-RPC router (Kotlin/Ktor). `RpcRouter` maps the Ethereum API onto a `MyotisRpcBackend` interface that the Android `NodeService` implements against its connector + beacon state. Strict permissionless mode by default; binds loopback only. (Consumed by the Android, iOS, and desktop apps and the daemon — which additionally has its CLI/IPC command surface.)
+- **jsonrpc-server** -- host-agnostic verified JSON-RPC router (Kotlin Multiplatform/Ktor). `RpcRouter` maps the Ethereum API onto this module's `RpcBackend` seam — implemented on the JVM by `VerifiedReadsBackend` over the `io.myotis.api.VerifiedReads` contract, and on iOS by `:app-ios`'s `IosRpcBackend`. Strict permissionless mode by default; binds loopback only. (Consumed by the Android, iOS, and desktop apps and the daemon — which additionally has its CLI/IPC command surface.)
 - **rpc-backend** -- the verified RPC backend (`VerifiedRpcBackend`): anchored-head building, serve-stale policy, and the readiness probe (`verifiedHeadAgeMs`) shared by the JSON-RPC server and the hosts
 - **ui** -- shared Compose Multiplatform `NodeScreen` (status, readiness strip, peers, logs, settings) used by the Android, desktop, and iOS apps
 - **app** -- daemon/CLI entry point, Unix domain socket IPC server, peer caching
