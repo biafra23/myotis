@@ -72,7 +72,10 @@ uniffi::setup_scaffolding!();
 ///      (the opt-in eth_getLogs watch-list index, docs/eth-getlogs-design.md).
 /// v22: added set_served_block_window (live per-handle eth/69 served-block
 ///      window — the Settings knob, previously a no-op on Rust chains).
-pub const ABI_VERSION: i32 = 22;
+/// v23: nativeEstimateGasJson may now return `{"status":"revert","dataHex"}`
+///      for an estimated transaction that reverts (a verified answer the host
+///      serves as JSON-RPC code 3) — a payload extension, no signature change.
+pub const ABI_VERSION: i32 = 23;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

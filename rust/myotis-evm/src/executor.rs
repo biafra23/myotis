@@ -176,8 +176,10 @@ impl EvmExecutor {
     }
 
     /// `estimateGas` for a call (`to` != null): run it and return the gas LIMIT that
-    /// would let it succeed. Reverts/halts yield no number (an `Err`) — the host
-    /// maps that to a JSON-RPC null, like the reference engine.
+    /// would let it succeed. Reverts/halts yield no
+    /// number (an `Err`); a revert's typed payload survives to the host, which
+    /// serves it as the standard JSON-RPC code-3 `execution reverted` error —
+    /// halts stay the retryable null.
     pub fn estimate_gas(
         &self,
         from: [u8; 20],

@@ -192,7 +192,25 @@ public interface VerifiedReads {
 
     /**
      * Gas estimate via the local EVM (intrinsic + metered + safety buffer), or
-     * null. A reverting call yields null (the engine won't estimate a doomed tx).
+     * null. The legacy two-state view: a reverting call yields null here —
+     * {@link #estimateGasDetailed} carries the revert payload.
      */
     Long estimateGas(byte[] from, byte[] to, byte[] data, String valueWei);
+
+    /**
+     * {@link #estimateGas} with a three-way outcome, so the estimated
+     * transaction REVERTING — a verified chain answer with a payload — is
+     * distinguishable from "cannot answer verified right now". Hosts map
+     * {@link EstimateResult.Status#REVERTED} to the standard JSON-RPC
+     * execution-reverted error (code 3, revert data attached), exactly as
+     * {@link #callDetailed} does for {@code eth_call}.
+     *
+     * <p>Default: wraps the nullable method, so every existing engine keeps its
+     * exact behaviour (a revert stays UNAVAILABLE) until it overrides this to
+     * surface the payload it already has.
+     */
+    default EstimateResult estimateGasDetailed(byte[] from, byte[] to, byte[] data, String valueWei) {
+        Long gas = estimateGas(from, to, data, valueWei);
+        return gas == null ? EstimateResult.unavailable(null) : EstimateResult.ok(gas);
+    }
 }

@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 22; // 22: + setServedBlockWindow (live eth/69 window knob)
+    static final int EXPECTED_ABI_VERSION = 23; // 23: estimateGas JSON gained {"status":"revert","dataHex"}
 
     private static final boolean AVAILABLE = load();
 

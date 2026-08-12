@@ -2854,9 +2854,11 @@ impl ElReader {
     }
 
     /// Verified `eth_estimateGas` for a call (`to` set): run the call against the
-    /// verified head and return the gas-limit estimate. A revert / halt / unverifiable
-    /// run yields [`GasOutcome::Unavailable`] (no number → the host returns null, as
-    /// the reference engine does). Same head-pinning + executor bridge as [`Self::eth_call`].
+    /// verified head and return the gas-limit estimate. A REVERT of the estimated
+    /// transaction yields [`GasOutcome::Revert`] with its payload (a verified
+    /// answer the host serves as the standard code-3 error); a halt /
+    /// unverifiable run yields [`GasOutcome::Unavailable`] (retryable null).
+    /// Same head-pinning + executor bridge as [`Self::eth_call`].
     pub async fn estimate_gas(
         &self,
         from: Option<[u8; 20]>,
@@ -2874,6 +2876,9 @@ impl ElReader {
         .map_err(|e| format!("estimateGas task join error: {e}"))?;
         Ok(match joined {
             Ok(gas) => GasOutcome::Estimate(gas),
+            // The typed error survives to here — don't stringify the revert
+            // payload away: it is the verified answer the host must serve.
+            Err(myotis_evm::EvmError::Reverted { data }) => GasOutcome::Revert(data),
             Err(e) => GasOutcome::Unavailable(e.to_string()),
         })
     }

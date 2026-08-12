@@ -52,14 +52,18 @@ pub enum CallOutcome {
     Unavailable(String),
 }
 
-/// The outcome of an `estimateGas`. `estimateGas` has no number for a revert or a
-/// failed/unverifiable run — the host maps `Unavailable` to a JSON-RPC null, like
-/// the Java engine.
+/// The outcome of an `estimateGas`. A REVERT is a verified chain answer (the
+/// transaction being estimated cannot succeed) and carries its raw payload so
+/// the host can serve the standard JSON-RPC code-3 `execution reverted` error;
+/// `Unavailable` maps to the retryable null/-32000, like the Java engine.
 #[derive(Debug, Clone)]
 pub enum GasOutcome {
     /// The gas-limit estimate (already buffered by the executor).
     Estimate(u64),
-    /// No estimate (revert / halt / state unavailable). The string is diagnostic.
+    /// The estimated transaction reverted with this raw data (Solidity
+    /// `Error(string)` is behind the `0x08c379a0` selector).
+    Revert(Vec<u8>),
+    /// No estimate (halt / state unavailable). The string is diagnostic.
     Unavailable(String),
 }
 

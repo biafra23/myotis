@@ -1076,7 +1076,7 @@ pub fn ens_record_json(handle: i64, params_json: &str) -> String {
 
 /// `nativeEstimateGasJson`: verified `eth_estimateGas` for a call (`to` set) over the
 /// revm executor. Args as for [`eth_call_json`] minus the block (estimate always runs
-/// against the verified head). Returns the estimate JSON (`ok`/`unavailable`, see
+/// against the verified head). Returns the estimate JSON (`ok`/`revert`/`unavailable`, see
 /// [`eljson::estimate_json`]) or `{"error": "..."}`.
 pub fn estimate_gas_json(
     handle: i64,

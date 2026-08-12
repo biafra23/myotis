@@ -650,15 +650,22 @@ pub fn ens_record_json(outcome: &EnsQueryOutcome) -> String {
 }
 
 /// `estimateGas` result: `{"status":"ok","gas":N}` (the buffered gas-limit estimate
-/// as a JSON number — the 1.15 buffer can put it slightly above the 30 M base) or
-/// `{"status":"unavailable","reason":"…"}`. The Java side returns the number for
-/// `ok` and null otherwise (a reverting/unverifiable estimate has no number).
+/// as a JSON number — the 1.15 buffer can put it slightly above the 30 M base),
+/// `{"status":"revert","dataHex":"0x…"}` (the estimated transaction reverted —
+/// a verified answer; the host serves the standard code-3 error with the raw
+/// payload, same shape as `call_json`'s revert), or
+/// `{"status":"unavailable","reason":"…"}` (retryable — the Java side maps it
+/// to null / the host's -32000).
 pub fn estimate_json(outcome: &GasOutcome) -> String {
     let mut obj = serde_json::Map::new();
     match outcome {
         GasOutcome::Estimate(gas) => {
             obj.insert("status".into(), "ok".into());
             obj.insert("gas".into(), json_u64(*gas));
+        }
+        GasOutcome::Revert(data) => {
+            obj.insert("status".into(), "revert".into());
+            obj.insert("dataHex".into(), hex0x_var(data).into());
         }
         GasOutcome::Unavailable(reason) => {
             obj.insert("status".into(), "unavailable".into());
@@ -927,12 +934,19 @@ mod tests {
         assert_eq!(ok["status"], "ok");
         assert_eq!(ok["gas"], 24_150);
 
+        let rv: serde_json::Value = serde_json::from_str(&estimate_json(
+            &GasOutcome::Revert(vec![0x08, 0xc3, 0x79, 0xa0]),
+        ))
+        .unwrap();
+        assert_eq!(rv["status"], "revert");
+        assert_eq!(rv["dataHex"], "0x08c379a0");
+
         let un: serde_json::Value = serde_json::from_str(&estimate_json(
-            &GasOutcome::Unavailable("execution reverted".to_string()),
+            &GasOutcome::Unavailable("no verified head".to_string()),
         ))
         .unwrap();
         assert_eq!(un["status"], "unavailable");
-        assert_eq!(un["reason"], "execution reverted");
+        assert_eq!(un["reason"], "no verified head");
     }
 
     #[test]

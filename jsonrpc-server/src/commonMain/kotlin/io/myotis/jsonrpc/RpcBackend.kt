@@ -36,6 +36,27 @@ class RpcCallResult private constructor(
     }
 }
 
+/**
+ * `io.myotis.api.EstimateResult`'s pure-Kotlin mirror: the three-way outcome of
+ * a detailed `eth_estimateGas`. REVERTED means the ESTIMATED TRANSACTION cannot
+ * succeed — a verified answer carrying the raw revert payload, served as the
+ * standard code-3 error; UNAVAILABLE keeps the retryable -32000 path.
+ */
+class RpcEstimateResult private constructor(
+    val kind: RpcCallResult.Kind,
+    val gas: Long?,
+    val data: ByteArray?,
+    val detail: String?,
+) {
+    companion object {
+        fun ok(gas: Long): RpcEstimateResult = RpcEstimateResult(RpcCallResult.Kind.OK, gas, null, null)
+        fun reverted(data: ByteArray): RpcEstimateResult =
+            RpcEstimateResult(RpcCallResult.Kind.REVERTED, null, data, null)
+        fun unavailable(detail: String? = null): RpcEstimateResult =
+            RpcEstimateResult(RpcCallResult.Kind.UNAVAILABLE, null, null, detail)
+    }
+}
+
 interface RpcBackend {
     fun chainId(): Long
     fun headBlockNumber(): Long?
@@ -128,6 +149,23 @@ interface RpcBackend {
     fun maxPriorityFeePerGas(): String?
     fun feeHistory(blockCount: Long, newestBlock: String, rewardPercentiles: DoubleArray?): String?
     fun estimateGas(from: ByteArray?, to: ByteArray?, data: ByteArray?, valueWei: String?): Long?
+
+    /**
+     * [estimateGas] with the three-way [RpcEstimateResult] outcome, so the
+     * estimated transaction REVERTING (a verified answer with a payload the
+     * router serves as code 3) is not conflated with "cannot answer right
+     * now". Default wraps the nullable method — every existing backend keeps
+     * its behaviour until it overrides this to surface the payload.
+     */
+    fun estimateGasDetailed(
+        from: ByteArray?,
+        to: ByteArray?,
+        data: ByteArray?,
+        valueWei: String?,
+    ): RpcEstimateResult {
+        val gas = estimateGas(from, to, data, valueWei)
+        return if (gas == null) RpcEstimateResult.unavailable() else RpcEstimateResult.ok(gas)
+    }
 }
 
 /**
