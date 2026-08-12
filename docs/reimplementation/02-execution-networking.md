@@ -189,7 +189,12 @@ macSecret    = keccak256( ephShared ‖ aesSecret )
 ### 5.3 Framed channel (`FrameCodec`) — AES-256-CTR + keccak MAC chains
 
 Frame: `header(16) ‖ header-mac(16) ‖ body(padded to 16) ‖ body-mac(16)`.
-Header (16, encrypted): `body-size(3 be) ‖ 0xc0 (RLP empty list) ‖ zero padding`.
+Header (16, encrypted): `body-size(3 be) ‖ rlp([0, 0]) = 0xc2 0x80 0x80 ‖ zero padding`.
+The header-data MUST be the canonical geth `zeroHeader` `rlp([0, 0])`, **not** a bare
+empty list `0xc0`: Nethermind's `FrameHeaderReader` unconditionally decodes an integer
+from the first sequence item and throws on `0xc0` + zero padding, killing the session
+with Disconnect `0x10` on the first frame (fatal on the Nethermind-dominant gnosis
+network — myotis #291).
 
 - **Two AES-256-CTR ciphers** (egress encrypt / ingress decrypt), both keyed with `aesSecret`,
   **zero IV, one continuous keystream per direction**.

@@ -2,7 +2,9 @@
 //! (docs/reimplementation/02 §5.3, §9.5-6).
 //!
 //! Frame: `header(16) ‖ header-mac(16) ‖ body(padded to 16) ‖ body-mac(16)`.
-//! Header (16, encrypted): `body-size(3 BE) ‖ 0xc0 (RLP empty list) ‖ zeros`.
+//! Header (16, encrypted): `body-size(3 BE) ‖ rlp([0, 0]) = 0xc2 0x80 0x80 ‖
+//! zeros` (geth's zeroHeader — see `encode_frame` for why the list must not
+//! be empty).
 //!
 //! Two AES-256-CTR ciphers (egress encrypt / ingress decrypt), both keyed with
 //! `aesSecret`, **zero IV, one continuous keystream per direction**. The MAC is
@@ -132,12 +134,19 @@ impl FrameEncoder {
         let padded_len = (body_len + 15) & !15;
         coded_body.resize(padded_len, 0);
 
-        // Header: body-size(3 BE) ‖ 0xc0 ‖ zeros.
+        // Header: body-size(3 BE) ‖ rlp([0, 0]) ‖ zeros. The header-data MUST be
+        // the canonical `0xc2 0x80 0x80` (geth's zeroHeader), not an empty list:
+        // Nethermind's FrameHeaderReader unconditionally DecodeInt()s the first
+        // sequence item and throws on `0xc0` + zero padding, killing the session
+        // with Disconnect reason 0x10 on our first frame (fatal on the
+        // Nethermind-dominant gnosis network).
         let mut header = [0u8; 16];
         header[0] = (body_len >> 16) as u8;
         header[1] = (body_len >> 8) as u8;
         header[2] = body_len as u8;
-        header[3] = 0xc0;
+        header[3] = 0xc2;
+        header[4] = 0x80;
+        header[5] = 0x80;
         self.encrypt.apply_keystream(&mut header);
         let header_mac = self.egress_mac.update_header(&header);
 

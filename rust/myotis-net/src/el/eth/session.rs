@@ -129,6 +129,14 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
                     cfg.fork_next,
                 )
             };
+            tracing::debug!(
+                // `{:?}` — client_id is peer-controlled and the host log drains
+                // split on '\n'; Debug-escape it so it can't forge log lines.
+                client = ?peer_hello.client_id,
+                eth = eth_version,
+                status_hex = %hex_all(&status),
+                "eth handshake: Hello ok, sending Status"
+            );
             conn.send(messages::STATUS, &status).await?;
 
             // Read the peer's Status (answering Ping in between).
@@ -140,9 +148,10 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
                             .map_err(|e| format!("peer Status decode: {}", e.0))?
                     }
                     P2P_DISCONNECT => {
-                        return Err(format!(
-                            "peer disconnected: {}",
-                            describe_disconnect(&frame.payload)
+                        return Err(status_disconnect_error(
+                            &peer_hello.client_id,
+                            eth_version,
+                            &frame.payload,
                         ))
                     }
                     other => {
@@ -508,6 +517,20 @@ fn response_request_id(payload: &[u8]) -> Option<u64> {
     rlp::decode(items.first()?).ok()?.as_u64().ok()
 }
 
+/// The Status-stage disconnect error. Keeps the "peer disconnected" prefix +
+/// `describe_disconnect`'s "reason=N" suffix — the pool's busy classifier pins
+/// both ends (its test builds a string through THIS producer). `{:?}` on the
+/// peer-controlled client id Debug-escapes newlines so it can't forge log
+/// lines in the hosts' split-on-'\n' drains.
+pub(crate) fn status_disconnect_error(client_id: &str, eth_version: u64, payload: &[u8]) -> String {
+    format!(
+        "peer disconnected after our Status (client={:?} eth={}): {}",
+        client_id,
+        eth_version,
+        describe_disconnect(payload)
+    )
+}
+
 /// A p2p Disconnect body is `[reason]`; decode the reason code for logging.
 /// `pub(crate)` so the pool's busy-classification test can pin the classifier
 /// against THIS producer — a format change here must break that test instead
@@ -521,6 +544,10 @@ pub(crate) fn describe_disconnect(payload: &[u8]) -> String {
         })
         .unwrap_or(u64::MAX);
     format!("reason={reason}")
+}
+
+fn hex_all(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 fn hex4(b: &[u8]) -> String {

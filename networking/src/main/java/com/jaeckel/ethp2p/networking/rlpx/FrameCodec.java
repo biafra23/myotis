@@ -103,12 +103,19 @@ public final class FrameCodec {
         int paddedBodyLen = (bodyLen + 15) & ~15;
         byte[] paddedBody = Arrays.copyOf(codedBody, paddedBodyLen);
 
-        // Build header (16 bytes): body-size(3) | RLP([]) (0xc0) | padding(zeros)
+        // Build header (16 bytes): body-size(3) | RLP([0, 0]) | padding(zeros).
+        // The header-data MUST be the canonical 0xc2 0x80 0x80 (geth's zeroHeader),
+        // not an empty list: Nethermind's FrameHeaderReader unconditionally
+        // DecodeInt()s the first sequence item and throws on 0xc0 + zero padding,
+        // killing the session with Disconnect reason 0x10 on our first frame
+        // (fatal on the Nethermind-dominant gnosis network).
         byte[] header = new byte[16];
         header[0] = (byte) ((bodyLen >> 16) & 0xFF);
         header[1] = (byte) ((bodyLen >> 8) & 0xFF);
         header[2] = (byte) (bodyLen & 0xFF);
-        header[3] = (byte) 0xc0; // RLP empty list
+        header[3] = (byte) 0xc2; // RLP [0, 0]
+        header[4] = (byte) 0x80;
+        header[5] = (byte) 0x80;
 
         // Encrypt header
         byte[] encHeader = new byte[16];
