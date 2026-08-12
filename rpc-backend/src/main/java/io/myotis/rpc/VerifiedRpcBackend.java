@@ -805,6 +805,19 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     }
 
     @Override
+    public io.myotis.api.CallResult callDetailed(byte[] from, byte[] to, byte[] data,
+                                                 String valueWei, String block,
+                                                 String stateOverridesJson) {
+        // The override path keeps the wrapping default (this engine's override
+        // support is a separate surface); the plain path surfaces the revert.
+        if (stateOverridesJson != null && !stateOverridesJson.isEmpty()) {
+            return io.myotis.api.VerifiedReads.super.callDetailed(
+                    from, to, data, valueWei, block, stateOverridesJson);
+        }
+        return rpcCallDetailed(from, to, data, parseWei(valueWei), block);
+    }
+
+    @Override
     public String getBalance(byte[] address, String block) {
         io.myotis.evm.world.AccountState a = rpcAccountState(address, block);
         return a == null ? null : a.balance().toString();
@@ -1941,23 +1954,33 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     // Verified reads (eth_call / accounts / code / storage / sendRaw)
     // ---------------------------------------------------------------------
 
-    /** eth_call over the shared anchored head. Returns raw ABI bytes, or null to error. */
+    /** eth_call over the shared anchored head. Returns raw ABI bytes, or null to error
+     *  (the legacy two-state view of {@link #rpcCallDetailed} — a revert reads as null). */
     private byte[] rpcCall(byte[] from, byte[] to, byte[] data,
                            java.math.BigInteger value, String block) {
+        io.myotis.api.CallResult r = rpcCallDetailed(from, to, data, value, block);
+        return r.status() == io.myotis.api.CallResult.Status.OK ? r.data() : null;
+    }
+
+    /** eth_call over the shared anchored head, three-way: OK bytes, REVERTED with the
+     *  revert payload (a verified answer — the EVM ran and the contract said no), or
+     *  UNAVAILABLE (no verified head / no peer / timeout — the retryable case). */
+    private io.myotis.api.CallResult rpcCallDetailed(byte[] from, byte[] to, byte[] data,
+                                                     java.math.BigInteger value, String block) {
         // Keep the early-rejection logs correlatable with the wallet call that triggered
         // them: include target + 4-byte selector, matching the richer `desc` logging below.
         String callCtx = " to=" + (to != null && to.length == 20 ? Bytes.wrap(to).toHexString() : "?")
                 + " sel=" + (data != null && data.length >= 4 ? Bytes.wrap(data, 0, 4).toHexString() : "0x");
         if (from != null && from.length != 20) {
             log.info("[rpc] eth_call -> malformed from (len=" + from.length + ")" + callCtx);
-            return null;
+            return io.myotis.api.CallResult.unavailable("malformed from");
         }
         // Defence in depth (the router already screens this): wei is non-negative, and a
         // negative value would throw IllegalArgumentException in Wei.of down in the executor.
         // Return null so the router centrally manages the fallback instead.
         if (value != null && value.signum() < 0) {
             log.info("[rpc] eth_call -> negative value (" + value + ")" + callCtx);
-            return null;
+            return io.myotis.api.CallResult.unavailable("negative value");
         }
         // Identify the call up front: caller + target + 4-byte selector + calldata size
         // + block tag. eth_call failures were undiagnosable as "eth_call -> proxy:
@@ -1996,12 +2019,12 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         // not dispatch at all; this is the belt-and-braces half.
         if (to == null || to.length != 20) {
             log.info("[rpc] eth_call " + desc + " -> contract creation is not served by this engine");
-            return null;
+            return io.myotis.api.CallResult.unavailable("contract creation not served");
         }
         RpcCallContext h = verifiedHeadFor(block);
         if (h == null) {
             log.info("[rpc] eth_call " + desc + " -> no verified head for block tag");
-            return null;
+            return io.myotis.api.CallResult.unavailable("no verified head");
         }
         long t0 = clock.elapsedMillis();
         // SINGLE-FLIGHT identical calls. MetaMask fires the same eth_call 4-6x
@@ -2029,7 +2052,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         if (cached != null) {
             log.info("[rpc] eth_call " + desc + " ok in "
                     + (clock.elapsedMillis() - t0) + "ms (cached)");
-            return cached.clone();   // hand each reader its own copy; never expose the cached array
+            // hand each reader its own copy; never expose the cached array
+            return io.myotis.api.CallResult.ok(cached.clone());
         }
         // Route small calls onto the reserved EVM lane so a confirm screen's tiny
         // probes/simulations never queue behind a ~32KB token-sweep storm. The hint
@@ -2090,16 +2114,43 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             byte[] out = flight.get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
             log.info("[rpc] eth_call " + desc + " ok in "
                     + (clock.elapsedMillis() - t0) + "ms" + (leader ? "" : " (deduped)"));
-            return out;
+            return out == null
+                    ? io.myotis.api.CallResult.unavailable("execution returned no result")
+                    : io.myotis.api.CallResult.ok(out);
         } catch (Exception e) {
+            // A REVERT is not an error: the EVM ran to completion over verified
+            // state and the contract answered no. Surface its payload so the
+            // router can serve the standard code-3 shape instead of claiming
+            // the node is unsynced (which stalls wallets' token-standard
+            // detection and with it the whole confirmation screen).
+            byte[] revert = revertDataOf(e);
+            if (revert != null) {
+                log.info("[rpc] eth_call " + desc + " -> reverted (" + revert.length
+                        + " bytes) after " + (clock.elapsedMillis() - t0) + "ms"
+                        + (leader ? "" : " (deduped)"));
+                return io.myotis.api.CallResult.reverted(revert);
+            }
             log.info("[rpc] eth_call " + desc + " -> error after "
                     + (clock.elapsedMillis() - t0) + "ms"
                     + (leader ? "" : " (deduped)") + ": " + describeEvmError(e));
             if (isStateUnavailable(e)) evictUnservableHead(h);
-            return null;
+            return io.myotis.api.CallResult.unavailable(describeEvmError(e));
         } finally {
             if (smallLane) EVM_SMALL_LANE.remove();
         }
+    }
+
+    /** The revert payload carried by the throwable chain, or null when the chain
+     *  holds no {@link io.myotis.evm.EvmExecutionError.Reverted} (the same
+     *  cause-walk shape as {@link #isStateUnavailable}). */
+    private static byte[] revertDataOf(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof io.myotis.evm.EvmExecutionException ee
+                    && ee.error() instanceof io.myotis.evm.EvmExecutionError.Reverted r) {
+                return r.data();
+            }
+        }
+        return null;
     }
 
     /** In-flight eth_call executions keyed by (stateRoot, to, keccak(calldata)) so

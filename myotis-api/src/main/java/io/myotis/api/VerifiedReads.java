@@ -102,6 +102,33 @@ public interface VerifiedReads {
         return null;
     }
 
+    /**
+     * {@link #call} (or {@link #callWithOverrides} when {@code stateOverridesJson}
+     * is non-empty) with a three-way outcome, so a contract REVERT — a verified
+     * chain answer — is distinguishable from "cannot answer verified right now".
+     * Hosts map {@link CallResult.Status#REVERTED} to the standard JSON-RPC
+     * execution-reverted error (code 3, revert data attached) instead of the
+     * retryable -32000, which wallets misread as a node outage.
+     *
+     * <p>Default: wraps the nullable methods, so every existing engine keeps its
+     * exact behaviour (a revert stays UNAVAILABLE) until it overrides this to
+     * surface the revert payload it already has.
+     *
+     * @param stateOverridesJson override object as JSON; null/empty ⇒ plain call
+     */
+    default CallResult callDetailed(
+            byte[] from,
+            byte[] to,
+            byte[] data,
+            String valueWei,
+            String block,
+            String stateOverridesJson) {
+        byte[] out = (stateOverridesJson == null || stateOverridesJson.isEmpty())
+                ? call(from, to, data, valueWei, block)
+                : callWithOverrides(from, to, data, valueWei, block, stateOverridesJson);
+        return out == null ? CallResult.unavailable(null) : CallResult.ok(out);
+    }
+
     /** Balance in decimal wei, or null. */
     String getBalance(byte[] address, String block);
 

@@ -759,17 +759,51 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 handle, fromHex, toHex, dataHex, valueDecimal, block, stateOverridesJson)));
     }
 
-    /** Package-private test seam: call JSON → result bytes (or null) without JNI. */
+    /** {@link #ethCallVerified} with the engine's three-way outcome — a revert
+     *  carries its payload instead of collapsing to null. Same JNI native. */
+    io.myotis.api.CallResult ethCallVerifiedDetailed(
+            String fromHex, String toHex, String dataHex, String valueDecimal, String block) {
+        return callDetailedFromJson(gated(() -> RustEngineNative.nativeEthCallJson(
+                handle, fromHex, toHex, dataHex, valueDecimal, block)));
+    }
+
+    /** {@link #ethCallVerifiedDetailed} with the state-override object as JSON. */
+    io.myotis.api.CallResult ethCallVerifiedDetailedWithOverrides(
+            String fromHex,
+            String toHex,
+            String dataHex,
+            String valueDecimal,
+            String block,
+            String stateOverridesJson) {
+        return callDetailedFromJson(gated(() -> RustEngineNative.nativeEthCallOverridesJson(
+                handle, fromHex, toHex, dataHex, valueDecimal, block, stateOverridesJson)));
+    }
+
+    /** Package-private test seam: call JSON → result bytes (or null) without JNI.
+     *  The legacy two-state view of {@link #callDetailedFromJson}: only "ok"
+     *  carries bytes; a revert or unavailable outcome reads as null. */
     static byte[] callResultFromJson(String json) {
+        io.myotis.api.CallResult r = callDetailedFromJson(json);
+        return r.status() == io.myotis.api.CallResult.Status.OK ? r.data() : null;
+    }
+
+    /** Package-private test seam: call JSON → the engine's three-way outcome.
+     *  The Rust side emits {@code {"status":"ok","resultHex"}} /
+     *  {@code {"status":"revert","dataHex"}} / {@code {"status":"unavailable",
+     *  "reason"}} (pinned by the eljson golden tests); a revert is a VERIFIED
+     *  answer whose payload the host serves as the standard code-3 error. */
+    static io.myotis.api.CallResult callDetailedFromJson(String json) {
         JsonObject o = parseResultOrThrow(json, "call");
         try {
-            // Only "ok" carries a result. A revert or an unavailable/unverifiable
-            // outcome is "no answer" → null, mirroring the reference engine (a
-            // reverting or unverifiable eth_call returns a JSON-RPC null, not -32000).
-            if ("ok".equals(stringOrNull(o, "status"))) {
-                return hexToBytes(stringOrNull(o, "resultHex")); // 0x / empty → empty bytes
+            String status = stringOrNull(o, "status");
+            if ("ok".equals(status)) {
+                // 0x / empty → empty bytes
+                return io.myotis.api.CallResult.ok(hexToBytes(stringOrNull(o, "resultHex")));
             }
-            return null;
+            if ("revert".equals(status)) {
+                return io.myotis.api.CallResult.reverted(hexToBytes(stringOrNull(o, "dataHex")));
+            }
+            return io.myotis.api.CallResult.unavailable(stringOrNull(o, "reason"));
         } catch (RuntimeException e) {
             throw new EngineException("malformed call JSON from the Rust engine: " + e.getMessage(), e);
         }

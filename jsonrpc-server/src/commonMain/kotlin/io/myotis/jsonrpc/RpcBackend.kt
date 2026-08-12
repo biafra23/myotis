@@ -15,6 +15,27 @@ import kotlinx.serialization.json.JsonObject
  *  meaning); the jvmMain adapter maps 1:1. */
 enum class RpcSyncState { SYNCING, CATCHING_UP, SYNCED }
 
+/**
+ * `io.myotis.api.CallResult`'s pure-Kotlin mirror: the three-way outcome of a
+ * detailed `eth_call`. REVERTED is a VERIFIED chain answer (the contract said
+ * no) and carries the raw revert payload; the router maps it to the standard
+ * `{code: 3, "execution reverted", data}` wallets parse. UNAVAILABLE keeps the
+ * retryable -32000 path.
+ */
+class RpcCallResult private constructor(
+    val kind: Kind,
+    val data: ByteArray?,
+    val detail: String?,
+) {
+    enum class Kind { OK, REVERTED, UNAVAILABLE }
+
+    companion object {
+        fun ok(data: ByteArray): RpcCallResult = RpcCallResult(Kind.OK, data, null)
+        fun reverted(data: ByteArray): RpcCallResult = RpcCallResult(Kind.REVERTED, data, null)
+        fun unavailable(detail: String? = null): RpcCallResult = RpcCallResult(Kind.UNAVAILABLE, null, detail)
+    }
+}
+
 interface RpcBackend {
     fun chainId(): Long
     fun headBlockNumber(): Long?
@@ -30,9 +51,10 @@ interface RpcBackend {
     /**
      * Whether this backend can APPLY state overrides. Distinguishes "overrides
      * unsupported" (permanent → -32602) from an ordinary null answer such as
-     * not-synced or a revert (transient → -32000, retryable). Collapsing the two
-     * would tell a client to stop asking over a condition that clears in
-     * seconds.
+     * not-synced (transient → -32000, retryable). Collapsing the two would tell
+     * a client to stop asking over a condition that clears in seconds. (A
+     * contract REVERT is neither — it rides [callDetailed] as a verified answer
+     * with its own error shape.)
      */
     fun supportsStateOverrides(): Boolean = false
 
@@ -60,6 +82,29 @@ interface RpcBackend {
         block: String,
         stateOverridesJson: String,
     ): ByteArray? = null
+
+    /**
+     * [call]/[callWithOverrides] with the three-way [RpcCallResult] outcome, so
+     * a contract revert is not conflated with "cannot answer verified right
+     * now". Default wraps the nullable methods (a revert stays UNAVAILABLE),
+     * keeping every existing backend's behaviour until it overrides this to
+     * surface the revert payload.
+     *
+     * @param stateOverridesJson override object as JSON; null ⇒ plain call
+     */
+    fun callDetailed(
+        from: ByteArray?,
+        to: ByteArray?,
+        data: ByteArray,
+        valueWei: String?,
+        block: String,
+        stateOverridesJson: String?,
+    ): RpcCallResult {
+        val out =
+            if (stateOverridesJson.isNullOrEmpty()) call(from, to, data, valueWei, block)
+            else callWithOverrides(from, to, data, valueWei, block, stateOverridesJson)
+        return if (out == null) RpcCallResult.unavailable() else RpcCallResult.ok(out)
+    }
     fun getBalance(address: ByteArray, block: String): String?
     fun getTransactionCount(address: ByteArray, block: String): Long?
     fun getCode(address: ByteArray, block: String): ByteArray?

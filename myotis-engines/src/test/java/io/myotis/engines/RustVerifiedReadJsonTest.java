@@ -227,7 +227,8 @@ class RustVerifiedReadJsonTest {
 
     @Test
     void revertedCallIsNull() {
-        // A revert carries data but is "no answer" at the RPC layer → null.
+        // The LEGACY two-state view stays null on a revert; the payload rides
+        // callDetailedFromJson (below) so the router can serve code 3.
         String json = "{\"status\":\"revert\",\"dataHex\":\"0x08c379a0\"}";
         assertNull(RustChainHandle.callResultFromJson(json));
     }
@@ -236,6 +237,33 @@ class RustVerifiedReadJsonTest {
     void unavailableCallIsNull() {
         assertNull(RustChainHandle.callResultFromJson(
                 "{\"status\":\"unavailable\",\"reason\":\"out of gas\"}"));
+    }
+
+    @Test
+    void detailedCall_okCarriesBytes() {
+        io.myotis.api.CallResult r = RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"ok\",\"resultHex\":\"0x2a\"}");
+        org.junit.jupiter.api.Assertions.assertEquals(io.myotis.api.CallResult.Status.OK, r.status());
+        org.junit.jupiter.api.Assertions.assertArrayEquals(new byte[]{0x2a}, r.data());
+    }
+
+    @Test
+    void detailedCall_revertCarriesThePayload() {
+        // The whole point of the detailed seam: the revert is a VERIFIED answer
+        // and its payload must survive to the router's code-3 envelope.
+        io.myotis.api.CallResult r = RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"revert\",\"dataHex\":\"0x08c379a0\"}");
+        org.junit.jupiter.api.Assertions.assertEquals(io.myotis.api.CallResult.Status.REVERTED, r.status());
+        org.junit.jupiter.api.Assertions.assertArrayEquals(
+                new byte[]{0x08, (byte) 0xc3, 0x79, (byte) 0xa0}, r.data());
+    }
+
+    @Test
+    void detailedCall_unavailableCarriesTheReason() {
+        io.myotis.api.CallResult r = RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"unavailable\",\"reason\":\"no snap peer\"}");
+        org.junit.jupiter.api.Assertions.assertEquals(io.myotis.api.CallResult.Status.UNAVAILABLE, r.status());
+        org.junit.jupiter.api.Assertions.assertEquals("no snap peer", r.detail());
     }
 
     @Test

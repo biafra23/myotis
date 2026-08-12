@@ -53,6 +53,22 @@ class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBack
         block: String,
         stateOverridesJson: String,
     ): ByteArray? = v.callWithOverrides(from, to, data, valueWei, block, stateOverridesJson)
+
+    override fun callDetailed(
+        from: ByteArray?,
+        to: ByteArray?,
+        data: ByteArray,
+        valueWei: String?,
+        block: String,
+        stateOverridesJson: String?,
+    ): RpcCallResult {
+        val r = v.callDetailed(from, to, data, valueWei, block, stateOverridesJson)
+        return when (r.status()!!) {
+            io.myotis.api.CallResult.Status.OK -> RpcCallResult.ok(r.data() ?: ByteArray(0))
+            io.myotis.api.CallResult.Status.REVERTED -> RpcCallResult.reverted(r.data() ?: ByteArray(0))
+            io.myotis.api.CallResult.Status.UNAVAILABLE -> RpcCallResult.unavailable(r.detail())
+        }
+    }
     override fun getBalance(address: ByteArray, block: String): String? = v.getBalance(address, block)
     override fun getTransactionCount(address: ByteArray, block: String): Long? = v.getTransactionCount(address, block)
     override fun getCode(address: ByteArray, block: String): ByteArray? = v.getCode(address, block)
