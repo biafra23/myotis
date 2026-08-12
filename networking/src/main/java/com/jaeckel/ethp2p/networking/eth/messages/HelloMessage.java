@@ -41,7 +41,7 @@ public final class HelloMessage {
             // client id from CARGO_PKG_VERSION, so this literal is the release
             // sweep's one remaining hand-edited client id. Dedicated
             // myotis-serving nodes admit peers by matching "myotis" here.
-            writer.writeString("myotis/0.1.6");
+            writer.writeString("myotis/0.1.7");
             writer.writeList(capWriter -> {
                 // Capabilities must be ascending (name, then version). eth/66 is the
                 // floor: it has request-IDs (which our GetBlockHeaders/snap requests

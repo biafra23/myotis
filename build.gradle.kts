@@ -30,7 +30,7 @@ plugins {
 
 allprojects {
     group = "com.jaeckel.ethp2p"
-    version = "0.1.6-SNAPSHOT"
+    version = "0.1.7-SNAPSHOT"
 }
 
 // The release version — project.version minus the -SNAPSHOT suffix — exactly as
