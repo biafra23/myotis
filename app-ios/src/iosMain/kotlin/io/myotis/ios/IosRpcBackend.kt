@@ -188,25 +188,10 @@ class IosRpcBackend(
     }
 
     override fun estimateGas(from: ByteArray?, to: ByteArray?, data: ByteArray?, valueWei: String?): Long? {
-        // Contract creation (to=null) isn't handled verified.
-        if (to == null || to.size != 20) return null
-        if (from != null && from.size != 20) return null
-        if (data == null || data.isEmpty()) {
-            // Plain transfer: 21000 iff the recipient is a verified codeless EOA;
-            // a recipient WITH code falls through to the EVM (receive/fallback).
-            val code = getCode(to, "latest") ?: return null
-            if (code.isEmpty()) return 21_000L
-        }
-        val handle = handleProvider() ?: return null
-        val o = resultOrNull(RustEngine.estimateGasJson(
-            handle,
-            from?.let(::hex) ?: "",
-            hex(to),
-            data?.let { if (it.isEmpty()) "" else hex(it) } ?: "",
-            valueWei ?: "",
-        )) ?: return null
-        if (o.engineString("status") != "ok") return null
-        return (o["gas"] as? JsonPrimitive)?.longOrNull
+        // Legacy two-state view of estimateGasDetailed (single source for the
+        // guards + 21000 fast path) — a revert reads as null here.
+        val r = estimateGasDetailed(from, to, data, valueWei)
+        return if (r.kind == RpcCallResult.Kind.OK) r.gas else null
     }
 
     override fun estimateGasDetailed(

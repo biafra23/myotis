@@ -417,29 +417,10 @@ final class RustVerifiedReads implements VerifiedReads {
 
     @Override
     public Long estimateGas(byte[] from, byte[] to, byte[] data, String valueWei) {
-        // Contract creation (to == null) isn't handled.
-        if (to == null || to.length != 20) return null;
-        if (from != null && from.length != 20) return null;
-        // Fast path: a plain value transfer (no calldata) to a codeless EOA costs
-        // exactly 21000 intrinsic gas — no EVM run needed. A recipient WITH code (a
-        // contract or a 7702-delegated EOA) can run its receive/fallback even on a
-        // bare transfer, so it falls through to the EVM.
-        if (data == null || data.length == 0) {
-            byte[] code = getCode(to, "latest"); // verified recipient bytecode
-            if (code != null && code.length == 0) return 21_000L;
-            if (code == null) return null; // couldn't verify the recipient → can't answer
-        }
-        // EVM path (EL-C): run the call and take the buffered gas-limit estimate.
-        try {
-            return handle.estimateGasVerified(
-                    from == null ? "" : toHex(from),
-                    toHex(to),
-                    data == null ? "" : toHex(data),
-                    valueWei == null ? "" : valueWei);
-        } catch (RuntimeException e) {
-            log.debug("[engines] verified estimateGas unavailable: {}", e.getMessage());
-            return null;
-        }
+        // Legacy two-state view of estimateGasDetailed (single source for the
+        // guards + 21000 fast path) — a revert reads as null here.
+        io.myotis.api.EstimateResult r = estimateGasDetailed(from, to, data, valueWei);
+        return r.status() == io.myotis.api.EstimateResult.Status.OK ? r.gas() : null;
     }
 
     // ---- helpers ----

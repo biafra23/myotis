@@ -3835,13 +3835,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     // eth_estimateGas
     // ---------------------------------------------------------------------
 
-    /**
-     * eth_estimateGas over the shared anchored head: runs the call in the local EVM
-     * against snap-verified state with full gas accounting (intrinsic + execution +
-     * 15% headroom — see {@code DefaultEvmExecutor.estimateGas}). A reverting tx gets
-     * an error, not a number — the wallet must not broadcast it. Contract creation
-     * (to=null) isn't served verified yet → null → router errors.
-     */
+    /** The legacy two-state view of {@link #rpcEstimateGasDetailed} — a revert
+     *  reads as null (kept for callers that only need "number or not"). */
     private java.math.BigInteger rpcEstimateGas(byte[] from, byte[] to, byte[] data,
                                                 java.math.BigInteger value) {
         io.myotis.api.EstimateResult r = rpcEstimateGasDetailed(from, to, data, value);
@@ -3849,9 +3844,16 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 ? java.math.BigInteger.valueOf(r.gas()) : null;
     }
 
-    /** eth_estimateGas, three-way: OK gas, REVERTED with the estimated transaction's
-     *  revert payload (a verified answer — the tx cannot succeed), or UNAVAILABLE
-     *  (no anchored head / no peer / timeout — the retryable case). */
+    /**
+     * eth_estimateGas over the shared anchored head, three-way: runs the call in the
+     * local EVM against snap-verified state with full gas accounting (intrinsic +
+     * execution + 15% headroom — see {@code DefaultEvmExecutor.estimateGas}).
+     * OK carries the gas; REVERTED carries the estimated transaction's revert
+     * payload (a verified answer — the tx cannot succeed as composed; the router
+     * serves code 3 and the wallet must not broadcast it); UNAVAILABLE is the
+     * retryable case (no anchored head / no peer / timeout; contract creation is
+     * also not served verified yet).
+     */
     private io.myotis.api.EstimateResult rpcEstimateGasDetailed(byte[] from, byte[] to, byte[] data,
                                                                 java.math.BigInteger value) {
         if (to == null || to.length != 20) return io.myotis.api.EstimateResult.unavailable("malformed to");
@@ -3913,6 +3915,10 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             // standard code-3 shape instead of the retryable "not synced" error.
             byte[] revert = revertDataOf(e);
             if (revert != null) {
+                // Follow-up (mirrors the eth_call note): reverted estimates are as
+                // deterministic per stateRoot as OK ones but are not stored in
+                // estimateCache (it holds bare gas longs), so repeated doomed-tx
+                // probes re-run the estimate; nothing dedups them beyond the EVM lanes.
                 log.info("[rpc] eth_estimateGas -> reverted (" + revert.length + " bytes)");
                 return io.myotis.api.EstimateResult.reverted(revert);
             }
