@@ -153,7 +153,11 @@ class IosRpcBackend(
             // A revert is a VERIFIED chain answer — the router serves it as the
             // standard code-3 execution-reverted error with the payload attached.
             "ok" -> RpcCallResult.ok(hexToBytes(o.engineString("resultHex")) ?: ByteArray(0))
-            "revert" -> RpcCallResult.reverted(hexToBytes(o.engineString("dataHex")) ?: ByteArray(0))
+            // Missing dataHex → empty payload (allowed); MALFORMED hex is engine
+            // shape drift → fail closed to retryable, never a definitive revert
+            // (JVM-adapter parity: EngineException → unavailable).
+            "revert" -> RpcCallResult.reverted(hexToBytes(o.engineString("dataHex"))
+                ?: return RpcCallResult.unavailable("malformed dataHex from engine"))
             else -> RpcCallResult.unavailable(o.engineString("reason"))
         }
     }
@@ -223,7 +227,10 @@ class IosRpcBackend(
             }
             // The estimated tx reverting is a VERIFIED answer — the router serves
             // the standard code-3 execution-reverted error with the payload.
-            "revert" -> RpcEstimateResult.reverted(hexToBytes(o.engineString("dataHex")) ?: ByteArray(0))
+            // Same fail-closed posture as callDetailed: malformed dataHex is
+            // shape drift → retryable, never a definitive revert.
+            "revert" -> RpcEstimateResult.reverted(hexToBytes(o.engineString("dataHex"))
+                ?: return RpcEstimateResult.unavailable("malformed dataHex from engine"))
             else -> RpcEstimateResult.unavailable(o.engineString("reason"))
         }
     }

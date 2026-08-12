@@ -3856,7 +3856,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      */
     private io.myotis.api.EstimateResult rpcEstimateGasDetailed(byte[] from, byte[] to, byte[] data,
                                                                 java.math.BigInteger value) {
-        if (to == null || to.length != 20) return io.myotis.api.EstimateResult.unavailable("malformed to");
+        if (to == null) return io.myotis.api.EstimateResult.unavailable("contract creation not estimated");
+        if (to.length != 20) return io.myotis.api.EstimateResult.unavailable("malformed to");
         if (from != null && from.length != 20) return io.myotis.api.EstimateResult.unavailable("malformed from");
         RpcCallContext h = anchoredHeadOrWait(stateHeadStaleCapMs, true);
         if (h == null) return io.myotis.api.EstimateResult.unavailable("no anchored head");

@@ -875,17 +875,11 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
     }
 
     /**
-     * One verified {@code eth_estimateGas}: the gas-limit estimate, or null. {@code
-     * from} empty for an anonymous sender; {@code valueDecimal} is wei as a decimal
+     * One verified {@code eth_estimateGas} with the engine's three-way outcome —
+     * a revert carries its payload instead of collapsing to null. {@code from}
+     * empty for an anonymous sender; {@code valueDecimal} is wei as a decimal
      * string. Throws {@link EngineException} on a transport / not-running failure.
      */
-    Long estimateGasVerified(String fromHex, String toHex, String dataHex, String valueDecimal) {
-        return estimateGasFromJson(gated(() -> RustEngineNative.nativeEstimateGasJson(
-                handle, fromHex, toHex, dataHex, valueDecimal)));
-    }
-
-    /** {@link #estimateGasVerified} with the engine's three-way outcome — a revert
-     *  carries its payload instead of collapsing to null. Same JNI native. */
     io.myotis.api.EstimateResult estimateGasVerifiedDetailed(
             String fromHex, String toHex, String dataHex, String valueDecimal) {
         return estimateGasDetailedFromJson(gated(() -> RustEngineNative.nativeEstimateGasJson(
