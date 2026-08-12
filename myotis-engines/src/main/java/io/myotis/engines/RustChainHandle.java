@@ -884,7 +884,40 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 handle, fromHex, toHex, dataHex, valueDecimal)));
     }
 
-    /** Package-private test seam: estimateGas JSON → gas estimate (or null) without JNI. */
+    /** {@link #estimateGasVerified} with the engine's three-way outcome — a revert
+     *  carries its payload instead of collapsing to null. Same JNI native. */
+    io.myotis.api.EstimateResult estimateGasVerifiedDetailed(
+            String fromHex, String toHex, String dataHex, String valueDecimal) {
+        return estimateGasDetailedFromJson(gated(() -> RustEngineNative.nativeEstimateGasJson(
+                handle, fromHex, toHex, dataHex, valueDecimal)));
+    }
+
+    /** Package-private test seam: estimateGas JSON → the engine's three-way outcome.
+     *  The Rust side emits {@code {"status":"ok","gas":N}} /
+     *  {@code {"status":"revert","dataHex"}} (ABI v23) / {@code {"status":
+     *  "unavailable","reason"}}; a revert is a VERIFIED answer whose payload the
+     *  host serves as the standard code-3 error. */
+    static io.myotis.api.EstimateResult estimateGasDetailedFromJson(String json) {
+        JsonObject o = parseResultOrThrow(json, "estimateGas");
+        String status = stringOrNull(o, "status");
+        if ("revert".equals(status)) {
+            try {
+                return io.myotis.api.EstimateResult.reverted(hexToBytes(stringOrNull(o, "dataHex")));
+            } catch (RuntimeException e) {
+                throw new EngineException(
+                        "malformed estimateGas JSON from the Rust engine: " + e.getMessage(), e);
+            }
+        }
+        if (!"ok".equals(status)) {
+            return io.myotis.api.EstimateResult.unavailable(stringOrNull(o, "reason"));
+        }
+        Long gas = estimateGasFromJson(json);
+        // estimateGasFromJson throws on ok-without-gas, so gas is non-null here.
+        return io.myotis.api.EstimateResult.ok(gas);
+    }
+
+    /** Package-private test seam: estimateGas JSON → gas estimate (or null) without JNI.
+     *  The legacy two-state view: a revert or unavailable outcome reads as null. */
     static Long estimateGasFromJson(String json) {
         JsonObject o = parseResultOrThrow(json, "estimateGas");
         // A revert / unavailable run has no estimate → null.

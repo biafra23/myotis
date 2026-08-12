@@ -2,6 +2,7 @@ package io.myotis.ios
 
 import io.myotis.jsonrpc.RpcBackend
 import io.myotis.jsonrpc.RpcCallResult
+import io.myotis.jsonrpc.RpcEstimateResult
 import io.myotis.jsonrpc.RpcBlockWindow
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -206,6 +207,40 @@ class IosRpcBackend(
         )) ?: return null
         if (o.engineString("status") != "ok") return null
         return (o["gas"] as? JsonPrimitive)?.longOrNull
+    }
+
+    override fun estimateGasDetailed(
+        from: ByteArray?,
+        to: ByteArray?,
+        data: ByteArray?,
+        valueWei: String?,
+    ): RpcEstimateResult {
+        // Same guards + 21000 fast path as estimateGas(); all "cannot answer", not reverts.
+        if (to == null || to.size != 20) return RpcEstimateResult.unavailable("contract creation not estimated")
+        if (from != null && from.size != 20) return RpcEstimateResult.unavailable("malformed from")
+        if (data == null || data.isEmpty()) {
+            val code = getCode(to, "latest") ?: return RpcEstimateResult.unavailable("recipient unverifiable")
+            if (code.isEmpty()) return RpcEstimateResult.ok(21_000L)
+        }
+        val handle = handleProvider() ?: return RpcEstimateResult.unavailable("engine not running")
+        val o = resultOrNull(RustEngine.estimateGasJson(
+            handle,
+            from?.let(::hex) ?: "",
+            hex(to),
+            data?.let { if (it.isEmpty()) "" else hex(it) } ?: "",
+            valueWei ?: "",
+        )) ?: return RpcEstimateResult.unavailable("engine error")
+        return when (o.engineString("status")) {
+            "ok" -> {
+                val gas = (o["gas"] as? JsonPrimitive)?.longOrNull
+                    ?: return RpcEstimateResult.unavailable("ok without gas")
+                RpcEstimateResult.ok(gas)
+            }
+            // The estimated tx reverting is a VERIFIED answer — the router serves
+            // the standard code-3 execution-reverted error with the payload.
+            "revert" -> RpcEstimateResult.reverted(hexToBytes(o.engineString("dataHex")) ?: ByteArray(0))
+            else -> RpcEstimateResult.unavailable(o.engineString("reason"))
+        }
     }
 
     override fun sendRawTransaction(rawTx: ByteArray): ByteArray? {

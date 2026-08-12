@@ -281,6 +281,34 @@ class RustVerifiedReadJsonTest {
     }
 
     @Test
+    void detailedEstimate_okRevertsUnavailable() {
+        var ok = RustChainHandle.estimateGasDetailedFromJson("{\"status\":\"ok\",\"gas\":24150}");
+        org.junit.jupiter.api.Assertions.assertEquals(io.myotis.api.EstimateResult.Status.OK, ok.status());
+        org.junit.jupiter.api.Assertions.assertEquals(24150L, ok.gas());
+
+        // ABI v23: the revert carries its payload — a verified answer the router
+        // serves as code 3, not the retryable null.
+        var rv = RustChainHandle.estimateGasDetailedFromJson(
+                "{\"status\":\"revert\",\"dataHex\":\"0x08c379a0\"}");
+        org.junit.jupiter.api.Assertions.assertEquals(
+                io.myotis.api.EstimateResult.Status.REVERTED, rv.status());
+        org.junit.jupiter.api.Assertions.assertArrayEquals(
+                new byte[]{0x08, (byte) 0xc3, 0x79, (byte) 0xa0}, rv.revertData());
+
+        var un = RustChainHandle.estimateGasDetailedFromJson(
+                "{\"status\":\"unavailable\",\"reason\":\"no verified head\"}");
+        org.junit.jupiter.api.Assertions.assertEquals(
+                io.myotis.api.EstimateResult.Status.UNAVAILABLE, un.status());
+        org.junit.jupiter.api.Assertions.assertEquals("no verified head", un.detail());
+    }
+
+    @Test
+    void detailedEstimate_legacyViewStaysNullOnRevert() {
+        org.junit.jupiter.api.Assertions.assertNull(RustChainHandle.estimateGasFromJson(
+                "{\"status\":\"revert\",\"dataHex\":\"0x08c379a0\"}"));
+    }
+
+    @Test
     void unavailableEstimateIsNull() {
         assertNull(RustChainHandle.estimateGasFromJson(
                 "{\"status\":\"unavailable\",\"reason\":\"execution reverted\"}"));

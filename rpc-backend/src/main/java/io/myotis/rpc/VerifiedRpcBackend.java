@@ -939,6 +939,12 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         return gas == null ? null : Long.valueOf(gas.longValue());
     }
 
+    @Override
+    public io.myotis.api.EstimateResult estimateGasDetailed(byte[] from, byte[] to,
+                                                            byte[] data, String valueWei) {
+        return rpcEstimateGasDetailed(from, to, data, parseWei(valueWei));
+    }
+
     /** Decode a decimal wei string from the {@link io.myotis.api.VerifiedReads} boundary to the
      *  BigInteger the internal EVM path uses. null → null (the router validated the range). */
     private static java.math.BigInteger parseWei(String decimal) {
@@ -3838,10 +3844,20 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      */
     private java.math.BigInteger rpcEstimateGas(byte[] from, byte[] to, byte[] data,
                                                 java.math.BigInteger value) {
-        if (to == null || to.length != 20) return null;
-        if (from != null && from.length != 20) return null;
+        io.myotis.api.EstimateResult r = rpcEstimateGasDetailed(from, to, data, value);
+        return r.status() == io.myotis.api.EstimateResult.Status.OK
+                ? java.math.BigInteger.valueOf(r.gas()) : null;
+    }
+
+    /** eth_estimateGas, three-way: OK gas, REVERTED with the estimated transaction's
+     *  revert payload (a verified answer — the tx cannot succeed), or UNAVAILABLE
+     *  (no anchored head / no peer / timeout — the retryable case). */
+    private io.myotis.api.EstimateResult rpcEstimateGasDetailed(byte[] from, byte[] to, byte[] data,
+                                                                java.math.BigInteger value) {
+        if (to == null || to.length != 20) return io.myotis.api.EstimateResult.unavailable("malformed to");
+        if (from != null && from.length != 20) return io.myotis.api.EstimateResult.unavailable("malformed from");
         RpcCallContext h = anchoredHeadOrWait(stateHeadStaleCapMs, true);
-        if (h == null) return null;
+        if (h == null) return io.myotis.api.EstimateResult.unavailable("no anchored head");
         // Replay a verified estimate for this exact (root, from, to, data, value): an
         // estimate is deterministic given the anchored state, so a retried confirm screen
         // hitting the same pinned head skips the binary-search EVM run entirely.
@@ -3852,7 +3868,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         ? "0x" : Hash.keccak256(Bytes.wrap(data)).toHexString())
                 + ":" + (value == null ? "0" : value.toString(16));
         Long cachedGas = estimateCache.get(estKey, clock.elapsedMillis());
-        if (cachedGas != null) return java.math.BigInteger.valueOf(cachedGas);
+        if (cachedGas != null) return io.myotis.api.EstimateResult.ok(cachedGas);
         try {
             // Fast path: a value transfer with no calldata to a plain account costs
             // exactly 21000 — no EVM execution, no 15% headroom (it's exact). This is
@@ -3868,7 +3884,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 byte[] codeHash = acct == null ? null : acct.codeHash();
                 if (codeHash != null && java.util.Arrays.equals(codeHash, EMPTY_CODE_HASH)) {
                     estimateCache.put(estKey, 21_000L, clock.elapsedMillis());
-                    return java.math.BigInteger.valueOf(21_000);
+                    return io.myotis.api.EstimateResult.ok(21_000L);
                 }
                 // Has code (contract / 7702 EOA) → fall through to the full EVM estimate.
             }
@@ -3889,12 +3905,20 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 if (ex == null && g != null) estimateCache.put(estKey, g, clock.elapsedMillis());
             });
             Long gas = est.get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
-            if (gas == null) return null;
-            return java.math.BigInteger.valueOf(gas);
+            if (gas == null) return io.myotis.api.EstimateResult.unavailable("estimator returned no result");
+            return io.myotis.api.EstimateResult.ok(gas);
         } catch (Exception e) {
+            // The estimated transaction REVERTING is a verified answer (it cannot
+            // succeed as composed) — surface the payload so the router serves the
+            // standard code-3 shape instead of the retryable "not synced" error.
+            byte[] revert = revertDataOf(e);
+            if (revert != null) {
+                log.info("[rpc] eth_estimateGas -> reverted (" + revert.length + " bytes)");
+                return io.myotis.api.EstimateResult.reverted(revert);
+            }
             log.info("[rpc] eth_estimateGas -> error: " + describeEvmError(e));
             if (isStateUnavailable(e)) evictUnservableHead(h);
-            return null;
+            return io.myotis.api.EstimateResult.unavailable(describeEvmError(e));
         }
     }
 

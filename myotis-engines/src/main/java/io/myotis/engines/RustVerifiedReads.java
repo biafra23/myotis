@@ -388,6 +388,34 @@ final class RustVerifiedReads implements VerifiedReads {
         }
     }
     @Override
+    public io.myotis.api.EstimateResult estimateGasDetailed(byte[] from, byte[] to,
+                                                            byte[] data, String valueWei) {
+        // Same guards + 21000 fast path as estimateGas(); all are "cannot answer",
+        // not reverts.
+        if (to == null || to.length != 20) {
+            return io.myotis.api.EstimateResult.unavailable("contract creation not estimated");
+        }
+        if (from != null && from.length != 20) {
+            return io.myotis.api.EstimateResult.unavailable("malformed from");
+        }
+        if (data == null || data.length == 0) {
+            byte[] code = getCode(to, "latest");
+            if (code != null && code.length == 0) return io.myotis.api.EstimateResult.ok(21_000L);
+            if (code == null) return io.myotis.api.EstimateResult.unavailable("recipient unverifiable");
+        }
+        try {
+            return handle.estimateGasVerifiedDetailed(
+                    from == null ? "" : toHex(from),
+                    toHex(to),
+                    data == null ? "" : toHex(data),
+                    valueWei == null ? "" : valueWei);
+        } catch (RuntimeException e) {
+            log.debug("[engines] verified estimateGas (detailed) unavailable: {}", e.getMessage());
+            return io.myotis.api.EstimateResult.unavailable(e.getMessage());
+        }
+    }
+
+    @Override
     public Long estimateGas(byte[] from, byte[] to, byte[] data, String valueWei) {
         // Contract creation (to == null) isn't handled.
         if (to == null || to.length != 20) return null;

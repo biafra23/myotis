@@ -129,6 +129,33 @@ class RpcRouterTest {
         assertEquals("0xdeadbeef", err["data"]!!.jsonPrimitive.content)
     }
 
+    @Test fun estimateGas_revert_isServedAsCode3WithData() {
+        // The estimated transaction reverting is a verified answer (the tx cannot
+        // succeed as composed) — geth's estimateGas serves code 3 too. -32000 here
+        // showed wallets "node not synced" for a doomed transaction.
+        val b = FakeBackend(applyOverrides = true)
+        b.estimateRevertData = ("08c379a0" +
+            "0000000000000000000000000000000000000000000000000000000000000020" +
+            "0000000000000000000000000000000000000000000000000000000000000004" +
+            "6e6f7065" + "00".repeat(28)).chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas",
+               "params":[{"to":"0x0000000000000000000000000000000000696969","data":"0xa9059cbb"}]}""")
+        assertEquals(3, errorCode(resp))
+        val err = Json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject
+        assertEquals("execution reverted: nope", err["message"]!!.jsonPrimitive.content)
+        assertTrue(err["data"]!!.jsonPrimitive.content.startsWith("0x08c379a0"))
+    }
+
+    @Test fun estimateGas_unavailable_staysRetryable32000() {
+        // The null path is untouched: no estimate -> the strict retryable error.
+        val b = FakeBackend(applyOverrides = true)   // estimate() returns null by default
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas",
+               "params":[{"to":"0x0000000000000000000000000000000000696969","data":"0xa9059cbb"}]}""")
+        assertEquals(-32000, errorCode(resp))
+    }
+
     @Test fun ethCall_panicRevert_decodesTheUnsignedCode() {
         // Panic(uint256): 0x4e487b71 + code. 0x11 = arithmetic overflow.
         val b = FakeBackend(applyOverrides = true)
@@ -339,6 +366,14 @@ class RpcRouterTest {
 
         /** When set, callDetailed reports a REVERT carrying these bytes. */
         var revertData: ByteArray? = null
+
+        /** When set, estimateGasDetailed reports a REVERT carrying these bytes. */
+        var estimateRevertData: ByteArray? = null
+        override fun estimateGasDetailed(from: ByteArray?, to: ByteArray?, data: ByteArray?,
+                                         valueWei: String?): io.myotis.api.EstimateResult {
+            estimateRevertData?.let { return io.myotis.api.EstimateResult.reverted(it) }
+            return super.estimateGasDetailed(from, to, data, valueWei)
+        }
         override fun callDetailed(from: ByteArray?, to: ByteArray?, data: ByteArray,
                                   valueWei: String?, block: String,
                                   stateOverridesJson: String?): io.myotis.api.CallResult {

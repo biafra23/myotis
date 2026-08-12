@@ -90,6 +90,21 @@ class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBack
         v.feeHistory(blockCount, newestBlock, rewardPercentiles)
     override fun estimateGas(from: ByteArray?, to: ByteArray?, data: ByteArray?, valueWei: String?): Long? =
         v.estimateGas(from, to, data, valueWei)
+
+    override fun estimateGasDetailed(
+        from: ByteArray?,
+        to: ByteArray?,
+        data: ByteArray?,
+        valueWei: String?,
+    ): RpcEstimateResult {
+        val r = v.estimateGasDetailed(from, to, data, valueWei)
+        return when (r.status()!!) {
+            io.myotis.api.EstimateResult.Status.OK -> RpcEstimateResult.ok(r.gas())
+            io.myotis.api.EstimateResult.Status.REVERTED ->
+                RpcEstimateResult.reverted(r.revertData() ?: ByteArray(0))
+            io.myotis.api.EstimateResult.Status.UNAVAILABLE -> RpcEstimateResult.unavailable(r.detail())
+        }
+    }
 }
 
 /** [RpcStatusSource] over the api contract + the pinned StatusJson shapes. */

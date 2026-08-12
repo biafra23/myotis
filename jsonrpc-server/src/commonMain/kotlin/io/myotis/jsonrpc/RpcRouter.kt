@@ -726,8 +726,17 @@ class RpcRouter(
                     val s = (valueElement as? JsonPrimitive)?.contentOrNull ?: return null
                     parseWeiQuantity(s) ?: return null
                 } else null
-                val gas = withContext(rpcIoDispatcher) { b.estimateGas(from, to, data, value) } ?: return null
-                resultEnvelope(id, JsonPrimitive(hexQuantity(gas)))
+                val outcome = withContext(rpcIoDispatcher) { b.estimateGasDetailed(from, to, data, value) }
+                when (outcome.kind) {
+                    RpcCallResult.Kind.OK ->
+                        resultEnvelope(id, JsonPrimitive(hexQuantity(outcome.gas ?: return null)))
+                    // The estimated transaction REVERTS: a verified answer, not a
+                    // failure to answer — geth's shape for estimateGas too. -32000
+                    // here made wallets show "node not synced" for a doomed tx.
+                    RpcCallResult.Kind.REVERTED ->
+                        revertEnvelope(id, outcome.data ?: ByteArray(0))
+                    RpcCallResult.Kind.UNAVAILABLE -> return null
+                }
             }
             else -> null
         }
