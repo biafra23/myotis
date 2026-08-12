@@ -26,6 +26,10 @@ package io.myotis.api;
  */
 public record CallResult(Status status, byte[] data, String detail) {
 
+    public CallResult {
+        java.util.Objects.requireNonNull(status, "status");
+    }
+
     public enum Status { OK, REVERTED, UNAVAILABLE }
 
     public static CallResult ok(byte[] data) {

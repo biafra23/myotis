@@ -250,6 +250,10 @@ class RpcRouter(
             val label =
                 if (takesOverrides(method) && stateOverrideJson(root) != null) "SIMULATED"
                 else "VERIFIED"
+            // NB a code-3 REVERT response counts here too, deliberately: the
+            // revert is a verified (or simulated) ANSWER, not a failure to
+            // answer — coverage tracks "could we serve this", not "did the
+            // contract say yes".
             logger.record(method!!, idStr, label, elapsedMs(t0))
             return verified
         }
@@ -914,7 +918,7 @@ class RpcRouter(
         if (d.size >= 4 + 32 && d[0] == 0x4e.toByte() && d[1] == 0x48.toByte() &&
             d[2] == 0x7b.toByte() && d[3] == 0x71.toByte()
         ) {
-            return "panic 0x" + be(d, 4 + 24, 8).toString(16)
+            return "panic 0x" + be(d, 4 + 24, 8).toULong().toString(16)
         }
         if (d.size < 4 + 64) return null
         if (d[0] != 0x08.toByte() || d[1] != 0xc3.toByte() ||
@@ -932,7 +936,9 @@ class RpcRouter(
         if (len < 0 || len > 1024 || lenPos + 32 + len > d.size) return null
         val bytes = d.copyOfRange(lenPos + 32, lenPos + 32 + len.toInt())
         val s = bytes.decodeToString()
-        // Control characters could forge log lines / confuse clients — keep it printable.
-        return s.map { if (it.code in 32..126 || it.code > 160) it else ' ' }.joinToString("")
+        // The reason is attacker-authored display text: keep it printable ASCII so
+        // it can neither forge log lines (\n) nor visually spoof UIs (RTL override,
+        // line separators). The raw bytes are always in `data` for exact decoding.
+        return s.map { if (it.code in 32..126) it else ' ' }.joinToString("")
     }
 }

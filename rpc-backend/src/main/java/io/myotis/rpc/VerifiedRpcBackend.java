@@ -2125,6 +2125,10 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             // detection and with it the whole confirmation screen).
             byte[] revert = revertDataOf(e);
             if (revert != null) {
+                // Follow-up: reverted results are as deterministic per stateRoot as OK
+                // ones but are not yet stored in callResultCache (it holds bare bytes),
+                // so a wallet's repeated revert probes re-execute; single-flight still
+                // dedups concurrent copies.
                 log.info("[rpc] eth_call " + desc + " -> reverted (" + revert.length
                         + " bytes) after " + (clock.elapsedMillis() - t0) + "ms"
                         + (leader ? "" : " (deduped)"));
@@ -2142,8 +2146,9 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
 
     /** The revert payload carried by the throwable chain, or null when the chain
      *  holds no {@link io.myotis.evm.EvmExecutionError.Reverted} (the same
-     *  cause-walk shape as {@link #isStateUnavailable}). */
-    private static byte[] revertDataOf(Throwable t) {
+     *  cause-walk shape as {@link #isStateUnavailable}). Package-private as a
+     *  test seam. */
+    static byte[] revertDataOf(Throwable t) {
         for (Throwable c = t; c != null; c = c.getCause()) {
             if (c instanceof io.myotis.evm.EvmExecutionException ee
                     && ee.error() instanceof io.myotis.evm.EvmExecutionError.Reverted r) {
