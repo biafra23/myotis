@@ -910,15 +910,21 @@ class RpcRouter(
      * raw payload is always in `data` for the client to decode itself.
      */
     private fun decodeRevertReason(d: ByteArray): String? {
-        fun be(b: ByteArray, off: Int, len: Int): Long {
+        // A full 32-byte ABI word as a Long — null unless the high 24 bytes are
+        // zero, so an invalid-ABI payload (which canonical decoders reject)
+        // never decodes to a plausible reason here that disagrees with the
+        // wallet's own decode of `data`.
+        fun word(b: ByteArray, wordStart: Int): Long? {
+            for (i in wordStart until wordStart + 24) if (b[i] != 0.toByte()) return null
             var v = 0L
-            for (i in off until off + len) v = (v shl 8) or (b[i].toLong() and 0xff)
+            for (i in wordStart + 24 until wordStart + 32) v = (v shl 8) or (b[i].toLong() and 0xff)
             return v
         }
         if (d.size >= 4 + 32 && d[0] == 0x4e.toByte() && d[1] == 0x48.toByte() &&
             d[2] == 0x7b.toByte() && d[3] == 0x71.toByte()
         ) {
-            return "panic 0x" + be(d, 4 + 24, 8).toULong().toString(16)
+            val code = word(d, 4) ?: return null
+            return "panic 0x" + code.toULong().toString(16)
         }
         if (d.size < 4 + 64) return null
         if (d[0] != 0x08.toByte() || d[1] != 0xc3.toByte() ||
@@ -928,11 +934,11 @@ class RpcRouter(
         }
         // 4-byte selector ‖ offset(32) ‖ len(32) ‖ bytes. Bounds are attacker-
         // controlled: validate every step and give up (null) on anything odd.
-        val off = be(d, 4 + 24, 8)
+        val off = word(d, 4) ?: return null
         if (off < 0 || off > d.size.toLong()) return null
         val lenPos = 4 + off.toInt()
         if (lenPos + 32 > d.size) return null
-        val len = be(d, lenPos + 24, 8)
+        val len = word(d, lenPos) ?: return null
         if (len < 0 || len > 1024 || lenPos + 32 + len > d.size) return null
         val bytes = d.copyOfRange(lenPos + 32, lenPos + 32 + len.toInt())
         val s = bytes.decodeToString()

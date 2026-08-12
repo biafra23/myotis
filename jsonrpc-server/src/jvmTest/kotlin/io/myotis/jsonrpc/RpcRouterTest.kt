@@ -161,6 +161,23 @@ class RpcRouterTest {
         assertTrue(err["data"]!!.jsonPrimitive.content.startsWith("0x08c379a0"))
     }
 
+    @Test fun ethCall_nonCanonicalAbiWords_areNotDecoded() {
+        // Offset word with non-zero HIGH bytes (2^64 + 0x20): invalid ABI that
+        // canonical decoders reject — our message must not decode a "plausible"
+        // reason they would disagree with. Bare message, raw data untouched.
+        val b = FakeBackend(applyOverrides = true)
+        b.revertData = ("08c379a0" +
+            "0000000000000000000000000000000000000000000000010000000000000020" +
+            "0000000000000000000000000000000000000000000000000000000000000004" +
+            "6e6f7065" + "00".repeat(28)).chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x0000000000000000000000000000000000696969","data":"0x01ffc9a7"},"latest"]}""")
+        assertEquals(3, errorCode(resp))
+        val err = Json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject
+        assertEquals("execution reverted", err["message"]!!.jsonPrimitive.content)
+    }
+
     @Test fun ethCall_revertReasonWithControlChars_isSanitizedInMessageOnly() {
         // A newline in the reason could forge access-log lines; RTL overrides
         // could spoof wallet UIs. The message is printable-ASCII-only — the

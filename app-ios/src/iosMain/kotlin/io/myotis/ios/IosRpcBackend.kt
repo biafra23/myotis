@@ -1,6 +1,7 @@
 package io.myotis.ios
 
 import io.myotis.jsonrpc.RpcBackend
+import io.myotis.jsonrpc.RpcCallResult
 import io.myotis.jsonrpc.RpcBlockWindow
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject

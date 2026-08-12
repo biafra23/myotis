@@ -3978,11 +3978,15 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         return new java.math.BigInteger(1, be);
     }
 
-    /** Render an estimate/call failure, decoding EvmExecutionException revert data —
-     *  the estimator packs halt diagnostics ("halt=... state=...") into Reverted bytes,
-     *  which the default toString prints as an opaque [B@hash. */
+    /** Render an estimate/call failure, decoding EvmExecutionException revert data
+     *  (the default toString prints Reverted's bytes as an opaque [B@hash) and the
+     *  Halted diagnostic string. */
     private static String describeEvmError(Throwable e) {
         for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof io.myotis.evm.EvmExecutionException he
+                    && he.error() instanceof io.myotis.evm.EvmExecutionError.Halted halted) {
+                return "Halted: " + halted.detail();
+            }
             if (t instanceof io.myotis.evm.EvmExecutionException ee
                     && ee.error() instanceof io.myotis.evm.EvmExecutionError.Reverted rev) {
                 byte[] d = rev.data();

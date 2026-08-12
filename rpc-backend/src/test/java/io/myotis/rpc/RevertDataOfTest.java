@@ -36,6 +36,11 @@ class RevertDataOfTest {
         assertNull(VerifiedRpcBackend.revertDataOf(new RuntimeException("timeout")));
         assertNull(VerifiedRpcBackend.revertDataOf(
                 new EvmExecutionException(new EvmExecutionError.OutOfGas())));
+        // An exceptional halt carries a LOCAL diagnostic, not chain-produced
+        // revert data — it must never surface as a code-3 revert.
+        assertNull(VerifiedRpcBackend.revertDataOf(
+                new EvmExecutionException(
+                        new EvmExecutionError.Halted("halt=INVALID_OPERATION state=EXCEPTIONAL_HALT"))));
         assertNull(VerifiedRpcBackend.revertDataOf(new java.util.concurrent.ExecutionException(
                 new EvmExecutionException(
                         new EvmExecutionError.StateUnavailable(new byte[32], null, null)))));

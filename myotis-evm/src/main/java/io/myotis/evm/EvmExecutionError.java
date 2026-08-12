@@ -56,6 +56,17 @@ public sealed interface EvmExecutionError {
     /** Estimation: execution exceeded the configured gas ceiling. */
     record OutOfGas() implements EvmExecutionError {}
 
+    /**
+     * EVM halted exceptionally WITHOUT a revert payload (invalid opcode, stack
+     * violation, the deliberate BLOCKHASH gap, …). Distinct from
+     * {@link Reverted} on purpose: a revert is a verified chain answer whose
+     * payload hosts serve verbatim (JSON-RPC code 3), while a halt's
+     * {@code detail} is a local diagnostic string the chain never produced —
+     * conflating them would serve fabricated revert data for calls that may
+     * succeed on a full node.
+     */
+    record Halted(String detail) implements EvmExecutionError {}
+
     /** Prefetch loop did not converge within the iteration cap. */
     record IterationLimitExceeded(int cap) implements EvmExecutionError {}
 
