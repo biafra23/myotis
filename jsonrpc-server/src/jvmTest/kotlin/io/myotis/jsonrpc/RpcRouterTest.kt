@@ -82,7 +82,7 @@ class RpcRouterTest {
 
     @Test fun capableBackendReturningNull_getsTheRETRYABLEcode_notPermanent() {
         // A capable backend returns null for ordinary reasons — not synced, no
-        // peer, out-of-window block, a plain revert. Those are transient, so the
+        // peer, out-of-window block. Those are transient, so the
         // client must be told to retry; -32602 would make a wallet stop asking
         // and pin its public-node fallback for the session.
         val b = FakeBackend(callResult = null, applyOverrides = true)
@@ -92,6 +92,126 @@ class RpcRouterTest {
                          "latest",
                          {"0x0000000000000000000000000000000000696969":{"code":"0x6080"}}]}""")
         assertEquals(-32000, errorCode(resp))
+    }
+
+    @Test fun ethCall_revert_isServedAsCode3WithDataAndDecodedReason() {
+        // A revert is a VERIFIED chain answer, not "cannot answer": geth's shape
+        // (code 3, raw payload in `data`, Error(string) reason decoded into the
+        // message) is what ethers/viem/MetaMask parse. Reporting -32000 instead
+        // made wallets treat a normal negative answer (an ERC-165 probe on a
+        // plain ERC-20) as a node outage and stall their confirmation screens.
+        val b = FakeBackend(applyOverrides = true)
+        // Error("nope"): selector 08c379a0 ‖ offset 0x20 ‖ len 4 ‖ "nope" padded.
+        b.revertData = ("08c379a0" +
+            "0000000000000000000000000000000000000000000000000000000000000020" +
+            "0000000000000000000000000000000000000000000000000000000000000004" +
+            "6e6f7065" + "00".repeat(28)).chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x0000000000000000000000000000000000696969","data":"0x01ffc9a7"},"latest"]}""")
+        assertEquals(3, errorCode(resp))
+        val err = Json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject
+        assertEquals("execution reverted: nope", err["message"]!!.jsonPrimitive.content)
+        assertTrue(err["data"]!!.jsonPrimitive.content.startsWith("0x08c379a0"))
+    }
+
+    @Test fun ethCall_revertWithOpaqueData_keepsBareMessageAndRawData() {
+        // Custom errors / raw payloads don't decode — the message stays bare and
+        // the client gets the untouched bytes to decode itself.
+        val b = FakeBackend(applyOverrides = true)
+        b.revertData = byteArrayOf(0xde.toByte(), 0xad.toByte(), 0xbe.toByte(), 0xef.toByte())
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x0000000000000000000000000000000000696969","data":"0x01ffc9a7"},"latest"]}""")
+        assertEquals(3, errorCode(resp))
+        val err = Json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject
+        assertEquals("execution reverted", err["message"]!!.jsonPrimitive.content)
+        assertEquals("0xdeadbeef", err["data"]!!.jsonPrimitive.content)
+    }
+
+    @Test fun ethCall_panicRevert_decodesTheUnsignedCode() {
+        // Panic(uint256): 0x4e487b71 + code. 0x11 = arithmetic overflow.
+        val b = FakeBackend(applyOverrides = true)
+        b.revertData = ("4e487b71" +
+            "0000000000000000000000000000000000000000000000000000000000000011")
+            .chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x0000000000000000000000000000000000696969","data":"0x01ffc9a7"},"latest"]}""")
+        assertEquals(3, errorCode(resp))
+        val err = Json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject
+        assertEquals("execution reverted: panic 0x11", err["message"]!!.jsonPrimitive.content)
+    }
+
+    @Test fun ethCall_truncatedOrHostileErrorString_staysBareButKeepsData() {
+        // Error(string) selector with a hostile length word pointing past the
+        // payload: the decoder must give up (bare message), never crash or
+        // over-read; the raw bytes still reach the client via `data`.
+        val b = FakeBackend(applyOverrides = true)
+        b.revertData = ("08c379a0" +
+            "0000000000000000000000000000000000000000000000000000000000000020" +
+            "00000000000000000000000000000000000000000000000000000000ffffffff")
+            .chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x0000000000000000000000000000000000696969","data":"0x01ffc9a7"},"latest"]}""")
+        assertEquals(3, errorCode(resp))
+        val err = Json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject
+        assertEquals("execution reverted", err["message"]!!.jsonPrimitive.content)
+        assertTrue(err["data"]!!.jsonPrimitive.content.startsWith("0x08c379a0"))
+    }
+
+    @Test fun ethCall_nonCanonicalAbiWords_areNotDecoded() {
+        // Offset word with non-zero HIGH bytes (2^64 + 0x20): invalid ABI that
+        // canonical decoders reject — our message must not decode a "plausible"
+        // reason they would disagree with. Bare message, raw data untouched.
+        val b = FakeBackend(applyOverrides = true)
+        b.revertData = ("08c379a0" +
+            "0000000000000000000000000000000000000000000000010000000000000020" +
+            "0000000000000000000000000000000000000000000000000000000000000004" +
+            "6e6f7065" + "00".repeat(28)).chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x0000000000000000000000000000000000696969","data":"0x01ffc9a7"},"latest"]}""")
+        assertEquals(3, errorCode(resp))
+        val err = Json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject
+        assertEquals("execution reverted", err["message"]!!.jsonPrimitive.content)
+    }
+
+    @Test fun ethCall_revertReasonWithControlChars_isSanitizedInMessageOnly() {
+        // A newline in the reason could forge access-log lines; RTL overrides
+        // could spoof wallet UIs. The message is printable-ASCII-only — the
+        // exact bytes stay available in `data`.
+        val reason = "no\u0000pe\nline"
+        val rb = reason.encodeToByteArray()
+        val padded = rb + ByteArray((32 - rb.size % 32) % 32)
+        val b = FakeBackend(applyOverrides = true)
+        b.revertData = ("08c379a0" +
+            "0000000000000000000000000000000000000000000000000000000000000020" +
+            rb.size.toString(16).padStart(64, '0'))
+            .chunked(2).map { it.toInt(16).toByte() }.toByteArray() + padded
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x0000000000000000000000000000000000696969","data":"0x01ffc9a7"},"latest"]}""")
+        val err = Json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject
+        val msg = err["message"]!!.jsonPrimitive.content
+        assertTrue(msg.startsWith("execution reverted: "))
+        assertTrue(!msg.contains('\n') && !msg.contains('\u0000'))
+    }
+
+    @Test fun ethCall_revert_doesNotFallThroughToTheDevProxy() {
+        // The revert IS the verified answer — in dev mode it must be served, not
+        // proxied to an upstream that would answer from unverified state.
+        val b = FakeBackend(applyOverrides = true)
+        b.revertData = ByteArray(0)
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x0000000000000000000000000000000000696969","data":"0x01ffc9a7"},"latest"]}""",
+            proxy = UpstreamProxy("http://127.0.0.1:1"))   // unreachable: a fall-through would error differently
+        assertEquals(3, errorCode(resp))
+        val err = Json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject
+        assertEquals("execution reverted", err["message"]!!.jsonPrimitive.content)
+        assertEquals("0x", err["data"]!!.jsonPrimitive.content)
     }
 
     @Test fun anImplementationThatDoesNotOverride_inheritsUnsupported() {
@@ -215,6 +335,15 @@ class RpcRouterTest {
             if (!applyOverrides) return null   // the interface default: unsupported
             lastOverrides = stateOverridesJson
             return callResult
+        }
+
+        /** When set, callDetailed reports a REVERT carrying these bytes. */
+        var revertData: ByteArray? = null
+        override fun callDetailed(from: ByteArray?, to: ByteArray?, data: ByteArray,
+                                  valueWei: String?, block: String,
+                                  stateOverridesJson: String?): io.myotis.api.CallResult {
+            revertData?.let { return io.myotis.api.CallResult.reverted(it) }
+            return super.callDetailed(from, to, data, valueWei, block, stateOverridesJson)
         }
         override fun getBalance(address: ByteArray, block: String): String? = balance?.toString()
         override fun getTransactionCount(address: ByteArray, block: String): Long? = nonce

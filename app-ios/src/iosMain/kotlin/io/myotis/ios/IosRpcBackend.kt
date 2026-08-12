@@ -1,6 +1,7 @@
 package io.myotis.ios
 
 import io.myotis.jsonrpc.RpcBackend
+import io.myotis.jsonrpc.RpcCallResult
 import io.myotis.jsonrpc.RpcBlockWindow
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -107,10 +108,53 @@ class IosRpcBackend(
             valueWei ?: "",
             block,
         )) ?: return null
-        // Only "ok" carries a result; a revert or unavailable outcome is "no
-        // answer" → null (a reverting eth_call is a JSON-RPC null, not -32000).
+        // Only "ok" carries a result here; callDetailed carries the revert payload.
         if (o.engineString("status") != "ok") return null
         return hexToBytes(o.engineString("resultHex"))
+    }
+
+    override fun callDetailed(
+        from: ByteArray?,
+        to: ByteArray?,
+        data: ByteArray,
+        valueWei: String?,
+        block: String,
+        stateOverridesJson: String?,
+    ): RpcCallResult {
+        // Same guards as call()/callWithOverrides(); all are "cannot answer", not reverts.
+        if (!isServableBlock(block)) return RpcCallResult.unavailable("block not servable")
+        if (to != null && to.size != 20) return RpcCallResult.unavailable("malformed to")
+        if (from != null && from.size != 20) return RpcCallResult.unavailable("malformed from")
+        val handle = handleProvider() ?: return RpcCallResult.unavailable("engine not running")
+        val json =
+            if (stateOverridesJson.isNullOrEmpty()) {
+                RustEngine.ethCallJson(
+                    handle,
+                    from?.let(::hex) ?: "",
+                    to?.let(::hex) ?: "",
+                    if (data.isEmpty()) "" else hex(data),
+                    valueWei ?: "",
+                    block,
+                )
+            } else {
+                RustEngine.ethCallOverridesJson(
+                    handle,
+                    from?.let(::hex) ?: "",
+                    to?.let(::hex) ?: "",
+                    if (data.isEmpty()) "" else hex(data),
+                    valueWei ?: "",
+                    block,
+                    stateOverridesJson,
+                )
+            }
+        val o = resultOrNull(json) ?: return RpcCallResult.unavailable("engine error")
+        return when (o.engineString("status")) {
+            // A revert is a VERIFIED chain answer — the router serves it as the
+            // standard code-3 execution-reverted error with the payload attached.
+            "ok" -> RpcCallResult.ok(hexToBytes(o.engineString("resultHex")) ?: ByteArray(0))
+            "revert" -> RpcCallResult.reverted(hexToBytes(o.engineString("dataHex")) ?: ByteArray(0))
+            else -> RpcCallResult.unavailable(o.engineString("reason"))
+        }
     }
 
     override fun supportsStateOverrides(): Boolean = true   // the revm executor applies them

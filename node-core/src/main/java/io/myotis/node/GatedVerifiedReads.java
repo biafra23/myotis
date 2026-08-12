@@ -76,6 +76,17 @@ final class GatedVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public io.myotis.api.CallResult callDetailed(byte[] from, byte[] to, byte[] data,
+                                                 String valueWei, String block,
+                                                 String stateOverridesJson) {
+        io.myotis.api.CallResult r =
+                guarded(d -> d.callDetailed(from, to, data, valueWei, block, stateOverridesJson));
+        // guarded() returns null when no backend is available (paused / torn down)
+        // — that is the retryable case, not a revert.
+        return r != null ? r : io.myotis.api.CallResult.unavailable("stack not ready");
+    }
+
+    @Override
     public String getBalance(byte[] address, String block) {
         return guarded(d -> d.getBalance(address, block));
     }

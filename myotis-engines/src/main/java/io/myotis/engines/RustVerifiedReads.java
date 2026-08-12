@@ -210,7 +210,7 @@ final class RustVerifiedReads implements VerifiedReads {
         try {
             // 'from' empty → anonymous zero sender; the revm executor runs the call
             // over verified state and returns the result bytes (or null on a revert /
-            // unverifiable outcome, matching the reference engine).
+            // unverifiable outcome — callDetailed carries the revert payload).
             return handle.ethCallVerified(
                     from == null ? "" : toHex(from),
                     to == null ? "" : toHex(to),
@@ -220,6 +220,29 @@ final class RustVerifiedReads implements VerifiedReads {
         } catch (RuntimeException e) {
             log.debug("[engines] verified eth_call unavailable: {}", e.getMessage());
             return null;
+        }
+    }
+
+    @Override
+    public io.myotis.api.CallResult callDetailed(byte[] from, byte[] to, byte[] data,
+                                                 String valueWei, String block,
+                                                 String stateOverridesJson) {
+        // Same guards as call()/callWithOverrides(); all are "cannot answer", not reverts.
+        if (!isServableBlock(block)) return io.myotis.api.CallResult.unavailable("block not servable");
+        if (to != null && to.length != 20) return io.myotis.api.CallResult.unavailable("malformed to");
+        if (from != null && from.length != 20) return io.myotis.api.CallResult.unavailable("malformed from");
+        try {
+            String fromHex = from == null ? "" : toHex(from);
+            String toHex20 = to == null ? "" : toHex(to);
+            String dataHex = data == null ? "" : toHex(data);
+            String value = valueWei == null ? "" : valueWei;
+            return (stateOverridesJson == null || stateOverridesJson.isEmpty())
+                    ? handle.ethCallVerifiedDetailed(fromHex, toHex20, dataHex, value, block)
+                    : handle.ethCallVerifiedDetailedWithOverrides(
+                            fromHex, toHex20, dataHex, value, block, stateOverridesJson);
+        } catch (RuntimeException e) {
+            log.debug("[engines] verified eth_call (detailed) unavailable: {}", e.getMessage());
+            return io.myotis.api.CallResult.unavailable(e.getMessage());
         }
     }
 

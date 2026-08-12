@@ -250,6 +250,10 @@ class RpcRouter(
             val label =
                 if (takesOverrides(method) && stateOverrideJson(root) != null) "SIMULATED"
                 else "VERIFIED"
+            // NB a code-3 REVERT response counts here too, deliberately: the
+            // revert is a verified (or simulated) ANSWER, not a failure to
+            // answer — coverage tracks "could we serve this", not "did the
+            // contract say yes".
             logger.record(method!!, idStr, label, elapsedMs(t0))
             return verified
         }
@@ -270,9 +274,11 @@ class RpcRouter(
             // applied here: an unsupported KIND (blockOverrides, estimateGas), or
             // a backend that cannot apply overrides at all. A capable backend
             // that returned null did so for an ordinary reason — not synced, no
-            // peer, out-of-window block, a plain revert — and those are
+            // peer, out-of-window block — and those are
             // transient, so they must fall through to the retryable -32000
-            // below. Getting this wrong tells a wallet to stop asking and pin
+            // below. (A contract REVERT is neither: it is a verified answer,
+            // served as code 3 by the eth_call handler and never reaching
+            // here.) Getting this wrong tells a wallet to stop asking and pin
             // its public-node fallback for the session, which is the behaviour
             // #314 exists to remove.
             // NOTE the outer guard: only a request that actually CARRIES an
@@ -435,14 +441,25 @@ class RpcRouter(
                 } else null
                 val block = p.blockTag(1)
                 // VerifiedReads takes wei as a decimal string (FFI-neutral boundary).
-                val out = withContext(rpcIoDispatcher) {
-                    if (overrideJson != null) {
-                        b.callWithOverrides(from, to, data, value, block, overrideJson)
-                    } else {
-                        b.call(from, to, data, value, block)
-                    }
-                } ?: return null
-                resultEnvelope(id, JsonPrimitive(hexData(out)))
+                val outcome = withContext(rpcIoDispatcher) {
+                    b.callDetailed(from, to, data, value, block, overrideJson)
+                }
+                when (outcome.kind) {
+                    RpcCallResult.Kind.OK ->
+                        resultEnvelope(id, JsonPrimitive(hexData(outcome.data ?: ByteArray(0))))
+                    // A revert is a VERIFIED chain answer (the contract said no),
+                    // not a failure to answer: return the standard shape wallets
+                    // parse — geth's code 3 with the raw revert payload attached.
+                    // Falling through to -32000 here made clients treat a normal
+                    // negative answer (e.g. an ERC-165 probe on a plain ERC-20)
+                    // as a node outage — MetaMask's token-standard detection then
+                    // aborts and its confirmation screen never renders.
+                    RpcCallResult.Kind.REVERTED ->
+                        revertEnvelope(id, outcome.data ?: ByteArray(0))
+                    // No verified answer right now — fall through to the strict
+                    // retryable -32000 (or the dev proxy), exactly as before.
+                    RpcCallResult.Kind.UNAVAILABLE -> return null
+                }
             }
             "eth_getBalance" -> {
                 val p = root.params()
@@ -866,4 +883,68 @@ class RpcRouter(
                 put("message", JsonPrimitive(message))
             })
         })
+
+    /**
+     * The standard execution-reverted error (geth's shape, what ethers/viem/
+     * MetaMask parse): code 3, `data` = the raw revert payload, and the message
+     * suffixed with the decoded `Error(string)` reason when one is present.
+     */
+    private fun revertEnvelope(id: JsonElement, revertData: ByteArray): String =
+        json.encodeToString(JsonObject.serializer(), buildJsonObject {
+            put("jsonrpc", JsonPrimitive("2.0"))
+            put("id", id)
+            put("error", buildJsonObject {
+                put("code", JsonPrimitive(3))
+                val reason = decodeRevertReason(revertData)
+                put("message", JsonPrimitive(
+                    if (reason != null) "execution reverted: $reason" else "execution reverted"))
+                put("data", JsonPrimitive(hexData(revertData)))
+            })
+        })
+
+    /**
+     * Best-effort human reason from a revert payload: the Solidity
+     * `Error(string)` shape (selector 0x08c379a0 + ABI-encoded string) and
+     * `Panic(uint256)` (0x4e487b71). Anything else — custom errors, empty data —
+     * decodes to null and the message stays the bare "execution reverted"; the
+     * raw payload is always in `data` for the client to decode itself.
+     */
+    private fun decodeRevertReason(d: ByteArray): String? {
+        // A full 32-byte ABI word as a Long — null unless the high 24 bytes are
+        // zero, so an invalid-ABI payload (which canonical decoders reject)
+        // never decodes to a plausible reason here that disagrees with the
+        // wallet's own decode of `data`.
+        fun word(b: ByteArray, wordStart: Int): Long? {
+            for (i in wordStart until wordStart + 24) if (b[i] != 0.toByte()) return null
+            var v = 0L
+            for (i in wordStart + 24 until wordStart + 32) v = (v shl 8) or (b[i].toLong() and 0xff)
+            return v
+        }
+        if (d.size >= 4 + 32 && d[0] == 0x4e.toByte() && d[1] == 0x48.toByte() &&
+            d[2] == 0x7b.toByte() && d[3] == 0x71.toByte()
+        ) {
+            val code = word(d, 4) ?: return null
+            return "panic 0x" + code.toULong().toString(16)
+        }
+        if (d.size < 4 + 64) return null
+        if (d[0] != 0x08.toByte() || d[1] != 0xc3.toByte() ||
+            d[2] != 0x79.toByte() || d[3] != 0xa0.toByte()
+        ) {
+            return null
+        }
+        // 4-byte selector ‖ offset(32) ‖ len(32) ‖ bytes. Bounds are attacker-
+        // controlled: validate every step and give up (null) on anything odd.
+        val off = word(d, 4) ?: return null
+        if (off < 0 || off > d.size.toLong()) return null
+        val lenPos = 4 + off.toInt()
+        if (lenPos + 32 > d.size) return null
+        val len = word(d, lenPos) ?: return null
+        if (len < 0 || len > 1024 || lenPos + 32 + len > d.size) return null
+        val bytes = d.copyOfRange(lenPos + 32, lenPos + 32 + len.toInt())
+        val s = bytes.decodeToString()
+        // The reason is attacker-authored display text: keep it printable ASCII so
+        // it can neither forge log lines (\n) nor visually spoof UIs (RTL override,
+        // line separators). The raw bytes are always in `data` for exact decoding.
+        return s.map { if (it.code in 32..126) it else ' ' }.joinToString("")
+    }
 }

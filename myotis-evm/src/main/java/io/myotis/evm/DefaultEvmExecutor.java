@@ -182,8 +182,9 @@ public final class DefaultEvmExecutor implements EvmExecutor {
         }
         String detail = "halt=" + halt.map(ExceptionalHaltReason::name).orElse("UNKNOWN")
                 + " state=" + frame.getState();
-        throw new EvmExecutionException(
-                new EvmExecutionError.Reverted(detail.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        // Halted, NOT Reverted: there is no chain-produced payload here, and hosts
+        // serve Reverted's bytes verbatim as JSON-RPC revert data.
+        throw new EvmExecutionException(new EvmExecutionError.Halted(detail));
     }
 
     /** EIP-7702 delegation designator prefix: an EOA whose code is
@@ -333,7 +334,7 @@ public final class DefaultEvmExecutor implements EvmExecutor {
                     new EvmExecutionError.Reverted(frame.getRevertReason().get().toArrayUnsafe()));
         }
         // Halt without an explicit revert payload: map the halt reason to
-        // OutOfGas where applicable, otherwise surface a Reverted with a
+        // OutOfGas where applicable, otherwise surface a Halted with a
         // human-readable detail so the failure isn't opaque.
         var halt = frame.getExceptionalHaltReason();
         if (halt.isPresent() && halt.get() == ExceptionalHaltReason.INSUFFICIENT_GAS) {
@@ -341,8 +342,9 @@ public final class DefaultEvmExecutor implements EvmExecutor {
         }
         String detail = "halt=" + halt.map(ExceptionalHaltReason::name).orElse("UNKNOWN")
                 + " state=" + frame.getState();
-        throw new EvmExecutionException(
-                new EvmExecutionError.Reverted(detail.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        // Halted, NOT Reverted: there is no chain-produced payload here, and hosts
+        // serve Reverted's bytes verbatim as JSON-RPC revert data.
+        throw new EvmExecutionException(new EvmExecutionError.Halted(detail));
     }
 
     /** Accessors used by {@code PrefetchingEvmExecutor} to share configuration. */
