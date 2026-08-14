@@ -670,12 +670,40 @@ impl LogIndex {
         self.serialize_with_clamp(tag, None)
     }
 
+    /// Export as a portable snapshot with the display names STRIPPED — the
+    /// generator's output path. Naming is the IMPORTING wallet's job (owner
+    /// decision, 2026-08-14), but the naming pass runs wherever an index is
+    /// enabled — a long-running generator daemon would otherwise bake its
+    /// own resolutions into the file and, since `set_name` fills only EMPTY
+    /// names, become authoritative for every importer. Blanked at write
+    /// time, never by cloning the (possibly GB-scale) store. `clamp` as in
+    /// [`Self::persist_clamped`] (None = unclamped, the zero-finality case).
+    pub fn export_unnamed(
+        &self,
+        tag: &ChainTag,
+        path: &Path,
+        clamp: Option<u64>,
+    ) -> std::io::Result<()> {
+        let tmp: PathBuf = path.with_extension(format!("tmp.{}", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&self.serialize_impl(tag, clamp, true))?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+    }
+
+    fn serialize_with_clamp(&self, tag: &ChainTag, clamp: Option<u64>) -> Vec<u8> {
+        self.serialize_impl(tag, clamp, false)
+    }
+
     /// The one serializer (always writes VERSION 2). `clamp` bounds what is
     /// written (see [`Self::serialize_clamped`]) and filters DURING the
     /// write: the tail keeps coverage above finality at all times, so a clamp
     /// that cloned the index would deep-copy the whole log store on every
-    /// checkpoint, under the index lock, on a 10s cadence.
-    fn serialize_with_clamp(&self, tag: &ChainTag, clamp: Option<u64>) -> Vec<u8> {
+    /// checkpoint, under the index lock, on a 10s cadence. `strip_names`
+    /// blanks the watch-table names (see [`Self::export_unnamed`]).
+    fn serialize_impl(&self, tag: &ChainTag, clamp: Option<u64>, strip_names: bool) -> Vec<u8> {
         let mut out = Vec::with_capacity(128 + self.logs.len() * 200);
         out.extend_from_slice(MAGIC);
         put_u32(&mut out, VERSION);
@@ -695,7 +723,7 @@ impl LogIndex {
             for t in &w.topic0s {
                 out.extend_from_slice(t);
             }
-            put_bytes(&mut out, w.name.as_bytes());
+            put_bytes(&mut out, if strip_names { b"" } else { w.name.as_bytes() });
         }
         // Coverage spans + cursor.
         put_u32(&mut out, self.coverage.len() as u32);
@@ -848,6 +876,23 @@ impl LogIndex {
     pub fn load_portable(path: &Path) -> Option<(ChainTag, Self)> {
         let data = std::fs::read(path).ok()?;
         Self::deserialize_portable(&data)
+    }
+
+    /// Does `path` hold a LEGACY (v1) snapshot? Distinguishes "not portable
+    /// because it predates the self-describing format" (real accumulated
+    /// coverage — refuse to overwrite it) from "not portable because it's
+    /// corrupt" (dead bytes — safe to replace). Only the frame header is
+    /// read.
+    pub fn is_legacy_snapshot(path: &Path) -> bool {
+        let mut header = [0u8; 8];
+        let Ok(mut f) = std::fs::File::open(path) else {
+            return false;
+        };
+        use std::io::Read as _;
+        if f.read_exact(&mut header).is_err() {
+            return false;
+        }
+        header[..4] == *MAGIC && u32::from_le_bytes([header[4], header[5], header[6], header[7]]) == VERSION_LEGACY
     }
 
     /// Atomic best-effort persist: temp file (pid-suffixed) + rename, the
@@ -1635,6 +1680,52 @@ mod tests {
         assert_eq!(back.coverage_of(&addr(1)).unwrap().span, Some((199, 200)));
         assert_eq!(back.cursor, Some((199, [9; 32])));
         assert_eq!(back.log_count(), 1);
+    }
+
+    #[test]
+    fn export_unnamed_strips_names_and_keeps_everything_else() {
+        let dir = std::env::temp_dir().join(format!("logindex-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("export.db");
+        let mut named = watch_all(addr(1), 100);
+        named.name = "generator-resolved.eth".to_string();
+        let mut ix = LogIndex::new(config(vec![named])).unwrap();
+        ix.append_block(200, [0xbb; 32], vec![log(200, 0, addr(1), vec![])]).unwrap();
+        ix.export_unnamed(&tag(), &path, None).unwrap();
+        let (t, back) = LogIndex::load_portable(&path).expect("portable");
+        assert_eq!(t, tag());
+        // The name did NOT travel — the importing wallet resolves its own —
+        // but coverage, logs and from_block all did.
+        assert!(back.config().watch[0].name.is_empty());
+        assert_eq!(back.config().watch[0].from_block, 100);
+        assert_eq!(back.coverage_of(&addr(1)).unwrap().span, Some((200, 200)));
+        assert_eq!(back.log_count(), 1);
+        // The clamp behaves like every checkpoint's.
+        ix.append_block(201, [0xbc; 32], vec![]).unwrap();
+        ix.export_unnamed(&tag(), &path, Some(200)).unwrap();
+        let (_, clamped) = LogIndex::load_portable(&path).unwrap();
+        assert_eq!(clamped.coverage_of(&addr(1)).unwrap().span, Some((200, 200)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_legacy_snapshot_detects_only_v1_frames() {
+        let dir = std::env::temp_dir().join(format!("logindex-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = config(vec![watch_all(addr(1), 0)]);
+        let mut ix = LogIndex::new(cfg).unwrap();
+        ix.append_block(5, [5; 32], vec![]).unwrap();
+        let v1 = dir.join("v1.db");
+        std::fs::write(&v1, serialize_v1(&ix)).unwrap();
+        assert!(LogIndex::is_legacy_snapshot(&v1));
+        let v2 = dir.join("v2.db");
+        ix.persist(&tag(), &v2).unwrap();
+        assert!(!LogIndex::is_legacy_snapshot(&v2));
+        let junk = dir.join("junk.db");
+        std::fs::write(&junk, b"nonsense").unwrap();
+        assert!(!LogIndex::is_legacy_snapshot(&junk));
+        assert!(!LogIndex::is_legacy_snapshot(&dir.join("absent.db")));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

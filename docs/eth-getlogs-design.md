@@ -192,7 +192,9 @@ router/API changes in this design already accommodate it.
 6. Generic build / import / export — DONE (2026-08-14), see §Import below.
 7. Follow-ups (separate): Unchained-Index-assisted discovery, JVM twin,
    `watch`-channel head notifications, EIP-7745 alignment, per-entry
-   frontiers (see §Import, canonical-shape note).
+   frontiers (see §Import, canonical-shape note), snapshot provenance
+   (imported-coverage marker / signed snapshots) and an explicit
+   unsubscribe surface (see §Import, trust notes).
 
 ## Import: generic build, portable snapshots, merge (v2 format)
 
@@ -221,7 +223,7 @@ below); the generator has no naming duties. `--from` is a trust assertion:
 real deployment silently hides events; undershooting (the default 0) only
 walks further.
 
-**Import** (`import_log_index_files`, ABI v23): hosts pick snapshot files
+**Import** (`import_log_index_files`, ABI v24): hosts pick snapshot files
 (desktop AWT dialog / Android SAF / iOS document picker; the daemon has
 `import-logindex <file>…` plus the zero-effort drop-in — a portable file at
 `dataDir/logindex[-net].db` activates itself at start). The engine merges
@@ -229,7 +231,14 @@ all-or-nothing with its current index and starts catch-up immediately for
 every imported address via the existing walker/bridge/appender. Trust: an
 imported file is data CLAIMED VERIFIED by whoever generated it — the same
 standing as the node's own snapshot — so import is a deliberate user act on
-the hosts, never something fetched.
+the hosts, never something fetched. Two properties to state plainly
+(review, 2026-08-14): served logs do not distinguish locally-verified from
+imported coverage (a provenance marker in the status JSON, or a signed
+snapshot format, is tracked follow-up hardening); and subscriptions are
+currently ADD-ONLY — config pushes union and imports merge, so an address
+can only leave the index via a topic-conflict replace or a cache wipe. An
+explicit unsubscribe/replace surface is follow-up work; until then, note
+that an imported subscription is sticky.
 
 **Merge rules** (`LogIndex::merge`): watch union (same address requires equal
 topic0 sets — a span's meaning includes the restriction it was indexed under;

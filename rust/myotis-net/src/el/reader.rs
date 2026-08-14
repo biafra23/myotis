@@ -1020,20 +1020,20 @@ impl ElReader {
     /// (optimistic coverage is only verifiable against this run's tail
     /// record); the v2 frame carries the watch-table + chain tag, so the file
     /// imports anywhere on the same chain. Partial coverage exports honestly
-    /// — the importer's catch-up finishes the walk.
+    /// — the importer's catch-up finishes the walk. Display names are
+    /// STRIPPED from the export: naming is the importing wallet's job, and
+    /// the naming pass runs wherever an index is enabled — a long-running
+    /// generator daemon must not bake its own resolutions into a file whose
+    /// importers would then never re-resolve (`set_name` fills only empty
+    /// names).
     pub fn export_log_index(&self, path: &std::path::Path) -> Result<(), String> {
         let tag = self.chain_tag();
         let finalized = self.finalized_block_number();
         match self.log_index.lock() {
             Ok(slot) => match slot.as_ref() {
-                Some(ix) => {
-                    let r = if finalized == 0 {
-                        ix.persist(&tag, path)
-                    } else {
-                        ix.persist_clamped(&tag, path, finalized)
-                    };
-                    r.map_err(|e| format!("could not write {}: {e}", path.display()))
-                }
+                Some(ix) => ix
+                    .export_unnamed(&tag, path, (finalized > 0).then_some(finalized))
+                    .map_err(|e| format!("could not write {}: {e}", path.display())),
                 None => Err("no log index is configured".to_string()),
             },
             Err(_) => Err("log index unavailable".to_string()),
@@ -1081,13 +1081,55 @@ impl ElReader {
         // Checkpoint the live index (finality-clamped, v2) and merge THROUGH
         // THE FILE rather than cloning the live store: the store is fully
         // resident and can be GBs — a clone would double it under the lock.
-        self.persist_log_index(self.finalized_block_number());
+        // STRICTLY, unlike the periodic best-effort checkpoints: a swallowed
+        // write failure here would merge from a stale file, install the
+        // result, and silently drop the live index's recent coverage — on
+        // the one path whose contract says nothing changes on failure.
+        {
+            let finalized = self.finalized_block_number();
+            let Ok(slot) = self.log_index.lock() else {
+                return Err("log index unavailable".to_string());
+            };
+            if let Some(ix) = slot.as_ref() {
+                let r = if finalized == 0 {
+                    ix.persist(&tag, &own_path)
+                } else {
+                    ix.persist_clamped(&tag, &own_path, finalized)
+                };
+                r.map_err(|e| {
+                    format!("could not checkpoint the current index before merging: {e}")
+                })?;
+            }
+        }
         let max_speed = self.with_log_index(|ix| ix.config().max_speed).unwrap_or(false);
         if own_path.exists() {
-            if let Some((t, ix)) = crate::el::logindex::LogIndex::load_portable(&own_path) {
-                if t == tag {
-                    sources.push((t, ix));
+            match crate::el::logindex::LogIndex::load_portable(&own_path) {
+                Some((t, ix)) if t == tag => sources.push((t, ix)),
+                Some(_) => {
+                    // A file for another chain at OUR canonical path — never
+                    // merge it, never overwrite it: someone put it there.
+                    return Err(format!(
+                        "{}: existing snapshot belongs to another chain; refusing to touch it",
+                        own_path.display()
+                    ));
                 }
+                // A legacy v1 checkpoint that nothing upgraded yet (no
+                // config push this run — the drop-in path skips v1, so
+                // the strict checkpoint above had nothing to write).
+                // Overwriting it would silently destroy its accumulated
+                // coverage; upgrading it needs the config only a push
+                // carries.
+                None if crate::el::logindex::LogIndex::is_legacy_snapshot(&own_path) => {
+                    return Err(format!(
+                        "{}: existing checkpoint predates the portable format (v1); \
+                         apply the log-index config once (host toggle / preset push) to \
+                         upgrade it, then re-import",
+                        own_path.display()
+                    ));
+                }
+                // Corrupt/unreadable: dead bytes — a load would discard them
+                // just the same; the merged result may replace them.
+                None => {}
             }
         }
         let (_, mut merged) =
@@ -1205,20 +1247,28 @@ impl ElReader {
         }));
     }
 
-    /// Best-effort ENS reverse naming for UNNAMED watch entries — the
-    /// imported-snapshot half of the naming story (the generator bakes names
-    /// at build time, but a file can arrive unnamed). Runs inside the
-    /// appender task so it dies with it at teardown (the Arc::try_unwrap
-    /// discipline). One address per tick, forward-verified engine-side
-    /// ([`EnsQuery::Reverse`]), and never gating indexing: an address whose
-    /// name cannot resolve just stays unnamed. Up to 3 attempts per address,
-    /// re-eligible every ~10 minutes — the first attempts often predate a
-    /// usable EVM state and must not be the last.
+    /// Best-effort ENS reverse naming for UNNAMED watch entries — imports
+    /// carry no names by design (the generator strips them; naming is the
+    /// importing wallet's job). Runs inside the appender task so it dies
+    /// with it at teardown (the Arc::try_unwrap discipline). Forward-verified
+    /// engine-side ([`EnsQuery::Reverse`]) and never gating indexing: an
+    /// address whose name cannot resolve just stays unnamed. Up to 3
+    /// attempts per address, re-eligible every ~10 minutes — the first
+    /// attempts often predate a usable EVM state and must not be the last.
+    ///
+    /// THROTTLED so cosmetics cannot starve indexing (this loop is also the
+    /// appender + backfill): one address per 5th tick (~30s cadence) and an
+    /// 8s bound per attempt — a cold resolution that needs longer just gets
+    /// retried once the EVM state is warm. Worst case the naming pass costs
+    /// the pipeline 8s in 30, instead of 30s per 6s tick.
     async fn log_index_name_tick(
         &self,
         attempts: &mut std::collections::HashMap<[u8; 20], (u8, u64)>,
         ticks: u64,
     ) {
+        if ticks % 5 != 0 {
+            return;
+        }
         if !self.with_log_index(|ix| ix.config().enabled).unwrap_or(false) {
             return;
         }
@@ -1247,10 +1297,10 @@ impl ElReader {
         entry.1 = ticks;
         // network_id == chain id on every hosted network (1 / 11155111 / 100).
         let chain_id = self.eth_cfg.network_id;
-        // Bounded well under the ENS API's own deadline: this shares the
+        // Tightly bounded (see the throttle note above): this shares the
         // appender loop, and a stalled resolution must not starve appends.
         let out = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(8),
             self.resolve_ens_query(EnsQuery::Reverse { address }, chain_id, EnsRootMode::Auto),
         )
         .await;

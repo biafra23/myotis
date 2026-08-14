@@ -321,18 +321,32 @@ public class CommandHandler {
         if (addresses.isEmpty() || addresses.size() != rawElements) {
             return jsonError("addresses must be a non-empty array of 0x-prefixed 20-byte hex addresses");
         }
+        // De-duplicate (case-insensitively — hex casing is display-only): a
+        // repeated address in a build command is harmless intent, but the
+        // engine's LogIndex::new rejects duplicate watch entries, and the
+        // resulting false would be misblamed on the engine choice below.
+        java.util.LinkedHashMap<String, String> unique = new java.util.LinkedHashMap<>();
+        for (String a : addresses) unique.putIfAbsent(a.toLowerCase(), a);
         StringBuilder watch = new StringBuilder();
-        for (int i = 0; i < addresses.size(); i++) {
-            if (i > 0) watch.append(',');
-            watch.append("{\"address\":\"").append(addresses.get(i))
+        StringBuilder building = new StringBuilder();
+        for (String a : unique.values()) {
+            if (watch.length() > 0) {
+                watch.append(',');
+                building.append(',');
+            }
+            watch.append("{\"address\":\"").append(a)
                  .append("\",\"fromBlock\":").append(fromBlock).append('}');
+            building.append('"').append(a).append('"');
         }
         String config = "{\"enabled\":true,\"maxSpeed\":true,\"watch\":[" + watch + "]}";
         if (!handle.setLogIndexConfig(config)) {
-            return jsonError("log index config rejected (is this daemon on the Rust engine? start with -Pengine=rust)");
+            // False has several causes; name them all rather than misdirect.
+            return jsonError("log index config rejected — not the Rust engine "
+                    + "(start with -Pengine=rust), engine not running, or the config "
+                    + "conflicts with the existing subscription's topic restrictions");
         }
-        return "{\"ok\":true,\"building\":" + addressesJson
-                + ",\"note\":\"poll logindex-status until complete, then export-logindex <path>\"}";
+        return "{\"ok\":true,\"building\":[" + building
+                + "],\"note\":\"poll logindex-status until complete, then export-logindex <path>\"}";
     }
 
     // -------------------------------------------------------------------------

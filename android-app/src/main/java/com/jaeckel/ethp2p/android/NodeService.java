@@ -306,7 +306,8 @@ public final class NodeService extends Service {
             return r;
         } catch (RuntimeException e) {
             String msg = e.getMessage() == null ? "import failed" : e.getMessage();
-            return "{\"error\":\"" + msg.replace("\\", "\\\\").replace("\"", "\\\"") + "\"}";
+            return "{\"error\":\"" + msg.replace("\\", "\\\\").replace("\"", "\\\"")
+                    .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t") + "\"}";
         }
     }
 
