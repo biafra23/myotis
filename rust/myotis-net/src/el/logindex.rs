@@ -344,6 +344,24 @@ impl LogIndex {
         &self.config
     }
 
+    /// Fill in a display name for a watched address IF it is still unnamed —
+    /// the post-import naming pass. Never overwrites: a name baked into a
+    /// snapshot (or pushed by a host) outranks a late lookup. Cosmetic only
+    /// (names are fingerprint-neutral); persists with the next checkpoint.
+    /// Returns whether anything changed.
+    pub fn set_name(&mut self, address: &[u8; 20], name: &str) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        match self.config.watch.iter_mut().find(|w| &w.address == address) {
+            Some(w) if w.name.is_empty() => {
+                w.name = name.to_string();
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn coverage_of(&self, address: &[u8; 20]) -> Option<Coverage> {
         self.config
             .watch
@@ -1649,6 +1667,21 @@ mod tests {
         // Same guards as ever: wrong fingerprint or truncation → None.
         assert!(LogIndex::deserialize(&config(vec![watch_all(addr(1), 101)]), &tag(), &v1).is_none());
         assert!(LogIndex::deserialize(&cfg, &tag(), &v1[..v1.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn set_name_fills_only_unnamed_entries() {
+        let mut named = watch_all(addr(1), 0);
+        named.name = "baked.eth".to_string();
+        let mut ix = LogIndex::new(config(vec![named, watch_all(addr(2), 0)])).unwrap();
+        // A baked-in name outranks a late lookup; empty names never install.
+        assert!(!ix.set_name(&addr(1), "late.eth"));
+        assert_eq!(ix.config().watch[0].name, "baked.eth");
+        assert!(!ix.set_name(&addr(2), ""));
+        assert!(ix.set_name(&addr(2), "resolved.eth"));
+        assert_eq!(ix.config().watch[1].name, "resolved.eth");
+        // Unknown address: no-op.
+        assert!(!ix.set_name(&addr(9), "nobody.eth"));
     }
 
     #[test]

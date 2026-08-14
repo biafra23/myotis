@@ -1105,6 +1105,8 @@ impl ElReader {
             let mut since_persist = 0u32;
             let mut ticks = 0u64;
             let mut backfill_ok = 0u64;
+            let mut name_attempts: std::collections::HashMap<[u8; 20], (u8, u64)> =
+                std::collections::HashMap::new();
             loop {
                 tick.tick().await;
                 let Some(reader) = weak.upgrade() else {
@@ -1122,9 +1124,75 @@ impl ElReader {
                     reader.log_index_append_tick(&mut since_persist, ticks).await;
                 }
                 reader.log_index_backfill_step(ticks, &mut backfill_ok).await;
+                reader.log_index_name_tick(&mut name_attempts, ticks).await;
                 ticks = ticks.wrapping_add(1);
             }
         }));
+    }
+
+    /// Best-effort ENS reverse naming for UNNAMED watch entries — the
+    /// imported-snapshot half of the naming story (the generator bakes names
+    /// at build time, but a file can arrive unnamed). Runs inside the
+    /// appender task so it dies with it at teardown (the Arc::try_unwrap
+    /// discipline). One address per tick, forward-verified engine-side
+    /// ([`EnsQuery::Reverse`]), and never gating indexing: an address whose
+    /// name cannot resolve just stays unnamed. Up to 3 attempts per address,
+    /// re-eligible every ~10 minutes — the first attempts often predate a
+    /// usable EVM state and must not be the last.
+    async fn log_index_name_tick(
+        &self,
+        attempts: &mut std::collections::HashMap<[u8; 20], (u8, u64)>,
+        ticks: u64,
+    ) {
+        if !self.with_log_index(|ix| ix.config().enabled).unwrap_or(false) {
+            return;
+        }
+        // Nothing can resolve before the anchor serves EVM reads at all.
+        if self.head_block_number().is_none() {
+            return;
+        }
+        let unnamed = self
+            .with_log_index(|ix| {
+                ix.config()
+                    .watch
+                    .iter()
+                    .filter(|w| w.name.is_empty())
+                    .map(|w| w.address)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let Some(address) = unnamed.into_iter().find(|a| match attempts.get(a) {
+            None => true,
+            Some((n, last)) => *n < 3 && ticks.saturating_sub(*last) >= 100,
+        }) else {
+            return;
+        };
+        let entry = attempts.entry(address).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 = ticks;
+        // network_id == chain id on every hosted network (1 / 11155111 / 100).
+        let chain_id = self.eth_cfg.network_id;
+        // Bounded well under the ENS API's own deadline: this shares the
+        // appender loop, and a stalled resolution must not starve appends.
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.resolve_ens_query(EnsQuery::Reverse { address }, chain_id, EnsRootMode::Auto),
+        )
+        .await;
+        if let Ok(Ok(EnsQueryOutcome::Value { value: EnsRecordValue::Name(name), .. })) = out {
+            if let Ok(mut slot) = self.log_index.lock() {
+                if let Some(ix) = slot.as_mut() {
+                    if ix.set_name(&address, &name) {
+                        tracing::info!(
+                            name = %name,
+                            "log index: named an imported watch entry via ENS reverse lookup"
+                        );
+                    }
+                }
+            }
+        }
+        // NoRecord / Offchain / errors: leave unnamed (attempt bookkeeping
+        // above bounds the churn).
     }
 
     /// One appender tick: record finalized blocks from the append edge up to
