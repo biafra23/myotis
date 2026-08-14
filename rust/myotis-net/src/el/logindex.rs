@@ -781,6 +781,209 @@ impl LogIndex {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Merge: combine self-describing snapshots (import). The output is CANONICAL —
+// every present span shares one global high and the cursor sits at the global
+// low — because that is the only shape the appender/walker pair can resume:
+// `append_block` demands each new block adjoin EVERY live entry's span, so
+// per-entry frontiers at different heights would wedge the appender on its
+// first tick. Canonicalization is what turns "import then catch up" into the
+// machinery that already exists (walker descends to the new lows, bridge +
+// appender close the top) instead of new per-entry reconciliation code.
+// ---------------------------------------------------------------------------
+
+/// Why a set of snapshots cannot be merged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeError {
+    /// No sources given.
+    Empty,
+    /// A source belongs to another network. Merging it would key logs of a
+    /// foreign chain into this chain's block numbers — fabricated coverage.
+    ChainMismatch { expected: ChainTag, got: ChainTag },
+    /// Two sources watch the same address under DIFFERENT topic0 sets. A
+    /// coverage span's meaning includes the topic restriction it was indexed
+    /// under; unioning restrictions would claim logs nobody stored. Refused
+    /// rather than resolved — re-generate one source with matching topics.
+    TopicConflict([u8; 20]),
+}
+
+impl LogIndex {
+    /// Merge portable snapshots (all of one chain) into a single canonical
+    /// index. Rules:
+    ///
+    /// - watch union — same address requires equal topic0 sets
+    ///   ([`MergeError::TopicConflict`]); `from_block` = min (undershooting
+    ///   cannot lie); name = first non-empty in input order.
+    /// - sources that contribute nothing (no new address, no lower
+    ///   `from_block`, no coverage extension) are dropped FIRST, so a stale
+    ///   re-import cannot drag the global high back in time.
+    /// - coverage: global high `H` = min over contributing sources' own
+    ///   highs; every span is clamped to `H` (one whose low is above `H`
+    ///   vanishes — its blocks re-index later) and unioned per address. With
+    ///   canonical inputs every surviving span contains `H`, so the union is
+    ///   contiguous and single-span coverage suffices. The band above `H` is
+    ///   re-covered by the existing bridge/appender — re-fetched, never
+    ///   trusted from the staler file.
+    /// - logs: kept iff inside the merged span of their address's entry —
+    ///   anything else is unreachable by the coverage-honest query anyway.
+    /// - cursor: the lowest source cursor (the deepest verified trust edge).
+    ///
+    /// Non-canonical inputs (hand-crafted files) degrade safely: a span that
+    /// cannot share `H` goes dormant (None — re-indexed), a cursor above some
+    /// span's low is dropped (the appender re-seeds it).
+    ///
+    /// The output's `enabled`/`max_speed` are false: runtime bits the
+    /// installing host decides, never file content.
+    pub fn merge(sources: Vec<(ChainTag, LogIndex)>) -> Result<(ChainTag, LogIndex), MergeError> {
+        let Some(expected) = sources.first().map(|(t, _)| *t) else {
+            return Err(MergeError::Empty);
+        };
+        if let Some((got, _)) = sources.iter().find(|(t, _)| *t != expected) {
+            return Err(MergeError::ChainMismatch { expected, got: *got });
+        }
+        let mut sources: Vec<LogIndex> = sources.into_iter().map(|(_, ix)| ix).collect();
+        // Topic conflicts are structural — check before any pruning so a
+        // conflicting pair is refused even when one side would be pruned.
+        for (i, a) in sources.iter().enumerate() {
+            for b in sources.iter().skip(i + 1) {
+                for wa in &a.config.watch {
+                    if let Some(wb) = b.config.watch.iter().find(|w| w.address == wa.address) {
+                        let mut ta = wa.topic0s.clone();
+                        let mut tb = wb.topic0s.clone();
+                        ta.sort_unstable();
+                        tb.sort_unstable();
+                        if ta != tb {
+                            return Err(MergeError::TopicConflict(wa.address));
+                        }
+                    }
+                }
+            }
+        }
+        // Drop redundant sources: everything they declare and cover is
+        // already declared and covered (at least as deeply) by the rest.
+        loop {
+            let redundant = (0..sources.len()).find(|&i| {
+                sources.len() > 1 && {
+                    let rest: Vec<&LogIndex> = sources
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, _)| *j != i)
+                        .map(|(_, s)| s)
+                        .collect();
+                    sources[i].config.watch.iter().all(|w| {
+                        rest.iter().any(|r| {
+                            r.config.watch.iter().zip(r.coverage.iter()).any(|(rw, rc)| {
+                                rw.address == w.address
+                                    && rw.from_block <= w.from_block
+                                    && match sources[i].coverage_of(&w.address).and_then(|c| c.span) {
+                                        None => true,
+                                        Some((low, high)) => matches!(
+                                            rc.span,
+                                            Some((rl, rh)) if rl <= low && high <= rh
+                                        ),
+                                    }
+                            })
+                        })
+                    })
+                }
+            });
+            match redundant {
+                Some(i) => {
+                    sources.remove(i);
+                }
+                None => break,
+            }
+        }
+        // Union the watch-lists (config order: first source first).
+        let mut watch: Vec<WatchEntry> = Vec::new();
+        for s in &sources {
+            for w in &s.config.watch {
+                match watch.iter_mut().find(|m| m.address == w.address) {
+                    Some(m) => {
+                        m.from_block = m.from_block.min(w.from_block);
+                        if m.name.is_empty() && !w.name.is_empty() {
+                            m.name = w.name.clone();
+                        }
+                    }
+                    None => watch.push(w.clone()),
+                }
+            }
+        }
+        // Global high H: the minimum of the contributing sources' own highs.
+        // A source without any coverage contributes config only and does not
+        // constrain H.
+        let h = sources
+            .iter()
+            .filter_map(|s| s.coverage.iter().filter_map(|c| c.span.map(|(_, hi)| hi)).max())
+            .min();
+        // Per entry: clamp every source span to H, union what overlaps or
+        // adjoins, and if disjoint pieces survive (non-canonical inputs only)
+        // keep the lowest — deployment-anchored history is the part a
+        // cold-syncing wallet cannot rebuild from the head.
+        let coverage: Vec<Coverage> = watch
+            .iter()
+            .map(|w| {
+                let mut pieces: Vec<(u64, u64)> = sources
+                    .iter()
+                    .filter_map(|s| s.coverage_of(&w.address).and_then(|c| c.span))
+                    .filter_map(|(low, high)| {
+                        let h = h.expect("a span exists, so H exists");
+                        (low <= h).then_some((low, high.min(h)))
+                    })
+                    .collect();
+                pieces.sort_unstable();
+                let merged = pieces.into_iter().fold(Vec::<(u64, u64)>::new(), |mut acc, p| {
+                    match acc.last_mut() {
+                        Some(last) if p.0 <= last.1.saturating_add(1) => last.1 = last.1.max(p.1),
+                        _ => acc.push(p),
+                    }
+                    acc
+                });
+                Coverage { span: merged.first().copied() }
+            })
+            .collect();
+        // Canonical output invariant: every present span ends at the same
+        // high. A piece that cannot (non-canonical input) goes dormant.
+        let out_high = coverage.iter().filter_map(|c| c.span.map(|(_, hi)| hi)).max();
+        let coverage: Vec<Coverage> = coverage
+            .into_iter()
+            .map(|c| Coverage { span: c.span.filter(|(_, hi)| Some(*hi) == out_high) })
+            .collect();
+        // Cursor: the deepest verified trust edge — canonical inputs put it
+        // at the merged global low. If it sits above some span's low (weird
+        // input), drop it: the appender re-seeds, the walker re-descends.
+        let cursor = sources
+            .iter()
+            .filter_map(|s| s.cursor)
+            .min_by_key(|(n, _)| *n)
+            .filter(|(n, _)| {
+                coverage.iter().all(|c| match c.span {
+                    Some((low, _)) => *n <= low,
+                    None => true,
+                })
+            });
+        // Logs: only what the merged coverage can actually serve.
+        let mut logs = BTreeMap::new();
+        for s in &mut sources {
+            let taken = std::mem::take(&mut s.logs);
+            for (key, log) in taken {
+                let served = watch
+                    .iter()
+                    .zip(coverage.iter())
+                    .find(|(w, _)| w.address == log.address)
+                    .is_some_and(|(_, c)| c.contains(log.block_number, log.block_number));
+                if served {
+                    logs.insert(key, log);
+                }
+            }
+        }
+        let config = LogIndexConfig { enabled: false, max_speed: false, watch };
+        // Duplicates are impossible post-union; new() also re-validates.
+        let ix = Self::new(config).expect("union has unique addresses");
+        Ok((expected, Self { coverage, logs, cursor, ..ix }))
+    }
+}
+
 /// A fully parsed v2 frame (tag + fingerprint + watch-table + body), before
 /// any policy decision about configs or tags.
 struct ParsedV2 {
@@ -1361,6 +1564,169 @@ mod tests {
         // Same guards as ever: wrong fingerprint or truncation → None.
         assert!(LogIndex::deserialize(&config(vec![watch_all(addr(1), 101)]), &tag(), &v1).is_none());
         assert!(LogIndex::deserialize(&cfg, &tag(), &v1[..v1.len() - 1]).is_none());
+    }
+
+    /// Build a canonical index over `cfg` covering `low..=high` (appender
+    /// seed at the top, walker descent to the bottom — cursor ends at `low`),
+    /// with `logs` inserted at their blocks along the way.
+    fn span_ix(cfg: LogIndexConfig, low: u64, high: u64, logs: Vec<StoredLog>) -> LogIndex {
+        let mut ix = LogIndex::new(cfg).unwrap();
+        let at = |b: u64| logs.iter().filter(|l| l.block_number == b).cloned().collect::<Vec<_>>();
+        ix.append_block(high, [high as u8; 32], at(high)).unwrap();
+        for b in (low..high).rev() {
+            ix.backfill_block(b, [b as u8; 32], at(b)).unwrap();
+        }
+        ix
+    }
+
+    #[test]
+    fn merge_unions_addresses_and_clamps_to_the_min_high() {
+        // A: tornado history, generated earlier (high 300). B: railgun,
+        // generated later (high 500). The union must not claim (300, 500]
+        // for A's address — that band re-indexes via the bridge.
+        let a = span_ix(config(vec![watch_all(addr(1), 100)]), 100, 300, vec![log(200, 0, addr(1), vec![])]);
+        let b = span_ix(config(vec![watch_all(addr(2), 400)]), 400, 500, vec![log(450, 0, addr(2), vec![])]);
+        let (t, m) = LogIndex::merge(vec![(tag(), a), (tag(), b)]).unwrap();
+        assert_eq!(t, tag());
+        assert_eq!(m.coverage_of(&addr(1)).unwrap().span, Some((100, 300)));
+        // B's span lies entirely above H=300 → dormant, its log dropped
+        // (unreachable by the coverage-honest query anyway).
+        assert_eq!(m.coverage_of(&addr(2)).unwrap().span, None);
+        assert_eq!(m.log_count(), 1);
+        // Config is the union; runtime bits are the installer's.
+        assert_eq!(m.config().watch.len(), 2);
+        assert!(!m.config().enabled);
+        // Cursor: the deepest trust edge.
+        assert_eq!(m.cursor, Some((100, [100; 32])));
+    }
+
+    #[test]
+    fn merge_same_address_unions_overlapping_spans() {
+        let a = span_ix(config(vec![watch_all(addr(1), 50)]), 50, 200, vec![log(60, 0, addr(1), vec![])]);
+        let b = span_ix(config(vec![watch_all(addr(1), 50)]), 150, 260, vec![log(250, 0, addr(1), vec![])]);
+        let (_, mut m) = LogIndex::merge(vec![(tag(), a), (tag(), b)]).unwrap();
+        // H = min(200, 260) = 200; spans [50,200] ∪ [150,200] = [50,200].
+        assert_eq!(m.coverage_of(&addr(1)).unwrap().span, Some((50, 200)));
+        // B's log at 250 is above the merged span → dropped; A's at 60 kept.
+        assert_eq!(m.log_count(), 1);
+        m.set_enabled(true); // the installer's decision, made here for the query
+        assert_eq!(m.query(&filter(50, 200, addr(1))).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merge_same_address_disjoint_spans_keep_the_lower() {
+        // A reaches only [50,120]; B covers [300,400]. H = 120 makes B's
+        // piece vanish — the deployment-anchored lower history survives and
+        // catch-up re-indexes upward from 120.
+        let a = span_ix(config(vec![watch_all(addr(1), 50)]), 50, 120, vec![log(70, 0, addr(1), vec![])]);
+        let b = span_ix(config(vec![watch_all(addr(1), 50)]), 300, 400, vec![log(350, 0, addr(1), vec![])]);
+        let (_, mut m) = LogIndex::merge(vec![(tag(), a), (tag(), b)]).unwrap();
+        assert_eq!(m.coverage_of(&addr(1)).unwrap().span, Some((50, 120)));
+        assert_eq!(m.log_count(), 1);
+        m.set_enabled(true); // the installer's decision, made here for the query
+        assert!(matches!(m.query(&filter(300, 400, addr(1))), Err(QueryError::OutOfCoverage { .. })));
+    }
+
+    #[test]
+    fn merge_refuses_other_chains_and_topic_conflicts() {
+        let a = span_ix(config(vec![watch_all(addr(1), 50)]), 50, 100, vec![]);
+        let b = span_ix(config(vec![watch_all(addr(2), 50)]), 50, 100, vec![]);
+        let sepolia = ChainTag { network_id: 11_155_111, genesis_hash: [0x25; 32] };
+        assert!(matches!(
+            LogIndex::merge(vec![(tag(), a), (sepolia, b)]),
+            Err(MergeError::ChainMismatch { .. })
+        ));
+        assert!(matches!(LogIndex::merge(vec![]), Err(MergeError::Empty)));
+        // Same address under different topic restrictions: a span's meaning
+        // includes what it indexed — refuse, never widen.
+        let all = span_ix(config(vec![watch_all(addr(1), 50)]), 50, 100, vec![]);
+        let restricted = span_ix(
+            config(vec![WatchEntry { address: addr(1), from_block: 50, topic0s: vec![topic(7)], name: String::new() }]),
+            50,
+            100,
+            vec![],
+        );
+        assert!(matches!(
+            LogIndex::merge(vec![(tag(), all), (tag(), restricted)]),
+            Err(MergeError::TopicConflict(a)) if a == addr(1)
+        ));
+    }
+
+    #[test]
+    fn merge_takes_min_from_block_and_first_nonempty_name() {
+        let mut named = watch_all(addr(1), 200);
+        named.name = "tornado.registry.eth".to_string();
+        let a = span_ix(config(vec![watch_all(addr(1), 400)]), 400, 500, vec![]);
+        let b = span_ix(config(vec![named]), 400, 500, vec![]);
+        let (_, m) = LogIndex::merge(vec![(tag(), a), (tag(), b)]).unwrap();
+        let w = &m.config().watch[0];
+        assert_eq!(w.from_block, 200);
+        assert_eq!(w.name, "tornado.registry.eth");
+    }
+
+    #[test]
+    fn merge_prunes_a_stale_source_instead_of_rewinding_the_fresh_one() {
+        // Re-importing an old file whose coverage is a subset must NOT drag
+        // the merged high back to the old file's high.
+        let fresh = span_ix(config(vec![watch_all(addr(1), 100)]), 100, 500, vec![log(450, 0, addr(1), vec![])]);
+        let stale = span_ix(config(vec![watch_all(addr(1), 100)]), 100, 300, vec![]);
+        let (_, m) = LogIndex::merge(vec![(tag(), stale), (tag(), fresh)]).unwrap();
+        assert_eq!(m.coverage_of(&addr(1)).unwrap().span, Some((100, 500)));
+        assert_eq!(m.log_count(), 1);
+    }
+
+    #[test]
+    fn merge_output_is_canonical_and_never_fabricates_coverage() {
+        // Pseudo-random source shapes (fixed LCG seed — deterministic): the
+        // merged result must (a) never claim a block for an address that no
+        // source covered for that address, and (b) stay canonical: all
+        // present spans share one high, the cursor sits at/below every low.
+        let mut state: u64 = 0x5eed;
+        let mut rng = move |bound: u64| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) % bound
+        };
+        for _ in 0..50 {
+            let n_sources = 1 + rng(3);
+            let mut sources = Vec::new();
+            for _ in 0..n_sources {
+                let n_watch = 1 + rng(3) as u8;
+                let entries: Vec<WatchEntry> = (1..=n_watch).map(|k| watch_all(addr(k), 10)).collect();
+                let low = 10 + rng(50);
+                let high = low + rng(60);
+                sources.push(span_ix(config(entries), low, high, vec![]));
+            }
+            let originals: Vec<LogIndex> = sources
+                .iter()
+                .map(|s| {
+                    let cfg = s.config().clone();
+                    let mut c = LogIndex::new(cfg).unwrap();
+                    c.coverage = s.coverage.clone();
+                    c
+                })
+                .collect();
+            let (_, m) = LogIndex::merge(sources.into_iter().map(|s| (tag(), s)).collect()).unwrap();
+            let highs: Vec<u64> =
+                m.coverage_entries().iter().filter_map(|(_, c)| c.span.map(|(_, h)| h)).collect();
+            assert!(highs.windows(2).all(|w| w[0] == w[1]), "unequal highs: {highs:?}");
+            if let Some((n, _)) = m.cursor {
+                for (_, c) in m.coverage_entries() {
+                    if let Some((low, _)) = c.span {
+                        assert!(n <= low, "cursor {n} above a span low {low}");
+                    }
+                }
+            }
+            for (w, c) in m.coverage_entries() {
+                if let Some((low, high)) = c.span {
+                    for b in low..=high {
+                        let covered_somewhere = originals.iter().any(|s| {
+                            s.coverage_of(&w.address).is_some_and(|sc| sc.contains(b, b))
+                        });
+                        assert!(covered_somewhere, "merged claims block {b} for an address no source covered");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
