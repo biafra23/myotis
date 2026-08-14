@@ -795,14 +795,21 @@ impl ElReader {
         })
     }
 
-    /// Install (or replace) the eth_getLogs watch-list config: reload the
-    /// persisted index when it matches the config's fingerprint, else start
-    /// empty (re-index). See docs/eth-getlogs-design.md.
+    /// Install the eth_getLogs watch-list config — ADDITIVELY: the pushed
+    /// config is unioned with what this node already subscribes (the live
+    /// index, or on boot the persisted snapshot's own watch-table), so a
+    /// host re-applying its shipped preset EXTENDS an imported subscription
+    /// instead of replacing it. Without this, every restart's preset push
+    /// would fingerprint-mismatch the imported index into a full re-index
+    /// (see docs/eth-getlogs-design.md §import).
+    ///
+    /// Accumulated coverage survives whenever the union changes nothing an
+    /// index can't absorb in place (bit flips, renames, a LOWERED
+    /// from_block). A genuinely new address or changed topic set still
+    /// checkpoints the old index and re-indexes under the union — per-entry
+    /// frontiers at different heights would wedge the appender.
     /// Returns false (and installs nothing) for an invalid config
-    /// (duplicate watch addresses). Re-applying a config whose watch-list
-    /// fingerprint matches the installed one only updates the enabled bit —
-    /// in-memory progress survives settings pokes; a genuinely changed
-    /// watch-list checkpoints the old index before replacing it.
+    /// (duplicate watch addresses).
     pub fn set_log_index_config(&self, config: crate::el::logindex::LogIndexConfig) -> bool {
         let finalized_now = self.finalized_block_number();
         // A SUCCESSFUL config apply invalidates the rate anchor: a pacing
@@ -814,22 +821,27 @@ impl ElReader {
                 *rate = None;
             }
         };
+        let tag = self.chain_tag();
         let Ok(mut slot) = self.log_index.lock() else {
             return false;
         };
         if let Some(ix) = slot.as_mut() {
-            if ix.config().fingerprint() == config.fingerprint() {
-                // Same watch-list: the index (and so the mapped gap and the
-                // tail record) still describes this coverage. Toggling enable
-                // or max-speed must not cost a full re-descent and a tail
-                // rewind back to finality.
-                ix.set_enabled(config.enabled);
-                ix.set_max_speed(config.max_speed);
-                reset_rate();
-                return true;
+            // Union against the LIVE watch-list. The live set always
+            // contains the persisted file's set (it was built from it), so
+            // no disk read is needed on a settings poke.
+            if let Some(eff) = config.union_with(&ix.config().watch) {
+                if ix.adopt_config(eff) {
+                    // Nothing accumulated was invalidated: coverage, the
+                    // mapped gap and the tail record still describe this
+                    // index. Bits/names/walk-target updated in place.
+                    reset_rate();
+                    return true;
+                }
             }
-            // A different watch-list REPLACES the index below, which
-            // invalidates both: neither describes the new coverage.
+            // New address or topic conflict → the union (or, on conflict,
+            // the pushed config alone) REPLACES the index below, which
+            // invalidates bridge and tail: neither describes the new
+            // coverage.
             self.clear_log_index_bridge();
             if let Ok(mut t) = self.log_index_tail.lock() {
                 t.clear();
@@ -839,28 +851,183 @@ impl ElReader {
                 // only verifiable against this run's tail record. A zero
                 // finality means no anchor (so nothing optimistic exists) —
                 // clamping there would erase the file.
-                let tag = self.chain_tag();
                 let _ = if finalized_now == 0 {
                     ix.persist(&tag, p)
                 } else {
                     ix.persist_clamped(&tag, p, finalized_now)
                 };
             }
+            let effective = config.union_with(&ix.config().watch).unwrap_or(config);
+            let fresh = match crate::el::logindex::LogIndex::new(effective) {
+                Ok(fresh) => fresh,
+                Err(_) => return false,
+            };
+            *slot = Some(fresh);
+            reset_rate();
+            return true;
         }
-        let loaded = self
+        // Boot: no live index yet. A portable (v2) snapshot on disk names
+        // its own subscription set — union the push with it and adopt its
+        // coverage; imports survive restarts this way. A legacy v1 file
+        // (config-keyed, pre-import builds) still loads the old way.
+        let stored = self
             .log_index_path
             .as_deref()
-            .and_then(|p| crate::el::logindex::LogIndex::load(&config, &self.chain_tag(), p));
-        let ix = match loaded {
-            Some(ix) => ix,
-            None => match crate::el::logindex::LogIndex::new(config) {
-                Ok(ix) => ix,
-                Err(_) => return false,
-            },
+            .and_then(crate::el::logindex::LogIndex::load_portable)
+            .filter(|(t, _)| *t == tag);
+        let ix = match stored {
+            Some((_, mut stored_ix)) => {
+                let adopted = config
+                    .union_with(&stored_ix.config().watch)
+                    .is_some_and(|eff| stored_ix.adopt_config(eff));
+                if adopted {
+                    stored_ix
+                } else {
+                    // Conflict or a genuinely new address: re-index under
+                    // the union when there is one (keep the imported
+                    // subscriptions — they re-cover), else the push alone.
+                    let effective =
+                        config.union_with(&stored_ix.config().watch).unwrap_or(config);
+                    match crate::el::logindex::LogIndex::new(effective) {
+                        Ok(fresh) => fresh,
+                        Err(_) => return false,
+                    }
+                }
+            }
+            None => {
+                let loaded = self
+                    .log_index_path
+                    .as_deref()
+                    .and_then(|p| crate::el::logindex::LogIndex::load(&config, &tag, p));
+                match loaded {
+                    Some(ix) => ix,
+                    None => match crate::el::logindex::LogIndex::new(config) {
+                        Ok(ix) => ix,
+                        Err(_) => return false,
+                    },
+                }
+            }
         };
         *slot = Some(ix);
         reset_rate();
         true
+    }
+
+    /// Activate a portable log-index snapshot found at this reader's own
+    /// path (the drop-in path, docs/eth-getlogs-design.md): a
+    /// self-describing file in the data dir IS an opt-in — someone put it
+    /// there deliberately, and the daemon has no settings surface to say so
+    /// otherwise. Enabled on activation; a host's config push right after
+    /// start unions with this and applies the host's own runtime bits (a
+    /// disabled toggle wins). No-op without a path, without a portable file
+    /// (legacy v1 files activate only through a config push — they name no
+    /// subscription set), for a foreign chain's file, or once a config has
+    /// already arrived.
+    pub fn activate_log_index_from_disk(self: &Arc<Self>, rt: &tokio::runtime::Handle) {
+        let Some(path) = self.log_index_path.as_deref() else {
+            return;
+        };
+        let Some((t, mut ix)) = crate::el::logindex::LogIndex::load_portable(path) else {
+            return;
+        };
+        if t != self.chain_tag() {
+            tracing::warn!(
+                path = %path.display(),
+                file_network = t.network_id,
+                own_network = self.eth_cfg.network_id,
+                "log-index snapshot on disk belongs to another chain; ignoring it"
+            );
+            return;
+        }
+        {
+            let Ok(mut slot) = self.log_index.lock() else {
+                return;
+            };
+            if slot.is_some() {
+                return; // a config already arrived — it wins
+            }
+            ix.set_enabled(true);
+            *slot = Some(ix);
+        }
+        tracing::info!(path = %path.display(), "activated log-index snapshot from disk");
+        self.ensure_log_index_appender(rt);
+    }
+
+    /// Import portable log-index snapshots (docs/eth-getlogs-design.md):
+    /// every file must be a v2 self-describing snapshot of THIS chain; they
+    /// merge with the node's current index (checkpointed first so nothing
+    /// in-memory is lost), the merged result is persisted and installed, and
+    /// the ordinary appender/bridge/walker machinery catches the union up —
+    /// new lows via the walker, the band above the merged high via bridge +
+    /// appender. All-or-nothing: any unreadable or foreign file fails the
+    /// whole import with nothing changed.
+    ///
+    /// Trust: an imported file is DATA CLAIMED VERIFIED by whoever generated
+    /// it (the same standing as the node's own snapshot — both were verified
+    /// at index time, neither is re-verified at load). Import is therefore a
+    /// deliberate, user-initiated act on the hosts, never something fetched.
+    ///
+    /// Importing enables the index (it is the opt-in, explicitly) and leaves
+    /// the pacing bit as it was.
+    pub fn import_log_index(&self, paths: &[std::path::PathBuf]) -> Result<(), String> {
+        let Some(own_path) = self.log_index_path.clone() else {
+            return Err("this node runs without a log-index path (no data dir)".to_string());
+        };
+        let tag = self.chain_tag();
+        let mut sources = Vec::new();
+        for p in paths {
+            let (t, ix) = crate::el::logindex::LogIndex::load_portable(p)
+                .ok_or_else(|| format!("{}: not a portable log-index snapshot", p.display()))?;
+            if t != tag {
+                return Err(format!(
+                    "{}: belongs to another chain (network id {}, this node is {})",
+                    p.display(),
+                    t.network_id,
+                    tag.network_id
+                ));
+            }
+            sources.push((t, ix));
+        }
+        if sources.is_empty() {
+            return Err("no files given".to_string());
+        }
+        // Checkpoint the live index (finality-clamped, v2) and merge THROUGH
+        // THE FILE rather than cloning the live store: the store is fully
+        // resident and can be GBs — a clone would double it under the lock.
+        self.persist_log_index(self.finalized_block_number());
+        let max_speed = self.with_log_index(|ix| ix.config().max_speed).unwrap_or(false);
+        if own_path.exists() {
+            if let Some((t, ix)) = crate::el::logindex::LogIndex::load_portable(&own_path) {
+                if t == tag {
+                    sources.push((t, ix));
+                }
+            }
+        }
+        let (_, mut merged) =
+            crate::el::logindex::LogIndex::merge(sources).map_err(|e| e.to_string())?;
+        // A snapshot generated by a node further along may carry coverage
+        // above THIS node's current finality. That data is finalized on the
+        // network (the generator clamps at its own finality) — local
+        // finality just hasn't caught up — so it persists as-is under the
+        // trusted-import premise above.
+        merged.set_enabled(true);
+        merged.set_max_speed(max_speed);
+        merged
+            .persist(&tag, &own_path)
+            .map_err(|e| format!("could not write {}: {e}", own_path.display()))?;
+        // Install: the bridge and tail describe the OLD coverage shape.
+        self.clear_log_index_bridge();
+        if let Ok(mut t) = self.log_index_tail.lock() {
+            t.clear();
+        }
+        if let Ok(mut rate) = self.log_index_rate.lock() {
+            *rate = None;
+        }
+        match self.log_index.lock() {
+            Ok(mut slot) => *slot = Some(merged),
+            Err(_) => return Err("log index unavailable".to_string()),
+        }
+        Ok(())
     }
 
     /// The beacon-anchored head block number, if the anchor is ready — the

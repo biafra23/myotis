@@ -712,6 +712,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_get_transaction_receipt_json(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_import_log_index_files(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_log_index_status_json(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_pause_handle(
@@ -792,6 +794,8 @@ internal object UniffiLib {
     external fun uniffi_myotis_engine_fn_func_get_transaction_by_hash_json(`handle`: Long,`txHashHex`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_get_transaction_receipt_json(`handle`: Long,`txHashHex`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_import_log_index_files(`handle`: Long,`pathsJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_log_index_status_json(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -998,6 +1002,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_get_transaction_receipt_json() != 56168) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_myotis_engine_checksum_func_import_log_index_files() != 14078) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_log_index_status_json() != 7764) {
@@ -1620,6 +1627,24 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         
         FfiConverterLong.lower(`handle`),
         FfiConverterString.lower(`txHashHex`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Import portable log-index snapshots (JSON array of absolute file paths;
+         * each file must be a self-describing snapshot of this handle's chain).
+         * All-or-nothing merge into the node's index; importing is the opt-in, so
+         * catch-up starts immediately. `{"ok":true,"status":…}` or `{"error":…}`.
+         */ fun `importLogIndexFiles`(`handle`: kotlin.Long, `pathsJson`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_import_log_index_files(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterString.lower(`pathsJson`),_status)
 }
     )
     }

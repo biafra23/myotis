@@ -337,6 +337,12 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
                 reader.set_served_block_window(w);
             }
         }
+        // Activate a portable log-index snapshot found on disk (the drop-in
+        // path): its presence in the engine's own data dir is the opt-in —
+        // the daemon has no settings surface at all, and hosts that do have
+        // one push their config right after start, which unions with (and
+        // can disable) what this activated.
+        reader.activate_log_index_from_disk(engine.rt.handle());
     }
     // Re-lock and publish ONLY if the entry is still the same Created/Paused one
     // we spun up from: a concurrent stop() may have removed it, or a racing
@@ -2237,6 +2243,34 @@ fn parse_log_index_config(
         }
     }
     Some(myotis_net::el::logindex::LogIndexConfig { enabled, max_speed, watch })
+}
+
+/// Import portable log-index snapshots: `paths_json` is a JSON array of
+/// absolute file paths (each a v2 self-describing snapshot of THIS handle's
+/// chain). They merge with the node's current index (all-or-nothing), the
+/// result is persisted + installed, and — since importing IS the opt-in —
+/// the appender is spawned so catch-up starts immediately.
+/// Returns `{"ok":true,"status":<status json>}` or `{"error":"..."}`.
+pub fn import_log_index_files(handle: i64, paths_json: &str) -> String {
+    let paths = match serde_json::from_str::<Vec<String>>(paths_json) {
+        Ok(p) if !p.is_empty() && p.iter().all(|s| !s.trim().is_empty()) => {
+            p.into_iter().map(std::path::PathBuf::from).collect::<Vec<_>>()
+        }
+        _ => return eljson::error_json("expected a non-empty JSON array of file paths"),
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
+        return eljson::error_json("node is not running");
+    };
+    match reader.import_log_index(&paths) {
+        Ok(()) => {
+            reader.ensure_log_index_appender(engine.rt.handle());
+            format!("{{\"ok\":true,\"status\":{}}}", log_index_status_json(handle))
+        }
+        Err(e) => eljson::error_json(&e),
+    }
 }
 
 /// Index status for hosts/UI: enabled, log count, backfill cursor, and per

@@ -172,6 +172,20 @@ public interface ChainHandle {
     }
 
     /**
+     * Import portable log-index snapshot files: {@code pathsJson} is a JSON
+     * array of absolute file paths, each a self-describing snapshot of this
+     * chain (produced by the daemon's {@code build-logindex} tool or another
+     * node's export). All-or-nothing merge into the node's index; importing
+     * is the opt-in, so catch-up for every imported address starts
+     * immediately. Returns {@code {"ok":true,"status":...}} or
+     * {@code {"error":...}}. Default: a stable not-supported error (the Java
+     * engine has no log index).
+     */
+    default String importLogIndexFiles(String pathsJson) {
+        return "{\"error\":\"log-index import is not supported by this engine\"}";
+    }
+
+    /**
      * Dial one specific EL peer by endpoint + secp256k1 public key (operator
      * debugging). Returns immediately after the connect is initiated.
      *

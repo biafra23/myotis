@@ -74,6 +74,39 @@ impl LogIndexConfig {
         })
     }
 
+    /// Union this (pushed) config with an already-subscribed watch-list —
+    /// what keeps an imported subscription alive across host preset pushes:
+    /// a host re-applying its shipped preset must EXTEND the stored set, not
+    /// replace it, or every restart would fingerprint-mismatch the imported
+    /// index into a full re-index. Same-address entries take the MIN
+    /// `from_block` (undershooting cannot lie) and the pushed name when
+    /// non-empty (the host is authoritative for cosmetics); addresses only
+    /// in `stored` are appended behind the pushed ones. `enabled`/`max_speed`
+    /// come from `self` — they are the push's whole point. None on a topic0
+    /// conflict (the caller falls back to replace semantics).
+    pub fn union_with(&self, stored: &[WatchEntry]) -> Option<LogIndexConfig> {
+        let mut watch = self.watch.clone();
+        for s in stored {
+            match watch.iter_mut().find(|w| w.address == s.address) {
+                Some(w) => {
+                    let mut ta = w.topic0s.clone();
+                    let mut tb = s.topic0s.clone();
+                    ta.sort_unstable();
+                    tb.sort_unstable();
+                    if ta != tb {
+                        return None;
+                    }
+                    w.from_block = w.from_block.min(s.from_block);
+                    if w.name.is_empty() && !s.name.is_empty() {
+                        w.name = s.name.clone();
+                    }
+                }
+                None => watch.push(s.clone()),
+            }
+        }
+        Some(LogIndexConfig { enabled: self.enabled, max_speed: self.max_speed, watch })
+    }
+
     /// Order-insensitive fingerprint of the watch-list. A changed fingerprint
     /// on load invalidates the persisted index (derived data — re-index
     /// rather than risk serving under a stale subscription set).
@@ -267,6 +300,38 @@ impl LogIndex {
     /// host re-applies a config whose watch-list fingerprint is unchanged).
     pub fn set_enabled(&mut self, enabled: bool) {
         self.config.enabled = enabled;
+    }
+
+    /// Swap in `config` while keeping ALL accumulated state — the additive
+    /// re-apply path. Adoptable iff it subscribes exactly this index's
+    /// address set under the same topic0 restrictions: then coverage still
+    /// describes every entry (re-paired by address, since order may differ),
+    /// and the only substantive change a caller can make is LOWERING a
+    /// `from_block` (a deeper walk target — the walker just keeps
+    /// descending; nothing accumulated is invalidated). Names and runtime
+    /// bits ride along. False (and untouched state) for a new/removed
+    /// address or a changed topic set — those need a re-index.
+    pub fn adopt_config(&mut self, config: LogIndexConfig) -> bool {
+        if config.watch.len() != self.config.watch.len() {
+            return false;
+        }
+        let mut coverage = Vec::with_capacity(config.watch.len());
+        for w in &config.watch {
+            let Some(i) = self.config.watch.iter().position(|o| o.address == w.address) else {
+                return false;
+            };
+            let mut ta = w.topic0s.clone();
+            let mut tb = self.config.watch[i].topic0s.clone();
+            ta.sort_unstable();
+            tb.sort_unstable();
+            if ta != tb {
+                return false;
+            }
+            coverage.push(self.coverage[i]);
+        }
+        self.config = config;
+        self.coverage = coverage;
+        true
     }
 
     /// Flip the backfill pacing bit without touching accumulated state (same
@@ -805,6 +870,26 @@ pub enum MergeError {
     /// under; unioning restrictions would claim logs nobody stored. Refused
     /// rather than resolved — re-generate one source with matching topics.
     TopicConflict([u8; 20]),
+}
+
+impl std::fmt::Display for MergeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MergeError::Empty => write!(f, "nothing to merge"),
+            MergeError::ChainMismatch { expected, got } => write!(
+                f,
+                "snapshot belongs to another chain (network id {}, expected {})",
+                got.network_id, expected.network_id
+            ),
+            MergeError::TopicConflict(a) => {
+                write!(f, "0x")?;
+                for b in a {
+                    write!(f, "{b:02x}")?;
+                }
+                write!(f, " is watched under conflicting topic restrictions")
+            }
+        }
+    }
 }
 
 impl LogIndex {
@@ -1564,6 +1649,60 @@ mod tests {
         // Same guards as ever: wrong fingerprint or truncation → None.
         assert!(LogIndex::deserialize(&config(vec![watch_all(addr(1), 101)]), &tag(), &v1).is_none());
         assert!(LogIndex::deserialize(&cfg, &tag(), &v1[..v1.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn union_with_extends_stored_and_keeps_pushed_bits() {
+        // The additive re-apply: a preset push must extend an imported
+        // subscription, never replace it.
+        let mut stored_extra = watch_all(addr(2), 300);
+        stored_extra.name = "imported.eth".to_string();
+        let stored = vec![watch_all(addr(1), 200), stored_extra.clone()];
+        let pushed = LogIndexConfig {
+            enabled: true,
+            max_speed: true,
+            watch: vec![{
+                let mut w = watch_all(addr(1), 100); // lower from_block
+                w.name = "preset name".to_string();
+                w
+            }],
+        };
+        let eff = pushed.union_with(&stored).unwrap();
+        assert!(eff.enabled && eff.max_speed);
+        assert_eq!(eff.watch.len(), 2);
+        assert_eq!(eff.watch[0].from_block, 100); // min wins
+        assert_eq!(eff.watch[0].name, "preset name"); // push is authoritative
+        assert_eq!(eff.watch[1], stored_extra); // imported entry survives
+        // Topic conflict → None (caller replaces instead).
+        let restricted = vec![WatchEntry { address: addr(1), from_block: 100, topic0s: vec![topic(7)], name: String::new() }];
+        assert!(pushed.union_with(&restricted).is_none());
+    }
+
+    #[test]
+    fn adopt_config_keeps_state_only_for_the_same_subscription_set() {
+        let mut ix = LogIndex::new(config(vec![watch_all(addr(1), 200), watch_all(addr(2), 200)])).unwrap();
+        ix.append_block(500, [5; 32], vec![log(500, 0, addr(1), vec![])]).unwrap();
+        // Reordered + renamed + lowered from_block + flipped bits: adoptable,
+        // and coverage re-pairs by address.
+        let mut renamed = watch_all(addr(2), 150);
+        renamed.name = "renamed.eth".to_string();
+        let eff = LogIndexConfig { enabled: true, max_speed: true, watch: vec![renamed, watch_all(addr(1), 200)] };
+        assert!(ix.adopt_config(eff));
+        assert!(ix.config().enabled && ix.config().max_speed);
+        assert_eq!(ix.config().watch[0].from_block, 150);
+        assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((500, 500)));
+        assert_eq!(ix.log_count(), 1);
+        // A new address is NOT adoptable (needs a re-index), and the failed
+        // attempt leaves everything untouched.
+        let wider = config(vec![watch_all(addr(1), 200), watch_all(addr(2), 150), watch_all(addr(3), 0)]);
+        assert!(!ix.adopt_config(wider));
+        assert_eq!(ix.config().watch.len(), 2);
+        // A changed topic set is NOT adoptable either.
+        let retopiced = config(vec![
+            WatchEntry { address: addr(1), from_block: 200, topic0s: vec![topic(9)], name: String::new() },
+            watch_all(addr(2), 150),
+        ]);
+        assert!(!ix.adopt_config(retopiced));
     }
 
     /// Build a canonical index over `cfg` covering `low..=high` (appender
