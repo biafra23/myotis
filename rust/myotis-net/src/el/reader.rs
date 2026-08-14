@@ -839,17 +839,18 @@ impl ElReader {
                 // only verifiable against this run's tail record. A zero
                 // finality means no anchor (so nothing optimistic exists) —
                 // clamping there would erase the file.
+                let tag = self.chain_tag();
                 let _ = if finalized_now == 0 {
-                    ix.persist(p)
+                    ix.persist(&tag, p)
                 } else {
-                    ix.persist_clamped(p, finalized_now)
+                    ix.persist_clamped(&tag, p, finalized_now)
                 };
             }
         }
         let loaded = self
             .log_index_path
             .as_deref()
-            .and_then(|p| crate::el::logindex::LogIndex::load(&config, p));
+            .and_then(|p| crate::el::logindex::LogIndex::load(&config, &self.chain_tag(), p));
         let ix = match loaded {
             Some(ix) => ix,
             None => match crate::el::logindex::LogIndex::new(config) {
@@ -1368,17 +1369,28 @@ impl ElReader {
     fn persist_log_index(&self, finalized: u64) {
         if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
             if let Some(ix) = slot.as_ref() {
+                let tag = self.chain_tag();
                 if finalized == 0 {
                     // No beacon anchor yet. There is no optimistic coverage to
                     // clamp either (the tail only runs below a real finality),
                     // and clamping AT ZERO would rewind the whole index and
                     // rename an empty file over a good checkpoint — losing, on
                     // a phone, months of backfill. Write it as it stands.
-                    let _ = ix.persist(path);
+                    let _ = ix.persist(&tag, path);
                 } else {
-                    let _ = ix.persist_clamped(path, finalized);
+                    let _ = ix.persist_clamped(&tag, path, finalized);
                 }
             }
+        }
+    }
+
+    /// The chain identity stamped into (and demanded of) every log-index
+    /// snapshot: this reader's own network, straight from its eth Status
+    /// config — never a filename convention.
+    pub fn chain_tag(&self) -> crate::el::logindex::ChainTag {
+        crate::el::logindex::ChainTag {
+            network_id: self.eth_cfg.network_id,
+            genesis_hash: self.eth_cfg.genesis_hash,
         }
     }
 

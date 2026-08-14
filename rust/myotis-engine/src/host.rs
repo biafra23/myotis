@@ -2176,8 +2176,8 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 /// Install the watch-list config: `{"enabled":bool,"watch":[{"address":"0x..",
-/// "fromBlock":n,"topic0s":["0x..",..]?}]}`. False on malformed input,
-/// duplicate addresses, or an unavailable reader.
+/// "fromBlock":n,"topic0s":["0x..",..]?,"name":"..."?}]}`. False on malformed
+/// input, duplicate addresses, or an unavailable reader.
 pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(config_json) else {
         return false;
@@ -2227,7 +2227,13 @@ fn parse_log_index_config(
                     topic0s.push(t.as_str().and_then(parse_word32)?);
                 }
             }
-            watch.push(myotis_net::el::logindex::WatchEntry { address, from_block, topic0s });
+            // Optional cosmetic label (empty = unnamed). A non-string name is
+            // malformed like any other wrong type — never silently coerced.
+            if e.get("name").is_some_and(|n| !n.is_string() && !n.is_null()) {
+                return None;
+            }
+            let name = e.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+            watch.push(myotis_net::el::logindex::WatchEntry { address, from_block, topic0s, name });
         }
     }
     Some(myotis_net::el::logindex::LogIndexConfig { enabled, max_speed, watch })
@@ -2314,6 +2320,14 @@ fn build_log_index_status(
             }
             s.push_str("\",\"fromBlock\":");
             s.push_str(&w.from_block.to_string());
+            if !w.name.is_empty() {
+                // serde_json handles the escaping (names come from hosts or
+                // ENS reverse records — arbitrary strings).
+                if let Ok(quoted) = serde_json::to_string(&w.name) {
+                    s.push_str(",\"name\":");
+                    s.push_str(&quoted);
+                }
+            }
             if let Some((low, high)) = c.span {
                 s.push_str(",\"coveredLow\":");
                 s.push_str(&low.to_string());
@@ -2569,11 +2583,33 @@ mod log_index_json_tests {
     }
 
     #[test]
+    fn parses_optional_names_and_reflects_them_in_status() {
+        let addr = format!("0x{}", "11".repeat(20));
+        let named = cfg(&format!(
+            r#"{{"enabled":true,"watch":[{{"address":"{addr}","fromBlock":5,"name":"tornado.registry.eth"}}]}}"#
+        ))
+        .unwrap();
+        assert_eq!(named.watch[0].name, "tornado.registry.eth");
+        // Absent name → empty (unnamed); a non-string name is malformed.
+        let unnamed = cfg(&format!(r#"{{"enabled":true,"watch":[{{"address":"{addr}","fromBlock":5}}]}}"#)).unwrap();
+        assert!(unnamed.watch[0].name.is_empty());
+        assert!(cfg(&format!(r#"{{"enabled":true,"watch":[{{"address":"{addr}","fromBlock":5,"name":7}}]}}"#)).is_none());
+        // Status carries the name for named entries and omits the key for
+        // unnamed ones (shape-stable for pre-name hosts).
+        let ix = myotis_net::el::logindex::LogIndex::new(named).unwrap();
+        let s = build_log_index_status(&ix, None, 0);
+        assert!(s.contains("\"name\":\"tornado.registry.eth\""), "{s}");
+        let ix = myotis_net::el::logindex::LogIndex::new(unnamed).unwrap();
+        assert!(!build_log_index_status(&ix, None, 0).contains("\"name\""));
+    }
+
+    #[test]
     fn status_json_carries_progress_keys() {
         let w = myotis_net::el::logindex::WatchEntry {
             address: [0x11; 20],
             from_block: 100,
             topic0s: vec![],
+            name: String::new(),
         };
         let cfg = myotis_net::el::logindex::LogIndexConfig {
             enabled: true,

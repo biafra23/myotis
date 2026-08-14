@@ -26,6 +26,25 @@ pub struct WatchEntry {
     pub address: [u8; 20],
     pub from_block: u64,
     pub topic0s: Vec<[u8; 32]>,
+    /// Human-readable label (ENS reverse name or a host-supplied one), purely
+    /// cosmetic: displayed by hosts, carried by the portable v2 snapshot, and
+    /// deliberately EXCLUDED from [`LogIndexConfig::fingerprint`] — renaming
+    /// an entry must never invalidate accumulated coverage. Empty = unnamed.
+    pub name: String,
+}
+
+/// The network a snapshot belongs to. Persisted in every v2 file and checked
+/// on load: logs are keyed by block-global `(block_number, log_index)`, so
+/// merging or loading a file from another chain would silently collide keys
+/// and fabricate coverage for blocks nobody verified on THIS chain. The
+/// filename suffix (`logindex-sepolia.db`) is a convention, not a guarantee —
+/// the bytes carry their own identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainTag {
+    /// EL network id (1 mainnet, 11155111 sepolia, 100 gnosis).
+    pub network_id: u64,
+    /// EL genesis block hash — distinguishes forks sharing a network id.
+    pub genesis_hash: [u8; 32],
 }
 
 /// The host-supplied index configuration (crosses the FFI as JSON, parsed
@@ -58,6 +77,8 @@ impl LogIndexConfig {
     /// Order-insensitive fingerprint of the watch-list. A changed fingerprint
     /// on load invalidates the persisted index (derived data — re-index
     /// rather than risk serving under a stale subscription set).
+    /// `name` is deliberately not encoded: it is cosmetic (see [`WatchEntry`])
+    /// and renaming must not cost a re-index.
     pub fn fingerprint(&self) -> u64 {
         // FNV-1a over sorted entry encodings: stable, dependency-free, and
         // this is a cache-invalidation tag, not a security boundary.
@@ -464,7 +485,20 @@ impl LogIndex {
 // ---------------------------------------------------------------------------
 
 const MAGIC: &[u8; 4] = b"MLIX";
-const VERSION: u32 = 1;
+/// v1: config-keyed blob (fingerprint only — unreadable without the exact
+///     watch-list that produced it; still LOADED for upgrade, never written).
+/// v2: self-describing — adds the chain tag and the full watch-table
+///     (address, from_block, topic0s, name), so a file can be imported on a
+///     host that has never seen its config, and cannot cross networks.
+const VERSION: u32 = 2;
+const VERSION_LEGACY: u32 = 1;
+
+/// Byte offset of the v2 checksum field: magic(4) + version(4) +
+/// network_id(8) + genesis_hash(32) + fingerprint(8). The checksum covers
+/// everything AFTER itself.
+const V2_CHECKSUM_AT: usize = 56;
+/// v1 layout: magic(4) + version(4) + fingerprint(8).
+const V1_CHECKSUM_AT: usize = 16;
 
 /// FNV-1a (same primitive as the config fingerprint): integrity tag for the
 /// snapshot payload — bit-rot detection, not a security boundary.
@@ -528,36 +562,52 @@ impl LogIndex {
     /// verifiable against the in-memory tail record, which does not survive a
     /// restart, so persisting it would leave a later run holding coverage it
     /// can never re-check.
-    pub fn serialize_clamped(&self, max_block: u64) -> Vec<u8> {
-        self.serialize_with_clamp(Some(max_block))
+    pub fn serialize_clamped(&self, tag: &ChainTag, max_block: u64) -> Vec<u8> {
+        self.serialize_with_clamp(tag, Some(max_block))
     }
 
     /// [`Self::persist`] with the same clamp as [`Self::serialize_clamped`].
-    pub fn persist_clamped(&self, path: &Path, max_block: u64) -> std::io::Result<()> {
+    pub fn persist_clamped(&self, tag: &ChainTag, path: &Path, max_block: u64) -> std::io::Result<()> {
         let tmp: PathBuf = path.with_extension(format!("tmp.{}", std::process::id()));
         {
             let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&self.serialize_clamped(max_block))?;
+            f.write_all(&self.serialize_clamped(tag, max_block))?;
             f.sync_all()?;
         }
         std::fs::rename(&tmp, path)
     }
 
-    pub fn serialize(&self) -> Vec<u8> {
-        self.serialize_with_clamp(None)
+    pub fn serialize(&self, tag: &ChainTag) -> Vec<u8> {
+        self.serialize_with_clamp(tag, None)
     }
 
-    /// The one serializer. `clamp` bounds what is written (see
-    /// [`Self::serialize_clamped`]) and filters DURING the write: the tail
-    /// keeps coverage above finality at all times, so a clamp that cloned the
-    /// index would deep-copy the whole log store on every checkpoint, under
-    /// the index lock, on a 10s cadence.
-    fn serialize_with_clamp(&self, clamp: Option<u64>) -> Vec<u8> {
-        let mut out = Vec::with_capacity(64 + self.logs.len() * 200);
+    /// The one serializer (always writes VERSION 2). `clamp` bounds what is
+    /// written (see [`Self::serialize_clamped`]) and filters DURING the
+    /// write: the tail keeps coverage above finality at all times, so a clamp
+    /// that cloned the index would deep-copy the whole log store on every
+    /// checkpoint, under the index lock, on a 10s cadence.
+    fn serialize_with_clamp(&self, tag: &ChainTag, clamp: Option<u64>) -> Vec<u8> {
+        let mut out = Vec::with_capacity(128 + self.logs.len() * 200);
         out.extend_from_slice(MAGIC);
         put_u32(&mut out, VERSION);
+        put_u64(&mut out, tag.network_id);
+        out.extend_from_slice(&tag.genesis_hash);
         put_u64(&mut out, self.config.fingerprint());
         put_u64(&mut out, 0); // checksum placeholder, patched below
+        // The watch-table, in config order (coverage below is parallel to
+        // it): what makes the file self-describing — an importer reconstructs
+        // the subscription set from the bytes instead of needing the exact
+        // config that produced them.
+        put_u32(&mut out, self.config.watch.len() as u32);
+        for w in &self.config.watch {
+            out.extend_from_slice(&w.address);
+            put_u64(&mut out, w.from_block);
+            put_u32(&mut out, w.topic0s.len() as u32);
+            for t in &w.topic0s {
+                out.extend_from_slice(t);
+            }
+            put_bytes(&mut out, w.name.as_bytes());
+        }
         // Coverage spans + cursor.
         put_u32(&mut out, self.coverage.len() as u32);
         for c in &self.coverage {
@@ -617,88 +667,211 @@ impl LogIndex {
         // structural framing catches truncation, this catches bit-rot inside
         // otherwise-valid frames — either way a bad load means re-index, never
         // serving corrupted logs as verified.
-        let sum = fnv64(&out[24..]);
-        if let Some(slot) = out.get_mut(16..24) {
+        let sum = fnv64(&out[V2_CHECKSUM_AT + 8..]);
+        if let Some(slot) = out.get_mut(V2_CHECKSUM_AT..V2_CHECKSUM_AT + 8) {
             slot.copy_from_slice(&sum.to_le_bytes());
         }
         out
     }
 
     /// Rebuild from bytes for the given config. Any mismatch or corruption
-    /// → None (re-index).
-    pub fn deserialize(config: &LogIndexConfig, data: &[u8]) -> Option<Self> {
+    /// → None (re-index). Accepts the current v2 layout (tag-checked) and the
+    /// legacy v1 layout (pre-tag files written by earlier builds — loading
+    /// them preserves accumulated coverage across the upgrade; the next
+    /// checkpoint rewrites the file as v2).
+    pub fn deserialize(config: &LogIndexConfig, tag: &ChainTag, data: &[u8]) -> Option<Self> {
         let mut c = Cursor { d: data, pos: 0 };
-        if c.take(4)? != MAGIC || c.u32()? != VERSION || c.u64()? != config.fingerprint() {
+        if c.take(4)? != MAGIC {
+            return None;
+        }
+        match c.u32()? {
+            VERSION_LEGACY => Self::deserialize_v1(config, data, c),
+            VERSION => {
+                let parsed = parse_v2(data, c)?;
+                if parsed.tag != *tag || parsed.fingerprint != config.fingerprint() {
+                    return None;
+                }
+                // The file's coverage vec parallels the file's watch order;
+                // the given config may list the same set in another order
+                // (the fingerprint is order-insensitive). Re-pair coverage by
+                // ADDRESS so a reordered-but-equal config cannot attach a
+                // span to the wrong entry. The config (not the file) supplies
+                // the names — the host is authoritative for cosmetics.
+                let mut coverage = Vec::with_capacity(config.watch.len());
+                for w in &config.watch {
+                    let j = parsed.watch.iter().position(|f| f.address == w.address)?;
+                    coverage.push(parsed.coverage[j]);
+                }
+                Some(Self { config: config.clone(), coverage, logs: parsed.logs, cursor: parsed.cursor })
+            }
+            _ => None,
+        }
+    }
+
+    /// The legacy (v1) layout: fingerprint-keyed, no chain tag, no
+    /// watch-table, coverage parallel to the SUPPLIED config's order.
+    fn deserialize_v1(config: &LogIndexConfig, data: &[u8], mut c: Cursor) -> Option<Self> {
+        if c.u64()? != config.fingerprint() {
             return None;
         }
         let stored_sum = c.u64()?;
-        if fnv64(data.get(24..)?) != stored_sum {
+        if fnv64(data.get(V1_CHECKSUM_AT + 8..)?) != stored_sum {
             return None;
         }
         let n_cov = c.u32()? as usize;
         if n_cov != config.watch.len() {
             return None;
         }
-        let mut coverage = Vec::with_capacity(n_cov);
-        for _ in 0..n_cov {
-            coverage.push(match c.take(1)?.first().copied()? {
-                0 => Coverage::default(),
-                1 => Coverage { span: Some((c.u64()?, c.u64()?)) },
-                _ => return None,
-            });
-        }
-        let cursor = match c.take(1)?.first().copied()? {
-            0 => None,
-            1 => Some((c.u64()?, c.arr::<32>()?)),
-            _ => return None,
-        };
-        let n_logs = c.u64()?;
-        let mut logs = BTreeMap::new();
-        for _ in 0..n_logs {
-            let block_number = c.u64()?;
-            let block_hash = c.arr::<32>()?;
-            let tx_hash = c.arr::<32>()?;
-            let tx_index = c.u32()?;
-            let log_index = c.u32()?;
-            let address = c.arr::<20>()?;
-            let n_topics = c.u32()? as usize;
-            if n_topics > 4 {
-                return None;
-            }
-            let mut topics = Vec::with_capacity(n_topics);
-            for _ in 0..n_topics {
-                topics.push(c.arr::<32>()?);
-            }
-            let data = c.bytes()?.to_vec();
-            logs.insert(
-                (block_number, log_index),
-                StoredLog { block_number, block_hash, tx_hash, tx_index, log_index, address, topics, data },
-            );
-        }
+        let (coverage, cursor, logs) = parse_body(&mut c, n_cov)?;
         if c.pos != data.len() {
             return None; // trailing garbage → treat as corrupt
         }
         Some(Self { config: config.clone(), coverage, logs, cursor })
     }
 
+    /// Self-describing read (v2 only): reconstruct the subscription set from
+    /// the file's own watch-table instead of requiring the config that wrote
+    /// it — the import path. Returns the file's chain tag so the importer can
+    /// refuse a file from another network, and the index carrying the file's
+    /// watch entries (names included) with `enabled`/`max_speed` false: those
+    /// are runtime bits the receiving host decides, never file content.
+    pub fn deserialize_portable(data: &[u8]) -> Option<(ChainTag, Self)> {
+        let mut c = Cursor { d: data, pos: 0 };
+        if c.take(4)? != MAGIC || c.u32()? != VERSION {
+            return None; // v1 files are not self-describing — not importable
+        }
+        let parsed = parse_v2(data, c)?;
+        let config =
+            LogIndexConfig { enabled: false, max_speed: false, watch: parsed.watch };
+        // The stored fingerprint must actually match the stored watch-table —
+        // a mismatch means the frame is inconsistent with itself.
+        if parsed.fingerprint != config.fingerprint() {
+            return None;
+        }
+        let ix = Self::new(config).ok()?;
+        Some((
+            parsed.tag,
+            Self { coverage: parsed.coverage, logs: parsed.logs, cursor: parsed.cursor, ..ix },
+        ))
+    }
+
+    /// [`Self::deserialize_portable`] from a file.
+    pub fn load_portable(path: &Path) -> Option<(ChainTag, Self)> {
+        let data = std::fs::read(path).ok()?;
+        Self::deserialize_portable(&data)
+    }
+
     /// Atomic best-effort persist: temp file (pid-suffixed) + rename, the
     /// `persist_snapshot` pattern. A failed write costs a re-index on the
     /// affected range, never correctness.
-    pub fn persist(&self, path: &Path) -> std::io::Result<()> {
+    pub fn persist(&self, tag: &ChainTag, path: &Path) -> std::io::Result<()> {
         let tmp: PathBuf = path.with_extension(format!("tmp.{}", std::process::id()));
         {
             let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&self.serialize())?;
+            f.write_all(&self.serialize(tag))?;
             f.sync_all()?;
         }
         std::fs::rename(&tmp, path)
     }
 
     /// Load a persisted index for `config`; None on absence or any mismatch.
-    pub fn load(config: &LogIndexConfig, path: &Path) -> Option<Self> {
+    pub fn load(config: &LogIndexConfig, tag: &ChainTag, path: &Path) -> Option<Self> {
         let data = std::fs::read(path).ok()?;
-        Self::deserialize(config, &data)
+        Self::deserialize(config, tag, &data)
     }
+}
+
+/// A fully parsed v2 frame (tag + fingerprint + watch-table + body), before
+/// any policy decision about configs or tags.
+struct ParsedV2 {
+    tag: ChainTag,
+    fingerprint: u64,
+    watch: Vec<WatchEntry>,
+    coverage: Vec<Coverage>,
+    cursor: Option<(u64, [u8; 32])>,
+    logs: BTreeMap<(u64, u32), StoredLog>,
+}
+
+/// Parse a v2 frame from just past the version field. Verifies the checksum
+/// and structural framing; policy checks (tag, fingerprint-vs-config) are the
+/// caller's.
+fn parse_v2(data: &[u8], mut c: Cursor) -> Option<ParsedV2> {
+    let network_id = c.u64()?;
+    let genesis_hash = c.arr::<32>()?;
+    let fingerprint = c.u64()?;
+    let stored_sum = c.u64()?;
+    if fnv64(data.get(V2_CHECKSUM_AT + 8..)?) != stored_sum {
+        return None;
+    }
+    let n_watch = c.u32()? as usize;
+    let mut watch = Vec::with_capacity(n_watch.min(1024));
+    for _ in 0..n_watch {
+        let address = c.arr::<20>()?;
+        let from_block = c.u64()?;
+        let n_topics = c.u32()? as usize;
+        let mut topic0s = Vec::with_capacity(n_topics.min(64));
+        for _ in 0..n_topics {
+            topic0s.push(c.arr::<32>()?);
+        }
+        let name = String::from_utf8(c.bytes()?.to_vec()).ok()?;
+        watch.push(WatchEntry { address, from_block, topic0s, name });
+    }
+    // Coverage is parallel to the watch-table by construction of the writer —
+    // a count disagreeing with the table is an inconsistent frame.
+    let n_cov = c.u32()? as usize;
+    if n_cov != n_watch {
+        return None;
+    }
+    let (coverage, cursor, logs) = parse_body(&mut c, n_cov)?;
+    if c.pos != data.len() {
+        return None; // trailing garbage → treat as corrupt
+    }
+    Some(ParsedV2 { tag: ChainTag { network_id, genesis_hash }, fingerprint, watch, coverage, cursor, logs })
+}
+
+/// Parse the coverage + cursor + log body shared by v1 and v2 frames.
+#[allow(clippy::type_complexity)]
+fn parse_body(
+    c: &mut Cursor,
+    n_cov: usize,
+) -> Option<(Vec<Coverage>, Option<(u64, [u8; 32])>, BTreeMap<(u64, u32), StoredLog>)> {
+    let mut coverage = Vec::with_capacity(n_cov.min(1024));
+    for _ in 0..n_cov {
+        coverage.push(match c.take(1)?.first().copied()? {
+            0 => Coverage::default(),
+            1 => Coverage { span: Some((c.u64()?, c.u64()?)) },
+            _ => return None,
+        });
+    }
+    let cursor = match c.take(1)?.first().copied()? {
+        0 => None,
+        1 => Some((c.u64()?, c.arr::<32>()?)),
+        _ => return None,
+    };
+    let n_logs = c.u64()?;
+    let mut logs = BTreeMap::new();
+    for _ in 0..n_logs {
+        let block_number = c.u64()?;
+        let block_hash = c.arr::<32>()?;
+        let tx_hash = c.arr::<32>()?;
+        let tx_index = c.u32()?;
+        let log_index = c.u32()?;
+        let address = c.arr::<20>()?;
+        let n_topics = c.u32()? as usize;
+        if n_topics > 4 {
+            return None;
+        }
+        let mut topics = Vec::with_capacity(n_topics);
+        for _ in 0..n_topics {
+            topics.push(c.arr::<32>()?);
+        }
+        let data = c.bytes()?.to_vec();
+        logs.insert(
+            (block_number, log_index),
+            StoredLog { block_number, block_hash, tx_hash, tx_index, log_index, address, topics, data },
+        );
+    }
+    Some((coverage, cursor, logs))
 }
 
 #[cfg(test)]
@@ -706,7 +879,7 @@ mod tests {
 
     #[test]
     fn max_speed_is_fingerprint_neutral_and_flippable() {
-        let w = WatchEntry { address: [7u8; 20], from_block: 5, topic0s: vec![] };
+        let w = WatchEntry { address: [7u8; 20], from_block: 5, topic0s: vec![], name: String::new() };
         let a = LogIndexConfig { enabled: true, max_speed: false, watch: vec![w.clone()] };
         let b = LogIndexConfig { enabled: true, max_speed: true, watch: vec![w] };
         // Flipping pacing must never invalidate accumulated coverage.
@@ -741,7 +914,12 @@ mod tests {
     }
 
     fn watch_all(a: [u8; 20], from: u64) -> WatchEntry {
-        WatchEntry { address: a, from_block: from, topic0s: vec![] }
+        WatchEntry { address: a, from_block: from, topic0s: vec![], name: String::new() }
+    }
+
+    /// The chain tag every test persists under (arbitrary but fixed).
+    fn tag() -> ChainTag {
+        ChainTag { network_id: 1, genesis_hash: [0xd4; 32] }
     }
 
     fn config(entries: Vec<WatchEntry>) -> LogIndexConfig {
@@ -797,7 +975,7 @@ mod tests {
 
     #[test]
     fn topic_restricted_watch_rejects_wildcard_queries() {
-        let w = WatchEntry { address: addr(1), from_block: 0, topic0s: vec![topic(7)] };
+        let w = WatchEntry { address: addr(1), from_block: 0, topic0s: vec![topic(7)], name: String::new() };
         let mut ix = LogIndex::new(config_ok(vec![w])).unwrap();
         ix.append_block(5, [0xbb; 32], vec![log(5, 0, addr(1), vec![topic(7)])]).unwrap();
         // Wildcard topic0 would deserve unindexed signatures → error.
@@ -848,15 +1026,15 @@ mod tests {
         // Finality at 12: blocks 13-14 are optimistic and must not persist —
         // a later run has no way to re-check them, and once finality moves
         // past them nothing would ever rewind them.
-        ix.persist_clamped(&path, 12).unwrap();
-        let loaded = LogIndex::load(&cfg, &path).unwrap();
+        ix.persist_clamped(&tag(), &path, 12).unwrap();
+        let loaded = LogIndex::load(&cfg, &tag(), &path).unwrap();
         assert_eq!(loaded.coverage_of(&addr(1)).unwrap().span, Some((10, 12)));
         assert_eq!(loaded.log_count(), 3);
         // The live index is untouched — the clamp is a serialization concern.
         assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((10, 14)));
         assert_eq!(ix.log_count(), 5);
         // Nothing above the clamp → byte-identical to a plain serialize.
-        assert_eq!(ix.serialize_clamped(14), ix.serialize());
+        assert_eq!(ix.serialize_clamped(&tag(), 14), ix.serialize(&tag()));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -869,13 +1047,13 @@ mod tests {
         }
         // A span entirely above the clamp disappears; one that straddles it is
         // written with the clamped high; the live index is untouched either way.
-        let bytes = ix.serialize_clamped(12);
-        let loaded = LogIndex::deserialize(&cfg, &bytes).unwrap();
+        let bytes = ix.serialize_clamped(&tag(), 12);
+        let loaded = LogIndex::deserialize(&cfg, &tag(), &bytes).unwrap();
         assert_eq!(loaded.coverage_of(&addr(1)).unwrap().span, Some((10, 12)));
         assert_eq!(loaded.log_count(), 3);
         assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((10, 14)));
         assert_eq!(ix.log_count(), 5);
-        let below = LogIndex::deserialize(&cfg, &ix.serialize_clamped(9)).unwrap();
+        let below = LogIndex::deserialize(&cfg, &tag(), &ix.serialize_clamped(&tag(), 9)).unwrap();
         assert_eq!(below.coverage_of(&addr(1)).unwrap().span, None);
         assert_eq!(below.log_count(), 0);
     }
@@ -890,10 +1068,10 @@ mod tests {
         // Clamped below it, the cursor must NOT persist: it is a hash, and
         // above the clamp it may name a block that was never re-checked — a
         // reloading walker would parent-chain into it.
-        let below = LogIndex::deserialize(&cfg, &ix.serialize_clamped(15)).unwrap();
+        let below = LogIndex::deserialize(&cfg, &tag(), &ix.serialize_clamped(&tag(), 15)).unwrap();
         assert_eq!(below.cursor, None);
         // At or above the cursor, it survives.
-        let at = LogIndex::deserialize(&cfg, &ix.serialize_clamped(20)).unwrap();
+        let at = LogIndex::deserialize(&cfg, &tag(), &ix.serialize_clamped(&tag(), 20)).unwrap();
         assert_eq!(at.cursor, Some((20, [20; 32])));
     }
 
@@ -924,24 +1102,28 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("logindex-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("logindex-test.db");
-        let cfg = config(vec![watch_all(addr(1), 100), WatchEntry { address: addr(2), from_block: 0, topic0s: vec![topic(7)] }]);
+        let cfg = config(vec![watch_all(addr(1), 100), WatchEntry { address: addr(2), from_block: 0, topic0s: vec![topic(7)], name: String::new() }]);
         let mut ix = LogIndex::new(cfg.clone()).unwrap();
         ix.append_block(200, [0xbb; 32], vec![log(200, 3, addr(1), vec![topic(7), topic(8)])]).unwrap();
         ix.backfill_block(199, [7; 32], vec![]).unwrap();
-        ix.persist(&path).unwrap();
+        ix.persist(&tag(), &path).unwrap();
 
-        let back = LogIndex::load(&cfg, &path).expect("roundtrip");
+        let back = LogIndex::load(&cfg, &tag(), &path).expect("roundtrip");
         assert_eq!(back.coverage_of(&addr(1)).unwrap().span, Some((199, 200)));
         assert_eq!(back.cursor, Some((199, [7; 32])));
         assert_eq!(back.query(&filter(199, 200, addr(1))).unwrap(), ix.query(&filter(199, 200, addr(1))).unwrap());
 
         // Changed watch-list → fingerprint mismatch → None (re-index).
         let changed = config(vec![watch_all(addr(1), 101)]);
-        assert!(LogIndex::load(&changed, &path).is_none());
+        assert!(LogIndex::load(&changed, &tag(), &path).is_none());
+        // Another network's tag → None, even for the very config that wrote
+        // the file: the bytes carry their own chain identity.
+        let other = ChainTag { network_id: 11_155_111, genesis_hash: [0x25; 32] };
+        assert!(LogIndex::load(&cfg, &other, &path).is_none());
         // Truncated file → None.
         let data = std::fs::read(&path).unwrap();
         std::fs::write(&path, &data[..data.len() - 1]).unwrap();
-        assert!(LogIndex::load(&cfg, &path).is_none());
+        assert!(LogIndex::load(&cfg, &tag(), &path).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -967,29 +1149,33 @@ mod tests {
         let cfg = config(vec![watch_all(addr(1), 0)]);
         let mut ix = LogIndex::new(cfg.clone()).unwrap();
         ix.append_block(7, [0xbb; 32], vec![log(7, 0, addr(1), vec![topic(1), topic(2)])]).unwrap();
-        let good = ix.serialize();
-        assert!(LogIndex::deserialize(&cfg, &good).is_some());
+        let good = ix.serialize(&tag());
+        assert!(LogIndex::deserialize(&cfg, &tag(), &good).is_some());
         // Every single-byte mutation must yield Some-or-None, never panic,
-        // and structural fields must not produce a bogus accepted index.
+        // and structural fields must not produce a bogus accepted index —
+        // on the config-keyed AND the self-describing path.
         for i in 0..good.len() {
             let mut bad = good.clone();
             bad[i] ^= 0xff;
-            let _ = LogIndex::deserialize(&cfg, &bad);
+            let _ = LogIndex::deserialize(&cfg, &tag(), &bad);
+            let _ = LogIndex::deserialize_portable(&bad);
         }
         // Every truncation length likewise.
         for n in 0..good.len() {
-            assert!(LogIndex::deserialize(&cfg, &good[..n]).is_none());
+            assert!(LogIndex::deserialize(&cfg, &tag(), &good[..n]).is_none());
+            assert!(LogIndex::deserialize_portable(&good[..n]).is_none());
         }
         // Huge length prefixes must fail cleanly (no allocation bomb).
         let mut huge = good.clone();
         let tail = huge.len() - 4;
         huge[tail..].copy_from_slice(&u32::MAX.to_le_bytes());
-        let _ = LogIndex::deserialize(&cfg, &huge);
+        let _ = LogIndex::deserialize(&cfg, &tag(), &huge);
+        let _ = LogIndex::deserialize_portable(&huge);
     }
 
     #[test]
     fn duplicate_watch_addresses_are_rejected() {
-        let dup = config(vec![watch_all(addr(1), 0), WatchEntry { address: addr(1), from_block: 50, topic0s: vec![] }]);
+        let dup = config(vec![watch_all(addr(1), 0), WatchEntry { address: addr(1), from_block: 50, topic0s: vec![], name: String::new() }]);
         assert!(matches!(LogIndex::new(dup), Err(DuplicateWatchAddress(a)) if a == addr(1)));
     }
 
@@ -1027,13 +1213,14 @@ mod tests {
         let cfg = config(vec![watch_all(addr(1), 0)]);
         let mut ix = LogIndex::new(cfg.clone()).unwrap();
         ix.append_block(7, [0xbb; 32], vec![log(7, 0, addr(1), vec![topic(1)])]).unwrap();
-        let good = ix.serialize();
-        // Flip one bit inside every payload byte (past the 24-byte header):
+        let good = ix.serialize(&tag());
+        // Flip one bit inside every payload byte (past the checksum field):
         // the checksum must reject each one.
-        for i in 24..good.len() {
+        for i in V2_CHECKSUM_AT + 8..good.len() {
             let mut bad = good.clone();
             bad[i] ^= 0x01;
-            assert!(LogIndex::deserialize(&cfg, &bad).is_none(), "bitflip at {i} accepted");
+            assert!(LogIndex::deserialize(&cfg, &tag(), &bad).is_none(), "bitflip at {i} accepted");
+            assert!(LogIndex::deserialize_portable(&bad).is_none(), "portable bitflip at {i} accepted");
         }
     }
 
@@ -1053,14 +1240,148 @@ mod tests {
     #[test]
     fn fingerprint_is_order_insensitive_but_content_sensitive() {
         let a = watch_all(addr(1), 5);
-        let b = WatchEntry { address: addr(2), from_block: 9, topic0s: vec![topic(3), topic(4)] };
+        let b = WatchEntry { address: addr(2), from_block: 9, topic0s: vec![topic(3), topic(4)], name: String::new() };
         let mut b_rev = b.clone();
         b_rev.topic0s.reverse();
         let c1 = config(vec![a.clone(), b.clone()]);
         let c2 = config(vec![b_rev, a.clone()]);
         assert_eq!(c1.fingerprint(), c2.fingerprint());
-        let c3 = config(vec![a, WatchEntry { address: addr(2), from_block: 10, topic0s: vec![topic(3), topic(4)] }]);
+        let c3 = config(vec![a, WatchEntry { address: addr(2), from_block: 10, topic0s: vec![topic(3), topic(4)], name: String::new() }]);
         assert_ne!(c1.fingerprint(), c3.fingerprint());
+    }
+
+    #[test]
+    fn names_are_fingerprint_neutral_and_never_cost_a_reindex() {
+        let unnamed = config(vec![watch_all(addr(1), 100)]);
+        let mut named_entry = watch_all(addr(1), 100);
+        named_entry.name = "tornado.registry.eth".to_string();
+        let named = config(vec![named_entry]);
+        assert_eq!(unnamed.fingerprint(), named.fingerprint());
+        // A file written unnamed loads under a renamed config (and the
+        // config's name wins — the host is authoritative for cosmetics).
+        let mut ix = LogIndex::new(unnamed).unwrap();
+        ix.append_block(200, [0xbb; 32], vec![]).unwrap();
+        let back = LogIndex::deserialize(&named, &tag(), &ix.serialize(&tag())).unwrap();
+        assert_eq!(back.config().watch[0].name, "tornado.registry.eth");
+        assert_eq!(back.coverage_of(&addr(1)).unwrap().span, Some((200, 200)));
+    }
+
+    #[test]
+    fn portable_roundtrip_reconstructs_config_from_the_bytes() {
+        let mut w1 = watch_all(addr(1), 100);
+        w1.name = "tornado.registry.eth".to_string();
+        let w2 = WatchEntry { address: addr(2), from_block: 50, topic0s: vec![topic(7)], name: String::new() };
+        let mut ix = LogIndex::new(config(vec![w1.clone(), w2.clone()])).unwrap();
+        ix.append_block(200, [0xbb; 32], vec![log(200, 0, addr(1), vec![topic(7)])]).unwrap();
+        ix.backfill_block(199, [9; 32], vec![]).unwrap();
+
+        let (got_tag, back) = LogIndex::deserialize_portable(&ix.serialize(&tag())).expect("portable");
+        assert_eq!(got_tag, tag());
+        // The watch-list — names included — comes from the FILE, no config
+        // supplied. Runtime bits are the receiving host's decision.
+        assert_eq!(back.config().watch, vec![w1, w2]);
+        assert!(!back.config().enabled);
+        assert!(!back.config().max_speed);
+        // Coverage, cursor, and logs all survive.
+        assert_eq!(back.coverage_of(&addr(1)).unwrap().span, Some((199, 200)));
+        assert_eq!(back.cursor, Some((199, [9; 32])));
+        assert_eq!(back.log_count(), 1);
+    }
+
+    #[test]
+    fn v1_files_are_not_portable() {
+        let ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
+        let mut v1 = ix.serialize(&tag());
+        v1[4..8].copy_from_slice(&1u32.to_le_bytes());
+        // (Bogus v1 framing after the version field — the point is only that
+        // the version gate itself refuses before parsing anything.)
+        assert!(LogIndex::deserialize_portable(&v1).is_none());
+    }
+
+    /// Serialize `ix` in the LEGACY v1 layout (what pre-v2 builds wrote):
+    /// magic, version 1, fingerprint, checksum over the rest, coverage,
+    /// cursor, logs — no chain tag, no watch-table.
+    fn serialize_v1(ix: &LogIndex) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        put_u32(&mut out, VERSION_LEGACY);
+        put_u64(&mut out, ix.config().fingerprint());
+        put_u64(&mut out, 0); // checksum placeholder
+        put_u32(&mut out, ix.coverage.len() as u32);
+        for c in &ix.coverage {
+            match c.span {
+                None => out.push(0),
+                Some((low, high)) => {
+                    out.push(1);
+                    put_u64(&mut out, low);
+                    put_u64(&mut out, high);
+                }
+            }
+        }
+        match ix.cursor {
+            None => out.push(0),
+            Some((n, h)) => {
+                out.push(1);
+                put_u64(&mut out, n);
+                out.extend_from_slice(&h);
+            }
+        }
+        put_u64(&mut out, ix.logs.len() as u64);
+        for log in ix.logs.values() {
+            put_u64(&mut out, log.block_number);
+            out.extend_from_slice(&log.block_hash);
+            out.extend_from_slice(&log.tx_hash);
+            put_u32(&mut out, log.tx_index);
+            put_u32(&mut out, log.log_index);
+            out.extend_from_slice(&log.address);
+            put_u32(&mut out, log.topics.len() as u32);
+            for t in &log.topics {
+                out.extend_from_slice(t);
+            }
+            put_bytes(&mut out, &log.data);
+        }
+        let sum = fnv64(&out[V1_CHECKSUM_AT + 8..]);
+        out[V1_CHECKSUM_AT..V1_CHECKSUM_AT + 8].copy_from_slice(&sum.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn legacy_v1_files_still_load_preserving_coverage() {
+        // The upgrade path: a file written by a pre-v2 build must load (months
+        // of phone backfill must not re-index just because the code updated).
+        let cfg = config(vec![watch_all(addr(1), 100)]);
+        let mut ix = LogIndex::new(cfg.clone()).unwrap();
+        ix.append_block(200, [0xbb; 32], vec![log(200, 0, addr(1), vec![topic(7)])]).unwrap();
+        ix.backfill_block(199, [9; 32], vec![]).unwrap();
+        let v1 = serialize_v1(&ix);
+        let back = LogIndex::deserialize(&cfg, &tag(), &v1).expect("v1 upgrade load");
+        assert_eq!(back.coverage_of(&addr(1)).unwrap().span, Some((199, 200)));
+        assert_eq!(back.cursor, Some((199, [9; 32])));
+        assert_eq!(back.log_count(), 1);
+        // Same guards as ever: wrong fingerprint or truncation → None.
+        assert!(LogIndex::deserialize(&config(vec![watch_all(addr(1), 101)]), &tag(), &v1).is_none());
+        assert!(LogIndex::deserialize(&cfg, &tag(), &v1[..v1.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn reordered_config_pairs_coverage_by_address() {
+        // The fingerprint is order-insensitive, so a host may re-apply the
+        // same watch-set in a different order. v2 stores the watch-table and
+        // re-pairs coverage by ADDRESS — entry order must not migrate a span
+        // to the wrong contract.
+        let w1 = watch_all(addr(1), 100);
+        let w2 = watch_all(addr(2), 300);
+        let mut ix = LogIndex::new(config(vec![w1.clone(), w2.clone()])).unwrap();
+        // Blocks 200..=210: only addr(1)'s entry is live (addr(2) starts at 300).
+        for b in 200..=210 {
+            ix.append_block(b, [0xbb; 32], vec![]).unwrap();
+        }
+        let bytes = ix.serialize(&tag());
+        let reordered = config(vec![w2, w1]);
+        assert_eq!(reordered.fingerprint(), ix.config().fingerprint());
+        let back = LogIndex::deserialize(&reordered, &tag(), &bytes).unwrap();
+        assert_eq!(back.coverage_of(&addr(1)).unwrap().span, Some((200, 210)));
+        assert_eq!(back.coverage_of(&addr(2)).unwrap().span, None);
     }
 }
 
@@ -1074,7 +1395,7 @@ mod bloom_match_tests {
         fn addr(b: u8) -> [u8; 20] {
             [b; 20]
         }
-        let watch = WatchEntry { address: addr(1), from_block: 100, topic0s: vec![[7; 32]] };
+        let watch = WatchEntry { address: addr(1), from_block: 100, topic0s: vec![[7; 32]], name: String::new() };
         let ix = LogIndex::new(LogIndexConfig { enabled: true, max_speed: false, watch: vec![watch] }).unwrap();
         let mut hit = EMPTY_BLOOM;
         accrue(&mut hit, &addr(1));
