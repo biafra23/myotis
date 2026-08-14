@@ -186,6 +186,18 @@ public interface ChainHandle {
     }
 
     /**
+     * Export the current log index as a portable snapshot file at
+     * {@code path} (finality-clamped, self-describing — importable via
+     * {@link #importLogIndexFiles} anywhere on the same chain; partial
+     * coverage exports honestly, the importer's catch-up finishes the walk).
+     * Returns {@code {"ok":true}} or {@code {"error":...}}. Default: a
+     * stable not-supported error (the Java engine has no log index).
+     */
+    default String exportLogIndex(String path) {
+        return "{\"error\":\"log-index export is not supported by this engine\"}";
+    }
+
+    /**
      * Dial one specific EL peer by endpoint + secp256k1 public key (operator
      * debugging). Returns immediately after the connect is initiated.
      *

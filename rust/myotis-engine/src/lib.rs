@@ -75,8 +75,8 @@ uniffi::setup_scaffolding!();
 /// v23: nativeEstimateGasJson may now return `{"status":"revert","dataHex"}`
 ///      for an estimated transaction that reverts (a verified answer the host
 ///      serves as JSON-RPC code 3) — a payload extension, no signature change.
-/// v24: added import_log_index_files (merge portable log-index snapshots into
-///      the node's index — the generic import path, docs/eth-getlogs-design.md).
+/// v24: added import_log_index_files + export_log_index (portable log-index
+///      snapshots: the generic import/export path, docs/eth-getlogs-design.md).
 ///      set_log_index_config became ADDITIVE (unions with the stored
 ///      subscription set) — a behavior change, no signature change.
 pub const ABI_VERSION: i32 = 24;

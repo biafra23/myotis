@@ -81,6 +81,8 @@ public class CommandHandler {
                 case "stop"                    -> handleStop();
                 case "beacon-status"           -> handleBeaconStatus();
                 case "import-logindex"         -> handleImportLogIndex(jsonLine);
+                case "export-logindex"         -> handleExportLogIndex(jsonLine);
+                case "build-logindex"          -> handleBuildLogIndex(jsonLine);
                 case "logindex-status"         -> handle.logIndexStatusJson();
                 default                        -> jsonError("Unknown command: " + cmd);
             };
@@ -269,6 +271,96 @@ public class CommandHandler {
      */
     private String handleImportLogIndex(String jsonLine) {
         return handle.importLogIndexFiles(extractArray(jsonLine, "paths"));
+    }
+
+    /**
+     * Export the current log index as a portable snapshot
+     * ({@code {"cmd":"export-logindex","path":"/abs/out.db"}}) — the
+     * generator's output step. Finality-clamped and self-describing;
+     * partial coverage exports honestly (check {@code logindex-status} for
+     * "complete" first if that matters). Engine JSON is the response.
+     */
+    private String handleExportLogIndex(String jsonLine) {
+        return handle.exportLogIndex(extractString(jsonLine, "path"));
+    }
+
+    /**
+     * The generic log-index GENERATOR
+     * ({@code {"cmd":"build-logindex","fromBlock":N,"addresses":["0x..",...]}}):
+     * subscribe the given contract addresses — no preset involved — and let
+     * the engine's backfill build the database. The config push is ADDITIVE
+     * engine-side (existing subscriptions/coverage survive) and runs at max
+     * download speed, since a generator daemon exists to finish the walk.
+     * Each address gets a best-effort ENS reverse name (forward-verified by
+     * {@link EnsApi#reverseResolve}) baked in as its display name; failures
+     * just leave the entry unnamed. Poll {@code logindex-status} until
+     * complete, then {@code export-logindex <path>}. Rust engine only.
+     *
+     * <p>{@code fromBlock} is a TRUST ASSERTION, not a hint: the engine
+     * serves a query once coverage reaches it, so a value LATER than the
+     * real deployment makes earlier events vanish without an error.
+     * Undershooting (the default 0) cannot lie — it only walks further.
+     */
+    private String handleBuildLogIndex(String jsonLine) {
+        String addressesJson = extractArray(jsonLine, "addresses");
+        long fromBlock;
+        try {
+            fromBlock = extractLong(jsonLine, "fromBlock");
+        } catch (IllegalArgumentException e) {
+            fromBlock = 0;
+        }
+        if (fromBlock < 0) return jsonError("fromBlock must be >= 0");
+        java.util.List<String> addresses = new java.util.ArrayList<>();
+        java.util.regex.Matcher m =
+                java.util.regex.Pattern.compile("\"(0x[0-9a-fA-F]{40})\"").matcher(addressesJson);
+        while (m.find()) addresses.add(m.group(1));
+        // Count the raw elements too: a malformed address must be an error,
+        // never silently dropped from the subscription (a well-formed result
+        // for a different question — the rule from CLAUDE.md §Trust).
+        int rawElements = addressesJson.replaceAll("[^\"]", "").length() / 2;
+        if (addresses.isEmpty() || addresses.size() != rawElements) {
+            return jsonError("addresses must be a non-empty array of 0x-prefixed 20-byte hex addresses");
+        }
+        StringBuilder watch = new StringBuilder();
+        StringBuilder named = new StringBuilder();
+        for (int i = 0; i < addresses.size(); i++) {
+            String addr = addresses.get(i);
+            String name = reverseNameOrNull(addr);
+            if (i > 0) {
+                watch.append(',');
+                named.append(',');
+            }
+            watch.append("{\"address\":\"").append(addr)
+                 .append("\",\"fromBlock\":").append(fromBlock);
+            if (name != null) {
+                watch.append(",\"name\":\"").append(escapeJson(name)).append('"');
+            }
+            watch.append('}');
+            named.append("{\"address\":\"").append(addr).append('"');
+            if (name != null) {
+                named.append(",\"name\":\"").append(escapeJson(name)).append('"');
+            }
+            named.append('}');
+        }
+        String config = "{\"enabled\":true,\"maxSpeed\":true,\"watch\":[" + watch + "]}";
+        if (!handle.setLogIndexConfig(config)) {
+            return jsonError("log index config rejected (is this daemon on the Rust engine? start with -Pengine=rust)");
+        }
+        return "{\"ok\":true,\"building\":[" + named + "]"
+                + ",\"note\":\"poll logindex-status until complete, then export-logindex <path>\"}";
+    }
+
+    /** Best-effort ENS reverse name (forward-verified engine-side); null on
+     *  any failure — a name must never gate indexing. */
+    private String reverseNameOrNull(String address) {
+        try {
+            EnsApi ens = handle.ens();
+            if (ens == null) return null;
+            EnsResolutionResult r = ens.reverseResolve(address);
+            return r != null ? r.name() : null;
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     // -------------------------------------------------------------------------

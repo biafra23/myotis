@@ -344,6 +344,11 @@ final class RustEngineNative {
         return Myotis_engineKt.importLogIndexFiles(handle, nz(pathsJson));
     }
 
+    /** Export the log index as a portable snapshot ({"ok":true} / {"error":...}). */
+    static String nativeExportLogIndex(long handle, String path) {
+        return Myotis_engineKt.exportLogIndex(handle, nz(path));
+    }
+
     /** Verified {@code eth_feeHistory} (feeHistory JSON / error). */
     static String nativeFeeHistoryJson(
             long handle, long blockCount, String newestBlockTag, String percentilesJson) {

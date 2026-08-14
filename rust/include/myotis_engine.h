@@ -164,6 +164,9 @@ char *myotis_log_index_status_json(int64_t handle);
  * chain; all-or-nothing merge, importing is the opt-in (catch-up starts
  * immediately). {"ok":true,"status":...} or {"error":...}. */
 char *myotis_import_log_index_files(int64_t handle, const char *paths_json);
+/* v23: export the current index as a portable snapshot at path
+ * (finality-clamped, self-describing). {"ok":true} or {"error":...}. */
+char *myotis_export_log_index(int64_t handle, const char *path);
 
 #ifdef __cplusplus
 }

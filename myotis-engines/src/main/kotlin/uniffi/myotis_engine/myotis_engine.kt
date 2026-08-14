@@ -690,6 +690,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_eth_call_overrides_json(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_export_log_index(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_fee_estimate_json(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_fee_history_json(
@@ -772,6 +774,8 @@ internal object UniffiLib {
     external fun uniffi_myotis_engine_fn_func_eth_call_json(`handle`: Long,`from`: RustBuffer.ByValue,`to`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`value`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_eth_call_overrides_json(`handle`: Long,`from`: RustBuffer.ByValue,`to`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`value`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,`stateOverrides`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_export_log_index(`handle`: Long,`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_fee_estimate_json(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -969,6 +973,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_eth_call_overrides_json() != 2974) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_myotis_engine_checksum_func_export_log_index() != 2966) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_fee_estimate_json() != 39989) {
@@ -1448,6 +1455,22 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         FfiConverterString.lower(`value`),
         FfiConverterString.lower(`block`),
         FfiConverterString.lower(`stateOverrides`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Export the current log index as a portable snapshot file (the generator's
+         * output; finality-clamped, self-describing). `{"ok":true}` or `{"error":…}`.
+         */ fun `exportLogIndex`(`handle`: kotlin.Long, `path`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_export_log_index(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterString.lower(`path`),_status)
 }
     )
     }

@@ -179,6 +179,33 @@ public class DaemonClient {
                 }
                 yield sb.append("]}").toString();
             }
+            case "export-logindex" -> {
+                if (args.length < 2) throw new IllegalArgumentException(
+                    "Usage: export-logindex <outFile>");
+                yield "{\"cmd\":\"export-logindex\",\"path\":\""
+                    + esc(java.nio.file.Path.of(args[1]).toAbsolutePath().normalize().toString()) + "\"}";
+            }
+            case "build-logindex" -> {
+                // build-logindex <0xAddr> [<0xAddr> ...] [--from <block>]
+                long from = 0;
+                StringBuilder addrs = new StringBuilder();
+                for (int i = 1; i < args.length; i++) {
+                    if ("--from".equals(args[i])) {
+                        if (i + 1 >= args.length) throw new IllegalArgumentException(
+                            "--from needs a block number");
+                        from = Long.parseLong(args[++i]);
+                    } else {
+                        if (addrs.length() > 0) addrs.append(',');
+                        addrs.append('"').append(esc(args[i])).append('"');
+                    }
+                }
+                if (addrs.length() == 0) throw new IllegalArgumentException(
+                    "Usage: build-logindex <0xAddr> [<0xAddr> ...] [--from <deploymentBlock>]\n"
+                    + "  --from defaults to 0 (undershooting cannot lie, it only walks further;\n"
+                    + "  pass the earliest deployment block to bound the backfill)");
+                yield "{\"cmd\":\"build-logindex\",\"fromBlock\":" + from
+                    + ",\"addresses\":[" + addrs + "]}";
+            }
             default -> "{\"cmd\":\"" + esc(cmd) + "\"}";
         };
     }

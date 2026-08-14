@@ -953,6 +953,31 @@ impl ElReader {
         self.ensure_log_index_appender(rt);
     }
 
+    /// Export the current index as a portable snapshot at `path` — the
+    /// generator's output. Clamped at finality like every checkpoint
+    /// (optimistic coverage is only verifiable against this run's tail
+    /// record); the v2 frame carries the watch-table + chain tag, so the file
+    /// imports anywhere on the same chain. Partial coverage exports honestly
+    /// — the importer's catch-up finishes the walk.
+    pub fn export_log_index(&self, path: &std::path::Path) -> Result<(), String> {
+        let tag = self.chain_tag();
+        let finalized = self.finalized_block_number();
+        match self.log_index.lock() {
+            Ok(slot) => match slot.as_ref() {
+                Some(ix) => {
+                    let r = if finalized == 0 {
+                        ix.persist(&tag, path)
+                    } else {
+                        ix.persist_clamped(&tag, path, finalized)
+                    };
+                    r.map_err(|e| format!("could not write {}: {e}", path.display()))
+                }
+                None => Err("no log index is configured".to_string()),
+            },
+            Err(_) => Err("log index unavailable".to_string()),
+        }
+    }
+
     /// Import portable log-index snapshots (docs/eth-getlogs-design.md):
     /// every file must be a v2 self-describing snapshot of THIS chain; they
     /// merge with the node's current index (checkpointed first so nothing

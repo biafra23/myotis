@@ -2273,6 +2273,25 @@ pub fn import_log_index_files(handle: i64, paths_json: &str) -> String {
     }
 }
 
+/// Export the current index as a portable snapshot at `path` (the
+/// generator's output; finality-clamped, self-describing v2 — importable
+/// anywhere on the same chain). `{"ok":true}` or `{"error":"..."}`.
+pub fn export_log_index(handle: i64, path: &str) -> String {
+    if path.trim().is_empty() {
+        return eljson::error_json("empty export path");
+    }
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
+        return eljson::error_json("node is not running");
+    };
+    match reader.export_log_index(std::path::Path::new(path)) {
+        Ok(()) => "{\"ok\":true}".to_string(),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
 /// Index status for hosts/UI: enabled, log count, backfill cursor, and per
 /// watch entry the covered span (absent while nothing is indexed).
 pub fn log_index_status_json(handle: i64) -> String {

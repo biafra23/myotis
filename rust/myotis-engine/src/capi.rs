@@ -642,3 +642,16 @@ pub unsafe extern "C" fn myotis_import_log_index_files(
         None => std::ptr::null_mut(),
     }
 }
+
+/// Export the log index as a portable snapshot (see ffi::export_log_index).
+/// Returned string must be freed with `myotis_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_export_log_index(
+    handle: i64,
+    path: *const std::os::raw::c_char,
+) -> *mut std::os::raw::c_char {
+    match read_string(path) {
+        Some(p) => into_c(crate::host::export_log_index(handle, &p)),
+        None => std::ptr::null_mut(),
+    }
+}
